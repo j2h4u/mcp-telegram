@@ -37,7 +37,7 @@ from mcp_telegram.dialog_selector import required_dialog_selector
 from mcp_telegram.event_handlers import EventHandlerManager, _InboxReadUpdateLike
 from mcp_telegram.feedback_db import SQLiteFeedbackStore
 from mcp_telegram.feedback_service import FeedbackApplicationService
-from mcp_telegram.flood import FloodWaitKillSwitchStatus
+from mcp_telegram.flood import FloodWaitKillSwitchStatus, TelegramRpcThrottled
 from mcp_telegram.folders.sqlite_repository import replace_folder_snapshot
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 from mcp_telegram.models import DialogType
@@ -1192,8 +1192,15 @@ async def test_list_messages_from_db() -> None:
     client = _TestClient()
     client.iter_messages = AsyncMock()
     server = make_server(conn, client)
+    server._health_status = lambda: FloodWaitKillSwitchStatus(
+        open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+    )
 
-    result = await server._list_messages({"dialog_id": 1, "limit": 10, "message_state": "sent"})
+    result, _, _ = await server._handle_client_line(
+        json.dumps({"method": "list_messages", "dialog_id": 1, "limit": 10, "message_state": "sent"}).encode(),
+        "",
+        None,
+    )
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
     assert result["data"]["source"] == "sync_db"
@@ -2361,8 +2368,11 @@ async def test_list_topics_through_daemon() -> None:
 
     client = _TestClient()
     server = make_server(conn, client)
+    server._health_status = lambda: FloodWaitKillSwitchStatus(
+        open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+    )
 
-    result = await server._list_topics({"dialog_id": 123})
+    result, _, _ = await server._handle_client_line(b'{"method":"list_topics","dialog_id":123}', "", None)
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
     assert "topics" in result["data"]
@@ -2646,8 +2656,8 @@ async def test_unknown_method() -> None:
 
 
 @pytest.mark.asyncio
-async def test_daemon_api_returns_unhealthy_when_flood_wait_kill_switch_is_open() -> None:
-    """Healthcheck method is blocked with a clear kill-switch error."""
+async def test_daemon_api_keeps_local_status_available_when_flood_wait_kill_switch_is_open() -> None:
+    """An active circuit does not pre-dispatch reject a local daemon read."""
     server = make_server()
     server._health_status = lambda: FloodWaitKillSwitchStatus(
         open=True,
@@ -2667,9 +2677,61 @@ async def test_daemon_api_returns_unhealthy_when_flood_wait_kill_switch_is_open(
 
     assert method == "get_sync_status"
     assert request_id == "deadbeef"
-    assert response["ok"] is False
-    assert response["error"] == "flood_wait_kill_switch_open"
-    assert "too_many_flood_wait_events" in str(response["detail"])
+    assert response["ok"] is True
+    assert response["data"]["dialog_id"] == 0
+
+
+def test_get_account_protection_reports_only_process_local_status() -> None:
+    server = make_server()
+
+    assert server._get_account_protection({}) == {"ok": True, "data": {"account_protection": None}}
+
+    server._health_status = lambda: FloodWaitKillSwitchStatus(
+        open=True,
+        reason="too_many_flood_wait_events",
+        opened_at=1_700_000_000,
+        events_in_window=5,
+        wait_s_in_window=300,
+        window_seconds=600,
+        source="test",
+    )
+
+    assert server._get_account_protection({}) == {
+        "ok": True,
+        "data": {
+            "account_protection": {
+                "status": "active",
+                "outbound_acquisition": "blocked",
+                "recovery": "manual",
+                "notice": (
+                    "Telegram acquisition is blocked by account protection. "
+                    "Freshness and incoming coverage may be limited. Recovery requires operator action."
+                ),
+                "reason": "too_many_flood_wait_events",
+                "opened_at": 1_700_000_000,
+            }
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_daemon_api_projects_latched_rpc_without_finite_retry() -> None:
+    server = make_server()
+
+    async def latched_dispatch(_req: dict[str, object]) -> dict[str, object]:
+        raise TelegramRpcThrottled(latched=True)
+
+    server._dispatch = latched_dispatch  # type: ignore[method-assign]
+
+    response = await server._dispatch_with_error_projection({}, method="list_topics", request_id="deadbeef")
+
+    assert response == {
+        "ok": False,
+        "error": "flood_wait_kill_switch_open",
+        "message": "Telegram acquisition is blocked by account protection.",
+        "required_action": "manual_operator_recovery",
+        "retryable": False,
+    }
 
 
 # ---------------------------------------------------------------------------

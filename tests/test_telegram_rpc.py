@@ -1314,6 +1314,34 @@ async def test_gate_blocks_when_circuit_is_open() -> None:
 
 
 @pytest.mark.asyncio
+async def test_latched_circuit_precedes_disconnected_transport_deferral() -> None:
+    gate = _gate(_CircuitStatus(open=True))
+    sender = _set_sender(gate, _request_value)
+    gate._transport_state = _TransportBoundaryState.DISCONNECTED
+
+    with pytest.raises(TelegramRpcThrottled) as caught:
+        await _call(gate, "request")
+
+    assert caught.value.latched is True
+    assert sender.calls == 0
+    assert gate._limiter.acquisitions == 0
+
+
+@pytest.mark.asyncio
+async def test_disconnected_transport_keeps_finite_admission_deferral_when_circuit_is_closed() -> None:
+    gate = _gate()
+    sender = _set_sender(gate, _request_value)
+    gate._transport_state = _TransportBoundaryState.DISCONNECTED
+
+    with pytest.raises(TelegramRpcAdmissionDeferred) as caught:
+        await _call(gate, "request")
+
+    assert caught.value.latched is False
+    assert caught.value.retry_after_seconds > 0
+    assert sender.calls == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "batch_request",
     [[], (), set(), {}, range(2), (item for item in range(2))],

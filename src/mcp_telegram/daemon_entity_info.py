@@ -74,7 +74,7 @@ from .entity_profile.refresh import (
 )
 from .entity_profile.repository import EntityProfileRepository, EntityRefreshCursor, EntitySectionCommit
 from .entity_store import EntitySnapshot, ensure_entity_stub
-from .flood import TelegramRpcThrottled
+from .flood import TelegramRpcThrottled, _raise_if_latched
 from .folders.read_model import dialog_placement
 from .linked_chat_fact import linked_chat_fact_owner
 from .models import DialogType
@@ -835,6 +835,7 @@ class DaemonEntityInfoService:
             self._observe_profile_section_failure(cursor, DialogType.GROUP, actual_attempts=0)
             raise
         except TelegramRpcThrottled as exc:
+            _raise_if_latched(exc)
             terminal = self._handle_profile_section_failure(
                 _ProfileSectionFailure(
                     cursor=cursor,
@@ -1032,6 +1033,7 @@ class DaemonEntityInfoService:
             self._observe_profile_section_failure(cursor, entity_type, actual_attempts=0)
             raise
         except TelegramRpcThrottled as exc:
+            _raise_if_latched(exc)
             retry_at = throttled_retry_at(now, exc.retry_after_seconds)
             return self._handle_profile_section_failure(
                 _ProfileSectionFailure(
@@ -1189,6 +1191,7 @@ class DaemonEntityInfoService:
             self._record_full_user_pair_failure(cursor, pair_mode, attempt_start, reuse_rejection_reason)
             raise
         except TelegramRpcThrottled as exc:
+            _raise_if_latched(exc)
             return self._handle_full_user_pair_failure(
                 _PairFailure(
                     cursor=cursor,
@@ -1868,6 +1871,7 @@ class DaemonEntityInfoService:
         except RpcAttemptBudgetExhaustedError:
             raise
         except TelegramRpcThrottled as exc:
+            _raise_if_latched(exc)
             self._profiles.mark_refresh_failure(
                 cursor.entity_id,
                 now=now,

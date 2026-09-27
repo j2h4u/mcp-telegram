@@ -1178,6 +1178,7 @@ class TelegramRpcGate(TelegramClient):
             self._transport_state = _TransportBoundaryState.FAILED
 
     def _raise_if_transport_unavailable(self, *, allow_disconnected: bool = False) -> None:
+        self.check_circuit()
         reusable = {_TransportBoundaryState.READY}
         if allow_disconnected:
             reusable.add(_TransportBoundaryState.DISCONNECTED)

@@ -1528,6 +1528,7 @@ async def _trace_enrich_candidate_messages(
                 break
             fetched.append(extract_message_row(request.dialog_id, msg, entity_name_map={}))
     except TelegramRpcThrottled as exc:
+        _raise_if_latched(exc)
         seconds = exc.retry_after_seconds
         if seconds is None:
             return fetched, "flood_wait"

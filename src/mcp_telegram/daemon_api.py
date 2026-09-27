@@ -80,7 +80,7 @@ from .entity_profile.ports import (
 )
 from .entity_profile.refresh import RefreshLimits
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
-from .flood import TelegramRpcThrottled
+from .flood import TelegramRpcThrottled, _raise_if_latched
 from .folders.read_model import dialog_placement, folder_snapshot, folder_summaries, folders_by_dialog
 from .history_enrollment import disable_history, enable_history, read_intent
 from .models import ReadMessage
@@ -177,6 +177,17 @@ def _rpc_busy_response() -> dict[str, object]:
         "message": "Telegram request capacity is currently busy; retry shortly or narrow the request.",
         "retryable": True,
         "required_action": "Retry shortly, or narrow the request scope.",
+    }
+
+
+def _account_protection_error() -> dict[str, object]:
+    """Project a latched acquisition outcome without inventing a retry deadline."""
+    return {
+        "ok": False,
+        "error": "flood_wait_kill_switch_open",
+        "message": "Telegram acquisition is blocked by account protection.",
+        "required_action": "manual_operator_recovery",
+        "retryable": False,
     }
 
 
@@ -798,18 +809,6 @@ class DaemonAPIServer:
                 request_id,
             )
 
-        health_status = self._health_status()
-        if health_status.open:
-            return (
-                {
-                    "ok": False,
-                    "error": "flood_wait_kill_switch_open",
-                    "detail": health_status.detail(),
-                },
-                method,
-                request_id,
-            )
-
         operation_result = _operation_id_or_error(req.get("operation_id"))
         if isinstance(operation_result, dict):
             return (
@@ -898,7 +897,17 @@ class DaemonAPIServer:
                 exc.retry_after_seconds,
                 request_id,
             )
-            return _rpc_busy_response()
+            response = _rpc_busy_response()
+        except TelegramRpcThrottled as exc:
+            if exc.latched:
+                response = _account_protection_error()
+            else:
+                logger.warning(
+                    "daemon_api_rpc_throttled retry_after=%s request_id=%s",
+                    exc.retry_after_seconds,
+                    request_id,
+                )
+                response = {"ok": False, "error": "internal", "message": "internal error"}
         except RpcAdmissionError as exc:
             logger.warning(
                 "daemon_api_rpc_admission_rejected source=%s service_class=%s error_type=%s request_id=%s",
@@ -907,21 +916,22 @@ class DaemonAPIServer:
                 type(exc).__name__,
                 request_id,
             )
-            return _rpc_admission_response(exc) or {
+            response = _rpc_admission_response(exc) or {
                 "ok": False,
                 "error": "internal",
                 "message": "internal error",
             }
         except UnclassifiedTelegramRpcError:
             logger.exception("daemon_api_unclassified_rpc method=%s request_id=%s", method, request_id)
-            return {"ok": False, "error": "internal", "message": "internal error"}
+            response = {"ok": False, "error": "internal", "message": "internal error"}
         except Exception:
             logger.exception(
                 "daemon_api_dispatch_error method=%s request_id=%s",
                 method,
                 request_id,
             )
-            return {"ok": False, "error": "internal", "message": "internal error"}
+            response = {"ok": False, "error": "internal", "message": "internal error"}
+        return response
 
     def _log_request_completion(
         self,
@@ -1001,6 +1011,7 @@ class DaemonAPIServer:
             "list_folders": self._list_folders,
             "list_topics": self._list_topics,
             "get_me": self._get_me,
+            "get_account_protection": self._get_account_protection,
             "mark_dialog_for_sync": self._mark_dialog_for_sync,
             "get_sync_status": self._get_sync_status,
             "recover_dialog_directory": self._recover_dialog_directory,
@@ -1561,6 +1572,7 @@ class DaemonAPIServer:
                 entity = await self._client.get_entity(dialog_id)
                 refreshed = await self._topic_refresher.refresh(dialog_id, entity)
             except TelegramRpcThrottled as exc:
+                _raise_if_latched(exc)
                 logger.info(
                     "list_topics_refresh_deferred_flood_wait dialog_id=%d seconds=%s",
                     dialog_id,
@@ -1586,6 +1598,27 @@ class DaemonAPIServer:
         if self.self_profile is None:
             return {"ok": False, "error": "not_found", "message": "account info unavailable"}
         return {"ok": True, "data": dict(self.self_profile)}
+
+    def _get_account_protection(self, req: dict[str, object]) -> dict[str, object]:
+        """Return the current process-local account-protection status."""
+        del req
+        status = self._health_status()
+        if not status.open:
+            return {"ok": True, "data": {"account_protection": None}}
+        protection: dict[str, object] = {
+            "status": "active",
+            "outbound_acquisition": "blocked",
+            "recovery": "manual",
+            "notice": (
+                "Telegram acquisition is blocked by account protection. "
+                "Freshness and incoming coverage may be limited. Recovery requires operator action."
+            ),
+        }
+        if status.reason is not None:
+            protection["reason"] = status.reason
+        if status.opened_at is not None:
+            protection["opened_at"] = status.opened_at
+        return {"ok": True, "data": {"account_protection": protection}}
 
     # ------------------------------------------------------------------
     # mark_dialog_for_sync

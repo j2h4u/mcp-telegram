@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import time
 from collections.abc import Iterator
@@ -17,6 +18,7 @@ from mcp_telegram.daemon_api import DaemonAPIServer
 from mcp_telegram.feedback_contracts import VALID_SEVERITIES
 from mcp_telegram.feedback_db import SQLiteFeedbackStore, ensure_feedback_schema
 from mcp_telegram.feedback_service import FeedbackApplicationService
+from mcp_telegram.flood import FloodWaitKillSwitchStatus
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     LoudChannelProfilePort,
@@ -88,6 +90,25 @@ async def test_submit_feedback_happy_path(tmp_path: Path) -> None:
         row = _fetchone_row(feedback_conn, "SELECT message, submitted_at FROM feedback")
         assert row[0] == "the search returns stale data"
         assert cast(int, row[1]) >= before
+
+
+@pytest.mark.asyncio
+async def test_submit_feedback_persists_through_local_ipc_when_protection_is_active(tmp_path: Path) -> None:
+    with _make_feedback_server(tmp_path) as (server, feedback_conn):
+        server._health_status = lambda: FloodWaitKillSwitchStatus(
+            open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+        )
+        socket_path = tmp_path / "daemon.sock"
+        async with await asyncio.start_unix_server(server.handle_client, path=socket_path):
+            reader, writer = await asyncio.open_unix_connection(socket_path)
+            writer.write(b'{"method":"submit_feedback","message":"local while protected"}\n')
+            await writer.drain()
+            response = json.loads((await reader.readline()).decode())
+            writer.close()
+            await writer.wait_closed()
+
+        assert response["ok"] is True
+        assert _fetchone_row(feedback_conn, "SELECT message FROM feedback") == ("local while protected",)
 
 
 @pytest.mark.asyncio

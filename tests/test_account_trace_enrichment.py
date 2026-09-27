@@ -28,7 +28,9 @@ from mcp_telegram.daemon_account_trace import (
     _messages_row_equal,
     _project_trace_content_rows,
     _trace_candidate_dialogs,
+    _trace_enrich_candidate_messages,
     _TraceCandidateBuildRequest,
+    _TraceCandidateMessagesContext,
     _TraceCoverageFragmentUpsertRequest,
     _upsert_trace_coverage_fragment,
 )
@@ -512,6 +514,30 @@ async def test_trace_enrichment_floodwait_persists_retry_fragment(
     assert fragment[0] == "flood_wait"
     assert fragment[1] == "TelegramRpcThrottled:120"
     assert fragment[2] > int(datetime.now(tz=UTC).timestamp())
+
+
+@pytest.mark.asyncio
+async def test_trace_enrichment_propagates_latched_protection_without_retry_fragment(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+) -> None:
+    _, conn, client = trace_enrichment_server
+    client.exc = TelegramRpcThrottled(latched=True)
+
+    with pytest.raises(TelegramRpcThrottled):
+        await _trace_enrich_candidate_messages(
+            _TraceCandidateMessagesContext(
+                client=client,
+                conn=conn,
+                dialog_id=222,
+                iter_kwargs={"limit": 1},
+                target_user_id=101,
+                now=1_700_000_000,
+                deadline_at=float("inf"),
+            )
+        )
+
+    assert client.calls == [(222, {"limit": 1})]
+    assert conn.execute("SELECT COUNT(*) FROM trace_coverage_fragments").fetchone()[0] == 0
 
 
 @pytest.mark.asyncio

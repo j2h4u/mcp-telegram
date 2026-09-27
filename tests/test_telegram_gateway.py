@@ -30,11 +30,8 @@ def test_translate_gateway_failure_classifies_telegram_and_local_errors() -> Non
 
 
 def test_translate_gateway_failure_marks_latched_throttling_non_retryable() -> None:
-    failure = translate_gateway_failure(TelegramRpcThrottled(latched=True))
-
-    assert failure.kind is GatewayFailureKind.FLOOD_WAIT
-    assert failure.retryable is False
-    assert failure.retry_after is None
+    with pytest.raises(TelegramRpcThrottled):
+        translate_gateway_failure(TelegramRpcThrottled(latched=True))
 
 
 def test_translate_gateway_failure_hides_internal_admission_subtype() -> None:

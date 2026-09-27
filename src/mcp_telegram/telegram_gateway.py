@@ -61,7 +61,7 @@ from .entity_profile.ports import (
     UserAvatarHistoryPort,
     UserProfilePort,
 )
-from .flood import TelegramRpcThrottled
+from .flood import TelegramRpcThrottled, _raise_if_latched
 from .identity_observation import USERNAME_UNOBSERVED, observe_username
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_reading import GatewayFailure, GatewayFailureKind
@@ -1032,6 +1032,7 @@ def _normalize_current_photo(photo: object) -> ChatCurrentPhoto | None:
 
 def translate_gateway_failure(exc: BaseException) -> GatewayFailure:
     """Translate Telegram exceptions at the integration boundary."""
+    _raise_if_latched(exc)
     if isinstance(exc, RpcAdmissionClosedError):
         raise exc
     if isinstance(exc, (RpcAdmissionError, UnclassifiedTelegramRpcError)):
