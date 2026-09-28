@@ -584,7 +584,7 @@ def _trim_inbox_to_size(payload: dict[str, object]) -> None:
             if isinstance(dialog, dict) and isinstance(dialog.get("messages", []), list)
         )
         budget["hidden_count"] = sum(
-            int(cast(dict[str, object], dialog["budget"]).get("hidden_count", 0) or 0)
+            int(cast(int, cast(dict[str, object], dialog["budget"]).get("hidden_count", 0) or 0))
             for dialog in dialogs
             if isinstance(dialog, dict) and isinstance(dialog.get("budget"), dict)
         )
