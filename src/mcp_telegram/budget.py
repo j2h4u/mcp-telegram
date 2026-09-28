@@ -77,9 +77,9 @@ def allocate_message_budget_round_robin(
 ) -> dict[int, int]:
     """Allocate a bounded inbox budget fairly in ranked dialog order."""
     if not unread_counts or limit <= 0 or max_per_chat <= 0:
-        return {chat_id: 0 for chat_id in unread_counts}
+        return dict.fromkeys(unread_counts, 0)
 
-    allocation = {chat_id: 0 for chat_id in unread_counts}
+    allocation = dict.fromkeys(unread_counts, 0)
     remaining = limit
     while remaining:
         advanced = False

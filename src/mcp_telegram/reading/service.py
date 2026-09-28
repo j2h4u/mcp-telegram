@@ -2711,14 +2711,10 @@ class ReadingService:
             return {"ok": False, "error": "invalid_input", "message": str(exc)}
         entries, counts = self._collect_unread_dialogs(group_size_threshold, since_utc, include_dialog_types)
         self._rank_unread_entries(entries)
-        page_size = 20
-        total_dialog_count = len(entries)
-        page_start = (page - 1) * page_size
-        page_entries = entries[page_start : page_start + page_size]
-        page_counts = {int(entry["chat_id"]): counts[int(entry["chat_id"])] for entry in page_entries}
+        page_data = self._paginate_unread_entries(entries, counts, page)
         groups = await self._fetch_unread_groups(
-            page_entries,
-            allocate_message_budget_round_robin(page_counts, limit),
+            cast(list[dict], page_data["entries"]),
+            allocate_message_budget_round_robin(cast(dict[int, int], page_data["counts"]), limit),
             since_utc,
         )
         pending_row = cast(tuple[object] | None, self._conn.execute(_COUNT_READ_POSITION_PENDING_SQL).fetchone())
@@ -2743,16 +2739,33 @@ class ReadingService:
             "data": {
                 "groups": groups,
                 "page": page,
-                "page_size": page_size,
-                "total_dialog_count": total_dialog_count,
+                "page_size": page_data["page_size"],
+                "total_dialog_count": page_data["total_dialog_count"],
                 "shown_dialog_count": len(groups),
-                "remaining_dialog_count": max(0, total_dialog_count - page_start - len(groups)),
-                "next_page": page + 1 if page_start + len(groups) < total_dialog_count else None,
+                "remaining_dialog_count": page_data["remaining_dialog_count"],
+                "next_page": page_data["next_page"],
                 "total_message_count": sum(counts.values()),
                 "shown_message_count": sum(len(group["messages"]) for group in groups),
                 "read_position_pending_count": pending_count,
                 "read_position_pending_entities": pending_entities,
             },
+        }
+
+    @staticmethod
+    def _paginate_unread_entries(entries: list[dict], counts: dict[int, int], page: int) -> dict[str, object]:
+        page_size = 20
+        total_dialog_count = len(entries)
+        page_start = (page - 1) * page_size
+        page_entries = entries[page_start : page_start + page_size]
+        page_counts = {int(entry["chat_id"]): counts[int(entry["chat_id"])] for entry in page_entries}
+        shown_dialog_count = len(page_entries)
+        return {
+            "entries": page_entries,
+            "counts": page_counts,
+            "page_size": page_size,
+            "total_dialog_count": total_dialog_count,
+            "remaining_dialog_count": max(0, total_dialog_count - page_start - shown_dialog_count),
+            "next_page": page + 1 if page_start + shown_dialog_count < total_dialog_count else None,
         }
 
     @staticmethod
@@ -2812,18 +2825,7 @@ class ReadingService:
                 },
             ).fetchall(),
         )
-        mention_counts: dict[int, int] = {}
-        dialog_columns = {str(row[1]) for row in self._conn.execute("PRAGMA table_info(dialogs)").fetchall()}
-        if rows and "unread_mentions_count" in dialog_columns:
-            dialog_ids = [int(cast(int | str, row[0])) for row in rows]
-            placeholders = ",".join("?" for _ in dialog_ids)
-            mention_counts = {
-                int(cast(int | str, dialog_id)): int(cast(int | str, count or 0))
-                for dialog_id, count in self._conn.execute(
-                    f"SELECT dialog_id, unread_mentions_count FROM dialogs WHERE dialog_id IN ({placeholders})",
-                    dialog_ids,
-                ).fetchall()
-            }
+        mention_counts = self._unread_mention_counts(rows)
         identities = read_dialog_identities(self._conn, [int(cast(int | str, row[0])) for row in rows])
         entries: list[dict] = []
         counts: dict[int, int] = {}
@@ -2860,6 +2862,20 @@ class ReadingService:
             )
             counts[dialog_id_i] = unread_count_i
         return entries, counts
+
+    def _unread_mention_counts(self, rows: list[tuple[object, ...]]) -> dict[int, int]:
+        dialog_columns = {str(row[1]) for row in self._conn.execute("PRAGMA table_info(dialogs)").fetchall()}
+        if not rows or "unread_mentions_count" not in dialog_columns:
+            return {}
+        dialog_ids = [int(cast(int | str, row[0])) for row in rows]
+        placeholders = ",".join("?" for _ in dialog_ids)
+        return {
+            int(cast(int | str, dialog_id)): int(cast(int | str, count or 0))
+            for dialog_id, count in self._conn.execute(
+                f"SELECT dialog_id, unread_mentions_count FROM dialogs WHERE dialog_id IN ({placeholders})",
+                dialog_ids,
+            ).fetchall()
+        }
 
     @staticmethod
     def _rank_unread_entries(entries: list[dict]) -> None:
