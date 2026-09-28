@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import threading
 import time
@@ -171,7 +172,11 @@ async def test_runtime_observation_sink_callback_is_prompt_and_fifo_under_conten
 
 
 @pytest.mark.asyncio
-async def test_runtime_observation_sink_retries_busy_head_until_fifo_lock_releases(tmp_path: Path) -> None:
+async def test_runtime_observation_sink_retries_busy_head_until_fifo_lock_releases(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     lock = sqlite3.connect(path, check_same_thread=False)
@@ -201,6 +206,9 @@ async def test_runtime_observation_sink_retries_busy_head_until_fifo_lock_releas
     assert sink.busy_retries > 0
     assert sink.permanent_failures == 0
     assert not sink._writer.is_alive()
+    summaries = [record for record in caplog.records if "runtime_observation_sink_summary" in record.message]
+    assert len(summaries) == 1
+    assert summaries[0].levelname == "DEBUG"
 
 
 def test_runtime_observation_sink_logs_aggregate_queue_overflow(
@@ -235,6 +243,8 @@ def test_runtime_observation_sink_logs_aggregate_queue_overflow(
 
     assert sink.queue_full_drops > 0
     assert caplog.text.count("runtime_observation_sink_summary") == 1
+    summary = next(record for record in caplog.records if "runtime_observation_sink_summary" in record.message)
+    assert summary.levelname == "WARNING"
 
     sink._increment("successful_writes")
     monkeypatch.setattr("mcp_telegram.runtime_observations.time.monotonic", lambda: 10_000.0)
