@@ -3577,7 +3577,9 @@ async def test_list_unread_messages_since_filter_keeps_counts_bodies_and_budget_
     assert [group["dialog_id"] for group in groups] == [1001]
     group = groups[0]
     assert group["unread_count"] == 2
-    assert [message["message_id"] for message in _group_messages(group)] == [2]
+    # A bounded inbox keeps the latest eligible row; rows within the selected
+    # window are still emitted chronologically.
+    assert [message["message_id"] for message in _group_messages(group)] == [3]
 
 
 @pytest.mark.asyncio
