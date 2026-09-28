@@ -109,6 +109,23 @@ def test_missing_dialog_name_keeps_numeric_display_provenance(
     assert entries[0]["category"] is DialogType.SUPERGROUP
 
 
+def test_inbox_uses_persisted_dialog_mention_count(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
+    conn = make_synced_db()
+    _seed_unread_dialog(conn, -1006, name="Mentioned", kind="user")
+    conn.execute("UPDATE dialogs SET unread_mentions_count = 2 WHERE dialog_id = -1006")
+    service = SimpleNamespace(
+        _conn=conn,
+        _deps=SimpleNamespace(deleted_message_visibility_seconds=86_400),
+        _should_include_unread_dialog=ReadingService._should_include_unread_dialog,
+    )
+
+    entries, _counts = ReadingService._collect_unread_dialogs(cast(ReadingService, service), 100)
+
+    assert entries[0]["unread_mentions_count"] == 2
+
+
 def test_unread_summary_uses_canonical_bundle_without_entities(
     make_synced_db: Callable[[], sqlite3.Connection],
 ) -> None:

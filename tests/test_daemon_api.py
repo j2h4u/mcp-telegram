@@ -3577,7 +3577,9 @@ async def test_list_unread_messages_since_filter_keeps_counts_bodies_and_budget_
     assert [group["dialog_id"] for group in groups] == [1001]
     group = groups[0]
     assert group["unread_count"] == 2
-    assert [message["message_id"] for message in _group_messages(group)] == [2]
+    # A bounded inbox keeps the latest eligible row; rows within the selected
+    # window are still emitted chronologically.
+    assert [message["message_id"] for message in _group_messages(group)] == [3]
 
 
 @pytest.mark.asyncio
@@ -3743,6 +3745,31 @@ async def test_list_unread_messages_budget_limits_messages() -> None:
     total_messages = sum(len(_group_messages(g)) for g in _response_groups(result))
     assert total_messages <= 10, f"Budget exceeded: {total_messages} messages returned"
     cast(MagicMock, client).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_reports_page_source_total_before_cap() -> None:
+    conn = _make_db()
+    for dialog_id in range(5000, 5025):
+        _seed_unread_state(conn, dialog_id, read_inbox_max_id=0, entity_type="User", entity_name=f"User{dialog_id}")
+        _seed_message(conn, dialog_id, message_id=1, text="unread")
+    _seed_unread_state(conn, 6000, read_inbox_max_id=0, entity_type="User", entity_name="Large")
+    for message_id in range(1, 301):
+        _seed_message(conn, 6000, message_id=message_id, text="unread")
+
+    server = make_server(conn, _TestClient())
+    first = await server._dispatch({"method": "get_inbox", "limit": 40, "page": 1})
+    second = await server._dispatch({"method": "get_inbox", "limit": 40, "page": 2})
+    first_data = _response_data(first)
+    second_data = _response_data(second)
+
+    assert first_data["total_message_count"] == 325
+    assert first_data["page_message_count"] == 20
+    assert first_data["next_page"] == 2
+    assert second_data["page_message_count"] == 305
+    assert second_data["remaining_dialog_count"] == 0
+    large_group = next(group for group in _response_groups(second) if group["dialog_id"] == 6000)
+    assert len(_group_messages(large_group)) == 5
 
 
 @pytest.mark.asyncio
