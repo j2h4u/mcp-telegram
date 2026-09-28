@@ -237,7 +237,7 @@ GET_INBOX_OUTPUT_SCHEMA = {
 
 _MAX_INBOX_LAST_HOURS = 720
 _MAX_INBOX_PREVIEW_CHARS = 400
-_MAX_INBOX_STRUCTURED_CHARS = 26_000
+_MAX_INBOX_STRUCTURED_CHARS = 24_000
 
 GET_UNREAD_SUMMARY_OUTPUT_SCHEMA = {
     "type": "object",
@@ -565,7 +565,7 @@ def _structured_messages(
 
 
 def _inbox_size(payload: Mapping[str, object]) -> int:
-    return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    return len(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
 
 
 def _drop_largest_inbox_preview(dialogs: list[object]) -> bool:
@@ -648,6 +648,13 @@ def _trim_inbox_to_size(payload: dict[str, object]) -> None:
             break
     _reconcile_inbox_receipts(payload, dialogs)
     payload["count"] = len(dialogs)
+    budget = payload.get("budget")
+    shown_messages = int(budget["result_message_count"]) if isinstance(budget, dict) else 0
+    payload["shown_message_count"] = shown_messages
+    payload["selection_complete"] = (
+        payload.get("total_dialog_count") == len(dialogs)
+        and payload.get("total_message_count") == shown_messages
+    )
     payload["content_truncated_count"] = _count_inbox_truncated_content(dialogs)
 
 
@@ -764,7 +771,7 @@ def _project_inbox_response(
         "coverage": _inbox_coverage_payload(read_position_pending_count, read_position_pending_entities),
         "warnings": warnings,
         "budget": _inbox_budget_payload(args, structured_dialogs, hidden_count_by_dialog, result_message_count),
-        "selection_complete": bool(data.get("selection_complete", True)),
+        "selection_complete": False,
         "content_truncated_count": content_truncated_count,
         "dialogs": structured_dialogs,
         "count": len(structured_dialogs),
