@@ -1522,6 +1522,7 @@ async def test_get_inbox_server_boundary_keeps_cyrillic_payload_bounded(
                         "remaining_dialog_count": 5,
                         "next_page": 2,
                         "total_message_count": 300,
+                        "page_message_count": 240,
                         "read_position_pending_count": 0,
                         "read_position_pending_entities": [],
                     },
@@ -1547,6 +1548,14 @@ async def test_get_inbox_server_boundary_keeps_cyrillic_payload_bounded(
     assert payload["account_protection"] == protection
     assert payload["selection_complete"] is False
     assert payload["shown_message_count"] == cast(dict[str, object], payload["budget"])["result_message_count"]
+    budget = cast(dict[str, object], payload["budget"])
+    page_message_count = payload["page_message_count"]
+    result_message_count = budget["result_message_count"]
+    hidden_count = budget["hidden_count"]
+    assert isinstance(page_message_count, int)
+    assert isinstance(result_message_count, int)
+    assert isinstance(hidden_count, int)
+    assert page_message_count == result_message_count + hidden_count
     assert len(json.dumps(payload, ensure_ascii=True, separators=(",", ":"))) < 50_000
     validate(
         instance=payload,

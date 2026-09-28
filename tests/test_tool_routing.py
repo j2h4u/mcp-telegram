@@ -2907,6 +2907,7 @@ async def test_get_inbox_bounds_previews_and_structured_output():
     assert isinstance(hidden, int)
     assert isinstance(truncated_count, int)
     assert shown + hidden == 24 * 5
+    assert payload["page_message_count"] == shown + hidden
     assert truncated_count == shown
     assert payload["shown_message_count"] == shown
     assert payload["selection_complete"] is False
@@ -2959,6 +2960,7 @@ async def test_get_inbox_passes_page_and_projects_page_receipt():
                 "remaining_dialog_count": 0,
                 "next_page": None,
                 "total_message_count": 5,
+                "page_message_count": 5,
                 "shown_message_count": 5,
                 "read_position_pending_count": 0,
                 "read_position_pending_entities": [],
