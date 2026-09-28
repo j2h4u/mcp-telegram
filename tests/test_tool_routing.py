@@ -2969,7 +2969,6 @@ async def test_get_inbox_passes_page_and_projects_page_receipt():
     assert call_kwargs["page"] == 2
     payload = _json_dict(result.structured_content)
     assert payload["page"] == 2
-    assert payload["page_size"] == 20
     assert payload["total_dialog_count"] == 25
     assert payload["next_page"] is None
 

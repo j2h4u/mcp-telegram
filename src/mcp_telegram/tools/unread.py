@@ -127,7 +127,6 @@ GET_INBOX_OUTPUT_SCHEMA = {
         "selection_complete": {"type": "boolean"},
         "content_truncated_count": {"type": "integer"},
         "page": {"type": "integer"},
-        "page_size": {"type": "integer"},
         "total_dialog_count": {"type": "integer"},
         "shown_dialog_count": {"type": "integer"},
         "remaining_dialog_count": {"type": "integer"},
@@ -223,7 +222,6 @@ GET_INBOX_OUTPUT_SCHEMA = {
         "selection_complete",
         "content_truncated_count",
         "page",
-        "page_size",
         "total_dialog_count",
         "shown_dialog_count",
         "remaining_dialog_count",
@@ -700,7 +698,6 @@ def _inbox_int(data: Mapping[str, object], key: str, default: int) -> int:
 def _inbox_paging_payload(data: Mapping[str, object], dialog_count: int, message_count: int) -> dict[str, object]:
     return {
         "page": _inbox_int(data, "page", 1),
-        "page_size": _inbox_int(data, "page_size", 20),
         "total_dialog_count": _inbox_int(data, "total_dialog_count", dialog_count),
         "shown_dialog_count": _inbox_int(data, "shown_dialog_count", dialog_count),
         "remaining_dialog_count": _inbox_int(data, "remaining_dialog_count", 0),
