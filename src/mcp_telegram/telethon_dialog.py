@@ -24,7 +24,7 @@ def classify_dialog_type(entity: object | None) -> DialogType:
     """Classify a Telethon entity through the transport-neutral domain rule."""
     if isinstance(entity, Channel):
         kind = EntityKind.CHANNEL
-    elif isinstance(entity, (Chat, ChatForbidden)):
+    elif isinstance(entity, Chat):
         kind = EntityKind.CHAT
     elif entity is not None and hasattr(entity, "first_name"):
         kind = EntityKind.USER
@@ -54,21 +54,27 @@ def observe_dialog_identity(
             identity_fields=(_positive_name(getattr(entity, "title", None)), None),
         )
     if isinstance(entity, ChatForbidden):
-        name = _positive_name(getattr(entity, "title", None))
-        return (
-            _complete_identity(
-                entity,
-                dialog_id=dialog_id,
-                source=source,
-                observed_at=observed_at,
-                identity_fields=(name, None),
-            )
-            if name is not None
-            else None
-        )
+        return _observe_forbidden_chat_identity(entity, dialog_id, source, observed_at)
     if isinstance(entity, ChannelForbidden):
         return _observe_partial_title_identity(entity, dialog_id=dialog_id, source=source, observed_at=observed_at)
     return None
+
+
+def _observe_forbidden_chat_identity(
+    entity: ChatForbidden, dialog_id: int, source: str, observed_at: int
+) -> DialogIdentityObservation | None:
+    name = _positive_name(getattr(entity, "title", None))
+    if name is None:
+        return None
+    return DialogIdentityObservation(
+        dialog_id=dialog_id,
+        name=name,
+        username=None,
+        dialog_type=DialogType.GROUP,
+        complete=True,
+        source=source,
+        observed_at=observed_at,
+    )
 
 
 def _observe_user_identity(

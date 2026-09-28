@@ -213,7 +213,7 @@ async def test_group_pair_uses_one_rpc_and_commits_independent_projections() -> 
 
 
 @pytest.mark.asyncio
-async def test_forbidden_group_pair_publishes_positive_title_without_inferred_type_or_username() -> None:
+async def test_forbidden_group_pair_publishes_complete_identity_without_mutating_entity_core() -> None:
     conn, service, client = _service()
     conn.execute("INSERT INTO dialogs(dialog_id,name,type,username) VALUES (-123,'Old group','group','old_public')")
     conn.commit()
@@ -226,7 +226,7 @@ async def test_forbidden_group_pair_publishes_positive_title_without_inferred_ty
     assert conn.execute("SELECT name,type,username,identity_revision FROM dialogs WHERE dialog_id=-123").fetchone() == (
         "Partial group",
         "group",
-        "old_public",
+        None,
         1,
     )
     await service.shutdown()  # type: ignore[attr-defined]
