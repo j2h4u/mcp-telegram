@@ -53,9 +53,28 @@ def observe_dialog_identity(
             observed_at=observed_at,
             identity_fields=(_positive_name(getattr(entity, "title", None)), None),
         )
-    if isinstance(entity, (ChannelForbidden, ChatForbidden)):
+    if isinstance(entity, ChatForbidden):
+        return _observe_forbidden_chat_identity(entity, dialog_id, source, observed_at)
+    if isinstance(entity, ChannelForbidden):
         return _observe_partial_title_identity(entity, dialog_id=dialog_id, source=source, observed_at=observed_at)
     return None
+
+
+def _observe_forbidden_chat_identity(
+    entity: ChatForbidden, dialog_id: int, source: str, observed_at: int
+) -> DialogIdentityObservation | None:
+    name = _positive_name(getattr(entity, "title", None))
+    if name is None:
+        return None
+    return DialogIdentityObservation(
+        dialog_id=dialog_id,
+        name=name,
+        username=None,
+        dialog_type=DialogType.GROUP,
+        complete=True,
+        source=source,
+        observed_at=observed_at,
+    )
 
 
 def _observe_user_identity(

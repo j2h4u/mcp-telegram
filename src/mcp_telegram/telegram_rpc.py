@@ -848,17 +848,24 @@ class TelegramRpcGate(TelegramClient):
 
     async def _call_update_difference(self, request: object, *, ordered: bool) -> object:
         """Give only Telethon's actual difference request its protocol identity."""
+        task = asyncio.current_task()
+        connection_owned = task is self._connect_owner or task in self._connection_rpc_tasks
         try:
-            token = current_demand_token()
-        except MissingTelegramDemandContextError:
-            with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE):
-                with acquisition_context(AcquisitionKind.UPDATE_DIFFERENCE):
-                    return await self._call_registered(request, ordered=ordered)
-        if token.kind is not DemandKind.TELETHON_UPDATE_DIFFERENCE:
-            raise RuntimeError("Telethon update difference request inherited an incompatible demand root")
-        require_execution_mode(ExecutionMode.PROTOCOL)
-        with acquisition_context(AcquisitionKind.UPDATE_DIFFERENCE):
-            return await self._call_registered(request, ordered=ordered)
+            try:
+                token = current_demand_token()
+            except MissingTelegramDemandContextError:
+                with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE):
+                    with acquisition_context(AcquisitionKind.UPDATE_DIFFERENCE):
+                        return await self._call_registered(request, ordered=ordered)
+            if token.kind is not DemandKind.TELETHON_UPDATE_DIFFERENCE:
+                raise RuntimeError("Telethon update difference request inherited an incompatible demand root")
+            require_execution_mode(ExecutionMode.PROTOCOL)
+            with acquisition_context(AcquisitionKind.UPDATE_DIFFERENCE):
+                return await self._call_registered(request, ordered=ordered)
+        except RpcAdmissionExpiredError as exc:
+            if not connection_owned and exc.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
+                raise OSError("Telegram update difference admission deadline elapsed") from exc
+            raise
 
     async def _call_registered(
         self,
@@ -905,6 +912,7 @@ class TelegramRpcGate(TelegramClient):
         connection_owned: bool,
     ) -> object:
         while True:
+            self._raise_if_update_scope_expired(scope, connection_owned=connection_owned)
             try:
                 return await self._dispatch_attempt(request, ordered=ordered, scope=scope)
             except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
@@ -917,6 +925,19 @@ class TelegramRpcGate(TelegramClient):
                 await self._retry_update_source(scope, reason="account_circuit")
             except (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError) as exc:
                 await self._handle_flood_wait(scope, exc, connection_owned=connection_owned)
+
+    def _raise_if_update_scope_expired(
+        self,
+        scope: TelegramRpcScope,
+        *,
+        connection_owned: bool,
+    ) -> None:
+        if connection_owned or scope.source is not TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
+            return
+        if scope.deadline is None or asyncio.get_running_loop().time() < scope.deadline:
+            return
+        self._admission_scheduler.record_expired_before_dispatch(scope, wait_seconds=0.0)
+        raise RpcAdmissionExpiredError(scope, "Telegram RPC admission deadline elapsed")
 
     def _send_real_sender(
         self,
@@ -1034,6 +1055,8 @@ class TelegramRpcGate(TelegramClient):
         connection_owned: bool,
     ) -> None:
         if not connection_owned and scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
+            if isinstance(exc, RpcAdmissionExpiredError):
+                raise exc
             await self._retry_update_source(scope, reason=type(exc).__name__)
             return
         retry_seconds = self._scheduler_policy.admission_retry_seconds
@@ -1045,7 +1068,10 @@ class TelegramRpcGate(TelegramClient):
 
     async def _retry_update_source(self, scope: TelegramRpcScope, *, reason: str) -> None:
         self._admission_scheduler.record_retry(scope, reason=reason)
-        await asyncio.sleep(self._scheduler_policy.update_loop_retry_seconds)
+        delay = self._scheduler_policy.update_loop_retry_seconds
+        if scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE and scope.deadline is not None:
+            delay = min(delay, max(0.0, scope.deadline - asyncio.get_running_loop().time()))
+        await asyncio.sleep(delay)
 
     async def _handle_flood_wait(
         self,

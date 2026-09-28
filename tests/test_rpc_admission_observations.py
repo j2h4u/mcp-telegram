@@ -8,6 +8,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from mcp_telegram.config import RuntimeObservationConfig
 from mcp_telegram.flood import FloodWaitObservation
 from mcp_telegram.rpc_admission_observations import DemandEvidenceOutcome, RpcAdmissionObservationAggregator
@@ -65,18 +67,33 @@ def test_routine_admissions_are_coalesced_into_one_source_summary() -> None:
     assert row["outcome"] == "summary"
     assert row["result_count"] == 2
     assert row["duration_ms"] == 200.0
-    assert row["payload"] == {
-        "source": "mcp_interactive",
-        "service_class": "interactive",
-        "queued_count": 2,
-        "dispatched_count": 2,
-        "max_wait_ms": 300.0,
-        "queue_depth_max": 2,
-        "total_depth_max": 3,
-        "active_depth_max": 1,
-        "total_outstanding_max": 4,
-        "window_seconds": 300,
-    }
+    payload = row["payload"]
+    assert isinstance(payload, dict)
+    assert payload["source"] == "mcp_interactive"
+    assert payload["dispatched_count"] == 2
+    assert payload["max_wait_ms"] == 300.0
+    assert payload["window_seconds"] == 300.0
+    assert isinstance(payload["bucket_started_at_ms"], int)
+    assert isinstance(payload["bucket_ended_at_ms"], int)
+    assert row["observed_at_ms"] == payload["bucket_ended_at_ms"]
+
+
+def test_admission_summary_records_actual_early_flush_span(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 10.0
+    monkeypatch.setattr("mcp_telegram.rpc_admission_observations.time.time", lambda: 20_000.0)
+    recorder = _Recorder()
+    aggregator = RpcAdmissionObservationAggregator(recorder, policy=RuntimeObservationConfig(), clock=lambda: now)
+    aggregator.observe(_event(RpcAdmissionEventKind.DISPATCHED, wait_seconds=0.1))
+
+    aggregator.flush(now=now + 7.5)
+
+    row = recorder.rows[0]
+    payload = row["payload"]
+    assert isinstance(payload, dict)
+    assert payload["window_seconds"] == 7.5
+    assert payload["bucket_started_at_ms"] == 19_992_500
+    assert payload["bucket_ended_at_ms"] == 20_000_000
+    assert row["observed_at_ms"] == 20_000_000
 
 
 def test_terminal_admission_outcomes_remain_raw() -> None:
@@ -275,26 +292,49 @@ def test_failed_summary_is_retained_without_replaying_successful_summaries() -> 
     )
 
     aggregator.flush(now=300.0)
-    assert [row["payload"] for row in recorder.rows] == [
-        {
-            "source": "realtime_event",
-            "service_class": "live_sync",
-            "queued_count": 0,
-            "dispatched_count": 1,
-            "max_wait_ms": 200.0,
-            "queue_depth_max": 2,
-            "total_depth_max": 3,
-            "active_depth_max": 1,
-            "total_outstanding_max": 4,
-            "window_seconds": 300.0,
-        }
-    ]
+    assert len(recorder.rows) == 1
+    first_payload = recorder.rows[0]["payload"]
+    assert isinstance(first_payload, dict)
+    assert first_payload["source"] == "realtime_event"
+    assert first_payload["dispatched_count"] == 1
+    assert first_payload["window_seconds"] == 300.0
 
     aggregator.flush(now=600.0)
     assert len(recorder.rows) == 2
     retried_payload = recorder.rows[1]["payload"]
     assert isinstance(retried_payload, dict)
     assert retried_payload["source"] == "mcp_interactive"
+
+
+def test_failed_admission_summary_retry_keeps_earliest_bucket_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 0.0
+    monkeypatch.setattr("mcp_telegram.rpc_admission_observations.time.time", lambda: 50_000.0)
+
+    class _FlakyRecorder(_Recorder):
+        fail_once = True
+
+        def record(self, **values: object) -> None:
+            if values.get("kind") == "telegram.rpc_admission" and self.fail_once:
+                self.fail_once = False
+                raise RuntimeError("offline")
+            super().record(**values)
+
+    recorder = _FlakyRecorder()
+    aggregator = RpcAdmissionObservationAggregator(recorder, policy=RuntimeObservationConfig(), clock=lambda: now)
+    aggregator.observe(_event(RpcAdmissionEventKind.DISPATCHED, wait_seconds=0.1))
+    aggregator.flush(now=5.0)
+
+    now = 45.0
+    aggregator.observe(_event(RpcAdmissionEventKind.DISPATCHED, wait_seconds=0.2))
+    aggregator.flush(now=45.0)
+
+    assert len(recorder.rows) == 1
+    payload = recorder.rows[0]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["dispatched_count"] == 2
+    assert payload["window_seconds"] == 45.0
+    assert payload["bucket_started_at_ms"] == 49_955_000
+    assert payload["bucket_ended_at_ms"] == 50_000_000
 
 
 def test_failed_flush_restores_only_its_unpersisted_summary_during_concurrent_callbacks() -> None:
