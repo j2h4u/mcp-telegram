@@ -2864,9 +2864,7 @@ class ReadingService:
         return entries, counts
 
     @staticmethod
-    def _unread_mention_counts(
-        conn: sqlite3.Connection, rows: Sequence[tuple[object, ...]]
-    ) -> dict[int, int]:
+    def _unread_mention_counts(conn: sqlite3.Connection, rows: Sequence[tuple[object, ...]]) -> dict[int, int]:
         table_info = cast(list[tuple[object, ...]], conn.execute("PRAGMA table_info(dialogs)").fetchall())
         dialog_columns = {str(row[1]) for row in table_info}
         if not rows or "unread_mentions_count" not in dialog_columns:
@@ -2880,10 +2878,7 @@ class ReadingService:
                 dialog_ids,
             ).fetchall(),
         )
-        return {
-            int(cast(int | str, dialog_id)): int(cast(int | str, count or 0))
-            for dialog_id, count in mention_rows
-        }
+        return {int(cast(int | str, dialog_id)): int(cast(int | str, count or 0)) for dialog_id, count in mention_rows}
 
     @staticmethod
     def _rank_unread_entries(entries: list[dict]) -> None:
