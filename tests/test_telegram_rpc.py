@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import AsyncMock
 
 import pytest
 import telethon
@@ -3884,6 +3885,74 @@ async def test_update_difference_next_outer_iteration_gets_a_fresh_scope() -> No
             assert await gate(request) is request
 
     assert sender.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_vendor_update_loop_recovers_expired_difference_with_fresh_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mcp_telegram.telegram_demand as demand
+
+    loop = asyncio.get_running_loop()
+    gate = _gate()
+    request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
+    first_deadline = loop.time() + 0.03
+    fresh_deadline = loop.time() + 5
+    connected_checks = iter((True, True, False))
+    sent_scopes: list[TelegramRpcScope] = []
+    tokens = iter(
+        (
+            demand.create_demand_token(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=first_deadline),
+            demand.create_demand_token(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=fresh_deadline),
+        )
+    )
+    original_sleep = asyncio.sleep
+    original_send = gate._send_real_sender
+    circuit_open = [True]
+    events: list[RpcAdmissionEvent] = []
+    gate.set_rpc_admission_observer(events.append)
+
+    async def sleep(delay: float) -> None:
+        if delay >= 5:
+            circuit_open[0] = False
+            return
+        await original_sleep(delay)
+
+    def send_real(request: object, *, ordered: bool = False) -> object:
+        sent_scopes.append(current_rpc_scope())
+        return original_send(request, ordered=ordered)
+
+    _set_sender(gate, _request_value)
+    sender = gate._main_sender
+    gate._rpc_circuit_status = lambda: _CircuitStatus(open=circuit_open[0])
+    gate._transport_state = _TransportBoundaryState.READY
+    gate._message_box = SimpleNamespace(
+        is_empty=lambda: False,
+        get_difference=lambda: request,
+        apply_difference=lambda *_args: ([], [], []),
+    )
+    gate._mb_entity_cache = []
+    gate._entity_cache_limit = 100
+    gate._catch_up = False
+    gate._authorized = True
+    gate.is_connected = lambda: next(connected_checks)
+    gate._log = {"telethon.client.updates": logging.getLogger(__name__)}
+    monkeypatch.setattr(gate, "_preprocess_updates", AsyncMock(return_value=[]))
+    monkeypatch.setattr(gate, "_send_real_sender", send_real)
+    monkeypatch.setattr(demand, "create_demand_token", lambda _kind, **_kwargs: next(tokens))
+    monkeypatch.setattr("mcp_telegram.telegram_rpc.asyncio.sleep", sleep)
+    try:
+        await gate._update_loop()
+    finally:
+        await gate.close_rpc_scheduler()
+
+    assert [event.kind for event in events if event.kind is RpcAdmissionEventKind.EXPIRED] == [
+        RpcAdmissionEventKind.EXPIRED
+    ]
+    assert circuit_open == [False]
+    assert sender.calls == 1
+    assert sent_scopes[0].source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE
+    assert sent_scopes[0].deadline == fresh_deadline
 
 
 @pytest.mark.asyncio

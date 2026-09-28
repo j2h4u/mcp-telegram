@@ -912,14 +912,7 @@ class TelegramRpcGate(TelegramClient):
         connection_owned: bool,
     ) -> object:
         while True:
-            if (
-                not connection_owned
-                and scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE
-                and scope.deadline is not None
-                and asyncio.get_running_loop().time() >= scope.deadline
-            ):
-                self._admission_scheduler.record_expired_before_dispatch(scope, wait_seconds=0.0)
-                raise RpcAdmissionExpiredError(scope, "Telegram RPC admission deadline elapsed")
+            self._raise_if_update_scope_expired(scope, connection_owned=connection_owned)
             try:
                 return await self._dispatch_attempt(request, ordered=ordered, scope=scope)
             except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
@@ -932,6 +925,19 @@ class TelegramRpcGate(TelegramClient):
                 await self._retry_update_source(scope, reason="account_circuit")
             except (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError) as exc:
                 await self._handle_flood_wait(scope, exc, connection_owned=connection_owned)
+
+    def _raise_if_update_scope_expired(
+        self,
+        scope: TelegramRpcScope,
+        *,
+        connection_owned: bool,
+    ) -> None:
+        if connection_owned or scope.source is not TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
+            return
+        if scope.deadline is None or asyncio.get_running_loop().time() < scope.deadline:
+            return
+        self._admission_scheduler.record_expired_before_dispatch(scope, wait_seconds=0.0)
+        raise RpcAdmissionExpiredError(scope, "Telegram RPC admission deadline elapsed")
 
     def _send_real_sender(
         self,
