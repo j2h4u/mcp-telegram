@@ -6,8 +6,8 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.14"
 dependencies = [
-  "mcp>=2.1.1,<3",
-  "telethon>=1.44.0",
+  "mcp>=2.2.0,<3",
+  "telethon>=1.45.0",
   "pydantic>=2.13.5",
   "pydantic-settings>=2.15.0",
   "typer>=0.27.2",
@@ -15,12 +15,12 @@ dependencies = [
   "rapidfuzz>=3.14.6",
   "anyascii>=0.3.3",
   "snowballstemmer>=3.1.1",
-  "phonenumberslite>=9.0.37",
+  "phonenumberslite>=9.0.39",
   "starlette>=1.5.1",
   "uvicorn>=0.52.4",
   "python-dotenv>=1.2.3",
   "qrcode>=8.2",
-  "aiolimiter>=1.2.1",
+  "aiolimiter>=1.3.0",
 ]
 
 [build-system]
@@ -32,13 +32,13 @@ dev = [
     "mypy>=2.3.1",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.3.0",
-    "hypothesis>=6.167.1",
-    "ruff>=0.16.5",
+    "hypothesis>=6.168.0",
+    "ruff>=0.16.7",
     "vulture>=2.14",
     "pytest-cov>=7",
     "pytest-xdist>=3.8.0",
     "actionlint-py>=1.7.12.24",
-    "basedpyright>=1.39.10",
+    "basedpyright>=1.40.1",
     "radon>=6.0.1",
     "setuptools>=84.0.0",
     "deptry>=0.25.1",
