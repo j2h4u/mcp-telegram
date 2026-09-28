@@ -2,6 +2,7 @@ import json
 import math
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import cast
 
@@ -552,21 +553,15 @@ def _structured_messages(
     marker_by_message = project_read_markers(messages, read_state=read_state, dialog_type=dialog_type)
     projected: list[dict[str, object]] = []
     for message in messages:
-        item = project_message_view(message, read_marker=marker_by_message.get(message.id))
         source_length = len(message.text or "")
-        content = item.get("content")
-        if isinstance(content, dict) and isinstance(content.get("text"), str):
-            text = content["text"]
-            truncated = len(text) > _MAX_INBOX_PREVIEW_CHARS
-            if truncated:
-                content = dict(content)
-                content["text"] = text[: _MAX_INBOX_PREVIEW_CHARS - 3] + "..."
-                item["content"] = content
-            item["content_truncated"] = truncated
-            item["content_source_length"] = source_length
-        else:
-            item["content_truncated"] = False
-            item["content_source_length"] = source_length
+        truncated = source_length > _MAX_INBOX_PREVIEW_CHARS
+        projected_message = (
+            replace(message, text=message.text[: _MAX_INBOX_PREVIEW_CHARS - 3] + "...")
+            if truncated and message.text is not None
+            else message
+        )
+        item = project_message_view(projected_message, read_marker=marker_by_message.get(message.id))
+        item.update({"content_truncated": truncated, "content_source_length": source_length})
         projected.append(item)
     return projected
 
@@ -777,8 +772,8 @@ def _project_inbox_response(
         "dialogs": structured_dialogs,
         "count": len(structured_dialogs),
         "result_count_semantics": "count is the number of unread dialogs returned; budget.result_message_count is the number of message rows shown",
+        **_inbox_paging_payload(data, len(structured_dialogs), result_message_count),
     }
-    structured_content.update(_inbox_paging_payload(data, len(structured_dialogs), result_message_count))
     if args.include_dialog_types is not None:
         structured_content["applied_dialog_types"] = list(
             dict.fromkeys(item.value for item in args.include_dialog_types)
