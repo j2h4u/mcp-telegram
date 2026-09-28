@@ -638,11 +638,11 @@ def _count_inbox_truncated_content(dialogs: list[object]) -> int:
     )
 
 
-def _trim_inbox_to_size(payload: dict[str, object]) -> None:
+def _finalize_inbox_payload(payload: dict[str, object]) -> int:
     """Drop whole preview rows fairly; counts continue to describe the source."""
     dialogs = payload.get("dialogs")
     if not isinstance(dialogs, list):
-        return
+        return 0
     while _inbox_size(payload) > _MAX_INBOX_STRUCTURED_CHARS:
         if not _drop_largest_inbox_preview(dialogs):
             break
@@ -655,6 +655,7 @@ def _trim_inbox_to_size(payload: dict[str, object]) -> None:
         payload.get("total_dialog_count") == len(dialogs) and payload.get("total_message_count") == shown_messages
     )
     payload["content_truncated_count"] = _count_inbox_truncated_content(dialogs)
+    return shown_messages
 
 
 def _identity_text_fact(value: object) -> str | None:
@@ -782,14 +783,14 @@ def _project_inbox_response(
             dict.fromkeys(item.value for item in args.include_dialog_types)
         )
 
-    _trim_inbox_to_size(structured_content)
+    final_message_count = _finalize_inbox_payload(structured_content)
 
     if not groups:
         return structured_result(structured_content, result_count=0, has_filter=has_inbox_filter)
 
     return structured_result(
         structured_content,
-        result_count=result_message_count,
+        result_count=final_message_count,
         has_filter=has_inbox_filter,
     )
 

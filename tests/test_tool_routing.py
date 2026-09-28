@@ -2910,6 +2910,7 @@ async def test_get_inbox_bounds_previews_and_structured_output():
     assert truncated_count == shown
     assert payload["shown_message_count"] == shown
     assert payload["selection_complete"] is False
+    assert result.result_count == shown
 
 
 async def test_get_inbox_empty():
