@@ -131,7 +131,8 @@ async def test_list_dialogs_surfaces_self_marker() -> None:
         result = await list_dialogs(ListDialogs())
 
     assert result.is_error is False
-    assert cast(dict[str, object], result.structured_content)["dialogs"][0]["is_self"] is True
+    dialogs = cast(list[dict[str, object]], cast(dict[str, object], result.structured_content)["dialogs"])
+    assert dialogs[0]["is_self"] is True
 
 
 @pytest.mark.asyncio
