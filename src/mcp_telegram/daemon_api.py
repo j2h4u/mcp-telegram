@@ -1211,10 +1211,19 @@ class DaemonAPIServer:
         candidates = cls._sorted_dialog_matches(result.matches)
         coverage_wire = coverage.to_wire()
         if len(candidates) == 1:
+            if coverage.status in {"never", "in_progress"} or not coverage.lookup_complete:
+                error = "dialog_directory_incomplete"
+                message = "No exact local match; coverage incomplete/unknown; one approximate match is available."
+            elif coverage.status == "stale" or not coverage.lookup_fresh:
+                error = "stale_local_directory"
+                message = "No exact local match; the local dialog directory or identity lookup is stale; one approximate match is available."
+            else:
+                error = "dialog_not_found"
+                message = f"Dialog {selector.label!r} was not found; one approximate match is available."
             return {
                 "ok": False,
-                "error": "dialog_not_found",
-                "message": f"Dialog {selector.label!r} was not found; one approximate match is available.",
+                "error": error,
+                "message": message,
                 "suggestion": candidates[0],
                 "directory_coverage": coverage_wire,
                 "required_action": "Retry with the suggestion's exact dialog id, or refine the dialog name.",

@@ -8109,6 +8109,7 @@ async def test_resolve_dialog_name_dialogs_snapshot_substring_is_suggestion_only
     """A unique approximate match suggests an id but does not auto-select it."""
     conn = _make_db_with_dialogs()
     _seed_dialog_row(conn, 777, name="Acme Corp Discussion", type_="supergroup")
+    _publish_test_dialog_directory(conn)
 
     client = _TestClient()
     client.get_entity = AsyncMock(side_effect=ValueError(""))
@@ -8122,6 +8123,25 @@ async def test_resolve_dialog_name_dialogs_snapshot_substring_is_suggestion_only
     assert isinstance(result, dict)
     assert result["error"] == "dialog_not_found"
     assert cast(dict[str, object], result["suggestion"])["entity_id"] == 777
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_dialog_name_fuzzy_suggestion_reports_incomplete_coverage() -> None:
+    """A fuzzy suggestion never claims absence while local directory coverage is incomplete."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 778, name="Acme Corp Discussion", type_="supergroup")
+
+    client = _TestClient()
+    client.get_entity = AsyncMock(side_effect=ValueError(""))
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("forbidden"))
+
+    server = make_server(conn, client)
+    result = await server._resolve_dialog_id(required_dialog_selector(dialog="acme corp"))
+
+    assert isinstance(result, dict)
+    assert result["error"] == "dialog_directory_incomplete"
+    assert cast(dict[str, object], result["suggestion"])["entity_id"] == 778
     cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
