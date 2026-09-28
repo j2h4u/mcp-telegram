@@ -2446,6 +2446,20 @@ async def test_list_topics_through_daemon() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_topics_rejects_saved_messages_without_refreshing_topics() -> None:
+    refresher = AsyncMock()
+    server = make_server(topic_refresher=cast(TopicRefresher, refresher))
+    server.self_id = 12345
+
+    result = await server._list_topics({"dialog_id": 12345})
+
+    assert result["ok"] is False
+    assert result["error"] == "saved_messages_not_supported"
+    assert "ListMessages" in result["required_action"]
+    refresher.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_list_topics_serves_cached_catalog_when_protection_blocks_optional_icon_enrichment() -> None:
     """A cached catalog remains usable when only optional icon Unicode is missing."""
 
@@ -5996,6 +6010,37 @@ async def test_list_dialogs_classifies_forum() -> None:
     assert len(dialogs) == 1
     assert dialogs[0]["type"] == "forum"
     cast(MagicMock, mock_client.iter_dialogs).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_marks_only_canonical_self_id() -> None:
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 6002, name="Self", type_="User")
+    _seed_dialog_row(conn, 6003, name="Ordinary DM", type_="User")
+    _seed_dialog_row(conn, 6004, name="Bot", type_="Bot")
+    server = make_server(conn)
+    server.self_id = 6002
+
+    result = await server._list_dialogs({})
+    rows = {row["id"]: row for row in result["data"]["dialogs"]}
+
+    assert rows[6002]["is_self"] is True
+    assert rows[6003]["is_self"] is False
+    assert rows[6004]["is_self"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_messages_empty_self_dialog_is_marked() -> None:
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 777, name="Saved Messages", type_="User")
+    server = make_server(conn)
+    server.self_id = 777
+
+    result = await server._list_messages({"dialog_id": 777, "limit": 10})
+
+    assert result["ok"] is True
+    assert result["data"]["messages"] == []
+    assert result["data"]["is_self"] is True
 
 
 # ---------------------------------------------------------------------------

@@ -304,6 +304,7 @@ def _canonical_dialog_row(
         "folder_ids": [],
         "folders": [],
         "archived": False,
+        "is_self": False,
         **_sync_read_model_payload(
             status=status,
             saved_message_count=saved_message_count,
