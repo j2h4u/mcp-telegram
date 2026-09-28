@@ -117,8 +117,24 @@ def test_rpc_admission_summary_explains_full_buckets_selected_by_end_time(tmp_pa
     _database(db_path, now_ms=now_ms)
     rows = [
         # A bounded bucket crosses the requested start and is counted in full.
-        (since_ms + 5_000, {"source": "crossing", "dispatched_count": 3, "bucket_started_at_ms": since_ms - 30_000, "bucket_ended_at_ms": since_ms + 5_000}),
-        (since_ms + 20_000, {"source": "inside", "dispatched_count": 4, "bucket_started_at_ms": since_ms + 6_000, "bucket_ended_at_ms": since_ms + 20_000}),
+        (
+            since_ms + 5_000,
+            {
+                "source": "crossing",
+                "dispatched_count": 3,
+                "bucket_started_at_ms": since_ms - 30_000,
+                "bucket_ended_at_ms": since_ms + 5_000,
+            },
+        ),
+        (
+            since_ms + 20_000,
+            {
+                "source": "inside",
+                "dispatched_count": 4,
+                "bucket_started_at_ms": since_ms + 6_000,
+                "bucket_ended_at_ms": since_ms + 20_000,
+            },
+        ),
         # Legacy rows have no bounds, so the reader cannot tell whether they cross.
         (since_ms + 3_000, {"source": "legacy", "dispatched_count": 5, "window_seconds": 300}),
     ]

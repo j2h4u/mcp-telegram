@@ -167,7 +167,9 @@ class _AdmissionAggregate:
     bucket_started_at: float | None = None
 
     def add(self, event: RpcAdmissionEvent, *, observed_at: float) -> None:
-        self.bucket_started_at = observed_at if self.bucket_started_at is None else min(self.bucket_started_at, observed_at)
+        self.bucket_started_at = (
+            observed_at if self.bucket_started_at is None else min(self.bucket_started_at, observed_at)
+        )
         if event.kind is RpcAdmissionEventKind.QUEUED:
             self.queued_count += 1
         elif event.kind is RpcAdmissionEventKind.DISPATCHED:
@@ -550,8 +552,13 @@ class RpcAdmissionObservationAggregator:
         for (source, service_class, demand_kind, acquisition_kind), aggregate in aggregates.items():
             try:
                 accepted = self._record_admission_summary(
-                    source, service_class, demand_kind, acquisition_kind, aggregate,
-                    flush_at=flush_at, flush_wall_at=flush_wall_at,
+                    source,
+                    service_class,
+                    demand_kind,
+                    acquisition_kind,
+                    aggregate,
+                    flush_at=flush_at,
+                    flush_wall_at=flush_wall_at,
                 )
                 if accepted is False:
                     with self._state_lock:
@@ -586,7 +593,9 @@ class RpcAdmissionObservationAggregator:
         flush_wall_at: float,
     ) -> bool | None:
         dispatched = aggregate.dispatched_count
-        elapsed = max(0.0, flush_at - (aggregate.bucket_started_at if aggregate.bucket_started_at is not None else flush_at))
+        elapsed = max(
+            0.0, flush_at - (aggregate.bucket_started_at if aggregate.bucket_started_at is not None else flush_at)
+        )
         bucket_ended_at_ms = int(flush_wall_at * _MILLISECONDS_PER_SECOND)
         bucket_started_at_ms = bucket_ended_at_ms - int(elapsed * _MILLISECONDS_PER_SECOND)
         payload: dict[str, object] = {

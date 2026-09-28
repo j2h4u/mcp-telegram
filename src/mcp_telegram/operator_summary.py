@@ -217,6 +217,20 @@ def _rpc_summary(
     rows = _rows_for_kind(observations, "telegram.rpc_admission")
     summaries = _rows_for_outcome(rows, "summary")
     sources: dict[str, RpcSourceSummary] = {}
+    for row in summaries:
+        payload = json.loads(str(row["payload_json"] or "{}"))
+        source = str(payload.get("source") or "unknown")
+        previous = sources.get(source, RpcSourceSummary())
+        sources[source] = RpcSourceSummary(
+            dispatched=previous.dispatched + _as_int(payload.get("dispatched_count") or 0),
+            worst_wait_ms=max(previous.worst_wait_ms, float(payload.get("max_wait_ms") or 0)),
+            max_queue=max(previous.max_queue, _as_int(payload.get("queue_depth_max") or 0)),
+        )
+    cancelled = sum(1 for row in rows if row["outcome"] == "cancelled")
+    return len(summaries), cancelled, sources, _rpc_bucket_summary(summaries, since_ms=since_ms)
+
+
+def _rpc_bucket_summary(summaries: list[Observation], *, since_ms: int) -> RpcBucketSummary:
     starts: list[int] = []
     ends: list[int] = []
     crossing_start = 0
@@ -236,15 +250,7 @@ def _rpc_summary(
             crossing_start += start_ms < since_ms
         else:
             unknown_bounds += 1
-        source = str(payload.get("source") or "unknown")
-        previous = sources.get(source, RpcSourceSummary())
-        sources[source] = RpcSourceSummary(
-            dispatched=previous.dispatched + _as_int(payload.get("dispatched_count") or 0),
-            worst_wait_ms=max(previous.worst_wait_ms, float(payload.get("max_wait_ms") or 0)),
-            max_queue=max(previous.max_queue, _as_int(payload.get("queue_depth_max") or 0)),
-        )
-    cancelled = sum(1 for row in rows if row["outcome"] == "cancelled")
-    return len(summaries), cancelled, sources, RpcBucketSummary(
+    return RpcBucketSummary(
         start_ms=min(starts) if starts else None,
         end_ms=max(ends) if ends else None,
         crossing_start=crossing_start,

@@ -8,6 +8,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from mcp_telegram.config import RuntimeObservationConfig
 from mcp_telegram.flood import FloodWaitObservation
 from mcp_telegram.rpc_admission_observations import DemandEvidenceOutcome, RpcAdmissionObservationAggregator
@@ -76,7 +78,7 @@ def test_routine_admissions_are_coalesced_into_one_source_summary() -> None:
     assert row["observed_at_ms"] == payload["bucket_ended_at_ms"]
 
 
-def test_admission_summary_records_actual_early_flush_span(monkeypatch) -> None:
+def test_admission_summary_records_actual_early_flush_span(monkeypatch: pytest.MonkeyPatch) -> None:
     now = 10.0
     monkeypatch.setattr("mcp_telegram.rpc_admission_observations.time.time", lambda: 20_000.0)
     recorder = _Recorder()
@@ -304,7 +306,7 @@ def test_failed_summary_is_retained_without_replaying_successful_summaries() -> 
     assert retried_payload["source"] == "mcp_interactive"
 
 
-def test_failed_admission_summary_retry_keeps_earliest_bucket_start(monkeypatch) -> None:
+def test_failed_admission_summary_retry_keeps_earliest_bucket_start(monkeypatch: pytest.MonkeyPatch) -> None:
     now = 0.0
     monkeypatch.setattr("mcp_telegram.rpc_admission_observations.time.time", lambda: 50_000.0)
 
