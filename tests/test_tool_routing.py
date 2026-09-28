@@ -2894,14 +2894,20 @@ async def test_get_inbox_bounds_previews_and_structured_output():
     first_message = _json_dict(_json_list(dialog_with_messages["messages"])[0])
     assert first_message["msg_id"] == 5
     content = _json_dict(first_message["content"])
-    assert len(content["text"]) == 400
+    preview_text = content["text"]
+    assert isinstance(preview_text, str)
+    assert len(preview_text) == 400
     assert first_message["content_truncated"] is True
     assert first_message["content_source_length"] == 1000
     budget = _json_dict(payload["budget"])
-    shown = int(budget["result_message_count"])
-    hidden = int(budget["hidden_count"])
+    shown = budget["result_message_count"]
+    hidden = budget["hidden_count"]
+    truncated_count = payload["content_truncated_count"]
+    assert isinstance(shown, int)
+    assert isinstance(hidden, int)
+    assert isinstance(truncated_count, int)
     assert shown + hidden == 24 * 5
-    assert int(payload["content_truncated_count"]) == shown
+    assert truncated_count == shown
 
 
 async def test_get_inbox_empty():
