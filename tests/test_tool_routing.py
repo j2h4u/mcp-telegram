@@ -11,6 +11,7 @@ instead of directly connecting to Telegram. These tests verify:
 
 from __future__ import annotations
 
+import json
 import pathlib
 from asyncio import StreamReader, StreamWriter
 from collections.abc import Awaitable, Callable
@@ -303,6 +304,7 @@ def _canonical_dialog_row(
         "folder_ids": [],
         "folders": [],
         "archived": False,
+        "is_self": False,
         **_sync_read_model_payload(
             status=status,
             saved_message_count=saved_message_count,
@@ -2705,7 +2707,7 @@ async def test_get_inbox_via_daemon():
     coverage = _json_dict(payload["coverage"])
     budget = _json_dict(payload["budget"])
     dialogs = _json_list(payload["dialogs"])
-    assert payload["limit"] == 100
+    assert payload["limit"] == 40
     assert payload["group_size_threshold"] == 100
     assert payload["read_position_pending_count"] == 0
     assert coverage["complete"] is True
@@ -2850,6 +2852,69 @@ async def test_get_inbox_frames_adversarial_body_without_framing_group_header():
     }
 
 
+async def test_get_inbox_bounds_previews_and_structured_output():
+    groups = [
+        {
+            "dialog_id": dialog_id,
+            "display_name": f"Диалог {dialog_id}",
+            "category": "user",
+            "dialog_type": "User",
+            "unread_count": 5,
+            "messages": [
+                {
+                    "message_id": message_id,
+                    "sent_at": message_id,
+                    "dialog_id": dialog_id,
+                    "text": "Ж" * 1000,
+                    "content_kind": "message_text",
+                }
+                for message_id in range(1, 6)
+            ],
+        }
+        for dialog_id in range(1, 25)
+    ]
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "groups": groups,
+                "read_position_pending_count": 0,
+                "read_position_pending_entities": [],
+            },
+        }
+    )
+    with _patch_daemon(conn):
+        result = await get_inbox(GetInbox())
+
+    assert result.structured_content is not None
+    payload = _json_dict(result.structured_content)
+    encoded_length = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    assert encoded_length <= 32_000
+    dialogs = _json_list(payload["dialogs"])
+    dialog_with_messages = next(_json_dict(dialog) for dialog in dialogs if _json_list(_json_dict(dialog)["messages"]))
+    first_message = _json_dict(_json_list(dialog_with_messages["messages"])[0])
+    assert first_message["msg_id"] == 5
+    content = _json_dict(first_message["content"])
+    preview_text = content["text"]
+    assert isinstance(preview_text, str)
+    assert len(preview_text) == 400
+    assert first_message["content_truncated"] is True
+    assert first_message["content_source_length"] == 1000
+    budget = _json_dict(payload["budget"])
+    shown = budget["result_message_count"]
+    hidden = budget["hidden_count"]
+    truncated_count = payload["content_truncated_count"]
+    assert isinstance(shown, int)
+    assert isinstance(hidden, int)
+    assert isinstance(truncated_count, int)
+    assert shown + hidden == 24 * 5
+    assert payload["page_message_count"] == shown + hidden
+    assert truncated_count == shown
+    assert payload["shown_message_count"] == shown
+    assert payload["selection_complete"] is False
+    assert result.result_count == shown
+
+
 async def test_get_inbox_empty():
     """GetInbox returns empty-inbox text when no groups."""
     conn = _make_daemon_conn({"ok": True, "data": {"groups": []}})
@@ -2876,11 +2941,43 @@ async def test_get_inbox_passes_params():
     """GetInbox passes personal-inbox limit and grouping params to daemon."""
     conn = _make_daemon_conn({"ok": True, "data": {"groups": []}})
     with _patch_daemon(conn):
-        await get_inbox(GetInbox(limit=200, group_size_threshold=50))
+        await get_inbox(GetInbox(limit=80, group_size_threshold=50))
 
     call_kwargs = _call_kwargs(conn.get_inbox)
-    assert call_kwargs["limit"] == 200
+    assert call_kwargs["limit"] == 80
     assert call_kwargs["group_size_threshold"] == 50
+
+
+async def test_get_inbox_passes_page_and_projects_page_receipt():
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "groups": [],
+                "page": 2,
+                "page_size": 20,
+                "total_dialog_count": 25,
+                "shown_dialog_count": 5,
+                "remaining_dialog_count": 0,
+                "next_page": None,
+                "total_message_count": 5,
+                "page_message_count": 5,
+                "shown_message_count": 5,
+                "read_position_pending_count": 0,
+                "read_position_pending_entities": [],
+            },
+        }
+    )
+    with _patch_daemon(conn):
+        result = await get_inbox(GetInbox(page=2))
+
+    call_kwargs = _call_kwargs(conn.get_inbox)
+    assert call_kwargs["page"] == 2
+    payload = _json_dict(result.structured_content)
+    assert payload["page"] == 2
+    assert payload["total_dialog_count"] == 25
+    assert payload["next_page"] is None
+    assert payload["selection_complete"] is False
 
 
 def test_get_inbox_rejects_removed_scope_argument() -> None:
@@ -2932,6 +3029,7 @@ async def test_get_inbox_empty_with_read_position_pending():
     assert payload["coverage"] == {
         "complete": False,
         "state": "partial",
+        "scope": "DB read-cursor coverage only; it does not mean all unread messages were selected.",
         "read_position_pending_count": 329,
         "read_position_pending_entities": [],
     }

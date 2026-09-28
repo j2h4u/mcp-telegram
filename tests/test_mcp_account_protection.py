@@ -561,6 +561,37 @@ async def test_registered_list_messages_pins_real_topic_lookup_identity_under_pr
 
 
 @pytest.mark.asyncio
+async def test_registered_list_messages_marks_empty_saved_messages_in_structured_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_server, "_schedule_telemetry", lambda _event: None)
+    daemon, sync_conn, feedback_conn, _ = _local_daemon(tmp_path, object())
+    daemon.self_id = 123
+    _seed_topic_dialog(sync_conn, 123, "Saved Messages", message=None)
+    socket_path = tmp_path / "daemon.sock"
+    _install_daemon_socket(monkeypatch, socket_path)
+    try:
+        async with await asyncio.start_unix_server(daemon.handle_client, path=socket_path):
+            result = await mcp_server.call_tool(
+                "list_messages",
+                {"exact_dialog_id": 123, "message_state": "sent"},
+            )
+    finally:
+        sync_conn.close()
+        feedback_conn.close()
+
+    assert result.is_error is False
+    assert result.content == []
+    payload = cast(dict[str, object], result.structured_content)
+    assert payload["messages"] == []
+    assert cast(dict[str, object], payload["dialog"])["is_self"] is True
+    schema = mcp_server.tool_by_name["list_messages"].output_schema
+    assert schema is not None
+    validate(payload, cast(dict[str, object], schema))
+
+
+@pytest.mark.asyncio
 async def test_registered_list_messages_required_topic_miss_projects_protection_over_real_ipc(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

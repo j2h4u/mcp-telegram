@@ -468,6 +468,7 @@ class DaemonConnection:
         self,
         *,
         limit: int = 100,
+        page: int = 1,
         group_size_threshold: int = 100,
         since_utc: str | None = None,
         include_dialog_types: list[str] | None = None,
@@ -476,6 +477,7 @@ class DaemonConnection:
         payload: dict[str, object] = {
             "method": "get_inbox",
             "limit": limit,
+            "page": page,
             "group_size_threshold": group_size_threshold,
         }
         if since_utc is not None:

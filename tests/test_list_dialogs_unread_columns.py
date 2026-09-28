@@ -746,6 +746,7 @@ async def test_list_dialogs_structured_output_includes_unread_values_and_channel
         "folder_ids": [],
         "folders": [],
         "archived": False,
+        "is_self": False,
         **sync_model,
     }
     response = {
