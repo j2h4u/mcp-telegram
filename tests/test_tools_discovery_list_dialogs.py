@@ -19,7 +19,7 @@ from mcp.types import TextContent
 
 from mcp_telegram.sync_read_model import build_sync_read_model
 from mcp_telegram.tools._base import ToolResult
-from mcp_telegram.tools.discovery import ListDialogs, list_dialogs
+from mcp_telegram.tools.discovery import ListDialogs, ListTopics, list_dialogs, list_topics
 
 
 @dataclass(frozen=True)
@@ -30,6 +30,7 @@ class _DialogDictOptions:
     unread_mentions_count: int = 0
     unread_reactions_count: int = 0
     draft_text: str | None = None
+    is_self: bool = False
 
 
 def _make_dialog_dict(*, opts: _DialogDictOptions | None = None, **kwargs: object) -> dict[str, object]:
@@ -57,6 +58,7 @@ def _make_dialog_dict(*, opts: _DialogDictOptions | None = None, **kwargs: objec
         "folder_ids": [],
         "folders": [],
         "archived": False,
+        "is_self": opts.is_self,
         **build_sync_read_model(
             persisted_status="synced",
             enrollment_enabled=True,
@@ -120,6 +122,40 @@ async def test_list_dialogs_accepts_canonical_empty_catalog() -> None:
     assert structured["count"] == 0
     assert structured["bootstrap_pending"] is False
     assert structured["scope"] == "all"
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_surfaces_self_marker() -> None:
+    dialog = _make_dialog_dict(is_self=True)
+    with _patched_daemon(_canonical_catalog(dialogs=[dialog])):
+        result = await list_dialogs(ListDialogs())
+
+    assert result.is_error is False
+    assert cast(dict[str, object], result.structured_content)["dialogs"][0]["is_self"] is True
+
+
+@pytest.mark.asyncio
+async def test_list_topics_saved_messages_action_is_specific() -> None:
+    conn = MagicMock()
+    conn.list_topics = AsyncMock(
+        return_value={
+            "ok": False,
+            "error": "saved_messages_not_supported",
+            "message": "Saved Messages is a personal self-dialog and does not contain forum topics.",
+            "required_action": "Use ListMessages to read Saved Messages, or ListDialogs to find the intended bot or forum.",
+        }
+    )
+
+    @asynccontextmanager
+    async def connection():
+        yield conn
+
+    with patch("mcp_telegram.tools.discovery.daemon_connection", side_effect=connection):
+        result = await list_topics(ListTopics(exact_dialog_id=12345))
+
+    assert result.is_error is True
+    assert "Use ListMessages" in _error_text(result)
+    assert "Retry ListTopics" not in _error_text(result)
 
 
 @pytest.mark.asyncio

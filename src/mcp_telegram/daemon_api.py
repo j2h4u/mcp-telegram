@@ -1404,7 +1404,14 @@ class DaemonAPIServer:
 
     async def _list_messages(self, req: dict[str, object]) -> dict:
         """Delegate list_messages orchestration to the reading service."""
-        return await self._get_reading_service().list_messages(cast(dict[str, object], req))
+        result = await self._get_reading_service().list_messages(cast(dict[str, object], req))
+        if result.get("ok"):
+            data = result.get("data")
+            if isinstance(data, dict):
+                dialog_id = data.get("dialog_id")
+                if isinstance(dialog_id, int) and not isinstance(dialog_id, bool):
+                    data["is_self"] = dialog_id == self.self_id
+        return result
 
     # ------------------------------------------------------------------
     # search_messages
@@ -1434,6 +1441,9 @@ class DaemonAPIServer:
             self._project_archived_dialogs(data, dialogs, limit)
         else:
             self._project_regular_folder_dialogs(data, dialogs, folder_id, limit)
+        for dialog in cast(list[dict[str, object]], data.get("dialogs", [])):
+            dialog_id = dialog.get("id")
+            dialog["is_self"] = isinstance(dialog_id, int) and dialog_id == self.self_id
         data["folder_snapshot"] = folder_snapshot(
             self._conn,
             stale_after_seconds=self._policy.folder_snapshot_stale_after_seconds,
@@ -1539,6 +1549,14 @@ class DaemonAPIServer:
         if isinstance(resolved, dict):
             return resolved
         dialog_id = resolved
+
+        if dialog_id == self.self_id:
+            return {
+                "ok": False,
+                "error": "saved_messages_not_supported",
+                "message": "Saved Messages is a personal self-dialog and does not contain forum topics.",
+                "required_action": "Use ListMessages to read Saved Messages, or ListDialogs to find the intended bot or forum.",
+            }
 
         rows = self._topic_rows(dialog_id)
         empty_reason = None
