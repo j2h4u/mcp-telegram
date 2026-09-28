@@ -67,6 +67,14 @@ class RpcSourceSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class RpcBucketSummary:
+    start_ms: int | None = None
+    end_ms: int | None = None
+    crossing_start: int = 0
+    unknown_bounds: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class DemandSummary:
     """Demand units and actual Telegram attempts kept as separate measures."""
 
@@ -203,7 +211,9 @@ def _timing_duration(row: Observation) -> float | None:
     return duration if math.isfinite(duration) and duration >= 0 else None
 
 
-def _rpc_summary(observations: list[Observation]) -> tuple[int, int, dict[str, RpcSourceSummary]]:
+def _rpc_summary(
+    observations: list[Observation], *, since_ms: int
+) -> tuple[int, int, dict[str, RpcSourceSummary], RpcBucketSummary]:
     rows = _rows_for_kind(observations, "telegram.rpc_admission")
     summaries = _rows_for_outcome(rows, "summary")
     sources: dict[str, RpcSourceSummary] = {}
@@ -217,7 +227,35 @@ def _rpc_summary(observations: list[Observation]) -> tuple[int, int, dict[str, R
             max_queue=max(previous.max_queue, _as_int(payload.get("queue_depth_max") or 0)),
         )
     cancelled = sum(1 for row in rows if row["outcome"] == "cancelled")
-    return len(summaries), cancelled, sources
+    return len(summaries), cancelled, sources, _rpc_bucket_summary(summaries, since_ms=since_ms)
+
+
+def _rpc_bucket_summary(summaries: list[Observation], *, since_ms: int) -> RpcBucketSummary:
+    starts: list[int] = []
+    ends: list[int] = []
+    crossing_start = 0
+    unknown_bounds = 0
+    for row in summaries:
+        payload = json.loads(str(row["payload_json"] or "{}"))
+        start_ms, end_ms = payload.get("bucket_started_at_ms"), payload.get("bucket_ended_at_ms")
+        if (
+            isinstance(start_ms, int)
+            and not isinstance(start_ms, bool)
+            and isinstance(end_ms, int)
+            and not isinstance(end_ms, bool)
+            and start_ms <= end_ms
+        ):
+            starts.append(start_ms)
+            ends.append(end_ms)
+            crossing_start += start_ms < since_ms
+        else:
+            unknown_bounds += 1
+    return RpcBucketSummary(
+        start_ms=min(starts) if starts else None,
+        end_ms=max(ends) if ends else None,
+        crossing_start=crossing_start,
+        unknown_bounds=unknown_bounds,
+    )
 
 
 def _demand_summary(observations: list[Observation]) -> DemandSummary:
@@ -459,11 +497,25 @@ def _slow_threshold_ms(seconds: float) -> float:
     return seconds * _MILLISECONDS_PER_SECOND if math.isfinite(seconds) and seconds > 0 else _DEFAULT_SLOW_MCP_MS
 
 
-def _rpc_lines(summary_count: int, cancelled: int, sources: dict[str, RpcSourceSummary]) -> list[str]:
+def _rpc_lines(
+    summary_count: int,
+    cancelled: int,
+    sources: dict[str, RpcSourceSummary],
+    buckets: RpcBucketSummary,
+) -> list[str]:
     actual_attempts = sum(summary.dispatched for summary in sources.values())
     lines = [
         (f"Telegram RPC admission: summaries={summary_count}, cancelled={cancelled}, actual attempts={actual_attempts}")
     ]
+    span = (
+        f"{_utc(buckets.start_ms / 1000)} .. {_utc(buckets.end_ms / 1000)}"
+        if buckets.start_ms is not None and buckets.end_ms is not None
+        else "unavailable"
+    )
+    lines.append(
+        f"  Bucket totals whose end is in the requested window; span={span} (not continuous coverage), "
+        f"crossing requested start={buckets.crossing_start}, unknown legacy bounds={buckets.unknown_bounds}"
+    )
     ordered = sorted(sources.items(), key=lambda item: item[1].worst_wait_ms, reverse=True)
     if not ordered:
         return [*lines, "  none"]
@@ -593,7 +645,7 @@ def build_operator_summary(  # noqa: PLR0914
     last_ms = max((_as_int(row["observed_at_ms"]) for row in observations), default=None)
     last_event = _utc(last_ms / 1000) if last_ms is not None else "none"
     status_text = ", ".join(f"{status}={count}" for status, count in snapshot.dialog_counts) or "none"
-    rpc_count, rpc_cancelled, rpc_sources = _rpc_summary(observations)
+    rpc_count, rpc_cancelled, rpc_sources, rpc_buckets = _rpc_summary(observations, since_ms=since_ms)
     demand_summary = _demand_summary(observations)
     coverage_text = _coverage_text(window_complete, coverage_reasons)
     slow_mcp_ms = _slow_threshold_ms(slow_request_seconds)
@@ -603,7 +655,7 @@ def build_operator_summary(  # noqa: PLR0914
         *_runtime_lines(observations),
         f"Dialog state: {status_text}",
         *_mcp_lines(_mcp_summary(observations, slow_mcp_ms=slow_mcp_ms)),
-        *_rpc_lines(rpc_count, rpc_cancelled, rpc_sources),
+        *_rpc_lines(rpc_count, rpc_cancelled, rpc_sources, rpc_buckets),
         *_linked_chat_rpc_lines(observations),
         *_demand_lines(demand_summary),
     ]
