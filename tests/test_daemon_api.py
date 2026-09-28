@@ -3760,14 +3760,16 @@ async def test_list_unread_messages_reports_page_source_total_before_cap() -> No
     server = make_server(conn, _TestClient())
     first = await server._dispatch({"method": "get_inbox", "limit": 40, "page": 1})
     second = await server._dispatch({"method": "get_inbox", "limit": 40, "page": 2})
+    first_data = _response_data(first)
+    second_data = _response_data(second)
 
-    assert first["data"]["total_message_count"] == 325
-    assert first["data"]["page_message_count"] == 20
-    assert first["data"]["next_page"] == 2
-    assert second["data"]["page_message_count"] == 305
-    assert second["data"]["remaining_dialog_count"] == 0
-    large_group = next(group for group in second["data"]["groups"] if group["dialog_id"] == 6000)
-    assert len(large_group["messages"]) == 5
+    assert first_data["total_message_count"] == 325
+    assert first_data["page_message_count"] == 20
+    assert first_data["next_page"] == 2
+    assert second_data["page_message_count"] == 305
+    assert second_data["remaining_dialog_count"] == 0
+    large_group = next(group for group in _response_groups(second) if group["dialog_id"] == 6000)
+    assert len(_group_messages(large_group)) == 5
 
 
 @pytest.mark.asyncio
