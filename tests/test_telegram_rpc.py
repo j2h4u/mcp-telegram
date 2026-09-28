@@ -1292,7 +1292,7 @@ def test_telethon_public_helper_and_update_loop_contract_is_pinned() -> None:
     from telethon.client.users import UserMethods
     from telethon.tl.custom.message import Message
 
-    assert telethon.__version__ == "1.44.0"
+    assert telethon.__version__ == "1.45.0"
     assert "await self(" in inspect.getsource(TelegramClient.get_me)
     sender_source = inspect.getsource(Message.get_sender)
     assert "await self._client.get_entity" in sender_source
