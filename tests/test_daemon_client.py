@@ -736,6 +736,29 @@ async def test_get_inbox_convenience_explicit() -> None:
     assert req["group_size_threshold"] == 50
 
 
+@pytest.mark.asyncio
+async def test_get_inbox_page_passthrough_preserves_response() -> None:
+    conn = DaemonConnection(MagicMock(), MagicMock())
+    captured: list[dict] = []
+    response = {"ok": True, "data": {"groups": [], "next_page": 3}}
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return response
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+
+    assert await conn.get_inbox(page=2) is response
+    assert captured == [
+        {
+            "method": "get_inbox",
+            "limit": 100,
+            "page": 2,
+            "group_size_threshold": 100,
+        }
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Convenience method: get_inbox with default params
 # ---------------------------------------------------------------------------

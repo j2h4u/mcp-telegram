@@ -9,7 +9,6 @@ import pytest
 from telethon.tl import types
 from telethon.tl.functions.messages import GetFullChatRequest
 
-from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED
 from mcp_telegram.telegram_gateway import TelethonGroupProfileGateway
 
 
@@ -89,7 +88,7 @@ async def test_group_gateway_builds_request_and_normalizes_all_primitives() -> N
 
 
 @pytest.mark.asyncio
-async def test_forbidden_group_gateway_observation_keeps_only_positive_title() -> None:
+async def test_forbidden_group_gateway_observation_is_complete_identity() -> None:
     response = _full_chat()
     object.__setattr__(response, "chats", [types.ChatForbidden(id=123, title="Partial group")])
 
@@ -101,9 +100,9 @@ async def test_forbidden_group_gateway_observation_keeps_only_positive_title() -
     assert identity is not None
     assert (identity.name, identity.username, identity.dialog_type, identity.complete, identity.observed_at) == (
         "Partial group",
-        IDENTITY_OMITTED,
-        IDENTITY_OMITTED,
-        False,
+        None,
+        "group",
+        True,
         100,
     )
 

@@ -420,7 +420,22 @@ class RuntimeObservationSink:
                 return
             self._last_log_at = now
             self._last_logged_summary = summary
-        logger.warning(
+        level = (
+            logging.WARNING
+            if any(
+                (
+                    counters.queue_full_drops,
+                    counters.shutdown_grace_drops,
+                    counters.permanent_failures,
+                    counters.startup_failures,
+                    counters.rejected_submissions,
+                    counters.startup_drops,
+                )
+            )
+            else logging.DEBUG
+        )
+        logger.log(
+            level,
             "runtime_observation_sink_summary queue_full_drops=%d shutdown_grace_drops=%d "
             "busy_retries=%d permanent_failures=%d startup_failures=%d rejected_submissions=%d startup_drops=%d",
             counters.queue_full_drops,

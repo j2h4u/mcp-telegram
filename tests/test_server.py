@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import re
 from collections.abc import AsyncIterator
@@ -1483,6 +1484,85 @@ async def test_success_result_cannot_use_reserved_error_envelope(monkeypatch: py
 
 
 @pytest.mark.asyncio
+async def test_get_inbox_server_boundary_keeps_cyrillic_payload_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    groups = [
+        {
+            "dialog_id": dialog_id,
+            "display_name": f"Диалог {dialog_id}",
+            "category": "user",
+            "dialog_type": "User",
+            "unread_count": 12,
+            "messages": [
+                {
+                    "message_id": message_id,
+                    "sent_at": message_id,
+                    "dialog_id": dialog_id,
+                    "text": "Ж" * 2000,
+                    "content_kind": "message_text",
+                }
+                for message_id in range(1, 13)
+            ],
+        }
+        for dialog_id in range(1, 26)
+    ]
+
+    @asynccontextmanager
+    async def inbox_connection() -> AsyncIterator[object]:
+        class _Connection:
+            async def get_inbox(self, **kwargs: object) -> dict[str, object]:
+                assert kwargs["limit"] == 100
+                return {
+                    "ok": True,
+                    "data": {
+                        "groups": groups,
+                        "page": 1,
+                        "total_dialog_count": 25,
+                        "remaining_dialog_count": 5,
+                        "next_page": 2,
+                        "total_message_count": 300,
+                        "page_message_count": 240,
+                        "read_position_pending_count": 0,
+                        "read_position_pending_entities": [],
+                    },
+                }
+
+        yield _Connection()
+
+    protection = {
+        "status": "active",
+        "outbound_acquisition": "blocked",
+        "recovery": "manual",
+        "notice": "Telegram acquisition is paused.",
+    }
+    monkeypatch.setattr("mcp_telegram.tools.unread.daemon_connection", inbox_connection)
+    monkeypatch.setattr(
+        server, "daemon_connection", lambda: _status_context({"ok": True, "data": {"account_protection": protection}})
+    )
+
+    result = _call_tool_result(await server.call_tool("get_inbox", {"limit": 100, "timezone": "Asia/Almaty"}))
+    assert result.is_error is False
+    assert result.content == []
+    payload = cast(dict[str, object], result.structured_content)
+    assert payload["account_protection"] == protection
+    assert payload["selection_complete"] is False
+    assert payload["shown_message_count"] == cast(dict[str, object], payload["budget"])["result_message_count"]
+    budget = cast(dict[str, object], payload["budget"])
+    page_message_count = payload["page_message_count"]
+    result_message_count = budget["result_message_count"]
+    hidden_count = budget["hidden_count"]
+    assert isinstance(page_message_count, int)
+    assert isinstance(result_message_count, int)
+    assert isinstance(hidden_count, int)
+    assert page_message_count == result_message_count + hidden_count
+    assert len(json.dumps(payload, ensure_ascii=True, separators=(",", ":"))) < 50_000
+    validate(
+        instance=payload,
+        schema=_tool_output_schema(next(tool for tool in await server.list_tools() if tool.name == "get_inbox")),
+    )
+
+
 async def test_call_tool_returns_structuredContent_with_empty_success_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

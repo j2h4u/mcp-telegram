@@ -71,6 +71,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                         "enum": ["name", "username", "numeric", None],
                     },
                     "type": {"type": ["string", "null"]},
+                    "is_self": {"type": "boolean"},
                     "last_message_at": {"type": ["integer", "string", "null"]},
                     "unread_count": {"type": ["integer", "null"]},
                     "sync_status": {"type": "string", "enum": [item.value for item in SyncStatus]},
@@ -157,6 +158,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "folder_ids",
                     "folders",
                     "archived",
+                    "is_self",
                 ],
                 "additionalProperties": False,
             },
@@ -317,6 +319,7 @@ class _DialogSurface:
     folder_ids: list[int]
     folders: list[tuple[int, str]]
     archived: bool
+    is_self: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -505,6 +508,7 @@ def _strict_dialog(value: object, index: int) -> _DialogSurface:
         folder_ids=_strict_int_list(value, "folder_ids", context=context),
         folders=_strict_folders(value, context=context),
         archived=_strict_bool(value, "archived", context=context),
+        is_self=_strict_bool(value, "is_self", context=context),
     )
 
 
@@ -851,6 +855,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                     for folder_id, title in dialog.folders
                 ],
                 "archived": dialog.archived,
+                "is_self": dialog.is_self,
             }
         )
     structured_content = {
@@ -929,6 +934,12 @@ async def _fetch_topics_response(
 def _list_topics_error_result(args: ListTopics, response: dict[str, object]) -> ToolResult:
     error_code = response.get("error", "")
     error_msg = response.get("message", "Request failed.")
+    if error_code == "saved_messages_not_supported":
+        action = response.get("required_action")
+        return error_result(
+            f"Error: {error_code}: {error_msg}\nAction: {action}",
+            has_filter=True,
+        )
     projection = project_dialog_resolution_error(
         response,
         fallback_action="Retry ListTopics with an exact dialog id.",

@@ -2446,6 +2446,20 @@ async def test_list_topics_through_daemon() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_topics_rejects_saved_messages_without_refreshing_topics() -> None:
+    refresher = AsyncMock()
+    server = make_server(topic_refresher=cast(TopicRefresher, refresher))
+    server.self_id = 12345
+
+    result = await server._list_topics({"dialog_id": 12345})
+
+    assert result["ok"] is False
+    assert result["error"] == "saved_messages_not_supported"
+    assert "ListMessages" in result["required_action"]
+    refresher.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_list_topics_serves_cached_catalog_when_protection_blocks_optional_icon_enrichment() -> None:
     """A cached catalog remains usable when only optional icon Unicode is missing."""
 
@@ -3577,7 +3591,9 @@ async def test_list_unread_messages_since_filter_keeps_counts_bodies_and_budget_
     assert [group["dialog_id"] for group in groups] == [1001]
     group = groups[0]
     assert group["unread_count"] == 2
-    assert [message["message_id"] for message in _group_messages(group)] == [2]
+    # A bounded inbox keeps the latest eligible row; rows within the selected
+    # window are still emitted chronologically.
+    assert [message["message_id"] for message in _group_messages(group)] == [3]
 
 
 @pytest.mark.asyncio
@@ -3743,6 +3759,31 @@ async def test_list_unread_messages_budget_limits_messages() -> None:
     total_messages = sum(len(_group_messages(g)) for g in _response_groups(result))
     assert total_messages <= 10, f"Budget exceeded: {total_messages} messages returned"
     cast(MagicMock, client).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_reports_page_source_total_before_cap() -> None:
+    conn = _make_db()
+    for dialog_id in range(5000, 5025):
+        _seed_unread_state(conn, dialog_id, read_inbox_max_id=0, entity_type="User", entity_name=f"User{dialog_id}")
+        _seed_message(conn, dialog_id, message_id=1, text="unread")
+    _seed_unread_state(conn, 6000, read_inbox_max_id=0, entity_type="User", entity_name="Large")
+    for message_id in range(1, 301):
+        _seed_message(conn, 6000, message_id=message_id, text="unread")
+
+    server = make_server(conn, _TestClient())
+    first = await server._dispatch({"method": "get_inbox", "limit": 40, "page": 1})
+    second = await server._dispatch({"method": "get_inbox", "limit": 40, "page": 2})
+    first_data = _response_data(first)
+    second_data = _response_data(second)
+
+    assert first_data["total_message_count"] == 325
+    assert first_data["page_message_count"] == 20
+    assert first_data["next_page"] == 2
+    assert second_data["page_message_count"] == 305
+    assert second_data["remaining_dialog_count"] == 0
+    large_group = next(group for group in _response_groups(second) if group["dialog_id"] == 6000)
+    assert len(_group_messages(large_group)) == 5
 
 
 @pytest.mark.asyncio
@@ -5971,6 +6012,37 @@ async def test_list_dialogs_classifies_forum() -> None:
     cast(MagicMock, mock_client.iter_dialogs).assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_list_dialogs_marks_only_canonical_self_id() -> None:
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 6002, name="Self", type_="User")
+    _seed_dialog_row(conn, 6003, name="Ordinary DM", type_="User")
+    _seed_dialog_row(conn, 6004, name="Bot", type_="Bot")
+    server = make_server(conn)
+    server.self_id = 6002
+
+    result = await server._list_dialogs({})
+    rows = {row["id"]: row for row in result["data"]["dialogs"]}
+
+    assert rows[6002]["is_self"] is True
+    assert rows[6003]["is_self"] is False
+    assert rows[6004]["is_self"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_messages_empty_self_dialog_is_marked() -> None:
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 777, name="Saved Messages", type_="User")
+    server = make_server(conn)
+    server.self_id = 777
+
+    result = await server._list_messages({"dialog_id": 777, "limit": 10})
+
+    assert result["ok"] is True
+    assert result["data"]["messages"] == []
+    assert result["data"]["is_self"] is True
+
+
 # ---------------------------------------------------------------------------
 # list_messages access_lost routing tests (Plan 36-02, Task 1)
 # ---------------------------------------------------------------------------
@@ -8082,6 +8154,7 @@ async def test_resolve_dialog_name_dialogs_snapshot_substring_is_suggestion_only
     """A unique approximate match suggests an id but does not auto-select it."""
     conn = _make_db_with_dialogs()
     _seed_dialog_row(conn, 777, name="Acme Corp Discussion", type_="supergroup")
+    _publish_test_dialog_directory(conn)
 
     client = _TestClient()
     client.get_entity = AsyncMock(side_effect=ValueError(""))
@@ -8095,6 +8168,25 @@ async def test_resolve_dialog_name_dialogs_snapshot_substring_is_suggestion_only
     assert isinstance(result, dict)
     assert result["error"] == "dialog_not_found"
     assert cast(dict[str, object], result["suggestion"])["entity_id"] == 777
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_dialog_name_fuzzy_suggestion_reports_incomplete_coverage() -> None:
+    """A fuzzy suggestion never claims absence while local directory coverage is incomplete."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 778, name="Acme Corp Discussion", type_="supergroup")
+
+    client = _TestClient()
+    client.get_entity = AsyncMock(side_effect=ValueError(""))
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("forbidden"))
+
+    server = make_server(conn, client)
+    result = await server._resolve_dialog_id(required_dialog_selector(dialog="acme corp"))
+
+    assert isinstance(result, dict)
+    assert result["error"] == "dialog_directory_incomplete"
+    assert cast(dict[str, object], result["suggestion"])["entity_id"] == 778
     cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
