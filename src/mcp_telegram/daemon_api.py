@@ -1209,22 +1209,18 @@ class DaemonAPIServer:
         coverage: DialogDirectoryCoverage,
     ) -> dict[str, object]:
         candidates = cls._sorted_dialog_matches(result.matches)
-        coverage_wire = coverage.to_wire()
         if len(candidates) == 1:
-            return {
-                "ok": False,
-                "error": "dialog_not_found",
-                "message": f"Dialog {selector.label!r} was not found; one approximate match is available.",
-                "suggestion": candidates[0],
-                "directory_coverage": coverage_wire,
-                "required_action": "Retry with the suggestion's exact dialog id, or refine the dialog name.",
-            }
+            response = cls._dialog_resolution_no_match_response(selector, coverage)
+            response["message"] = f"{response['message']} One approximate match is available."
+            response["suggestion"] = candidates[0]
+            response["required_action"] = "Retry with the suggestion's exact dialog id, or refine the dialog name."
+            return response
         return {
             "ok": False,
             "error": "ambiguous_dialog",
             "message": f"Dialog {selector.label!r} matched multiple dialogs.",
             "candidates": candidates,
-            "directory_coverage": coverage_wire,
+            "directory_coverage": coverage.to_wire(),
             "required_action": "Retry with an exact dialog id from structuredContent.error.details.candidates.",
         }
 

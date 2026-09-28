@@ -4,7 +4,7 @@ from telethon.tl import types
 
 from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
 from mcp_telegram.models import DialogType
-from mcp_telegram.telethon_dialog import observe_dialog_identity
+from mcp_telegram.telethon_dialog import classify_dialog_type, observe_dialog_identity
 
 
 def _observe(entity: object) -> DialogIdentityObservation | None:
@@ -58,13 +58,44 @@ def test_partial_objects_keep_only_positive_identity_facts() -> None:
         (_observe(min_user), "Ada", IDENTITY_OMITTED),
         (_observe(min_channel), "Partial", "active"),
         (_observe(forbidden_channel), "Hidden", IDENTITY_OMITTED),
-        (_observe(forbidden_chat), "Unavailable", IDENTITY_OMITTED),
     ):
         assert observation is not None
         assert observation.complete is False
         assert observation.dialog_type is IDENTITY_OMITTED
         assert observation.name == name
         assert observation.username == username
+
+    observation = _observe(forbidden_chat)
+    assert observation is not None
+    assert (observation.name, observation.username, observation.dialog_type, observation.complete) == (
+        "Unavailable",
+        None,
+        DialogType.GROUP,
+        True,
+    )
+
+
+def test_forbidden_identity_requires_authoritative_title() -> None:
+    assert _observe(types.ChatForbidden(id=42, title=" ")) is None
+    assert _observe(types.ChannelForbidden(id=42, access_hash=1, title=" ")) is None
+
+
+def test_forbidden_chat_identity_is_complete_while_classifier_stays_unknown() -> None:
+    entity = types.ChatForbidden(id=42, title="Unavailable")
+    assert classify_dialog_type(entity) is DialogType.UNKNOWN
+    observation = observe_dialog_identity(
+        entity,
+        dialog_id=42,
+        source="profile",
+        observed_at=123,
+    )
+    assert observation is not None
+    assert (observation.name, observation.username, observation.dialog_type, observation.complete) == (
+        "Unavailable",
+        None,
+        DialogType.GROUP,
+        True,
+    )
 
 
 def test_partial_empty_identity_and_unsupported_objects_are_omitted() -> None:
