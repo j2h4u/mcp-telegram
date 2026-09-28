@@ -652,8 +652,7 @@ def _trim_inbox_to_size(payload: dict[str, object]) -> None:
     shown_messages = int(budget["result_message_count"]) if isinstance(budget, dict) else 0
     payload["shown_message_count"] = shown_messages
     payload["selection_complete"] = (
-        payload.get("total_dialog_count") == len(dialogs)
-        and payload.get("total_message_count") == shown_messages
+        payload.get("total_dialog_count") == len(dialogs) and payload.get("total_message_count") == shown_messages
     )
     payload["content_truncated_count"] = _count_inbox_truncated_content(dialogs)
 
