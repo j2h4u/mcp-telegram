@@ -125,6 +125,14 @@ GET_INBOX_OUTPUT_SCHEMA = {
         },
         "selection_complete": {"type": "boolean"},
         "content_truncated_count": {"type": "integer"},
+        "page": {"type": "integer"},
+        "page_size": {"type": "integer"},
+        "total_dialog_count": {"type": "integer"},
+        "shown_dialog_count": {"type": "integer"},
+        "remaining_dialog_count": {"type": "integer"},
+        "next_page": {"type": ["integer", "null"]},
+        "total_message_count": {"type": "integer"},
+        "shown_message_count": {"type": "integer"},
         "dialogs": {
             "type": "array",
             "items": {
@@ -213,6 +221,14 @@ GET_INBOX_OUTPUT_SCHEMA = {
         "budget",
         "selection_complete",
         "content_truncated_count",
+        "page",
+        "page_size",
+        "total_dialog_count",
+        "shown_dialog_count",
+        "remaining_dialog_count",
+        "next_page",
+        "total_message_count",
+        "shown_message_count",
         "dialogs",
         "count",
         "result_count_semantics",
@@ -301,6 +317,7 @@ class GetInbox(ToolArgs):
     model_config = ConfigDict(extra="forbid")
 
     limit: int = Field(default=40, ge=1, le=100, description="Total message budget across all chats (1-100)")
+    page: int = Field(default=1, ge=1, description="Dialog page number; each page contains at most 20 dialogs.")
     group_size_threshold: int = Field(
         default=100,
         ge=10,
@@ -558,59 +575,87 @@ def _inbox_size(payload: Mapping[str, object]) -> int:
     return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
 
-def _trim_inbox_to_size(payload: dict[str, object]) -> None:
-    """Drop whole preview rows fairly; counts continue to describe the source."""
-    dialogs = payload.get("dialogs")
-    if not isinstance(dialogs, list):
+def _drop_largest_inbox_preview(dialogs: list[object]) -> bool:
+    candidates = [dialog for dialog in dialogs if isinstance(dialog, dict) and dialog.get("messages")]
+    if not candidates:
+        return False
+    dialog = max(candidates, key=lambda item: len(cast(list[object], item["messages"])))
+    messages = cast(list[object], dialog["messages"])
+    messages.pop(0)
+    budget = dialog.get("budget")
+    if isinstance(budget, dict):
+        total = int(budget.get("total_in_chat", 0) or 0)
+        budget["shown_count"] = len(messages)
+        budget["hidden_count"] = max(0, total - len(messages))
+    return True
+
+
+def _inbox_valid_dialogs(dialogs: list[object]) -> list[dict[str, object]]:
+    return [dialog for dialog in dialogs if isinstance(dialog, dict)]
+
+
+def _inbox_message_count(dialogs: list[dict[str, object]]) -> int:
+    return sum(
+        len(cast(list[object], dialog.get("messages", [])))
+        for dialog in dialogs
+        if isinstance(dialog.get("messages", []), list)
+    )
+
+
+def _inbox_hidden_count(dialogs: list[dict[str, object]]) -> int:
+    return sum(
+        int(cast(int, cast(dict[str, object], dialog["budget"]).get("hidden_count", 0) or 0))
+        for dialog in dialogs
+        if isinstance(dialog.get("budget"), dict)
+    )
+
+
+def _inbox_hidden_entry(dialog: dict[str, object]) -> dict[str, object] | None:
+    budget = dialog.get("budget")
+    if not isinstance(budget, dict) or not budget.get("hidden_count"):
+        return None
+    return {
+        "entity": dialog["entity"],
+        "display_name_source": dialog["display_name_source"],
+        "hidden_count": budget["hidden_count"],
+    }
+
+
+def _inbox_hidden_by_dialog(dialogs: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [entry for dialog in dialogs if (entry := _inbox_hidden_entry(dialog)) is not None]
+
+
+def _reconcile_inbox_receipts(payload: dict[str, object], dialogs: list[object]) -> None:
+    budget = payload.get("budget")
+    if not isinstance(budget, dict):
         return
-    while _inbox_size(payload) > _MAX_INBOX_STRUCTURED_CHARS:
-        candidates = [dialog for dialog in dialogs if isinstance(dialog, dict) and dialog.get("messages")]
-        if not candidates:
-            break
-        dialog = max(candidates, key=lambda item: len(cast(list[object], item["messages"])))
-        messages = cast(list[object], dialog["messages"])
-        messages.pop()
-        budget = dialog.get("budget")
-        if isinstance(budget, dict):
-            total = int(budget.get("total_in_chat", 0) or 0)
-            budget["shown_count"] = len(messages)
-            budget["hidden_count"] = max(0, total - len(messages))
-        dialog["messages"] = messages
-    if isinstance(payload.get("budget"), dict):
-        budget = cast(dict[str, object], payload["budget"])
-        budget["result_message_count"] = sum(
-            len(cast(list[object], dialog.get("messages", [])))
-            for dialog in dialogs
-            if isinstance(dialog, dict) and isinstance(dialog.get("messages", []), list)
-        )
-        budget["hidden_count"] = sum(
-            int(cast(int, cast(dict[str, object], dialog["budget"]).get("hidden_count", 0) or 0))
-            for dialog in dialogs
-            if isinstance(dialog, dict) and isinstance(dialog.get("budget"), dict)
-        )
-        hidden_by_dialog = []
-        for dialog in dialogs:
-            if not isinstance(dialog, dict):
-                continue
-            dialog_budget = dialog.get("budget")
-            if not isinstance(dialog_budget, dict) or not dialog_budget.get("hidden_count"):
-                continue
-            hidden_by_dialog.append(
-                {
-                    "entity": dialog["entity"],
-                    "display_name_source": dialog["display_name_source"],
-                    "hidden_count": dialog_budget["hidden_count"],
-                }
-            )
-        budget["hidden_count_by_dialog"] = hidden_by_dialog
-    payload["count"] = len(dialogs)
-    payload["content_truncated_count"] = sum(
+    valid_dialogs = _inbox_valid_dialogs(dialogs)
+    budget["result_message_count"] = _inbox_message_count(valid_dialogs)
+    budget["hidden_count"] = _inbox_hidden_count(valid_dialogs)
+    budget["hidden_count_by_dialog"] = _inbox_hidden_by_dialog(valid_dialogs)
+
+
+def _count_inbox_truncated_content(dialogs: list[object]) -> int:
+    return sum(
         1
         for dialog in dialogs
         if isinstance(dialog, dict)
         for message in cast(list[dict[str, object]], dialog.get("messages", []))
         if message.get("content_truncated") is True
     )
+
+
+def _trim_inbox_to_size(payload: dict[str, object]) -> None:
+    """Drop whole preview rows fairly; counts continue to describe the source."""
+    dialogs = payload.get("dialogs")
+    if not isinstance(dialogs, list):
+        return
+    while _inbox_size(payload) > _MAX_INBOX_STRUCTURED_CHARS:
+        if not _drop_largest_inbox_preview(dialogs):
+            break
+    _reconcile_inbox_receipts(payload, dialogs)
+    payload["count"] = len(dialogs)
+    payload["content_truncated_count"] = _count_inbox_truncated_content(dialogs)
 
 
 def _identity_text_fact(value: object) -> str | None:
@@ -652,6 +697,51 @@ def _project_unread_summary_dialogs(raw_dialogs: object) -> list[dict[str, objec
     return dialogs
 
 
+def _inbox_int(data: Mapping[str, object], key: str, default: int) -> int:
+    value = data.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+
+def _inbox_paging_payload(data: Mapping[str, object], dialog_count: int, message_count: int) -> dict[str, object]:
+    return {
+        "page": _inbox_int(data, "page", 1),
+        "page_size": _inbox_int(data, "page_size", 20),
+        "total_dialog_count": _inbox_int(data, "total_dialog_count", dialog_count),
+        "shown_dialog_count": _inbox_int(data, "shown_dialog_count", dialog_count),
+        "remaining_dialog_count": _inbox_int(data, "remaining_dialog_count", 0),
+        "next_page": data.get("next_page"),
+        "total_message_count": _inbox_int(data, "total_message_count", message_count),
+        "shown_message_count": _inbox_int(data, "shown_message_count", message_count),
+    }
+
+
+def _inbox_coverage_payload(pending_count: int, pending_entities: list[dict[str, object]]) -> dict[str, object]:
+    complete = pending_count == 0
+    return {
+        "complete": complete,
+        "state": "complete" if complete else "partial",
+        "scope": "DB read-cursor coverage only; it does not mean all unread messages were selected.",
+        "read_position_pending_count": pending_count,
+        "read_position_pending_entities": pending_entities,
+    }
+
+
+def _inbox_budget_payload(
+    args: GetInbox,
+    dialogs: list[dict[str, object]],
+    hidden_by_dialog: list[dict[str, object]],
+    message_count: int,
+) -> dict[str, object]:
+    return {
+        "requested_limit": args.limit,
+        "result_message_count": message_count,
+        "dialog_count": len(dialogs),
+        "hidden_count": sum(cast(int, item["hidden_count"]) for item in hidden_by_dialog),
+        "hidden_count_by_dialog": hidden_by_dialog,
+        "allocation_policy": "daemon allocates the requested unread message budget across dialogs",
+    }
+
+
 def _project_inbox_response(
     args: GetInbox,
     response: dict,
@@ -663,7 +753,8 @@ def _project_inbox_response(
         err.has_filter = has_inbox_filter
         return err
 
-    data = response.get("data", {})
+    raw_data = response.get("data", {})
+    data = raw_data if isinstance(raw_data, Mapping) else {}
     groups = data.get("groups", [])
     # The daemon contract is atomic: missing read-position coverage fields are
     # a protocol defect, never an implicit "no pending work" result.
@@ -671,40 +762,23 @@ def _project_inbox_response(
     read_position_pending_entities = _project_read_position_pending_entities(data["read_position_pending_entities"])
     warnings = _read_position_pending_warnings(read_position_pending_count)
     structured_dialogs, hidden_count_by_dialog, result_message_count = _structured_inbox_groups(groups)
-    content_truncated_count = sum(
-        1
-        for dialog in structured_dialogs
-        for message in cast(list[dict[str, object]], dialog["messages"])
-        if message.get("content_truncated") is True
-    )
+    content_truncated_count = _count_inbox_truncated_content(cast(list[object], structured_dialogs))
     structured_content: dict[str, object] = {
         "limit": args.limit,
         "group_size_threshold": args.group_size_threshold,
         "applied_since_utc": applied_since_utc,
         "read_position_pending_count": read_position_pending_count,
         "read_position_pending_entities": read_position_pending_entities,
-        "coverage": {
-            "complete": read_position_pending_count == 0,
-            "state": "complete" if read_position_pending_count == 0 else "partial",
-            "scope": "DB read-cursor coverage only; it does not mean all unread messages were selected.",
-            "read_position_pending_count": read_position_pending_count,
-            "read_position_pending_entities": read_position_pending_entities,
-        },
+        "coverage": _inbox_coverage_payload(read_position_pending_count, read_position_pending_entities),
         "warnings": warnings,
-        "budget": {
-            "requested_limit": args.limit,
-            "result_message_count": result_message_count,
-            "dialog_count": len(structured_dialogs),
-            "hidden_count": sum(cast(int, item["hidden_count"]) for item in hidden_count_by_dialog),
-            "hidden_count_by_dialog": hidden_count_by_dialog,
-            "allocation_policy": "daemon allocates the requested unread message budget across dialogs",
-        },
+        "budget": _inbox_budget_payload(args, structured_dialogs, hidden_count_by_dialog, result_message_count),
         "selection_complete": bool(data.get("selection_complete", True)),
         "content_truncated_count": content_truncated_count,
         "dialogs": structured_dialogs,
         "count": len(structured_dialogs),
         "result_count_semantics": "count is the number of unread dialogs returned; budget.result_message_count is the number of message rows shown",
     }
+    structured_content.update(_inbox_paging_payload(data, len(structured_dialogs), result_message_count))
     if args.include_dialog_types is not None:
         structured_content["applied_dialog_types"] = list(
             dict.fromkeys(item.value for item in args.include_dialog_types)
@@ -744,6 +818,7 @@ async def get_inbox(args: GetInbox) -> ToolResult:
         async with daemon_connection() as conn:
             response = await conn.get_inbox(
                 limit=args.limit,
+                page=args.page,
                 group_size_threshold=args.group_size_threshold,
                 since_utc=applied_since_utc,
                 include_dialog_types=(

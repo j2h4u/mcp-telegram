@@ -2892,6 +2892,7 @@ async def test_get_inbox_bounds_previews_and_structured_output():
     dialogs = _json_list(payload["dialogs"])
     dialog_with_messages = next(_json_dict(dialog) for dialog in dialogs if _json_list(_json_dict(dialog)["messages"]))
     first_message = _json_dict(_json_list(dialog_with_messages["messages"])[0])
+    assert first_message["msg_id"] == 5
     content = _json_dict(first_message["content"])
     assert len(content["text"]) == 400
     assert first_message["content_truncated"] is True
@@ -2934,6 +2935,37 @@ async def test_get_inbox_passes_params():
     call_kwargs = _call_kwargs(conn.get_inbox)
     assert call_kwargs["limit"] == 80
     assert call_kwargs["group_size_threshold"] == 50
+
+
+async def test_get_inbox_passes_page_and_projects_page_receipt():
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "groups": [],
+                "page": 2,
+                "page_size": 20,
+                "total_dialog_count": 25,
+                "shown_dialog_count": 5,
+                "remaining_dialog_count": 0,
+                "next_page": None,
+                "total_message_count": 5,
+                "shown_message_count": 5,
+                "read_position_pending_count": 0,
+                "read_position_pending_entities": [],
+            },
+        }
+    )
+    with _patch_daemon(conn):
+        result = await get_inbox(GetInbox(page=2))
+
+    call_kwargs = _call_kwargs(conn.get_inbox)
+    assert call_kwargs["page"] == 2
+    payload = _json_dict(result.structured_content)
+    assert payload["page"] == 2
+    assert payload["page_size"] == 20
+    assert payload["total_dialog_count"] == 25
+    assert payload["next_page"] is None
 
 
 def test_get_inbox_rejects_removed_scope_argument() -> None:
