@@ -1,3 +1,4 @@
+import json
 import math
 import time
 from collections.abc import Mapping
@@ -58,6 +59,7 @@ GET_INBOX_OUTPUT_SCHEMA = {
             "properties": {
                 "complete": {"type": "boolean"},
                 "state": {"type": "string"},
+                "scope": {"type": "string"},
                 "read_position_pending_count": {"type": "integer"},
                 "read_position_pending_entities": {
                     "type": "array",
@@ -72,7 +74,7 @@ GET_INBOX_OUTPUT_SCHEMA = {
                     },
                 },
             },
-            "required": ["complete", "state", "read_position_pending_count", "read_position_pending_entities"],
+            "required": ["complete", "state", "scope", "read_position_pending_count", "read_position_pending_entities"],
             "additionalProperties": False,
         },
         "warnings": {
@@ -121,6 +123,8 @@ GET_INBOX_OUTPUT_SCHEMA = {
             ],
             "additionalProperties": False,
         },
+        "selection_complete": {"type": "boolean"},
+        "content_truncated_count": {"type": "integer"},
         "dialogs": {
             "type": "array",
             "items": {
@@ -161,6 +165,8 @@ GET_INBOX_OUTPUT_SCHEMA = {
                             "type": "object",
                             "properties": {
                                 **cast(dict[str, object], MESSAGE_VIEW_SCHEMA["properties"]),
+                                "content_truncated": {"type": "boolean"},
+                                "content_source_length": {"type": "integer"},
                             },
                             "required": [
                                 "dialog_id",
@@ -169,6 +175,8 @@ GET_INBOX_OUTPUT_SCHEMA = {
                                 "out",
                                 "reaction_events",
                                 "reaction_events_status",
+                                "content_truncated",
+                                "content_source_length",
                             ],
                             "additionalProperties": False,
                         },
@@ -203,6 +211,8 @@ GET_INBOX_OUTPUT_SCHEMA = {
         "coverage",
         "warnings",
         "budget",
+        "selection_complete",
+        "content_truncated_count",
         "dialogs",
         "count",
         "result_count_semantics",
@@ -211,6 +221,8 @@ GET_INBOX_OUTPUT_SCHEMA = {
 }
 
 _MAX_INBOX_LAST_HOURS = 720
+_MAX_INBOX_PREVIEW_CHARS = 400
+_MAX_INBOX_STRUCTURED_CHARS = 28_000
 
 GET_UNREAD_SUMMARY_OUTPUT_SCHEMA = {
     "type": "object",
@@ -273,7 +285,7 @@ class GetUnreadSummary(ToolArgs):
 
 
 class GetInbox(ToolArgs):
-    """Fetch unread messages from personal chats and small groups, prioritized by tier.
+    """Return a compact unread orientation from personal chats and small groups.
 
     Uses the synchronized Telegram state. Prioritizes mentions, DMs, bots, services, and groups;
     channel dialogs are excluded unless explicitly included with include_dialog_types.
@@ -288,7 +300,7 @@ class GetInbox(ToolArgs):
 
     model_config = ConfigDict(extra="forbid")
 
-    limit: int = Field(default=100, ge=50, le=500, description="Total message budget across all chats (50-500)")
+    limit: int = Field(default=40, ge=1, le=100, description="Total message budget across all chats (1-100)")
     group_size_threshold: int = Field(
         default=100,
         ge=10,
@@ -521,7 +533,84 @@ def _structured_messages(
     )
     messages = [ReadMessage(**row) for row in ordered_rows]
     marker_by_message = project_read_markers(messages, read_state=read_state, dialog_type=dialog_type)
-    return [project_message_view(message, read_marker=marker_by_message.get(message.id)) for message in messages]
+    projected: list[dict[str, object]] = []
+    for message in messages:
+        item = project_message_view(message, read_marker=marker_by_message.get(message.id))
+        source_length = len(message.text or "")
+        content = item.get("content")
+        if isinstance(content, dict) and isinstance(content.get("text"), str):
+            text = content["text"]
+            truncated = len(text) > _MAX_INBOX_PREVIEW_CHARS
+            if truncated:
+                content = dict(content)
+                content["text"] = text[: _MAX_INBOX_PREVIEW_CHARS - 3] + "..."
+                item["content"] = content
+            item["content_truncated"] = truncated
+            item["content_source_length"] = source_length
+        else:
+            item["content_truncated"] = False
+            item["content_source_length"] = source_length
+        projected.append(item)
+    return projected
+
+
+def _inbox_size(payload: Mapping[str, object]) -> int:
+    return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
+def _trim_inbox_to_size(payload: dict[str, object]) -> None:
+    """Drop whole preview rows fairly; counts continue to describe the source."""
+    dialogs = payload.get("dialogs")
+    if not isinstance(dialogs, list):
+        return
+    while _inbox_size(payload) > _MAX_INBOX_STRUCTURED_CHARS:
+        candidates = [dialog for dialog in dialogs if isinstance(dialog, dict) and dialog.get("messages")]
+        if not candidates:
+            break
+        dialog = max(candidates, key=lambda item: len(cast(list[object], item["messages"])))
+        messages = cast(list[object], dialog["messages"])
+        messages.pop()
+        budget = dialog.get("budget")
+        if isinstance(budget, dict):
+            total = int(budget.get("total_in_chat", 0) or 0)
+            budget["shown_count"] = len(messages)
+            budget["hidden_count"] = max(0, total - len(messages))
+        dialog["messages"] = messages
+    if isinstance(payload.get("budget"), dict):
+        budget = cast(dict[str, object], payload["budget"])
+        budget["result_message_count"] = sum(
+            len(cast(list[object], dialog.get("messages", [])))
+            for dialog in dialogs
+            if isinstance(dialog, dict) and isinstance(dialog.get("messages", []), list)
+        )
+        budget["hidden_count"] = sum(
+            int(cast(dict[str, object], dialog["budget"]).get("hidden_count", 0) or 0)
+            for dialog in dialogs
+            if isinstance(dialog, dict) and isinstance(dialog.get("budget"), dict)
+        )
+        hidden_by_dialog = []
+        for dialog in dialogs:
+            if not isinstance(dialog, dict):
+                continue
+            dialog_budget = dialog.get("budget")
+            if not isinstance(dialog_budget, dict) or not dialog_budget.get("hidden_count"):
+                continue
+            hidden_by_dialog.append(
+                {
+                    "entity": dialog["entity"],
+                    "display_name_source": dialog["display_name_source"],
+                    "hidden_count": dialog_budget["hidden_count"],
+                }
+            )
+        budget["hidden_count_by_dialog"] = hidden_by_dialog
+    payload["count"] = len(dialogs)
+    payload["content_truncated_count"] = sum(
+        1
+        for dialog in dialogs
+        if isinstance(dialog, dict)
+        for message in cast(list[dict[str, object]], dialog.get("messages", []))
+        if message.get("content_truncated") is True
+    )
 
 
 def _identity_text_fact(value: object) -> str | None:
@@ -582,6 +671,12 @@ def _project_inbox_response(
     read_position_pending_entities = _project_read_position_pending_entities(data["read_position_pending_entities"])
     warnings = _read_position_pending_warnings(read_position_pending_count)
     structured_dialogs, hidden_count_by_dialog, result_message_count = _structured_inbox_groups(groups)
+    content_truncated_count = sum(
+        1
+        for dialog in structured_dialogs
+        for message in cast(list[dict[str, object]], dialog["messages"])
+        if message.get("content_truncated") is True
+    )
     structured_content: dict[str, object] = {
         "limit": args.limit,
         "group_size_threshold": args.group_size_threshold,
@@ -591,6 +686,7 @@ def _project_inbox_response(
         "coverage": {
             "complete": read_position_pending_count == 0,
             "state": "complete" if read_position_pending_count == 0 else "partial",
+            "scope": "DB read-cursor coverage only; it does not mean all unread messages were selected.",
             "read_position_pending_count": read_position_pending_count,
             "read_position_pending_entities": read_position_pending_entities,
         },
@@ -603,6 +699,8 @@ def _project_inbox_response(
             "hidden_count_by_dialog": hidden_count_by_dialog,
             "allocation_policy": "daemon allocates the requested unread message budget across dialogs",
         },
+        "selection_complete": bool(data.get("selection_complete", True)),
+        "content_truncated_count": content_truncated_count,
         "dialogs": structured_dialogs,
         "count": len(structured_dialogs),
         "result_count_semantics": "count is the number of unread dialogs returned; budget.result_message_count is the number of message rows shown",
@@ -611,6 +709,8 @@ def _project_inbox_response(
         structured_content["applied_dialog_types"] = list(
             dict.fromkeys(item.value for item in args.include_dialog_types)
         )
+
+    _trim_inbox_to_size(structured_content)
 
     if not groups:
         return structured_result(structured_content, result_count=0, has_filter=has_inbox_filter)
