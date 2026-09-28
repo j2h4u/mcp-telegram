@@ -164,8 +164,10 @@ class _AdmissionAggregate:
     total_depth_max: int = 0
     active_depth_max: int = 0
     total_outstanding_max: int = 0
+    bucket_started_at: float | None = None
 
-    def add(self, event: RpcAdmissionEvent) -> None:
+    def add(self, event: RpcAdmissionEvent, *, observed_at: float) -> None:
+        self.bucket_started_at = observed_at if self.bucket_started_at is None else min(self.bucket_started_at, observed_at)
         if event.kind is RpcAdmissionEventKind.QUEUED:
             self.queued_count += 1
         elif event.kind is RpcAdmissionEventKind.DISPATCHED:
@@ -188,6 +190,12 @@ class _AdmissionAggregate:
         self.total_depth_max = max(self.total_depth_max, other.total_depth_max)
         self.active_depth_max = max(self.active_depth_max, other.active_depth_max)
         self.total_outstanding_max = max(self.total_outstanding_max, other.total_outstanding_max)
+        if other.bucket_started_at is not None:
+            self.bucket_started_at = (
+                other.bucket_started_at
+                if self.bucket_started_at is None
+                else min(self.bucket_started_at, other.bucket_started_at)
+            )
 
 
 class RpcAdmissionObservationAggregator:
@@ -448,7 +456,7 @@ class RpcAdmissionObservationAggregator:
             aggregates, self._aggregates = self._aggregates, {}
             demand_aggregates, self._demand_aggregates = self._demand_aggregates, {}
             self._last_flush_at = flush_at
-        self._flush_admission_aggregates(aggregates)
+        self._flush_admission_aggregates(aggregates, flush_at=flush_at, flush_wall_at=time.time())
         self._flush_demand_aggregates(demand_aggregates)
         with self._state_lock:
             profile_aggregates, self._profile_aggregates = self._profile_aggregates, {}
@@ -536,10 +544,25 @@ class RpcAdmissionObservationAggregator:
                     "rpc_request_summary_flush_failed request_class=get_full_channel source=%s", source.value
                 )
 
-    def _flush_admission_aggregates(self, aggregates: dict[_AdmissionKey, _AdmissionAggregate]) -> None:
+    def _flush_admission_aggregates(
+        self, aggregates: dict[_AdmissionKey, _AdmissionAggregate], *, flush_at: float, flush_wall_at: float
+    ) -> None:
         for (source, service_class, demand_kind, acquisition_kind), aggregate in aggregates.items():
             try:
-                self._record_admission_summary(source, service_class, demand_kind, acquisition_kind, aggregate)
+                accepted = self._record_admission_summary(
+                    source, service_class, demand_kind, acquisition_kind, aggregate,
+                    flush_at=flush_at, flush_wall_at=flush_wall_at,
+                )
+                if accepted is False:
+                    with self._state_lock:
+                        self._aggregates.setdefault(
+                            (source, service_class, demand_kind, acquisition_kind), _AdmissionAggregate()
+                        ).merge(aggregate)
+                    logger.warning(
+                        "rpc_admission_summary_queue_full source=%s service_class=%s",
+                        source.value,
+                        service_class.value,
+                    )
             except Exception:
                 with self._state_lock:
                     self._aggregates.setdefault(
@@ -551,15 +574,21 @@ class RpcAdmissionObservationAggregator:
                     service_class.value,
                 )
 
-    def _record_admission_summary(
+    def _record_admission_summary(  # noqa: PLR0913 - explicit timestamps keep bucket timing at the recorder boundary
         self,
         source: TelegramRpcSource,
         service_class: RpcServiceClass,
         demand_kind: DemandKind | None,
         acquisition_kind: AcquisitionKind | None,
         aggregate: _AdmissionAggregate,
-    ) -> None:
+        *,
+        flush_at: float,
+        flush_wall_at: float,
+    ) -> bool | None:
         dispatched = aggregate.dispatched_count
+        elapsed = max(0.0, flush_at - (aggregate.bucket_started_at if aggregate.bucket_started_at is not None else flush_at))
+        bucket_ended_at_ms = int(flush_wall_at * _MILLISECONDS_PER_SECOND)
+        bucket_started_at_ms = bucket_ended_at_ms - int(elapsed * _MILLISECONDS_PER_SECOND)
         payload: dict[str, object] = {
             "source": source.value,
             "service_class": service_class.value,
@@ -570,19 +599,22 @@ class RpcAdmissionObservationAggregator:
             "total_depth_max": aggregate.total_depth_max,
             "active_depth_max": aggregate.active_depth_max,
             "total_outstanding_max": aggregate.total_outstanding_max,
-            "window_seconds": self._summary_interval_seconds,
+            "window_seconds": elapsed,
+            "bucket_started_at_ms": bucket_started_at_ms,
+            "bucket_ended_at_ms": bucket_ended_at_ms,
         }
         if demand_kind is not None:
             payload["demand_kind"] = demand_kind.value
             payload["actual_attempts"] = dispatched
         if acquisition_kind is not None:
             payload["acquisition_kind"] = acquisition_kind.value
-        self._recorder.record(
+        return self._recorder.record(
             kind="telegram.rpc_admission",
             outcome="summary",
             duration_ms=(aggregate.wait_total_seconds * _MILLISECONDS_PER_SECOND / dispatched if dispatched else None),
             result_count=dispatched,
             payload=payload,
+            observed_at_ms=bucket_ended_at_ms,
         )
 
     def _flush_demand_aggregates(self, aggregates: dict[_DemandKey, _DemandAggregate]) -> None:
@@ -677,8 +709,9 @@ class RpcAdmissionObservationAggregator:
             self._record_raw(event)
             return
         key = (event.source, event.service_class, event.demand_kind, event.acquisition_kind)
+        observed_at = self._clock()
         with self._state_lock:
-            self._aggregates.setdefault(key, _AdmissionAggregate()).add(event)
+            self._aggregates.setdefault(key, _AdmissionAggregate()).add(event, observed_at=observed_at)
 
     def _record_raw(self, event: RpcAdmissionEvent) -> None:
         self._recorder.record(

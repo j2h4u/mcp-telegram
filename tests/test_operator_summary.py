@@ -109,6 +109,41 @@ def test_summary_is_one_coherent_content_free_report(tmp_path: Path) -> None:
     assert "get_entity_info: tool_error" in report.text
 
 
+def test_rpc_admission_summary_explains_full_buckets_selected_by_end_time(tmp_path: Path) -> None:
+    now = 2_000_000_000.0
+    now_ms = int(now * 1000)
+    since_ms = now_ms - 180_000
+    db_path = tmp_path / "sync.db"
+    _database(db_path, now_ms=now_ms)
+    rows = [
+        # A bounded bucket crosses the requested start and is counted in full.
+        (since_ms + 5_000, {"source": "crossing", "dispatched_count": 3, "bucket_started_at_ms": since_ms - 30_000, "bucket_ended_at_ms": since_ms + 5_000}),
+        (since_ms + 20_000, {"source": "inside", "dispatched_count": 4, "bucket_started_at_ms": since_ms + 6_000, "bucket_ended_at_ms": since_ms + 20_000}),
+        # Legacy rows have no bounds, so the reader cannot tell whether they cross.
+        (since_ms + 3_000, {"source": "legacy", "dispatched_count": 5, "window_seconds": 300}),
+    ]
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.executemany(
+            "INSERT INTO runtime_observations(observed_at_ms,kind,runtime_instance_id,outcome,payload_json) "
+            "VALUES (?, 'telegram.rpc_admission', 'current', 'summary', ?)",
+            [(observed_at_ms, json.dumps(payload)) for observed_at_ms, payload in rows],
+        )
+        conn.commit()
+
+    report = build_operator_summary(db_path, since_seconds=180, now=now)
+
+    assert "actual attempts=24" in report.text, report.text
+    assert "Bucket totals whose end is in the requested window" in report.text
+    assert f"span={_utc_ms(since_ms - 30_000)} .. {_utc_ms(since_ms + 20_000)}" in report.text
+    assert "crossing requested start=1, unknown legacy bounds=2" in report.text
+
+
+def _utc_ms(value: int) -> str:
+    from datetime import UTC, datetime
+
+    return datetime.fromtimestamp(value / 1000, tz=UTC).strftime("%Y-%m-%d %H:%M:%SZ")
+
+
 def test_summary_reconciles_get_full_channel_attempts_by_source_and_demand(tmp_path: Path) -> None:
     now = 2_000_000_000.0
     db_path = tmp_path / "sync.db"
