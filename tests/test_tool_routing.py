@@ -2854,21 +2854,21 @@ async def test_get_inbox_frames_adversarial_body_without_framing_group_header():
 async def test_get_inbox_bounds_previews_and_structured_output():
     groups = [
         {
-                "dialog_id": dialog_id,
-                "display_name": f"Диалог {dialog_id}",
-                "category": "user",
-                "dialog_type": "User",
-                "unread_count": 5,
-                "messages": [
-                    {
-                        "message_id": message_id,
-                        "sent_at": message_id,
-                        "dialog_id": dialog_id,
-                        "text": "Ж" * 1000,
-                        "content_kind": "message_text",
-                    }
-                    for message_id in range(1, 6)
-                ],
+            "dialog_id": dialog_id,
+            "display_name": f"Диалог {dialog_id}",
+            "category": "user",
+            "dialog_type": "User",
+            "unread_count": 5,
+            "messages": [
+                {
+                    "message_id": message_id,
+                    "sent_at": message_id,
+                    "dialog_id": dialog_id,
+                    "text": "Ж" * 1000,
+                    "content_kind": "message_text",
+                }
+                for message_id in range(1, 6)
+            ],
         }
         for dialog_id in range(1, 25)
     ]
