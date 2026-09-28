@@ -2749,6 +2749,7 @@ class ReadingService:
                 "remaining_dialog_count": page_data["remaining_dialog_count"],
                 "next_page": page_data["next_page"],
                 "total_message_count": sum(counts.values()),
+                "page_message_count": sum(cast(dict[int, int], page_data["counts"]).values()),
                 "read_position_pending_count": pending_count,
                 "read_position_pending_entities": pending_entities,
             },
