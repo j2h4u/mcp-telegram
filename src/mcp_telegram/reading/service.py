@@ -2825,7 +2825,7 @@ class ReadingService:
                 },
             ).fetchall(),
         )
-        mention_counts = self._unread_mention_counts(rows)
+        mention_counts = ReadingService._unread_mention_counts(self._conn, rows)
         identities = read_dialog_identities(self._conn, [int(cast(int | str, row[0])) for row in rows])
         entries: list[dict] = []
         counts: dict[int, int] = {}
@@ -2863,18 +2863,26 @@ class ReadingService:
             counts[dialog_id_i] = unread_count_i
         return entries, counts
 
-    def _unread_mention_counts(self, rows: list[tuple[object, ...]]) -> dict[int, int]:
-        dialog_columns = {str(row[1]) for row in self._conn.execute("PRAGMA table_info(dialogs)").fetchall()}
+    @staticmethod
+    def _unread_mention_counts(
+        conn: sqlite3.Connection, rows: Sequence[tuple[object, ...]]
+    ) -> dict[int, int]:
+        table_info = cast(list[tuple[object, ...]], conn.execute("PRAGMA table_info(dialogs)").fetchall())
+        dialog_columns = {str(row[1]) for row in table_info}
         if not rows or "unread_mentions_count" not in dialog_columns:
             return {}
         dialog_ids = [int(cast(int | str, row[0])) for row in rows]
         placeholders = ",".join("?" for _ in dialog_ids)
-        return {
-            int(cast(int | str, dialog_id)): int(cast(int | str, count or 0))
-            for dialog_id, count in self._conn.execute(
+        mention_rows = cast(
+            list[tuple[object, object]],
+            conn.execute(
                 f"SELECT dialog_id, unread_mentions_count FROM dialogs WHERE dialog_id IN ({placeholders})",
                 dialog_ids,
-            ).fetchall()
+            ).fetchall(),
+        )
+        return {
+            int(cast(int | str, dialog_id)): int(cast(int | str, count or 0))
+            for dialog_id, count in mention_rows
         }
 
     @staticmethod
