@@ -8,6 +8,7 @@ from mcp_telegram.budget import (
     UNREAD_TIER_MENTION_GROUP,
     UNREAD_TIER_SMALL_GROUP,
     allocate_message_budget_proportional,
+    allocate_message_budget_round_robin,
     unread_chat_tier,
 )
 
@@ -122,3 +123,11 @@ class TestAllocateMessageBudget:
         counts = {1: 1000, 2: 1000}
         result = allocate_message_budget_proportional(counts, limit=10)
         assert all(v >= 3 for v in result.values())
+
+    def test_round_robin_caps_each_dialog_and_preserves_rank_order(self):
+        result = allocate_message_budget_round_robin({10: 300, 20: 300, 30: 300}, limit=8)
+        assert result == {10: 3, 20: 3, 30: 2}
+
+    def test_round_robin_never_allocates_more_than_five_per_dialog(self):
+        result = allocate_message_budget_round_robin({10: 300}, limit=100)
+        assert result == {10: 5}

@@ -375,7 +375,7 @@ _FETCH_UNREAD_MESSAGES_SQL = (
     f"AND ((m.is_deleted = 0 AND (:since_utc IS NULL OR m.sent_at >= :since_utc)) "
     f"OR (m.is_deleted = 1 AND m.deleted_at >= :deleted_since_utc "
     f"AND (:since_utc IS NULL OR m.deleted_at >= :since_utc) AND {incoming_human_dm_sql('m')})) "
-    f"ORDER BY m.message_id ASC LIMIT :limit"
+    f"ORDER BY m.sent_at DESC, m.message_id DESC LIMIT :limit"
 )
 
 # Base SELECT shared by _build_list_messages_query and _list_messages_context_window.

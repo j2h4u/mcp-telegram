@@ -72,6 +72,30 @@ def allocate_message_budget_proportional(
     return _trim_allocation(allocation, limit, min_per_chat)
 
 
+def allocate_message_budget_round_robin(
+    unread_counts: dict[int, int], limit: int, *, max_per_chat: int = 5
+) -> dict[int, int]:
+    """Allocate a bounded inbox budget fairly in ranked dialog order."""
+    if not unread_counts or limit <= 0 or max_per_chat <= 0:
+        return {chat_id: 0 for chat_id in unread_counts}
+
+    allocation = {chat_id: 0 for chat_id in unread_counts}
+    remaining = limit
+    while remaining:
+        advanced = False
+        for chat_id, unread_count in unread_counts.items():
+            if remaining == 0:
+                break
+            if allocation[chat_id] >= min(unread_count, max_per_chat):
+                continue
+            allocation[chat_id] += 1
+            remaining -= 1
+            advanced = True
+        if not advanced:
+            break
+    return allocation
+
+
 def _allocate_evenly(unread_counts: dict[int, int], limit: int) -> dict[int, int]:
     num_chats = len(unread_counts)
     per_chat, remainder = divmod(limit, num_chats)

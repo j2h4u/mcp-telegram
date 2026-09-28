@@ -13,7 +13,7 @@ from typing import Protocol, cast
 
 from rapidfuzz import fuzz as _fuzz
 
-from ..budget import allocate_message_budget_proportional, unread_chat_tier
+from ..budget import allocate_message_budget_round_robin, unread_chat_tier
 from ..daemon_message import (
     cached_reaction_freshness,
     project_cached_message_facts,
@@ -2698,7 +2698,8 @@ class ReadingService:
                 "error": "invalid_input",
                 "message": "scope is not supported by get_inbox; use get_unread_summary for an overview",
             }
-        limit = _clamp(_coerce_int(req.get("limit", 100), 100), 1, 500)
+        limit = _clamp(_coerce_int(req.get("limit", 40), 40), 1, 100)
+        page = _clamp(_coerce_int(req.get("page", 1), 1), 1, 2_147_483_647)
         group_size_threshold = _coerce_int(req.get("group_size_threshold", 100), 100)
         try:
             include_dialog_types = self._parse_dialog_type_allowlist(req.get("include_dialog_types"))
@@ -2710,9 +2711,14 @@ class ReadingService:
             return {"ok": False, "error": "invalid_input", "message": str(exc)}
         entries, counts = self._collect_unread_dialogs(group_size_threshold, since_utc, include_dialog_types)
         self._rank_unread_entries(entries)
+        page_size = 20
+        total_dialog_count = len(entries)
+        page_start = (page - 1) * page_size
+        page_entries = entries[page_start : page_start + page_size]
+        page_counts = {int(entry["chat_id"]): counts[int(entry["chat_id"])] for entry in page_entries}
         groups = await self._fetch_unread_groups(
-            entries,
-            allocate_message_budget_proportional(counts, limit),
+            page_entries,
+            allocate_message_budget_round_robin(page_counts, limit),
             since_utc,
         )
         pending_row = cast(tuple[object] | None, self._conn.execute(_COUNT_READ_POSITION_PENDING_SQL).fetchone())
@@ -2736,6 +2742,14 @@ class ReadingService:
             "ok": True,
             "data": {
                 "groups": groups,
+                "page": page,
+                "page_size": page_size,
+                "total_dialog_count": total_dialog_count,
+                "shown_dialog_count": len(groups),
+                "remaining_dialog_count": max(0, total_dialog_count - page_start - len(groups)),
+                "next_page": page + 1 if page_start + len(groups) < total_dialog_count else None,
+                "total_message_count": sum(counts.values()),
+                "shown_message_count": sum(len(group["messages"]) for group in groups),
                 "read_position_pending_count": pending_count,
                 "read_position_pending_entities": pending_entities,
             },
@@ -2798,17 +2812,23 @@ class ReadingService:
                 },
             ).fetchall(),
         )
+        mention_counts: dict[int, int] = {}
+        dialog_columns = {str(row[1]) for row in self._conn.execute("PRAGMA table_info(dialogs)").fetchall()}
+        if rows and "unread_mentions_count" in dialog_columns:
+            dialog_ids = [int(cast(int | str, row[0])) for row in rows]
+            placeholders = ",".join("?" for _ in dialog_ids)
+            mention_counts = {
+                int(cast(int | str, dialog_id)): int(cast(int | str, count or 0))
+                for dialog_id, count in self._conn.execute(
+                    f"SELECT dialog_id, unread_mentions_count FROM dialogs WHERE dialog_id IN ({placeholders})",
+                    dialog_ids,
+                ).fetchall()
+            }
         identities = read_dialog_identities(self._conn, [int(cast(int | str, row[0])) for row in rows])
         entries: list[dict] = []
         counts: dict[int, int] = {}
         for row in rows:
-            (
-                dialog_id,
-                read_max,
-                last_event_at,
-                participants_count,
-                unread_count,
-            ) = row
+            dialog_id, read_max, last_event_at, participants_count, unread_count = row
             dialog_id_i = int(cast(int | str, dialog_id))
             identity = identities[dialog_id_i]
             unread_count_i = int(cast(int | str, unread_count))
@@ -2832,7 +2852,7 @@ class ReadingService:
                     "display_name_source": identity.display_name_source,
                     "dialog_type": category.value,
                     "unread_count": unread_count_i,
-                    "unread_mentions_count": 0,
+                    "unread_mentions_count": mention_counts.get(dialog_id_i, 0),
                     "category": category,
                     "date": last_event_at,
                     "read_inbox_max_id": read_max,
@@ -2847,7 +2867,7 @@ class ReadingService:
             entry["tier"] = unread_chat_tier(
                 {"unread_mentions_count": entry["unread_mentions_count"], "category": entry["category"]}
             )
-        entries.sort(key=lambda entry: (entry["tier"], -(entry["date"] or 0)))
+        entries.sort(key=lambda entry: (entry["tier"], -(entry["date"] or 0), entry["chat_id"]))
 
     async def _fetch_unread_groups(
         self, entries: list[dict], allocation: dict[int, int], since_utc: int | None = None
@@ -2886,7 +2906,7 @@ class ReadingService:
                     ).fetchall(),
                 )
                 messages, freshness = await self._enrich_unread_rows(chat_id, rows)
-                group["messages"] = [dataclasses.asdict(message) for message in messages]
+                group["messages"] = [dataclasses.asdict(message) for message in reversed(messages)]
                 if freshness is not None:
                     group["reaction_freshness"] = freshness.as_dict()
             groups.append(group)
