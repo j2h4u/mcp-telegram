@@ -3752,6 +3752,141 @@ async def test_update_difference_open_circuit_waits_without_fatal_exception(
 
 
 @pytest.mark.asyncio
+async def test_update_difference_expired_scope_returns_without_sending() -> None:
+    gate = _gate()
+    sender = gate._main_sender
+    events: list[RpcAdmissionEvent] = []
+    gate.set_rpc_admission_observer(events.append)
+    request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
+    deadline = asyncio.get_running_loop().time() - 1
+
+    with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
+        with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
+            with pytest.raises(OSError, match="admission deadline elapsed"):
+                await asyncio.wait_for(gate(request), timeout=0.1)
+
+    assert sender.calls == 0
+    assert gate._limiter.acquisitions == 0
+    assert [event.kind for event in events] == [RpcAdmissionEventKind.EXPIRED]
+    assert events[0].reason == "deadline_elapsed"
+
+
+@pytest.mark.asyncio
+async def test_update_difference_saturation_wait_is_bounded_by_original_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = _gate()
+    sender = gate._main_sender
+    request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
+    deadline = asyncio.get_running_loop().time() + 0.01
+    calls = 0
+
+    async def saturated(*_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        scope = current_rpc_scope()
+        raise RpcAdmissionSaturatedError(scope, "saturated")
+
+    monkeypatch.setattr(gate, "_dispatch_attempt", saturated)
+    with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
+        with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
+            with pytest.raises(OSError, match="admission deadline elapsed"):
+                await asyncio.wait_for(gate(request), timeout=0.2)
+
+    assert calls == 1
+    assert sender.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_update_difference_open_circuit_wait_is_bounded_by_scope_deadline() -> None:
+    gate = _gate(_CircuitStatus(open=True))
+    sender = gate._main_sender
+    request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
+    deadline = asyncio.get_running_loop().time() + 0.01
+
+    with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
+        with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
+            with pytest.raises(OSError, match="admission deadline elapsed"):
+                await asyncio.wait_for(gate(request), timeout=0.2)
+
+    assert sender.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_update_difference_flood_cooldown_expiry_does_not_send_again() -> None:
+    gate = _gate()
+    sender = gate._main_sender
+    request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
+    deadline = asyncio.get_running_loop().time() + 0.01
+
+    def flood_once(_request: object) -> object:
+        raise FloodWaitError(request=None, capture=30)
+
+    _set_sender(gate, flood_once)
+    sender = gate._main_sender
+    with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
+        with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
+            with pytest.raises(OSError, match="admission deadline elapsed"):
+                await asyncio.wait_for(gate(request), timeout=0.2)
+
+    assert sender.calls == 1
+    assert gate._limiter.acquisitions == 1
+
+
+@pytest.mark.asyncio
+async def test_update_difference_cancellation_during_saturation_wait_is_preserved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = _gate()
+    sender = gate._main_sender
+    request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
+    deadline = asyncio.get_running_loop().time() + 5
+    waiting = asyncio.Event()
+
+    async def saturated(*_args: object, **_kwargs: object) -> object:
+        scope = current_rpc_scope()
+        raise RpcAdmissionSaturatedError(scope, "saturated")
+
+    async def wait_forever(_delay: float) -> None:
+        waiting.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(gate, "_dispatch_attempt", saturated)
+    monkeypatch.setattr("mcp_telegram.telegram_rpc.asyncio.sleep", wait_forever)
+    caller = asyncio.create_task(gate(request))
+    try:
+        await waiting.wait()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+    finally:
+        if not caller.done():
+            caller.cancel()
+            await asyncio.gather(caller, return_exceptions=True)
+
+    assert sender.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_update_difference_next_outer_iteration_gets_a_fresh_scope() -> None:
+    gate = _gate()
+    sender = gate._main_sender
+    request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
+    expired_deadline = asyncio.get_running_loop().time() - 1
+    with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=expired_deadline):
+        with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE, deadline=expired_deadline):
+            with pytest.raises(OSError):
+                await gate(request)
+
+    deadline = asyncio.get_running_loop().time() + 5
+    with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
+        with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
+            assert await gate(request) is request
+
+    assert sender.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_telethon_update_loop_scopes_difference_and_live_dispatch_separately(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
