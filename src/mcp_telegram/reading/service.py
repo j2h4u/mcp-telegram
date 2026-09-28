@@ -83,6 +83,11 @@ _TRACE_ACRONYM_MIN_LEN = 2
 _TRACE_ACRONYM_MAX_LEN = 4
 _TRACE_FUZZY_MIN_LEN = 4
 _TRACE_FUZZY_SCORE_MIN = 75
+_INBOX_DIALOG_CAP = 20
+
+
+def _inbox_dialog_cap() -> int:
+    return _INBOX_DIALOG_CAP
 
 
 class LoggerLike(Protocol):
@@ -2753,7 +2758,7 @@ class ReadingService:
 
     @staticmethod
     def _paginate_unread_entries(entries: list[dict], counts: dict[int, int], page: int) -> dict[str, object]:
-        page_size = 20
+        page_size = _inbox_dialog_cap()
         total_dialog_count = len(entries)
         page_start = (page - 1) * page_size
         page_entries = entries[page_start : page_start + page_size]
