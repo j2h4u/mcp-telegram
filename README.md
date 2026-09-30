@@ -146,10 +146,14 @@ The default excludes DMs: `dialog_kinds=["group", "forum"]`. Use
 `dialog_kinds=["user", "bot"]` for private or bot dialogs, or `["all"]` to
 disable the filter.
 
-Triage unread conversations:
+Triage unread conversations. `get_inbox` defaults to the last 24 hours;
+`last_hours=0` removes the time filter, `last_hours=1..720` selects that many
+hours, and `since_utc` sets an inclusive UTC lower bound. Human personal chats
+rank first regardless of mentions, followed by mentioned groups and then bots.
 
 ```text
-get_inbox(last_hours=24, limit=100)
+get_inbox(limit=100)
+get_inbox(last_hours=0, limit=100)  # all history
 get_unread_summary(limit=50)
 list_messages(exact_dialog_id=<dialog_id>, unread=true)
 ```
