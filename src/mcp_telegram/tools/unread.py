@@ -310,7 +310,8 @@ class GetUnreadSummary(ToolArgs):
 class GetInbox(ToolArgs):
     """Return a compact unread orientation from personal chats and small groups.
 
-    Uses the synchronized Telegram state. Prioritizes mentions, DMs, bots, services, and groups;
+    Uses the synchronized Telegram state. Prioritizes human personal chats, mentioned groups,
+    bots, services, and other groups in that order;
     channel dialogs are excluded unless explicitly included with include_dialog_types.
     Incoming human-DM messages deleted before reading remain visible for the configured
     recent-deletion period and include their last known content and deletion time.
@@ -339,13 +340,13 @@ class GetInbox(ToolArgs):
     )
     since_utc: str | None = Field(
         default=None,
-        description="Inclusive RFC3339 UTC lower bound (Z or +00:00); mutually exclusive with last_hours.",
+        description="Inclusive RFC3339 UTC lower bound (Z or +00:00); mutually exclusive with last_hours and overrides its implicit 24-hour default.",
     )
     last_hours: StrictInt | None = Field(
-        default=None,
-        ge=1,
+        default=24,
+        ge=0,
         le=_MAX_INBOX_LAST_HOURS,
-        description="Return unread messages from the last 1-720 hours, evaluated at request time; mutually exclusive with since_utc.",
+        description="Return unread messages from the last 24 hours by default (0 disables the time filter; 1-720 returns that many hours). Evaluated at request time; mutually exclusive with since_utc.",
     )
     include_dialog_types: list[DialogType] | None = Field(
         default=None,
@@ -358,8 +359,10 @@ class GetInbox(ToolArgs):
     def validate_last_hours_range(cls, value: object) -> object:
         if isinstance(value, dict):
             hours = value.get("last_hours")
-            if isinstance(hours, int) and not isinstance(hours, bool) and not 1 <= hours <= _MAX_INBOX_LAST_HOURS:
-                raise ValueError(f"last_hours must be between 1 and {_MAX_INBOX_LAST_HOURS} hours.")
+            if "since_utc" in value and value["since_utc"] is not None and "last_hours" not in value:
+                value = {**value, "last_hours": None}
+            elif isinstance(hours, int) and not isinstance(hours, bool) and not 0 <= hours <= _MAX_INBOX_LAST_HOURS:
+                raise ValueError(f"last_hours must be between 0 and {_MAX_INBOX_LAST_HOURS} hours.")
         return value
 
     @model_validator(mode="after")
@@ -384,9 +387,9 @@ def _parse_inbox_since(since_utc: str) -> int:
 
 def _validate_inbox_last_hours(last_hours: int) -> None:
     if isinstance(last_hours, bool) or not isinstance(last_hours, int):
-        raise ValueError("last_hours must be an integer between 1 and 720 hours.")
-    if not 1 <= last_hours <= _MAX_INBOX_LAST_HOURS:
-        raise ValueError(f"last_hours must be between 1 and {_MAX_INBOX_LAST_HOURS} hours.")
+        raise ValueError("last_hours must be an integer between 0 and 720 hours.")
+    if not 0 <= last_hours <= _MAX_INBOX_LAST_HOURS:
+        raise ValueError(f"last_hours must be between 0 and {_MAX_INBOX_LAST_HOURS} hours.")
 
 
 def _resolve_inbox_relative(last_hours: int, now: datetime | None) -> str:
@@ -410,6 +413,9 @@ def _resolve_inbox_since(
     if since_utc is not None:
         return _canonical_utc_seconds(_parse_inbox_since(since_utc))
     if last_hours is None:
+        last_hours = 24
+    _validate_inbox_last_hours(last_hours)
+    if last_hours == 0:
         return None
     return _resolve_inbox_relative(last_hours, now)
 

@@ -12,6 +12,20 @@ def test_inbox_since_resolver_canonicalizes_absolute_and_relative_bounds() -> No
     fixed_now = datetime(2026, 8, 20, 12, 34, 56, 789000, tzinfo=UTC)
     assert _resolve_inbox_since("2026-08-20T10:00:00+00:00", None) == "2026-08-20T10:00:00Z"
     assert _resolve_inbox_since(None, 2, now=fixed_now) == "2026-08-20T10:34:56Z"
+    assert _resolve_inbox_since(None, None, now=fixed_now) == "2026-08-19T12:34:56Z"
+    assert _resolve_inbox_since(None, 168, now=fixed_now) == "2026-08-13T12:34:56Z"
+    assert _resolve_inbox_since(None, 0, now=fixed_now) is None
+
+
+def test_inbox_since_only_overrides_default_window() -> None:
+    args = GetInbox.model_validate({"since_utc": "2026-08-20T10:00:00Z"})
+    assert args.last_hours is None
+    assert _resolve_inbox_since(args.since_utc, args.last_hours) == "2026-08-20T10:00:00Z"
+
+
+def test_inbox_last_hours_default_and_all_history_selector() -> None:
+    assert GetInbox().last_hours == 24
+    assert GetInbox(last_hours=0).last_hours == 0
 
 
 @pytest.mark.parametrize("value", [True, 1.0, "1", float("nan"), float("inf")])
@@ -40,13 +54,19 @@ def test_inbox_relative_resolver_requires_aware_utc_clock(clock: datetime) -> No
 @pytest.mark.parametrize(
     "kwargs",
     [
+        {"since_utc": "2026-08-20T10:00:00Z", "last_hours": 0},
         {"since_utc": "2026-08-20T10:00:00Z", "last_hours": 2},
         {"since_utc": "2026-08-20T10:00:00"},
         {"since_utc": "2026-08-20T10:00:00+05:00"},
-        {"last_hours": 0},
+        {"last_hours": -1},
         {"last_hours": 721},
     ],
 )
 def test_inbox_time_filter_validation_is_actionable(kwargs: dict[str, object]) -> None:
-    with pytest.raises(ValidationError, match="mutually exclusive|offset|between 1 and 720"):
+    with pytest.raises(ValidationError, match="mutually exclusive|offset|between 0 and 720"):
         GetInbox.model_validate(kwargs)
+
+
+def test_inbox_last_hours_resolver_rejects_boolean_zero() -> None:
+    with pytest.raises(ValueError, match="integer"):
+        _resolve_inbox_since(None, False)

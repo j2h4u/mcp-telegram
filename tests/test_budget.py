@@ -4,7 +4,6 @@ from mcp_telegram.budget import (
     UNREAD_TIER_BOT_DM,
     UNREAD_TIER_CHANNEL,
     UNREAD_TIER_HUMAN_DM,
-    UNREAD_TIER_MENTION_DM,
     UNREAD_TIER_MENTION_GROUP,
     UNREAD_TIER_SMALL_GROUP,
     allocate_message_budget_round_robin,
@@ -15,11 +14,11 @@ from mcp_telegram.budget import (
 class TestUnreadChatTier:
     def test_dm_with_mention(self):
         chat = {"unread_mentions_count": 1, "category": "user"}
-        assert unread_chat_tier(chat) == UNREAD_TIER_MENTION_DM
+        assert unread_chat_tier(chat) == UNREAD_TIER_HUMAN_DM
 
     def test_bot_with_mention(self):
         chat = {"unread_mentions_count": 1, "category": "bot"}
-        assert unread_chat_tier(chat) == UNREAD_TIER_MENTION_DM
+        assert unread_chat_tier(chat) == UNREAD_TIER_BOT_DM
 
     def test_group_with_mention(self):
         chat = {"unread_mentions_count": 2, "category": "group"}
@@ -50,8 +49,8 @@ class TestUnreadChatTier:
         assert unread_chat_tier(chat) == UNREAD_TIER_SMALL_GROUP
 
     def test_tier_ordering(self):
-        assert UNREAD_TIER_MENTION_DM < UNREAD_TIER_MENTION_GROUP
-        assert UNREAD_TIER_MENTION_GROUP < UNREAD_TIER_HUMAN_DM
+        assert UNREAD_TIER_HUMAN_DM < UNREAD_TIER_MENTION_GROUP
+        assert UNREAD_TIER_MENTION_GROUP < UNREAD_TIER_BOT_DM
         assert UNREAD_TIER_HUMAN_DM < UNREAD_TIER_BOT_DM
         assert UNREAD_TIER_BOT_DM < UNREAD_TIER_SMALL_GROUP
         assert UNREAD_TIER_SMALL_GROUP < UNREAD_TIER_CHANNEL
