@@ -68,6 +68,12 @@ class _ForwardClient(_Client):
     def __init__(self) -> None:
         super().__init__()
         self.forward_response: object | None = None
+        self.remote_peer_lookups = 0
+        self.session = _PeerSession()
+
+    async def get_input_entity(self, peer: object) -> object:
+        self.remote_peer_lookups += 1
+        return await super().get_input_entity(peer)
 
     async def __call__(self, request: object) -> object:
         self.requests.append(request)
@@ -76,6 +82,16 @@ class _ForwardClient(_Client):
         if self.forward_response is not None:
             return self.forward_response
         return types.messages.Messages(messages=self.messages, topics=[], chats=[], users=[])
+
+
+class _PeerSession:
+    def __init__(self) -> None:
+        self.peer: object = types.InputPeerUser(user_id=7, access_hash=123)
+
+    def get_input_entity(self, _peer: object) -> object:
+        if isinstance(self.peer, BaseException):
+            raise self.peer
+        return self.peer
 
 
 @pytest.mark.asyncio
@@ -153,6 +169,33 @@ async def test_forward_gap_empty_page_is_complete() -> None:
         7,
         after_message_id=13,
         should_stop=lambda: False,
+    )
+
+    assert page.messages == ()
+    assert page.complete is True
+
+
+@pytest.mark.asyncio
+async def test_forward_gap_uncached_peer_does_not_try_remote_resolution() -> None:
+    client = _ForwardClient()
+    client.session.peer = ValueError("peer is not cached")
+
+    with pytest.raises(MessageHistoryUnavailableError, match="peer is not cached"):
+        await TelethonForwardGapPageAdapter(client).fetch_page(
+            7, after_message_id=13, should_stop=lambda: False
+        )
+
+    assert client.remote_peer_lookups == 0
+    assert client.requests == []
+
+
+@pytest.mark.asyncio
+async def test_forward_gap_full_message_empty_page_is_terminal() -> None:
+    client = _ForwardClient()
+    client.messages = [types.MessageEmpty(id=message_id, peer_id=types.PeerUser(user_id=7)) for message_id in range(1, 101)]
+
+    page = await TelethonForwardGapPageAdapter(client).fetch_page(
+        7, after_message_id=0, should_stop=lambda: False
     )
 
     assert page.messages == ()
