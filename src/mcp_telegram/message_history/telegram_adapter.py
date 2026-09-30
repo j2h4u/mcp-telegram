@@ -24,6 +24,8 @@ from .contracts import (
 )
 from .ports import ForwardGapPagePort, FullHistoryPagePort
 
+type _ForwardMessagesResponse = types.messages.Messages | types.messages.MessagesSlice | types.messages.ChannelMessages
+
 
 class _TelegramHistoryClient(Protocol):
     async def get_messages(self, **kwargs: object) -> object: ...
@@ -148,29 +150,84 @@ class TelethonForwardGapPageAdapter(ForwardGapPagePort):
         after_message_id: int,
         should_stop: Callable[[], bool],
     ) -> ForwardGapPage:
-        messages: list[object] = []
-        complete = True
         try:
-            async for message in self._client.iter_messages(
-                entity=dialog_id,
-                min_id=after_message_id,
-                reverse=True,
-                limit=MESSAGE_HISTORY_PAGE_SIZE,
-            ):
-                if should_stop():
-                    complete = False
-                    break
-                messages.append(message)
+            input_entity, response = await _fetch_forward_history_response(self._client, dialog_id, after_message_id)
         except ACCESS_LOST_ERRORS as exc:
             raise MessageHistoryAccessLostError(
                 f"message history access lost for dialog {dialog_id}", reason_code=type(exc).__name__
             ) from exc
         except (RPCError, TimeoutError, OSError) as exc:
             raise MessageHistoryUnavailableError(f"message history unavailable for dialog {dialog_id}") from exc
-        if len(messages) == MESSAGE_HISTORY_PAGE_SIZE:
-            complete = False
-        normalized = tuple(extract_message_row(dialog_id, message) for message in messages)
-        return ForwardGapPage(messages=normalized, complete=complete)
+        return _build_forward_gap_page(self._client, dialog_id, after_message_id, should_stop, (input_entity, response))
+
+
+async def _fetch_forward_history_response(
+    client: _TelegramHistoryClient, dialog_id: int, after_message_id: int
+) -> tuple[object, object]:
+    input_entity = await client.get_input_entity(dialog_id)
+    response = await client(
+        GetHistoryRequest(
+            peer=cast(TypeInputPeer, input_entity),
+            offset_id=after_message_id + 1,
+            offset_date=None,
+            add_offset=-MESSAGE_HISTORY_PAGE_SIZE,
+            limit=MESSAGE_HISTORY_PAGE_SIZE,
+            max_id=0,
+            min_id=0,
+            hash=0,
+        )
+    )
+    return input_entity, response
+
+
+def _build_forward_gap_page(
+    client: _TelegramHistoryClient,
+    dialog_id: int,
+    after_message_id: int,
+    should_stop: Callable[[], bool],
+    fetched: tuple[object, object],
+) -> ForwardGapPage:
+    input_entity, response = fetched
+    response, raw_messages = _forward_raw_messages(client, input_entity, response)
+    messages, stopped = _select_forward_messages(raw_messages, after_message_id, should_stop)
+    complete = not stopped and (len(response.messages) < MESSAGE_HISTORY_PAGE_SIZE or not raw_messages)
+    if raw_messages and isinstance(response, (types.messages.MessagesSlice, types.messages.ChannelMessages)):
+        complete = False
+    normalized = tuple(extract_message_row(dialog_id, message) for message in messages)
+    return ForwardGapPage(messages=normalized, complete=complete)
+
+
+def _forward_raw_messages(
+    client: _TelegramHistoryClient,
+    input_entity: object,
+    response: object,
+) -> tuple[_ForwardMessagesResponse, Sequence[object]]:
+    if not isinstance(
+        response, (types.messages.Messages, types.messages.MessagesSlice, types.messages.ChannelMessages)
+    ):
+        raise MessageHistoryUnavailableError("Telegram forward history page has an invalid response")
+    response = cast(_ForwardMessagesResponse, response)
+    entities = {get_peer_id(entity): entity for entity in (*response.users, *response.chats)}
+    messages = [message for message in response.messages if not isinstance(message, types.MessageEmpty)]
+    for message in messages:
+        finish_init = getattr(message, "_finish_init", None)
+        if callable(finish_init):
+            finish_init(client, entities, input_entity)
+    return response, messages
+
+
+def _select_forward_messages(
+    raw_messages: Sequence[object], after_message_id: int, should_stop: Callable[[], bool]
+) -> tuple[list[object], bool]:
+    messages: list[object] = []
+    stopped = False
+    for message in sorted(raw_messages, key=lambda item: _positive_id(item) or 0):
+        if should_stop():
+            stopped = True
+            break
+        if (_positive_id(message) or 0) > after_message_id:
+            messages.append(message)
+    return messages, stopped
 
 
 class TelethonHistoryAccessProbe:
