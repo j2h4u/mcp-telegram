@@ -64,6 +64,20 @@ class _Client:
         return _iterate()
 
 
+class _ForwardClient(_Client):
+    def __init__(self) -> None:
+        super().__init__()
+        self.forward_response: object | None = None
+
+    async def __call__(self, request: object) -> object:
+        self.requests.append(request)
+        if self.error is not None:
+            raise self.error
+        if self.forward_response is not None:
+            return self.forward_response
+        return types.messages.Messages(messages=self.messages, topics=[], chats=[], users=[])
+
+
 @pytest.mark.asyncio
 async def test_full_history_maps_one_backward_page_and_reads_total() -> None:
     client = _Client()
@@ -116,21 +130,23 @@ async def test_nonempty_raw_page_without_positive_ids_is_unavailable() -> None:
 
 @pytest.mark.asyncio
 async def test_forward_gap_maps_one_bounded_exclusive_page() -> None:
-    client = _Client()
+    client = _ForwardClient()
+    client.messages = [build_mock_message(id=15), build_mock_message(id=14)]
     page = await TelethonForwardGapPageAdapter(client).fetch_page(
         7,
         after_message_id=13,
         should_stop=lambda: False,
     )
 
-    assert client.iter_messages_calls == [{"entity": 7, "min_id": 13, "reverse": True, "limit": 100}]
-    assert [row.message.message_id for row in page.messages] == [2, 1]
+    request = cast(GetHistoryRequest, client.requests[0])
+    assert (request.offset_id, request.add_offset, request.limit) == (14, -100, 100)
+    assert [row.message.message_id for row in page.messages] == [14, 15]
     assert page.complete is True
 
 
 @pytest.mark.asyncio
 async def test_forward_gap_empty_page_is_complete() -> None:
-    client = _Client()
+    client = _ForwardClient()
     client.messages = []
 
     page = await TelethonForwardGapPageAdapter(client).fetch_page(
@@ -144,9 +160,35 @@ async def test_forward_gap_empty_page_is_complete() -> None:
 
 
 @pytest.mark.asyncio
+async def test_forward_gap_short_slice_commits_then_confirms_empty_terminal_page() -> None:
+    client = _ForwardClient()
+    client.forward_response = types.messages.MessagesSlice(
+        count=50,
+        messages=[build_mock_message(id=14)],
+        topics=[],
+        chats=[],
+        users=[],
+    )
+
+    adapter = TelethonForwardGapPageAdapter(client)
+    first = await adapter.fetch_page(7, after_message_id=13, should_stop=lambda: False)
+    client.forward_response = types.messages.MessagesSlice(
+        count=50, messages=[], topics=[], chats=[], users=[]
+    )
+    terminal = await adapter.fetch_page(7, after_message_id=14, should_stop=lambda: False)
+
+    assert [row.message.message_id for row in first.messages] == [14]
+    assert first.complete is False
+    assert terminal.messages == ()
+    assert terminal.complete is True
+    assert len(client.requests) == 2
+    assert [cast(GetHistoryRequest, request).offset_id for request in client.requests] == [14, 15]
+
+
+@pytest.mark.asyncio
 async def test_forward_gap_exactly_full_page_requires_continuation() -> None:
-    client = _Client()
-    client.messages = [build_mock_message(id=message_id) for message_id in range(1, 101)]
+    client = _ForwardClient()
+    client.messages = [build_mock_message(id=message_id) for message_id in range(14, 114)]
 
     page = await TelethonForwardGapPageAdapter(client).fetch_page(
         7,
@@ -160,7 +202,7 @@ async def test_forward_gap_exactly_full_page_requires_continuation() -> None:
 
 @pytest.mark.asyncio
 async def test_forward_gap_marks_interruption_before_normalization() -> None:
-    client = _Client()
+    client = _ForwardClient()
     page = await TelethonForwardGapPageAdapter(client).fetch_page(
         7,
         after_message_id=13,
@@ -173,7 +215,8 @@ async def test_forward_gap_marks_interruption_before_normalization() -> None:
 
 @pytest.mark.asyncio
 async def test_forward_gap_keeps_received_rows_when_interrupted() -> None:
-    client = _Client()
+    client = _ForwardClient()
+    client.messages = [build_mock_message(id=15), build_mock_message(id=14)]
     checks = 0
 
     def should_stop() -> bool:
@@ -187,7 +230,7 @@ async def test_forward_gap_keeps_received_rows_when_interrupted() -> None:
         should_stop=should_stop,
     )
 
-    assert [row.message.message_id for row in page.messages] == [2]
+    assert [row.message.message_id for row in page.messages] == [14]
     assert page.complete is False
 
 
@@ -203,7 +246,7 @@ async def test_access_probe_is_separate_and_uses_limit_one() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("adapter_kind", ["full", "forward", "probe"])
 async def test_access_loss_is_translated_at_telegram_boundary(adapter_kind: str) -> None:
-    client = _Client()
+    client = _ForwardClient() if adapter_kind == "forward" else _Client()
     client.error = ChannelPrivateError(request=None)
     with pytest.raises(MessageHistoryAccessLostError) as caught:
         if adapter_kind == "full":
@@ -221,7 +264,7 @@ async def test_access_loss_is_translated_at_telegram_boundary(adapter_kind: str)
     [TelegramRpcAdmissionDeferred(retry_after_seconds=3), TelegramRpcThrottled(retry_after_seconds=4)],
 )
 async def test_forward_gap_passes_scheduler_outcomes_without_translation(error: BaseException) -> None:
-    client = _Client()
+    client = _ForwardClient()
     client.error = error
 
     with pytest.raises(type(error)) as caught:
@@ -233,7 +276,7 @@ async def test_forward_gap_passes_scheduler_outcomes_without_translation(error: 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("adapter_kind", ["full", "forward", "probe"])
 async def test_ordinary_rpc_failure_is_translated_at_telegram_boundary(adapter_kind: str) -> None:
-    client = _Client()
+    client = _ForwardClient() if adapter_kind == "forward" else _Client()
     client.error = RPCError(None, "history failed")
     with pytest.raises(MessageHistoryUnavailableError):
         if adapter_kind == "full":

@@ -148,26 +148,47 @@ class TelethonForwardGapPageAdapter(ForwardGapPagePort):
         after_message_id: int,
         should_stop: Callable[[], bool],
     ) -> ForwardGapPage:
-        messages: list[object] = []
-        complete = True
         try:
-            async for message in self._client.iter_messages(
-                entity=dialog_id,
-                min_id=after_message_id,
-                reverse=True,
-                limit=MESSAGE_HISTORY_PAGE_SIZE,
-            ):
-                if should_stop():
-                    complete = False
-                    break
-                messages.append(message)
+            input_entity = await self._client.get_input_entity(dialog_id)
+            response = await self._client(
+                GetHistoryRequest(
+                    peer=cast(TypeInputPeer, input_entity),
+                    offset_id=after_message_id + 1,
+                    offset_date=None,
+                    add_offset=-MESSAGE_HISTORY_PAGE_SIZE,
+                    limit=MESSAGE_HISTORY_PAGE_SIZE,
+                    max_id=0,
+                    min_id=0,
+                    hash=0,
+                )
+            )
         except ACCESS_LOST_ERRORS as exc:
             raise MessageHistoryAccessLostError(
                 f"message history access lost for dialog {dialog_id}", reason_code=type(exc).__name__
             ) from exc
         except (RPCError, TimeoutError, OSError) as exc:
             raise MessageHistoryUnavailableError(f"message history unavailable for dialog {dialog_id}") from exc
-        if len(messages) == MESSAGE_HISTORY_PAGE_SIZE:
+        if not isinstance(response, (types.messages.Messages, types.messages.MessagesSlice, types.messages.ChannelMessages)):
+            raise MessageHistoryUnavailableError("Telegram forward history page has an invalid response")
+        entities = {
+            get_peer_id(entity): entity
+            for entity in (*response.users, *response.chats)
+        }
+        raw_messages = [message for message in response.messages if not isinstance(message, types.MessageEmpty)]
+        for message in raw_messages:
+            finish_init = getattr(message, "_finish_init", None)
+            if callable(finish_init):
+                finish_init(self._client, entities, input_entity)
+        messages: list[object] = []
+        stopped = False
+        for message in sorted(raw_messages, key=lambda item: _positive_id(item) or 0):
+            if should_stop():
+                stopped = True
+                break
+            if (_positive_id(message) or 0) > after_message_id:
+                messages.append(message)
+        complete = not stopped and len(response.messages) < MESSAGE_HISTORY_PAGE_SIZE
+        if raw_messages and isinstance(response, (types.messages.MessagesSlice, types.messages.ChannelMessages)):
             complete = False
         normalized = tuple(extract_message_row(dialog_id, message) for message in messages)
         return ForwardGapPage(messages=normalized, complete=complete)
