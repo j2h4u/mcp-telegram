@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from telethon.errors import ChannelPrivateError, RPCError  # type: ignore[import-untyped]
+from telethon.tl import types  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import GetHistoryRequest  # type: ignore[import-untyped]
 from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
@@ -134,6 +135,20 @@ class _RawHistoryClient:
         if self._get_entity is None:
             raise AssertionError("unexpected entity lookup")
         return await self._get_entity(peer)
+
+
+class _ForwardHistoryClient:
+    def __init__(self, respond: Callable[[GetHistoryRequest], Awaitable[object]]) -> None:
+        self._respond = respond
+        self.requests: list[GetHistoryRequest] = []
+
+    async def get_input_entity(self, peer: object) -> object:
+        return peer
+
+    async def __call__(self, request: object, **_kwargs: object) -> object:
+        history_request = cast(GetHistoryRequest, request)
+        self.requests.append(history_request)
+        return await self._respond(history_request)
 
 
 @pytest.mark.asyncio
@@ -378,13 +393,10 @@ async def test_empty_delta_completion_persists_two_hour_cadence_across_restart(
     )
     conn.commit()
 
-    async def iter_messages(**_kwargs: object) -> AsyncIterator[object]:
-        if False:
-            yield None
+    async def send_history(_request: GetHistoryRequest) -> object:
+        return types.messages.Messages(messages=[], topics=[], chats=[], users=[])
 
-    worker = DeltaSyncWorker(
-        TelethonForwardGapPageAdapter(SimpleNamespace(iter_messages=iter_messages)), conn, asyncio.Event()
-    )
+    worker = DeltaSyncWorker(TelethonForwardGapPageAdapter(_ForwardHistoryClient(send_history)), conn, asyncio.Event())
     adapter = DeltaGapFillDemandAdapter(worker)
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
         await adapter.run_slice(RpcAttemptBudget(limit=1))
@@ -421,15 +433,12 @@ async def test_delta_gap_slice_commits_one_page_and_keeps_durable_continuation(
     observed_scopes: list[TelegramRpcScope] = []
     observed_limits: list[object] = []
 
-    async def iter_messages(**kwargs: object) -> AsyncIterator[object]:
+    async def send_history(request: GetHistoryRequest) -> object:
         observed_scopes.append(current_rpc_scope())
-        observed_limits.append(kwargs["limit"])
-        for message in pages.pop(0):
-            yield message
+        observed_limits.append(request.limit)
+        return types.messages.Messages(messages=pages.pop(0), topics=[], chats=[], users=[])
 
-    worker = DeltaSyncWorker(
-        TelethonForwardGapPageAdapter(SimpleNamespace(iter_messages=iter_messages)), conn, asyncio.Event()
-    )
+    worker = DeltaSyncWorker(TelethonForwardGapPageAdapter(_ForwardHistoryClient(send_history)), conn, asyncio.Event())
     adapter = DeltaGapFillDemandAdapter(worker)
     budget = RpcAttemptBudget(limit=1)
 
@@ -1117,7 +1126,7 @@ async def test_delta_gap_adapter_propagates_coordinator_outcomes_without_checkpo
     )
     conn.commit()
 
-    async def iter_messages(**_kwargs: object) -> AsyncIterator[object]:
+    async def send_history(_request: GetHistoryRequest) -> object:
         if failure_type is TelegramRpcAdmissionDeferred:
             raise TelegramRpcAdmissionDeferred(retry_after_seconds=7)
         if failure_type is TelegramRpcThrottled:
@@ -1127,12 +1136,9 @@ async def test_delta_gap_adapter_propagates_coordinator_outcomes_without_checkpo
         if failure_type is RpcAttemptBudgetExhaustedError:
             raise RpcAttemptBudgetExhaustedError("slice attempt budget exhausted")
         raise RPCError(None, "delta failed")
-        yield  # pragma: no cover
 
     adapter = DeltaGapFillDemandAdapter(
-        DeltaSyncWorker(
-            TelethonForwardGapPageAdapter(SimpleNamespace(iter_messages=iter_messages)), conn, asyncio.Event()
-        )
+        DeltaSyncWorker(TelethonForwardGapPageAdapter(_ForwardHistoryClient(send_history)), conn, asyncio.Event())
     )
 
     expected_failure = MessageHistoryUnavailableError if failure_type is RPCError else failure_type
@@ -1299,11 +1305,11 @@ async def test_access_probe_adapter_persists_probe_to_gap_fill_handoff(conn: sql
     conn.commit()
     get_messages = AsyncMock(return_value=MockTotalList([], total=12))
 
-    async def iter_messages(**_kwargs: object) -> AsyncIterator[object]:
-        return
-        yield  # pragma: no cover
+    async def send_history(_request: GetHistoryRequest) -> object:
+        return types.messages.Messages(messages=[], topics=[], chats=[], users=[])
 
-    client = SimpleNamespace(get_messages=get_messages, iter_messages=iter_messages)
+    client = _ForwardHistoryClient(send_history)
+    client.get_messages = get_messages  # type: ignore[method-assign]
     worker = DeltaSyncWorker(TelethonForwardGapPageAdapter(client), conn, asyncio.Event())
     adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), TelethonHistoryAccessProbe(client))
 
@@ -1353,11 +1359,11 @@ async def test_recovery_query_failure_does_not_reuse_prior_slice_metrics(conn: s
     conn.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (?, ?, 1)", (dialog_id, 10))
     conn.commit()
 
-    async def iter_messages(**_kwargs: object) -> AsyncIterator[object]:
-        for message_id in range(11, 18):
-            yield build_mock_message(id=message_id, text=f"message {message_id}")
+    async def send_history(_request: GetHistoryRequest) -> object:
+        messages = [build_mock_message(id=message_id, text=f"message {message_id}") for message_id in range(11, 18)]
+        return types.messages.Messages(messages=messages, topics=[], chats=[], users=[])
 
-    client = SimpleNamespace(iter_messages=iter_messages)
+    client = _ForwardHistoryClient(send_history)
     worker = DeltaSyncWorker(
         TelethonForwardGapPageAdapter(client),
         conn,
