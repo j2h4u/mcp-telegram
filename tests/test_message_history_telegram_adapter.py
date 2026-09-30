@@ -23,7 +23,11 @@ from mcp_telegram.message_history.telegram_adapter import (
     TelethonFullHistoryPageAdapter,
     TelethonHistoryAccessProbe,
 )
-from mcp_telegram.telegram_demand import demand_context
+from mcp_telegram.telegram_demand import (
+    RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
+    demand_context,
+)
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred
 
@@ -69,7 +73,6 @@ class _ForwardClient(_Client):
         super().__init__()
         self.forward_response: object | None = None
         self.remote_peer_lookups = 0
-        self.session = _PeerSession()
 
     async def get_input_entity(self, peer: object) -> object:
         self.remote_peer_lookups += 1
@@ -84,14 +87,22 @@ class _ForwardClient(_Client):
         return types.messages.Messages(messages=self.messages, topics=[], chats=[], users=[])
 
 
-class _PeerSession:
+class _ColdCacheForwardClient(_ForwardClient):
     def __init__(self) -> None:
-        self.peer: object = types.InputPeerUser(user_id=7, access_hash=123)
+        super().__init__()
+        self.cached = False
+        self.budget = RpcAttemptBudget(limit=1)
 
-    def get_input_entity(self, _peer: object) -> object:
-        if isinstance(self.peer, BaseException):
-            raise self.peer
-        return self.peer
+    async def get_input_entity(self, peer: object) -> object:
+        if not self.cached:
+            self.remote_peer_lookups += 1
+            self.budget.debit()
+            self.cached = True
+        return await super(_ForwardClient, self).get_input_entity(peer)
+
+    async def __call__(self, request: object) -> object:
+        self.budget.debit()
+        return await super().__call__(request)
 
 
 @pytest.mark.asyncio
@@ -176,17 +187,24 @@ async def test_forward_gap_empty_page_is_complete() -> None:
 
 
 @pytest.mark.asyncio
-async def test_forward_gap_uncached_peer_does_not_try_remote_resolution() -> None:
-    client = _ForwardClient()
-    client.session.peer = ValueError("peer is not cached")
+async def test_forward_gap_cold_peer_warms_cache_then_defers_until_next_slice() -> None:
+    client = _ColdCacheForwardClient()
+    client.messages = [build_mock_message(id=15), build_mock_message(id=14)]
+    adapter = TelethonForwardGapPageAdapter(client)
 
-    with pytest.raises(MessageHistoryUnavailableError, match="peer is not cached"):
-        await TelethonForwardGapPageAdapter(client).fetch_page(
-            7, after_message_id=13, should_stop=lambda: False
-        )
-
-    assert client.remote_peer_lookups == 0
+    with pytest.raises(RpcAttemptBudgetExhaustedError):
+        await adapter.fetch_page(7, after_message_id=13, should_stop=lambda: False)
+    assert client.cached is True
+    assert client.remote_peer_lookups == 1
     assert client.requests == []
+
+    client.budget = RpcAttemptBudget(limit=1)
+    page = await adapter.fetch_page(7, after_message_id=13, should_stop=lambda: False)
+
+    assert [row.message.message_id for row in page.messages] == [14, 15]
+    assert client.remote_peer_lookups == 1
+    assert len(client.requests) == 1
+    assert client.budget.attempts == 1
 
 
 @pytest.mark.asyncio

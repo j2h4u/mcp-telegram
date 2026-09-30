@@ -149,9 +149,7 @@ class TelethonForwardGapPageAdapter(ForwardGapPagePort):
         should_stop: Callable[[], bool],
     ) -> ForwardGapPage:
         try:
-            input_entity = _cached_input_peer(self._client, dialog_id)
-            if input_entity is None:
-                raise MessageHistoryUnavailableError("Telegram history peer is not cached")
+            input_entity = await self._client.get_input_entity(dialog_id)
             response = await self._client(
                 GetHistoryRequest(
                     peer=cast(TypeInputPeer, input_entity),
@@ -196,20 +194,6 @@ class TelethonForwardGapPageAdapter(ForwardGapPagePort):
             complete = False
         normalized = tuple(extract_message_row(dialog_id, message) for message in messages)
         return ForwardGapPage(messages=normalized, complete=complete)
-
-
-def _cached_input_peer(client: object, dialog_id: int) -> TypeInputPeer | None:
-    session = getattr(client, "session", None)
-    get_input_entity = getattr(session, "get_input_entity", None)
-    if not callable(get_input_entity):
-        return None
-    try:
-        peer = get_input_entity(dialog_id)
-    except (AttributeError, KeyError, TypeError, ValueError):
-        return None
-    if isinstance(peer, (types.InputPeerUser, types.InputPeerChat, types.InputPeerChannel, types.InputPeerSelf)):
-        return cast(TypeInputPeer, peer)
-    return None
 
 
 class TelethonHistoryAccessProbe:
