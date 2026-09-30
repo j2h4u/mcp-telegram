@@ -23,8 +23,6 @@ from .hydration_queue import (
     HydrationQueueSummary,
 )
 from .messages.sqlite_hydration_jobs import (
-    has_media_metadata_hydration_repair_candidates,
-    has_transcription_hydration_repair_candidates,
     repair_media_metadata_hydration_jobs,
     repair_transcription_hydration_jobs,
 )
@@ -254,10 +252,11 @@ class FactHydrationDemandAdapter(DurableDemandAdapter):
         self.demand_kind = _hydration_demand_kind(priority)
 
     def status(self, now: float) -> DemandStatus | None:
-        """Return queued work or a read-only backfill-repair demand."""
+        """Return queued work or the next bounded backfill-repair time."""
         release_at = self._worker._queue.next_release_at(self._priority)
-        if self._priority is HydrationPriority.BACKFILL and self._worker.has_repair_candidates():
-            return DemandStatus(release_at=now)
+        if self._priority is HydrationPriority.BACKFILL:
+            repair_at = self._worker.next_repair_at
+            return DemandStatus(release_at=min(float(release_at), repair_at) if release_at is not None else repair_at)
         if release_at is not None:
             return DemandStatus(release_at=float(release_at))
         return None
@@ -307,6 +306,8 @@ class MessageFactHydrationWorker:
         self._retry_delay_seconds = retry_delay_seconds
         self._max_attempts = max_attempts
         self._clock = clock
+        self._interval_seconds = interval_seconds
+        self.next_repair_at = clock()
         if backfill_debt_limit <= 0:
             raise ValueError("fact hydration backfill_debt_limit must be positive")
         self._queue = HydrationQueueRepository(conn)
@@ -319,12 +320,10 @@ class MessageFactHydrationWorker:
             raise TypeError("budget must be an RpcAttemptBudget")
         if self._shutdown_event.is_set():
             return
-        effective_now = int(self._clock())
+        clock_now = self._clock()
+        effective_now = int(clock_now)
         if priority is HydrationPriority.BACKFILL:
-            self._run_repair_producers(effective_now)
-            # Repair is a producer transaction. Durable continuation must exist
-            # before the slice can await Telegram or yield on its attempt budget.
-            self._conn.commit()
+            self._run_due_repairs(clock_now, effective_now)
         if budget.exhausted:
             return
         per_kind = {
@@ -357,22 +356,31 @@ class MessageFactHydrationWorker:
             attempt_budget=budget,
         )
 
-    def has_repair_candidates(self) -> bool:
-        """Return whether a bounded backfill repair can create durable work."""
-        if TRANSCRIPTION_HYDRATION_KIND in self._handlers and has_transcription_hydration_repair_candidates(self._conn):
-            return True
-        return MEDIA_METADATA_KIND in self._handlers and has_media_metadata_hydration_repair_candidates(self._conn)
+    def _run_due_repairs(self, clock_now: float, effective_now: int) -> None:
+        if clock_now < self.next_repair_at:
+            return
+        has_more = self._run_repair_producers(effective_now)
+        # Commit repair work before the slice can await Telegram or yield on its budget.
+        self._conn.commit()
+        self.next_repair_at = clock_now if has_more else clock_now + self._interval_seconds
 
-    def _run_repair_producers(self, effective_now: int) -> None:
+    def _run_repair_producers(self, effective_now: int) -> bool:
+        has_more = False
         if TRANSCRIPTION_HYDRATION_KIND in self._handlers:
-            repair_transcription_hydration_jobs(self._conn, due_at=effective_now, max_jobs=self._max_jobs_per_cycle)
+            has_more = repair_transcription_hydration_jobs(
+                self._conn, due_at=effective_now, max_jobs=self._max_jobs_per_cycle
+            ).has_more
         media_handler = self._handlers.get(MEDIA_METADATA_KIND)
         if media_handler is not None:
-            repair_media_metadata_hydration_jobs(
-                self._conn,
-                due_at=effective_now,
-                max_jobs=min(media_handler.batch_size, self._max_jobs_per_cycle),
+            has_more = (
+                repair_media_metadata_hydration_jobs(
+                    self._conn,
+                    due_at=effective_now,
+                    max_jobs=min(media_handler.batch_size, self._max_jobs_per_cycle),
+                ).has_more
+                or has_more
             )
+        return has_more
 
     async def _process_batch(  # noqa: PLR0911 - each transport outcome owns one durable recovery path
         self,

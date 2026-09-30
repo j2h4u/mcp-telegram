@@ -261,13 +261,19 @@ async def test_hydration_latched_throttle_restores_undispatched_job_and_stops_co
         conn.close()
 
 
-def _repair_hydration_worker(conn: sqlite3.Connection, handler: _HydrationHandler) -> MessageFactHydrationWorker:
+def _repair_hydration_worker(
+    conn: sqlite3.Connection,
+    handler: _HydrationHandler,
+    *,
+    clock: Callable[[], float] = lambda: 100.0,
+    interval_seconds: float = 60.0,
+) -> MessageFactHydrationWorker:
     return MessageFactHydrationWorker(
         object(),
         conn,
         asyncio.Event(),
         handlers=(handler,),
-        interval_seconds=60,
+        interval_seconds=interval_seconds,
         max_requests_per_cycle=2,
         max_jobs_per_cycle=1,
         retry_delay_seconds=30,
@@ -275,10 +281,11 @@ def _repair_hydration_worker(conn: sqlite3.Connection, handler: _HydrationHandle
         max_attempts=3,
         pause_between_requests_seconds=0.01,
         backfill_debt_limit=1,
+        clock=clock,
     )
 
 
-def test_backfill_status_reports_repair_candidates_without_mutation(tmp_path: Path) -> None:
+def test_backfill_status_uses_repair_deadline_without_candidate_scans(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
@@ -296,11 +303,14 @@ def test_backfill_status_reports_repair_candidates_without_mutation(tmp_path: Pa
     worker = _repair_hydration_worker(conn, handler)
     adapter = FactHydrationDemandAdapter(worker, HydrationPriority.BACKFILL)
     before = conn.total_changes
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
 
-    status = adapter.status(100.0)
+    assert adapter.status(100.0) == DemandStatus(release_at=100.0)
+    assert adapter.status(100.0) == DemandStatus(release_at=100.0)
 
-    assert status == DemandStatus(release_at=100.0)
     assert conn.total_changes == before
+    assert not any("LEFT JOIN hydration_jobs" in statement for statement in statements)
     conn.close()
 
 
@@ -320,12 +330,116 @@ async def test_backfill_slice_seeds_and_processes_repair_candidates(tmp_path: Pa
     conn.commit()
     handler = _HydrationHandler()
     handler.kind = "media_metadata"
-    worker = _hydration_worker(conn, handler, clock=lambda: 100.0)
+    worker = _repair_hydration_worker(conn, handler, clock=lambda: 100.75, interval_seconds=0.5)
     adapter = FactHydrationDemandAdapter(worker, HydrationPriority.BACKFILL)
+    assert adapter.status(100.75) == DemandStatus(release_at=100.75)
 
     await adapter.run_slice(RpcAttemptBudget(limit=1))
 
     assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+    assert worker.next_repair_at == 101.25
+    assert adapter.status(100.75) == DemandStatus(release_at=101.25)
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_queued_work_runs_during_repair_cooldown(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
+    conn.execute(
+        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
+    )
+    conn.executemany(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
+        "VALUES (1, ?, ?, 'other', '{}')",
+        ((1, 1),),
+    )
+    conn.commit()
+    handler = _HydrationHandler()
+    handler.kind = "media_metadata"
+    worker = _repair_hydration_worker(conn, handler)
+    adapter = FactHydrationDemandAdapter(worker, HydrationPriority.BACKFILL)
+
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    assert worker.next_repair_at == 160
+
+    conn.execute(
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, priority) "
+        "VALUES ('media_metadata', 1, 3, 101, 0)"
+    )
+    conn.commit()
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    worker._clock = lambda: 101.0
+    handler.scope = None
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert handler.scope is not None
+    assert not any("LEFT JOIN hydration_jobs" in statement for statement in statements)
+    assert worker.next_repair_at == 160
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_more_repair_candidates_keep_repair_due(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
+    conn.execute(
+        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
+    )
+    conn.executemany(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
+        "VALUES (1, ?, ?, 'other', '{}')",
+        ((1, 1), (2, 2)),
+    )
+    conn.commit()
+    handler = _HydrationHandler()
+    handler.kind = "media_metadata"
+    worker = _repair_hydration_worker(conn, handler)
+    adapter = FactHydrationDemandAdapter(worker, HydrationPriority.BACKFILL)
+
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert worker.next_repair_at == 100
+    assert adapter.status(100.0) == DemandStatus(release_at=100.0)
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_repair_failure_keeps_deadline_due() -> None:
+    conn = _hydration_db()
+    handler = _HydrationHandler()
+    worker = _repair_hydration_worker(conn, handler)
+
+    def fail(_now: int) -> bool:
+        raise RuntimeError("producer failed")
+
+    worker._run_repair_producers = fail  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="producer failed"):
+        await worker.run_priority_slice(HydrationPriority.BACKFILL, RpcAttemptBudget(limit=1))
+
+    assert worker.next_repair_at == 100
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_repair_commit_failure_keeps_deadline_due() -> None:
+    conn = _hydration_db()
+    worker = _repair_hydration_worker(conn, _HydrationHandler())
+
+    class _CommitFailure:
+        def commit(self) -> None:
+            raise RuntimeError("commit failed")
+
+    worker._conn = _CommitFailure()  # type: ignore[assignment]
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await worker.run_priority_slice(HydrationPriority.BACKFILL, RpcAttemptBudget(limit=1))
+
+    assert worker.next_repair_at == 100
     conn.close()
 
 
