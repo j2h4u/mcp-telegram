@@ -210,11 +210,11 @@ async def test_forward_gap_cold_peer_warms_cache_then_defers_until_next_slice() 
 @pytest.mark.asyncio
 async def test_forward_gap_full_message_empty_page_is_terminal() -> None:
     client = _ForwardClient()
-    client.messages = [types.MessageEmpty(id=message_id, peer_id=types.PeerUser(user_id=7)) for message_id in range(1, 101)]
+    client.messages = [
+        types.MessageEmpty(id=message_id, peer_id=types.PeerUser(user_id=7)) for message_id in range(1, 101)
+    ]
 
-    page = await TelethonForwardGapPageAdapter(client).fetch_page(
-        7, after_message_id=0, should_stop=lambda: False
-    )
+    page = await TelethonForwardGapPageAdapter(client).fetch_page(7, after_message_id=0, should_stop=lambda: False)
 
     assert page.messages == ()
     assert page.complete is True
@@ -233,9 +233,7 @@ async def test_forward_gap_short_slice_commits_then_confirms_empty_terminal_page
 
     adapter = TelethonForwardGapPageAdapter(client)
     first = await adapter.fetch_page(7, after_message_id=13, should_stop=lambda: False)
-    client.forward_response = types.messages.MessagesSlice(
-        count=50, messages=[], topics=[], chats=[], users=[]
-    )
+    client.forward_response = types.messages.MessagesSlice(count=50, messages=[], topics=[], chats=[], users=[])
     terminal = await adapter.fetch_page(7, after_message_id=14, should_stop=lambda: False)
 
     assert [row.message.message_id for row in first.messages] == [14]

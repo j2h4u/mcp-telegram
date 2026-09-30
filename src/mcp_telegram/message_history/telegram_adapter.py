@@ -170,12 +170,11 @@ class TelethonForwardGapPageAdapter(ForwardGapPagePort):
             ) from exc
         except (RPCError, TimeoutError, OSError) as exc:
             raise MessageHistoryUnavailableError(f"message history unavailable for dialog {dialog_id}") from exc
-        if not isinstance(response, (types.messages.Messages, types.messages.MessagesSlice, types.messages.ChannelMessages)):
+        if not isinstance(
+            response, (types.messages.Messages, types.messages.MessagesSlice, types.messages.ChannelMessages)
+        ):
             raise MessageHistoryUnavailableError("Telegram forward history page has an invalid response")
-        entities = {
-            get_peer_id(entity): entity
-            for entity in (*response.users, *response.chats)
-        }
+        entities = {get_peer_id(entity): entity for entity in (*response.users, *response.chats)}
         raw_messages = [message for message in response.messages if not isinstance(message, types.MessageEmpty)]
         for message in raw_messages:
             finish_init = getattr(message, "_finish_init", None)
