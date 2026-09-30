@@ -261,6 +261,7 @@ class TelegramDemandCoordinator:
                 finally:
                     self._active_kind = None
                     self.scan(now=self._now())
+                    await asyncio.sleep(0)
         except asyncio.CancelledError:
             raise
         except TelegramRpcThrottled as exc:
