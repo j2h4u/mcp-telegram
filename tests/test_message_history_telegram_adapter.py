@@ -84,7 +84,9 @@ class _ForwardClient(_Client):
             raise self.error
         if self.forward_response is not None:
             return self.forward_response
-        return types.messages.Messages(messages=self.messages, topics=[], chats=[], users=[])
+        return types.messages.Messages(
+            messages=cast(list[types.TypeMessage], self.messages), topics=[], chats=[], users=[]
+        )
 
 
 class _ColdCacheForwardClient(_ForwardClient):
@@ -225,7 +227,7 @@ async def test_forward_gap_short_slice_commits_then_confirms_empty_terminal_page
     client = _ForwardClient()
     client.forward_response = types.messages.MessagesSlice(
         count=50,
-        messages=[build_mock_message(id=14)],
+        messages=cast(list[types.TypeMessage], [build_mock_message(id=14)]),
         topics=[],
         chats=[],
         users=[],

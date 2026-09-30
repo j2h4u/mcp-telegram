@@ -1360,7 +1360,10 @@ async def test_recovery_query_failure_does_not_reuse_prior_slice_metrics(conn: s
     conn.commit()
 
     async def send_history(_request: GetHistoryRequest) -> object:
-        messages = [build_mock_message(id=message_id, text=f"message {message_id}") for message_id in range(11, 18)]
+        messages = cast(
+            list[types.TypeMessage],
+            [build_mock_message(id=message_id, text=f"message {message_id}") for message_id in range(11, 18)],
+        )
         return types.messages.Messages(messages=messages, topics=[], chats=[], users=[])
 
     client = _ForwardHistoryClient(send_history)
