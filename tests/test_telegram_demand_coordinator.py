@@ -149,6 +149,40 @@ async def test_run_executes_one_slice_with_contract_budget_and_stops_cleanly() -
 
 
 @pytest.mark.asyncio
+async def test_run_yields_to_protocol_task_between_synchronous_slices() -> None:
+    target = DURABLE_DEMAND_ORDER[0]
+    adapters = _adapters({target: DemandStatus(0)})
+    shutdown = asyncio.Event()
+    first_slice_done = asyncio.Event()
+    protocol_progress = asyncio.Event()
+    slice_count = 0
+    protocol_progress_at_second_slice = False
+
+    async def local_slice() -> None:
+        nonlocal slice_count, protocol_progress_at_second_slice
+        slice_count += 1
+        if slice_count == 1:
+            first_slice_done.set()
+        else:
+            protocol_progress_at_second_slice = protocol_progress.is_set()
+            adapters[target].current_status = None
+            shutdown.set()
+
+    async def protocol_task() -> None:
+        await first_slice_done.wait()
+        protocol_progress.set()
+
+    adapters[target].on_run = local_slice
+    coordinator = TelegramDemandCoordinator(adapters, shutdown, clock=_Clock())
+    protocol = asyncio.create_task(protocol_task())
+
+    await coordinator.run()
+    await protocol
+
+    assert protocol_progress_at_second_slice
+
+
+@pytest.mark.asyncio
 async def test_single_flight_holds_during_active_slice_and_offer_wakes_waiter() -> None:
     shutdown = asyncio.Event()
     started = asyncio.Event()
