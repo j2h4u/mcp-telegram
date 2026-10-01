@@ -75,10 +75,10 @@ def test_stale_session_is_debug_only_and_other_security_warnings_survive(
                 "Security error while unpacking a received message: "
                 "Server replied with a wrong session ID (see FAQ for details)"
             )
-        assert [record.levelno for record in caplog.records] == (
-            [logging.DEBUG, logging.WARNING, logging.ERROR]
+        assert [(record.levelno, record.levelname) for record in caplog.records] == (
+            [(logging.DEBUG, "DEBUG"), (logging.WARNING, "WARNING"), (logging.ERROR, "ERROR")]
             if level == logging.DEBUG
-            else [logging.WARNING, logging.ERROR]
+            else [(logging.WARNING, "WARNING"), (logging.ERROR, "ERROR")]
         )
     finally:
         sender.filters[:] = original_filters
