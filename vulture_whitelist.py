@@ -58,6 +58,7 @@ row_factory      # sqlite3.Connection.row_factory, consumed by sqlite3 (daemon_a
 model_config     # Pydantic BaseModel config, consumed by Pydantic (tools/_base.py)
 capture_signals  # override of uvicorn.Server.capture_signals, called by uvicorn (server.py:357)
 should_exit     # uvicorn.Server shutdown flag, consumed by Uvicorn (server.py:86,105)
+levelname       # logging.Formatter reads the level demoted by runtime_logging.py
 
 upsert_entities       # retained daemon-client API for external entity projection callers
 
