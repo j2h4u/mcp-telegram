@@ -4,7 +4,11 @@ import logging
 
 import pytest
 
-from mcp_telegram.runtime_logging import _TelethonRoutineDifferenceFilter, install_telethon_log_filter
+from mcp_telegram.runtime_logging import (
+    _TelethonRoutineDifferenceFilter,
+    _TelethonStaleSessionFilter,
+    install_telethon_log_filter,
+)
 
 
 def _record(*, message: str, level: int = logging.INFO, name: str = "telethon.client.updates") -> logging.LogRecord:
@@ -49,3 +53,32 @@ def test_telethon_log_filter_installation_is_idempotent() -> None:
         assert sum(isinstance(filter_, _TelethonRoutineDifferenceFilter) for filter_ in target_logger.filters) == 1
     finally:
         target_logger.filters[:] = original_filters
+
+
+@pytest.mark.parametrize("level", (logging.INFO, logging.DEBUG))
+def test_stale_session_is_debug_only_and_other_security_warnings_survive(
+    caplog: pytest.LogCaptureFixture, level: int
+) -> None:
+    sender = logging.getLogger("telethon.network.mtprotosender")
+    original_filters = list(sender.filters)
+    try:
+        install_telethon_log_filter()
+        install_telethon_log_filter()
+        assert sum(isinstance(filter_, _TelethonStaleSessionFilter) for filter_ in sender.filters) == 1
+        with caplog.at_level(level, logger=sender.name):
+            sender.warning(
+                "Security error while unpacking a received message: %s",
+                ValueError("Server replied with a wrong session ID (see FAQ for details)"),
+            )
+            sender.warning("Security error while unpacking a received message: invalid checksum")
+            sender.error(
+                "Security error while unpacking a received message: "
+                "Server replied with a wrong session ID (see FAQ for details)"
+            )
+        assert [record.levelno for record in caplog.records] == (
+            [logging.DEBUG, logging.WARNING, logging.ERROR]
+            if level == logging.DEBUG
+            else [logging.WARNING, logging.ERROR]
+        )
+    finally:
+        sender.filters[:] = original_filters
