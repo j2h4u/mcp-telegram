@@ -260,10 +260,13 @@ class _Export:
             offset = next_offset
 
     async def reactions(self, stream: TextIO, reactions: Payload, peer_id: int, message_id: int) -> None:
-        status = _status(reactions, {"known_empty", "unknown", "pending", "unavailable"})
+        status = _status(reactions, {"known_empty", "unknown", "pending", "unavailable", "complete"})
+        items = reactions.pop("items", None)
         _field(stream, "reactions", _facts(reactions))
         stream.write(',"reactors":[')
-        if status == "pending" and reactions.get("can_view_list") is True:
+        if status == "complete":
+            await self.reactor_items(stream, {"items": items}, peer_id, 0)
+        elif status == "pending" and reactions.get("can_view_list") is True:
             await self.reaction_pages(stream, peer_id, message_id)
         stream.write("]")
 

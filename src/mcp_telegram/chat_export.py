@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 import sqlite3
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from typing import Protocol, cast
 
@@ -202,16 +203,88 @@ async def _history_response(client: _Client, peer: object, before: int, upper: i
     )
 
 
+def _reaction_item(item: object, entities: Mapping[int, object], conn: sqlite3.Connection) -> dict[str, object]:
+    return {
+        "peer": _identity(getattr(item, "peer_id", None), entities, conn),
+        "reaction": _raw(getattr(item, "reaction", None)),
+        "date": _raw(getattr(item, "date", None)),
+        "raw": _raw(item),
+    }
+
+
+def _reaction_key(reaction: object) -> str | None:
+    if not isinstance(reaction, (types.ReactionEmoji, types.ReactionCustomEmoji)):
+        return None
+    return json.dumps(_raw(reaction), sort_keys=True)
+
+
+def _recent_reactor_key(item: object, entities: Mapping[int, object]) -> tuple[int, str] | None:
+    if not isinstance(item, types.MessagePeerReaction) or item.date is None:
+        return None
+    peer = _peer(item.peer_id)
+    reaction = _reaction_key(item.reaction)
+    if peer is None or reaction is None:
+        return None
+    peer_id = cast(int, peer["id"])
+    entity = entities.get(peer_id)
+    if not isinstance(entity, (types.User, types.Channel, types.Chat)):
+        return None
+    if getattr(entity, "min", False):
+        return None
+    return peer_id, reaction
+
+
+def _reaction_counts(reactions: object) -> dict[str, int] | None:
+    if not isinstance(reactions, types.MessageReactions):
+        return None
+    if reactions.min or not reactions.can_see_list or reactions.top_reactors:
+        return None
+    expected: dict[str, int] = {}
+    for result in reactions.results:
+        key = _reaction_key(result.reaction)
+        if key is None or key in expected or result.count <= 0:
+            return None
+        expected[key] = result.count
+    return expected
+
+
+def _complete_recent_reactions(
+    reactions: object, entities: Mapping[int, object], conn: sqlite3.Connection
+) -> list[dict[str, object]] | None:
+    """Reuse recent peers only when each ordinary reaction count is fully accounted for."""
+    expected = _reaction_counts(reactions)
+    if expected is None:
+        return None
+    recent = _objects(getattr(reactions, "recent_reactions", ()))
+    keys = [_recent_reactor_key(item, entities) for item in recent]
+    if None in keys or len(set(keys)) != len(keys):
+        return None
+    actual = Counter(key[1] for key in keys if key is not None)
+    if actual != expected:
+        return None
+    return [_reaction_item(item, entities, conn) for item in recent]
+
+
+def _message_reactions(
+    reactions: object, entities: Mapping[int, object], conn: sqlite3.Connection
+) -> dict[str, object]:
+    counts = _objects(getattr(reactions, "results", ()))
+    status = "unknown" if reactions is None else "pending" if counts else "known_empty"
+    complete = _complete_recent_reactions(reactions, entities, conn) if counts else None
+    return {
+        "status": "complete" if complete is not None else status,
+        "aggregate": _raw(reactions),
+        "can_view_list": bool(getattr(reactions, "can_see_list", False)),
+        **({"items": complete} if complete is not None else {}),
+    }
+
+
 def _message(
     item: object, dialog_id: int, entities: Mapping[int, object], conn: sqlite3.Connection
 ) -> dict[str, object]:
     stored = extract_message_row(dialog_id, item).message
     reply = getattr(item, "reply_to", None)
     reply_id = getattr(reply, "reply_to_msg_id", None)
-    reactions = getattr(item, "reactions", None)
-    aggregate = _raw(reactions)
-    counts = _objects(getattr(reactions, "results", ()))
-    status = "unknown" if reactions is None else "pending" if counts else "known_empty"
     return {
         "id": stored.message_id,
         "date": _raw(getattr(item, "date", None)),
@@ -230,11 +303,7 @@ def _message(
         "topic_id": (getattr(reply, "reply_to_top_id", None) or reply_id)
         if getattr(reply, "forum_topic", False)
         else None,
-        "reactions": {
-            "status": status,
-            "aggregate": aggregate,
-            "can_view_list": bool(getattr(reactions, "can_see_list", False)),
-        },
+        "reactions": _message_reactions(getattr(item, "reactions", None), entities, conn),
     }
 
 
@@ -327,14 +396,7 @@ async def _reactions(
         AcquisitionKind.REACTION_SNAPSHOT,
     )
     entities = _identities(response)
-    items = [
-        {
-            "peer": _identity(getattr(item, "peer_id", None), entities, conn),
-            "reaction": _raw(getattr(item, "reaction", None)),
-            "date": _raw(getattr(item, "date", None)),
-        }
-        for item in _objects(getattr(response, "reactions", ()))
-    ]
+    items = [_reaction_item(item, entities, conn) for item in _objects(getattr(response, "reactions", ()))]
     # Opaque Telegram reaction offsets cannot be rebuilt after byte trimming.
     if len(_bounded_page(items)) != len(items):
         raise ValueError("Reaction page exceeds export IPC byte limit")
