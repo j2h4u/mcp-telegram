@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import math
 import os
 import re
+from collections.abc import Awaitable
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any, Protocol
@@ -41,8 +44,8 @@ class HttpMcpClient:
     ) -> None:
         if not url:
             raise ValueError("url must not be empty")
-        if timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be finite and positive")
 
         self._url = url
         self._timeout_seconds = timeout_seconds
@@ -62,12 +65,23 @@ class HttpMcpClient:
 
         exit_stack = AsyncExitStack()
         try:
-            read_stream, write_stream = await exit_stack.enter_async_context(streamable_http_client(self._url))
-            session = await exit_stack.enter_async_context(ClientSession(read_stream, write_stream))
-            await session.initialize()
-        except Exception as exc:
-            await exit_stack.aclose()
-            raise McpClientError(str(exc)) from exc
+            # Keep SDK task-group entry and exit in this task, including on timeout.
+            async with asyncio.timeout(self._timeout_seconds):
+                read_stream, write_stream = await exit_stack.enter_async_context(streamable_http_client(self._url))
+                session = await exit_stack.enter_async_context(
+                    ClientSession(read_stream, write_stream, read_timeout_seconds=self._timeout_seconds)
+                )
+                await session.initialize()
+        except BaseException as exc:
+            try:
+                await self._request("cleanup", exit_stack.aclose())
+            except McpClientError as cleanup_exc:
+                exc.add_note(str(cleanup_exc))
+            if isinstance(exc, TimeoutError):
+                raise McpClientError(f"MCP initialization timed out after {self._timeout_seconds:g}s") from exc
+            if isinstance(exc, Exception):
+                raise McpClientError(str(exc)) from exc
+            raise
 
         self._exit_stack = exit_stack
         self._session = session
@@ -77,43 +91,43 @@ class HttpMcpClient:
         self._exit_stack = None
         self._session = None
         if exit_stack is not None:
-            await exit_stack.aclose()
+            await self._request("cleanup", exit_stack.aclose())
 
     async def list_tools(self) -> list[dict[str, Any]]:
         session = self._require_session()
-        try:
-            result = await session.list_tools()
-        except Exception as exc:
-            raise McpClientError(str(exc)) from exc
+        result = await self._request("tools/list", session.list_tools())
         return [tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in result.tools]
 
     async def list_prompts(self) -> list[dict[str, Any]]:
         session = self._require_session()
-        try:
-            result = await session.list_prompts()
-        except Exception as exc:
-            raise McpClientError(str(exc)) from exc
+        result = await self._request("prompts/list", session.list_prompts())
         return [prompt.model_dump(mode="json", by_alias=True, exclude_none=True) for prompt in result.prompts]
 
     async def get_prompt(self, name: str, arguments: dict[str, str] | None = None) -> dict[str, Any]:
         session = self._require_session()
-        try:
-            result = await session.get_prompt(name, arguments)
-        except Exception as exc:
-            raise McpClientError(str(exc)) from exc
+        result = await self._request("prompts/get", session.get_prompt(name, arguments))
         return result.model_dump(mode="json", by_alias=True, exclude_none=True)
 
     async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         session = self._require_session()
-        try:
-            result = await session.call_tool(
+        result = await self._request(
+            "tools/call",
+            session.call_tool(
                 name,
                 arguments or {},
                 read_timeout_seconds=self._timeout_seconds,
-            )
+            ),
+        )
+        return result.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+    async def _request[T](self, operation: str, request: Awaitable[T]) -> T:
+        try:
+            async with asyncio.timeout(self._timeout_seconds):
+                return await request
+        except TimeoutError as exc:
+            raise McpClientError(f"MCP {operation} timed out after {self._timeout_seconds:g}s") from exc
         except Exception as exc:
             raise McpClientError(str(exc)) from exc
-        return result.model_dump(mode="json", by_alias=True, exclude_none=True)
 
     def _require_session(self) -> ClientSession:
         session = self._session
