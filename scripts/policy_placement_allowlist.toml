@@ -481,3 +481,8 @@ rationale = "Finite export IPC timeout has 60 seconds of headroom over the 360-s
 category = "policy_assignments"
 key = "src/mcp_telegram/chat_export_cli.py:<module>:IPC_TIMEOUT_SECONDS"
 rationale = "Reviewed export Unix-socket response contract: 420 seconds covers the 360-second operation deadline plus scheduling headroom under host pressure."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/message_fact_refresh.py:<module>:_REACTION_DISCOVERY_PAGE_SIZE"
+rationale = "Reviewed SQLite discovery work bound: at most 256 raw aggregate rows are examined before yielding; this is an adapter resource contract, not a scheduling interval."
