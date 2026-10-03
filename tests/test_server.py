@@ -573,6 +573,119 @@ async def test_call_tool_records_cancellation_once_and_propagates(monkeypatch: p
 
 
 @pytest.mark.asyncio
+async def test_call_tool_primary_timeout_returns_schema_valid_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "_TOOL_CALL_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(server.tools, "tool_args", lambda tool, **kwargs: object())
+    cancelled = asyncio.Event()
+
+    async def blocked_runner(_args: object) -> ToolResult:
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+        return ToolResult()
+
+    monkeypatch.setattr(server.tools, "tool_runner", blocked_runner)
+    protection = AsyncMock()
+    monkeypatch.setattr(server, "_account_protection_status", protection)
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(server, "_schedule_telemetry", events.append)
+
+    result = await asyncio.wait_for(server.call_tool("list_dialogs", {}), timeout=0.5)
+
+    assert cancelled.is_set()
+    assert result.is_error is True
+    assert "Action:" in _call_tool_text(result)
+    schema = server.tool_by_name["list_dialogs"].output_schema
+    assert schema is not None
+    validate(instance=cast(dict[str, object], result.structured_content), schema=cast(dict[str, object], schema))
+    protection.assert_not_awaited()
+    assert events[0]["outcome"] == "exception"
+    assert events[0]["error_type"] == "TimeoutError"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_error", [False, True])
+@pytest.mark.parametrize("primary_delay", [0.0, 0.06])
+async def test_call_tool_delayed_protection_preserves_result_within_total_budget(
+    monkeypatch: pytest.MonkeyPatch, tool_error: bool, primary_delay: float
+) -> None:
+    monkeypatch.setattr(server, "_TOOL_CALL_TIMEOUT_SECONDS", 0.08)
+    monkeypatch.setattr(server, "_OPTIONAL_DAEMON_TIMEOUT_SECONDS", 0.04)
+    monkeypatch.setattr(server.tools, "tool_args", lambda tool, **kwargs: object())
+    schema = cast(dict[str, object], server.tool_by_name["submit_feedback"].output_schema)
+    payload = cast(
+        dict[str, object], _minimal_schema_value(_tool_output_schema(server.tool_by_name["submit_feedback"]))
+    )
+    payload["accepted"] = True
+    writes: list[object] = []
+
+    async def completed_runner(_args: object) -> ToolResult:
+        await asyncio.sleep(primary_delay)
+        if tool_error:
+            return ToolResult(
+                content=[TextContent(type="text", text="Unavailable.\nAction: Retry later.")],
+                is_error=True,
+                error_code="tool_error",
+            )
+        writes.append(_args)
+        return ToolResult(structured_content=payload)
+
+    async def blocked_protection() -> dict[str, object]:
+        await asyncio.Future()
+        return {}
+
+    monkeypatch.setattr(server.tools, "tool_runner", completed_runner)
+    monkeypatch.setattr(server, "_account_protection_status", blocked_protection)
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(server, "_schedule_telemetry", events.append)
+    started = asyncio.get_running_loop().time()
+    result = await asyncio.wait_for(server.call_tool("submit_feedback", {}), timeout=0.5)
+
+    assert asyncio.get_running_loop().time() - started < 0.10
+    assert result.is_error is tool_error
+    assert len(writes) == (0 if tool_error else 1)
+    assert events[0]["outcome"] == ("tool_error" if tool_error else "success")
+    if not tool_error:
+        assert result.content == []
+        assert cast(dict[str, object], result.structured_content)["accepted"] is True
+    else:
+        assert _call_tool_text(result) == "Unavailable.\nAction: Retry later."
+    assert (
+        cast(dict[str, object], result.structured_content)["account_protection"]
+        == server._account_protection_unavailable()["account_protection"]
+    )
+    validate(instance=cast(dict[str, object], result.structured_content), schema=schema)
+
+
+@pytest.mark.asyncio
+async def test_call_tool_cancellation_during_protection_is_cancelled_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server.tools, "tool_args", lambda tool, **kwargs: object())
+    monkeypatch.setattr(
+        server.tools, "tool_runner", AsyncMock(return_value=ToolResult(structured_content={"count": 0}))
+    )
+    started = asyncio.Event()
+
+    async def blocked_protection() -> dict[str, object]:
+        started.set()
+        await asyncio.Future()
+        return {}
+
+    monkeypatch.setattr(server, "_account_protection_status", blocked_protection)
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(server, "_schedule_telemetry", events.append)
+    task = asyncio.create_task(server.call_tool("list_dialogs", {}))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(events) == 1
+    assert events[0]["outcome"] == "cancelled"
+
+
+@pytest.mark.asyncio
 async def test_flush_telemetry_cancels_delivery_after_bound(monkeypatch: pytest.MonkeyPatch) -> None:
     release = asyncio.Event()
 
@@ -1030,6 +1143,7 @@ class _FakeConfig:
 class _FakeServer:
     def __init__(self, captured: dict[str, object], config: object) -> None:
         captured["server"] = config
+        captured["server_type"] = type(self)
         self._captured = captured
 
     async def serve(self) -> None:
@@ -1053,8 +1167,10 @@ def _fake_assert_exposure_allowed(captured: dict[str, object], host: str) -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("missing_daemon", [False, True])
 async def test_run_mcp_http_server_normalizes_mount_and_builds_transport(
     monkeypatch: pytest.MonkeyPatch,
+    missing_daemon: bool,
 ) -> None:
     captured: dict[str, object] = {}
     monkeypatch.setattr(
@@ -1067,14 +1183,29 @@ async def test_run_mcp_http_server_normalizes_mount_and_builds_transport(
     monkeypatch.setattr("starlette.routing.Route", partial(_FakeRoute, captured))
     monkeypatch.setattr("starlette.routing.Mount", partial(_FakeMount, captured))
     monkeypatch.setattr("uvicorn.Config", partial(_FakeConfig, captured))
-    monkeypatch.setattr("uvicorn.Server", _make_fake_uvicorn_server(captured))
+    fake_server_type = _make_fake_uvicorn_server(captured)
+    monkeypatch.setattr("uvicorn.Server", fake_server_type)
     monkeypatch.setattr("logging.basicConfig", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "_http_allowed_hosts", lambda host, port: [f"{host}:{port}"])
     monkeypatch.setattr(server, "_http_allowed_origins", lambda: ["https://example.com"])
-    monkeypatch.setattr("mcp_telegram.server._build_server_instructions", _fake_build_server_instructions)
+    if missing_daemon:
+
+        class UnresponsiveConnection:
+            async def get_me(self) -> dict[str, object]:
+                await asyncio.Future()
+                return {}
+
+        @asynccontextmanager
+        async def unresponsive_daemon() -> AsyncIterator[object]:
+            yield UnresponsiveConnection()
+
+        monkeypatch.setattr("mcp_telegram.daemon_client.daemon_connection", unresponsive_daemon)
+        monkeypatch.setattr(server, "_OPTIONAL_DAEMON_TIMEOUT_SECONDS", 0.02)
+    else:
+        monkeypatch.setattr("mcp_telegram.server._build_server_instructions", _fake_build_server_instructions)
     monkeypatch.setattr(server, "_assert_http_exposure_allowed", partial(_fake_assert_exposure_allowed, captured))
 
-    await server.run_mcp_http_server(host="127.0.0.1", port=4100, mount_path="mcp")
+    await asyncio.wait_for(server.run_mcp_http_server(host="127.0.0.1", port=4100, mount_path="mcp"), timeout=0.5)
 
     assert captured["assert"] == "127.0.0.1"
     assert captured["security"] == {
@@ -1086,12 +1217,19 @@ async def test_run_mcp_http_server_normalizes_mount_and_builds_transport(
     assert session_manager["stateless"] is True
     assert session_manager["json_response"] is True
     assert captured["server"]
+    assert captured["server_type"] is fake_server_type
     routes = cast(list[tuple[str, str]], captured.get("routes", []))
     assert routes[0][0] == "mount"
     assert routes[0][1] == "/mcp"
     assert routes[1][0] == "route"
     assert routes[1][1] == "/health"
-    assert server.app.instructions == "Built"
+    if missing_daemon:
+        assert server.app.instructions is not None
+        assert server.app.instructions.startswith("Telegram-read-only access")
+        assert "Connected account: id=" not in server.app.instructions
+        assert captured["serve"] is True
+    else:
+        assert server.app.instructions == "Built"
 
 
 @pytest.mark.asyncio

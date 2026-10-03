@@ -29,7 +29,7 @@ require_ignore_directive_reasons = "error"
 [[modules]]
 path = "mcp_telegram"
 layer = "delivery"
-depends_on = ["mcp_telegram.config", "mcp_telegram.daemon", "mcp_telegram.daemon_client", "mcp_telegram.feedback_db", "mcp_telegram.request_timing", "mcp_telegram.runtime_logging", "mcp_telegram.server", "mcp_telegram.telegram"]
+depends_on = ["mcp_telegram.config", "mcp_telegram.daemon", "mcp_telegram.daemon_client", "mcp_telegram.feedback_db", "mcp_telegram.request_timing", "mcp_telegram.runtime_logging", "mcp_telegram.server", "mcp_telegram.service_processes", "mcp_telegram.telegram"]
 
 [[modules]]
 path = "mcp_telegram.server"
@@ -937,3 +937,8 @@ expose = ["read_message_from_row"]
 path = "mcp_telegram.event_recovery"
 layer = "persistence"
 depends_on = ["mcp_telegram.alert_policy", "mcp_telegram.runtime_observations", "mcp_telegram.sync_db"]
+
+[[modules]]
+path = "mcp_telegram.service_processes"
+layer = "delivery"
+depends_on = []

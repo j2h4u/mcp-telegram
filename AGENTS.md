@@ -6,11 +6,12 @@
 
 ## Architecture
 
-Default Docker runtime is one container process:
+Default Docker runtime is one container with two worker processes:
 
-- **Service** (`mcp-telegram serve`) — PID 1; runs the sync daemon and Streamable HTTP MCP endpoint
-  together. The daemon owns the TelegramClient, runs FullSyncWorker and DeltaSyncWorker, handles
+- **Service** (`mcp-telegram serve`) — under Docker init; coordinates separate sync daemon and
+  Streamable HTTP MCP worker processes. If either exits, stops the other; Docker owns restart. The daemon owns the TelegramClient, runs FullSyncWorker and DeltaSyncWorker, handles
   real-time events, and exposes its Unix socket API internally.
+- **HTTP-only mode** (`mcp-telegram http`) — serves MCP through the existing daemon Unix socket.
 - **Daemon-only mode** (`mcp-telegram sync`) — useful for split-mode debugging, but it is not the
   default Docker command.
 

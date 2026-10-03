@@ -53,7 +53,10 @@ mcp-telegram daemon / serve
 ```
 
 The default Docker image starts `mcp-telegram serve`, which runs the sync daemon
-and the HTTP MCP endpoint in one process.
+and the HTTP MCP endpoint as separate worker processes in one container.
+Compose enables `init: true`; `serve` stops both workers if either exits, leaving
+restart to Docker. `mcp-telegram http` runs only the HTTP endpoint, while
+`mcp-telegram sync` owns Telegram and local writes.
 
 The deployed compose template publishes HTTP only on host loopback:
 

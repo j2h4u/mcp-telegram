@@ -54,6 +54,8 @@ _MCP_HTTP_LOGGER_NAME = "mcp.server.streamable_http"
 _MCP_HTTP_SSE_ERROR_MESSAGE = "SSE response error"
 _ANYIO_CLOSED_RESOURCE_ERROR = ("anyio", "ClosedResourceError")
 _TELEMETRY_FLUSH_TIMEOUT_SECONDS = 1.0
+_TOOL_CALL_TIMEOUT_SECONDS = 30.0
+_OPTIONAL_DAEMON_TIMEOUT_SECONDS = 1.0
 _TELEMETRY_OUTCOMES = frozenset({"success", "tool_error", "validation_error", "exception", "cancelled"})
 _SLOW_TOOL_CALL_SECONDS = resolve_logging_config().daemon_api_slow_request_seconds
 
@@ -613,12 +615,34 @@ async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:
         raise ValueError(f"Unknown tool: {name}")
 
     t0 = time.monotonic()
+    deadline = asyncio.get_running_loop().time() + _TOOL_CALL_TIMEOUT_SECONDS
     operation_id = standalone_operation_id(None)
     telemetry = _CallTelemetry()
     try:
         with correlation_context(operation_id):
-            result = await _execute_tool(name, tool, arguments, t0, telemetry)
-            return _attach_account_protection(result, await _account_protection_status())
+            try:
+                async with asyncio.timeout_at(deadline):
+                    result = await _execute_tool(name, tool, arguments, t0, telemetry)
+            except TimeoutError as exc:
+                telemetry.outcome = "exception"
+                telemetry.error_type = type(exc).__name__
+                result = _error_call_result(
+                    _safe_boundary_error_text(tool_name=name, stage="runtime", exc=exc),
+                    code="tool_error",
+                )
+            status = _account_protection_unavailable()
+            if asyncio.get_running_loop().time() < deadline:
+                try:
+                    async with asyncio.timeout_at(
+                        min(deadline, asyncio.get_running_loop().time() + _OPTIONAL_DAEMON_TIMEOUT_SECONDS)
+                    ):
+                        status = await _account_protection_status()
+                except TimeoutError:
+                    pass
+            return _attach_account_protection(result, status)
+    except asyncio.CancelledError:
+        telemetry.outcome = "cancelled"
+        raise
     finally:
         _schedule_telemetry(
             _telemetry_event(
@@ -712,14 +736,14 @@ async def _build_server_instructions() -> str:
         "surprising, or missing a useful capability -- don't wait until end of session.\n"
     )
     try:
-        async with daemon_connection() as conn:
+        async with asyncio.timeout(_OPTIONAL_DAEMON_TIMEOUT_SECONDS), daemon_connection() as conn:
             response = await conn.get_me()
         if response.get("ok"):
             data = response["data"]
             name = " ".join(filter(None, [data.get("first_name"), data.get("last_name")]))
             username = data.get("username") or "none"
             base += f' Connected account: id={data["id"]}, name="{name}", @{username}.'
-    except (AttributeError, DaemonNotRunningError, KeyError, TypeError, ValueError) as exc:
+    except (AttributeError, DaemonNotRunningError, KeyError, OSError, TimeoutError, TypeError, ValueError) as exc:
         logger.debug("server_instructions: could not fetch account info: %s", exc)
     return base
 
@@ -801,8 +825,7 @@ async def run_mcp_http_server(
     class _NoSignalServer(uvicorn.Server):
         @contextlib.contextmanager
         def capture_signals(self) -> t.Iterator[None]:
-            # The sync daemon owns process signal handling; this server is
-            # asked to stop by the combined `serve` entrypoint during shutdown.
+            # Embedded callers providing stop_event own process signals.
             yield
 
     config = uvicorn.Config(
@@ -812,7 +835,7 @@ async def run_mcp_http_server(
         log_level=log_level.lower(),
         access_log=False,
     )
-    http_server = _NoSignalServer(config)
+    http_server = uvicorn.Server(config) if stop_event is None else _NoSignalServer(config)
     try:
         if stop_event is None:
             await http_server.serve()

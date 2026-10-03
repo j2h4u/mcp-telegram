@@ -70,7 +70,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         "--timeout",
         type=float,
         default=DEFAULT_TIMEOUT_SECONDS,
-        help=f"Per-request timeout in seconds. Default: {DEFAULT_TIMEOUT_SECONDS}",
+        help=f"Timeout for initialization, each request, and cleanup in seconds. Default: {DEFAULT_TIMEOUT_SECONDS}",
     )
     parser.add_argument(
         "--compact",

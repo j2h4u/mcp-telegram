@@ -128,56 +128,30 @@ def serve(
         ),
     ] = None,
 ) -> None:
-    """Run the sync daemon and Streamable HTTP MCP endpoint in one process."""
-    import logging
-    import sys
-
-    from . import server as _server
-    from .daemon import sync_main
-    from .runtime_logging import install_telethon_log_filter
+    """Run isolated sync and HTTP workers in one service."""
+    from .service_processes import run_service
 
     operator_config = load_config()
     resolved_host = _resolve_http_host(host, base=operator_config.http)
     resolved_port = _resolve_http_port(port, base=operator_config.http)
-    log_level = resolve_logging_config().level
-    logging.basicConfig(
-        level=getattr(logging, log_level, logging.INFO),
-        stream=sys.stderr,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        force=True,
-    )
-    install_telethon_log_filter()
+    raise SystemExit(asyncio.run(run_service(host=resolved_host, port=resolved_port)))
 
-    async def _run() -> None:
-        sync_task = asyncio.create_task(sync_main(), name="sync-daemon")
-        http_stop_event = asyncio.Event()
-        http_task = asyncio.create_task(
-            _server.run_mcp_http_server(host=resolved_host, port=resolved_port, stop_event=http_stop_event),
-            name="mcp-http",
+
+@app.command("http")
+def http(
+    host: Annotated[str | None, Option("--host", envvar="MCP_TELEGRAM_HTTP_HOST")] = None,
+    port: Annotated[int | None, Option("--port", envvar="MCP_TELEGRAM_HTTP_PORT")] = None,
+) -> None:
+    """Run only the HTTP MCP endpoint against the existing sync daemon."""
+    from .server import run_mcp_http_server
+
+    operator_config = load_config()
+    asyncio.run(
+        run_mcp_http_server(
+            host=_resolve_http_host(host, base=operator_config.http),
+            port=_resolve_http_port(port, base=operator_config.http),
         )
-        tasks = {sync_task, http_task}
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-
-        if sync_task in done and not sync_task.cancelled() and sync_task.exception() is None:
-            http_stop_event.set()
-            await http_task
-            return
-
-        for task in pending:
-            task.cancel()
-        for task in pending:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        for task in done:
-            if task.cancelled():
-                raise asyncio.CancelledError
-            exc = task.exception()
-            if exc is not None:
-                raise exc
-
-    asyncio.run(_run())
+    )
 
 
 # ---------------------------------------------------------------------------

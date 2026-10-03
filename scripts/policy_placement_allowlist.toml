@@ -12,6 +12,26 @@ rationale = "No exclusions use this grouping; every entry below has its own rati
 
 [[entry]]
 category = "policy_assignments"
+key = "src/mcp_telegram/server.py:<module>:_TOOL_CALL_TIMEOUT_SECONDS"
+rationale = "Reviewed MCP response contract: one 30-second budget before the upstream client timeout, including sequential IPC and optional enrichment."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/server.py:<module>:_OPTIONAL_DAEMON_TIMEOUT_SECONDS"
+rationale = "Reviewed optional-enrichment contract: identity and protection must not hold up HTTP startup or a completed tool result beyond one second."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/server.py:call_tool:deadline"
+rationale = "Computed monotonic timestamp for the reviewed complete-response budget, not another configurable policy."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/service_processes.py:_stop_workers:deadline"
+rationale = "Computed monotonic timestamp for bounded cleanup of the two fixed service workers."
+
+[[entry]]
+category = "policy_assignments"
 key = "src/mcp_telegram/linked_chat_fact.py:LinkedChatRetryPolicy:base_delay_seconds"
 rationale = "This retry delay is a code-owned recovery invariant for retained linked-chat demand."
 
