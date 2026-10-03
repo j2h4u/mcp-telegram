@@ -30,7 +30,11 @@ from .telegram_reading import READ_DATE_REASONS, TelegramReadReceiptGateway
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import rpc_attempt_budget
 
+_ReactionCandidate = tuple[int, int, int, str | None]
+_ReactionRankedCandidate = tuple[tuple[int, int, int, int, int, int], _ReactionCandidate]
+
 _REACTION_CANDIDATES_SQL = """
+{requested_cte}
 SELECT m.dialog_id, m.message_id, a.generation, d.next_offset
 FROM messages m
 JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
@@ -45,6 +49,7 @@ WHERE sd.status = 'synced'
        OR d.status = 'stale'
        OR (d.status IN ('partial','unavailable') AND d.next_attempt_at IS NOT NULL
            AND d.next_attempt_at <= ?))
+  {requested_filter}
 ORDER BY
   CASE
     WHEN d.status = 'partial' AND d.next_offset IS NOT NULL THEN 0
@@ -58,6 +63,35 @@ ORDER BY
   COALESCE(d.checked_at, 0),
   m.sent_at DESC, m.dialog_id, m.message_id
 LIMIT ?
+"""
+
+_REACTION_DISCOVERY_PAGE_SIZE = 256
+# ponytail: New read-at facts may take up to 60 seconds to become visible to scheduling.
+_REACTION_DISCOVERY_REFRESH_SECONDS = 60
+_REACTION_DISCOVERY_PAGE_SQL = """
+WITH aggregate_page AS MATERIALIZED (
+  SELECT dialog_id, message_id, generation, aggregate_row_count
+  FROM message_reaction_aggregate_state
+  {keyset}
+  ORDER BY dialog_id, message_id
+  LIMIT ?
+)
+SELECT p.dialog_id, p.message_id, p.generation, p.aggregate_row_count,
+       sd.status, fhe.enabled, m.is_deleted, m.sent_at,
+       d.aggregate_generation, d.status, d.next_offset, d.next_attempt_at, d.checked_at
+FROM aggregate_page p
+LEFT JOIN synced_dialogs sd ON sd.dialog_id=p.dialog_id
+LEFT JOIN full_history_enrollment fhe ON fhe.dialog_id=p.dialog_id
+LEFT JOIN messages m ON m.dialog_id=p.dialog_id AND m.message_id=p.message_id
+LEFT JOIN message_reaction_event_status d ON d.dialog_id=p.dialog_id AND d.message_id=p.message_id
+ORDER BY p.dialog_id, p.message_id
+"""
+
+_REACTION_UPPER_KEY_SQL = """
+SELECT dialog_id, message_id
+FROM message_reaction_aggregate_state
+ORDER BY dialog_id DESC, message_id DESC
+LIMIT 1
 """
 
 
@@ -212,6 +246,114 @@ def _reaction_pacing_release_at(conn: sqlite3.Connection) -> float | None:
     return None if row is None else float(cast(int | float, row[0]))
 
 
+def _reaction_upper_key(conn: sqlite3.Connection) -> tuple[int, int] | None:
+    row = cast(tuple[object, object] | None, conn.execute(_REACTION_UPPER_KEY_SQL).fetchone())
+    return None if row is None else (int(cast(int, row[0])), int(cast(int, row[1])))
+
+
+def _reaction_discovery_page(
+    conn: sqlite3.Connection,
+    cursor: tuple[int, int] | None,
+    upper: tuple[int, int],
+) -> list[tuple[object, ...]]:
+    keyset = "WHERE (dialog_id,message_id) <= (?,?)"
+    params: tuple[object, ...] = (*upper, _REACTION_DISCOVERY_PAGE_SIZE)
+    if cursor is not None:
+        keyset = "WHERE (dialog_id,message_id) > (?,?) AND (dialog_id,message_id) <= (?,?)"
+        params = (*cursor, *upper, _REACTION_DISCOVERY_PAGE_SIZE)
+    query = _REACTION_DISCOVERY_PAGE_SQL.format(keyset=keyset)
+    return cast(list[tuple[object, ...]], conn.execute(query, params).fetchall())
+
+
+def _reaction_page_identity(
+    row: tuple[object, ...],
+) -> tuple[int, int, int, int, str | None, int, object, int] | None:
+    dialog_id, message_id, generation, aggregate_count = (int(cast(int, row[i])) for i in range(4))
+    if row[4] != "synced" or row[5] != 1 or row[6] != 0 or row[7] is None:
+        return None
+    detail_status = None if row[9] is None else str(row[9])
+    if aggregate_count <= 0 and detail_status not in {"partial", "unavailable"}:
+        return None
+    sent_at = int(cast(int, row[7]))
+    checked_at = 0 if row[12] is None else int(cast(int, row[12]))
+    return dialog_id, message_id, generation, aggregate_count, detail_status, sent_at, row[10], checked_at
+
+
+def _reaction_detail_is_stale(row: tuple[object, ...], generation: int) -> bool:
+    detail_generation = None if row[8] is None else int(cast(int, row[8]))
+    detail_status = None if row[9] is None else str(row[9])
+    return (
+        detail_status is None or detail_generation is None or detail_generation < generation or detail_status == "stale"
+    )
+
+
+def _reaction_detail_release(
+    row: tuple[object, ...], generation: int, now: float
+) -> tuple[float, bool, bool, int | None] | None:
+    detail_status = None if row[9] is None else str(row[9])
+    stale = _reaction_detail_is_stale(row, generation)
+    next_attempt = None if row[11] is None else int(cast(int, row[11]))
+    if not stale and (detail_status not in {"partial", "unavailable"} or next_attempt is None):
+        return None
+    release_at = 0.0 if stale else float(next_attempt or 0)
+    return release_at, release_at <= now, stale, next_attempt
+
+
+def _ranked_reaction_candidate(
+    identity: tuple[int, int, int, int, str | None, int, object, int],
+    *,
+    stale: bool,
+    next_attempt: int | None,
+) -> _ReactionRankedCandidate:
+    dialog_id, message_id, generation, _, detail_status, sent_at, offset_value, checked_at = identity
+    offset = None if offset_value is None else str(offset_value)
+    partial_first = detail_status == "partial" and offset is not None
+    priority = (
+        0 if partial_first else 1 if stale else 2,
+        0 if stale else next_attempt or 0,
+        checked_at,
+        -sent_at,
+        dialog_id,
+        message_id,
+    )
+    return priority, (dialog_id, message_id, generation, offset)
+
+
+def _reaction_page_candidate(
+    row: tuple[object, ...], now: float
+) -> tuple[float, _ReactionRankedCandidate | None] | None:
+    identity = _reaction_page_identity(row)
+    if identity is None:
+        return None
+    release = _reaction_detail_release(row, identity[2], now)
+    if release is None:
+        return None
+    release_at, due, stale, next_attempt = release
+    if not due:
+        return release_at, None
+    return release_at, _ranked_reaction_candidate(identity, stale=stale, next_attempt=next_attempt)
+
+
+def _merge_reaction_page(
+    rows: Sequence[tuple[object, ...]],
+    candidates: list[_ReactionRankedCandidate],
+    *,
+    now: float,
+    limit: int,
+    release_at: float | None,
+) -> tuple[list[_ReactionRankedCandidate], float | None]:
+    for row in rows:
+        entry = _reaction_page_candidate(row, now)
+        if entry is None:
+            continue
+        row_release, candidate = entry
+        release_at = row_release if release_at is None else min(release_at, row_release)
+        if candidate is not None:
+            candidates.append(candidate)
+    candidates.sort(key=lambda item: item[0])
+    return candidates[:limit], release_at
+
+
 def _reaction_release_at(conn: sqlite3.Connection, now: float) -> float | None:
     """Combine raw reaction due state with the durable pacing window."""
     pacing_release = _reaction_pacing_release_at(conn)
@@ -243,43 +385,148 @@ class MessageFactRefreshDemandAdapter(DurableDemandAdapter):
         self._deps = deps
         self._policy = policy
         self._shutdown_event = shutdown_event
+        self._reaction_upper: tuple[int, int] | None = None
+        self._reaction_cursor: tuple[int, int] | None = None
+        self._reaction_sweep_started = False
+        self._reaction_sweep_complete = False
+        self._reaction_next_scan_at: float | None = None
+        self._reaction_release_at: float | None = None
+        self._reaction_candidates: list[_ReactionRankedCandidate] = []
+        self._read_at_release_at: float | None = None
+        self._read_at_checked_at: float | None = None
+        self._reaction_candidate_limit = min(
+            policy.reaction_max_messages_per_cycle, policy.reaction_detail_max_pages_per_cycle
+        )
 
     def status(self, now: float) -> DemandStatus | None:
         """Return the first missing or TTL-expired candidate release boundary."""
         releases: list[float] = []
         if self._policy.reaction_max_messages_per_cycle > 0:
-            reaction_release = _reaction_release_at(self._deps.conn, now)
+            reaction_release = self._reaction_status_release(now)
             if reaction_release is not None:
                 releases.append(reaction_release)
-        if self._policy.read_at_max_messages_per_cycle > 0:
-            read_at_release = _next_release_at(
+        if self._policy.read_at_max_messages_per_cycle > 0 and (
+            self._read_at_checked_at is None or now - self._read_at_checked_at >= _REACTION_DISCOVERY_REFRESH_SECONDS
+        ):
+            self._read_at_release_at = _next_release_at(
                 self._deps.conn,
                 _NEXT_READ_AT_RELEASE_SQL,
                 (),
             )
-            if read_at_release is not None:
-                releases.append(read_at_release)
+            self._read_at_checked_at = self._deps.clock()
+        if self._policy.read_at_max_messages_per_cycle > 0 and self._read_at_release_at is not None:
+            releases.append(self._read_at_release_at)
         if not releases:
             return None
         return DemandStatus(release_at=min(releases))
+
+    def _reaction_status_release(self, now: float) -> float | None:
+        pacing_release = _reaction_pacing_release_at(self._deps.conn)
+        if pacing_release is not None and pacing_release > now:
+            return pacing_release
+        if not self._reaction_sweep_complete:
+            return now
+        if self._reaction_candidates:
+            return now
+        next_scan = self._reaction_next_scan_at or now
+        if self._reaction_release_at is not None:
+            next_scan = min(next_scan, self._reaction_release_at)
+        if now < next_scan:
+            return next_scan
+        return now
+
+    def _reset_reaction_sweep(self) -> None:
+        self._reaction_upper = None
+        self._reaction_cursor = None
+        self._reaction_sweep_started = False
+        self._reaction_sweep_complete = False
+        self._reaction_next_scan_at = None
+        self._reaction_release_at = None
+        self._reaction_candidates = []
+
+    def _restart_empty_sweep_if_due(self, now: float) -> None:
+        restart_at = self._reaction_next_scan_at
+        if self._reaction_release_at is not None:
+            restart_at = self._reaction_release_at if restart_at is None else min(restart_at, self._reaction_release_at)
+        if (
+            self._reaction_sweep_complete
+            and not self._reaction_candidates
+            and restart_at is not None
+            and restart_at <= now
+        ):
+            self._reset_reaction_sweep()
+
+    def _advance_reaction_sweep(self, now: float) -> bool:
+        if not self._reaction_sweep_started:
+            self._reaction_upper = _reaction_upper_key(self._deps.conn)
+            self._reaction_sweep_started = True
+            if self._reaction_upper is None:
+                self._finish_reaction_sweep(now)
+                return True
+        upper = self._reaction_upper
+        assert upper is not None
+        rows = _reaction_discovery_page(self._deps.conn, self._reaction_cursor, upper)
+        if rows:
+            last = rows[-1]
+            self._reaction_cursor = (int(cast(int, last[0])), int(cast(int, last[1])))
+            self._reaction_candidates, self._reaction_release_at = _merge_reaction_page(
+                rows,
+                self._reaction_candidates,
+                now=now,
+                limit=self._reaction_candidate_limit,
+                release_at=self._reaction_release_at,
+            )
+        if len(rows) < _REACTION_DISCOVERY_PAGE_SIZE:
+            self._finish_reaction_sweep(now)
+        return self._reaction_sweep_complete
+
+    def _reaction_candidates_for_slice(self, now: float) -> Sequence[_ReactionCandidate] | None:
+        if self._policy.reaction_max_messages_per_cycle <= 0:
+            return None
+        pacing_release = _reaction_pacing_release_at(self._deps.conn)
+        if pacing_release is not None and pacing_release > now:
+            return ()
+        if self._reaction_sweep_complete:
+            return tuple(item[1] for item in self._reaction_candidates)
+        if self._advance_reaction_sweep(now):
+            return tuple(item[1] for item in self._reaction_candidates)
+        return ()
+
+    def _finish_reaction_sweep(self, now: float) -> None:
+        self._reaction_sweep_complete = True
+        del now
+        self._reaction_next_scan_at = self._deps.clock() + _REACTION_DISCOVERY_REFRESH_SECONDS
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
         """Run one bounded candidate cycle under its registered root."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
-        status = self.status(time.time())
-        if status is None or not status.is_ready(time.time()):
+        now = self._deps.clock()
+        status = self.status(now)
+        if status is None or not status.is_ready(now):
             return
+        self._restart_empty_sweep_if_due(now)
+        reaction_candidates = self._reaction_candidates_for_slice(now)
+        read_at_due = self._read_at_release_at is not None and self._read_at_release_at <= now
+        if not reaction_candidates and not read_at_due:
+            return
+        if read_at_due:
+            self._read_at_checked_at = None
         with demand_context(DemandKind.MESSAGE_FACT_REFRESH):
             with rpc_attempt_budget(budget):
                 try:
                     await refresh_message_facts_once(
                         self._deps,
                         self._policy,
+                        read_at_due=read_at_due,
+                        reaction_candidates=reaction_candidates,
                         shutdown_event=self._shutdown_event,
                     )
                 except RpcAttemptBudgetExhaustedError:
                     return
+                finally:
+                    if reaction_candidates:
+                        self._reset_reaction_sweep()
 
 
 class ReadReceiptDemandAdapter(DurableDemandAdapter):
@@ -331,15 +578,30 @@ def _row_ints(row: Sequence[object]) -> tuple[int, ...]:
     return tuple(int(cast(int | str, value)) for value in row)
 
 
+def _reaction_candidates_query(*, keys: Sequence[tuple[int, int]] | None = None) -> tuple[str, tuple[int, ...]]:
+    if not keys:
+        return _REACTION_CANDIDATES_SQL.format(requested_cte="", requested_filter=""), ()
+    values = ",".join("(?,?)" for _ in keys)
+    params = tuple(value for key in keys for value in key)
+    return (
+        _REACTION_CANDIDATES_SQL.format(
+            requested_cte=f"WITH requested(dialog_id,message_id) AS (VALUES {values})",
+            requested_filter="AND (m.dialog_id,m.message_id) IN (SELECT dialog_id,message_id FROM requested)",
+        ),
+        params,
+    )
+
+
 def _reaction_candidates(
     conn: sqlite3.Connection,
     *,
     stale_before_utc: int,
     limit: int,
 ) -> list[tuple[int, int, int, str | None]]:
+    query, key_params = _reaction_candidates_query()
     rows = cast(
         list[tuple[object, ...]],
-        conn.execute(_REACTION_CANDIDATES_SQL, (stale_before_utc, limit)).fetchall(),
+        conn.execute(query, (*key_params, stale_before_utc, limit)).fetchall(),
     )
     return [
         (
@@ -352,13 +614,81 @@ def _reaction_candidates(
     ]
 
 
-def _claim_reaction_pages(
+def _revalidate_reaction_candidates(
+    conn: sqlite3.Connection,
+    candidates: Sequence[tuple[int, int, int, str | None]],
+    *,
+    now: int,
+    limit: int,
+) -> list[tuple[int, int, int, str | None]]:
+    if not candidates or limit <= 0:
+        return []
+    keys = [(dialog_id, message_id) for dialog_id, message_id, _, _ in candidates]
+    query, key_params = _reaction_candidates_query(keys=keys)
+    rows = cast(
+        list[tuple[object, ...]],
+        conn.execute(query, (*key_params, now, limit)).fetchall(),
+    )
+    return [
+        (
+            int(cast(int, row[0])),
+            int(cast(int, row[1])),
+            int(cast(int, row[2])),
+            None if row[3] is None else str(row[3]),
+        )
+        for row in rows
+    ]
+
+
+def _reserve_reaction_candidates(  # noqa: PLR0913 - explicit claim transaction inputs
+    conn: sqlite3.Connection,
+    *,
+    now: int,
+    cycle_seconds: int,
+    limit: int,
+    candidates: Sequence[tuple[int, int, int, str | None]] | None,
+    selected: list[tuple[int, int, int, str | None]],
+) -> list[tuple[int, int, int, str | None]]:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = cast(
+            tuple[object, ...] | None,
+            conn.execute(
+                "SELECT release_at, claimed_pages FROM reaction_detail_pacing_state WHERE singleton=1"
+            ).fetchone(),
+        )
+        if row is not None and now < int(cast(int | str, row[0])):
+            conn.commit()
+            return []
+        if candidates is not None:
+            selected = _revalidate_reaction_candidates(conn, candidates, now=now, limit=limit)
+        if not selected:
+            conn.commit()
+            return []
+        release_at = now + cycle_seconds
+        conn.execute(
+            "INSERT INTO reaction_detail_pacing_state "
+            "(singleton, window_started_at, release_at, claimed_pages, started_pages) "
+            "VALUES (1, ?, ?, ?, 0) "
+            "ON CONFLICT(singleton) DO UPDATE SET window_started_at=excluded.window_started_at, "
+            "release_at=excluded.release_at, claimed_pages=excluded.claimed_pages, started_pages=0",
+            (now, release_at, len(selected)),
+        )
+        conn.commit()
+        return selected
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _claim_reaction_pages(  # noqa: PLR0913 - explicit transactional inputs
     conn: sqlite3.Connection,
     *,
     now: int,
     max_pages: int,
     cycle_seconds: int,
     candidate_limit: int,
+    candidates: Sequence[tuple[int, int, int, str | None]] | None = None,
 ) -> list[tuple[int, int, int, str | None]]:
     """Reserve one pacing window and its candidate pages transactionally."""
     if max_pages <= 0 or candidate_limit <= 0:
@@ -374,34 +704,23 @@ def _claim_reaction_pages(
     )
     if state is not None and now < int(cast(int | str, state[0])):
         return []
-    candidates = _reaction_candidates(conn, stale_before_utc=now, limit=min(candidate_limit, max_pages))
-    if not candidates:
+    limit = min(candidate_limit, max_pages)
+    if candidates is None:
+        selected = _reaction_candidates(conn, stale_before_utc=now, limit=limit)
+    elif not candidates:
         return []
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        row = cast(
-            tuple[object, ...] | None,
-            conn.execute(
-                "SELECT release_at, claimed_pages FROM reaction_detail_pacing_state WHERE singleton=1"
-            ).fetchone(),
-        )
-        if row is not None and now < int(cast(int | str, row[0])):
-            conn.commit()
-            return []
-        release_at = now + cycle_seconds
-        conn.execute(
-            "INSERT INTO reaction_detail_pacing_state "
-            "(singleton, window_started_at, release_at, claimed_pages, started_pages) "
-            "VALUES (1, ?, ?, ?, 0) "
-            "ON CONFLICT(singleton) DO UPDATE SET window_started_at=excluded.window_started_at, "
-            "release_at=excluded.release_at, claimed_pages=excluded.claimed_pages, started_pages=0",
-            (now, release_at, len(candidates)),
-        )
-        conn.commit()
-        return candidates
-    except BaseException:
-        conn.rollback()
-        raise
+    else:
+        selected = []
+    if candidates is None and not selected:
+        return []
+    return _reserve_reaction_candidates(
+        conn,
+        now=now,
+        cycle_seconds=cycle_seconds,
+        limit=limit,
+        candidates=candidates,
+        selected=selected,
+    )
 
 
 def _start_reaction_page(conn: sqlite3.Connection) -> bool:
@@ -681,12 +1000,13 @@ async def _refresh_one_reaction_page(
     return detail.fetched_pages, detail.stop_cycle or detail.status == "cancelled"
 
 
-async def _refresh_reaction_pages(
+async def _refresh_reaction_pages(  # noqa: PLR0913 - keeps transaction and demand inputs explicit
     deps: MessageFactRefreshDeps,
     policy: MessageFactRefreshPolicy,
     *,
     checked_at: int,
     claim_at: int,
+    candidates: Sequence[_ReactionCandidate] | None,
     shutdown_event: asyncio.Event | None,
 ) -> int:
     if shutdown_event is not None and shutdown_event.is_set():
@@ -697,6 +1017,7 @@ async def _refresh_reaction_pages(
         max_pages=policy.reaction_detail_max_pages_per_cycle,
         cycle_seconds=policy.reaction_detail_cycle_seconds,
         candidate_limit=policy.reaction_max_messages_per_cycle,
+        candidates=candidates,
     )
     reaction_refreshed = 0
     for index, row in enumerate(selected_reaction_rows):
@@ -714,11 +1035,13 @@ async def _refresh_reaction_pages(
     return reaction_refreshed
 
 
-async def refresh_message_facts_once(
+async def refresh_message_facts_once(  # noqa: PLR0913 - public orchestration inputs are explicit
     deps: MessageFactRefreshDeps,
     policy: MessageFactRefreshPolicy,
     *,
     now: int | None = None,
+    read_at_due: bool = True,
+    reaction_candidates: Sequence[_ReactionCandidate] | None = None,
     shutdown_event: asyncio.Event | None = None,
 ) -> MessageFactRefreshResult:
     """Refresh a bounded batch of optional message facts into SQLite."""
@@ -726,7 +1049,7 @@ async def refresh_message_facts_once(
         return MessageFactRefreshResult(reaction_refreshed=0)
 
     checked_at = int(time.time() if now is None else now)
-    if policy.read_at_max_messages_per_cycle > 0:
+    if policy.read_at_max_messages_per_cycle > 0 and read_at_due:
         stats = await _refresh_read_at_cycle(
             deps,
             policy,
@@ -742,6 +1065,7 @@ async def refresh_message_facts_once(
         policy,
         checked_at=checked_at,
         claim_at=claim_at,
+        candidates=reaction_candidates,
         shutdown_event=shutdown_event,
     )
 

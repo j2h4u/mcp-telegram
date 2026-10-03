@@ -17,6 +17,7 @@ from mcp_telegram.message_fact_refresh import (
     _claim_reaction_pages,
     _cutoff_backlog_suppressed,
     _next_release_at,
+    _reaction_page_candidate,
     _reaction_release_at,
     _read_at_candidates,
     _terminal_read_at_suppressed,
@@ -498,10 +499,230 @@ def test_open_reaction_pacing_boundary_does_not_hide_due_read_dates() -> None:
     conn.close()
 
 
+@pytest.mark.asyncio
+async def test_cached_retry_boundary_restarts_empty_sweep_when_due() -> None:
+    conn = _make_db()
+    _seed_reaction_candidates(conn, count=1)
+    conn.execute(
+        "UPDATE message_reaction_event_status SET status='partial', next_offset=NULL, next_attempt_at=120 "
+        "WHERE dialog_id=1 AND message_id=1"
+    )
+    conn.commit()
+    clock = [100]
+    calls: list[int] = []
+    adapter = MessageFactRefreshDemandAdapter(
+        MessageFactRefreshDeps(
+            conn,
+            cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
+            cast(TelegramReadReceiptGateway, object()),
+            clock=lambda: clock[0],
+        ),
+        MessageFactRefreshPolicy(10, 0, 0, 600, 5, 600),
+    )
+
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    before_due = adapter.status(119)
+    at_due = adapter.status(120)
+    clock[0] = 120
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert before_due is not None and before_due.release_at == 120
+    assert at_due is not None and at_due.release_at == 120
+    assert calls == [1]
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_late_page_partial_candidate_outranks_earlier_missing_candidate() -> None:
+    conn = _make_db()
+    _seed_reaction_candidates(conn, count=257)
+    conn.execute(
+        "UPDATE message_reaction_event_status SET status='partial', next_offset='page-token', "
+        "next_attempt_at=1 WHERE dialog_id=1 AND message_id=257"
+    )
+    conn.commit()
+    queries: list[str] = []
+    conn.set_trace_callback(queries.append)
+    calls: list[int] = []
+    adapter = MessageFactRefreshDemandAdapter(
+        MessageFactRefreshDeps(
+            conn,
+            cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
+            cast(TelegramReadReceiptGateway, object()),
+            clock=lambda: 100,
+        ),
+        MessageFactRefreshPolicy(1, 0, 0, 600, 1, 600),
+    )
+
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    assert calls == []
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert calls == [257]
+    page_queries = [query for query in queries if "WITH aggregate_page AS MATERIALIZED" in query]
+    assert len(page_queries) == 2
+    assert all("LIMIT 256" in query for query in page_queries)
+    conn.close()
+
+
 def test_due_reaction_window_without_pacing_reads_normal_release() -> None:
     conn = _make_db()
     _seed_reaction_candidates(conn, count=1)
     assert _reaction_release_at(conn, 100) == 0
+    conn.close()
+
+
+def test_terminal_reaction_does_not_hide_future_retry_release() -> None:
+    terminal = (1, 1, 1, 1, "synced", 1, 0, 100, 1, "unavailable", None, None, 50)
+    retry = (1, 2, 1, 1, "synced", 1, 0, 100, 1, "partial", None, 120, 50)
+
+    assert _reaction_page_candidate(terminal, now=100) is None
+    retry_entry = _reaction_page_candidate(retry, now=100)
+    assert retry_entry is not None
+    assert retry_entry == (120.0, None)
+
+
+def test_read_at_status_cache_keeps_release_without_requerying() -> None:
+    conn = _make_db()
+    conn.executescript(
+        """
+        INSERT INTO synced_dialogs VALUES (20, 'synced', 5);
+        INSERT INTO entities VALUES (20, 'user');
+        INSERT INTO messages VALUES (20, 1, 1000, 1, NULL, 0);
+        """
+    )
+    seed_full_history_enrollment(conn, 20, enabled=True)
+    queries: list[str] = []
+    conn.set_trace_callback(queries.append)
+    clock = [100]
+    deps = MessageFactRefreshDeps(
+        conn,
+        cast(ReactionDetailRefresher, object()),
+        cast(TelegramReadReceiptGateway, object()),
+        clock=lambda: clock[0],
+    )
+    adapter = MessageFactRefreshDemandAdapter(deps, _policy(reaction_max=0))
+
+    first = adapter.status(100)
+    second = adapter.status(101)
+    clock[0] = 160
+    third = adapter.status(160)
+    fourth = adapter.status(161)
+
+    assert first is not None and first.release_at == 0
+    assert second is not None and second.release_at == 0
+    assert third is not None and third.release_at == 0
+    assert fourth is not None and fourth.release_at == 0
+    assert sum("MIN(CASE WHEN f.dialog_id IS NULL" in query for query in queries) == 2
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_reaction_pages_have_bounded_vm_and_read_at_status_work() -> None:
+    conn = _make_db()
+    conn.executemany(
+        "INSERT INTO message_reaction_aggregate_state VALUES (?, ?, 1, 1, ?, 'history', 1, 1)",
+        ((dialog_id, message_id, message_id) for message_id in range(1, 6001) for dialog_id in (1,)),
+    )
+    conn.commit()
+    queries: list[str] = []
+    conn.set_trace_callback(queries.append)
+    clock = [100]
+    observations: list[Mapping[str, object]] = []
+    adapter = MessageFactRefreshDemandAdapter(
+        MessageFactRefreshDeps(
+            conn,
+            cast(ReactionDetailRefresher, object()),
+            cast(TelegramReadReceiptGateway, object()),
+            read_at_observer=observations.append,
+            clock=lambda: clock[0],
+        ),
+        MessageFactRefreshPolicy(1, 1, 0, 600, 1, 600),
+    )
+    work_calls = [0]
+
+    def limit_vm_work() -> int:
+        work_calls[0] += 1
+        return int(work_calls[0] > 200)
+
+    conn.set_progress_handler(limit_vm_work, 200)
+    maximum_page_callbacks = 0
+    for index in range(24):
+        work_calls[0] = 0
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        maximum_page_callbacks = max(maximum_page_callbacks, work_calls[0])
+        assert work_calls[0] <= 200
+        if index == 0:
+            adapter.status(101)
+            adapter.status(159)
+            clock[0] = 160
+            adapter.status(160)
+
+    conn.set_progress_handler(None, 0)
+    assert maximum_page_callbacks < 200
+    assert sum("MIN(CASE WHEN f.dialog_id IS NULL" in query for query in queries) == 2
+    assert not any("ORDER BY m.sent_at DESC" in query for query in queries)
+    assert observations == []
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_frozen_reaction_upper_and_claim_revalidation() -> None:
+    conn = _make_db()
+    conn.execute("INSERT INTO synced_dialogs VALUES (1, 'synced', NULL)")
+    seed_full_history_enrollment(conn, 1, enabled=True)
+    conn.execute("INSERT INTO entities VALUES (1, 'channel')")
+    conn.executemany(
+        "INSERT INTO message_reaction_aggregate_state VALUES (1, ?, 1, 1, ?, 'history', 1, 1)",
+        ((message_id, message_id) for message_id in range(1, 257)),
+    )
+    conn.commit()
+    calls: list[int] = []
+    clock = [0]
+    adapter = MessageFactRefreshDemandAdapter(
+        MessageFactRefreshDeps(
+            conn,
+            cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
+            cast(TelegramReadReceiptGateway, object()),
+            clock=lambda: clock[0],
+        ),
+        MessageFactRefreshPolicy(1, 0, 0, 600, 1, 600),
+    )
+
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    conn.execute("INSERT INTO message_reaction_aggregate_state VALUES (1, 257, 2, 1, 257, 'history', 1, 1)")
+    conn.execute("INSERT INTO messages VALUES (1, 257, 257, 0, NULL, 0)")
+    conn.commit()
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    assert calls == []
+    clock[0] = 60
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    assert calls == [257]
+
+    conn.close()
+    conn = _make_db()
+    _seed_reaction_candidates(conn, count=2)
+    conn.execute(
+        "UPDATE message_reaction_event_status SET status='partial', next_offset='fresh-offset', "
+        "next_attempt_at=1, aggregate_generation=1 WHERE dialog_id=1 AND message_id=1"
+    )
+    conn.execute("UPDATE message_reaction_aggregate_state SET generation=3 WHERE dialog_id=1 AND message_id=1")
+    conn.execute(
+        "UPDATE message_reaction_event_status SET status='partial', next_attempt_at=200 "
+        "WHERE dialog_id=1 AND message_id=2"
+    )
+    conn.execute("UPDATE reaction_detail_pacing_state SET release_at=0 WHERE singleton=1")
+    conn.commit()
+    selected = _claim_reaction_pages(
+        conn,
+        now=100,
+        max_pages=2,
+        cycle_seconds=600,
+        candidate_limit=2,
+        candidates=[(1, 1, 1, None), (1, 2, 1, None)],
+    )
+    assert selected == [(1, 1, 3, "fresh-offset")]
     conn.close()
 
 
