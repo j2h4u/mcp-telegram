@@ -282,6 +282,7 @@ ignore_decorators = [
 source = ["src/mcp_telegram"]
 branch = true
 sigterm = true
+patch = ["subprocess"]
 
 [tool.coverage.report]
 # Aggregate coverage is informational; per-function coverage feeds the CRAP gate.
