@@ -60,7 +60,9 @@ def install_daemon(monkeypatch: pytest.MonkeyPatch, handler: Callable[[Payload],
 
 
 @pytest.mark.asyncio
-async def test_pages_roles_reactions_service_admin_and_legacy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_pages_roles_reactions_service_admin_and_legacy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     calls: list[Payload] = []
 
     async def handler(p: Payload) -> Payload:
@@ -131,6 +133,9 @@ async def test_pages_roles_reactions_service_admin_and_legacy(monkeypatch: pytes
     assert set(summary) == {"messages", "admin_events", "reactors"}
     assert summary["messages"] == 4
     assert summary["reactors"] == 8
+    progress = capsys.readouterr().err
+    assert "admin events 2" in progress
+    assert "estimated history total 4" in progress
     assert [m["message_id"] for m in doc["messages"]] == ["2", "1", "2", "1"]
     assert doc["messages"][1]["kind"] == "service"
     message = cast(Payload, doc["messages"][0])

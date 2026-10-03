@@ -144,7 +144,12 @@ class _Export:
     def progress(self) -> None:
         elapsed = time.monotonic() - self.clock
         rate = self.counts["messages"] / elapsed if elapsed else 0
-        detail = f"; stage {self.stage}; enrichments {self.counts['enrichments']}"
+        detail = (
+            f"; stage {self.stage}; admin events {self.counts['admin_events']}"
+            f"; enrichments {self.counts['enrichments']}"
+        )
+        if self.total_hint is not None:
+            detail += f"; estimated history total {self.total_hint}"
         if self.wait_reason is not None:
             detail += f"; waiting: {self.wait_reason}; retry in {max(0, self.retry_at - time.monotonic()):.0f}s"
         if not self.history_finished and self.total_hint is not None and rate > 0:
