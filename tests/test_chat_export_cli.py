@@ -25,6 +25,7 @@ class Reactor(TypedDict):
 
 
 class Message(TypedDict):
+    text: str
     message_id: str
     kind: str
     reactors: list[Reactor]
@@ -210,13 +211,31 @@ async def test_history_failure_removes_temporary(monkeypatch: pytest.MonkeyPatch
     with pytest.raises(cli.ChatExportError, match="Access lost"):
         await cli.export_group(-1, tmp_path / "out")
     assert not list(tmp_path.glob(".*.tmp"))
-    assert not (tmp_path / "out").exists()
+    assert json.loads((tmp_path / "out").read_text())["messages"] == []
+    assert (tmp_path / ".out.resume.sqlite3").exists()
 
 
 @pytest.mark.asyncio
 async def test_million_messages_remain_bounded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """A million records stay paged; inspect output in chunks, never json.load."""
     million = 1_000_000
+    original_init = cli.Checkpoint.__init__
+
+    def fast_init(self: cli.Checkpoint, path: Path) -> None:
+        original_init(self, path)
+        # Durability uses real FULL commits in the interruption tests; this checks memory only.
+        self.db.execute("PRAGMA synchronous=OFF")
+
+    monkeypatch.setattr(cli.Checkpoint, "__init__", fast_init)
+
+    def fast_save(  # noqa: PLR0913 -- monkeypatch must preserve Checkpoint.save signature
+        self: cli.Checkpoint, kind: str, peer: int, identifier: int, payload: str, cursor_key: str
+    ) -> None:
+        # Synthetic memory stress commits at the normal page marker; real crash tests commit each record.
+        self.db.execute("INSERT OR REPLACE INTO records VALUES (?,?,?,?)", (kind, peer, identifier, payload))
+        self.set_state(cursor_key, identifier)
+
+    monkeypatch.setattr(cli.Checkpoint, "save", fast_save)
     max_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 
     async def handler(p: Payload) -> Payload:
@@ -408,3 +427,357 @@ async def test_unavailable_current_role_keeps_identity_with_null_role(monkeypatc
     install_daemon(monkeypatch, handler)
     identity = await cli._Export(-1).identity({"id": 5, "kind": "user", "first_name": "Alice"}, -1)
     assert identity == {"id": 5, "kind": "user", "first_name": "Alice", "role": None, "is_admin": None}
+
+
+def minimal_message(peer: object, identifier: int, text: str = "") -> Payload:
+    return {
+        "id": identifier,
+        "dialog_id": peer,
+        "kind": "message",
+        "raw": {"message": text},
+        "author": None,
+        "reactions": {"status": "known_empty", "can_view_list": False},
+    }
+
+
+@pytest.mark.asyncio
+async def test_committed_records_survive_failure_and_resume_frozen_boundary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[Payload] = []
+    fail = True
+
+    async def handler(p: Payload) -> Payload:
+        calls.append(p)
+        if p["operation"] == "open":
+            data = {"group": {"dialog_id": -1}, "upper_id": 4, "migrated_from_dialog_id": None}
+        elif p["operation"] == "admin_log":
+            data = {"items": [], "done": True, "status": "complete"}
+        elif fail and p["before_id"]:
+            raise cli.ChatExportError("lost connection")
+        else:
+            ids = [4, 3] if not p["before_id"] else [2, 1]
+            data = {
+                "items": [minimal_message(-1, i) for i in ids],
+                "next_before_id": ids[-1],
+                "done": bool(p["before_id"]),
+            }
+        return {"ok": True, "data": data}
+
+    install_daemon(monkeypatch, handler)
+    output = tmp_path / "out.json"
+    with pytest.raises(cli.ChatExportError):
+        await cli.export_group(-1, output)
+    assert [m["message_id"] for m in cast(ExportDocument, json.loads(output.read_text()))["messages"]] == ["4", "3"]
+    checkpoint = tmp_path / ".out.json.resume.sqlite3"
+    assert checkpoint.exists() and checkpoint.stat().st_mode & 0o777 == 0o600
+    calls.clear()
+    fail = False
+    await cli.export_group(-1, output)
+    assert [p["operation"] for p in calls] == ["history"]
+    assert calls[0]["before_id"] == 3 and calls[0]["upper_id"] == 4
+    assert [m["message_id"] for m in cast(ExportDocument, json.loads(output.read_text()))["messages"]] == [
+        "4",
+        "3",
+        "2",
+        "1",
+    ]
+    assert not checkpoint.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refresh", [0, 2])
+async def test_incremental_keeps_old_history_and_refreshes_recent_deletions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, refresh: int
+) -> None:
+    phase = "base"
+    calls: list[Payload] = []
+
+    async def handler(p: Payload) -> Payload:
+        calls.append(p)
+        if p["operation"] == "open":
+            data = {
+                "group": {"dialog_id": -1},
+                "upper_id": 5 if phase == "base" else 7,
+                "migrated_from_dialog_id": None,
+            }
+        elif p["operation"] == "admin_log":
+            data = {"items": [], "done": True, "status": "complete"}
+        else:
+            ids = [5, 4, 3, 2, 1] if phase == "base" else [7, 6, 5, 3, 2, 1]
+            ids = [i for i in ids if i > cast(int, p["min_id"])]
+            data = {
+                "items": [minimal_message(-1, i, "old" if phase == "base" else "edited") for i in ids],
+                "next_before_id": ids[-1] if ids else 0,
+                "done": True,
+            }
+        return {"ok": True, "data": data}
+
+    install_daemon(monkeypatch, handler)
+    base = tmp_path / "base.json"
+    await cli.export_group(-1, base)
+    original = base.read_bytes()
+    phase = "update"
+    calls.clear()
+    output = tmp_path / "new.json"
+    await cli.export_group(-1, output, update_from=base, refresh_messages=refresh)
+    assert base.read_bytes() == original
+    messages = cast(ExportDocument, json.loads(output.read_text()))["messages"]
+    assert [m["message_id"] for m in messages] == (
+        ["7", "6", "5", "4", "3", "2", "1"] if refresh == 0 else ["7", "6", "5", "3", "2", "1"]
+    )
+    assert messages[-1]["text"] == "old"
+    assert messages[2]["text"] == ("old" if refresh == 0 else "edited")
+    assert next(p for p in calls if p["operation"] == "history")["min_id"] == (5 if refresh == 0 else 3)
+
+
+@pytest.mark.asyncio
+async def test_cancel_mid_record_keeps_only_complete_records(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    waiting = asyncio.Event()
+
+    async def handler(p: Payload) -> Payload:
+        if p["operation"] == "open":
+            data = {"group": {"dialog_id": -1}, "upper_id": 2, "migrated_from_dialog_id": None}
+        elif p["operation"] == "admin_log":
+            data = {"items": [], "done": True, "status": "complete"}
+        elif p["operation"] == "participant":
+            waiting.set()
+            await asyncio.Event().wait()
+            return {}
+        else:
+            second = minimal_message(-1, 1)
+            second["author"] = {"id": 5, "kind": "user"}
+            data = {"items": [minimal_message(-1, 2), second], "done": True}
+        return {"ok": True, "data": data}
+
+    install_daemon(monkeypatch, handler)
+    output = tmp_path / "out.json"
+    task = asyncio.create_task(cli.export_group(-1, output))
+    await waiting.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [m["message_id"] for m in cast(ExportDocument, json.loads(output.read_text()))["messages"]] == ["2"]
+    assert (tmp_path / ".out.json.resume.sqlite3").exists()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("format_version", True),
+        ("format_version", "1"),
+        ("messages", None),
+        ("messages", {}),
+        ("messages", [None]),
+        ("admin_events", [42]),
+    ],
+)
+def test_malformed_incremental_base_rejected(tmp_path: Path, field: str, value: object) -> None:
+    doc: Payload = {
+        "format_version": 1,
+        "group": {"dialog_id": "-1"},
+        "metadata": {"order": cli.ORDER, "peers": [{"dialog_id": "-1"}]},
+        "admin_events": [],
+        "messages": [],
+        "export": {"messages": 0, "admin_events": 0, "reactors": 0},
+    }
+    doc[field] = value
+    source = tmp_path / "base.json"
+    source.write_text(json.dumps(doc))
+    with pytest.raises(ValueError):
+        cli.census(source, 100)
+
+
+@pytest.mark.asyncio
+async def test_sigkill_recovers_real_committed_records(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import subprocess
+    import sys
+
+    output = tmp_path / "killed.json"
+    script = """
+import asyncio, os, signal, sys
+from pathlib import Path
+from mcp_telegram import chat_export_cli as cli
+async def request(self, operation, peer, **kwargs):
+    if operation == 'open':
+        return {'group': {'dialog_id': -1}, 'upper_id': 3, 'migrated_from_dialog_id': None}
+    if operation == 'admin_log':
+        return {'items': [], 'done': True, 'status': 'complete'}
+    if kwargs['before_id']:
+        os.kill(os.getpid(), signal.SIGKILL)
+    return {'items': [{'id': i, 'dialog_id': -1, 'kind': 'message', 'raw': {}, 'author': None,
+        'reactions': {'status': 'known_empty', 'can_view_list': False}} for i in [3, 2]],
+        'next_before_id': 2, 'done': False}
+cli._Export.request = request
+asyncio.run(cli.export_group(-1, Path(sys.argv[1])))
+"""
+    result = subprocess.run([sys.executable, "-c", script, str(output)], capture_output=True, check=False)
+    assert result.returncode < 0
+    assert not output.exists()
+    calls: list[Payload] = []
+
+    async def handler(p: Payload) -> Payload:
+        calls.append(p)
+        assert p["operation"] == "history" and p["before_id"] == 2 and p["upper_id"] == 3
+        return {"ok": True, "data": {"items": [minimal_message(-1, 1)], "done": True}}
+
+    install_daemon(monkeypatch, handler)
+    await cli.export_group(-1, output)
+    assert [m["message_id"] for m in cast(ExportDocument, json.loads(output.read_text()))["messages"]] == [
+        "3",
+        "2",
+        "1",
+    ]
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_transient_ipc_retries_without_repeating_committed_records(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts = 0
+
+    async def handler(p: Payload) -> Payload:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise cli.DaemonNotRunningError("stalled", kind="response_timeout")
+        return {"ok": True, "data": {"items": [], "done": True}}
+
+    async def defer(self: cli._Export, data: Payload) -> None:
+        assert data["retry_after"] in {1, 2}
+
+    install_daemon(monkeypatch, handler)
+    monkeypatch.setattr(cli._Export, "defer", defer)
+    await cli._Export(-1).request("history", -1, before_id=2, upper_id=3)
+    assert attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_unfinished_base_is_rejected_without_telegram(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    base = tmp_path / "base.json"
+    base.write_text("{}")
+    (tmp_path / ".base.json.resume.sqlite3").touch()
+
+    async def handler(p: Payload) -> Payload:
+        pytest.fail("Incomplete base must fail before Telegram requests")
+
+    install_daemon(monkeypatch, handler)
+    with pytest.raises(cli.ChatExportError, match="incomplete"):
+        await cli.export_group(-1, tmp_path / "new.json", update_from=base)
+    assert base.read_text() == "{}"
+
+
+@pytest.mark.asyncio
+async def test_export_rejects_concurrent_owner(tmp_path: Path) -> None:
+    import fcntl
+
+    output = tmp_path / "locked.json"
+    with (tmp_path / ".locked.json.resume.sqlite3").open("wb") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(BlockingIOError):
+            await cli.export_group(-1, output)
+    assert not output.exists()
+
+
+@pytest.mark.asyncio
+async def test_directory_filenames_use_group_id_and_preserve_completed_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def handler(p: Payload) -> Payload:
+        identifier = -1001 if p["dialog_id"] == "@one" else -1002
+        return {"ok": True, "data": {"group": {"dialog_id": identifier, "title": "Same title"}}}
+
+    install_daemon(monkeypatch, handler)
+    one = await cli.choose_output_directory("@one", tmp_path)
+    two = await cli.choose_output_directory("@two", tmp_path)
+    assert one.name == "telegram-group--1001.json"
+    assert two.name == "telegram-group--1002.json"
+    one.write_text("valuable export")
+    again = await cli.choose_output_directory("@one", tmp_path)
+    assert again.name == "telegram-group--1001.2.json"
+    assert one.read_text() == "valuable export"
+
+
+@pytest.mark.asyncio
+async def test_directory_selection_resumes_only_matching_owned_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def handler(p: Payload) -> Payload:
+        return {"ok": True, "data": {"group": {"dialog_id": -1}}}
+
+    install_daemon(monkeypatch, handler)
+    for identifier, number, selector in [(-1, 1, "@different"), (-1, 2, "@one"), (-100, 1, "@one")]:
+        suffix = "" if number == 1 else f".{number}"
+        output = tmp_path / f"telegram-group-{identifier}{suffix}.json"
+        checkpoint = cli.Checkpoint(output.with_name(f".{output.name}.resume.sqlite3"))
+        checkpoint.mark(
+            "options",
+            {"selector": selector, "output": str(output.resolve()), "update_from": None, "refresh_messages": 100},
+        )
+        checkpoint.db.close()
+    chosen = await cli.choose_output_directory("@one", tmp_path)
+    assert chosen.name == "telegram-group--1.2.json"
+    other = await cli.choose_output_directory("@new", tmp_path)
+    assert other.name == "telegram-group--1.3.json"
+
+
+@pytest.mark.asyncio
+async def test_directory_selection_recovers_hot_rollback_journal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import subprocess
+    import sys
+
+    output = tmp_path / "telegram-group--1.json"
+    sidecar = tmp_path / ".telegram-group--1.json.resume.sqlite3"
+    script = """
+import os, signal, sys
+from pathlib import Path
+from mcp_telegram.chat_export_checkpoint import Checkpoint
+checkpoint = Checkpoint(Path(sys.argv[1]))
+checkpoint.mark('options', {'selector': '@one', 'output': sys.argv[2], 'update_from': None,
+                           'refresh_messages': 100})
+checkpoint.mark('committed', True)
+checkpoint.db.execute('PRAGMA cache_size=1')
+checkpoint.db.execute('BEGIN IMMEDIATE')
+checkpoint.db.execute("UPDATE state SET value='false' WHERE key='committed'")
+for identifier in range(1000):
+    checkpoint.db.execute('INSERT INTO records VALUES (?,?,?,?)', ('message', -1, identifier, 'x' * 4096))
+os.kill(os.getpid(), signal.SIGKILL)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(sidecar), str(output.resolve())], capture_output=True, check=False
+    )
+    assert result.returncode < 0
+    assert sidecar.with_name(sidecar.name + "-journal").exists()
+
+    async def handler(p: Payload) -> Payload:
+        return {"ok": True, "data": {"group": {"dialog_id": -1}}}
+
+    install_daemon(monkeypatch, handler)
+    assert await cli.choose_output_directory("@one", tmp_path) == output
+    recovered = cli.Checkpoint(sidecar)
+    try:
+        assert recovered.state("committed") is True
+        assert recovered.db.execute("SELECT count(*) FROM records").fetchone()[0] == 0
+    finally:
+        recovered.db.close()
+
+
+@pytest.mark.asyncio
+async def test_directory_selection_reports_active_export_instead_of_starting_another(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import fcntl
+
+    sidecar = tmp_path / ".telegram-group--1.json.resume.sqlite3"
+    checkpoint = cli.Checkpoint(sidecar)
+    checkpoint.db.close()
+
+    async def handler(p: Payload) -> Payload:
+        return {"ok": True, "data": {"group": {"dialog_id": -1}}}
+
+    install_daemon(monkeypatch, handler)
+    with sidecar.open("rb") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(FileExistsError, match="already running"):
+            await cli.choose_output_directory("@one", tmp_path)
