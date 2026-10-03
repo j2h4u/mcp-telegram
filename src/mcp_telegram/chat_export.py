@@ -31,7 +31,7 @@ from .telegram_rpc_scheduler import (
     rpc_attempt_budget,
 )
 
-EXPORT_OPERATION_SECONDS = 60.0
+EXPORT_OPERATION_SECONDS = 360.0
 EXPORT_RESPONSE_BYTES = 1_000_000
 EXPORT_ATTEMPTS = 6
 CHANNEL_ID_OFFSET = 1000000000000
@@ -633,10 +633,13 @@ async def export_operation(  # noqa: PLR0911 - explicit transport outcomes keep 
         return {"ok": False, "error": "export_failed", "reason": "admission_closed"}
     except RpcAdmissionError:
         return {"ok": False, "error": "export_deferred", "reason": "admission", "retry_after": 5.0}
+    except TimeoutError as exc:
+        _log_export_failure(operation, exc)
+        return {"ok": False, "error": "export_deferred", "reason": "operation_timeout", "retry_after": 5}
     except _InvalidPageError as exc:
         _log_export_failure(operation, exc)
         return _failed_export("invalid_response")
-    except (RPCError, TimeoutError, OSError, ValueError, RpcAttemptBudgetExhaustedError) as exc:
+    except (RPCError, OSError, ValueError, RpcAttemptBudgetExhaustedError) as exc:
         reason = describe_telegram_rpc_error(exc).error_type
         _log_export_failure(operation, exc)
         return _export_failure(operation, reason)
