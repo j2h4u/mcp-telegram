@@ -141,11 +141,9 @@ async def test_pages_roles_reactions_service_admin_and_legacy(
     summary = await cli.export_group(-1, output)
     doc = cast(ExportDocument, json.loads(output.read_text()))
     assert set(summary) == {"messages", "admin_events", "reactors"}
-    assert summary["messages"] == 4
-    assert summary["reactors"] == 8
+    assert (summary["messages"], summary["reactors"]) == (4, 8)
     progress = capsys.readouterr().err
-    assert "admin events 2" in progress
-    assert "estimated history total 4" in progress
+    assert "admin events 2" in progress and "estimated history total 4" in progress
     if inline_reactors:
         assert not any(call["operation"] == "reactions" for call in calls)
         assert "items" not in cast(Payload, cast(Payload, doc["messages"][0])["reactions"])
