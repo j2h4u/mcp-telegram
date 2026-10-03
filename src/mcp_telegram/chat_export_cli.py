@@ -12,6 +12,15 @@ from contextlib import suppress
 from pathlib import Path
 from typing import TextIO, cast
 
+from .chat_export_projection import (
+    clean_facts as _facts,
+)
+from .chat_export_projection import (
+    project_admin_event,
+    project_group,
+    project_message,
+    project_reactor,
+)
 from .daemon_client import daemon_connection
 
 MIN_RETRY_SECONDS = 0.1
@@ -28,10 +37,6 @@ def _object(value: object) -> Payload:
     if not isinstance(value, dict):
         raise ChatExportError("Malformed export response: expected object")
     return cast(Payload, value)
-
-
-def _facts(data: Payload) -> Payload:
-    return {key: value for key, value in data.items() if key not in {"observed_at", "status", "source", "reason"}}
 
 
 def _integer(value: object) -> int:
@@ -125,7 +130,7 @@ class _Export:
 
     def __init__(self, dialog_id: int | str) -> None:
         self.selector = dialog_id
-        self.dialog_id = 0
+        self.dialog_id = dialog_id if isinstance(dialog_id, int) else 0
         self.clock = time.monotonic()
         self.counts = {"messages": 0, "admin_events": 0, "reactors": 0, "enrichments": 0}
         self.roles: OrderedDict[tuple[int, int], Payload] = OrderedDict()
@@ -195,7 +200,7 @@ class _Export:
         result = _facts(_object(identity))
         if result.get("kind") != "user":
             return result
-        data = await self.role(peer_id, _integer(result.get("id")))
+        data = await self.role(self.dialog_id, _integer(result.get("id")))
         participant = data.get("participant")
         if participant is not None:
             result.update(_facts(_object(participant)))
@@ -230,7 +235,7 @@ class _Export:
             reactor["peer"] = await self.identity(reactor.get("peer"), peer_id)
             if fetched:
                 stream.write(",")
-            _dump(stream, reactor)
+            _dump(stream, project_reactor(reactor))
             fetched += 1
             self.counts["reactors"] += 1
         return fetched
@@ -268,7 +273,7 @@ class _Export:
         await self.topic(message, peer_id)
         reactions = _object(message.pop("reactions"))
         stream.write("{")
-        for name, value in message.items():
+        for name, value in project_message(message).items():
             _field(stream, name, value)
             stream.write(",")
         await self.reactions(stream, reactions, peer_id, message_id)
@@ -321,7 +326,7 @@ class _Export:
             await self.related_users(event, self.dialog_id)
             if not first:
                 stream.write(",")
-            _dump(stream, event)
+            _dump(stream, project_admin_event(event, self.dialog_id))
             first = False
             self.counts["admin_events"] += 1
         return last, first
@@ -345,22 +350,22 @@ class _Export:
     async def write(self, stream: TextIO) -> Payload:
         peers = await self.open_peers()
         stream.write('{"format_version":1,"group":')
-        _dump(stream, _facts(_object(peers[0]["group"])))
+        _dump(stream, project_group(_object(peers[0]["group"])))
         stream.write(',"metadata":')
         _dump(
             stream,
             {
                 "order": "newest_to_oldest within each peer; primary then migrated predecessors",
-                "peers": [_facts(_object(peer["group"])) for peer in peers],
+                "peers": [project_group(_object(peer["group"])) for peer in peers],
             },
         )
-        stream.write(',"messages":[')
+        stream.write(',"admin_events":[')
+        await self.admin_log(stream)
+        stream.write('],"messages":[')
         first = True
         for peer in peers:
             first = await self.history_peer(stream, peer, first)
         self.history_finished = True
-        stream.write('],"admin_events":[')
-        await self.admin_log(stream)
         summary = self.summary()
         stream.write('],"export":')
         _dump(stream, summary)

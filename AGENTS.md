@@ -43,6 +43,7 @@ MCP serving code uses daemon APIs and read-only DB access for lightweight querie
 - `telegram.py` — TelegramClient factory and auth flows
 - `__init__.py` — CLI entrypoint: `logout`, `sync`, `serve`, `feedback`
 - `chat_export_cli.py` — rare `export-chat` command: streamed JSON, progress, atomic publication
+- `chat_export_projection.py` — pure Pandas-oriented JSON projector over shared Telegram facts
 - `chat_export.py` — finite BACKGROUND export operations through the daemon's RPC client; no archive writes
 - `message_composition.py` — shared complete formatting/service facts for sync, ordinary reading and export
 

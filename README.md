@@ -322,6 +322,31 @@ Messages are newest first per peer, with migrated predecessors retaining their
 own IDs; admin events have a separate source-labelled array. Each peer has a
 frozen upper message ID.
 
+Each `messages` record has scalar author, date, text and reply columns for
+analysis. IDs are strings; join replies using `reply_to_dialog_id` and
+`reply_to_message_id` against `dialog_id` and `message_id`. Formatting,
+service actions, reactors and additional Telegram metadata remain nested.
+Administrator roles describe the current target group, including for messages
+from a migrated predecessor. The separate JSON projector does not change how
+Telegram data is acquired or stored.
+
+For an export that fits in memory:
+
+```python
+import json
+import pandas as pd
+
+with open("group.json", encoding="utf-8") as source:
+    export = json.load(source)
+messages = pd.DataFrame(export["messages"])
+conversation = messages[messages["kind"] == "message"]
+activity = conversation.groupby("author_id").size().sort_values(ascending=False)
+replies = conversation[conversation["reply_to_message_id"].notna()]
+```
+
+For very large exports, extract records in chunks before loading them into
+Pandas; the exporter itself keeps only bounded pages and caches in memory.
+
 This is a rare independent operation: it does not enroll the group or populate
 the local archive. All acquisition uses the daemon's shared RPC protections at
 background priority. Progress, waits and approximate history ETA go to stderr.

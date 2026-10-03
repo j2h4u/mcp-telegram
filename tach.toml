@@ -951,7 +951,12 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.chat_export_cli"
 layer = "delivery"
-depends_on = ["mcp_telegram.daemon_client"]
+depends_on = ["mcp_telegram.chat_export_projection", "mcp_telegram.daemon_client"]
+
+[[modules]]
+path = "mcp_telegram.chat_export_projection"
+layer = "foundation"
+depends_on = []
 
 [[modules]]
 path = "mcp_telegram.chat_export"

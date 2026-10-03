@@ -21,18 +21,18 @@ class Identity(TypedDict):
 
 
 class Reactor(TypedDict):
-    peer: Identity
+    actor_role: str
 
 
 class Message(TypedDict):
-    id: int
+    message_id: str
     kind: str
     reactors: list[Reactor]
     related_users: list[Identity]
 
 
 class AdminEvent(TypedDict):
-    actor: Identity
+    actor_is_admin: bool
 
 
 class Metadata(TypedDict):
@@ -131,20 +131,20 @@ async def test_pages_roles_reactions_service_admin_and_legacy(monkeypatch: pytes
     assert set(summary) == {"messages", "admin_events", "reactors"}
     assert summary["messages"] == 4
     assert summary["reactors"] == 8
-    assert [m["id"] for m in doc["messages"]] == [2, 1, 2, 1]
+    assert [m["message_id"] for m in doc["messages"]] == ["2", "1", "2", "1"]
     assert doc["messages"][1]["kind"] == "service"
     message = cast(Payload, doc["messages"][0])
     assert message["date"] == "2026-10-03T10:00:00+00:00"
-    assert cast(Payload, message["raw"])["message"] == "Юникод"
-    author = cast(Payload, message["author"])
-    assert author["rank"] == "Moderator"
-    assert "status" not in author
+    assert message["text"] == "Юникод"
+    assert "message" not in cast(Payload, message["metadata"])
+    assert message["author_rank"] == "Moderator"
+    assert message["author_id"] == "5"
     assert "status" not in cast(Payload, message["reactions"])
     assert "source" not in cast(Payload, doc["admin_events"][0])
-    assert doc["messages"][0]["reactors"][0]["peer"]["role"] == "admin"
-    assert doc["admin_events"][0]["actor"]["is_admin"] is True
+    assert doc["messages"][0]["reactors"][0]["actor_role"] == "admin"
+    assert doc["admin_events"][0]["actor_is_admin"] is True
     assert doc["messages"][0].get("topic") is None
-    assert len([c for c in calls if c["operation"] == "participant"]) == 2
+    assert [c["dialog_id"] for c in calls if c["operation"] == "participant"] == [-1]
     assert not list(tmp_path.glob(".*.tmp"))
 
 
@@ -186,6 +186,8 @@ async def test_history_failure_removes_temporary(monkeypatch: pytest.MonkeyPatch
     async def handler(p: Payload) -> Payload:
         if p["operation"] == "open":
             return {"ok": True, "data": {"group": {"dialog_id": -1}, "upper_id": 1, "migrated_from_dialog_id": None}}
+        if p["operation"] == "admin_log":
+            return {"ok": True, "data": {"items": [], "next_before_id": 0, "done": True, "status": "complete"}}
         return {"ok": False, "error": "history_unavailable", "message": "Access lost"}
 
     install_daemon(monkeypatch, handler)
@@ -376,9 +378,9 @@ async def test_exact_url_resolves_once_then_uses_canonical_numeric_peer(
     output = tmp_path / "guild.json"
     await cli.export_group(selector, output)
     doc = cast(ExportDocument, json.loads(output.read_text()))
-    assert doc["group"]["dialog_id"] == canonical
-    assert doc["metadata"]["peers"][0]["dialog_id"] == canonical
-    assert [p["operation"] for p in calls] == ["open", "history", "admin_log"]
+    assert doc["group"]["dialog_id"] == str(canonical)
+    assert doc["metadata"]["peers"][0]["dialog_id"] == str(canonical)
+    assert [p["operation"] for p in calls] == ["open", "admin_log", "history"]
 
 
 @pytest.mark.asyncio
