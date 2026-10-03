@@ -153,7 +153,9 @@ class _Export:
         if self.wait_reason is not None:
             detail += f"; waiting: {self.wait_reason}; retry in {max(0, self.retry_at - time.monotonic()):.0f}s"
         if not self.history_finished and self.total_hint is not None and rate > 0:
-            detail += f"; approximate history ETA {max(0, self.total_hint - self.counts['messages']) / rate:.0f}s"
+            seconds = round(max(0, self.total_hint - self.counts["messages"]) / rate)
+            hours, remainder = divmod(seconds, 3600)
+            detail += f"; approximate history ETA {hours}h{remainder // 60:02d}m ({seconds}s)"
         print(
             f"Export: {self.counts['messages']} messages; {rate:.1f}/s; elapsed {elapsed:.0f}s{detail}", file=sys.stderr
         )
