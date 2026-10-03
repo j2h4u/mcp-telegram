@@ -23,6 +23,7 @@ from .hydration_queue import (
     HydrationQueueSummary,
 )
 from .messages.sqlite_hydration_jobs import (
+    HydrationRepairCursor,
     repair_media_metadata_hydration_jobs,
     repair_transcription_hydration_jobs,
 )
@@ -308,6 +309,9 @@ class MessageFactHydrationWorker:
         self._clock = clock
         self._interval_seconds = interval_seconds
         self.next_repair_at = clock()
+        self._repair_cursors: tuple[
+            HydrationRepairCursor | None, HydrationRepairCursor | None, HydrationRepairCursor | None
+        ] = (None, None, None)
         if backfill_debt_limit <= 0:
             raise ValueError("fact hydration backfill_debt_limit must be positive")
         self._queue = HydrationQueueRepository(conn)
@@ -324,6 +328,7 @@ class MessageFactHydrationWorker:
         effective_now = int(clock_now)
         if priority is HydrationPriority.BACKFILL:
             self._run_due_repairs(clock_now, effective_now)
+            effective_now = int(self._clock())
         if budget.exhausted:
             return
         per_kind = {
@@ -359,28 +364,36 @@ class MessageFactHydrationWorker:
     def _run_due_repairs(self, clock_now: float, effective_now: int) -> None:
         if clock_now < self.next_repair_at:
             return
-        has_more = self._run_repair_producers(effective_now)
+        has_more, cursors = self._run_repair_producers(effective_now)
         # Commit repair work before the slice can await Telegram or yield on its budget.
         self._conn.commit()
-        self.next_repair_at = clock_now if has_more else clock_now + self._interval_seconds
+        self._repair_cursors = cursors if has_more else (None, None, None)
+        self.next_repair_at = clock_now if has_more else self._clock() + self._interval_seconds
 
-    def _run_repair_producers(self, effective_now: int) -> bool:
+    def _run_repair_producers(
+        self, effective_now: int
+    ) -> tuple[bool, tuple[HydrationRepairCursor | None, HydrationRepairCursor | None, HydrationRepairCursor | None]]:
         has_more = False
+        transcription_cursor, contact_other_cursor, video_cursor = self._repair_cursors
         if TRANSCRIPTION_HYDRATION_KIND in self._handlers:
-            has_more = repair_transcription_hydration_jobs(
-                self._conn, due_at=effective_now, max_jobs=self._max_jobs_per_cycle
-            ).has_more
+            transcription = repair_transcription_hydration_jobs(
+                self._conn, due_at=effective_now, max_jobs=self._max_jobs_per_cycle, cursor=transcription_cursor
+            )
+            has_more = transcription.has_more
+            transcription_cursor = transcription.next_cursor
         media_handler = self._handlers.get(MEDIA_METADATA_KIND)
         if media_handler is not None:
-            has_more = (
-                repair_media_metadata_hydration_jobs(
-                    self._conn,
-                    due_at=effective_now,
-                    max_jobs=min(media_handler.batch_size, self._max_jobs_per_cycle),
-                ).has_more
-                or has_more
+            media = repair_media_metadata_hydration_jobs(
+                self._conn,
+                due_at=effective_now,
+                max_jobs=min(media_handler.batch_size, self._max_jobs_per_cycle),
+                contact_other_cursor=contact_other_cursor,
+                video_cursor=video_cursor,
             )
-        return has_more
+            has_more = media.has_more or has_more
+            contact_other_cursor = media.next_contact_other_cursor
+            video_cursor = media.next_video_cursor
+        return has_more, (transcription_cursor, contact_other_cursor, video_cursor)
 
     async def _process_batch(  # noqa: PLR0911 - each transport outcome owns one durable recovery path
         self,
@@ -396,7 +409,10 @@ class MessageFactHydrationWorker:
             return _BatchOutcome(dropped=len(preflight_observations))
         attempts_before_request = None if attempt_budget is None else attempt_budget.attempts
         try:
-            result = await self._request_batch(handler, started, attempt_budget=attempt_budget)
+            try:
+                result = await self._request_batch(handler, started, attempt_budget=attempt_budget)
+            finally:
+                effective_now = int(self._clock())
         except TelegramRpcAdmissionDeferred as exc:
             return self._handle_admission_rejection(handler, batch, started, preflight_observations, exc, effective_now)
         except TelegramRpcThrottled as exc:
@@ -426,7 +442,7 @@ class MessageFactHydrationWorker:
             return self._handle_request_error(handler, batch, started, preflight_observations, exc, effective_now)
 
         applied = handler.apply(self._conn, self._queue, started, result, now=effective_now)
-        return self._finish_applied(handler, batch, started, preflight_observations, applied, effective_now)
+        return self._finish_applied(handler, batch, started, preflight_observations, applied, int(self._clock()))
 
     async def _request_batch(
         self,

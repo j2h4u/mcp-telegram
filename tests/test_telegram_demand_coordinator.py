@@ -96,7 +96,7 @@ def test_startup_uses_explicit_order_and_full_authoritative_scan() -> None:
     assert all(adapter.status_calls == [100.0] for adapter in adapters.values())
 
 
-def test_offer_coalesces_and_performs_one_full_scan() -> None:
+def test_offer_coalesces_without_scanning_adapters() -> None:
     clock = _Clock()
     adapters = _adapters()
     coordinator = TelegramDemandCoordinator(adapters, clock=clock)
@@ -106,7 +106,31 @@ def test_offer_coalesces_and_performs_one_full_scan() -> None:
     assert coordinator.offer(target) is True
     assert [coordinator.offer(target) for _ in range(1_000)] == [False] * 1_000
     assert coordinator.offered_kinds == frozenset({target})
-    assert all(len(adapter.status_calls) == 2 for adapter in adapters.values())
+    assert all(len(adapter.status_calls) == 1 for adapter in adapters.values())
+
+
+@pytest.mark.asyncio
+async def test_offer_wakes_pump_to_scan_and_run_new_state() -> None:
+    target = DURABLE_DEMAND_ORDER[0]
+    shutdown = asyncio.Event()
+    adapters = _adapters()
+    coordinator = TelegramDemandCoordinator(adapters, shutdown, clock=_Clock())
+
+    async def finish() -> None:
+        adapters[target].current_status = None
+        shutdown.set()
+
+    adapters[target].on_run = finish
+    task = asyncio.create_task(coordinator.run())
+    await asyncio.sleep(0)
+    adapters[target].current_status = DemandStatus(release_at=100)
+    calls_before_offer = len(adapters[target].status_calls)
+    assert coordinator.offer(target)
+    assert len(adapters[target].status_calls) == calls_before_offer
+    await task
+
+    assert len(adapters[target].run_calls) == 1
+    assert len(adapters[target].status_calls) > calls_before_offer
 
 
 @pytest.mark.asyncio
@@ -126,7 +150,7 @@ async def test_scan_preserves_fifo_positions_and_tail_rotates_after_slice() -> N
     coordinator = TelegramDemandCoordinator(adapters, shutdown, clock=clock)
     assert coordinator.ready_kinds == (first, second)
     await coordinator.run()
-    assert coordinator.ready_kinds == (second, first)
+    assert coordinator.ready_kinds == (second,)
 
 
 @pytest.mark.asyncio
@@ -400,7 +424,7 @@ async def test_suspended_discovery_does_not_spin_coordinator_and_restore_reoffer
     assert len(callback_adapter.run_calls) == 1
     assert callback_offers == [True]
     assert client.requests == []
-    assert DemandKind.SCHEDULED_DISCOVERY in coordinator.ready_kinds
+    assert DemandKind.SCHEDULED_DISCOVERY not in coordinator.ready_kinds
     assert discovery.status(clock.value + 1) == DemandStatus(release_at=0.0, freshness_deadline=float(now))
     conn.close()
 

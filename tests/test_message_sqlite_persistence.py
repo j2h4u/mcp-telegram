@@ -31,8 +31,10 @@ from mcp_telegram.messages.sqlite_hydration_jobs import (
     _REPAIR_MEDIA_METADATA_VIDEO_SQL,
     _REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL,
     _TRANSCRIBABLE_MEDIA_SQL,
+    HydrationRepairCursor,
     TranscriptionHydrationRepair,
     _is_transcribable_media_pair,
+    _repair_raw_page,
     reconcile_fact_hydration_jobs_for_dialog,
     repair_media_metadata_hydration_jobs,
     repair_transcription_hydration_jobs,
@@ -270,25 +272,47 @@ def test_media_metadata_repair_is_bounded_newest_first_and_terminal_safe(conn: s
     conn.commit()
 
     first = repair_media_metadata_hydration_jobs(conn, due_at=900, max_jobs=2)
-    assert first == type(first)(has_more=True)
-    assert conn.execute(
-        "SELECT message_id, priority, message_sent_at, terminal FROM hydration_jobs "
-        "WHERE kind = 'media_metadata' ORDER BY message_id"
-    ).fetchall() == [(102, 0, 200, 0), (105, 0, 500, 0), (107, 0, 0, 1)]
+    assert first.has_more is True
+    assert first.next_contact_other_cursor == HydrationRepairCursor(550, 42, 107)
+    assert first.next_video_cursor == HydrationRepairCursor(500, 42, 105)
     assert conn.execute(
         "SELECT message_id FROM hydration_jobs WHERE kind = 'media_metadata' AND terminal = 0 "
         "ORDER BY message_sent_at DESC"
-    ).fetchall() == [(105,), (102,)]
+    ).fetchall() == [(105,)]
 
-    second = repair_media_metadata_hydration_jobs(conn, due_at=901, max_jobs=2)
-    assert second == type(second)(has_more=False)
+    second = repair_media_metadata_hydration_jobs(
+        conn,
+        due_at=901,
+        max_jobs=2,
+        contact_other_cursor=first.next_contact_other_cursor,
+        video_cursor=first.next_video_cursor,
+    )
+    assert second.has_more is True
+    third = repair_media_metadata_hydration_jobs(
+        conn,
+        due_at=902,
+        max_jobs=2,
+        contact_other_cursor=second.next_contact_other_cursor,
+        video_cursor=second.next_video_cursor,
+    )
+    assert third.has_more is False
     assert conn.execute(
         "SELECT message_id FROM hydration_jobs WHERE kind = 'media_metadata' AND terminal = 0 "
         "ORDER BY message_sent_at DESC"
     ).fetchall() == [(105,), (102,), (106,), (101,)]
-
-    third = repair_media_metadata_hydration_jobs(conn, due_at=902, max_jobs=2)
-    assert third == type(third)(has_more=False)
+    assert conn.execute("SELECT due_at, attempts, terminal FROM hydration_jobs WHERE message_id = 107").fetchone() == (
+        1,
+        3,
+        1,
+    )
+    fourth = repair_media_metadata_hydration_jobs(
+        conn,
+        due_at=903,
+        max_jobs=2,
+        contact_other_cursor=third.next_contact_other_cursor,
+        video_cursor=third.next_video_cursor,
+    )
+    assert fourth.has_more is False
 
     for index_name in (
         "idx_messages_media_unresolved_contact_other",
@@ -487,15 +511,15 @@ def test_transcription_repair_is_bounded_idempotent_and_newest_first(conn: sqlit
         "SELECT due_at, attempts, priority, message_sent_at, terminal FROM hydration_jobs WHERE message_id = 505"
     ).fetchone() == (900, 0, 0, 505, 0)
 
-    second = repair_transcription_hydration_jobs(conn, due_at=901, max_jobs=300)
+    second = repair_transcription_hydration_jobs(conn, due_at=901, max_jobs=300, cursor=first.next_cursor)
     assert second.has_more is False
     conn.commit()
-    third = repair_transcription_hydration_jobs(conn, due_at=902, max_jobs=300)
+    third = repair_transcription_hydration_jobs(conn, due_at=902, max_jobs=300, cursor=second.next_cursor)
     assert third.has_more is False
     assert conn.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'transcription'").fetchone() == (505,)
 
 
-def test_transcription_repair_only_probes_has_more_at_batch_boundary(conn: sqlite3.Connection) -> None:
+def test_transcription_repair_has_more_uses_raw_page_lookahead(conn: sqlite3.Connection) -> None:
     _make_hydration_eligible(conn)
     conn.executemany(
         "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
@@ -504,11 +528,13 @@ def test_transcription_repair_only_probes_has_more_at_batch_boundary(conn: sqlit
     )
     conn.commit()
 
-    def traced_repair(max_jobs: int) -> tuple[TranscriptionHydrationRepair, list[str]]:
+    def traced_repair(
+        max_jobs: int, cursor: HydrationRepairCursor | None = None
+    ) -> tuple[TranscriptionHydrationRepair, list[str]]:
         statements: list[str] = []
         conn.set_trace_callback(statements.append)
         try:
-            result = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=max_jobs)
+            result = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=max_jobs, cursor=cursor)
         finally:
             conn.set_trace_callback(None)
         executable = [
@@ -523,14 +549,16 @@ def test_transcription_repair_only_probes_has_more_at_batch_boundary(conn: sqlit
     assert len(first_statements) == 2
     conn.commit()
 
-    second, second_statements = traced_repair(max_jobs=1)
+    second, second_statements = traced_repair(max_jobs=1, cursor=first.next_cursor)
     assert second.has_more is False
-    assert len(second_statements) == 2
+    assert len(second_statements) == 4
     conn.commit()
 
-    third, third_statements = traced_repair(max_jobs=10)
+    third, third_statements = traced_repair(max_jobs=10, cursor=second.next_cursor)
     assert third.has_more is False
-    assert len(third_statements) == 1
+    assert len(third_statements) == 3
+    assert all("LIMIT" in sql for sql in third_statements)
+    assert all("SELECT 1" not in sql for sql in third_statements)
 
 
 def test_transcription_repair_excludes_ineligible_and_queued_messages(conn: sqlite3.Connection) -> None:
@@ -763,3 +791,99 @@ def test_repository_writes_rollback_with_caller_transaction(conn: sqlite3.Connec
             raise RuntimeError("abort")
     assert conn.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=30").fetchone() == ("before",)
     assert conn.execute("SELECT COUNT(*) FROM message_versions WHERE dialog_id=42 AND message_id=30").fetchone() == (0,)
+
+
+@pytest.mark.parametrize(
+    "media_kind,candidates_sql,index_name",
+    [
+        ("voice", _REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL, "idx_messages_transcribable_undeleted_sent"),
+        ("contact", _REPAIR_MEDIA_METADATA_CONTACT_OTHER_SQL, "idx_messages_media_unresolved_contact_other"),
+        ("video", _REPAIR_MEDIA_METADATA_VIDEO_SQL, "idx_messages_media_unresolved_video"),
+    ],
+)
+def test_hydration_repair_bounds_terminal_prefix_and_later_equal_time_seek(
+    conn: sqlite3.Connection, media_kind: str, candidates_sql: str, index_name: str
+) -> None:
+    _make_hydration_eligible(conn)
+    total = 6_000
+    payload = '{"duration":1}' if media_kind == "video" else "{}"
+    kind = "transcription" if media_kind == "voice" else "media_metadata"
+    conn.executemany(
+        "INSERT INTO messages(dialog_id,message_id,sent_at,media_kind,media_payload) VALUES (42,?,10,?,?)",
+        ((identifier, media_kind, payload) for identifier in range(1, total + 1)),
+    )
+    conn.executemany(
+        "INSERT INTO hydration_jobs(kind,dialog_id,message_id,due_at,attempts,priority,terminal) "
+        "VALUES (?,42,?,1,4,1,1)",
+        ((kind, identifier) for identifier in range(1, total - 9)),
+    )
+    conn.commit()
+
+    def repair(cursor: HydrationRepairCursor | None, budget: int) -> tuple[bool, HydrationRepairCursor | None]:
+        if media_kind == "voice":
+            transcription = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=budget, cursor=cursor)
+            return transcription.has_more, transcription.next_cursor
+        media = repair_media_metadata_hydration_jobs(
+            conn,
+            due_at=900,
+            max_jobs=budget,
+            contact_other_cursor=cursor if media_kind == "contact" else None,
+            video_cursor=cursor if media_kind == "video" else None,
+        )
+        return media.has_more, media.next_contact_other_cursor if media_kind == "contact" else media.next_video_cursor
+
+    for incoming in (None, HydrationRepairCursor(10, 42, total - 20)):
+        steps = 0
+        statements: list[str] = []
+
+        def progress() -> int:
+            nonlocal steps
+            steps += 1
+            return int(steps > 15_000)
+
+        conn.set_progress_handler(progress, 1)
+        conn.set_trace_callback(statements.append)
+        try:
+            has_more, next_cursor = repair(incoming, 64)
+        finally:
+            conn.set_progress_handler(None, 0)
+            conn.set_trace_callback(None)
+        assert steps < 15_000
+        assert next_cursor == HydrationRepairCursor(10, 42, 64 if incoming is None else total)
+        assert has_more is (incoming is None)
+        if incoming is not None:
+            selections = [statement for statement in statements if statement.startswith("SELECT m.sent_at")]
+            for selection in selections:
+                if index_name not in selection:
+                    continue
+                plan = cast(list[tuple[object, ...]], conn.execute("EXPLAIN QUERY PLAN " + selection).fetchall())
+                details = " ".join(str(row[3]) for row in plan)
+                assert "SEARCH m USING INDEX " + index_name in details
+                assert "USE TEMP B-TREE" not in details
+        conn.commit()
+
+    # Even a page containing only terminal jobs must advance until older missing work is reached.
+    cursor = None
+    for _ in range(total // 256 + 2):
+        has_more, cursor = repair(cursor, 256)
+        conn.commit()
+        if not has_more:
+            break
+    assert has_more is False
+    assert cursor == HydrationRepairCursor(10, 42, total)
+    assert conn.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind=? AND terminal=0", (kind,)).fetchone() == (10,)
+    assert conn.execute(
+        "SELECT due_at,attempts,priority,terminal FROM hydration_jobs WHERE kind=? AND message_id=1", (kind,)
+    ).fetchone() == (1, 4, 1, 1)
+
+
+def test_hydration_raw_seek_crosses_equal_peer_and_older_time_without_skips(conn: sqlite3.Connection) -> None:
+    conn.executemany(
+        "INSERT INTO messages(dialog_id,message_id,sent_at,media_kind,media_payload) VALUES (?,?,?,'voice','{}')",
+        [(42, 1, 10), (42, 2, 10), (43, 1, 10), (43, 2, 10), (42, 3, 9), (42, 4, 9)],
+    )
+    page = _repair_raw_page(conn, _REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL, HydrationRepairCursor(10, 42, 1), 4)
+    assert page == [(10, 42, 2), (10, 43, 1), (10, 43, 2), (9, 42, 3)]
+    assert _repair_raw_page(conn, _REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL, HydrationRepairCursor(*page[-1]), 4) == [
+        (9, 42, 4)
+    ]

@@ -40,10 +40,20 @@ _TRANSCRIPTION_HYDRATION_MESSAGE_SQL = (
 
 
 @dataclass(frozen=True, slots=True)
+class HydrationRepairCursor:
+    """Position in the raw index order: newest time, then increasing peer/message IDs."""
+
+    sent_at: int
+    dialog_id: int
+    message_id: int
+
+
+@dataclass(frozen=True, slots=True)
 class TranscriptionHydrationRepair:
     """Bounded result of repairing missing transcription jobs."""
 
     has_more: bool
+    next_cursor: HydrationRepairCursor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +61,8 @@ class MediaMetadataHydrationRepair:
     """Bounded result of repairing missing media metadata jobs."""
 
     has_more: bool
+    next_contact_other_cursor: HydrationRepairCursor | None = None
+    next_video_cursor: HydrationRepairCursor | None = None
 
 
 def _first_json_object_key_wins(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -134,11 +146,7 @@ def transcription_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, m
 
 _REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL = (
     "FROM messages m INDEXED BY idx_messages_transcribable_undeleted_sent "
-    "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
-    "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
-    "LEFT JOIN hydration_jobs hj ON hj.kind = 'transcription' "
-    "AND hj.dialog_id = m.dialog_id AND hj.message_id = m.message_id "
-    f"WHERE {_TRANSCRIPTION_HYDRATION_MESSAGE_SQL} AND hj.message_id IS NULL"
+    "WHERE m.is_deleted = 0 AND " + _TRANSCRIBABLE_MEDIA_SQL
 )
 _MEDIA_METADATA_HYDRATION_ELIGIBILITY_SQL = (
     "m.is_deleted = 0 AND ((m.media_kind IN ('contact', 'other') AND m.media_payload = '{}') "
@@ -148,88 +156,114 @@ _MEDIA_METADATA_HYDRATION_ELIGIBILITY_SQL = (
 )
 _REPAIR_MEDIA_METADATA_CONTACT_OTHER_SQL = (
     "FROM messages m INDEXED BY idx_messages_media_unresolved_contact_other "
-    "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
-    "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
-    "LEFT JOIN hydration_jobs hj ON hj.kind = 'media_metadata' "
-    "AND hj.dialog_id = m.dialog_id AND hj.message_id = m.message_id "
-    "WHERE m.is_deleted = 0 AND m.media_kind IN ('contact', 'other') AND m.media_payload = '{}' "
-    "AND hj.message_id IS NULL"
+    "WHERE m.is_deleted = 0 AND m.media_kind IN ('contact', 'other') AND m.media_payload = '{}'"
 )
 _REPAIR_MEDIA_METADATA_VIDEO_SQL = (
     "FROM messages m INDEXED BY idx_messages_media_unresolved_video "
-    "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
-    "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
-    "LEFT JOIN hydration_jobs hj ON hj.kind = 'media_metadata' "
-    "AND hj.dialog_id = m.dialog_id AND hj.message_id = m.message_id "
     "WHERE m.is_deleted = 0 AND m.media_kind = 'video' AND json_valid(m.media_payload) "
     "AND json_type(m.media_payload) = 'object' "
-    "AND json_type(m.media_payload, '$.round_message') IS NULL "
-    "AND hj.message_id IS NULL"
+    "AND json_type(m.media_payload, '$.round_message') IS NULL"
 )
+type _RepairRow = tuple[int, int, int]
+_REPAIR_ORDER_SQL = " ORDER BY m.sent_at DESC, m.dialog_id, m.message_id LIMIT ?"
+
+
+def _repair_raw_page(
+    conn: sqlite3.Connection, candidates_sql: str, cursor: HydrationRepairCursor | None, limit: int
+) -> list[_RepairRow]:
+    """Bound raw index reads before eligibility/queue checks, including skipped rows."""
+    selection = "SELECT m.sent_at, m.dialog_id, m.message_id " + candidates_sql
+    if cursor is None:
+        return cast(list[_RepairRow], conn.execute(selection + _REPAIR_ORDER_SQL, (limit,)).fetchall())
+    # Mixed-direction indexes need disjoint seeks; an OR/negated-time tuple scans old prefixes.
+    seeks = (
+        (
+            "m.sent_at = ? AND m.dialog_id = ? AND m.message_id > ?",
+            (cursor.sent_at, cursor.dialog_id, cursor.message_id),
+        ),
+        ("m.sent_at = ? AND m.dialog_id > ?", (cursor.sent_at, cursor.dialog_id)),
+        ("m.sent_at < ?", (cursor.sent_at,)),
+    )
+    rows: list[_RepairRow] = []
+    for predicate, parameters in seeks:
+        remaining = limit - len(rows)
+        if remaining == 0:
+            break
+        rows.extend(
+            cast(
+                list[_RepairRow],
+                conn.execute(selection + " AND " + predicate + _REPAIR_ORDER_SQL, (*parameters, remaining)).fetchall(),
+            )
+        )
+    return rows
+
+
+def _enqueue_repair_rows(
+    conn: sqlite3.Connection, rows: Sequence[_RepairRow], *, kind: str, due_at: int, eligibility: str
+) -> None:
+    conn.executemany(
+        "INSERT OR IGNORE INTO hydration_jobs "
+        "(kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at, terminal) "
+        "SELECT ?, m.dialog_id, m.message_id, ?, 0, ?, m.sent_at, 0 FROM messages m "
+        "WHERE m.dialog_id = ? AND m.message_id = ? AND "
+        + eligibility
+        + " AND EXISTS ("
+        + _FACT_HYDRATION_ELIGIBILITY_SQL
+        + ")",
+        ((kind, due_at, int(HydrationPriority.BACKFILL), dialog, message, dialog) for _, dialog, message in rows),
+    )
 
 
 def repair_transcription_hydration_jobs(
-    conn: sqlite3.Connection, *, due_at: int, max_jobs: int
+    conn: sqlite3.Connection, *, due_at: int, max_jobs: int, cursor: HydrationRepairCursor | None = None
 ) -> TranscriptionHydrationRepair:
-    """Bound the recurring repair of missing transcribable-media jobs."""
+    """Examine one bounded raw page; callers retain the cursor only after commit."""
     if max_jobs <= 0:
-        return TranscriptionHydrationRepair(False)
-    candidates_sql = (
-        "SELECT 'transcription', m.dialog_id, m.message_id, ?, 0, ?, m.sent_at, 0 "
-        f"{_REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL} "
-        "ORDER BY m.sent_at DESC, m.dialog_id, m.message_id LIMIT ?"
+        return TranscriptionHydrationRepair(False, cursor)
+    rows = _repair_raw_page(conn, _REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL, cursor, max_jobs + 1)
+    examined = rows[:max_jobs]
+    _enqueue_repair_rows(
+        conn,
+        examined,
+        kind=TRANSCRIPTION_HYDRATION_KIND,
+        due_at=due_at,
+        eligibility=_TRANSCRIPTION_HYDRATION_MESSAGE_SQL,
     )
-    cursor = conn.execute(
-        "INSERT OR IGNORE INTO hydration_jobs "
-        "(kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at, terminal) "
-        f"{candidates_sql}",
-        (due_at, int(HydrationPriority.BACKFILL), max_jobs),
-    )
-    has_more = False
-    if cursor.rowcount >= max_jobs:
-        has_more = (
-            conn.execute(
-                "SELECT 1 "
-                f"{_REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL} "
-                "ORDER BY m.sent_at DESC, m.dialog_id, m.message_id LIMIT 1",
-            ).fetchone()
-            is not None
-        )
-    return TranscriptionHydrationRepair(has_more)
+    next_cursor = HydrationRepairCursor(*examined[-1]) if examined else cursor
+    return TranscriptionHydrationRepair(len(rows) > max_jobs, next_cursor)
 
 
 def repair_media_metadata_hydration_jobs(
-    conn: sqlite3.Connection, *, due_at: int, max_jobs: int
+    conn: sqlite3.Connection,
+    *,
+    due_at: int,
+    max_jobs: int,
+    contact_other_cursor: HydrationRepairCursor | None = None,
+    video_cursor: HydrationRepairCursor | None = None,
 ) -> MediaMetadataHydrationRepair:
-    """Bound recurring repair of unresolved contact/other and video metadata."""
+    """Merge bounded raw pages from the two partial indexes before checking eligibility."""
     if max_jobs <= 0:
-        return MediaMetadataHydrationRepair(False)
-    candidates_sql = (
-        "SELECT 'media_metadata', m.dialog_id, m.message_id, ?, 0, ?, m.sent_at, 0 "
-        f"{_REPAIR_MEDIA_METADATA_CONTACT_OTHER_SQL} "
-        "UNION ALL "
-        "SELECT 'media_metadata', m.dialog_id, m.message_id, ?, 0, ?, m.sent_at, 0 "
-        f"{_REPAIR_MEDIA_METADATA_VIDEO_SQL} "
-        "ORDER BY 7 DESC, 2, 3 LIMIT ?"
+        return MediaMetadataHydrationRepair(False, contact_other_cursor, video_cursor)
+    contacts = _repair_raw_page(conn, _REPAIR_MEDIA_METADATA_CONTACT_OTHER_SQL, contact_other_cursor, max_jobs + 1)
+    videos = _repair_raw_page(conn, _REPAIR_MEDIA_METADATA_VIDEO_SQL, video_cursor, max_jobs + 1)
+    combined = sorted(
+        [(False, row) for row in contacts] + [(True, row) for row in videos],
+        key=lambda pair: (-pair[1][0], pair[1][1], pair[1][2]),
     )
-    cursor = conn.execute(
-        "INSERT OR IGNORE INTO hydration_jobs "
-        "(kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at, terminal) "
-        f"{candidates_sql}",
-        (due_at, int(HydrationPriority.BACKFILL), due_at, int(HydrationPriority.BACKFILL), max_jobs),
+    examined = combined[:max_jobs]
+    _enqueue_repair_rows(
+        conn,
+        [row for _, row in examined],
+        kind=MEDIA_METADATA_KIND,
+        due_at=due_at,
+        eligibility=_MEDIA_METADATA_HYDRATION_ELIGIBILITY_SQL,
     )
-    has_more = False
-    if cursor.rowcount >= max_jobs:
-        has_more = (
-            conn.execute(
-                "SELECT 1 FROM (SELECT 1 "
-                f"{_REPAIR_MEDIA_METADATA_CONTACT_OTHER_SQL} "
-                "UNION ALL SELECT 1 "
-                f"{_REPAIR_MEDIA_METADATA_VIDEO_SQL}) LIMIT 1",
-            ).fetchone()
-            is not None
-        )
-    return MediaMetadataHydrationRepair(has_more)
+    for video, row in examined:
+        if video:
+            video_cursor = HydrationRepairCursor(*row)
+        else:
+            contact_other_cursor = HydrationRepairCursor(*row)
+    return MediaMetadataHydrationRepair(len(combined) > max_jobs, contact_other_cursor, video_cursor)
 
 
 def reconcile_fact_hydration_job(
