@@ -8,16 +8,16 @@ import math
 import os
 import re
 import signal
-import sqlite3
 import sys
 import tempfile
 import time
 from collections import OrderedDict
-from contextlib import closing, suppress
+from contextlib import suppress
 from pathlib import Path
 from typing import TextIO, cast
 
-from .chat_export_checkpoint import ORDER, Checkpoint, base_records, census
+from .chat_export_checkpoint import ORDER, Checkpoint, CheckpointError, census, read_checkpoint_options
+from .chat_export_checkpoint import fingerprint as _fingerprint
 from .chat_export_projection import (
     clean_facts as _facts,
 )
@@ -397,15 +397,6 @@ class _Export:
             checkpoint.mark("admin", before)
 
 
-def _fingerprint(path: Path) -> list[int] | None:
-    if path.is_symlink():
-        raise FileExistsError(f"Export path is a symbolic link: {path}")
-    if not path.exists():
-        return None
-    stat = path.stat()
-    return [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns]
-
-
 def _sync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -460,31 +451,6 @@ def _publish(checkpoint: Checkpoint, peers: list[Payload], output: Path) -> Payl
         temporary.unlink(missing_ok=True)
 
 
-def _import_base(checkpoint: Checkpoint, base: Path, info: Payload) -> None:
-    if checkpoint.state("base_imported"):
-        return
-    boundaries = _object(info["boundaries"])
-    with checkpoint.db:
-        for kind, record in base_records(base):
-            if kind == "messages.item":
-                peer, identifier = int(cast(str, record["dialog_id"])), int(cast(str, record["message_id"]))
-                if identifier > cast(int, boundaries[str(peer)]):
-                    continue
-                record_kind = "message"
-            elif kind == "admin_events.item":
-                peer, identifier = int(cast(str, record["dialog_id"])), int(cast(str, record["event_id"]))
-                record_kind = "admin"
-            else:
-                continue
-            checkpoint.db.execute(
-                "INSERT OR IGNORE INTO records VALUES (?,?,?,?)",
-                (record_kind, peer, identifier, json.dumps(record, ensure_ascii=False, allow_nan=False)),
-            )
-        if _fingerprint(base) != checkpoint.state("base_fingerprint"):
-            raise ChatExportError("Incremental base changed while importing")
-        checkpoint.set_state("base_imported", True)
-
-
 def _base_info(checkpoint: Checkpoint, base: Path | None, refresh: int) -> Payload:
     if base is None:
         return {"boundaries": {}, "admin_max": 0}
@@ -501,9 +467,7 @@ def _base_info(checkpoint: Checkpoint, base: Path | None, refresh: int) -> Paylo
         info = census(base, refresh)
         if _fingerprint(base) != fingerprint:
             raise ChatExportError("Incremental base changed while reading")
-        with checkpoint.db:
-            checkpoint.set_state("base_info", info)
-            checkpoint.set_state("base_fingerprint", fingerprint)
+        checkpoint.mark_many({"base_info": info, "base_fingerprint": fingerprint})
     return _object(info)
 
 
@@ -522,7 +486,7 @@ async def _prepare(
     export.dialog_id = cast(int, peers[0]["dialog_id"])
     export.total_hint = _hint(peers) if base is None else None
     if base is not None:
-        _import_base(checkpoint, base, info)
+        checkpoint.import_base(base, info)
         if _fingerprint(base) != checkpoint.state("base_fingerprint"):
             raise ChatExportError("Incremental base changed while importing")
     export.counts.update(cast(dict[str, int], checkpoint.summary()))
@@ -554,7 +518,7 @@ async def _run_export(
         if saved_peers is not None:
             try:
                 _publish(checkpoint, cast(list[Payload], saved_peers), output)
-            except (OSError, ValueError, sqlite3.Error) as exc:
+            except (OSError, ValueError, CheckpointError) as exc:
                 print(f"Could not publish partial JSON: {exc}; durable records remain saved", file=sys.stderr)
         print(
             f"Export interrupted; saved progress retained. Repeat the same command to resume: {checkpoint.path}",
@@ -571,10 +535,7 @@ async def _run_export(
 
 def _resume_options(checkpoint: Checkpoint, options: Payload) -> None:
     saved = checkpoint.state("options")
-    if saved is None and (
-        checkpoint.db.execute("SELECT 1 FROM state LIMIT 1").fetchone()
-        or checkpoint.db.execute("SELECT 1 FROM records LIMIT 1").fetchone()
-    ):
+    if saved is None and not checkpoint.is_empty():
         raise ChatExportError("Populated checkpoint has no export identity")
     if saved is not None and saved != options:
         raise ChatExportError("Resume options differ from the saved export")
@@ -612,7 +573,7 @@ async def export_group(
             _resume_options(checkpoint, options)
             summary = await _run_export(_Export(dialog_id), checkpoint, output, update_from, refresh_messages)
         finally:
-            checkpoint.db.close()
+            checkpoint.close()
         path.unlink()
         _sync_directory(path.parent)
         return summary
@@ -628,11 +589,8 @@ def _checkpoint_options(path: Path) -> Payload:
         except BlockingIOError as exc:
             raise FileExistsError("An export in this directory is already running") from exc
         try:
-            # Recovery of a hot rollback journal requires RW, but this never creates a database.
-            with closing(sqlite3.connect(path.as_uri() + "?mode=rw", uri=True)) as db:
-                row = cast(tuple[str] | None, db.execute("SELECT value FROM state WHERE key='options'").fetchone())
-                return _object(cast(object, json.loads(row[0]))) if row else {}
-        except sqlite3.Error, ValueError, ChatExportError:
+            return read_checkpoint_options(path)
+        except CheckpointError, ValueError, ChatExportError:
             return {}
     finally:
         os.close(descriptor)

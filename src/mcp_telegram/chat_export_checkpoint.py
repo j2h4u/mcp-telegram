@@ -2,7 +2,8 @@
 
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
+from contextlib import closing
 from pathlib import Path
 from typing import cast
 
@@ -10,6 +11,7 @@ import ijson  # type: ignore[import-untyped]
 from ijson.common import ObjectBuilder  # type: ignore[import-untyped]
 
 type Payload = dict[str, object]
+CheckpointError = sqlite3.Error
 ORDER = "newest_to_oldest within each peer; primary then migrated predecessors"
 
 
@@ -165,6 +167,25 @@ def census(path: Path, refresh: int) -> Payload:
     return state.finish()
 
 
+def fingerprint(path: Path) -> list[int] | None:
+    if path.is_symlink():
+        raise FileExistsError(f"Export path is a symbolic link: {path}")
+    if not path.exists():
+        return None
+    stat = path.stat()
+    return [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns]
+
+
+def read_checkpoint_options(path: Path) -> Payload:
+    """Recover an existing database before inspecting its export identity."""
+    with closing(sqlite3.connect(path.as_uri() + "?mode=rw", uri=True)) as db:
+        row = cast(tuple[str] | None, db.execute("SELECT value FROM state WHERE key='options'").fetchone())
+        value = cast(object, json.loads(row[0])) if row else {}
+        if not isinstance(value, dict):
+            raise ValueError("Malformed export checkpoint identity")
+        return cast(Payload, value)
+
+
 class Checkpoint:
     """SQLite commits each fully enriched record together with its resume cursor."""
 
@@ -220,3 +241,41 @@ class Checkpoint:
             else:
                 admins += 1
         return {"messages": messages, "admin_events": admins, "reactors": reactors}
+
+    def import_base(self, base: Path, info: Payload) -> None:
+        if self.state("base_imported"):
+            return
+        boundaries = cast(Payload, info["boundaries"])
+        with self.db:
+            for kind, record in base_records(base):
+                if kind == "messages.item":
+                    peer, identifier = int(cast(str, record["dialog_id"])), int(cast(str, record["message_id"]))
+                    if identifier > cast(int, boundaries[str(peer)]):
+                        continue
+                    record_kind = "message"
+                elif kind == "admin_events.item":
+                    peer, identifier = int(cast(str, record["dialog_id"])), int(cast(str, record["event_id"]))
+                    record_kind = "admin"
+                else:
+                    continue
+                self.db.execute(
+                    "INSERT OR IGNORE INTO records VALUES (?,?,?,?)",
+                    (record_kind, peer, identifier, json.dumps(record, ensure_ascii=False, allow_nan=False)),
+                )
+            if fingerprint(base) != self.state("base_fingerprint"):
+                raise ValueError("Incremental base changed while importing")
+            self.set_state("base_imported", True)
+
+    def mark_many(self, values: Mapping[str, object]) -> None:
+        with self.db:
+            for key, value in values.items():
+                self.set_state(key, value)
+
+    def is_empty(self) -> bool:
+        return (
+            self.db.execute("SELECT 1 FROM state LIMIT 1").fetchone() is None
+            and self.db.execute("SELECT 1 FROM records LIMIT 1").fetchone() is None
+        )
+
+    def close(self) -> None:
+        self.db.close()
