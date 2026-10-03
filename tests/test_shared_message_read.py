@@ -73,8 +73,7 @@ def test_utf16_spans_refer_to_original_text_after_hidden_link_rendering() -> Non
     jsonschema.validate(view, MESSAGE_VIEW_SCHEMA)
     assert view["formatting_entities"] == entities
     assert view["formatting_text"] == "😀 link"
-    assert message.text is not None
-    assert "https://example.org" in message.text
+    assert message.text == "😀 [link](https://example.org)"
     assert view["composition_is_telegram_content"] is True
 
 
