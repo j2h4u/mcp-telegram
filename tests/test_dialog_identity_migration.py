@@ -89,7 +89,7 @@ def test_fresh_schema_has_separate_identity_fence_and_complete_presence_trigger(
     request.addfinalizer(conn.close)
     _apply_migrations(conn)
     version_row = cast(tuple[int], conn.execute("SELECT MAX(version) FROM schema_version").fetchone())
-    assert version_row[0] == 78
+    assert version_row[0] == 79
     dialog_columns = cast(list[tuple[object, str]], conn.execute("PRAGMA table_info(dialogs)").fetchall())
     columns = {row[1] for row in dialog_columns}
     assert "identity_revision" in columns

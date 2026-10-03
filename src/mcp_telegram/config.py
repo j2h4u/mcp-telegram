@@ -165,7 +165,7 @@ class RuntimeObservationConfig:
     queue_capacity: int = 1_024
     writer_startup_wait_seconds: float = 1.0
     shutdown_drain_grace_seconds: float = 2.0
-    row_cap: int = 250_000
+    row_cap: int = 300_000
     rpc_summary_interval_seconds: float = 300.0
 
     def __post_init__(self) -> None:
