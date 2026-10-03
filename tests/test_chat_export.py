@@ -39,6 +39,7 @@ class Facts(TypedDict):
     group: Facts
     peer: Facts
     reaction: Facts
+    reactions: Facts
     id: int
     dialog_id: int
     next_before_id: int
@@ -57,6 +58,9 @@ class Facts(TypedDict):
     next_offset: str | None
     done: bool
     view_messages: bool
+    big: bool | None
+    unread: bool | None
+    my: bool | None
 
 
 class Result(TypedDict):
@@ -264,6 +268,122 @@ async def test_reaction_opaque_cursor_identity_and_date(archive: sqlite3.Connect
     assert item["peer"]["id"] == 7
     assert item["date"] == DATE.isoformat()
     assert item["reaction"]["emoticon"] == "👍"
+
+
+async def test_history_complete_recent_reactors_match_paged_wire_facts(archive: sqlite3.Connection) -> None:
+    emoji = types.ReactionEmoji("👍")
+    custom = types.ReactionCustomEmoji(123456)
+    records = [
+        types.MessagePeerReaction(types.PeerUser(7), DATE, emoji, big=True, unread=True, my=True),
+        types.MessagePeerReaction(types.PeerUser(7), DATE, custom),
+        types.MessagePeerReaction(types.PeerUser(8), DATE, emoji),
+    ]
+    users = [types.User(7, first_name="Current", username="current"), types.User(8, first_name="Other")]
+    item = message(10)
+    item.reactions = types.MessageReactions(
+        [types.ReactionCount(emoji, 2), types.ReactionCount(custom, 1)],
+        can_see_list=True,
+        recent_reactions=records,
+    )
+    client = Client(SimpleNamespace(messages=[item], users=users, chats=[]))
+    history = await call(archive, client, upper_id=10)
+    envelope = history["data"]["items"][0]["reactions"]
+    assert envelope["status"] == "complete"
+    assert len(client.requests) == 1
+    assert isinstance(client.requests[0], functions.messages.GetHistoryRequest)
+    paged = await call(
+        archive,
+        Client(SimpleNamespace(reactions=records, users=users, chats=[], count=3)),
+        "reactions",
+        message_id=10,
+    )
+    assert envelope["items"] == paged["data"]["items"]
+    assert [record["peer"]["id"] for record in envelope["items"]] == [7, 7, 8]
+    assert envelope["items"][0]["peer"]["identity_source"] == "telegram_response"
+    assert envelope["items"][0]["date"] == DATE.isoformat()
+    assert envelope["items"][0]["raw"]["big"] is True
+    assert envelope["items"][0]["raw"]["unread"] is True
+    assert envelope["items"][0]["raw"]["my"] is True
+
+
+@pytest.mark.parametrize(
+    "reaction_changes,users",
+    [
+        ({"min": True}, [types.User(7, first_name="Current")]),
+        ({"can_see_list": False}, [types.User(7, first_name="Current")]),
+        ({"top_reactors": [types.MessageReactor(1, peer_id=types.PeerUser(7))]}, [types.User(7, first_name="Current")]),
+        ({"results": [types.ReactionCount(types.ReactionPaid(), 1)]}, [types.User(7, first_name="Current")]),
+        ({"results": [types.ReactionCount(types.ReactionEmoji("👍"), 2)]}, [types.User(7, first_name="Current")]),
+        ({"results": [types.ReactionCount(types.ReactionEmoji("❤"), 1)]}, [types.User(7, first_name="Current")]),
+        (
+            {"results": [types.ReactionCount(types.ReactionEmoji("👍"), 1)] * 2},
+            [types.User(7, first_name="Current")],
+        ),
+        (
+            {"recent_reactions": [types.MessagePeerReaction(types.PeerUser(7), DATE, types.ReactionEmoji("👍"))] * 2},
+            [types.User(7, first_name="Current")],
+        ),
+        (
+            {"recent_reactions": [types.MessagePeerReaction(types.PeerUser(7), None, types.ReactionEmoji("👍"))]},
+            [types.User(7, first_name="Current")],
+        ),
+        (
+            {"recent_reactions": [types.MessagePeerReaction(types.PeerUser(7), DATE, types.ReactionPaid())]},
+            [types.User(7, first_name="Current")],
+        ),
+        ({"recent_reactions": []}, [types.User(7, first_name="Current")]),
+        ({}, []),
+        ({}, [types.UserEmpty(7)]),
+        ({}, [types.User(7, first_name="Partial", min=True)]),
+        (
+            {"recent_reactions": [types.MessagePeerReaction(types.PeerChannel(123), DATE, types.ReactionEmoji("👍"))]},
+            [types.Channel(123, "Partial channel", types.ChatPhotoEmpty(), DATE, min=True)],
+        ),
+    ],
+    ids=[
+        "min",
+        "hidden",
+        "paid-top-reactors",
+        "paid-count",
+        "count-mismatch",
+        "reaction-mismatch",
+        "duplicate-count",
+        "duplicate-peer",
+        "missing-date",
+        "paid-record",
+        "missing-records",
+        "cached-identity",
+        "empty-identity",
+        "min-user-identity",
+        "min-channel-identity",
+    ],
+)
+async def test_history_ambiguous_recent_reactors_keep_paged_fallback(
+    archive: sqlite3.Connection, reaction_changes: dict[str, object], users: list[object]
+) -> None:
+    reaction = types.MessagePeerReaction(types.PeerUser(7), DATE, types.ReactionEmoji("👍"))
+    reactions = types.MessageReactions(
+        [types.ReactionCount(types.ReactionEmoji("👍"), 1)], can_see_list=True, recent_reactions=[reaction]
+    )
+    for key, value in reaction_changes.items():
+        setattr(reactions, key, value)
+    item = message(10)
+    item.reactions = reactions
+    client = Client(
+        SimpleNamespace(
+            messages=[item],
+            users=[entity for entity in users if isinstance(entity, (types.User, types.UserEmpty))],
+            chats=[entity for entity in users if isinstance(entity, types.Channel)],
+        ),
+        response(reactions=[reaction], count=1),
+    )
+    history = await call(archive, client, upper_id=10)
+    envelope = history["data"]["items"][0]["reactions"]
+    assert envelope["status"] == "pending"
+    assert "items" not in envelope
+    paged = await call(archive, client, "reactions", message_id=10)
+    assert paged["data"]["items"][0]["peer"]["id"] == 7
+    assert isinstance(client.requests[1], functions.messages.GetMessageReactionsListRequest)
 
 
 @pytest.mark.parametrize(

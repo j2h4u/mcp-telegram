@@ -60,7 +60,10 @@ def install_daemon(monkeypatch: pytest.MonkeyPatch, handler: Callable[[Payload],
 
 
 @pytest.mark.asyncio
-async def test_pages_roles_reactions_service_admin_and_legacy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize("inline_reactors", [False, True])
+async def test_pages_roles_reactions_service_admin_and_legacy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str], inline_reactors: bool
+) -> None:
     calls: list[Payload] = []
 
     async def handler(p: Payload) -> Payload:
@@ -89,7 +92,16 @@ async def test_pages_roles_reactions_service_admin_and_legacy(monkeypatch: pytes
                         "date": "2026-10-03T10:00:00+00:00",
                         "author": {"id": 5, "kind": "user"},
                         "topic_id": 7,
-                        "reactions": {"status": "pending", "can_view_list": True},
+                        "reactions": {
+                            "status": "complete",
+                            "can_view_list": True,
+                            "items": [
+                                {"peer": {"id": 5, "kind": "user"}, "reaction": {"emoji": "👍"}},
+                                {"peer": {"id": 5, "kind": "user"}, "reaction": {"emoji": "❤️"}},
+                            ],
+                        }
+                        if inline_reactors
+                        else {"status": "pending", "can_view_list": True},
                     }
                 ],
                 "next_before_id": mid,
@@ -129,8 +141,12 @@ async def test_pages_roles_reactions_service_admin_and_legacy(monkeypatch: pytes
     summary = await cli.export_group(-1, output)
     doc = cast(ExportDocument, json.loads(output.read_text()))
     assert set(summary) == {"messages", "admin_events", "reactors"}
-    assert summary["messages"] == 4
-    assert summary["reactors"] == 8
+    assert (summary["messages"], summary["reactors"]) == (4, 8)
+    progress = capsys.readouterr().err
+    assert "admin events 2" in progress and "estimated history total 4" in progress
+    if inline_reactors:
+        assert not any(call["operation"] == "reactions" for call in calls)
+        assert "items" not in cast(Payload, cast(Payload, doc["messages"][0])["reactions"])
     assert [m["message_id"] for m in doc["messages"]] == ["2", "1", "2", "1"]
     assert doc["messages"][1]["kind"] == "service"
     message = cast(Payload, doc["messages"][0])

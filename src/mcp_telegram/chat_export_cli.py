@@ -144,11 +144,18 @@ class _Export:
     def progress(self) -> None:
         elapsed = time.monotonic() - self.clock
         rate = self.counts["messages"] / elapsed if elapsed else 0
-        detail = f"; stage {self.stage}; enrichments {self.counts['enrichments']}"
+        detail = (
+            f"; stage {self.stage}; admin events {self.counts['admin_events']}"
+            f"; enrichments {self.counts['enrichments']}"
+        )
+        if self.total_hint is not None:
+            detail += f"; estimated history total {self.total_hint}"
         if self.wait_reason is not None:
             detail += f"; waiting: {self.wait_reason}; retry in {max(0, self.retry_at - time.monotonic()):.0f}s"
         if not self.history_finished and self.total_hint is not None and rate > 0:
-            detail += f"; approximate history ETA {max(0, self.total_hint - self.counts['messages']) / rate:.0f}s"
+            seconds = round(max(0, self.total_hint - self.counts["messages"]) / rate)
+            hours, remainder = divmod(seconds, 3600)
+            detail += f"; approximate history ETA {hours}h{remainder // 60:02d}m ({seconds}s)"
         print(
             f"Export: {self.counts['messages']} messages; {rate:.1f}/s; elapsed {elapsed:.0f}s{detail}", file=sys.stderr
         )
@@ -255,10 +262,13 @@ class _Export:
             offset = next_offset
 
     async def reactions(self, stream: TextIO, reactions: Payload, peer_id: int, message_id: int) -> None:
-        status = _status(reactions, {"known_empty", "unknown", "pending", "unavailable"})
+        status = _status(reactions, {"known_empty", "unknown", "pending", "unavailable", "complete"})
+        items = reactions.pop("items", None)
         _field(stream, "reactions", _facts(reactions))
         stream.write(',"reactors":[')
-        if status == "pending" and reactions.get("can_view_list") is True:
+        if status == "complete":
+            await self.reactor_items(stream, {"items": items}, peer_id, 0)
+        elif status == "pending" and reactions.get("can_view_list") is True:
             await self.reaction_pages(stream, peer_id, message_id)
         stream.write("]")
 
