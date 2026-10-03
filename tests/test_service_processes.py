@@ -1,15 +1,15 @@
 import asyncio
 import signal
+import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 from mcp_telegram import service_processes
 
 
-@pytest.mark.parametrize("exiting_worker", ["sync", "http"])
-@pytest.mark.asyncio
-async def test_worker_exit_stops_sibling(monkeypatch: pytest.MonkeyPatch, exiting_worker: str) -> None:
+async def _check_worker_exit_stops_sibling(monkeypatch: pytest.MonkeyPatch, exiting_worker: str) -> None:
     spawn = asyncio.create_subprocess_exec
     workers: list[asyncio.subprocess.Process] = []
 
@@ -25,8 +25,7 @@ async def test_worker_exit_stops_sibling(monkeypatch: pytest.MonkeyPatch, exitin
     assert all(worker.returncode is not None for worker in workers)
 
 
-@pytest.mark.asyncio
-async def test_partial_start_failure_stops_first_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+async def _check_partial_start_failure_stops_first_worker(monkeypatch: pytest.MonkeyPatch) -> None:
     spawn = asyncio.create_subprocess_exec
     workers: list[asyncio.subprocess.Process] = []
 
@@ -43,8 +42,7 @@ async def test_partial_start_failure_stops_first_worker(monkeypatch: pytest.Monk
     assert workers[0].returncode is not None
 
 
-@pytest.mark.asyncio
-async def test_operator_stop_drains_http_before_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
+async def _check_operator_stop_drains_http_before_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
     spawn = asyncio.create_subprocess_exec
     workers: list[asyncio.subprocess.Process] = []
     signals: list[int] = []
@@ -75,8 +73,7 @@ async def test_operator_stop_drains_http_before_daemon(monkeypatch: pytest.Monke
     assert all(worker.returncode is not None for worker in workers)
 
 
-@pytest.mark.asyncio
-async def test_stopped_worker_is_killed_after_grace() -> None:
+async def _check_stopped_worker_is_killed_after_grace() -> None:
     worker = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(60)")
     worker.send_signal(signal.SIGSTOP)
     try:
@@ -86,3 +83,38 @@ async def test_stopped_worker_is_killed_after_grace() -> None:
         if worker.returncode is None:
             worker.kill()
         await worker.wait()
+
+
+async def _run_scenario(scenario: str) -> None:
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        if scenario in ("sync", "http"):
+            await _check_worker_exit_stops_sibling(monkeypatch, scenario)
+        elif scenario == "partial":
+            await _check_partial_start_failure_stops_first_worker(monkeypatch)
+        elif scenario == "stop":
+            await _check_operator_stop_drains_http_before_daemon(monkeypatch)
+        else:
+            await _check_stopped_worker_is_killed_after_grace()
+
+
+@pytest.mark.parametrize("scenario", ["sync", "http", "partial", "stop", "kill"])
+def test_coordinator_lifecycle_in_fresh_process(scenario: str) -> None:
+    # The full suite has a 512 MiB address-space ceiling. A fresh interpreter
+    # leaves room for asyncio's child-watcher threads without raising that limit.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import asyncio, sys; from test_service_processes import _run_scenario; "
+                "asyncio.run(_run_scenario(sys.argv[1]))"
+            ),
+            scenario,
+        ],
+        cwd=Path(__file__).parent,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
