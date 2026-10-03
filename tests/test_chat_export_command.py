@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 from mcp_telegram import app, chat_export_cli
@@ -48,7 +49,8 @@ def install_daemon(monkeypatch: pytest.MonkeyPatch, *, failure: BaseException | 
 def test_export_requires_exactly_one_destination(options: list[str]) -> None:
     result = runner.invoke(app, ["export-chat", "@group", *options])
     assert result.exit_code == 2
-    assert "Specify exactly one of --output or --output-dir" in result.output
+    output = unstyle(result.output)
+    assert all(fragment in output for fragment in ("Specify exactly one", "--output", "--output-dir"))
 
 
 @pytest.mark.parametrize("identifier", ["0", "42"])
