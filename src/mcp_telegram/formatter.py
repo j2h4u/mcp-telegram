@@ -299,10 +299,33 @@ def _resolve_message_format_options(kwargs: _FormatMessagesKwargs) -> _MessageFo
     )
 
 
+def _service_description(msg: ReadMessage) -> str:  # noqa: PLR0911
+    action = msg.service_action
+    if action is None:
+        return "Service event (details not captured)"
+    kind = str(action.get("_", "ServiceEvent"))
+    if kind == "MessageActionChatAddUser":
+        return f"Members added: {action.get('users', [])}"
+    if kind == "MessageActionChatDeleteUser":
+        return f"Member removed: {action.get('user_id')}"
+    if kind == "MessageActionPinMessage":
+        return f"Message pinned: {msg.reply_to_msg_id}" if msg.reply_to_msg_id is not None else "Message pinned"
+    if kind in {"MessageActionTopicCreate", "MessageActionTopicEdit"}:
+        return f"Topic changed: {action.get('title') or msg.topic_title or ''}".rstrip()
+    if kind in {"MessageActionChatCreate", "MessageActionChannelCreate", "MessageActionChatEditTitle"}:
+        return f"Group changed: {action.get('title', '')}".rstrip()
+    return {
+        "MessageActionChatJoinedByLink": "Member joined",
+        "MessageActionChatJoinedByRequest": "Member joined",
+        "MessageActionChatEditPhoto": "Group photo changed",
+        "MessageActionChatDeletePhoto": "Group photo removed",
+    }.get(kind, f"Service event: {kind}")
+
+
 def _format_message_body(msg: ReadMessage, effective_tz: ZoneInfo) -> str:
     primary_text = project_message_text(msg.text)
     if primary_text is None:
-        primary_text = msg.media_description
+        primary_text = _service_description(msg) if msg.is_service else msg.media_description
     text = frame_telegram_content(primary_text) if primary_text is not None else ""
     if msg.edit_date is not None:
         ed_dt = datetime.fromtimestamp(msg.edit_date, tz=UTC).astimezone(effective_tz)

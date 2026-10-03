@@ -307,6 +307,33 @@ docker exec -it mcp-telegram mcp-telegram feedback list
 docker exec -it mcp-telegram mcp-telegram feedback status <id> done --reason "fixed"
 ```
 
+Export an accessible group to a new JSON file:
+
+```bash
+mcp-telegram export-chat https://t.me/ai_engineers_guild --output group.json
+```
+
+The CLI connects to the existing daemon and streams current messages, replies,
+formatting, service events, attachment metadata and disclosed reaction authors.
+It also includes the accessible recent admin log and current participant roles
+and custom labels. Deleted text and old edits are not restored. Media files
+are not downloaded.
+Messages are newest first per peer, with migrated predecessors retaining their
+own IDs; admin events have a separate source-labelled array. Each peer has a
+frozen upper message ID.
+
+This is a rare independent operation: it does not enroll the group or populate
+the local archive. All acquisition uses the daemon's shared RPC protections at
+background priority. Progress, waits and approximate history ETA go to stderr.
+An interrupted export starts over; its temporary file is cleaned on handled
+errors, and an existing destination is never overwritten. Run inside Docker
+with an output path on a mounted host directory if using the container's CLI.
+
+Ordinary message reading preserves full formatting spans and service-action
+payloads too. Spans use UTF-16 offsets into the original `formatting_text`;
+legacy rows missing these facts explicitly report `unknown` until reobserved
+by normal synchronization.
+
 ## Development
 
 The project uses `uv` and `just`.

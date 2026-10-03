@@ -109,7 +109,7 @@ from .sync_read_model import (
     decode_dm_deletion_checkpoint,
     dm_deletion_reconciliation_is_blocked,
 )
-from .telegram_demand import AcquisitionKind
+from .telegram_demand import AcquisitionKind, demand_context
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
     RpcAdmissionError,
@@ -1017,6 +1017,7 @@ class DaemonAPIServer:
 
     def _dispatch_handlers(self) -> dict[str, _DispatchHandler]:
         return {
+            "export_chat": self._export_chat,
             "list_messages": self._list_messages,
             "search_messages": self._search_messages,
             "trace_account_messages": self._trace_account_messages,
@@ -1050,11 +1051,24 @@ class DaemonAPIServer:
         if handler is None:
             return {"ok": False, "error": "unknown_method"}
 
+        if method == "export_chat":
+            with demand_context(DemandKind.CHAT_EXPORT_OPERATION):
+                with _preserve_or_rpc_scope(TelegramRpcSource.CHAT_EXPORT):
+                    result = handler(req)
+                    if isinstance(result, dict):
+                        return result
+                    return cast(dict[str, object], await result)
+
         with _preserve_or_rpc_scope(TelegramRpcSource.MCP_INTERACTIVE):
             result = handler(req)
             if isinstance(result, dict):
                 return result
             return cast(dict[str, object], await result)
+
+    async def _export_chat(self, req: dict[str, object]) -> dict[str, object]:
+        from .chat_export import export_operation
+
+        return await export_operation(self._client, req, self._conn)
 
     # ------------------------------------------------------------------
     # Dialog name resolution

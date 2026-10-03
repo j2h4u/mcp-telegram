@@ -312,6 +312,10 @@ class DaemonConnection:
         payload.update(_list_messages_state_payload(kwargs))
         return await self.request(payload)
 
+    async def export_chat(self, operation: str, **kwargs: object) -> dict:
+        """Run one stateless chat export operation through the sync daemon."""
+        return await self.request({"method": "export_chat", "operation": operation, **kwargs})
+
     async def search_messages(self, **kwargs: Unpack[_SearchMessagesKwargs]) -> dict:
         """Send search_messages request with optional UTC bounds.
 

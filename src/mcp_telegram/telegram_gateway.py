@@ -82,6 +82,11 @@ class GroupProfileClient(Protocol):
     async def __call__(self, _request: object, **_kwargs: object) -> object: ...
 
 
+async def fetch_group_profile_response(client: object, group_id: int) -> object:
+    """Read one legacy group's materialized facts under the caller's RPC scope."""
+    return await cast(GroupProfileClient, client)(GetFullChatRequest(chat_id=_raw_group_id(group_id)))
+
+
 class ChannelProfileClient(Protocol):
     async def __call__(self, _request: object, **_kwargs: object) -> object: ...
 
@@ -203,7 +208,7 @@ class TelethonGroupProfileGateway(GroupProfilePort):
     async def fetch_group_profile(self, group_id: int) -> GroupProfileObservation:
         raw_group_id = _raw_group_id(group_id)
         started_at = int(self._now_provider())
-        result = await self._client(GetFullChatRequest(chat_id=raw_group_id))
+        result = await fetch_group_profile_response(self._client, group_id)
         completed_at = int(self._now_provider())
         full_chat = _validated_full_chat(result, raw_group_id)
         created = _group_created(result, raw_group_id)

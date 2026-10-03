@@ -456,3 +456,23 @@ rationale = "GetMessageReactionsList page size is a fixed Telegram adapter proto
 category = "policy_dict_values"
 key = "src/mcp_telegram/tools/reading.py:<module>:freshness"
 rationale = "The draft coverage response field derives its fixed vocabulary from DraftCoverageFreshness, not an operator freshness policy."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/chat_export_cli.py:<module>:MIN_RETRY_SECONDS"
+rationale = "Minimum accepted deferral duration is a wire validation floor, not an operator retry policy."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/chat_export_cli.py:_Export.__init__:self.retry_at"
+rationale = "This is local progress state tracking the next retry timestamp."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/chat_export_cli.py:_Export.defer:self.retry_at"
+rationale = "This timestamp is computed from the authoritative daemon deferral, not a configured schedule."
+
+[[entry]]
+category = "policy_call_keywords"
+key = "src/mcp_telegram/chat_export_cli.py:_Export.request:timeout_seconds"
+rationale = "Finite export IPC timeout has headroom over the 60-second daemon operation budget; not a whole-export deadline."

@@ -1,5 +1,6 @@
 import asyncio
 import sqlite3
+from pathlib import Path
 from typing import Annotated, cast
 
 from typer import Argument, BadParameter, Option, Typer
@@ -7,6 +8,31 @@ from typer import Argument, BadParameter, Option, Typer
 from .config import ConfigError, HttpServerConfig, load_config, resolve_http_server_config, resolve_logging_config
 
 app = Typer(no_args_is_help=True)
+
+
+@app.command("export-chat")
+def export_chat(
+    dialog_id: Annotated[str, Argument(help="Public Telegram group URL, @username, or canonical negative group ID.")],
+    output: Annotated[Path, Option("--output", help="New JSON file; an existing destination is never replaced.")],
+) -> None:
+    """Export current group history and available events without adding to the archive."""
+    import sys
+
+    from .chat_export_cli import ChatExportError, export_group
+    from .daemon_client import AccountProtectionError, DaemonNotRunningError
+
+    selector: int | str = int(dialog_id) if dialog_id.lstrip("-").isdigit() else dialog_id
+    if isinstance(selector, int) and selector >= 0:
+        raise BadParameter("Use a canonical negative Telegram group ID.")
+    try:
+        result = asyncio.run(export_group(selector, output))
+    except (ChatExportError, AccountProtectionError, DaemonNotRunningError, ConfigError, OSError, ValueError) as exc:
+        print(f"Export failed: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    print(
+        f"Exported {result['messages']} messages and {result['admin_events']} admin events to {output}",
+        file=sys.stderr,
+    )
 
 
 def _resolve_http_host(host: str | None, *, base: HttpServerConfig | None = None) -> str:

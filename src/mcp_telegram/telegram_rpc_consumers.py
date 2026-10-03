@@ -22,6 +22,7 @@ class TelegramRpcSource(StrEnum):
     """Application-owned reasons for issuing Telegram RPCs."""
 
     MCP_INTERACTIVE = "mcp_interactive"
+    CHAT_EXPORT = "chat_export"
     MESSAGE_READ_FALLBACK = "message_read_fallback"
     DIALOG_RESOLUTION = "dialog_resolution"
     TOPIC_RESOLUTION = "topic_resolution"
@@ -55,6 +56,7 @@ class DemandKind(StrEnum):
     """Stable root operations that can cause application Telegram traffic."""
 
     MCP_REMOTE_ACQUISITION = "mcp_remote_acquisition"
+    CHAT_EXPORT_OPERATION = "chat_export_operation"
     MESSAGE_READ_FALLBACK = "message_read_fallback"
     ENTITY_LOOKUP = "entity_lookup"
     TOPIC_LOOKUP = "topic_lookup"
@@ -297,6 +299,21 @@ _REGISTRY: dict[TelegramRpcSource, TelegramRpcConsumerSpec] = {
         _D,
         AcquisitionTrigger.REQUEST,
         FanoutScope.SINGLE,
+        DemandPolicyOwner.CALLER,
+    ),
+    TelegramRpcSource.CHAT_EXPORT: _consumer(
+        "Chat export",
+        "Export a finite set of facts from one Telegram dialog",
+        _B,
+        (
+            TelegramFactDomain.MESSAGE_HISTORY,
+            TelegramFactDomain.REACTIONS,
+            TelegramFactDomain.ENTITIES,
+            TelegramFactDomain.TOPICS,
+        ),
+        _D,
+        AcquisitionTrigger.REQUEST,
+        FanoutScope.DIALOG,
         DemandPolicyOwner.CALLER,
     ),
     TelegramRpcSource.MESSAGE_READ_FALLBACK: _consumer(
@@ -648,6 +665,9 @@ _DURABLE = ExecutionMode.DURABLE
 _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
     DemandKind.MCP_REMOTE_ACQUISITION: _contract(
         DemandKind.MCP_REMOTE_ACQUISITION, TelegramRpcSource.MCP_INTERACTIVE, _INLINE
+    ),
+    DemandKind.CHAT_EXPORT_OPERATION: _contract(
+        DemandKind.CHAT_EXPORT_OPERATION, TelegramRpcSource.CHAT_EXPORT, _INLINE
     ),
     DemandKind.MESSAGE_READ_FALLBACK: _contract(
         DemandKind.MESSAGE_READ_FALLBACK, TelegramRpcSource.MESSAGE_READ_FALLBACK, _INLINE

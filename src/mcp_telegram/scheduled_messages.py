@@ -192,6 +192,8 @@ def _scheduled_params(dialog_id: int, extracted: ExtractedMessage, source: objec
         "sender_first_name": message.sender_first_name,
         "media_kind": message.media_kind,
         "media_payload": message.media_payload,
+        "formatting_entities": message.formatting_entities,
+        "service_action": message.service_action,
         "reply_to_msg_id": message.reply_to_msg_id,
         "forum_topic_id": message.forum_topic_id,
         "edit_date": message.edit_date,
@@ -208,14 +210,16 @@ def _scheduled_params(dialog_id: int, extracted: ExtractedMessage, source: objec
 _UPSERT_SCHEDULED_SQL = """
 INSERT INTO scheduled_messages (
     dialog_id, message_id, scheduled_at, text, sender_id, sender_first_name,
-    media_kind, media_payload, reply_to_msg_id, forum_topic_id, edit_date, grouped_id,
+    media_kind, media_payload, formatting_entities, service_action, reply_to_msg_id,
+    forum_topic_id, edit_date, grouped_id,
     reply_to_peer_id, out, is_service, post_author, schedule_repeat_period,
     message_state, visibility, unpublished, unseen, publication_hint_message_id,
     published_message_id, publication_verified_at, published_at, deleted_at,
     first_seen_at, updated_at
 ) VALUES (
     :dialog_id, :message_id, :scheduled_at, :text, :sender_id, :sender_first_name,
-    :media_kind, :media_payload, :reply_to_msg_id, :forum_topic_id, :edit_date, :grouped_id,
+    :media_kind, :media_payload, :formatting_entities, :service_action, :reply_to_msg_id,
+    :forum_topic_id, :edit_date, :grouped_id,
     :reply_to_peer_id, :out, :is_service, :post_author, :schedule_repeat_period,
     'scheduled', 'author_only', 1, 1, NULL, NULL, NULL, NULL, NULL,
     :updated_at, :updated_at
@@ -227,6 +231,8 @@ ON CONFLICT(dialog_id, message_id) DO UPDATE SET
     sender_first_name = excluded.sender_first_name,
     media_kind = excluded.media_kind,
     media_payload = excluded.media_payload,
+    formatting_entities = excluded.formatting_entities,
+    service_action = excluded.service_action,
     reply_to_msg_id = excluded.reply_to_msg_id,
     forum_topic_id = excluded.forum_topic_id,
     edit_date = excluded.edit_date,

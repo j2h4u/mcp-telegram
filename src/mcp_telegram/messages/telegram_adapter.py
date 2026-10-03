@@ -22,6 +22,7 @@ from telethon.tl.types import TypePeer  # type: ignore[import-untyped]
 from .. import message_contracts as _message_contracts
 from ..flood import TelegramRpcThrottled, _raise_if_latched
 from ..media_fact import encode_media_payload
+from ..message_composition import extract_message_composition
 from ..telegram_demand import RpcAttemptBudgetExhaustedError
 from ..telethon_media import extract_media_fact
 from ..telethon_message import is_service_message
@@ -617,6 +618,7 @@ def extract_message_row(
     reply_to_msg_id, forum_topic_id = extract_reply_and_topic(msg)
 
     media_kind_value, media_payload = _extract_media_fact(msg)
+    formatting_entities, service_action = extract_message_composition(msg)
     stored = _message_contracts.StoredMessage(
         dialog_id=dialog_id,
         message_id=message_id,
@@ -626,6 +628,8 @@ def extract_message_row(
         sender_first_name=_extract_sender_first_name(msg),
         media_kind=media_kind_value,
         media_payload=media_payload,
+        formatting_entities=formatting_entities,
+        service_action=service_action,
         reply_to_msg_id=reply_to_msg_id,
         forum_topic_id=forum_topic_id,
         edit_date=_extract_edit_date(msg),

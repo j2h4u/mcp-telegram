@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from typing import cast
 
 from ..media_fact import decode_media_fact, media_description
+from ..message_composition import decode_formatting_entities, decode_service_action
 from ..models import ContentKind, ReadMessage
 
 
@@ -34,6 +35,7 @@ def _coerce_optional_int(value: object | None) -> int | None:
 def read_message_from_row(row: Mapping[str, object] | object, *, reactions_display: str = "") -> ReadMessage:
     """Decode any reading SELECT row into the one canonical message record."""
     fact = decode_media_fact(_row_value(row, "media_kind"), _row_value(row, "media_payload"))
+    entities = decode_formatting_entities(cast(str | None, _row_value(row, "formatting_entities")))
     return ReadMessage(
         message_id=_coerce_int(_row_value(row, "message_id"), 0),
         sent_at=_coerce_int(_row_value(row, "sent_at"), 0),
@@ -53,6 +55,9 @@ def read_message_from_row(row: Mapping[str, object] | object, *, reactions_displ
         topic_title=cast(str | None, _row_value(row, "topic_title")),
         effective_sender_id=_coerce_optional_int(_row_value(row, "effective_sender_id")),
         is_service=_coerce_int(_row_value(row, "is_service", 0), 0),
+        service_action=decode_service_action(cast(str | None, _row_value(row, "service_action"))),
+        formatting_entities=None if entities is None else tuple(entities),
+        formatting_text=cast(str | None, _row_value(row, "text")) if entities is not None else None,
         out=_coerce_int(_row_value(row, "out", 0), 0),
         fwd_from_name=cast(str | None, _row_value(row, "fwd_from_name")),
         post_author=cast(str | None, _row_value(row, "post_author")),

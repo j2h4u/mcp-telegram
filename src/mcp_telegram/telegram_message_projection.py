@@ -7,6 +7,7 @@ from typing import Protocol
 
 from .formatter import format_reaction_counts
 from .media_fact import encode_media_payload
+from .message_composition import decode_formatting_entities, decode_service_action, extract_message_composition
 from .message_content import MessageSnapshot, project_message_content
 from .messages.telegram_adapter import extract_entity_rows, extract_message_text, extract_reply_and_topic
 from .telethon_media import extract_media_fact
@@ -162,7 +163,12 @@ def message_to_dict(  # noqa: PLR0914
             text_links=tuple(text_links),
         )
     )
+    entities_json, action_json = extract_message_composition(msg)
+    entities = decode_formatting_entities(entities_json)
     return {
+        "formatting_entities": None if entities is None else tuple(entities),
+        "formatting_text": extract_message_text(msg) if entities is not None else None,
+        "service_action": decode_service_action(action_json),
         "message_id": msg.id,
         "sent_at": sent_at,
         "text": content.text,
