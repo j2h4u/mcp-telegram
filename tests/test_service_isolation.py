@@ -9,9 +9,10 @@ import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from http.client import HTTPResponse
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import cast
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -55,9 +56,19 @@ def _worker(command: list[str], env: dict[str, str], log_path: Path) -> Iterator
                     process.wait(timeout=5)
 
 
-def _health(url: str) -> dict[str, Any]:
-    with urlopen(f"{url.removesuffix('/mcp')}/health", timeout=2) as response:
-        return json.load(response)
+def _mapping(value: object) -> dict[str, object]:
+    assert isinstance(value, dict)
+    return cast(dict[str, object], value)
+
+
+def _sequence(value: object) -> list[object]:
+    assert isinstance(value, list)
+    return cast(list[object], value)
+
+
+def _health(url: str) -> dict[str, object]:
+    with cast(HTTPResponse, urlopen(f"{url.removesuffix('/mcp')}/health", timeout=2)) as response:
+        return _mapping(cast(object, json.load(response)))
 
 
 def _wait_for_http(url: str, process: subprocess.Popen[bytes]) -> None:
@@ -73,40 +84,50 @@ def _wait_for_http(url: str, process: subprocess.Popen[bytes]) -> None:
     pytest.fail("isolated HTTP startup exceeded 120s")
 
 
-def _cli(env: dict[str, str], url: str, command: str) -> Any:
+def _cli(env: dict[str, str], url: str, command: str) -> object:
     arguments = [sys.executable, "-m", "devtools.mcp_client.cli", command, "--url", url, "--timeout", "35"]
     if command == "call-tool":
         arguments.extend(["--name", "get_sync_status", "--arguments", '{"dialog_id": 987654321}'])
     result = subprocess.run(arguments, cwd=_REPO, env=env, capture_output=True, text=True, timeout=50, check=False)
     assert result.returncode == 0, result.stderr
-    return json.loads(result.stdout)
+    return cast(object, json.loads(result.stdout))
+
+
+def _assert_tool_available(env: dict[str, str], url: str) -> None:
+    assert any(_mapping(tool)["name"] == "get_sync_status" for tool in _sequence(_cli(env, url, "list-tools")))
 
 
 def _exercise_stalled_daemon(
     env: dict[str, str], url: str, http: subprocess.Popen[bytes], daemon: subprocess.Popen[bytes]
 ) -> None:
-    initial = _cli(env, url, "call-tool")
+    initial = _mapping(_cli(env, url, "call-tool"))
+    initial_data = _mapping(initial["structuredContent"])
     assert initial["isError"] is False
-    assert initial["structuredContent"]["coverage_status"] == "not_synced"
+    assert initial_data["coverage_status"] == "not_synced"
     daemon.send_signal(signal.SIGSTOP)
     assert _health(url)["ok"] is True
-    assert any(tool["name"] == "get_sync_status" for tool in _cli(env, url, "list-tools"))
+    _assert_tool_available(env, url)
     started = time.monotonic()
-    stalled = _cli(env, url, "call-tool")
+    stalled = _mapping(_cli(env, url, "call-tool"))
     elapsed = time.monotonic() - started
     assert stalled["isError"] is True
-    text = stalled["content"][0]["text"]
+    text = _mapping(_sequence(stalled["content"])[0])["text"]
+    assert isinstance(text, str)
     assert "Action:" in text and ("IPC timeout" in text or "TimeoutError" in text)
-    assert stalled["structuredContent"]["error"]["code"] == "tool_error"
-    assert stalled["structuredContent"]["error"]["action"]
-    assert stalled["structuredContent"]["account_protection"]["status"] == "unavailable"
+    stalled_data = _mapping(stalled["structuredContent"])
+    error = _mapping(stalled_data["error"])
+    assert error["code"] == "tool_error"
+    assert error["action"]
+    assert _mapping(stalled_data["account_protection"])["status"] == "unavailable"
     assert http.poll() is None
-    print(f"SIGSTOP: health/list-tools available, real IPC deadline returned MCP isError; CLI wall time {elapsed:.2f}s")
+    print(
+        f"SIGSTOP: health/list-tools available, real 30s request budget returned MCP isError; CLI wall time {elapsed:.2f}s"
+    )
     daemon.send_signal(signal.SIGCONT)
-    recovered = _cli(env, url, "call-tool")
+    recovered = _mapping(_cli(env, url, "call-tool"))
     assert recovered["isError"] is False
     for field in ("dialog_id", "coverage_status", "account_protection"):
-        assert recovered["structuredContent"].get(field) == initial["structuredContent"].get(field)
+        assert _mapping(recovered["structuredContent"]).get(field) == initial_data.get(field)
     assert http.poll() is None
     print("SIGCONT: get_sync_status recovered without HTTP restart")
 
@@ -125,14 +146,14 @@ def test_http_survives_absent_and_stopped_daemon_without_restart() -> None:
         env = dict(os.environ, XDG_CONFIG_HOME=str(root / "config"), PYTHONPATH=f"{_REPO}:{_REPO / 'tests'}")
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
-            port = listener.getsockname()[1]
+            port = cast(tuple[str, int], listener.getsockname())[1]
         url = f"http://127.0.0.1:{port}/mcp"
         console_script = Path(sys.executable).with_name("mcp-telegram")
         http_command = [sys.executable, str(console_script), "http", "--host", "127.0.0.1", "--port", str(port)]
         with _worker(http_command, env, root / "http.log") as http:
             _wait_for_http(url, http)
-            assert any(tool["name"] == "get_sync_status" for tool in _cli(env, url, "list-tools"))
-            assert _cli(env, url, "call-tool")["isError"] is True
+            _assert_tool_available(env, url)
+            assert _mapping(_cli(env, url, "call-tool"))["isError"] is True
             print("cold startup: health/list-tools available, missing daemon returns MCP isError")
             with _worker([sys.executable, "-c", _DAEMON_CODE], env, root / "daemon.log") as daemon:
                 deadline = time.monotonic() + 120
