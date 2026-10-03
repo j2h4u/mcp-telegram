@@ -10,6 +10,7 @@ import sqlite3
 import traceback
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from itertools import pairwise
 from typing import Protocol, cast
 
 from telethon.errors import RPCError, UserNotParticipantError
@@ -42,6 +43,10 @@ class _Client(Protocol):
     async def get_input_entity(self, dialog_id: int | str) -> object: ...
 
     async def __call__(self, request: object) -> object: ...
+
+
+class _InvalidPageError(ValueError):
+    """Telegram returned page IDs that cannot safely advance an export cursor."""
 
 
 def _integer(req: Mapping[str, object], key: str, *, default: int | None = None) -> int:
@@ -88,6 +93,10 @@ def _export_failure(operation: object, reason: str) -> dict[str, object]:
                 "topic": None,
             },
         }
+    return _failed_export(reason)
+
+
+def _failed_export(reason: str) -> dict[str, object]:
     return {
         "ok": False,
         "error": "export_failed",
@@ -397,15 +406,24 @@ async def _open(client: _Client, peer: object, dialog_id: int) -> dict[str, obje
     }
 
 
-def _history_ids(raw_items: Sequence[object], upper: int, before: int) -> list[int]:
+def _ordered_page_ids(raw_items: Sequence[object], max_id: int, kind: str) -> list[int]:
     values = [cast(object, getattr(item, "id", None)) for item in raw_items]
-    if any(type(value) is not int or value < 1 for value in values):
-        raise ValueError("Telegram history returned invalid message IDs")
+    if any(type(value) is not int or not 1 <= value <= max_id for value in values):
+        raise _InvalidPageError(f"Telegram {kind} returned invalid IDs")
     ids = cast(list[int], values)
-    if ids and max(ids) > upper:
-        raise ValueError("Telegram history exceeded its frozen boundary")
-    if ids and before and max(ids) >= before:
-        raise ValueError("Telegram history cursor did not advance")
+    if any(current <= following for current, following in pairwise(ids)):
+        raise _InvalidPageError(f"Telegram {kind} IDs are not strictly descending")
+    return ids
+
+
+def _history_ids(
+    raw_items: Sequence[object], upper: int, before: int, *, max_id: int = 2**31 - 1, kind: str = "history"
+) -> list[int]:
+    ids = _ordered_page_ids(raw_items, max_id, kind)
+    if ids and ids[0] > upper:
+        raise _InvalidPageError(f"Telegram {kind} exceeded its upper boundary")
+    if ids and before and ids[0] >= before:
+        raise _InvalidPageError(f"Telegram {kind} cursor did not advance")
     return ids
 
 
@@ -540,7 +558,14 @@ async def _admin_log(
         AcquisitionKind.ADMIN_LOG_PAGE,
     )
     entities = _identities(response)
-    events = [event for event in _objects(getattr(response, "events", ())) if getattr(event, "id", 0) > lower]
+    raw_events = _objects(getattr(response, "events", ()))
+    event_ids = _history_ids(raw_events, 2**63 - 1, before, max_id=2**63 - 1, kind="admin log")
+    eligible = [
+        (event, event_id)
+        for event, event_id in zip(raw_events, event_ids, strict=True)
+        if event_id > lower
+    ]
+    events = [event for event, _ in eligible]
     items = _bounded_page(
         [
             {
@@ -612,6 +637,9 @@ async def export_operation(  # noqa: PLR0911 - explicit transport outcomes keep 
         return {"ok": False, "error": "export_failed", "reason": "admission_closed"}
     except RpcAdmissionError:
         return {"ok": False, "error": "export_deferred", "reason": "admission", "retry_after": 5.0}
+    except _InvalidPageError as exc:
+        _log_export_failure(operation, exc)
+        return _failed_export("invalid_response")
     except (RPCError, TimeoutError, OSError, ValueError, RpcAttemptBudgetExhaustedError) as exc:
         reason = describe_telegram_rpc_error(exc).error_type
         _log_export_failure(operation, exc)

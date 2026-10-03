@@ -218,6 +218,16 @@ async def test_history_rejects_nonadvancing_or_outside_frozen_boundary(
     assert result["ok"] is False
 
 
+@pytest.mark.parametrize("ids", [[100, 90, 95], [100, 90, 90]])
+async def test_history_rejects_malformed_page_order_before_returning_items(
+    archive: sqlite3.Connection, ids: list[int]
+) -> None:
+    result = await call(archive, Client(response(messages=[message(i) for i in ids])), upper_id=100)
+    assert result["ok"] is False
+    assert result["error"] == "export_failed"
+    assert "data" not in result
+
+
 async def test_byte_split_resumes_at_last_delivered_id_and_oversize_is_explicit(
     archive: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -280,6 +290,20 @@ async def test_admin_log_minimum_event_id_is_exclusive(archive: sqlite3.Connecti
     request = client.requests[0]
     assert isinstance(request, functions.channels.GetAdminLogRequest)
     assert request.min_id == 7
+
+
+@pytest.mark.parametrize("ids", [[100, 90, 95], [100, 90, 90]])
+async def test_admin_log_rejects_malformed_page_order_before_returning_items(
+    archive: sqlite3.Connection, ids: list[int]
+) -> None:
+    events = [
+        types.ChannelAdminLogEvent(event_id, DATE, 7, types.ChannelAdminLogEventActionParticipantJoin())
+        for event_id in ids
+    ]
+    result = await call(archive, Client(response(events=events)), "admin_log")
+    assert result["ok"] is False
+    assert result["error"] == "export_failed"
+    assert "data" not in result
 
 
 @pytest.mark.parametrize("lower_id", [True, -1, "7", 2**63])
