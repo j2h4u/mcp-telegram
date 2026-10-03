@@ -560,11 +560,7 @@ async def _admin_log(
     entities = _identities(response)
     raw_events = _objects(getattr(response, "events", ()))
     event_ids = _history_ids(raw_events, 2**63 - 1, before, max_id=2**63 - 1, kind="admin log")
-    eligible = [
-        (event, event_id)
-        for event, event_id in zip(raw_events, event_ids, strict=True)
-        if event_id > lower
-    ]
+    eligible = [(event, event_id) for event, event_id in zip(raw_events, event_ids, strict=True) if event_id > lower]
     events = [event for event, _ in eligible]
     items = _bounded_page(
         [
