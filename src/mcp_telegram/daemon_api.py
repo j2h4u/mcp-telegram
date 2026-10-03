@@ -42,9 +42,11 @@ import json
 import logging
 import re
 import sqlite3
+import sys
+import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, SupportsIndex, cast
 
@@ -156,6 +158,71 @@ _ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, type FROM entities WHERE u
 _TELEMETRY_OUTCOMES = frozenset({"success", "tool_error", "validation_error", "exception", "cancelled"})
 _TELEMETRY_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _runtime_event_write_count = 0
+_EXPORT_STACK_FRAMES = 20
+_EXPORT_LOOP_STALL_SECONDS = 10
+
+
+def _export_loop_stack(thread_id: int) -> str:
+    """Bounded function/line stack only: no source lines, locals or message data."""
+    frame = sys._current_frames().get(thread_id)
+    stack: list[str] = []
+    while frame is not None and len(stack) < _EXPORT_STACK_FRAMES:
+        stack.append(f"{Path(frame.f_code.co_filename).name}:{frame.f_code.co_name}:{frame.f_lineno}")
+        frame = frame.f_back
+    return " <- ".join(stack)
+
+
+def _export_response_metadata(response: Mapping[str, object]) -> dict[str, object]:
+    data = response.get("data")
+    detail = data if isinstance(data, dict) else {}
+    result: dict[str, object] = {}
+    for field in ("error", "reason", "status"):
+        value = response.get(field, detail.get(field))
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", value):
+            result[field] = value
+    retry_after = response.get("retry_after")
+    if type(retry_after) in (int, float) and 0 <= cast(float, retry_after) < 2**31:
+        result["retry_after"] = retry_after
+    return result
+
+
+def _export_observation_payload(
+    req: Mapping[str, object],
+    timing: DaemonRequestTiming,
+    response: Mapping[str, object] | None,
+    *,
+    cancelled: bool,
+) -> dict[str, object]:
+    from .chat_export import EXPORT_OPERATION_SECONDS
+
+    operation = req.get("operation")
+    payload: dict[str, object] = {
+        "method": "export_chat",
+        "operation": operation
+        if operation in ("open", "history", "reactions", "participant", "topic", "admin_log")
+        else "invalid",
+        "request_id": timing.request_id,
+        "operation_id": timing.operation_id,
+        "outcome": "started"
+        if response is None
+        else "cancelled"
+        if cancelled
+        else "success"
+        if response.get("ok")
+        else "failed",
+        "duration_ms": round(timing.duration_ms(), 3),
+        "rpc_admission_ms": timing.phases.get("rpc_admission"),
+        "rpc_execution_ms": timing.phases.get("rpc_execution"),
+        "rpc_attempts": timing.rpc_attempts,
+    }
+    for field in ("dialog_id", "message_id", "user_id", "topic_id", "before_id", "min_id", "upper_id"):
+        value = req.get(field)
+        if type(value) is int and -(2**63) < value < 2**63:
+            payload[field] = value
+    if response is not None:
+        payload.update(_export_response_metadata(response))
+        payload["deadline_exceeded"] = timing.duration_ms() > EXPORT_OPERATION_SECONDS * 1000
+    return payload
 
 
 @contextmanager
@@ -856,19 +923,104 @@ class DaemonAPIServer:
         cancelled = False
         with timing_context(operation_id, request_id=standalone_request_id(request_id)) as timing:
             response: dict[str, object] = {"ok": False, "error": "cancelled"}
-            try:
-                response = await self._dispatch_with_error_projection(req, method=method, request_id=request_id)
-            except asyncio.CancelledError:
-                cancelled = True
-                raise
-            finally:
-                _current_request_id.reset(request_token)
-                if method == "list_messages" and timing is not None:
-                    timing.set_served_source(_served_source(response))
-                    self._record_request_timing(timing, response, cancelled=cancelled)
+            with self._observe_export_loop(req, timing) if method == "export_chat" else nullcontext():
+                try:
+                    response = await self._dispatch_with_error_projection(req, method=method, request_id=request_id)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    raise
+                finally:
+                    _current_request_id.reset(request_token)
+                    if method == "list_messages" and timing is not None:
+                        timing.set_served_source(_served_source(response))
+                        self._record_request_timing(timing, response, cancelled=cancelled)
+                    if method == "export_chat" and timing is not None:
+                        self._record_export_observation(req, timing, response, cancelled=cancelled)
 
         self._log_request_completion(method, request_id, response, time.perf_counter() - started_at)
         return response
+
+    def _record_export_observation(
+        self,
+        req: Mapping[str, object],
+        timing: DaemonRequestTiming,
+        response: Mapping[str, object] | None = None,
+        *,
+        cancelled: bool = False,
+        diagnostic: Mapping[str, object] | None = None,
+    ) -> None:
+        """Record only export control metadata, never selectors or Telegram facts."""
+        payload = _export_observation_payload(req, timing, response, cancelled=cancelled)
+        payload.update(diagnostic or {})
+        logger.info("daemon_export_operation %s", json.dumps(payload, separators=(",", ":")))
+        if self._runtime_observation_sink is None:
+            return
+        try:
+            self._runtime_observation_sink.record(
+                kind=TIMING_KIND,
+                operation_id=timing.operation_id,
+                dialog_id=cast(int | None, payload.get("dialog_id")),
+                outcome=cast(str, payload["outcome"]),
+                reason_code=cast(str | None, payload.get("reason")),
+                duration_ms=timing.duration_ms(),
+                payload=payload,
+            )
+        except Exception:
+            logger.debug("daemon_export_observation_record_failed", exc_info=True)
+
+    @contextmanager
+    def _observe_export_loop(self, req: Mapping[str, object], timing: DaemonRequestTiming | None) -> Iterator[None]:
+        """Sample a stalled event loop once while this export operation is active."""
+        if timing is None:
+            yield
+            return
+        self._record_export_observation(req, timing)
+        loop = asyncio.get_running_loop()
+        loop_thread_id = threading.get_ident()
+        stopped = threading.Event()
+        last_pulse = time.monotonic()
+        pulse_handle: asyncio.TimerHandle | None = None
+
+        def pulse() -> None:
+            nonlocal last_pulse, pulse_handle
+            last_pulse = time.monotonic()
+            if not stopped.is_set():
+                pulse_handle = loop.call_later(_EXPORT_LOOP_STALL_SECONDS / 10, pulse)
+
+        def watch() -> None:
+            while not stopped.wait(_EXPORT_LOOP_STALL_SECONDS / 2):
+                delay = time.monotonic() - last_pulse
+                if delay < _EXPORT_LOOP_STALL_SECONDS:
+                    continue
+                stack = _export_loop_stack(loop_thread_id)
+                logger.warning(
+                    "daemon_export_loop_stalled request_id=%s operation_id=%s delay_s=%.3f stack=%s",
+                    timing.request_id,
+                    timing.operation_id,
+                    delay,
+                    stack,
+                )
+                self._record_export_observation(
+                    req,
+                    timing,
+                    diagnostic={
+                        "outcome": "loop_stalled",
+                        "reason": "loop_stalled",
+                        "loop_delay_ms": round(delay * 1000),
+                        "stack": stack[:200],
+                    },
+                )
+                return
+
+        pulse()
+        watcher = threading.Thread(target=watch, name="export-loop-watchdog", daemon=True)
+        watcher.start()
+        try:
+            yield
+        finally:
+            stopped.set()
+            if pulse_handle is not None:
+                pulse_handle.cancel()
 
     def _record_request_timing(
         self,

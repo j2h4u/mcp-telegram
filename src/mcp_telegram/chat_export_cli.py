@@ -1,9 +1,13 @@
 """Stream a current Telegram group export through finite daemon requests."""
 
 import asyncio
+import fcntl
 import json
+import logging
 import math
 import os
+import re
+import signal
 import sys
 import tempfile
 import time
@@ -12,6 +16,8 @@ from contextlib import suppress
 from pathlib import Path
 from typing import TextIO, cast
 
+from .chat_export_checkpoint import ORDER, Checkpoint, CheckpointError, census, read_checkpoint_options
+from .chat_export_checkpoint import fingerprint as _fingerprint
 from .chat_export_projection import (
     clean_facts as _facts,
 )
@@ -21,11 +27,13 @@ from .chat_export_projection import (
     project_message,
     project_reactor,
 )
-from .daemon_client import daemon_connection
+from .daemon_client import DaemonNotRunningError, daemon_connection
 
 MIN_RETRY_SECONDS = 0.1
 ROLE_CACHE_SIZE = 512
 TOPIC_CACHE_SIZE = 64
+IPC_RETRIES = 3
+_LOGGER = logging.getLogger(__name__)
 type Payload = dict[str, object]
 
 
@@ -64,7 +72,7 @@ def _items(data: Payload) -> list[Payload]:
 
 
 def _dump(stream: TextIO, value: object) -> None:
-    json.dump(value, stream, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    stream.write(json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
 
 
 def _field(stream: TextIO, name: str, value: object) -> None:
@@ -137,13 +145,14 @@ class _Export:
         self.topics: OrderedDict[tuple[int, int], Payload] = OrderedDict()
         self.total_hint: int | None = None
         self.history_finished = False
+        self.started_messages = 0
         self.stage = "open"
         self.wait_reason: str | None = None
         self.retry_at = 0.0
 
     def progress(self) -> None:
         elapsed = time.monotonic() - self.clock
-        rate = self.counts["messages"] / elapsed if elapsed else 0
+        rate = (self.counts["messages"] - self.started_messages) / elapsed if elapsed else 0
         detail = (
             f"; stage {self.stage}; admin events {self.counts['admin_events']}"
             f"; enrichments {self.counts['enrichments']}"
@@ -176,12 +185,38 @@ class _Export:
     async def request(self, operation: str, peer_id: int | str, **kwargs: object) -> Payload:
         self.stage = operation
         while True:
-            async with daemon_connection(timeout_seconds=75) as conn:
-                response = _object(
-                    await conn.request(
-                        {"method": "export_chat", "operation": operation, "dialog_id": peer_id, **kwargs}
+            response: Payload = {}
+            for attempt in range(IPC_RETRIES + 1):
+                started = time.monotonic()
+                try:
+                    async with daemon_connection(timeout_seconds=75) as conn:
+                        response = _object(
+                            await conn.request(
+                                {"method": "export_chat", "operation": operation, "dialog_id": peer_id, **kwargs}
+                            )
+                        )
+                    _LOGGER.info(
+                        "Export RPC operation=%s attempt=%s elapsed=%.3fs result=%s",
+                        operation,
+                        attempt + 1,
+                        time.monotonic() - started,
+                        response.get("error", "ok"),
                     )
-                )
+                    break
+                except DaemonNotRunningError as exc:
+                    _LOGGER.warning(
+                        "Export RPC operation=%s attempt=%s elapsed=%.3fs error=%s",
+                        operation,
+                        attempt + 1,
+                        time.monotonic() - started,
+                        exc.kind,
+                    )
+                    if (
+                        exc.kind not in {"response_timeout", "connect_timeout", "send_timeout", "connection_broken"}
+                        or attempt == IPC_RETRIES
+                    ):
+                        raise
+                    await self.defer({"retry_after": 2**attempt, "reason": f"IPC {exc.kind}"})
             if response.get("ok") is True:
                 return _object(response.get("data"))
             if response.get("error") != "export_deferred":
@@ -288,7 +323,6 @@ class _Export:
             stream.write(",")
         await self.reactions(stream, reactions, peer_id, message_id)
         stream.write("}")
-        self.counts["messages"] += 1
 
     async def open_peers(self) -> list[Payload]:
         peers: list[Payload] = []
@@ -310,98 +344,291 @@ class _Export:
         self.total_hint = _hint(peers)
         return peers
 
-    async def history_peer(self, stream: TextIO, peer: Payload, first: bool) -> bool:
-        before = 0
+    async def history_peer(self, checkpoint: Checkpoint, peer: Payload, minimum: int) -> None:
         peer_id = cast(int, peer["dialog_id"])
+        key = f"history:{peer_id}"
+        if checkpoint.state(key + ":done"):
+            return
+        before = cast(int, checkpoint.state(key) or 0)
         upper = _integer(peer["upper_id"])
         while True:
-            page = await self.request("history", peer_id, upper_id=upper, before_id=before)
+            page = await self.request("history", peer_id, upper_id=upper, before_id=before, min_id=minimum)
             last = before
             for item in _items(page):
                 last = _ordered_id(item, last, upper)
-                if not first:
-                    stream.write(",")
-                await self.write_message(stream, item, peer_id)
-                first = False
+                if last <= minimum:
+                    raise ChatExportError("History escaped incremental boundary")
+                with tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+", encoding="utf-8") as spool:
+                    await self.write_message(cast(TextIO, spool), item, peer_id)
+                    spool.seek(0)
+                    checkpoint.save("message", peer_id, last, spool.read(), key)
+                    self.counts["messages"] += 1
             if page["done"]:
-                return first
-            before = _advance(page, before, last, upper)
-
-    async def admin_items(self, stream: TextIO, page: Payload, before: int, first: bool) -> tuple[int, bool]:
-        last = before
-        for raw in _items(page):
-            event = _facts(raw)
-            last = _ordered_id(event, last)
-            event["actor"] = await self.identity(event.get("actor"), self.dialog_id)
-            await self.related_users(event, self.dialog_id)
-            if not first:
-                stream.write(",")
-            _dump(stream, project_admin_event(event, self.dialog_id))
-            first = False
-            self.counts["admin_events"] += 1
-        return last, first
-
-    async def admin_log(self, stream: TextIO) -> None:
-        before = 0
-        first = True
-        while True:
-            page = await self.request("admin_log", self.dialog_id, before_id=before)
-            status = _status(page, {"complete", "unavailable"})
-            if status == "unavailable":
+                checkpoint.mark(key + ":done", True)
                 return
-            last, first = await self.admin_items(stream, page, before, first)
-            if page["done"]:
+            before = _advance(page, before, last, upper)
+            checkpoint.mark(key, before)
+
+    async def admin_log(self, checkpoint: Checkpoint, minimum: int) -> None:
+        if checkpoint.state("admin:done"):
+            return
+        before = cast(int, checkpoint.state("admin") or 0)
+        while True:
+            page = await self.request("admin_log", self.dialog_id, before_id=before, min_id=minimum)
+            status = _status(page, {"complete", "unavailable"})
+            last = before
+            if status != "unavailable":
+                for raw in _items(page):
+                    event = _facts(raw)
+                    last = _ordered_id(event, last)
+                    if last <= minimum:
+                        raise ChatExportError("Admin log escaped incremental boundary")
+                    event["actor"] = await self.identity(event.get("actor"), self.dialog_id)
+                    await self.related_users(event, self.dialog_id)
+                    payload = json.dumps(
+                        project_admin_event(event, self.dialog_id), ensure_ascii=False, allow_nan=False
+                    )
+                    checkpoint.save("admin", self.dialog_id, last, payload, "admin")
+                    self.counts["admin_events"] += 1
+            if status == "unavailable" or page["done"]:
+                checkpoint.mark("admin:done", True)
                 return
             before = _advance(page, before, last)
+            checkpoint.mark("admin", before)
 
-    def summary(self) -> Payload:
-        return {name: self.counts[name] for name in ("messages", "admin_events", "reactors")}
 
-    async def write(self, stream: TextIO) -> Payload:
-        peers = await self.open_peers()
-        stream.write('{"format_version":1,"group":')
-        _dump(stream, project_group(_object(peers[0]["group"])))
-        stream.write(',"metadata":')
-        _dump(
-            stream,
-            {
-                "order": "newest_to_oldest within each peer; primary then migrated predecessors",
-                "peers": [project_group(_object(peer["group"])) for peer in peers],
-            },
-        )
-        stream.write(',"admin_events":[')
-        await self.admin_log(stream)
-        stream.write('],"messages":[')
+def _sync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_records(stream: TextIO, checkpoint: Checkpoint, peers: list[Payload]) -> None:
+    for kind, field in (("admin", "admin_events"), ("message", "messages")):
+        stream.write(f',"{field}":[')
         first = True
-        for peer in peers:
-            first = await self.history_peer(stream, peer, first)
-        self.history_finished = True
-        summary = self.summary()
-        stream.write('],"export":')
-        _dump(stream, summary)
-        stream.write("}\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-        return summary
+        for peer in peers[:1] if kind == "admin" else peers:
+            for payload in checkpoint.records(kind, cast(int, peer["dialog_id"])):
+                if not first:
+                    stream.write(",")
+                stream.write(payload)
+                first = False
+        stream.write("]")
 
 
-async def export_group(dialog_id: int | str, output: Path) -> Payload:
-    """Write atomically without clobbering, returning the final export summary."""
-    if output.exists() or output.is_symlink():
-        raise FileExistsError(f"Export destination already exists: {output}")
-    export = _Export(dialog_id)
+def _publish(checkpoint: Checkpoint, peers: list[Payload], output: Path) -> Payload:
+    if _fingerprint(output) != checkpoint.state("published"):
+        raise FileExistsError(f"Export destination changed independently: {output}")
     descriptor, name = tempfile.mkstemp(prefix=f".{output.name}.", suffix=".tmp", dir=output.parent)
     temporary = Path(name)
-    print(f"Export temporary file (remove after a crash): {temporary}", file=sys.stderr)
-    task = asyncio.create_task(export.ticker())
+    summary = checkpoint.summary()
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            summary = await export.write(stream)
-        os.link(temporary, output)
-        export.progress()
+            stream.write('{"format_version":1,"group":')
+            _dump(stream, project_group(_object(peers[0]["group"])))
+            stream.write(',"metadata":')
+            _dump(stream, {"order": ORDER, "peers": [project_group(_object(peer["group"])) for peer in peers]})
+            _write_records(stream, checkpoint, peers)
+            stream.write(',"export":')
+            _dump(stream, summary)
+            stream.write("}\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        if _fingerprint(output) != checkpoint.state("published"):
+            raise FileExistsError(f"Export destination changed independently: {output}")
+        checkpoint.mark("pending_publish", _fingerprint(temporary))
+        if output.exists():
+            temporary.replace(output)
+        else:
+            os.link(temporary, output)
+        _sync_directory(output.parent)
+        checkpoint.mark("published", _fingerprint(output))
+        checkpoint.mark("pending_publish", None)
         return summary
     finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _base_info(checkpoint: Checkpoint, base: Path | None, refresh: int) -> Payload:
+    if base is None:
+        return {"boundaries": {}, "admin_max": 0}
+    if base.with_name(f".{base.name}.resume.sqlite3").exists():
+        raise ChatExportError("Incremental base is incomplete; resume its original export first")
+    fingerprint = _fingerprint(base)
+    saved = checkpoint.state("base_fingerprint")
+    if saved is not None and fingerprint != saved:
+        raise ChatExportError("Incremental base changed since checkpoint creation")
+    info = checkpoint.state("base_info")
+    if info is not None and saved is None:
+        raise ChatExportError("Incomplete base fingerprint checkpoint")
+    if info is None:
+        info = census(base, refresh)
+        if _fingerprint(base) != fingerprint:
+            raise ChatExportError("Incremental base changed while reading")
+        checkpoint.mark_many({"base_info": info, "base_fingerprint": fingerprint})
+    return _object(info)
+
+
+async def _prepare(
+    export: _Export, checkpoint: Checkpoint, base: Path | None, refresh: int
+) -> tuple[list[Payload], Payload]:
+    info = _base_info(checkpoint, base, refresh)
+    saved_peers = checkpoint.state("peers")
+    peers = cast(list[Payload], saved_peers) if saved_peers else await export.open_peers()
+    if base is not None:
+        if _object(info["group"]).get("dialog_id") != str(peers[0]["dialog_id"]):
+            raise ChatExportError("Incremental base belongs to another group")
+        if not set(cast(list[int], info["peers"])).issubset({cast(int, p["dialog_id"]) for p in peers}):
+            raise ChatExportError("Incremental base migration chain does not match")
+    checkpoint.mark("peers", peers)
+    export.dialog_id = cast(int, peers[0]["dialog_id"])
+    export.total_hint = _hint(peers) if base is None else None
+    if base is not None:
+        checkpoint.import_base(base, info)
+        if _fingerprint(base) != checkpoint.state("base_fingerprint"):
+            raise ChatExportError("Incremental base changed while importing")
+    export.counts.update(cast(dict[str, int], checkpoint.summary()))
+    export.started_messages = export.counts["messages"]
+    return peers, info
+
+
+async def _run_export(
+    export: _Export, checkpoint: Checkpoint, output: Path, base: Path | None, refresh: int
+) -> Payload:
+    task = asyncio.create_task(export.ticker())
+    current = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    if current is not None:
+        loop.add_signal_handler(signal.SIGTERM, current.cancel)
+    try:
+        peers, info = await _prepare(export, checkpoint, base, refresh)
+        await export.admin_log(checkpoint, cast(int, info["admin_max"]))
+        boundaries = _object(info["boundaries"])
+        for peer in peers:
+            await export.history_peer(checkpoint, peer, cast(int, boundaries.get(str(peer["dialog_id"]), 0)))
+        export.history_finished = True
+        summary = _publish(checkpoint, peers, output)
+        export.progress()
+        return summary
+    except BaseException:
+        saved_peers = checkpoint.state("peers")
+        if saved_peers is not None:
+            try:
+                _publish(checkpoint, cast(list[Payload], saved_peers), output)
+            except (OSError, ValueError, CheckpointError) as exc:
+                print(f"Could not publish partial JSON: {exc}; durable records remain saved", file=sys.stderr)
+        print(
+            f"Export interrupted; saved progress retained. Repeat the same command to resume: {checkpoint.path}",
+            file=sys.stderr,
+        )
+        raise
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, previous_sigterm)
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
-        temporary.unlink(missing_ok=True)
+
+
+def _resume_options(checkpoint: Checkpoint, options: Payload) -> None:
+    saved = checkpoint.state("options")
+    if saved is None and not checkpoint.is_empty():
+        raise ChatExportError("Populated checkpoint has no export identity")
+    if saved is not None and saved != options:
+        raise ChatExportError("Resume options differ from the saved export")
+    checkpoint.mark("options", options)
+    pending = checkpoint.state("pending_publish")
+    output = Path(cast(str, options["output"]))
+    if pending is not None and _fingerprint(output) == pending:
+        checkpoint.mark("published", pending)
+
+
+async def export_group(
+    dialog_id: int | str, output: Path, *, update_from: Path | None = None, refresh_messages: int = 100
+) -> Payload:
+    """Commit every received record locally, resume automatically, and publish valid v1 JSON."""
+    if refresh_messages < 0:
+        raise ValueError("refresh_messages must be nonnegative")
+    if update_from is not None and update_from.resolve() == output.resolve():
+        raise ValueError("Incremental output must differ from its immutable base")
+    path = output.with_name(f".{output.name}.resume.sqlite3")
+    if path.is_symlink() or (not path.exists() and _fingerprint(output) is not None):
+        raise FileExistsError(f"Export destination already exists: {output}")
+    options: Payload = {
+        "selector": dialog_id,
+        "output": str(output.resolve()),
+        "update_from": str(update_from.resolve()) if update_from else None,
+        "refresh_messages": refresh_messages,
+    }
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        path.chmod(0o600)
+        checkpoint = Checkpoint(path)
+        _sync_directory(path.parent)
+        try:
+            _resume_options(checkpoint, options)
+            summary = await _run_export(_Export(dialog_id), checkpoint, output, update_from, refresh_messages)
+        finally:
+            checkpoint.close()
+        path.unlink()
+        _sync_directory(path.parent)
+        return summary
+    finally:
+        os.close(descriptor)
+
+
+def _checkpoint_options(path: Path) -> Payload:
+    descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise FileExistsError("An export in this directory is already running") from exc
+        try:
+            return read_checkpoint_options(path)
+        except CheckpointError, ValueError, ChatExportError:
+            return {}
+    finally:
+        os.close(descriptor)
+
+
+def _matching_checkpoint(path: Path, selector: int | str, base: Path | None, refresh: int) -> bool:
+    if path.is_symlink():
+        return False
+    options = _checkpoint_options(path)
+    output = path.with_name(path.name[1:].removesuffix(".resume.sqlite3"))
+    return (
+        options.get("output") == str(output.resolve())
+        and options.get("selector") == selector
+        and options.get("update_from") == (str(base.resolve()) if base else None)
+        and options.get("refresh_messages") == refresh
+    )
+
+
+async def choose_output_directory(
+    selector: int | str, directory: Path, *, update_from: Path | None = None, refresh_messages: int = 100
+) -> Path:
+    """Name exports by canonical group identity and preserve every completed file."""
+    directory = directory.resolve()
+    opened = await _Export(selector).request("open", selector)
+    identifier = _group_id(_object(opened.get("group")).get("dialog_id"))
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stem = f"telegram-group-{identifier}"
+    for checkpoint in sorted(directory.glob(f".{stem}*.json.resume.sqlite3")):
+        name = checkpoint.name[1:].removesuffix(".resume.sqlite3")
+        if re.fullmatch(re.escape(stem) + r"(?:\.\d+)?\.json", name) and _matching_checkpoint(
+            checkpoint, selector, update_from, refresh_messages
+        ):
+            return checkpoint.with_name(checkpoint.name[1:].removesuffix(".resume.sqlite3"))
+    number = 1
+    while True:
+        suffix = "" if number == 1 else f".{number}"
+        output = directory / f"{stem}{suffix}.json"
+        checkpoint = output.with_name(f".{output.name}.resume.sqlite3")
+        if not output.exists() and not output.is_symlink() and not checkpoint.exists() and not checkpoint.is_symlink():
+            return output
+        number += 1

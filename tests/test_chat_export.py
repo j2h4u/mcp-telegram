@@ -182,12 +182,50 @@ async def test_history_full_facts_service_actions_and_frozen_id_cursor(archive: 
     assert (await call(archive, client, upper_id=100, before_id=20))["data"]["done"]
 
 
+async def test_history_lower_bound_is_exclusive_and_passed_to_telegram(archive: sqlite3.Connection) -> None:
+    client = Client(response(messages=[message(i) for i in [100, 20, 7, 3]]))
+    result = await call(archive, client, upper_id=100, min_id=7)
+    assert [item["id"] for item in result["data"]["items"]] == [100, 20]
+    request = client.requests[0]
+    assert isinstance(request, functions.messages.GetHistoryRequest)
+    assert request.min_id == 7
+
+    empty_client = Client(response(messages=[message(10)]))
+    empty = await call(archive, empty_client, upper_id=10, min_id=10)
+    assert empty["data"] == {"items": [], "next_before_id": 0, "done": True}
+    assert empty_client.requests == []
+
+
+@pytest.mark.parametrize("lower_id", [True, -1, "7", 2**31])
+async def test_history_rejects_invalid_minimum_id(archive: sqlite3.Connection, lower_id: object) -> None:
+    result = await call(archive, Client(response(messages=[])), upper_id=100, min_id=lower_id)
+    assert result["ok"] is False
+
+
+async def test_history_defaults_lower_bound_to_zero(archive: sqlite3.Connection) -> None:
+    client = Client(response(messages=[message(10)]))
+    assert (await call(archive, client, upper_id=10))["data"]["items"][0]["id"] == 10
+    request = client.requests[0]
+    assert isinstance(request, functions.messages.GetHistoryRequest)
+    assert request.min_id == 0
+
+
 @pytest.mark.parametrize("ids,before", [([101], 0), ([70], 70)])
 async def test_history_rejects_nonadvancing_or_outside_frozen_boundary(
     archive: sqlite3.Connection, ids: list[int], before: int
 ) -> None:
     result = await call(archive, Client(response(messages=[message(i) for i in ids])), upper_id=100, before_id=before)
     assert result["ok"] is False
+
+
+@pytest.mark.parametrize("ids", [[100, 90, 95], [100, 90, 90]])
+async def test_history_rejects_malformed_page_order_before_returning_items(
+    archive: sqlite3.Connection, ids: list[int]
+) -> None:
+    result = await call(archive, Client(response(messages=[message(i) for i in ids])), upper_id=100)
+    assert result["ok"] is False
+    assert result["error"] == "export_failed"
+    assert "data" not in result
 
 
 async def test_byte_split_resumes_at_last_delivered_id_and_oversize_is_explicit(
@@ -239,6 +277,42 @@ async def test_admin_audit_keeps_ban_rank_but_never_deleted_or_edited_bodies(arc
     assert all(text not in serialized for text in ["REMOVED", "REPLACEMENT", "DELETED"])
     assert items[2]["action"]["new_message"]["id"] == 4
     assert result["data"]["next_before_id"] == 97
+
+
+async def test_admin_log_minimum_event_id_is_exclusive(archive: sqlite3.Connection) -> None:
+    events = [
+        types.ChannelAdminLogEvent(event_id, DATE, 7, types.ChannelAdminLogEventActionParticipantJoin())
+        for event_id in [100, 20, 7, 3]
+    ]
+    client = Client(response(events=events))
+    result = await call(archive, client, "admin_log", min_id=7)
+    assert [item["id"] for item in result["data"]["items"]] == [100, 20]
+    request = client.requests[0]
+    assert isinstance(request, functions.channels.GetAdminLogRequest)
+    assert request.min_id == 7
+
+
+@pytest.mark.parametrize("ids", [[100, 90, 95], [100, 90, 90]])
+async def test_admin_log_rejects_malformed_page_order_before_returning_items(
+    archive: sqlite3.Connection, ids: list[int]
+) -> None:
+    events = [
+        types.ChannelAdminLogEvent(event_id, DATE, 7, types.ChannelAdminLogEventActionParticipantJoin())
+        for event_id in ids
+    ]
+    result = await call(archive, Client(response(events=events)), "admin_log")
+    assert result["ok"] is False
+    assert result["error"] == "export_failed"
+    assert "data" not in result
+
+
+@pytest.mark.parametrize("lower_id", [True, -1, "7", 2**63])
+async def test_admin_log_rejects_invalid_minimum_event_id(archive: sqlite3.Connection, lower_id: object) -> None:
+    client = Client(response(events=[]))
+    result = await call(archive, client, "admin_log", min_id=lower_id)
+    assert result["ok"] is True
+    assert result["data"]["status"] == "unavailable"
+    assert client.requests == []
 
 
 async def test_participant_current_admin_unknown_and_former(archive: sqlite3.Connection) -> None:
@@ -408,6 +482,23 @@ async def test_account_protection_is_terminal_and_cancellation_propagates(archiv
     assert "retry_after" not in result
     with pytest.raises(asyncio.CancelledError):
         await call(archive, Client(asyncio.CancelledError()), upper_id=10)
+
+
+async def test_export_error_log_has_safe_frames_without_exception_text(
+    archive: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def fail(*args: object) -> dict[str, object]:
+        raise ValueError("PRIVATE CONTENT")
+
+    monkeypatch.setattr(chat_export, "_perform", fail)
+    result = await call(archive, Client(), upper_id=10)
+
+    assert result["ok"] is False
+    assert "PRIVATE CONTENT" not in caplog.text
+    assert "error_class=ValueError" in caplog.text
+    assert "function'" in caplog.text and "fail" in caplog.text
+    assert "test_chat_export.py" in caplog.text
+    assert "line'" in caplog.text
 
 
 async def test_large_participant_id_is_resolved_to_input_peer(archive: sqlite3.Connection) -> None:

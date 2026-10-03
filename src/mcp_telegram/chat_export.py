@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import sqlite3
+import traceback
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from itertools import pairwise
 from typing import Protocol, cast
 
 from telethon.errors import RPCError, UserNotParticipantError
@@ -33,12 +36,17 @@ EXPORT_RESPONSE_BYTES = 1_000_000
 EXPORT_ATTEMPTS = 6
 CHANNEL_ID_OFFSET = 1000000000000
 REACTION_CURSOR_BYTES = 4096
+logger = logging.getLogger(__name__)
 
 
 class _Client(Protocol):
     async def get_input_entity(self, dialog_id: int | str) -> object: ...
 
     async def __call__(self, request: object) -> object: ...
+
+
+class _InvalidPageError(ValueError):
+    """Telegram returned page IDs that cannot safely advance an export cursor."""
 
 
 def _integer(req: Mapping[str, object], key: str, *, default: int | None = None) -> int:
@@ -50,6 +58,51 @@ def _integer(req: Mapping[str, object], key: str, *, default: int | None = None)
     if key not in {"dialog_id", "user_id"} and not 0 <= value < 2**31:
         raise ValueError(f"{key} must be a nonnegative Telegram identifier")
     return value
+
+
+def _admin_cursor(req: Mapping[str, object], key: str) -> int:
+    value = req.get(key, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2**63:
+        raise ValueError("Invalid admin event cursor")
+    return value
+
+
+def _log_export_failure(operation: object, exc: Exception) -> None:
+    frames = [
+        {"function": frame.name, "file": frame.filename.rsplit("/", 1)[-1], "line": frame.lineno}
+        for frame in traceback.extract_tb(exc.__traceback__)[-12:]
+    ]
+    logger.error(
+        "Chat export operation failed: operation=%s error_class=%s frames=%s",
+        operation if isinstance(operation, str) else "unknown",
+        type(exc).__name__,
+        frames,
+    )
+
+
+def _export_failure(operation: object, reason: str) -> dict[str, object]:
+    if operation in {"reactions", "participant", "topic", "admin_log"}:
+        return {
+            "ok": True,
+            "data": {
+                "status": "unavailable",
+                "reason": reason,
+                "items": [],
+                "done": True,
+                "participant": _participant_data(None),
+                "topic": None,
+            },
+        }
+    return _failed_export(reason)
+
+
+def _failed_export(reason: str) -> dict[str, object]:
+    return {
+        "ok": False,
+        "error": "export_failed",
+        "reason": reason,
+        "message": "History export could not complete; no final file was published",
+    }
 
 
 def _objects(value: object) -> Sequence[object]:
@@ -186,7 +239,9 @@ async def _legacy_group(client: _Client, peer: types.InputPeerChat, kind: Acquis
         return await fetch_group_profile_response(client, -peer.chat_id)
 
 
-async def _history_response(client: _Client, peer: object, before: int, upper: int, limit: int) -> object:
+async def _history_response(  # noqa: PLR0913 - mirrors the Telegram history request bounds
+    client: _Client, peer: object, before: int, upper: int, limit: int, *, lower: int = 0
+) -> object:
     return await _send(
         client,
         functions.messages.GetHistoryRequest(
@@ -196,7 +251,7 @@ async def _history_response(client: _Client, peer: object, before: int, upper: i
             add_offset=0,
             limit=limit,
             max_id=upper + 1 if upper else 0,
-            min_id=0,
+            min_id=lower,
             hash=0,
         ),
         AcquisitionKind.MESSAGE_HISTORY_PAGE,
@@ -351,15 +406,24 @@ async def _open(client: _Client, peer: object, dialog_id: int) -> dict[str, obje
     }
 
 
-def _history_ids(raw_items: Sequence[object], upper: int, before: int) -> list[int]:
+def _ordered_page_ids(raw_items: Sequence[object], max_id: int, kind: str) -> list[int]:
     values = [cast(object, getattr(item, "id", None)) for item in raw_items]
-    if any(type(value) is not int or value < 1 for value in values):
-        raise ValueError("Telegram history returned invalid message IDs")
+    if any(type(value) is not int or not 1 <= value <= max_id for value in values):
+        raise _InvalidPageError(f"Telegram {kind} returned invalid IDs")
     ids = cast(list[int], values)
-    if ids and max(ids) > upper:
-        raise ValueError("Telegram history exceeded its frozen boundary")
-    if ids and before and max(ids) >= before:
-        raise ValueError("Telegram history cursor did not advance")
+    if any(current <= following for current, following in pairwise(ids)):
+        raise _InvalidPageError(f"Telegram {kind} IDs are not strictly descending")
+    return ids
+
+
+def _history_ids(
+    raw_items: Sequence[object], upper: int, before: int, *, max_id: int = 2**31 - 1, kind: str = "history"
+) -> list[int]:
+    ids = _ordered_page_ids(raw_items, max_id, kind)
+    if ids and ids[0] > upper:
+        raise _InvalidPageError(f"Telegram {kind} exceeded its upper boundary")
+    if ids and before and ids[0] >= before:
+        raise _InvalidPageError(f"Telegram {kind} cursor did not advance")
     return ids
 
 
@@ -368,18 +432,20 @@ async def _history(
 ) -> dict[str, object]:
     upper = _integer(req, "upper_id")
     before = _integer(req, "before_id", default=0)
-    if upper == 0:
+    lower = _integer(req, "min_id", default=0)
+    if upper <= lower:
         return {"items": [], "next_before_id": before, "done": True}
-    response = await _history_response(client, peer, before, upper, MESSAGE_HISTORY_PAGE_SIZE)
+    response = await _history_response(client, peer, before, upper, MESSAGE_HISTORY_PAGE_SIZE, lower=lower)
     raw_items = _objects(getattr(response, "messages", ()))
     entities = _identities(response)
     ids = _history_ids(raw_items, upper, before)
-    valid = [item for item in raw_items if isinstance(item, (types.Message, types.MessageService))]
+    eligible = [(item, item_id) for item, item_id in zip(raw_items, ids, strict=True) if item_id > lower]
+    valid = [item for item, _ in eligible if isinstance(item, (types.Message, types.MessageService))]
     items = _bounded_page([_message(item, _integer(req, "dialog_id"), entities, conn) for item in valid])
-    next_id = min(ids, default=before)
+    next_id = min((item_id for _, item_id in eligible), default=before)
     if len(items) < len(valid):
         next_id = cast(int, items[-1]["id"])
-    return {"items": items, "next_before_id": next_id, "done": not raw_items}
+    return {"items": items, "next_before_id": next_id, "done": not eligible}
 
 
 async def _reactions(
@@ -482,18 +548,20 @@ async def _admin_log(
     if not isinstance(peer, types.InputPeerChannel):
         return {"items": [], "done": True, "status": "unavailable", "reason": "legacy_group_has_no_admin_log"}
     # Admin event IDs are int64, unlike message IDs.
-    before = req.get("before_id", 0)
-    if isinstance(before, bool) or not isinstance(before, int) or not 0 <= before < 2**63:
-        raise ValueError("Invalid admin event cursor")
+    before = _admin_cursor(req, "before_id")
+    lower = _admin_cursor(req, "min_id")
     response = await _send(
         client,
         functions.channels.GetAdminLogRequest(
-            channel=types.InputChannel(peer.channel_id, peer.access_hash), q="", max_id=before, min_id=0, limit=50
+            channel=types.InputChannel(peer.channel_id, peer.access_hash), q="", max_id=before, min_id=lower, limit=50
         ),
         AcquisitionKind.ADMIN_LOG_PAGE,
     )
     entities = _identities(response)
-    events = _objects(getattr(response, "events", ()))
+    raw_events = _objects(getattr(response, "events", ()))
+    event_ids = _history_ids(raw_events, 2**63 - 1, before, max_id=2**63 - 1, kind="admin log")
+    eligible = [(event, event_id) for event, event_id in zip(raw_events, event_ids, strict=True) if event_id > lower]
+    events = [event for event, _ in eligible]
     items = _bounded_page(
         [
             {
@@ -565,23 +633,10 @@ async def export_operation(  # noqa: PLR0911 - explicit transport outcomes keep 
         return {"ok": False, "error": "export_failed", "reason": "admission_closed"}
     except RpcAdmissionError:
         return {"ok": False, "error": "export_deferred", "reason": "admission", "retry_after": 5.0}
+    except _InvalidPageError as exc:
+        _log_export_failure(operation, exc)
+        return _failed_export("invalid_response")
     except (RPCError, TimeoutError, OSError, ValueError, RpcAttemptBudgetExhaustedError) as exc:
         reason = describe_telegram_rpc_error(exc).error_type
-        if operation in {"reactions", "participant", "topic", "admin_log"}:
-            return {
-                "ok": True,
-                "data": {
-                    "status": "unavailable",
-                    "reason": reason,
-                    "items": [],
-                    "done": True,
-                    "participant": _participant_data(None),
-                    "topic": None,
-                },
-            }
-        return {
-            "ok": False,
-            "error": "export_failed",
-            "reason": reason,
-            "message": "History export could not complete; no final file was published",
-        }
+        _log_export_failure(operation, exc)
+        return _export_failure(operation, reason)

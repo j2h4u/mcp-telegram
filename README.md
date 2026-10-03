@@ -310,8 +310,14 @@ docker exec -it mcp-telegram mcp-telegram feedback status <id> done --reason "fi
 Export an accessible group to a new JSON file:
 
 ```bash
-mcp-telegram export-chat https://t.me/ai_engineers_guild --output group.json
+mcp-telegram export-chat https://t.me/ai_engineers_guild --output-dir ./exports
 ```
+
+Directory output uses the canonical group ID in filenames, so groups with equal
+titles keep separate exports. Completed files remain intact; a later export gets
+a numbered filename, while matching unfinished exports resume automatically.
+For an exact filename, use `--output group.json`; an unrelated existing file is
+never replaced. Choose either `--output-dir` or `--output`.
 
 The CLI connects to the existing daemon and streams current messages, replies,
 formatting, service events, attachment metadata and disclosed reaction authors.
@@ -319,8 +325,28 @@ It also includes the accessible recent admin log and current participant roles
 and custom labels. Deleted text and old edits are not restored. Media files
 are not downloaded.
 Messages are newest first per peer, with migrated predecessors retaining their
-own IDs; admin events have a separate source-labelled array. Each peer has a
+own IDs; admin events have a separate array. Each peer has a
 frozen upper message ID.
+
+Every fully enriched record is committed to a local SQLite sidecar before the
+next record is fetched. Repeat the same command after an interruption to resume
+from the saved cursor and original upper bounds. Handled failures and cancellation
+publish a valid partial JSON file and retain the sidecar; sudden crashes recover
+from the sidecar on the next invocation. Keep the sidecar until completion: its
+presence means the export is still incomplete. Success removes it.
+
+Create a new complete file from a completed export while keeping its older
+history unchanged:
+
+```bash
+mcp-telegram export-chat https://t.me/ai_engineers_guild --update-from group.json --output group-updated.json --refresh-messages 100
+```
+
+Updates fetch all new messages and refresh the last 100 existing messages per
+peer, including edits, reactions and deletions in that recent window. Use zero
+to fetch only new messages. Older records and the original file remain unchanged.
+Available new admin events are added. An update is also resumable with the same
+command and unchanged base file.
 
 Each `messages` record has scalar author, date, text and reply columns for
 analysis. IDs are strings; join replies using `reply_to_dialog_id` and

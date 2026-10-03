@@ -27,6 +27,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
     "subprocess": frozenset(),
     "sqlite3": frozenset(
         {
+            "chat_export_checkpoint.py",  # Durable export sidecar; separate from the daemon archive.
             "chat_export.py",  # Finite read-only operations through the daemon-owned RPC client.
             "__init__.py",
             "access_lifecycle/__init__.py",

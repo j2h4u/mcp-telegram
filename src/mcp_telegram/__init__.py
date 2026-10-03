@@ -13,19 +13,42 @@ app = Typer(no_args_is_help=True)
 @app.command("export-chat")
 def export_chat(
     dialog_id: Annotated[str, Argument(help="Public Telegram group URL, @username, or canonical negative group ID.")],
-    output: Annotated[Path, Option("--output", help="New JSON file; an existing destination is never replaced.")],
+    output: Annotated[
+        Path | None, Option("--output", help="JSON destination; interrupted exports resume automatically.")
+    ] = None,
+    output_dir: Annotated[
+        Path | None, Option("--output-dir", help="Directory for safe filenames based on canonical group ID.")
+    ] = None,
+    update_from: Annotated[
+        Path | None, Option("--update-from", help="Completed v1 base export; output is a new complete file.")
+    ] = None,
+    refresh_messages: Annotated[
+        int, Option("--refresh-messages", min=0, help="Recent messages per peer to refresh during an update.")
+    ] = 100,
 ) -> None:
     """Export current group history and available events without adding to the archive."""
     import sys
 
-    from .chat_export_cli import ChatExportError, export_group
+    from .chat_export_cli import ChatExportError, choose_output_directory, export_group
     from .daemon_client import AccountProtectionError, DaemonNotRunningError
 
+    if (output is None) == (output_dir is None):
+        raise BadParameter("Specify exactly one of --output or --output-dir.")
     selector: int | str = int(dialog_id) if dialog_id.lstrip("-").isdigit() else dialog_id
     if isinstance(selector, int) and selector >= 0:
         raise BadParameter("Use a canonical negative Telegram group ID.")
     try:
-        result = asyncio.run(export_group(selector, output))
+        if output_dir is not None:
+            output = asyncio.run(
+                choose_output_directory(
+                    selector, output_dir, update_from=update_from, refresh_messages=refresh_messages
+                )
+            )
+        assert output is not None
+        result = asyncio.run(export_group(selector, output, update_from=update_from, refresh_messages=refresh_messages))
+    except (asyncio.CancelledError, KeyboardInterrupt) as exc:
+        print("Export stopped; repeat the same command to resume saved progress.", file=sys.stderr)
+        raise SystemExit(130) from exc
     except (ChatExportError, AccountProtectionError, DaemonNotRunningError, ConfigError, OSError, ValueError) as exc:
         print(f"Export failed: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
