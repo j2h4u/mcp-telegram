@@ -59,6 +59,8 @@ def _stored_message() -> StoredMessage:
                 "post_author",
                 "media_kind",
                 "media_payload",
+                "formatting_entities",
+                "service_action",
             ),
         ),
         (ReactionRecord, ("dialog_id", "message_id", "emoji", "count")),

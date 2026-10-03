@@ -707,6 +707,8 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             out                 INTEGER NOT NULL DEFAULT 0,
             is_service          INTEGER NOT NULL DEFAULT 0,
             post_author         TEXT,
+            formatting_entities TEXT,
+            service_action      TEXT,
             PRIMARY KEY (dialog_id, message_id)
         ) WITHOUT ROWID
         """
@@ -8500,6 +8502,8 @@ def _make_trace_db() -> sqlite3.Connection:
             out             INTEGER NOT NULL DEFAULT 0,
             is_service      INTEGER NOT NULL DEFAULT 0,
             post_author     TEXT,
+            formatting_entities TEXT,
+            service_action TEXT,
             PRIMARY KEY (dialog_id, message_id)
         ) WITHOUT ROWID;
 

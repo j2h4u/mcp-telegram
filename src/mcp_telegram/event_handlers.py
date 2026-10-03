@@ -87,12 +87,14 @@ from .history_enrollment import EnrollmentOutcome, ensure_automatic_dm_enrollmen
 from .hydration_queue import HydrationPriority
 from .identity_observation import USERNAME_UNOBSERVED, observe_username
 from .linked_chat_fact import LinkedChatWork, linked_chat_fact_owner
+from .message_composition import extract_message_composition
 from .messages.sqlite_bundle import (
     find_unique_incoming_human_dm_dialogs,
     insert_messages_with_fts,
     list_undeleted_message_ids,
     mark_message_deleted,
     persist_edited_message,
+    persist_message_composition,
     read_message_out,
     read_message_text,
 )
@@ -1257,7 +1259,7 @@ class EventHandlerManager:
 
         Three cases:
         1. Message not in sync.db yet: INSERT it with current text, no version history.
-        2. Text unchanged: no-op (covers service edits, reactions updates, etc.).
+        2. Text unchanged: update composition facts and reaction deltas without text history.
         3. Text changed: insert old_text into message_versions, update messages.text.
 
         All operations in a single transaction.
@@ -1292,11 +1294,16 @@ class EventHandlerManager:
 
             old_text = existing.text
             if old_text == new_text:
-                # No text change. Two sub-cases:
-                # 1. msg.reactions present -> reactions-only edit; apply delta
-                #    (Phase 39.2-01 AC-1 via edited path, AC-2 removal via empty results).
-                # 2. msg.reactions is None -> service edit / media caption etc.; no-op
-                #    (regression guard AC-8).
+                formatting_entities, service_action = extract_message_composition(msg)
+                with self._conn:
+                    if allows_existing_body_update(
+                        self._realtime_coverage(dialog_id),
+                        RealtimeBodyEvent.EDIT,
+                        outgoing=existing_out.outgoing,
+                    ):
+                        persist_message_composition(
+                            self._conn, dialog_id, message_id, formatting_entities, service_action
+                        )
                 self._apply_reaction_only_edit(dialog_id, message_id, msg, coverage, existing_out.outgoing, now)
                 return
 

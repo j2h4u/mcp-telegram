@@ -820,7 +820,7 @@ def test_schema_version_records_current(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-    assert _CURRENT_SCHEMA_VERSION == 78
+    assert _CURRENT_SCHEMA_VERSION == 79
 
 
 def test_migration_v77_creates_retained_linked_chat_fact_ledger() -> None:
@@ -1631,7 +1631,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-    assert _CURRENT_SCHEMA_VERSION == 78
+    assert _CURRENT_SCHEMA_VERSION == 79
 
 
 def test_migration_v78_rollback_then_reopen_applies_atomically(tmp_path: Path) -> None:
@@ -1662,7 +1662,7 @@ def test_migration_v78_rollback_then_reopen_applies_atomically(tmp_path: Path) -
             "baseline_revision INTEGER NOT NULL,seen INTEGER NOT NULL DEFAULT 0,"
             "PRIMARY KEY(generation,dialog_id)) WITHOUT ROWID"
         )
-        conn.execute("DELETE FROM schema_version WHERE version=78")
+        conn.execute("DELETE FROM schema_version WHERE version>=78")
         conn.execute(
             "UPDATE dialog_directory_state SET generation=8,status='in_progress',"
             "ordinary_status='incomplete',pinned_main_status='complete',"
@@ -1690,7 +1690,7 @@ def test_migration_v78_rollback_then_reopen_applies_atomically(tmp_path: Path) -
 
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
-        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 78
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
         assert _fetchone_row(conn, "SELECT generation,status FROM dialog_directory_state WHERE singleton=1") == (
             8,
             "pending",

@@ -148,11 +148,14 @@ def test_read_state_per_dialog_skips_non_dm_and_zero_dialogs() -> None:
             media_payload TEXT,
             out INTEGER NOT NULL,
             is_deleted INTEGER NOT NULL,
-            is_service INTEGER NOT NULL
+            is_service INTEGER NOT NULL,
+            formatting_entities TEXT,
+            service_action TEXT
         );
         INSERT INTO entities (id, type) VALUES (7, 'User'), (8, 'Channel');
         INSERT INTO synced_dialogs (dialog_id, read_inbox_max_id, read_outbox_max_id) VALUES (7, 10, 20);
-        INSERT INTO messages VALUES (7, 11, 1700000000, NULL, NULL, 0, 0, 0), (7, 21, 1700000100, NULL, NULL, 1, 0, 0);
+        INSERT INTO messages (dialog_id, message_id, sent_at, media_kind, media_payload, out, is_deleted, is_service)
+            VALUES (7, 11, 1700000000, NULL, NULL, 0, 0, 0), (7, 21, 1700000100, NULL, NULL, 1, 0, 0);
         """
     )
     seed_full_history_enrollment(conn, 7, enabled=False)
@@ -363,7 +366,9 @@ async def test_search_scoped_result_applies_time_bounds_and_keeps_cursor_context
             forum_topic_id INTEGER,
             is_service INTEGER NOT NULL,
             out INTEGER NOT NULL,
-            is_deleted INTEGER NOT NULL DEFAULT 0
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            formatting_entities TEXT,
+            service_action TEXT
         );
         -- Keep this hand-built search fixture compatible with the canonical
         -- read projection's persisted-topic join.

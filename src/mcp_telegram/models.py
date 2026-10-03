@@ -185,6 +185,9 @@ class ReadMessage:
     topic_title: str | None = None
     effective_sender_id: int | None = None
     is_service: int = 0
+    service_action: dict[str, object] | None = None
+    formatting_entities: tuple[dict[str, object], ...] | None = None
+    formatting_text: str | None = None
     out: int = 0
     fwd_from_name: str | None = None
     post_author: str | None = None

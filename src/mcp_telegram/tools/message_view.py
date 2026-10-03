@@ -59,6 +59,22 @@ MESSAGE_VIEW_SCHEMA: dict[str, object] = {
         "sender": ENTITY_IDENTITY_SCHEMA,
         "out": {"type": "boolean"},
         "is_service": {"type": "boolean"},
+        "service_action": {
+            "type": "object",
+            "description": "Untrusted Telegram service action, retaining its typed payload.",
+        },
+        "service_action_status": {"type": "string", "enum": ["captured", "unknown"]},
+        "formatting_entities": {
+            "type": "array",
+            "items": {"type": "object"},
+            "description": "Untrusted Telegram formatting spans; offsets and lengths use UTF-16 code units.",
+        },
+        "formatting_text": {
+            "type": "string",
+            "description": "Untrusted original Telegram text; formatting_entities UTF-16 spans refer to this text, not rendered content.",
+        },
+        "formatting_entities_status": {"type": "string", "enum": ["captured", "unknown"]},
+        "composition_is_telegram_content": {"type": "boolean", "enum": [True]},
         "topic": TOPIC_IDENTITY_SCHEMA,
         "content": TELEGRAM_CONTENT_OUTPUT_SCHEMA,
         "media": MEDIA_OUTPUT_SCHEMA,
@@ -309,7 +325,18 @@ def _content_facts(message: ReadMessage) -> dict[str, object]:
     projected = serialize_message_content(
         message.text, message.media_description, message.content_kind, message.media_kind
     )
-    return {key: value for key, value in projected.items() if value is not None}
+    facts = {key: value for key, value in projected.items() if value is not None}
+    facts["composition_is_telegram_content"] = True
+    facts["formatting_entities_status"] = "unknown" if message.formatting_entities is None else "captured"
+    if message.formatting_entities is not None:
+        facts["formatting_entities"] = list(message.formatting_entities)
+        if message.formatting_text is not None:
+            facts["formatting_text"] = message.formatting_text
+    if message.is_service:
+        facts["service_action_status"] = "unknown" if message.service_action is None else "captured"
+    if message.service_action is not None:
+        facts["service_action"] = message.service_action
+    return facts
 
 
 def _context_facts(message: ReadMessage, *, parent_in_page: bool, context_included: bool) -> dict[str, object]:

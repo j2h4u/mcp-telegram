@@ -93,6 +93,7 @@ DIALOG_IDENTITY_ROLE_FUNCTIONS: Mapping[str, Mapping[str, frozenset[str]]] = {
 # These functions read entities in an explicit non-dialog role: account target,
 # profile stub, or user-only read-receipt routing.
 ENTITY_IDENTITY_ROLE_FUNCTIONS: Mapping[str, Mapping[str, frozenset[str]]] = {
+    "chat_export.py": {"_identity": frozenset({"name", "username"})},
     "account_trace_sqlite.py": {
         name: frozenset({"name", "username", "type"})
         for name in ("account_by_id", "account_by_username", "account_directory_names")
@@ -175,6 +176,12 @@ CANONICAL_MESSAGE_VIEW_FIELDS = frozenset(
         "deleted_at",
         "topic",
         "content",
+        "service_action",
+        "service_action_status",
+        "formatting_entities",
+        "formatting_entities_status",
+        "formatting_text",
+        "composition_is_telegram_content",
         "media",
         "reply_context_ref",
         "forward",

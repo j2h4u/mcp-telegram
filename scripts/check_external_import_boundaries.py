@@ -27,6 +27,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
     "subprocess": frozenset(),
     "sqlite3": frozenset(
         {
+            "chat_export.py",  # Finite read-only operations through the daemon-owned RPC client.
             "__init__.py",
             "access_lifecycle/__init__.py",
             "activity_cold_backfill.py",
@@ -91,6 +92,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
     ),
     "telethon": frozenset(
         {
+            "chat_export.py",  # Finite read-only operations through the daemon-owned RPC client.
             "activity_peer_resolve.py",
             "channel_full_siblings.py",
             "linked_chat_fact.py",

@@ -14,7 +14,8 @@ from .dialog_classification import (
 )
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 78
+_CURRENT_SCHEMA_VERSION = 79
+_MESSAGE_COMPOSITION_MIGRATION = 79
 _LINKED_CHAT_FACT_DEMAND_MIGRATION = 77
 _DIALOG_IDENTITY_OWNER_MIGRATION = 78
 _SCHEMA_VERSION_WITH_FTS = 3
@@ -4609,6 +4610,25 @@ def _apply_migration_78(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
+def _apply_migration_79(conn: sqlite3.Connection, current: int) -> int:
+    """Preserve newly observed formatting and service facts; old rows stay unknown."""
+    if current >= _MESSAGE_COMPOSITION_MIGRATION:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for table in ("messages", "scheduled_messages"):
+            columns = _table_column_names(conn, table)
+            for column in ("formatting_entities", "service_action"):
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+        conn.execute("INSERT OR IGNORE INTO schema_version VALUES (79, strftime('%s','now'))")
+        conn.commit()
+        return 79
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _apply_migrations_64_to_67(conn: sqlite3.Connection, current: int) -> int:
     """Apply the ordered canonical-directory and folder migrations."""
     if _CURRENT_SCHEMA_VERSION >= _CANONICAL_DIALOG_DIRECTORY_MIGRATION_64:
@@ -4656,6 +4676,8 @@ def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
         current = _apply_migration_77(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _DIALOG_IDENTITY_OWNER_MIGRATION:
         current = _apply_migration_78(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _MESSAGE_COMPOSITION_MIGRATION:
+        current = _apply_migration_79(conn, current)
     return current
 
 

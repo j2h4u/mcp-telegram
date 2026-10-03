@@ -74,6 +74,7 @@ def test_demand_registry_has_exact_operation_and_source_coverage() -> None:
     assert set(TELEGRAM_DEMAND_CONTRACTS) == set(DemandKind)
     expected_by_source = {
         TelegramRpcSource.MCP_INTERACTIVE: {DemandKind.MCP_REMOTE_ACQUISITION},
+        TelegramRpcSource.CHAT_EXPORT: {DemandKind.CHAT_EXPORT_OPERATION},
         TelegramRpcSource.MESSAGE_READ_FALLBACK: {DemandKind.MESSAGE_READ_FALLBACK},
         TelegramRpcSource.DIALOG_RESOLUTION: {DemandKind.ENTITY_LOOKUP},
         TelegramRpcSource.TOPIC_RESOLUTION: {DemandKind.TOPIC_LOOKUP},

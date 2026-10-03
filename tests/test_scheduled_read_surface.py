@@ -348,6 +348,8 @@ def _create_scheduled_table(conn: sqlite3.Connection) -> None:
             message_id INTEGER NOT NULL,
             scheduled_at INTEGER,
             text TEXT,
+            formatting_entities TEXT,
+            service_action TEXT,
             sender_id INTEGER,
             sender_first_name TEXT,
             media_kind TEXT CHECK (media_kind IN ('photo', 'video', 'audio', 'voice', 'document', 'animation', 'sticker', 'custom_emoji', 'poll', 'location', 'venue', 'contact', 'link_preview', 'game', 'invoice', 'dice', 'story', 'other')),

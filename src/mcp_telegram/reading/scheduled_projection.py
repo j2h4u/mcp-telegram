@@ -38,7 +38,9 @@ SELECT
     sm.post_author,
     NULL AS dialog_name,
     sm.scheduled_at AS scheduled_at,
-    sm.published_at AS published_at
+    sm.published_at AS published_at,
+    sm.service_action,
+    sm.formatting_entities
 """
 _SCHEDULED_MESSAGE_LIST_FROM_SQL = """
 FROM scheduled_messages sm

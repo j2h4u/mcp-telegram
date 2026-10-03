@@ -88,6 +88,23 @@ def read_message_out(conn: sqlite3.Connection, dialog_id: int, message_id: int) 
     return MessageOutLookup(found=row is not None, outgoing=bool(row[0]) if row is not None else False)
 
 
+def persist_message_composition(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    formatting_entities: str | None,
+    service_action: str | None,
+) -> bool:
+    """Update composition facts without disturbing text, reactions or edit history."""
+    cursor = conn.execute(
+        "UPDATE messages SET formatting_entities = ?, service_action = ? "
+        "WHERE dialog_id = ? AND message_id = ? "
+        "AND (formatting_entities IS NOT ? OR service_action IS NOT ?)",
+        (formatting_entities, service_action, dialog_id, message_id, formatting_entities, service_action),
+    )
+    return cursor.rowcount > 0
+
+
 def persist_edited_message(  # noqa: PLR0913
     conn: sqlite3.Connection,
     extracted: _message_contracts.ExtractedMessage,
@@ -100,7 +117,12 @@ def persist_edited_message(  # noqa: PLR0913
     """Version and persist a changed message in the caller's transaction."""
     dialog_id, message_id = extracted.message.dialog_id, extracted.message.message_id
     current = read_message_text(conn, dialog_id, message_id)
-    if not current.found or current.text == extracted.message.text:
+    if not current.found:
+        return None
+    if current.text == extracted.message.text:
+        persist_message_composition(
+            conn, dialog_id, message_id, extracted.message.formatting_entities, extracted.message.service_action
+        )
         return None
     old_text = current.text
     keep_history = conn.execute(_SELECT_HUMAN_DM_MESSAGE_SQL, (dialog_id, message_id)).fetchone() is not None

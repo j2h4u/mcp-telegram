@@ -307,6 +307,58 @@ docker exec -it mcp-telegram mcp-telegram feedback list
 docker exec -it mcp-telegram mcp-telegram feedback status <id> done --reason "fixed"
 ```
 
+Export an accessible group to a new JSON file:
+
+```bash
+mcp-telegram export-chat https://t.me/ai_engineers_guild --output group.json
+```
+
+The CLI connects to the existing daemon and streams current messages, replies,
+formatting, service events, attachment metadata and disclosed reaction authors.
+It also includes the accessible recent admin log and current participant roles
+and custom labels. Deleted text and old edits are not restored. Media files
+are not downloaded.
+Messages are newest first per peer, with migrated predecessors retaining their
+own IDs; admin events have a separate source-labelled array. Each peer has a
+frozen upper message ID.
+
+Each `messages` record has scalar author, date, text and reply columns for
+analysis. IDs are strings; join replies using `reply_to_dialog_id` and
+`reply_to_message_id` against `dialog_id` and `message_id`. Formatting,
+service actions, reactors and additional Telegram metadata remain nested.
+Administrator roles describe the current target group, including for messages
+from a migrated predecessor. The separate JSON projector does not change how
+Telegram data is acquired or stored.
+
+For an export that fits in memory:
+
+```python
+import json
+import pandas as pd
+
+with open("group.json", encoding="utf-8") as source:
+    export = json.load(source)
+messages = pd.DataFrame(export["messages"])
+conversation = messages[messages["kind"] == "message"]
+activity = conversation.groupby("author_id").size().sort_values(ascending=False)
+replies = conversation[conversation["reply_to_message_id"].notna()]
+```
+
+For very large exports, extract records in chunks before loading them into
+Pandas; the exporter itself keeps only bounded pages and caches in memory.
+
+This is a rare independent operation: it does not enroll the group or populate
+the local archive. All acquisition uses the daemon's shared RPC protections at
+background priority. Progress, waits and approximate history ETA go to stderr.
+An interrupted export starts over; its temporary file is cleaned on handled
+errors, and an existing destination is never overwritten. Run inside Docker
+with an output path on a mounted host directory if using the container's CLI.
+
+Ordinary message reading preserves full formatting spans and service-action
+payloads too. Spans use UTF-16 offsets into the original `formatting_text`;
+legacy rows missing these facts explicitly report `unknown` until reobserved
+by normal synchronization.
+
 ## Development
 
 The project uses `uv` and `just`.
