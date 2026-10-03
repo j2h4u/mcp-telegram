@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from mcp_telegram.chat_export import EXPORT_OPERATION_SECONDS
 from mcp_telegram.daemon_api import DaemonAPIServer, _export_loop_stack, _export_observation_payload
 from mcp_telegram.request_timing import DaemonRequestTiming, timing_phase
 from mcp_telegram.runtime_observations import encode_payload
@@ -110,7 +111,9 @@ async def test_watchdog_distinguishes_loop_block_from_async_wait(
 
 
 def test_export_late_completion_and_maximum_metadata_fit_sink_budget() -> None:
-    timing = DaemonRequestTiming(operation_id="a" * 64, request_id="1234abcd", started_at=time.monotonic() - 143)
+    timing = DaemonRequestTiming(
+        operation_id="a" * 64, request_id="1234abcd", started_at=time.monotonic() - EXPORT_OPERATION_SECONDS - 1
+    )
     req: dict[str, object] = dict.fromkeys(
         ("dialog_id", "message_id", "user_id", "topic_id", "before_id", "min_id", "upper_id"), 2**63 - 1
     )

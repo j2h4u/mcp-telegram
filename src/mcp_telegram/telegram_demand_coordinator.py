@@ -176,17 +176,15 @@ class TelegramDemandCoordinator:
             yield token
 
     def offer(self, kind: DemandKind) -> bool:
-        """Record a post-commit wakeup and coalesce repeats until the next scan."""
+        """Record a cheap post-commit wakeup and coalesce until the next scan."""
         self._validate_durable_kind(kind)
         if self._state in {CoordinatorState.STOPPING, CoordinatorState.STOPPED}:
             return False
         if kind in self._offered or kind in self._queued or kind is self._active_kind:
             return False
-        accepted = True
-        self.scan(clear_offers=False)
         self._offered.add(kind)
         self._wake.set()
-        return accepted
+        return True
 
     def scan(self, *, now: float | None = None, clear_offers: bool = True) -> tuple[DemandKind, ...]:
         """Perform one complete authoritative status scan in stable order."""
@@ -260,7 +258,6 @@ class TelegramDemandCoordinator:
                     await self._execute_slice(kind)
                 finally:
                     self._active_kind = None
-                    self.scan(now=self._now())
                     await asyncio.sleep(0)
         except asyncio.CancelledError:
             raise
@@ -319,7 +316,9 @@ class TelegramDemandCoordinator:
     def _handle_throttle(self, kind: DemandKind, budget: RpcAttemptBudget, exc: TelegramRpcThrottled) -> bool:
         if exc.latched:
             return True
-        self._global_release_at = max(self._global_release_at or 0.0, self._now() + (exc.retry_after_seconds or 0))
+        now = self._now()
+        self._global_release_at = max(self._global_release_at or 0.0, now + (exc.retry_after_seconds or 0))
+        self._recompute_next_release(now)
         self._observe("deferred", kind, actual_attempts=budget.attempts, reason="flood_wait")
         return False
 
@@ -355,7 +354,9 @@ class TelegramDemandCoordinator:
 
     def _suppress(self, kind: DemandKind, seconds: int | float | None) -> None:
         duration = self._safety_scan_seconds if seconds is None else max(0.0, float(seconds))
-        self._suppressed_until[kind] = self._now() + duration
+        now = self._now()
+        self._suppressed_until[kind] = now + duration
+        self._recompute_next_release(now)
 
     def _is_suppressed(self, kind: DemandKind, now: float) -> bool:
         until = self._suppressed_until.get(kind)

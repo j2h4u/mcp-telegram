@@ -23,6 +23,7 @@ from mcp_telegram.hydration_queue import HydrationJob, HydrationPriority, Hydrat
 from mcp_telegram.message_fact_refresh import (
     ReadReceiptDemandAdapter,
 )
+from mcp_telegram.messages.sqlite_hydration_jobs import HydrationRepairCursor
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
@@ -34,6 +35,7 @@ from mcp_telegram.telegram_demand_coordinator import CoordinatorState, TelegramD
 from mcp_telegram.telegram_read_receipts import TelethonTelegramReadReceiptGateway
 from mcp_telegram.telegram_rpc_consumers import DURABLE_DEMAND_ORDER, DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
+    TelegramRpcAdmissionDeferred,
     TelegramRpcScope,
     TelegramRpcSource,
     current_rpc_scope,
@@ -285,6 +287,69 @@ def _repair_hydration_worker(
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expected_due", "expected_attempts"),
+    [("transient", 430, 2), ("admission", 430, 1), ("flood_wait", 417, 2), ("pending", 480, 2)],
+)
+async def test_hydration_reschedules_from_slow_request_completion(
+    outcome: str, expected_due: int, expected_attempts: int
+) -> None:
+    conn = _hydration_db()
+    clock = [100.0]
+    calls = 0
+
+    class SlowHandler(_HydrationHandler):
+        async def request(self, client: object, jobs: Sequence[HydrationJob]) -> object:
+            nonlocal calls
+            calls += 1
+            clock[0] += 300
+            if outcome == "admission":
+                raise TelegramRpcAdmissionDeferred(retry_after_seconds=17)
+            result = await super().request(client, jobs)
+            if outcome == "transient":
+                raise TimeoutError
+            if outcome == "flood_wait":
+                raise TelegramRpcThrottled(retry_after_seconds=17)
+            return result
+
+        def apply(
+            self,
+            conn: sqlite3.Connection,
+            queue: HydrationQueueRepository,
+            jobs: Sequence[HydrationJob],
+            result: object,
+            *,
+            now: int,
+        ) -> AppliedFacts:
+            assert now == 400
+            clock[0] += 50
+            return AppliedFacts(pending=True)
+
+    try:
+        conn.execute(
+            "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, message_sent_at, priority) "
+            "VALUES ('test', 1, 1, 1, 1, 23, 1)"
+        )
+        worker = _hydration_worker(conn, SlowHandler(), clock=lambda: clock[0])
+        if outcome == "flood_wait":
+            with pytest.raises(TelegramRpcThrottled):
+                await worker.run_priority_slice(HydrationPriority.FOREGROUND, RpcAttemptBudget(limit=1))
+        else:
+            await worker.run_priority_slice(HydrationPriority.FOREGROUND, RpcAttemptBudget(limit=1))
+        assert conn.execute("SELECT due_at, attempts, terminal, message_sent_at FROM hydration_jobs").fetchone() == (
+            expected_due,
+            expected_attempts,
+            0,
+            23,
+        )
+        assert expected_due > clock[0]
+        await worker.run_priority_slice(HydrationPriority.FOREGROUND, RpcAttemptBudget(limit=1))
+        assert calls == 1
+    finally:
+        conn.close()
+
+
 def test_backfill_status_uses_repair_deadline_without_candidate_scans(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
@@ -410,6 +475,48 @@ async def test_backfill_more_repair_candidates_keep_repair_due(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_backfill_raw_pages_advance_past_existing_jobs_without_erasing_backoff(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
+        conn.execute(
+            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
+        )
+        conn.executemany(
+            "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) VALUES (1, ?, ?, ?, '{}')",
+            [(1, 10, "other"), (2, 9, "video"), (3, 8, "contact")],
+        )
+        conn.executemany(
+            "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, priority, terminal) "
+            "VALUES ('media_metadata', 1, ?, ?, ?, 0, ?)",
+            [(1, 4, 3, 1), (2, 999, 2, 0)],
+        )
+        conn.commit()
+        handler = _HydrationHandler()
+        handler.kind = "media_metadata"
+        worker = _repair_hydration_worker(conn, handler)
+        budget = RpcAttemptBudget(limit=1)
+        budget.debit()
+        await worker.run_priority_slice(HydrationPriority.BACKFILL, budget)
+        assert worker._repair_cursors == (None, HydrationRepairCursor(10, 1, 1), None)
+        assert worker.next_repair_at == 100
+        await worker.run_priority_slice(HydrationPriority.BACKFILL, budget)
+        assert worker._repair_cursors == (None, HydrationRepairCursor(10, 1, 1), HydrationRepairCursor(9, 1, 2))
+        assert worker.next_repair_at == 100
+        await worker.run_priority_slice(HydrationPriority.BACKFILL, budget)
+        assert worker._repair_cursors == (None, None, None)
+        assert worker.next_repair_at == 160
+        assert conn.execute(
+            "SELECT message_id, due_at, attempts, terminal FROM hydration_jobs ORDER BY message_id"
+        ).fetchall() == [(1, 4, 3, 1), (2, 999, 2, 0), (3, 100, 0, 0)]
+        assert handler.scope is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
 async def test_backfill_repair_failure_keeps_deadline_due() -> None:
     conn = _hydration_db()
     handler = _HydrationHandler()
@@ -424,6 +531,60 @@ async def test_backfill_repair_failure_keeps_deadline_due() -> None:
 
     assert worker.next_repair_at == 100
     conn.close()
+
+
+@pytest.mark.asyncio
+async def test_slow_backfill_repair_cooldown_starts_after_completion(monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = _hydration_db()
+    clock = [100.0]
+    worker = _repair_hydration_worker(conn, _HydrationHandler(), clock=lambda: clock[0])
+    calls = 0
+
+    def repair(_now: int) -> tuple[bool, tuple[None, None, None]]:
+        nonlocal calls
+        calls += 1
+        clock[0] += 300
+        return False, (None, None, None)
+
+    monkeypatch.setattr(worker, "_run_repair_producers", repair)
+    try:
+        await worker.run_priority_slice(HydrationPriority.BACKFILL, RpcAttemptBudget(limit=1))
+        assert worker.next_repair_at == 460
+        await worker.run_priority_slice(HydrationPriority.BACKFILL, RpcAttemptBudget(limit=1))
+        assert calls == 1
+    finally:
+        conn.close()
+
+
+def test_repair_cursor_advances_only_after_commit_and_resets_at_completed_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = _hydration_db()
+    worker = _repair_hydration_worker(conn, _HydrationHandler())
+    cursor = HydrationRepairCursor(23, 1, 5)
+    next_cursors = (cursor, cursor, cursor)
+    monkeypatch.setattr(worker, "_run_repair_producers", lambda _now: (True, next_cursors))
+
+    class CommitFailure:
+        def commit(self) -> None:
+            raise RuntimeError("commit failed")
+
+    try:
+        monkeypatch.setattr(worker, "_conn", CommitFailure())
+        with pytest.raises(RuntimeError, match="commit failed"):
+            worker._run_due_repairs(100, 100)
+        assert worker._repair_cursors == (None, None, None)
+        assert worker.next_repair_at == 100
+        monkeypatch.setattr(worker, "_conn", conn)
+        worker._run_due_repairs(100, 100)
+        assert worker._repair_cursors == next_cursors
+        assert worker.next_repair_at == 100
+        monkeypatch.setattr(worker, "_run_repair_producers", lambda _now: (False, next_cursors))
+        worker._run_due_repairs(100, 100)
+        assert worker._repair_cursors == (None, None, None)
+        assert worker.next_repair_at == 160
+    finally:
+        conn.close()
 
 
 @pytest.mark.asyncio

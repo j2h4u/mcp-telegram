@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from typing import TypedDict, cast
 
 import pytest
-from telethon.errors import UserNotParticipantError
+from telethon.errors import ChatAdminRequiredError, UserNotParticipantError
 from telethon.tl import functions, types
 
 from mcp_telegram import chat_export
@@ -474,6 +474,29 @@ async def test_deferrals_return_without_retry_or_sleep(
     result = await asyncio.wait_for(call(archive, client, upper_id=10), 1)
     assert result == {"ok": False, "error": "export_deferred", "reason": reason, "retry_after": seconds}
     assert len(client.requests) == 1
+
+
+@pytest.mark.parametrize("operation", ["history", "reactions", "participant", "topic", "admin_log"])
+async def test_operation_timeout_is_deferred_for_every_operation(
+    archive: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    async def timeout(*args: object) -> dict[str, object]:
+        raise TimeoutError
+
+    monkeypatch.setattr(chat_export, "_perform", timeout)
+    result = await call(archive, Client(), operation, upper_id=10)
+    assert result == {
+        "ok": False,
+        "error": "export_deferred",
+        "reason": "operation_timeout",
+        "retry_after": 5,
+    }
+
+
+async def test_admin_permission_error_remains_unavailable(archive: sqlite3.Connection) -> None:
+    result = await call(archive, Client(ChatAdminRequiredError(request=None)), "admin_log")
+    assert result["ok"] is True
+    assert result["data"]["status"] == "unavailable"
 
 
 async def test_account_protection_is_terminal_and_cancellation_propagates(archive: sqlite3.Connection) -> None:

@@ -33,6 +33,7 @@ MIN_RETRY_SECONDS = 0.1
 ROLE_CACHE_SIZE = 512
 TOPIC_CACHE_SIZE = 64
 IPC_RETRIES = 3
+IPC_TIMEOUT_SECONDS = 420
 _LOGGER = logging.getLogger(__name__)
 type Payload = dict[str, object]
 
@@ -189,7 +190,7 @@ class _Export:
             for attempt in range(IPC_RETRIES + 1):
                 started = time.monotonic()
                 try:
-                    async with daemon_connection(timeout_seconds=75) as conn:
+                    async with daemon_connection(timeout_seconds=IPC_TIMEOUT_SECONDS) as conn:
                         response = _object(
                             await conn.request(
                                 {"method": "export_chat", "operation": operation, "dialog_id": peer_id, **kwargs}

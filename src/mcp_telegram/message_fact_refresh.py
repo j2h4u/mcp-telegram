@@ -212,12 +212,14 @@ def _reaction_pacing_release_at(conn: sqlite3.Connection) -> float | None:
     return None if row is None else float(cast(int | float, row[0]))
 
 
-def _reaction_release_at(conn: sqlite3.Connection) -> float | None:
+def _reaction_release_at(conn: sqlite3.Connection, now: float) -> float | None:
     """Combine raw reaction due state with the durable pacing window."""
+    pacing_release = _reaction_pacing_release_at(conn)
+    if pacing_release is not None and pacing_release > now:
+        return pacing_release
     raw_release = _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, (0,))
     if raw_release is None:
         return None
-    pacing_release = _reaction_pacing_release_at(conn)
     return raw_release if pacing_release is None else max(raw_release, pacing_release)
 
 
@@ -244,10 +246,9 @@ class MessageFactRefreshDemandAdapter(DurableDemandAdapter):
 
     def status(self, now: float) -> DemandStatus | None:
         """Return the first missing or TTL-expired candidate release boundary."""
-        del now
         releases: list[float] = []
         if self._policy.reaction_max_messages_per_cycle > 0:
-            reaction_release = _reaction_release_at(self._deps.conn)
+            reaction_release = _reaction_release_at(self._deps.conn, now)
             if reaction_release is not None:
                 releases.append(reaction_release)
         if self._policy.read_at_max_messages_per_cycle > 0:

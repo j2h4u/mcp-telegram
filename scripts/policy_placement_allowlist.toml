@@ -475,4 +475,9 @@ rationale = "This timestamp is computed from the authoritative daemon deferral, 
 [[entry]]
 category = "policy_call_keywords"
 key = "src/mcp_telegram/chat_export_cli.py:_Export.request:timeout_seconds"
-rationale = "Finite export IPC timeout has headroom over the 60-second daemon operation budget; not a whole-export deadline."
+rationale = "Finite export IPC timeout has 60 seconds of headroom over the 360-second daemon operation budget; not a whole-export deadline."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/chat_export_cli.py:<module>:IPC_TIMEOUT_SECONDS"
+rationale = "Reviewed export Unix-socket response contract: 420 seconds covers the 360-second operation deadline plus scheduling headroom under host pressure."

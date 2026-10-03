@@ -54,7 +54,7 @@ def install_daemon(monkeypatch: pytest.MonkeyPatch, handler: Callable[[Payload],
 
     @asynccontextmanager
     async def connection(timeout_seconds: float) -> AsyncIterator[Connection]:
-        assert timeout_seconds == 75
+        assert timeout_seconds == 420
         yield Connection()
 
     monkeypatch.setattr(cli, "daemon_connection", connection)
@@ -496,7 +496,7 @@ async def test_incremental_keeps_old_history_and_refreshes_recent_deletions(
     async def handler(p: Payload) -> Payload:
         calls.append(p)
         if p["operation"] == "open":
-            data = {
+            data: Payload = {
                 "group": {"dialog_id": -1},
                 "upper_id": 5 if phase == "base" else 7,
                 "migrated_from_dialog_id": None,
@@ -781,3 +781,45 @@ async def test_directory_selection_reports_active_export_instead_of_starting_ano
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         with pytest.raises(FileExistsError, match="already running"):
             await cli.choose_output_directory("@one", tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_operation_timeout_deferral_keeps_committed_cursor_and_repeats_same_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[Payload] = []
+    deferred = 0
+    output = tmp_path / "out.json"
+
+    async def handler(payload: Payload) -> Payload:
+        nonlocal deferred
+        calls.append(payload)
+        if payload["operation"] == "open":
+            data: Payload = {"group": {"dialog_id": -1}, "upper_id": 2, "migrated_from_dialog_id": None}
+        elif payload["operation"] == "admin_log":
+            data = {"items": [], "done": True, "status": "complete"}
+        elif payload["before_id"] == 0:
+            data = {"items": [minimal_message(-1, 2)], "next_before_id": 2, "done": False}
+        elif deferred < 2:
+            deferred += 1
+            return {"ok": False, "error": "export_deferred", "reason": "operation_timeout", "retry_after": 5}
+        else:
+            data = {"items": [minimal_message(-1, 1)], "done": True}
+        return {"ok": True, "data": data}
+
+    async def defer(self: cli._Export, response: Payload) -> None:
+        assert response["reason"] == "operation_timeout" and response["retry_after"] == 5
+        checkpoint = cli.Checkpoint(output.with_name(f".{output.name}.resume.sqlite3"))
+        try:
+            assert checkpoint.state("history:-1") == 2
+            assert checkpoint.summary()["messages"] == 1
+        finally:
+            checkpoint.close()
+
+    install_daemon(monkeypatch, handler)
+    monkeypatch.setattr(cli._Export, "defer", defer)
+    summary = await cli.export_group(-1, output)
+    retries = [call for call in calls if call["operation"] == "history" and call["before_id"] == 2]
+    assert len(retries) == 3 and retries[0] == retries[1] == retries[2]
+    assert summary["messages"] == 2
+    assert not output.with_name(f".{output.name}.resume.sqlite3").exists()
