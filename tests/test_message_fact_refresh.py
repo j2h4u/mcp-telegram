@@ -482,6 +482,8 @@ def test_open_reaction_pacing_boundary_does_not_hide_due_read_dates() -> None:
         """
     )
     seed_full_history_enrollment(conn, 20, enabled=True)
+    queries: list[str] = []
+    conn.set_trace_callback(queries.append)
     deps = MessageFactRefreshDeps(
         conn,
         cast(ReactionDetailRefresher, object()),
@@ -489,9 +491,17 @@ def test_open_reaction_pacing_boundary_does_not_hide_due_read_dates() -> None:
     )
     policy = MessageFactRefreshPolicy(10, 1, 0, 600, 5, 600)
     status = MessageFactRefreshDemandAdapter(deps, policy).status(100)
-    assert _reaction_release_at(conn) == 700
+    assert _reaction_release_at(conn, 100) == 700
+    assert not any("FROM message_reaction_aggregate_state a" in query for query in queries)
     assert status is not None
     assert status.release_at == 0
+    conn.close()
+
+
+def test_due_reaction_window_without_pacing_reads_normal_release() -> None:
+    conn = _make_db()
+    _seed_reaction_candidates(conn, count=1)
+    assert _reaction_release_at(conn, 100) == 0
     conn.close()
 
 
