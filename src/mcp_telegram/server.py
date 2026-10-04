@@ -296,6 +296,21 @@ def _protection_error_call_result(exc: AccountProtectionError) -> CallToolResult
     )
 
 
+_PROTECTION_NOTICE_CHARS = 400
+_PROTECTION_REASON_CHARS = 128
+
+
+def _bounded_account_protection(status: dict[str, object]) -> dict[str, object]:
+    bounded = dict(status)
+    notice = t.cast(str, bounded["notice"])
+    if len(notice) > _PROTECTION_NOTICE_CHARS:
+        bounded["notice"] = notice[: _PROTECTION_NOTICE_CHARS - 3] + "..."
+    reason = bounded.get("reason")
+    if isinstance(reason, str) and len(reason) > _PROTECTION_REASON_CHARS:
+        del bounded["reason"]
+    return bounded
+
+
 async def _account_protection_status() -> dict[str, object]:
     try:
         async with daemon_connection() as conn:
@@ -308,7 +323,7 @@ async def _account_protection_status() -> dict[str, object]:
             if status is None:
                 return {}
             if _is_valid_active_account_protection(status):
-                return {"account_protection": t.cast(dict[str, object], status)}
+                return {"account_protection": _bounded_account_protection(t.cast(dict[str, object], status))}
     except Exception as exc:  # noqa: BLE001 - status failure must not discard the tool result
         logger.debug("account_protection_status_unavailable: %s", exc)
     return _account_protection_unavailable()

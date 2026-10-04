@@ -37,7 +37,7 @@ def _shared_message() -> dict[str, object]:
     }
 
 
-def test_list_and_inbox_share_one_message_view_contract() -> None:
+def test_inbox_preserves_message_facts_without_detailed_reading_payload() -> None:
     row = _shared_message()
     read_state = {
         "inbox_unread_count": 0,
@@ -59,16 +59,14 @@ def test_list_and_inbox_share_one_message_view_contract() -> None:
         "content",
         "media",
         "topic",
-        "forward",
-        "post_author",
         "edit_date",
-        "reactions",
-        "reaction_events",
-        "reaction_events_status",
         "read_at",
         "read_markers",
     }
     assert {key: listed[key] for key in shared_fields} == {key: inbox[key] for key in shared_fields}
+    detailed_fields = {"forward", "post_author", "reactions", "reaction_events", "reaction_events_status"}
+    assert detailed_fields <= listed.keys()
+    assert detailed_fields.isdisjoint(inbox)
     assert "date" not in listed
     assert "date" not in inbox
     assert "reply_to_msg_id" not in listed
@@ -146,7 +144,7 @@ def test_read_markers_are_projected_once_for_both_surfaces() -> None:
     assert all("inline_markers" not in item for item in (*listed, *inbox))
 
 
-def test_list_and_inbox_schemas_embed_the_same_canonical_message_contract() -> None:
+def test_list_schema_stays_complete_and_inbox_schema_is_compact() -> None:
     canonical_properties = cast(dict[str, object], MESSAGE_VIEW_SCHEMA["properties"])
     canonical_required = set(cast(list[str], MESSAGE_VIEW_SCHEMA["required"]))
 
@@ -161,10 +159,23 @@ def test_list_and_inbox_schemas_embed_the_same_canonical_message_contract() -> N
     inbox_messages = cast(dict[str, object], dialog_properties["messages"])
     inbox_item = cast(dict[str, object], inbox_messages["items"])
 
-    for item_schema in (list_item, inbox_item):
-        item_properties = cast(dict[str, object], item_schema["properties"])
-        assert {key: item_properties[key] for key in canonical_properties} == canonical_properties
-        assert canonical_required <= set(cast(list[str], item_schema["required"]))
+    list_item_properties = cast(dict[str, object], list_item["properties"])
+    assert {key: list_item_properties[key] for key in canonical_properties} == canonical_properties
+    assert canonical_required <= set(cast(list[str], list_item["required"]))
+    inbox_item_properties = cast(dict[str, object], inbox_item["properties"])
+    assert {
+        "dialog_id",
+        "msg_id",
+        "sent_at",
+        "out",
+        "content",
+        "media",
+        "sender",
+        "read_markers",
+    } <= inbox_item_properties.keys()
+    assert {"formatting_text", "formatting_entities", "reaction_events", "reactions", "service_action"}.isdisjoint(
+        inbox_item_properties
+    )
 
 
 def test_structured_result_renders_canonical_event_times_once_in_requested_timezone() -> None:
@@ -191,7 +202,8 @@ def test_structured_result_renders_canonical_event_times_once_in_requested_timez
         assert item["sent_at"] == format_timestamp(1_700_000_000, timezone)
         assert item["edit_date"] == format_timestamp(1_700_000_100, timezone)
         assert item["read_at"] == format_timestamp(1_700_000_300, timezone)
-        events = cast(list[dict[str, object]], item["reaction_events"])
-        assert events[0]["reacted_at"] == format_timestamp(1_700_000_200, timezone)
         assert "date" not in item
+    events = cast(list[dict[str, object]], cast(list[dict[str, object]], payload["listed"])[0]["reaction_events"])
+    assert events[0]["reacted_at"] == format_timestamp(1_700_000_200, timezone)
+    assert "reaction_events" not in cast(list[dict[str, object]], payload["inbox"])[0]
     assert cast(dict[str, object], payload["time_context"])["timezone"] == timezone

@@ -30,14 +30,25 @@ def unread_chat_tier(chat: dict) -> int:
 
 
 def allocate_message_budget_round_robin(
-    unread_counts: dict[int, int], limit: int, *, max_per_chat: int = 5
+    unread_counts: dict[int, int], limit: int, *, tiers: dict[int, int], max_per_chat: int = 5
 ) -> dict[int, int]:
-    """Allocate a bounded inbox budget fairly in ranked dialog order."""
+    """Exhaust higher-priority tiers, sharing each tier's budget in ranked order."""
     if not unread_counts or limit <= 0 or max_per_chat <= 0:
         return dict.fromkeys(unread_counts, 0)
 
     allocation = dict.fromkeys(unread_counts, 0)
     remaining = limit
+    for tier in sorted({tiers[chat_id] for chat_id in unread_counts}):
+        tier_counts = {chat_id: count for chat_id, count in unread_counts.items() if tiers[chat_id] == tier}
+        remaining = _allocate_tier_round_robin(tier_counts, allocation, remaining, max_per_chat)
+        if remaining == 0:
+            break
+    return allocation
+
+
+def _allocate_tier_round_robin(
+    unread_counts: dict[int, int], allocation: dict[int, int], remaining: int, max_per_chat: int
+) -> int:
     while remaining:
         advanced = False
         for chat_id, unread_count in unread_counts.items():
@@ -50,4 +61,4 @@ def allocate_message_budget_round_robin(
             advanced = True
         if not advanced:
             break
-    return allocation
+    return remaining

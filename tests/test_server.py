@@ -1561,6 +1561,31 @@ async def test_each_registered_tool_response_gets_one_active_protection_snapshot
 
 
 @pytest.mark.asyncio
+async def test_protection_snapshot_bounds_text_without_hiding_blocked_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    protection = {
+        "status": "active",
+        "outbound_acquisition": "blocked",
+        "recovery": "manual",
+        "opened_at": 1234567890,
+        "notice": "n" * 5000,
+        "reason": "r" * 5000,
+    }
+    monkeypatch.setattr(
+        server,
+        "daemon_connection",
+        lambda: _status_context({"ok": True, "data": {"account_protection": protection}}),
+    )
+    result = await server._account_protection_status()
+    snapshot = cast(dict[str, object], result["account_protection"])
+    assert snapshot == {
+        **{key: protection[key] for key in ("status", "outbound_acquisition", "recovery", "opened_at")},
+        "notice": "n" * 397 + "...",
+    }
+    assert protection["notice"] == "n" * 5000
+    assert protection["reason"] == "r" * 5000
+
+
+@pytest.mark.asyncio
 async def test_typed_protection_error_has_manual_action_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(server.tools, "tool_args", lambda tool, **kwargs: object())
     monkeypatch.setattr(

@@ -464,10 +464,12 @@ class DaemonConnection:
         """
         return await self.request({"method": "get_entity_info", "entity_id": entity_id})
 
-    async def get_inbox(
+    async def get_inbox(  # noqa: PLR0913
         self,
         *,
-        limit: int = 100,
+        limit: int = 40,
+        messages_per_dialog: int = 5,
+        dialogs_per_page: int = 20,
         page: int = 1,
         group_size_threshold: int = 100,
         since_utc: str | None = None,
@@ -477,6 +479,8 @@ class DaemonConnection:
         payload: dict[str, object] = {
             "method": "get_inbox",
             "limit": limit,
+            "messages_per_dialog": messages_per_dialog,
+            "dialogs_per_page": dialogs_per_page,
             "page": page,
             "group_size_threshold": group_size_threshold,
         }

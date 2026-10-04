@@ -58,9 +58,32 @@ class TestUnreadChatTier:
 
 class TestAllocateMessageBudget:
     def test_round_robin_caps_each_dialog_and_preserves_rank_order(self):
-        result = allocate_message_budget_round_robin({10: 300, 20: 300, 30: 300}, limit=8)
+        result = allocate_message_budget_round_robin(
+            {10: 300, 20: 300, 30: 300}, limit=8, tiers={10: 10, 20: 10, 30: 10}
+        )
         assert result == {10: 3, 20: 3, 30: 2}
 
     def test_round_robin_never_allocates_more_than_five_per_dialog(self):
-        result = allocate_message_budget_round_robin({10: 300}, limit=100)
+        result = allocate_message_budget_round_robin({10: 300}, limit=100, tiers={10: 10})
         assert result == {10: 5}
+
+    def test_higher_tier_exhausts_budget_before_lower_tier(self):
+        result = allocate_message_budget_round_robin(
+            {10: 300, 20: 300, 30: 300}, limit=8, tiers={10: 10, 20: 10, 30: 40}
+        )
+        assert result == {10: 4, 20: 4, 30: 0}
+
+    def test_lower_tier_receives_remaining_budget_after_higher_tier_cap(self):
+        result = allocate_message_budget_round_robin({10: 300, 20: 1, 30: 300}, limit=8, tiers={10: 10, 20: 10, 30: 40})
+        assert result == {10: 5, 20: 1, 30: 2}
+
+    def test_custom_cap_and_unsorted_tiers(self):
+        result = allocate_message_budget_round_robin(
+            {30: 100, 10: 100, 20: 100}, limit=30, tiers={30: 40, 10: 10, 20: 10}, max_per_chat=20
+        )
+        assert result == {30: 0, 10: 15, 20: 15}
+
+    def test_empty_counts_and_exhausted_budget(self):
+        assert allocate_message_budget_round_robin({}, limit=40, tiers={}) == {}
+        assert allocate_message_budget_round_robin({10: 5}, limit=0, tiers={10: 10}) == {10: 0}
+        assert allocate_message_budget_round_robin({10: 0}, limit=40, tiers={10: 10}) == {10: 0}

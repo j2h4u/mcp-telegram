@@ -727,13 +727,15 @@ async def test_get_inbox_convenience_explicit() -> None:
 
     conn.request = _mock_request  # type: ignore[method-assign]
 
-    await conn.get_inbox(limit=200, group_size_threshold=50)
+    await conn.get_inbox(limit=200, group_size_threshold=50, messages_per_dialog=12, dialogs_per_page=3)
 
     assert len(captured) == 1
     req = captured[0]
     assert req["method"] == "get_inbox"
     assert req["limit"] == 200
     assert req["group_size_threshold"] == 50
+    assert req["messages_per_dialog"] == 12
+    assert req["dialogs_per_page"] == 3
 
 
 @pytest.mark.asyncio
@@ -752,7 +754,9 @@ async def test_get_inbox_page_passthrough_preserves_response() -> None:
     assert captured == [
         {
             "method": "get_inbox",
-            "limit": 100,
+            "limit": 40,
+            "messages_per_dialog": 5,
+            "dialogs_per_page": 20,
             "page": 2,
             "group_size_threshold": 100,
         }
@@ -766,7 +770,7 @@ async def test_get_inbox_page_passthrough_preserves_response() -> None:
 
 @pytest.mark.asyncio
 async def test_get_inbox_convenience_defaults() -> None:
-    """get_inbox sends limit=100 and group_size_threshold=100 by default."""
+    """get_inbox sends the bounded inbox defaults."""
     reader = MagicMock(spec=asyncio.StreamReader)
     writer = MagicMock(spec=asyncio.StreamWriter)
     conn = DaemonConnection(reader, writer)
@@ -784,8 +788,10 @@ async def test_get_inbox_convenience_defaults() -> None:
     assert len(captured) == 1
     req = captured[0]
     assert req["method"] == "get_inbox"
-    assert req["limit"] == 100
+    assert req["limit"] == 40
     assert req["group_size_threshold"] == 100
+    assert req["messages_per_dialog"] == 5
+    assert req["dialogs_per_page"] == 20
 
 
 @pytest.mark.asyncio
