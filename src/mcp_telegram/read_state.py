@@ -16,7 +16,7 @@ Contract:
   into the SQL, and it comes from a closed whitelist (``_CURSOR_COLUMNS``) —
   no SQL-injection surface.
 * The caller owns the transaction boundary. The helper does NOT open a
-  ``with conn:`` block; if you want the write committed, commit yourself.
+  transaction block; the caller must use an owned ``write_transaction``.
 * Monotonic semantics: ``MAX(COALESCE(<col>, 0), ?)`` — a smaller ``max_id``
   is silently absorbed. The stored cursor never regresses.
 * ``UPDATE`` on a missing ``dialog_id`` is a no-op (affects 0 rows, no raise) —
@@ -28,6 +28,8 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Mapping
 from typing import Final, Literal
+
+from .sync_transactions import require_write_transaction
 
 ReadCursorKind = Literal["inbox", "outbox"]
 
@@ -63,6 +65,7 @@ def apply_read_cursor(
         KeyError: if ``kind`` is not one of ``_CURSOR_COLUMNS``.
     """
     column = _CURSOR_COLUMNS[kind]  # KeyError on unknown kind — not silent.
+    require_write_transaction(conn)
     # Safe f-string: ``column`` is always one of two hard-coded strings
     # (see _CURSOR_COLUMNS). No user-controlled text flows into the SQL.
     sql = f"UPDATE synced_dialogs SET {column} = MAX(COALESCE({column}, 0), ?) WHERE dialog_id = ?"
@@ -83,6 +86,7 @@ def apply_reconciled_unread_count(
     deliberately rejects equal-second writes because SQLite timestamps have
     only second precision and cannot order a racing realtime event safely.
     """
+    require_write_transaction(conn)
     cursor = conn.execute(
         "UPDATE dialogs SET unread_count = ?, unread_count_observed_at = ? "
         "WHERE dialog_id = ? AND "

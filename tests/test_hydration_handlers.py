@@ -23,6 +23,7 @@ from mcp_telegram.hydration_queue import (
 )
 from mcp_telegram.media_hydration import MediaFactHydrationHandler
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.transcription_hydration import TranscriptionHydrationHandler
 
 
@@ -69,7 +70,9 @@ def _enqueue(
     attempts: int = 0,
 ) -> HydrationJob:
     job = HydrationJob(kind, dialog_id, message_id, due_at=1, attempts=attempts)
-    HydrationQueueRepository(conn).enqueue(job)
+    conn.commit()
+    with write_transaction(conn):
+        HydrationQueueRepository(conn).enqueue(job)
     return job
 
 
@@ -83,13 +86,15 @@ def test_media_apply_maps_single_result_and_persists_empty_and_unknown_facts(
     second = _enqueue(db, MEDIA_METADATA_KIND, 2)
     db.commit()
 
-    applied = MediaFactHydrationHandler(batch_size=2).apply(
-        db,
-        HydrationQueueRepository(db),
-        [first, second],
-        SimpleNamespace(id=1, media=SimpleNamespace()),
-        now=20,
-    )
+    db.commit()
+    with write_transaction(db):
+        applied = MediaFactHydrationHandler(batch_size=2).apply(
+            db,
+            HydrationQueueRepository(db),
+            [first, second],
+            SimpleNamespace(id=1, media=SimpleNamespace()),
+            now=20,
+        )
 
     assert applied.hydrated == 1
     assert applied.completed == 1
@@ -116,14 +121,18 @@ def test_media_apply_marks_missing_and_invalid_results_terminal(db: sqlite3.Conn
     handler = MediaFactHydrationHandler(batch_size=2)
     queue = HydrationQueueRepository(db)
 
-    missing = handler.apply(
-        db,
-        queue,
-        [first],
-        [SimpleNamespace(id=0), SimpleNamespace(id=99)],
-        now=20,
-    )
-    invalid = handler.apply(db, queue, [second], 123, now=20)
+    db.commit()
+    with write_transaction(db):
+        missing = handler.apply(
+            db,
+            queue,
+            [first],
+            [SimpleNamespace(id=0), SimpleNamespace(id=99)],
+            now=20,
+        )
+    db.commit()
+    with write_transaction(db):
+        invalid = handler.apply(db, queue, [second], 123, now=20)
 
     assert missing.dropped == 1
     assert missing.drop_observations[0].reason == "missing_response"
@@ -145,13 +154,15 @@ def test_media_apply_rejects_non_collection_results(
     job = _enqueue(db, MEDIA_METADATA_KIND, 1)
     db.commit()
 
-    applied = MediaFactHydrationHandler(batch_size=1).apply(
-        db,
-        HydrationQueueRepository(db),
-        [job],
-        result,
-        now=20,
-    )
+    db.commit()
+    with write_transaction(db):
+        applied = MediaFactHydrationHandler(batch_size=1).apply(
+            db,
+            HydrationQueueRepository(db),
+            [job],
+            result,
+            now=20,
+        )
 
     assert applied == applied.__class__(
         dropped=1, drop_observations=(HydrationDropObservation("invalid_result", 1, MEDIA_METADATA_KIND, 1, 0),)
@@ -164,13 +175,15 @@ def test_media_apply_reports_not_applied_when_access_is_lost(db: sqlite3.Connect
     job = _enqueue(db, MEDIA_METADATA_KIND, 1)
     db.commit()
 
-    applied = MediaFactHydrationHandler(batch_size=1).apply(
-        db,
-        HydrationQueueRepository(db),
-        [job],
-        SimpleNamespace(id=1, media=None),
-        now=20,
-    )
+    db.commit()
+    with write_transaction(db):
+        applied = MediaFactHydrationHandler(batch_size=1).apply(
+            db,
+            HydrationQueueRepository(db),
+            [job],
+            SimpleNamespace(id=1, media=None),
+            now=20,
+        )
 
     assert applied.completed == 0
     assert applied.dropped == 1
@@ -184,13 +197,15 @@ def test_transcription_apply_persists_final_result(db: sqlite3.Connection) -> No
     job = _enqueue(db, TRANSCRIPTION_HYDRATION_KIND, 1)
     db.commit()
 
-    applied = TranscriptionHydrationHandler(recheck_delay_seconds=30).apply(
-        db,
-        HydrationQueueRepository(db),
-        [job],
-        SimpleNamespace(pending=False, text="  speech words  ", transcription_id=7),
-        now=20,
-    )
+    db.commit()
+    with write_transaction(db):
+        applied = TranscriptionHydrationHandler(recheck_delay_seconds=30).apply(
+            db,
+            HydrationQueueRepository(db),
+            [job],
+            SimpleNamespace(pending=False, text="  speech words  ", transcription_id=7),
+            now=20,
+        )
 
     assert applied.hydrated == 1
     assert applied.completed == 1
@@ -210,19 +225,23 @@ def test_transcription_apply_handles_pending_and_existing_fact(db: sqlite3.Conne
     handler = TranscriptionHydrationHandler(recheck_delay_seconds=30)
     queue = HydrationQueueRepository(db)
 
-    pending = handler.apply(db, queue, [pending_job], SimpleNamespace(pending=True), now=20)
+    db.commit()
+    with write_transaction(db):
+        pending = handler.apply(db, queue, [pending_job], SimpleNamespace(pending=True), now=20)
     db.execute(
         "INSERT INTO message_transcriptions(dialog_id, message_id, text, transcription_id, received_at) "
         "VALUES (1, 1, 'event fact', 8, 19)"
     )
     db.commit()
-    existing = handler.apply(
-        db,
-        queue,
-        [pending_job],
-        SimpleNamespace(pending=False, text="worker fact", transcription_id=9),
-        now=20,
-    )
+    db.commit()
+    with write_transaction(db):
+        existing = handler.apply(
+            db,
+            queue,
+            [pending_job],
+            SimpleNamespace(pending=False, text="worker fact", transcription_id=9),
+            now=20,
+        )
 
     assert pending.pending is True
     assert existing == existing.__class__(completed=1)
@@ -236,13 +255,15 @@ def test_transcription_apply_removes_job_when_message_is_no_longer_eligible(db: 
     job = _enqueue(db, TRANSCRIPTION_HYDRATION_KIND, 1)
     db.commit()
 
-    applied = TranscriptionHydrationHandler(recheck_delay_seconds=30).apply(
-        db,
-        HydrationQueueRepository(db),
-        [job],
-        SimpleNamespace(pending=False, text="stale result", transcription_id=9),
-        now=20,
-    )
+    db.commit()
+    with write_transaction(db):
+        applied = TranscriptionHydrationHandler(recheck_delay_seconds=30).apply(
+            db,
+            HydrationQueueRepository(db),
+            [job],
+            SimpleNamespace(pending=False, text="stale result", transcription_id=9),
+            now=20,
+        )
 
     assert applied.dropped == 1
     assert applied.drop_observations[0].reason == "not_applied"
@@ -267,13 +288,15 @@ def test_transcription_apply_marks_malformed_results_terminal(
     job = _enqueue(db, TRANSCRIPTION_HYDRATION_KIND, 1)
     db.commit()
 
-    applied = TranscriptionHydrationHandler(recheck_delay_seconds=30).apply(
-        db,
-        HydrationQueueRepository(db),
-        [job],
-        result,
-        now=20,
-    )
+    db.commit()
+    with write_transaction(db):
+        applied = TranscriptionHydrationHandler(recheck_delay_seconds=30).apply(
+            db,
+            HydrationQueueRepository(db),
+            [job],
+            result,
+            now=20,
+        )
 
     assert applied.dropped == 1
     assert applied.drop_observations[0].reason == "invalid_result"

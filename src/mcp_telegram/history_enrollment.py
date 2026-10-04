@@ -4,21 +4,19 @@
 capability owns the separate, durable operator intent which authorizes full
 history, delta, and body-event fetching.  The small SQLite implementation is
 deliberately concrete: callers share the daemon's writer connection and each
-mutation is isolated by a SAVEPOINT.
+mutation owns a short write unit or a verified nested savepoint.
 """
 
 from __future__ import annotations
 
 import sqlite3
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
-from itertools import count
 from typing import cast
 
 from .hydration_queue import HydrationQueueRepository
+from .sync_transactions import require_write_transaction, write_savepoint
 
 
 class EnrollmentSource(StrEnum):
@@ -53,7 +51,6 @@ class _TransitionDecision:
     fetch: bool
 
 
-_SAVEPOINTS = count()
 _COVERAGE_STATUSES = frozenset({"not_synced", "own_only", "fragment", "syncing", "synced", "access_lost"})
 _ENROLLMENT_SOURCES = frozenset(
     (EnrollmentSource.EXPLICIT.value, EnrollmentSource.AUTOMATIC.value, EnrollmentSource.MIGRATION.value)
@@ -62,26 +59,13 @@ _ENROLLMENT_SOURCES = frozenset(
 
 def reset_read_position_retry(conn: sqlite3.Connection, dialog_id: int) -> int:
     """Clear reconciliation backoff when enrollment or access makes work relevant."""
+    require_write_transaction(conn)
     cur = conn.execute(
         "UPDATE synced_dialogs SET read_position_next_attempt_at = NULL, "
         "read_position_attempt_count = 0 WHERE dialog_id = ?",
         (dialog_id,),
     )
     return cur.rowcount
-
-
-@contextmanager
-def _savepoint(conn: sqlite3.Connection) -> Iterator[None]:
-    name = f"history_enrollment_{next(_SAVEPOINTS)}"
-    conn.execute(f"SAVEPOINT {name}")
-    try:
-        yield
-    except BaseException:
-        conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
-        conn.execute(f"RELEASE SAVEPOINT {name}")
-        raise
-    else:
-        conn.execute(f"RELEASE SAVEPOINT {name}")
 
 
 def read_intent(conn: sqlite3.Connection, dialog_id: int) -> EnrollmentIntent:
@@ -193,7 +177,7 @@ def enable_history(
 ) -> EnrollmentOutcome:
     """Persist an enabled intent and queue work according to factual coverage."""
     timestamp = int(time.time()) if now is None else now
-    with _savepoint(conn):
+    with write_savepoint(conn):
         previous = read_intent(conn, dialog_id)
         coverage = _coverage_status(conn, dialog_id)
         if source is EnrollmentSource.AUTOMATIC and previous.source is EnrollmentSource.EXPLICIT:
@@ -253,7 +237,7 @@ def disable_history(
 ) -> EnrollmentOutcome:
     """Persist an explicit disable without destroying factual local coverage."""
     timestamp = int(time.time()) if now is None else now
-    with _savepoint(conn):
+    with write_savepoint(conn):
         coverage = _coverage_status(conn, dialog_id)
         _store_intent(conn, dialog_id, False, EnrollmentSource.EXPLICIT, timestamp)
         reset_read_position_retry(conn, dialog_id)
@@ -313,7 +297,7 @@ def record_automatic_group_decision(
 ) -> EnrollmentIntent:
     """Persist a first-page group decision while preserving explicit intent."""
     timestamp = int(time.time()) if now is None else now
-    with _savepoint(conn):
+    with write_savepoint(conn):
         previous = read_intent(conn, dialog_id)
         if previous.source is not None:
             return previous
@@ -333,6 +317,7 @@ def record_automatic_group_decision(
 
 def restore_access_status(conn: sqlite3.Connection, dialog_id: int) -> bool:
     """Restore coverage according to intent; return whether sync is authorized."""
+    require_write_transaction(conn)
     enabled = full_history_enabled(conn, dialog_id)
     conn.execute(
         "UPDATE synced_dialogs SET status = ?, delta_refresh_requested_at = NULL WHERE dialog_id = ?",

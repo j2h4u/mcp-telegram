@@ -27,6 +27,7 @@ from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
 from mcp_telegram.messages.sqlite_hydration import apply_message_transcription_if_absent
 from mcp_telegram.runtime_observations import RuntimeObservationSink
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_demand import demand_context
 from mcp_telegram.telegram_rpc_consumers import DemandKind, TelegramRpcSource
 
@@ -130,10 +131,11 @@ def test_activity_search_entity_upsert_skips_unknown_and_bad_peer(
         raise TypeError
 
     monkeypatch.setattr("telethon.utils.get_peer_id", fake_peer_id)
-    _upsert_entities_from_search(
-        sync_conn,
-        cast(_SearchResultLike, _SearchResult(users=[_User(), _Unknown()], chats=[_Chat()])),
-    )
+    with write_transaction(sync_conn):
+        _upsert_entities_from_search(
+            sync_conn,
+            cast(_SearchResultLike, _SearchResult(users=[_User(), _Unknown()], chats=[_Chat()])),
+        )
     assert sync_conn.execute(
         "SELECT id, type, name, username, name_normalized FROM entities ORDER BY id"
     ).fetchall() == [
@@ -242,10 +244,11 @@ def _message(message_id: int, *, text: str | None, media_kind: str = "voice") ->
 
 
 def _enable_history(conn: sqlite3.Connection) -> None:
-    conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (42, 'synced')")
-    conn.execute(
-        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (42, 1, 'explicit', 1)"
-    )
+    with write_transaction(conn):
+        conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (42, 'synced')")
+        conn.execute(
+            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (42, 1, 'explicit', 1)"
+        )
 
 
 def test_transcription_worker_result_is_idempotent_and_race_aware(sync_conn: sqlite3.Connection) -> None:
@@ -256,7 +259,7 @@ def test_transcription_worker_result_is_idempotent_and_race_aware(sync_conn: sql
         == "not_applied"
     )
     _enable_history(sync_conn)
-    with sync_conn:
+    with write_transaction(sync_conn):
         insert_messages_with_fts(sync_conn, [_message(1, text=None)])
     assert (
         apply_message_transcription_if_absent(

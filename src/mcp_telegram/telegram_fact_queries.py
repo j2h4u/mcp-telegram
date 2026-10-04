@@ -16,6 +16,7 @@ from collections.abc import Sequence
 from typing import cast
 
 from .models import DialogType, ReadMessage, ReadReactionEvent
+from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_demand import RpcAttemptBudgetExhaustedError
 from .telegram_gateway import CATCHABLE_GATEWAY_FAILURES
 from .telegram_read_receipts import classify_read_date_exception
@@ -165,6 +166,8 @@ async def enrich_read_at(  # noqa: PLR0913
     candidate_ids = _outgoing_candidate_ids(messages, dialog_id)
     if not candidate_ids:
         return list(messages)
+    if conn.in_transaction:
+        raise RuntimeError("read-date enrichment requires an idle connection")
     now = int(checked_at if checked_at is not None else time.time())
     counts = await _refresh_stale_read_at_facts(
         conn,
@@ -327,8 +330,7 @@ def _persist_message_too_old(
         raise RuntimeError("_persist_message_too_old requires no open transaction")
     if not 0 < sent_at <= checked_at:
         raise InvalidReadDateWitnessError("read-date witness must satisfy 0 < sent_at <= checked_at")
-    conn.execute("BEGIN IMMEDIATE")
-    try:
+    with write_transaction(conn):
         state = cast(
             tuple[object, ...],
             conn.execute("SELECT expired_through_sent_at FROM read_date_expiry_state WHERE singleton=1").fetchone(),
@@ -365,11 +367,7 @@ def _persist_message_too_old(
             reason=ReadDateReason.MESSAGE_TOO_OLD,
             next_attempt_at=None,
         )
-        conn.commit()
         return int(inserted or 0) + int(updated or 0)
-    except BaseException:
-        conn.rollback()
-        raise
 
 
 async def _refresh_stale_read_at_facts(  # noqa: PLR0913
@@ -564,6 +562,7 @@ def _persist_read_at_v70(  # noqa: PLR0913
     reason: ReadDateReason,
     next_attempt_at: int | None,
 ) -> None:
+    require_write_transaction(conn)
     conn.execute(
         "INSERT INTO message_read_facts "
         "(dialog_id, message_id, read_at, checked_at, status, reason, next_attempt_at) "
@@ -603,7 +602,7 @@ def persist_read_at(  # noqa: PLR0913
     elif next_attempt_at is None:
         raise ValueError("retryable read-date result requires next_attempt_at")
 
-    with conn:
+    with write_transaction(conn):
         _persist_read_at_v70(
             conn,
             dialog_id,

@@ -593,6 +593,7 @@ async def test_get_entity_info_user_partial_personal_channel_skips_local_enrichm
     server = make_server(conn=conn, client=client, user_profile_port=_user_profile_port(user, full))
 
     with patch.object(server, "_ready", True):
+        conn.commit()
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 45})
 
     d = _dict(r["data"])

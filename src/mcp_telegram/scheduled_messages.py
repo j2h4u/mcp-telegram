@@ -39,6 +39,7 @@ from .own_only import (
     remove_own_only_basis,
 )
 from .sync_db import SCHEDULED_ACTIVE_REPAIR_SECONDS, SCHEDULED_QUIET_DISCOVERY_SECONDS
+from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import (
     AcquisitionKind,
@@ -265,6 +266,7 @@ def upsert_scheduled_message(
 ) -> None:
     """Insert or replace one scheduled snapshot without touching sent history."""
     extracted = extract_message_row(dialog_id, message)
+    require_write_transaction(conn)
     timestamp = int(time.time()) if now is None else int(now)
     scheduled_at = _unix_timestamp(getattr(extracted, "scheduled_at", None)) or extracted.message.sent_at
     if scheduled_at is None or scheduled_at <= timestamp:
@@ -303,30 +305,30 @@ def mark_scheduled_messages_removed(
     """
     timestamp = int(time.time()) if now is None else int(now)
     hints = list(sent_message_ids or ())
-    with conn:
-        for index, raw_message_id in enumerate(message_ids):
-            message_id = int(raw_message_id)
-            hint = int(hints[index]) if index < len(hints) else None
-            state = "unknown_missing" if hint is not None else "cancelled"
+    require_write_transaction(conn)
+    for index, raw_message_id in enumerate(message_ids):
+        message_id = int(raw_message_id)
+        hint = int(hints[index]) if index < len(hints) else None
+        state = "unknown_missing" if hint is not None else "cancelled"
+        conn.execute(
+            _INSERT_SCHEDULED_TOMBSTONE_SQL,
+            (dialog_id, message_id, state, timestamp, timestamp, timestamp if hint is None else None, hint),
+        )
+        if hint is None:
             conn.execute(
-                _INSERT_SCHEDULED_TOMBSTONE_SQL,
-                (dialog_id, message_id, state, timestamp, timestamp, timestamp if hint is None else None, hint),
+                "UPDATE scheduled_messages SET message_state='cancelled', unpublished=1, "
+                "unseen=1, deleted_at=?, updated_at=? WHERE dialog_id=? AND message_id=?",
+                (timestamp, timestamp, dialog_id, message_id),
             )
-            if hint is None:
-                conn.execute(
-                    "UPDATE scheduled_messages SET message_state='cancelled', unpublished=1, "
-                    "unseen=1, deleted_at=?, updated_at=? WHERE dialog_id=? AND message_id=?",
-                    (timestamp, timestamp, dialog_id, message_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE scheduled_messages SET message_state='unknown_missing', unpublished=1, "
-                    "unseen=1, publication_hint_message_id=?, deleted_at=NULL, updated_at=? "
-                    "WHERE dialog_id=? AND message_id=?",
-                    (hint, timestamp, dialog_id, message_id),
-                )
-            conn.execute(_DELETE_SCHEDULED_FTS_SQL, (dialog_id, message_id))
-        _mark_scheduled_dialog_dirty(conn, dialog_id, timestamp)
+        else:
+            conn.execute(
+                "UPDATE scheduled_messages SET message_state='unknown_missing', unpublished=1, "
+                "unseen=1, publication_hint_message_id=?, deleted_at=NULL, updated_at=? "
+                "WHERE dialog_id=? AND message_id=?",
+                (hint, timestamp, dialog_id, message_id),
+            )
+        conn.execute(_DELETE_SCHEDULED_FTS_SQL, (dialog_id, message_id))
+    _mark_scheduled_dialog_dirty(conn, dialog_id, timestamp)
 
 
 def verify_scheduled_publication(
@@ -337,6 +339,7 @@ def verify_scheduled_publication(
     now: int | None = None,
 ) -> int:
     """Confirm a publication hint after a normal ``from_scheduled`` message."""
+    require_write_transaction(conn)
     timestamp = int(time.time()) if now is None else int(now)
     rows = cast(
         list[tuple[object]],
@@ -368,6 +371,7 @@ def mark_missing_from_snapshot(
     now: int | None = None,
 ) -> int:
     """Mark active rows absent from an authoritative snapshot as non-visible."""
+    require_write_transaction(conn)
     timestamp = int(time.time()) if now is None else int(now)
     if not message_ids:
         return 0
@@ -385,11 +389,11 @@ def mark_missing_from_snapshot(
 
 
 def _record_retry(conn: sqlite3.Connection, retry_at: int, error: str) -> None:
-    conn.execute(
-        "UPDATE scheduled_sync_state SET next_retry_at=?, last_error=? WHERE key=?",
-        (retry_at, error, _SCHEDULED_SYNC_KEY),
-    )
-    conn.commit()
+    with write_transaction(conn):
+        conn.execute(
+            "UPDATE scheduled_sync_state SET next_retry_at=?, last_error=? WHERE key=?",
+            (retry_at, error, _SCHEDULED_SYNC_KEY),
+        )
 
 
 def _log_own_only_entity_rpc_error(conn: sqlite3.Connection, dialog_id: int, exc: RPCError) -> None:
@@ -397,7 +401,6 @@ def _log_own_only_entity_rpc_error(conn: sqlite3.Connection, dialog_id: int, exc
     if isinstance(exc, ACCESS_LOST_ERRORS):
         now = int(time.time())
         set_access_lost(conn, dialog_id, now, reason=type(exc).__name__)
-        conn.commit()
         return
     logger.warning(
         "scheduled_own_only_entity_error dialog_id=%d name=%r type=%s error_type=%s error=%s",
@@ -410,11 +413,11 @@ def _log_own_only_entity_rpc_error(conn: sqlite3.Connection, dialog_id: int, exc
 
 
 def _clear_retry(conn: sqlite3.Connection, now: int) -> None:
-    conn.execute(
-        "UPDATE scheduled_sync_state SET next_retry_at=NULL, last_snapshot_at=?, last_error=NULL WHERE key=?",
-        (now, _SCHEDULED_SYNC_KEY),
-    )
-    conn.commit()
+    with write_transaction(conn):
+        conn.execute(
+            "UPDATE scheduled_sync_state SET next_retry_at=NULL, last_snapshot_at=?, last_error=NULL WHERE key=?",
+            (now, _SCHEDULED_SYNC_KEY),
+        )
 
 
 def _retry_at(conn: sqlite3.Connection) -> int | None:
@@ -489,7 +492,7 @@ class ScheduledMessageReconciler:
             )
         }
         candidate_ids.update(active_ids)
-        with self._conn:
+        with write_transaction(self._conn):
             for dialog_id in candidate_ids:
                 self._conn.execute(
                     """
@@ -625,7 +628,8 @@ class ScheduledMessageReconciler:
             context=context,
         )
         if classification.included:
-            enroll_own_only_dialog(self._conn, dialog_id, classification)
+            with write_transaction(self._conn):
+                enroll_own_only_dialog(self._conn, dialog_id, classification)
         return classification.included
 
     async def _fetch_scheduled_snapshot(self, dialog_id: int) -> list[object]:
@@ -672,11 +676,11 @@ class ScheduledMessageReconciler:
 
     def _record_dialog_failure(self, dialog_id: int, kind: str, _code: str, now: int) -> None:
         due_column = "discovery_due_at" if kind == "discovery" else "repair_due_at"
-        self._conn.execute(
-            f"UPDATE scheduled_reconciliation_state SET {due_column}=?, updated_at=? WHERE dialog_id=?",
-            (now + self._policy.failure_retry_seconds, now, dialog_id),
-        )
-        self._conn.commit()
+        with write_transaction(self._conn):
+            self._conn.execute(
+                f"UPDATE scheduled_reconciliation_state SET {due_column}=?, updated_at=? WHERE dialog_id=?",
+                (now + self._policy.failure_retry_seconds, now, dialog_id),
+            )
 
     def _apply_snapshot(
         self,
@@ -690,8 +694,7 @@ class ScheduledMessageReconciler:
         # Acquire the write lock before checking the generation.  Otherwise a
         # concurrent event can dirty the dialog after the check and be erased
         # by this older snapshot.
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self._conn):
             current = cast(
                 tuple[object] | None,
                 self._conn.execute(
@@ -699,7 +702,6 @@ class ScheduledMessageReconciler:
                 ).fetchone(),
             )
             if current is None or _as_int(current[0]) != generation:
-                self._conn.rollback()
                 return None
             snapshot_ids = _snapshot_message_ids(snapshot)
             missing_ids = _missing_scheduled_ids(self._conn, dialog_id, snapshot_ids)
@@ -726,30 +728,26 @@ class ScheduledMessageReconciler:
             )
             if not active:
                 remove_own_only_basis(self._conn, dialog_id, OwnOnlyBasis.SCHEDULED_EVENT, now=now)
-            self._conn.commit()
             return changed
-        except BaseException:
-            self._conn.rollback()
-            raise
 
     def _finish_excluded_discovery(self, dialog_id: int, now: int) -> bool:
-        active = cast(
-            tuple[object] | None,
-            self._conn.execute(
-                "SELECT 1 FROM scheduled_messages WHERE dialog_id=? AND message_state='scheduled' LIMIT 1",
-                (dialog_id,),
-            ).fetchone(),
-        )
-        if active is not None:
-            return False
-        with self._conn:
+        with write_transaction(self._conn):
+            active = cast(
+                tuple[object] | None,
+                self._conn.execute(
+                    "SELECT 1 FROM scheduled_messages WHERE dialog_id=? AND message_state='scheduled' LIMIT 1",
+                    (dialog_id,),
+                ).fetchone(),
+            )
+            if active is not None:
+                return False
             remove_own_only_basis(self._conn, dialog_id, OwnOnlyBasis.SCHEDULED_EVENT, now=now)
             self._conn.execute(
                 "UPDATE scheduled_reconciliation_state SET repair_due_at=NULL, discovery_due_at=?, "
                 "updated_at=? WHERE dialog_id=?",
                 (now + SCHEDULED_QUIET_DISCOVERY_SECONDS, now, dialog_id),
             )
-        return True
+            return True
 
     async def _prepare_discovery(self, dialog_id: int, now: int) -> tuple[int, bool] | None:
         try:
@@ -837,6 +835,8 @@ class ScheduledMessageReconciler:
 
     async def _run_slice(self, demand_kind: DemandKind | None = None) -> int:
         """Process one bounded slice, optionally restricted to one demand kind."""
+        if self._conn.in_transaction:
+            raise RuntimeError("scheduled reconciliation requires an idle connection")
         now = int(time.time())
         retry_at = _retry_at(self._conn)
         if retry_at is not None and retry_at > now:

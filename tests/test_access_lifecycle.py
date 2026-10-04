@@ -12,6 +12,7 @@ from mcp_telegram.access_lifecycle import (
     set_access_lost,
     stamp_access_revalidation,
 )
+from mcp_telegram.sync_transactions import write_transaction
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
@@ -67,13 +68,14 @@ def test_nested_lifecycle_savepoint_preserves_outer_write() -> None:
     conn.execute("INSERT INTO dialogs VALUES (1, 0, 0, 1, 0, 0, 0, 0, 'x')")
     conn.execute("CREATE TABLE unrelated (value INTEGER)")
     conn.commit()
-    conn.execute("INSERT INTO unrelated VALUES (7)")
-
     try:
-        set_access_lost(conn, 1, 10)
-        stamp_access_revalidation(conn, 1, 11, 20)
-        assert conn.in_transaction
-        conn.rollback()
+        with pytest.raises(RuntimeError, match="abort outer"):
+            with write_transaction(conn):
+                conn.execute("INSERT INTO unrelated VALUES (7)")
+                set_access_lost(conn, 1, 10)
+                stamp_access_revalidation(conn, 1, 11, 20)
+                assert conn.in_transaction
+                raise RuntimeError("abort outer")
         assert conn.execute("SELECT COUNT(*) FROM unrelated").fetchone() == (0,)
         assert conn.execute("SELECT status FROM synced_dialogs").fetchone() == ("synced",)
     finally:
@@ -210,6 +212,7 @@ def test_lifecycle_history_and_operational_logs_are_ordered_and_deduplicated(
             assert restore_access_after_revalidation(conn, 1, 12)
             assert not restore_access_after_revalidation(conn, 1, 13)
             conn.execute("UPDATE synced_dialogs SET status = 'syncing' WHERE dialog_id = 1")
+            conn.commit()
             assert set_access_lost(conn, 1, 14)
         assert conn.execute(
             "SELECT kind, occurred_at, reason_code, previous_status, access_change_cause, actor_id "

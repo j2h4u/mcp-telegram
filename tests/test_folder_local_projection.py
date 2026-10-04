@@ -21,14 +21,16 @@ from mcp_telegram.folders.read_repository import folder_snapshot
 from mcp_telegram.folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from mcp_telegram.folders.telegram_adapter import TelethonTelegramFolderGateway, _observation_token
 from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.sync_transactions import write_savepoint
 
 
 def _conn(path: Path) -> sqlite3.Connection:
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
-    conn.execute(
-        "UPDATE dialog_directory_publication SET account_id=1,generation=7,observation_started_at=10,observation_completed_at=11 WHERE singleton=1"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE dialog_directory_publication SET account_id=1,generation=7,observation_started_at=10,observation_completed_at=11 WHERE singleton=1"
+        )
     return conn
 
 
@@ -54,10 +56,11 @@ def test_three_valued_precedence_and_missing_explicit_peer() -> None:
 def test_projection_retains_unknown_and_custom_pin_order(tmp_path: Path) -> None:
     conn = _conn(tmp_path / "sync.db")
     try:
-        conn.executemany(
-            "INSERT INTO dialog_directory_facts(dialog_id,category,archived,unread,mute_until,observed_at) VALUES (?,?,?,?,?,?)",
-            [(3, "contact", 0, 1, 0, 10), (8, None, 0, 1, 0, 10)],
-        )
+        with write_savepoint(conn):
+            conn.executemany(
+                "INSERT INTO dialog_directory_facts(dialog_id,category,archived,unread,mute_until,observed_at) VALUES (?,?,?,?,?,?)",
+                [(3, "contact", 0, 1, 0, 10), (8, None, 0, 1, 0, 10)],
+            )
         repo = SQLiteFolderSnapshotRepository(conn)
         rule = FolderRule(4, "Work", pinned_ids=(8, 3), categories=frozenset({DialogCategory.CONTACT}))
         assert repo.project_observation(_observation(rule), completed_at=100) == 7
@@ -72,9 +75,10 @@ def test_projection_retains_unknown_and_custom_pin_order(tmp_path: Path) -> None
 def test_pending_rule_observation_is_preserved_without_catalog(tmp_path: Path) -> None:
     conn = _conn(tmp_path / "sync.db")
     try:
-        conn.execute(
-            "UPDATE dialog_directory_publication SET account_id=NULL,generation=NULL,observation_started_at=NULL WHERE singleton=1"
-        )
+        with write_savepoint(conn):
+            conn.execute(
+                "UPDATE dialog_directory_publication SET account_id=NULL,generation=NULL,observation_started_at=NULL WHERE singleton=1"
+            )
         repo = SQLiteFolderSnapshotRepository(conn)
         assert repo.project_observation(_observation(FolderRule(1, "A"), started_at=55), completed_at=56) is None
         assert conn.execute("SELECT token,started_at FROM telegram_folder_pending_observation").fetchone() == (
@@ -90,9 +94,10 @@ def test_pending_rule_observation_is_preserved_without_catalog(tmp_path: Path) -
 def test_newer_pending_rule_replaces_older_rule_before_catalog_publication(tmp_path: Path) -> None:
     conn = _conn(tmp_path / "sync.db")
     try:
-        conn.execute(
-            "UPDATE dialog_directory_publication SET account_id=NULL,generation=NULL,observation_started_at=NULL WHERE singleton=1"
-        )
+        with write_savepoint(conn):
+            conn.execute(
+                "UPDATE dialog_directory_publication SET account_id=NULL,generation=NULL,observation_started_at=NULL WHERE singleton=1"
+            )
         repo = SQLiteFolderSnapshotRepository(conn)
         first = FolderRuleObservation((FolderRule(1, "Old"),), "old", 55)
         second = FolderRuleObservation((FolderRule(2, "New"),), "new", 70)
@@ -102,9 +107,10 @@ def test_newer_pending_rule_replaces_older_rule_before_catalog_publication(tmp_p
             "new",
             70,
         )
-        conn.execute(
-            "UPDATE dialog_directory_publication SET account_id=1,generation=8,observation_started_at=80 WHERE singleton=1"
-        )
+        with write_savepoint(conn):
+            conn.execute(
+                "UPDATE dialog_directory_publication SET account_id=1,generation=8,observation_started_at=80 WHERE singleton=1"
+            )
         assert repo.reproject_current_rules(now=81) == 8
         assert conn.execute("SELECT folder_id,title FROM telegram_folder_rules").fetchall() == [(2, "New")]
     finally:
@@ -114,15 +120,18 @@ def test_newer_pending_rule_replaces_older_rule_before_catalog_publication(tmp_p
 def test_default_uses_catalog_and_main_pin_order(tmp_path: Path) -> None:
     conn = _conn(tmp_path / "sync.db")
     try:
-        conn.executemany(
-            "INSERT INTO dialog_directory_facts(dialog_id,category,archived,unread,mute_until,observed_at) VALUES (?,?,?,?,?,?)",
-            [(40, "group", 0, 0, 0, 10), (10, "bot", 0, 1, 0, 10)],
-        )
-        conn.executemany("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (?, 'group', 0)", [(40,), (10,)])
-        conn.executemany(
-            "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (0,?,?)",
-            [(40, 1), (10, 0)],
-        )
+        with write_savepoint(conn):
+            conn.executemany(
+                "INSERT INTO dialog_directory_facts(dialog_id,category,archived,unread,mute_until,observed_at) VALUES (?,?,?,?,?,?)",
+                [(40, "group", 0, 0, 0, 10), (10, "bot", 0, 1, 0, 10)],
+            )
+        with write_savepoint(conn):
+            conn.executemany("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (?, 'group', 0)", [(40,), (10,)])
+        with write_savepoint(conn):
+            conn.executemany(
+                "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (0,?,?)",
+                [(40, 1), (10, 0)],
+            )
         repo = SQLiteFolderSnapshotRepository(conn)
         rule = FolderRule(0, "All chats", DEFAULT_FOLDER_NAMESPACE, FolderRuleKind.DEFAULT)
         repo.project_observation(_observation(rule), completed_at=100)
@@ -136,7 +145,8 @@ def test_default_uses_catalog_and_main_pin_order(tmp_path: Path) -> None:
 def test_visible_dialog_without_eligibility_facts_is_not_omitted(tmp_path: Path) -> None:
     conn = _conn(tmp_path / "sync.db")
     try:
-        conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (77,'user',0)")
+        with write_savepoint(conn):
+            conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (77,'user',0)")
         repo = SQLiteFolderSnapshotRepository(conn)
         default = FolderRule(0, "All chats", DEFAULT_FOLDER_NAMESPACE, FolderRuleKind.DEFAULT)
         filtered = FolderRule(2, "Contacts", categories=frozenset({DialogCategory.CONTACT}))
@@ -151,11 +161,13 @@ def test_visible_dialog_without_eligibility_facts_is_not_omitted(tmp_path: Path)
 def test_default_excludes_archived_dialogs_and_marks_unknown_archive_unknown(tmp_path: Path) -> None:
     conn = _conn(tmp_path / "sync.db")
     try:
-        conn.executemany(
-            "INSERT INTO dialogs(dialog_id,type,hidden,archived) VALUES (?,'user',0,?)",
-            [(1, 0), (2, 1), (3, 0)],
-        )
-        conn.execute("INSERT INTO dialog_directory_facts VALUES (3,NULL,NULL,NULL,NULL,NULL)")
+        with write_savepoint(conn):
+            conn.executemany(
+                "INSERT INTO dialogs(dialog_id,type,hidden,archived) VALUES (?,'user',0,?)",
+                [(1, 0), (2, 1), (3, 0)],
+            )
+        with write_savepoint(conn):
+            conn.execute("INSERT INTO dialog_directory_facts VALUES (3,NULL,NULL,NULL,NULL,NULL)")
         repo = SQLiteFolderSnapshotRepository(conn)
         default = FolderRule(0, "All chats", DEFAULT_FOLDER_NAMESPACE, FolderRuleKind.DEFAULT)
         repo.project_observation(_observation(default), completed_at=100)
@@ -185,8 +197,10 @@ def test_canonical_and_rule_receipts_turn_stale_at_exactly_900_seconds(tmp_path:
 def test_mute_expiry_reprojects_without_rule_rpc(tmp_path: Path) -> None:
     conn = _conn(tmp_path / "sync.db")
     try:
-        conn.execute("INSERT INTO dialog_directory_facts VALUES (1,'contact',0,1,200,10)")
-        conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (1,'user',0)")
+        with write_savepoint(conn):
+            conn.execute("INSERT INTO dialog_directory_facts VALUES (1,'contact',0,1,200,10)")
+        with write_savepoint(conn):
+            conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (1,'user',0)")
         repo = SQLiteFolderSnapshotRepository(conn)
         rule = FolderRule(1, "Unmuted", categories=frozenset({DialogCategory.CONTACT}), exclude_muted=True)
         repo.project_observation(_observation(rule), completed_at=100)

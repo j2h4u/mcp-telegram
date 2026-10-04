@@ -134,3 +134,6 @@ authoritative_absence
 # entry point whose caller may live outside this source tree.
 section_is_reusable
 request_follow_up
+
+# sqlite3 consumes this native connection setting; it is not a Python reader.
+isolation_level

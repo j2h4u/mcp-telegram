@@ -55,6 +55,7 @@ from mcp_telegram.pagination import (
     decode_account_trace_navigation,
     encode_account_trace_navigation,
 )
+from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_demand import AcquisitionKind
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope
@@ -480,15 +481,17 @@ def test_trace_observed_coverage_ignores_unrelated_historical_failures(
     _server, conn, _client = trace_server
     seed_synced_dialog(conn, dialog_id=-100123, status="access_lost")
     seed_synced_dialog(conn, dialog_id=-100124, status="synced")
-    _upsert_trace_coverage_fragment(
-        _TraceCoverageFragmentUpsertRequest(
-            conn=conn,
-            target_user_id=101,
-            dialog_id=-100125,
-            status="flood_wait",
-            next_retry_at=1_700_000_120,
+    conn.commit()
+    with write_transaction(conn):
+        _upsert_trace_coverage_fragment(
+            _TraceCoverageFragmentUpsertRequest(
+                conn=conn,
+                target_user_id=101,
+                dialog_id=-100125,
+                status="flood_wait",
+                next_retry_at=1_700_000_120,
+            )
         )
-    )
     conn.commit()
 
     coverage = _build_trace_coverage(
@@ -573,26 +576,30 @@ def test_trace_fragment_helpers_preserve_created_at_and_store_retry(
 ) -> None:
     _server, conn, _client = trace_server
 
-    _upsert_trace_coverage_fragment(
-        _TraceCoverageFragmentUpsertRequest(
-            conn=conn,
-            target_user_id=101,
-            dialog_id=-100123,
-            status="flood_wait",
-            next_retry_at=1_700_000_120,
-            last_error="TelegramRpcThrottled:120",
-            now=1_700_000_000,
+    conn.commit()
+    with write_transaction(conn):
+        _upsert_trace_coverage_fragment(
+            _TraceCoverageFragmentUpsertRequest(
+                conn=conn,
+                target_user_id=101,
+                dialog_id=-100123,
+                status="flood_wait",
+                next_retry_at=1_700_000_120,
+                last_error="TelegramRpcThrottled:120",
+                now=1_700_000_000,
+            )
         )
-    )
-    _upsert_trace_coverage_fragment(
-        _TraceCoverageFragmentUpsertRequest(
-            conn=conn,
-            target_user_id=101,
-            dialog_id=-100123,
-            status="complete",
-            now=1_700_000_060,
+    conn.commit()
+    with write_transaction(conn):
+        _upsert_trace_coverage_fragment(
+            _TraceCoverageFragmentUpsertRequest(
+                conn=conn,
+                target_user_id=101,
+                dialog_id=-100123,
+                status="complete",
+                now=1_700_000_060,
+            )
         )
-    )
     conn.commit()
 
     fragments = coverage_fragments(conn, target_user_id=101)

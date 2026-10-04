@@ -38,6 +38,7 @@ from mcp_telegram.sync_db import (
     _open_sync_db,
     ensure_sync_schema,
 )
+from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_demand import AcquisitionKind, DemandStatus, RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind, demand_contract
 from mcp_telegram.telegram_rpc_scheduler import (
@@ -129,8 +130,12 @@ def test_scheduled_schema_is_separate_and_explicit(conn: sqlite3.Connection) -> 
 
 
 def test_upsert_reschedule_updates_same_queue_identity_without_sent_row(conn: sqlite3.Connection) -> None:
-    upsert_scheduled_message(conn, 42, _message(11, "first", scheduled_at=1_900_000_001), now=100)
-    upsert_scheduled_message(conn, 42, _message(11, "rescheduled", scheduled_at=1_900_000_101), now=101)
+    conn.commit()
+    with write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(11, "first", scheduled_at=1_900_000_001), now=100)
+    conn.commit()
+    with write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(11, "rescheduled", scheduled_at=1_900_000_101), now=101)
     conn.commit()
 
     row = conn.execute(
@@ -142,14 +147,22 @@ def test_upsert_reschedule_updates_same_queue_identity_without_sent_row(conn: sq
 
 
 def test_upsert_drops_non_future_queue_rows(conn: sqlite3.Connection) -> None:
-    upsert_scheduled_message(conn, 42, _message(11, scheduled_at=100), now=101)
+    conn.commit()
+    with write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(11, scheduled_at=100), now=101)
     assert conn.execute("SELECT COUNT(*) FROM scheduled_messages").fetchone() == (0,)
 
 
 def test_removal_retains_cancel_and_unverified_publication_evidence(conn: sqlite3.Connection) -> None:
-    upsert_scheduled_message(conn, 42, _message(11), now=100)
-    upsert_scheduled_message(conn, 42, _message(12), now=100)
-    mark_scheduled_messages_removed(conn, 42, [11, 12], [901], now=200)
+    conn.commit()
+    with write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(11), now=100)
+    conn.commit()
+    with write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(12), now=100)
+    conn.commit()
+    with write_transaction(conn):
+        mark_scheduled_messages_removed(conn, 42, [11, 12], [901], now=200)
 
     rows = conn.execute(
         "SELECT message_id, message_state, visibility, unpublished, publication_hint_message_id "
@@ -159,7 +172,9 @@ def test_removal_retains_cancel_and_unverified_publication_evidence(conn: sqlite
         (11, "unknown_missing", "author_only", 1, 901),
         (12, "cancelled", "author_only", 1, None),
     ]
-    assert verify_scheduled_publication(conn, 42, 901, now=201) == 1
+    conn.commit()
+    with write_transaction(conn):
+        assert verify_scheduled_publication(conn, 42, 901, now=201) == 1
     assert conn.execute(
         "SELECT message_state, visibility, unpublished, unseen, published_message_id, published_at "
         "FROM scheduled_messages WHERE message_id=11"
@@ -170,13 +185,16 @@ def test_removal_retains_cancel_and_unverified_publication_evidence(conn: sqlite
 @pytest.mark.asyncio
 async def test_reconciliation_snapshot_marks_disappearance_nonvisible(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (42, 'synced')")
-    upsert_scheduled_message(conn, 42, _message(11), now=100)
+    conn.commit()
+    with write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(11), now=100)
     conn.commit()
     client = _ScheduledSnapshotClient({42: []})
     worker = ScheduledMessageReconciler(
         client, conn, asyncio.Event(), policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0)
     )
 
+    conn.commit()
     assert await _run_all_demand_slices(worker) == 1
     assert conn.execute(
         "SELECT message_state, unpublished, unseen FROM scheduled_messages WHERE message_id=11"
@@ -191,13 +209,16 @@ async def test_reconciliation_floodwait_records_retry_and_stops_account_pass(con
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         [(42,), (43,)],
     )
-    upsert_scheduled_message(conn, 42, _message(11), now=100)
+    conn.commit()
+    with write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(11), now=100)
     conn.commit()
     client = _ScheduledSnapshotClient(call_error=TelegramRpcThrottled(retry_after_seconds=30))
     worker = ScheduledMessageReconciler(
         client, conn, asyncio.Event(), policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0)
     )
 
+    conn.commit()
     assert await _run_all_demand_slices(worker) == 0
     retry_at, error = conn.execute(
         "SELECT next_retry_at, last_error FROM scheduled_sync_state WHERE key='account'"
@@ -222,6 +243,7 @@ async def test_reconciliation_without_own_only_context_does_not_sweep_all_synced
         client, conn, asyncio.Event(), policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0)
     )
 
+    conn.commit()
     assert await _run_all_demand_slices(worker) == 0
     assert client.requests == []
     assert client.input_entity_calls == []
@@ -283,6 +305,7 @@ async def test_reconciliation_classifies_and_enrolls_own_only_candidates(
     )
     conn.commit()
 
+    conn.commit()
     assert await _run_all_demand_slices(worker) == 0
     assert conn.execute("SELECT message_id FROM scheduled_messages WHERE dialog_id=?", (personal_id,)).fetchone() == (
         99,
@@ -375,9 +398,12 @@ async def test_pending_linked_chat_gates_discovery_without_account_retry_and_all
         None,
     )
 
-    upsert_scheduled_message(conn, 42, _message(90), now=now)
+    conn.commit()
+    with write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(90), now=now)
     repair_status = ScheduledRepairDemandAdapter(worker).status(now)
     assert repair_status is not None and repair_status.release_at <= now
+    conn.commit()
     assert await worker.run_demand_slice(DemandKind.SCHEDULED_REPAIR) == 1
     assert len(client.requests) == 1
     assert conn.execute("SELECT next_retry_at,last_error FROM scheduled_sync_state WHERE key='account'").fetchone() == (
@@ -453,6 +479,7 @@ async def test_suspended_pending_fact_suppresses_only_discovery_and_restore_rele
     assert discovery_adapter.status(now) is None
     repair_status = repair_adapter.status(now)
     assert repair_status is not None and repair_status.release_at == now
+    conn.commit()
     await worker.run_demand_slice(DemandKind.SCHEDULED_DISCOVERY)
     assert client.requests == []
     assert conn.execute("SELECT next_retry_at,last_error FROM scheduled_sync_state WHERE key='account'").fetchone() == (
@@ -460,7 +487,10 @@ async def test_suspended_pending_fact_suppresses_only_discovery_and_restore_rele
         None,
     )
 
-    upsert_scheduled_message(conn, 42, _message(90), now=now)
+    conn.commit()
+    with write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(90), now=now)
+    conn.commit()
     conn.commit()
     assert await worker.run_demand_slice(DemandKind.SCHEDULED_REPAIR) == 1
     assert len(client.requests) == 1
@@ -511,6 +541,7 @@ async def test_reconciliation_access_lost_candidate_log_has_dialog_context(
     conn.commit()
 
     with caplog.at_level("WARNING", logger="mcp_telegram.access_lifecycle"):
+        conn.commit()
         assert await _run_all_demand_slices(worker) == 0
 
     records = [record for record in caplog.records if record.message.startswith("access_lost ")]
@@ -568,8 +599,12 @@ async def test_raw_scheduled_updates_ingest_without_messages_row(conn: sqlite3.C
 
 @pytest.mark.asyncio
 async def test_publication_reconciliation_runs_before_sync_enrollment(conn: sqlite3.Connection) -> None:
-    upsert_scheduled_message(conn, 42, _message(21), now=100)
-    mark_scheduled_messages_removed(conn, 42, [21], [901], now=200)
+    conn.commit()
+    with write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(21), now=100)
+    conn.commit()
+    with write_transaction(conn):
+        mark_scheduled_messages_removed(conn, 42, [21], [901], now=200)
     client = MagicMock()
     manager = EventHandlerManager(client, conn, asyncio.Event())
     manager.bind_demand_sink(MagicMock())
@@ -633,8 +668,12 @@ def test_unix_timestamp_from_none() -> None:
 
 
 def test_realtime_updates_coalesce_into_one_dirty_dialog(conn: sqlite3.Connection) -> None:
-    upsert_scheduled_message(conn, 42, _message(11), now=100)
-    upsert_scheduled_message(conn, 42, _message(12), now=101)
+    conn.commit()
+    with write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(11), now=100)
+    conn.commit()
+    with write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(12), now=101)
     conn.commit()
 
     state = conn.execute(
@@ -667,6 +706,7 @@ async def test_reconciliation_processes_only_one_bounded_slice(conn: sqlite3.Con
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10, max_dialogs_per_slice=2),
     )
 
+    conn.commit()
     await _run_all_demand_slices(worker)
 
     assert len(client.requests) == 2
@@ -677,13 +717,16 @@ async def test_reconciliation_processes_only_one_bounded_slice(conn: sqlite3.Con
 
 @pytest.mark.asyncio
 async def test_concurrent_event_prevents_stale_snapshot_apply(conn: sqlite3.Connection) -> None:
-    upsert_scheduled_message(conn, 42, _message(11), now=100)
+    conn.commit()
+    with write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(11), now=100)
     conn.commit()
 
     class _ConcurrentClient(_ScheduledSnapshotClient):
         async def __call__(self, _request: object, **_kwargs: object) -> object:
             del _request, _kwargs
-            upsert_scheduled_message(conn, 42, _message(12), now=200)
+            with write_transaction(conn):
+                upsert_scheduled_message(conn, 42, _message(12), now=200)
             conn.commit()
             return SimpleNamespace(messages=[])
 
@@ -693,6 +736,7 @@ async def test_concurrent_event_prevents_stale_snapshot_apply(conn: sqlite3.Conn
         asyncio.Event(),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
     )
+    conn.commit()
     assert await worker.run_demand_slice(DemandKind.SCHEDULED_REPAIR) == 0
     assert conn.execute(
         "SELECT message_id FROM scheduled_messages WHERE dialog_id=42 AND message_state='scheduled' ORDER BY message_id"
@@ -838,7 +882,9 @@ def test_scheduled_demand_status_keeps_later_queue_release(
 
 @pytest.mark.asyncio
 async def test_scheduled_repair_adapter_runs_only_repair_rows_with_precise_scope(conn: sqlite3.Connection) -> None:
-    upsert_scheduled_message(conn, 42, _message(11), now=100)
+    conn.commit()
+    with write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(11), now=100)
     conn.execute(
         "UPDATE scheduled_reconciliation_state SET repair_due_at=0, discovery_due_at=9999999999 WHERE dialog_id=42"
     )
@@ -852,6 +898,7 @@ async def test_scheduled_repair_adapter_runs_only_repair_rows_with_precise_scope
     )
     budget = RpcAttemptBudget(limit=16)
 
+    conn.commit()
     await ScheduledRepairDemandAdapter(reconciler).run_slice(budget)
 
     assert len(client.requests) == 1
@@ -882,6 +929,7 @@ async def test_scheduled_discovery_adapter_runs_only_discovery_rows_with_precise
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
     )
 
+    conn.commit()
     await ScheduledDiscoveryDemandAdapter(reconciler).run_slice(RpcAttemptBudget(limit=16))
 
     assert len(client.requests) == 1
@@ -909,6 +957,7 @@ async def test_future_account_retry_does_not_appear_runnable(conn: sqlite3.Conne
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10, state_scan_seconds=60),
     )
 
+    conn.commit()
     assert await _run_all_demand_slices(worker) == 0
     assert client.requests == []
 
@@ -979,6 +1028,7 @@ async def test_excluded_discovery_removes_only_scheduled_ownership_basis(conn: s
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
     )
 
+    conn.commit()
     assert await _run_all_demand_slices(worker) == 0
     assert conn.execute("SELECT inclusion_basis FROM own_only_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
         '["owned_channel"]',

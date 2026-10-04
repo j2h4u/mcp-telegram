@@ -37,6 +37,7 @@ from mcp_telegram.event_handlers import (
     _RawReactionUpdate,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.sync_transactions import enable_runtime_writes
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 _SQLiteConnection = sqlite3.Connection
@@ -250,7 +251,10 @@ async def test_on_raw_reaction_update_user_peer(
     )
 
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
+    enable_runtime_writes(sync_db)
     await mgr.on_raw_reaction_update(update)
+    assert not sync_db.in_transaction
+    assert sync_db.execute("PRAGMA query_only").fetchone()[0] == 1
 
     assert _reactions(sync_db, dialog_id, 500) == [("🔥", 4)]
     mock_client.get_messages.assert_not_called()

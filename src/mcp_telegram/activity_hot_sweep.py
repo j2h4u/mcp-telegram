@@ -29,6 +29,7 @@ from .activity_peer_sweep import (
 )
 from .activity_substrate import ActivityClient
 from .hydration_queue import HydrationPriority
+from .sync_transactions import write_transaction
 from .telegram_demand import (
     AcquisitionKind,
     DemandStatus,
@@ -98,7 +99,7 @@ class _HotWindowState:
 
 def _begin_hot_window(conn: sqlite3.Connection, dialog_id: int) -> _HotWindowState | None:
     """Atomically initialize or reload one peer's in-progress hot window."""
-    with conn:
+    with write_transaction(conn):
         row = cast(
             tuple[int | None, int | None, int | None, int] | None,
             conn.execute(
@@ -168,7 +169,7 @@ def _save_hot_window_progress(
     had_new: bool,
 ) -> None:
     """Commit one complete page's continuation and observed window maximum."""
-    with conn:
+    with write_transaction(conn):
         conn.execute(
             "UPDATE activity_dialog_state "
             "SET hot_page_offset_id = ?, hot_window_max_id = ?, hot_window_had_new = ?, updated_at = ? "
@@ -353,7 +354,7 @@ def _save_hot_completed_state(  # noqa: PLR0913
     policy: HotSweepPolicy,
 ) -> None:
     """Persist cursor and exponential empty-yield cadence after completion."""
-    with conn:
+    with write_transaction(conn):
         row = cast(
             tuple[int],
             conn.execute(

@@ -18,6 +18,7 @@ from .dialog_identity import read_dialog_identities
 from .models import DialogType
 from .own_only_contracts import OwnOnlyContext, normalize_channel_peer_id
 from .sync_db import ensure_own_only_schema
+from .sync_transactions import require_write_transaction, write_savepoint
 
 
 class OwnOnlyBasis(StrEnum):
@@ -116,8 +117,7 @@ def enroll_own_only_dialog(
     if not classification.included:
         return
     timestamp = int(time.time()) if now is None else int(now)
-    ensure_own_only_schema(conn)
-    with conn:
+    with write_savepoint(conn):
         conn.execute(
             """
             INSERT INTO own_only_dialogs (dialog_id, inclusion_basis, updated_at)
@@ -143,6 +143,7 @@ def enroll_own_only_sync_dialog(conn: sqlite3.Connection, dialog_id: int) -> Non
     The caller owns the transaction.  Keeping this helper execute-only lets a
     message batch atomically roll back both its message rows and enrollment.
     """
+    require_write_transaction(conn)
     conn.execute(
         "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'own_only')",
         (int(dialog_id),),
@@ -179,6 +180,7 @@ def add_own_only_basis(
     scheduled event can coalesce its queue state and ownership evidence in one
     commit.
     """
+    require_write_transaction(conn)
     timestamp = int(time.time()) if now is None else int(now)
     value = str(basis.value if isinstance(basis, OwnOnlyBasis) else basis)
     row = cast(
@@ -212,6 +214,7 @@ def remove_own_only_basis(
     now: int | None = None,
 ) -> None:
     """Remove one ownership reason without discarding unrelated evidence."""
+    require_write_transaction(conn)
     timestamp = int(time.time()) if now is None else int(now)
     value = str(basis.value if isinstance(basis, OwnOnlyBasis) else basis)
     row = cast(

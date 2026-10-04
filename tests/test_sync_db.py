@@ -17,6 +17,7 @@ from mcp_telegram.sync_db import (
     load_account_cooldown_until_utc,
     load_self_profile_last_success_at,
     migrate_legacy_databases,
+    open_runtime_sync_db,
     open_sync_db_reader,
     save_account_cooldown_until_utc,
     save_self_profile_last_success_at,
@@ -1799,3 +1800,21 @@ def test_v20_migration_is_idempotent(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     # Second call must not raise.
     ensure_sync_schema(db_path)
+
+
+def test_runtime_factory_guards_writes_after_bootstrap(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    with closing(open_runtime_sync_db(path)) as conn:
+        assert conn.isolation_level is None
+        assert conn.execute("PRAGMA query_only").fetchone() == (1,)
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute("INSERT INTO daemon_state(key, value) VALUES ('bypass', 'bad')")
+        save_self_profile_last_success_at(conn, 123)
+        assert load_self_profile_last_success_at(conn) == 123
+        assert not conn.in_transaction
+        assert conn.execute("PRAGMA query_only").fetchone() == (1,)
+    ensure_sync_schema(path)
+    with closing(open_sync_db_reader(path)) as conn:
+        assert load_self_profile_last_success_at(conn) == 123
+        assert conn.execute("SELECT value FROM daemon_state WHERE key='bypass'").fetchone() is None

@@ -49,6 +49,7 @@ from mcp_telegram.reading.sqlite_projection import (
 from mcp_telegram.runtime_observations import record_runtime_observation
 from mcp_telegram.sync_db import _RUNTIME_OBSERVATIONS_V54_DDL, ensure_sync_schema
 from mcp_telegram.sync_read_model import compute_sync_coverage as _compute_sync_coverage
+from mcp_telegram.sync_transactions import enable_runtime_writes
 from mcp_telegram.telegram_demand import AcquisitionKind
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
@@ -456,6 +457,7 @@ async def test_recover_dialog_directory_uses_daemon_writer_and_preserves_publica
         conn.execute(
             "UPDATE dialog_directory_publication SET generation=3,observation_started_at=10,observation_completed_at=20"
         )
+        conn.commit()
         result = await make_server(conn)._dispatch({"method": "recover_dialog_directory"})
         assert result["ok"] is True
         data = cast(dict[str, object], result["data"])
@@ -476,6 +478,7 @@ async def test_recover_dialog_directory_rejects_non_invalid_state(tmp_path: Path
         conn.execute(
             "UPDATE dialog_directory_state SET generation=4,status='incomplete',reason='ordinary:TimeoutError'"
         )
+        conn.commit()
         result = await make_server(conn)._dispatch({"method": "recover_dialog_directory"})
         assert result == {
             "ok": False,
@@ -9122,3 +9125,24 @@ def test_trace_candidate_no_discussion_group_stays_signature_only() -> None:
     )
     # No linked-chat candidate must appear.
     assert _LINKED_CHAT_ID not in dialog_ids, "linked group appeared in candidates despite no discussion group"
+
+
+def test_telemetry_rejects_foreign_transaction_without_committing() -> None:
+    conn = _make_db_with_entities()
+    conn.execute("INSERT INTO daemon_state(key,value) VALUES ('foreign', 'pending')")
+    with pytest.raises(RuntimeError, match="idle connection"):
+        _write_telemetry(conn, make_daemon_api_policy(), {"tool_name": "Current"})
+    assert conn.in_transaction
+    assert conn.execute("SELECT COUNT(*) FROM runtime_observations").fetchone()[0] == 0
+    conn.rollback()
+    assert conn.execute("SELECT COUNT(*) FROM daemon_state WHERE key='foreign'").fetchone()[0] == 0
+
+
+def test_telemetry_writes_with_runtime_guard_and_restores_it() -> None:
+    conn = _make_db_with_entities()
+    conn.commit()
+    enable_runtime_writes(conn)
+    _write_telemetry(conn, make_daemon_api_policy(), {"tool_name": "Current"})
+    assert not conn.in_transaction
+    assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+    assert conn.execute("SELECT tool_name FROM runtime_observations").fetchone()[0] == "Current"

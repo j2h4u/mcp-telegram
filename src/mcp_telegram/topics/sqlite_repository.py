@@ -6,6 +6,7 @@ import sqlite3
 import time
 from typing import cast
 
+from ..sync_transactions import require_write_transaction, write_savepoint
 from .contracts import TopicFact
 from .ports import TopicMetadataRepository, TopicSnapshotRepository
 
@@ -55,7 +56,7 @@ class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataReposi
             }
             for topic in topics
         )
-        with self._conn:
+        with write_savepoint(self._conn):
             self._conn.executemany(_UPSERT_TOPIC_SQL, rows)
 
     def apply_topic_create(  # noqa: PLR0913
@@ -68,6 +69,7 @@ class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataReposi
         date: int | None,
         observed_at: int,
     ) -> None:
+        require_write_transaction(self._conn)
         self._conn.execute(
             """
             INSERT INTO topic_metadata
@@ -97,6 +99,7 @@ class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataReposi
         hidden: bool | None,
         observed_at: int,
     ) -> None:
+        require_write_transaction(self._conn)
         if hidden:
             self._conn.execute(
                 "UPDATE topic_metadata SET hidden=1, snapshot_at=?, updated_at=? WHERE dialog_id=? AND topic_id=?",
@@ -112,6 +115,7 @@ class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataReposi
         )
 
     def apply_topic_pin(self, dialog_id: int, topic_id: int, *, pinned: bool, observed_at: int) -> None:
+        require_write_transaction(self._conn)
         self._conn.execute(
             "UPDATE topic_metadata SET pinned=?, snapshot_at=?, updated_at=? WHERE dialog_id=? AND topic_id=?",
             (int(pinned), observed_at, observed_at, dialog_id, topic_id),
@@ -119,6 +123,7 @@ class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataReposi
 
     def apply_topic_pins(self, dialog_id: int, order: tuple[int, ...], *, observed_at: int) -> None:
         """Apply a complete pin membership set without creating unknown topics."""
+        require_write_transaction(self._conn)
         rows = cast(
             list[tuple[int]],
             self._conn.execute("SELECT topic_id FROM topic_metadata WHERE dialog_id=?", (dialog_id,)).fetchall(),

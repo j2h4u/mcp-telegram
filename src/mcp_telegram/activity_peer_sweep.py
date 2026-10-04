@@ -41,6 +41,7 @@ from .message_contracts import ExtractedMessage
 from .messages.sqlite_bundle import insert_messages_with_fts, message_exists
 from .messages.telegram_adapter import extract_dialog_id, extract_message_row
 from .own_only import enroll_own_only_sync_dialog
+from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import RpcAttemptBudgetExhaustedError
 from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource
@@ -223,14 +224,13 @@ def _extract_and_persist_sweep_messages(
 ) -> tuple[list[ExtractedMessage], frozenset[tuple[int, int]]] | SweepResult:
     """Return page rows or an explicit non-completion processing error."""
     try:
-        extracted, genuinely_new_keys = _extract_sweep_messages(request, batch)
-    except Exception:
-        logger.warning("sweep_peer_once_extraction_error dialog_id=%r", request.dialog_id, exc_info=True)
-        return _access_skip_result(rpc_calls=2, pages_fetched=1)
-
-    try:
-        if extracted:
-            with request.conn:
+        with write_transaction(request.conn):
+            try:
+                extracted, genuinely_new_keys = _extract_sweep_messages(request, batch)
+            except Exception:
+                logger.warning("sweep_peer_once_extraction_error dialog_id=%r", request.dialog_id, exc_info=True)
+                return _access_skip_result(rpc_calls=2, pages_fetched=1)
+            if extracted:
                 insert_messages_with_fts(
                     request.conn,
                     extracted,
@@ -362,8 +362,8 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, 
             early_result=_access_skip_result(rpc_calls=rpc_calls),
         )
     except ACCESS_LOST_ERRORS as exc:
-        set_access_lost(request.conn, request.dialog_id, int(time.time()), reason=type(exc).__name__)
-        request.conn.commit()
+        with write_transaction(request.conn):
+            set_access_lost(request.conn, request.dialog_id, int(time.time()), reason=type(exc).__name__)
         return _SearchOutcome(
             result=None,
             rpc_duration_s=_elapsed_s(search_started_at),
@@ -508,32 +508,43 @@ def enroll_activity_dialog(
     synced_dialogs enrollment uses INSERT OR IGNORE so an existing
     higher-status row (e.g. 'active'/'synced') is NEVER downgraded.
     """
+    with write_transaction(conn):
+        _enroll_activity_dialog_in_transaction(conn, dialog_id, source, last_activity_at=last_activity_at)
+
+
+def _enroll_activity_dialog_in_transaction(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    source: str,
+    *,
+    last_activity_at: int | None = None,
+) -> None:
+    require_write_transaction(conn)
     now = int(time.time())
-    with conn:
-        conn.execute(
-            """
-            INSERT INTO activity_dialog_state
-                (dialog_id, source, last_activity_at, cold_status, created_at, updated_at)
-            VALUES (?, ?, ?, 'pending', ?, ?)
-            ON CONFLICT(dialog_id) DO UPDATE SET
-                -- Provenance precedence: a peer enrolled as a direct 'supergroup'
-                -- membership must NOT be downgraded to 'linked_chat' by a later
-                -- trace-driven enrollment (the same peer can be both a direct
-                -- supergroup AND a channel's linked discussion group). 'supergroup'
-                -- is sticky; any other existing source is refreshed normally.
-                source           = CASE
-                                       WHEN activity_dialog_state.source = 'supergroup'
-                                       THEN activity_dialog_state.source
-                                       ELSE excluded.source
-                                   END,
-                updated_at       = excluded.updated_at,
-                last_activity_at = COALESCE(excluded.last_activity_at,
-                                            activity_dialog_state.last_activity_at)
-            """,
-            (dialog_id, source, last_activity_at, now, now),
-        )
-        enroll_own_only_sync_dialog(conn, dialog_id)
-        conn.execute(_INSERT_THIN_DIALOG_SQL, (dialog_id, now))
+    conn.execute(
+        """
+        INSERT INTO activity_dialog_state
+            (dialog_id, source, last_activity_at, cold_status, created_at, updated_at)
+        VALUES (?, ?, ?, 'pending', ?, ?)
+        ON CONFLICT(dialog_id) DO UPDATE SET
+            -- Provenance precedence: a peer enrolled as a direct 'supergroup'
+            -- membership must NOT be downgraded to 'linked_chat' by a later
+            -- trace-driven enrollment (the same peer can be both a direct
+            -- supergroup AND a channel's linked discussion group). 'supergroup'
+            -- is sticky; any other existing source is refreshed normally.
+            source           = CASE
+                                   WHEN activity_dialog_state.source = 'supergroup'
+                                   THEN activity_dialog_state.source
+                                   ELSE excluded.source
+                               END,
+            updated_at       = excluded.updated_at,
+            last_activity_at = COALESCE(excluded.last_activity_at,
+                                        activity_dialog_state.last_activity_at)
+        """,
+        (dialog_id, source, last_activity_at, now, now),
+    )
+    enroll_own_only_sync_dialog(conn, dialog_id)
+    conn.execute(_INSERT_THIN_DIALOG_SQL, (dialog_id, now))
 
 
 # ---------------------------------------------------------------------------
@@ -621,7 +632,7 @@ def _save_dialog_state(
     values = list(fields.values())
     values.append(int(time.time()))
     values.append(dialog_id)
-    with conn:
+    with write_transaction(conn):
         conn.execute(
             f"UPDATE activity_dialog_state SET {set_clause}, updated_at = ? WHERE dialog_id = ?",
             values,
@@ -715,27 +726,16 @@ def working_set_enrollment_release_at(
 
 
 def _start_working_set_enrollment(conn: sqlite3.Connection) -> str:
-    with conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
-            (_ENROLLMENT_PHASE_KEY, _ENROLLMENT_SUPERGROUPS),
-        )
-        conn.execute(
-            "DELETE FROM activity_sync_state WHERE key IN (?, ?)",
-            (_ENROLLMENT_CURSOR_KEY, _ENROLLMENT_NEXT_ATTEMPT_AT_KEY),
-        )
+    require_write_transaction(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
+        (_ENROLLMENT_PHASE_KEY, _ENROLLMENT_SUPERGROUPS),
+    )
+    conn.execute(
+        "DELETE FROM activity_sync_state WHERE key IN (?, ?)",
+        (_ENROLLMENT_CURSOR_KEY, _ENROLLMENT_NEXT_ATTEMPT_AT_KEY),
+    )
     return _ENROLLMENT_SUPERGROUPS
-
-
-def _set_working_set_enrollment_position(
-    conn: sqlite3.Connection,
-    *,
-    phase: str,
-    cursor: int | None,
-    retry_at: int | None = None,
-) -> None:
-    with conn:
-        _write_working_set_enrollment_position(conn, phase=phase, cursor=cursor, retry_at=retry_at)
 
 
 def _write_working_set_enrollment_position(
@@ -746,6 +746,7 @@ def _write_working_set_enrollment_position(
     retry_at: int | None = None,
 ) -> None:
     """Write enrollment state without acquiring or committing a transaction."""
+    require_write_transaction(conn)
     conn.execute(
         "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
         (_ENROLLMENT_PHASE_KEY, phase),
@@ -767,7 +768,7 @@ def _write_working_set_enrollment_position(
 
 
 def _finish_working_set_enrollment(conn: sqlite3.Connection, *, completed_at: int) -> None:
-    with conn:
+    with write_transaction(conn):
         conn.execute(
             "DELETE FROM activity_sync_state WHERE key IN (?, ?, ?)",
             (_ENROLLMENT_PHASE_KEY, _ENROLLMENT_CURSOR_KEY, _ENROLLMENT_NEXT_ATTEMPT_AT_KEY),
@@ -812,31 +813,33 @@ class _ChannelEnrollmentRequest:
 
 
 def _load_or_start_working_set_enrollment(conn: sqlite3.Connection) -> _WorkingSetEnrollmentPosition:
-    state = _load_working_set_enrollment_state(conn)
-    phase = state.get(_ENROLLMENT_PHASE_KEY)
-    if phase is None:
-        return _WorkingSetEnrollmentPosition(_start_working_set_enrollment(conn), None)
-    cursor_value = state.get(_ENROLLMENT_CURSOR_KEY)
-    cursor = int(cursor_value) if cursor_value is not None else None
-    return _WorkingSetEnrollmentPosition(phase, cursor)
+    with write_transaction(conn):
+        state = _load_working_set_enrollment_state(conn)
+        phase = state.get(_ENROLLMENT_PHASE_KEY)
+        if phase is None:
+            return _WorkingSetEnrollmentPosition(_start_working_set_enrollment(conn), None)
+        cursor_value = state.get(_ENROLLMENT_CURSOR_KEY)
+        cursor = int(cursor_value) if cursor_value is not None else None
+        return _WorkingSetEnrollmentPosition(phase, cursor)
 
 
 def _enroll_supergroup_slice(
     conn: sqlite3.Connection,
     position: _WorkingSetEnrollmentPosition,
 ) -> WorkingSetEnrollmentSliceResult | None:
-    row = _next_enrollment_dialog(conn, dialog_type="supergroup", cursor=position.cursor)
-    if row is None:
-        _set_working_set_enrollment_position(conn, phase=_ENROLLMENT_CHANNELS, cursor=None)
-        return None
-    dialog_id, last_activity_at = row
-    enroll_activity_dialog(conn, dialog_id, "supergroup", last_activity_at=last_activity_at)
-    _set_working_set_enrollment_position(
-        conn,
-        phase=_ENROLLMENT_SUPERGROUPS,
-        cursor=dialog_id,
-    )
-    return WorkingSetEnrollmentSliceResult(consumed=True)
+    with write_transaction(conn):
+        row = _next_enrollment_dialog(conn, dialog_type="supergroup", cursor=position.cursor)
+        if row is None:
+            _write_working_set_enrollment_position(conn, phase=_ENROLLMENT_CHANNELS, cursor=None)
+            return None
+        dialog_id, last_activity_at = row
+        _enroll_activity_dialog_in_transaction(conn, dialog_id, "supergroup", last_activity_at=last_activity_at)
+        _write_working_set_enrollment_position(
+            conn,
+            phase=_ENROLLMENT_SUPERGROUPS,
+            cursor=dialog_id,
+        )
+        return WorkingSetEnrollmentSliceResult(consumed=True)
 
 
 async def _enroll_channel_slice(
@@ -855,33 +858,34 @@ async def _enroll_channel_slice(
         timeout_s=request.timeout_s,
     )
 
-    if resolution.state is LinkedChatState.UNKNOWN:
-        _set_working_set_enrollment_position(
-            request.conn,
-            phase=_ENROLLMENT_CHANNELS,
-            cursor=channel_id,
-        )
+    with write_transaction(request.conn):
+        if resolution.state is LinkedChatState.UNKNOWN:
+            _write_working_set_enrollment_position(
+                request.conn,
+                phase=_ENROLLMENT_CHANNELS,
+                cursor=channel_id,
+            )
+            return WorkingSetEnrollmentSliceResult(consumed=True)
+        if resolution.state is LinkedChatState.KNOWN_LINK:
+            assert resolution.linked_chat_id is not None
+            _write_working_set_enrollment_position(
+                request.conn,
+                phase=_ENROLLMENT_CHANNELS,
+                cursor=channel_id,
+            )
+            _enroll_activity_dialog_in_transaction(
+                request.conn,
+                resolution.linked_chat_id,
+                "linked_chat",
+                last_activity_at=last_activity_at,
+            )
+        else:
+            _write_working_set_enrollment_position(
+                request.conn,
+                phase=_ENROLLMENT_CHANNELS,
+                cursor=channel_id,
+            )
         return WorkingSetEnrollmentSliceResult(consumed=True)
-    if resolution.state is LinkedChatState.KNOWN_LINK:
-        assert resolution.linked_chat_id is not None
-        _set_working_set_enrollment_position(
-            request.conn,
-            phase=_ENROLLMENT_CHANNELS,
-            cursor=channel_id,
-        )
-        enroll_activity_dialog(
-            request.conn,
-            resolution.linked_chat_id,
-            "linked_chat",
-            last_activity_at=last_activity_at,
-        )
-    else:
-        _set_working_set_enrollment_position(
-            request.conn,
-            phase=_ENROLLMENT_CHANNELS,
-            cursor=channel_id,
-        )
-    return WorkingSetEnrollmentSliceResult(consumed=True)
 
 
 async def run_working_set_enrollment_slice(  # noqa: PLR0913 - explicit bounded slice dependencies

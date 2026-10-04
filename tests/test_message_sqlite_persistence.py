@@ -41,6 +41,7 @@ from mcp_telegram.messages.sqlite_hydration_jobs import (
     transcription_hydration_eligible,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
 
 
 def _message(  # noqa: PLR0913
@@ -80,6 +81,7 @@ def conn(tmp_path: Path):
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     connection = _open_sync_db(path)
+    enable_runtime_writes(connection)
     try:
         yield connection
     finally:
@@ -96,7 +98,7 @@ def test_read_message_text_distinguishes_missing_from_null(conn: sqlite3.Connect
     assert missing.found is False
     assert missing.text is None
 
-    with conn:
+    with write_transaction(conn):
         insert_messages_with_fts(conn, [_message(1, text=None)])
     null_text = read_message_text(conn, 42, 1)
     assert null_text.found is True
@@ -104,12 +106,12 @@ def test_read_message_text_distinguishes_missing_from_null(conn: sqlite3.Connect
 
 
 def test_persist_edited_message_versions_sequentially_and_refreshes_fts(conn: sqlite3.Connection) -> None:
-    with conn:
+    with write_transaction(conn):
         _seed_human_dm(conn)
         insert_messages_with_fts(conn, [_message(10, text="first")])
-    with conn:
+    with write_transaction(conn):
         assert persist_edited_message(conn, _message(10, text="second"), old_text="first", edit_date=200) == 1
-    with conn:
+    with write_transaction(conn):
         assert persist_edited_message(conn, _message(10, text="third"), old_text="second", edit_date=300) == 2
 
     assert conn.execute(
@@ -122,19 +124,19 @@ def test_persist_edited_message_versions_sequentially_and_refreshes_fts(conn: sq
 
 
 def test_persist_edited_message_unchanged_is_noop(conn: sqlite3.Connection) -> None:
-    with conn:
+    with write_transaction(conn):
         insert_messages_with_fts(conn, [_message(11, text="same")])
-    with conn:
+    with write_transaction(conn):
         assert persist_edited_message(conn, _message(11, text="same"), old_text="same", edit_date=200) is None
     assert conn.execute("SELECT COUNT(*) FROM message_versions").fetchone() == (0,)
 
 
 def test_edit_alert_policy_accepts_only_incoming_confirmed_human_dm(conn: sqlite3.Connection) -> None:
-    with conn:
+    with write_transaction(conn):
         conn.execute("INSERT INTO dialogs(dialog_id, type) VALUES (42, 'user')")
         conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (42, 'user', 1)")
         insert_messages_with_fts(conn, [_message(20, text="first"), _message(21, text="own", out=1)])
-    with conn:
+    with write_transaction(conn):
         assert persist_edited_message(conn, _message(20, text="second"), old_text="first", edit_date=200) == 1
         assert persist_edited_message(conn, _message(21, text="changed", out=1), old_text="own", edit_date=201) is None
     assert conn.execute("SELECT message_id FROM message_versions ORDER BY message_id").fetchall() == [(20,)]
@@ -159,7 +161,7 @@ def test_edit_alert_policy_accepts_only_incoming_confirmed_human_dm(conn: sqlite
 def test_irrelevant_edit_updates_message_without_storing_history(
     conn: sqlite3.Connection, dialog_type: str | None, entity_type: str | None
 ) -> None:
-    with conn:
+    with write_transaction(conn):
         conn.execute("INSERT INTO dialogs(dialog_id, type) VALUES (42, ?)", (dialog_type,))
         if entity_type is not None:
             conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (42, ?, 1)", (entity_type,))
@@ -171,7 +173,7 @@ def test_irrelevant_edit_updates_message_without_storing_history(
 
 
 def test_transcription_creates_neither_version_nor_change_alert(conn: sqlite3.Connection) -> None:
-    with conn:
+    with write_transaction(conn):
         conn.execute("INSERT INTO dialogs(dialog_id, type) VALUES (42, 'user')")
         insert_messages_with_fts(conn, [_message(22, text=None)])
         assert persist_transcribed_text(conn, 42, 22, old_text=None, transcribed_text="local transcript")
@@ -180,10 +182,11 @@ def test_transcription_creates_neither_version_nor_change_alert(conn: sqlite3.Co
 
 
 def _make_hydration_eligible(conn: sqlite3.Connection, status: str = "synced") -> None:
-    conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (42, ?)", (status,))
-    conn.execute(
-        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (42, 1, 'explicit', 1)"
-    )
+    with write_transaction(conn):
+        conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (42, ?)", (status,))
+        conn.execute(
+            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (42, 1, 'explicit', 1)"
+        )
 
 
 @pytest.mark.parametrize("media_kind", ["contact", "other"])
@@ -191,11 +194,12 @@ def test_message_persistence_enqueues_one_unresolved_job_and_preserves_attempts(
     conn: sqlite3.Connection, media_kind: str
 ) -> None:
     _make_hydration_eligible(conn)
-    conn.execute(
-        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts) "
-        "VALUES ('media_metadata', 42, 90, 100, 2)"
-    )
-    with conn:
+    with write_transaction(conn):
+        conn.execute(
+            "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts) "
+            "VALUES ('media_metadata', 42, 90, 100, 2)"
+        )
+    with write_transaction(conn):
         insert_messages_with_fts(
             conn,
             [_message(90, text=None, media_kind=media_kind, media_payload="{}")],
@@ -214,7 +218,7 @@ def test_message_persistence_enqueues_one_unresolved_job_and_preserves_attempts(
 
 def test_foreground_voice_persistence_keeps_transcription_foreground(conn: sqlite3.Connection) -> None:
     _make_hydration_eligible(conn)
-    with conn:
+    with write_transaction(conn):
         insert_messages_with_fts(
             conn,
             [_message(93, text=None, media_kind="voice", media_payload="{}")],
@@ -226,7 +230,7 @@ def test_foreground_voice_persistence_keeps_transcription_foreground(conn: sqlit
 
 def test_foreground_round_video_persistence_enqueues_transcription(conn: sqlite3.Connection) -> None:
     _make_hydration_eligible(conn)
-    with conn:
+    with write_transaction(conn):
         insert_messages_with_fts(
             conn,
             [_message(94, text=None, media_kind="video", media_payload='{"round_message":true}')],
@@ -239,7 +243,7 @@ def test_foreground_round_video_persistence_enqueues_transcription(conn: sqlite3
 
 def test_plain_video_is_not_admitted_to_transcription(conn: sqlite3.Connection) -> None:
     _make_hydration_eligible(conn)
-    with conn:
+    with write_transaction(conn):
         insert_messages_with_fts(
             conn,
             [_message(95, text=None, media_kind="video", media_payload='{"duration":12}')],
@@ -252,26 +256,27 @@ def test_plain_video_is_not_admitted_to_transcription(conn: sqlite3.Connection) 
 
 def test_media_metadata_repair_is_bounded_newest_first_and_terminal_safe(conn: sqlite3.Connection) -> None:
     _make_hydration_eligible(conn)
-    conn.executemany(
-        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload, is_deleted) "
-        "VALUES (42, ?, ?, NULL, ?, ?, ?)",
-        [
-            (101, 100, "other", "{}", 0),
-            (102, 200, "video", '{"duration": 2}', 0),
-            (103, 300, "other", "{}", 1),
-            (104, 400, "video", '{"round_message":false}', 0),
-            (105, 500, "video", '{"duration": 2}', 0),
-            (106, 150, "other", "{}", 0),
-            (107, 550, "other", "{}", 0),
-        ],
-    )
-    conn.execute(
-        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, terminal) "
-        "VALUES ('media_metadata', 42, 107, 1, 3, 1)"
-    )
-    conn.commit()
+    with write_transaction(conn):
+        conn.executemany(
+            "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload, is_deleted) "
+            "VALUES (42, ?, ?, NULL, ?, ?, ?)",
+            [
+                (101, 100, "other", "{}", 0),
+                (102, 200, "video", '{"duration": 2}', 0),
+                (103, 300, "other", "{}", 1),
+                (104, 400, "video", '{"round_message":false}', 0),
+                (105, 500, "video", '{"duration": 2}', 0),
+                (106, 150, "other", "{}", 0),
+                (107, 550, "other", "{}", 0),
+            ],
+        )
+        conn.execute(
+            "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, terminal) "
+            "VALUES ('media_metadata', 42, 107, 1, 3, 1)"
+        )
 
-    first = repair_media_metadata_hydration_jobs(conn, due_at=900, max_jobs=2)
+    with write_transaction(conn):
+        first = repair_media_metadata_hydration_jobs(conn, due_at=900, max_jobs=2)
     assert first.has_more is True
     assert first.next_contact_other_cursor == HydrationRepairCursor(550, 42, 107)
     assert first.next_video_cursor == HydrationRepairCursor(500, 42, 105)
@@ -280,21 +285,23 @@ def test_media_metadata_repair_is_bounded_newest_first_and_terminal_safe(conn: s
         "ORDER BY message_sent_at DESC"
     ).fetchall() == [(105,)]
 
-    second = repair_media_metadata_hydration_jobs(
-        conn,
-        due_at=901,
-        max_jobs=2,
-        contact_other_cursor=first.next_contact_other_cursor,
-        video_cursor=first.next_video_cursor,
-    )
+    with write_transaction(conn):
+        second = repair_media_metadata_hydration_jobs(
+            conn,
+            due_at=901,
+            max_jobs=2,
+            contact_other_cursor=first.next_contact_other_cursor,
+            video_cursor=first.next_video_cursor,
+        )
     assert second.has_more is True
-    third = repair_media_metadata_hydration_jobs(
-        conn,
-        due_at=902,
-        max_jobs=2,
-        contact_other_cursor=second.next_contact_other_cursor,
-        video_cursor=second.next_video_cursor,
-    )
+    with write_transaction(conn):
+        third = repair_media_metadata_hydration_jobs(
+            conn,
+            due_at=902,
+            max_jobs=2,
+            contact_other_cursor=second.next_contact_other_cursor,
+            video_cursor=second.next_video_cursor,
+        )
     assert third.has_more is False
     assert conn.execute(
         "SELECT message_id FROM hydration_jobs WHERE kind = 'media_metadata' AND terminal = 0 "
@@ -305,13 +312,14 @@ def test_media_metadata_repair_is_bounded_newest_first_and_terminal_safe(conn: s
         3,
         1,
     )
-    fourth = repair_media_metadata_hydration_jobs(
-        conn,
-        due_at=903,
-        max_jobs=2,
-        contact_other_cursor=third.next_contact_other_cursor,
-        video_cursor=third.next_video_cursor,
-    )
+    with write_transaction(conn):
+        fourth = repair_media_metadata_hydration_jobs(
+            conn,
+            due_at=903,
+            max_jobs=2,
+            contact_other_cursor=third.next_contact_other_cursor,
+            video_cursor=third.next_video_cursor,
+        )
     assert fourth.has_more is False
 
     for index_name in (
@@ -344,26 +352,27 @@ def test_historical_transcription_repair_and_dialog_reconciliation_admit_voice_a
     conn: sqlite3.Connection,
 ) -> None:
     _make_hydration_eligible(conn)
-    conn.executemany(
-        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
-        "VALUES (42, ?, ?, NULL, ?, ?)",
-        [
-            (96, 96, "video", '{"round_message":true}'),
-            (97, 97, "voice", "{}"),
-            (98, 98, "video", '{"round_message":false}'),
-        ],
-    )
-    conn.commit()
+    with write_transaction(conn):
+        conn.executemany(
+            "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+            "VALUES (42, ?, ?, NULL, ?, ?)",
+            [
+                (96, 96, "video", '{"round_message":true}'),
+                (97, 97, "voice", "{}"),
+                (98, 98, "video", '{"round_message":false}'),
+            ],
+        )
 
-    repair = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=300)
+    with write_transaction(conn):
+        repair = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=300)
     assert conn.execute("SELECT message_id FROM hydration_jobs ORDER BY message_id").fetchall() == [(96,), (97,)]
     assert conn.execute("SELECT DISTINCT priority FROM hydration_jobs").fetchall() == [
         (int(HydrationPriority.BACKFILL),)
     ]
-    conn.execute("DELETE FROM hydration_jobs")
-    conn.commit()
+    with write_transaction(conn):
+        conn.execute("DELETE FROM hydration_jobs")
 
-    with conn:
+    with write_transaction(conn):
         reconcile_fact_hydration_jobs_for_dialog(conn, 42, due_at=901)
     assert conn.execute("SELECT message_id FROM hydration_jobs ORDER BY message_id").fetchall() == [(96,), (97,)]
 
@@ -399,8 +408,9 @@ def test_historical_transcription_repair_and_dialog_reconciliation_admit_voice_a
 def test_sql_transcribable_media_predicate_matches_pair_adapter(
     conn: sqlite3.Connection, media_kind: str | None, media_payload: str | None
 ) -> None:
-    conn.execute("CREATE TEMP TABLE media_candidates(media_kind TEXT, media_payload TEXT)")
-    conn.execute("INSERT INTO media_candidates VALUES (?, ?)", (media_kind, media_payload))
+    with write_transaction(conn):
+        conn.execute("CREATE TEMP TABLE media_candidates(media_kind TEXT, media_payload TEXT)")
+        conn.execute("INSERT INTO media_candidates VALUES (?, ?)", (media_kind, media_payload))
     sql_row = cast(
         tuple[object] | None,
         conn.execute(f"SELECT {_TRANSCRIBABLE_MEDIA_SQL} FROM media_candidates m").fetchone(),
@@ -415,16 +425,18 @@ def test_transcription_repair_accepts_noncanonical_json_and_preflight_stays_elig
     conn: sqlite3.Connection,
 ) -> None:
     _make_hydration_eligible(conn)
-    conn.execute(
-        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
-        "VALUES (42, 101, 101, NULL, 'video', '{\"duration\":12, \"round_message\": true}')"
-    )
-    conn.commit()
+    with write_transaction(conn):
+        conn.execute(
+            "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+            "VALUES (42, 101, 101, NULL, 'video', '{\"duration\":12, \"round_message\": true}')"
+        )
 
-    first = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=1)
+    with write_transaction(conn):
+        first = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=1)
     assert first.has_more is False
     assert transcription_hydration_eligible(conn, 42, 101)
-    second = repair_transcription_hydration_jobs(conn, due_at=901, max_jobs=1)
+    with write_transaction(conn):
+        second = repair_transcription_hydration_jobs(conn, due_at=901, max_jobs=1)
     assert second.has_more is False
     assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (1,)
 
@@ -436,13 +448,13 @@ def test_transcription_repair_accepts_noncanonical_json_and_preflight_stays_elig
 def test_authoritative_transcription_applies_only_to_transcribable_media(
     conn: sqlite3.Connection, media_kind: str, media_payload: str, expected: bool
 ) -> None:
-    with conn:
+    with write_transaction(conn):
         insert_messages_with_fts(
             conn,
             [_message(98, text=None, media_kind=media_kind, media_payload=media_payload)],
         )
 
-    with conn:
+    with write_transaction(conn):
         applied = apply_message_transcription(
             conn, 42, 98, transcribed_text="round words", transcription_id=7, received_at=100
         )
@@ -452,11 +464,11 @@ def test_authoritative_transcription_applies_only_to_transcribable_media(
 
 def test_staged_transcription_is_removed_when_plain_video_materializes(conn: sqlite3.Connection) -> None:
     _make_hydration_eligible(conn)
-    with conn:
+    with write_transaction(conn):
         assert stage_message_transcription(
             conn, 42, 99, transcribed_text="staged speech", transcription_id=8, received_at=100
         )
-    with conn:
+    with write_transaction(conn):
         insert_messages_with_fts(
             conn,
             [_message(99, text="caption", media_kind="video", media_payload='{"duration":12}')],
@@ -472,11 +484,11 @@ def test_staged_transcription_is_removed_when_plain_video_materializes(conn: sql
 
 def test_staged_transcription_overlays_round_video_materialization(conn: sqlite3.Connection) -> None:
     _make_hydration_eligible(conn)
-    with conn:
+    with write_transaction(conn):
         assert stage_message_transcription(
             conn, 42, 100, transcribed_text="round speech", transcription_id=9, received_at=100
         )
-    with conn:
+    with write_transaction(conn):
         insert_messages_with_fts(
             conn,
             [_message(100, text="caption", media_kind="video", media_payload='{"round_message":true}')],
@@ -495,38 +507,39 @@ def test_staged_transcription_overlays_round_video_materialization(conn: sqlite3
 
 def test_transcription_repair_is_bounded_idempotent_and_newest_first(conn: sqlite3.Connection) -> None:
     _make_hydration_eligible(conn)
-    conn.executemany(
-        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
-        "VALUES (42, ?, ?, NULL, 'voice', '{}')",
-        ((message_id, message_id) for message_id in range(1, 506)),
-    )
-    conn.commit()
+    with write_transaction(conn):
+        conn.executemany(
+            "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+            "VALUES (42, ?, ?, NULL, 'voice', '{}')",
+            ((message_id, message_id) for message_id in range(1, 506)),
+        )
 
-    first = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=300)
+    with write_transaction(conn):
+        first = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=300)
     assert first.has_more is True
-    conn.commit()
     assert conn.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'transcription'").fetchone() == (300,)
     assert conn.execute("SELECT MIN(message_id), MAX(message_id) FROM hydration_jobs").fetchone() == (206, 505)
     assert conn.execute(
         "SELECT due_at, attempts, priority, message_sent_at, terminal FROM hydration_jobs WHERE message_id = 505"
     ).fetchone() == (900, 0, 0, 505, 0)
 
-    second = repair_transcription_hydration_jobs(conn, due_at=901, max_jobs=300, cursor=first.next_cursor)
+    with write_transaction(conn):
+        second = repair_transcription_hydration_jobs(conn, due_at=901, max_jobs=300, cursor=first.next_cursor)
     assert second.has_more is False
-    conn.commit()
-    third = repair_transcription_hydration_jobs(conn, due_at=902, max_jobs=300, cursor=second.next_cursor)
+    with write_transaction(conn):
+        third = repair_transcription_hydration_jobs(conn, due_at=902, max_jobs=300, cursor=second.next_cursor)
     assert third.has_more is False
     assert conn.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'transcription'").fetchone() == (505,)
 
 
 def test_transcription_repair_has_more_uses_raw_page_lookahead(conn: sqlite3.Connection) -> None:
     _make_hydration_eligible(conn)
-    conn.executemany(
-        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
-        "VALUES (42, ?, ?, NULL, 'voice', '{}')",
-        ((message_id, message_id) for message_id in range(1, 3)),
-    )
-    conn.commit()
+    with write_transaction(conn):
+        conn.executemany(
+            "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+            "VALUES (42, ?, ?, NULL, 'voice', '{}')",
+            ((message_id, message_id) for message_id in range(1, 3)),
+        )
 
     def traced_repair(
         max_jobs: int, cursor: HydrationRepairCursor | None = None
@@ -534,25 +547,24 @@ def test_transcription_repair_has_more_uses_raw_page_lookahead(conn: sqlite3.Con
         statements: list[str] = []
         conn.set_trace_callback(statements.append)
         try:
-            result = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=max_jobs, cursor=cursor)
+            with write_transaction(conn):
+                result = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=max_jobs, cursor=cursor)
         finally:
             conn.set_trace_callback(None)
         executable = [
             statement
             for statement in statements
-            if statement.lstrip().split(maxsplit=1)[0].upper() not in {"BEGIN", "COMMIT", "ROLLBACK"}
+            if statement.lstrip().split(maxsplit=1)[0].upper() not in {"BEGIN", "COMMIT", "ROLLBACK", "PRAGMA"}
         ]
         return result, executable
 
     first, first_statements = traced_repair(max_jobs=1)
     assert first.has_more is True
     assert len(first_statements) == 2
-    conn.commit()
 
     second, second_statements = traced_repair(max_jobs=1, cursor=first.next_cursor)
     assert second.has_more is False
     assert len(second_statements) == 4
-    conn.commit()
 
     third, third_statements = traced_repair(max_jobs=10, cursor=second.next_cursor)
     assert third.has_more is False
@@ -563,47 +575,48 @@ def test_transcription_repair_has_more_uses_raw_page_lookahead(conn: sqlite3.Con
 
 def test_transcription_repair_excludes_ineligible_and_queued_messages(conn: sqlite3.Connection) -> None:
     _make_hydration_eligible(conn)
-    conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (43, 'access_lost')")
-    conn.execute(
-        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (43, 1, 'explicit', 1)"
-    )
-    conn.executemany(
-        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload, is_deleted, out) "
-        "VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
-        [
-            (42, 1, 10, "voice", "{}", 0, 0),  # eligible inbound, transcript below
-            (42, 2, 20, "voice", "{}", 0, 1),  # eligible outbound, terminal job below
-            (42, 3, 30, "voice", "{}", 1, 0),  # deleted
-            (42, 4, 40, "other", "{}", 0, 0),  # not transcribable
-            (43, 5, 50, "voice", "{}", 0, 0),  # inactive dialog
-            (42, 6, 60, "voice", "{}", 0, 0),  # eligible inbound
-            (42, 7, 70, "voice", "{}", 0, 1),  # eligible outbound
-            (42, 8, 80, "video", '{"round_message":true}', 0, 0),  # round, transcript below
-            (42, 9, 90, "video", '{"round_message":true}', 0, 0),  # round, terminal job below
-            (42, 10, 100, "video", '{"round_message":true}', 1, 0),  # deleted round
-            (43, 11, 110, "video", '{"round_message":true}', 0, 0),  # inactive round
-            (42, 12, 120, "video", '{"round_message":true}', 0, 0),  # eligible round
-        ],
-    )
-    conn.execute(
-        "INSERT INTO message_transcriptions(dialog_id, message_id, text, transcription_id, received_at) "
-        "VALUES (42, 1, 'already', 1, 1)"
-    )
-    conn.execute(
-        "INSERT INTO message_transcriptions(dialog_id, message_id, text, transcription_id, received_at) "
-        "VALUES (42, 8, 'already round', 8, 1)"
-    )
-    conn.execute(
-        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, terminal) "
-        "VALUES ('transcription', 42, 2, 1, 4, 1)"
-    )
-    conn.execute(
-        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, terminal) "
-        "VALUES ('transcription', 42, 9, 1, 4, 1)"
-    )
-    conn.commit()
+    with write_transaction(conn):
+        conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (43, 'access_lost')")
+        conn.execute(
+            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (43, 1, 'explicit', 1)"
+        )
+        conn.executemany(
+            "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload, is_deleted, out) "
+            "VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
+            [
+                (42, 1, 10, "voice", "{}", 0, 0),  # eligible inbound, transcript below
+                (42, 2, 20, "voice", "{}", 0, 1),  # eligible outbound, terminal job below
+                (42, 3, 30, "voice", "{}", 1, 0),  # deleted
+                (42, 4, 40, "other", "{}", 0, 0),  # not transcribable
+                (43, 5, 50, "voice", "{}", 0, 0),  # inactive dialog
+                (42, 6, 60, "voice", "{}", 0, 0),  # eligible inbound
+                (42, 7, 70, "voice", "{}", 0, 1),  # eligible outbound
+                (42, 8, 80, "video", '{"round_message":true}', 0, 0),  # round, transcript below
+                (42, 9, 90, "video", '{"round_message":true}', 0, 0),  # round, terminal job below
+                (42, 10, 100, "video", '{"round_message":true}', 1, 0),  # deleted round
+                (43, 11, 110, "video", '{"round_message":true}', 0, 0),  # inactive round
+                (42, 12, 120, "video", '{"round_message":true}', 0, 0),  # eligible round
+            ],
+        )
+        conn.execute(
+            "INSERT INTO message_transcriptions(dialog_id, message_id, text, transcription_id, received_at) "
+            "VALUES (42, 1, 'already', 1, 1)"
+        )
+        conn.execute(
+            "INSERT INTO message_transcriptions(dialog_id, message_id, text, transcription_id, received_at) "
+            "VALUES (42, 8, 'already round', 8, 1)"
+        )
+        conn.execute(
+            "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, terminal) "
+            "VALUES ('transcription', 42, 2, 1, 4, 1)"
+        )
+        conn.execute(
+            "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, terminal) "
+            "VALUES ('transcription', 42, 9, 1, 4, 1)"
+        )
 
-    repair = repair_transcription_hydration_jobs(conn, due_at=100, max_jobs=300)
+    with write_transaction(conn):
+        repair = repair_transcription_hydration_jobs(conn, due_at=100, max_jobs=300)
 
     assert repair.has_more is False
     assert conn.execute(
@@ -634,17 +647,20 @@ def test_transcription_repair_plan_uses_partial_voice_index(conn: sqlite3.Connec
 
 def test_transcription_repair_rolls_back_without_leaving_queue_rows(conn: sqlite3.Connection) -> None:
     _make_hydration_eligible(conn)
-    conn.execute(
-        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
-        "VALUES (42, 8, 8, NULL, 'voice', '{}')"
-    )
-    conn.commit()
+    with write_transaction(conn):
+        conn.execute(
+            "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+            "VALUES (42, 8, 8, NULL, 'voice', '{}')"
+        )
 
-    repair = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=1)
-    conn.rollback()
+    with pytest.raises(RuntimeError, match="abort"):
+        with write_transaction(conn):
+            repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=1)
+            raise RuntimeError("abort")
     assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
 
-    repair = repair_transcription_hydration_jobs(conn, due_at=901, max_jobs=1)
+    with write_transaction(conn):
+        repair = repair_transcription_hydration_jobs(conn, due_at=901, max_jobs=1)
     assert repair.has_more is False
 
 
@@ -656,11 +672,12 @@ def test_message_persistence_removes_job_for_resolved_or_missing_media(
     conn: sqlite3.Connection, media_kind: str | None, media_payload: str | None
 ) -> None:
     _make_hydration_eligible(conn)
-    conn.execute(
-        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts) "
-        "VALUES ('media_metadata', 42, 91, 100, 2)"
-    )
-    with conn:
+    with write_transaction(conn):
+        conn.execute(
+            "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts) "
+            "VALUES ('media_metadata', 42, 91, 100, 2)"
+        )
+    with write_transaction(conn):
         insert_messages_with_fts(conn, [_message(91, text=None, media_kind=media_kind, media_payload=media_payload)])
     assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
 
@@ -668,15 +685,15 @@ def test_message_persistence_removes_job_for_resolved_or_missing_media(
 @pytest.mark.parametrize("status", ["not_synced", "own_only", "fragment", "access_lost"])
 def test_message_persistence_does_not_enqueue_inactive_dialogs(conn: sqlite3.Connection, status: str) -> None:
     _make_hydration_eligible(conn, status=status)
-    with conn:
+    with write_transaction(conn):
         insert_messages_with_fts(conn, [_message(92, text=None, media_kind="other", media_payload="{}")])
     assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
 
 
 def test_persist_transcribed_text_refreshes_fts_without_version_history(conn: sqlite3.Connection) -> None:
-    with conn:
+    with write_transaction(conn):
         insert_messages_with_fts(conn, [_message(12, text=None)])
-    with conn:
+    with write_transaction(conn):
         assert (
             persist_transcribed_text(
                 conn,
@@ -692,7 +709,7 @@ def test_persist_transcribed_text_refreshes_fts_without_version_history(conn: sq
     assert conn.execute("SELECT stemmed_text FROM messages_fts WHERE dialog_id=42 AND message_id=12").fetchone() == (
         stem_text("voice words"),
     )
-    with conn:
+    with write_transaction(conn):
         assert (
             persist_transcribed_text(
                 conn,
@@ -707,7 +724,7 @@ def test_persist_transcribed_text_refreshes_fts_without_version_history(conn: sq
 
 
 def test_message_transcription_is_applied_by_canonical_bundle_writer(conn: sqlite3.Connection) -> None:
-    with conn:
+    with write_transaction(conn):
         upsert_message_transcription(conn, 42, 14, transcribed_text="voice words", transcription_id=14, received_at=400)
         insert_messages_with_fts(conn, [_message(14, text="caption", media_kind="voice", media_payload="{}")])
         insert_messages_with_fts(conn, [_message(14, text=None, media_kind="voice", media_payload="{}")])
@@ -720,7 +737,7 @@ def test_message_transcription_is_applied_by_canonical_bundle_writer(conn: sqlit
 
 
 def test_existing_transcription_survives_voice_reimport(conn: sqlite3.Connection) -> None:
-    with conn:
+    with write_transaction(conn):
         upsert_message_transcription(conn, 42, 15, transcribed_text="voice words", transcription_id=15, received_at=400)
         insert_messages_with_fts(conn, [_message(15, text="caption", media_kind="voice", media_payload="{}")])
         insert_messages_with_fts(conn, [_message(15, text=None, media_kind="voice", media_payload="{}")])
@@ -728,18 +745,18 @@ def test_existing_transcription_survives_voice_reimport(conn: sqlite3.Connection
 
 
 def test_unrelated_media_caption_can_be_removed_on_reimport(conn: sqlite3.Connection) -> None:
-    with conn:
+    with write_transaction(conn):
         insert_messages_with_fts(conn, [_message(16, text="caption", media_kind="photo", media_payload="{}")])
         insert_messages_with_fts(conn, [_message(16, text=None, media_kind="photo", media_payload="{}")])
     assert conn.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=16").fetchone() == (None,)
 
 
 def test_mark_message_deleted_is_idempotent_and_retains_text_and_fts(conn: sqlite3.Connection) -> None:
-    with conn:
+    with write_transaction(conn):
         insert_messages_with_fts(conn, [_message(13, text="retain me")])
-    with conn:
+    with write_transaction(conn):
         assert mark_message_deleted(conn, 42, 13, 500) is True
-    with conn:
+    with write_transaction(conn):
         assert mark_message_deleted(conn, 42, 13, 600) is False
     assert conn.execute(
         "SELECT text, is_deleted, deleted_at FROM messages WHERE dialog_id=42 AND message_id=13"
@@ -752,12 +769,12 @@ def test_mark_message_deleted_is_idempotent_and_retains_text_and_fts(conn: sqlit
 
 
 def test_find_unique_incoming_human_dm_dialogs_requires_one_policy_match(conn: sqlite3.Connection) -> None:
-    with conn:
+    with write_transaction(conn):
         conn.execute("INSERT INTO dialogs(dialog_id, type) VALUES (42, 'user'), (43, 'user')")
         conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (42, 'user', 1), (43, 'user', 1)")
         insert_messages_with_fts(conn, [_message(13, text="one")])
     assert find_unique_incoming_human_dm_dialogs(conn, [13]) == {13: 42}
-    with conn:
+    with write_transaction(conn):
         duplicate = replace(
             _message(13, text="two"),
             message=replace(_message(13, text="two").message, dialog_id=43, sender_id=43),
@@ -767,7 +784,7 @@ def test_find_unique_incoming_human_dm_dialogs_requires_one_policy_match(conn: s
 
 
 def test_list_undeleted_message_ids_uses_strict_cutoff(conn: sqlite3.Connection) -> None:
-    with conn:
+    with write_transaction(conn):
         insert_messages_with_fts(
             conn,
             [
@@ -782,11 +799,11 @@ def test_list_undeleted_message_ids_uses_strict_cutoff(conn: sqlite3.Connection)
 
 
 def test_repository_writes_rollback_with_caller_transaction(conn: sqlite3.Connection) -> None:
-    with conn:
+    with write_transaction(conn):
         _seed_human_dm(conn)
         insert_messages_with_fts(conn, [_message(30, text="before")])
     with pytest.raises(RuntimeError, match="abort"):
-        with conn:
+        with write_transaction(conn):
             assert persist_edited_message(conn, _message(30, text="after"), old_text="before", edit_date=700) == 1
             raise RuntimeError("abort")
     assert conn.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=30").fetchone() == ("before",)
@@ -808,16 +825,16 @@ def test_hydration_repair_bounds_terminal_prefix_and_later_equal_time_seek(
     total = 6_000
     payload = '{"duration":1}' if media_kind == "video" else "{}"
     kind = "transcription" if media_kind == "voice" else "media_metadata"
-    conn.executemany(
-        "INSERT INTO messages(dialog_id,message_id,sent_at,media_kind,media_payload) VALUES (42,?,10,?,?)",
-        ((identifier, media_kind, payload) for identifier in range(1, total + 1)),
-    )
-    conn.executemany(
-        "INSERT INTO hydration_jobs(kind,dialog_id,message_id,due_at,attempts,priority,terminal) "
-        "VALUES (?,42,?,1,4,1,1)",
-        ((kind, identifier) for identifier in range(1, total - 9)),
-    )
-    conn.commit()
+    with write_transaction(conn):
+        conn.executemany(
+            "INSERT INTO messages(dialog_id,message_id,sent_at,media_kind,media_payload) VALUES (42,?,10,?,?)",
+            ((identifier, media_kind, payload) for identifier in range(1, total + 1)),
+        )
+        conn.executemany(
+            "INSERT INTO hydration_jobs(kind,dialog_id,message_id,due_at,attempts,priority,terminal) "
+            "VALUES (?,42,?,1,4,1,1)",
+            ((kind, identifier) for identifier in range(1, total - 9)),
+        )
 
     def repair(cursor: HydrationRepairCursor | None, budget: int) -> tuple[bool, HydrationRepairCursor | None]:
         if media_kind == "voice":
@@ -844,7 +861,8 @@ def test_hydration_repair_bounds_terminal_prefix_and_later_equal_time_seek(
         conn.set_progress_handler(progress, 1)
         conn.set_trace_callback(statements.append)
         try:
-            has_more, next_cursor = repair(incoming, 64)
+            with write_transaction(conn):
+                has_more, next_cursor = repair(incoming, 64)
         finally:
             conn.set_progress_handler(None, 0)
             conn.set_trace_callback(None)
@@ -860,13 +878,12 @@ def test_hydration_repair_bounds_terminal_prefix_and_later_equal_time_seek(
                 details = " ".join(str(row[3]) for row in plan)
                 assert "SEARCH m USING INDEX " + index_name in details
                 assert "USE TEMP B-TREE" not in details
-        conn.commit()
 
     # Even a page containing only terminal jobs must advance until older missing work is reached.
     cursor = None
     for _ in range(total // 256 + 2):
-        has_more, cursor = repair(cursor, 256)
-        conn.commit()
+        with write_transaction(conn):
+            has_more, cursor = repair(cursor, 256)
         if not has_more:
             break
     assert has_more is False
@@ -878,10 +895,11 @@ def test_hydration_repair_bounds_terminal_prefix_and_later_equal_time_seek(
 
 
 def test_hydration_raw_seek_crosses_equal_peer_and_older_time_without_skips(conn: sqlite3.Connection) -> None:
-    conn.executemany(
-        "INSERT INTO messages(dialog_id,message_id,sent_at,media_kind,media_payload) VALUES (?,?,?,'voice','{}')",
-        [(42, 1, 10), (42, 2, 10), (43, 1, 10), (43, 2, 10), (42, 3, 9), (42, 4, 9)],
-    )
+    with write_transaction(conn):
+        conn.executemany(
+            "INSERT INTO messages(dialog_id,message_id,sent_at,media_kind,media_payload) VALUES (?,?,?,'voice','{}')",
+            [(42, 1, 10), (42, 2, 10), (43, 1, 10), (43, 2, 10), (42, 3, 9), (42, 4, 9)],
+        )
     page = _repair_raw_page(conn, _REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL, HydrationRepairCursor(10, 42, 1), 4)
     assert page == [(10, 42, 2), (10, 43, 1), (10, 43, 2), (9, 42, 3)]
     assert _repair_raw_page(conn, _REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL, HydrationRepairCursor(*page[-1]), 4) == [

@@ -13,6 +13,7 @@ from mcp_telegram.history_enrollment import (
     full_history_enabled,
     read_intent,
 )
+from mcp_telegram.sync_transactions import write_transaction
 
 
 @pytest.fixture
@@ -93,6 +94,7 @@ def test_enrollment_transitions_clear_read_position_retry(conn: sqlite3.Connecti
 
 def test_weak_migration_disable_can_be_promoted_for_automatic_dm(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO full_history_enrollment VALUES (2, 0, 'migration', 1)")
+    conn.commit()
     outcome = ensure_automatic_dm_enrollment(conn, 2, now=2)
     assert outcome.enabled is True
     assert read_intent(conn, 2).source is EnrollmentSource.AUTOMATIC
@@ -100,6 +102,7 @@ def test_weak_migration_disable_can_be_promoted_for_automatic_dm(conn: sqlite3.C
 
 def test_enable_unknown_coverage_fails_closed(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (3, 'future_status')")
+    conn.commit()
     outcome = enable_history(conn, 3, now=3)
     assert outcome.action == "unsupported_coverage"
     assert outcome.blocked_reason == "unsupported_coverage"
@@ -109,14 +112,13 @@ def test_enable_unknown_coverage_fails_closed(conn: sqlite3.Connection) -> None:
 def test_nested_savepoint_rollback_preserves_outer_transaction(
     conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    conn.execute("BEGIN")
-    conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (9, 'synced')")
+    with write_transaction(conn):
+        conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (9, 'synced')")
 
-    def reject_store(*_args: object, **_kwargs: object) -> None:
-        raise sqlite3.IntegrityError("reject")
+        def reject_store(*_args: object, **_kwargs: object) -> None:
+            raise sqlite3.IntegrityError("reject")
 
-    monkeypatch.setattr("mcp_telegram.history_enrollment._store_intent", reject_store)
-    with pytest.raises(sqlite3.IntegrityError):
-        enable_history(conn, 9, now=1)
-    assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=9").fetchone() == ("synced",)
-    conn.rollback()
+        monkeypatch.setattr("mcp_telegram.history_enrollment._store_intent", reject_store)
+        with pytest.raises(sqlite3.IntegrityError):
+            enable_history(conn, 9, now=1)
+        assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=9").fetchone() == ("synced",)

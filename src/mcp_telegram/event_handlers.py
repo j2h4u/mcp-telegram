@@ -131,6 +131,7 @@ from .scheduled_messages import (
     upsert_scheduled_message,
     verify_scheduled_publication,
 )
+from .sync_transactions import require_write_transaction, write_savepoint, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import (
     AcquisitionKind,
@@ -309,7 +310,7 @@ class _OutboxReadEvent(Protocol):
 def _record_runtime_observation_best_effort(conn: sqlite3.Connection, **event: object) -> None:
     """Record diagnostics without changing event-handler outcomes."""
     try:
-        with conn:
+        with write_transaction(conn):
             record_runtime_observation(conn, **event)  # type: ignore[arg-type]
     except Exception:
         logger.exception("runtime_event_record_failed kind=%s", event.get("kind"))
@@ -344,8 +345,8 @@ def _apply_observed_inbox_read(  # noqa: PLR0913
     operation_id: str,
     partial_reason: str | None,
 ) -> tuple[int, int]:
-    before_cursor, before_unread = _read_state(conn, dialog_id)
-    with conn:
+    with write_transaction(conn):
+        before_cursor, before_unread = _read_state(conn, dialog_id)
         rowcounts = _apply_inbox_read_fact(
             conn,
             dialog_id,
@@ -353,7 +354,7 @@ def _apply_observed_inbox_read(  # noqa: PLR0913
             unread_count=still_unread,
             observed_at=int(time.time()),
         )
-    after_cursor, after_unread = _read_state(conn, dialog_id)
+        after_cursor, after_unread = _read_state(conn, dialog_id)
     changed = before_cursor != after_cursor or before_unread != after_unread
     _record_runtime_observation_best_effort(
         conn,
@@ -470,6 +471,7 @@ def _apply_inbox_read_fact(
     ``dialogs`` row marked for refresh. The cursor side remains UPDATE-only
     and therefore does nothing when ``synced_dialogs`` has no row.
     """
+    require_write_transaction(conn)
     cursor_rowcount = apply_read_cursor(conn, dialog_id, "inbox", max_id)
     unread_rowcount = apply_unread_facts(
         conn,
@@ -860,8 +862,7 @@ class EventHandlerManager:
         observed_at: int,
         identity_baseline: _IdentityBaseline | None = None,
     ) -> EnrollmentOutcome:
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self._conn):
             baseline_revision = (
                 identity_baseline.revision
                 if identity_baseline is not None
@@ -869,7 +870,6 @@ class EventHandlerManager:
             )
             outcome = ensure_automatic_dm_enrollment(self._conn, dialog_id, now=observed_at)
             if not outcome.enabled:
-                self._conn.commit()
                 return outcome
             row_existed_before_presence = (
                 self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
@@ -891,11 +891,7 @@ class EventHandlerManager:
                     row_existed_before_presence=row_existed_before_presence,
                 )
             unhide_after_realtime_presence(self._conn, dialog_id)
-            self._conn.commit()
             return outcome
-        except BaseException:
-            self._conn.rollback()
-            raise
 
     def _publish_dm_identity(
         self,
@@ -906,6 +902,7 @@ class EventHandlerManager:
         *,
         row_existed_before_presence: bool,
     ) -> None:
+        require_write_transaction(self._conn)
         observation = identity.dialog_identity_observation
         if observation is None:
             return
@@ -923,7 +920,7 @@ class EventHandlerManager:
 
     def _persist_dm_entity(self, dialog_id: int, identity: _DmIdentity, observed_at: int) -> None:
         try:
-            with self._conn:
+            with write_transaction(self._conn):
                 apply_partial_entity_identity(
                     self._conn,
                     dialog_id,
@@ -1007,7 +1004,7 @@ class EventHandlerManager:
     ) -> None:
         if not bool(getattr(message, "from_scheduled", False)):
             return
-        with conn:
+        with write_savepoint(conn):
             if now is None:
                 verify_scheduled_publication(conn, dialog_id, int(message.id))
             else:
@@ -1046,7 +1043,7 @@ class EventHandlerManager:
                 return
             now = int(time.time())
 
-            with self._conn:
+            with write_transaction(self._conn):
                 if not allows_new_message(
                     self._realtime_coverage(dialog_id), outgoing=bool(getattr(msg, "out", False))
                 ):
@@ -1128,10 +1125,11 @@ class EventHandlerManager:
         if not self._metadata_realtime_allowed(coverage):
             return
         now = int(time.time())
-        with self._conn:
+        with write_transaction(self._conn):
             self._project_new_message_metadata(dialog_id, msg, now)
 
     def _update_last_message_timestamp(self, dialog_id: int, now: int, msg_date: datetime | None) -> None:
+        require_write_transaction(self._conn)
         if msg_date is not None:
             self._conn.execute(
                 _UPDATE_DIALOG_LAST_MESSAGE_AT_SQL,
@@ -1139,6 +1137,7 @@ class EventHandlerManager:
             )
 
     def _record_body_event(self, dialog_id: int, now: int) -> None:
+        require_write_transaction(self._conn)
         self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 
     def _project_new_message_metadata(self, dialog_id: int, msg: _MessageLike, now: int) -> None:
@@ -1165,7 +1164,7 @@ class EventHandlerManager:
             if not self._metadata_realtime_allowed(self._realtime_coverage(dialog_id)):
                 return
             now = int(time.time())
-            with self._conn:
+            with write_transaction(self._conn):
                 if not self._metadata_realtime_allowed(self._realtime_coverage(dialog_id)):
                     return
                 self._handle_topic_message_action(dialog_id, cast(_MessageLike, msg), now)
@@ -1178,6 +1177,7 @@ class EventHandlerManager:
         msg: _MessageLike,
         now: int,
     ) -> None:
+        require_write_transaction(self._conn)
         action = cast(object | None, getattr(msg, "action", None))
         if isinstance(action, MessageActionTopicCreate):
             self._handle_topic_create_action(dialog_id, msg, now, action)
@@ -1282,7 +1282,7 @@ class EventHandlerManager:
                 return
 
             # Resolve async data BEFORE opening transaction — SQLite's synchronous
-            # driver cannot safely suspend inside a `with self._conn:` block while
+            # driver cannot safely suspend inside a `with write_transaction(self._conn):` block while
             # another coroutine may call into the same connection.
             existing = read_message_text(self._conn, dialog_id, message_id)
             existing_out = read_message_out(self._conn, dialog_id, message_id)
@@ -1299,7 +1299,8 @@ class EventHandlerManager:
             old_text = existing.text
             if old_text == new_text:
                 formatting_entities, service_action = extract_message_composition(msg)
-                with self._conn:
+                with write_transaction(self._conn):
+                    existing_out = read_message_out(self._conn, dialog_id, message_id)
                     if allows_existing_body_update(
                         self._realtime_coverage(dialog_id),
                         RealtimeBodyEvent.EDIT,
@@ -1348,7 +1349,7 @@ class EventHandlerManager:
         coverage = self._realtime_coverage(dialog_id)
         if not allows_missing_body_insert(coverage, RealtimeBodyEvent.EDIT, outgoing=outgoing):
             return False
-        with self._conn:
+        with write_transaction(self._conn):
             if not allows_missing_body_insert(
                 self._realtime_coverage(dialog_id), RealtimeBodyEvent.EDIT, outgoing=outgoing
             ):
@@ -1381,7 +1382,12 @@ class EventHandlerManager:
         ):
             return
         aggregates = project_reaction_aggregates(reactions_obj)
-        with self._conn:
+        with write_transaction(self._conn):
+            outgoing = read_message_out(self._conn, dialog_id, message_id).outgoing
+            if not allows_existing_body_update(
+                self._realtime_coverage(dialog_id), RealtimeBodyEvent.REACTION, outgoing=outgoing
+            ):
+                return
             replace_reaction_aggregates(
                 self._conn,
                 dialog_id,
@@ -1418,7 +1424,8 @@ class EventHandlerManager:
             # The incoming edit object may omit Telethon's ``out`` flag;
             # preserve the canonical outgoing classification of the row.
             extracted = replace(extracted, message=replace(extracted.message, out=1))
-        with self._conn:
+        with write_transaction(self._conn):
+            outgoing = read_message_out(self._conn, dialog_id, int(msg.id)).outgoing
             if not allows_existing_body_update(
                 self._realtime_coverage(dialog_id), RealtimeBodyEvent.EDIT, outgoing=outgoing
             ):
@@ -1455,15 +1462,17 @@ class EventHandlerManager:
 
         try:
             now = int(time.time())
-            allowed_ids = list(event.deleted_ids)
-            if coverage is RealtimeHistoryCoverage.OWN_OUTGOING:
-                allowed_ids = [
-                    msg_id for msg_id in allowed_ids if read_message_out(self._conn, dialog_id, int(msg_id)).outgoing
-                ]
-            if not allowed_ids:
-                return
+            with write_transaction(self._conn):
+                allowed_ids = list(event.deleted_ids)
+                if coverage is RealtimeHistoryCoverage.OWN_OUTGOING:
+                    allowed_ids = [
+                        msg_id
+                        for msg_id in allowed_ids
+                        if read_message_out(self._conn, dialog_id, int(msg_id)).outgoing
+                    ]
+                if not allowed_ids:
+                    return
 
-            with self._conn:
                 for msg_id in allowed_ids:
                     mark_message_deleted(self._conn, dialog_id, msg_id, now)
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
@@ -1475,8 +1484,8 @@ class EventHandlerManager:
     def _handle_peerless_deletions(self, deleted_ids: Sequence[int]) -> None:
         now = int(time.time())
         resolved: list[tuple[int, int]] = []
-        candidate_dialogs = find_unique_incoming_human_dm_dialogs(self._conn, deleted_ids)
-        with self._conn:
+        with write_transaction(self._conn):
+            candidate_dialogs = find_unique_incoming_human_dm_dialogs(self._conn, deleted_ids)
             for raw_message_id in deleted_ids:
                 message_id = int(raw_message_id)
                 dialog_id = candidate_dialogs.get(message_id)
@@ -1501,7 +1510,7 @@ class EventHandlerManager:
             logger.warning("scheduled_new_missing_peer message_id=%s", cast(object, getattr(message, "id", None)))
             return
         try:
-            with self._conn:
+            with write_transaction(self._conn):
                 upsert_scheduled_message(self._conn, dialog_id, message)
             self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
             message_id_attr = "id"
@@ -1522,7 +1531,8 @@ class EventHandlerManager:
             return
         sent_message_ids = cast(Sequence[int] | None, getattr(update, "sent_messages", None))
         try:
-            mark_scheduled_messages_removed(self._conn, dialog_id, message_ids, sent_message_ids)
+            with write_transaction(self._conn):
+                mark_scheduled_messages_removed(self._conn, dialog_id, message_ids, sent_message_ids)
             self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
             logger.info("scheduled_removed dialog_id=%d count=%d", dialog_id, len(message_ids))
         except Exception:
@@ -1591,7 +1601,7 @@ class EventHandlerManager:
 
         try:
             now = int(time.time())
-            with self._conn:
+            with write_transaction(self._conn):
                 rowcount = apply_read_cursor(self._conn, dialog_id, "outbox", max_id)
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
             if rowcount > 0:
@@ -1651,8 +1661,7 @@ class EventHandlerManager:
         try:
             aggregates = project_reaction_aggregates(update.reactions)
             previous_generation = self._reaction_generation(dialog_id, msg_id)
-            boundary = allocate_observation_boundary(self._conn, ReactionAggregateSource.RAW_UPDATE)
-            if not self._apply_reaction_event(dialog_id, msg_id, aggregates, boundary):
+            if not self._apply_reaction_event(dialog_id, msg_id, aggregates):
                 _record_runtime_observation_best_effort(
                     self._conn,
                     kind="reaction.aggregate",
@@ -1717,14 +1726,16 @@ class EventHandlerManager:
         aggregates: Sequence[ReactionAggregate],
         boundary: ReactionObservationBoundary | None = None,
     ) -> bool:
-        coverage = self._realtime_coverage(dialog_id)
-        existing_out = read_message_out(self._conn, dialog_id, msg_id)
-        if not allows_existing_body_update(coverage, RealtimeBodyEvent.REACTION, outgoing=existing_out.outgoing):
-            return False
-        if coverage is not RealtimeHistoryCoverage.FULL_HISTORY and not existing_out.found:
-            return False
-        now = int(time.time())
-        with self._conn:
+        with write_transaction(self._conn):
+            coverage = self._realtime_coverage(dialog_id)
+            existing_out = read_message_out(self._conn, dialog_id, msg_id)
+            if not allows_existing_body_update(coverage, RealtimeBodyEvent.REACTION, outgoing=existing_out.outgoing):
+                return False
+            if coverage is not RealtimeHistoryCoverage.FULL_HISTORY and not existing_out.found:
+                return False
+            now = int(time.time())
+            if boundary is None:
+                boundary = allocate_observation_boundary(self._conn, ReactionAggregateSource.RAW_UPDATE)
             accepted = replace_reaction_aggregates(
                 self._conn,
                 dialog_id,
@@ -1737,7 +1748,7 @@ class EventHandlerManager:
             if not accepted:
                 return False
             self._record_body_event(dialog_id, now)
-        return True
+            return True
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_transcribed_audio(self, update: UpdateTranscribedAudio) -> None:
@@ -1795,7 +1806,7 @@ class EventHandlerManager:
         now: int,
     ) -> None:
         """Store a FULL_HISTORY fact only while capture authorization remains."""
-        with self._conn:
+        with write_transaction(self._conn):
             if self._realtime_coverage(event.dialog_id) is not RealtimeHistoryCoverage.FULL_HISTORY:
                 return
             if read_message_text(self._conn, event.dialog_id, event.message_id).found:
@@ -1818,14 +1829,15 @@ class EventHandlerManager:
         now: int,
     ) -> None:
         """Upsert a final fact and project changed text under current policy."""
-        existing_out = read_message_out(self._conn, event.dialog_id, event.message_id)
-        if not allows_existing_body_update(
-            coverage,
-            RealtimeBodyEvent.TRANSCRIPTION,
-            outgoing=existing_out.outgoing,
-        ):
-            return
-        with self._conn:
+        with write_transaction(self._conn):
+            existing_out = read_message_out(self._conn, event.dialog_id, event.message_id)
+            if not allows_existing_body_update(
+                coverage,
+                RealtimeBodyEvent.TRANSCRIPTION,
+                outgoing=existing_out.outgoing,
+            ):
+                return
+            old_text = read_message_text(self._conn, event.dialog_id, event.message_id).text
             if not allows_existing_body_update(
                 self._realtime_coverage(event.dialog_id),
                 RealtimeBodyEvent.TRANSCRIPTION,
@@ -1898,6 +1910,7 @@ class EventHandlerManager:
 
     def _apply_published_pin_mutation(self, folder_id: int | None, dialog_id: int, pinned: int) -> None:
         """Apply one published pin change within the caller's transaction."""
+        require_write_transaction(self._conn)
         if folder_id is None:
             return
         current = [
@@ -1952,7 +1965,7 @@ class EventHandlerManager:
         folder_id = getattr(update, "folder_id", None)
         published_folder = self._published_pin_folder(folder_id)
         pinned = 1 if update.pinned else 0
-        with self._conn:
+        with write_transaction(self._conn):
             known_dialog = (
                 self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
             )
@@ -1976,7 +1989,7 @@ class EventHandlerManager:
         published_folder = self._published_pin_folder(folder_id)
         is_main_folder = published_folder == 0
         pinned_ids = self._collect_pinned_dialog_ids(cast(Sequence[object], order))
-        with self._conn:
+        with write_transaction(self._conn):
             for dialog_id in pinned_ids:
                 if (
                     is_main_folder
@@ -2022,7 +2035,7 @@ class EventHandlerManager:
         dialog_id = self._dialog_id_from_peer(update.peer)
         if dialog_id is None:
             return
-        with self._conn:
+        with write_transaction(self._conn):
             rowcount = apply_unread_facts(
                 self._conn,
                 dialog_id,
@@ -2060,7 +2073,7 @@ class EventHandlerManager:
         return IDENTITY_OMITTED if observed is USERNAME_UNOBSERVED else cast(str | None, observed)
 
     def _update_realtime_username(self, update: UpdateUserName, now: int) -> None:
-        with self._conn:
+        with write_transaction(self._conn):
             name = self._username_update_name(update)
             username = self._username_update_alias(update)
             dialog_id = int(update.user_id)
@@ -2105,13 +2118,13 @@ class EventHandlerManager:
         if isinstance(mute_until, datetime):
             mute_until = int(mute_until.timestamp())
         if mute_until is None:
-            with self._conn:
+            with write_transaction(self._conn):
                 if clear_realtime_mute(self._conn, dialog_id, observed_at=now):
                     SQLiteFolderSnapshotRepository(self._conn).reproject_current_rules_in_transaction(now=now)
             return
         if not _is_valid_nonnegative_int(mute_until):
             return
-        with self._conn:
+        with write_transaction(self._conn):
             apply_realtime_eligibility(self._conn, dialog_id, mute_until=mute_until, observed_at=now)
             SQLiteFolderSnapshotRepository(self._conn).reproject_current_rules_in_transaction(now=now)
 
@@ -2188,7 +2201,7 @@ class EventHandlerManager:
                 return
             dialog_id = self._participant_dialog_id(update)
             occurred_at = int(update.date.timestamp()) if update.date is not None else int(time.time())
-            with self._conn:
+            with write_transaction(self._conn):
                 changed = set_access_lost(
                     self._conn,
                     dialog_id,
@@ -2248,7 +2261,7 @@ class EventHandlerManager:
         now: int,
         invalidate_linked_chat: bool = False,
     ) -> tuple[int, tuple[str | None, int | None] | None]:
-        with self._conn:
+        with write_transaction(self._conn):
             changed = self._conn.execute(_UPDATE_DIALOG_NEEDS_REFRESH_SQL, (now, dialog_id)).rowcount
             row = cast(
                 tuple[str | None, int | None] | None,
@@ -2268,11 +2281,11 @@ class EventHandlerManager:
         now = int(time.time())
         # next_due performs a bounded self-heal UPDATE. End its write transaction
         # before peer resolution or the first asynchronous Telegram RPC.
-        with self._conn:
+        with write_transaction(self._conn):
             work = linked_chat_fact_owner.next_due(self._conn, now)
         if work is None:
             return False
-        with self._conn:
+        with write_transaction(self._conn):
             generation = linked_chat_fact_owner.capture_generation(self._conn, work.channel_id)
             siblings_token = capture_channel_full_siblings_token(self._conn, work.channel_id)
         return await self._acquire_linked_chat_work(work, generation, siblings_token, now)
@@ -2344,7 +2357,7 @@ class EventHandlerManager:
             self._defer_linked_chat_work(work, now)
             logger.debug("linked_chat_refresh_invalid_observation dialog_id=%d", channel_id)
             return True
-        with self._conn:
+        with write_transaction(self._conn):
             published = linked_chat_fact_owner.publish(
                 self._conn,
                 channel_id,
@@ -2378,7 +2391,7 @@ class EventHandlerManager:
         *,
         flood_wait_seconds: int | None = None,
     ) -> None:
-        with self._conn:
+        with write_transaction(self._conn):
             retry_at = linked_chat_fact_owner.retry_at_for_failure(
                 self._conn,
                 work,
@@ -2388,7 +2401,7 @@ class EventHandlerManager:
             linked_chat_fact_owner.defer(self._conn, work, retry_at)
 
     def _mark_linked_chat_access_lost(self, channel_id: int, now: int, error: Exception) -> None:
-        with self._conn:
+        with write_transaction(self._conn):
             changed = set_access_lost(self._conn, channel_id, now, reason=type(error).__name__)
         if changed:
             self._synced_dialog_ids.discard(channel_id)
@@ -2511,7 +2524,7 @@ class EventHandlerManager:
                 return
             topic_id = int(topic_id_raw)
             now = int(time.time())
-            with self._conn:
+            with write_transaction(self._conn):
                 self._topic_metadata.apply_topic_pin(
                     dialog_id,
                     topic_id,
@@ -2546,7 +2559,7 @@ class EventHandlerManager:
             if not self._metadata_realtime_allowed(self._realtime_coverage(dialog_id)):
                 return
             now = int(time.time())
-            with self._conn:
+            with write_transaction(self._conn):
                 self._topic_metadata.apply_topic_pins(
                     dialog_id,
                     order,
@@ -2627,7 +2640,7 @@ class EventHandlerManager:
         )
         marked = 0
         now = int(time.time())
-        with self._conn:  # atomic per-dialog batch
+        with write_transaction(self._conn):  # atomic per-dialog batch
             for queried_id, returned_msg in zip(message_ids, results, strict=False):
                 if returned_msg is None and mark_message_deleted(self._conn, dialog_id, queried_id, now):
                     marked += 1

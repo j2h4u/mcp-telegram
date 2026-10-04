@@ -12,6 +12,7 @@ from .dialog_classification import (
     is_bot_dialog_type,
     is_reserved_replies_username,
 )
+from .sync_transactions import enable_runtime_writes, write_transaction
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
 _CURRENT_SCHEMA_VERSION = 79
@@ -1511,6 +1512,17 @@ def open_sync_db_reader(db_path: Path) -> sqlite3.Connection:
     return _open_sync_db(db_path, read_only=True)
 
 
+def open_runtime_sync_db(db_path: Path) -> sqlite3.Connection:
+    """Open an initialized archive with writes restricted to owned units."""
+    conn = _open_sync_db(db_path)
+    try:
+        enable_runtime_writes(conn)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
 def load_account_cooldown_until_utc(conn: sqlite3.Connection) -> float | None:
     """Load the persisted finite account cooldown as a Unix UTC deadline."""
     row = cast(
@@ -1533,7 +1545,7 @@ def load_account_cooldown_until_utc(conn: sqlite3.Connection) -> float | None:
 def save_account_cooldown_until_utc(conn: sqlite3.Connection, deadline_utc: float | None) -> None:
     """Atomically replace or clear the finite account cooldown UTC deadline."""
     if deadline_utc is None:
-        with conn:
+        with write_transaction(conn):
             conn.execute("DELETE FROM daemon_state WHERE key = ?", (_ACCOUNT_COOLDOWN_UNTIL_UTC_KEY,))
         return
     if (
@@ -1543,7 +1555,7 @@ def save_account_cooldown_until_utc(conn: sqlite3.Connection, deadline_utc: floa
         or deadline_utc < 0
     ):
         raise ValueError("deadline_utc must be a finite non-negative Unix timestamp or None")
-    with conn:
+    with write_transaction(conn):
         conn.execute(
             "INSERT INTO daemon_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (_ACCOUNT_COOLDOWN_UNTIL_UTC_KEY, repr(float(deadline_utc))),
@@ -1578,7 +1590,7 @@ def save_self_profile_last_success_at(conn: sqlite3.Connection, completed_at: fl
         or completed_at < 0
     ):
         raise ValueError("completed_at must be a finite non-negative Unix timestamp")
-    with conn:
+    with write_transaction(conn):
         conn.execute(
             "INSERT INTO daemon_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (_SELF_PROFILE_LAST_SUCCESS_AT_KEY, repr(float(completed_at))),

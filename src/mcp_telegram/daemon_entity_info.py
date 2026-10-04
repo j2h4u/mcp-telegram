@@ -78,6 +78,7 @@ from .flood import TelegramRpcThrottled, _raise_if_latched
 from .folders.read_model import dialog_placement
 from .linked_chat_fact import linked_chat_fact_owner
 from .models import DialogType
+from .sync_transactions import write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import (
     AcquisitionKind,
@@ -1153,7 +1154,7 @@ class DaemonEntityInfoService:
             and context.linked_chat_fact_captured
             and context.linked_chat_observation_usable
         ):
-            with self._deps.conn:
+            with write_transaction(self._deps.conn):
                 published = linked_chat_fact_owner.publish(
                     self._deps.conn,
                     cursor.entity_id,
@@ -2074,7 +2075,7 @@ class DaemonEntityInfoService:
         context: _ProfileSectionContext | None,
     ) -> None:
         if is_broadcast_channel and context is not None:
-            with self._deps.conn:
+            with write_transaction(self._deps.conn):
                 context.linked_chat_fact_generation = linked_chat_fact_owner.capture_generation(
                     self._deps.conn, entity_id
                 )
@@ -2789,34 +2790,34 @@ class DaemonEntityInfoService:
     ) -> None:
         full_fetch_ok = detail.pop("_full_fetch_ok", True)
         try:
-            ensure_entity_stub(
-                self._deps.conn,
-                EntitySnapshot(
-                    entity_id=entity_id,
-                    entity_type=cast(str, detail.get("type", "unknown")),
-                    name=cast(str | None, detail.get("name")),
-                    username=cast(str | None, detail.get("username")),
-                    name_normalized=None,
-                    updated_at=now,
-                ),
-            )
-            if full_fetch_ok:
-                payload_with_schema = {
-                    "schema": _ENTITY_DETAIL_SCHEMA_VERSION,
-                    **{key: value for key, value in detail.items() if key != "linked_chat_id"},
-                }
-                self._deps.conn.execute(
-                    "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) VALUES (?, ?, ?)",
-                    (entity_id, json.dumps(payload_with_schema), now),
-                )
-            if dialog_identity_observation is not None:
-                publish_dialog_identity(
+            with write_transaction(self._deps.conn):
+                ensure_entity_stub(
                     self._deps.conn,
-                    entity_id,
-                    dialog_identity_observation,
-                    dialog_identity_baseline_revision,
+                    EntitySnapshot(
+                        entity_id=entity_id,
+                        entity_type=cast(str, detail.get("type", "unknown")),
+                        name=cast(str | None, detail.get("name")),
+                        username=cast(str | None, detail.get("username")),
+                        name_normalized=None,
+                        updated_at=now,
+                    ),
                 )
-            self._deps.conn.commit()
+                if full_fetch_ok:
+                    payload_with_schema = {
+                        "schema": _ENTITY_DETAIL_SCHEMA_VERSION,
+                        **{key: value for key, value in detail.items() if key != "linked_chat_id"},
+                    }
+                    self._deps.conn.execute(
+                        "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) VALUES (?, ?, ?)",
+                        (entity_id, json.dumps(payload_with_schema), now),
+                    )
+                if dialog_identity_observation is not None:
+                    publish_dialog_identity(
+                        self._deps.conn,
+                        entity_id,
+                        dialog_identity_observation,
+                        dialog_identity_baseline_revision,
+                    )
         except sqlite3.OperationalError as exc:
             self._deps.logger.warning(
                 "entity_info db_writeback_failed entity_id=%r error=%s%s",
@@ -3372,7 +3373,7 @@ class DaemonEntityInfoService:
         fact_generation = self._capture_legacy_linked_chat_fact_generation(channel_id)
         profile = await self._fetch_channel_profile_observation(reference)
         if profile is not None and fact_generation is not _LINKED_CHAT_FACT_CAPTURE_UNAVAILABLE:
-            with self._deps.conn:
+            with write_transaction(self._deps.conn):
                 published = linked_chat_fact_owner.publish(
                     self._deps.conn,
                     channel_id,
@@ -3426,7 +3427,7 @@ class DaemonEntityInfoService:
             )
             if ledger_exists is None:
                 return _LINKED_CHAT_FACT_CAPTURE_UNAVAILABLE
-            with self._deps.conn:
+            with write_transaction(self._deps.conn):
                 return linked_chat_fact_owner.capture_generation(self._deps.conn, channel_id)
         except sqlite3.Error as exc:
             self._deps.logger.warning(
@@ -3467,7 +3468,7 @@ class DaemonEntityInfoService:
             return None
         if observation.channel_id != channel_id:
             raise ValueError("channel profile observation target does not match")
-        with self._deps.conn:
+        with write_transaction(self._deps.conn):
             self._profiles.persist_group_created(observation.channel_id, observation.created)
         if observation.status is ProjectionStatus.UNAVAILABLE:
             reason = observation.reason or "channel_profile_unavailable"
@@ -3617,7 +3618,7 @@ class DaemonEntityInfoService:
             observation = await self._deps.group_profile_port.fetch_group_profile(chat_id)
             if observation.group_id != chat_id:
                 raise ValueError("group profile observation target does not match")
-            with self._deps.conn:
+            with write_transaction(self._deps.conn):
                 self._profiles.persist_group_created(observation.group_id, observation.created)
             return observation
         except TelegramRpcThrottled:

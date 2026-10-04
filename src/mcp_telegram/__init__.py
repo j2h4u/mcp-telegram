@@ -326,7 +326,7 @@ def feedback_list(
 
     # Open with a short busy_timeout — daemon holds WAL but reads are non-blocking.
     # See Pitfall 3 in 48-RESEARCH.md.
-    conn = sqlite3.connect(str(path), timeout=5.0)
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=5.0)
     try:
         conn.execute("PRAGMA busy_timeout=5000")
         rows = _feedback_list_select_rows(conn, limit, show_all)

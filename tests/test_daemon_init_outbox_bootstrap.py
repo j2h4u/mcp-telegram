@@ -32,6 +32,7 @@ from unittest.mock import patch
 
 import pytest
 
+from mcp_telegram.sync_transactions import write_transaction
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 # ---------------------------------------------------------------------------
@@ -397,8 +398,8 @@ async def test_bootstrap_live_event_race_newer_wins():
         # Dialog(500).
         async def _slow_call(req: object) -> SimpleNamespace:
             # Concurrent live event landed first.
-            apply_read_cursor(conn, 1001, "outbox", 999)
-            conn.commit()
+            with write_transaction(conn):
+                apply_read_cursor(conn, 1001, "outbox", 999)
             return SimpleNamespace(
                 dialogs=[
                     SimpleNamespace(

@@ -14,6 +14,7 @@ from mcp_telegram.folders.refresh import FolderRefresher
 from mcp_telegram.folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from mcp_telegram.folders.worker import FolderAttemptResult, FolderProjectionDemandAdapter, FolderProjectionWorker
 from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.sync_transactions import enable_runtime_writes
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 
 
@@ -42,6 +43,8 @@ async def test_worker_does_not_observe_rules_before_exact_900_second_deadline(tm
         conn.execute(
             "UPDATE dialog_directory_publication SET account_id=1,generation=1,observation_started_at=1 WHERE singleton=1"
         )
+        conn.commit()
+        enable_runtime_writes(conn)
         repository = SQLiteFolderSnapshotRepository(conn)
         repository.project_observation(FolderRuleObservation((FolderRule(1, "One"),), "token", 100), completed_at=100)
         gateway = _Gateway()
@@ -55,6 +58,8 @@ async def test_worker_does_not_observe_rules_before_exact_900_second_deadline(tm
         )
         await FolderProjectionDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
         assert gateway.calls == 1
+        assert not conn.in_transaction
+        assert conn.execute("PRAGMA query_only").fetchone() == (1,)
     finally:
         conn.close()
 

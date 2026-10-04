@@ -16,6 +16,7 @@ from typing import cast
 
 from .models import ReadMessage
 from .reactions import ReactionDetailRefresher
+from .sync_transactions import write_transaction
 from .telegram_demand import (
     AcquisitionKind,
     DemandStatus,
@@ -649,8 +650,7 @@ def _reserve_reaction_candidates(  # noqa: PLR0913 - explicit claim transaction 
     candidates: Sequence[tuple[int, int, int, str | None]] | None,
     selected: list[tuple[int, int, int, str | None]],
 ) -> list[tuple[int, int, int, str | None]]:
-    conn.execute("BEGIN IMMEDIATE")
-    try:
+    with write_transaction(conn):
         row = cast(
             tuple[object, ...] | None,
             conn.execute(
@@ -658,12 +658,11 @@ def _reserve_reaction_candidates(  # noqa: PLR0913 - explicit claim transaction 
             ).fetchone(),
         )
         if row is not None and now < int(cast(int | str, row[0])):
-            conn.commit()
             return []
-        if candidates is not None:
-            selected = _revalidate_reaction_candidates(conn, candidates, now=now, limit=limit)
+        selected = _revalidate_reaction_candidates(
+            conn, candidates if candidates is not None else selected, now=now, limit=limit
+        )
         if not selected:
-            conn.commit()
             return []
         release_at = now + cycle_seconds
         conn.execute(
@@ -674,11 +673,7 @@ def _reserve_reaction_candidates(  # noqa: PLR0913 - explicit claim transaction 
             "release_at=excluded.release_at, claimed_pages=excluded.claimed_pages, started_pages=0",
             (now, release_at, len(selected)),
         )
-        conn.commit()
         return selected
-    except BaseException:
-        conn.rollback()
-        raise
 
 
 def _claim_reaction_pages(  # noqa: PLR0913 - explicit transactional inputs
@@ -693,11 +688,8 @@ def _claim_reaction_pages(  # noqa: PLR0913 - explicit transactional inputs
     """Reserve one pacing window and its candidate pages transactionally."""
     if max_pages <= 0 or candidate_limit <= 0:
         return []
-    # Candidate maintenance may have left a local transaction open.  Flush it
-    # before taking the singleton's write lock so the reservation is the next
-    # atomic unit and is committed before any Telegram call.
     if conn.in_transaction:
-        conn.commit()
+        raise RuntimeError("reaction page claims require an idle connection")
     state = cast(
         tuple[object, ...] | None,
         conn.execute("SELECT release_at, claimed_pages FROM reaction_detail_pacing_state WHERE singleton=1").fetchone(),
@@ -725,33 +717,23 @@ def _claim_reaction_pages(  # noqa: PLR0913 - explicit transactional inputs
 
 def _start_reaction_page(conn: sqlite3.Connection) -> bool:
     """Consume a previously claimed page before making its Telegram call."""
-    conn.execute("BEGIN IMMEDIATE")
-    try:
+    with write_transaction(conn):
         cursor = conn.execute(
             "UPDATE reaction_detail_pacing_state SET started_pages=started_pages+1 "
             "WHERE singleton=1 AND started_pages < claimed_pages"
         )
-        conn.commit()
         return cursor.rowcount == 1
-    except BaseException:
-        conn.rollback()
-        raise
 
 
 def _extend_reaction_release(conn: sqlite3.Connection, *, now: int, retry_after: int) -> None:
     """Extend the durable window after a FloodWait without reopening it."""
     if retry_after <= 0:
         return
-    conn.execute("BEGIN IMMEDIATE")
-    try:
+    with write_transaction(conn):
         conn.execute(
             "UPDATE reaction_detail_pacing_state SET release_at=MAX(release_at, ?) WHERE singleton=1",
             (now + retry_after,),
         )
-        conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
 
 
 def _read_at_candidates(

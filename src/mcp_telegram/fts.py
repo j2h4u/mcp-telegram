@@ -24,6 +24,7 @@ from typing import cast
 import snowballstemmer  # type: ignore[import-untyped]
 
 from .search_contracts import SEARCHABLE_QUERY_TOKEN_PATTERN
+from .sync_transactions import write_transaction
 
 # Module-level stemmer — Russian language model.
 # snowballstemmer is stateless for stemWords(), safe for concurrent reads.
@@ -137,7 +138,7 @@ def backfill_fts_index(conn: sqlite3.Connection) -> int:
     if not rows:
         return 0
 
-    with conn:
+    with write_transaction(conn):
         conn.executemany(
             INSERT_FTS_SQL,
             ((dialog_id, message_id, stem_text(text)) for dialog_id, message_id, text in rows),

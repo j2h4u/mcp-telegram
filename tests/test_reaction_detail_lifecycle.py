@@ -103,12 +103,14 @@ def test_detail_partial_offset_survives_restart_and_publishes(tmp_path: Path) ->
 
     gateway = Gateway()
     refresher = ReactionDetailRefresher(conn, gateway, now=lambda: 20)
+    conn.commit()
     first = asyncio.run(refresher.refresh_one(1, 2, 1, entity=SimpleNamespace(), now=20))
     assert first.status == "partial"
     assert conn.execute("SELECT next_offset FROM message_reaction_event_status").fetchone() == ("next",)
     assert conn.execute("SELECT COUNT(*) FROM message_reaction_events WHERE display_generation=0").fetchone() == (1,)
     assert reaction_event_projection(conn, 1, [2]) == ({}, {2: "partial"})
 
+    conn.commit()
     second = asyncio.run(refresher.refresh_one(1, 2, 1, entity=SimpleNamespace(), offset="next", now=21))
     assert second.status == "complete"
     assert gateway.offsets == [None, "next"]
@@ -135,7 +137,7 @@ def test_detail_persistence_requires_an_idle_dedicated_connection(tmp_path: Path
             del entity, message_id, offset, limit
             return ReactionDetailFetchResult(page=ReactionDetailPage((ReactionEvent(7, "👍", None),), None))
 
-    with pytest.raises(RuntimeError, match="idle dedicated connection"):
+    with pytest.raises(RuntimeError, match="idle connection"):
         asyncio.run(ReactionDetailRefresher(conn, Gateway()).refresh_one(1, 2, 1, entity=1))
     assert conn.execute("SELECT COUNT(*) FROM message_reaction_events").fetchone() == (0,)
     conn.rollback()
@@ -254,6 +256,7 @@ def test_real_refresher_exposes_flood_wait_cycle_stop(tmp_path: Path) -> None:
                 failure=GatewayFailure(GatewayFailureKind.FLOOD_WAIT, "Flood", "wait", False, retry_after=17)
             )
 
+    conn.commit()
     result = asyncio.run(ReactionDetailRefresher(conn, Gateway()).refresh_one(1, 2, 1, entity=1, now=10))
     assert result.status == "unavailable"
     assert result.failure_kind == GatewayFailureKind.FLOOD_WAIT.value
@@ -371,6 +374,7 @@ def test_refresh_cycle_passes_generation_and_offset_and_limits_detail_pages(tmp_
             return ReactionDetailResult("partial", fetched_pages=1)
 
     refresher = Refresher()
+    conn.commit()
     result = asyncio.run(
         refresh_message_facts_once(
             MessageFactRefreshDeps(
@@ -422,6 +426,7 @@ def test_refresh_cycle_stops_reaction_probes_after_flood_wait(tmp_path: Path) ->
             return ReactionDetailResult("unavailable", failure_kind="flood_wait", retry_after=17)
 
     refresher = Refresher()
+    conn.commit()
     result = asyncio.run(
         refresh_message_facts_once(
             MessageFactRefreshDeps(
@@ -561,6 +566,7 @@ def test_detail_replaces_migrated_display_rows_on_first_complete_page(tmp_path: 
             del entity, message_id, offset, limit
             return ReactionDetailFetchResult(page=ReactionDetailPage((ReactionEvent(9, "👍", None),), None))
 
+    conn.commit()
     result = asyncio.run(ReactionDetailRefresher(conn, Gateway(), now=lambda: 3).refresh_one(1, 2, 1, entity=1, now=3))
     assert result.status == "complete"
     assert conn.execute(
@@ -601,8 +607,10 @@ def test_detail_stale_writer_failure_and_non_advancing_offset_preserve_display(t
 
     gateway = FailingGateway()
     refresher = ReactionDetailRefresher(conn, gateway, now=lambda: 10)
+    conn.commit()
     assert asyncio.run(refresher.refresh_one(1, 2, 99, entity=1, now=10)).status == "stale_writer"
     assert gateway.calls == 0
+    conn.commit()
     result = asyncio.run(refresher.refresh_one(1, 2, 2, entity=1, now=10))
     assert result.status == "unavailable"
     assert conn.execute("SELECT status, next_attempt_at FROM message_reaction_event_status").fetchone() == (
@@ -626,6 +634,7 @@ def test_detail_stale_writer_failure_and_non_advancing_offset_preserve_display(t
             del entity, message_id, limit
             return ReactionDetailFetchResult(page=ReactionDetailPage((), offset))
 
+    conn.commit()
     result = asyncio.run(
         ReactionDetailRefresher(conn, RepeatingGateway(), now=lambda: 11).refresh_one(
             1, 2, 2, entity=1, offset="same", now=11
@@ -664,6 +673,7 @@ def test_permanent_detail_failure_is_terminal_until_new_aggregate(
             del entity, message_id, offset, limit
             return ReactionDetailFetchResult(failure=GatewayFailure(failure_kind, "Permanent", "unavailable", False))
 
+    conn.commit()
     result = asyncio.run(
         ReactionDetailRefresher(
             conn, Gateway(), observation_sink=lambda kind, outcome: observations.append((kind, outcome))
@@ -714,6 +724,7 @@ def test_terminal_failure_clears_partial_staging_without_erasing_display(tmp_pat
                 failure=GatewayFailure(GatewayFailureKind.INVALID_TARGET, "Permanent", "target", False)
             )
 
+    conn.commit()
     result = asyncio.run(
         ReactionDetailRefresher(conn, Gateway()).refresh_one(1, 2, 1, entity=1, offset="resume", now=10)
     )
@@ -771,6 +782,7 @@ def test_detail_final_cas_discards_page_when_status_changes_before_update(tmp_pa
             del entity, message_id, offset, limit
             return ReactionDetailFetchResult(page=ReactionDetailPage((ReactionEvent(4, "👍", None),), None))
 
+    conn.commit()
     result = asyncio.run(ReactionDetailRefresher(conn, Gateway(), now=lambda: 5).refresh_one(1, 2, 1, entity=1, now=5))
     assert result.status == "stale_writer"
     assert conn.execute("SELECT COUNT(*) FROM message_reaction_events").fetchone() == (0,)
@@ -810,6 +822,7 @@ def test_detail_rechecks_enrollment_after_gateway_returns(tmp_path: Path) -> Non
         gateway.release.set()
         return await task
 
+    conn.commit()
     result = asyncio.run(run())
     assert result.status == "ineligible"
     assert conn.execute("SELECT status FROM message_reaction_event_status").fetchone() == ("stale",)
@@ -839,6 +852,7 @@ def test_empty_aggregate_is_not_a_detail_candidate_without_explicit_retry(tmp_pa
             del args, kwargs
             raise AssertionError("terminal empty aggregate must not issue detail RPC")
 
+    conn.commit()
     result = asyncio.run(
         refresh_message_facts_once(
             MessageFactRefreshDeps(

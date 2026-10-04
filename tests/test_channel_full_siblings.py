@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import cast
 
+import pytest
 from telethon.tl import types
 
 from mcp_telegram.channel_full_siblings import (
@@ -14,18 +15,22 @@ from mcp_telegram.channel_full_siblings import (
 )
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
 from mcp_telegram.sync_db import _apply_migrations
+from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
 
 
 def _db(entity_id: int = 42) -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
-    conn.execute("INSERT INTO entities(id,type,name,updated_at) VALUES(?,'channel','Channel',100)", (entity_id,))
-    conn.execute(
-        "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_revision) "
-        'VALUES(?,\'{"retained":"value"}\',100,0)',
-        (entity_id,),
-    )
+    with write_transaction(conn):
+        conn.execute("INSERT INTO entities(id,type,name,updated_at) VALUES(?,'channel','Channel',100)", (entity_id,))
+    with write_transaction(conn):
+        conn.execute(
+            "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_revision) "
+            'VALUES(?,\'{"retained":"value"}\',100,0)',
+            (entity_id,),
+        )
     conn.commit()
+    enable_runtime_writes(conn)
     return conn
 
 
@@ -37,7 +42,8 @@ def test_channel_full_siblings_merge_without_linkage_and_reject_stale_profile_to
             full_chat=SimpleNamespace(participants_count=12, pinned_msg_id=7, about="Observed"),
             chats=[],
         )
-        assert write_channel_full_siblings(conn, 42, result, token, observed_at=200)
+        with write_transaction(conn):
+            assert write_channel_full_siblings(conn, 42, result, token, observed_at=200)
         row = cast(
             tuple[str, int] | None,
             conn.execute("SELECT detail_json, profile_revision FROM entity_details WHERE entity_id=42").fetchone(),
@@ -55,11 +61,13 @@ def test_channel_full_siblings_merge_without_linkage_and_reject_stale_profile_to
         assert row[1] == 1
 
         stale_token = capture_channel_full_siblings_token(conn, 42)
-        conn.execute(
-            "UPDATE entity_details SET detail_json=?, profile_revision=profile_revision+1 WHERE entity_id=42",
-            ('{"newer":true}',),
-        )
-        assert not write_channel_full_siblings(conn, 42, result, stale_token, observed_at=300)
+        with write_transaction(conn):
+            conn.execute(
+                "UPDATE entity_details SET detail_json=?, profile_revision=profile_revision+1 WHERE entity_id=42",
+                ('{"newer":true}',),
+            )
+        with write_transaction(conn):
+            assert not write_channel_full_siblings(conn, 42, result, stale_token, observed_at=300)
         assert cast(
             tuple[str] | None,
             conn.execute("SELECT detail_json FROM entity_details WHERE entity_id=42").fetchone(),
@@ -72,9 +80,10 @@ def test_channel_identity_partial_and_blank_observations_preserve_stored_identit
     channel_id = -1_000_000_000_042
     conn = _db(channel_id)
     try:
-        conn.execute(
-            "UPDATE entities SET username='canonical_name', name_normalized='channel' WHERE id=?", (channel_id,)
-        )
+        with write_transaction(conn):
+            conn.execute(
+                "UPDATE entities SET username='canonical_name', name_normalized='channel' WHERE id=?", (channel_id,)
+            )
         token = capture_channel_full_siblings_token(conn, channel_id)
         result = SimpleNamespace(
             full_chat=SimpleNamespace(participants_count=None, pinned_msg_id=None, about=None),
@@ -89,7 +98,8 @@ def test_channel_identity_partial_and_blank_observations_preserve_stored_identit
             ],
         )
 
-        assert write_channel_full_siblings(conn, channel_id, result, token, observed_at=200)
+        with write_transaction(conn):
+            assert write_channel_full_siblings(conn, channel_id, result, token, observed_at=200)
         identity = cast(
             tuple[object, object, object] | None,
             conn.execute("SELECT name, username, name_normalized FROM entities WHERE id=?", (channel_id,)).fetchone(),
@@ -106,7 +116,8 @@ def test_channel_identity_observation_creates_missing_entity_and_normalizes_name
     channel_id = -1_000_000_000_042
     conn = _db(channel_id)
     try:
-        conn.execute("DELETE FROM entities WHERE id=?", (channel_id,))
+        with write_transaction(conn):
+            conn.execute("DELETE FROM entities WHERE id=?", (channel_id,))
         token = capture_channel_full_siblings_token(conn, channel_id)
         result = SimpleNamespace(
             full_chat=SimpleNamespace(participants_count=None, pinned_msg_id=None, about=None),
@@ -121,7 +132,8 @@ def test_channel_identity_observation_creates_missing_entity_and_normalizes_name
             ],
         )
 
-        assert write_channel_full_siblings(conn, channel_id, result, token, observed_at=200)
+        with write_transaction(conn):
+            assert write_channel_full_siblings(conn, channel_id, result, token, observed_at=200)
         assert conn.execute(
             "SELECT type, name, username, name_normalized FROM entities WHERE id=?", (channel_id,)
         ).fetchone() == (
@@ -138,6 +150,7 @@ def test_uncached_channel_creates_parent_before_detail_with_foreign_keys_enabled
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
     conn.execute("PRAGMA foreign_keys=ON")
+    enable_runtime_writes(conn)
     channel_id = -1_000_000_000_042
     token = capture_channel_full_siblings_token(conn, channel_id)
     result = SimpleNamespace(
@@ -153,7 +166,7 @@ def test_uncached_channel_creates_parent_before_detail_with_foreign_keys_enabled
         ],
     )
 
-    with conn:
+    with write_transaction(conn):
         assert write_channel_full_siblings(conn, channel_id, result, token, observed_at=200)
 
     assert conn.execute("PRAGMA foreign_keys").fetchone() == (1,)
@@ -172,17 +185,20 @@ def test_core_only_revision_seeds_first_detail_and_allows_successive_profile_com
     _apply_migrations(conn)
     channel_id = -1_000_000_000_042
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute(
-        "INSERT INTO entities(id,type,name,updated_at) VALUES(?,'channel','Core only',100)",
-        (channel_id,),
-    )
-    conn.execute(
-        "INSERT INTO entity_profile_refresh_state(entity_id,status,retry_at,reason,updated_at,next_section,"
-        "acquisition_cursor,generation,profile_revision) VALUES(?,'pending',NULL,'refresh_in_progress',100,"
-        "'common_chats',1,0,2)",
-        (channel_id,),
-    )
+    with write_transaction(conn):
+        conn.execute(
+            "INSERT INTO entities(id,type,name,updated_at) VALUES(?,'channel','Core only',100)",
+            (channel_id,),
+        )
+    with write_transaction(conn):
+        conn.execute(
+            "INSERT INTO entity_profile_refresh_state(entity_id,status,retry_at,reason,updated_at,next_section,"
+            "acquisition_cursor,generation,profile_revision) VALUES(?,'pending',NULL,'refresh_in_progress',100,"
+            "'common_chats',1,0,2)",
+            (channel_id,),
+        )
     conn.commit()
+    enable_runtime_writes(conn)
     profiles = EntityProfileRepository(conn, section_ttl_seconds=300)
     cursor = profiles.next_due_refresh(now=100)
     assert cursor is not None and cursor.profile_revision == 2
@@ -193,7 +209,7 @@ def test_core_only_revision_seeds_first_detail_and_allows_successive_profile_com
         full_chat=SimpleNamespace(participants_count=12, pinned_msg_id=None, about="About"),
         chats=[],
     )
-    with conn:
+    with write_transaction(conn):
         assert write_channel_full_siblings(conn, channel_id, result, token, observed_at=101)
     assert conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=?", (channel_id,)).fetchone() == (
         3,
@@ -210,3 +226,19 @@ def test_core_only_revision_seeds_first_detail_and_allows_successive_profile_com
             "SELECT profile_revision FROM entity_details WHERE entity_id=?", (channel_id,)
         ).fetchone() == (next_revision,)
     conn.close()
+
+
+def test_channel_sibling_projection_rejects_idle_native_writer_without_partial_updates() -> None:
+    conn = _db()
+    try:
+        token = capture_channel_full_siblings_token(conn, 42)
+        result = SimpleNamespace(
+            full_chat=SimpleNamespace(participants_count=12, pinned_msg_id=7, about="Rejected"), chats=[]
+        )
+        with pytest.raises(RuntimeError, match="owned write_transaction"):
+            write_channel_full_siblings(conn, 42, result, token, observed_at=200)
+        assert capture_channel_full_siblings_token(conn, 42) == token
+        assert not conn.in_transaction
+        assert conn.execute("PRAGMA query_only").fetchone() == (1,)
+    finally:
+        conn.close()
