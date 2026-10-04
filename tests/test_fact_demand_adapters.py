@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mcp_telegram import fact_hydration
 from mcp_telegram.entity_profile.refresh import (
     EntityProfileDemandAdapter,
     EntityRefreshCoordinator,
@@ -20,9 +21,11 @@ from mcp_telegram.fact_hydration import (
 )
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.hydration_queue import HydrationJob, HydrationPriority, HydrationQueueRepository
+from mcp_telegram.media_hydration import MediaFactHydrationHandler
 from mcp_telegram.message_fact_refresh import (
     ReadReceiptDemandAdapter,
 )
+from mcp_telegram.messages import sqlite_hydration_jobs
 from mcp_telegram.messages.sqlite_hydration_jobs import HydrationRepairCursor
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_demand import (
@@ -563,19 +566,27 @@ def test_repair_cursor_advances_only_after_commit_and_resets_at_completed_sweep(
     worker = _repair_hydration_worker(conn, _HydrationHandler())
     cursor = HydrationRepairCursor(23, 1, 5)
     next_cursors = (cursor, cursor, cursor)
-    monkeypatch.setattr(worker, "_run_repair_producers", lambda _now: (True, next_cursors))
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("CREATE TABLE repair_parent(id INTEGER PRIMARY KEY)")
+    conn.execute(
+        "CREATE TABLE repair_child(parent_id INTEGER REFERENCES repair_parent(id) DEFERRABLE INITIALLY DEFERRED)"
+    )
 
-    class CommitFailure:
-        def commit(self) -> None:
-            raise RuntimeError("commit failed")
+    def fail_commit(
+        _now: int,
+    ) -> tuple[bool, tuple[HydrationRepairCursor, HydrationRepairCursor, HydrationRepairCursor]]:
+        conn.execute("INSERT INTO repair_child VALUES (1)")
+        return True, next_cursors
 
     try:
-        monkeypatch.setattr(worker, "_conn", CommitFailure())
-        with pytest.raises(RuntimeError, match="commit failed"):
+        monkeypatch.setattr(worker, "_run_repair_producers", fail_commit)
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
             worker._run_due_repairs(100, 100)
+        assert not conn.in_transaction
+        assert conn.execute("SELECT COUNT(*) FROM repair_child").fetchone() == (0,)
         assert worker._repair_cursors == (None, None, None)
         assert worker.next_repair_at == 100
-        monkeypatch.setattr(worker, "_conn", conn)
+        monkeypatch.setattr(worker, "_run_repair_producers", lambda _now: (True, next_cursors))
         worker._run_due_repairs(100, 100)
         assert worker._repair_cursors == next_cursors
         assert worker.next_repair_at == 100
@@ -587,21 +598,131 @@ def test_repair_cursor_advances_only_after_commit_and_resets_at_completed_sweep(
         conn.close()
 
 
-@pytest.mark.asyncio
-async def test_backfill_repair_commit_failure_keeps_deadline_due() -> None:
-    conn = _hydration_db()
-    worker = _repair_hydration_worker(conn, _HydrationHandler())
+def test_backfill_repair_rejects_foreign_transaction_without_rolling_it_back(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    reader = _open_sync_db(db_path)
+    try:
+        worker = _repair_hydration_worker(conn, _HydrationHandler())
+        conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
+        with pytest.raises(RuntimeError, match="requires no open transaction"):
+            worker._run_due_repairs(100, 100)
+        assert conn.in_transaction
+        assert conn.execute("SELECT dialog_id FROM synced_dialogs").fetchall() == [(1,)]
+        assert reader.execute("SELECT dialog_id FROM synced_dialogs").fetchall() == []
+        assert worker._repair_cursors == (None, None, None)
+        assert worker.next_repair_at == 100
+    finally:
+        reader.close()
+        conn.close()
 
-    class _CommitFailure:
-        def commit(self) -> None:
-            raise RuntimeError("commit failed")
 
-    worker._conn = _CommitFailure()  # type: ignore[assignment]
-    with pytest.raises(RuntimeError, match="commit failed"):
-        await worker.run_priority_slice(HydrationPriority.BACKFILL, RpcAttemptBudget(limit=1))
+def test_backfill_repair_rolls_back_all_producers_and_retries_same_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    reader = _open_sync_db(db_path)
+    try:
+        assert conn.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+        conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
+        conn.execute(
+            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
+        )
+        conn.execute(
+            "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
+            "VALUES (1, 1, 1, 'voice', '{}')"
+        )
+        conn.commit()
+        handler = _HydrationHandler()
+        handler.kind = "transcription"
+        worker = MessageFactHydrationWorker(
+            object(),
+            conn,
+            asyncio.Event(),
+            handlers=(handler, MediaFactHydrationHandler(batch_size=1)),
+            interval_seconds=60,
+            max_requests_per_cycle=2,
+            max_jobs_per_cycle=2,
+            retry_delay_seconds=30,
+            circuit_retry_seconds=30,
+            max_attempts=3,
+            pause_between_requests_seconds=0.01,
+            backfill_debt_limit=1,
+            clock=lambda: 100.0,
+        )
+        media_repair = fact_hydration.repair_media_metadata_hydration_jobs
 
-    assert worker.next_repair_at == 100
-    conn.close()
+        def fail_second_producer(*_args: object, **_kwargs: object) -> None:
+            assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (1,)
+            raise sqlite3.OperationalError("producer failed")
+
+        monkeypatch.setattr(fact_hydration, "repair_media_metadata_hydration_jobs", fail_second_producer)
+        with pytest.raises(sqlite3.OperationalError, match="producer failed"):
+            worker._run_due_repairs(100, 100)
+        assert not conn.in_transaction
+        assert reader.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+        assert worker._repair_cursors == (None, None, None)
+        assert worker.next_repair_at == 100
+
+        monkeypatch.setattr(fact_hydration, "repair_media_metadata_hydration_jobs", media_repair)
+        worker._run_due_repairs(100, 100)
+        assert not conn.in_transaction
+        assert reader.execute("SELECT kind, message_id FROM hydration_jobs").fetchall() == [("transcription", 1)]
+        assert worker.next_repair_at == 160
+    finally:
+        reader.close()
+        conn.close()
+
+
+def test_backfill_repair_owns_wal_writer_before_candidate_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    writer = sqlite3.connect(db_path, timeout=0)
+    try:
+        conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
+        conn.execute(
+            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
+        )
+        conn.execute(
+            "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
+            "VALUES (1, 1, 1, 'other', '{}')"
+        )
+        conn.commit()
+        handler = _HydrationHandler()
+        handler.kind = "media_metadata"
+        worker = _repair_hydration_worker(conn, handler)
+        raw_page = sqlite_hydration_jobs._repair_raw_page
+        interleaved = False
+
+        def attempt_competing_write(*args: object, **kwargs: object) -> object:
+            nonlocal interleaved
+            rows = raw_page(*args, **kwargs)  # type: ignore[arg-type]
+            if not interleaved:
+                interleaved = True
+                with pytest.raises(sqlite3.OperationalError) as error:
+                    writer.execute("UPDATE synced_dialogs SET last_synced_at=2 WHERE dialog_id=1")
+                assert error.value.sqlite_errorcode == sqlite3.SQLITE_BUSY
+                writer.rollback()
+            return rows
+
+        monkeypatch.setattr(sqlite_hydration_jobs, "_repair_raw_page", attempt_competing_write)
+        worker._run_due_repairs(100, 100)
+        assert interleaved
+        assert not conn.in_transaction
+        assert conn.execute("SELECT kind, message_id FROM hydration_jobs").fetchall() == [("media_metadata", 1)]
+        with writer:
+            writer.execute("UPDATE synced_dialogs SET last_synced_at=2 WHERE dialog_id=1")
+    finally:
+        writer.close()
+        conn.close()
 
 
 @pytest.mark.asyncio

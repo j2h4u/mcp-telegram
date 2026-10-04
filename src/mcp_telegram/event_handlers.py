@@ -1032,11 +1032,10 @@ class EventHandlerManager:
         coverage = await self._new_message_coverage(dialog_id, event, identity_baseline=identity_baseline)
         if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
             return
-        if not allows_new_message(coverage, outgoing=bool(getattr(msg, "out", False))):
-            self._project_denied_new_message_metadata(dialog_id, msg, coverage)
-            return
-
         try:
+            if not allows_new_message(coverage, outgoing=bool(getattr(msg, "out", False))):
+                self._project_denied_new_message_metadata(dialog_id, msg, coverage)
+                return
             entity_name_map = await _build_fwd_entity_map(msg, cast(_PeerNameClient, self._client))
             extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
             # Forward enrichment suspends the handler; status may have changed
@@ -1076,8 +1075,13 @@ class EventHandlerManager:
             logger.debug("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
         except RpcAdmissionClosedError:
             raise
-        except Exception:
-            logger.exception("event_new_failed dialog_id=%s", dialog_id)
+        except Exception as exc:
+            logger.exception(
+                "event_new_failed dialog_id=%s sqlite_errorcode=%s sqlite_errorname=%s",
+                dialog_id,
+                getattr(exc, "sqlite_errorcode", None),
+                getattr(exc, "sqlite_errorname", None),
+            )
 
     async def _new_message_coverage(
         self,

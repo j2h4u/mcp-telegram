@@ -335,9 +335,11 @@ class TelegramDemandCoordinator:
     def _handle_slice_failure(self, kind: DemandKind, budget: RpcAttemptBudget, exc: Exception) -> None:
         self._suppress(kind, self._safety_scan_seconds)
         logger.warning(
-            "telegram_demand_slice_failed kind=%s error_type=%s",
+            "telegram_demand_slice_failed kind=%s error_type=%s sqlite_errorcode=%s sqlite_errorname=%s",
             kind.value,
             type(exc).__name__,
+            getattr(exc, "sqlite_errorcode", None),
+            getattr(exc, "sqlite_errorname", None),
         )
         self._observe("failed", kind, actual_attempts=budget.attempts, reason=type(exc).__name__)
 

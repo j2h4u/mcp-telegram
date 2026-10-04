@@ -364,9 +364,13 @@ class MessageFactHydrationWorker:
     def _run_due_repairs(self, clock_now: float, effective_now: int) -> None:
         if clock_now < self.next_repair_at:
             return
-        has_more, cursors = self._run_repair_producers(effective_now)
-        # Commit repair work before the slice can await Telegram or yield on its budget.
-        self._conn.commit()
+        if self._conn.in_transaction:
+            raise RuntimeError("fact hydration repair requires no open transaction")
+        # Own the writer before candidate reads; never retain a WAL read snapshot
+        # across producer writes or leave partial repairs for another caller to commit.
+        with self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            has_more, cursors = self._run_repair_producers(effective_now)
         self._repair_cursors = cursors if has_more else (None, None, None)
         self.next_repair_at = clock_now if has_more else self._clock() + self._interval_seconds
 

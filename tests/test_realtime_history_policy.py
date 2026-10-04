@@ -153,6 +153,47 @@ async def test_own_only_inbound_new_keeps_dialog_and_topic_metadata_only(
 
 
 @pytest.mark.asyncio
+async def test_own_only_inbound_metadata_lock_is_handled_and_next_event_succeeds(
+    sync_db: sqlite3.Connection,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sync_db.execute("INSERT INTO dialogs(dialog_id, snapshot_at) VALUES (42, 1)")
+    sync_db.commit()
+    manager = _manager(sync_db, MagicMock())
+    message = build_mock_message(id=7, text="inbound")
+    message.out = False
+    message.action = tl.MessageActionTopicCreate(title="Inbound topic", icon_color=0)
+    event = SimpleNamespace(chat_id=42, is_private=False, message=message)
+    sync_db.execute("PRAGMA busy_timeout=0")
+    blocker = sqlite3.connect(tmp_path / "sync.db")
+    try:
+        blocker.execute("BEGIN IMMEDIATE")
+        await manager.on_new_message(event)
+        assert not sync_db.in_transaction
+        assert "event_new_failed dialog_id=42 sqlite_errorcode=5 sqlite_errorname=SQLITE_BUSY" in caplog.text
+        assert sync_db.execute("SELECT last_message_at, snapshot_at FROM dialogs WHERE dialog_id=42").fetchone() == (
+            None,
+            1,
+        )
+        assert sync_db.execute("SELECT COUNT(*) FROM topic_metadata").fetchone()[0] == 0
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    message.id = 8
+    await manager.on_new_message(event)
+    assert not sync_db.in_transaction
+    assert sync_db.execute("SELECT last_message_at FROM dialogs WHERE dialog_id=42").fetchone() == (1704110400,)
+    assert sync_db.execute("SELECT title FROM topic_metadata WHERE dialog_id=42 AND topic_id=8").fetchone() == (
+        "Inbound topic",
+    )
+    assert sync_db.execute("SELECT COUNT(*) FROM topic_metadata WHERE dialog_id=42 AND topic_id=7").fetchone()[0] == 0
+    assert sync_db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
+    assert sync_db.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=42").fetchone()[0] is None
+
+
+@pytest.mark.asyncio
 async def test_own_only_outgoing_new_is_persisted(sync_db: sqlite3.Connection) -> None:
     manager = _manager(sync_db, MagicMock())
     message = build_mock_message(id=8, text="outgoing")
