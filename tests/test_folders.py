@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 import ast
+import sqlite3
 from pathlib import Path
+
+import pytest
+
+from mcp_telegram.folders.sqlite_repository import SQLiteFolderSnapshotRepository
+from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.sync_transactions import write_savepoint
 
 
 def test_folder_package_has_no_directory_traversal_dependency() -> None:
@@ -68,3 +75,22 @@ def test_account_wide_dialog_directory_has_one_production_owner() -> None:
         )
     for relative_path in ("sync_worker.py", "daemon_api.py"):
         assert "iter_dialogs" not in (source_root / relative_path).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("expiry", [None, 500])
+def test_mute_projection_noop_does_not_wait_for_writer(tmp_path: Path, expiry: int | None) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    writer = sqlite3.connect(path)
+    writer.execute("PRAGMA journal_mode=WAL")
+    with write_savepoint(writer):
+        writer.execute("UPDATE telegram_folder_projection_state SET next_mute_expiry=? WHERE singleton=1", (expiry,))
+    reader = sqlite3.connect(path, timeout=0.05)
+    try:
+        with write_savepoint(writer):
+            writer.execute("UPDATE telegram_folder_projection_state SET last_outcome='lock-holder' WHERE singleton=1")
+            assert SQLiteFolderSnapshotRepository(reader).ensure_mute_projection(now=100) is None
+            assert not reader.in_transaction
+    finally:
+        reader.close()
+        writer.close()

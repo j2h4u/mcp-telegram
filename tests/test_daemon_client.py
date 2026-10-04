@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -132,6 +133,34 @@ async def test_request_round_trip(tmp_path: Path) -> None:
     finally:
         server.close()
         await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_request_logs_slow_stage_with_correlation_and_without_payload(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Slow client-stage diagnostics identify the request without logging payloads."""
+    reader = AsyncMock(spec=asyncio.StreamReader)
+    reader.readline = AsyncMock(return_value=b'{"ok":true}\n')
+    writer = AsyncMock(spec=asyncio.StreamWriter)
+    writer.drain = AsyncMock()
+    conn = DaemonConnection(reader, writer)
+    clock_values = iter((1.0, 2.25, 3.0, 3.25, 4.0, 4.1))
+    monkeypatch.setattr("mcp_telegram.daemon_client.time.perf_counter", lambda: next(clock_values))
+    monkeypatch.setattr("mcp_telegram.daemon_client.uuid.uuid4", lambda: uuid.UUID("0123456789abcdef0123456789abcdef"))
+    with patch("mcp_telegram.daemon_client.current_operation_id", return_value="operation-1"):
+        with caplog.at_level("DEBUG", logger="mcp_telegram.daemon_client"):
+            response = await conn.request({"method": "get_entity_info", "private": "DO_NOT_LOG"})
+
+    assert response["ok"] is True
+    record = next(record for record in caplog.records if "daemon_client_request_timing" in record.getMessage())
+    assert record.levelname == "WARNING"
+    assert "method=get_entity_info" in record.getMessage()
+    assert "request_id=01234567" in record.getMessage()
+    assert "operation_id=operation-1" in record.getMessage()
+    assert "send_drain_s=1.250" in record.getMessage()
+    assert "DO_NOT_LOG" not in caplog.text
 
 
 @pytest.mark.asyncio

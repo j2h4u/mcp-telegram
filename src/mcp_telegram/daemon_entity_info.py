@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from dataclasses import replace as dataclass_replace
@@ -478,11 +479,19 @@ class DaemonEntityInfoService:
 
     async def get_entity_info(self, req: Mapping[str, object]) -> dict[str, object]:
         """Run one foreground entity-info use case under its RPC source."""
+        started_at = time.perf_counter()
         with rpc_scope(
             TelegramRpcSource.ENTITY_INFO_FOREGROUND,
             acquisition_kind=AcquisitionKind.ENTITY_LOOKUP,
         ):
-            return await self._get_entity_info(req)
+            try:
+                return await self._get_entity_info(req)
+            finally:
+                self._deps.logger.info(
+                    "entity_profile.request duration_s=%.3f%s",
+                    time.perf_counter() - started_at,
+                    self._deps.rid(),
+                )
 
     async def _get_entity_info(self, req: Mapping[str, object]) -> dict[str, object]:
         """Type-tagged entity inspector covering 5 Telegram entity kinds."""
@@ -519,9 +528,17 @@ class DaemonEntityInfoService:
         if fallback.get("error") == "entity_not_found":
             return fallback
         assert self._refresh is not None
+        started_at = time.perf_counter()
         completed = await self._refresh.wait_for_completion(
             entity_id,
             self._deps.refresh_limits.foreground_refresh_wait_seconds,
+        )
+        self._deps.logger.info(
+            "entity_profile.refresh_wait completed=%s duration_s=%.3f budget_s=%.3f%s",
+            completed,
+            time.perf_counter() - started_at,
+            self._deps.refresh_limits.foreground_refresh_wait_seconds,
+            self._deps.rid(),
         )
         if not completed:
             return fallback
@@ -2499,7 +2516,7 @@ class DaemonEntityInfoService:
         result["completeness"] = completeness(sections)
         result["sections"] = self._section_summaries(sections)
         self._deps.logger.info(
-            "entity_profile.request outcome=%s entity_id=%r duration_s=0.000 sections=%s%s",
+            "entity_profile.projection outcome=%s entity_id=%r sections=%s%s",
             result["completeness"],
             entity_id,
             self._section_counts(sections),

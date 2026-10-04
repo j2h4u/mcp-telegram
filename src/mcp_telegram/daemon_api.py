@@ -2005,8 +2005,11 @@ class DaemonAPIServer:
 
     async def _get_entity_info(self, req: dict[str, object]) -> dict:
         """Type-tagged entity inspector covering 5 Telegram entity kinds."""
+        started_at = time.perf_counter()
         self._reproject_due_folder_memberships()
+        projected_at = time.perf_counter()
         result = await self._get_entity_info_service().get_entity_info(req)
+        fetched_at = time.perf_counter()
         if result.get("error") == "entity_info_pending" and self._health_status().open:
             return _account_protection_error()
         if result.get("ok"):
@@ -2014,6 +2017,13 @@ class DaemonAPIServer:
             entity_id = data.get("id")
             if isinstance(entity_id, int):
                 data["dialog_placement"] = dialog_placement(self._conn, entity_id)
+        logger.info(
+            "entity_info_dispatch_timing folder_projection_s=%.3f service_s=%.3f dialog_placement_s=%.3f%s",
+            projected_at - started_at,
+            fetched_at - projected_at,
+            time.perf_counter() - fetched_at,
+            _rid(),
+        )
         return result
 
     async def shutdown(self) -> None:
