@@ -252,6 +252,23 @@ async def test_unexpected_failure_is_suppressed_and_other_kind_runs() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sqlite_failure_reports_code_without_exception_text(caplog: pytest.LogCaptureFixture) -> None:
+    target = DemandKind.BACKFILL_HYDRATION_BATCH
+    adapters = _adapters({target: DemandStatus(0)})
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("SELECT * FROM private_failure_context")
+    except sqlite3.OperationalError as exc:
+        adapters[target].run_error = exc
+    finally:
+        conn.close()
+    coordinator = TelegramDemandCoordinator(adapters, clock=_Clock())
+    await coordinator._execute_slice(target)
+    assert "sqlite_errorcode=1 sqlite_errorname=SQLITE_ERROR" in caplog.text
+    assert "private_failure_context" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_attempt_budget_exhaustion_is_deferred_and_suppressed() -> None:
     clock = _Clock()
     target = DemandKind.DELTA_GAP_FILL
