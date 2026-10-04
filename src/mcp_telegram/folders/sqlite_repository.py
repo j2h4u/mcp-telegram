@@ -117,6 +117,9 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
         return generation
 
     def ensure_mute_projection(self, *, now: int) -> int | None:
+        expiry = self.next_mute_expiry()
+        if expiry is None or now < expiry:
+            return None
         with write_savepoint(self._conn):
             expiry = self.next_mute_expiry()
             if expiry is None or now < expiry:

@@ -562,6 +562,38 @@ async def test_get_entity_info_uses_startup_snapshot_for_self_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_entity_info_dispatch_logs_separate_stage_durations(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    server = make_server()
+    clock = iter([10.0, 10.2, 10.5, 10.9])
+    monkeypatch.setattr("mcp_telegram.daemon_api.time.perf_counter", lambda: next(clock))
+    service = MagicMock()
+    service.get_entity_info = AsyncMock(return_value={"ok": True, "data": {"id": 42}})
+    monkeypatch.setattr(server, "_get_entity_info_service", lambda: service)
+    monkeypatch.setattr("mcp_telegram.daemon_api.dialog_placement", lambda _conn, _entity_id: {})
+    with caplog.at_level("INFO", logger="mcp_telegram.daemon_api"):
+        result = await server._get_entity_info({"entity_id": 42})
+    assert result["ok"] is True
+    message = next(record.message for record in caplog.records if "entity_info_dispatch_timing" in record.message)
+    assert "folder_projection_s=0.200 service_s=0.300 dialog_placement_s=0.400" in message
+
+
+@pytest.mark.asyncio
+async def test_entity_profile_request_duration_is_measured(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    service = make_server()._get_entity_info_service()
+    clock = iter([10.0, 10.6])
+    monkeypatch.setattr("mcp_telegram.daemon_entity_info.time.perf_counter", lambda: next(clock))
+    monkeypatch.setattr(service, "_get_entity_info", AsyncMock(return_value={"ok": True}))
+    with caplog.at_level("INFO", logger="mcp_telegram.daemon_api"):
+        result = await service.get_entity_info({"entity_id": 42})
+    assert result["ok"] is True
+    assert any("entity_profile.request duration_s=0.600" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_daemon_api_logs_request_completion_for_errors(caplog: pytest.LogCaptureFixture) -> None:
     server = make_server()
     line = json.dumps({"method": "unknown_method", "request_id": "abcdef12"}).encode()
