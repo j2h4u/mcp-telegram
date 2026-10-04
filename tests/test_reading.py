@@ -821,8 +821,8 @@ def test_structured_read_surfaces_preserve_nullable_reaction_events_and_read_at(
     from mcp_telegram.tools.unread import _structured_messages
 
     inbox = _structured_messages([row], read_state=None, dialog_type="User")
-    assert inbox[0]["reaction_events"] == listed[0]["reaction_events"]
-    assert inbox[0]["reaction_events_status"] == "partial"
+    assert "reaction_events" not in inbox[0]
+    assert "reaction_events_status" not in inbox[0]
     assert inbox[0]["read_at"] == 1_700_000_200
 
     object_event_row = {
