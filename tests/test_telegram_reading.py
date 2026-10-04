@@ -20,6 +20,7 @@ from telethon.tl import types
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.models import ReadMessage
 from mcp_telegram.reactions.telegram_adapter import TelethonTelegramReactionGateway
+from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
 from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudgetExhaustedError
 from mcp_telegram.telegram_fact_queries import enrich_read_at, persist_read_at, stale_read_at_ids
 from mcp_telegram.telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
@@ -591,7 +592,9 @@ def test_read_receipt_at_exact_ttl_age_is_stale(make_synced_db: Callable[[], sql
 
 def test_read_at_persistence_is_terminal_and_monotonic(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
     conn = make_synced_db()
-    seed_full_history_enrollment(conn, 42, enabled=True)
+    enable_runtime_writes(conn)
+    with write_transaction(conn):
+        seed_full_history_enrollment(conn, 42, enabled=True)
 
     persist_read_at(
         conn,
