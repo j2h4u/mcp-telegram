@@ -3789,6 +3789,85 @@ async def test_list_unread_messages_reports_page_source_total_before_cap() -> No
 
 
 @pytest.mark.asyncio
+async def test_list_unread_messages_exhausts_human_tier_before_bots_and_groups() -> None:
+    conn = _make_db()
+    for dialog_id, entity_type in [(1001, "User"), (1002, "User"), (1003, "Bot"), (1004, "Group")]:
+        _seed_unread_state(conn, dialog_id, read_inbox_max_id=0, entity_type=entity_type, last_event_at=dialog_id)
+        for message_id in range(1, 7):
+            _seed_message(conn, dialog_id, message_id=message_id, sent_at=message_id)
+    server = make_server(conn, _TestClient())
+
+    first = await server._dispatch({"method": "get_inbox", "limit": 5, "messages_per_dialog": 3})
+    groups = _response_groups(first)
+    assert [group["dialog_id"] for group in groups] == [1002, 1001, 1003, 1004]
+    assert [len(_group_messages(group)) for group in groups] == [3, 2, 0, 0]
+    assert [message["message_id"] for message in _group_messages(groups[0])] == [4, 5, 6]
+    assert _response_data(first)["total_message_count"] == 24
+    assert _response_data(first)["page_message_count"] == 24
+
+    second = await server._dispatch({"method": "get_inbox", "limit": 8, "messages_per_dialog": 3})
+    assert [len(_group_messages(group)) for group in _response_groups(second)] == [3, 3, 2, 0]
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_custom_dialog_page_preserves_source_counts() -> None:
+    conn = _make_db()
+    for dialog_id in range(1001, 1006):
+        _seed_unread_state(conn, dialog_id, read_inbox_max_id=0, last_event_at=dialog_id)
+        for message_id in range(1, 5):
+            _seed_message(conn, dialog_id, message_id=message_id)
+    server = make_server(conn, _TestClient())
+    seen: list[int] = []
+    for page, page_source_count, remaining, next_page in [(1, 8, 3, 2), (2, 8, 1, 3), (3, 4, 0, None)]:
+        result = await server._dispatch(
+            {"method": "get_inbox", "page": page, "dialogs_per_page": 2, "messages_per_dialog": 1}
+        )
+        data = _response_data(result)
+        assert data["page_size"] == 2
+        assert data["total_message_count"] == 20
+        assert data["page_message_count"] == page_source_count
+        assert data["remaining_dialog_count"] == remaining
+        assert data["next_page"] == next_page
+        for group in _response_groups(result):
+            assert len(_group_messages(group)) == 1
+            seen.append(cast(int, group["dialog_id"]))
+    assert seen == [1005, 1004, 1003, 1002, 1001]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("limit", "messages_per_dialog", "dialogs_per_page", "expected_page_size", "expected_messages"),
+    [(-10, -10, -10, 1, 1), (500, 500, 1, 1, 20), (500, 500, 500, 20, 100), ("bad", "bad", "bad", 20, 40)],
+)
+async def test_list_unread_messages_clamps_inbox_limits(
+    limit: object,
+    messages_per_dialog: object,
+    dialogs_per_page: object,
+    expected_page_size: int,
+    expected_messages: int,
+) -> None:
+    conn = _make_db()
+    for dialog_id in range(1001, 1022):
+        _seed_unread_state(conn, dialog_id, read_inbox_max_id=0)
+        for message_id in range(1, 22):
+            _seed_message(conn, dialog_id, message_id=message_id)
+    server = make_server(conn, _TestClient())
+    result = await server._dispatch(
+        {
+            "method": "get_inbox",
+            "limit": limit,
+            "messages_per_dialog": messages_per_dialog,
+            "dialogs_per_page": dialogs_per_page,
+        }
+    )
+    assert _response_data(result)["page_size"] == expected_page_size
+    assert sum(len(_group_messages(group)) for group in _response_groups(result)) == expected_messages
+    assert _response_data(result)["total_message_count"] == 441
+    assert _response_data(result)["page_message_count"] == expected_page_size * 21
+    assert _response_data(result)["next_page"] == 2
+
+
+@pytest.mark.asyncio
 async def test_list_unread_messages_dispatch_routing() -> None:
     """_dispatch routes 'list_unread_messages' to _list_unread_messages; empty DB → ok=True."""
     conn = _make_db()

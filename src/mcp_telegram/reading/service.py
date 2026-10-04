@@ -83,11 +83,6 @@ _TRACE_ACRONYM_MIN_LEN = 2
 _TRACE_ACRONYM_MAX_LEN = 4
 _TRACE_FUZZY_MIN_LEN = 4
 _TRACE_FUZZY_SCORE_MIN = 75
-_INBOX_DIALOG_CAP = 20
-
-
-def _inbox_dialog_cap() -> int:
-    return _INBOX_DIALOG_CAP
 
 
 class LoggerLike(Protocol):
@@ -2716,10 +2711,17 @@ class ReadingService:
             return {"ok": False, "error": "invalid_input", "message": str(exc)}
         entries, counts = self._collect_unread_dialogs(group_size_threshold, since_utc, include_dialog_types)
         self._rank_unread_entries(entries)
-        page_data = self._paginate_unread_entries(entries, counts, page)
+        page_data = self._paginate_unread_entries(
+            entries, counts, page, _clamp(_coerce_int(req.get("dialogs_per_page", 20), 20), 1, 20)
+        )
         groups = await self._fetch_unread_groups(
             cast(list[dict], page_data["entries"]),
-            allocate_message_budget_round_robin(cast(dict[int, int], page_data["counts"]), limit),
+            allocate_message_budget_round_robin(
+                cast(dict[int, int], page_data["counts"]),
+                limit,
+                tiers={entry["chat_id"]: entry["tier"] for entry in cast(list[dict], page_data["entries"])},
+                max_per_chat=_clamp(_coerce_int(req.get("messages_per_dialog", 5), 5), 1, 20),
+            ),
             since_utc,
         )
         pending_row = cast(tuple[object] | None, self._conn.execute(_COUNT_READ_POSITION_PENDING_SQL).fetchone())
@@ -2756,8 +2758,9 @@ class ReadingService:
         }
 
     @staticmethod
-    def _paginate_unread_entries(entries: list[dict], counts: dict[int, int], page: int) -> dict[str, object]:
-        page_size = _inbox_dialog_cap()
+    def _paginate_unread_entries(
+        entries: list[dict], counts: dict[int, int], page: int, page_size: int
+    ) -> dict[str, object]:
         total_dialog_count = len(entries)
         page_start = (page - 1) * page_size
         page_entries = entries[page_start : page_start + page_size]

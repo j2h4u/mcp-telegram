@@ -424,6 +424,24 @@ def test_local_helper_cannot_hide_presenter_field_mutation() -> None:
     assert any("canonical field 'sender'" in finding.message for finding in findings)
 
 
+def test_inbox_compact_adapter_only_exempts_bounded_identity_fields() -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _structured_messages(message):\n"
+        "    return _project_inbox_message(project_message_view(message))\n"
+        "def _project_inbox_message(item):\n"
+        "    item['sender'] = {'display_name': 'short', 'telegram_id': 1}\n"
+        "    item['topic'] = {'topic_id': 2}\n"
+        "    item['formatting_text'] = 'full original'\n"
+        "    return item\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert [finding.message for finding in findings] == [
+        "canonical field 'formatting_text' must be owned by project_message_view"
+    ]
+
+
 @pytest.mark.parametrize(
     "source",
     [

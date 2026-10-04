@@ -1195,6 +1195,10 @@ def _canonical_message_view_violations(path: str, tree: ast.AST) -> list[Finding
             self._visit_function(node)
 
         def _record_mutation(self, node: ast.AST, key: str | None) -> None:
+            # Inbox bounds cosmetic identities after the canonical projection;
+            # other presenter fields retain their single rich-message owner.
+            if path == "tools/unread.py" and self.function == "_project_inbox_message" and key in {"sender", "topic"}:
+                return
             if key in CANONICAL_MESSAGE_VIEW_FIELDS:
                 findings.append(
                     Finding(path, _line(node), f"canonical field {key!r} must be owned by project_message_view")

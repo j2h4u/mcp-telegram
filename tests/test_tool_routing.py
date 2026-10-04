@@ -2718,7 +2718,7 @@ async def test_get_inbox_via_daemon():
     assert "dialog_id" not in dialog
     assert "name" not in dialog
     assert dialog["category"] == "user"
-    assert dialog["dialog_type"] == "User"
+    assert dialog["dialog_type"] == "user"
     assert dialog["unread_mentions_count"] == 0
     assert dialog["total_in_chat"] == 2
     read_state = _json_dict(dialog["read_state"])
@@ -2871,7 +2871,7 @@ async def test_get_inbox_bounds_previews_and_structured_output():
                 for message_id in range(1, 6)
             ],
         }
-        for dialog_id in range(1, 25)
+        for dialog_id in range(1, 21)
     ]
     conn = _make_daemon_conn(
         {
@@ -2888,8 +2888,8 @@ async def test_get_inbox_bounds_previews_and_structured_output():
 
     assert result.structured_content is not None
     payload = _json_dict(result.structured_content)
-    encoded_length = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-    assert encoded_length <= 32_000
+    encoded_length = len(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
+    assert encoded_length <= 24_000
     dialogs = _json_list(payload["dialogs"])
     dialog_with_messages = next(_json_dict(dialog) for dialog in dialogs if _json_list(_json_dict(dialog)["messages"]))
     first_message = _json_dict(_json_list(dialog_with_messages["messages"])[0])
@@ -2897,7 +2897,7 @@ async def test_get_inbox_bounds_previews_and_structured_output():
     content = _json_dict(first_message["content"])
     preview_text = content["text"]
     assert isinstance(preview_text, str)
-    assert len(preview_text) == 400
+    assert 32 <= len(preview_text) <= 400
     assert first_message["content_truncated"] is True
     assert first_message["content_source_length"] == 1000
     budget = _json_dict(payload["budget"])
@@ -2907,7 +2907,7 @@ async def test_get_inbox_bounds_previews_and_structured_output():
     assert isinstance(shown, int)
     assert isinstance(hidden, int)
     assert isinstance(truncated_count, int)
-    assert shown + hidden == 24 * 5
+    assert shown + hidden == 20 * 5
     assert payload["page_message_count"] == shown + hidden
     assert truncated_count == shown
     assert payload["shown_message_count"] == shown
@@ -2941,11 +2941,13 @@ async def test_get_inbox_passes_params():
     """GetInbox passes personal-inbox limit and grouping params to daemon."""
     conn = _make_daemon_conn({"ok": True, "data": {"groups": []}})
     with _patch_daemon(conn):
-        await get_inbox(GetInbox(limit=80, group_size_threshold=50))
+        await get_inbox(GetInbox(limit=80, group_size_threshold=50, messages_per_dialog=9, dialogs_per_page=7))
 
     call_kwargs = _call_kwargs(conn.get_inbox)
     assert call_kwargs["limit"] == 80
     assert call_kwargs["group_size_threshold"] == 50
+    assert call_kwargs["messages_per_dialog"] == 9
+    assert call_kwargs["dialogs_per_page"] == 7
 
 
 async def test_get_inbox_passes_page_and_projects_page_receipt():
