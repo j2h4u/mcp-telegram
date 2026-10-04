@@ -478,6 +478,7 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_small() -> N
         (333,),
     )
 
+    server._conn.commit()
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001234567890})
     d = _dict(r["data"])
     assert d["type"] == "channel"
@@ -530,6 +531,7 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_large() -> N
         (111,),
     )
 
+    server._conn.commit()
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1009876543210})
     d = _dict(r["data"])
     assert d["contacts_subscribed_partial"] is True

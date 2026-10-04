@@ -18,6 +18,7 @@ from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
 from mcp_telegram.entity_profile.contracts import UserProfileObservation
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.sync_transactions import write_savepoint
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from tests.helpers import ClientCommonChatsPort
@@ -123,16 +124,19 @@ async def test_scope_is_private_evidence_and_reuse_stops_at_ttl(tmp_path: Path) 
         )["full_profile"]
     )
 
-    conn.execute(
-        "UPDATE entity_profile_refresh_state SET status='pending', next_section='full_profile', acquisition_cursor=0 "
-        "WHERE entity_id=42"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_profile_refresh_state SET status='pending', next_section='full_profile', acquisition_cursor=0 "
+            "WHERE entity_id=42"
+        )
     conn.commit()
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
     assert client.full_user_calls == 1
 
-    conn.execute("UPDATE entity_profile_refresh_state SET status='pending' WHERE entity_id=42")
-    conn.execute("UPDATE entity_profile_refresh_state SET next_section='full_profile' WHERE entity_id=42")
+    with write_savepoint(conn):
+        conn.execute("UPDATE entity_profile_refresh_state SET status='pending' WHERE entity_id=42")
+    with write_savepoint(conn):
+        conn.execute("UPDATE entity_profile_refresh_state SET next_section='full_profile' WHERE entity_id=42")
     conn.commit()
     service._deps = replace(service._deps, now_provider=lambda: 400.0)
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
@@ -152,16 +156,21 @@ async def test_disabled_baseline_scope_reuse_survives_restart_without_pair_recei
 
     service._profiles.mark_pending(42, now=100, pair_mode_override="disabled")
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
-    conn.execute(
-        "UPDATE entity_profile_refresh_state SET next_section='personal_channel', acquisition_cursor=0 "
-        "WHERE entity_id=42"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_profile_refresh_state SET next_section='personal_channel', acquisition_cursor=0 "
+            "WHERE entity_id=42"
+        )
     conn.commit()
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
-    conn.execute("UPDATE entity_detail_sections SET status='fresh', observed_at=100, reason=NULL WHERE entity_id=42")
-    conn.execute(
-        "UPDATE entity_profile_refresh_state SET status='complete', retry_at=NULL, reason=NULL WHERE entity_id=42"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_detail_sections SET status='fresh', observed_at=100, reason=NULL WHERE entity_id=42"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_profile_refresh_state SET status='complete', retry_at=NULL, reason=NULL WHERE entity_id=42"
+        )
     conn.commit()
     before = cast(
         tuple[object, ...] | None,
@@ -221,11 +230,13 @@ async def test_ownership_invalid_cached_profile_admits_refresh_and_offers_demand
     service.bind_demand_sink(sink)
 
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
-    conn.execute(
-        "UPDATE entity_details SET profile_owner_account_id=NULL, profile_observation_scope_json=NULL "
-        "WHERE entity_id=42"
-    )
-    conn.execute("DELETE FROM entity_profile_refresh_state WHERE entity_id=42")
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_details SET profile_owner_account_id=NULL, profile_observation_scope_json=NULL "
+            "WHERE entity_id=42"
+        )
+    with write_savepoint(conn):
+        conn.execute("DELETE FROM entity_profile_refresh_state WHERE entity_id=42")
     conn.commit()
 
     result = service._progressive_cached_result(42, now=100)  # type: ignore[attr-defined]
@@ -252,13 +263,15 @@ async def test_ownership_invalid_cached_profile_preserves_failed_retry_state(tmp
     service.bind_demand_sink(sink)
 
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
-    conn.execute(
-        "UPDATE entity_details SET profile_owner_account_id=NULL, profile_observation_scope_json=NULL "
-        "WHERE entity_id=42"
-    )
-    conn.execute(
-        "UPDATE entity_profile_refresh_state SET status='failed', retry_at=777, reason='flood_wait' WHERE entity_id=42"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_details SET profile_owner_account_id=NULL, profile_observation_scope_json=NULL "
+            "WHERE entity_id=42"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_profile_refresh_state SET status='failed', retry_at=777, reason='flood_wait' WHERE entity_id=42"
+        )
     conn.commit()
     before = cast(
         tuple[object, ...] | None,
@@ -293,20 +306,23 @@ async def test_public_wait_reread_does_not_requeue_flooded_refresh(tmp_path: Pat
     assert coordinator is not None
 
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
-    conn.execute(
-        "UPDATE entity_profile_refresh_state SET status='complete', next_section='personal_channel' WHERE entity_id=42"
-    )
-    conn.execute(
-        "UPDATE entity_detail_sections SET acquisition_generation=NULL, acquisition_outcome=NULL, "
-        "provenance_json=NULL, normalization_version=NULL, observation_started_at=NULL, "
-        "observation_completed_at=NULL, acquisition_identity_json=NULL, observed_at=0 "
-        "WHERE entity_id=42 AND section IN ('full_profile', 'personal_channel')"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_profile_refresh_state SET status='complete', next_section='personal_channel' WHERE entity_id=42"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_detail_sections SET acquisition_generation=NULL, acquisition_outcome=NULL, "
+            "provenance_json=NULL, normalization_version=NULL, observation_started_at=NULL, "
+            "observation_completed_at=NULL, acquisition_identity_json=NULL, observed_at=0 "
+            "WHERE entity_id=42 AND section IN ('full_profile', 'personal_channel')"
+        )
     service._profiles.mark_pending(42, now=100)  # type: ignore[attr-defined]
-    conn.execute(
-        "UPDATE entity_details SET profile_owner_account_id=NULL, profile_observation_scope_json=NULL "
-        "WHERE entity_id=42"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_details SET profile_owner_account_id=NULL, profile_observation_scope_json=NULL "
+            "WHERE entity_id=42"
+        )
     conn.commit()
 
     class RecoveryClient(_PairClient):
@@ -399,9 +415,10 @@ async def test_auth_scope_change_starts_new_generation_and_keeps_old_facts(tmp_p
         conn.execute("SELECT generation FROM entity_profile_refresh_state WHERE entity_id=42").fetchone(),
     )
     generation = generation_row[0]
-    conn.execute(
-        "UPDATE entity_profile_refresh_state SET status='complete', next_section='personal_channel' WHERE entity_id=42"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_profile_refresh_state SET status='complete', next_section='personal_channel' WHERE entity_id=42"
+        )
     conn.commit()
     service.auth_scope_changed()  # type: ignore[attr-defined]
     assert conn.execute(

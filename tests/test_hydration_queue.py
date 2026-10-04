@@ -16,6 +16,7 @@ from mcp_telegram.hydration_queue import (
     HydrationQueueKindSnapshot,
     HydrationQueueRepository,
 )
+from mcp_telegram.sync_transactions import enable_runtime_writes, write_savepoint, write_transaction
 
 
 def _make_db() -> sqlite3.Connection:
@@ -43,6 +44,7 @@ def _make_db() -> sqlite3.Connection:
 @pytest.fixture
 def db() -> Iterator[sqlite3.Connection]:
     conn = _make_db()
+    enable_runtime_writes(conn)
     try:
         yield conn
     finally:
@@ -72,15 +74,19 @@ def _job(  # noqa: PLR0913
 def test_enqueue_is_idempotent_moves_due_time_earlier_and_preserves_attempts(db: sqlite3.Connection) -> None:
     conn = db
     repository = HydrationQueueRepository(conn)
-    repository.enqueue(_job("media", -100, 7, 400))
-    started = repository.start(_job("media", -100, 7, 400))
+    with write_savepoint(db):
+        repository.enqueue(_job("media", -100, 7, 400))
+    with write_savepoint(db):
+        started = repository.start(_job("media", -100, 7, 400))
     assert started == _job("media", -100, 7, 400, attempts=1)
 
-    repository.enqueue(_job("media", -100, 7, 300, attempts=99))
+    with write_savepoint(db):
+        repository.enqueue(_job("media", -100, 7, 300, attempts=99))
     assert repository.due_jobs(299, 10) == []
     assert repository.due_jobs(300, 10) == [_job("media", -100, 7, 300, attempts=1)]
 
-    repository.enqueue(_job("media", -100, 7, 500, attempts=99))
+    with write_savepoint(db):
+        repository.enqueue(_job("media", -100, 7, 500, attempts=99))
     assert repository.due_jobs(499, 10) == [_job("media", -100, 7, 300, attempts=1)]
 
 
@@ -94,7 +100,8 @@ def test_due_jobs_are_deterministically_ordered_and_limited(db: sqlite3.Connecti
         _job("a", 1, 2, 9),
         _job("future", 1, 1, 11),
     ):
-        repository.enqueue(job)
+        with write_savepoint(db):
+            repository.enqueue(job)
 
     assert repository.due_jobs(10, 3) == [
         _job("a", 1, 2, 9),
@@ -113,7 +120,8 @@ def test_due_jobs_prioritize_foreground_then_newest_message(db: sqlite3.Connecti
         _job("media", 3, 1, 1, message_sent_at=50),
     ]
     for job in jobs:
-        repository.enqueue(job)
+        with write_savepoint(db):
+            repository.enqueue(job)
 
     assert repository.due_jobs(1, 10) == [jobs[2], jobs[3], jobs[1], jobs[0]]
 
@@ -123,7 +131,8 @@ def test_priority_specific_limit_keeps_backfill_visible(db: sqlite3.Connection) 
     foreground = _job("media", 1, 1, 1, message_sent_at=300)
     backfill = _job("media", 1, 2, 1, message_sent_at=100, priority=HydrationPriority.BACKFILL)
     for job in (foreground, backfill):
-        repository.enqueue(job)
+        with write_savepoint(db):
+            repository.enqueue(job)
 
     assert repository.due_jobs(1, 1, priority=HydrationPriority.FOREGROUND) == [foreground]
     assert repository.due_jobs(1, 1, priority=HydrationPriority.BACKFILL) == [backfill]
@@ -131,11 +140,15 @@ def test_priority_specific_limit_keeps_backfill_visible(db: sqlite3.Connection) 
 
 def test_snapshot_distinguishes_active_ready_priority_and_terminal_jobs(db: sqlite3.Connection) -> None:
     repository = HydrationQueueRepository(db)
-    repository.enqueue(_job("media", 1, 1, 90, attempts=2, message_sent_at=40, priority=HydrationPriority.BACKFILL))
-    repository.enqueue(_job("media", 1, 2, 110, attempts=1, message_sent_at=80))
+    with write_savepoint(db):
+        repository.enqueue(_job("media", 1, 1, 90, attempts=2, message_sent_at=40, priority=HydrationPriority.BACKFILL))
+    with write_savepoint(db):
+        repository.enqueue(_job("media", 1, 2, 110, attempts=1, message_sent_at=80))
     terminal = _job("media", 1, 3, 50, attempts=4, message_sent_at=20)
-    repository.enqueue(terminal)
-    assert repository.mark_terminal(terminal)
+    with write_savepoint(db):
+        repository.enqueue(terminal)
+    with write_savepoint(db):
+        assert repository.mark_terminal(terminal)
 
     assert repository.snapshot(100) == (
         HydrationQueueKindSnapshot(
@@ -155,23 +168,30 @@ def test_snapshot_distinguishes_active_ready_priority_and_terminal_jobs(db: sqli
 def test_enqueue_promotes_existing_backfill_without_resetting_attempts(db: sqlite3.Connection) -> None:
     repository = HydrationQueueRepository(db)
     backfill = _job("media", 1, 1, 100, priority=HydrationPriority.BACKFILL)
-    repository.enqueue(backfill)
-    started = repository.start(backfill)
+    with write_savepoint(db):
+        repository.enqueue(backfill)
+    with write_savepoint(db):
+        started = repository.start(backfill)
     assert started is not None and started.attempts == 1
 
-    repository.enqueue(_job("media", 1, 1, 50))
+    with write_savepoint(db):
+        repository.enqueue(_job("media", 1, 1, 50))
     assert repository.due_jobs(50, 10) == [_job("media", 1, 1, 50, attempts=1)]
 
-    repository.enqueue(_job("media", 1, 1, 25, priority=HydrationPriority.BACKFILL))
+    with write_savepoint(db):
+        repository.enqueue(_job("media", 1, 1, 25, priority=HydrationPriority.BACKFILL))
     assert repository.due_jobs(25, 10) == [_job("media", 1, 1, 25, attempts=1)]
 
 
 def test_terminal_job_is_suppressed_and_enqueue_preserves_state(db: sqlite3.Connection) -> None:
     repository = HydrationQueueRepository(db)
     job = _job(TRANSCRIPTION_HYDRATION_KIND, 1, 1, 100, attempts=2)
-    repository.enqueue(job)
-    assert repository.mark_terminal(job)
-    repository.enqueue(_job(TRANSCRIPTION_HYDRATION_KIND, 1, 1, 1, attempts=99))
+    with write_savepoint(db):
+        repository.enqueue(job)
+    with write_savepoint(db):
+        assert repository.mark_terminal(job)
+    with write_savepoint(db):
+        repository.enqueue(_job(TRANSCRIPTION_HYDRATION_KIND, 1, 1, 1, attempts=99))
     assert repository.due_jobs(100, 10) == []
     assert db.execute("SELECT due_at, attempts, terminal FROM hydration_jobs").fetchone() == (1, 2, 1)
 
@@ -180,33 +200,43 @@ def test_start_increments_attempts_atomically_and_missing_job_returns_none(db: s
     conn = db
     repository = HydrationQueueRepository(conn)
     queued = _job("read", 42, 8, 500, attempts=3)
-    repository.enqueue(queued)
+    with write_savepoint(db):
+        repository.enqueue(queued)
 
-    assert repository.start(queued) == _job("read", 42, 8, 500, attempts=4)
-    assert repository.start(_job("missing", 42, 8, 500)) is None
+    with write_savepoint(db):
+        assert repository.start(queued) == _job("read", 42, 8, 500, attempts=4)
+    with write_savepoint(db):
+        assert repository.start(_job("missing", 42, 8, 500)) is None
 
 
 def test_reschedule_and_remove_only_touch_existing_identity(db: sqlite3.Connection) -> None:
     conn = db
     repository = HydrationQueueRepository(conn)
     queued = _job("media", 42, 9, 100)
-    repository.enqueue(queued)
+    with write_savepoint(db):
+        repository.enqueue(queued)
 
-    assert repository.reschedule(queued, 900)
+    with write_savepoint(db):
+        assert repository.reschedule(queued, 900)
     assert repository.due_jobs(899, 10) == []
     assert repository.due_jobs(900, 10) == [_job("media", 42, 9, 900)]
-    assert repository.remove(queued)
+    with write_savepoint(db):
+        assert repository.remove(queued)
     assert repository.due_jobs(1_000, 10) == []
-    assert not repository.remove(queued)
+    with write_savepoint(db):
+        assert not repository.remove(queued)
 
 
 def test_summarize_for_dialog_includes_future_jobs_and_bounds_message_ids(db: sqlite3.Connection) -> None:
     repository = HydrationQueueRepository(db)
     for message_id in range(1, 41):
-        repository.enqueue(_job(MEDIA_METADATA_KIND, 42, message_id, 9_999, attempts=message_id % 4))
+        with write_savepoint(db):
+            repository.enqueue(_job(MEDIA_METADATA_KIND, 42, message_id, 9_999, attempts=message_id % 4))
     for message_id in (1, 2):
-        repository.enqueue(_job(TRANSCRIPTION_HYDRATION_KIND, 42, message_id, 9_999, attempts=7))
-    repository.enqueue(_job(MEDIA_METADATA_KIND, 99, 1, 9_999, attempts=99))
+        with write_savepoint(db):
+            repository.enqueue(_job(TRANSCRIPTION_HYDRATION_KIND, 42, message_id, 9_999, attempts=7))
+    with write_savepoint(db):
+        repository.enqueue(_job(MEDIA_METADATA_KIND, 99, 1, 9_999, attempts=99))
 
     statements: list[str] = []
     db.set_trace_callback(statements.append)
@@ -245,10 +275,12 @@ def test_summarize_for_dialog_includes_future_jobs_and_bounds_message_ids(db: sq
 def test_repository_never_commits_callers_transaction(db: sqlite3.Connection) -> None:
     conn = db
     repository = HydrationQueueRepository(conn)
-    conn.execute("BEGIN")
-    repository.enqueue(_job("media", 42, 1, 100))
-    assert conn.in_transaction
-    conn.rollback()
+    with pytest.raises(ValueError, match="rollback"):
+        with write_transaction(conn):
+            with write_savepoint(db):
+                repository.enqueue(_job("media", 42, 1, 100))
+            assert conn.in_transaction
+            raise ValueError("rollback")
     assert repository.due_jobs(100, 10) == []
 
 

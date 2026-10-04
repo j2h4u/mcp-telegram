@@ -22,6 +22,7 @@ from ..dialog_identity_contracts import DialogIdentityObservation
 from ..entity_store import EntitySnapshot, ensure_entity_stub, upsert_entity_snapshots
 from ..models import DialogType
 from ..resolver import latinize
+from ..sync_transactions import require_write_transaction, write_savepoint
 from .contracts import (
     FULL_PROFILE_OWNED_FIELDS,
     FULL_USER_ENDPOINT,
@@ -38,6 +39,10 @@ _SECTION_STATUSES = {"fresh", "stale", "pending", "unavailable", "not_applicable
 
 def _is_nonnegative_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+class _CoreAcquisitionRejectedError(Exception):
+    """Rollback a rejected core CAS without disturbing its caller's write unit."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,7 +201,7 @@ class EntityProfileRepository:
         """Reuse both positive pair receipts without renewing their age."""
         if cursor.next_section != "full_profile":
             return False
-        with self._conn:
+        with write_savepoint(self._conn):
             if not self._cursor_matches(cursor):
                 return False
             if not all(
@@ -351,7 +356,7 @@ class EntityProfileRepository:
             return False
         if identity is None:
             return False
-        with self._conn:
+        with write_savepoint(self._conn):
             if not self._cursor_matches(cursor):
                 return False
             personal_receipt = self._parse_validated_receipt(
@@ -518,7 +523,7 @@ class EntityProfileRepository:
         entity_id = detail.get("id")
         if not isinstance(entity_id, int):
             return
-        with self._conn:
+        with write_savepoint(self._conn):
             canonical = self._read_entity_stub(entity_id)
             identity = _apply_identity_patch(canonical or {"id": entity_id}, detail, allow_deletions=False)
             upsert_entity_snapshots(
@@ -543,10 +548,11 @@ class EntityProfileRepository:
         """Ratchet a legacy group's canonical creation time when the table exists."""
         if created is None or not {"dialog_id", "created"} <= self._columns("dialogs"):
             return
-        self._conn.execute(
-            "UPDATE dialogs SET created=? WHERE dialog_id=? AND created IS NULL",
-            (created, entity_id),
-        )
+        with write_savepoint(self._conn):
+            self._conn.execute(
+                "UPDATE dialogs SET created=? WHERE dialog_id=? AND created IS NULL",
+                (created, entity_id),
+            )
 
     def commit_core_acquisition(  # noqa: PLR0913
         self,
@@ -564,57 +570,59 @@ class EntityProfileRepository:
         entity_id = core.get("id")
         if not isinstance(entity_id, int) or entity_id != cursor.entity_id:
             return False
-        with self._conn:
-            if not self._cursor_matches(cursor):
-                return False
-            canonical = self._read_entity_stub(entity_id)
-            identity = _apply_identity_patch(canonical or {"id": entity_id}, core, allow_deletions=False)
-            upsert_entity_snapshots(
-                self._conn,
-                [
-                    EntitySnapshot(
-                        entity_id=entity_id,
-                        entity_type=str(identity.get("type", "unknown")),
-                        name=_optional_text(identity.get("name")),
-                        username=_optional_text(identity.get("username")),
-                        name_normalized=_identity_name_normalized(canonical, identity),
-                        updated_at=now,
-                    )
-                ],
-            )
-            detail_revision = cursor.profile_revision
-            if self._detail_has("profile_revision"):
-                detail_exists = self._conn.execute(
-                    "SELECT 1 FROM entity_details WHERE entity_id=?", (entity_id,)
-                ).fetchone()
-                if detail_exists is not None:
-                    self._conn.execute(
-                        "UPDATE entity_details SET profile_revision=profile_revision+1 WHERE entity_id=?",
-                        (entity_id,),
-                    )
-                    detail_revision = self._profile_revision(entity_id)
-                else:
-                    # The core RPC establishes canonical identity while the
-                    # next section owns the first detail insert.  Advance the
-                    # refresh fence through the cursor CAS below.
-                    detail_revision = cursor.profile_revision + 1
-            self._publish_dialog_identity(dialog_identity_observation, dialog_identity_baseline_revision)
-            predicate, parameters = self._cursor_predicate(cursor)
-            assignments = (
-                "status='pending', retry_at=NULL, reason='refresh_in_progress', updated_at=?, acquisition_cursor=?"
-            )
-            values: tuple[object, ...] = (now, next_acquisition_cursor)
-            if self._refresh_has("profile_revision"):
-                assignments += ", profile_revision=?"
-                values += (detail_revision,)
-            changed = self._conn.execute(
-                "UPDATE entity_profile_refresh_state SET " + assignments + " WHERE " + predicate,
-                (*values, *parameters),
-            ).rowcount
-            if changed != 1:
-                self._conn.rollback()
-                return False
-            return True
+        try:
+            with write_savepoint(self._conn):
+                if not self._cursor_matches(cursor):
+                    return False
+                canonical = self._read_entity_stub(entity_id)
+                identity = _apply_identity_patch(canonical, core, allow_deletions=False)
+                upsert_entity_snapshots(
+                    self._conn,
+                    [
+                        EntitySnapshot(
+                            entity_id=entity_id,
+                            entity_type=str(identity.get("type", "unknown")),
+                            name=_optional_text(identity.get("name")),
+                            username=_optional_text(identity.get("username")),
+                            name_normalized=_identity_name_normalized(canonical, identity),
+                            updated_at=now,
+                        )
+                    ],
+                )
+                detail_revision = cursor.profile_revision
+                if self._detail_has("profile_revision"):
+                    detail_exists = self._conn.execute(
+                        "SELECT 1 FROM entity_details WHERE entity_id=?", (entity_id,)
+                    ).fetchone()
+                    if detail_exists is not None:
+                        self._conn.execute(
+                            "UPDATE entity_details SET profile_revision=profile_revision+1 WHERE entity_id=?",
+                            (entity_id,),
+                        )
+                        detail_revision = self._profile_revision(entity_id)
+                    else:
+                        # The core RPC establishes canonical identity while the
+                        # next section owns the first detail insert.  Advance the
+                        # refresh fence through the cursor CAS below.
+                        detail_revision = cursor.profile_revision + 1
+                self._publish_dialog_identity(dialog_identity_observation, dialog_identity_baseline_revision)
+                predicate, parameters = self._cursor_predicate(cursor)
+                assignments = (
+                    "status='pending', retry_at=NULL, reason='refresh_in_progress', updated_at=?, acquisition_cursor=?"
+                )
+                values: tuple[object, ...] = (now, next_acquisition_cursor)
+                if self._refresh_has("profile_revision"):
+                    assignments += ", profile_revision=?"
+                    values += (detail_revision,)
+                changed = self._conn.execute(
+                    "UPDATE entity_profile_refresh_state SET " + assignments + " WHERE " + predicate,
+                    (*values, *parameters),
+                ).rowcount
+                if changed != 1:
+                    raise _CoreAcquisitionRejectedError
+                return True
+        except _CoreAcquisitionRejectedError:
+            return False
 
     def ensure_unknown_refresh_parent(self, entity_id: int, *, now: int) -> bool:
         """Create an unknown entity parent before FK-protected refresh rows."""
@@ -622,7 +630,7 @@ class EntityProfileRepository:
             foreign_keys = self._conn.execute("PRAGMA foreign_keys").fetchone()
             if foreign_keys is None or int(foreign_keys[0]) != 1:
                 return True
-            with self._conn:
+            with write_savepoint(self._conn):
                 ensure_entity_stub(
                     self._conn,
                     EntitySnapshot(entity_id, "unknown", None, None, None, now),
@@ -679,7 +687,7 @@ class EntityProfileRepository:
     ) -> None:
         """Make pending explicit where the additive section table is present."""
         try:
-            with self._conn:
+            with write_savepoint(self._conn):
                 new_generation = self._upsert_pending_refresh(
                     entity_id,
                     now=now,
@@ -718,7 +726,7 @@ class EntityProfileRepository:
     ) -> None:
         """Clear rejection state and restore an honest queued reason."""
         try:
-            with self._conn:
+            with write_savepoint(self._conn):
                 new_generation = self._upsert_pending_refresh(
                     entity_id,
                     now=self._database_now(),
@@ -743,6 +751,7 @@ class EntityProfileRepository:
         pair_eligible_override: bool | None = None,
         pair_mode_override: str | None = None,
     ) -> bool:
+        require_write_transaction(self._conn)
         if not self._refresh_has("generation"):
             self._upsert_legacy_pending_refresh(entity_id, now=now, reason=reason)
             return True
@@ -845,6 +854,7 @@ class EntityProfileRepository:
         }
 
     def _upsert_legacy_pending_refresh(self, entity_id: int, *, now: int, reason: str) -> None:
+        require_write_transaction(self._conn)
         self._conn.execute(
             """
             INSERT INTO entity_profile_refresh_state(
@@ -884,6 +894,7 @@ class EntityProfileRepository:
         return 0
 
     def _bump_identity_fence(self, entity_id: int) -> int | None:
+        require_write_transaction(self._conn)
         if self._detail_has("profile_revision"):
             changed = self._conn.execute(
                 "UPDATE entity_details SET profile_revision=profile_revision+1 WHERE entity_id=?",
@@ -904,6 +915,7 @@ class EntityProfileRepository:
         return None
 
     def _carry_active_refresh_revision(self, entity_id: int, revision: int) -> None:
+        require_write_transaction(self._conn)
         if self._refresh_has("profile_revision"):
             self._conn.execute(
                 "UPDATE entity_profile_refresh_state SET profile_revision=? "
@@ -1006,7 +1018,7 @@ class EntityProfileRepository:
         }
         if not required <= self._columns("entity_profile_refresh_state"):
             return
-        with self._conn:
+        with write_savepoint(self._conn):
             self._conn.execute(
                 "UPDATE entity_profile_refresh_state SET pair_measurement_complete=1, "
                 "pair_ready_at=COALESCE(pair_ready_at, ?), "
@@ -1029,7 +1041,7 @@ class EntityProfileRepository:
             raise ValueError("pair mode must be enabled or disabled")
         if not self._refresh_has("pair_mode"):
             return mode
-        with self._conn:
+        with write_savepoint(self._conn):
             row = self._conn.execute(
                 "SELECT pair_mode FROM entity_profile_refresh_state WHERE entity_id=? AND generation=?",
                 (cursor.entity_id, cursor.generation),
@@ -1053,7 +1065,7 @@ class EntityProfileRepository:
         actual_attempts: int,
     ) -> None:
         """Durably attribute dispatched pair requests, including retries."""
-        with self._conn:
+        with write_savepoint(self._conn):
             self._record_pair_attempt_in_transaction(
                 cursor,
                 section,
@@ -1068,6 +1080,7 @@ class EntityProfileRepository:
         actual_attempts: int,
     ) -> None:
         """Attribute a pair request while an outer transaction is active."""
+        require_write_transaction(self._conn)
         if section not in {"full_profile", "personal_channel"} or actual_attempts <= 0:
             return
         if not isinstance(actual_attempts, int) or isinstance(actual_attempts, bool):
@@ -1139,7 +1152,7 @@ class EntityProfileRepository:
         }
         if not required <= self._columns("entity_profile_refresh_state"):
             return None
-        with self._conn:
+        with write_savepoint(self._conn):
             return self._record_pair_section_outcome_in_transaction(
                 cursor,
                 section,
@@ -1153,6 +1166,7 @@ class EntityProfileRepository:
         measurement: _PairMeasurement,
     ) -> dict[str, object] | None:
         """Record one pair outcome while an outer transaction is active."""
+        require_write_transaction(self._conn)
         state = self._pair_outcome_state(cursor)
         if state is None:
             return None
@@ -1186,6 +1200,7 @@ class EntityProfileRepository:
         return mode, state[1]
 
     def _pair_outcome_summary(self, context: _PairSummaryContext) -> dict[str, object] | None:
+        require_write_transaction(self._conn)
         cursor = context.cursor
         section = context.section
         mode = context.mode
@@ -1224,7 +1239,7 @@ class EntityProfileRepository:
         """Commit one section outcome and its next cursor in one transaction."""
         if commit.status not in {"fresh", "unavailable", "not_applicable"}:
             raise ValueError("invalid terminal section status")
-        with self._conn:
+        with write_savepoint(self._conn):
             return self._commit_section_in_transaction(cursor, commit, now=now)
 
     def commit_section_with_pair_measurement(
@@ -1253,7 +1268,7 @@ class EntityProfileRepository:
         }
         if not required <= self._columns("entity_profile_refresh_state"):
             return self.commit_section(cursor, commit, now=now), None
-        with self._conn:
+        with write_savepoint(self._conn):
             committed = self._commit_section_in_transaction(cursor, commit, now=now)
             if not committed:
                 return False, None
@@ -1332,6 +1347,7 @@ class EntityProfileRepository:
         now: int,
         detail_revision: int | None,
     ) -> int:
+        require_write_transaction(self._conn)
         if self._refresh_has("generation"):
             if self._refresh_follow_up_required(cursor):
                 return self._start_follow_up_generation(cursor, now=now, profile_revision=detail_revision)
@@ -1356,6 +1372,7 @@ class EntityProfileRepository:
         now: int,
         detail_revision: int | None,
     ) -> int:
+        require_write_transaction(self._conn)
         predicate, parameters = self._cursor_predicate(cursor)
         revision_assignment = ", profile_revision=?" if detail_revision is not None else ""
         revision_value = (detail_revision,) if detail_revision is not None else ()
@@ -1430,6 +1447,7 @@ class EntityProfileRepository:
         now: int,
         expected_revision: int,
     ) -> bool:
+        require_write_transaction(self._conn)
         entity_id = detail.entity_id
         encoded_detail = detail.encoded
         metadata_columns = detail.metadata_columns
@@ -1473,6 +1491,7 @@ class EntityProfileRepository:
         *,
         now: int,
     ) -> bool:
+        require_write_transaction(self._conn)
         columns = ("entity_id", "detail_json", "fetched_at", *metadata_columns)
         values = (entity_id, encoded_detail, now, *metadata_values)
         updates = "detail_json=excluded.detail_json, fetched_at=excluded.fetched_at"
@@ -1496,6 +1515,7 @@ class EntityProfileRepository:
         now: int,
         evidence: ProfileAcquisitionEvidence | None,
     ) -> bool:
+        require_write_transaction(self._conn)
         observed_at = self._section_observed_at(entity_id, section, status, evidence, now=now)
         columns = ["entity_id", "section", "status", "observed_at", "reason", "payload_json", "retry_at"]
         values: list[object] = [entity_id, section, status, observed_at, reason, _encode_payload(payload), None]
@@ -1581,7 +1601,7 @@ class EntityProfileRepository:
         if cursor.next_section != "full_profile":
             return False
         self._validate_pair_commits(cursor, full_profile, personal_channel)
-        with self._conn:
+        with write_savepoint(self._conn):
             if not self._cursor_matches(cursor):
                 return False
             detail = self._pair_detail(cursor, full_profile, personal_channel, now=now)
@@ -1604,7 +1624,7 @@ class EntityProfileRepository:
         if cursor.next_section != "full_profile":
             return False
         self._validate_group_pair_commits(cursor, full_profile, contact_overlap)
-        with self._conn:
+        with write_savepoint(self._conn):
             if not self._cursor_matches(cursor):
                 return False
             detail = self._group_pair_detail(cursor, full_profile, contact_overlap, now=now)
@@ -1708,6 +1728,7 @@ class EntityProfileRepository:
                 raise ValueError("legacy group evidence generation does not match refresh cursor")
 
     def _advance_group_full_chat_cursor(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
+        require_write_transaction(self._conn)
         predicate, parameters = self._cursor_predicate(cursor)
         assignments = (
             "status='pending', retry_at=NULL, reason='refresh_queued', updated_at=?, "
@@ -1789,6 +1810,7 @@ class EntityProfileRepository:
         *,
         now: int,
     ) -> None:
+        require_write_transaction(self._conn)
         required = {
             "pair_mode",
             "pair_eligible",
@@ -1820,6 +1842,7 @@ class EntityProfileRepository:
         )
 
     def _advance_full_pair_cursor(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
+        require_write_transaction(self._conn)
         predicate, parameters = self._cursor_predicate(cursor)
         assignments = (
             "status='pending', retry_at=NULL, reason='refresh_queued', updated_at=?, "
@@ -1839,7 +1862,7 @@ class EntityProfileRepository:
         """Record a new freshness demand without losing the active generation."""
         if not self._refresh_has("follow_up_required"):
             return False
-        with self._conn:
+        with write_savepoint(self._conn):
             changed = self._conn.execute(
                 "UPDATE entity_profile_refresh_state SET follow_up_required=1, updated_at=? "
                 "WHERE entity_id=? AND status IN ('pending', 'failed')",
@@ -1887,6 +1910,7 @@ class EntityProfileRepository:
         now: int,
         profile_revision: int | None = None,
     ) -> int:
+        require_write_transaction(self._conn)
         predicate, parameters = self._cursor_predicate(cursor)
         revision_assignment = ""
         revision_value: tuple[object, ...] = ()
@@ -1916,6 +1940,7 @@ class EntityProfileRepository:
         return changed
 
     def _reset_pair_measurement(self, entity_id: int) -> None:
+        require_write_transaction(self._conn)
         columns = self._columns("entity_profile_refresh_state")
         assignments: list[str] = []
         assignments.extend(
@@ -1949,6 +1974,7 @@ class EntityProfileRepository:
             )
 
     def _advance_completed_section(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
+        require_write_transaction(self._conn)
         next_section = _next_profile_section(cursor.next_section)
         if next_section is None and self._refresh_has("generation") and self._refresh_follow_up_required(cursor):
             return self._start_follow_up_generation(cursor, now=now) == 1
@@ -1995,7 +2021,7 @@ class EntityProfileRepository:
     def mark_refresh_rejected(self, entity_id: int, *, now: int, reason: str = "refresh_rejected") -> None:
         """Persist queue rejection without claiming that work was queued."""
         try:
-            with self._conn:
+            with write_savepoint(self._conn):
                 self._conn.execute(
                     "INSERT INTO entity_profile_refresh_state(entity_id, status, retry_at, reason, updated_at) "
                     "VALUES (?, 'rejected', NULL, ?, ?) ON CONFLICT(entity_id) DO UPDATE SET status=excluded.status, "
@@ -2028,7 +2054,7 @@ class EntityProfileRepository:
         retry_at: int,
     ) -> bool:
         """Atomically defer only the section owned by the current durable cursor."""
-        with self._conn:
+        with write_savepoint(self._conn):
             predicate, parameters = self._cursor_predicate(cursor)
             changed = self._conn.execute(
                 "UPDATE entity_profile_refresh_state SET status='failed', retry_at=?, reason=?, updated_at=? "
@@ -2060,22 +2086,22 @@ class EntityProfileRepository:
     ) -> None:
         """Record failure while preserving payload and its last successful timestamp."""
         try:
-            try:
+            with write_savepoint(self._conn):
+                try:
+                    self._conn.execute(
+                        "INSERT INTO entity_profile_refresh_state(entity_id, status, retry_at, reason, updated_at) "
+                        "VALUES (?, 'failed', ?, ?, ?) ON CONFLICT(entity_id) DO UPDATE SET status=excluded.status, "
+                        "retry_at=excluded.retry_at, reason=excluded.reason, updated_at=excluded.updated_at",
+                        (entity_id, retry_at, reason, now),
+                    )
+                except sqlite3.OperationalError:
+                    pass
                 self._conn.execute(
-                    "INSERT INTO entity_profile_refresh_state(entity_id, status, retry_at, reason, updated_at) "
-                    "VALUES (?, 'failed', ?, ?, ?) ON CONFLICT(entity_id) DO UPDATE SET status=excluded.status, "
-                    "retry_at=excluded.retry_at, reason=excluded.reason, updated_at=excluded.updated_at",
-                    (entity_id, retry_at, reason, now),
+                    "UPDATE entity_detail_sections SET status=CASE WHEN observed_at IS NULL "
+                    "THEN 'unavailable' ELSE 'stale' END, reason=?, retry_at=? "
+                    "WHERE entity_id=? AND status <> 'not_applicable'",
+                    (reason, retry_at, entity_id),
                 )
-            except sqlite3.OperationalError:
-                pass
-            self._conn.execute(
-                "UPDATE entity_detail_sections SET status=CASE WHEN observed_at IS NULL "
-                "THEN 'unavailable' ELSE 'stale' END, reason=?, retry_at=? "
-                "WHERE entity_id=? AND status <> 'not_applicable'",
-                (reason, retry_at, entity_id),
-            )
-            self._conn.commit()
         except sqlite3.OperationalError:
             return
 

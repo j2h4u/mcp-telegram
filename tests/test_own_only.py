@@ -11,6 +11,7 @@ from mcp_telegram.own_only import (
     query_own_only_candidates,
 )
 from mcp_telegram.own_only_contracts import OwnOnlyContext
+from mcp_telegram.sync_transactions import write_savepoint, write_transaction
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
@@ -103,22 +104,26 @@ def test_candidate_query_keeps_rights_classification_out_of_sql() -> None:
                 updated_at INTEGER NOT NULL
             ) WITHOUT ROWID"""
         )
-        conn.executemany(
-            "INSERT INTO dialogs(dialog_id,name,type,linked_chat_id,last_message_at,hidden) VALUES (?, ?, ?, ?, ?, ?)",
-            [
-                (1, "dm", "user", None, 10, 0),
-                (-1000000009001, "channel", "channel", -1000000008001, 20, 0),
-                (-1000000008001, "discussion", "forum", None, 30, 0),
-                (-1000000007001, "other", "supergroup", None, 40, 0),
-                (-1000000006001, "lost", "channel", None, 50, 1),
-            ],
-        )
-        conn.execute("INSERT INTO entities VALUES (1,'bot','Stale profile name','stale_bot')")
-        conn.execute(
-            "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'access_lost')",
-            (-1000000006001,),
-        )
-        seed_full_history_enrollment(conn, -1000000006001, enabled=False)
+        with write_savepoint(conn):
+            conn.executemany(
+                "INSERT INTO dialogs(dialog_id,name,type,linked_chat_id,last_message_at,hidden) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (1, "dm", "user", None, 10, 0),
+                    (-1000000009001, "channel", "channel", -1000000008001, 20, 0),
+                    (-1000000008001, "discussion", "forum", None, 30, 0),
+                    (-1000000007001, "other", "supergroup", None, 40, 0),
+                    (-1000000006001, "lost", "channel", None, 50, 1),
+                ],
+            )
+        with write_savepoint(conn):
+            conn.execute("INSERT INTO entities VALUES (1,'bot','Stale profile name','stale_bot')")
+        with write_savepoint(conn):
+            conn.execute(
+                "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'access_lost')",
+                (-1000000006001,),
+            )
+        with write_savepoint(conn):
+            seed_full_history_enrollment(conn, -1000000006001, enabled=False)
         candidates = query_own_only_candidates(conn, personal_channel_id=9001)
         assert [row["dialog_id"] for row in candidates] == [
             -1000000009001,
@@ -138,14 +143,15 @@ def test_sync_enrollment_respects_outer_transaction_rollback() -> None:
         conn.execute("CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT)")
         conn.execute("CREATE TABLE messages (message_id INTEGER PRIMARY KEY, media_kind TEXT)")
 
-        conn.execute("BEGIN")
         try:
-            conn.execute("INSERT INTO messages (message_id) VALUES (7)")
-            enroll_own_only_sync_dialog(conn, 42)
-            raise RuntimeError("batch failed")
+            with write_transaction(conn):
+                with write_savepoint(conn):
+                    conn.execute("INSERT INTO messages (message_id) VALUES (7)")
+                with write_savepoint(conn):
+                    enroll_own_only_sync_dialog(conn, 42)
+                raise RuntimeError("batch failed")
         except RuntimeError as exc:
             assert str(exc) == "batch failed"
-            conn.rollback()
 
         assert conn.execute("SELECT COUNT(*) FROM messages").fetchone() == (0,)
         assert conn.execute("SELECT COUNT(*) FROM synced_dialogs").fetchone() == (0,)

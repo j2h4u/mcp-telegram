@@ -38,6 +38,7 @@ from mcp_telegram.dialog_identity import capture_identity_baseline, publish_dial
 from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.sync_transactions import write_transaction
 
 
 def _dialog(peer_id: int, message_id: int) -> types.Dialog:
@@ -439,7 +440,8 @@ class _RealtimePinClient(_FakeClient):
             self._published = True
             conn = _open_sync_db(self._db_path)
             try:
-                with conn:
+                conn.commit()
+                with write_transaction(conn):
                     conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (?,'user',0)", (self._dialog_id,))
                     conn.execute(
                         "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (?,?,0)",
@@ -468,7 +470,8 @@ class _RealtimeDeltaPinClient(_FakeClient):
             self._applied = True
             conn = _open_sync_db(self._db_path)
             try:
-                with conn:
+                conn.commit()
+                with write_transaction(conn):
                     conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (?,'user',0)", (self._dialog_id,))
                     apply_active_generation_pin_delta(conn, 0, self._dialog_id, True)
                     record_realtime_pin_fence(
@@ -556,7 +559,8 @@ async def test_existing_realtime_active_pins_are_replaced_by_unchanged_pinned_rp
     directory.bind_account_id(100)
     conn = _open_sync_db(db_path)
     try:
-        with conn:
+        conn.commit()
+        with write_transaction(conn):
             CanonicalDialogDirectory._start_generation(conn, 1)
             conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (?,'user',0)", (realtime_id,))
             conn.execute(
@@ -598,7 +602,9 @@ def test_realtime_mute_clear_fences_staged_directory_eligibility(tmp_path: Path)
             "eligibility_category,eligibility_archived,eligibility_unread,eligibility_mute_until,eligibility_observed_at) "
             "VALUES (1,1,'ordinary','PeerUser',1,'One','user',0,0,0,0,20,1,'directory','contact',0,1,900,20)"
         )
-        assert clear_realtime_mute(conn, 1, observed_at=30) == 1
+        conn.commit()
+        with write_transaction(conn):
+            assert clear_realtime_mute(conn, 1, observed_at=30) == 1
         assert conn.execute("SELECT revision FROM dialogs WHERE dialog_id=1").fetchone() == (1,)
         assert conn.execute(
             "SELECT mute_until,observed_at FROM dialog_directory_facts WHERE dialog_id=1"
@@ -720,7 +726,8 @@ async def test_directory_does_not_publish_identity_over_realtime_created_members
 
     conn = _open_sync_db(db_path)
     try:
-        with conn:
+        conn.commit()
+        with write_transaction(conn):
             conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (1,'unknown',0)")
             assert publish_dialog_identity(
                 conn,
@@ -863,7 +870,8 @@ def _stage_min_user_directory_generation(db_path: Path) -> None:
     directory.bind_account_id(99)
     conn = _open_sync_db(db_path)
     try:
-        with conn:
+        conn.commit()
+        with write_transaction(conn):
             directory._start_generation(conn, 1)
             directory._stage_facts(
                 conn,
@@ -948,7 +956,8 @@ def _stage_repeated_peer_directory_facts(db_path: Path) -> None:
     )
     conn = _open_sync_db(db_path)
     try:
-        with conn:
+        conn.commit()
+        with write_transaction(conn):
             directory._start_generation(conn, 1)
             directory._stage_facts(conn, 1, facts, folder_id=None, account_id=99)
             conn.execute(
@@ -1283,7 +1292,8 @@ async def test_semantic_invalid_latches_without_rpc_or_automatic_recovery(tmp_pa
     assert len(client.requests) == 4
     conn = _open_sync_db(db_path)
     try:
-        with conn:
+        conn.commit()
+        with write_transaction(conn):
             recover_invalid_generation_in_transaction(conn)
     finally:
         conn.close()
@@ -1310,8 +1320,7 @@ async def test_pinned_semantic_invalid_latches_its_source_and_logs_once(
         await directory.run_slice()
         conn = _open_sync_db(db_path)
         try:
-            with conn:
-                directory._latch_semantic_invalid(conn, 1, "pinned_0", "unexpected_pinned_response:Dialogs", 100)
+            directory._latch_semantic_invalid(conn, 1, "pinned_0", "unexpected_pinned_response:Dialogs", 100)
         finally:
             conn.close()
     conn = _open_sync_db(db_path)
@@ -1726,7 +1735,8 @@ def test_identity_owner_keeps_presence_and_identity_fences_independent(tmp_path:
             "VALUES (1,'Old','user','old',10,1,'directory')"
         )
         identity_revision = capture_identity_baseline(conn, 1)
-        with conn:
+        conn.commit()
+        with write_transaction(conn):
             assert apply_realtime_eligibility(conn, 1, category="contact", archived=0, observed_at=20) == 1
             assert apply_realtime_eligibility(conn, 1, unread=1, observed_at=30) == 1
             assert publish_dialog_identity(
@@ -1755,7 +1765,8 @@ def test_partial_identity_omission_preserves_values_and_explicit_clear_clears(tm
             "VALUES (1,'Known','user','known',10,1,'directory')"
         )
         revision = capture_identity_baseline(conn, 1)
-        with conn:
+        conn.commit()
+        with write_transaction(conn):
             assert not publish_dialog_identity(
                 conn, 1, DialogIdentityObservation(1, source="realtime", observed_at=20), revision
             )
@@ -1784,7 +1795,8 @@ def test_realtime_identity_does_not_change_hidden_presence(tmp_path: Path) -> No
             [(1, "Known", "user", 0), (2, "Lost", "user", 0)],
         )
         conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (2,'access_lost')")
-        with conn:
+        conn.commit()
+        with write_transaction(conn):
             for dialog_id in (1, 2):
                 revision = capture_identity_baseline(conn, dialog_id)
                 assert publish_dialog_identity(
@@ -1973,7 +1985,8 @@ async def test_complete_directory_absence_hides_row_and_removes_current_eligibil
     await directory.run_slice()
     conn = _open_sync_db(db_path)
     try:
-        with conn:
+        conn.commit()
+        with write_transaction(conn):
             apply_realtime_eligibility(conn, 1, category="bot", unread=1, observed_at=50)
     finally:
         conn.close()

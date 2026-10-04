@@ -32,6 +32,7 @@ from mcp_telegram.message_history.telegram_adapter import TelethonFullHistoryPag
 from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
 from mcp_telegram.messages.telegram_adapter import _PeerLike, extract_message_row
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncWorker, _FetchedBatchPage
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_scheduler import (
@@ -893,7 +894,7 @@ async def test_insert_messages_with_fts_preserves_existing_transcribed_text(
     )
     extracted = [extract_message_row(dialog_id, msg)]
 
-    with sync_db:
+    with write_transaction(cast(sqlite3.Connection, sync_db)):
         insert_messages_with_fts(cast(sqlite3.Connection, sync_db), extracted)
 
     row = cast(
@@ -2239,7 +2240,7 @@ def test_extract_message_row_insert_roundtrip_preserves_out_and_is_service(
 
     msg = _minimal_msg(id=777, out=True)
     em = extract_message_row(dialog_id, msg)
-    with cast(sqlite3.Connection, sync_db):
+    with write_transaction(cast(sqlite3.Connection, sync_db)):
         insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em])
 
     row = sync_db.execute(
@@ -2263,7 +2264,7 @@ def test_extract_message_row_persists_reply_count(sync_db: _SQLiteConnection) ->
 
     msg = build_mock_message(id=778, reply_count=3)
     em = extract_message_row(dialog_id, msg)
-    with cast(sqlite3.Connection, sync_db):
+    with write_transaction(cast(sqlite3.Connection, sync_db)):
         insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em])
 
     row = sync_db.execute(
@@ -2319,7 +2320,7 @@ def test_insert_messages_with_fts_writes_reactions(sync_db: _SQLiteConnection) -
             ReactionRecord(dialog_id=dialog_id, message_id=message_id, emoji="❤", count=2),
         ],
     )
-    with cast(sqlite3.Connection, sync_db):
+    with write_transaction(cast(sqlite3.Connection, sync_db)):
         insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em])
 
     rows = sync_db.execute(
@@ -2352,7 +2353,7 @@ def test_insert_messages_with_fts_writes_forwards(sync_db: _SQLiteConnection) ->
             fwd_channel_post=None,
         ),
     )
-    with cast(sqlite3.Connection, sync_db):
+    with write_transaction(cast(sqlite3.Connection, sync_db)):
         insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em])
 
     row = sync_db.execute(
@@ -2382,7 +2383,7 @@ def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: _SQLiteCon
             ReactionRecord(dialog_id=dialog_id, message_id=message_id, emoji="❤", count=1),
         ],
     )
-    with cast(sqlite3.Connection, sync_db):
+    with write_transaction(cast(sqlite3.Connection, sync_db)):
         insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em1])
 
     em2 = ExtractedMessage(
@@ -2390,7 +2391,7 @@ def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: _SQLiteCon
         reply_count=0,
         reactions=[ReactionRecord(dialog_id=dialog_id, message_id=message_id, emoji="🔥", count=7)],
     )
-    with cast(sqlite3.Connection, sync_db):
+    with write_transaction(cast(sqlite3.Connection, sync_db)):
         insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em2])
 
     rows = sync_db.execute(
@@ -2419,7 +2420,7 @@ def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: _SQLiteConn
             EntityRecord(dialog_id=dialog_id, message_id=message_id, offset=6, length=5, type="mention", value="@old2"),
         ],
     )
-    with cast(sqlite3.Connection, sync_db):
+    with write_transaction(cast(sqlite3.Connection, sync_db)):
         insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em1])
 
     em2 = ExtractedMessage(
@@ -2429,7 +2430,7 @@ def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: _SQLiteConn
             EntityRecord(dialog_id=dialog_id, message_id=message_id, offset=0, length=4, type="hashtag", value="#new")
         ],
     )
-    with cast(sqlite3.Connection, sync_db):
+    with write_transaction(cast(sqlite3.Connection, sync_db)):
         insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em2])
 
     rows = sync_db.execute(
@@ -2462,7 +2463,7 @@ def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: _SQLiteConn
             fwd_channel_post=None,
         ),
     )
-    with cast(sqlite3.Connection, sync_db):
+    with write_transaction(cast(sqlite3.Connection, sync_db)):
         insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em1])
 
     row = sync_db.execute(
@@ -2478,7 +2479,7 @@ def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: _SQLiteConn
         reply_count=0,
         forward=None,
     )
-    with cast(sqlite3.Connection, sync_db):
+    with write_transaction(cast(sqlite3.Connection, sync_db)):
         insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em2])
 
     row = sync_db.execute(
@@ -2513,10 +2514,10 @@ def test_insert_messages_with_fts_clears_empty_child_projections(sync_db: _SQLit
             fwd_channel_post=None,
         ),
     )
-    with cast(sqlite3.Connection, sync_db):
+    with write_transaction(cast(sqlite3.Connection, sync_db)):
         insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [populated])
     empty = ExtractedMessage(message=_stored(dialog_id, message_id, "empty"), reply_count=0)
-    with cast(sqlite3.Connection, sync_db):
+    with write_transaction(cast(sqlite3.Connection, sync_db)):
         insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [empty])
 
     for table in ("message_entities", "message_reactions", "message_forwards"):
@@ -2550,7 +2551,7 @@ def test_insert_messages_with_fts_uses_callers_transaction_for_all_projections(s
     )
 
     with pytest.raises(RuntimeError, match="rollback"):
-        with cast(sqlite3.Connection, sync_db):
+        with write_transaction(cast(sqlite3.Connection, sync_db)):
             insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [extracted])
             raise RuntimeError("rollback")
 

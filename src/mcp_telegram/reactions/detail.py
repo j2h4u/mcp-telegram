@@ -9,10 +9,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
+from ..sync_transactions import require_write_transaction, write_transaction
 from ..telegram_demand import AcquisitionKind, acquisition_context
 from ..telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
 from .contracts import GatewayFailure, GatewayFailureKind, ReactionDetailFetchResult, ReactionEvent
 from .ports import TelegramReactionGateway
+
+
+class _StaleReactionWriterError(Exception):
+    """Abort an owned unit when its final generation CAS fails."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +92,8 @@ class ReactionDetailRefresher:
         cancellation_event: asyncio.Event | None = None,
         now: int | None = None,
     ) -> ReactionDetailResult:
+        if self._conn.in_transaction:
+            raise RuntimeError("reaction detail refresh requires an idle connection")
         when = int(self._now() if now is None else now)
         if cancellation_event is not None and cancellation_event.is_set():
             return ReactionDetailResult("cancelled")
@@ -227,19 +234,6 @@ class ReactionDetailRefresher:
             (dialog_id, message_id, generation, when, when),
         )
 
-    def _begin_persistence(self) -> None:
-        """Require the dedicated connection to be idle before taking the write lock."""
-        if self._conn.in_transaction:
-            raise RuntimeError("reaction detail persistence requires an idle dedicated connection")
-        self._conn.execute("BEGIN IMMEDIATE")
-
-    def _discard_staged_page(self, dialog_id: int, message_id: int, generation: int, first_ordinal: int) -> None:
-        self._conn.execute(
-            "DELETE FROM message_reaction_events WHERE dialog_id=? AND message_id=? "
-            "AND detail_generation=? AND page_ordinal>=?",
-            (dialog_id, message_id, generation, first_ordinal),
-        )
-
     @staticmethod
     def _positive_retry_after(failure: object | None) -> int | None:
         value = getattr(failure, "retry_after", None)
@@ -276,86 +270,88 @@ class ReactionDetailRefresher:
         next_offset: str | None,
         when: int,
     ) -> ReactionDetailResult:
-        self._begin_persistence()
-        with self._conn:
-            if not self._eligible(dialog_id):
-                return ReactionDetailResult("ineligible")
-            if not self._cas_status(dialog_id, message_id, generation, expected_status, expected_offset):
-                return ReactionDetailResult("stale_writer")
-            self._ensure_status(dialog_id, message_id, generation, when)
-            row = cast(
-                tuple[object, ...] | None,
-                self._conn.execute(
-                    "SELECT staged_count FROM message_reaction_event_status WHERE dialog_id=? AND message_id=?",
-                    (dialog_id, message_id),
-                ).fetchone(),
-            )
-            staged_count = 0 if row is None else int(cast(int | str, row[0]))
-            self._conn.executemany(
-                "INSERT INTO message_reaction_events "
-                "(dialog_id, message_id, reactor_id, emoji, reacted_at, fetched_at, detail_generation, page_ordinal, display_generation) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
-                [
-                    (
-                        dialog_id,
-                        message_id,
-                        event.reactor_id,
-                        event.emoji,
-                        event.reacted_at,
-                        when,
-                        generation,
-                        staged_count + index,
-                    )
-                    for index, event in enumerate(events)
-                ],
-            )
-            total = staged_count + len(events)
-            if next_offset is None:
-                self._conn.execute(
-                    "UPDATE message_reaction_events SET display_generation=? "
-                    "WHERE dialog_id=? AND message_id=? AND detail_generation=?",
-                    (generation, dialog_id, message_id, generation),
+        try:
+            with write_transaction(self._conn):
+                return self._persist_page_locked(
+                    dialog_id,
+                    message_id,
+                    generation,
+                    expected_status=expected_status,
+                    expected_offset=expected_offset,
+                    events=events,
+                    next_offset=next_offset,
+                    when=when,
                 )
-                self._conn.execute(
-                    "DELETE FROM message_reaction_events WHERE dialog_id=? AND message_id=? "
-                    "AND display_generation > 0 AND detail_generation != ?",
-                    (dialog_id, message_id, generation),
-                )
-                status_update = self._conn.execute(
-                    "UPDATE message_reaction_event_status SET detail_generation=?, display_generation=?, "
-                    "published_generation=?, checked_at=?, status='complete', returned_count=?, staged_count=0, "
-                    "next_offset=NULL, next_attempt_at=NULL, failure_kind=NULL WHERE dialog_id=? AND message_id=? "
-                    "AND aggregate_generation=? AND status=? AND next_offset IS ?",
-                    (
-                        generation,
-                        generation,
-                        generation,
-                        when,
-                        total,
-                        dialog_id,
-                        message_id,
-                        generation,
-                        expected_status,
-                        expected_offset,
-                    ),
-                )
-                if status_update.rowcount != 1:
-                    self._discard_staged_page(dialog_id, message_id, generation, staged_count)
-                    self._conn.rollback()
-                    return ReactionDetailResult("stale_writer")
-                self._observe("reaction.detail", "complete")
-                return ReactionDetailResult("complete", fetched_pages=1)
-            status_update = self._conn.execute(
-                "UPDATE message_reaction_event_status SET detail_generation=?, checked_at=?, status='partial', "
-                "returned_count=?, staged_count=?, next_offset=?, next_attempt_at=?, failure_kind=NULL "
-                "WHERE dialog_id=? AND message_id=? AND aggregate_generation=? AND status=? AND next_offset IS ?",
+        except _StaleReactionWriterError:
+            return ReactionDetailResult("stale_writer")
+
+    def _persist_page_locked(  # noqa: PLR0913
+        self,
+        dialog_id: int,
+        message_id: int,
+        generation: int,
+        *,
+        expected_status: str,
+        expected_offset: str | None,
+        events: tuple[ReactionEvent, ...],
+        next_offset: str | None,
+        when: int,
+    ) -> ReactionDetailResult:
+        require_write_transaction(self._conn)
+        if not self._eligible(dialog_id):
+            return ReactionDetailResult("ineligible")
+        if not self._cas_status(dialog_id, message_id, generation, expected_status, expected_offset):
+            return ReactionDetailResult("stale_writer")
+        self._ensure_status(dialog_id, message_id, generation, when)
+        row = cast(
+            tuple[object, ...] | None,
+            self._conn.execute(
+                "SELECT staged_count FROM message_reaction_event_status WHERE dialog_id=? AND message_id=?",
+                (dialog_id, message_id),
+            ).fetchone(),
+        )
+        staged_count = 0 if row is None else int(cast(int | str, row[0]))
+        self._conn.executemany(
+            "INSERT INTO message_reaction_events "
+            "(dialog_id, message_id, reactor_id, emoji, reacted_at, fetched_at, detail_generation, page_ordinal, display_generation) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            [
                 (
+                    dialog_id,
+                    message_id,
+                    event.reactor_id,
+                    event.emoji,
+                    event.reacted_at,
+                    when,
+                    generation,
+                    staged_count + index,
+                )
+                for index, event in enumerate(events)
+            ],
+        )
+        total = staged_count + len(events)
+        if next_offset is None:
+            self._conn.execute(
+                "UPDATE message_reaction_events SET display_generation=? "
+                "WHERE dialog_id=? AND message_id=? AND detail_generation=?",
+                (generation, dialog_id, message_id, generation),
+            )
+            self._conn.execute(
+                "DELETE FROM message_reaction_events WHERE dialog_id=? AND message_id=? "
+                "AND display_generation > 0 AND detail_generation != ?",
+                (dialog_id, message_id, generation),
+            )
+            status_update = self._conn.execute(
+                "UPDATE message_reaction_event_status SET detail_generation=?, display_generation=?, "
+                "published_generation=?, checked_at=?, status='complete', returned_count=?, staged_count=0, "
+                "next_offset=NULL, next_attempt_at=NULL, failure_kind=NULL WHERE dialog_id=? AND message_id=? "
+                "AND aggregate_generation=? AND status=? AND next_offset IS ?",
+                (
+                    generation,
+                    generation,
                     generation,
                     when,
                     total,
-                    total,
-                    next_offset,
-                    when,
                     dialog_id,
                     message_id,
                     generation,
@@ -364,13 +360,62 @@ class ReactionDetailRefresher:
                 ),
             )
             if status_update.rowcount != 1:
-                self._discard_staged_page(dialog_id, message_id, generation, staged_count)
-                self._conn.rollback()
-                return ReactionDetailResult("stale_writer")
-            self._observe("reaction.detail", "partial")
-            return ReactionDetailResult("partial", fetched_pages=1, next_offset=next_offset)
+                raise _StaleReactionWriterError
+            self._observe("reaction.detail", "complete")
+            return ReactionDetailResult("complete", fetched_pages=1)
+        status_update = self._conn.execute(
+            "UPDATE message_reaction_event_status SET detail_generation=?, checked_at=?, status='partial', "
+            "returned_count=?, staged_count=?, next_offset=?, next_attempt_at=?, failure_kind=NULL "
+            "WHERE dialog_id=? AND message_id=? AND aggregate_generation=? AND status=? AND next_offset IS ?",
+            (
+                generation,
+                when,
+                total,
+                total,
+                next_offset,
+                when,
+                dialog_id,
+                message_id,
+                generation,
+                expected_status,
+                expected_offset,
+            ),
+        )
+        if status_update.rowcount != 1:
+            raise _StaleReactionWriterError
+        self._observe("reaction.detail", "partial")
+        return ReactionDetailResult("partial", fetched_pages=1, next_offset=next_offset)
 
     def _persist_failure(  # noqa: PLR0913
+        self,
+        dialog_id: int,
+        message_id: int,
+        generation: int,
+        *,
+        expected_status: str,
+        expected_offset: str | None,
+        staged_count: int,
+        failure: GatewayFailure | None,
+        when: int,
+        failure_kind: str | None = None,
+    ) -> ReactionDetailResult:
+        try:
+            with write_transaction(self._conn):
+                return self._persist_failure_locked(
+                    dialog_id,
+                    message_id,
+                    generation,
+                    expected_status=expected_status,
+                    expected_offset=expected_offset,
+                    staged_count=staged_count,
+                    failure=failure,
+                    when=when,
+                    failure_kind=failure_kind,
+                )
+        except _StaleReactionWriterError:
+            return ReactionDetailResult("stale_writer")
+
+    def _persist_failure_locked(  # noqa: PLR0913
         self,
         dialog_id: int,
         message_id: int,
@@ -388,41 +433,39 @@ class ReactionDetailRefresher:
         terminal = self._is_terminal_failure(failure)
         status = self._failure_status(staged_count, expected_status, terminal)
         next_attempt_at = self._failure_next_attempt_at(when, retry_after, terminal)
-        self._begin_persistence()
-        with self._conn:
-            if not self._eligible(dialog_id):
-                return ReactionDetailResult("ineligible")
-            if not self._cas_status(dialog_id, message_id, generation, expected_status, expected_offset):
-                return ReactionDetailResult("stale_writer")
-            if terminal:
-                self._conn.execute(
-                    "DELETE FROM message_reaction_events WHERE dialog_id=? AND message_id=? "
-                    "AND detail_generation=? AND display_generation=0",
-                    (dialog_id, message_id, generation),
-                )
-            self._ensure_status(dialog_id, message_id, generation, when)
-            status_update = self._conn.execute(
-                "UPDATE message_reaction_event_status SET checked_at=?, status=?, next_attempt_at=?, "
-                "next_offset=?, staged_count=?, failure_kind=? "
-                "WHERE dialog_id=? AND message_id=? AND aggregate_generation=? AND status=? AND next_offset IS ?",
-                (
-                    when,
-                    status,
-                    next_attempt_at,
-                    None if terminal else expected_offset,
-                    0 if terminal else staged_count,
-                    kind,
-                    dialog_id,
-                    message_id,
-                    generation,
-                    expected_status,
-                    expected_offset,
-                ),
+        require_write_transaction(self._conn)
+        if not self._eligible(dialog_id):
+            return ReactionDetailResult("ineligible")
+        if not self._cas_status(dialog_id, message_id, generation, expected_status, expected_offset):
+            return ReactionDetailResult("stale_writer")
+        if terminal:
+            self._conn.execute(
+                "DELETE FROM message_reaction_events WHERE dialog_id=? AND message_id=? "
+                "AND detail_generation=? AND display_generation=0",
+                (dialog_id, message_id, generation),
             )
-            if status_update.rowcount != 1:
-                self._conn.rollback()
-                return ReactionDetailResult("stale_writer")
-            self._observe("reaction.detail", "terminal_unavailable" if terminal else status)
+        self._ensure_status(dialog_id, message_id, generation, when)
+        status_update = self._conn.execute(
+            "UPDATE message_reaction_event_status SET checked_at=?, status=?, next_attempt_at=?, "
+            "next_offset=?, staged_count=?, failure_kind=? "
+            "WHERE dialog_id=? AND message_id=? AND aggregate_generation=? AND status=? AND next_offset IS ?",
+            (
+                when,
+                status,
+                next_attempt_at,
+                None if terminal else expected_offset,
+                0 if terminal else staged_count,
+                kind,
+                dialog_id,
+                message_id,
+                generation,
+                expected_status,
+                expected_offset,
+            ),
+        )
+        if status_update.rowcount != 1:
+            raise _StaleReactionWriterError
+        self._observe("reaction.detail", "terminal_unavailable" if terminal else status)
         return ReactionDetailResult(
             status,
             next_offset=None if terminal else expected_offset,

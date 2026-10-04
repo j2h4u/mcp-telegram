@@ -101,7 +101,6 @@ from .message_history.telegram_adapter import (
     TelethonHistoryAccessProbe,
 )
 from .messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
-from .own_only import ensure_own_only_schema
 from .own_only_contracts import OwnOnlyContext
 from .reactions import ReactionDetailPolicy, ReactionDetailRefresher
 from .reactions.telegram_adapter import TelethonTelegramReactionGateway
@@ -125,10 +124,12 @@ from .sync_db import (
     load_account_cooldown_until_utc,
     load_self_profile_last_success_at,
     migrate_legacy_databases,
+    open_runtime_sync_db,
     open_sync_db_reader,
     save_account_cooldown_until_utc,
     save_self_profile_last_success_at,
 )
+from .sync_transactions import enable_runtime_writes, write_transaction
 from .sync_worker import FullSyncWorker
 from .telegram import create_client
 from .telegram_demand import AcquisitionKind, DemandStatus, RpcAttemptBudget, acquisition_context, demand_context
@@ -518,12 +519,12 @@ async def _reconcile_read_position_batch(  # noqa: PLR0913
             raise
         logger.warning("read_pos_bootstrap flood_wait seconds=%s", exc.retry_after_seconds)
         retry_ids.update(batch_ids)
-        _mark_read_position_retry(
-            conn,
-            retry_ids,
-            _read_position_retry_at(int(time.time()), failure_cooldown_seconds),
-        )
-        conn.commit()
+        with write_transaction(conn):
+            _mark_read_position_retry(
+                conn,
+                retry_ids,
+                _read_position_retry_at(int(time.time()), failure_cooldown_seconds),
+            )
         if exc.retry_after_seconds is not None:
             await sleep_through_flood(shutdown_event, exc.retry_after_seconds)
         return 0, True
@@ -531,12 +532,12 @@ async def _reconcile_read_position_batch(  # noqa: PLR0913
         logger.debug("read_pos_bootstrap batch_failed error=%s", exc)
         retry_ids.update(batch_ids)
         filled = 0
-    _mark_read_position_retry(
-        conn,
-        retry_ids,
-        _read_position_retry_at(int(time.time()), failure_cooldown_seconds),
-    )
-    conn.commit()
+    with write_transaction(conn):
+        _mark_read_position_retry(
+            conn,
+            retry_ids,
+            _read_position_retry_at(int(time.time()), failure_cooldown_seconds),
+        )
     return filled, False
 
 
@@ -622,7 +623,7 @@ def _apply_read_positions_from_dialogs(  # noqa: PLR0913
 ) -> int:
     """Apply read cursors from a GetPeerDialogsRequest result."""
     filled = 0
-    with conn:
+    with write_transaction(conn):
         for dialog in result.dialogs:
             if _apply_read_position_dialog(
                 conn,
@@ -909,7 +910,7 @@ def _handle_tracked_task_completion(ctx: _SyncMainContext, task: asyncio.Task[ob
     if exc is None:
         return
     try:
-        with ctx.conn:
+        with write_transaction(ctx.conn):
             record_runtime_observation(
                 ctx.conn,
                 kind="runtime.task_failed",
@@ -939,7 +940,7 @@ def _observe_runtime(  # noqa: PLR0913 - mirrors the bounded runtime-observation
     observed_at_ms: int | None = None,
 ) -> None:
     try:
-        with ctx.conn:
+        with write_transaction(ctx.conn):
             record_runtime_observation(
                 ctx.conn,
                 kind=kind,
@@ -1079,7 +1080,8 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         state_paths.state_dir,
         telemetry_retention_ttl_seconds=config.telemetry.retention_ttl_seconds,
     )
-    with conn:
+    enable_runtime_writes(conn)
+    with write_transaction(conn):
         prune_runtime_observations(
             conn,
             ttl_seconds=config.telemetry.retention_ttl_seconds,
@@ -1273,7 +1275,7 @@ async def _run_fts_backfill(ctx: _SyncMainContext) -> None:
         # Open a dedicated connection for the thread — sqlite3 connections are
         # not thread-safe and cannot be shared across threads.
         def _backfill_in_thread() -> int:
-            thread_conn = _open_sync_db(ctx.db_path)
+            thread_conn = open_runtime_sync_db(ctx.db_path)
             try:
                 return backfill_fts_index(thread_conn)
             finally:
@@ -1406,7 +1408,6 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     ctx.demand_runtime.dialog_directory.bind_account_id(ctx.api_server.self_id)
     assert ctx.handler_manager is not None
     ctx.handler_manager.set_self_id(ctx.api_server.self_id)
-    ensure_own_only_schema(ctx.conn)
     logger.info("daemon self_id cached: %s", ctx.api_server.self_id)
 
     ctx.api_server.startup_detail = "refreshing Telegram folders"
@@ -1419,11 +1420,11 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     # values — so the NULL-sender shape is rare in practice. This daemon
     # step closes the gap once self_id is known. Idempotent via out=0.
     try:
-        cur = ctx.conn.execute(
-            "UPDATE messages SET out = 1 WHERE out = 0 AND dialog_id > 0 AND sender_id = ?",
-            (ctx.api_server.self_id,),
-        )
-        ctx.conn.commit()
+        with write_transaction(ctx.conn):
+            cur = ctx.conn.execute(
+                "UPDATE messages SET out = 1 WHERE out = 0 AND dialog_id > 0 AND sender_id = ?",
+                (ctx.api_server.self_id,),
+            )
         if cur.rowcount > 0:
             logger.info("backfilled out=1 on %d historical outgoing DM rows", cur.rowcount)
     except Exception:
@@ -1495,7 +1496,7 @@ def _publish_startup_identity(ctx: _SyncMainContext, profile: object, own_only_c
 
 
 def _build_message_fact_refresh_dependencies(ctx: _SyncMainContext) -> MessageFactRefreshDeps:
-    conn = _open_sync_db(ctx.db_path)
+    conn = open_runtime_sync_db(ctx.db_path)
     read_at_callback: Callable[[Mapping[str, object]], None] | None = None
     reaction_callback: Callable[[str, str], None] | None = None
     sink = ctx.rpc_observation_sink
@@ -1712,7 +1713,7 @@ def _close_runtime_connections(ctx: _SyncMainContext) -> None:
     except Exception:
         logger.debug("feedback_conn close error", exc_info=True)
     try:
-        with ctx.conn:
+        with write_transaction(ctx.conn):
             record_runtime_observation(ctx.conn, kind="runtime.stopped", outcome="observed")
     except Exception:
         logger.exception("runtime_event_record_failed kind=runtime.stopped")
@@ -1728,7 +1729,7 @@ def _persist_runtime_observation_loss(ctx: _SyncMainContext) -> None:
     if not any(counts):
         return
     queue_full_drops, _shutdown_drops, _startup_drops, _rejected_submissions, writer_failures = counts
-    with ctx.conn:
+    with write_transaction(ctx.conn):
         try:
             record_runtime_observation(
                 ctx.conn,

@@ -306,3 +306,41 @@ async def test_archive_incremental_latched_throttle_stops_coordinator_without_lo
     assert conn.execute("SELECT value FROM activity_sync_state WHERE key='last_sync_at'").fetchone() == ("1",)
     assert conn.execute("SELECT value FROM activity_sync_state WHERE key='incremental_min_date'").fetchone() == ("0",)
     assert [event["outcome"] for event in observer.events] == ["selected"]
+
+
+@pytest.mark.asyncio
+async def test_archive_runtime_commits_page_and_leaves_rpc_connection_idle(conn: sqlite3.Connection) -> None:
+    from mcp_telegram.sync_transactions import enable_runtime_writes
+
+    class IdleClient(_FakeClient):
+        async def __call__(self, request: object) -> FakeSearchResult:
+            assert not conn.in_transaction
+            assert conn.execute("PRAGMA query_only").fetchone() == (1,)
+            return await super().__call__(request)
+
+    enable_runtime_writes(conn)
+    client = IdleClient([FakeSearchResult(messages=[_msg(100, 42, 1_700_000_100)])])
+    adapter = ArchiveBackfillDemandAdapter(client, conn, asyncio.Event(), timeout_s=_TEST_TIMEOUT_S)
+    await adapter.run_slice(RpcAttemptBudget(1))
+
+    assert conn.execute("SELECT message_id FROM messages").fetchall() == [(100,)]
+    assert conn.execute("SELECT value FROM activity_sync_state WHERE key='backfill_offset_id'").fetchone() == ("100",)
+    assert not conn.in_transaction
+    assert conn.execute("PRAGMA query_only").fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+async def test_archive_page_failure_rolls_back_messages_and_checkpoint(conn: sqlite3.Connection) -> None:
+    from mcp_telegram.sync_transactions import enable_runtime_writes
+
+    enable_runtime_writes(conn)
+    client = _FakeClient([FakeSearchResult(messages=[_msg(100, 42, 1_700_000_100)])])
+    adapter = ArchiveBackfillDemandAdapter(client, conn, asyncio.Event(), timeout_s=_TEST_TIMEOUT_S)
+    with patch.object(activity_sync, "_upsert_entities_from_search", side_effect=RuntimeError("identity write failed")):
+        with pytest.raises(RuntimeError, match="identity write failed"):
+            await adapter.run_slice(RpcAttemptBudget(1))
+
+    assert conn.execute("SELECT message_id FROM messages").fetchall() == []
+    assert conn.execute("SELECT value FROM activity_sync_state WHERE key='backfill_offset_id'").fetchone() == ("0",)
+    assert not conn.in_transaction
+    assert conn.execute("PRAGMA query_only").fetchone() == (1,)

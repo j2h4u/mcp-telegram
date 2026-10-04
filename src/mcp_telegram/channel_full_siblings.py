@@ -10,6 +10,7 @@ from telethon.tl import types
 
 from .entity_store import EntitySnapshot, ensure_entity_stub, upsert_entity_snapshots
 from .resolver import latinize
+from .sync_transactions import require_write_transaction
 
 _DETAIL_BASE_COLUMN_COUNT = 2
 
@@ -62,6 +63,7 @@ def write_channel_full_siblings(
     The caller validates and publishes the linked-chat fact in the same outer
     transaction. This function never reads or writes linked_chat_id.
     """
+    require_write_transaction(conn)
     sibling_values = _sibling_values(full_result)
     if sibling_values:
         if not _write_sibling_detail(conn, channel_id, sibling_values, token, observed_at):

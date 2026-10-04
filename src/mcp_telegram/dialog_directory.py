@@ -37,7 +37,8 @@ from .flood import TelegramRpcThrottled
 from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .models import DialogType
 from .read_state import apply_read_cursor
-from .sync_db import _open_sync_db
+from .sync_db import open_runtime_sync_db
+from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_demand import (
     AcquisitionKind,
     DemandStatus,
@@ -272,11 +273,11 @@ class CanonicalDialogDirectory:
         """Run exactly one pinned or ordinary raw request, then commit its result."""
         if self._shutdown_event.is_set():
             return
-        conn = _open_sync_db(self._db_path)
+        conn = open_runtime_sync_db(self._db_path)
         try:
             initial_state = self._load_state(conn)
             if initial_state.cursor_error:
-                with conn:
+                with write_transaction(conn):
                     conn.execute(
                         "UPDATE dialog_directory_state SET status='invalid',ordinary_status='invalid',"
                         "reason='ordinary:invalid:corrupt_cursor',retry_at=NULL WHERE singleton=1 AND generation=?",
@@ -309,7 +310,7 @@ class CanonicalDialogDirectory:
 
     def bind_account_id(self, account_id: int) -> None:
         """Fence the directory to the authenticated account before readers start."""
-        conn = _open_sync_db(self._db_path)
+        conn = open_runtime_sync_db(self._db_path)
         try:
             self._bind_account(conn, account_id)
         finally:
@@ -330,11 +331,11 @@ class CanonicalDialogDirectory:
         return state.account_id
 
     def _bind_account(self, conn: sqlite3.Connection, account_id: int) -> None:
-        state = self._load_state(conn)
-        if state.account_id is not None and state.account_id != account_id:
-            raise RuntimeError("dialog directory account identity changed")
-        if state.account_id is None:
-            with conn:
+        with write_transaction(conn):
+            state = self._load_state(conn)
+            if state.account_id is not None and state.account_id != account_id:
+                raise RuntimeError("dialog directory account identity changed")
+            if state.account_id is None:
                 conn.execute(
                     "UPDATE dialog_directory_state SET account_id=? WHERE singleton=1 AND account_id IS NULL",
                     (account_id,),
@@ -355,29 +356,28 @@ class CanonicalDialogDirectory:
             raise exc
 
     def _prepare_or_resume(self, conn: sqlite3.Connection) -> _DirectoryState | None:
-        state = self._load_state(conn)
-        if state.retry_at is not None and time.time() < state.retry_at:
-            return None
-        if state.status == "invalid":
-            return None
-        if state.status == "complete":
-            # The timestamp is original observation time. Starting a new
-            # generation never refreshes it until a complete publication.
-            with conn:
+        with write_transaction(conn):
+            state = self._load_state(conn)
+            if state.retry_at is not None and time.time() < state.retry_at:
+                return None
+            if state.status == "invalid":
+                return None
+            if state.status == "complete":
+                # The timestamp is original observation time. Starting a new
+                # generation never refreshes it until a complete publication.
                 self._start_generation(conn, state.generation + 1)
-            return self._load_state(conn)
-        if state.status == "pending":
-            with conn:
+                return self._load_state(conn)
+            if state.status == "pending":
                 self._start_generation(conn, state.generation)
-            return self._load_state(conn)
-        if state.status == "incomplete":
-            with conn:
+                return self._load_state(conn)
+            if state.status == "incomplete":
                 conn.execute("UPDATE dialog_directory_state SET status='in_progress', reason=NULL WHERE singleton=1")
-            return self._load_state(conn)
-        return state
+                return self._load_state(conn)
+            return state
 
     @staticmethod
     def _start_generation(conn: sqlite3.Connection, generation: int) -> None:
+        require_write_transaction(conn)
         started_at = int(time.time())
         conn.execute("DELETE FROM dialog_directory_staging")
         conn.execute("DELETE FROM dialog_directory_baseline")
@@ -440,7 +440,7 @@ class CanonicalDialogDirectory:
             return
         if page.kind not in {"terminal", "page"}:
             raise RuntimeError(f"unexpected normalized pinned response: {page.kind}")
-        with conn:
+        with write_transaction(conn):
             self._stage_facts(conn, state.generation, page.facts, folder_id=folder_id, account_id=account_id)
             _commit_pinned_generation(
                 conn,
@@ -467,7 +467,7 @@ class CanonicalDialogDirectory:
         if self._handle_ordinary_non_authoritative(conn, state, account_id, page):
             return
         published = False
-        with conn:
+        with write_transaction(conn):
             new_ids = self._new_dialog_ids(conn, state.generation, page.facts)
             self._stage_facts(conn, state.generation, page.facts, folder_id=None, account_id=account_id)
             if page.kind == "page":
@@ -519,7 +519,7 @@ class CanonicalDialogDirectory:
         if page.kind != "incomplete":
             return False
         reason = page.reason or "incomplete_page"
-        with conn:
+        with write_transaction(conn):
             # An incomplete page may still contribute catalog rows.
             # It never advances the committed cursor or publishes.
             self._stage_facts(conn, state.generation, page.facts, folder_id=None, account_id=account_id)
@@ -540,7 +540,7 @@ class CanonicalDialogDirectory:
         source_column: str | None,
     ) -> None:
         source_update = "" if source_column is None else f", {source_column}='incomplete'"
-        with conn:
+        with write_transaction(conn):
             conn.execute(
                 f"UPDATE dialog_directory_state SET status='incomplete'{source_update}, reason=?, retry_at=? "
                 "WHERE singleton=1 AND account_id=? AND generation=?",
@@ -557,7 +557,7 @@ class CanonicalDialogDirectory:
         *,
         source_column: str,
     ) -> None:
-        with conn:
+        with write_transaction(conn):
             conn.execute(
                 f"UPDATE dialog_directory_state SET status='incomplete', {source_column}='incomplete', reason=?, retry_at=? "
                 "WHERE singleton=1 AND account_id=? AND generation=?",
@@ -576,7 +576,7 @@ class CanonicalDialogDirectory:
         }.get(source)
         if column is None:
             raise ValueError(f"unknown directory source: {source}")
-        with conn:
+        with write_transaction(conn):
             cursor = conn.execute(
                 f"UPDATE dialog_directory_state SET status='invalid', {column}='invalid', reason=?, retry_at=NULL "
                 "WHERE singleton=1 AND account_id=? AND generation=? AND status != 'invalid'",
@@ -601,6 +601,7 @@ class CanonicalDialogDirectory:
         folder_id: int | None,
         account_id: int,
     ) -> None:
+        require_write_transaction(conn)
         state = self._load_state(conn)
         observed_at = state.observation_started_at
         if observed_at is None:
@@ -731,6 +732,7 @@ class CanonicalDialogDirectory:
         )
 
     def _publish_if_complete(self, conn: sqlite3.Connection, generation: int, account_id: int) -> bool:
+        require_write_transaction(conn)
         state = self._load_state(conn)
         if not _publication_ready(state, generation, account_id):
             return False
@@ -883,6 +885,7 @@ class CanonicalDialogDirectory:
         return True
 
     def _save_cursor(self, conn: sqlite3.Connection, cursor: DialogCursor, generation: int, account_id: int) -> None:
+        require_write_transaction(conn)
         peer_json = _encode_input_peer(cursor)
         conn.execute(
             "UPDATE dialog_directory_state SET offset_date=?, offset_id=?, offset_peer=? "
@@ -1006,6 +1009,7 @@ def _publish_staged_read_cursors(conn: sqlite3.Connection, generation: int) -> N
 
 
 def _publish_directory_absence(conn: sqlite3.Connection, state: _DirectoryState, generation: int) -> None:
+    require_write_transaction(conn)
     observed_at = state.observation_started_at
     if observed_at is None:
         raise RuntimeError("complete directory generation has no observation start")
@@ -1105,6 +1109,7 @@ def recover_invalid_generation_in_transaction(conn: sqlite3.Connection) -> dict[
 
 def sync_active_generation_pins_from_publication(conn: sqlite3.Connection, folder_id: int) -> None:
     """Fence an active source against newer realtime pin membership and order."""
+    require_write_transaction(conn)
     row = cast(
         tuple[int, str] | None,
         conn.execute("SELECT generation,status FROM dialog_directory_state WHERE singleton=1").fetchone(),
@@ -1127,6 +1132,7 @@ def apply_active_generation_pin_delta(conn: sqlite3.Connection, folder_id: int, 
     progress.  Reading the published relation here would discard pins already
     acquired by the in-flight generation.
     """
+    require_write_transaction(conn)
     row = cast(
         tuple[object, object] | None,
         conn.execute("SELECT generation,status FROM dialog_directory_state WHERE singleton=1").fetchone(),
@@ -1174,6 +1180,7 @@ def record_realtime_pin_fence(
     Python flag.  This small durable fence keeps event ordering across that
     await boundary without changing the published schema.
     """
+    require_write_transaction(conn)
     row = cast(
         tuple[object, object] | None,
         conn.execute("SELECT generation,status FROM dialog_directory_state WHERE singleton=1").fetchone(),
@@ -1215,6 +1222,7 @@ def read_realtime_pin_fence(conn: sqlite3.Connection, generation: int, folder_id
 def replace_active_generation_pins(
     conn: sqlite3.Connection, generation: int, folder_id: int, dialog_ids: list[int]
 ) -> None:
+    require_write_transaction(conn)
     conn.execute(
         "DELETE FROM dialog_directory_pins WHERE generation=? AND folder_id=?",
         (generation, folder_id),
@@ -1283,6 +1291,7 @@ def _insert_realtime_eligibility(
     supplied: tuple[str | None, int | None, int | None, int | None],
     observed_at: int,
 ) -> None:
+    require_write_transaction(conn)
     conn.execute(
         "INSERT INTO dialog_directory_facts(dialog_id,category,archived,unread,mute_until,observed_at) VALUES (?,?,?,?,?,?)",
         (dialog_id, *supplied, observed_at),
@@ -1296,6 +1305,7 @@ def _merge_realtime_eligibility(
     prior: tuple[str | None, int | None, int | None, int | None, int | None],
     observed_at: int,
 ) -> bool:
+    require_write_transaction(conn)
     values: tuple[str | None, int | None, int | None, int | None] = (
         supplied[0] if supplied[0] is not None else prior[0],
         supplied[1] if supplied[1] is not None else prior[1],
@@ -1324,6 +1334,7 @@ def apply_realtime_eligibility(  # noqa: PLR0913
     mute_until: int | None = None,
 ) -> int:
     """Merge a partial realtime eligibility observation without renewing retained facts."""
+    require_write_transaction(conn)
     supplied = (category, archived, unread, mute_until)
     if all(value is None for value in supplied):
         return 0
@@ -1344,6 +1355,7 @@ def apply_realtime_eligibility(  # noqa: PLR0913
 
 def clear_realtime_mute(conn: sqlite3.Connection, dialog_id: int, *, observed_at: int) -> int:
     """Clear a realtime mute fact while fencing an in-flight directory snapshot."""
+    require_write_transaction(conn)
     cursor = conn.execute(
         "UPDATE dialog_directory_facts SET mute_until=NULL, "
         "observed_at=CASE WHEN observed_at IS NULL THEN ? ELSE MIN(observed_at,?) END "

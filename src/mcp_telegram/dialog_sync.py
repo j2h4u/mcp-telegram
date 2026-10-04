@@ -19,6 +19,7 @@ from .access_lifecycle import set_access_lost
 from .dialog_classification import EntityKind, classify_dialog_type
 from .flood import TelegramRpcThrottled, sleep_through_flood
 from .maintenance_logging import log_maintenance_cycle
+from .sync_transactions import write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import (
     AcquisitionKind,
@@ -174,7 +175,7 @@ class DialogReconciliationWorker:
             entity = await self._client.get_entity(dialog_id)
             fields = _extract_entity_fields(entity)
             snapshot_at = int(time.time())
-            with self._conn:
+            with write_transaction(self._conn):
                 self._conn.execute(
                     _UPDATE_DIALOG_ENTITY_SQL,
                     (
@@ -202,8 +203,8 @@ class DialogReconciliationWorker:
                 type(exc).__name__,
             )
         except ACCESS_LOST_ERRORS as exc:
-            set_access_lost(self._conn, dialog_id, int(time.time()), reason=type(exc).__name__)
-            self._conn.commit()
+            with write_transaction(self._conn):
+                set_access_lost(self._conn, dialog_id, int(time.time()), reason=type(exc).__name__)
         except PeerIdInvalidError:
             logger.warning(
                 "recon_light_pass_peer_invalid dialog_id=%s (session cache miss; will retry next cycle)",

@@ -4,17 +4,14 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass
-from itertools import count
 from typing import cast
 
 from ..history_enrollment import reset_read_position_retry, restore_access_status
 from ..hydration_queue import HydrationPriority, HydrationQueueRepository
 from ..messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
+from ..sync_transactions import write_savepoint
 
-_SAVEPOINTS = count()
 logger = logging.getLogger(__name__)
 
 
@@ -45,21 +42,6 @@ def _rearm_terminal_reaction_details(conn: sqlite3.Connection, dialog_id: int, n
     )
 
 
-@contextmanager
-def _lifecycle_savepoint(conn: sqlite3.Connection) -> Iterator[None]:
-    """Isolate one lifecycle operation without consuming an outer transaction."""
-    name = f"access_lifecycle_{next(_SAVEPOINTS)}"
-    conn.execute(f"SAVEPOINT {name}")
-    try:
-        yield
-    except BaseException:
-        conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
-        conn.execute(f"RELEASE SAVEPOINT {name}")
-        raise
-    else:
-        conn.execute(f"RELEASE SAVEPOINT {name}")
-
-
 def set_access_lost(
     conn: sqlite3.Connection,
     dialog_id: int,
@@ -71,7 +53,7 @@ def set_access_lost(
     """Atomically mark a peer inaccessible and hide its local snapshot."""
     changed = False
     reason_code = evidence.reason_code if evidence is not None else reason
-    with _lifecycle_savepoint(conn):
+    with write_savepoint(conn):
         row = cast(
             tuple[str | None] | None,
             conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone(),
@@ -116,7 +98,7 @@ def restore_access_after_revalidation(
 ) -> bool:
     """Restore access while preserving snapshot metadata and requesting refresh."""
     changed = False
-    with _lifecycle_savepoint(conn):
+    with write_savepoint(conn):
         row = cast(
             tuple[str | None] | None,
             conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone(),
@@ -173,7 +155,7 @@ def due_access_revalidations(conn: sqlite3.Connection, *, now: int, cooldown_sec
 
 
 def stamp_access_revalidation(conn: sqlite3.Connection, dialog_id: int, checked_at: int, cooldown_seconds: int) -> None:
-    with _lifecycle_savepoint(conn):
+    with write_savepoint(conn):
         conn.execute(
             "UPDATE synced_dialogs SET access_last_revalidated_at = ?, access_next_revalidate_at = ? WHERE dialog_id = ?",
             (checked_at, checked_at + cooldown_seconds, dialog_id),
@@ -182,7 +164,7 @@ def stamp_access_revalidation(conn: sqlite3.Connection, dialog_id: int, checked_
 
 def complete_access_revalidation(conn: sqlite3.Connection, dialog_id: int, checked_at: int) -> None:
     """Record a successful probe while retaining the access-lost status."""
-    with _lifecycle_savepoint(conn):
+    with write_savepoint(conn):
         conn.execute(
             "UPDATE synced_dialogs SET access_last_revalidated_at = ?, access_next_revalidate_at = NULL "
             "WHERE dialog_id = ? AND status = 'access_lost'",
@@ -201,7 +183,7 @@ def not_access_lost_sql(dialog_id_expression: str) -> str:
 
 def unhide_after_realtime_presence(conn: sqlite3.Connection, dialog_id: int) -> bool:
     """Expose a catalog row proved present by realtime without reviving access loss."""
-    with _lifecycle_savepoint(conn):
+    with write_savepoint(conn):
         cursor = conn.execute(
             "UPDATE dialogs SET hidden=0 WHERE dialog_id=? AND hidden=1 AND "
             + not_access_lost_sql("dialogs.dialog_id"),

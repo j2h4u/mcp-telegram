@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from mcp_telegram.sync_transactions import write_transaction
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
@@ -269,7 +270,10 @@ def test_reconciliation_snapshot_cannot_overwrite_same_second_realtime_count() -
             read_outbox_max_id=10,
             unread_count=0,
         )
-        with patch("mcp_telegram.daemon.telethon_utils.get_peer_id", return_value=1001):
+        with (
+            write_transaction(conn),
+            patch("mcp_telegram.daemon.telethon_utils.get_peer_id", return_value=1001),
+        ):
             assert _apply_read_position_dialog(
                 conn,
                 cast(_ReadPositionDialogLike, dialog),

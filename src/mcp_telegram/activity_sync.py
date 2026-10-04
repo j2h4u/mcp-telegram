@@ -28,6 +28,7 @@ from .messages.sqlite_bundle import insert_messages_with_fts
 from .messages.telegram_adapter import extract_dialog_id, extract_message_row
 from .models import DialogType
 from .own_only import enroll_own_only_sync_dialog
+from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_demand import (
     AcquisitionKind,
     DemandStatus,
@@ -231,24 +232,24 @@ def _coordinator_owns_throttle() -> bool:
 
 
 def _set_state(conn: sqlite3.Connection, key: str, value: str | None) -> None:
-    with conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
-            (key, value),
-        )
+    require_write_transaction(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
+        (key, value),
+    )
 
 
 def _finish_incremental_slice(conn: sqlite3.Connection) -> None:
     """Atomically finish one incremental window and publish its next cadence anchor."""
-    with conn:
-        conn.execute(
-            "DELETE FROM activity_sync_state WHERE key IN (?, ?)",
-            (_INCREMENTAL_MIN_DATE_KEY, _INCREMENTAL_OFFSET_ID_KEY),
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('last_sync_at', ?)",
-            (str(int(time.time())),),
-        )
+    require_write_transaction(conn)
+    conn.execute(
+        "DELETE FROM activity_sync_state WHERE key IN (?, ?)",
+        (_INCREMENTAL_MIN_DATE_KEY, _INCREMENTAL_OFFSET_ID_KEY),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('last_sync_at', ?)",
+        (str(int(time.time())),),
+    )
 
 
 def _normalize(text: str | None) -> str | None:
@@ -334,8 +335,8 @@ def _upsert_entities_from_search(conn: sqlite3.Connection, result: _SearchResult
     snapshots = _search_entity_snapshots(result, updated_at=int(time.time()))
     if not snapshots:
         return
-    with conn:
-        upsert_entity_snapshots(conn, snapshots)
+    require_write_transaction(conn)
+    upsert_entity_snapshots(conn, snapshots)
 
 
 def _fmt_duration(seconds: int) -> str:
@@ -366,11 +367,11 @@ def _persist_own_message_rows(
     """Persist extracted own-message rows and enroll their dialogs."""
     if not extracted:
         return
-    with conn:
-        insert_messages_with_fts(conn, extracted, priority=priority)
-        dialog_ids = {em.message.dialog_id for em in extracted}
-        for dialog_id in dialog_ids:
-            enroll_own_only_sync_dialog(conn, dialog_id)
+    require_write_transaction(conn)
+    insert_messages_with_fts(conn, extracted, priority=priority)
+    dialog_ids = {em.message.dialog_id for em in extracted}
+    for dialog_id in dialog_ids:
+        enroll_own_only_sync_dialog(conn, dialog_id)
 
 
 async def _search_backfill_batch(
@@ -558,21 +559,21 @@ def _log_incremental_batch(
 
 def _prepare_incremental_slice(
     conn: sqlite3.Connection,
-    state: dict[str, str | None],
     shutdown_event: asyncio.Event,
 ) -> tuple[int, int] | None:
     """Load and, for a new window, durably initialize incremental state."""
-    if shutdown_event.is_set() or state.get("backfill_complete") != "1":
-        return None
-    last_sync_at = int(state.get("last_sync_at") or 0)
-    if last_sync_at == 0:
-        return None
+    with write_transaction(conn):
+        state = _load_state(conn)
+        if shutdown_event.is_set() or state.get("backfill_complete") != "1":
+            return None
+        last_sync_at = int(state.get("last_sync_at") or 0)
+        if last_sync_at == 0:
+            return None
 
-    raw_min_date = state.get(_INCREMENTAL_MIN_DATE_KEY)
-    min_date = int(raw_min_date) if raw_min_date is not None else max(0, last_sync_at - 60)
-    offset_id = int(state.get(_INCREMENTAL_OFFSET_ID_KEY) or 0)
-    if raw_min_date is None:
-        with conn:
+        raw_min_date = state.get(_INCREMENTAL_MIN_DATE_KEY)
+        min_date = int(raw_min_date) if raw_min_date is not None else max(0, last_sync_at - 60)
+        offset_id = int(state.get(_INCREMENTAL_OFFSET_ID_KEY) or 0)
+        if raw_min_date is None:
             conn.execute(
                 "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
                 (_INCREMENTAL_MIN_DATE_KEY, str(min_date)),
@@ -581,7 +582,7 @@ def _prepare_incremental_slice(
                 "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, '0')",
                 (_INCREMENTAL_OFFSET_ID_KEY,),
             )
-    return min_date, offset_id
+        return min_date, offset_id
 
 
 def _commit_incremental_slice_result(
@@ -591,38 +592,39 @@ def _commit_incremental_slice_result(
     batch_started_at: float,
 ) -> None:
     """Persist one incremental page and its restart-safe continuation."""
-    batch = list(search_result.messages or [])
-    if not batch:
-        _finish_incremental_slice(conn)
-        return
+    with write_transaction(conn):
+        batch = list(search_result.messages or [])
+        if not batch:
+            _finish_incremental_slice(conn)
+            return
 
-    in_window, past_window = _trim_incremental_batch(batch, min_date)
-    extracted = _extract_own_message_rows(in_window)
-    _persist_own_message_rows(conn, extracted, priority=HydrationPriority.FOREGROUND)
-    _upsert_entities_from_search(conn, search_result)
-    next_offset_id = min(message.id for message in batch)
-    _log_incremental_batch(
-        _IncrementalState(
-            min_date=min_date,
-            inserted=len(in_window),
-            batch_num=1,
-            offset_id=next_offset_id,
-            loop_start=batch_started_at,
-        ),
-        _IncrementalBatchLog(
-            fetched=len(batch),
-            in_window=len(in_window),
-            extracted=len(extracted),
-            inserted=len(in_window),
-            next_offset_id=next_offset_id,
-            past_window=past_window,
-        ),
-        time.monotonic() - batch_started_at,
-    )
-    if past_window:
-        _finish_incremental_slice(conn)
-        return
-    _set_state(conn, _INCREMENTAL_OFFSET_ID_KEY, str(next_offset_id))
+        in_window, past_window = _trim_incremental_batch(batch, min_date)
+        extracted = _extract_own_message_rows(in_window)
+        _persist_own_message_rows(conn, extracted, priority=HydrationPriority.FOREGROUND)
+        _upsert_entities_from_search(conn, search_result)
+        next_offset_id = min(message.id for message in batch)
+        _log_incremental_batch(
+            _IncrementalState(
+                min_date=min_date,
+                inserted=len(in_window),
+                batch_num=1,
+                offset_id=next_offset_id,
+                loop_start=batch_started_at,
+            ),
+            _IncrementalBatchLog(
+                fetched=len(batch),
+                in_window=len(in_window),
+                extracted=len(extracted),
+                inserted=len(in_window),
+                next_offset_id=next_offset_id,
+                past_window=past_window,
+            ),
+            time.monotonic() - batch_started_at,
+        )
+        if past_window:
+            _finish_incremental_slice(conn)
+            return
+        _set_state(conn, _INCREMENTAL_OFFSET_ID_KEY, str(next_offset_id))
 
 
 async def _run_backfill_slice(
@@ -633,11 +635,11 @@ async def _run_backfill_slice(
     timeout_s: float,
 ) -> None:
     """Fetch one restart-safe archive-backfill page."""
-    state = _load_state(conn)
-    if shutdown_event.is_set() or state.get("backfill_complete") == "1":
-        return
-    checkpoint = int(state.get("backfill_offset_id") or 0)
-    with conn:
+    with write_transaction(conn):
+        state = _load_state(conn)
+        if shutdown_event.is_set() or state.get("backfill_complete") == "1":
+            return
+        checkpoint = int(state.get("backfill_offset_id") or 0)
         conn.execute(
             "INSERT OR IGNORE INTO activity_sync_state (key, value) VALUES ('backfill_started_at', ?)",
             (str(int(time.time())),),
@@ -655,18 +657,19 @@ async def _run_backfill_slice(
     search_result = cast(_SearchResultLike, result)
     batch = list(search_result.messages or [])
     if not batch:
-        with conn:
+        with write_transaction(conn):
             conn.execute("INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('backfill_complete', '1')")
             conn.execute(
                 "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('last_sync_at', ?)",
                 (str(int(time.time())),),
             )
         return
-    extracted = _extract_own_message_rows(batch)
-    _persist_own_message_rows(conn, extracted, priority=HydrationPriority.BACKFILL)
-    _upsert_entities_from_search(conn, search_result)
-    checkpoint = min(message.id for message in batch)
-    _set_state(conn, "backfill_offset_id", str(checkpoint))
+    with write_transaction(conn):
+        extracted = _extract_own_message_rows(batch)
+        _persist_own_message_rows(conn, extracted, priority=HydrationPriority.BACKFILL)
+        _upsert_entities_from_search(conn, search_result)
+        checkpoint = min(message.id for message in batch)
+        _set_state(conn, "backfill_offset_id", str(checkpoint))
     _log_backfill_batch(
         _BackfillState(
             checkpoint=checkpoint,
@@ -687,8 +690,7 @@ async def _run_incremental_slice(
     timeout_s: float,
 ) -> None:
     """Fetch one restart-safe page from the current incremental window."""
-    state = _load_state(conn)
-    window = _prepare_incremental_slice(conn, state, shutdown_event)
+    window = _prepare_incremental_slice(conn, shutdown_event)
     if window is None:
         return
     min_date, offset_id = window
@@ -705,6 +707,7 @@ async def _run_incremental_slice(
     if result is _SEARCH_BATCH_RETRY:
         return
     if result is _SEARCH_BATCH_STOP:
-        _finish_incremental_slice(conn)
+        with write_transaction(conn):
+            _finish_incremental_slice(conn)
         return
     _commit_incremental_slice_result(conn, cast(_SearchResultLike, result), min_date, batch_started_at)

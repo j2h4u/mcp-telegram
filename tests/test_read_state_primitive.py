@@ -16,6 +16,8 @@ from typing import cast
 
 import pytest
 
+from mcp_telegram.sync_transactions import enable_runtime_writes, write_savepoint, write_transaction
+
 
 def _create_synced_dialogs(conn: sqlite3.Connection) -> None:
     conn.execute(
@@ -38,11 +40,12 @@ def _create_synced_dialogs(conn: sqlite3.Connection) -> None:
         ) WITHOUT ROWID
         """
     )
-    conn.execute(
-        "INSERT INTO synced_dialogs (dialog_id, read_inbox_max_id, read_outbox_max_id, status) "
-        "VALUES (?, NULL, NULL, 'synced')",
-        (111,),
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO synced_dialogs (dialog_id, read_inbox_max_id, read_outbox_max_id, status) "
+            "VALUES (?, NULL, NULL, 'synced')",
+            (111,),
+        )
     conn.commit()
 
 
@@ -50,6 +53,7 @@ def _create_synced_dialogs(conn: sqlite3.Connection) -> None:
 def mem_conn() -> Iterator[sqlite3.Connection]:
     conn = cast(sqlite3.Connection, sqlite3.connect(":memory:"))
     _create_synced_dialogs(conn)
+    enable_runtime_writes(conn)
     try:
         yield conn
     finally:
@@ -84,7 +88,8 @@ def _read_cursors(conn: sqlite3.Connection, dialog_id: int) -> tuple[int | None,
 def testapply_read_cursor_inbox_writes_value(mem_conn: sqlite3.Connection) -> None:
     from mcp_telegram.read_state import apply_read_cursor
 
-    apply_read_cursor(mem_conn, 111, "inbox", 42)
+    with write_savepoint(mem_conn):
+        apply_read_cursor(mem_conn, 111, "inbox", 42)
     mem_conn.commit()
     inbox, outbox = _read_cursors(mem_conn, 111)
     assert inbox == 42
@@ -94,7 +99,8 @@ def testapply_read_cursor_inbox_writes_value(mem_conn: sqlite3.Connection) -> No
 def testapply_read_cursor_outbox_writes_value(mem_conn: sqlite3.Connection) -> None:
     from mcp_telegram.read_state import apply_read_cursor
 
-    apply_read_cursor(mem_conn, 111, "outbox", 99)
+    with write_savepoint(mem_conn):
+        apply_read_cursor(mem_conn, 111, "outbox", 99)
     mem_conn.commit()
     inbox, outbox = _read_cursors(mem_conn, 111)
     assert inbox is None
@@ -104,7 +110,8 @@ def testapply_read_cursor_outbox_writes_value(mem_conn: sqlite3.Connection) -> N
 def testapply_read_cursor_inbox_does_not_touch_outbox(mem_conn: sqlite3.Connection) -> None:
     from mcp_telegram.read_state import apply_read_cursor
 
-    apply_read_cursor(mem_conn, 111, "inbox", 5)
+    with write_savepoint(mem_conn):
+        apply_read_cursor(mem_conn, 111, "inbox", 5)
     mem_conn.commit()
     _, outbox = _read_cursors(mem_conn, 111)
     assert outbox is None
@@ -113,7 +120,8 @@ def testapply_read_cursor_inbox_does_not_touch_outbox(mem_conn: sqlite3.Connecti
 def testapply_read_cursor_outbox_does_not_touch_inbox(mem_conn: sqlite3.Connection) -> None:
     from mcp_telegram.read_state import apply_read_cursor
 
-    apply_read_cursor(mem_conn, 111, "outbox", 7)
+    with write_savepoint(mem_conn):
+        apply_read_cursor(mem_conn, 111, "outbox", 7)
     mem_conn.commit()
     inbox, _ = _read_cursors(mem_conn, 111)
     assert inbox is None
@@ -122,8 +130,10 @@ def testapply_read_cursor_outbox_does_not_touch_inbox(mem_conn: sqlite3.Connecti
 def testapply_read_cursor_monotonic_inbox(mem_conn: sqlite3.Connection) -> None:
     from mcp_telegram.read_state import apply_read_cursor
 
-    apply_read_cursor(mem_conn, 111, "inbox", 100)
-    apply_read_cursor(mem_conn, 111, "inbox", 50)
+    with write_savepoint(mem_conn):
+        apply_read_cursor(mem_conn, 111, "inbox", 100)
+    with write_savepoint(mem_conn):
+        apply_read_cursor(mem_conn, 111, "inbox", 50)
     mem_conn.commit()
     inbox, _ = _read_cursors(mem_conn, 111)
     assert inbox == 100  # regression rejected
@@ -132,8 +142,10 @@ def testapply_read_cursor_monotonic_inbox(mem_conn: sqlite3.Connection) -> None:
 def testapply_read_cursor_monotonic_outbox(mem_conn: sqlite3.Connection) -> None:
     from mcp_telegram.read_state import apply_read_cursor
 
-    apply_read_cursor(mem_conn, 111, "outbox", 100)
-    apply_read_cursor(mem_conn, 111, "outbox", 33)
+    with write_savepoint(mem_conn):
+        apply_read_cursor(mem_conn, 111, "outbox", 100)
+    with write_savepoint(mem_conn):
+        apply_read_cursor(mem_conn, 111, "outbox", 33)
     mem_conn.commit()
     _, outbox = _read_cursors(mem_conn, 111)
     assert outbox == 100
@@ -144,7 +156,8 @@ def testapply_read_cursor_null_then_value_inbox(mem_conn: sqlite3.Connection) ->
 
     inbox_before, _ = _read_cursors(mem_conn, 111)
     assert inbox_before is None
-    apply_read_cursor(mem_conn, 111, "inbox", 42)
+    with write_savepoint(mem_conn):
+        apply_read_cursor(mem_conn, 111, "inbox", 42)
     mem_conn.commit()
     inbox_after, _ = _read_cursors(mem_conn, 111)
     assert inbox_after == 42
@@ -154,14 +167,16 @@ def testapply_read_cursor_bad_kind_raises(mem_conn: sqlite3.Connection) -> None:
     from mcp_telegram.read_state import ReadCursorKind, apply_read_cursor
 
     with pytest.raises(KeyError):
-        apply_read_cursor(mem_conn, 111, cast(ReadCursorKind, "garbage"), 1)
+        with write_savepoint(mem_conn):
+            apply_read_cursor(mem_conn, 111, cast(ReadCursorKind, "garbage"), 1)
 
 
 def testapply_read_cursor_unknown_dialog_id_is_noop(mem_conn: sqlite3.Connection) -> None:
     from mcp_telegram.read_state import apply_read_cursor
 
     # UPDATE on missing row: affects 0 rows, no exception.
-    apply_read_cursor(mem_conn, 999_999, "inbox", 10)
+    with write_savepoint(mem_conn):
+        apply_read_cursor(mem_conn, 999_999, "inbox", 10)
     mem_conn.commit()
     row = cast(
         tuple[int] | None,
@@ -183,10 +198,11 @@ def testapply_read_cursor_caller_controls_transaction(file_db_path: Path) -> Non
     seeder = sqlite3.connect(str(file_db_path), timeout=5.0)
     try:
         _create_synced_dialogs(seeder)
-        seeder.execute(
-            "UPDATE synced_dialogs SET read_inbox_max_id = 10 WHERE dialog_id=?",
-            (111,),
-        )
+        with write_savepoint(seeder):
+            seeder.execute(
+                "UPDATE synced_dialogs SET read_inbox_max_id = 10 WHERE dialog_id=?",
+                (111,),
+            )
         seeder.commit()
     finally:
         seeder.close()
@@ -194,22 +210,24 @@ def testapply_read_cursor_caller_controls_transaction(file_db_path: Path) -> Non
     conn_a = sqlite3.connect(str(file_db_path), timeout=5.0, isolation_level="DEFERRED")
     conn_b = sqlite3.connect(str(file_db_path), timeout=5.0)
     try:
-        # Connection A writes via helper — does NOT commit.
-        apply_read_cursor(conn_a, 111, "inbox", 77)
+        enable_runtime_writes(conn_a)
+        with write_transaction(conn_a):
+            # Connection A writes via helper — does NOT commit.
+            with write_savepoint(conn_a):
+                apply_read_cursor(conn_a, 111, "inbox", 77)
 
-        # Connection B sees the OLD value (uncommitted write is invisible).
-        row = cast(
-            tuple[int] | None,
-            conn_b.execute(
-                "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id=?",
-                (111,),
-            ).fetchone(),
-        )
-        assert row is not None
-        assert row[0] == 10, "helper must not auto-commit — B should see old value"
+            # Connection B sees the OLD value (uncommitted write is invisible).
+            row = cast(
+                tuple[int] | None,
+                conn_b.execute(
+                    "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id=?",
+                    (111,),
+                ).fetchone(),
+            )
+            assert row is not None
+            assert row[0] == 10, "helper must not auto-commit — B should see old value"
 
         # Now A commits — B sees the new value on a fresh read.
-        conn_a.commit()
         # Start a new read txn on B to force re-read.
         conn_b.rollback()
         row = cast(

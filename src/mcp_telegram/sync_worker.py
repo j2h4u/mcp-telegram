@@ -48,6 +48,7 @@ from .message_history.ports import FullHistoryPagePort
 from .messages.sqlite_bundle import insert_messages_with_fts
 from .read_state import apply_read_cursor
 from .resolver import latinize
+from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_demand import (
     AcquisitionKind,
     DemandStatus,
@@ -175,6 +176,7 @@ def _dm_enrollment_state(conn: sqlite3.Connection, key: str) -> str | None:
 
 
 def _set_dm_enrollment_state(conn: sqlite3.Connection, key: str, value: str | None) -> None:
+    require_write_transaction(conn)
     conn.execute("INSERT OR REPLACE INTO daemon_state(key, value) VALUES (?, ?)", (key, value))
 
 
@@ -190,6 +192,7 @@ def _total_messages_repair_retry_at(conn: sqlite3.Connection) -> int | None:
 
 
 def _set_total_messages_repair_retry(conn: sqlite3.Connection, retry_at: int | None) -> None:
+    require_write_transaction(conn)
     _set_dm_enrollment_state(
         conn,
         _TOTAL_MESSAGES_REPAIR_GATE_STATE_KEY,
@@ -260,6 +263,7 @@ class FullSyncWorker:
 
     def _upsert_local_entity_stub(self, dialog_id: int, dialog_type: str, name: str | None, now: int) -> None:
         """Create a local identity row while retaining richer existing fields."""
+        require_write_transaction(self._conn)
         upsert_entity_stub(
             self._conn,
             EntitySnapshot(
@@ -273,6 +277,7 @@ class FullSyncWorker:
         )
 
     def _consume_one_canonical_dm(self, row: tuple[object, ...], now: int) -> int:
+        require_write_transaction(self._conn)
         dialog_id = int(cast(int, row[0]))
         dialog_type = str(row[1])
         name = cast(str | None, row[2])
@@ -288,29 +293,24 @@ class FullSyncWorker:
 
     def consume_canonical_dm_publication(self) -> int:
         """Consume one completed canonical dialog publication entirely locally."""
-        generation = self._published_dm_generation()
-        if generation is None or generation <= self._last_consumed_dm_generation():
-            return 0
-        rows = cast(
-            list[tuple[object, ...]],
-            self._conn.execute(
-                "SELECT dialog_id,type,name,read_inbox_max_id,read_outbox_max_id FROM dialogs "
-                "WHERE type IN ('user','bot') AND hidden=0 ORDER BY dialog_id"
-            ).fetchall(),
-        )
-        now = int(time.time())
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self._conn):
+            generation = self._published_dm_generation()
+            if generation is None or generation <= self._last_consumed_dm_generation():
+                return 0
+            rows = cast(
+                list[tuple[object, ...]],
+                self._conn.execute(
+                    "SELECT dialog_id,type,name,read_inbox_max_id,read_outbox_max_id FROM dialogs "
+                    "WHERE type IN ('user','bot') AND hidden=0 ORDER BY dialog_id"
+                ).fetchall(),
+            )
+            now = int(time.time())
             enrolled = sum(self._consume_one_canonical_dm(row, now) for row in rows)
             _set_dm_enrollment_state(
                 self._conn,
                 _DM_ENROLLMENT_KEY_LAST_PUBLICATION_GENERATION,
                 str(generation),
             )
-            self._conn.commit()
-        except BaseException:
-            self._conn.rollback()
-            raise
         logger.info("dm_publication_consumed generation=%d enrolled=%d", generation, enrolled)
         return enrolled
 
@@ -374,8 +374,8 @@ class FullSyncWorker:
             self._last_total_repair_error = exc
             return False
         except MessageHistoryAccessLostError as exc:
-            set_access_lost(self._conn, dialog_id, int(time.time()), reason=exc.reason_code)
-            self._conn.commit()
+            with write_transaction(self._conn):
+                set_access_lost(self._conn, dialog_id, int(time.time()), reason=exc.reason_code)
             return False
         except MessageHistoryUnavailableError as exc:
             logger.warning("sync_total_repair_failed dialog_id=%d error=%s", dialog_id, exc)
@@ -387,7 +387,7 @@ class FullSyncWorker:
             logger.warning("sync_total_repair_missing_total dialog_id=%d", dialog_id)
             self._set_total_repair_retry(None)
             return False
-        with self._conn:
+        with write_transaction(self._conn):
             self._conn.execute(
                 _UPDATE_TOTAL_MESSAGES_SQL,
                 (total_messages, dialog_id, "access_lost", dialog_id),
@@ -402,7 +402,7 @@ class FullSyncWorker:
         except TypeError, ValueError:
             failure_delay = 0
         release_at = int(time.time()) + max(_TOTAL_MESSAGES_REPAIR_FAILURE_DELAY_S, failure_delay)
-        with self._conn:
+        with write_transaction(self._conn):
             _set_total_messages_repair_retry(self._conn, release_at)
 
     # ------------------------------------------------------------------
@@ -451,6 +451,7 @@ class FullSyncWorker:
         return None if row is None or row[0] is None else float(row[0])
 
     def _set_automatic_group_retry(self, dialog_id: int) -> None:
+        require_write_transaction(self._conn)
         assert self._automatic_group_history is not None
         self._conn.execute(
             "INSERT OR REPLACE INTO daemon_state(key,value) VALUES (?,?)",
@@ -505,25 +506,24 @@ class FullSyncWorker:
         try:
             page = await self._fetch_batch_page(dialog_id, 0)
         except Exception:
-            self._set_automatic_group_retry(dialog_id)
-            self._conn.commit()
+            with write_transaction(self._conn):
+                self._set_automatic_group_retry(dialog_id)
             raise
         if page.retry is not None:
-            self._set_automatic_group_retry(dialog_id)
-            self._conn.commit()
+            with write_transaction(self._conn):
+                self._set_automatic_group_retry(dialog_id)
             if isinstance(self._last_page_error, MessageHistoryUnavailableError):
                 self._last_page_error = None
             return True
         if page.total_messages is None:
-            self._set_automatic_group_retry(dialog_id)
-            self._conn.commit()
+            with write_transaction(self._conn):
+                self._set_automatic_group_retry(dialog_id)
             return True
         return self._finalize_automatic_group_page(dialog_id, page)
 
     def _finalize_automatic_group_page(self, dialog_id: int, page: _FetchedBatchPage) -> bool:
         assert self._automatic_group_history is not None
-        self._conn.execute("BEGIN IMMEDIATE")
-        with self._conn:
+        with write_transaction(self._conn):
             intent = read_intent(self._conn, dialog_id)
             if intent.source is not None:
                 self._conn.execute(
@@ -611,8 +611,8 @@ class FullSyncWorker:
             return _FetchedBatchPage(None, (), None, (sync_progress, False))
         if isinstance(exc, MessageHistoryAccessLostError):
             now = int(time.time())
-            set_access_lost(self._conn, dialog_id, now, reason=exc.reason_code)
-            self._conn.commit()
+            with write_transaction(self._conn):
+                set_access_lost(self._conn, dialog_id, now, reason=exc.reason_code)
             return _FetchedBatchPage(None, (), None, (sync_progress, True))
         raise exc
 
@@ -685,7 +685,7 @@ class FullSyncWorker:
         page: _FetchedBatchPage,
     ) -> tuple[int, bool]:
         """Persist one fetched batch and update sync progress."""
-        with self._conn:
+        with write_transaction(self._conn):
             return self._store_batch_page_locked(dialog_id, sync_progress, page)
 
     def _store_batch_page_locked(
@@ -694,6 +694,7 @@ class FullSyncWorker:
         sync_progress: int,
         page: _FetchedBatchPage,
     ) -> tuple[int, bool]:
+        require_write_transaction(self._conn)
         if page.next_before_message_id is None:
             if not full_history_enabled(self._conn, dialog_id):
                 logger.info("sync_batch_discarded_disabled dialog_id=%d fetched=0", dialog_id)
@@ -740,6 +741,7 @@ class FullSyncWorker:
 
     def _begin_topic_attribution_pass(self, dialog_id: int, sync_progress: int, observed_at: int) -> None:
         """Start or safely resume a current-extractor full-history receipt."""
+        require_write_transaction(self._conn)
         del sync_progress
         self._conn.execute(
             "UPDATE synced_dialogs SET topic_attribution_version=?, topic_attribution_state='partial', "
@@ -751,6 +753,7 @@ class FullSyncWorker:
 
     def _record_no_topic_attribution(self, dialog_id: int, batch: Sequence[_ExtractedMessage]) -> None:
         """Record legal extractor NULL outcomes from one current history page."""
+        require_write_transaction(self._conn)
         count = sum(message.message.forum_topic_id is None for message in batch)
         if count:
             self._conn.execute(
@@ -761,6 +764,7 @@ class FullSyncWorker:
 
     def _complete_topic_attribution_pass(self, dialog_id: int, completed_at: int) -> None:
         """Publish a full current-extractor traversal, including legal NULL outcomes."""
+        require_write_transaction(self._conn)
         self._conn.execute(
             "UPDATE synced_dialogs SET topic_attribution_state='complete', topic_attribution_completed_at=? "
             "WHERE dialog_id=? AND topic_attribution_version=? AND topic_attribution_state='partial'",

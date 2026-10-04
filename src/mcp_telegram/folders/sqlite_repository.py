@@ -7,6 +7,7 @@ import sqlite3
 from collections.abc import Iterable
 from typing import cast
 
+from ..sync_transactions import require_write_transaction, write_savepoint
 from .contracts import (
     RULE_TTL_SECONDS,
     DialogCategory,
@@ -27,7 +28,7 @@ def replace_folder_snapshot(
     """Compatibility fixture helper for pre-v67 callers."""
     folder_rows = tuple(folders)
     member_rows = tuple(memberships)
-    with conn:
+    with write_savepoint(conn):
         conn.execute("DELETE FROM telegram_folder_members")
         conn.execute("DELETE FROM telegram_folders")
         conn.executemany("INSERT INTO telegram_folders(folder_id, title) VALUES (?, ?)", folder_rows)
@@ -78,7 +79,7 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
 
     def project_observation(self, observation: FolderRuleObservation, *, completed_at: int) -> int | None:
         """Publish a rule receipt only when a coherent canonical directory exists."""
-        with self._conn:
+        with write_savepoint(self._conn):
             canonical = _canonical_receipt(self._conn)
             if canonical is None:
                 self._save_pending(observation)
@@ -95,11 +96,12 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
 
     def reproject_current_rules(self, *, now: int) -> int | None:
         """Re-evaluate retained accepted rules with no Telegram RPC or clock rewrite."""
-        with self._conn:
+        with write_savepoint(self._conn):
             return self.reproject_current_rules_in_transaction(now=now)
 
     def reproject_current_rules_in_transaction(self, *, now: int) -> int | None:
         """Local publication hook for the canonical directory transaction."""
+        require_write_transaction(self._conn)
         canonical = _canonical_receipt(self._conn)
         observation = self._accepted_observation() or self._pending_observation()
         if canonical is None or observation is None:
@@ -115,15 +117,16 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
         return generation
 
     def ensure_mute_projection(self, *, now: int) -> int | None:
-        expiry = self.next_mute_expiry()
-        if expiry is None or now < expiry:
-            return None
-        return self.reproject_current_rules(now=now)
+        with write_savepoint(self._conn):
+            expiry = self.next_mute_expiry()
+            if expiry is None or now < expiry:
+                return None
+            return self.reproject_current_rules_in_transaction(now=now)
 
     def record_attempt(
         self, *, attempted_at: int, outcome: str, next_retry_at: int | None, consecutive_failures: int
     ) -> None:
-        with self._conn:
+        with write_savepoint(self._conn):
             self._conn.execute(
                 "UPDATE telegram_folder_projection_state SET last_attempt_at=?,last_outcome=?,next_retry_at=?,consecutive_failures=? WHERE singleton=1",
                 (attempted_at, outcome, next_retry_at, consecutive_failures),
@@ -138,6 +141,7 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
         canonical_observed_at: int,
         completed_at: int,
     ) -> None:
+        require_write_transaction(self._conn)
         facts = _canonical_facts(self._conn)
         members = _evaluate_rules(
             self._conn, observation.rules, facts, _published_main_pins(self._conn), now=completed_at
@@ -184,6 +188,7 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
         self._conn.execute("DELETE FROM telegram_folder_pending_observation")
 
     def _save_pending(self, observation: FolderRuleObservation) -> None:
+        require_write_transaction(self._conn)
         row = cast(
             tuple[object, object] | None,
             self._conn.execute(

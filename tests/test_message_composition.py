@@ -17,6 +17,7 @@ from mcp_telegram.message_composition import (
 from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts, persist_edited_message
 from mcp_telegram.messages.telegram_adapter import extract_message_row
 from mcp_telegram.sync_db import _apply_migration_79, _open_sync_db, ensure_sync_schema
+from mcp_telegram.sync_transactions import write_transaction
 
 
 def _message(entities: list[object] | None = None, action: object | None = None) -> SimpleNamespace:
@@ -100,7 +101,7 @@ def test_identical_text_edit_updates_formatting_and_action_without_text_version(
                 action=types.MessageActionChatAddUser(users=[123]),
             ),
         )
-        with conn:
+        with write_transaction(conn):
             insert_messages_with_fts(conn, [before])
             assert persist_edited_message(conn, after, old_text="😀code", edit_date=20) is None
         row = cast(

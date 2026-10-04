@@ -813,6 +813,7 @@ def test_dm_entity_collectible_username_and_partial_sender_preserve_canonical_fa
             observed_at=102,
         )
         assert identity is not None
+        sync_db.commit()
         manager._persist_dm_entity(unknown_id, identity, observed_at=102)
         assert sync_db.execute("SELECT type,username FROM entities WHERE id=?", (unknown_id,)).fetchone() == (
             "user",

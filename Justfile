@@ -8,7 +8,7 @@ default:
     @just --list
 
 # Run all local source checks.
-check: fmt-check lint radon-threshold lock-check typecheck typecheck-pyright typecheck-tests import-contracts module-boundaries semantic-boundaries message-boundaries telegram-rpc-boundaries config-imports policy-placement demand-cutover runtime-seams actionlint supply-chain-pins deptry compile deadcode package-smoke
+check: fmt-check lint radon-threshold lock-check typecheck typecheck-pyright typecheck-tests import-contracts module-boundaries semantic-boundaries transaction-boundaries message-boundaries telegram-rpc-boundaries config-imports policy-placement demand-cutover runtime-seams actionlint supply-chain-pins deptry compile deadcode package-smoke
 
 # Verify uv.lock is synchronized with pyproject.toml.
 lock-check:
@@ -181,3 +181,7 @@ verify: check crap-threshold runtime-verify
 # Show live Docker container state.
 runtime-status:
     docker compose -f {{compose_file}} ps {{container}}
+
+# Enforce ownership of synchronous runtime SQLite write units.
+transaction-boundaries:
+    uv run python scripts/check_transaction_boundaries.py

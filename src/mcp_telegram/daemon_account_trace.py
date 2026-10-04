@@ -51,6 +51,7 @@ from .messages.sqlite_bundle import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
 from .models import DialogType
 from .resolver import Candidates, Resolved, _parse_tme_link, latinize, resolve
+from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import AcquisitionKind
 from .telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
@@ -731,34 +732,35 @@ class DaemonAccountTraceService:
         result["messages_seen"] = len(fetched)
         unique_messages, duplicate_count = _dedupe_trace_messages(fetched)
         result["duplicates_skipped"] += duplicate_count
-        changed, persisted_duplicate_count = _split_trace_duplicate_messages(
-            conn=self._deps.conn,
-            messages=unique_messages,
-        )
-        result["duplicates_skipped"] += persisted_duplicate_count
-
-        if changed:
-            _persist_trace_messages(self._deps.conn, changed)
-            result["messages_persisted"] = len(changed)
-
-        status = _trace_candidate_status_after_fetch(
-            fetched_count=len(fetched),
-            max_per_dialog=max_per_dialog,
-            deadline_ms=deadline_ms,
-            deadline_at=deadline_at,
-        )
-        _upsert_trace_coverage_fragment(
-            _TraceCoverageFragmentUpsertRequest(
+        with write_transaction(self._deps.conn):
+            changed, persisted_duplicate_count = _split_trace_duplicate_messages(
                 conn=self._deps.conn,
-                target_user_id=target_user_id,
-                dialog_id=dialog_id,
-                topic_id=topic_id,
-                status=status,
-                fetched_at=now,
-                last_error=f"BudgetExceeded:{deadline_ms}" if status == "budget_exceeded" else None,
-                now=now,
+                messages=unique_messages,
             )
-        )
+            result["duplicates_skipped"] += persisted_duplicate_count
+
+            if changed:
+                _persist_trace_messages(self._deps.conn, changed)
+                result["messages_persisted"] = len(changed)
+
+            status = _trace_candidate_status_after_fetch(
+                fetched_count=len(fetched),
+                max_per_dialog=max_per_dialog,
+                deadline_ms=deadline_ms,
+                deadline_at=deadline_at,
+            )
+            _upsert_trace_coverage_fragment(
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=self._deps.conn,
+                    target_user_id=target_user_id,
+                    dialog_id=dialog_id,
+                    topic_id=topic_id,
+                    status=status,
+                    fetched_at=now,
+                    last_error=f"BudgetExceeded:{deadline_ms}" if status == "budget_exceeded" else None,
+                    now=now,
+                )
+            )
         result["status"] = status
         return result
 
@@ -781,25 +783,10 @@ class DaemonAccountTraceService:
         now = int(time.time())
         selected = candidate_dialogs[: request.max_dialogs]
         overflow = candidate_dialogs[request.max_dialogs :]
-        _mark_budget_exceeded_candidates(
-            self._deps.conn,
-            candidates=overflow,
-            request=_TraceVisibleBudgetContext(
-                target_user_id=target_user_id,
-                deadline_ms=request.deadline_ms,
-                now=now,
-                result=result,
-            ),
-        )
-
-        if not selected:
-            self._deps.conn.commit()
-            return result
-
-        if request.deadline_ms <= 0:
+        with write_transaction(self._deps.conn):
             _mark_budget_exceeded_candidates(
                 self._deps.conn,
-                candidates=selected,
+                candidates=overflow,
                 request=_TraceVisibleBudgetContext(
                     target_user_id=target_user_id,
                     deadline_ms=request.deadline_ms,
@@ -807,7 +794,22 @@ class DaemonAccountTraceService:
                     result=result,
                 ),
             )
-            self._deps.conn.commit()
+
+        if not selected:
+            return result
+
+        if request.deadline_ms <= 0:
+            with write_transaction(self._deps.conn):
+                _mark_budget_exceeded_candidates(
+                    self._deps.conn,
+                    candidates=selected,
+                    request=_TraceVisibleBudgetContext(
+                        target_user_id=target_user_id,
+                        deadline_ms=request.deadline_ms,
+                        now=now,
+                        result=result,
+                    ),
+                )
             return result
 
         deadline_at = time.monotonic() + (request.deadline_ms / 1000)
@@ -828,7 +830,6 @@ class DaemonAccountTraceService:
             result["messages_persisted"] += int(item["messages_persisted"])
             result["duplicates_skipped"] += int(item["duplicates_skipped"])
             _trace_increment_status(result, str(item["status"]))
-        self._deps.conn.commit()
         return result
 
     async def _trace_account_messages(self, req: dict) -> dict[str, object]:
@@ -1459,63 +1460,64 @@ def _parse_trace_account_navigation_scope(
 
 
 def _trace_enrich_candidate_precheck(request: _TraceEnrichPrecheckContext) -> str | None:
-    next_retry_at = fragment_next_retry_at(
-        request.conn,
-        target_user_id=request.target_user_id,
-        dialog_id=request.dialog_id,
-        topic_id=request.topic_id,
-    )
-    if next_retry_at is not None and next_retry_at > request.now:
-        _upsert_trace_coverage_fragment(
-            _TraceCoverageFragmentUpsertRequest(
-                conn=request.conn,
-                target_user_id=request.target_user_id,
-                dialog_id=request.dialog_id,
-                topic_id=request.topic_id,
-                status="pending",
-                fetched_at=request.now,
-                last_error=None,
-                now=request.now,
-            )
+    with write_transaction(request.conn):
+        next_retry_at = fragment_next_retry_at(
+            request.conn,
+            target_user_id=request.target_user_id,
+            dialog_id=request.dialog_id,
+            topic_id=request.topic_id,
         )
-        return "pending"
-
-    if request.strategy in {"hidden", "access_lost", "unsupported", "signature_only"}:
-        status = {
-            "hidden": "unsupported",
-            "access_lost": "access_lost",
-            "unsupported": "unsupported",
-            "signature_only": "unsupported",
-        }[request.strategy]
-        _upsert_trace_coverage_fragment(
-            _TraceCoverageFragmentUpsertRequest(
-                conn=request.conn,
-                target_user_id=request.target_user_id,
-                dialog_id=request.dialog_id,
-                topic_id=request.topic_id,
-                status=status,
-                fetched_at=request.now,
-                last_error=f"{request.strategy}:no_author_search",
-                now=request.now,
+        if next_retry_at is not None and next_retry_at > request.now:
+            _upsert_trace_coverage_fragment(
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=request.conn,
+                    target_user_id=request.target_user_id,
+                    dialog_id=request.dialog_id,
+                    topic_id=request.topic_id,
+                    status="pending",
+                    fetched_at=request.now,
+                    last_error=None,
+                    now=request.now,
+                )
             )
-        )
-        return status
+            return "pending"
 
-    if time.monotonic() >= request.deadline_at:
-        _upsert_trace_coverage_fragment(
-            _TraceCoverageFragmentUpsertRequest(
-                conn=request.conn,
-                target_user_id=request.target_user_id,
-                dialog_id=request.dialog_id,
-                topic_id=request.topic_id,
-                status="budget_exceeded",
-                last_error=f"BudgetExceeded:{request.deadline_ms}",
-                now=request.now,
+        if request.strategy in {"hidden", "access_lost", "unsupported", "signature_only"}:
+            status = {
+                "hidden": "unsupported",
+                "access_lost": "access_lost",
+                "unsupported": "unsupported",
+                "signature_only": "unsupported",
+            }[request.strategy]
+            _upsert_trace_coverage_fragment(
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=request.conn,
+                    target_user_id=request.target_user_id,
+                    dialog_id=request.dialog_id,
+                    topic_id=request.topic_id,
+                    status=status,
+                    fetched_at=request.now,
+                    last_error=f"{request.strategy}:no_author_search",
+                    now=request.now,
+                )
             )
-        )
-        return "budget_exceeded"
+            return status
 
-    return None
+        if time.monotonic() >= request.deadline_at:
+            _upsert_trace_coverage_fragment(
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=request.conn,
+                    target_user_id=request.target_user_id,
+                    dialog_id=request.dialog_id,
+                    topic_id=request.topic_id,
+                    status="budget_exceeded",
+                    last_error=f"BudgetExceeded:{request.deadline_ms}",
+                    now=request.now,
+                )
+            )
+            return "budget_exceeded"
+
+        return None
 
 
 async def _trace_enrich_candidate_messages(
@@ -1532,53 +1534,57 @@ async def _trace_enrich_candidate_messages(
         seconds = exc.retry_after_seconds
         if seconds is None:
             return fetched, "flood_wait"
-        _upsert_trace_coverage_fragment(
-            _TraceCoverageFragmentUpsertRequest(
-                conn=request.conn,
-                target_user_id=request.target_user_id,
-                dialog_id=request.dialog_id,
-                status="flood_wait",
-                last_error=f"TelegramRpcThrottled:{seconds}",
-                next_retry_at=request.now + seconds,
-                now=request.now,
+        with write_transaction(request.conn):
+            _upsert_trace_coverage_fragment(
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=request.conn,
+                    target_user_id=request.target_user_id,
+                    dialog_id=request.dialog_id,
+                    status="flood_wait",
+                    last_error=f"TelegramRpcThrottled:{seconds}",
+                    next_retry_at=request.now + seconds,
+                    now=request.now,
+                )
             )
-        )
         return fetched, "flood_wait"
     except ACCESS_LOST_ERRORS as exc:
-        _upsert_trace_coverage_fragment(
-            _TraceCoverageFragmentUpsertRequest(
-                conn=request.conn,
-                target_user_id=request.target_user_id,
-                dialog_id=request.dialog_id,
-                status="access_lost",
-                last_error=type(exc).__name__,
-                now=request.now,
+        with write_transaction(request.conn):
+            _upsert_trace_coverage_fragment(
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=request.conn,
+                    target_user_id=request.target_user_id,
+                    dialog_id=request.dialog_id,
+                    status="access_lost",
+                    last_error=type(exc).__name__,
+                    now=request.now,
+                )
             )
-        )
         return fetched, "access_lost"
     except RPCError as exc:
-        _upsert_trace_coverage_fragment(
-            _TraceCoverageFragmentUpsertRequest(
-                conn=request.conn,
-                target_user_id=request.target_user_id,
-                dialog_id=request.dialog_id,
-                status="partial",
-                last_error=type(exc).__name__,
-                now=request.now,
+        with write_transaction(request.conn):
+            _upsert_trace_coverage_fragment(
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=request.conn,
+                    target_user_id=request.target_user_id,
+                    dialog_id=request.dialog_id,
+                    status="partial",
+                    last_error=type(exc).__name__,
+                    now=request.now,
+                )
             )
-        )
         return fetched, "partial"
     except (RuntimeError, TypeError, AttributeError, ValueError, sqlite3.Error) as exc:
-        _upsert_trace_coverage_fragment(
-            _TraceCoverageFragmentUpsertRequest(
-                conn=request.conn,
-                target_user_id=request.target_user_id,
-                dialog_id=request.dialog_id,
-                status="partial",
-                last_error=type(exc).__name__,
-                now=request.now,
+        with write_transaction(request.conn):
+            _upsert_trace_coverage_fragment(
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=request.conn,
+                    target_user_id=request.target_user_id,
+                    dialog_id=request.dialog_id,
+                    status="partial",
+                    last_error=type(exc).__name__,
+                    now=request.now,
+                )
             )
-        )
         return fetched, "partial"
     return fetched, None
 
@@ -1627,8 +1633,8 @@ def _split_trace_duplicate_messages(
 
 
 def _persist_trace_messages(conn: sqlite3.Connection, messages: list[ExtractedMessage]) -> None:
-    with conn:
-        insert_messages_with_fts(conn, messages, priority=HydrationPriority.BACKFILL)
+    require_write_transaction(conn)
+    insert_messages_with_fts(conn, messages, priority=HydrationPriority.BACKFILL)
 
 
 _TRACE_FRAGMENT_STATUSES = {
@@ -1798,20 +1804,20 @@ def _persist_trace_username_result(
     entity_type = classify_dialog_type(user).value
     display_name = _trace_username_display_name(user, username)
     resolved_username = _trace_username_value(user, username)
-    upsert_entity_snapshots(
-        deps.conn,
-        (
-            EntitySnapshot(
-                entity_id=user_id,
-                entity_type=entity_type,
-                name=display_name,
-                username=resolved_username,
-                name_normalized=latinize(display_name),
-                updated_at=int(time.time()),
+    with write_transaction(deps.conn):
+        upsert_entity_snapshots(
+            deps.conn,
+            (
+                EntitySnapshot(
+                    entity_id=user_id,
+                    entity_type=entity_type,
+                    name=display_name,
+                    username=resolved_username,
+                    name_normalized=latinize(display_name),
+                    updated_at=int(time.time()),
+                ),
             ),
-        ),
-    )
-    deps.conn.commit()
+        )
     row = account_by_id(deps.conn, user_id)
     if row is None:
         return _unresolved_trace_account(
@@ -1873,6 +1879,7 @@ def _upsert_trace_coverage_fragment(
 ) -> None:
     """Insert/update one target-specific coverage fragment."""
     conn = request.conn
+    require_write_transaction(conn)
     if request.status not in _TRACE_FRAGMENT_STATUSES:
         raise ValueError(f"invalid trace coverage status: {request.status}")
     timestamp = request.now if request.now is not None else int(time.time())

@@ -11,14 +11,18 @@ from mcp_telegram.entity_profile.contracts import ProfileAcquisitionEvidence
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
 from mcp_telegram.models import DialogType
 from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.sync_transactions import enable_runtime_writes, write_savepoint
 
 
 def _database(path: Path) -> tuple[sqlite3.Connection, EntityProfileRepository]:
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
-    conn.execute("INSERT INTO entities(id,type,name,username,updated_at) VALUES (42,'user','Old','old',1)")
-    conn.execute("INSERT INTO dialogs(dialog_id,name,type,username) VALUES (42,'Old','user','old')")
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities(id,type,name,username,updated_at) VALUES (42,'user','Old','old',1)")
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO dialogs(dialog_id,name,type,username) VALUES (42,'Old','user','old')")
     conn.commit()
+    enable_runtime_writes(conn)
     return conn, EntityProfileRepository(conn, section_ttl_seconds=10)
 
 
@@ -58,12 +62,13 @@ def test_stale_equal_time_profile_keeps_facts_but_loses_identity_cas(tmp_path: P
     conn, repo = _database(tmp_path / "stale.sqlite")
     baseline = capture_identity_baseline(conn, 42)
     assert baseline == 0
-    assert publish_dialog_identity(
-        conn,
-        42,
-        DialogIdentityObservation(42, "Realtime", "current", "user", True, "realtime", 18),
-        baseline,
-    )
+    with write_savepoint(conn):
+        assert publish_dialog_identity(
+            conn,
+            42,
+            DialogIdentityObservation(42, "Realtime", "current", "user", True, "realtime", 18),
+            baseline,
+        )
     repo.save_core(
         {"id": 42, "type": "user", "name": "Stale", "username": "stale"},
         now=20,
@@ -90,10 +95,11 @@ def test_one_paired_observation_publishes_once_and_rolls_back_with_profile(tmp_p
     cursor = repo.next_due_refresh(now=10)
     assert cursor is not None
     baseline = capture_identity_baseline(conn, 42)
-    conn.execute(
-        "CREATE TRIGGER fail_second_profile_section BEFORE INSERT ON entity_detail_sections "
-        "WHEN NEW.section='personal_channel' BEGIN SELECT RAISE(ABORT,'rollback pair'); END"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TRIGGER fail_second_profile_section BEFORE INSERT ON entity_detail_sections "
+            "WHEN NEW.section='personal_channel' BEGIN SELECT RAISE(ABORT,'rollback pair'); END"
+        )
     with pytest.raises(sqlite3.IntegrityError, match="rollback pair"):
         repo.commit_full_user_pair(
             cursor,
@@ -119,7 +125,8 @@ def test_one_paired_observation_publishes_once_and_rolls_back_with_profile(tmp_p
     assert conn.execute("SELECT next_section FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
         "full_profile",
     )
-    conn.execute("DROP TRIGGER fail_second_profile_section")
+    with write_savepoint(conn):
+        conn.execute("DROP TRIGGER fail_second_profile_section")
     assert repo.commit_full_user_pair(
         cursor,
         EntitySectionCommit(

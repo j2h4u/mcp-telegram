@@ -9,6 +9,7 @@ from typing import Protocol, cast
 from .hydration_queue import HydrationPriority
 from .messages.sqlite_bundle import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
+from .sync_transactions import write_transaction
 from .telegram_demand import AcquisitionKind
 from .telegram_gateway import CATCHABLE_GATEWAY_FAILURES, translate_gateway_failure
 from .telegram_reading import FragmentFetchResult, TelegramFragmentGateway
@@ -31,7 +32,7 @@ class FragmentContextService:
         self._gateway = gateway
 
     async def fetch(self, dialog_id: int, anchor_message_id: int, context_size: int) -> FragmentFetchResult:
-        with self._conn:
+        with write_transaction(self._conn):
             self._conn.execute(
                 "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'fragment')", (dialog_id,)
             )
@@ -42,7 +43,7 @@ class FragmentContextService:
             result = await self._gateway.fetch_context(dialog_id, anchor_message_id, context_size)
         if not result.ok or not result.messages:
             return result
-        with self._conn:
+        with write_transaction(self._conn):
             insert_messages_with_fts(self._conn, result.messages, priority=HydrationPriority.BACKFILL)
         return result
 

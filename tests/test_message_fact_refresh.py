@@ -231,14 +231,17 @@ async def test_reaction_pacing_caps_repeated_slices_and_opens_next_window() -> N
     )
 
     for _ in range(3):
+        conn.commit()
         await refresh_message_facts_once(deps, policy, now=100)
     assert len(calls) == 5
     assert conn.execute(
         "SELECT window_started_at, release_at, claimed_pages, started_pages FROM reaction_detail_pacing_state"
     ).fetchone() == (100, 700, 5, 5)
 
+    conn.commit()
     await refresh_message_facts_once(deps, policy, now=699)
     assert len(calls) == 5
+    conn.commit()
     await refresh_message_facts_once(deps, policy, now=700)
     assert len(calls) == 10
     conn.close()
@@ -257,9 +260,11 @@ async def test_reaction_pacing_claim_survives_cancellation_and_restart(tmp_path:
         cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
         cast(TelegramReadReceiptGateway, object()),
     )
+    conn.commit()
     await refresh_message_facts_once(deps, policy, now=100, shutdown_event=event)
     assert len(calls) == 5
     event.set()
+    conn.commit()
     await refresh_message_facts_once(deps, policy, now=100, shutdown_event=event)
     assert len(calls) == 5
     conn.close()
@@ -292,6 +297,7 @@ async def test_open_reaction_window_accepts_only_one_claim_batch() -> None:
     )
     policy = MessageFactRefreshPolicy(10, 0, 0, 600, 5, 600)
 
+    conn.commit()
     await refresh_message_facts_once(deps, policy, now=100)
     conn.execute("INSERT INTO messages VALUES (1, 3, 3, 0, NULL, 0)")
     conn.execute("INSERT INTO message_reaction_aggregate_state VALUES (1, 3, 1, 1, 3, 'history', 1, 1)")
@@ -300,6 +306,7 @@ async def test_open_reaction_window_accepts_only_one_claim_batch() -> None:
         "(dialog_id, message_id, aggregate_generation, status, checked_at, next_attempt_at) "
         "VALUES (1, 3, 1, 'stale', 1, 1)"
     )
+    conn.commit()
     conn.commit()
     await refresh_message_facts_once(deps, policy, now=101)
     assert len(calls) == 2
@@ -352,6 +359,7 @@ async def test_empty_reaction_scan_does_not_open_or_reset_window() -> None:
     )
     policy = MessageFactRefreshPolicy(10, 0, 0, 600, 5, 600)
 
+    conn.commit()
     await refresh_message_facts_once(deps, policy, now=100)
     assert calls == []
     assert conn.execute(
@@ -372,6 +380,7 @@ async def test_set_shutdown_skips_reaction_claim() -> None:
     )
     shutdown_event = asyncio.Event()
     shutdown_event.set()
+    conn.commit()
     await refresh_message_facts_once(
         deps,
         MessageFactRefreshPolicy(10, 0, 0, 600, 5, 600),
@@ -402,6 +411,7 @@ async def test_demand_adapter_passes_shutdown_to_message_fact_refresh() -> None:
         shutdown_event=shutdown_event,
     )
 
+    conn.commit()
     await adapter.run_slice(RpcAttemptBudget(limit=1))
 
     assert calls == []
@@ -423,6 +433,7 @@ async def test_reaction_flood_wait_extends_durable_release() -> None:
         cast(TelegramReadReceiptGateway, object()),
         clock=lambda: 350,
     )
+    conn.commit()
     await refresh_message_facts_once(
         deps,
         MessageFactRefreshPolicy(10, 0, 0, 600, 5, 600),
@@ -458,6 +469,7 @@ async def test_read_date_runs_before_reaction_when_both_lanes_are_due() -> None:
             order.append("reaction")
             return await super().refresh_one(dialog_id, message_id, generation, **kwargs)
 
+    conn.commit()
     await refresh_message_facts_once(
         MessageFactRefreshDeps(
             conn,
@@ -520,10 +532,12 @@ async def test_cached_retry_boundary_restarts_empty_sweep_when_due() -> None:
         MessageFactRefreshPolicy(10, 0, 0, 600, 5, 600),
     )
 
+    conn.commit()
     await adapter.run_slice(RpcAttemptBudget(limit=1))
     before_due = adapter.status(119)
     at_due = adapter.status(120)
     clock[0] = 120
+    conn.commit()
     await adapter.run_slice(RpcAttemptBudget(limit=1))
 
     assert before_due is not None and before_due.release_at == 120
@@ -554,8 +568,10 @@ async def test_late_page_partial_candidate_outranks_earlier_missing_candidate() 
         MessageFactRefreshPolicy(1, 0, 0, 600, 1, 600),
     )
 
+    conn.commit()
     await adapter.run_slice(RpcAttemptBudget(limit=1))
     assert calls == []
+    conn.commit()
     await adapter.run_slice(RpcAttemptBudget(limit=1))
 
     assert calls == [257]
@@ -649,6 +665,7 @@ async def test_empty_reaction_pages_have_bounded_vm_and_read_at_status_work() ->
     maximum_page_callbacks = 0
     for index in range(24):
         work_calls[0] = 0
+        conn.commit()
         await adapter.run_slice(RpcAttemptBudget(limit=1))
         maximum_page_callbacks = max(maximum_page_callbacks, work_calls[0])
         assert work_calls[0] <= 200
@@ -689,14 +706,18 @@ async def test_frozen_reaction_upper_and_claim_revalidation() -> None:
         MessageFactRefreshPolicy(1, 0, 0, 600, 1, 600),
     )
 
+    conn.commit()
     await adapter.run_slice(RpcAttemptBudget(limit=1))
     conn.execute("INSERT INTO message_reaction_aggregate_state VALUES (1, 257, 2, 1, 257, 'history', 1, 1)")
     conn.execute("INSERT INTO messages VALUES (1, 257, 257, 0, NULL, 0)")
     conn.commit()
+    conn.commit()
     await adapter.run_slice(RpcAttemptBudget(limit=1))
     assert calls == []
     clock[0] = 60
+    conn.commit()
     await adapter.run_slice(RpcAttemptBudget(limit=1))
+    conn.commit()
     await adapter.run_slice(RpcAttemptBudget(limit=1))
     assert calls == [257]
 
@@ -745,6 +766,7 @@ async def test_read_at_cycle_telemetry_is_aggregate_and_terminal_safe() -> None:
     seed_full_history_enrollment(conn, 20, enabled=True)
     observations: list[Mapping[str, object]] = []
     try:
+        conn.commit()
         await refresh_message_facts_once(
             MessageFactRefreshDeps(
                 conn,
@@ -824,6 +846,7 @@ async def test_read_at_cycle_groups_interleaved_candidates_by_dialog() -> None:
             (20, 2),
             (21, 2),
         ]
+        conn.commit()
         await refresh_message_facts_once(
             MessageFactRefreshDeps(
                 conn,
@@ -854,6 +877,7 @@ async def test_read_at_attempt_telemetry_distinguishes_equal_message_ids_across_
     seed_full_history_enrollment(conn, 21, enabled=True)
     observations: list[Mapping[str, object]] = []
     try:
+        conn.commit()
         await refresh_message_facts_once(
             MessageFactRefreshDeps(
                 conn,
@@ -884,6 +908,7 @@ async def test_canceled_read_at_cycle_publishes_no_incomplete_telemetry() -> Non
     seed_full_history_enrollment(conn, 20, enabled=True)
     gateway = _BlockingReadReceiptGateway()
     observations: list[Mapping[str, object]] = []
+    conn.commit()
     task = asyncio.create_task(
         refresh_message_facts_once(
             MessageFactRefreshDeps(
@@ -934,6 +959,7 @@ async def test_message_too_old_cutoff_is_global_and_sent_at_based() -> None:
                 return ReadDateFetchResult(status="unavailable", reason=ReadDateReason.MESSAGE_TOO_OLD)
             return ReadDateFetchResult(read_at=1_700_000_000, status="complete")
 
+    conn.commit()
     await refresh_message_facts_once(
         MessageFactRefreshDeps(
             conn,
@@ -968,6 +994,7 @@ async def test_message_too_old_cutoff_is_global_and_sent_at_based() -> None:
     # History imported after the witness remains outside both candidate and
     # release SQL, so it cannot trigger a gateway call.
     conn.execute("INSERT INTO messages VALUES (20, 3, 200, 1, NULL, 0)")
+    conn.commit()
     conn.commit()
     await refresh_message_facts_once(
         MessageFactRefreshDeps(
@@ -1232,6 +1259,7 @@ async def test_invalid_witness_is_quarantined_and_cycle_continues(invalid_sent_a
                 return ReadDateFetchResult(status="unavailable", reason=ReadDateReason.MESSAGE_TOO_OLD)
             return ReadDateFetchResult(status="complete", read_at=1700000200)
 
+    conn.commit()
     await refresh_message_facts_once(
         MessageFactRefreshDeps(
             conn,
@@ -1255,6 +1283,7 @@ async def test_invalid_witness_is_quarantined_and_cycle_continues(invalid_sent_a
     assert observations[0]["invalid_cutoff_witnesses"] == 1
     assert observations[0]["locally_classified"] == 0
 
+    conn.commit()
     await refresh_message_facts_once(
         MessageFactRefreshDeps(
             conn,
@@ -1301,6 +1330,7 @@ async def test_privacy_outcome_does_not_advance_read_date_cutoff() -> None:
             del entity, message_id
             return ReadDateFetchResult(status="unavailable", reason=ReadDateReason.PRIVACY_RESTRICTED)
 
+    conn.commit()
     await refresh_message_facts_once(
         MessageFactRefreshDeps(
             conn, cast(ReactionDetailRefresher, object()), cast(TelegramReadReceiptGateway, Gateway())
@@ -1338,6 +1368,7 @@ async def test_read_at_control_errors_leave_facts_and_telemetry_untouched(
 
     try:
         with pytest.raises(type(error)):
+            conn.commit()
             await refresh_message_facts_once(
                 MessageFactRefreshDeps(
                     conn,
@@ -1458,6 +1489,7 @@ async def test_refresh_message_facts_once_respects_zero_budget() -> None:
     read_receipts = _ReadReceiptGateway()
 
     try:
+        conn.commit()
         result = await refresh_message_facts_once(
             MessageFactRefreshDeps(
                 conn,

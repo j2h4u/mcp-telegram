@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 from typing import cast
 
+from .sync_transactions import require_write_transaction
+
 # Keep this name in lock-step with the current schema.  The queue is part of the
 # durable database contract, so callers must never create an ad-hoc variant.
 HYDRATION_QUEUE_TABLE = "hydration_jobs"
@@ -197,6 +199,7 @@ class HydrationQueueRepository:
         A retry count belongs to the queue identity, so re-enqueueing an
         existing job never resets ``attempts``.
         """
+        require_write_transaction(self._conn)
         self._conn.execute(
             f"INSERT INTO {HYDRATION_QUEUE_TABLE} ({_JOB_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(kind, dialog_id, message_id) DO UPDATE SET "
@@ -281,6 +284,7 @@ class HydrationQueueRepository:
         ``UPDATE ... RETURNING`` makes the increment and read one SQLite
         statement.  A missing identity therefore cannot manufacture a job.
         """
+        require_write_transaction(self._conn)
         row = cast(
             tuple[object, ...] | None,
             self._conn.execute(
@@ -302,6 +306,7 @@ class HydrationQueueRepository:
         error_code: str | None = None,
     ) -> bool:
         """Set the next due time for *job* without changing its attempts."""
+        require_write_transaction(self._conn)
         cursor = self._conn.execute(
             f"UPDATE {HYDRATION_QUEUE_TABLE} SET due_at = ?, last_outcome = ?, last_error_code = ? "
             "WHERE kind = ? AND dialog_id = ? AND message_id = ? AND terminal = 0",
@@ -323,6 +328,7 @@ class HydrationQueueRepository:
         before Telegram dispatch.  Such a rejection is scheduler pressure, not
         a Telegram attempt, so restore the durable attempt count atomically.
         """
+        require_write_transaction(self._conn)
         cursor = self._conn.execute(
             f"UPDATE {HYDRATION_QUEUE_TABLE} SET attempts = attempts - 1, due_at = ?, "
             "last_outcome = ?, last_error_code = ? "
@@ -339,6 +345,7 @@ class HydrationQueueRepository:
         error_code: str | None = None,
     ) -> bool:
         """Suppress a job permanently until its message fact is reconciled."""
+        require_write_transaction(self._conn)
         cursor = self._conn.execute(
             f"UPDATE {HYDRATION_QUEUE_TABLE} SET terminal = 1, last_outcome = ?, last_error_code = ? "
             "WHERE kind = ? AND dialog_id = ? AND message_id = ?",
@@ -348,6 +355,7 @@ class HydrationQueueRepository:
 
     def remove(self, job: HydrationJob) -> bool:
         """Delete *job* and report whether a row was removed."""
+        require_write_transaction(self._conn)
         cursor = self._conn.execute(
             f"DELETE FROM {HYDRATION_QUEUE_TABLE} WHERE kind = ? AND dialog_id = ? AND message_id = ?",
             _identity(job),
@@ -356,6 +364,7 @@ class HydrationQueueRepository:
 
     def remove_active(self, job: HydrationJob) -> bool:
         """Delete one active job while retaining a terminal suppression."""
+        require_write_transaction(self._conn)
         cursor = self._conn.execute(
             f"DELETE FROM {HYDRATION_QUEUE_TABLE} WHERE kind = ? AND dialog_id = ? AND message_id = ? AND terminal = 0",
             _identity(job),
@@ -364,6 +373,7 @@ class HydrationQueueRepository:
 
     def remove_active_for_dialog(self, dialog_id: int) -> int:
         """Delete active jobs while retaining terminal suppressions."""
+        require_write_transaction(self._conn)
         if not self.is_available():
             return 0
         cursor = self._conn.execute(
@@ -374,6 +384,7 @@ class HydrationQueueRepository:
 
     def remove_for_message(self, dialog_id: int, message_id: int) -> int:
         """Delete every fact job associated with one message."""
+        require_write_transaction(self._conn)
         if not self.is_available():
             return 0
         cursor = self._conn.execute(

@@ -124,6 +124,7 @@ async def test_projection_lag_enrolls_published_link_after_completed_scan(access
         )
         if access_lost:
             conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(?,'access_lost')", (channel_a,))
+        conn.commit()
         client = _FakeClient()
         unresolved = await run_working_set_enrollment_slice(
             client, conn, source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL, cadence_s=60, timeout_s=1, now=now
@@ -198,6 +199,7 @@ async def test_existing_activity_projection_prevents_linked_chat_lag_and_preserv
             "INSERT INTO dialogs(dialog_id,type,hidden,last_message_at,linked_chat_id) VALUES(?, 'channel', 0, 100, ?)",
             (channel_id, peer_id),
         )
+        conn.commit()
         enroll_activity_dialog(conn, peer_id, "supergroup", last_activity_at=100)
         conn.execute(
             "INSERT INTO activity_sync_state(key,value) VALUES('activity_working_set_completed_at',?)",

@@ -14,6 +14,7 @@ from typing import cast
 from .alert_policy import incoming_human_dm_sql
 from .runtime_observations import prune_runtime_observations, tool_telemetry_identity
 from .sync_db import _CONVERSATION_HISTORY_TRIGGERS_V54, _CURRENT_SCHEMA_VERSION
+from .sync_transactions import require_write_transaction, write_transaction
 
 EXPECTED_TELEMETRY = 1_271
 EXPECTED_EDITS = 102
@@ -96,6 +97,7 @@ def _inventory(source: sqlite3.Connection) -> tuple[list[tuple[object, ...]], li
 
 
 def _enrich_losses(target: sqlite3.Connection, losses: list[tuple[object, ...]]) -> None:
+    require_write_transaction(target)
     for event_id, dialog_id, occurred_at, payload_json in losses:
         payload = cast(dict[str, object], json.loads(cast(str, payload_json)))
         row = cast(
@@ -118,6 +120,7 @@ def _enrich_losses(target: sqlite3.Connection, losses: list[tuple[object, ...]])
 
 
 def _import_telemetry(target: sqlite3.Connection, telemetry: list[tuple[object, ...]]) -> None:
+    require_write_transaction(target)
     for row in telemetry:
         (
             event_id,
@@ -161,6 +164,7 @@ def _import_telemetry(target: sqlite3.Connection, telemetry: list[tuple[object, 
 
 
 def _write_coverage(target: sqlite3.Connection) -> None:
+    require_write_transaction(target)
     bounds = cast(
         tuple[int | None, int | None],
         target.execute(
@@ -226,50 +230,47 @@ def _verify_recovery_state(
 def _recover(
     source: sqlite3.Connection, target: sqlite3.Connection, fingerprint: str, retention_seconds: int
 ) -> dict[str, object]:
-    if source.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] != SOURCE_SCHEMA_VERSION:
-        raise RuntimeError("backup must be schema 50")
-    if source.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-        raise RuntimeError("backup is corrupt")
-    if target.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] != TARGET_SCHEMA_VERSION:
-        raise RuntimeError(f"target must be schema {TARGET_SCHEMA_VERSION}")
-    _verify_history(source, target)
-    telemetry, losses = _inventory(source)
-    now_ms = int(time.time() * 1000)
-    cutoff_ms = now_ms - retention_seconds * 1000
-    existing = cast(
-        tuple[int, int] | None,
-        target.execute(
-            "SELECT legacy_observation_count,enriched_history_count FROM event_recovery_ledger WHERE source_fingerprint=?",
-            (fingerprint,),
-        ).fetchone(),
-    )
-    if existing is not None:
-        target.execute("BEGIN IMMEDIATE")
-        prune_runtime_observations(target, **{"ttl_seconds": retention_seconds}, now_ms=now_ms)  # noqa: PIE804
+    with write_transaction(target):
+        if source.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] != SOURCE_SCHEMA_VERSION:
+            raise RuntimeError("backup must be schema 50")
+        if source.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise RuntimeError("backup is corrupt")
+        if target.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] != TARGET_SCHEMA_VERSION:
+            raise RuntimeError(f"target must be schema {TARGET_SCHEMA_VERSION}")
+        _verify_history(source, target)
+        telemetry, losses = _inventory(source)
+        now_ms = int(time.time() * 1000)
+        cutoff_ms = now_ms - retention_seconds * 1000
+        existing = cast(
+            tuple[int, int] | None,
+            target.execute(
+                "SELECT legacy_observation_count,enriched_history_count FROM event_recovery_ledger WHERE source_fingerprint=?",
+                (fingerprint,),
+            ).fetchone(),
+        )
+        if existing is not None:
+            prune_runtime_observations(target, **{"ttl_seconds": retention_seconds}, now_ms=now_ms)  # noqa: PIE804
+            _write_coverage(target)
+            _verify_recovery_state(source, target, losses, cutoff_ms=cutoff_ms)
+            return {"status": "no_op", "telemetry": existing[0], "lifecycle": existing[1]}
+        target.execute("DROP TRIGGER conversation_history_no_update")
+        target.execute("DROP TRIGGER conversation_history_no_delete")
+        _enrich_losses(target, losses)
+        _import_telemetry(target, telemetry)
+        prune_runtime_observations(
+            target,
+            **{"ttl_seconds": retention_seconds},  # noqa: PIE804
+            now_ms=now_ms,
+        )
         _write_coverage(target)
+        for statement in _CONVERSATION_HISTORY_TRIGGERS_V54[-2:]:
+            target.execute(statement)
+        target.execute(
+            "INSERT INTO event_recovery_ledger VALUES (?,strftime('%s','now'),?,?)",
+            (fingerprint, len(telemetry), len(losses)),
+        )
         _verify_recovery_state(source, target, losses, cutoff_ms=cutoff_ms)
-        target.commit()
-        return {"status": "no_op", "telemetry": existing[0], "lifecycle": existing[1]}
-    target.execute("BEGIN IMMEDIATE")
-    target.execute("DROP TRIGGER conversation_history_no_update")
-    target.execute("DROP TRIGGER conversation_history_no_delete")
-    _enrich_losses(target, losses)
-    _import_telemetry(target, telemetry)
-    prune_runtime_observations(
-        target,
-        **{"ttl_seconds": retention_seconds},  # noqa: PIE804
-        now_ms=now_ms,
-    )
-    _write_coverage(target)
-    for statement in _CONVERSATION_HISTORY_TRIGGERS_V54[-2:]:
-        target.execute(statement)
-    target.execute(
-        "INSERT INTO event_recovery_ledger VALUES (?,strftime('%s','now'),?,?)",
-        (fingerprint, len(telemetry), len(losses)),
-    )
-    _verify_recovery_state(source, target, losses, cutoff_ms=cutoff_ms)
-    target.commit()
-    return {"status": "imported", "telemetry": len(telemetry), "lifecycle": len(losses)}
+        return {"status": "imported", "telemetry": len(telemetry), "lifecycle": len(losses)}
 
 
 def recover_events(
@@ -288,9 +289,6 @@ def recover_events(
         target = sqlite3.connect(target_path)
         try:
             return _recover(source, target, fingerprint, retention_seconds)
-        except BaseException:
-            target.rollback()
-            raise
         finally:
             source.close()
             target.close()

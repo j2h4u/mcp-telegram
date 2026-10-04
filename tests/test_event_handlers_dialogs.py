@@ -508,6 +508,7 @@ async def test_realtime_main_pin_order_replaces_published_pin_order(
         folder_id=None,
         order=[DialogPeer(peer=PeerUser(user_id=702)), DialogPeer(peer=PeerUser(user_id=701))],
     )
+    sync_db.commit()
     await _make_manager(mock_client, sync_db, shutdown_event).on_raw_dialog_pinned(update)
     assert sync_db.execute(
         "SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=0 ORDER BY position"
@@ -576,6 +577,7 @@ async def test_realtime_single_pin_toggle_preserves_existing_published_order(
         [(first, 0), (second, 1)],
     )
     manager = _make_manager(mock_client, sync_db, shutdown_event)
+    sync_db.commit()
     await manager.on_raw_dialog_pinned(
         UpdateDialogPinned(peer=DialogPeer(peer=PeerUser(user_id=713)), pinned=True, folder_id=None)
     )
@@ -636,6 +638,7 @@ async def test_realtime_archive_pin_rewrite_preserves_main_pin_and_scope(
         [(0, main_dialog, 0), (1, old_archive_dialog, 0)],
     )
 
+    sync_db.commit()
     await _make_manager(mock_client, sync_db, shutdown_event).on_raw_dialog_pinned(
         UpdatePinnedDialogs(
             folder_id=1,
@@ -829,6 +832,7 @@ async def test_realtime_identity_write_carries_profile_revision_past_old_cursor(
         "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_revision) VALUES (?,?,?,?)",
         (dialog_id, '{"id": 67893, "type": "user"}', 1, 0),
     )
+    sync_db.commit()
     repo.mark_pending(dialog_id, now=1)
     old_cursor = repo.next_due_refresh(now=1)
     assert old_cursor is not None
@@ -863,6 +867,7 @@ async def test_dm_identity_write_carries_profile_revision_past_old_cursor(
         "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_revision) VALUES (?,?,?,?)",
         (dialog_id, '{"id": 67894, "type": "user"}', 1, 0),
     )
+    sync_db.commit()
     repo.mark_pending(dialog_id, now=1)
     old_cursor = repo.next_due_refresh(now=1)
     assert old_cursor is not None

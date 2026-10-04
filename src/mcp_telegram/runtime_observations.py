@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
 
+from .sync_transactions import enable_runtime_writes, write_transaction
+
 RUNTIME_INSTANCE_ID = uuid.uuid4().hex
 MAX_PAYLOAD_BYTES = 1024
 DEFAULT_ROW_CAP = 100_000
@@ -48,6 +50,14 @@ ALLOWED_KINDS = frozenset(
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _raise_if_writer_retired(conn: sqlite3.Connection, primary: BaseException) -> None:
+    """Dropping a job must never conceal a retired connection."""
+    try:
+        _ = conn.in_transaction
+    except sqlite3.ProgrammingError as probe_error:
+        raise primary from probe_error
 
 
 def _seconds_from_milliseconds(milliseconds: int) -> float:
@@ -515,13 +525,22 @@ class RuntimeObservationSink:
         )
         conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
         conn.execute("PRAGMA foreign_keys=ON")
+        enable_runtime_writes(conn)
         conn.set_progress_handler(lambda: int(self._abort_requested.is_set()), 1_000)
         return conn
 
     def _interrupt_writer(self) -> None:
         with self._connection_lock:
             if self._writer_connection is not None:
-                self._writer_connection.interrupt()
+                try:
+                    self._writer_connection.interrupt()
+                except sqlite3.ProgrammingError:
+                    # The owner may retire its connection during shutdown.
+                    try:
+                        _ = self._writer_connection.in_transaction
+                    except sqlite3.ProgrammingError:
+                        return
+                    raise
 
     def _run_writer_loop(self, conn: sqlite3.Connection) -> None:
         writes_since_prune = 0
@@ -570,7 +589,7 @@ class RuntimeObservationSink:
         attempt = 0
         while not self._abort_requested.is_set():
             try:
-                with conn:
+                with write_transaction(conn):
                     record_runtime_observation(
                         conn,
                         kind=job.kind,
@@ -599,8 +618,9 @@ class RuntimeObservationSink:
                 self._increment("successful_writes")
                 return True
             except sqlite3.OperationalError as exc:
+                _raise_if_writer_retired(conn, exc)
                 if self._abort_requested.is_set():
-                    return self._shutdown_drop(conn, "after interrupt")
+                    return None
                 message = str(exc).lower()
                 if "locked" not in message and "busy" not in message:
                     self._increment("permanent_failures")
@@ -608,20 +628,13 @@ class RuntimeObservationSink:
                 self._increment("busy_retries")
                 time.sleep(min(0.01 * (attempt + 1), 0.05))
                 attempt += 1
-            except Exception:  # noqa: BLE001 - one bad job must not stop FIFO draining
+            except Exception as exc:  # noqa: BLE001 - one bad job must not stop FIFO draining
+                _raise_if_writer_retired(conn, exc)
                 if self._abort_requested.is_set():
-                    return self._shutdown_drop(conn, "during shutdown")
+                    return None
                 self._increment("permanent_failures")
                 return False
         return None
-
-    @staticmethod
-    def _shutdown_drop(conn: sqlite3.Connection, reason: str) -> None:
-        try:
-            conn.rollback()
-        except sqlite3.Error:
-            logger.debug("runtime observation rollback %s failed", reason, exc_info=True)
-        return
 
 
 def prune_runtime_observations(

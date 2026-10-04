@@ -79,6 +79,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "resolver.py",
             "scheduled_messages.py",
             "sync_db.py",
+            "sync_transactions.py",
             "conversation_changes.py",
             "sync_worker.py",
             "sqlite_checkpoint.py",

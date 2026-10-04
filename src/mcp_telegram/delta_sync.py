@@ -45,6 +45,7 @@ from .sync_read_model import (
     dm_deletion_reconciliation_is_blocked,
     encode_dm_deletion_checkpoint,
 )
+from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_demand import (
     AcquisitionKind,
     DeltaGapFillObservationHook,
@@ -209,6 +210,7 @@ def _load_dm_gap_scan_state(conn: sqlite3.Connection) -> _DmGapScanState | None:
 
 
 def _store_dm_gap_scan_state(conn: sqlite3.Connection, state: _DmGapScanState) -> None:
+    require_write_transaction(conn)
     conn.execute(
         "INSERT OR REPLACE INTO daemon_state(key, value) VALUES (?, ?)",
         (_DM_GAP_SCAN_STATE_KEY, encode_dm_deletion_checkpoint(state)),
@@ -279,25 +281,25 @@ def _prepare_legacy_dm_scan_state(state: _DmGapScanState, changed_at: int) -> _D
 
 def prepare_dm_deletion_reconciliation(conn: sqlite3.Connection, *, now: int | None = None) -> None:
     """Quarantine unfinished legacy work and interrupted claims before registration."""
-    try:
-        state = _load_dm_gap_scan_state(conn)
-    except InvalidDmDeletionCheckpointError:
-        logger.warning("dm_deletion_reconciliation_checkpoint_invalid_during_prepare")
-        return
-    if state is None:
-        return
-    changed_at = int(time.time()) if now is None else now
-    if changed_at < 0:
-        raise ValueError("now must be non-negative")
+    with write_transaction(conn):
+        try:
+            state = _load_dm_gap_scan_state(conn)
+        except InvalidDmDeletionCheckpointError:
+            logger.warning("dm_deletion_reconciliation_checkpoint_invalid_during_prepare")
+            return
+        if state is None:
+            return
+        changed_at = int(time.time()) if now is None else now
+        if changed_at < 0:
+            raise ValueError("now must be non-negative")
 
-    if state.policy_version is None:
-        state = _prepare_legacy_dm_scan_state(state, changed_at)
-    elif state.status == "verifying":
-        state = _dm_scan_transition(state, status="suspended", reason="interrupted", changed_at=changed_at)
-    else:
-        return
+        if state.policy_version is None:
+            state = _prepare_legacy_dm_scan_state(state, changed_at)
+        elif state.status == "verifying":
+            state = _dm_scan_transition(state, status="suspended", reason="interrupted", changed_at=changed_at)
+        else:
+            return
 
-    with conn:
         _store_dm_gap_scan_state(conn, state)
 
 
@@ -379,9 +381,11 @@ class DeltaSyncWorker:
         self._delta_gap_fill_observation_enabled = False
 
     def _stamp_delta_checkpoint(self, dialog_id: int, checked_at: int) -> None:
+        require_write_transaction(self._conn)
         self._conn.execute(_UPDATE_DELTA_CHECKPOINT_SQL, (checked_at, checked_at, dialog_id, dialog_id))
 
     def _stamp_delta_checked(self, dialog_id: int, checked_at: int) -> None:
+        require_write_transaction(self._conn)
         self._conn.execute(_UPDATE_DELTA_CHECKED_SQL, (checked_at, dialog_id, dialog_id))
 
     @_delta_rpc_scope(DemandKind.DELTA_GAP_FILL, AcquisitionKind.MESSAGE_HISTORY_PAGE)
@@ -416,7 +420,7 @@ class DeltaSyncWorker:
         return _row_first_int(row)
 
     def _complete_empty_delta_slice(self, dialog_id: int) -> None:
-        with self._conn:
+        with write_transaction(self._conn):
             self._stamp_delta_checked(dialog_id, int(time.time()))
         self._last_delta_slice_completed = True
         self._last_delta_slice_succeeded = True
@@ -441,8 +445,8 @@ class DeltaSyncWorker:
             return _DeltaFetchOutcome([], 0)
         except MessageHistoryAccessLostError as exc:
             self._last_delta_slice_access_lost = True
-            set_access_lost(self._conn, dialog_id, int(time.time()), reason=exc.reason_code)
-            self._conn.commit()
+            with write_transaction(self._conn):
+                set_access_lost(self._conn, dialog_id, int(time.time()), reason=exc.reason_code)
             return _DeltaFetchOutcome([], 0)
         except MessageHistoryUnavailableError as exc:
             logger.warning("delta_slice_rpc_error dialog_id=%d error=%s", dialog_id, exc)
@@ -481,7 +485,7 @@ class DeltaSyncWorker:
     def _commit_delta_transaction(
         self, dialog_id: int, outcome: _DeltaFetchOutcome, continuation_required: bool, now: int
     ) -> tuple[list[int], set[int], int] | None:
-        with self._conn:
+        with write_transaction(self._conn):
             unique_message_ids, existing_ids = self._existing_delta_message_ids(dialog_id, outcome.rows)
             if not full_history_enabled(self._conn, dialog_id):
                 self._record_uncommitted_delta_counts(unique_message_ids, existing_ids)
@@ -530,6 +534,7 @@ class DeltaSyncWorker:
         existing_ids: set[int],
         now: int,
     ) -> int:
+        require_write_transaction(self._conn)
         if not outcome.rows:
             return 0
         insert_messages_with_fts(
@@ -678,27 +683,27 @@ class DmDeletionReconciliationDemandAdapter:
         return None if release_at is None else DemandStatus(release_at=release_at)
 
     def _start_scan(self, now: int) -> _DmGapScanState | None:
-        state = _load_dm_gap_scan_state(self._conn)
-        if state is None or (state.status == "idle" and state.next_run_at <= now):
-            generation = 1 if state is None else state.generation + 1
-            state = _DmGapScanState(
-                "running",
-                generation,
-                now,
-                None,
-                0,
-                0,
-                _DM_GAP_SCAN_POLICY_VERSION,
-                None,
-                now,
-            )
-            with self._conn:
+        with write_transaction(self._conn):
+            state = _load_dm_gap_scan_state(self._conn)
+            if state is None or (state.status == "idle" and state.next_run_at <= now):
+                generation = 1 if state is None else state.generation + 1
+                state = _DmGapScanState(
+                    "running",
+                    generation,
+                    now,
+                    None,
+                    0,
+                    0,
+                    _DM_GAP_SCAN_POLICY_VERSION,
+                    None,
+                    now,
+                )
                 _store_dm_gap_scan_state(self._conn, state)
-        if state.status == "idle":
-            return None
-        if state.status != "running" or state.policy_version != _DM_GAP_SCAN_POLICY_VERSION:
-            return None
-        return state
+            if state.status == "idle":
+                return None
+            if state.status != "running" or state.policy_version != _DM_GAP_SCAN_POLICY_VERSION:
+                return None
+            return state
 
     @staticmethod
     def _next_dialog(state: _DmGapScanState, dialog_ids: Sequence[int]) -> int | None:
@@ -714,10 +719,10 @@ class DmDeletionReconciliationDemandAdapter:
         )
 
     def _write_transition(self, old_state: _DmGapScanState, new_state: _DmGapScanState) -> None:
-        current = _load_dm_gap_scan_state(self._conn)
-        if current != old_state:
-            raise DmGapScanStateError("DM deletion reconciliation state changed during a slice")
-        with self._conn:
+        with write_transaction(self._conn):
+            current = _load_dm_gap_scan_state(self._conn)
+            if current != old_state:
+                raise DmGapScanStateError("DM deletion reconciliation state changed during a slice")
             _store_dm_gap_scan_state(self._conn, new_state)
 
     def _suspend_after_throttle(self, state: _DmGapScanState, now: int) -> None:
@@ -901,8 +906,8 @@ def _restore_revalidated_access(
     total_messages: int | None,
 ) -> int:
     """Persist one verified restoration and return its counter contribution."""
+    require_write_transaction(conn)
     changed = restore_access_after_revalidation(conn, dialog_id, int(time.time()), total_messages=total_messages)
-    conn.commit()
     return int(changed)
 
 
@@ -935,7 +940,7 @@ def _due_access_recovery(conn: sqlite3.Connection, *, now: int) -> _DurableAcces
 
 
 def _set_access_recovery_retry(conn: sqlite3.Connection, dialog_id: int, retry_at: int | None) -> None:
-    with conn:
+    with write_transaction(conn):
         conn.execute(
             "UPDATE delta_access_recovery_state SET retry_at=?, updated_at=? WHERE dialog_id=?",
             (retry_at, int(time.time()), dialog_id),
@@ -947,7 +952,7 @@ def _finish_durable_access_recovery(
     recovery: _DurableAccessRecovery,
 ) -> None:
     now = int(time.time())
-    with conn:
+    with write_transaction(conn):
         restore_access_after_revalidation(
             conn,
             recovery.dialog_id,
@@ -1114,33 +1119,33 @@ class DeltaAccessProbeDemandAdapter:
                 type(exc).__name__,
             )
             retry = max(1, int(exc.retry_after_seconds or 1))
-            stamp_access_revalidation(conn, dialog_id, now, retry)
-            conn.commit()
+            with write_transaction(conn):
+                stamp_access_revalidation(conn, dialog_id, now, retry)
             return
         if isinstance(exc, MessageHistoryAccessLostError):
             logger.debug("access_still_lost dialog_id=%d", dialog_id)
-            stamp_access_revalidation(conn, dialog_id, now, self._policy.cooldown_seconds)
-            conn.commit()
+            with write_transaction(conn):
+                stamp_access_revalidation(conn, dialog_id, now, self._policy.cooldown_seconds)
             return
         if isinstance(exc, TelegramRpcThrottled):
             _raise_if_latched(exc)
             retry = max(self._policy.cooldown_seconds, exc.retry_after_seconds or self._policy.cooldown_seconds)
-            stamp_access_revalidation(conn, dialog_id, now, retry)
-            conn.commit()
+            with write_transaction(conn):
+                stamp_access_revalidation(conn, dialog_id, now, retry)
             return
         logger.warning("probe_rpc_error dialog_id=%d error=%s", dialog_id, exc)
-        stamp_access_revalidation(conn, dialog_id, now, self._policy.cooldown_seconds)
-        conn.commit()
+        with write_transaction(conn):
+            stamp_access_revalidation(conn, dialog_id, now, self._policy.cooldown_seconds)
 
     def _persist_probe_success(self, dialog_id: int, now: int, total_messages: int | None) -> None:
-        if not full_history_enabled(self._worker._conn, dialog_id):
-            _restore_revalidated_access(
-                self._worker._conn,
-                dialog_id,
-                total_messages=total_messages,
-            )
-            return
-        with self._worker._conn:
+        with write_transaction(self._worker._conn):
+            if not full_history_enabled(self._worker._conn, dialog_id):
+                _restore_revalidated_access(
+                    self._worker._conn,
+                    dialog_id,
+                    total_messages=total_messages,
+                )
+                return
             self._worker._conn.execute(
                 """
                 INSERT INTO delta_access_recovery_state(

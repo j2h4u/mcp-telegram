@@ -22,6 +22,7 @@ from mcp_telegram.linked_chat_fact import (
     validate_observation,
 )
 from mcp_telegram.sync_db import _apply_migrations
+from mcp_telegram.sync_transactions import write_transaction
 
 
 def _db() -> sqlite3.Connection:
@@ -195,19 +196,20 @@ def test_access_lifecycle_suspends_and_restores_linked_chat_demand_without_chang
             (suspended_channel,),
         ).fetchone(),
     )
-    assert next_due(conn, 300) == LinkedChatWork(active_channel, 0, 220)
-    assert next_release_at(conn) == 220
-    assert (
-        conn.execute(
-            "SELECT generation,pending_generation,requested_at,retry_at,failure_count "
-            "FROM linked_chat_fact_state WHERE channel_id=?",
-            (suspended_channel,),
-        ).fetchone()
-        == suspended_ledger
-    )
+    with write_transaction(conn):
+        assert next_due(conn, 300) == LinkedChatWork(active_channel, 0, 220)
+        assert next_release_at(conn) == 220
+        assert (
+            conn.execute(
+                "SELECT generation,pending_generation,requested_at,retry_at,failure_count "
+                "FROM linked_chat_fact_state WHERE channel_id=?",
+                (suspended_channel,),
+            ).fetchone()
+            == suspended_ledger
+        )
 
-    assert publish(conn, active_channel, 0, None, 300)
-    assert next_due(conn, 300) is None
+        assert publish(conn, active_channel, 0, None, 300)
+        assert next_due(conn, 300) is None
 
     assert restore_access_after_revalidation(conn, suspended_channel, 350)
     restored_fact = read_fact(conn, suspended_channel)
@@ -235,7 +237,7 @@ def test_publish_rolls_back_fact_ledger_and_sibling_detail_together() -> None:
     conn.commit()
 
     with pytest.raises(RuntimeError, match="injected failure"):
-        with conn:
+        with write_transaction(conn):
             assert publish(conn, channel_id, generation, 4444444444, 40)
             conn.execute("INSERT INTO sibling_detail VALUES (?, 'new')", (channel_id,))
             raise RuntimeError("injected failure")

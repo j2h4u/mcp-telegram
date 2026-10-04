@@ -7,6 +7,7 @@ from typing import cast
 
 from .models import DialogType
 from .resolver import latinize
+from .sync_transactions import require_write_transaction
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +71,7 @@ def _snapshot_values(snapshot: EntitySnapshot) -> tuple[int, str, str | None, st
 
 def upsert_entity_snapshots(conn: sqlite3.Connection, snapshots: Sequence[EntitySnapshot]) -> None:
     """Insert or update complete snapshots without owning the transaction."""
+    require_write_transaction(conn)
     if not snapshots:
         return
     conn.executemany(_UPSERT_ENTITY_SQL, (_snapshot_values(snapshot) for snapshot in snapshots))
@@ -87,6 +89,7 @@ def apply_partial_entity_identity(
     known canonical type remains authoritative while an unknown placeholder
     may be upgraded by a classified observation.
     """
+    require_write_transaction(conn)
     current = cast(
         tuple[object, ...] | None,
         conn.execute("SELECT type, name, username, name_normalized FROM entities WHERE id=?", (entity_id,)).fetchone(),
@@ -166,6 +169,7 @@ def _bump_refresh_if_detail_missing(conn: sqlite3.Connection, entity_id: int) ->
 
 
 def _bump_existing_detail_revision(conn: sqlite3.Connection, entity_id: int) -> int | None:
+    require_write_transaction(conn)
     changed = conn.execute(
         "UPDATE entity_details SET profile_revision=profile_revision+1 WHERE entity_id=?", (entity_id,)
     ).rowcount
@@ -190,6 +194,7 @@ def _bump_existing_detail_revision(conn: sqlite3.Connection, entity_id: int) -> 
 
 
 def _bump_refresh_revision(conn: sqlite3.Connection, entity_id: int) -> int | None:
+    require_write_transaction(conn)
     refresh_rows = cast(
         list[tuple[object, ...]], conn.execute("PRAGMA table_info(entity_profile_refresh_state)").fetchall()
     )
@@ -213,9 +218,11 @@ def _bump_refresh_revision(conn: sqlite3.Connection, entity_id: int) -> int | No
 
 def ensure_entity_stub(conn: sqlite3.Connection, snapshot: EntitySnapshot) -> None:
     """Insert a missing parent entity without changing an existing row."""
+    require_write_transaction(conn)
     conn.execute(_INSERT_ENTITY_STUB_SQL, _snapshot_values(snapshot))
 
 
 def upsert_entity_stub(conn: sqlite3.Connection, snapshot: EntitySnapshot) -> None:
     """Fill a local stub without replacing richer existing entity facts."""
+    require_write_transaction(conn)
     conn.execute(_UPSERT_ENTITY_STUB_SQL, _snapshot_values(snapshot))

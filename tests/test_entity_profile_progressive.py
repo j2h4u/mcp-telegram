@@ -53,6 +53,7 @@ from mcp_telegram.entity_profile.repository import EntityProfileRepository, Enti
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.models import DialogType
 from mcp_telegram.sync_db import _CURRENT_SCHEMA_VERSION, _apply_migration_57, _apply_migrations, ensure_sync_schema
+from mcp_telegram.sync_transactions import enable_runtime_writes, write_savepoint
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
     DemandStatus,
@@ -123,35 +124,38 @@ class _FloodClient(_UnusedClient):
 
 
 def _sections_schema(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """CREATE TABLE entity_detail_sections (
-            entity_id INTEGER NOT NULL, section TEXT NOT NULL, status TEXT NOT NULL,
-            observed_at INTEGER, reason TEXT, payload_json TEXT, retry_at INTEGER,
-            PRIMARY KEY(entity_id, section)
-        ) WITHOUT ROWID"""
-    )
-    conn.execute(
-        """CREATE TABLE entity_profile_refresh_state (
-            entity_id INTEGER PRIMARY KEY, status TEXT NOT NULL,
-            retry_at INTEGER, reason TEXT, updated_at INTEGER NOT NULL,
-            next_section TEXT NOT NULL DEFAULT 'full_profile',
-            acquisition_cursor INTEGER NOT NULL DEFAULT 0
-        ) WITHOUT ROWID"""
-    )
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS dialogs (
-            dialog_id INTEGER PRIMARY KEY, name TEXT, type TEXT, username TEXT,
-            created INTEGER, hidden INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0,
-            revision INTEGER NOT NULL DEFAULT 0, identity_revision INTEGER NOT NULL DEFAULT 0,
-            identity_observed_at INTEGER, identity_complete INTEGER NOT NULL DEFAULT 0,
-            identity_source TEXT, linked_chat_id INTEGER, linked_chat_resolved_at INTEGER
-        )"""
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            """CREATE TABLE entity_detail_sections (
+                entity_id INTEGER NOT NULL, section TEXT NOT NULL, status TEXT NOT NULL,
+                observed_at INTEGER, reason TEXT, payload_json TEXT, retry_at INTEGER,
+                PRIMARY KEY(entity_id, section)
+            ) WITHOUT ROWID"""
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            """CREATE TABLE entity_profile_refresh_state (
+                entity_id INTEGER PRIMARY KEY, status TEXT NOT NULL,
+                retry_at INTEGER, reason TEXT, updated_at INTEGER NOT NULL,
+                next_section TEXT NOT NULL DEFAULT 'full_profile',
+                acquisition_cursor INTEGER NOT NULL DEFAULT 0
+            ) WITHOUT ROWID"""
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS dialogs (
+                dialog_id INTEGER PRIMARY KEY, name TEXT, type TEXT, username TEXT,
+                created INTEGER, hidden INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0,
+                revision INTEGER NOT NULL DEFAULT 0, identity_revision INTEGER NOT NULL DEFAULT 0,
+                identity_observed_at INTEGER, identity_complete INTEGER NOT NULL DEFAULT 0,
+                identity_source TEXT, linked_chat_id INTEGER, linked_chat_resolved_at INTEGER
+            )"""
+        )
 
 
 def _advance_fixture_cursor(repo: EntityProfileRepository, entity_id: int, next_cursor: int, now: int) -> None:
     """Move a hand-built fixture past core acquisition without testing a writer API."""
-    with repo._conn:
+    with write_savepoint(repo._conn):
         repo._conn.execute(
             "UPDATE entity_profile_refresh_state SET status='pending', retry_at=NULL, "
             "reason='refresh_in_progress', updated_at=?, acquisition_cursor=? WHERE entity_id=?",
@@ -161,12 +165,14 @@ def _advance_fixture_cursor(repo: EntityProfileRepository, entity_id: int, next_
 
 def test_local_core_has_pending_sections_without_rpc() -> None:
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
-    conn.execute("INSERT INTO entities VALUES (42, 'User', 'Local User', 'local', NULL, 100)")
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities VALUES (42, 'User', 'Local User', 'local', NULL, 100)")
     profile = EntityProfileRepository(conn, section_ttl_seconds=300).read(42, now=101)
     assert profile is not None
     assert profile.detail == {"id": 42, "type": "user", "name": "Local User", "username": "local"}
@@ -208,15 +214,18 @@ async def test_refresh_coordinator_waits_for_single_flight_completion() -> None:
 @pytest.mark.asyncio
 async def test_get_entity_info_waits_for_fresh_profile_after_cache_miss() -> None:
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
-    conn.execute("INSERT INTO entities VALUES (42, 'User', 'Local User', 'local', NULL, 100)")
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities VALUES (42, 'User', 'Local User', 'local', NULL, 100)")
     limits = RefreshLimits(foreground_refresh_wait_seconds=0.1)
     service = _test_service(conn, limits=limits)
     service._deps = replace(service._deps, get_dialog_placement=lambda _entity_id: {})
@@ -272,10 +281,11 @@ async def test_refresh_coordinator_reports_coalescing_and_queue_saturation() -> 
 @pytest.mark.asyncio
 async def test_rejected_refresh_is_not_reported_as_queued() -> None:
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
     service = _test_service(
         conn,
@@ -318,10 +328,11 @@ async def test_rejected_refresh_is_not_reported_as_queued() -> None:
 @pytest.mark.asyncio
 async def test_progressive_miss_persists_rejected_admission() -> None:
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
     service = _test_service(
         conn,
@@ -358,10 +369,11 @@ async def test_progressive_miss_persists_rejected_admission() -> None:
 @pytest.mark.asyncio
 async def test_self_profile_rejection_persists_unavailable_sections() -> None:
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
     service = _test_service(
         conn,
@@ -392,19 +404,23 @@ async def test_self_profile_rejection_persists_unavailable_sections() -> None:
 
 def test_last_good_survives_refresh_failure() -> None:
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
-    conn.execute("INSERT INTO entities VALUES (42, 'user', 'Good', 'good', NULL, 100)")
-    conn.execute(
-        "INSERT INTO entity_details VALUES (42, ?, 100)",
-        (json.dumps({"schema": 1, "id": 42, "type": "user", "name": "Good", "common_chats": [{"id": 7}]}),),
-    )
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities VALUES (42, 'user', 'Good', 'good', NULL, 100)")
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entity_details VALUES (42, ?, 100)",
+            (json.dumps({"schema": 1, "id": 42, "type": "user", "name": "Good", "common_chats": [{"id": 7}]}),),
+        )
     repo = EntityProfileRepository(conn, section_ttl_seconds=300)
     repo.mark_pending(42, now=100)
     cursor = repo.next_due_refresh(now=100)
@@ -429,15 +445,18 @@ def test_last_good_survives_refresh_failure() -> None:
 
 def test_durable_section_failure_preserves_completed_sections_and_cursor() -> None:
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
-    conn.execute("INSERT INTO entities VALUES (42, 'user', 'Known', 'known', NULL, 1)")
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities VALUES (42, 'user', 'Known', 'known', NULL, 1)")
     repo = EntityProfileRepository(conn, section_ttl_seconds=300)
     repo.mark_pending(42, now=100)
     cursor = repo.next_due_refresh(now=100)
@@ -461,15 +480,18 @@ def test_durable_section_failure_preserves_completed_sections_and_cursor() -> No
 @pytest.mark.asyncio
 async def test_flood_wait_refresh_failure_signals_terminal_waiter_and_persists_retry() -> None:
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
-    conn.execute("INSERT INTO entities VALUES (42, 'user', 'Good', 'good', NULL, 100)")
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities VALUES (42, 'user', 'Good', 'good', NULL, 100)")
     repo = EntityProfileRepository(conn, section_ttl_seconds=300)
     repo.mark_pending(42, now=100)
     service = _test_service(conn, limits=RefreshLimits())
@@ -499,6 +521,7 @@ async def test_flood_wait_refresh_failure_signals_terminal_waiter_and_persists_r
 
 
 def _test_service(conn: sqlite3.Connection, *, limits: RefreshLimits) -> DaemonEntityInfoService:
+    enable_runtime_writes(conn)
     service = DaemonEntityInfoService(
         EntityInfoDeps(
             conn=conn,
@@ -596,22 +619,26 @@ def _channel_profile_service(
     overlap: ChannelContactOverlapObservation | None = None,
 ) -> tuple[DaemonEntityInfoService, sqlite3.Connection, FakeChannelProfilePort]:
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE linked_chat_fact_state (channel_id INTEGER PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 0, "
-        "pending_generation INTEGER, requested_at INTEGER, retry_at INTEGER, failure_count INTEGER NOT NULL DEFAULT 0)"
-    )
-    conn.execute(
-        "INSERT INTO dialogs(dialog_id, linked_chat_id, linked_chat_resolved_at) VALUES (?, ?, ?)",
-        (channel_id, linked_chat_id, 100 if linked_chat_id is not None else None),
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE linked_chat_fact_state (channel_id INTEGER PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 0, "
+            "pending_generation INTEGER, requested_at INTEGER, retry_at INTEGER, failure_count INTEGER NOT NULL DEFAULT 0)"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO dialogs(dialog_id, linked_chat_id, linked_chat_resolved_at) VALUES (?, ?, ?)",
+            (channel_id, linked_chat_id, 100 if linked_chat_id is not None else None),
+        )
     profile = ChannelProfileObservation(
         channel_id=channel_id,
         about="profile",
@@ -674,9 +701,9 @@ async def test_channel_profile_commit_publishes_linked_chat_fact_and_overlays_ca
             return await fetch_profile(reference)
 
         port.fetch_channel_profile = check_committed_capture  # type: ignore[method-assign]
-        linked_chat_fact_owner.invalidate_from_update(conn, -10042, 100)
-        cursor = service._profiles.next_due_refresh(now=100)
-        assert cursor is not None
+        with write_savepoint(conn):
+            linked_chat_fact_owner.invalidate_from_update(conn, -10042, 100)
+        assert service._profiles.next_due_refresh(now=100) is not None
         _advance_fixture_cursor(service._profiles, -10042, 1, 100)
         cursor = service._profiles.next_due_refresh(now=100)
         assert cursor is not None and cursor.next_section == "full_profile"
@@ -685,9 +712,10 @@ async def test_channel_profile_commit_publishes_linked_chat_fact_and_overlays_ca
 
         context = _ProfileSectionContext(None, 0, False, "disabled", False)
         commit = await service._acquire_channel_full_profile(-10042, DialogType.CHANNEL, context=context)
-        conn.execute(
-            "INSERT INTO dialogs(dialog_id, linked_chat_id, linked_chat_resolved_at) VALUES(-1004201, NULL, 99)"
-        )
+        with write_savepoint(conn):
+            conn.execute(
+                "INSERT INTO dialogs(dialog_id, linked_chat_id, linked_chat_resolved_at) VALUES(-1004201, NULL, 99)"
+            )
         committed = service._profiles.commit_section(cursor, commit, now=100)
         service._publish_profile_linked_chat_fact(cursor, DialogType.CHANNEL, context, committed, now=100)
         assert committed
@@ -700,8 +728,10 @@ async def test_channel_profile_commit_publishes_linked_chat_fact_and_overlays_ca
         stored = service._profiles.read(-10042, now=100)
         assert stored is not None
         assert "linked_chat_id" not in stored.detail
-        result = service._progressive_result(-10042, stored.detail, stored.sections, now=100, admit_refresh=False)
-        data = cast(dict[str, object], result["data"])
+        data = cast(
+            dict[str, object],
+            service._progressive_result(-10042, stored.detail, stored.sections, now=100, admit_refresh=False)["data"],
+        )
         assert data["linked_chat_id"] == -1000000000777
         fact = linked_chat_fact_owner.read_fact(conn, -10042)
         assert fact.state is LinkedChatState.KNOWN_LINK and fact.linked_chat_id == -1000000000777
@@ -759,7 +789,8 @@ async def test_channel_profile_fact_publish_is_fenced_by_newer_dialog_revision()
 
         context = _ProfileSectionContext(None, 0, False, "disabled", False)
         commit = await service._acquire_channel_full_profile(-10047, DialogType.CHANNEL, context=context)
-        linked_chat_fact_owner.invalidate_from_update(conn, -10047, 100)
+        with write_savepoint(conn):
+            linked_chat_fact_owner.invalidate_from_update(conn, -10047, 100)
         assert service._profiles.commit_section(cursor, commit, now=100)
         service._publish_profile_linked_chat_fact(cursor, DialogType.CHANNEL, context, True, now=100)
         assert conn.execute("SELECT linked_chat_id FROM dialogs WHERE dialog_id=?", (-10047,)).fetchone() == (-10099,)
@@ -830,11 +861,13 @@ async def test_legacy_profile_publication_wakes_cold_adapter_for_local_link_enro
     _apply_migrations(conn)
     channel_id = -10042
     linked_chat_id = -1000000000777
-    conn.execute(
-        "INSERT INTO dialogs(dialog_id, type, hidden, last_message_at) VALUES (?, 'channel', 0, 100)",
-        (channel_id,),
-    )
-    conn.execute("INSERT INTO activity_sync_state(key, value) VALUES ('activity_working_set_completed_at', '50')")
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO dialogs(dialog_id, type, hidden, last_message_at) VALUES (?, 'channel', 0, 100)",
+            (channel_id,),
+        )
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO activity_sync_state(key, value) VALUES ('activity_working_set_completed_at', '50')")
     conn.commit()
 
     profile = ChannelProfileObservation(
@@ -1025,23 +1058,27 @@ async def test_durable_channel_reference_miss_commits_unavailable_without_rpc_at
 
     channel_id = -1000000000047
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
-    conn.execute(
-        "INSERT INTO entities VALUES (?, 'channel', 'Channel', NULL, NULL, 100)",
-        (channel_id,),
-    )
-    conn.execute(
-        "INSERT INTO entity_profile_refresh_state(entity_id,status,retry_at,reason,updated_at,next_section,acquisition_cursor) "
-        "VALUES (?, 'pending', NULL, 'refresh_queued', 100, 'full_profile', 0)",
-        (channel_id,),
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entities VALUES (?, 'channel', 'Channel', NULL, NULL, 100)",
+            (channel_id,),
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entity_profile_refresh_state(entity_id,status,retry_at,reason,updated_at,next_section,acquisition_cursor) "
+            "VALUES (?, 'pending', NULL, 'refresh_queued', 100, 'full_profile', 0)",
+            (channel_id,),
+        )
     provider = MissingReferenceProvider()
     service = _test_service(conn, limits=RefreshLimits())
     service._deps = replace(
@@ -1103,15 +1140,18 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt() 
             raise AssertionError("dialog traversal is not part of a profile section")
 
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
-    conn.execute("INSERT INTO entities VALUES (42, 'user', 'Known', 'known', NULL, 1)")
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities VALUES (42, 'user', 'Known', 'known', NULL, 1)")
     repository = EntityProfileRepository(conn, section_ttl_seconds=300)
     repository.mark_pending(42, now=100)
     client = BudgetedClient()
@@ -1184,19 +1224,22 @@ async def test_durable_profile_adapter_checkpoints_core_resolution_before_sectio
             return User(id=entity_id, first_name="Resolved", username="resolved")
 
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
-    conn.execute(
-        "INSERT INTO entity_profile_refresh_state("
-        "entity_id,status,retry_at,reason,updated_at,next_section,acquisition_cursor) "
-        "VALUES (42,'pending',NULL,'refresh_queued',100,'full_profile',0)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entity_profile_refresh_state("
+            "entity_id,status,retry_at,reason,updated_at,next_section,acquisition_cursor) "
+            "VALUES (42,'pending',NULL,'refresh_queued',100,'full_profile',0)"
+        )
     service = _test_service(conn, limits=RefreshLimits())
     service._deps = replace(
         service._deps,
@@ -1227,19 +1270,22 @@ async def test_durable_profile_budget_exhaustion_leaves_core_cursor_ready() -> N
             raise RpcAttemptBudgetExhaustedError("slice complete")
 
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
-    conn.execute(
-        "INSERT INTO entity_profile_refresh_state("
-        "entity_id,status,retry_at,reason,updated_at,next_section,acquisition_cursor) "
-        "VALUES (42,'pending',NULL,'refresh_queued',100,'full_profile',0)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entity_profile_refresh_state("
+            "entity_id,status,retry_at,reason,updated_at,next_section,acquisition_cursor) "
+            "VALUES (42,'pending',NULL,'refresh_queued',100,'full_profile',0)"
+        )
     service = _test_service(conn, limits=RefreshLimits())
     service._deps = replace(service._deps, client=ExhaustedClient())
     coordinator = service.refresh_coordinator
@@ -1287,15 +1333,18 @@ async def test_entity_info_foreground_entrypoint_sets_rpc_source() -> None:
 @pytest.mark.asyncio
 async def test_entity_profile_adapter_sets_bounded_rpc_scope() -> None:
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
-    conn.execute("INSERT INTO entities VALUES (42, 'user', 'Known', 'known', NULL, 1)")
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities VALUES (42, 'user', 'Known', 'known', NULL, 1)")
     EntityProfileRepository(conn, section_ttl_seconds=300).mark_pending(42, now=100)
     limits = RefreshLimits(foreground_resolve_seconds=0.01, per_rpc_seconds=0.02, whole_refresh_seconds=0.05)
     service = _test_service(conn, limits=limits)
@@ -1337,15 +1386,17 @@ async def test_entity_profile_adapter_sets_bounded_rpc_scope() -> None:
 @pytest.mark.asyncio
 async def test_refresh_resolution_preserves_success_and_failure_semantics() -> None:
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
-    conn.execute(
-        "INSERT INTO entity_profile_refresh_state(entity_id,status,retry_at,reason,updated_at) "
-        "VALUES (42,'pending',NULL,'refresh_queued',100)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entity_profile_refresh_state(entity_id,status,retry_at,reason,updated_at) "
+            "VALUES (42,'pending',NULL,'refresh_queued',100)"
+        )
     service = _test_service(conn, limits=RefreshLimits())
     entity = SimpleNamespace(id=42)
 
@@ -1422,12 +1473,14 @@ async def test_expected_enrichment_timeout_does_not_emit_traceback(caplog: pytes
 @pytest.mark.asyncio
 async def test_cached_core_path_is_local_and_fast() -> None:
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
-    conn.execute("INSERT INTO entities VALUES (42, 'user', 'Cached', 'cached', NULL, 100)")
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities VALUES (42, 'user', 'Cached', 'cached', NULL, 100)")
     service = _test_service(conn, limits=RefreshLimits())
     result = await service.get_entity_info({"entity_id": 42})
     await service.shutdown()
@@ -1441,19 +1494,23 @@ async def test_cached_core_path_is_local_and_fast() -> None:
 @pytest.mark.asyncio
 async def test_partial_detail_uses_canonical_identity_and_skips_core_resolution() -> None:  # noqa: PLR0915
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
-    conn.execute("INSERT INTO entities VALUES (42, 'user', 'Canonical', 'canonical', NULL, 100)")
-    conn.execute(
-        "INSERT INTO entity_details VALUES (42, ?, 90)",
-        (json.dumps({"schema": 1, "id": 999, "type": "unknown", "name": "Enrichment", "about": "legacy"}),),
-    )
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities VALUES (42, 'user', 'Canonical', 'canonical', NULL, 100)")
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entity_details VALUES (42, ?, 90)",
+            (json.dumps({"schema": 1, "id": 999, "type": "unknown", "name": "Enrichment", "about": "legacy"}),),
+        )
     repo = EntityProfileRepository(conn, section_ttl_seconds=300)
     repo.mark_pending(42, now=100)
     cursor = repo.next_due_refresh(now=100)
@@ -1513,19 +1570,23 @@ async def test_partial_detail_uses_canonical_identity_and_skips_core_resolution(
 async def test_core_acquisition_becomes_known_across_reopen_without_cursor_retry(tmp_path: Path) -> None:
     path = tmp_path / "partial-core.sqlite"
     conn = sqlite3.connect(path)
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
-    conn.execute("INSERT INTO entities VALUES (42, 'unknown', 'Legacy', NULL, NULL, 90)")
-    conn.execute(
-        "INSERT INTO entity_details VALUES (42, ?, 90)",
-        (json.dumps({"schema": 1, "about": "legacy"}),),
-    )
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities VALUES (42, 'unknown', 'Legacy', NULL, NULL, 90)")
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entity_details VALUES (42, ?, 90)",
+            (json.dumps({"schema": 1, "about": "legacy"}),),
+        )
     repo = EntityProfileRepository(conn, section_ttl_seconds=300)
     repo.mark_pending(42, now=100)
     cursor = repo.next_due_refresh(now=100)
@@ -1575,11 +1636,13 @@ async def test_production_schema_core_write_syncs_revision_before_next_section_a
     path = tmp_path / "production-core.sqlite"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
-    conn.execute("INSERT INTO entities(id, type, name, updated_at) VALUES (42, 'unknown', 'Legacy', 90)")
-    conn.execute(
-        "INSERT INTO entity_details(entity_id, detail_json, fetched_at) VALUES (42, ?, 90)",
-        (json.dumps({"schema": 1, "about": "legacy"}),),
-    )
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities(id, type, name, updated_at) VALUES (42, 'unknown', 'Legacy', 90)")
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entity_details(entity_id, detail_json, fetched_at) VALUES (42, ?, 90)",
+            (json.dumps({"schema": 1, "about": "legacy"}),),
+        )
     conn.commit()
     service = _test_service(conn, limits=RefreshLimits())
     service._profiles.mark_pending(42, now=100)
@@ -1670,13 +1733,15 @@ async def test_progressive_cached_avatar_projects_persisted_current_photo_withou
     entity_id = 42 if entity_type == "user" else 43
     client = CountingClient()
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
     detail = {
         "schema": 1,
@@ -1686,8 +1751,12 @@ async def test_progressive_cached_avatar_projects_persisted_current_photo_withou
         "avatar_history": [{"photo_id": 7, "date": None}],
         "avatar_count": 1,
     }
-    conn.execute("INSERT INTO entities VALUES (?, ?, ?, NULL, NULL, 100)", (entity_id, entity_type, "Cached profile"))
-    conn.execute("INSERT INTO entity_details VALUES (?, ?, 100)", (entity_id, json.dumps(detail)))
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entities VALUES (?, ?, ?, NULL, NULL, 100)", (entity_id, entity_type, "Cached profile")
+        )
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entity_details VALUES (?, ?, 100)", (entity_id, json.dumps(detail)))
     section_rows = {
         "full_profile": ("fresh", 100, None, {"current_photo": {"photo_id": 99, "date": None}}),
         "common_chats": ("fresh", 100, None, []),
@@ -1700,14 +1769,15 @@ async def test_progressive_cached_avatar_projects_persisted_current_photo_withou
         ),
         "personal_channel": ("fresh", 100, None, None),
     }
-    conn.executemany(
-        "INSERT INTO entity_detail_sections(entity_id, section, status, observed_at, reason, payload_json, retry_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, NULL)",
-        (
-            (entity_id, section, status, observed_at, reason, json.dumps(payload) if payload is not None else None)
-            for section, (status, observed_at, reason, payload) in section_rows.items()
-        ),
-    )
+    with write_savepoint(conn):
+        conn.executemany(
+            "INSERT INTO entity_detail_sections(entity_id, section, status, observed_at, reason, payload_json, retry_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+            (
+                (entity_id, section, status, observed_at, reason, json.dumps(payload) if payload is not None else None)
+                for section, (status, observed_at, reason, payload) in section_rows.items()
+            ),
+        )
     service = _test_service(conn, limits=RefreshLimits(foreground_refresh_wait_seconds=0.01))
     service._deps = replace(
         service._deps,
@@ -1733,10 +1803,11 @@ async def test_progressive_cached_avatar_projects_persisted_current_photo_withou
 @pytest.mark.asyncio
 async def test_unknown_core_timeout_enqueues_background_resolution() -> None:
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
     calls = 0
     entity = SimpleNamespace(id=42, first_name="Known", username="known")
@@ -1764,10 +1835,11 @@ async def test_unknown_core_timeout_enqueues_background_resolution() -> None:
 @pytest.mark.asyncio
 async def test_unknown_core_flood_wait_is_durable_without_fake_entity_row() -> None:
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
     _sections_schema(conn)
     service = _test_service(conn, limits=RefreshLimits(0.01, 0.02, 0.05, 1))
     calls = 0
@@ -1866,10 +1938,14 @@ async def test_entity_info_rejects_ids_outside_telethon_peer_domain_before_rpc(
             raise ValueError("unknown entity")
 
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
-    conn.execute("CREATE TABLE dialogs (dialog_id INTEGER PRIMARY KEY, identity_revision INTEGER NOT NULL DEFAULT 0)")
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "CREATE TABLE dialogs (dialog_id INTEGER PRIMARY KEY, identity_revision INTEGER NOT NULL DEFAULT 0)"
+        )
     client = CountingClient()
     service = _test_service(conn, limits=RefreshLimits())
     demand_sink = MagicMock()
@@ -1970,8 +2046,10 @@ def test_refresh_rejection_is_fk_safe_without_unknown_parent(tmp_path: Path) -> 
 
 def test_progressive_projection_schema_is_idempotent() -> None:
     conn = sqlite3.connect(":memory:")
-    conn.execute("CREATE TABLE entities (id INTEGER PRIMARY KEY)")
-    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)")
+    with write_savepoint(conn):
+        conn.execute("CREATE TABLE entities (id INTEGER PRIMARY KEY)")
+    with write_savepoint(conn):
+        conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)")
     _apply_migration_57(conn, 56)
     _apply_migration_57(conn, 57)
     assert conn.execute(
@@ -2000,8 +2078,10 @@ def test_progressive_projection_schema_upgrades_from_v56(tmp_path: Path) -> None
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
-    conn.execute("DROP TABLE entity_detail_sections")
-    conn.execute("DELETE FROM schema_version WHERE version = 57")
+    with write_savepoint(conn):
+        conn.execute("DROP TABLE entity_detail_sections")
+    with write_savepoint(conn):
+        conn.execute("DELETE FROM schema_version WHERE version = 57")
     conn.commit()
     _apply_migrations(conn)
     assert conn.execute(

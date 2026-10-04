@@ -111,6 +111,7 @@ from .sync_read_model import (
     decode_dm_deletion_checkpoint,
     dm_deletion_reconciliation_is_blocked,
 )
+from .sync_transactions import write_transaction
 from .telegram_demand import AcquisitionKind, demand_context
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
@@ -365,15 +366,15 @@ def _write_telemetry(
     event: Mapping[str, object],
 ) -> None:
     global _runtime_event_write_count
-    _insert_telemetry_row(conn, event)
-    _runtime_event_write_count += 1
-    if _runtime_event_write_count % 128 == 0:
-        prune_runtime_observations(
-            conn,
-            ttl_seconds=policy.telemetry.retention_ttl_seconds,
-            row_cap=policy.telemetry.runtime_observations.row_cap,
-        )
-    conn.commit()
+    with write_transaction(conn):
+        _insert_telemetry_row(conn, event)
+        _runtime_event_write_count += 1
+        if _runtime_event_write_count % 128 == 0:
+            prune_runtime_observations(
+                conn,
+                ttl_seconds=policy.telemetry.retention_ttl_seconds,
+                row_cap=policy.telemetry.runtime_observations.row_cap,
+            )
 
 
 class TelemetryPolicy(Protocol):
@@ -1840,10 +1841,12 @@ class DaemonAPIServer:
         dialog_id = _coerce_int(req.get("dialog_id", 0), 0)
         enable = bool(req.get("enable", True))
         now = int(time.time())
-        outcome = enable_history(self._conn, dialog_id, now=now) if enable else disable_history(self._conn, dialog_id)
-        if enable and self._hydration_requester is not None:
-            self._hydration_requester(self._conn, dialog_id, now)
-        self._conn.commit()
+        with write_transaction(self._conn):
+            outcome = (
+                enable_history(self._conn, dialog_id, now=now) if enable else disable_history(self._conn, dialog_id)
+            )
+            if enable and self._hydration_requester is not None:
+                self._hydration_requester(self._conn, dialog_id, now)
         if enable:
             if outcome.action in {
                 "queue_full_history",
@@ -1949,7 +1952,7 @@ class DaemonAPIServer:
 
     def _recover_dialog_directory(self, req: dict[str, object]) -> dict[str, object]:
         """Start a new unpublished attempt only after a semantic-invalid latch."""
-        with self._conn:
+        with write_transaction(self._conn):
             result = recover_invalid_generation_in_transaction(self._conn)
         if result["ok"]:
             return {"ok": True, "data": result}
@@ -2112,21 +2115,21 @@ class DaemonAPIServer:
         now = int(time.time())
         try:
             mapped_entities = [cast(Mapping[str, object], e) for e in entities]
-            upsert_entity_snapshots(
-                self._conn,
-                [
-                    EntitySnapshot(
-                        entity_id=cast(int, e["id"]),
-                        entity_type=cast(str, e["type"]),
-                        name=cast(str | None, e.get("name") or None),
-                        username=cast(str | None, e.get("username")),
-                        name_normalized=latinize(str(e["name"])) if e.get("name") else None,
-                        updated_at=now,
-                    )
-                    for e in mapped_entities
-                ],
-            )
-            self._conn.commit()
+            with write_transaction(self._conn):
+                upsert_entity_snapshots(
+                    self._conn,
+                    [
+                        EntitySnapshot(
+                            entity_id=cast(int, e["id"]),
+                            entity_type=cast(str, e["type"]),
+                            name=cast(str | None, e.get("name") or None),
+                            username=cast(str | None, e.get("username")),
+                            name_normalized=latinize(str(e["name"])) if e.get("name") else None,
+                            updated_at=now,
+                        )
+                        for e in mapped_entities
+                    ],
+                )
             return {"ok": True, "upserted": len(entities)}
         except Exception as exc:
             logger.exception("upsert_entities failed: %s", exc)

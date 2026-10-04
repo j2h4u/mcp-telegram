@@ -28,6 +28,7 @@ from mcp_telegram.message_fact_refresh import (
 from mcp_telegram.messages import sqlite_hydration_jobs
 from mcp_telegram.messages.sqlite_hydration_jobs import HydrationRepairCursor
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.sync_transactions import enable_runtime_writes
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
     DemandStatus,
@@ -189,6 +190,8 @@ def _hydration_worker(
     *,
     clock: Callable[[], float] = lambda: 1.0,
 ) -> MessageFactHydrationWorker:
+    conn.commit()
+    enable_runtime_writes(conn)
     return MessageFactHydrationWorker(
         object(),
         conn,

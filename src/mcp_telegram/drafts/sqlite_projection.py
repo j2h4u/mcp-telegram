@@ -5,8 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import cast
 
@@ -21,6 +20,7 @@ from mcp_telegram.drafts.contracts import (
     SnapshotCoverage,
 )
 from mcp_telegram.drafts.ports import DraftRecoveryScheduling
+from mcp_telegram.sync_transactions import require_write_transaction, write_savepoint
 
 _NORMALIZATION_VERSION = 1
 _MAX_RECOVERY_REASON_LENGTH = 256
@@ -59,7 +59,7 @@ class SQLiteDraftProjection:
     def bind_account(self, account_id: int) -> None:
         """Bind this writer runtime to one authenticated Telegram account."""
         _validate_account_id(account_id)
-        with self._write_transaction():
+        with write_savepoint(self._conn):
             self._conn.execute("INSERT OR IGNORE INTO draft_projection_runtime(singleton) VALUES (1)")
             self._conn.execute(
                 "UPDATE draft_projection_runtime SET account_id=?,recovery_due_at=NULL,recovery_claimed_at=NULL,"
@@ -89,7 +89,7 @@ class SQLiteDraftProjection:
         """Apply a realtime observation using Telegram source order only."""
         if observation.source is not DraftObservationSource.REALTIME:
             raise ValueError("apply_realtime requires a realtime observation")
-        with self._write_transaction():
+        with write_savepoint(self._conn):
             self._require_active_account(observation.scope.account_id)
             existing = self._row_for_scope(observation.scope)
             candidate = _row_values(observation, source_kind=_source_kind(observation))
@@ -209,6 +209,7 @@ class SQLiteDraftProjection:
         return row is not None
 
     def _mark_scope_uncertain(self, scope: DraftScope, observed_at: int) -> None:
+        require_write_transaction(self._conn)
         self._conn.execute(
             "INSERT INTO draft_order_uncertainty(account_id,dialog_id,top_message_id,subdialog_peer_id,observed_at) "
             "VALUES (?,?,?,?,?) ON CONFLICT(account_id,dialog_id,top_message_id,subdialog_peer_id) DO UPDATE SET "
@@ -223,6 +224,7 @@ class SQLiteDraftProjection:
         )
 
     def _clear_scope_uncertainty(self, scope: DraftScope) -> None:
+        require_write_transaction(self._conn)
         self._conn.execute(
             "DELETE FROM draft_order_uncertainty WHERE account_id=? AND dialog_id=? AND top_message_id=? "
             "AND subdialog_peer_id=?",
@@ -244,6 +246,7 @@ class SQLiteDraftProjection:
         return row is not None
 
     def _publish_realtime(self, scope: DraftScope, candidate: dict[str, object]) -> DraftApplyResult:
+        require_write_transaction(self._conn)
         revision = self._next_revision()
         self._upsert_current(scope, candidate, revision)
         if not self._recovery_pending():
@@ -270,7 +273,7 @@ class SQLiteDraftProjection:
         _validate_account_id(coverage.account_id)
         _validate_snapshot_inputs(observations, coverage)
         completed_at = int(time.time())
-        with self._write_transaction():
+        with write_savepoint(self._conn):
             self._require_active_account(coverage.account_id)
             if not self._claim_matches(claim_token):
                 return DraftApplyResult(accepted=False, decision="snapshot_superseded")
@@ -378,6 +381,7 @@ class SQLiteDraftProjection:
         self, account_id: int, completed_at: int, claim_token: int, source_order_at: datetime
     ) -> bool:
         """Clear only the recovery request claimed by this snapshot run."""
+        require_write_transaction(self._conn)
         if self._has_scope_uncertainty(account_id):
             self._conn.execute(
                 "UPDATE draft_sync_state SET observation_completed_at=?,source_order_floor="
@@ -426,6 +430,7 @@ class SQLiteDraftProjection:
         return row is not None and row[0] == claim_token
 
     def _refresh_source_order(self, scope: DraftScope, candidate: Mapping[str, object]) -> None:
+        require_write_transaction(self._conn)
         self._conn.execute(
             "UPDATE draft_current SET source_observed_at=?,source_order_at=? WHERE account_id=? AND dialog_id=? "
             "AND top_message_id=? AND subdialog_peer_id=?",
@@ -472,7 +477,7 @@ class SQLiteDraftProjection:
 
     def mark_recovery_needed(self, *, reason: str, observed_at: datetime) -> None:
         """Persist a retryable recovery requirement without inventing draft absence."""
-        with self._write_transaction():
+        with write_savepoint(self._conn):
             self._invalidate_recovery_claim(reason, _as_unix(observed_at))
 
     def recovery_due_at(self) -> float | None:
@@ -490,7 +495,7 @@ class SQLiteDraftProjection:
     def claim_recovery(self, *, now: float) -> int | None:
         """Claim a due recovery run exactly once for the active account."""
         now_int = _finite_non_negative_unix(now)
-        with self._write_transaction():
+        with write_savepoint(self._conn):
             row = cast(
                 tuple[object | None, object | None] | None,
                 self._conn.execute(
@@ -513,7 +518,7 @@ class SQLiteDraftProjection:
     def rearm_recovery(self, *, reason: str, now: float, claim_token: int) -> bool:
         """Requeue a claimed recovery with durable exponential backoff."""
         now_int = _finite_non_negative_unix(now)
-        with self._write_transaction():
+        with write_savepoint(self._conn):
             row = cast(
                 tuple[object | None, object | None] | None,
                 self._conn.execute(
@@ -537,21 +542,6 @@ class SQLiteDraftProjection:
                 expected_claim_token=claim_token,
             )
 
-    @contextmanager
-    def _write_transaction(self) -> Iterator[None]:
-        owns_transaction = not self._conn.in_transaction
-        if owns_transaction:
-            self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield
-        except BaseException:
-            if owns_transaction:
-                self._conn.rollback()
-            raise
-        else:
-            if owns_transaction:
-                self._conn.commit()
-
     def _require_active_account(self, account_id: int) -> None:
         row = cast(
             tuple[object | None] | None,
@@ -561,6 +551,7 @@ class SQLiteDraftProjection:
             raise DraftAccountFenceError("draft projection account is not bound to this runtime")
 
     def _next_revision(self) -> int:
+        require_write_transaction(self._conn)
         self._conn.execute(
             "UPDATE draft_projection_runtime SET projection_revision=projection_revision+1 WHERE singleton=1"
         )
@@ -581,6 +572,7 @@ class SQLiteDraftProjection:
         failure_count: int = 0,
         expected_claim_token: int | None = None,
     ) -> bool:
+        require_write_transaction(self._conn)
         if not reason or len(reason) > _MAX_RECOVERY_REASON_LENGTH:
             raise ValueError("draft recovery reason must be a non-empty string of at most 256 characters")
         row = cast(
@@ -623,6 +615,7 @@ class SQLiteDraftProjection:
         return dict(zip((column[0] for column in cursor.description), row, strict=True))
 
     def _upsert_current(self, scope: DraftScope, values: dict[str, object], revision: int) -> None:
+        require_write_transaction(self._conn)
         assignments = ",".join(f"{column}=excluded.{column}" for column in _CURRENT_VALUE_COLUMNS)
         placeholders = ",".join("?" for _ in range(5 + len(_CURRENT_VALUE_COLUMNS)))
         self._conn.execute(

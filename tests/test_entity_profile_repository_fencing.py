@@ -15,11 +15,13 @@ from mcp_telegram.entity_profile.contracts import FULL_PROFILE_OWNED_FIELDS, Pro
 from mcp_telegram.entity_profile.refresh import failure_retry_at, scope_changed_retry_at, throttled_retry_at
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
 from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.sync_transactions import write_savepoint
 
 
 def _repository(path: Path) -> tuple[sqlite3.Connection, EntityProfileRepository]:
     conn = sqlite3.connect(path)
-    conn.execute("INSERT INTO entities(id, type, name, updated_at) VALUES (42, 'user', 'User', 1)")
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities(id, type, name, updated_at) VALUES (42, 'user', 'User', 1)")
     conn.commit()
     return conn, EntityProfileRepository(conn, section_ttl_seconds=10)
 
@@ -43,15 +45,18 @@ def test_migration_is_additive_and_invents_no_evidence(tmp_path: Path, monkeypat
         old_schema.setattr(sync_db_module, "_ENTITY_PROFILE_ACQUISITION_MIGRATION_61", 61)
         ensure_sync_schema(path)
     conn = sqlite3.connect(path)
-    conn.execute("INSERT INTO entities(id, type, name, updated_at) VALUES (42, 'user', 'Old', 1)")
-    conn.execute(
-        "INSERT INTO entity_details(entity_id, detail_json, fetched_at) VALUES (42, ?, 90)",
-        ('{"schema":1,"id":42,"type":"user","name":"Old"}',),
-    )
-    conn.execute(
-        "INSERT INTO entity_profile_refresh_state(entity_id,status,retry_at,reason,updated_at,next_section,acquisition_cursor) "
-        "VALUES (42,'failed',123,'timeout',90,'common_chats',3)"
-    )
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities(id, type, name, updated_at) VALUES (42, 'user', 'Old', 1)")
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entity_details(entity_id, detail_json, fetched_at) VALUES (42, ?, 90)",
+            ('{"schema":1,"id":42,"type":"user","name":"Old"}',),
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entity_profile_refresh_state(entity_id,status,retry_at,reason,updated_at,next_section,acquisition_cursor) "
+            "VALUES (42,'failed',123,'timeout',90,'common_chats',3)"
+        )
     conn.commit()
     ensure_sync_schema(path)
     row = conn.execute(
@@ -196,14 +201,16 @@ def test_active_auth_scope_readmission_preserves_completed_pair_sections(tmp_pat
     ensure_sync_schema(path)
     conn, repo = _repository(path)
     repo.mark_pending(42, now=100, pair_mode_override="enabled")
-    conn.execute(
-        "UPDATE entity_profile_refresh_state SET status='failed', retry_at=777, reason='flood_wait', "
-        "next_section='personal_channel', acquisition_cursor=3 WHERE entity_id=42"
-    )
-    conn.execute(
-        "UPDATE entity_detail_sections SET status='fresh', observed_at=90, reason=NULL, payload_json='{}' "
-        "WHERE entity_id=42 AND section IN ('full_profile', 'personal_channel')"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_profile_refresh_state SET status='failed', retry_at=777, reason='flood_wait', "
+            "next_section='personal_channel', acquisition_cursor=3 WHERE entity_id=42"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_detail_sections SET status='fresh', observed_at=90, reason=NULL, payload_json='{}' "
+            "WHERE entity_id=42 AND section IN ('full_profile', 'personal_channel')"
+        )
     conn.commit()
     repo.mark_pending(42, now=200, reason="auth_scope_changed", pair_mode_override="disabled")
     assert conn.execute(
@@ -221,17 +228,19 @@ def test_generation_and_revision_fences_reject_stale_writers(tmp_path: Path) -> 
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     conn, repo = _repository(path)
-    conn.execute("UPDATE entities SET username='canonical' WHERE id=42")
+    with write_savepoint(conn):
+        conn.execute("UPDATE entities SET username='canonical' WHERE id=42")
     conn.commit()
     repo.mark_pending(42, now=100)
     cursor = repo.next_due_refresh(now=100)
     assert cursor is not None
     # A newer canonical writer changes the revision without changing the
     # durable cursor.  The old response must not overwrite it.
-    conn.execute(
-        "INSERT INTO entity_details(entity_id, detail_json, fetched_at, profile_revision) VALUES (42, ?, 101, 1)",
-        ('{"schema":1,"id":42,"type":"user","name":"newer"}',),
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entity_details(entity_id, detail_json, fetched_at, profile_revision) VALUES (42, ?, 101, 1)",
+            ('{"schema":1,"id":42,"type":"user","name":"newer"}',),
+        )
     conn.commit()
     assert not repo.commit_section(
         cursor, EntitySectionCommit({"name": "older"}, identity_patch={"username": None}), now=102
@@ -244,9 +253,10 @@ def test_generation_and_revision_fences_reject_stale_writers(tmp_path: Path) -> 
         "User",
         "canonical",
     )
-    conn.execute(
-        "UPDATE entity_profile_refresh_state SET generation=generation+1, profile_revision=1 WHERE entity_id=42"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_profile_refresh_state SET generation=generation+1, profile_revision=1 WHERE entity_id=42"
+        )
     conn.commit()
     assert not repo.commit_section(cursor, EntitySectionCommit({"name": "aba"}), now=103)
     conn.close()
@@ -256,11 +266,13 @@ def test_canonical_identity_merge_preserves_richer_placeholders_and_materializes
     path = tmp_path / "identity-merge.sqlite"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
-    conn.execute("INSERT INTO entities(id, type, name, username, updated_at) VALUES (42, 'unknown', NULL, NULL, 1)")
-    conn.execute(
-        "INSERT INTO entity_details(entity_id, detail_json, fetched_at) VALUES (42, ?, 90)",
-        ('{"schema":1,"id":999,"type":"user","name":"Blob User","username":"blob"}',),
-    )
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities(id, type, name, username, updated_at) VALUES (42, 'unknown', NULL, NULL, 1)")
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entity_details(entity_id, detail_json, fetched_at) VALUES (42, ?, 90)",
+            ('{"schema":1,"id":999,"type":"user","name":"Blob User","username":"blob"}',),
+        )
     conn.commit()
     repo = EntityProfileRepository(conn, section_ttl_seconds=10)
 
@@ -301,10 +313,11 @@ def test_core_acquisition_is_atomic_and_reopens_at_next_section(tmp_path: Path) 
     path = tmp_path / "core-acquisition.sqlite"
     ensure_sync_schema(path)
     conn, repo = _repository(path)
-    conn.execute(
-        "INSERT INTO entity_details(entity_id, detail_json, fetched_at, profile_revision) VALUES (42, ?, 90, 0)",
-        ('{"schema":1,"about":"old"}',),
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entity_details(entity_id, detail_json, fetched_at, profile_revision) VALUES (42, ?, 90, 0)",
+            ('{"schema":1,"about":"old"}',),
+        )
     repo.mark_pending(42, now=100)
     cursor = repo.next_due_refresh(now=100)
     assert cursor is not None
@@ -345,14 +358,16 @@ def test_core_acquisition_stale_cursor_and_exception_leave_all_rows_unchanged(
     path = tmp_path / "core-rollback.sqlite"
     ensure_sync_schema(path)
     conn, repo = _repository(path)
-    conn.execute(
-        "INSERT INTO entity_details(entity_id, detail_json, fetched_at, profile_revision) VALUES (42, ?, 90, 0)",
-        ('{"schema":1,"about":"old"}',),
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entity_details(entity_id, detail_json, fetched_at, profile_revision) VALUES (42, ?, 90, 0)",
+            ('{"schema":1,"about":"old"}',),
+        )
     repo.mark_pending(42, now=100)
     cursor = repo.next_due_refresh(now=100)
     assert cursor is not None
-    conn.execute("UPDATE entity_profile_refresh_state SET acquisition_cursor=1 WHERE entity_id=42")
+    with write_savepoint(conn):
+        conn.execute("UPDATE entity_profile_refresh_state SET acquisition_cursor=1 WHERE entity_id=42")
     conn.commit()
     before = (
         conn.execute("SELECT type, name, username FROM entities WHERE id=42").fetchone(),
@@ -368,13 +383,15 @@ def test_core_acquisition_stale_cursor_and_exception_leave_all_rows_unchanged(
         conn.execute("SELECT type, name, username FROM entities WHERE id=42").fetchone(),
         conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone(),
     )
-    conn.execute("UPDATE entity_profile_refresh_state SET acquisition_cursor=0 WHERE entity_id=42")
+    with write_savepoint(conn):
+        conn.execute("UPDATE entity_profile_refresh_state SET acquisition_cursor=0 WHERE entity_id=42")
     conn.commit()
     original_matches = repo._cursor_matches
 
     def stale_after_match(candidate: object) -> bool:
         matched = original_matches(candidate)  # type: ignore[arg-type]
-        conn.execute("UPDATE entity_profile_refresh_state SET acquisition_cursor=1 WHERE entity_id=42")
+        with write_savepoint(conn):
+            conn.execute("UPDATE entity_profile_refresh_state SET acquisition_cursor=1 WHERE entity_id=42")
         return matched
 
     monkeypatch.setattr(repo, "_cursor_matches", stale_after_match)
@@ -419,10 +436,11 @@ def test_save_core_carries_active_refresh_revision_before_section_progress(tmp_p
     path = tmp_path / "save-core-active.sqlite"
     ensure_sync_schema(path)
     conn, repo = _repository(path)
-    conn.execute(
-        "INSERT INTO entity_details(entity_id, detail_json, fetched_at, profile_revision) VALUES (42, ?, 90, 0)",
-        ('{"schema":1,"about":"old"}',),
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entity_details(entity_id, detail_json, fetched_at, profile_revision) VALUES (42, ?, 90, 0)",
+            ('{"schema":1,"about":"old"}',),
+        )
     repo.mark_pending(42, now=100)
     repo.save_core({"id": 42, "type": "user", "name": "Fresh Name", "username": "fresh"}, now=101)
     assert conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone() == (1,)
@@ -440,15 +458,17 @@ def test_refresh_readmission_paths_preserve_detail_revision_fence(tmp_path: Path
     path = tmp_path / "readmission-fence.sqlite"
     ensure_sync_schema(path)
     conn, repo = _repository(path)
-    conn.execute(
-        "INSERT INTO entity_details(entity_id, detail_json, fetched_at, profile_revision) VALUES (42, ?, 90, 0)",
-        ('{"schema":1,"about":"old"}',),
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entity_details(entity_id, detail_json, fetched_at, profile_revision) VALUES (42, ?, 90, 0)",
+            ('{"schema":1,"about":"old"}',),
+        )
     repo.mark_pending(42, now=100)
-    conn.execute(
-        "UPDATE entity_profile_refresh_state SET status='complete', retry_at=NULL, reason='refresh_complete' "
-        "WHERE entity_id=42"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_profile_refresh_state SET status='complete', retry_at=NULL, reason='refresh_complete' "
+            "WHERE entity_id=42"
+        )
     conn.commit()
     # A realtime identity write can arrive after completion. It advances the
     # detail fence while no refresh generation is active.
@@ -467,10 +487,11 @@ def test_refresh_readmission_paths_preserve_detail_revision_fence(tmp_path: Path
     assert cursor is not None
     assert repo.commit_section(cursor, EntitySectionCommit({"about": "readmitted"}), now=103)
 
-    conn.execute(
-        "UPDATE entity_profile_refresh_state SET status='complete', retry_at=NULL, reason='refresh_complete' "
-        "WHERE entity_id=42"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_profile_refresh_state SET status='complete', retry_at=NULL, reason='refresh_complete' "
+            "WHERE entity_id=42"
+        )
     conn.commit()
     assert conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone() == (2,)
     assert conn.execute("SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
@@ -493,9 +514,10 @@ def test_refresh_readmission_paths_preserve_detail_revision_fence(tmp_path: Path
     assert cursor is not None
     assert repo.commit_section(cursor, EntitySectionCommit({"about": "follow-up"}), now=106)
 
-    conn.execute(
-        "UPDATE entity_profile_refresh_state SET status='failed', retry_at=777, reason='flood_wait' WHERE entity_id=42"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_profile_refresh_state SET status='failed', retry_at=777, reason='flood_wait' WHERE entity_id=42"
+        )
     conn.commit()
     # Active failed generations already carry the detail fence; re-admission
     # must preserve it without advancing generation or resetting the cursor.
@@ -610,7 +632,8 @@ def test_identity_patch_deletion_absence_and_empty_semantics(
     path = tmp_path / "identity-patch.sqlite"
     ensure_sync_schema(path)
     conn, repo = _repository(path)
-    conn.execute("UPDATE entities SET username='known' WHERE id=42")
+    with write_savepoint(conn):
+        conn.execute("UPDATE entities SET username='known' WHERE id=42")
     conn.commit()
     repo.mark_pending(42, now=100)
     cursor = repo.next_due_refresh(now=100)
@@ -631,11 +654,13 @@ def test_known_canonical_null_identity_overrides_legacy_blob_after_reopen(tmp_pa
     path = tmp_path / "canonical-null.sqlite"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
-    conn.execute("INSERT INTO entities(id, type, name, username, updated_at) VALUES (42, 'user', 'Known', NULL, 1)")
-    conn.execute(
-        "INSERT INTO entity_details(entity_id, detail_json, fetched_at) VALUES (42, ?, 90)",
-        ('{"schema":1,"id":999,"type":"user","name":"Old","username":"old"}',),
-    )
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities(id, type, name, username, updated_at) VALUES (42, 'user', 'Known', NULL, 1)")
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entity_details(entity_id, detail_json, fetched_at) VALUES (42, ?, 90)",
+            ('{"schema":1,"id":999,"type":"user","name":"Old","username":"old"}',),
+        )
     conn.commit()
     repo = EntityProfileRepository(conn, section_ttl_seconds=10)
     stored = repo.read(42, now=100)
@@ -653,11 +678,15 @@ def test_known_canonical_identity_is_not_erased_by_placeholder_section_values(tm
     path = tmp_path / "identity-placeholder.sqlite"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
-    conn.execute("INSERT INTO entities(id, type, name, username, updated_at) VALUES (42, 'user', 'Known', 'known', 1)")
-    conn.execute(
-        "INSERT INTO entity_details(entity_id, detail_json, fetched_at) VALUES (42, ?, 90)",
-        ('{"schema":1,"id":42,"type":"unknown","name":"Old","username":"old"}',),
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entities(id, type, name, username, updated_at) VALUES (42, 'user', 'Known', 'known', 1)"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entity_details(entity_id, detail_json, fetched_at) VALUES (42, ?, 90)",
+            ('{"schema":1,"id":42,"type":"unknown","name":"Old","username":"old"}',),
+        )
     conn.commit()
     repo = EntityProfileRepository(conn, section_ttl_seconds=10)
     repo.save_core({"id": 42, "type": "unknown", "name": None, "username": None}, now=95)
@@ -763,10 +792,11 @@ def test_same_generation_channel_completion_ignores_ttl(tmp_path: Path) -> None:
         ),
         now=101,
     )
-    conn.execute(
-        "UPDATE entity_profile_refresh_state SET next_section='personal_channel', acquisition_cursor=0 "
-        "WHERE entity_id=42"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_profile_refresh_state SET next_section='personal_channel', acquisition_cursor=0 "
+            "WHERE entity_id=42"
+        )
     conn.commit()
     channel_cursor = repo.next_due_refresh(now=10_000)
     assert channel_cursor is not None
@@ -814,11 +844,12 @@ def test_same_generation_channel_completion_rejects_changed_generation_or_scope(
         EntitySectionCommit({"personal_channel": None}, evidence=evidence),
         now=101,
     )
-    conn.execute(
-        "UPDATE entity_profile_refresh_state SET next_section='personal_channel', acquisition_cursor=0, generation=generation+? "
-        "WHERE entity_id=42",
-        (generation_delta,),
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_profile_refresh_state SET next_section='personal_channel', acquisition_cursor=0, generation=generation+? "
+            "WHERE entity_id=42",
+            (generation_delta,),
+        )
     conn.commit()
     fenced_cursor = repo.next_due_refresh(now=10_000)
     assert fenced_cursor is not None
@@ -860,13 +891,15 @@ def test_same_generation_completion_rejects_corrupt_provenance_or_payload(tmp_pa
         EntitySectionCommit({"personal_channel": {"channel_id": 1}}, payload={"channel_id": 1}, evidence=evidence),
         now=101,
     )
-    conn.execute(
-        "UPDATE entity_profile_refresh_state SET next_section='personal_channel', acquisition_cursor=0 WHERE entity_id=42"
-    )
-    conn.execute(
-        "UPDATE entity_detail_sections SET provenance_json='{}', payload_json='not-json' "
-        "WHERE entity_id=42 AND section='personal_channel'"
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_profile_refresh_state SET next_section='personal_channel', acquisition_cursor=0 WHERE entity_id=42"
+        )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_detail_sections SET provenance_json='{}', payload_json='not-json' "
+            "WHERE entity_id=42 AND section='personal_channel'"
+        )
     conn.commit()
     fenced_cursor = repo.next_due_refresh(now=10_000)
     assert fenced_cursor is not None
@@ -903,11 +936,12 @@ def test_receipts_with_invalid_observation_bounds_are_rejected(
         identity=identity,
     )
     assert repo.commit_section(cursor, EntitySectionCommit({"about": "old"}, evidence=evidence), now=101)
-    conn.execute(
-        "UPDATE entity_detail_sections SET observation_started_at=?, observation_completed_at=? "
-        "WHERE entity_id=42 AND section='full_profile'",
-        (started_at, completed_at),
-    )
+    with write_savepoint(conn):
+        conn.execute(
+            "UPDATE entity_detail_sections SET observation_started_at=?, observation_completed_at=? "
+            "WHERE entity_id=42 AND section='full_profile'",
+            (started_at, completed_at),
+        )
     conn.commit()
     assert not repo.section_is_reusable(42, "full_profile", identity=identity, now=100)
     conn.close()

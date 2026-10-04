@@ -43,6 +43,7 @@ from mcp_telegram.message_contracts import (
     ReactionRecord,
     StoredMessage,
 )
+from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     LoudChannelProfilePort,
@@ -620,14 +621,16 @@ async def test_trace_account_observed_mode_does_not_call_enrichment(
     server, conn, _client = trace_enrichment_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     seed_synced_dialog(conn, dialog_id=-2002, status="access_lost")
-    _upsert_trace_coverage_fragment(
-        _TraceCoverageFragmentUpsertRequest(
-            conn=conn,
-            target_user_id=101,
-            dialog_id=-2003,
-            status="budget_exceeded",
+    conn.commit()
+    with write_transaction(conn):
+        _upsert_trace_coverage_fragment(
+            _TraceCoverageFragmentUpsertRequest(
+                conn=conn,
+                target_user_id=101,
+                dialog_id=-2003,
+                status="budget_exceeded",
+            )
         )
-    )
     conn.commit()
     enrich = AsyncMock()
     monkeypatch.setattr(DaemonAccountTraceService, "_trace_enrich_visible_dialogs", enrich)
@@ -692,3 +695,30 @@ async def test_trace_account_best_effort_calls_enrichment_and_reruns_db_query(
     assert coverage_bounds["max_dialogs"] == 10
     assert coverage_bounds["max_per_dialog"] == 100
     assert coverage_bounds["deadline_ms"] == 15_000
+
+
+@pytest.mark.asyncio
+async def test_trace_page_rolls_back_messages_when_coverage_write_fails(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+    trace_service: DaemonAccountTraceService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _server, conn, client = trace_enrichment_server
+    client.messages_by_dialog = {222: [fake_message(message_id=1)]}
+    seed_dialog(conn, dialog_id=222, name="Alice", dialog_type="User")
+    seed_synced_dialog(conn, dialog_id=222)
+    conn.commit()
+    enable_runtime_writes(conn)
+
+    def fail_coverage(request: _TraceCoverageFragmentUpsertRequest) -> None:
+        assert request.conn.in_transaction
+        raise sqlite3.OperationalError("coverage failure")
+
+    monkeypatch.setattr("mcp_telegram.daemon_account_trace._upsert_trace_coverage_fragment", fail_coverage)
+    with pytest.raises(sqlite3.OperationalError, match="coverage failure"):
+        await trace_service._trace_enrich_visible_dialogs(
+            101, [{"dialog_id": 222, "strategy": "dialog_scan", "topic_id": None}]
+        )
+    assert conn.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=222").fetchone()[0] == 0
+    assert not conn.in_transaction
+    assert conn.execute("PRAGMA query_only").fetchone()[0] == 1

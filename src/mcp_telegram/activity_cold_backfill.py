@@ -42,6 +42,7 @@ from .activity_peer_sweep import (
 from .activity_substrate import ActivityClient
 from .hydration_queue import HydrationPriority
 from .sync_read_model import SyncStatus
+from .sync_transactions import write_transaction
 from .telegram_demand import (
     AcquisitionKind,
     DemandStatus,
@@ -245,7 +246,7 @@ def _claim_cold_backfill_peer(
     claim_until: int,
 ) -> tuple[int, int | None] | None:
     """Atomically claim the oldest due peer using the existing retry field as a lease."""
-    with conn:
+    with write_transaction(conn):
         return cast(
             tuple[int, int | None] | None,
             conn.execute(
@@ -285,7 +286,7 @@ def _save_claimed_cold_state(ctx: _ColdPeerFinishContext, **fields: object) -> b
         raise ValueError(f"unknown claimed cold fields {unknown!r}")
     assignments = ", ".join(f"{column} = ?" for column in fields)
     values = [*fields.values(), int(time.time()), ctx.dialog_id, ctx.claim_until]
-    with ctx.conn:
+    with write_transaction(ctx.conn):
         cursor = ctx.conn.execute(
             f"UPDATE activity_dialog_state SET {assignments}, updated_at = ? "
             "WHERE dialog_id = ? AND cold_status = 'running' AND cold_next_retry_at = ?",
@@ -296,7 +297,7 @@ def _save_claimed_cold_state(ctx: _ColdPeerFinishContext, **fields: object) -> b
 
 def _release_cold_claim(conn: sqlite3.Connection, *, dialog_id: int, claim_until: int) -> bool:
     """Return an unfinished peer to the queue after a slice boundary."""
-    with conn:
+    with write_transaction(conn):
         cursor = conn.execute(
             "UPDATE activity_dialog_state "
             "SET cold_status = 'pending', cold_next_retry_at = NULL, updated_at = ? "

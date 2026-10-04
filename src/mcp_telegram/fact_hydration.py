@@ -27,6 +27,7 @@ from .messages.sqlite_hydration_jobs import (
     repair_media_metadata_hydration_jobs,
     repair_transcription_hydration_jobs,
 )
+from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import (
     AcquisitionKind,
@@ -368,8 +369,7 @@ class MessageFactHydrationWorker:
             raise RuntimeError("fact hydration repair requires no open transaction")
         # Own the writer before candidate reads; never retain a WAL read snapshot
         # across producer writes or leave partial repairs for another caller to commit.
-        with self._conn:
-            self._conn.execute("BEGIN IMMEDIATE")
+        with write_transaction(self._conn):
             has_more, cursors = self._run_repair_producers(effective_now)
         self._repair_cursors = cursors if has_more else (None, None, None)
         self.next_repair_at = clock_now if has_more else self._clock() + self._interval_seconds
@@ -377,6 +377,7 @@ class MessageFactHydrationWorker:
     def _run_repair_producers(
         self, effective_now: int
     ) -> tuple[bool, tuple[HydrationRepairCursor | None, HydrationRepairCursor | None, HydrationRepairCursor | None]]:
+        require_write_transaction(self._conn)
         has_more = False
         transcription_cursor, contact_other_cursor, video_cursor = self._repair_cursors
         if TRANSCRIPTION_HYDRATION_KIND in self._handlers:
@@ -433,20 +434,21 @@ class MessageFactHydrationWorker:
         except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
             return self._handle_admission_rejection(handler, batch, started, preflight_observations, exc, effective_now)
         except RpcAdmissionClosedError as exc:
-            self._release_undispatched(
-                started,
-                effective_now,
-                error_code=type(exc).__name__,
-            )
-            self._conn.commit()
+            with write_transaction(self._conn):
+                self._release_undispatched(
+                    started,
+                    effective_now,
+                    error_code=type(exc).__name__,
+                )
             raise
         except ACCESS_LOST_ERRORS as exc:
             return self._handle_access_lost(handler, batch, started, preflight_observations, exc, effective_now)
         except Exception as exc:  # noqa: BLE001 - Telegram transient classes vary by RPC layer
             return self._handle_request_error(handler, batch, started, preflight_observations, exc, effective_now)
 
-        applied = handler.apply(self._conn, self._queue, started, result, now=effective_now)
-        return self._finish_applied(handler, batch, started, preflight_observations, applied, int(self._clock()))
+        with write_transaction(self._conn):
+            applied = handler.apply(self._conn, self._queue, started, result, now=effective_now)
+            return self._finish_applied(handler, batch, started, preflight_observations, applied, int(self._clock()))
 
     async def _request_batch(
         self,
@@ -494,12 +496,12 @@ class MessageFactHydrationWorker:
         exc: RpcAdmissionSaturatedError | RpcAdmissionExpiredError | TelegramRpcAdmissionDeferred,
         effective_now: int,
     ) -> _BatchOutcome:
-        retried = self._release_undispatched(
-            started,
-            effective_now + self._retry_delay_seconds,
-            error_code=type(exc).__name__,
-        )
-        self._conn.commit()
+        with write_transaction(self._conn):
+            retried = self._release_undispatched(
+                started,
+                effective_now + self._retry_delay_seconds,
+                error_code=type(exc).__name__,
+            )
         self._log_drops(batch, preflight_observations)
         logger.warning(
             "message_fact_hydration admission_rejected kind=%s dialog_id=%d jobs=%d error_type=%s",
@@ -521,6 +523,7 @@ class MessageFactHydrationWorker:
         *,
         error_code: str,
     ) -> int:
+        require_write_transaction(self._conn)
         return sum(self._queue.requeue_undispatched(job, due_at, error_code=error_code) for job in jobs)
 
     def _handle_flood_wait(  # noqa: PLR0913, PLR0917
@@ -536,14 +539,14 @@ class MessageFactHydrationWorker:
         if retry_delay is None:
             return self._handle_circuit_open(handler, batch, started, preflight_observations, effective_now)
         descriptor = describe_telegram_rpc_error(exc)
-        retried, dropped, drop_observations = self._reschedule_or_drop(
-            handler,
-            started,
-            effective_now + retry_delay,
-            outcome=HydrationOutcome.RPC_PAUSED,
-            error_code=descriptor.symbol,
-        )
-        self._conn.commit()
+        with write_transaction(self._conn):
+            retried, dropped, drop_observations = self._reschedule_or_drop(
+                handler,
+                started,
+                effective_now + retry_delay,
+                outcome=HydrationOutcome.RPC_PAUSED,
+                error_code=descriptor.symbol,
+            )
         self._log_drops(
             batch,
             preflight_observations,
@@ -611,24 +614,24 @@ class MessageFactHydrationWorker:
             self._handle_flood_wait(handler, batch, started, preflight_observations, exc, effective_now)
             return
 
-        error_code = type(exc).__name__
-        if request_dispatched:
-            for job in started:
-                self._queue.reschedule(
-                    job,
-                    job.due_at,
-                    outcome=HydrationOutcome.RPC_PAUSED,
-                    error_code=error_code,
-                )
-        else:
-            for job in started:
-                self._queue.requeue_undispatched(
-                    job,
-                    job.due_at,
-                    outcome=HydrationOutcome.RPC_PAUSED,
-                    error_code=error_code,
-                )
-        self._conn.commit()
+        with write_transaction(self._conn):
+            error_code = type(exc).__name__
+            if request_dispatched:
+                for job in started:
+                    self._queue.reschedule(
+                        job,
+                        job.due_at,
+                        outcome=HydrationOutcome.RPC_PAUSED,
+                        error_code=error_code,
+                    )
+            else:
+                for job in started:
+                    self._queue.requeue_undispatched(
+                        job,
+                        job.due_at,
+                        outcome=HydrationOutcome.RPC_PAUSED,
+                        error_code=error_code,
+                    )
         self._log_drops(batch, preflight_observations)
         logger.info(
             "message_fact_hydration coordinator_throttled kind=%s dialog_id=%d jobs=%d dispatched=%s latched=%s",
@@ -647,7 +650,6 @@ class MessageFactHydrationWorker:
         preflight_observations: Sequence[HydrationDropObservation],
         effective_now: int,
     ) -> _BatchOutcome:
-        self._conn.commit()
         self._log_drops(batch, preflight_observations)
         logger.info(
             "message_fact_hydration circuit_open kind=%s dialog_id=%d jobs=%d paused_until_reset=true",
@@ -672,12 +674,12 @@ class MessageFactHydrationWorker:
         descriptor = describe_telegram_rpc_error(exc)
         self._log_drops(batch, preflight_observations)
         dialog_ids = tuple(dict.fromkeys(job.dialog_id for job in started))
-        summaries = tuple(
-            summary for dialog_id in dialog_ids for summary in self._queue.summarize_for_dialog(dialog_id)
-        )
-        for dialog_id in dialog_ids:
-            set_access_lost(self._conn, dialog_id, effective_now, reason=descriptor.error_type)
-        self._conn.commit()
+        with write_transaction(self._conn):
+            summaries = tuple(
+                summary for dialog_id in dialog_ids for summary in self._queue.summarize_for_dialog(dialog_id)
+            )
+            for dialog_id in dialog_ids:
+                set_access_lost(self._conn, dialog_id, effective_now, reason=descriptor.error_type)
         self._log_summaries(summaries, descriptor)
         drop_counts: dict[str, int] = defaultdict(int)
         for summary in summaries:
@@ -702,20 +704,22 @@ class MessageFactHydrationWorker:
     ) -> _BatchOutcome:
         descriptor = describe_telegram_rpc_error(exc)
         if handler.is_terminal_error(exc):
-            for job in started:
-                self._queue.mark_terminal(job, outcome=HydrationOutcome.TERMINAL_ERROR, error_code=descriptor.symbol)
-            self._conn.commit()
+            with write_transaction(self._conn):
+                for job in started:
+                    self._queue.mark_terminal(
+                        job, outcome=HydrationOutcome.TERMINAL_ERROR, error_code=descriptor.symbol
+                    )
             self._log_drops(batch, preflight_observations)
             self._log_drops(started, self._observations("terminal_rpc", started), descriptor=descriptor)
             return _BatchOutcome(dropped=len(preflight_observations) + len(started))
-        retried, dropped, drop_observations = self._reschedule_or_drop(
-            handler,
-            started,
-            effective_now + self._retry_delay_seconds,
-            outcome=HydrationOutcome.TEMPORARY_FAILURE,
-            error_code=descriptor.symbol,
-        )
-        self._conn.commit()
+        with write_transaction(self._conn):
+            retried, dropped, drop_observations = self._reschedule_or_drop(
+                handler,
+                started,
+                effective_now + self._retry_delay_seconds,
+                outcome=HydrationOutcome.TEMPORARY_FAILURE,
+                error_code=descriptor.symbol,
+            )
         self._log_drops(batch, preflight_observations)
         self._log_drops(started, drop_observations, descriptor=descriptor)
         logger.warning(
@@ -739,6 +743,7 @@ class MessageFactHydrationWorker:
         applied: AppliedFacts,
         effective_now: int,
     ) -> _BatchOutcome:
+        require_write_transaction(self._conn)
         pending = 0
         if applied.pending:
             pending, dropped, drop_observations = self._reschedule_or_drop(
@@ -755,7 +760,6 @@ class MessageFactHydrationWorker:
             )
         self._log_drops(batch, preflight_observations)
         self._log_drops(started, applied.drop_observations)
-        self._conn.commit()
         return _BatchOutcome(
             hydrated=applied.hydrated,
             completed=applied.completed,
@@ -766,28 +770,28 @@ class MessageFactHydrationWorker:
     def _start_batch(
         self, handler: HydrationHandler, jobs: Sequence[HydrationJob]
     ) -> tuple[list[HydrationJob], tuple[HydrationDropObservation, ...]]:
-        started: list[HydrationJob] = []
-        observations: list[HydrationDropObservation] = []
-        for job in jobs:
-            if not handler.eligible(self._conn, job):
-                self._queue.remove(job)
-                observations.append(
-                    HydrationDropObservation("ineligible", job.message_id, job.kind, job.dialog_id, job.attempts)
-                )
-                continue
-            current = self._queue.start(job)
-            if current is None:
-                continue
-            if current.attempts > self._max_attempts:
-                self._queue.mark_terminal(current, outcome=HydrationOutcome.EXHAUSTED)
-                observations.append(
-                    HydrationDropObservation(
-                        "attempt_limit", current.message_id, current.kind, current.dialog_id, current.attempts
+        with write_transaction(self._conn):
+            started: list[HydrationJob] = []
+            observations: list[HydrationDropObservation] = []
+            for job in jobs:
+                if not handler.eligible(self._conn, job):
+                    self._queue.remove(job)
+                    observations.append(
+                        HydrationDropObservation("ineligible", job.message_id, job.kind, job.dialog_id, job.attempts)
                     )
-                )
-                continue
-            started.append(current)
-        self._conn.commit()
+                    continue
+                current = self._queue.start(job)
+                if current is None:
+                    continue
+                if current.attempts > self._max_attempts:
+                    self._queue.mark_terminal(current, outcome=HydrationOutcome.EXHAUSTED)
+                    observations.append(
+                        HydrationDropObservation(
+                            "attempt_limit", current.message_id, current.kind, current.dialog_id, current.attempts
+                        )
+                    )
+                    continue
+                started.append(current)
         return started, tuple(observations)
 
     def _reschedule_or_drop(
@@ -799,6 +803,7 @@ class MessageFactHydrationWorker:
         outcome: HydrationOutcome,
         error_code: str | None = None,
     ) -> tuple[int, int, tuple[HydrationDropObservation, ...]]:
+        require_write_transaction(self._conn)
         rescheduled = dropped = 0
         observations: list[HydrationDropObservation] = []
         for job in jobs:
