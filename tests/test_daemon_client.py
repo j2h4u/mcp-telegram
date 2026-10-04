@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -147,11 +148,10 @@ async def test_request_logs_slow_stage_with_correlation_and_without_payload(
     conn = DaemonConnection(reader, writer)
     clock_values = iter((1.0, 2.25, 3.0, 3.25, 4.0, 4.1))
     monkeypatch.setattr("mcp_telegram.daemon_client.time.perf_counter", lambda: next(clock_values))
-    with patch("mcp_telegram.daemon_client.uuid.uuid4") as uuid4:
-        uuid4.return_value.hex = "0123456789abcdef"
-        with patch("mcp_telegram.daemon_client.current_operation_id", return_value="operation-1"):
-            with caplog.at_level("DEBUG", logger="mcp_telegram.daemon_client"):
-                response = await conn.request({"method": "get_entity_info", "private": "DO_NOT_LOG"})
+    monkeypatch.setattr("mcp_telegram.daemon_client.uuid.uuid4", lambda: uuid.UUID("0123456789abcdef0123456789abcdef"))
+    with patch("mcp_telegram.daemon_client.current_operation_id", return_value="operation-1"):
+        with caplog.at_level("DEBUG", logger="mcp_telegram.daemon_client"):
+            response = await conn.request({"method": "get_entity_info", "private": "DO_NOT_LOG"})
 
     assert response["ok"] is True
     record = next(record for record in caplog.records if "daemon_client_request_timing" in record.getMessage())
