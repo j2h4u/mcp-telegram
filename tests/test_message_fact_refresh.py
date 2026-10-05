@@ -10,6 +10,7 @@ from typing import cast
 import pytest
 
 from mcp_telegram.message_fact_refresh import (
+    _NEXT_REACTION_RELEASE_SQL,
     _NEXT_READ_AT_RELEASE_SQL,
     MessageFactRefreshDemandAdapter,
     MessageFactRefreshDeps,
@@ -17,6 +18,8 @@ from mcp_telegram.message_fact_refresh import (
     _claim_reaction_pages,
     _cutoff_backlog_suppressed,
     _next_release_at,
+    _reaction_candidates,
+    _reaction_discovery_page,
     _reaction_page_candidate,
     _reaction_release_at,
     _read_at_candidates,
@@ -56,6 +59,10 @@ def _make_db(path: str | Path = ":memory:") -> sqlite3.Connection:
         CREATE TABLE entities (
             id INTEGER PRIMARY KEY,
             type TEXT NOT NULL
+        );
+        CREATE TABLE dialogs (
+            dialog_id INTEGER PRIMARY KEY,
+            type TEXT
         );
         CREATE TABLE messages (
             dialog_id INTEGER NOT NULL,
@@ -745,6 +752,47 @@ async def test_frozen_reaction_upper_and_claim_revalidation() -> None:
     )
     assert selected == [(1, 1, 3, "fresh-offset")]
     conn.close()
+
+
+def test_broadcast_reaction_details_are_excluded_from_all_scheduler_paths() -> None:
+    conn = _make_db()
+    try:
+        for dialog_id, dialog_type, next_attempt_at in (
+            (1, "channel", 10),
+            (2, "supergroup", 200),
+            (3, None, 300),
+        ):
+            if dialog_type is not None:
+                conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (?,?)", (dialog_id, dialog_type))
+            conn.execute("INSERT INTO synced_dialogs VALUES (?, 'synced', NULL)", (dialog_id,))
+            seed_full_history_enrollment(conn, dialog_id, enabled=True)
+            conn.execute("INSERT INTO messages VALUES (?,1,1,0,NULL,0)", (dialog_id,))
+            conn.execute(
+                "INSERT INTO message_reaction_aggregate_state VALUES (?,1,1,1,1,'history',1,1)",
+                (dialog_id,),
+            )
+            conn.execute(
+                "INSERT INTO message_reaction_event_status "
+                "(dialog_id,message_id,aggregate_generation,detail_generation,status,checked_at,next_attempt_at) "
+                "VALUES (?,1,1,1,'unavailable',0,?)",
+                (dialog_id, next_attempt_at),
+            )
+        conn.commit()
+
+        assert _reaction_candidates(conn, stale_before_utc=1_000, limit=10) == [
+            (2, 1, 1, None),
+            (3, 1, 1, None),
+        ]
+        assert _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, (0,)) == 200
+
+        page_rows = _reaction_discovery_page(conn, None, (3, 1))
+        assert len(page_rows) == 3
+        assert all(len(row) == 13 for row in page_rows)
+        discovered = [_reaction_page_candidate(row, 1_000) for row in page_rows]
+        assert [item[1][1][0] for item in discovered if item is not None and item[1] is not None] == [2, 3]
+        assert conn.execute("SELECT COUNT(*) FROM message_reaction_aggregate_state").fetchone() == (3,)
+    finally:
+        conn.close()
 
 
 @pytest.mark.asyncio
