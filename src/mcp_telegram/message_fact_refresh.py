@@ -43,6 +43,10 @@ JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled
 JOIN message_reaction_aggregate_state a ON a.dialog_id=m.dialog_id AND a.message_id=m.message_id
 LEFT JOIN message_reaction_event_status d ON d.dialog_id=m.dialog_id AND d.message_id=m.message_id
 WHERE sd.status = 'synced'
+  AND NOT EXISTS (
+      SELECT 1 FROM dialogs directory
+      WHERE directory.dialog_id=m.dialog_id AND directory.type='channel'
+  )
   AND m.is_deleted = 0
   AND (a.aggregate_row_count > 0
        OR d.status IN ('partial','unavailable'))
@@ -82,6 +86,10 @@ SELECT p.dialog_id, p.message_id, p.generation, p.aggregate_row_count,
        d.aggregate_generation, d.status, d.next_offset, d.next_attempt_at, d.checked_at
 FROM aggregate_page p
 LEFT JOIN synced_dialogs sd ON sd.dialog_id=p.dialog_id
+  AND NOT EXISTS (
+      SELECT 1 FROM dialogs directory
+      WHERE directory.dialog_id=p.dialog_id AND directory.type='channel'
+  )
 LEFT JOIN full_history_enrollment fhe ON fhe.dialog_id=p.dialog_id
 LEFT JOIN messages m ON m.dialog_id=p.dialog_id AND m.message_id=p.message_id
 LEFT JOIN message_reaction_event_status d ON d.dialog_id=p.dialog_id AND d.message_id=p.message_id
@@ -127,6 +135,10 @@ SELECT MIN(
 )
 FROM message_reaction_aggregate_state a
 JOIN synced_dialogs sd ON sd.dialog_id=a.dialog_id AND sd.status='synced'
+  AND NOT EXISTS (
+      SELECT 1 FROM dialogs directory
+      WHERE directory.dialog_id=a.dialog_id AND directory.type='channel'
+  )
 JOIN full_history_enrollment fhe ON fhe.dialog_id=a.dialog_id AND fhe.enabled=1
 LEFT JOIN message_reaction_event_status d ON d.dialog_id=a.dialog_id AND d.message_id=a.message_id
 WHERE EXISTS (

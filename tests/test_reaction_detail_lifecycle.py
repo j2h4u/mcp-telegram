@@ -11,6 +11,7 @@ from typing import cast
 
 import pytest
 from telethon.errors import (  # type: ignore[import-untyped]
+    BroadcastForbiddenError,
     ChannelPrivateError,
     ChatAdminRequiredError,
     MsgIdInvalidError,
@@ -229,6 +230,7 @@ def test_detail_gateway_translates_private_and_flood_failures(
 @pytest.mark.parametrize(
     ("error_type", "kind"),
     [
+        (BroadcastForbiddenError, GatewayFailureKind.INVALID_TARGET),
         (MsgIdInvalidError, GatewayFailureKind.INVALID_TARGET),
         (PeerIdInvalidError, GatewayFailureKind.INVALID_TARGET),
         (ChatAdminRequiredError, GatewayFailureKind.INVALID_TARGET),

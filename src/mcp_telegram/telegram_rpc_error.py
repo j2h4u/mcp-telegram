@@ -11,6 +11,7 @@ _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,127}\Z", re.ASCII)
 _SYMBOL_RE = re.compile(r"[A-Z][A-Z0-9_]{0,127}\Z", re.ASCII)
 REACTION_DETAIL_TERMINAL_RPC_SYMBOLS = frozenset(
     {
+        "BROADCAST_FORBIDDEN",
         "CHANNEL_ID_INVALID",
         "CHANNEL_INVALID",
         "CHAT_ADMIN_INVITE_REQUIRED",
