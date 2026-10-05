@@ -561,7 +561,7 @@ depends_on = ["mcp_telegram.reactions.contracts"]
 [[modules]]
 path = "mcp_telegram.reactions.telegram_adapter"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.reactions.contracts", "mcp_telegram.reactions.ports", "mcp_telegram.telegram_gateway", "mcp_telegram.telegram_rpc_scheduler"]
+depends_on = ["mcp_telegram.reactions.contracts", "mcp_telegram.reactions.ports", "mcp_telegram.telegram_gateway", "mcp_telegram.telegram_rpc_error", "mcp_telegram.telegram_rpc_scheduler"]
 
 [[modules]]
 path = "mcp_telegram.topics.telegram_adapter"

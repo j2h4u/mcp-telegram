@@ -2,19 +2,63 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import os
 import re
+import time
 from collections.abc import Awaitable
 from contextlib import AsyncExitStack
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Protocol
 
-from mcp import ClientSession
+from mcp import ClientSession, types
 from mcp.client.streamable_http import streamable_http_client
 
 DEFAULT_TIMEOUT_SECONDS = 30.0
+SLOW_TOOL_CALL_WARNING_MS = 1000.0
 _ENV_PLACEHOLDER_RE = re.compile(r"^\$\{([A-Z_][A-Z0-9_]*)\}$")
+logger = logging.getLogger(__name__)
+_tool_call_started_at: ContextVar[float | None] = ContextVar("tool_call_started_at", default=None)
+
+
+class _TimedClientSession(ClientSession):
+    """Expose when a tool result reaches SDK output-schema validation."""
+
+    async def validate_tool_result(self, name: str, result: types.CallToolResult) -> None:
+        call_started = _tool_call_started_at.get()
+        wire_elapsed_ms = (time.perf_counter() - call_started) * 1000 if call_started is not None else None
+        wire_elapsed = f"{wire_elapsed_ms:.1f}" if wire_elapsed_ms is not None else "unknown"
+        wire_logger = (
+            logger.warning
+            if wire_elapsed_ms is not None and wire_elapsed_ms >= SLOW_TOOL_CALL_WARNING_MS
+            else logger.debug
+        )
+        wire_logger("mcp_tool_result_received tool=%s wire_elapsed_ms=%s", name, wire_elapsed)
+        started = time.perf_counter()
+        outcome = "incomplete"
+        try:
+            await super().validate_tool_result(name, result)
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except Exception:
+            outcome = "error"
+            raise
+        else:
+            outcome = "success"
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            completion_logger = (
+                logger.warning if outcome != "success" or elapsed_ms >= SLOW_TOOL_CALL_WARNING_MS else logger.debug
+            )
+            completion_logger(
+                "mcp_tool_result_validation_complete tool=%s elapsed_ms=%.1f outcome=%s",
+                name,
+                elapsed_ms,
+                outcome,
+            )
 
 
 class McpClientError(RuntimeError):
@@ -69,7 +113,7 @@ class HttpMcpClient:
             async with asyncio.timeout(self._timeout_seconds):
                 read_stream, write_stream = await exit_stack.enter_async_context(streamable_http_client(self._url))
                 session = await exit_stack.enter_async_context(
-                    ClientSession(read_stream, write_stream, read_timeout_seconds=self._timeout_seconds)
+                    _TimedClientSession(read_stream, write_stream, read_timeout_seconds=self._timeout_seconds)
                 )
                 await session.initialize()
         except BaseException as exc:
@@ -110,14 +154,18 @@ class HttpMcpClient:
 
     async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         session = self._require_session()
-        result = await self._request(
-            "tools/call",
-            session.call_tool(
-                name,
-                arguments or {},
-                read_timeout_seconds=self._timeout_seconds,
-            ),
-        )
+        token = _tool_call_started_at.set(time.perf_counter())
+        try:
+            result = await self._request(
+                "tools/call",
+                session.call_tool(
+                    name,
+                    arguments or {},
+                    read_timeout_seconds=self._timeout_seconds,
+                ),
+            )
+        finally:
+            _tool_call_started_at.reset(token)
         return result.model_dump(mode="json", by_alias=True, exclude_none=True)
 
     async def _request[T](self, operation: str, request: Awaitable[T]) -> T:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -167,6 +168,35 @@ def test_detail_gateway_uses_one_page_and_never_get_messages() -> None:
     assert result.ok
     assert client.pages == 1
     assert client.resolved == [42]
+
+
+def test_detail_gateway_logs_safe_decode_failure_diagnostics(caplog: pytest.LogCaptureFixture) -> None:
+    marker = "telegram_response_secret_marker=do_not_log"
+
+    class BrokenResponse:
+        @property
+        def next_offset(self) -> str | None:
+            raise AttributeError(marker)
+
+    class Client:
+        async def get_input_entity(self, entity: object) -> object:
+            return entity
+
+        async def __call__(self, request: object) -> object:
+            del request
+            return BrokenResponse()
+
+    with caplog.at_level(logging.WARNING, logger="mcp_telegram.reactions.telegram_adapter"):
+        result = asyncio.run(
+            TelethonTelegramReactionGateway(Client()).fetch_reaction_page(42, 2, offset=None, limit=100)
+        )
+
+    assert result.failure is not None
+    assert result.failure.kind is GatewayFailureKind.TRANSIENT
+    assert "reaction_detail_fetch_failed stage=decode" in caplog.text
+    assert "error_type=AttributeError" in caplog.text
+    assert "failure_kind=transient" in caplog.text
+    assert marker not in caplog.text
 
 
 @pytest.mark.parametrize(
