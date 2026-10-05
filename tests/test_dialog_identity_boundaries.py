@@ -175,6 +175,39 @@ def test_operational_dialog_roles_are_read_only_and_field_limited() -> None:
     )
 
 
+def test_reaction_sql_constants_have_exact_type_only_dialog_role() -> None:
+    names = (
+        "_REACTION_CANDIDATES_SQL",
+        "_REACTION_DISCOVERY_PAGE_SQL",
+        "_NEXT_REACTION_RELEASE_SQL",
+    )
+    for name in names:
+        assert (
+            _identity_findings(
+                "message_fact_refresh.py",
+                f'{name} = "SELECT d.type FROM dialogs d WHERE d.dialog_id = ?"',
+            )
+            == []
+        )
+        assert _identity_findings(
+            "message_fact_refresh.py",
+            f'{name} = "SELECT d.name FROM dialogs d WHERE d.dialog_id = ?"',
+        )
+        assert _identity_findings(
+            "message_fact_refresh.py",
+            f'{name} = "UPDATE dialogs SET type = ? WHERE dialog_id = ?"',
+        )
+
+    assert _identity_findings(
+        "message_fact_refresh.py",
+        'UNREGISTERED_SQL = "SELECT d.type FROM dialogs d WHERE d.dialog_id = ?"',
+    )
+    assert _identity_findings(
+        "other_module.py",
+        '_REACTION_CANDIDATES_SQL = "SELECT d.type FROM dialogs d WHERE d.dialog_id = ?"',
+    )
+
+
 def test_dialog_entity_alias_filters_remain_owned_in_consumer_roles() -> None:
     for sql in (
         "SELECT d.name FROM scheduled_messages sm LEFT JOIN dialogs d ON d.dialog_id=sm.dialog_id",

@@ -82,6 +82,16 @@ DIALOG_IDENTITY_ROLE_FUNCTIONS: Mapping[str, Mapping[str, frozenset[str]]] = {
         "_read_identity_aggregate": frozenset({"identity_complete", "identity_observed_at"})
     },
     "event_handlers.py": {"EventHandlerManager._mark_channel_chat_update": frozenset({"type"})},
+    # Named SQL constants use canonical dialog kind only to decide whether a
+    # peer is eligible for reaction scheduling.
+    "message_fact_refresh.py": {
+        name: frozenset({"type"})
+        for name in (
+            "_REACTION_CANDIDATES_SQL",
+            "_REACTION_DISCOVERY_PAGE_SQL",
+            "_NEXT_REACTION_RELEASE_SQL",
+        )
+    },
     "scheduled_messages.py": {"ScheduledMessageReconciler._discover_eligibility": frozenset({"type"})},
     "sync_worker.py": {
         "FullSyncWorker.consume_canonical_dm_publication": frozenset({"name", "type"}),
@@ -606,7 +616,7 @@ def _has_dialog_identity_sql(sql: str, *, relative: str, function: str | None = 
     tokens = _sql_tokens(sql)
     dialog_aliases = {alias for alias, table in aliases.items() if table == "dialogs"}
     entity_aliases = {alias for alias, table in aliases.items() if table == "entities"}
-    dialog_fields = DIALOG_IDENTITY_ROLE_FUNCTIONS.get(relative, {}).get(function or "", frozenset())
+    dialog_fields = DIALOG_IDENTITY_ROLE_FUNCTIONS.get(relative, {}).get(function or name or "", frozenset())
     entity_fields = ENTITY_IDENTITY_ROLE_FUNCTIONS.get(relative, {}).get(function or "", frozenset())
     entity_fields |= ENTITY_IDENTITY_ROLE_CONSTANTS.get(relative, {}).get(name or "", frozenset())
     strict_entity_role = relative in ENTITY_DIALOG_ROLE_PATHS
