@@ -171,13 +171,24 @@ def test_detail_gateway_uses_one_page_and_never_get_messages() -> None:
     assert client.resolved == [42]
 
 
-def test_detail_gateway_logs_safe_decode_failure_diagnostics(caplog: pytest.LogCaptureFixture) -> None:
+@pytest.mark.parametrize(
+    ("error_type", "failure_kind"),
+    [
+        (AttributeError, GatewayFailureKind.TRANSIENT),
+        (ValueError, GatewayFailureKind.INVALID_TARGET),
+    ],
+)
+def test_detail_gateway_logs_safe_decode_failure_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+    error_type: type[Exception],
+    failure_kind: GatewayFailureKind,
+) -> None:
     marker = "telegram_response_secret_marker=do_not_log"
 
     class BrokenResponse:
         @property
         def next_offset(self) -> str | None:
-            raise AttributeError(marker)
+            raise error_type(marker)
 
     class Client:
         async def get_input_entity(self, entity: object) -> object:
@@ -193,11 +204,12 @@ def test_detail_gateway_logs_safe_decode_failure_diagnostics(caplog: pytest.LogC
         )
 
     assert result.failure is not None
-    assert result.failure.kind is GatewayFailureKind.TRANSIENT
+    assert result.failure.kind is failure_kind
     assert "reaction_detail_fetch_failed stage=decode" in caplog.text
-    assert "error_type=AttributeError" in caplog.text
-    assert "failure_kind=transient" in caplog.text
+    assert f"error_type={error_type.__name__}" in caplog.text
+    assert f"failure_kind={failure_kind.value}" in caplog.text
     assert marker not in caplog.text
+    assert any(record.levelname == "WARNING" for record in caplog.records)
 
 
 @pytest.mark.parametrize(
@@ -237,7 +249,7 @@ def test_detail_gateway_translates_private_and_flood_failures(
     ],
 )
 def test_detail_gateway_classifies_known_permanent_rpc_symbols(
-    error_type: type[Exception], kind: GatewayFailureKind
+    error_type: type[Exception], kind: GatewayFailureKind, caplog: pytest.LogCaptureFixture
 ) -> None:
     class Client:
         async def get_input_entity(self, entity: object) -> object:
@@ -248,11 +260,16 @@ def test_detail_gateway_classifies_known_permanent_rpc_symbols(
             del request
             raise AssertionError("request must not be sent after permanent entity failure")
 
-    result = asyncio.run(TelethonTelegramReactionGateway(Client()).fetch_reaction_page(42, 2, offset=None, limit=100))
+    with caplog.at_level(logging.INFO, logger="mcp_telegram.reactions.telegram_adapter"):
+        result = asyncio.run(
+            TelethonTelegramReactionGateway(Client()).fetch_reaction_page(42, 2, offset=None, limit=100)
+        )
     assert not result.ok
     assert result.failure is not None
     assert result.failure.kind is kind
     assert result.failure.retryable is False
+    failure_log = next(record for record in caplog.records if "reaction_detail_fetch_failed" in record.message)
+    assert failure_log.levelname == "INFO"
 
 
 def test_detail_gateway_propagates_rpc_admission_closed() -> None:

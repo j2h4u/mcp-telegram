@@ -112,7 +112,8 @@ class TelethonTelegramReactionGateway(TelegramReactionGateway):
         except CATCHABLE_GATEWAY_FAILURES as exc:
             failure = translate_reaction_detail_failure(exc)
             descriptor = describe_telegram_rpc_error(exc)
-            logger.warning(
+            logger.log(
+                logging.WARNING if failure.retryable or stage == "decode" else logging.INFO,
                 "reaction_detail_fetch_failed stage=%s error_type=%s error_code=%s error_symbol=%s failure_kind=%s",
                 stage,
                 descriptor.error_type,
