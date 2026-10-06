@@ -8,10 +8,12 @@ import argparse
 import json
 import os
 import tempfile
+from importlib.metadata import version
 from pathlib import Path
 from typing import TextIO, cast
 
 from mcp_telegram.chat_export_checkpoint import base_records, fingerprint
+from mcp_telegram.chat_export_projection import project_exporter
 
 # Account-relative state, administration details and unnecessary media handles.
 PRIVATE_FIELDS = frozenset(
@@ -81,6 +83,8 @@ def _write_public_export(path: Path, stream: TextIO) -> dict[str, int]:
     stream.write('{"format_version":1')
     for kind, record in base_records(path):
         if kind in {"group", "metadata"}:
+            if kind == "metadata":
+                record = {"exporter": project_exporter(version("mcp-telegram")), **record}
             stream.write(f',"{kind}":')
             json.dump(public_facts(record), stream, ensure_ascii=False, separators=(",", ":"))
             if kind == "metadata":

@@ -6,6 +6,14 @@ from typing import cast
 type Facts = dict[str, object]
 
 
+def project_exporter(software_version: str) -> Facts:
+    return {
+        "name": "mcp-telegram",
+        "version": software_version,
+        "repository_url": "https://github.com/j2h4u/mcp-telegram",
+    }
+
+
 def clean_facts(data: Mapping[str, object]) -> Facts:
     return {
         key: value

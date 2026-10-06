@@ -38,6 +38,7 @@ class AdminEvent(TypedDict):
 
 class Metadata(TypedDict):
     peers: list[Payload]
+    exporter: Payload
 
 
 class ExportDocument(TypedDict):
@@ -415,6 +416,7 @@ async def test_exact_url_resolves_once_then_uses_canonical_numeric_peer(
     doc = cast(ExportDocument, json.loads(output.read_text()))
     assert doc["group"]["dialog_id"] == str(canonical)
     assert doc["metadata"]["peers"][0]["dialog_id"] == str(canonical)
+    assert doc["metadata"]["exporter"] == cli.project_exporter(cli.version("mcp-telegram"))
     assert [p["operation"] for p in calls] == ["open", "admin_log", "history"]
 
 
