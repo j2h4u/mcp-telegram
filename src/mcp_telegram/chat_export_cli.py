@@ -29,6 +29,7 @@ from .chat_export_projection import (
     project_message,
     project_reactor,
 )
+from .chat_export_schema import CURRENT_FORMAT_VERSION, validate_record
 from .daemon_client import DaemonNotRunningError, daemon_connection
 
 MIN_RETRY_SECONDS = 0.1
@@ -319,7 +320,7 @@ class _Export:
         message["author"] = await self.identity(message.get("author"), peer_id)
         await self.related_users(message, peer_id)
         await self.topic(message, peer_id)
-        reactions = _object(message.pop("reactions"))
+        reactions = _object(message["reactions"])
         stream.write("{")
         for name, value in project_message(message).items():
             _field(stream, name, value)
@@ -429,19 +430,21 @@ def _publish(checkpoint: Checkpoint, peers: list[Payload], output: Path) -> Payl
     summary = checkpoint.summary()
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write('{"format_version":1,"group":')
-            _dump(stream, project_group(_object(peers[0]["group"])))
+            stream.write(f'{{"format_version":{CURRENT_FORMAT_VERSION},"group":')
+            group = project_group(_object(peers[0]["group"]))
+            validate_record("group", group)
+            _dump(stream, group)
             stream.write(',"metadata":')
-            _dump(
-                stream,
-                {
-                    "exporter": project_exporter(version("mcp-telegram")),
-                    "order": ORDER,
-                    "peers": [project_group(_object(peer["group"])) for peer in peers],
-                },
-            )
+            metadata = {
+                "exporter": project_exporter(version("mcp-telegram")),
+                "order": ORDER,
+                "peers": [project_group(_object(peer["group"])) for peer in peers],
+            }
+            validate_record("metadata", metadata)
+            _dump(stream, metadata)
             _write_records(stream, checkpoint, peers)
             stream.write(',"export":')
+            validate_record("export", summary)
             _dump(stream, summary)
             stream.write("}\n")
             stream.flush()
@@ -550,6 +553,8 @@ def _resume_options(checkpoint: Checkpoint, options: Payload) -> None:
     if saved is not None and saved != options:
         raise ChatExportError("Resume options differ from the saved export")
     checkpoint.mark("options", options)
+    if saved is None:
+        checkpoint.mark("format_version", CURRENT_FORMAT_VERSION)
     pending = checkpoint.state("pending_publish")
     output = Path(cast(str, options["output"]))
     if pending is not None and _fingerprint(output) == pending:
@@ -559,7 +564,7 @@ def _resume_options(checkpoint: Checkpoint, options: Payload) -> None:
 async def export_group(
     dialog_id: int | str, output: Path, *, update_from: Path | None = None, refresh_messages: int = 100
 ) -> Payload:
-    """Commit every received record locally, resume automatically, and publish valid v1 JSON."""
+    """Commit every received record locally, resume automatically, and publish current-version JSON."""
     if refresh_messages < 0:
         raise ValueError("refresh_messages must be nonnegative")
     if update_from is not None and update_from.resolve() == output.resolve():

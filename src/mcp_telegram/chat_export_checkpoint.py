@@ -1,4 +1,4 @@
-"""Crash-safe local export records and bounded-memory reading of v1 exports."""
+"""Crash-safe local records and bounded-memory reading of versioned exports."""
 
 import json
 import sqlite3
@@ -10,6 +10,13 @@ from typing import cast
 import ijson  # type: ignore[import-untyped]
 from ijson.common import ObjectBuilder  # type: ignore[import-untyped]
 
+from .chat_export_schema import (
+    migrate_record,
+    read_export_version,
+    validate_record,
+    validate_version,
+)
+
 type Payload = dict[str, object]
 CheckpointError = sqlite3.Error
 ORDER = "newest_to_oldest within each peer; primary then migrated predecessors"
@@ -17,8 +24,9 @@ ORDER = "newest_to_oldest within each peer; primary then migrated predecessors"
 
 def _top_shape(prefix: str, event: str, value: object) -> bool:
     if prefix == "format_version":
-        if event != "number" or type(value) is not int or value != 1:
+        if event != "number":
             raise ValueError("Unsupported base export format")
+        validate_version(value)
         return True
     if prefix in {"messages", "admin_events"}:
         if event not in {"start_array", "end_array"}:
@@ -65,7 +73,9 @@ def base_records(path: Path) -> Iterator[tuple[str, Payload]]:
         builder.event(event, value)
         depth += depth_changes.get(event, 0)
         if depth == 0:
-            yield active, cast(Payload, builder.value)
+            record = cast(Payload, builder.value)
+            validate_record(active, record)
+            yield active, record
             builder = None
 
 
@@ -164,7 +174,7 @@ def census(path: Path, refresh: int) -> Payload:
             state.message(record)
         else:
             state.footer = record
-    return state.finish()
+    return {**state.finish(), "format_version": read_export_version(path)}
 
 
 def fingerprint(path: Path) -> list[int] | None:
@@ -224,12 +234,16 @@ class Checkpoint:
             self.set_state(key, value)
 
     def records(self, kind: str, peer: int) -> Iterator[str]:
+        saved_version = self.state("format_version")
+        version = validate_version(1 if saved_version is None else saved_version)
+        prefix = "messages.item" if kind == "message" else "admin_events.item"
         rows = cast(
             Iterator[tuple[str]],
             self.db.execute("SELECT payload FROM records WHERE kind=? AND peer=? ORDER BY id DESC", (kind, peer)),
         )
         for row in rows:
-            yield row[0]
+            record = cast(Payload, json.loads(row[0]))
+            yield json.dumps(migrate_record(version, prefix, record), ensure_ascii=False, allow_nan=False)
 
     def summary(self) -> Payload:
         messages = admins = reactors = 0
@@ -258,6 +272,7 @@ class Checkpoint:
                     record_kind = "admin"
                 else:
                     continue
+                record = migrate_record(validate_version(info["format_version"]), kind, record)
                 self.db.execute(
                     "INSERT OR IGNORE INTO records VALUES (?,?,?,?)",
                     (record_kind, peer, identifier, json.dumps(record, ensure_ascii=False, allow_nan=False)),

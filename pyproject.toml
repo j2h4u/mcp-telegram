@@ -22,6 +22,7 @@ dependencies = [
   "qrcode>=8.2",
   "aiolimiter>=1.3.0",
   "ijson>=3.4.0",
+  "jsonschema>=4.26.0,<5",
 ]
 
 [build-system]

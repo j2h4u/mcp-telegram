@@ -16,6 +16,7 @@ from typing import TextIO, cast
 
 from mcp_telegram.chat_export_checkpoint import base_records, fingerprint
 from mcp_telegram.chat_export_projection import project_exporter
+from mcp_telegram.chat_export_schema import read_export_version
 
 # Each nested object has its own allowlist. Scalar slots reject containers;
 # Telegram adding a field never expands the public export implicitly.
@@ -52,7 +53,7 @@ def _scalar(value: object) -> object:
 
 
 def _role(value: object) -> object:
-    return value if isinstance(value, str) and value in {"owner", "admin", "member"} else None
+    return value if isinstance(value, str) and value in {"owner", "admin", "member", "unknown"} else None
 
 
 def _fields(*names: str) -> dict[str, Projection]:
@@ -95,7 +96,42 @@ def _reaction(value: object) -> object:
     )
 
 
-PHOTO = ("_", "id", "date", "has_stickers")
+def _boolean(value: object) -> object:
+    return value if isinstance(value, bool) else None
+
+
+def _encoded(value: object) -> object:
+    return _project(value, ("data", "encoding")) if isinstance(value, dict) else _scalar(value)
+
+
+def _page(value: object) -> object:
+    return _constructors(value, {"Page": PAGE})
+
+
+def _web_attribute(value: object) -> object:
+    return _constructors(
+        value, {"WebPageAttributeStickerSet": {**_fields("_", "emojis", "text_color"), "stickers": [_document]}}
+    )
+
+
+def _size(value: object) -> object:
+    return _constructors(
+        value,
+        {
+            "PhotoSize": ("_", "type", "w", "h", "size"),
+            "PhotoSizeProgressive": {**_fields("_", "type", "w", "h"), "sizes": [_scalar]},
+            "PhotoStrippedSize": {**_fields("_", "type", "w", "h", "bytes_length", "bytes_omitted"), "bytes": _encoded},
+            "PhotoPathSize": {**_fields("_", "type", "w", "h"), "bytes": _encoded},
+            "VideoSize": ("_", "type", "w", "h", "size", "video_start_ts"),
+        },
+    )
+
+
+def _stickerset(value: object) -> object:
+    return _constructors(value, {"InputStickerSetID": ("_", "id")})
+
+
+PHOTO = {**_fields("_", "id", "date", "has_stickers", "dc_id"), "sizes": [_size], "video_sizes": [_size]}
 ATTRIBUTE_CONSTRUCTORS: dict[str, Projection] = {
     "DocumentAttributeFilename": ("_", "file_name"),
     "DocumentAttributeImageSize": ("_", "w", "h"),
@@ -108,9 +144,15 @@ ATTRIBUTE_CONSTRUCTORS: dict[str, Projection] = {
         "supports_streaming",
         "nosound",
         "video_codec",
+        "preload_prefix_size",
+        "video_start_ts",
     ),
-    "DocumentAttributeAudio": ("_", "duration", "voice", "title", "performer"),
-    "DocumentAttributeSticker": ("_", "alt"),
+    "DocumentAttributeAudio": {**_fields("_", "duration", "voice", "title", "performer"), "waveform": _encoded},
+    "DocumentAttributeSticker": {
+        **_fields("_", "alt", "mask"),
+        "stickerset": _stickerset,
+        "mask_coords": ("_", "n", "x", "y", "zoom"),
+    },
     "DocumentAttributeAnimated": ("_",),
 }
 
@@ -119,7 +161,26 @@ def _attribute(value: object) -> object:
     return _constructors(value, ATTRIBUTE_CONSTRUCTORS)
 
 
-DOCUMENT = {**_fields("_", "id", "date", "mime_type", "size"), "attributes": [_attribute]}
+DOCUMENT = {
+    **_fields("_", "id", "date", "mime_type", "size", "dc_id"),
+    "attributes": [_attribute],
+    "thumbs": [_size],
+    "video_thumbs": [_size],
+}
+
+
+def _media(value: object) -> object:
+    return _project(value, MEDIA)
+
+
+def _photo(value: object) -> object:
+    return _constructors(value, {"Photo": PHOTO, "PhotoEmpty": ("_", "id")})
+
+
+def _document(value: object) -> object:
+    return _constructors(value, {"Document": DOCUMENT, "DocumentEmpty": ("_", "id")})
+
+
 POLL = {
     **_fields(
         "_",
@@ -135,26 +196,266 @@ POLL = {
         "shuffle_answers",
         "subscribers_only",
         "open_answers",
+        "hash",
     ),
+    "countries_iso2": [_scalar],
     "question": _text,
-    "answers": [{**_fields("_", "date"), "text": _text, "option": _option}],
+    "answers": [{**_fields("_", "date"), "text": _text, "option": _option, "media": _media, "added_by": _peer}],
 }
-POLL_RESULTS = {**_fields("_", "total_voters"), "results": [{**_fields("_", "voters"), "option": _option}]}
+POLL_RESULTS = {
+    **_fields("_", "total_voters", "min"),
+    "results": [{**_fields("_", "voters", "correct"), "option": _option}],
+    "solution": _scalar,
+    "solution_entities": [ENTITY],
+    "solution_media": _media,
+}
 MEDIA = {
-    **_fields("_", "spoiler", "ttl_seconds", "voice", "video", "round", "video_timestamp"),
+    **_fields(
+        "_",
+        "spoiler",
+        "ttl_seconds",
+        "voice",
+        "video",
+        "round",
+        "video_timestamp",
+        "force_large_media",
+        "force_small_media",
+        "manual",
+        "safe",
+        "live_photo",
+        "nopremium",
+    ),
     "photo": PHOTO,
     "document": DOCUMENT,
+    "alt_documents": [_document],
+    "video_cover": _photo,
+    "attached_media": [_media],
     "poll": POLL,
     "results": POLL_RESULTS,
-    "webpage": ("_", "url", "display_url", "type", "site_name", "title", "description", "author", "duration"),
+    "webpage": {
+        **_fields(
+            "_",
+            "url",
+            "display_url",
+            "type",
+            "site_name",
+            "title",
+            "description",
+            "author",
+            "duration",
+            "has_large_media",
+            "video_cover_photo",
+            "embed_url",
+            "embed_type",
+            "embed_width",
+            "embed_height",
+            "id",
+            "hash",
+        ),
+        "photo": _photo,
+        "document": _document,
+        "cached_page": _page,
+        "attributes": [_web_attribute],
+    },
 }
 FORWARD = {**_fields("_", "date", "from_name", "channel_post", "post_author", "imported", "psa_type"), "from_id": _peer}
+
+
+def _rich_text(value: object) -> object:
+    return value if isinstance(value, str) else _rich_node(value)
+
+
+def _rich_node(value: object) -> object:
+    return _constructors(value, RICH_CONSTRUCTORS)
+
+
+RICH_CONSTRUCTORS: dict[str, Projection] = {
+    "TextPlain": ("_", "text"),
+    "TextConcat": {"_": _scalar, "texts": [_rich_node]},
+    **{name: {"_": _scalar, "text": _rich_text} for name in ("TextBold", "TextFixed", "TextItalic", "TextAutoUrl")},
+    "TextUrl": {**_fields("_", "url", "webpage_id"), "text": _rich_text},
+    **{name: {"_": _scalar, "text": _rich_text} for name in ("PageBlockParagraph", "PageBlockHeading6")},
+    "PageBlockDivider": ("_",),
+    "PageBlockList": {"_": _scalar, "items": [_rich_node]},
+    "PageListItemBlocks": {"_": _scalar, "checkbox": _boolean, "checked": _boolean, "blocks": [_rich_node]},
+}
+
+
+RICH_CONSTRUCTORS.update(
+    {
+        "TextEmpty": ("_",),
+        **{
+            name: {"_": _scalar, "text": _rich_text}
+            for name in ("TextUnderline", "TextStrike", "TextSubscript", "TextSuperscript", "TextSpoiler")
+        },
+        "TextAnchor": {**_fields("_", "name"), "text": _rich_text},
+        "TextEmail": {**_fields("_", "email"), "text": _rich_text},
+        "TextPhone": {**_fields("_", "phone"), "text": _rich_text},
+        "TextImage": ("_", "document_id", "w", "h"),
+        "PageCaption": {"_": _scalar, "text": _rich_text, "credit": _rich_text},
+        **{
+            name: {"_": _scalar, "text": _rich_text}
+            for name in (
+                "PageBlockTitle",
+                "PageBlockSubtitle",
+                "PageBlockHeader",
+                "PageBlockSubheader",
+                "PageBlockFooter",
+            )
+        },
+        "PageBlockAuthorDate": {**_fields("_", "published_date"), "author": _rich_text},
+        "PageBlockAnchor": ("_", "name"),
+        "PageBlockBlockquote": {**_fields("_", "collapsed"), "text": _rich_text, "caption": _rich_text},
+        "PageBlockPullquote": {"_": _scalar, "text": _rich_text, "caption": _rich_text},
+        "PageBlockPhoto": {**_fields("_", "photo_id", "spoiler", "url", "webpage_id"), "caption": _rich_node},
+        "PageBlockVideo": {**_fields("_", "video_id", "autoplay", "loop", "spoiler"), "caption": _rich_node},
+        "PageBlockCover": {"_": _scalar, "cover": _rich_node},
+        **{
+            name: {"_": _scalar, "items": [_rich_node], "caption": _rich_node}
+            for name in ("PageBlockCollage", "PageBlockSlideshow")
+        },
+        "PageBlockDetails": {**_fields("_", "open"), "blocks": [_rich_node], "title": _rich_text},
+        "PageListItemText": {**_fields("_", "checkbox", "checked"), "text": _rich_text},
+        "PageListOrderedItemText": {**_fields("_", "num", "checkbox", "checked", "type", "value"), "text": _rich_text},
+        "PageListOrderedItemBlocks": {**_fields("_", "num"), "blocks": [_rich_node]},
+        "PageBlockOrderedList": {**_fields("_", "start", "reversed", "type"), "items": [_rich_node]},
+        "PageTableRow": {"_": _scalar, "cells": [_rich_node]},
+        "PageTableCell": {
+            **_fields(
+                "_", "align_center", "align_right", "colspan", "header", "rowspan", "valign_bottom", "valign_middle"
+            ),
+            "text": _rich_text,
+        },
+        "PageBlockTable": {**_fields("_", "bordered", "striped", "compact"), "title": _rich_text, "rows": [_rich_node]},
+        "PageRelatedArticle": (
+            "_",
+            "url",
+            "webpage_id",
+            "title",
+            "description",
+            "photo_id",
+            "author",
+            "published_date",
+        ),
+        "PageBlockRelatedArticles": {"_": _scalar, "title": _rich_text, "articles": [_rich_node]},
+    }
+)
+PAGE = {
+    **_fields("_", "part", "rtl", "v2", "url", "views"),
+    "blocks": [_rich_node],
+    "photos": [_photo],
+    "documents": [_document],
+}
+
+
+def _rich(value: object) -> object:
+    return _constructors(
+        value,
+        {
+            "RichMessage": {
+                **_fields("_", "part", "rtl"),
+                "blocks": [_rich_node],
+                "documents": [_document],
+                "photos": [_photo],
+            }
+        },
+    )
+
+
+def _button(value: object) -> object:
+    return _constructors(value, {"KeyboardInlineButton": {**_fields("_", "text", "style"), "type": _button_type}})
+
+
+def _button_type(value: object) -> object:
+    return _constructors(value, {"InlineButtonTypeUrl": ("_", "url")})
+
+
+def _button_row(value: object) -> object:
+    return _constructors(value, {"KeyboardInlineButtonRow": {"_": _scalar, "buttons": [_button]}})
+
+
+def _markup(value: object) -> object:
+    return _constructors(value, {"ReplyInlineMarkup": {**_fields("_", "force_reply"), "rows": [_button_row]}})
+
+
+REACTION_EVENT = {**_fields("_", "date"), "big": _boolean, "peer_id": _peer, "reaction": _reaction}
+
+
+def _reaction_event(value: object) -> object:
+    return _project(value, REACTION_EVENT)
+
+
+def _top_reactor(value: object) -> object:
+    return _constructors(value, {"MessageReactor": {**_fields("_", "count", "top", "anonymous"), "peer_id": _peer}})
+
+
+REACTIONS_AGGREGATE = {
+    **_fields("_", "min"),
+    "results": [{**_fields("_", "count"), "reaction": _reaction}],
+    "recent_reactions": [_reaction_event],
+    "top_reactors": [_top_reactor],
+}
+
+
 MESSAGE_METADATA = {
-    **_fields("views", "forwards", "pinned", "post", "post_author", "via_bot_id"),
-    "replies": ("_", "replies", "comments", "channel_id", "max_id"),
+    **_fields(
+        "views",
+        "forwards",
+        "pinned",
+        "post",
+        "post_author",
+        "via_bot_id",
+        "from_rank",
+        "summary_from_language",
+        "edit_hide",
+        "invert_media",
+        "silent",
+        "_",
+        "from_scheduled",
+        "legacy",
+        "noforwards",
+        "offline",
+        "video_processing_pending",
+        "paid_suggested_post_stars",
+        "paid_suggested_post_ton",
+        "from_boosts_applied",
+        "effect",
+        "paid_message_stars",
+        "ttl_period",
+        "schedule_repeat_period",
+        "via_business_bot_id",
+        "reactions_are_possible",
+        "report_delivery_until_date",
+    ),
+    "from_id": _peer,
+    "peer_id": _peer,
+    "factcheck": {**_fields("_", "hash", "need_check", "country"), "text": _text},
+    "restriction_reason": [("_", "platform", "reason", "text")],
+    "reactions": REACTIONS_AGGREGATE,
+    "guestchat_via_from": _peer,
+    "rich_message": _rich,
+    "reply_markup": _markup,
+    "replies": {
+        **_fields("_", "replies", "comments", "channel_id", "max_id", "replies_pts"),
+        "recent_repliers": [_peer],
+    },
     "fwd_from": FORWARD,
     "reply_to": {
-        **_fields("_", "quote", "quote_text", "quote_offset", "forum_topic", "reply_to_top_id"),
+        **_fields(
+            "_",
+            "quote",
+            "quote_text",
+            "quote_offset",
+            "forum_topic",
+            "reply_to_top_id",
+            "reply_to_msg_id",
+            "reply_to_ephemeral",
+            "reply_to_scheduled",
+            "todo_item_id",
+        ),
+        "reply_to_peer_id": _peer,
+        "poll_option": _option,
+        "reply_media": _media,
         "quote_entities": [ENTITY],
         "reply_from": FORWARD,
     },
@@ -163,8 +464,8 @@ MESSAGE_METADATA = {
 ACTION_CONSTRUCTORS: dict[str, Projection] = {
     "MessageActionPinMessage": ("_",),
     "MessageActionInviteToGroupCall": {"_": _scalar, "users": [_scalar], "call": ("_", "id")},
-    "MessageActionTopicCreate": ("_", "title", "icon_color", "icon_emoji_id"),
-    "MessageActionTopicEdit": ("_", "title", "icon_emoji_id", "closed", "hidden"),
+    "MessageActionTopicCreate": ("_", "title", "icon_color", "icon_emoji_id", "title_missing"),
+    "MessageActionTopicEdit": ("_", "title", "icon_emoji_id", "closed", "hidden", "title_missing"),
     "MessageActionChatAddUser": {"_": _scalar, "users": [_scalar]},
     "MessageActionChatCreate": {"_": _scalar, "title": _scalar, "users": [_scalar]},
     "MessageActionChatDeleteUser": ("_", "user_id"),
@@ -185,6 +486,12 @@ def _action(value: object) -> object:
 
 def _identity_fields(prefix: str) -> dict[str, Projection]:
     return {f"{prefix}{key}": child for key, child in IDENTITY.items()}
+
+
+def _reactor(value: object) -> object:
+    return _project(
+        value, {**_identity_fields("actor_"), "date": _scalar, "reaction": _reaction, "raw": _reaction_event}
+    )
 
 
 MESSAGE = {
@@ -208,8 +515,8 @@ MESSAGE = {
     "topic": ("id", "topic_id", "title"),
     "related_users": [IDENTITY],
     "metadata": MESSAGE_METADATA,
-    "reactions": {"aggregate": {"results": [{**_fields("_", "count"), "reaction": _reaction}]}},
-    "reactors": [{**_identity_fields("actor_"), "date": _scalar, "reaction": _reaction}],
+    "reactions": {"aggregate": REACTIONS_AGGREGATE},
+    "reactors": [_reactor],
 }
 HEADER_METADATA = {"order": _scalar, "peers": [GROUP], "exporter": ("name", "version", "repository_url")}
 
@@ -245,7 +552,7 @@ def _write_public_export(path: Path, stream: TextIO, removed_stream: TextIO) -> 
     counts = {"messages": 0, "admin_events": 0, "reactors": 0}
     declared = None
     first_removed = True
-    stream.write('{"format_version":1')
+    stream.write(f'{{"format_version":{read_export_version(path)}')
     removed_stream.write('{"format_version":1,"removed":[')
 
     def write_removed(items: Iterator[dict[str, object]]) -> None:
