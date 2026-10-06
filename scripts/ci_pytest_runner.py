@@ -77,6 +77,7 @@ def _run_once(command: list[str], work_dir: Path, attempt: int) -> tuple[int, st
     process_temp.mkdir()
     log_path = attempt_dir / "pytest.log"
     env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
     env["TMPDIR"] = str(process_temp)
     env["PYTEST_ADDOPTS"] = f"{env.get('PYTEST_ADDOPTS', '')} --basetemp={pytest_temp}".strip()
     with log_path.open("w", encoding="utf-8") as log_file:
@@ -91,6 +92,7 @@ def _run_once(command: list[str], work_dir: Path, attempt: int) -> tuple[int, st
         stdout = cast(TextIO, process.stdout)
         for line in stdout:
             sys.stdout.write(line)
+            sys.stdout.flush()
             log_file.write(line)
         return_code = process.wait()
     return return_code, log_path.read_text(encoding="utf-8", errors="replace")

@@ -306,6 +306,10 @@ class Checkpoint:
         )
         for row in rows:
             record = cast(Payload, json.loads(row[0]))
+            if version == INTERNAL_FORMAT_VERSION:
+                validate_record(prefix, record, internal=True)
+                yield row[0]
+                continue
             yield json.dumps(
                 migrate_record(version, prefix, record, internal=version >= IDENTITY_FORMAT_VERSION),
                 ensure_ascii=False,

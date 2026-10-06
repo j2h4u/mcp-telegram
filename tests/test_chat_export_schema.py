@@ -112,6 +112,26 @@ def test_old_resume_checkpoint_migrates_records(tmp_path: Path) -> None:
         checkpoint.close()
 
 
+@pytest.mark.parametrize(("field", "value"), [("", None), ("text", None), ("text", []), ("author_name", [])])
+def test_current_checkpoint_preserves_json_and_rejects_malformed_empty_fields(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    record = migrate_record(1, "messages.item", legacy_record())
+    if field:
+        record[field] = value
+    payload = json.dumps(record, indent=2)
+    checkpoint = Checkpoint(tmp_path / "current.sqlite3")
+    try:
+        checkpoint.save("message", -1, 5, payload, "history:-1")
+        if field:
+            with pytest.raises(ValueError, match=field):
+                next(checkpoint.records("message", -1))
+        else:
+            assert next(checkpoint.records("message", -1)) == payload
+    finally:
+        checkpoint.close()
+
+
 @pytest.mark.parametrize("version", [1, 2, INTERNAL_FORMAT_VERSION])
 def test_fixed_schema_registry_and_legacy_string_reactions(version: int) -> None:
     record = legacy_record()
