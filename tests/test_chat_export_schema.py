@@ -122,6 +122,7 @@ def test_current_checkpoint_preserves_json_and_rejects_malformed_empty_fields(
     payload = json.dumps(record, indent=2)
     checkpoint = Checkpoint(tmp_path / "current.sqlite3")
     try:
+        checkpoint.mark("format_version", INTERNAL_FORMAT_VERSION)
         checkpoint.save("message", -1, 5, payload, "history:-1")
         if field:
             with pytest.raises(ValueError, match=field):
