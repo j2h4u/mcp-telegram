@@ -420,7 +420,7 @@ def _publish(checkpoint: Checkpoint, peers: list[Payload], output: Path) -> Payl
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             group = project_group(_object(peers[0]["group"]))
-            metadata = {
+            metadata: Payload = {
                 "exporter": project_exporter(version("mcp-telegram")),
                 "order": ORDER,
                 "peers": [project_group(_object(peer["group"])) for peer in peers],

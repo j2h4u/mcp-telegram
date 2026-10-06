@@ -159,7 +159,7 @@ async def test_pages_roles_reactions_service_admin_and_legacy(
     assert message["date"] == "2026-10-03T10:00:00+00:00"
     assert message["text"] == "Юникод"
     assert "metadata" not in message
-    author = doc["identities"][message["author"]]
+    author = doc["identities"][doc["messages"][0]["author"]]
     assert (author["rank"], author["id"]) == ("Moderator", "5")
     assert "status" not in cast(Payload, message["reactions"])
     assert "source" not in cast(Payload, doc["admin_events"][0])

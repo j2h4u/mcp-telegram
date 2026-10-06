@@ -4,12 +4,22 @@ import io
 import json
 from collections.abc import Iterator
 from pathlib import Path
+from typing import TypedDict, cast
 
 import pytest
 
 from mcp_telegram.chat_export_checkpoint import ORDER
 from mcp_telegram.chat_export_identity import IdentityIndex, expand_record, pack_record, write_export
 from mcp_telegram.chat_export_schema import CURRENT_FORMAT_VERSION, IDENTITY_FORMAT_VERSION, migrate_record
+
+type Payload = dict[str, object]
+
+
+class ExportDocument(TypedDict):
+    format_version: int
+    identities: list[Payload]
+    messages: list[Payload]
+    admin_events: list[Payload]
 
 
 def _identity(prefix: str, *, rank: str = "member") -> dict[str, object]:
@@ -24,7 +34,7 @@ def _identity(prefix: str, *, rank: str = "member") -> dict[str, object]:
 
 
 def _records() -> list[tuple[str, dict[str, object]]]:
-    group = {"dialog_id": "-1", "title": "Group"}
+    group: Payload = {"dialog_id": "-1", "title": "Group"}
     same = {
         "id": "5",
         "kind": "user",
@@ -69,16 +79,18 @@ def test_wire_export_deduplicates_exact_snapshots_and_roundtrips() -> None:
     rows = _records()
     stream = io.StringIO()
     write_export(lambda: iter(rows), stream)
-    wire = json.loads(stream.getvalue())
+    wire = cast(ExportDocument, json.loads(stream.getvalue()))
     assert wire["format_version"] == CURRENT_FORMAT_VERSION == 5
     assert len(wire["identities"]) == 2
     assert "author_id" not in wire["messages"][0]
     assert "actor_id" not in wire["admin_events"][0]
-    assert "actor_id" not in wire["messages"][0]["reactors"][0]
-    assert wire["messages"][0]["author"] == wire["messages"][0]["related_users"][0]
+    assert "actor_id" not in cast(list[Payload], wire["messages"][0]["reactors"])[0]
+    assert wire["messages"][0]["author"] == cast(list[int], wire["messages"][0]["related_users"])[0]
     assert wire["admin_events"][0]["actor"] == wire["messages"][0]["author"]
-    assert wire["messages"][0]["reactors"][0]["actor"] == wire["messages"][0]["author"]
-    assert wire["messages"][0]["reactions"]["aggregate"]["recent_reactions"] == [
+    assert cast(list[Payload], wire["messages"][0]["reactors"])[0]["actor"] == wire["messages"][0]["author"]
+    assert cast(dict[str, list[Payload]], cast(Payload, wire["messages"][0]["reactions"])["aggregate"])[
+        "recent_reactions"
+    ] == [
         {"reactor": 0},
         {
             "_": "MessagePeerReaction",
@@ -97,7 +109,9 @@ def test_wire_export_deduplicates_exact_snapshots_and_roundtrips() -> None:
         assert expanded_admin["actor_name"] == "Alice"
         assert expanded_message["author_rank"] == "member"
         assert expanded_message["related_users"] == [_identity("")]
-        assert expanded_message["reactions"]["aggregate"]["recent_reactions"][0] == {
+        assert cast(dict[str, list[Payload]], cast(Payload, expanded_message["reactions"])["aggregate"])[
+            "recent_reactions"
+        ][0] == {
             "_": "MessagePeerReaction",
             "big": True,
             "peer_id": {"_": "PeerUser", "user_id": 5},
@@ -166,8 +180,8 @@ def test_reader_rejects_nonobject_directory_and_mixed_identity_fields(tmp_path: 
 
     stream = io.StringIO()
     write_export(lambda: iter(_records()), stream)
-    wire = json.loads(stream.getvalue())
-    wire["identities"][0] = None
+    wire = cast(ExportDocument, json.loads(stream.getvalue()))
+    cast(list[object], wire["identities"])[0] = None
     path = tmp_path / "malformed.json"
     path.write_text(json.dumps(wire))
     with pytest.raises(ValueError, match="objects"):
@@ -187,7 +201,7 @@ def test_v4_and_v5_readers_preserve_wire_and_expand_missing_reactors(tmp_path: P
 
     stream = io.StringIO()
     write_export(lambda: iter(_records()), stream)
-    sparse = json.loads(stream.getvalue())
+    sparse = cast(ExportDocument, json.loads(stream.getvalue()))
     message = sparse["messages"][1]
     message.pop("reactors", None)
     path = tmp_path / "v5.json"
@@ -198,8 +212,8 @@ def test_v4_and_v5_readers_preserve_wire_and_expand_missing_reactors(tmp_path: P
     assert [record for kind, record in expanded if kind == "messages.item"][1]["reactors"] == []
 
     legacy = {**sparse, "format_version": IDENTITY_FORMAT_VERSION}
-    legacy["identities"][0]["metadata"]["v4_null_fact"] = None
-    legacy["messages"][0]["reactors"][0]["raw"]["v4_null_fact"] = None
+    cast(Payload, legacy["identities"][0]["metadata"])["v4_null_fact"] = None
+    cast(Payload, cast(list[Payload], legacy["messages"][0]["reactors"])[0]["raw"])["v4_null_fact"] = None
     for record in legacy["messages"]:
         record.setdefault("reactors", [])
     old_path = tmp_path / "v4.json"
@@ -207,5 +221,10 @@ def test_v4_and_v5_readers_preserve_wire_and_expand_missing_reactors(tmp_path: P
     old_records = list(base_records(old_path))
     assert [record for kind, record in old_records if kind == "messages.item"][1]["reactors"] == []
     old_message = [record for kind, record in old_records if kind == "messages.item"][0]
-    assert old_message["author_metadata"]["v4_null_fact"] is None
-    assert old_message["reactions"]["aggregate"]["recent_reactions"][0]["v4_null_fact"] is None
+    assert cast(Payload, old_message["author_metadata"])["v4_null_fact"] is None
+    assert (
+        cast(dict[str, list[Payload]], cast(Payload, old_message["reactions"])["aggregate"])["recent_reactions"][0][
+            "v4_null_fact"
+        ]
+        is None
+    )

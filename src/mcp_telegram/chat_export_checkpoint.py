@@ -73,7 +73,26 @@ def _record_start(prefix: str, event: str) -> bool:
     )
 
 
-def base_records(path: Path, *, expand_identities: bool = True) -> Iterator[tuple[str, Payload]]:  # noqa: PLR0912
+def _expand_base_record(
+    kind: str,
+    record: Payload,
+    file_version: int,
+    identity_index: IdentityIndex | None,
+    *,
+    expand_identities: bool,
+) -> Payload:
+    if file_version >= IDENTITY_FORMAT_VERSION and kind in {"messages.item", "admin_events.item"}:
+        if identity_index is None:
+            raise ValueError("Missing export identity directory")
+        expanded = expand_record(kind, record, identity_index)
+        if file_version == SPARSE_FORMAT_VERSION and kind == "messages.item":
+            expanded.setdefault("reactors", [])
+        validate_record(kind, expanded, internal=True)
+        return expanded if expand_identities else record
+    return record
+
+
+def base_records(path: Path, *, expand_identities: bool = True) -> Iterator[tuple[str, Payload]]:
     """Read one projected record at a time, including the small header/footer."""
     file_version = read_export_version(path)
     identity_index = IdentityIndex() if file_version >= IDENTITY_FORMAT_VERSION else None
@@ -101,16 +120,13 @@ def base_records(path: Path, *, expand_identities: bool = True) -> Iterator[tupl
                     identity_position += 1
                     if not expand_identities:
                         yield active, record
-                elif file_version >= IDENTITY_FORMAT_VERSION and active in {"messages.item", "admin_events.item"}:
-                    if identity_index is None:
-                        raise ValueError("Missing export identity directory")
-                    expanded = expand_record(active, record, identity_index)
-                    if file_version == SPARSE_FORMAT_VERSION and active == "messages.item":
-                        expanded.setdefault("reactors", [])
-                    validate_record(active, expanded, internal=True)
-                    yield active, expanded if expand_identities else record
                 else:
-                    yield active, record
+                    yield (
+                        active,
+                        _expand_base_record(
+                            active, record, file_version, identity_index, expand_identities=expand_identities
+                        ),
+                    )
                 builder = None
     finally:
         if identity_index is not None:
@@ -168,15 +184,18 @@ class _Census:
         self.admin_last = identifier
         self.admins += 1
 
-    def message(self, record: Payload) -> None:
-        peer = canonical_id(record.get("dialog_id"), negative=True)
-        identifier = canonical_id(record.get("message_id"))
+    def _validate_message_identity(self, record: Payload, peer: int, identifier: int) -> None:
         if (
             peer not in self.counts
             or (self.format_version < INTERNAL_FORMAT_VERSION and record.get("message_key") != f"{peer}:{identifier}")
             or ("message_key" in record and record["message_key"] != f"{peer}:{identifier}")
         ):
             raise ValueError("Malformed base message identity")
+
+    def message(self, record: Payload) -> None:
+        peer = canonical_id(record.get("dialog_id"), negative=True)
+        identifier = canonical_id(record.get("message_id"))
+        self._validate_message_identity(record, peer, identifier)
         while self.peer_index < len(self.peers) and self.peers[self.peer_index] != peer:
             self.peer_index += 1
         if self.peer_index == len(self.peers) or (peer in self.last and identifier >= self.last[peer]):
@@ -345,7 +364,9 @@ class Checkpoint:
                 else:
                     continue
                 source_version = validate_version(info["format_version"])
-                record = migrate_record(source_version, kind, record, internal=source_version >= IDENTITY_FORMAT_VERSION)
+                record = migrate_record(
+                    source_version, kind, record, internal=source_version >= IDENTITY_FORMAT_VERSION
+                )
                 self.db.execute(
                     "INSERT OR IGNORE INTO records VALUES (?,?,?,?)",
                     (record_kind, peer, identifier, json.dumps(record, ensure_ascii=False, allow_nan=False)),

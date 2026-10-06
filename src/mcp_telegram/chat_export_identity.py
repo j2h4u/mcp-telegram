@@ -141,14 +141,7 @@ def _recent_candidate(reactor: Mapping[str, object], identity: Mapping[str, obje
     return candidate
 
 
-def compact_reaction_events(record: Payload, index: IdentityIndex) -> None:
-    reactions = record.get("reactions")
-    reactors = record.get("reactors", [])
-    if not isinstance(reactions, Mapping) or not isinstance(reactors, list):
-        return
-    aggregate = reactions.get("aggregate")
-    if not isinstance(aggregate, Mapping) or not isinstance(aggregate.get("recent_reactions"), list):
-        return
+def _reaction_candidates(reactors: list[object], index: IdentityIndex) -> dict[str, int]:
     candidates: dict[str, int] = {}
     for position, value in enumerate(reactors):
         if not isinstance(value, Mapping) or "actor" not in value:
@@ -161,6 +154,18 @@ def compact_reaction_events(record: Payload, index: IdentityIndex) -> None:
             ),
             position,
         )
+    return candidates
+
+
+def compact_reaction_events(record: Payload, index: IdentityIndex) -> None:
+    reactions = record.get("reactions")
+    reactors = record.get("reactors", [])
+    if not isinstance(reactions, Mapping) or not isinstance(reactors, list):
+        return
+    aggregate = reactions.get("aggregate")
+    if not isinstance(aggregate, Mapping) or not isinstance(aggregate.get("recent_reactions"), list):
+        return
+    candidates = _reaction_candidates(reactors, index)
     result = dict(aggregate)
     events = []
     for event in cast(list[object], aggregate["recent_reactions"]):
@@ -175,6 +180,18 @@ def compact_reaction_events(record: Payload, index: IdentityIndex) -> None:
     record["reactions"] = {**dict(reactions), "aggregate": result}
 
 
+def _expand_reaction_event(event: object, reactors: list[object]) -> object:
+    if isinstance(event, Mapping) and set(event) == {"reactor"}:
+        reference = event["reactor"]
+        if type(reference) is not int or not 0 <= reference < len(reactors):
+            raise ValueError("Recent reaction reference is out of range")
+        reactor = reactors[reference]
+        if not isinstance(reactor, Mapping):
+            raise ValueError("Recent reaction reference is invalid")
+        return _recent_candidate(reactor, _snapshot(reactor, "actor_"))
+    return event
+
+
 def expand_reaction_events(record: Payload) -> None:
     reactions = record.get("reactions")
     reactors = record.get("reactors", [])
@@ -184,18 +201,7 @@ def expand_reaction_events(record: Payload) -> None:
     if not isinstance(aggregate, Mapping) or not isinstance(aggregate.get("recent_reactions"), list):
         return
     result = dict(aggregate)
-    events = []
-    for event in cast(list[object], aggregate["recent_reactions"]):
-        if isinstance(event, Mapping) and set(event) == {"reactor"}:
-            reference = event["reactor"]
-            if type(reference) is not int or not 0 <= reference < len(reactors):
-                raise ValueError("Recent reaction reference is out of range")
-            reactor = reactors[reference]
-            if not isinstance(reactor, Mapping):
-                raise ValueError("Recent reaction reference is invalid")
-            events.append(_recent_candidate(reactor, _snapshot(reactor, "actor_")))
-        else:
-            events.append(event)
+    events = [_expand_reaction_event(event, reactors) for event in cast(list[object], aggregate["recent_reactions"])]
     result["recent_reactions"] = events
     record["reactions"] = {**dict(reactions), "aggregate": result}
 
@@ -238,38 +244,74 @@ def expand_record(kind: str, wire: Mapping[str, object], index: IdentityIndex) -
     return result
 
 
-def write_export(record_factory: RecordFactory, stream: TextIO) -> None:  # noqa: PLR0912, PLR0915
-    """Write sparse v5 JSON using a deterministic two-pass identity index."""
+def _check_record_order(kind: str, previous: int, order: Mapping[str, int]) -> int:
+    position = order.get(kind, -1)
+    if position < previous or position == -1 or (position == previous and kind in {"group", "metadata", "export"}):
+        raise ValueError("Invalid export record order")
+    return position
+
+
+def _index_export(
+    record_factory: RecordFactory, index: IdentityIndex
+) -> tuple[Payload | None, Payload | None, Payload | None, dict[str, int]]:
     from .chat_export_schema import CURRENT_FORMAT_VERSION, validate_record
 
     group: Payload | None = None
     metadata: Payload | None = None
     footer: Payload | None = None
+    order = {"group": 0, "metadata": 1, "admin_events.item": 2, "messages.item": 3, "export": 4}
+    previous = -1
+    counts = {"messages": 0, "admin_events": 0, "reactors": 0}
+    for kind, record in record_factory():
+        previous = _check_record_order(kind, previous, order)
+        if kind == "group":
+            group = cast(Payload, omit_empty_fields(record))
+        elif kind == "metadata":
+            metadata = cast(Payload, omit_empty_fields(record))
+        elif kind in {"messages.item", "admin_events.item"}:
+            counts["messages" if kind == "messages.item" else "admin_events"] += 1
+            if kind == "messages.item":
+                counts["reactors"] += len(cast(list[object], record.get("reactors", [])))
+            packed = pack_record(kind, record, index)
+            validate_record(kind, packed, CURRENT_FORMAT_VERSION)
+        elif kind == "export":
+            footer = cast(Payload, omit_empty_fields(record))
+    return group, metadata, footer, counts
+
+
+def _write_export_records(record_factory: RecordFactory, stream: TextIO, index: IdentityIndex) -> None:
+    from .chat_export_schema import CURRENT_FORMAT_VERSION, validate_record
+
+    state = "admin_events.item"
+    first = True
+    for kind, record in record_factory():
+        if kind in {"group", "metadata", "export"}:
+            continue
+        if kind == "messages.item":
+            if state != "messages.item":
+                stream.write('],"messages":[')
+                state = "messages.item"
+                first = True
+        elif kind != "admin_events.item":
+            continue
+        elif state == "messages.item":
+            raise ValueError("Admin events follow messages")
+        if not first:
+            stream.write(",")
+        packed = pack_record(kind, record, index)
+        validate_record(kind, packed, CURRENT_FORMAT_VERSION)
+        _dump(stream, packed)
+        first = False
+    if state == "admin_events.item":
+        stream.write('],"messages":[')
+
+
+def write_export(record_factory: RecordFactory, stream: TextIO) -> None:
+    """Write sparse v5 JSON using a deterministic two-pass identity index."""
+    from .chat_export_schema import CURRENT_FORMAT_VERSION, validate_record
+
     with IdentityIndex() as index:
-        order = {"group": 0, "metadata": 1, "admin_events.item": 2, "messages.item": 3, "export": 4}
-        previous = -1
-        counts = {"messages": 0, "admin_events": 0, "reactors": 0}
-        for kind, record in record_factory():
-            position = order.get(kind, -1)
-            if (
-                position < previous
-                or position == -1
-                or (position == previous and kind in {"group", "metadata", "export"})
-            ):
-                raise ValueError("Invalid export record order")
-            previous = position
-            if kind == "group":
-                group = cast(Payload, omit_empty_fields(record))
-            elif kind == "metadata":
-                metadata = cast(Payload, omit_empty_fields(record))
-            elif kind in {"messages.item", "admin_events.item"}:
-                counts["messages" if kind == "messages.item" else "admin_events"] += 1
-                if kind == "messages.item":
-                    counts["reactors"] += len(cast(list[object], record.get("reactors", [])))
-                packed = pack_record(kind, record, index)
-                validate_record(kind, packed, CURRENT_FORMAT_VERSION)
-            elif kind == "export":
-                footer = cast(Payload, omit_empty_fields(record))
+        group, metadata, footer, counts = _index_export(record_factory, index)
         if group is None or metadata is None or footer is None:
             raise ValueError("Export record stream is missing a header or footer")
         if footer != counts:
@@ -290,30 +332,7 @@ def write_export(record_factory: RecordFactory, stream: TextIO) -> None:  # noqa
             validate_record("identities.item", identity, CURRENT_FORMAT_VERSION)
             _dump(stream, identity)
         stream.write('],"admin_events":[')
-        state = "admin_events.item"
-        first = True
-        for kind, record in record_factory():
-            if kind in {"group", "metadata", "export"}:
-                continue
-            if kind == "messages.item":
-                if state == "messages.item":
-                    pass
-                else:
-                    stream.write('],"messages":[')
-                    state = "messages.item"
-                    first = True
-            elif kind != "admin_events.item":
-                continue
-            elif state == "messages.item":
-                raise ValueError("Admin events follow messages")
-            if not first:
-                stream.write(",")
-            packed = pack_record(kind, record, index)
-            validate_record(kind, packed, CURRENT_FORMAT_VERSION)
-            _dump(stream, packed)
-            first = False
-        if state == "admin_events.item":
-            stream.write('],"messages":[')
+        _write_export_records(record_factory, stream, index)
         stream.write('],"export":')
         _dump(stream, footer)
         stream.write("}")

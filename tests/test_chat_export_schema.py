@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -38,7 +39,7 @@ def document(record: dict[str, object], version: object = 1) -> dict[str, object
         "metadata": {"order": ORDER, "peers": [{"dialog_id": "-1"}]},
         "admin_events": [],
         "messages": [record],
-        "export": {"messages": 1, "admin_events": 0, "reactors": len(record["reactors"])},
+        "export": {"messages": 1, "admin_events": 0, "reactors": len(cast(list[object], record["reactors"]))},
     }
 
 
@@ -104,7 +105,7 @@ def test_old_resume_checkpoint_migrates_records(tmp_path: Path) -> None:
         checkpoint.db.execute("DELETE FROM state WHERE key='format_version'")
         checkpoint.db.commit()
         checkpoint.save("message", -1, 5, json.dumps(legacy_record()), "history:-1")
-        restored = json.loads(next(checkpoint.records("message", -1)))
+        restored = cast(dict[str, object], json.loads(next(checkpoint.records("message", -1))))
         assert restored["metadata"] == {"from_rank": "Keep"}
         assert checkpoint.state("history:-1") == 5
     finally:
@@ -119,15 +120,36 @@ def test_fixed_schema_registry_and_legacy_string_reactions(version: int) -> None
     Draft202012Validator.check_schema(schema)
     Draft202012Validator(schema).validate(document(record, version))
     current_schema = schema_for_version(INTERNAL_FORMAT_VERSION)
-    assert current_schema["properties"]["format_version"]["const"] == INTERNAL_FORMAT_VERSION
-    assert "message_key" not in current_schema["properties"]["messages"]["items"]["properties"]
+    assert (
+        cast(dict[str, dict[str, object]], current_schema["properties"])["format_version"]["const"]
+        == INTERNAL_FORMAT_VERSION
+    )
+    assert (
+        "message_key"
+        not in cast(dict[str, dict[str, dict[str, dict[str, object]]]], current_schema["properties"])["messages"][
+            "items"
+        ]["properties"]
+    )
     wire_schema = schema_for_version(IDENTITY_FORMAT_VERSION)
-    assert "identities" in wire_schema["required"]
-    assert "message_key" not in wire_schema["properties"]["messages"]["items"]["properties"]
+    assert "identities" in cast(list[str], wire_schema["required"])
+    assert (
+        "message_key"
+        not in cast(dict[str, dict[str, dict[str, dict[str, object]]]], wire_schema["properties"])["messages"]["items"][
+            "properties"
+        ]
+    )
     sparse_schema = schema_for_version(CURRENT_FORMAT_VERSION)
-    assert sparse_schema["properties"]["format_version"]["const"] == 5
-    assert "reactors" not in sparse_schema["properties"]["messages"]["items"]["required"]
-    assert "reactors" in wire_schema["properties"]["messages"]["items"]["required"]
+    assert cast(dict[str, dict[str, object]], sparse_schema["properties"])["format_version"]["const"] == 5
+    assert (
+        "reactors"
+        not in cast(dict[str, dict[str, dict[str, list[str]]]], sparse_schema["properties"])["messages"]["items"][
+            "required"
+        ]
+    )
+    assert (
+        "reactors"
+        in cast(dict[str, dict[str, dict[str, list[str]]]], wire_schema["properties"])["messages"]["items"]["required"]
+    )
     with pytest.raises(ValueError):
         migrate_record(CURRENT_FORMAT_VERSION, "messages.item", record)
     expanded = legacy_record()

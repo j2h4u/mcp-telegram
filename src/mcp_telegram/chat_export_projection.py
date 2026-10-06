@@ -158,6 +158,18 @@ def project_message(message: Mapping[str, object]) -> Facts:
 def deduplicate_export_message(record: Mapping[str, object]) -> Facts:
     """Remove only facts already represented by a projected v1 record, without mutating it."""
     result = dict(record)
+    metadata = _deduplicate_message_metadata(record)
+    if isinstance(record.get("metadata"), Mapping) and isinstance(result.get("metadata"), Mapping):
+        result["metadata"] = metadata
+    if isinstance(record.get("reactors"), list):
+        result["reactors"] = [
+            _deduplicate_reactor(reactor) if isinstance(reactor, Mapping) else reactor
+            for reactor in cast(list[object], record["reactors"])
+        ]
+    return result
+
+
+def _deduplicate_message_metadata(record: Mapping[str, object]) -> Facts:
     metadata = _object(record.get("metadata"))
     if _peer_matches(metadata.get("from_id"), {"id": record.get("author_id"), "kind": record.get("author_kind")}):
         metadata.pop("from_id")
@@ -166,6 +178,11 @@ def deduplicate_export_message(record: Mapping[str, object]) -> Facts:
     reactions = _object(record.get("reactions"))
     if "reactions" in metadata and "aggregate" in reactions and metadata["reactions"] == reactions["aggregate"]:
         metadata.pop("reactions")
+    _deduplicate_reply(metadata, record)
+    return metadata
+
+
+def _deduplicate_reply(metadata: Facts, record: Mapping[str, object]) -> None:
     if isinstance(metadata.get("reply_to"), Mapping):
         reply = _object(metadata["reply_to"])
         if (
@@ -177,14 +194,6 @@ def deduplicate_export_message(record: Mapping[str, object]) -> Facts:
         if _dialog_peer_matches(reply.get("reply_to_peer_id"), record.get("reply_to_dialog_id")):
             reply.pop("reply_to_peer_id")
         metadata["reply_to"] = reply
-    if isinstance(record.get("metadata"), Mapping) and isinstance(result.get("metadata"), Mapping):
-        result["metadata"] = metadata
-    if isinstance(record.get("reactors"), list):
-        result["reactors"] = [
-            _deduplicate_reactor(reactor) if isinstance(reactor, Mapping) else reactor
-            for reactor in cast(list[object], record["reactors"])
-        ]
-    return result
 
 
 def project_reactor(reactor: Mapping[str, object]) -> Facts:
@@ -207,6 +216,22 @@ def compact_export_record(kind: str, record: Mapping[str, object]) -> Facts:
 
 
 def _compact_message(result: Facts) -> None:
+    _compact_message_identity(result)
+    topic = _object(result.get("topic"))
+    for key in ("id", "topic_id"):
+        if key in topic and "topic_id" in result and _id(topic[key]) == result["topic_id"]:
+            topic.pop(key)
+    if isinstance(result.get("topic"), Mapping):
+        result["topic"] = topic
+    _compact_identity_label(result, "author_")
+    _compact_related_users(result)
+    if isinstance(result.get("reactors"), list):
+        result["reactors"] = [
+            compact_export_record("reactors.item", _object(x)) for x in cast(list[object], result["reactors"])
+        ]
+
+
+def _compact_message_identity(result: Facts) -> None:
     for key, expected, error in (
         ("message_key", _key(result.get("dialog_id"), result.get("message_id")), "message identity"),
         (
@@ -227,18 +252,6 @@ def _compact_message(result: Facts) -> None:
         metadata.pop("from_rank")
     if isinstance(result.get("metadata"), Mapping):
         result["metadata"] = metadata
-    topic = _object(result.get("topic"))
-    for key in ("id", "topic_id"):
-        if key in topic and "topic_id" in result and _id(topic[key]) == result["topic_id"]:
-            topic.pop(key)
-    if isinstance(result.get("topic"), Mapping):
-        result["topic"] = topic
-    _compact_identity_label(result, "author_")
-    _compact_related_users(result)
-    if isinstance(result.get("reactors"), list):
-        result["reactors"] = [
-            compact_export_record("reactors.item", _object(x)) for x in cast(list[object], result["reactors"])
-        ]
 
 
 def _compact_related_users(result: Facts) -> None:

@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 from devtools.migrate_chat_export import migrate_export
@@ -41,7 +42,7 @@ def test_migration_preserves_incremental_base_and_repeats_identically(tmp_path: 
     assert migrate_export(source, output) == {"from_version": 1, "to_version": 5}
     assert source.read_bytes() == before
     assert census(output, 100) == {**old_info, "format_version": 5}
-    migrated = json.loads(output.read_text())
+    migrated = cast(dict[str, object], json.loads(output.read_text()))
     data["format_version"] = 5
     del data["messages"][0]["metadata"]["from_id"]
     del data["messages"][0]["message_key"]
@@ -102,12 +103,12 @@ def test_v4_sparse_migration_preserves_values_and_array_positions(tmp_path: Path
     source.write_text(json.dumps(original))
     before = source.read_bytes()
     migrate_export(source, output)
-    result = json.loads(output.read_text())
+    result = cast(dict[str, object], json.loads(output.read_text()))
     assert source.read_bytes() == before
     assert result["format_version"] == 5
     assert result["group"] == {"dialog_id": "-1"}
     assert result["identities"] == [{"id": "7", "role": "member"}]
-    assert result["messages"][0] == {
+    assert cast(list[dict[str, object]], result["messages"])[0] == {
         "dialog_id": "-1",
         "message_id": "2",
         "author": 0,

@@ -1,11 +1,12 @@
 """Fixed export schemas and deterministic export migrations."""
 
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import cast
 
-import ijson
-from jsonschema import Draft202012Validator
+import ijson  # type: ignore[import-untyped]
+from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
+from jsonschema.exceptions import ValidationError  # type: ignore[import-untyped]
 
 from .chat_export_projection import compact_export_record, deduplicate_export_message, omit_empty_fields
 
@@ -33,7 +34,7 @@ def _identity_fields(prefix: str) -> Facts:
     }
 
 
-_GROUP = {"type": "object", "required": ["dialog_id"], "properties": {"dialog_id": _DIALOG_ID}}
+_GROUP: Facts = {"type": "object", "required": ["dialog_id"], "properties": {"dialog_id": _DIALOG_ID}}
 _REACTOR = {
     "type": "object",
     "properties": {
@@ -43,7 +44,7 @@ _REACTOR = {
         "raw": _OBJECT,
     },
 }
-LEGACY_V1_RECORD_SCHEMAS = {
+LEGACY_V1_RECORD_SCHEMAS: dict[str, Facts] = {
     "group": _GROUP,
     "metadata": {
         "type": "object",
@@ -103,19 +104,19 @@ LEGACY_V1_RECORD_SCHEMAS = {
     },
 }
 LEGACY_V2_RECORD_SCHEMAS = LEGACY_V1_RECORD_SCHEMAS
-V3_RECORD_SCHEMAS = {
+V3_RECORD_SCHEMAS: dict[str, Facts] = {
     **LEGACY_V1_RECORD_SCHEMAS,
     "messages.item": {
         **LEGACY_V1_RECORD_SCHEMAS["messages.item"],
         "required": ["dialog_id", "message_id", "reactors"],
         "properties": {
             k: v
-            for k, v in LEGACY_V1_RECORD_SCHEMAS["messages.item"]["properties"].items()
+            for k, v in cast(Facts, LEGACY_V1_RECORD_SCHEMAS["messages.item"]["properties"]).items()
             if k not in {"message_key", "reply_key"}
         },
     },
 }
-_IDENTITY = {
+_IDENTITY: Facts = {
     "type": "object",
     "properties": {
         "id": _NULLABLE_ID,
@@ -141,7 +142,7 @@ def _without_identity_fields(prefix: str) -> Facts:
     return {"patternProperties": {f"^{prefix}": False}}
 
 
-V4_RECORD_SCHEMAS = {
+V4_RECORD_SCHEMAS: dict[str, Facts] = {
     **V3_RECORD_SCHEMAS,
     "identities.item": _IDENTITY,
     "messages.item": {
@@ -149,7 +150,7 @@ V4_RECORD_SCHEMAS = {
         "properties": {
             **{
                 k: v
-                for k, v in V3_RECORD_SCHEMAS["messages.item"]["properties"].items()
+                for k, v in cast(Facts, V3_RECORD_SCHEMAS["messages.item"]["properties"]).items()
                 if not k.startswith("author_") and k != "related_users"
             },
             "author": {"type": "integer", "minimum": 0},
@@ -194,7 +195,7 @@ V4_RECORD_SCHEMAS = {
         "properties": {
             **{
                 k: v
-                for k, v in V3_RECORD_SCHEMAS["admin_events.item"]["properties"].items()
+                for k, v in cast(Facts, V3_RECORD_SCHEMAS["admin_events.item"]["properties"]).items()
                 if not k.startswith("actor_") and k != "related_users"
             },
             "actor": {"type": "integer", "minimum": 0},
@@ -203,15 +204,17 @@ V4_RECORD_SCHEMAS = {
         **_without_identity_fields("actor_"),
     },
 }
-V5_RECORD_SCHEMAS = {
+V5_RECORD_SCHEMAS: dict[str, Facts] = {
     **V4_RECORD_SCHEMAS,
     "messages.item": {
         **V4_RECORD_SCHEMAS["messages.item"],
-        "required": [key for key in V4_RECORD_SCHEMAS["messages.item"]["required"] if key != "reactors"],
+        "required": [
+            key for key in cast(list[str], V4_RECORD_SCHEMAS["messages.item"]["required"]) if key != "reactors"
+        ],
     },
 }
 RECORD_SCHEMAS = V5_RECORD_SCHEMAS
-EXPORT_SCHEMA = {
+EXPORT_SCHEMA: Facts = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "required": ["format_version", "group", "metadata", "identities", "admin_events", "messages", "export"],
@@ -227,10 +230,10 @@ EXPORT_SCHEMA = {
     },
 }
 Draft202012Validator.check_schema(EXPORT_SCHEMA)
-V4_EXPORT_SCHEMA = {
+V4_EXPORT_SCHEMA: Facts = {
     **EXPORT_SCHEMA,
     "properties": {
-        **EXPORT_SCHEMA["properties"],
+        **cast(Facts, EXPORT_SCHEMA["properties"]),
         "format_version": {"const": 4, "type": "integer"},
         "group": V4_RECORD_SCHEMAS["group"],
         "metadata": V4_RECORD_SCHEMAS["metadata"],
@@ -251,12 +254,12 @@ _VALIDATORS = {
         (CURRENT_FORMAT_VERSION, V5_RECORD_SCHEMAS),
     )
 }
-EXPORT_SCHEMAS = {
+EXPORT_SCHEMAS: dict[int, Facts] = {
     1: {
         **EXPORT_SCHEMA,
         "required": ["format_version", "group", "metadata", "admin_events", "messages", "export"],
         "properties": {
-            **EXPORT_SCHEMA["properties"],
+            **cast(Facts, EXPORT_SCHEMA["properties"]),
             "identities": False,
             "format_version": {"const": 1, "type": "integer"},
             "messages": {"type": "array", "items": LEGACY_V1_RECORD_SCHEMAS["messages.item"]},
@@ -267,7 +270,7 @@ EXPORT_SCHEMAS = {
         **EXPORT_SCHEMA,
         "required": ["format_version", "group", "metadata", "admin_events", "messages", "export"],
         "properties": {
-            **EXPORT_SCHEMA["properties"],
+            **cast(Facts, EXPORT_SCHEMA["properties"]),
             "identities": False,
             "format_version": {"const": 2, "type": "integer"},
             "messages": {"type": "array", "items": LEGACY_V2_RECORD_SCHEMAS["messages.item"]},
@@ -278,7 +281,7 @@ EXPORT_SCHEMAS = {
         **EXPORT_SCHEMA,
         "required": ["format_version", "group", "metadata", "admin_events", "messages", "export"],
         "properties": {
-            **{k: v for k, v in EXPORT_SCHEMA["properties"].items() if k != "identities"},
+            **{k: v for k, v in cast(Facts, EXPORT_SCHEMA["properties"]).items() if k != "identities"},
             "identities": False,
             "format_version": {"const": INTERNAL_FORMAT_VERSION, "type": "integer"},
             "messages": {"type": "array", "items": V3_RECORD_SCHEMAS["messages.item"]},
@@ -298,14 +301,15 @@ def validate_version(value: object) -> int:
 
 def read_export_version(path: Path) -> int:
     with path.open("rb") as stream:
-        for prefix, _event, value in ijson.parse(stream):
+        events = cast(Iterator[tuple[str, str, object]], ijson.parse(stream))  # pyright: ignore[reportAny]
+        for prefix, _event, value in events:
             if prefix == "format_version":
                 return validate_version(value)
     raise ValueError("Missing export format_version")
 
 
 def schema_for_version(version: int) -> Facts:
-    return cast(Facts, EXPORT_SCHEMAS[validate_version(version)])
+    return EXPORT_SCHEMAS[validate_version(version)]
 
 
 def validate_record(
@@ -315,10 +319,14 @@ def validate_record(
     version = validate_version(version)
     if kind not in _VALIDATORS[version]:
         raise ValueError("Unknown export record kind")
-    error = next(_VALIDATORS[version][kind].iter_errors(record), None)
+    # jsonschema validates arbitrary Python objects; its stub restricts inputs to JSON values.
+    iter_errors = cast(Callable[[object], Iterator[ValidationError]], _VALIDATORS[version][kind].iter_errors)
+    error = next(iter_errors(record), None)
     if error is not None:
-        location = "/".join(str(part) for part in error.absolute_path)
-        raise ValueError(f"Invalid export record {kind}/{location}: {error.validator} constraint")
+        path = cast(Iterable[object], error.absolute_path)  # pyright: ignore[reportAny]
+        constraint = cast(object, error.validator)  # pyright: ignore[reportAny]
+        location = "/".join(str(part) for part in path)
+        raise ValueError(f"Invalid export record {kind}/{location}: {constraint} constraint")
     if version == SPARSE_FORMAT_VERSION and omit_empty_fields(record) != dict(record):
         raise ValueError(f"Invalid export record {kind}: fields must use canonical sparse form")
 

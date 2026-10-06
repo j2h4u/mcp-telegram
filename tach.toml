@@ -946,7 +946,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.chat_export_cli"
 layer = "delivery"
-depends_on = ["mcp_telegram.chat_export_checkpoint", "mcp_telegram.chat_export_projection", "mcp_telegram.daemon_client"]
+depends_on = ["mcp_telegram.chat_export_checkpoint", "mcp_telegram.chat_export_identity", "mcp_telegram.chat_export_projection", "mcp_telegram.chat_export_schema", "mcp_telegram.daemon_client"]
 
 [[modules]]
 path = "mcp_telegram.chat_export_projection"
@@ -961,7 +961,17 @@ depends_on = ["mcp_telegram.message_history.contracts", "mcp_telegram.telegram_g
 [[modules]]
 path = "mcp_telegram.chat_export_checkpoint"
 layer = "persistence"
-depends_on = []
+depends_on = ["mcp_telegram.chat_export_identity", "mcp_telegram.chat_export_schema"]
+
+[[modules]]
+path = "mcp_telegram.chat_export_identity"
+layer = "persistence"
+depends_on = ["mcp_telegram.chat_export_projection", "mcp_telegram.chat_export_schema"]
+
+[[modules]]
+path = "mcp_telegram.chat_export_schema"
+layer = "foundation"
+depends_on = ["mcp_telegram.chat_export_projection"]
 
 [[modules]]
 path = "mcp_telegram.sync_transactions"

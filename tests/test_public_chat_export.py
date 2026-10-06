@@ -2,13 +2,21 @@ import io
 import json
 from importlib.metadata import version
 from pathlib import Path
-from typing import cast
+from typing import TypedDict, cast
 
 import pytest
 from devtools.public_chat_export import MESSAGE, _removed, public_facts, sanitize_export
 from ijson.common import IncompleteJSONError
 
 from mcp_telegram.chat_export_checkpoint import ORDER, census
+
+
+class ExportDocument(TypedDict):
+    format_version: int
+    identities: list[dict[str, object]]
+    messages: list[dict[str, object]]
+    admin_events: list[dict[str, object]]
+    metadata: dict[str, object]
 
 
 def test_public_normalized_export_keeps_references_and_removes_admin_only_identities(tmp_path: Path) -> None:
@@ -44,12 +52,12 @@ def test_public_normalized_export_keeps_references_and_removes_admin_only_identi
     removed = tmp_path / "private.json"
     sanitize_export(source, output, removed)
     census(output, 0)
-    raw = json.loads(output.read_text())
+    raw = cast(ExportDocument, json.loads(output.read_text()))
     assert raw["format_version"] == 5 and raw["admin_events"] == []
     assert "Private actor" not in output.read_text()
     assert "Public member" in output.read_text()
-    assert raw["identities"][raw["messages"][0]["author"]]["id"] == "43"
-    assert "metadata" not in raw["identities"][raw["messages"][0]["author"]]
+    assert raw["identities"][cast(int, raw["messages"][0]["author"])]["id"] == "43"
+    assert "metadata" not in raw["identities"][cast(int, raw["messages"][0]["author"])]
     assert "metadata" not in raw["messages"][0]
     assert "reactors" not in raw["messages"][0] and "related_users" not in raw["messages"][0]
     assert any(not identity for identity in raw["identities"])
@@ -660,7 +668,7 @@ def _public_content_records() -> tuple[dict[str, object], dict[str, object], dic
             },
         },
     }
-    encoded = {"data": "AQ==", "encoding": "base64"}
+    encoded: dict[str, object] = {"data": "AQ==", "encoding": "base64"}
     photo["dc_id"] = 2
     photo["access_hash"] = 777
     photo["file_reference"] = encoded
@@ -809,7 +817,9 @@ def test_public_rich_content_media_and_buttons_are_preserved(tmp_path: Path) -> 
     assert public[1]["metadata"]["media"]["webpage"]["document"]["attributes"][1]["waveform"] == encoded
     assert "access_hash" not in output.read_text() and "file_reference" not in output.read_text()
     assert "novel_private_marker" not in output.read_text()
-    removed = json.loads((tmp_path / "public.removed.json").read_text())["removed"]  # pyright: ignore[reportAny]
+    removed = cast(dict[str, list[dict[str, object]]], json.loads((tmp_path / "public.removed.json").read_text()))[
+        "removed"
+    ]
     assert all(item["path"] != "/messages/0/text" for item in removed)
     assert {"path": "/messages/0/reactors/0/raw/my", "value": False} in removed
     assert source.read_bytes() == original

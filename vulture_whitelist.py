@@ -137,3 +137,6 @@ request_follow_up
 
 # sqlite3 consumes this native connection setting; it is not a Python reader.
 isolation_level
+
+# Versioned export schema accessor is used by offline consumers and schema tests.
+schema_for_version
