@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import uuid
 from pathlib import Path
 from typing import cast
@@ -15,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from mcp_telegram.config import McpTelegramConfig, StateConfig
 from mcp_telegram.daemon_client import (
     AccountProtectionError,
     DaemonConnection,
@@ -31,6 +33,39 @@ def _dialog_selector_fields(payload: dict[str, object]) -> dict[str, object]:
 # ---------------------------------------------------------------------------
 # DaemonNotRunningError — not running when socket absent
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_daemon_connection_config_loading_allows_other_tasks(tmp_path: Path) -> None:
+    """Blocked config I/O must not stall an unrelated asyncio task."""
+    loop = asyncio.get_running_loop()
+    config_started = asyncio.Event()
+    config_finished = threading.Event()
+    release_config = threading.Event()
+
+    def blocked_load_config() -> McpTelegramConfig:
+        loop.call_soon_threadsafe(config_started.set)
+        release_config.wait(timeout=5)
+        config_finished.set()
+        return McpTelegramConfig(state=StateConfig(dir=tmp_path))
+
+    async def connect() -> None:
+        with pytest.raises(DaemonNotRunningError):
+            async with daemon_connection():
+                pass  # pragma: no cover
+
+    async def unrelated_task() -> None:
+        await asyncio.wait_for(config_started.wait(), timeout=5)
+        assert not config_finished.is_set(), "Config loading blocked the event loop"
+        release_config.set()
+
+    with patch("mcp_telegram.daemon_client.load_config", side_effect=blocked_load_config):
+        tasks = [asyncio.create_task(connect()), asyncio.create_task(unrelated_task())]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            release_config.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio
