@@ -42,7 +42,18 @@ def test_public_export_is_account_independent_atomic_and_idempotent(tmp_path: Pa
                             "can_view_stats": bool(account),
                             "has_unread_votes": bool(account),
                             "poll": {"question": "Keep question", "public_voters": False},
-                            "results": {"results": [{"option": "a", "voters": 5, "chosen": bool(account)}]},
+                            "results": {
+                                "total_voters": 5,
+                                "recent_voters": [account],
+                                "results": [
+                                    {
+                                        "option": "a",
+                                        "voters": 5,
+                                        "chosen": bool(account),
+                                        "recent_voters": [account],
+                                    }
+                                ],
+                            },
                             "access_hash": account,
                         },
                     },
@@ -84,7 +95,7 @@ def test_public_export_is_account_independent_atomic_and_idempotent(tmp_path: Pa
         "replies": {"replies": 2},
         "media": {
             "poll": {"question": "Keep question", "public_voters": False},
-            "results": {"results": [{"option": "a", "voters": 5}]},
+            "results": {"total_voters": 5, "results": [{"option": "a", "voters": 5}]},
         },
     }
     assert message["reactors"] == [{"actor_id": "456", "reaction": "👍"}]
