@@ -24,6 +24,8 @@ PRIVATE_FIELDS = frozenset(
         "self",
         "chosen",
         "chosen_order",
+        "has_unread_votes",
+        "can_view_stats",
         "correct",
         "solution",
         "solution_entities",

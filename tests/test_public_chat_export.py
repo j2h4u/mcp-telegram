@@ -37,6 +37,8 @@ def test_public_export_is_account_independent_atomic_and_idempotent(tmp_path: Pa
                         "mentioned": bool(account),
                         "replies": {"read_max_id": account, "replies": 2},
                         "media": {
+                            "can_view_stats": bool(account),
+                            "has_unread_votes": bool(account),
                             "poll": {"question": "Keep question", "public_voters": False},
                             "results": {"results": [{"option": "a", "voters": 5, "chosen": bool(account)}]},
                             "access_hash": account,
