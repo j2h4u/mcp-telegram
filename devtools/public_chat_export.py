@@ -229,7 +229,7 @@ MEDIA = {
     "document": DOCUMENT,
     "alt_documents": [_document],
     "video_cover": _photo,
-    "attached_media": [_media],
+    "attached_media": _media,
     "poll": POLL,
     "results": POLL_RESULTS,
     "webpage": {
@@ -385,15 +385,28 @@ def _reaction_event(value: object) -> object:
     return _project(value, REACTION_EVENT)
 
 
-def _top_reactor(value: object) -> object:
-    return _constructors(value, {"MessageReactor": {**_fields("_", "count", "top", "anonymous"), "peer_id": _peer}})
+def _top_reactors(value: object) -> object:
+    if not isinstance(value, list):
+        return []
+    result = []
+    for reactor in value:
+        if not isinstance(reactor, dict) or reactor.get("_") != "MessageReactor" or reactor.get("top") is not True:
+            continue
+        public = cast(
+            dict[str, object], _project(reactor, {**_fields("_", "count", "top", "anonymous"), "peer_id": _peer})
+        )
+        # Anonymous self-reactions carry our peer; non-top entries are also viewer-specific.
+        if reactor.get("anonymous") is not False:
+            public.pop("peer_id", None)
+        result.append(public)
+    return result
 
 
 REACTIONS_AGGREGATE = {
     **_fields("_", "min"),
     "results": [{**_fields("_", "count"), "reaction": _reaction}],
     "recent_reactions": [_reaction_event],
-    "top_reactors": [_top_reactor],
+    "top_reactors": _top_reactors,
 }
 
 
@@ -411,7 +424,6 @@ MESSAGE_METADATA = {
         "invert_media",
         "silent",
         "_",
-        "from_scheduled",
         "legacy",
         "noforwards",
         "offline",
@@ -422,7 +434,6 @@ MESSAGE_METADATA = {
         "effect",
         "paid_message_stars",
         "ttl_period",
-        "schedule_repeat_period",
         "via_business_bot_id",
         "reactions_are_possible",
         "report_delivery_until_date",

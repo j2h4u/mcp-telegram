@@ -10,6 +10,59 @@ from ijson.common import IncompleteJSONError
 from mcp_telegram.chat_export_checkpoint import ORDER, census
 
 
+def test_public_paid_leaderboard_and_poll_attachment_are_account_independent() -> None:
+    public_outputs = []
+    for account in (123, 456):
+        reactor = {"_": "MessageReactor", "top": True, "anonymous": True, "my": True, "count": 5}
+        anonymous_peer = {"_": "PeerUser", "user_id": account}
+        named = {
+            "_": "MessageReactor",
+            "top": True,
+            "anonymous": False,
+            "count": 10,
+            "peer_id": {"_": "PeerUser", "user_id": 789},
+        }
+        message = {
+            "metadata": {
+                "from_scheduled": True,
+                "schedule_repeat_period": 86400,
+                "media": {
+                    "_": "MessageMediaPoll",
+                    "attached_media": {
+                        "_": "MessageMediaPhoto",
+                        "photo": {"_": "Photo", "id": 10, "access_hash": account},
+                    },
+                },
+            },
+            "reactions": {
+                "aggregate": {
+                    "top_reactors": [
+                        {**reactor, "peer_id": anonymous_peer},
+                        named,
+                        {**named, "top": False, "my": True, "peer_id": anonymous_peer},
+                    ]
+                }
+            },
+        }
+        public = public_facts(message, MESSAGE)
+        public_outputs.append(public)
+        assert public == {
+            "metadata": {
+                "media": {
+                    "_": "MessageMediaPoll",
+                    "attached_media": {"_": "MessageMediaPhoto", "photo": {"_": "Photo", "id": 10}},
+                }
+            },
+            "reactions": {
+                "aggregate": {
+                    "top_reactors": [{"_": "MessageReactor", "count": 5, "top": True, "anonymous": True}, named]
+                }
+            },
+        }
+        assert public_facts(public, MESSAGE) == public
+    assert public_outputs[0] == public_outputs[1]
+
+
 @pytest.mark.parametrize("format_version", [1, 2])
 def test_public_export_is_account_independent_atomic_and_idempotent(tmp_path: Path, format_version: int) -> None:
     outputs = []
