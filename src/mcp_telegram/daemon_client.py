@@ -668,7 +668,7 @@ async def daemon_connection(
     - The connection is refused (socket exists but daemon crashed)
     """
     config_path_started = time.perf_counter()
-    socket_path = get_daemon_socket_path(load_config().state.dir)
+    socket_path = get_daemon_socket_path((await asyncio.to_thread(load_config)).state.dir)
     config_path_seconds = time.perf_counter() - config_path_started
     reader: asyncio.StreamReader | None = None
     writer: asyncio.StreamWriter | None = None
