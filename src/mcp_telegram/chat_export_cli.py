@@ -13,6 +13,7 @@ import tempfile
 import time
 from collections import OrderedDict
 from contextlib import suppress
+from importlib.metadata import version
 from pathlib import Path
 from typing import TextIO, cast
 
@@ -23,6 +24,7 @@ from .chat_export_projection import (
 )
 from .chat_export_projection import (
     project_admin_event,
+    project_exporter,
     project_group,
     project_message,
     project_reactor,
@@ -430,7 +432,14 @@ def _publish(checkpoint: Checkpoint, peers: list[Payload], output: Path) -> Payl
             stream.write('{"format_version":1,"group":')
             _dump(stream, project_group(_object(peers[0]["group"])))
             stream.write(',"metadata":')
-            _dump(stream, {"order": ORDER, "peers": [project_group(_object(peer["group"])) for peer in peers]})
+            _dump(
+                stream,
+                {
+                    "exporter": project_exporter(version("mcp-telegram")),
+                    "order": ORDER,
+                    "peers": [project_group(_object(peer["group"])) for peer in peers],
+                },
+            )
             _write_records(stream, checkpoint, peers)
             stream.write(',"export":')
             _dump(stream, summary)

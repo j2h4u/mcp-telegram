@@ -1,4 +1,5 @@
 import json
+from importlib.metadata import version
 from pathlib import Path
 from typing import cast
 
@@ -69,6 +70,11 @@ def test_public_export_is_account_independent_atomic_and_idempotent(tmp_path: Pa
         outputs.append(first)
     assert outputs[0] == outputs[1]
     result = cast(dict[str, object], json.loads(outputs[0]))
+    assert cast(dict[str, object], result["metadata"])["exporter"] == {
+        "name": "mcp-telegram",
+        "version": version("mcp-telegram"),
+        "repository_url": "https://github.com/j2h4u/mcp-telegram",
+    }
     message = cast(dict[str, object], cast(list[object], result["messages"])[0])
     assert result["admin_events"] == []
     assert message["author_id"] == "123" and message["text"] == "Keep this"
