@@ -12,7 +12,7 @@ SOURCE_ROOT = Path(__file__).parents[1] / "src" / "mcp_telegram"
 
 # Separate stores have their own transaction contracts and are outside the
 # sync.db ownership gate.
-EXCLUDED_MODULES = {Path("feedback_db.py"), Path("chat_export_checkpoint.py")}
+EXCLUDED_MODULES = {Path("feedback_db.py"), Path("chat_export_checkpoint.py"), Path("chat_export_identity.py")}
 
 # These functions are schema/bootstrap transactions, recovery/checkpoint
 # boundaries, or a read-only snapshot transaction. Exceptions stay narrow and

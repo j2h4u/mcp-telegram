@@ -18,10 +18,12 @@ type Payload = dict[str, object]
 class Identity(TypedDict):
     role: str
     is_admin: bool
+    id: str
+    rank: str
 
 
 class Reactor(TypedDict):
-    actor_role: str
+    actor: int
 
 
 class Message(TypedDict):
@@ -29,11 +31,12 @@ class Message(TypedDict):
     message_id: str
     kind: str
     reactors: list[Reactor]
-    related_users: list[Identity]
+    related_users: list[int]
+    author: int
 
 
 class AdminEvent(TypedDict):
-    actor_is_admin: bool
+    actor: int
 
 
 class Metadata(TypedDict):
@@ -42,6 +45,7 @@ class Metadata(TypedDict):
 
 
 class ExportDocument(TypedDict):
+    identities: list[Identity]
     messages: list[Message]
     admin_events: list[AdminEvent]
     group: Payload
@@ -154,13 +158,13 @@ async def test_pages_roles_reactions_service_admin_and_legacy(
     message = cast(Payload, doc["messages"][0])
     assert message["date"] == "2026-10-03T10:00:00+00:00"
     assert message["text"] == "Юникод"
-    assert "message" not in cast(Payload, message["metadata"])
-    assert message["author_rank"] == "Moderator"
-    assert message["author_id"] == "5"
+    assert "metadata" not in message
+    author = doc["identities"][doc["messages"][0]["author"]]
+    assert (author["rank"], author["id"]) == ("Moderator", "5")
     assert "status" not in cast(Payload, message["reactions"])
     assert "source" not in cast(Payload, doc["admin_events"][0])
-    assert doc["messages"][0]["reactors"][0]["actor_role"] == "admin"
-    assert doc["admin_events"][0]["actor_is_admin"] is True
+    assert doc["identities"][doc["messages"][0]["reactors"][0]["actor"]]["role"] == "admin"
+    assert doc["identities"][doc["admin_events"][0]["actor"]]["is_admin"] is True
     assert doc["messages"][0].get("topic") is None
     assert [c["dialog_id"] for c in calls if c["operation"] == "participant"] == [-1]
     assert not list(tmp_path.glob(".*.tmp"))
@@ -286,7 +290,7 @@ async def test_million_messages_remain_bounded(monkeypatch: pytest.MonkeyPatch, 
             # Retain only an incomplete marker across chunk boundaries.
             tail = combined[-len(needle) + 1 :]
             total -= tail.count(needle)
-    assert total == million
+    assert total == 0
     output.unlink()
 
 
@@ -345,7 +349,8 @@ async def test_tombstones_partial_reactors_and_related_roles(monkeypatch: pytest
     summary = await cli.export_group(-1, output)
     doc = cast(ExportDocument, json.loads(output.read_text()))
     assert history_cursors == [0, 8, 6]
-    assert doc["messages"][0]["related_users"][0]["role"] == "member"
+    related = doc["identities"][doc["messages"][0]["related_users"][0]]
+    assert related["role"] == "member"
     assert len(doc["messages"][0]["reactors"]) == 1
     assert summary == {"messages": 1, "admin_events": 0, "reactors": 1}
 

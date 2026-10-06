@@ -70,7 +70,7 @@ jobs:
         with:
           enable-cache: true
 
-      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: just
 
@@ -84,37 +84,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Filesystem diagnostics
-        run: python3 scripts/ci_pytest_runner.py diagnose
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.14.6"
-
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          enable-cache: true
-
-      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
-        with:
-          tool: just
-
-      - name: Install dependencies
-        run: uv sync --locked
-
-      - name: Unit tests
-        run: python3 scripts/ci_pytest_runner.py run -- just unit
-
-  crap-threshold:
-    needs: changes
-    if: needs.changes.outputs.run_heavy == 'true'
-    runs-on: ubuntu-latest
-    # Instrumented halves currently take about 23 minutes end to end; keep the
-    # timeout bounded while leaving enough room for runner variance.
+    # The validated million-message export stress takes about 14 minutes alone.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -130,7 +100,37 @@ jobs:
         with:
           enable-cache: true
 
-      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: just
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Unit tests
+        run: python3 scripts/ci_pytest_runner.py run -- just unit
+
+  crap-threshold:
+    needs: changes
+    if: needs.changes.outputs.run_heavy == 'true'
+    runs-on: ubuntu-latest
+    # Include the million-message stress with instrumentation and both suite halves.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Filesystem diagnostics
+        run: python3 scripts/ci_pytest_runner.py diagnose
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14.6"
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: just
 
@@ -150,7 +150,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: just
 
