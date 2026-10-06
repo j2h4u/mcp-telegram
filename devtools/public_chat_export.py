@@ -1,6 +1,6 @@
 """Make a separate filtered copy for sharing with ordinary chat members.
 
-Run: uv run python -m devtools.public_chat_export ORIGINAL.json PUBLIC.json
+Run: uv run python -m devtools.public_chat_export ORIGINAL.json PUBLIC.json [REMOVED.json]
 Works offline; cannot detect messages deleted after the original export.
 """
 
@@ -8,7 +8,8 @@ import argparse
 import json
 import os
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack
 from importlib.metadata import version
 from pathlib import Path
 from typing import TextIO, cast
@@ -218,29 +219,63 @@ def public_facts(value: object, projection: Projection) -> object:
     return _project(value, projection)
 
 
-def _write_public_export(path: Path, stream: TextIO) -> dict[str, int]:
+def _removed(original: object, public: object, path: str) -> Iterator[dict[str, object]]:
+    """Diff source facts; emit missing subtrees once, with original array indices."""
+    if isinstance(original, dict) and isinstance(public, dict):
+        published = cast(dict[str, object], public)
+        for key, value in cast(dict[str, object], original).items():
+            pointer = f"{path}/{key.replace('~', '~0').replace('/', '~1')}"
+            if key not in published:
+                yield {"path": pointer, "value": value}
+            else:
+                yield from _removed(value, published[key], pointer)
+    elif isinstance(original, list) and isinstance(public, list):
+        published_items = cast(list[object], public)
+        for index, value in enumerate(cast(list[object], original)):
+            pointer = f"{path}/{index}"
+            if index >= len(published_items):
+                yield {"path": pointer, "value": value}
+            else:
+                yield from _removed(value, published_items[index], pointer)
+    elif type(original) is not type(public) or original != public:
+        yield {"path": path, "value": original}
+
+
+def _write_public_export(path: Path, stream: TextIO, removed_stream: TextIO) -> dict[str, int]:
     counts = {"messages": 0, "admin_events": 0, "reactors": 0}
     declared = None
+    first_removed = True
     stream.write('{"format_version":1')
+    removed_stream.write('{"format_version":1,"removed":[')
+
+    def write_removed(items: Iterator[dict[str, object]]) -> None:
+        nonlocal first_removed
+        for item in items:
+            if not first_removed:
+                removed_stream.write(",")
+            json.dump(item, removed_stream, ensure_ascii=False, separators=(",", ":"))
+            first_removed = False
+
     for kind, record in base_records(path):
         if kind in {"group", "metadata"}:
+            source = record
             if kind == "metadata":
                 record = {"exporter": project_exporter(version("mcp-telegram")), **record}
+            public = public_facts(record, GROUP if kind == "group" else HEADER_METADATA)
+            write_removed(_removed(source, public, f"/{kind}"))
             stream.write(f',"{kind}":')
-            json.dump(
-                public_facts(record, GROUP if kind == "group" else HEADER_METADATA),
-                stream,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
+            json.dump(public, stream, ensure_ascii=False, separators=(",", ":"))
             if kind == "metadata":
                 stream.write(',"admin_events":[],"messages":[')
         elif kind == "admin_events.item":
+            write_removed(iter([{"path": f"/admin_events/{counts['admin_events']}", "value": record}]))
             counts["admin_events"] += 1
         elif kind == "messages.item":
+            public = public_facts(record, MESSAGE)
+            write_removed(_removed(record, public, f"/messages/{counts['messages']}"))
             if counts["messages"]:
                 stream.write(",")
-            json.dump(public_facts(record, MESSAGE), stream, ensure_ascii=False, separators=(",", ":"))
+            json.dump(public, stream, ensure_ascii=False, separators=(",", ":"))
             counts["messages"] += 1
             counts["reactors"] += len(cast(list[object], record["reactors"]))
         elif kind == "export":
@@ -248,42 +283,73 @@ def _write_public_export(path: Path, stream: TextIO) -> dict[str, int]:
     if declared != counts:
         raise ValueError("Export counts do not match its records")
     counts["admin_events"] = 0
+    write_removed(_removed(declared, counts, "/export"))
     stream.write('],"export":')
     json.dump(counts, stream, separators=(",", ":"))
     stream.write("}\n")
+    removed_stream.write("]}\n")
     return counts
 
 
-def sanitize_export(path: Path, output: Path) -> dict[str, int]:
-    """Stream to a new destination; never modify input or overwrite existing files."""
-    if path.resolve() == output.resolve():
-        raise ValueError("Output must differ from the original export")
-    if fingerprint(output) is not None:
-        raise FileExistsError("Output already exists")
+def _rollback(published: list[tuple[Path, Path]]) -> None:
+    for temporary, destination in reversed(published):
+        try:
+            identity = destination.lstat()
+        except FileNotFoundError:
+            continue
+        if os.path.samestat(identity, temporary.stat()):
+            destination.unlink()
+
+
+def sanitize_export(path: Path, output: Path, removed_output: Path | None = None) -> dict[str, int]:
+    """Stage both new files; publish private removals first and public facts last."""
+    removed_output = removed_output if removed_output is not None else output.with_name(f"{output.stem}.removed.json")
+    destinations = (removed_output, output)
+    paths = (path, *destinations)
+    if len({item.resolve() for item in paths}) != len(paths):
+        raise ValueError("Source and both outputs must differ")
+    for destination in destinations:
+        if destination.exists() and destination.samefile(path):
+            raise ValueError("Output must differ from the original export")
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError("Output already exists")
     before = fingerprint(path)
-    descriptor, name = tempfile.mkstemp(prefix=f".{output.name}.", suffix=".tmp", dir=output.parent)
-    temporary = Path(name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            counts = _write_public_export(path, stream)
+    with ExitStack() as stack:
+        staged = []
+        streams = []
+        for destination in destinations:
+            descriptor, name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
+            temporary = Path(name)
+            stack.callback(temporary.unlink, missing_ok=True)
+            streams.append(stack.enter_context(os.fdopen(descriptor, "w", encoding="utf-8")))
+            staged.append((temporary, destination))
+        counts = _write_public_export(path, streams[1], streams[0])
+        for stream in streams:
             stream.flush()
             os.fsync(stream.fileno())
         if fingerprint(path) != before:
             raise ValueError("Input changed during filtering")
-        os.link(temporary, output)
-        directory = os.open(output.parent, os.O_RDONLY | os.O_DIRECTORY)
+        published: list[tuple[Path, Path]] = []
         try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+            for temporary, destination in staged:
+                os.link(temporary, destination)
+                published.append((temporary, destination))
+            for parent in {destination.parent for destination in destinations}:
+                directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+        except BaseException:
+            _rollback(published)
+            raise
         return counts
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("export", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("removed_output", nargs="?", type=Path)
     args = parser.parse_args()
-    print(json.dumps(sanitize_export(args.export, args.output)))
+    print(json.dumps(sanitize_export(args.export, args.output, args.removed_output)))
