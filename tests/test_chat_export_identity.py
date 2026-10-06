@@ -1,4 +1,4 @@
-"""The v4 wire directory stores each exact identity snapshot once."""
+"""The v5 wire directory stores sparse identity snapshots once."""
 
 import io
 import json
@@ -9,7 +9,7 @@ import pytest
 
 from mcp_telegram.chat_export_checkpoint import ORDER
 from mcp_telegram.chat_export_identity import IdentityIndex, expand_record, pack_record, write_export
-from mcp_telegram.chat_export_schema import CURRENT_FORMAT_VERSION, migrate_record
+from mcp_telegram.chat_export_schema import CURRENT_FORMAT_VERSION, IDENTITY_FORMAT_VERSION, migrate_record
 
 
 def _identity(prefix: str, *, rank: str = "member") -> dict[str, object]:
@@ -70,7 +70,7 @@ def test_wire_export_deduplicates_exact_snapshots_and_roundtrips() -> None:
     stream = io.StringIO()
     write_export(lambda: iter(rows), stream)
     wire = json.loads(stream.getvalue())
-    assert wire["format_version"] == CURRENT_FORMAT_VERSION == 4
+    assert wire["format_version"] == CURRENT_FORMAT_VERSION == 5
     assert len(wire["identities"]) == 2
     assert "author_id" not in wire["messages"][0]
     assert "actor_id" not in wire["admin_events"][0]
@@ -107,14 +107,14 @@ def test_wire_export_deduplicates_exact_snapshots_and_roundtrips() -> None:
         assert migrate_record(4, "messages.item", expanded_message, internal=True) == expanded_message
 
 
-def test_distinct_metadata_and_null_presence_remain_distinct() -> None:
+def test_null_and_empty_identity_variants_share_no_snapshot() -> None:
     with IdentityIndex() as index:
         first = pack_record("messages.item", {"author_rank": None}, index)
         second = pack_record("messages.item", {}, index)
         third = pack_record("messages.item", {"author_rank": "member"}, index)
-        assert first["author"] != second.get("author")
-        assert third["author"] != first["author"]
-        assert index.count() == 2
+        assert first == second == {}
+        assert third["author"] == 0
+        assert index.count() == 1
 
 
 def test_duplicate_public_directory_slots_and_empty_related_identity_are_legal() -> None:
@@ -180,3 +180,32 @@ def test_reader_rejects_nonobject_directory_and_mixed_identity_fields(tmp_path: 
         pack_record(
             "messages.item", {"reactors": [], "reactions": {"aggregate": {"recent_reactions": [{"reactor": 0}]}}}, index
         )
+
+
+def test_v4_and_v5_readers_preserve_wire_and_expand_missing_reactors(tmp_path: Path) -> None:
+    from mcp_telegram.chat_export_checkpoint import base_records
+
+    stream = io.StringIO()
+    write_export(lambda: iter(_records()), stream)
+    sparse = json.loads(stream.getvalue())
+    message = sparse["messages"][1]
+    message.pop("reactors", None)
+    path = tmp_path / "v5.json"
+    path.write_text(json.dumps(sparse))
+    raw = list(base_records(path, expand_identities=False))
+    assert "reactors" not in [record for kind, record in raw if kind == "messages.item"][1]
+    expanded = list(base_records(path))
+    assert [record for kind, record in expanded if kind == "messages.item"][1]["reactors"] == []
+
+    legacy = {**sparse, "format_version": IDENTITY_FORMAT_VERSION}
+    legacy["identities"][0]["metadata"]["v4_null_fact"] = None
+    legacy["messages"][0]["reactors"][0]["raw"]["v4_null_fact"] = None
+    for record in legacy["messages"]:
+        record.setdefault("reactors", [])
+    old_path = tmp_path / "v4.json"
+    old_path.write_text(json.dumps(legacy))
+    old_records = list(base_records(old_path))
+    assert [record for kind, record in old_records if kind == "messages.item"][1]["reactors"] == []
+    old_message = [record for kind, record in old_records if kind == "messages.item"][0]
+    assert old_message["author_metadata"]["v4_null_fact"] is None
+    assert old_message["reactions"]["aggregate"]["recent_reactions"][0]["v4_null_fact"] is None

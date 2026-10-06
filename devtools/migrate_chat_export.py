@@ -14,6 +14,7 @@ from typing import TextIO
 
 from mcp_telegram.chat_export_checkpoint import Payload, base_records, census, fingerprint
 from mcp_telegram.chat_export_identity import write_export
+from mcp_telegram.chat_export_projection import omit_empty_fields
 from mcp_telegram.chat_export_schema import (
     CURRENT_FORMAT_VERSION,
     IDENTITY_FORMAT_VERSION,
@@ -27,7 +28,7 @@ def _write_migration(path: Path, stream: TextIO, version: int) -> None:
         for kind, source in base_records(path):
             if kind == "identities.item":
                 continue
-            yield kind, migrate_record(version, kind, source, internal=version == IDENTITY_FORMAT_VERSION)
+            yield kind, migrate_record(version, kind, source, internal=version >= IDENTITY_FORMAT_VERSION)
 
     write_export(records, stream)
 
@@ -49,7 +50,7 @@ def migrate_export(path: Path, output: Path) -> dict[str, int]:
             stream.flush()
             os.fsync(stream.fileno())
         migrated = census(temporary, 100)
-        if migrated != {**info, "format_version": CURRENT_FORMAT_VERSION}:
+        if migrated != {**info, "group": omit_empty_fields(info["group"]), "format_version": CURRENT_FORMAT_VERSION}:
             raise ValueError("Migration changed incremental history boundaries")
         if fingerprint(path) != before:
             raise ValueError("Migration source changed while reading")

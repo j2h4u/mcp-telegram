@@ -26,7 +26,9 @@ def test_public_normalized_export_keeps_references_and_removes_admin_only_identi
                 "author_id": "43",
                 "author_name": "Public member",
                 "author_role": "member",
+                "author_metadata": {"private_marker": True},
                 "text": "Public",
+                "metadata": {"out": False},
                 "reactors": [],
                 "related_users": [],
             },
@@ -43,10 +45,13 @@ def test_public_normalized_export_keeps_references_and_removes_admin_only_identi
     sanitize_export(source, output, removed)
     census(output, 0)
     raw = json.loads(output.read_text())
-    assert raw["format_version"] == 4 and raw["admin_events"] == []
+    assert raw["format_version"] == 5 and raw["admin_events"] == []
     assert "Private actor" not in output.read_text()
     assert "Public member" in output.read_text()
     assert raw["identities"][raw["messages"][0]["author"]]["id"] == "43"
+    assert "metadata" not in raw["identities"][raw["messages"][0]["author"]]
+    assert "metadata" not in raw["messages"][0]
+    assert "reactors" not in raw["messages"][0] and "related_users" not in raw["messages"][0]
     assert any(not identity for identity in raw["identities"])
     assert "author_name" not in raw["messages"][0]
     assert "exporter" not in raw["metadata"]  # A privacy filter adds no data.

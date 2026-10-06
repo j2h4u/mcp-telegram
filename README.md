@@ -348,10 +348,13 @@ to fetch only new messages. Older records and the original file remain unchanged
 Available new admin events are added. An update is also resumable with the same
 command and unchanged base file.
 
-Format version 4 stores each distinct user identity once in `identities`.
+Format version 5 stores each distinct user identity once in `identities`.
 Message `author`, reactor/admin-event `actor`, and `related_users` values are
 array indices into that directory. Different observed names or roles remain
-different snapshots. IDs are strings; join replies using `reply_to_dialog_id`
+different snapshots. Optional properties containing `null`, `{}` or `[]` are
+omitted recursively; a missing property means no value. `false`, `0`, empty
+text and array positions remain intact. Root collection arrays remain explicit.
+IDs are strings; join replies using `reply_to_dialog_id`
 and `reply_to_message_id` against `dialog_id` and `message_id`. Formatting,
 service actions and additional Telegram metadata remain nested. An exact copy
 of a reactor event in `reactions.aggregate.recent_reactions` is replaced by

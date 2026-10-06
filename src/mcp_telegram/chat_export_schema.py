@@ -7,12 +7,13 @@ from typing import cast
 import ijson
 from jsonschema import Draft202012Validator
 
-from .chat_export_projection import compact_export_record, deduplicate_export_message
+from .chat_export_projection import compact_export_record, deduplicate_export_message, omit_empty_fields
 
 INTERNAL_FORMAT_VERSION = 3
 IDENTITY_FORMAT_VERSION = 4
-CURRENT_FORMAT_VERSION = IDENTITY_FORMAT_VERSION
-SUPPORTED_FORMAT_VERSIONS = (1, 2, INTERNAL_FORMAT_VERSION, CURRENT_FORMAT_VERSION)
+SPARSE_FORMAT_VERSION = 5
+CURRENT_FORMAT_VERSION = SPARSE_FORMAT_VERSION
+SUPPORTED_FORMAT_VERSIONS = (1, 2, INTERNAL_FORMAT_VERSION, IDENTITY_FORMAT_VERSION, CURRENT_FORMAT_VERSION)
 type Facts = dict[str, object]
 
 _ID = {"type": "string", "pattern": "^[1-9][0-9]*$"}
@@ -202,7 +203,14 @@ V4_RECORD_SCHEMAS = {
         **_without_identity_fields("actor_"),
     },
 }
-RECORD_SCHEMAS = V4_RECORD_SCHEMAS
+V5_RECORD_SCHEMAS = {
+    **V4_RECORD_SCHEMAS,
+    "messages.item": {
+        **V4_RECORD_SCHEMAS["messages.item"],
+        "required": [key for key in V4_RECORD_SCHEMAS["messages.item"]["required"] if key != "reactors"],
+    },
+}
+RECORD_SCHEMAS = V5_RECORD_SCHEMAS
 EXPORT_SCHEMA = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -219,13 +227,28 @@ EXPORT_SCHEMA = {
     },
 }
 Draft202012Validator.check_schema(EXPORT_SCHEMA)
+V4_EXPORT_SCHEMA = {
+    **EXPORT_SCHEMA,
+    "properties": {
+        **EXPORT_SCHEMA["properties"],
+        "format_version": {"const": 4, "type": "integer"},
+        "group": V4_RECORD_SCHEMAS["group"],
+        "metadata": V4_RECORD_SCHEMAS["metadata"],
+        "identities": {"type": "array", "items": V4_RECORD_SCHEMAS["identities.item"]},
+        "admin_events": {"type": "array", "items": V4_RECORD_SCHEMAS["admin_events.item"]},
+        "messages": {"type": "array", "items": V4_RECORD_SCHEMAS["messages.item"]},
+        "export": V4_RECORD_SCHEMAS["export"],
+    },
+}
+Draft202012Validator.check_schema(V4_EXPORT_SCHEMA)
 _VALIDATORS = {
     version: {kind: Draft202012Validator(schema) for kind, schema in schemas.items()}
     for version, schemas in (
         (1, LEGACY_V1_RECORD_SCHEMAS),
         (2, LEGACY_V2_RECORD_SCHEMAS),
         (INTERNAL_FORMAT_VERSION, V3_RECORD_SCHEMAS),
-        (CURRENT_FORMAT_VERSION, V4_RECORD_SCHEMAS),
+        (IDENTITY_FORMAT_VERSION, V4_RECORD_SCHEMAS),
+        (CURRENT_FORMAT_VERSION, V5_RECORD_SCHEMAS),
     )
 }
 EXPORT_SCHEMAS = {
@@ -262,13 +285,14 @@ EXPORT_SCHEMAS = {
             "admin_events": {"type": "array", "items": V3_RECORD_SCHEMAS["admin_events.item"]},
         },
     },
+    IDENTITY_FORMAT_VERSION: V4_EXPORT_SCHEMA,
     CURRENT_FORMAT_VERSION: EXPORT_SCHEMA,
 }
 
 
 def validate_version(value: object) -> int:
     if type(value) is not int or value not in SUPPORTED_FORMAT_VERSIONS:
-        raise ValueError("Unsupported export format_version; expected integer 1, 2, 3, or 4")
+        raise ValueError("Unsupported export format_version; expected integer 1, 2, 3, 4, or 5")
     return value
 
 
@@ -295,20 +319,22 @@ def validate_record(
     if error is not None:
         location = "/".join(str(part) for part in error.absolute_path)
         raise ValueError(f"Invalid export record {kind}/{location}: {error.validator} constraint")
+    if version == SPARSE_FORMAT_VERSION and omit_empty_fields(record) != dict(record):
+        raise ValueError(f"Invalid export record {kind}: fields must use canonical sparse form")
 
 
 def migrate_record(version: int, kind: str, record: Mapping[str, object], *, internal: bool = False) -> Facts:
     validate_version(version)
-    if version == CURRENT_FORMAT_VERSION:
+    if version >= IDENTITY_FORMAT_VERSION:
         if not internal:
-            raise ValueError("Version 4 records must be expanded through the identity directory")
+            raise ValueError(f"Version {version} records must be expanded through the identity directory")
         validate_record(kind, record, internal=True)
         return dict(record)
     validate_record(kind, record, version)
     result = dict(record)
     if version == 1 and kind == "messages.item":
         result = deduplicate_export_message(result)
-    if version < CURRENT_FORMAT_VERSION and kind in {"messages.item", "admin_events.item"}:
+    if version < SPARSE_FORMAT_VERSION and kind in {"messages.item", "admin_events.item"}:
         result = compact_export_record(kind, result)
     validate_record(kind, result, internal=True)
     return cast(Facts, result)

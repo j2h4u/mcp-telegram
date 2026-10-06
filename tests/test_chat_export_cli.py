@@ -158,7 +158,7 @@ async def test_pages_roles_reactions_service_admin_and_legacy(
     message = cast(Payload, doc["messages"][0])
     assert message["date"] == "2026-10-03T10:00:00+00:00"
     assert message["text"] == "Юникод"
-    assert "message" not in cast(Payload, message["metadata"])
+    assert "metadata" not in message
     author = doc["identities"][message["author"]]
     assert (author["rank"], author["id"]) == ("Moderator", "5")
     assert "status" not in cast(Payload, message["reactions"])
@@ -290,7 +290,7 @@ async def test_million_messages_remain_bounded(monkeypatch: pytest.MonkeyPatch, 
             # Retain only an incomplete marker across chunk boundaries.
             tail = combined[-len(needle) + 1 :]
             total -= tail.count(needle)
-    assert total == million
+    assert total == 0
     output.unlink()
 
 

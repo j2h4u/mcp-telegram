@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import TextIO, cast
 
-from .chat_export_projection import compact_export_metadata
+from .chat_export_projection import compact_export_metadata, omit_empty_fields
 
 Payload = dict[str, object]
 RecordFactory = Callable[[], Iterator[tuple[str, Payload]]]
@@ -35,7 +35,7 @@ class IdentityIndex:
         return json.dumps(dict(identity), ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
     def intern(self, identity: Mapping[str, object]) -> int:
-        snapshot = self._json(identity)
+        snapshot = self._json(cast(Mapping[str, object], omit_empty_fields(identity)))
         row = cast(
             tuple[int] | None,
             self.db.execute("SELECT id FROM identities WHERE snapshot=? ORDER BY id LIMIT 1", (snapshot,)).fetchone(),
@@ -82,7 +82,7 @@ def _snapshot(record: Mapping[str, object], prefix: str) -> Payload:
 def _identity_ref(record: Payload, prefix: str, index: IdentityIndex) -> None:
     if prefix[:-1] in record:
         raise ValueError("Flat identity contains a reserved reference field")
-    identity = _snapshot(record, prefix)
+    identity = cast(Payload, omit_empty_fields(_snapshot(record, prefix)))
     for key in tuple(record):
         if key.startswith(prefix):
             record.pop(key)
@@ -143,7 +143,7 @@ def _recent_candidate(reactor: Mapping[str, object], identity: Mapping[str, obje
 
 def compact_reaction_events(record: Payload, index: IdentityIndex) -> None:
     reactions = record.get("reactions")
-    reactors = record.get("reactors")
+    reactors = record.get("reactors", [])
     if not isinstance(reactions, Mapping) or not isinstance(reactors, list):
         return
     aggregate = reactions.get("aggregate")
@@ -156,14 +156,19 @@ def compact_reaction_events(record: Payload, index: IdentityIndex) -> None:
         identity = index.get(value["actor"])
         candidate = _recent_candidate(value, identity)
         candidates.setdefault(
-            json.dumps(candidate, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False), position
+            json.dumps(
+                omit_empty_fields(candidate), ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+            ),
+            position,
         )
     result = dict(aggregate)
     events = []
     for event in cast(list[object], aggregate["recent_reactions"]):
         if isinstance(event, Mapping) and "reactor" in event:
             raise ValueError("Flat reaction contains a reserved reference field")
-        key = json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        key = json.dumps(
+            omit_empty_fields(event), ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
         position = candidates.get(key) if isinstance(event, Mapping) else None
         events.append({"reactor": position} if position is not None else event)
     result["recent_reactions"] = events
@@ -172,7 +177,7 @@ def compact_reaction_events(record: Payload, index: IdentityIndex) -> None:
 
 def expand_reaction_events(record: Payload) -> None:
     reactions = record.get("reactions")
-    reactors = record.get("reactors")
+    reactors = record.get("reactors", [])
     if not isinstance(reactions, Mapping) or not isinstance(reactors, list):
         return
     aggregate = reactions.get("aggregate")
@@ -208,7 +213,7 @@ def pack_record(kind: str, flat: Mapping[str, object], index: IdentityIndex) -> 
             packed.append(reactor)
         result["reactors"] = packed
         compact_reaction_events(result, index)
-    return result
+    return cast(Payload, omit_empty_fields(result))
 
 
 def expand_record(kind: str, wire: Mapping[str, object], index: IdentityIndex) -> Payload:
@@ -221,19 +226,20 @@ def expand_record(kind: str, wire: Mapping[str, object], index: IdentityIndex) -
             index,
         )
         _related_expand(result, index)
-    if kind == "messages.item" and isinstance(result.get("reactors"), list):
-        expanded = []
-        for value in cast(list[object], result["reactors"]):
-            reactor = dict(cast(Mapping[str, object], value))
-            _expand_ref(reactor, "actor", "actor_", index)
-            expanded.append(reactor)
-        result["reactors"] = expanded
+    if kind == "messages.item":
+        if isinstance(result.get("reactors"), list):
+            expanded = []
+            for value in cast(list[object], result["reactors"]):
+                reactor = dict(cast(Mapping[str, object], value))
+                _expand_ref(reactor, "actor", "actor_", index)
+                expanded.append(reactor)
+            result["reactors"] = expanded
         expand_reaction_events(result)
     return result
 
 
 def write_export(record_factory: RecordFactory, stream: TextIO) -> None:  # noqa: PLR0912, PLR0915
-    """Write v4 JSON using a deterministic two-pass, disk-backed identity index."""
+    """Write sparse v5 JSON using a deterministic two-pass identity index."""
     from .chat_export_schema import CURRENT_FORMAT_VERSION, validate_record
 
     group: Payload | None = None
@@ -253,9 +259,9 @@ def write_export(record_factory: RecordFactory, stream: TextIO) -> None:  # noqa
                 raise ValueError("Invalid export record order")
             previous = position
             if kind == "group":
-                group = dict(record)
+                group = cast(Payload, omit_empty_fields(record))
             elif kind == "metadata":
-                metadata = dict(record)
+                metadata = cast(Payload, omit_empty_fields(record))
             elif kind in {"messages.item", "admin_events.item"}:
                 counts["messages" if kind == "messages.item" else "admin_events"] += 1
                 if kind == "messages.item":
@@ -263,7 +269,7 @@ def write_export(record_factory: RecordFactory, stream: TextIO) -> None:  # noqa
                 packed = pack_record(kind, record, index)
                 validate_record(kind, packed, CURRENT_FORMAT_VERSION)
             elif kind == "export":
-                footer = dict(record)
+                footer = cast(Payload, omit_empty_fields(record))
         if group is None or metadata is None or footer is None:
             raise ValueError("Export record stream is missing a header or footer")
         if footer != counts:
@@ -273,7 +279,7 @@ def write_export(record_factory: RecordFactory, stream: TextIO) -> None:  # noqa
         validate_record("group", group, CURRENT_FORMAT_VERSION)
         validate_record("metadata", metadata, CURRENT_FORMAT_VERSION)
         validate_record("export", footer, CURRENT_FORMAT_VERSION)
-        stream.write('{"format_version":4,"group":')
+        stream.write('{"format_version":5,"group":')
         _dump(stream, group)
         stream.write(',"metadata":')
         _dump(stream, metadata)

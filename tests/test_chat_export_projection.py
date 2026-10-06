@@ -10,10 +10,25 @@ from mcp_telegram.chat_export_checkpoint import ORDER, Checkpoint, census, finge
 from mcp_telegram.chat_export_projection import (
     compact_export_record,
     deduplicate_export_message,
+    omit_empty_fields,
     project_admin_event,
     project_message,
     project_reactor,
 )
+
+
+def test_sparse_normalization_preserves_scalars_and_array_positions() -> None:
+    assert omit_empty_fields(
+        {
+            "null": None,
+            "object": {},
+            "array": [],
+            "false": False,
+            "zero": 0,
+            "empty_string": "",
+            "items": [None, {}, [], False, 0, ""],
+        }
+    ) == {"false": False, "zero": 0, "empty_string": "", "items": [None, {}, [], False, 0, ""]}
 
 
 def test_pandas_projection_preserves_content_and_lossless_keys() -> None:

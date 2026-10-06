@@ -6,6 +6,20 @@ from typing import cast
 type Facts = dict[str, object]
 
 
+def omit_empty_fields(value: object) -> object:
+    """Drop empty object properties recursively while preserving every array slot."""
+    if isinstance(value, Mapping):
+        result = {}
+        for key, item in value.items():
+            normalized = omit_empty_fields(item)
+            if normalized is not None and normalized != {} and normalized != []:
+                result[key] = normalized
+        return result
+    if isinstance(value, list):
+        return [omit_empty_fields(item) for item in value]
+    return value
+
+
 def project_exporter(software_version: str) -> Facts:
     return {
         "name": "mcp-telegram",

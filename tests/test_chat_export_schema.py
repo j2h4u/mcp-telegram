@@ -9,6 +9,7 @@ from jsonschema import Draft202012Validator
 from mcp_telegram import chat_export_cli as cli
 from mcp_telegram.chat_export_checkpoint import ORDER, Checkpoint, census
 from mcp_telegram.chat_export_schema import (
+    CURRENT_FORMAT_VERSION,
     IDENTITY_FORMAT_VERSION,
     INTERNAL_FORMAT_VERSION,
     migrate_record,
@@ -41,7 +42,7 @@ def document(record: dict[str, object], version: object = 1) -> dict[str, object
     }
 
 
-@pytest.mark.parametrize("version", [True, "1", 0, 5, None])
+@pytest.mark.parametrize("version", [True, "1", 0, 6, None])
 def test_future_or_malformed_version_rejected(tmp_path: Path, version: object) -> None:
     path = tmp_path / "base.json"
     path.write_text(json.dumps(document(legacy_record(), version)), encoding="utf-8")
@@ -62,6 +63,15 @@ def test_known_fields_validated_without_private_error_values(field: str, value: 
         validate_record("messages.item", record, internal=True)
     assert field in str(error.value)
     assert "Private source text" not in str(error.value)
+
+
+@pytest.mark.parametrize("value", [None, {}, []])
+def test_v5_records_require_canonical_sparse_fields(value: object) -> None:
+    record = legacy_record()
+    record.pop("message_key")
+    record["metadata"] = value
+    with pytest.raises(ValueError):
+        validate_record("messages.item", record, 5)
 
 
 @pytest.mark.parametrize("version", [1, 2, 3])
@@ -114,10 +124,16 @@ def test_fixed_schema_registry_and_legacy_string_reactions(version: int) -> None
     wire_schema = schema_for_version(IDENTITY_FORMAT_VERSION)
     assert "identities" in wire_schema["required"]
     assert "message_key" not in wire_schema["properties"]["messages"]["items"]["properties"]
+    sparse_schema = schema_for_version(CURRENT_FORMAT_VERSION)
+    assert sparse_schema["properties"]["format_version"]["const"] == 5
+    assert "reactors" not in sparse_schema["properties"]["messages"]["items"]["required"]
+    assert "reactors" in wire_schema["properties"]["messages"]["items"]["required"]
     with pytest.raises(ValueError):
-        schema_for_version(5)
-    with pytest.raises(ValueError):
-        migrate_record(5, "messages.item", record)
+        migrate_record(CURRENT_FORMAT_VERSION, "messages.item", record)
+    expanded = legacy_record()
+    expanded.pop("message_key")
+    assert migrate_record(IDENTITY_FORMAT_VERSION, "messages.item", expanded, internal=True) == expanded
+    assert migrate_record(CURRENT_FORMAT_VERSION, "messages.item", expanded, internal=True) == expanded
 
 
 @pytest.mark.asyncio

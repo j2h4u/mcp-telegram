@@ -12,8 +12,9 @@ from ijson.common import ObjectBuilder  # type: ignore[import-untyped]
 
 from .chat_export_identity import IdentityIndex, expand_record
 from .chat_export_schema import (
-    CURRENT_FORMAT_VERSION,
+    IDENTITY_FORMAT_VERSION,
     INTERNAL_FORMAT_VERSION,
+    SPARSE_FORMAT_VERSION,
     migrate_record,
     read_export_version,
     validate_record,
@@ -51,12 +52,12 @@ def _validated_events(path: Path) -> Iterator[tuple[str, str, object]]:
             yield prefix, event, value
     version = read_export_version(path)
     expected_shapes = {"format_version", "messages", "admin_events", "group", "metadata", "export"}
-    if version == CURRENT_FORMAT_VERSION:
+    if version >= IDENTITY_FORMAT_VERSION:
         expected_shapes.add("identities")
     if shapes != expected_shapes:
         raise ValueError("Malformed base export field types")
     expected_keys = ["format_version", "group", "metadata"]
-    if version == CURRENT_FORMAT_VERSION:
+    if version >= IDENTITY_FORMAT_VERSION:
         expected_keys.append("identities")
     expected_keys.extend(["admin_events", "messages", "export"])
     if keys != expected_keys:
@@ -75,7 +76,7 @@ def _record_start(prefix: str, event: str) -> bool:
 def base_records(path: Path, *, expand_identities: bool = True) -> Iterator[tuple[str, Payload]]:  # noqa: PLR0912
     """Read one projected record at a time, including the small header/footer."""
     file_version = read_export_version(path)
-    identity_index = IdentityIndex() if file_version == CURRENT_FORMAT_VERSION else None
+    identity_index = IdentityIndex() if file_version >= IDENTITY_FORMAT_VERSION else None
     identity_position = 0
     builder = None
     active = ""
@@ -100,10 +101,12 @@ def base_records(path: Path, *, expand_identities: bool = True) -> Iterator[tupl
                     identity_position += 1
                     if not expand_identities:
                         yield active, record
-                elif file_version == CURRENT_FORMAT_VERSION and active in {"messages.item", "admin_events.item"}:
+                elif file_version >= IDENTITY_FORMAT_VERSION and active in {"messages.item", "admin_events.item"}:
                     if identity_index is None:
                         raise ValueError("Missing export identity directory")
                     expanded = expand_record(active, record, identity_index)
+                    if file_version == SPARSE_FORMAT_VERSION and active == "messages.item":
+                        expanded.setdefault("reactors", [])
                     validate_record(active, expanded, internal=True)
                     yield active, expanded if expand_identities else record
                 else:
@@ -284,7 +287,11 @@ class Checkpoint:
         )
         for row in rows:
             record = cast(Payload, json.loads(row[0]))
-            yield json.dumps(migrate_record(version, prefix, record), ensure_ascii=False, allow_nan=False)
+            yield json.dumps(
+                migrate_record(version, prefix, record, internal=version >= IDENTITY_FORMAT_VERSION),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
 
     def upgrade_records(self) -> None:
         """Atomically migrate all saved rows before adding records in the current format."""
@@ -297,7 +304,12 @@ class Checkpoint:
             )
             for kind, peer, identifier, payload in rows:
                 prefix = "messages.item" if kind == "message" else "admin_events.item"
-                upgraded = migrate_record(version, prefix, cast(Payload, json.loads(payload)))
+                upgraded = migrate_record(
+                    version,
+                    prefix,
+                    cast(Payload, json.loads(payload)),
+                    internal=version >= IDENTITY_FORMAT_VERSION,
+                )
                 self.db.execute(
                     "UPDATE records SET payload=? WHERE kind=? AND peer=? AND id=?",
                     (json.dumps(upgraded, ensure_ascii=False, allow_nan=False), kind, peer, identifier),
@@ -333,7 +345,7 @@ class Checkpoint:
                 else:
                     continue
                 source_version = validate_version(info["format_version"])
-                record = migrate_record(source_version, kind, record, internal=source_version == CURRENT_FORMAT_VERSION)
+                record = migrate_record(source_version, kind, record, internal=source_version >= IDENTITY_FORMAT_VERSION)
                 self.db.execute(
                     "INSERT OR IGNORE INTO records VALUES (?,?,?,?)",
                     (record_kind, peer, identifier, json.dumps(record, ensure_ascii=False, allow_nan=False)),
