@@ -109,3 +109,126 @@ def test_public_export_is_account_independent_atomic_and_idempotent(tmp_path: Pa
     assert broken.read_bytes() == original
     assert not unpublished.exists()
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_public_export_discards_unknown_fields_in_every_context(tmp_path: Path) -> None:
+    secret = {"novel_sensitive_field": "private"}
+    identity = {"id": "123", "name": "Member", "role": "member", "metadata": {"label": "Public", **secret}, **secret}
+    reaction = {"_": "ReactionEmoji", "emoticon": "👍", **secret}
+    message = {
+        "message_id": "1",
+        "dialog_id": "-1001",
+        "message_key": "-1001:1",
+        "text": "Public",
+        "author_id": "123",
+        "author_name": secret,
+        "author_metadata": {"label": "Public", **secret},
+        "topic": {"id": "2", "title": "Topic", **secret},
+        "related_users": [identity],
+        "entities": [{"_": "MessageEntityTextUrl", "offset": 0, "length": 6, "url": "https://example.org", **secret}],
+        "service_action": {
+            "_": "MessageActionInviteToGroupCall",
+            "users": ["123"],
+            "call": {"_": "InputGroupCall", "id": "2", **secret},
+            **secret,
+        },
+        "reactions": {
+            "can_view_list": True,
+            "aggregate": {
+                "results": [{"count": 1, "reaction": reaction, **secret}],
+                "recent_reactions": [secret],
+                **secret,
+            },
+            **secret,
+        },
+        "reactors": [{"actor_id": "456", "date": "2026-01-01", "reaction": reaction, **secret}],
+        "metadata": {
+            "replies": {"replies": 2, "title": "wrong context", **secret},
+            "fwd_from": {"date": "2026-01-01", "from_id": {"_": "PeerUser", "user_id": "123", **secret}, **secret},
+            "media": {
+                "_": "MessageMediaPoll",
+                "poll": {
+                    "question": {"_": "TextWithEntities", "text": "Question", "entities": [], **secret},
+                    "answers": [
+                        {
+                            "text": "Option",
+                            "option": {"encoding": "base64", "data": "YQ==", **secret},
+                            "added_by": secret,
+                            **secret,
+                        }
+                    ],
+                    **secret,
+                },
+                "results": {
+                    "total_voters": 2,
+                    "results": [{"option": "a", "voters": 2, "correct": True, **secret}],
+                    "recent_voters": [secret],
+                    **secret,
+                },
+                **secret,
+            },
+            **secret,
+        },
+        **secret,
+    }
+    data = {
+        "format_version": 1,
+        "group": {"dialog_id": "-1001", "title": "Group", **secret},
+        "metadata": {"order": "newest", "peers": [{"dialog_id": "-1001", **secret}], **secret},
+        "admin_events": [],
+        "messages": [message],
+        "export": {"messages": 1, "admin_events": 0, "reactors": 1},
+    }
+    source = tmp_path / "source.json"
+    source.write_text(json.dumps(data))
+    output = tmp_path / "public.json"
+    sanitize_export(source, output)
+    result = json.loads(output.read_text())  # pyright: ignore[reportAny]
+    assert "novel_sensitive_field" not in output.read_text()
+    public = result["messages"][0]  # pyright: ignore[reportAny]
+    assert "author_name" not in public
+    assert public["related_users"] == [
+        {"id": "123", "name": "Member", "role": "member", "metadata": {"label": "Public"}}
+    ]
+    assert public["topic"] == {"id": "2", "title": "Topic"}
+    assert public["service_action"] == {
+        "_": "MessageActionInviteToGroupCall",
+        "users": ["123"],
+        "call": {"_": "InputGroupCall", "id": "2"},
+    }
+    assert public["reactions"] == {
+        "aggregate": {"results": [{"count": 1, "reaction": {"_": "ReactionEmoji", "emoticon": "👍"}}]}
+    }
+    assert public["metadata"]["replies"] == {"replies": 2}
+    assert public["metadata"]["media"]["poll"]["question"]["text"] == "Question"
+    assert public["metadata"]["media"]["results"] == {"total_voters": 2, "results": [{"option": "a", "voters": 2}]}
+    message["service_action"] = {
+        "_": "ChannelAdminLogEventActionParticipantToggleAdmin",
+        "users": ["123"],
+        "title": "private",
+    }
+    message["entities"][0]["url"] = secret
+    identity["role"] = "unknown"
+    identity["metadata"]["label"] = secret
+    message["metadata"]["media"]["results"]["total_voters"] = secret
+    message["metadata"]["media"]["poll"]["question"]["text"] = secret
+    message["reactors"][0]["reaction"] = {"_": "UnknownReaction", "emoticon": "private"}
+    source.write_text(json.dumps(data))
+    second = tmp_path / "unknown.json"
+    sanitize_export(source, second)
+    public = json.loads(second.read_text())["messages"][0]  # pyright: ignore[reportAny]
+    assert public["service_action"] == {}
+    assert "url" not in public["entities"][0]
+    assert "role" not in public["related_users"][0]
+    assert public["related_users"][0]["metadata"] == {}
+    assert "total_voters" not in public["metadata"]["media"]["results"]
+    assert "text" not in public["metadata"]["media"]["poll"]["question"]
+    assert public["reactors"][0]["reaction"] == {}
+
+    data["novel_sensitive_field"] = "private"
+    source.write_text(json.dumps(data))
+    rejected = tmp_path / "rejected.json"
+    with pytest.raises(ValueError, match="Malformed base export structure"):
+        sanitize_export(source, rejected)
+    assert not rejected.exists()
+    assert not list(tmp_path.glob("*.tmp"))
