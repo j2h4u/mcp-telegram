@@ -51,11 +51,20 @@ def test_public_export_is_account_independent_atomic_and_idempotent(tmp_path: Pa
             "export": {"messages": 1, "admin_events": 1, "reactors": 1},
         }
         path.write_text(json.dumps(data))
-        assert sanitize_export(path) == {"messages": 1, "admin_events": 0, "reactors": 1}
-        census(path, 0)
-        first = path.read_bytes()
-        sanitize_export(path)
-        assert path.read_bytes() == first
+        original = path.read_bytes()
+        output = tmp_path / f"public-{account}.json"
+        assert sanitize_export(path, output) == {"messages": 1, "admin_events": 0, "reactors": 1}
+        assert path.read_bytes() == original
+        census(output, 0)
+        first = output.read_bytes()
+        repeated = tmp_path / f"repeated-{account}.json"
+        sanitize_export(output, repeated)
+        assert repeated.read_bytes() == first
+        with pytest.raises(ValueError):
+            sanitize_export(path, path)
+        with pytest.raises(FileExistsError):
+            sanitize_export(path, output)
+        assert path.read_bytes() == original and output.read_bytes() == first
         outputs.append(first)
     assert outputs[0] == outputs[1]
     result = json.loads(outputs[0])
@@ -71,7 +80,9 @@ def test_public_export_is_account_independent_atomic_and_idempotent(tmp_path: Pa
     broken = tmp_path / "broken.json"
     original = outputs[0][:-2]
     broken.write_bytes(original)
+    unpublished = tmp_path / "unpublished.json"
     with pytest.raises(IncompleteJSONError):
-        sanitize_export(broken)
+        sanitize_export(broken, unpublished)
     assert broken.read_bytes() == original
+    assert not unpublished.exists()
     assert not list(tmp_path.glob("*.tmp"))

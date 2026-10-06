@@ -1,6 +1,6 @@
-"""Filter a completed v1 export in place for sharing with ordinary chat members.
+"""Make a separate filtered copy for sharing with ordinary chat members.
 
-Run: uv run python -m devtools.public_chat_export EXPORT.json
+Run: uv run python -m devtools.public_chat_export ORIGINAL.json PUBLIC.json
 Works offline; cannot detect messages deleted after the original export.
 """
 
@@ -9,7 +9,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import cast
+from typing import TextIO, cast
 
 from mcp_telegram.chat_export_checkpoint import base_records, fingerprint
 
@@ -75,44 +75,53 @@ def public_facts(value: object) -> object:
     return value
 
 
-def sanitize_export(path: Path) -> dict[str, int]:
-    """Stream records and replace only after parsing and checking the full input."""
-    before = fingerprint(path)
+def _write_public_export(path: Path, stream: TextIO) -> dict[str, int]:
     counts = {"messages": 0, "admin_events": 0, "reactors": 0}
     declared = None
-    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    stream.write('{"format_version":1')
+    for kind, record in base_records(path):
+        if kind in {"group", "metadata"}:
+            stream.write(f',"{kind}":')
+            json.dump(public_facts(record), stream, ensure_ascii=False, separators=(",", ":"))
+            if kind == "metadata":
+                stream.write(',"admin_events":[],"messages":[')
+        elif kind == "admin_events.item":
+            counts["admin_events"] += 1
+        elif kind == "messages.item":
+            if counts["messages"]:
+                stream.write(",")
+            json.dump(public_facts(record), stream, ensure_ascii=False, separators=(",", ":"))
+            counts["messages"] += 1
+            counts["reactors"] += len(cast(list[object], record["reactors"]))
+        elif kind == "export":
+            declared = record
+    if declared != counts:
+        raise ValueError("Export counts do not match its records")
+    counts["admin_events"] = 0
+    stream.write('],"export":')
+    json.dump(counts, stream, separators=(",", ":"))
+    stream.write("}\n")
+    return counts
+
+
+def sanitize_export(path: Path, output: Path) -> dict[str, int]:
+    """Stream to a new destination; never modify input or overwrite existing files."""
+    if path.resolve() == output.resolve():
+        raise ValueError("Output must differ from the original export")
+    if fingerprint(output) is not None:
+        raise FileExistsError("Output already exists")
+    before = fingerprint(path)
+    descriptor, name = tempfile.mkstemp(prefix=f".{output.name}.", suffix=".tmp", dir=output.parent)
     temporary = Path(name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write('{"format_version":1')
-            for kind, record in base_records(path):
-                if kind in {"group", "metadata"}:
-                    stream.write(f',"{kind}":')
-                    json.dump(public_facts(record), stream, ensure_ascii=False, separators=(",", ":"))
-                    if kind == "metadata":
-                        stream.write(',"admin_events":[],"messages":[')
-                elif kind == "admin_events.item":
-                    counts["admin_events"] += 1
-                elif kind == "messages.item":
-                    if counts["messages"]:
-                        stream.write(",")
-                    json.dump(public_facts(record), stream, ensure_ascii=False, separators=(",", ":"))
-                    counts["messages"] += 1
-                    counts["reactors"] += len(cast(list[object], record["reactors"]))
-                elif kind == "export":
-                    declared = record
-            if declared != counts:
-                raise ValueError("Export counts do not match its records")
-            counts["admin_events"] = 0
-            stream.write('],"export":')
-            json.dump(counts, stream, separators=(",", ":"))
-            stream.write("}\n")
+            counts = _write_public_export(path, stream)
             stream.flush()
             os.fsync(stream.fileno())
         if fingerprint(path) != before:
             raise ValueError("Input changed during filtering")
-        temporary.replace(path)
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        os.link(temporary, output)
+        directory = os.open(output.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(directory)
         finally:
@@ -125,4 +134,6 @@ def sanitize_export(path: Path) -> dict[str, int]:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("export", type=Path)
-    print(json.dumps(sanitize_export(parser.parse_args().export)))
+    parser.add_argument("output", type=Path)
+    args = parser.parse_args()
+    print(json.dumps(sanitize_export(args.export, args.output)))
