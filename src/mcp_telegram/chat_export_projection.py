@@ -116,7 +116,6 @@ def project_message(message: Mapping[str, object]) -> Facts:
         {
             "dialog_id": _id(message.get("dialog_id")),
             "message_id": _id(message.get("id")),
-            "message_key": _key(message.get("dialog_id"), message.get("id")),
             "date": message.get("date", raw.get("date")),
             "text": raw.get("message", ""),
             "edited_at": raw.get("edit_date"),
@@ -135,8 +134,9 @@ def project_message(message: Mapping[str, object]) -> Facts:
     )
     result.update(project_identity(message.get("author"), "author_"))
     result.update(_reply(message))
+    result.pop("reply_key", None)
     result["reactions"] = message.get("reactions")
-    result = deduplicate_export_message(result)
+    result = compact_export_record("messages.item", deduplicate_export_message(result))
     result.pop("reactions")
     return result
 
@@ -163,7 +163,7 @@ def deduplicate_export_message(record: Mapping[str, object]) -> Facts:
         if _dialog_peer_matches(reply.get("reply_to_peer_id"), record.get("reply_to_dialog_id")):
             reply.pop("reply_to_peer_id")
         metadata["reply_to"] = reply
-    if isinstance(record.get("metadata"), Mapping):
+    if isinstance(record.get("metadata"), Mapping) and isinstance(result.get("metadata"), Mapping):
         result["metadata"] = metadata
     if isinstance(record.get("reactors"), list):
         result["reactors"] = [
@@ -176,7 +176,80 @@ def deduplicate_export_message(record: Mapping[str, object]) -> Facts:
 def project_reactor(reactor: Mapping[str, object]) -> Facts:
     result = {key: value for key, value in clean_facts(reactor).items() if key != "peer"}
     result.update(project_identity(reactor.get("peer"), "actor_"))
-    return _deduplicate_reactor(result)
+    return compact_export_record("reactors.item", _deduplicate_reactor(result))
+
+
+def compact_export_record(kind: str, record: Mapping[str, object]) -> Facts:
+    """Remove only exact generated identity aliases from a legacy export record."""
+    result = dict(record)
+    if kind == "messages.item":
+        _compact_message(result)
+    elif kind == "admin_events.item":
+        _compact_identity_label(result, "actor_")
+        _compact_related_users(result)
+    elif kind == "reactors.item":
+        _compact_identity_label(result, "actor_")
+    return result
+
+
+def _compact_message(result: Facts) -> None:
+    for key, expected, error in (
+        ("message_key", _key(result.get("dialog_id"), result.get("message_id")), "message identity"),
+        (
+            "reply_key",
+            _key(result.get("reply_to_dialog_id"), result.get("reply_to_message_id")),
+            "reply identity",
+        ),
+    ):
+        if key in result:
+            if result[key] != expected:
+                raise ValueError(f"Legacy {key} does not match {error}")
+            result.pop(key)
+    metadata = _object(result.get("metadata"))
+    expected_kind = {"message": "Message", "service": "MessageService"}.get(str(result.get("kind")))
+    if metadata.get("_") == expected_kind and expected_kind is not None:
+        metadata.pop("_")
+    if "author_rank" in result and "from_rank" in metadata and metadata["from_rank"] == result["author_rank"]:
+        metadata.pop("from_rank")
+    if isinstance(result.get("metadata"), Mapping):
+        result["metadata"] = metadata
+    topic = _object(result.get("topic"))
+    for key in ("id", "topic_id"):
+        if key in topic and "topic_id" in result and _id(topic[key]) == result["topic_id"]:
+            topic.pop(key)
+    if isinstance(result.get("topic"), Mapping):
+        result["topic"] = topic
+    _compact_identity_label(result, "author_")
+    _compact_related_users(result)
+    if isinstance(result.get("reactors"), list):
+        result["reactors"] = [
+            compact_export_record("reactors.item", _object(x)) for x in cast(list[object], result["reactors"])
+        ]
+
+
+def _compact_related_users(result: Facts) -> None:
+    if isinstance(result.get("related_users"), list):
+        result["related_users"] = [
+            _compact_identity_label(_object(x), "") for x in cast(list[object], result["related_users"])
+        ]
+
+
+def _compact_identity_label(record: Facts, prefix: str) -> Facts:
+    rank_key, metadata_key = prefix + "rank", prefix + "metadata"
+    metadata = _object(record.get(metadata_key))
+    if rank_key in record and "label" in metadata and metadata["label"] == record[rank_key]:
+        metadata.pop("label")
+    if isinstance(record.get(metadata_key), Mapping):
+        record[metadata_key] = metadata
+    return record
+
+
+def compact_export_metadata(group: Mapping[str, object], metadata: Mapping[str, object]) -> Facts:
+    result = dict(metadata)
+    peers = result.get("peers")
+    if isinstance(peers, list) and peers and isinstance(peers[0], Mapping) and dict(peers[0]) == dict(group):
+        result["peers"] = [{"dialog_id": peers[0].get("dialog_id")}, *peers[1:]]
+    return result
 
 
 def _deduplicate_reactor(reactor: Mapping[str, object]) -> Facts:
@@ -202,4 +275,4 @@ def project_admin_event(event: Mapping[str, object], dialog_id: int) -> Facts:
         }
     )
     result.update(project_identity(event.get("actor"), "actor_"))
-    return result
+    return compact_export_record("admin_events.item", result)

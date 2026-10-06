@@ -1,13 +1,60 @@
+import io
 import json
 from importlib.metadata import version
 from pathlib import Path
 from typing import cast
 
 import pytest
-from devtools.public_chat_export import MESSAGE, public_facts, sanitize_export
+from devtools.public_chat_export import MESSAGE, _removed, public_facts, sanitize_export
 from ijson.common import IncompleteJSONError
 
 from mcp_telegram.chat_export_checkpoint import ORDER, census
+
+
+def test_public_normalized_export_keeps_references_and_removes_admin_only_identities(tmp_path: Path) -> None:
+    from mcp_telegram.chat_export_identity import write_export
+
+    rows = [
+        ("group", {"dialog_id": "-1001", "title": "Group"}),
+        ("metadata", {"order": ORDER, "peers": [{"dialog_id": "-1001", "title": "Group"}]}),
+        ("admin_events.item", {"dialog_id": "-1001", "event_id": "7", "actor_id": "42", "actor_name": "Private actor"}),
+        (
+            "messages.item",
+            {
+                "dialog_id": "-1001",
+                "message_id": "5",
+                "author_id": "43",
+                "author_name": "Public member",
+                "author_role": "member",
+                "text": "Public",
+                "reactors": [],
+                "related_users": [],
+            },
+        ),
+        ("export", {"messages": 1, "admin_events": 1, "reactors": 0}),
+    ]
+    stream = io.StringIO()
+    write_export(lambda: iter(rows), stream)
+    source = tmp_path / "original.json"
+    source.write_text(stream.getvalue())
+    before = source.read_bytes()
+    output = tmp_path / "public.json"
+    removed = tmp_path / "private.json"
+    sanitize_export(source, output, removed)
+    census(output, 0)
+    raw = json.loads(output.read_text())
+    assert raw["format_version"] == 4 and raw["admin_events"] == []
+    assert "Private actor" not in output.read_text()
+    assert "Public member" in output.read_text()
+    assert raw["identities"][raw["messages"][0]["author"]]["id"] == "43"
+    assert any(not identity for identity in raw["identities"])
+    assert "author_name" not in raw["messages"][0]
+    assert "exporter" not in raw["metadata"]  # A privacy filter adds no data.
+    assert "Private actor" in removed.read_text()
+    assert source.read_bytes() == before
+    repeated = tmp_path / "again.json"
+    sanitize_export(output, repeated)
+    assert repeated.read_bytes() == output.read_bytes()
 
 
 def test_public_paid_leaderboard_and_poll_attachment_are_account_independent() -> None:
@@ -61,6 +108,16 @@ def test_public_paid_leaderboard_and_poll_attachment_are_account_independent() -
         }
         assert public_facts(public, MESSAGE) == public
     assert public_outputs[0] == public_outputs[1]
+    hidden = {"_": "MessageReactor", "top": False, "count": 2}
+    named = {
+        "_": "MessageReactor",
+        "top": True,
+        "anonymous": False,
+        "count": 5,
+        "peer_id": {"_": "PeerUser", "user_id": 789},
+    }
+    # A shortened list must not leave shifted public keys in the restored source.
+    assert list(_removed([hidden, named], [named], "/top")) == [{"path": "/top", "value": [hidden, named]}]
 
 
 @pytest.mark.parametrize("format_version", [1, 2])
@@ -72,6 +129,11 @@ def test_public_export_is_account_independent_atomic_and_idempotent(tmp_path: Pa
             "format_version": format_version,
             "group": {"dialog_id": "-1001", "title": "Group"},
             "metadata": {
+                "exporter": {
+                    "name": "mcp-telegram",
+                    "version": version("mcp-telegram"),
+                    "repository_url": "https://github.com/j2h4u/mcp-telegram",
+                },
                 "order": "newest_to_oldest within each peer; primary then migrated predecessors",
                 "peers": [{"dialog_id": "-1001"}],
             },

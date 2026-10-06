@@ -10,13 +10,11 @@ import os
 import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack
-from importlib.metadata import version
 from pathlib import Path
 from typing import TextIO, cast
 
 from mcp_telegram.chat_export_checkpoint import base_records, fingerprint
-from mcp_telegram.chat_export_projection import project_exporter
-from mcp_telegram.chat_export_schema import read_export_version
+from mcp_telegram.chat_export_schema import IDENTITY_FORMAT_VERSION, read_export_version
 
 # Each nested object has its own allowlist. Scalar slots reject containers;
 # Telegram adding a field never expands the public export implicitly.
@@ -382,6 +380,13 @@ REACTION_EVENT = {**_fields("_", "date"), "big": _boolean, "peer_id": _peer, "re
 
 
 def _reaction_event(value: object) -> object:
+    if (
+        isinstance(value, dict)
+        and set(value) == {"reactor"}
+        and type(value["reactor"]) is int
+        and value["reactor"] >= 0
+    ):
+        return dict(value)
     return _project(value, REACTION_EVENT)
 
 
@@ -501,8 +506,21 @@ def _identity_fields(prefix: str) -> dict[str, Projection]:
 
 def _reactor(value: object) -> object:
     return _project(
-        value, {**_identity_fields("actor_"), "date": _scalar, "reaction": _reaction, "raw": _reaction_event}
+        value,
+        {
+            **_identity_fields("actor_"),
+            "actor": _scalar,
+            "date": _scalar,
+            "reaction": _reaction,
+            "raw": _reaction_event,
+        },
     )
+
+
+def _identity_or_reference(value: object) -> object:
+    if type(value) is int and value >= 0:
+        return value
+    return _project(value, IDENTITY)
 
 
 MESSAGE = {
@@ -521,10 +539,11 @@ MESSAGE = {
         "reply_key",
     ),
     **_identity_fields("author_"),
+    "author": _scalar,
     "entities": [ENTITY],
     "service_action": _action,
     "topic": ("id", "topic_id", "title"),
-    "related_users": [IDENTITY],
+    "related_users": [_identity_or_reference],
     "metadata": MESSAGE_METADATA,
     "reactions": {"aggregate": REACTIONS_AGGREGATE},
     "reactors": [_reactor],
@@ -548,6 +567,9 @@ def _removed(original: object, public: object, path: str) -> Iterator[dict[str, 
             else:
                 yield from _removed(value, published[key], pointer)
     elif isinstance(original, list) and isinstance(public, list):
+        if len(original) != len(public):
+            yield {"path": path, "value": original}
+            return
         published_items = cast(list[object], public)
         for index, value in enumerate(cast(list[object], original)):
             pointer = f"{path}/{index}"
@@ -559,12 +581,27 @@ def _removed(original: object, public: object, path: str) -> Iterator[dict[str, 
         yield {"path": path, "value": original}
 
 
-def _write_public_export(path: Path, stream: TextIO, removed_stream: TextIO) -> dict[str, int]:
+def _write_public_export(path: Path, stream: TextIO, removed_stream: TextIO) -> dict[str, int]:  # noqa: PLR0912, PLR0915
     counts = {"messages": 0, "admin_events": 0, "reactors": 0}
     declared = None
     first_removed = True
-    stream.write(f'{{"format_version":{read_export_version(path)}')
+    format_version = read_export_version(path)
+    referenced: set[int] = set()
+    if format_version == IDENTITY_FORMAT_VERSION:
+        # Admin-only identities are private evidence even after removing the log.
+        for kind, record in base_records(path, expand_identities=False):
+            if kind != "messages.item":
+                continue
+            if "author" in record:
+                referenced.add(cast(int, record["author"]))
+            referenced.update(cast(list[int], record.get("related_users", [])))
+            for reactor in cast(list[dict[str, object]], record.get("reactors", [])):
+                if "actor" in reactor:
+                    referenced.add(cast(int, reactor["actor"]))
+    stream.write(f'{{"format_version":{format_version}')
     removed_stream.write('{"format_version":1,"removed":[')
+    identities = 0
+    messages_started = format_version != IDENTITY_FORMAT_VERSION
 
     def write_removed(items: Iterator[dict[str, object]]) -> None:
         nonlocal first_removed
@@ -574,21 +611,37 @@ def _write_public_export(path: Path, stream: TextIO, removed_stream: TextIO) -> 
             json.dump(item, removed_stream, ensure_ascii=False, separators=(",", ":"))
             first_removed = False
 
-    for kind, record in base_records(path):
+    def start_messages() -> None:
+        nonlocal messages_started
+        if not messages_started:
+            stream.write('],"admin_events":[],"messages":[')
+            messages_started = True
+
+    for kind, record in base_records(path, expand_identities=False):
         if kind in {"group", "metadata"}:
             source = record
-            if kind == "metadata":
-                record = {"exporter": project_exporter(version("mcp-telegram")), **record}
             public = public_facts(record, GROUP if kind == "group" else HEADER_METADATA)
             write_removed(_removed(source, public, f"/{kind}"))
             stream.write(f',"{kind}":')
             json.dump(public, stream, ensure_ascii=False, separators=(",", ":"))
             if kind == "metadata":
-                stream.write(',"admin_events":[],"messages":[')
+                stream.write(
+                    ',"identities":['
+                    if format_version == IDENTITY_FORMAT_VERSION
+                    else ',"admin_events":[],"messages":['
+                )
+        elif kind == "identities.item":
+            public = public_facts(record, IDENTITY) if identities in referenced else {}
+            write_removed(_removed(record, public, f"/identities/{identities}"))
+            if identities:
+                stream.write(",")
+            json.dump(public, stream, ensure_ascii=False, separators=(",", ":"))
+            identities += 1
         elif kind == "admin_events.item":
             write_removed(iter([{"path": f"/admin_events/{counts['admin_events']}", "value": record}]))
             counts["admin_events"] += 1
         elif kind == "messages.item":
+            start_messages()
             public = public_facts(record, MESSAGE)
             write_removed(_removed(record, public, f"/messages/{counts['messages']}"))
             if counts["messages"]:
@@ -600,6 +653,7 @@ def _write_public_export(path: Path, stream: TextIO, removed_stream: TextIO) -> 
             declared = record
     if declared != counts:
         raise ValueError("Export counts do not match its records")
+    start_messages()
     counts["admin_events"] = 0
     write_removed(_removed(declared, counts, "/export"))
     stream.write('],"export":')

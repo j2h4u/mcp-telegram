@@ -38,15 +38,20 @@ def test_migration_preserves_incremental_base_and_repeats_identically(tmp_path: 
     before = source.read_bytes()
     old_info = census(source, 100)
     output = tmp_path / "migrated.json"
-    assert migrate_export(source, output) == {"from_version": 1, "to_version": 2}
+    assert migrate_export(source, output) == {"from_version": 1, "to_version": 4}
     assert source.read_bytes() == before
-    assert census(output, 100) == {**old_info, "format_version": 2}
+    assert census(output, 100) == {**old_info, "format_version": 4}
     migrated = json.loads(output.read_text())
-    data["format_version"] = 2
+    data["format_version"] = 4
     del data["messages"][0]["metadata"]["from_id"]
+    del data["messages"][0]["message_key"]
+    del data["messages"][0]["author_id"]
+    del data["messages"][0]["author_kind"]
+    data["messages"][0]["author"] = 0
+    data["identities"] = [{"id": "42", "kind": "user"}]
     assert migrated == data
     repeated = tmp_path / "repeated.json"
-    assert migrate_export(output, repeated) == {"from_version": 2, "to_version": 2}
+    assert migrate_export(output, repeated) == {"from_version": 4, "to_version": 4}
     assert repeated.read_bytes() == output.read_bytes()
     with pytest.raises(FileExistsError):
         migrate_export(source, output)

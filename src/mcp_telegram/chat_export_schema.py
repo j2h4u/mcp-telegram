@@ -1,4 +1,4 @@
-"""Fixed export schemas and the deterministic v1-to-v2 migration."""
+"""Fixed export schemas and deterministic export migrations."""
 
 from collections.abc import Mapping
 from pathlib import Path
@@ -7,10 +7,12 @@ from typing import cast
 import ijson
 from jsonschema import Draft202012Validator
 
-from .chat_export_projection import deduplicate_export_message
+from .chat_export_projection import compact_export_record, deduplicate_export_message
 
-CURRENT_FORMAT_VERSION = 2
-SUPPORTED_FORMAT_VERSIONS = (1, CURRENT_FORMAT_VERSION)
+INTERNAL_FORMAT_VERSION = 3
+IDENTITY_FORMAT_VERSION = 4
+CURRENT_FORMAT_VERSION = IDENTITY_FORMAT_VERSION
+SUPPORTED_FORMAT_VERSIONS = (1, 2, INTERNAL_FORMAT_VERSION, CURRENT_FORMAT_VERSION)
 type Facts = dict[str, object]
 
 _ID = {"type": "string", "pattern": "^[1-9][0-9]*$"}
@@ -99,27 +101,166 @@ LEGACY_V1_RECORD_SCHEMAS = {
         "properties": {key: {"type": "integer", "minimum": 0} for key in ("messages", "admin_events", "reactors")},
     },
 }
-RECORD_SCHEMAS = LEGACY_V1_RECORD_SCHEMAS
+LEGACY_V2_RECORD_SCHEMAS = LEGACY_V1_RECORD_SCHEMAS
+V3_RECORD_SCHEMAS = {
+    **LEGACY_V1_RECORD_SCHEMAS,
+    "messages.item": {
+        **LEGACY_V1_RECORD_SCHEMAS["messages.item"],
+        "required": ["dialog_id", "message_id", "reactors"],
+        "properties": {
+            k: v
+            for k, v in LEGACY_V1_RECORD_SCHEMAS["messages.item"]["properties"].items()
+            if k not in {"message_key", "reply_key"}
+        },
+    },
+}
+_IDENTITY = {
+    "type": "object",
+    "properties": {
+        "id": _NULLABLE_ID,
+        "kind": _STRING,
+        "name": _STRING,
+        "username": _STRING,
+        "is_admin": {"type": ["boolean", "null"]},
+        "role": _STRING,
+        "rank": _STRING,
+        "metadata": {"type": "object"},
+    },
+}
+_RECENT_REACTOR_REF = {
+    "type": "object",
+    "required": ["reactor"],
+    "properties": {"reactor": {"type": "integer", "minimum": 0}},
+    "additionalProperties": False,
+}
+_RAW_RECENT_REACTION = {"type": "object", "not": {"required": ["reactor"]}}
+
+
+def _without_identity_fields(prefix: str) -> Facts:
+    return {"patternProperties": {f"^{prefix}": False}}
+
+
+V4_RECORD_SCHEMAS = {
+    **V3_RECORD_SCHEMAS,
+    "identities.item": _IDENTITY,
+    "messages.item": {
+        **V3_RECORD_SCHEMAS["messages.item"],
+        "properties": {
+            **{
+                k: v
+                for k, v in V3_RECORD_SCHEMAS["messages.item"]["properties"].items()
+                if not k.startswith("author_") and k != "related_users"
+            },
+            "author": {"type": "integer", "minimum": 0},
+            "related_users": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+            "reactors": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "actor": {"type": "integer", "minimum": 0},
+                        "reaction": {"type": ["object", "string", "null"]},
+                        "date": _STRING,
+                        "raw": _OBJECT,
+                    },
+                    **_without_identity_fields("actor_"),
+                },
+            },
+            "reactions": {
+                "type": "object",
+                "properties": {
+                    "aggregate": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "recent_reactions": {
+                                "type": "array",
+                                "items": {"oneOf": [_RAW_RECENT_REACTION, _RECENT_REACTOR_REF]},
+                            },
+                        },
+                    },
+                    "can_view_list": {"type": "boolean"},
+                    "recent_reactions": {
+                        "type": "array",
+                        "items": {"oneOf": [_RAW_RECENT_REACTION, _RECENT_REACTOR_REF]},
+                    },
+                },
+            },
+        },
+        **_without_identity_fields("author_"),
+    },
+    "admin_events.item": {
+        **V3_RECORD_SCHEMAS["admin_events.item"],
+        "properties": {
+            **{
+                k: v
+                for k, v in V3_RECORD_SCHEMAS["admin_events.item"]["properties"].items()
+                if not k.startswith("actor_") and k != "related_users"
+            },
+            "actor": {"type": "integer", "minimum": 0},
+            "related_users": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+        },
+        **_without_identity_fields("actor_"),
+    },
+}
+RECORD_SCHEMAS = V4_RECORD_SCHEMAS
 EXPORT_SCHEMA = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
-    "required": ["format_version", "group", "metadata", "admin_events", "messages", "export"],
+    "required": ["format_version", "group", "metadata", "identities", "admin_events", "messages", "export"],
     "additionalProperties": False,
     "properties": {
         "format_version": {"const": CURRENT_FORMAT_VERSION, "type": "integer"},
         "group": RECORD_SCHEMAS["group"],
         "metadata": RECORD_SCHEMAS["metadata"],
+        "identities": {"type": "array", "items": RECORD_SCHEMAS["identities.item"]},
         "admin_events": {"type": "array", "items": RECORD_SCHEMAS["admin_events.item"]},
         "messages": {"type": "array", "items": RECORD_SCHEMAS["messages.item"]},
         "export": RECORD_SCHEMAS["export"],
     },
 }
 Draft202012Validator.check_schema(EXPORT_SCHEMA)
-_VALIDATORS = {kind: Draft202012Validator(schema) for kind, schema in RECORD_SCHEMAS.items()}
+_VALIDATORS = {
+    version: {kind: Draft202012Validator(schema) for kind, schema in schemas.items()}
+    for version, schemas in (
+        (1, LEGACY_V1_RECORD_SCHEMAS),
+        (2, LEGACY_V2_RECORD_SCHEMAS),
+        (INTERNAL_FORMAT_VERSION, V3_RECORD_SCHEMAS),
+        (CURRENT_FORMAT_VERSION, V4_RECORD_SCHEMAS),
+    )
+}
 EXPORT_SCHEMAS = {
     1: {
         **EXPORT_SCHEMA,
-        "properties": {**EXPORT_SCHEMA["properties"], "format_version": {"const": 1, "type": "integer"}},
+        "required": ["format_version", "group", "metadata", "admin_events", "messages", "export"],
+        "properties": {
+            **EXPORT_SCHEMA["properties"],
+            "identities": False,
+            "format_version": {"const": 1, "type": "integer"},
+            "messages": {"type": "array", "items": LEGACY_V1_RECORD_SCHEMAS["messages.item"]},
+            "admin_events": {"type": "array", "items": LEGACY_V1_RECORD_SCHEMAS["admin_events.item"]},
+        },
+    },
+    2: {
+        **EXPORT_SCHEMA,
+        "required": ["format_version", "group", "metadata", "admin_events", "messages", "export"],
+        "properties": {
+            **EXPORT_SCHEMA["properties"],
+            "identities": False,
+            "format_version": {"const": 2, "type": "integer"},
+            "messages": {"type": "array", "items": LEGACY_V2_RECORD_SCHEMAS["messages.item"]},
+            "admin_events": {"type": "array", "items": LEGACY_V2_RECORD_SCHEMAS["admin_events.item"]},
+        },
+    },
+    INTERNAL_FORMAT_VERSION: {
+        **EXPORT_SCHEMA,
+        "required": ["format_version", "group", "metadata", "admin_events", "messages", "export"],
+        "properties": {
+            **{k: v for k, v in EXPORT_SCHEMA["properties"].items() if k != "identities"},
+            "identities": False,
+            "format_version": {"const": INTERNAL_FORMAT_VERSION, "type": "integer"},
+            "messages": {"type": "array", "items": V3_RECORD_SCHEMAS["messages.item"]},
+            "admin_events": {"type": "array", "items": V3_RECORD_SCHEMAS["admin_events.item"]},
+        },
     },
     CURRENT_FORMAT_VERSION: EXPORT_SCHEMA,
 }
@@ -127,7 +268,7 @@ EXPORT_SCHEMAS = {
 
 def validate_version(value: object) -> int:
     if type(value) is not int or value not in SUPPORTED_FORMAT_VERSIONS:
-        raise ValueError("Unsupported export format_version; expected integer 1 or 2")
+        raise ValueError("Unsupported export format_version; expected integer 1, 2, 3, or 4")
     return value
 
 
@@ -143,18 +284,31 @@ def schema_for_version(version: int) -> Facts:
     return cast(Facts, EXPORT_SCHEMAS[validate_version(version)])
 
 
-def validate_record(kind: str, record: Mapping[str, object]) -> None:
-    if kind not in _VALIDATORS:
+def validate_record(
+    kind: str, record: Mapping[str, object], version: int | None = None, *, internal: bool = False
+) -> None:
+    version = INTERNAL_FORMAT_VERSION if internal else CURRENT_FORMAT_VERSION if version is None else version
+    version = validate_version(version)
+    if kind not in _VALIDATORS[version]:
         raise ValueError("Unknown export record kind")
-    error = next(_VALIDATORS[kind].iter_errors(record), None)
+    error = next(_VALIDATORS[version][kind].iter_errors(record), None)
     if error is not None:
         location = "/".join(str(part) for part in error.absolute_path)
         raise ValueError(f"Invalid export record {kind}/{location}: {error.validator} constraint")
 
 
-def migrate_record(version: int, kind: str, record: Mapping[str, object]) -> Facts:
+def migrate_record(version: int, kind: str, record: Mapping[str, object], *, internal: bool = False) -> Facts:
     validate_version(version)
-    validate_record(kind, record)
-    result = deduplicate_export_message(record) if version == 1 and kind == "messages.item" else dict(record)
-    validate_record(kind, result)
+    if version == CURRENT_FORMAT_VERSION:
+        if not internal:
+            raise ValueError("Version 4 records must be expanded through the identity directory")
+        validate_record(kind, record, internal=True)
+        return dict(record)
+    validate_record(kind, record, version)
+    result = dict(record)
+    if version == 1 and kind == "messages.item":
+        result = deduplicate_export_message(result)
+    if version < CURRENT_FORMAT_VERSION and kind in {"messages.item", "admin_events.item"}:
+        result = compact_export_record(kind, result)
+    validate_record(kind, result, internal=True)
     return cast(Facts, result)

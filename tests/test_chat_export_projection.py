@@ -8,6 +8,7 @@ import pytest
 
 from mcp_telegram.chat_export_checkpoint import ORDER, Checkpoint, census, fingerprint
 from mcp_telegram.chat_export_projection import (
+    compact_export_record,
     deduplicate_export_message,
     project_admin_event,
     project_message,
@@ -47,8 +48,8 @@ def test_pandas_projection_preserves_content_and_lossless_keys() -> None:
     )
     assert message["author_id"] == "9007199254740993"
     assert message["author_rank"] == "Moderator"
-    assert message["message_key"] == "-1001234567890:5"
-    assert message["reply_key"] == "-1009876543210:4"
+    assert "message_key" not in message
+    assert "reply_key" not in message
     assert message["topic_id"] == "3"
     assert message["grouped_id"] == "9007199254740995"
     assert message["text"] == "**Full text**"
@@ -152,6 +153,66 @@ def test_message_mismatches_and_missing_canonical_facts_retained() -> None:
     assert project_message({"raw": raw})["metadata"] == raw
 
 
+def test_v3_compaction_rejects_conflicting_generated_keys_and_preserves_unique_values() -> None:
+    record = {"dialog_id": "-1", "message_id": "5", "message_key": "wrong", "metadata": {"keep": 1}}
+    with pytest.raises(ValueError, match="message_key"):
+        compact_export_record("messages.item", record)
+    assert record["message_key"] == "wrong"
+    assert compact_export_record("messages.item", {"dialog_id": "-1", "message_id": "5", "message_key": "-1:5"}) == {
+        "dialog_id": "-1",
+        "message_id": "5",
+    }
+
+
+def test_v3_compaction_removes_only_equal_identity_aliases() -> None:
+    record = {
+        "kind": "message",
+        "dialog_id": "-1",
+        "message_id": "5",
+        "message_key": "-1:5",
+        "reply_to_dialog_id": None,
+        "reply_to_message_id": None,
+        "reply_key": None,
+        "author_rank": "Equal",
+        "author_metadata": {"label": "Equal", "other": "keep"},
+        "metadata": {"_": "Message", "from_rank": "Different", "unique": True},
+        "topic_id": "7",
+        "topic": {"id": "7", "title": "Keep"},
+        "related_users": [{"rank": "R", "metadata": {"label": "R", "extra": 1}}],
+        "reactors": [{"actor_rank": "A", "actor_metadata": {"label": "A", "raw": True}}],
+    }
+    original = deepcopy(record)
+    compacted = compact_export_record("messages.item", record)
+    assert "message_key" not in compacted and "reply_key" not in compacted
+    assert compacted["metadata"] == {"from_rank": "Different", "unique": True}
+    assert compacted["author_metadata"] == {"other": "keep"}
+    assert compacted["topic"] == {"title": "Keep"}
+    assert compacted["related_users"] == [{"rank": "R", "metadata": {"extra": 1}}]
+    assert compacted["reactors"] == [{"actor_rank": "A", "actor_metadata": {"raw": True}}]
+    assert compact_export_record("messages.item", compacted) == compacted
+    assert record == original
+
+
+def test_v3_compaction_removes_present_equal_null_aliases_only() -> None:
+    record = {
+        "author_rank": None,
+        "author_metadata": {"label": None},
+        "metadata": {"from_rank": None},
+        "topic_id": None,
+        "topic": {"id": None},
+    }
+    compacted = compact_export_record("messages.item", record)
+    assert compacted == {
+        "author_rank": None,
+        "author_metadata": {},
+        "metadata": {},
+        "topic_id": None,
+        "topic": {},
+    }
+    missing = compact_export_record("messages.item", {"author_rank": None, "author_metadata": {}})
+    assert missing == {"author_rank": None, "author_metadata": {}}
+
+
 @pytest.mark.parametrize(
     ("kind", "identifier", "peer"),
     [
@@ -249,7 +310,9 @@ def test_existing_v1_deduplication_is_idempotent_and_keeps_incremental_cursors(t
     try:
         checkpoint.mark("base_fingerprint", fingerprint(base))
         checkpoint.import_base(base, before)
-        assert [json.loads(item) for item in checkpoint.records("message", -1001)] == [cleaned]
+        restored = [json.loads(item) for item in checkpoint.records("message", -1001)]
+        assert restored[0]["message_id"] == cleaned["message_id"]
+        assert "message_key" not in restored[0]
     finally:
         checkpoint.close()
     assert base.read_bytes() == original_bytes

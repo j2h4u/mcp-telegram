@@ -8,43 +8,28 @@ import argparse
 import json
 import os
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TextIO
 
-from mcp_telegram.chat_export_checkpoint import base_records, census, fingerprint
-from mcp_telegram.chat_export_schema import CURRENT_FORMAT_VERSION, migrate_record, read_export_version
+from mcp_telegram.chat_export_checkpoint import Payload, base_records, census, fingerprint
+from mcp_telegram.chat_export_identity import write_export
+from mcp_telegram.chat_export_schema import (
+    CURRENT_FORMAT_VERSION,
+    IDENTITY_FORMAT_VERSION,
+    migrate_record,
+    read_export_version,
+)
 
 
 def _write_migration(path: Path, stream: TextIO, version: int) -> None:
-    stream.write(f'{{"format_version":{CURRENT_FORMAT_VERSION}')
-    admins = messages = 0
-    messages_started = False
-    for kind, source in base_records(path):
-        record = migrate_record(version, kind, source)
-        if kind in {"group", "metadata"}:
-            stream.write(f',"{kind}":')
-            json.dump(record, stream, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-            if kind == "metadata":
-                stream.write(',"admin_events":[')
-        elif kind == "admin_events.item":
-            if admins:
-                stream.write(",")
-            json.dump(record, stream, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-            admins += 1
-        elif kind == "messages.item":
-            if not messages_started:
-                stream.write('],"messages":[')
-                messages_started = True
-            if messages:
-                stream.write(",")
-            json.dump(record, stream, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-            messages += 1
-        elif kind == "export":
-            if not messages_started:
-                stream.write('],"messages":[')
-            stream.write('],"export":')
-            json.dump(record, stream, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    stream.write("}\n")
+    def records() -> Iterator[tuple[str, Payload]]:
+        for kind, source in base_records(path):
+            if kind == "identities.item":
+                continue
+            yield kind, migrate_record(version, kind, source, internal=version == IDENTITY_FORMAT_VERSION)
+
+    write_export(records, stream)
 
 
 def migrate_export(path: Path, output: Path) -> dict[str, int]:

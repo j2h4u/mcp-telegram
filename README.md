@@ -348,10 +348,16 @@ to fetch only new messages. Older records and the original file remain unchanged
 Available new admin events are added. An update is also resumable with the same
 command and unchanged base file.
 
-Each `messages` record has scalar author, date, text and reply columns for
-analysis. IDs are strings; join replies using `reply_to_dialog_id` and
-`reply_to_message_id` against `dialog_id` and `message_id`. Formatting,
-service actions, reactors and additional Telegram metadata remain nested.
+Format version 4 stores each distinct user identity once in `identities`.
+Message `author`, reactor/admin-event `actor`, and `related_users` values are
+array indices into that directory. Different observed names or roles remain
+different snapshots. IDs are strings; join replies using `reply_to_dialog_id`
+and `reply_to_message_id` against `dialog_id` and `message_id`. Formatting,
+service actions and additional Telegram metadata remain nested. An exact copy
+of a reactor event in `reactions.aggregate.recent_reactions` is replaced by
+`{"reactor": index}`, referring to that message's `reactors` array.
+The CLI validates the versioned schema and references before incremental
+acquisition and deterministically migrates older supported files on import.
 Administrator roles describe the current target group, including for messages
 from a migrated predecessor. The separate JSON projector does not change how
 Telegram data is acquired or stored.
@@ -365,6 +371,8 @@ import pandas as pd
 with open("group.json", encoding="utf-8") as source:
     export = json.load(source)
 messages = pd.DataFrame(export["messages"])
+identities = pd.DataFrame(export["identities"])
+messages["author_id"] = messages["author"].map(identities["id"])
 conversation = messages[messages["kind"] == "message"]
 activity = conversation.groupby("author_id").size().sort_values(ascending=False)
 replies = conversation[conversation["reply_to_message_id"].notna()]
@@ -376,9 +384,9 @@ Pandas; the exporter itself keeps only bounded pages and caches in memory.
 This is a rare independent operation: it does not enroll the group or populate
 the local archive. All acquisition uses the daemon's shared RPC protections at
 background priority. Progress, waits and approximate history ETA go to stderr.
-An interrupted export starts over; its temporary file is cleaned on handled
-errors, and an existing destination is never overwritten. Run inside Docker
-with an output path on a mounted host directory if using the container's CLI.
+An interrupted export resumes from its sidecar as described above. Temporary
+publication files are removed after use. Run inside Docker with an output
+path on a mounted host directory if using the container's CLI.
 
 Ordinary message reading preserves full formatting spans and service-action
 payloads too. Spans use UTF-16 offsets into the original `formatting_text`;

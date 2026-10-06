@@ -9,7 +9,8 @@ from jsonschema import Draft202012Validator
 from mcp_telegram import chat_export_cli as cli
 from mcp_telegram.chat_export_checkpoint import ORDER, Checkpoint, census
 from mcp_telegram.chat_export_schema import (
-    CURRENT_FORMAT_VERSION,
+    IDENTITY_FORMAT_VERSION,
+    INTERNAL_FORMAT_VERSION,
     migrate_record,
     read_export_version,
     schema_for_version,
@@ -40,7 +41,7 @@ def document(record: dict[str, object], version: object = 1) -> dict[str, object
     }
 
 
-@pytest.mark.parametrize("version", [True, "1", 0, 3, None])
+@pytest.mark.parametrize("version", [True, "1", 0, 5, None])
 def test_future_or_malformed_version_rejected(tmp_path: Path, version: object) -> None:
     path = tmp_path / "base.json"
     path.write_text(json.dumps(document(legacy_record(), version)), encoding="utf-8")
@@ -58,19 +59,21 @@ def test_known_fields_validated_without_private_error_values(field: str, value: 
     record = legacy_record()
     record[field] = value
     with pytest.raises(ValueError) as error:
-        validate_record("messages.item", record)
+        validate_record("messages.item", record, internal=True)
     assert field in str(error.value)
     assert "Private source text" not in str(error.value)
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_migration_versions_census_and_checkpoint(tmp_path: Path, version: int) -> None:
     original = legacy_record()
+    if version == INTERNAL_FORMAT_VERSION:
+        original.pop("message_key")
     migrated = migrate_record(version, "messages.item", original)
-    assert migrated["message_key"] == "-1:5"
+    assert "message_key" not in migrated
     assert migrated["metadata"] == ({"from_rank": "Keep"} if version == 1 else original["metadata"])
     assert migrated["unique"] == original["unique"]
-    assert migrate_record(2, "messages.item", migrated) == migrated
+    assert migrate_record(INTERNAL_FORMAT_VERSION, "messages.item", migrated) == migrated
     base = tmp_path / "base.json"
     base.write_text(json.dumps(document(original, version)), encoding="utf-8")
     original_bytes = base.read_bytes()
@@ -78,7 +81,7 @@ def test_migration_versions_census_and_checkpoint(tmp_path: Path, version: int) 
     assert info["format_version"] == version
     assert info["boundaries"] == {"-1": 5}
     rebuilt = tmp_path / "new.json"
-    rebuilt.write_text(json.dumps(document(migrated, CURRENT_FORMAT_VERSION)), encoding="utf-8")
+    rebuilt.write_text(json.dumps(document(migrated, INTERNAL_FORMAT_VERSION)), encoding="utf-8")
     assert {key: val for key, val in census(rebuilt, 0).items() if key != "format_version"} == {
         key: val for key, val in info.items() if key != "format_version"
     }
@@ -98,17 +101,23 @@ def test_old_resume_checkpoint_migrates_records(tmp_path: Path) -> None:
         checkpoint.close()
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, INTERNAL_FORMAT_VERSION])
 def test_fixed_schema_registry_and_legacy_string_reactions(version: int) -> None:
     record = legacy_record()
     record["reactors"] = [{"actor_id": "42", "reaction": "👍", "raw": {"my": True}}]
     schema = schema_for_version(version)
     Draft202012Validator.check_schema(schema)
     Draft202012Validator(schema).validate(document(record, version))
+    current_schema = schema_for_version(INTERNAL_FORMAT_VERSION)
+    assert current_schema["properties"]["format_version"]["const"] == INTERNAL_FORMAT_VERSION
+    assert "message_key" not in current_schema["properties"]["messages"]["items"]["properties"]
+    wire_schema = schema_for_version(IDENTITY_FORMAT_VERSION)
+    assert "identities" in wire_schema["required"]
+    assert "message_key" not in wire_schema["properties"]["messages"]["items"]["properties"]
     with pytest.raises(ValueError):
-        schema_for_version(3)
+        schema_for_version(5)
     with pytest.raises(ValueError):
-        migrate_record(3, "messages.item", record)
+        migrate_record(5, "messages.item", record)
 
 
 @pytest.mark.asyncio

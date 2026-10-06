@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from collections import OrderedDict
+from collections.abc import Iterator
 from contextlib import suppress
 from importlib.metadata import version
 from pathlib import Path
@@ -19,6 +20,7 @@ from typing import TextIO, cast
 
 from .chat_export_checkpoint import ORDER, Checkpoint, CheckpointError, census, read_checkpoint_options
 from .chat_export_checkpoint import fingerprint as _fingerprint
+from .chat_export_identity import write_export
 from .chat_export_projection import (
     clean_facts as _facts,
 )
@@ -29,7 +31,7 @@ from .chat_export_projection import (
     project_message,
     project_reactor,
 )
-from .chat_export_schema import CURRENT_FORMAT_VERSION, validate_record
+from .chat_export_schema import INTERNAL_FORMAT_VERSION
 from .daemon_client import DaemonNotRunningError, daemon_connection
 
 MIN_RETRY_SECONDS = 0.1
@@ -409,19 +411,6 @@ def _sync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _write_records(stream: TextIO, checkpoint: Checkpoint, peers: list[Payload]) -> None:
-    for kind, field in (("admin", "admin_events"), ("message", "messages")):
-        stream.write(f',"{field}":[')
-        first = True
-        for peer in peers[:1] if kind == "admin" else peers:
-            for payload in checkpoint.records(kind, cast(int, peer["dialog_id"])):
-                if not first:
-                    stream.write(",")
-                stream.write(payload)
-                first = False
-        stream.write("]")
-
-
 def _publish(checkpoint: Checkpoint, peers: list[Payload], output: Path) -> Payload:
     if _fingerprint(output) != checkpoint.state("published"):
         raise FileExistsError(f"Export destination changed independently: {output}")
@@ -430,23 +419,27 @@ def _publish(checkpoint: Checkpoint, peers: list[Payload], output: Path) -> Payl
     summary = checkpoint.summary()
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(f'{{"format_version":{CURRENT_FORMAT_VERSION},"group":')
             group = project_group(_object(peers[0]["group"]))
-            validate_record("group", group)
-            _dump(stream, group)
-            stream.write(',"metadata":')
             metadata = {
                 "exporter": project_exporter(version("mcp-telegram")),
                 "order": ORDER,
                 "peers": [project_group(_object(peer["group"])) for peer in peers],
             }
-            validate_record("metadata", metadata)
-            _dump(stream, metadata)
-            _write_records(stream, checkpoint, peers)
-            stream.write(',"export":')
-            validate_record("export", summary)
-            _dump(stream, summary)
-            stream.write("}\n")
+
+            def records() -> Iterator[tuple[str, Payload]]:
+                yield "group", group
+                yield "metadata", metadata
+                for kind, output_kind, selected_peers in (
+                    ("admin", "admin_events.item", peers[:1]),
+                    ("message", "messages.item", peers),
+                ):
+                    for peer in selected_peers:
+                        for payload in checkpoint.records(kind, cast(int, peer["dialog_id"])):
+                            yield output_kind, cast(Payload, json.loads(payload))
+                yield "export", summary
+
+            write_export(records, stream)
+            stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
         if _fingerprint(output) != checkpoint.state("published"):
@@ -552,9 +545,10 @@ def _resume_options(checkpoint: Checkpoint, options: Payload) -> None:
         raise ChatExportError("Populated checkpoint has no export identity")
     if saved is not None and saved != options:
         raise ChatExportError("Resume options differ from the saved export")
+    checkpoint.upgrade_records()
     checkpoint.mark("options", options)
     if saved is None:
-        checkpoint.mark("format_version", CURRENT_FORMAT_VERSION)
+        checkpoint.mark("format_version", INTERNAL_FORMAT_VERSION)
     pending = checkpoint.state("pending_publish")
     output = Path(cast(str, options["output"]))
     if pending is not None and _fingerprint(output) == pending:
