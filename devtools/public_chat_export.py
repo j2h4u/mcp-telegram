@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TextIO, cast
 
 from mcp_telegram.chat_export_checkpoint import base_records, fingerprint
+from mcp_telegram.chat_export_identity import IdentityIndex
 from mcp_telegram.chat_export_projection import omit_empty_fields
 from mcp_telegram.chat_export_schema import IDENTITY_FORMAT_VERSION, SPARSE_FORMAT_VERSION, read_export_version
 
@@ -582,31 +583,66 @@ def _removed(original: object, public: object, path: str) -> Iterator[dict[str, 
         yield {"path": path, "value": original}
 
 
-def _write_public_export(path: Path, stream: TextIO, removed_stream: TextIO) -> dict[str, int]:  # noqa: PLR0912, PLR0915
+def _remap_public_refs(record: dict[str, object], remap: Callable[[object], int]) -> None:
+    if "author" in record:
+        record["author"] = remap(record["author"])
+    if "related_users" in record:
+        record["related_users"] = [remap(ref) for ref in cast(list[object], record["related_users"])]
+    for reactor in cast(list[dict[str, object]], record.get("reactors", [])):
+        if "actor" in reactor:
+            reactor["actor"] = remap(reactor["actor"])
+
+
+def _dump_identities(stream: TextIO, index: IdentityIndex) -> None:
+    for position, identity in enumerate(index.records()):
+        if position:
+            stream.write(",")
+        json.dump(identity, stream, ensure_ascii=False, separators=(",", ":"))
+
+
+def _write_public_export(  # noqa: PLR0912, PLR0915
+    path: Path, stream: TextIO, removed_stream: TextIO, source_index: IdentityIndex, public_index: IdentityIndex
+) -> dict[str, int]:
     counts = {"messages": 0, "admin_events": 0, "reactors": 0}
     declared = None
     first_removed = True
     format_version = read_export_version(path)
-    referenced: set[int] = set()
-    if format_version >= IDENTITY_FORMAT_VERSION:
-        # Admin-only identities are private evidence even after removing the log.
-        for kind, record in base_records(path, expand_identities=False):
-            if kind != "messages.item":
-                continue
-            if "author" in record:
-                referenced.add(cast(int, record["author"]))
-            referenced.update(cast(list[int], record.get("related_users", [])))
-            for reactor in cast(list[dict[str, object]], record.get("reactors", [])):
-                if "actor" in reactor:
-                    referenced.add(cast(int, reactor["actor"]))
-    stream.write(f'{{"format_version":{format_version}')
-    removed_stream.write('{"format_version":1,"removed":[')
-    identities = 0
-    messages_started = format_version < IDENTITY_FORMAT_VERSION
 
     def project(record: object, projection: Projection) -> object:
         result = public_facts(record, projection)
         return omit_empty_fields(result) if format_version >= SPARSE_FORMAT_VERSION else result
+
+    next_public_identity = 0
+
+    def remap(reference: object) -> int:
+        nonlocal next_public_identity
+        identity = cast(dict[str, object], project(source_index.get(reference), IDENTITY))
+        # Keep v4 explicit empty facts; IdentityIndex.intern intentionally sparsifies them.
+        snapshot = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        row = cast(
+            tuple[int] | None,
+            public_index.db.execute(
+                "SELECT id FROM identities WHERE snapshot=? ORDER BY id LIMIT 1", (snapshot,)
+            ).fetchone(),
+        )
+        if row is not None:
+            return row[0] - 1
+        position = next_public_identity
+        public_index.put_at(position, identity)
+        next_public_identity += 1
+        return position
+
+    if format_version >= IDENTITY_FORMAT_VERSION:
+        next_source_identity = 0
+        for kind, record in base_records(path, expand_identities=False):
+            if kind == "identities.item":
+                source_index.put_at(next_source_identity, record)
+                next_source_identity += 1
+            elif kind == "messages.item":
+                _remap_public_refs(cast(dict[str, object], project(record, MESSAGE)), remap)
+    stream.write(f'{{"format_version":{format_version}')
+    removed_stream.write('{"format_version":1,"removed":[')
+    messages_started = format_version < IDENTITY_FORMAT_VERSION
 
     def write_removed(items: Iterator[dict[str, object]]) -> None:
         nonlocal first_removed
@@ -614,6 +650,19 @@ def _write_public_export(path: Path, stream: TextIO, removed_stream: TextIO) -> 
             if not first_removed:
                 removed_stream.write(",")
             json.dump(item, removed_stream, ensure_ascii=False, separators=(",", ":"))
+            first_removed = False
+
+    def write_identity_removals() -> None:
+        nonlocal first_removed
+        changed = source_index.count() != public_index.count() or any(
+            identity != public_index.get(position) for position, identity in enumerate(source_index.records())
+        )
+        if changed:
+            if not first_removed:
+                removed_stream.write(",")
+            removed_stream.write('{"path":"/identities","value":[')
+            _dump_identities(removed_stream, source_index)
+            removed_stream.write("]}")
             first_removed = False
 
     def start_messages() -> None:
@@ -635,19 +684,19 @@ def _write_public_export(path: Path, stream: TextIO, removed_stream: TextIO) -> 
                     if format_version >= IDENTITY_FORMAT_VERSION
                     else ',"admin_events":[],"messages":['
                 )
+                if format_version >= IDENTITY_FORMAT_VERSION:
+                    _dump_identities(stream, public_index)
+                    write_identity_removals()
         elif kind == "identities.item":
-            public = project(record, IDENTITY) if identities in referenced else {}
-            write_removed(_removed(record, public, f"/identities/{identities}"))
-            if identities:
-                stream.write(",")
-            json.dump(public, stream, ensure_ascii=False, separators=(",", ":"))
-            identities += 1
+            continue
         elif kind == "admin_events.item":
             write_removed(iter([{"path": f"/admin_events/{counts['admin_events']}", "value": record}]))
             counts["admin_events"] += 1
         elif kind == "messages.item":
             start_messages()
-            public = project(record, MESSAGE)
+            public = cast(dict[str, object], project(record, MESSAGE))
+            if format_version >= IDENTITY_FORMAT_VERSION:
+                _remap_public_refs(public, remap)
             write_removed(_removed(record, public, f"/messages/{counts['messages']}"))
             if counts["messages"]:
                 stream.write(",")
@@ -700,7 +749,9 @@ def sanitize_export(path: Path, output: Path, removed_output: Path | None = None
             stack.callback(temporary.unlink, missing_ok=True)
             streams.append(stack.enter_context(os.fdopen(descriptor, "w", encoding="utf-8")))
             staged.append((temporary, destination))
-        counts = _write_public_export(path, streams[1], streams[0])
+        source_index = stack.enter_context(IdentityIndex())
+        public_index = stack.enter_context(IdentityIndex())
+        counts = _write_public_export(path, streams[1], streams[0], source_index, public_index)
         for stream in streams:
             stream.flush()
             os.fsync(stream.fileno())

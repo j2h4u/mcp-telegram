@@ -44,7 +44,7 @@ def test_public_normalized_export_keeps_references_and_removes_admin_only_identi
         ("export", {"messages": 1, "admin_events": 1, "reactors": 0}),
     ]
     stream = io.StringIO()
-    write_export(lambda: iter(rows), stream)
+    write_export(lambda rows=rows: iter(rows), stream)
     source = tmp_path / "original.json"
     source.write_text(stream.getvalue())
     before = source.read_bytes()
@@ -60,7 +60,7 @@ def test_public_normalized_export_keeps_references_and_removes_admin_only_identi
     assert "metadata" not in raw["identities"][cast(int, raw["messages"][0]["author"])]
     assert "metadata" not in raw["messages"][0]
     assert "reactors" not in raw["messages"][0] and "related_users" not in raw["messages"][0]
-    assert any(not identity for identity in raw["identities"])
+    assert len(raw["identities"]) == 1 and raw["messages"][0]["author"] == 0
     assert "author_name" not in raw["messages"][0]
     assert "exporter" not in raw["metadata"]  # A privacy filter adds no data.
     assert "Private actor" in removed.read_text()
@@ -68,6 +68,106 @@ def test_public_normalized_export_keeps_references_and_removes_admin_only_identi
     repeated = tmp_path / "again.json"
     sanitize_export(output, repeated)
     assert repeated.read_bytes() == output.read_bytes()
+
+
+def _restore_export(public: Path, removed: Path) -> ExportDocument:
+    restored = cast(ExportDocument, json.loads(public.read_text()))
+    journal = cast(dict[str, object], json.loads(removed.read_text()))
+    for entry in cast(list[dict[str, object]], journal["removed"]):
+        parts = [part.replace("~1", "/").replace("~0", "~") for part in cast(str, entry["path"]).split("/")[1:]]
+        target = cast(dict[str, object] | list[object], restored)
+        for part in parts[:-1]:
+            target = cast(
+                dict[str, object] | list[object],
+                target[int(part)] if isinstance(target, list) else target.setdefault(part, {}),
+            )
+        if isinstance(target, list):
+            index = int(parts[-1])
+            if index == len(target):
+                target.append(entry["value"])
+            else:
+                target[index] = entry["value"]
+        else:
+            target[parts[-1]] = entry["value"]
+    return restored
+
+
+@pytest.mark.parametrize("format_version", [4, 5])
+def test_public_identity_order_is_independent_of_admin_log_and_private_snapshots(
+    tmp_path: Path, format_version: int
+) -> None:
+    from mcp_telegram.chat_export_checkpoint import base_records
+    from mcp_telegram.chat_export_identity import write_export
+
+    outputs = []
+    expanded_outputs = []
+    for variant, private_actor in enumerate((None, "102", "103")):
+        rows = [
+            ("group", {"dialog_id": "-1001", "title": "Group"}),
+            ("metadata", {"order": ORDER, "peers": [{"dialog_id": "-1001", "title": "Group"}]}),
+        ]
+        if private_actor:
+            rows.append(("admin_events.item", {"dialog_id": "-1001", "event_id": "1", "actor_id": private_actor}))
+        for number, identifier in ((3, "101"), (2, "102"), (1, "101")):
+            rows.append(
+                (
+                    "messages.item",
+                    {
+                        "dialog_id": "-1001",
+                        "message_id": str(number),
+                        "author_id": identifier,
+                        "author_metadata": {"private_marker": f"{variant}-{number}"},
+                        "related_users": [{"id": "102", "metadata": {"private_marker": variant}}],
+                        "reactors": [
+                            {"actor_id": "102", "actor_metadata": {"private_marker": variant}, "reaction": "👍"}
+                        ],
+                        "reactions": {"aggregate": {"recent_reactions": [{"reaction": "👍"}]}},
+                        "text": "Public",
+                    },
+                )
+            )
+        rows.append(("export", {"messages": 3, "admin_events": int(bool(private_actor)), "reactors": 3}))
+        stream = io.StringIO()
+        write_export(lambda rows=rows: iter(rows), stream)
+        original = cast(ExportDocument, json.loads(stream.getvalue()))
+        original["format_version"] = format_version
+        if format_version == 4:
+            for identity in original["identities"]:
+                identity["username"] = None
+        source = tmp_path / f"source-{variant}.json"
+        source.write_text(json.dumps(original))
+        output = tmp_path / f"public-{variant}.json"
+        removed = tmp_path / f"removed-{variant}.json"
+        sanitize_export(source, output, removed)
+        census(output, 0)
+        public = cast(ExportDocument, json.loads(output.read_text()))
+        assert len(public["identities"]) == 2
+        assert [message["author"] for message in public["messages"]] == [0, 1, 0]
+        assert all(message["related_users"] == [1] for message in public["messages"])
+        assert all(
+            cast(list[dict[str, object]], message["reactors"])[0]["actor"] == 1 for message in public["messages"]
+        )
+        assert all(
+            cast(dict[str, object], cast(dict[str, object], message["reactions"])["aggregate"])["recent_reactions"]
+            == [{"reactor": 0}]
+            for message in public["messages"]
+        )
+        if format_version == 4:
+            assert all(identity["username"] is None for identity in public["identities"])
+        outputs.append(output.read_bytes())
+        expanded_outputs.append([record for kind, record in base_records(output) if kind == "messages.item"])
+        assert _restore_export(output, removed) == original
+        repeated = tmp_path / f"again-{variant}.json"
+        sanitize_export(output, repeated)
+        assert repeated.read_bytes() == output.read_bytes()
+        assert (
+            cast(dict[str, object], json.loads(repeated.with_name(f"{repeated.stem}.removed.json").read_text()))[
+                "removed"
+            ]
+            == []
+        )
+    assert outputs[0] == outputs[1] == outputs[2]
+    assert expanded_outputs[0] == expanded_outputs[1] == expanded_outputs[2]
 
 
 def test_public_paid_leaderboard_and_poll_attachment_are_account_independent() -> None:
