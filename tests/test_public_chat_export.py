@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 from devtools.public_chat_export import sanitize_export
@@ -67,15 +68,20 @@ def test_public_export_is_account_independent_atomic_and_idempotent(tmp_path: Pa
         assert path.read_bytes() == original and output.read_bytes() == first
         outputs.append(first)
     assert outputs[0] == outputs[1]
-    result = json.loads(outputs[0])
-    message = result["messages"][0]
+    result = cast(dict[str, object], json.loads(outputs[0]))
+    message = cast(dict[str, object], cast(list[object], result["messages"])[0])
     assert result["admin_events"] == []
     assert message["author_id"] == "123" and message["text"] == "Keep this"
     assert message["author_rank"] == "Moderator" and "author_role" not in message
     assert message["reply_key"] == "-1001:2" and message["entities"]
-    assert message["metadata"]["media"]["results"]["results"] == [{"option": "a", "voters": 5}]
+    assert message["metadata"] == {
+        "replies": {"replies": 2},
+        "media": {
+            "poll": {"question": "Keep question", "public_voters": False},
+            "results": {"results": [{"option": "a", "voters": 5}]},
+        },
+    }
     assert message["reactors"] == [{"actor_id": "456", "reaction": "👍"}]
-    assert message["metadata"]["replies"] == {"replies": 2}
 
     broken = tmp_path / "broken.json"
     original = outputs[0][:-2]
