@@ -7,7 +7,6 @@ import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -45,6 +44,8 @@ from ..telegram_reading import (
 )
 from ..temporal import parse_utc_boundary
 from .draft_projection import draft_message_key, read_drafts
+from .history_scan import HistoryScanRequest as _ListMessagesTelegramRequest
+from .history_scan import scan_history
 from .query_records import read_message_from_row
 from .scheduled_projection import (
     build_scheduled_list_query,
@@ -308,35 +309,6 @@ class _AllNavigationPosition:
             self.draft_key = str(row["message_key"])
 
 
-_MAX_TELEGRAM_BOUNDARY_BATCHES = 16
-
-
-@dataclass(frozen=True)
-class _ListMessagesTelegramRequest:
-    dialog_id: int
-    limit: int
-    direction: str
-    direction_enum: HistoryDirection
-    anchor_msg_id: int | None
-    sender_id: int | None
-    topic_id: int | None
-    unread_after_id: int | None
-    unread: bool = False
-    since_utc: int | None = None
-    until_utc: int | None = None
-
-
-@dataclass
-class _TelegramBatchRun:
-    messages: list[object]
-    last_raw_message: object | None
-    last_batch_index: int
-    last_batch_size: int
-    last_batch_message_id: int
-    last_batch_previous_offset: int | None
-    failure: GatewayFailure | None = None
-
-
 @dataclass(frozen=True, slots=True)
 class _HistoryNavigationContext:
     """Immutable request context bound into a history continuation token."""
@@ -499,100 +471,6 @@ def _message_sent_at(item: object) -> int | None:
     if isinstance(item, ReadMessage):
         return item.sent_at
     return _object_to_int_or_none(_row_value(item, "sent_at"))
-
-
-@dataclass(frozen=True, slots=True)
-class _TelegramBatchSelection:
-    messages: tuple[object, ...]
-    seen_ids: frozenset[int]
-    last_message_id: int
-    last_raw_message: object | None
-
-
-@dataclass(frozen=True, slots=True)
-class _TelegramBatchRequest:
-    batch: Sequence[object]
-    seen_ids: frozenset[int]
-    current_count: int
-    limit: int
-    since_utc: int | None
-    until_utc: int | None
-
-
-def _select_telegram_batch(request: _TelegramBatchRequest) -> _TelegramBatchSelection:
-    """Select one bounded history batch without mutating request state."""
-    selected: list[object] = []
-    updated_seen = set(request.seen_ids)
-    for message in request.batch:
-        message_id = _message_id_from_item(message)
-        if message_id in updated_seen:
-            continue
-        updated_seen.add(message_id)
-        sent_at = _message_sent_at(message)
-        if not _telegram_message_in_time_range(sent_at, request):
-            continue
-        selected.append(message)
-        if request.current_count + len(selected) >= request.limit:
-            break
-    return _TelegramBatchSelection(
-        messages=tuple(selected),
-        seen_ids=frozenset(updated_seen),
-        last_message_id=_message_id_from_item(request.batch[-1]) if request.batch else 0,
-        last_raw_message=request.batch[-1] if request.batch else None,
-    )
-
-
-def _telegram_message_in_time_range(sent_at: int | None, request: _TelegramBatchRequest) -> bool:
-    if sent_at is None:
-        return False
-    if request.since_utc is not None and sent_at < request.since_utc:
-        return False
-    return request.until_utc is None or sent_at < request.until_utc
-
-
-def _next_telegram_offset(last_message_id: int, current_offset: int | None) -> int | None:
-    if last_message_id <= 0 or last_message_id == current_offset:
-        return None
-    return last_message_id
-
-
-@dataclass(frozen=True, slots=True)
-class _TelegramBatchCapContext:
-    has_time_bounds: bool
-    message_count: int
-    limit: int
-    batch_size: int
-    batch_index: int
-    max_batches: int
-    last_message_id: int
-    previous_offset: int | None
-
-
-def _telegram_batch_cap_reached(context: _TelegramBatchCapContext) -> bool:
-    return (
-        context.has_time_bounds
-        and context.message_count < context.limit
-        and context.batch_size >= context.limit
-        and context.batch_index == context.max_batches - 1
-        and context.last_message_id > 0
-        and context.last_message_id != context.previous_offset
-    )
-
-
-def _telegram_history_kwargs(req: _ListMessagesTelegramRequest) -> dict[str, object]:
-    return {
-        key: value
-        for key, value in {
-            "limit": req.limit,
-            "offset_id": req.anchor_msg_id,
-            "from_user": req.sender_id,
-            "reply_to": req.topic_id,
-            "min_id": req.unread_after_id,
-            "reverse": True if req.direction == "oldest" else None,
-            "offset_date": datetime.fromtimestamp(req.until_utc, tz=UTC) if req.until_utc is not None else None,
-        }.items()
-        if value is not None
-    }
 
 
 def _context_uses_fragment_fallback(status: str | None) -> bool:
@@ -802,55 +680,6 @@ class ReadingService:
     @staticmethod
     def _navigation_sent_at(message: object) -> int | None:
         return _message_sent_at(message)
-
-    @staticmethod
-    def _telegram_boundary_continuation(
-        req: _ListMessagesTelegramRequest,
-        last_raw_message: object | None,
-    ) -> str | None:
-        """Continue after the last raw batch when bounded paging hits its cap."""
-        if last_raw_message is None:
-            return None
-        message_id = _message_id_from_item(last_raw_message)
-        if message_id <= 0:
-            return None
-        return encode_history_navigation(
-            message_id,
-            req.dialog_id,
-            topic_id=req.topic_id,
-            direction=req.direction_enum,
-            sent_at=ReadingService._navigation_sent_at(last_raw_message),
-            message_state="sent",
-            unread=req.unread,
-            since_utc=req.since_utc,
-            until_utc=req.until_utc,
-        )
-
-    def _telegram_next_navigation(
-        self,
-        req: _ListMessagesTelegramRequest,
-        messages: list[object],
-        last_raw_message: object | None,
-        batch_cap_reached: bool,
-    ) -> str | None:
-        if batch_cap_reached and len(messages) < req.limit:
-            return self._telegram_boundary_continuation(req, last_raw_message)
-        return self._maybe_encode_next_nav(
-            _NextNavContext(
-                messages=messages,
-                limit=req.limit,
-                dialog_id=req.dialog_id,
-                direction=req.direction,
-                direction_enum=req.direction_enum,
-                topic_id=req.topic_id,
-                logger=self._logger,
-                request_id=self._deps.rid,
-                message_state="sent",
-                unread=req.unread,
-                since_utc=req.since_utc,
-                until_utc=req.until_utc,
-            ),
-        )
 
     @staticmethod
     def _decode_history_navigation(
@@ -1714,101 +1543,39 @@ class ReadingService:
     ) -> dict:
         """Fetch messages on-demand from Telegram API."""
         self._logger.debug("list_messages_fallback_telegram dialog_id=%d%s", req.dialog_id, self._deps.rid())
-        base_kwargs = _telegram_history_kwargs(req)
-        has_time_bounds = req.since_utc is not None or req.until_utc is not None
-        max_batches = _MAX_TELEGRAM_BOUNDARY_BATCHES if has_time_bounds else 1
         with timing_phase("telegram_fallback"):
-            batch_run = await self._fetch_telegram_batches(req, base_kwargs, max_batches)
-        if batch_run.failure is not None:
-            return self._list_messages_telegram_error(req, batch_run.failure)
+            result = await scan_history(self._deps.history_gateway, req, self_id=self._deps.self_id)
+        self._logger.info(
+            "history_scan_complete stop=%s matched_count=%d%s",
+            result.stop,
+            len(result.messages),
+            self._deps.rid(),
+        )
+        if result.failure is not None:
+            return self._list_messages_telegram_error(req, result.failure)
         with timing_phase("response_shape"):
-            messages = batch_run.messages
-            batch_cap_reached = _telegram_batch_cap_reached(
-                _TelegramBatchCapContext(
-                    has_time_bounds=has_time_bounds,
-                    message_count=len(messages),
-                    limit=req.limit,
-                    batch_size=batch_run.last_batch_size,
-                    batch_index=batch_run.last_batch_index,
-                    max_batches=max_batches,
-                    last_message_id=batch_run.last_batch_message_id,
-                    previous_offset=batch_run.last_batch_previous_offset,
-                ),
-            )
-            messages = messages[: req.limit]
-
-            next_nav = self._telegram_next_navigation(req, messages, batch_run.last_raw_message, batch_cap_reached)
+            messages = list(result.messages)
+            resume_after = result.resume_after
+            next_nav = None
+            if resume_after is not None and result.stop in {"output_limit", "candidate_limit", "window_edge"}:
+                message_id = _message_id_from_item(resume_after.message)
+                if message_id > 0:
+                    sent_at = int(resume_after.date.timestamp()) if resume_after.date is not None else None
+                    next_nav = encode_history_navigation(
+                        message_id,
+                        req.dialog_id,
+                        topic_id=req.topic_id,
+                        direction=req.direction_enum,
+                        sent_at=sent_at,
+                        message_state="sent",
+                        unread=req.unread,
+                        since_utc=req.since_utc,
+                        until_utc=req.until_utc,
+                    )
             return {
                 "ok": True,
                 "data": {"messages": messages, "source": "telegram", "next_navigation": next_nav},
             }
-
-    async def _fetch_telegram_batches(
-        self,
-        req: _ListMessagesTelegramRequest,
-        base_kwargs: dict[str, object],
-        max_batches: int,
-    ) -> _TelegramBatchRun:
-        messages: list[object] = []
-        seen_message_ids: set[int] = set()
-        next_offset_id = req.anchor_msg_id
-        last_raw_message: object | None = None
-        last_batch_index = -1
-        last_batch_size = 0
-        last_batch_message_id = 0
-        last_batch_previous_offset: int | None = None
-        for batch_index in range(max_batches):
-            last_batch_index = batch_index
-            last_batch_previous_offset = next_offset_id
-            iter_kwargs = {**base_kwargs, "offset_id": next_offset_id} if next_offset_id is not None else base_kwargs
-            history_result = await self._deps.history_gateway.fetch_history(
-                req.dialog_id,
-                iter_kwargs,
-                self._deps.self_id,
-            )
-            if not history_result.ok:
-                failure = history_result.failure
-                assert failure is not None
-                return _TelegramBatchRun(
-                    messages=messages,
-                    last_raw_message=last_raw_message,
-                    last_batch_index=last_batch_index,
-                    last_batch_size=last_batch_size,
-                    last_batch_message_id=last_batch_message_id,
-                    last_batch_previous_offset=last_batch_previous_offset,
-                    failure=failure,
-                )
-            batch = list(history_result.messages)
-            last_batch_size = len(batch)
-            selection = _select_telegram_batch(
-                _TelegramBatchRequest(
-                    batch=batch,
-                    seen_ids=frozenset(seen_message_ids),
-                    current_count=len(messages),
-                    limit=req.limit,
-                    since_utc=req.since_utc,
-                    until_utc=req.until_utc,
-                ),
-            )
-            seen_message_ids = set(selection.seen_ids)
-            messages.extend(selection.messages)
-            last_batch_message_id = selection.last_message_id
-            if selection.last_raw_message is not None:
-                last_raw_message = selection.last_raw_message
-            if len(messages) >= req.limit or len(batch) < req.limit:
-                break
-            next_offset = _next_telegram_offset(last_batch_message_id, next_offset_id)
-            if next_offset is None:
-                break
-            next_offset_id = next_offset
-        return _TelegramBatchRun(
-            messages=messages,
-            last_raw_message=last_raw_message,
-            last_batch_index=last_batch_index,
-            last_batch_size=last_batch_size,
-            last_batch_message_id=last_batch_message_id,
-            last_batch_previous_offset=last_batch_previous_offset,
-        )
 
     def _list_messages_telegram_error(self, req: _ListMessagesTelegramRequest, failure: GatewayFailure) -> dict:
         if not failure.retryable or failure.kind.value in {"flood_wait", "access_lost", "transient"}:
