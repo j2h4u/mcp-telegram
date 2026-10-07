@@ -32,6 +32,7 @@ from mcp_telegram.telegram_read_receipts import (
 from mcp_telegram.telegram_reading import (
     GatewayFailure,
     GatewayFailureKind,
+    HistoryMessage,
     ReadDateFetchResult,
     ReadDateReason,
 )
@@ -78,12 +79,16 @@ class _HistoryClient:
         self.error = error
         self.calls: list[tuple[int, dict[str, object]]] = []
 
-    async def iter_messages(self, dialog_id: int, **kwargs: object) -> AsyncIterator[object]:
+    def iter_messages(self, dialog_id: int, **kwargs: object) -> AsyncIterator[object]:
         self.calls.append((dialog_id, kwargs))
-        for message in self.messages:
-            yield message
-        if self.error is not None:
-            raise self.error
+
+        async def stream() -> AsyncIterator[object]:
+            for message in self.messages:
+                yield message
+            if self.error is not None:
+                raise self.error
+
+        return stream()
 
 
 def _seed_synced(conn: sqlite3.Connection, dialog_id: int) -> None:
@@ -102,30 +107,42 @@ def _seed_enrollment(conn: sqlite3.Connection, dialog_id: int, *, enabled: bool 
 
 
 @pytest.mark.asyncio
-async def test_history_gateway_projects_ordered_messages_and_preserves_query_options() -> None:
+async def test_history_gateway_streams_ordered_messages_and_preserves_query_options() -> None:
     client = _HistoryClient([_message(10), _message(12)])
 
-    result = await TelethonTelegramHistoryGateway(client).fetch_history(
-        42,
-        {"limit": 2, "reverse": True},
-        self_id=101,
-    )
+    streamed = [
+        item
+        async for item in TelethonTelegramHistoryGateway(client).stream_history(
+            42,
+            {"limit": 2, "reverse": True},
+            self_id=101,
+        )
+    ]
 
     assert client.calls == [(42, {"limit": 2, "reverse": True})]
-    assert result.failure is None
-    assert [message["message_id"] for message in result.messages] == [10, 12]
-    assert [message["dialog_id"] for message in result.messages] == [42, 42]
-    assert [message["effective_sender_id"] for message in result.messages] == [101, 101]
+    assert all(isinstance(item, HistoryMessage) for item in streamed)
+    messages = [item.message for item in streamed if isinstance(item, HistoryMessage)]
+    assert [message["message_id"] for message in messages] == [10, 12]
+    assert [message["dialog_id"] for message in messages] == [42, 42]
+    assert [message["effective_sender_id"] for message in messages] == [101, 101]
 
 
 @pytest.mark.asyncio
-async def test_history_gateway_returns_structured_failure_without_partial_messages() -> None:
+async def test_history_gateway_streams_prefix_before_structured_failure() -> None:
     client = _HistoryClient([_message(10)], error=ValueError("dialog not available"))
 
-    result = await TelethonTelegramHistoryGateway(client).fetch_history(42, {"limit": 2}, self_id=101)
+    streamed = [
+        item
+        async for item in TelethonTelegramHistoryGateway(client).stream_history(
+            42,
+            {"limit": 2},
+            self_id=101,
+        )
+    ]
 
-    assert result.messages == ()
-    assert result.failure == GatewayFailure(
+    assert isinstance(streamed[0], HistoryMessage)
+    assert streamed[0].message["message_id"] == 10
+    assert streamed[1] == GatewayFailure(
         kind=GatewayFailureKind.INVALID_TARGET,
         error_type="ValueError",
         error_message="dialog not available",

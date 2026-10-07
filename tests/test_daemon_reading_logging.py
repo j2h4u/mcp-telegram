@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -16,20 +17,20 @@ from mcp_telegram.reactions.contracts import ReactionFreshness
 from mcp_telegram.reading import ReadingDeps, ReadingService
 from mcp_telegram.reading.service import (
     _ListMessagesTelegramRequest,
-    _next_telegram_offset,
     _object_to_int,
     _object_to_int_or_none,
     _row_sequence,
     _row_value,
     _SearchMessagesRequest,
-    _select_telegram_batch,
-    _telegram_batch_cap_reached,
-    _TelegramBatchCapContext,
-    _TelegramBatchRequest,
 )
 from mcp_telegram.telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
 from mcp_telegram.telegram_history import TelethonTelegramHistoryGateway
-from mcp_telegram.telegram_reading import HistoryFetchResult, TelegramHistoryGateway
+from mcp_telegram.telegram_reading import (
+    GatewayFailure,
+    GatewayFailureKind,
+    HistoryMessage,
+    TelegramHistoryGateway,
+)
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
@@ -73,17 +74,27 @@ class _TestLogger:
 
 
 class _PagedHistoryGateway:
-    def __init__(self, pages: list[tuple[dict[str, object], ...]]) -> None:
-        self.pages = pages
+    def __init__(
+        self,
+        pages: list[tuple[dict[str, object], ...]],
+        *,
+        failure: GatewayFailure | None = None,
+    ) -> None:
+        self.messages = [message for page in pages for message in page]
+        self.failure = failure
         self.calls: list[dict[str, object]] = []
 
-    async def fetch_history(
+    async def stream_history(
         self, dialog_id: int, kwargs: Mapping[str, object], self_id: int | None
-    ) -> HistoryFetchResult:
+    ) -> AsyncGenerator[HistoryMessage | GatewayFailure]:
         _ = (dialog_id, self_id)
         self.calls.append(dict(kwargs))
-        page = self.pages.pop(0) if self.pages else ()
-        return HistoryFetchResult(messages=page)
+        for message in self.messages:
+            sent_at = message.get("sent_at")
+            date = datetime.fromtimestamp(sent_at, tz=UTC) if isinstance(sent_at, int) else None
+            yield HistoryMessage(message=message, date=date)
+        if self.failure is not None:
+            yield self.failure
 
 
 @pytest.mark.parametrize(
@@ -188,85 +199,6 @@ def test_read_state_per_dialog_skips_non_dm_and_zero_dialogs() -> None:
     assert set(states) == {7}
     assert states[7]["inbox_unread_count"] == 1
     assert states[7]["outbox_unread_count"] == 1
-
-
-def test_telegram_batch_selection_filters_deduplicates_and_stops_at_limit() -> None:
-    batch = (
-        {"message_id": 1, "sent_at": 100},
-        {"message_id": 1, "sent_at": 100},
-        {"message_id": 2},
-        {"message_id": 3, "sent_at": 200},
-        {"message_id": 4, "sent_at": 300},
-    )
-
-    selection = _select_telegram_batch(
-        _TelegramBatchRequest(
-            batch=batch,
-            seen_ids=frozenset({9}),
-            current_count=1,
-            limit=2,
-            since_utc=150,
-            until_utc=300,
-        ),
-    )
-
-    assert selection.messages == (batch[3],)
-    assert selection.seen_ids == frozenset({1, 2, 3, 9})
-    assert selection.last_message_id == 4
-    assert selection.last_raw_message is batch[4]
-
-    empty = _select_telegram_batch(
-        _TelegramBatchRequest(
-            batch=(),
-            seen_ids=frozenset(),
-            current_count=0,
-            limit=10,
-            since_utc=None,
-            until_utc=None,
-        ),
-    )
-    assert empty.messages == ()
-    assert empty.last_message_id == 0
-    assert empty.last_raw_message is None
-
-
-@pytest.mark.parametrize(
-    ("last_message_id", "current_offset", "expected"),
-    [(0, None, None), (12, 12, None), (12, None, 12)],
-)
-def test_telegram_offset_progression_stops_on_invalid_or_repeated_id(
-    last_message_id: int,
-    current_offset: int | None,
-    expected: int | None,
-) -> None:
-    assert _next_telegram_offset(last_message_id, current_offset) == expected
-
-
-def test_telegram_batch_cap_predicate_requires_all_boundary_conditions() -> None:
-    assert _telegram_batch_cap_reached(
-        _TelegramBatchCapContext(
-            has_time_bounds=True,
-            message_count=1,
-            limit=10,
-            batch_size=10,
-            batch_index=15,
-            max_batches=16,
-            last_message_id=20,
-            previous_offset=10,
-        ),
-    )
-    assert not _telegram_batch_cap_reached(
-        _TelegramBatchCapContext(
-            has_time_bounds=False,
-            message_count=1,
-            limit=10,
-            batch_size=10,
-            batch_index=15,
-            max_batches=16,
-            last_message_id=20,
-            previous_offset=10,
-        ),
-    )
 
 
 def _telegram_service(gateway: _PagedHistoryGateway, conn: sqlite3.Connection | None = None) -> ReadingService:
@@ -601,7 +533,7 @@ async def test_build_read_messages_projects_persisted_reaction_events() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_messages_telegram_boundary_fetch_fills_page_and_continues() -> None:
+async def test_list_messages_telegram_stream_filters_window_and_continues() -> None:
     gateway = _PagedHistoryGateway(
         [
             ({"message_id": 1, "sent_at": 100}, {"message_id": 2, "sent_at": 101}),
@@ -630,12 +562,13 @@ async def test_list_messages_telegram_boundary_fetch_fills_page_and_continues() 
     assert result["ok"] is True
     assert [row["message_id"] for row in result["data"]["messages"]] == [3, 4]
     assert result["data"]["next_navigation"] is not None
-    assert len(gateway.calls) == 2
-    assert gateway.calls[1]["offset_id"] == 2
+    assert len(gateway.calls) == 1
+    assert gateway.calls[0]["reverse"] is True
+    assert "offset_date" not in gateway.calls[0]
 
 
 @pytest.mark.asyncio
-async def test_list_messages_telegram_boundary_cutoff_is_exclusive_and_bounded() -> None:
+async def test_list_messages_telegram_until_is_exclusive() -> None:
     gateway = _PagedHistoryGateway(
         [
             ({"message_id": 10, "sent_at": 300}, {"message_id": 9, "sent_at": 299}),
@@ -664,7 +597,45 @@ async def test_list_messages_telegram_boundary_cutoff_is_exclusive_and_bounded()
     assert result["ok"] is True
     assert [row["message_id"] for row in result["data"]["messages"]] == [9]
     assert result["data"]["next_navigation"] is None
-    assert len(gateway.calls) == 2
+    assert len(gateway.calls) == 1
+    assert gateway.calls[0]["offset_date"] == datetime.fromtimestamp(300, tz=UTC)
+
+
+@pytest.mark.asyncio
+async def test_public_telegram_read_discards_successful_prefix_on_stream_failure() -> None:
+    failure = GatewayFailure(
+        kind=GatewayFailureKind.TRANSIENT,
+        error_type="OSError",
+        error_message="temporary failure",
+        retryable=True,
+    )
+    gateway = _PagedHistoryGateway(
+        [({"message_id": 5, "sent_at": 150},)],
+        failure=failure,
+    )
+    service = _telegram_service(gateway)
+    try:
+        result = await service.list_messages_from_telegram(
+            _ListMessagesTelegramRequest(
+                dialog_id=123,
+                limit=2,
+                direction="newest",
+                direction_enum=HistoryDirection.NEWEST,
+                anchor_msg_id=None,
+                sender_id=None,
+                topic_id=None,
+                unread_after_id=None,
+                since_utc=None,
+                until_utc=None,
+            )
+        )
+    finally:
+        service._conn.close()
+
+    assert result["ok"] is False
+    assert result["error"] == "telegram_error"
+    assert result["detail"]["error_type"] == "OSError"
+    assert len(gateway.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -701,4 +672,4 @@ async def test_list_messages_telegram_boundary_cap_exposes_continuation() -> Non
     assert token.value == 32
     assert token.since_utc == 1000
     assert token.until_utc == 2000
-    assert len(gateway.calls) == 16
+    assert len(gateway.calls) == 1

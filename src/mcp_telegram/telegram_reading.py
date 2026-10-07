@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Mapping
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Protocol
 
@@ -91,13 +92,9 @@ class FragmentFetchResult:
 
 
 @dataclass(frozen=True, slots=True)
-class HistoryFetchResult:
-    messages: tuple[dict[str, object], ...] = ()
-    failure: GatewayFailure | None = None
-
-    @property
-    def ok(self) -> bool:
-        return self.failure is None
+class HistoryMessage:
+    message: dict[str, object]
+    date: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,9 +116,9 @@ class TelegramFragmentGateway(Protocol):
 
 
 class TelegramHistoryGateway(Protocol):
-    async def fetch_history(
+    def stream_history(
         self, dialog_id: int, kwargs: Mapping[str, object], self_id: int | None
-    ) -> HistoryFetchResult: ...
+    ) -> AsyncGenerator[HistoryMessage | GatewayFailure]: ...
 
 
 class TelegramReadReceiptGateway(Protocol):
