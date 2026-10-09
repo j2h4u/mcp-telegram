@@ -49,6 +49,10 @@ from mcp_telegram.telegram_rpc_scheduler import (
 
 def _hydration_db() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute(
+        "CREATE TABLE message_observations (dialog_id INTEGER, message_id INTEGER, observation_order INTEGER, is_deleted INTEGER)"
+    )
     conn.execute(
         """CREATE TABLE hydration_jobs (
             kind TEXT NOT NULL,
@@ -120,7 +124,7 @@ class _HydrationHandler:
             self.scope.attempt_budget.debit()
         return object()
 
-    def apply(
+    def apply(  # noqa: PLR0913
         self,
         conn: sqlite3.Connection,
         queue: HydrationQueueRepository,
@@ -128,8 +132,9 @@ class _HydrationHandler:
         result: object,
         *,
         now: int,
+        observation_order: int | None = None,
     ) -> AppliedFacts:
-        del conn, result, now
+        del conn, result, now, observation_order
         for job in jobs:
             queue.remove(job)
         return AppliedFacts(completed=len(jobs))
@@ -319,7 +324,7 @@ async def test_hydration_reschedules_from_slow_request_completion(
                 raise TelegramRpcThrottled(retry_after_seconds=17)
             return result
 
-        def apply(
+        def apply(  # noqa: PLR0913
             self,
             conn: sqlite3.Connection,
             queue: HydrationQueueRepository,
@@ -327,6 +332,7 @@ async def test_hydration_reschedules_from_slow_request_completion(
             result: object,
             *,
             now: int,
+            observation_order: int | None = None,
         ) -> AppliedFacts:
             assert now == 400
             clock[0] += 50

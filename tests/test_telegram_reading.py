@@ -18,7 +18,10 @@ from telethon.errors import (
 from telethon.tl import types
 
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
+from mcp_telegram.messages.telegram_adapter import extract_message_row
 from mcp_telegram.models import ReadMessage
+from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.reactions.telegram_adapter import TelethonTelegramReactionGateway
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
 from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudgetExhaustedError
@@ -175,6 +178,9 @@ async def test_fragment_gateway_preserves_fixed_window_and_normalized_persistenc
     scopes: list[tuple[TelegramRpcSource, DemandKind, AcquisitionKind | None]] = []
 
     async def get_input_entity(_dialog_id: int) -> str:
+        assert conn.execute("SELECT value FROM daemon_state WHERE key='canonical_observation_sequence'").fetchone() == (
+            "1",
+        )
         scope = current_rpc_scope()
         assert scope.demand_kind is not None
         scopes.append((scope.source, scope.demand_kind, scope.acquisition_kind))
@@ -194,6 +200,7 @@ async def test_fragment_gateway_preserves_fixed_window_and_normalized_persistenc
     result = await FragmentContextService(conn, TelethonTelegramFragmentGateway(client)).fetch(42, 10, 6)
 
     assert result.ok is True
+    assert all(message.observation_order == 1 for message in result.messages)
     cast(AsyncMock, client.get_messages).assert_awaited_once_with("entity", ids=[7, 8, 9, 10, 11, 12])
     assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=42").fetchone() == ("fragment",)
     assert conn.execute("SELECT message_id, text FROM messages ORDER BY message_id").fetchall() == [
@@ -220,6 +227,29 @@ async def test_fragment_gateway_preserves_fixed_window_and_normalized_persistenc
             AcquisitionKind.MESSAGE_LOOKUP,
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_fragment_late_result_keeps_message_observed_during_fetch(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
+    conn = make_synced_db()
+
+    async def get_messages(_entity: object, *, ids: list[int]) -> list[object]:
+        newer = _message(10)
+        newer.message = "newer"
+        with write_transaction(conn):
+            extracted = extract_message_row(42, newer)
+            extracted.observation_order = allocate_observation_order(conn)
+            insert_messages_with_fts(conn, [extracted])
+        return [_message(10)]
+
+    client = SimpleNamespace(
+        get_input_entity=AsyncMock(return_value="entity"), get_messages=AsyncMock(side_effect=get_messages)
+    )
+    result = await FragmentContextService(conn, TelethonTelegramFragmentGateway(client)).fetch(42, 10, 1)
+    assert result.messages[0].observation_order == 1
+    assert conn.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=10").fetchone() == ("newer",)
 
 
 @pytest.mark.asyncio

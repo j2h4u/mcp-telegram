@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import replace
 from typing import Protocol, cast
 
 from .hydration_queue import HydrationPriority
 from .messages.sqlite_bundle import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
+from .observation_order import allocate_observation_order
 from .sync_transactions import write_transaction
 from .telegram_demand import AcquisitionKind
 from .telegram_gateway import CATCHABLE_GATEWAY_FAILURES, translate_gateway_failure
@@ -36,6 +38,7 @@ class FragmentContextService:
             self._conn.execute(
                 "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'fragment')", (dialog_id,)
             )
+            observation_order = allocate_observation_order(self._conn)
         with rpc_scope(
             TelegramRpcSource.MESSAGE_READ_FALLBACK,
             acquisition_kind=AcquisitionKind.MESSAGE_HISTORY_PAGE,
@@ -43,6 +46,10 @@ class FragmentContextService:
             result = await self._gateway.fetch_context(dialog_id, anchor_message_id, context_size)
         if not result.ok or not result.messages:
             return result
+        result = replace(
+            result,
+            messages=tuple(replace(message, observation_order=observation_order) for message in result.messages),
+        )
         with write_transaction(self._conn):
             insert_messages_with_fts(self._conn, result.messages, priority=HydrationPriority.BACKFILL)
         return result

@@ -6,8 +6,10 @@ from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import patch
 
 import pytest
+from telethon.errors import RPCError
 from telethon.errors.rpcerrorlist import ChatForbiddenError  # type: ignore[import-untyped]
 
 from mcp_telegram.fact_hydration import (
@@ -15,6 +17,7 @@ from mcp_telegram.fact_hydration import (
     HydrationHandler,
     MessageFactHydrationWorker,
 )
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.hydration_queue import (
     MEDIA_METADATA_KIND,
     TRANSCRIPTION_HYDRATION_KIND,
@@ -22,8 +25,20 @@ from mcp_telegram.hydration_queue import (
     HydrationQueueRepository,
 )
 from mcp_telegram.media_hydration import MediaFactHydrationHandler
+from mcp_telegram.messages.sqlite_bundle import mark_message_deleted
+from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
+from mcp_telegram.telegram_demand import RpcAttemptBudget
+from mcp_telegram.telegram_rpc_scheduler import (
+    RpcAdmissionClosedError,
+    RpcAdmissionExpiredError,
+    RpcAdmissionSaturatedError,
+    TelegramRpcAdmissionDeferred,
+    TelegramRpcSource,
+    current_rpc_scope,
+    rpc_scope,
+)
 from mcp_telegram.transcription_hydration import TranscriptionHydrationHandler
 
 
@@ -74,6 +89,155 @@ def _enqueue(
     with write_transaction(conn):
         HydrationQueueRepository(conn).enqueue(job)
     return job
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [MEDIA_METADATA_KIND, TRANSCRIPTION_HYDRATION_KIND])
+@pytest.mark.parametrize("newer", ["edit", "delete"])
+@pytest.mark.parametrize("valid_result", [True, False])
+async def test_worker_reserves_before_request_and_rejects_late_fact_and_queue_effects(
+    db: sqlite3.Connection,
+    kind: str,
+    newer: str,
+    valid_result: bool,
+) -> None:
+    _seed_dialog(db)
+    _seed_message(db, 1, media_kind="voice" if kind == TRANSCRIPTION_HYDRATION_KIND else "other")
+    job = _enqueue(db, kind, 1)
+    handler = (
+        TranscriptionHydrationHandler(recheck_delay_seconds=30)
+        if kind == TRANSCRIPTION_HYDRATION_KIND
+        else MediaFactHydrationHandler(batch_size=1)
+    )
+    worker = MessageFactHydrationWorker(
+        object(),
+        db,
+        asyncio.Event(),
+        handlers=(handler,),
+        interval_seconds=1,
+        max_requests_per_cycle=2,
+        max_jobs_per_cycle=1,
+        retry_delay_seconds=1,
+        circuit_retry_seconds=1,
+        max_attempts=3,
+        pause_between_requests_seconds=0,
+        backfill_debt_limit=1,
+    )
+
+    async def request(*args: object, **kwargs: object) -> object:
+        assert db.execute("SELECT value FROM daemon_state WHERE key='canonical_observation_sequence'").fetchone() == (
+            "1",
+        )
+        assert not db.in_transaction
+        with write_transaction(db):
+            if newer == "delete":
+                mark_message_deleted(db, 1, 1, 30)
+            else:
+                sequence = allocate_observation_order(db)
+                db.execute(
+                    "INSERT INTO message_observations(dialog_id,message_id,observation_order,is_deleted) VALUES (1, 1, ?, 0)",
+                    (sequence,),
+                )
+                db.execute("UPDATE messages SET text='newer', edit_date=30 WHERE dialog_id=1 AND message_id=1")
+        if not valid_result:
+            return None
+        if kind == TRANSCRIPTION_HYDRATION_KIND:
+            return SimpleNamespace(text="older transcription", pending=False, transcription_id=5)
+        return SimpleNamespace(id=1, media=None)
+
+    with patch.object(worker, "_request_batch", side_effect=request):
+        outcome = await worker._process_batch(handler, [job], 20)
+    assert outcome.hydrated == 0
+    assert db.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == (0,)
+    if newer == "delete":
+        assert db.execute("SELECT is_deleted FROM messages").fetchone() == (1,)
+        assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+    else:
+        assert db.execute("SELECT text, media_payload FROM messages").fetchone() == ("newer", "{}")
+        assert db.execute("SELECT terminal FROM hydration_jobs").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "terminal",
+        "transient",
+        "flood",
+        "admission",
+        "saturated",
+        "expired",
+        "closed",
+        "access_lost",
+        "latched",
+        "undispatched",
+    ],
+)
+async def test_old_request_error_preserves_replacement_job(db: sqlite3.Connection, failure: str) -> None:
+    _seed_dialog(db)
+    _seed_message(db, 1, media_kind="voice")
+    job = _enqueue(db, TRANSCRIPTION_HYDRATION_KIND, 1)
+    handler = TranscriptionHydrationHandler(recheck_delay_seconds=30)
+    worker = MessageFactHydrationWorker(
+        object(),
+        db,
+        asyncio.Event(),
+        handlers=(handler,),
+        interval_seconds=1,
+        max_requests_per_cycle=2,
+        max_jobs_per_cycle=1,
+        retry_delay_seconds=1,
+        circuit_retry_seconds=1,
+        max_attempts=3,
+        pause_between_requests_seconds=0,
+        backfill_debt_limit=1,
+    )
+    budget = RpcAttemptBudget(limit=2)
+    replacement: list[tuple[object, ...]] = []
+
+    async def request(*args: object, **kwargs: object) -> object:
+        with write_transaction(db):
+            sequence = allocate_observation_order(db)
+            db.execute(
+                "INSERT INTO message_observations(dialog_id,message_id,observation_order) VALUES (1,1,?)", (sequence,)
+            )
+            db.execute("UPDATE messages SET text='new voice',edit_date=30 WHERE dialog_id=1 AND message_id=1")
+            queue = HydrationQueueRepository(db)
+            queue.remove(job)
+            queue.enqueue(HydrationJob(TRANSCRIPTION_HYDRATION_KIND, 1, 1, due_at=73, attempts=2))
+        replacement.append(cast(tuple[object, ...], db.execute("SELECT * FROM hydration_jobs").fetchone()))
+        if failure != "undispatched":
+            budget.debit()
+        if failure == "terminal":
+            raise RPCError(request=None, message="MSG_VOICE_MISSING", code=400)
+        if failure == "transient":
+            raise TimeoutError
+        if failure == "flood":
+            raise TelegramRpcThrottled(retry_after_seconds=17)
+        if failure in {"latched", "undispatched"}:
+            raise TelegramRpcThrottled(latched=True)
+        if failure == "admission":
+            raise TelegramRpcAdmissionDeferred(retry_after_seconds=17)
+        if failure == "access_lost":
+            raise ChatForbiddenError(request=None)
+        error_type = {
+            "closed": RpcAdmissionClosedError,
+            "expired": RpcAdmissionExpiredError,
+            "saturated": RpcAdmissionSaturatedError,
+        }[failure]
+        with rpc_scope(TelegramRpcSource.FACT_HYDRATION_LIVE):
+            raise error_type(current_rpc_scope(), "test admission failure")
+
+    with patch.object(worker, "_request_batch", side_effect=request):
+        if failure in {"flood", "latched", "undispatched", "closed"}:
+            expected_error = RpcAdmissionClosedError if failure == "closed" else TelegramRpcThrottled
+            with pytest.raises(expected_error):
+                await worker._process_batch(handler, [job], 20, attempt_budget=budget)
+        else:
+            await worker._process_batch(handler, [job], 20, attempt_budget=budget)
+    assert cast(tuple[object, ...], db.execute("SELECT * FROM hydration_jobs").fetchone()) == replacement[0]
+    assert db.execute("SELECT status FROM synced_dialogs").fetchone() == ("synced",)
+    assert not db.in_transaction
 
 
 def test_media_apply_maps_single_result_and_persists_empty_and_unknown_facts(

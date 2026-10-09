@@ -43,6 +43,8 @@ from mcp_telegram.message_contracts import (
     ReactionRecord,
     StoredMessage,
 )
+from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
+from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
@@ -145,6 +147,72 @@ class _SeedExistingMessageBundleKwargs(TypedDict, total=False):
 
 def _dict(value: object) -> dict[str, object]:
     return cast(dict[str, object], value)
+
+
+@pytest.mark.asyncio
+async def test_trace_acquisition_reserves_order_before_iterator_and_keeps_newer_message(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+) -> None:
+    _, conn, _ = trace_enrichment_server
+
+    class UpdatingClient(FakeTraceClient):
+        async def iter_messages(self, dialog_id: int, **kwargs: object) -> AsyncIterator[object]:
+            assert (
+                conn.execute("SELECT value FROM daemon_state WHERE key='canonical_observation_sequence'").fetchone()[0]
+                == "1"
+            )
+            with write_transaction(conn):
+                newer = candidate_message(text="newer")
+                newer.observation_order = allocate_observation_order(conn)
+                insert_messages_with_fts(conn, [newer])
+            yield fake_message(message_id=1, text="older")
+
+    fetched, status = await _trace_enrich_candidate_messages(
+        _TraceCandidateMessagesContext(
+            client=UpdatingClient(),
+            conn=conn,
+            dialog_id=222,
+            iter_kwargs={"limit": 1},
+            target_user_id=101,
+            now=1_700_000_000,
+            deadline_at=float("inf"),
+        )
+    )
+    assert status is None
+    assert fetched[0].observation_order == 1
+    with write_transaction(conn):
+        insert_messages_with_fts(conn, fetched)
+    assert conn.execute("SELECT text FROM messages WHERE dialog_id=222 AND message_id=1").fetchone()[0] == "newer"
+
+
+@pytest.mark.asyncio
+async def test_trace_receipt_counts_zero_when_newer_observation_rejects_fetched_message(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+    trace_service: DaemonAccountTraceService,
+) -> None:
+    _, conn, client = trace_enrichment_server
+    seed_dialog(conn, dialog_id=222, name="Alice", dialog_type="User")
+    seed_synced_dialog(conn, dialog_id=222)
+    conn.commit()
+
+    async def messages(*args: object, **kwargs: object) -> AsyncIterator[object]:
+        with write_transaction(conn):
+            newer = candidate_message(text="newer")
+            newer.observation_order = allocate_observation_order(conn)
+            insert_messages_with_fts(conn, [newer])
+        yield fake_message(message_id=1, text="older")
+
+    with patch.object(client, "iter_messages", side_effect=messages):
+        result = await trace_service._trace_enrich_one_candidate(
+            target_user_id=101,
+            candidate={"dialog_id": 222, "strategy": "dialog_scan", "topic_id": None},
+            max_per_dialog=100,
+            deadline_ms=15_000,
+            deadline_at=float("inf"),
+        )
+    assert result["messages_seen"] == 1
+    assert result["messages_persisted"] == 0
+    assert conn.execute("SELECT text FROM messages WHERE dialog_id=222 AND message_id=1").fetchone()[0] == "newer"
 
 
 @pytest.fixture()
@@ -439,7 +507,7 @@ async def test_trace_enrichment_uses_canonical_insert_for_new_messages(
     seed_synced_dialog(conn, dialog_id=222)
     conn.commit()
 
-    with patch("mcp_telegram.daemon_account_trace.insert_messages_with_fts") as insert_mock:
+    with patch("mcp_telegram.daemon_account_trace.insert_messages_with_fts", return_value=1) as insert_mock:
         result = await trace_service._trace_enrich_visible_dialogs(
             101,
             [{"dialog_id": 222, "strategy": "dialog_scan", "topic_id": None}],
@@ -460,7 +528,7 @@ async def test_trace_enrichment_skips_unchanged_duplicates(
     seed_existing_message_bundle(conn)
     client.messages_by_dialog = {222: [fake_message(message_id=1, text="same")]}
 
-    with patch("mcp_telegram.daemon_account_trace.insert_messages_with_fts") as insert_mock:
+    with patch("mcp_telegram.daemon_account_trace.insert_messages_with_fts", return_value=1) as insert_mock:
         result = await trace_service._trace_enrich_visible_dialogs(
             101,
             [{"dialog_id": 222, "strategy": "dialog_scan", "topic_id": None}],
@@ -481,7 +549,7 @@ async def test_trace_enrichment_changed_existing_uses_canonical_insert(
     seed_existing_message_bundle(conn, text="old")
     client.messages_by_dialog = {222: [fake_message(message_id=1, text="new")]}
 
-    with patch("mcp_telegram.daemon_account_trace.insert_messages_with_fts") as insert_mock:
+    with patch("mcp_telegram.daemon_account_trace.insert_messages_with_fts", return_value=1) as insert_mock:
         result = await trace_service._trace_enrich_visible_dialogs(
             101,
             [{"dialog_id": 222, "strategy": "dialog_scan", "topic_id": None}],
