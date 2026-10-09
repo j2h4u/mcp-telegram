@@ -13,6 +13,7 @@ from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
 from telethon.tl.types import DocumentAttributeCustomEmoji, TypeInputPeer  # type: ignore[import-untyped]
 
 from ..flood import TelegramRpcThrottled
+from ..models import FORUM_TOPICS_PAGE_SIZE
 from ..telegram_demand import UnclassifiedTelegramDemandError
 from ..telegram_rpc_scheduler import current_rpc_scope
 from .contracts import TopicFact, TopicSourceUnavailableError
@@ -48,9 +49,6 @@ class _DocumentLike(Protocol):
     attributes: tuple[object, ...] | list[object]
 
 
-_TOPIC_PAGE_SIZE = 100
-
-
 class TelethonTelegramTopicGateway(TelegramTopicGateway):
     """Topic adapter that inherits the caller's reconciliation RPC scope."""
 
@@ -83,7 +81,7 @@ class TelethonTelegramTopicGateway(TelegramTopicGateway):
                         offset_date=offset_date,
                         offset_id=offset_id,
                         offset_topic=offset_topic,
-                        limit=_TOPIC_PAGE_SIZE,
+                        limit=FORUM_TOPICS_PAGE_SIZE,
                     )
                 ),
             )
@@ -129,7 +127,7 @@ def _merge_topic_page(
         raise TopicSourceUnavailableError("Telegram topic pagination made no progress")
     if count is not None:
         return len(topics) >= count
-    return len(page) < _TOPIC_PAGE_SIZE
+    return len(page) < FORUM_TOPICS_PAGE_SIZE
 
 
 def _topic_fact(topic: _TopicLike, emoji_by_id: dict[int, str]) -> TopicFact:

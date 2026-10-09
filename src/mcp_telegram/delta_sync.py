@@ -151,10 +151,6 @@ _UPDATE_DELTA_CHECKPOINT_SQL = (
     "SET last_synced_at = ?, last_delta_checked_at = ?, delta_refresh_requested_at = NULL "
     "WHERE dialog_id = ? AND EXISTS (SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1)"
 )
-_UPDATE_DELTA_CHECKED_SQL = (
-    "UPDATE synced_dialogs SET last_delta_checked_at = ?, delta_refresh_requested_at = NULL WHERE dialog_id = ? "
-    "AND EXISTS (SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1)"
-)
 _REQUEST_DELTA_CONTINUATION_SQL = (
     "UPDATE synced_dialogs SET delta_refresh_requested_at = COALESCE(delta_refresh_requested_at, ?) "
     "WHERE dialog_id = ? "
@@ -384,10 +380,6 @@ class DeltaSyncWorker:
     def _stamp_delta_checkpoint(self, dialog_id: int, checked_at: int) -> None:
         require_write_transaction(self._conn)
         self._conn.execute(_UPDATE_DELTA_CHECKPOINT_SQL, (checked_at, checked_at, dialog_id, dialog_id))
-
-    def _stamp_delta_checked(self, dialog_id: int, checked_at: int) -> None:
-        require_write_transaction(self._conn)
-        self._conn.execute(_UPDATE_DELTA_CHECKED_SQL, (checked_at, dialog_id, dialog_id))
 
     @_delta_rpc_scope(DemandKind.DELTA_GAP_FILL, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def fetch_delta_slice_for_dialog(self, dialog_id: int) -> int:
