@@ -95,14 +95,6 @@ def no_active_topics_text(dialog_name: str) -> str:
     )
 
 
-def invalid_navigation_text(detail: str, *, retry_tool: str) -> str:
-    """Return an action-oriented response for malformed shared navigation tokens."""
-    return action_text(
-        f"Navigation token is invalid: {detail}",
-        f"Retry {retry_tool} without navigation to start from the first page, or reuse the exact next_navigation value from the previous {retry_tool} response.",
-    )
-
-
 def sender_not_found_text(sender_name: str, *, retry_tool: str) -> str:
     """Return an action-oriented response for missing senders."""
     return action_text(

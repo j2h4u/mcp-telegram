@@ -52,6 +52,10 @@ REQUIRED_POLICY_SINKS = {
 # these keys here makes the detector reject the same spelling everywhere else.
 NON_OPERATOR_POLICY_FINDINGS: frozenset[tuple[str, str]] = frozenset(
     {
+        # Unix wire/assembly invariants shared by both endpoints, never operator tuning.
+        ("policy_assignments", "src/mcp_telegram/daemon_ipc.py:<module>:REQUEST_LIMIT"),
+        ("policy_assignments", "src/mcp_telegram/daemon_ipc.py:<module>:RESPONSE_FRAME_LIMIT"),
+        ("policy_assignments", "src/mcp_telegram/daemon_ipc.py:<module>:RESPONSE_LIMIT"),
         (
             "policy_assignments",
             "src/mcp_telegram/folders/contracts.py:<module>:FOLDER_DIALOG_PAGE_SIZE",

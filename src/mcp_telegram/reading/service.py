@@ -992,6 +992,7 @@ class ReadingService:
                 "dialog_name_source": None,
                 "total": len(messages),
                 "next_navigation": next_nav,
+                "offset": request.offset,
                 "read_state_per_dialog": self._read_state_per_dialog(messages),
             },
         }
@@ -1040,6 +1041,7 @@ class ReadingService:
                 "dialog_name_source": identity.display_name_source,
                 "total": len(messages),
                 "next_navigation": next_nav,
+                "offset": request.offset,
                 "read_state_per_dialog": self._read_state_per_dialog(messages),
                 "reaction_freshness": freshness.as_dict(),
                 **access_meta,
@@ -1106,7 +1108,13 @@ class ReadingService:
         if not scheduled_messages_available(self._conn):
             return {
                 "ok": True,
-                "data": {"messages": [], "total": 0, "next_navigation": None, "source": "scheduled_messages"},
+                "data": {
+                    "messages": [],
+                    "total": 0,
+                    "next_navigation": None,
+                    "offset": request.offset,
+                    "source": "scheduled_messages",
+                },
             }
         with timing_phase("local_projection"):
             own_basis = self._own_only_basis_by_dialog()
@@ -1153,6 +1161,7 @@ class ReadingService:
                 "messages": rows,
                 "total": len(rows),
                 "next_navigation": next_nav,
+                "offset": request.offset,
                 "source": "scheduled_messages",
                 "scope": "own_only",
                 **(
@@ -1195,6 +1204,7 @@ class ReadingService:
                 "messages": page,
                 "total": len(page),
                 "next_navigation": next_navigation,
+                "offset": request.offset,
                 "source": "sync_db+scheduled_messages",
                 "read_state_per_dialog": sent_data.get("read_state_per_dialog", {}),
                 "scope": "all",

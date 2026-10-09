@@ -50,6 +50,9 @@ def _findings(source: str) -> set[tuple[str, str]]:
 
 
 NON_OPERATOR_POLICY_CASES = (
+    ("src/mcp_telegram/daemon_ipc.py", "REQUEST_LIMIT = 2 * 1024 * 1024\n"),
+    ("src/mcp_telegram/daemon_ipc.py", "RESPONSE_FRAME_LIMIT = 64 * 1024\n"),
+    ("src/mcp_telegram/daemon_ipc.py", "RESPONSE_LIMIT = 64 * 1024 * 1024\n"),
     ("src/mcp_telegram/delta_sync.py", "_DELTA_SLICE_MESSAGE_LIMIT = 100\n"),
     (
         "src/mcp_telegram/scheduled_messages.py",
