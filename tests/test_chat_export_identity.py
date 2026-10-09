@@ -228,3 +228,27 @@ def test_v4_and_v5_readers_preserve_wire_and_expand_missing_reactors(tmp_path: P
         ]
         is None
     )
+
+
+@pytest.mark.parametrize("legacy_empty", [False, True])
+def test_export_without_admin_events_is_sparse_and_incrementally_readable(tmp_path: Path, legacy_empty: bool) -> None:
+    from jsonschema import Draft202012Validator
+
+    from mcp_telegram.chat_export_checkpoint import base_records, census
+    from mcp_telegram.chat_export_schema import EXPORT_SCHEMA
+
+    rows = [(kind, record) for kind, record in _records() if kind != "admin_events.item"]
+    rows[-1] = ("export", {"messages": 2, "admin_events": 0, "reactors": 1})
+    stream = io.StringIO()
+    write_export(lambda: iter(rows), stream)
+    document = cast(Payload, json.loads(stream.getvalue()))
+    assert "admin_events" not in document
+    Draft202012Validator(EXPORT_SCHEMA).validate(document)
+    if legacy_empty:
+        messages = document.pop("messages")
+        footer = document.pop("export")
+        document.update(admin_events=[], messages=messages, export=footer)
+    path = tmp_path / "export.json"
+    path.write_text(json.dumps(document))
+    assert census(path, 0)["boundaries"] == {"-1": 2}
+    assert sum(kind == "messages.item" for kind, _ in base_records(path)) == 2

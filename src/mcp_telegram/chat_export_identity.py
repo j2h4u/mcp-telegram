@@ -279,10 +279,12 @@ def _index_export(
     return group, metadata, footer, counts
 
 
-def _write_export_records(record_factory: RecordFactory, stream: TextIO, index: IdentityIndex) -> None:
+def _write_export_records(
+    record_factory: RecordFactory, stream: TextIO, index: IdentityIndex, *, has_admins: bool
+) -> None:
     from .chat_export_schema import CURRENT_FORMAT_VERSION, validate_record
 
-    state = "admin_events.item"
+    state = "admin_events.item" if has_admins else "messages.item"
     first = True
     for kind, record in record_factory():
         if kind in {"group", "metadata", "export"}:
@@ -331,8 +333,9 @@ def write_export(record_factory: RecordFactory, stream: TextIO) -> None:
                 stream.write(",")
             validate_record("identities.item", identity, CURRENT_FORMAT_VERSION)
             _dump(stream, identity)
-        stream.write('],"admin_events":[')
-        _write_export_records(record_factory, stream, index)
+        has_admins = bool(counts["admin_events"])
+        stream.write('],"admin_events":[' if has_admins else '],"messages":[')
+        _write_export_records(record_factory, stream, index, has_admins=has_admins)
         stream.write('],"export":')
         _dump(stream, footer)
         stream.write("}")
