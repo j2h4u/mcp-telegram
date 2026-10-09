@@ -10,6 +10,7 @@ from typing import cast
 
 import pytest
 
+from helpers import remove_v80_schema_for_historical_fixture
 from mcp_telegram.config import DraftRecoveryConfig
 from mcp_telegram.drafts.contracts import (
     DraftComposition,
@@ -360,6 +361,7 @@ def test_v74_upgrade_removes_previews_without_promoting_them(tmp_path: Path) -> 
         conn.execute("ALTER TABLE dialogs ADD COLUMN draft_text TEXT")
         conn.execute("ALTER TABLE dialog_directory_staging ADD COLUMN draft_text TEXT")
         conn.execute("INSERT INTO dialogs(dialog_id,draft_text) VALUES (200,'old truncated preview')")
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version=74")
         conn.commit()
         assert _apply_migration_74(conn, 73) == 74
@@ -381,6 +383,7 @@ def test_v75_adds_durable_recovery_backoff_and_removes_key_prefix_index(tmp_path
             "CREATE INDEX idx_draft_current_account_dialog "
             "ON draft_current(account_id,dialog_id,top_message_id,subdialog_peer_id)"
         )
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version=75")
         conn.commit()
 

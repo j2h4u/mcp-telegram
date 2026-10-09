@@ -14,6 +14,7 @@ from telethon.tl import types
 
 from helpers import build_mock_message
 from mcp_telegram.event_handlers import EventHandlerManager, _EditedMessageEvent
+from mcp_telegram.fts import stem_text
 from mcp_telegram.message_composition import decode_formatting_entities
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 
@@ -48,8 +49,11 @@ async def test_formatting_only_edit_persists_without_lookup_or_history(tmp_path:
         assert facts == ([{"_": "MessageEntityBold", "offset": 0, "length": 4}] if enabled else [])
         assert conn.execute("SELECT COUNT(*) FROM message_versions").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM conversation_history_events").fetchone()[0] == 0
-        assert conn.execute("SELECT stemmed_text FROM messages_fts").fetchone()[0] == "unchanged fts"
-        assert conn.execute("SELECT last_event_at FROM synced_dialogs").fetchone()[0] == 17
+        assert conn.execute("SELECT stemmed_text FROM messages_fts").fetchone()[0] == (
+            stem_text("same") if enabled else "unchanged fts"
+        )
+        event_time = cast(tuple[int], conn.execute("SELECT last_event_at FROM synced_dialogs").fetchone())[0]
+        assert event_time > 17 if enabled else event_time == 17
         assert client.mock_calls == []
     finally:
         conn.close()

@@ -105,6 +105,8 @@ def _row_first_int(row: tuple[object | None, ...] | None) -> int:
 
 def backfill_fts_index(conn: sqlite3.Connection) -> int:
     """Repair live key coverage and remove duplicate/deleted rows in bounded batches."""
+    with write_transaction(conn):
+        conn.execute(MESSAGES_FTS_DDL)
     last_rowid = 0
     while True:
         rows = cast(

@@ -4677,6 +4677,9 @@ def _repair_v54_schema_ledger(conn: sqlite3.Connection, current: int) -> int:
 
 
 def _apply_migration_80(conn: sqlite3.Connection, current: int) -> int:
+    fts_exists = (
+        conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts'").fetchone() is not None
+    )
     return _apply_migration(
         conn,
         current,
@@ -4688,7 +4691,13 @@ def _apply_migration_80(conn: sqlite3.Connection, current: int) -> int:
             "INSERT INTO message_observations(dialog_id,message_id,observation_order,is_deleted) SELECT dialog_id,message_id,0,is_deleted FROM messages",
             "CREATE TABLE scheduled_publication_evidence (dialog_id INTEGER NOT NULL,published_message_id INTEGER NOT NULL,published_at INTEGER,verified_at INTEGER NOT NULL,PRIMARY KEY(dialog_id,published_message_id)) WITHOUT ROWID",
             "CREATE TABLE message_fts_keys (id INTEGER PRIMARY KEY,dialog_id INTEGER NOT NULL,message_id INTEGER NOT NULL,UNIQUE(dialog_id,message_id))",
-            "INSERT INTO message_fts_keys(id,dialog_id,message_id) SELECT MIN(rowid),dialog_id,message_id FROM messages_fts GROUP BY dialog_id,message_id",
+            *(
+                [
+                    "INSERT INTO message_fts_keys(id,dialog_id,message_id) SELECT MIN(rowid),dialog_id,message_id FROM messages_fts GROUP BY dialog_id,message_id"
+                ]
+                if fts_exists
+                else []
+            ),
             "INSERT OR IGNORE INTO message_fts_keys(dialog_id,message_id) SELECT dialog_id,message_id FROM messages",
             "CREATE TRIGGER message_fts_key_insert AFTER INSERT ON messages BEGIN INSERT INTO message_fts_keys(dialog_id,message_id) VALUES(NEW.dialog_id,NEW.message_id) ON CONFLICT(dialog_id,message_id) DO NOTHING; END",
         ],

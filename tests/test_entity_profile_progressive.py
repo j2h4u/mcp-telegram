@@ -18,6 +18,7 @@ from jsonschema import validate
 from telethon.errors import PeerIdInvalidError  # type: ignore[import-untyped]
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
+from helpers import remove_v80_schema_for_historical_fixture
 from mcp_telegram.daemon_entity_info import (
     _SQLITE_INT64_MAX,
     _SQLITE_INT64_MIN,
@@ -2074,10 +2075,13 @@ def test_progressive_projection_schema_is_present_on_fresh_database(tmp_path: Pa
     conn.close()
 
 
-def test_progressive_projection_schema_upgrades_from_v56(tmp_path: Path) -> None:
+def test_progressive_projection_schema_upgrades_from_v56(tmp_path: Path, request: pytest.FixtureRequest) -> None:
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
+    request.addfinalizer(conn.close)
+    remove_v80_schema_for_historical_fixture(conn)
+    conn.commit()
     with write_savepoint(conn):
         conn.execute("DROP TABLE entity_detail_sections")
     with write_savepoint(conn):

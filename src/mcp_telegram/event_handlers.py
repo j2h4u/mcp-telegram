@@ -1033,14 +1033,14 @@ class EventHandlerManager:
         dialog_id = event.chat_id
         if dialog_id is None:
             return
-        reaction_observed_at = int(time.time())
-        observation_order = allocate_observation_order(self._conn)
-        msg = event.message
-        identity_baseline = _IdentityBaseline(capture_identity_baseline(self._conn, dialog_id))
-        coverage = await self._new_message_coverage(dialog_id, event, identity_baseline=identity_baseline)
-        if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
-            return
         try:
+            reaction_observed_at = int(time.time())
+            observation_order = allocate_observation_order(self._conn)
+            msg = event.message
+            identity_baseline = _IdentityBaseline(capture_identity_baseline(self._conn, dialog_id))
+            coverage = await self._new_message_coverage(dialog_id, event, identity_baseline=identity_baseline)
+            if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
+                return
             if not allows_new_message(coverage, outgoing=bool(getattr(msg, "out", False))):
                 self._project_denied_new_message_metadata(dialog_id, msg, coverage, observation_order=observation_order)
                 return
@@ -1301,8 +1301,8 @@ class EventHandlerManager:
         if dialog_id is None:
             return
 
-        observation_order = allocate_observation_order(self._conn)
         try:
+            observation_order = allocate_observation_order(self._conn)
             msg = event.message
             message_id = int(msg.id)
             now = int(time.time())
@@ -1423,6 +1423,13 @@ class EventHandlerManager:
             if old_text != extracted.message.text or msg.edit_date is not None or msg.reactions is not None:
                 self._record_body_event(dialog_id, now)
         self._offer_message_ingestion()
+        if msg.reactions is not None and old_text == extracted.message.text:
+            logger.debug(
+                "event_edit_reactions dialog_id=%d message_id=%d count=%d",
+                dialog_id,
+                int(msg.id),
+                len(extracted.reactions),
+            )
         return next_ver
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)

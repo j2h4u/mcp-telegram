@@ -8,6 +8,7 @@ from typing import cast
 import pytest
 from telethon.tl import types
 
+from helpers import remove_v80_schema_for_historical_fixture
 from mcp_telegram.message_composition import (
     decode_formatting_entities,
     decode_service_action,
@@ -67,6 +68,7 @@ def test_migration_leaves_historical_messages_and_scheduled_messages_unknown(tmp
         for table in ("messages", "scheduled_messages"):
             conn.execute(f"ALTER TABLE {table} DROP COLUMN formatting_entities")
             conn.execute(f"ALTER TABLE {table} DROP COLUMN service_action")
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version=79")
         conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at,text) VALUES(42,1,1,'old')")
         conn.execute(

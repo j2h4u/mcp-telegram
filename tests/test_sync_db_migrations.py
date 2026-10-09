@@ -11,6 +11,7 @@ from typing import cast
 import pytest
 
 import mcp_telegram.sync_db as sync_db_module
+from helpers import remove_v80_schema_for_historical_fixture
 from mcp_telegram.sync_db import (
     _CURRENT_SCHEMA_VERSION,
     _DIALOGS_V74_DDL,
@@ -340,8 +341,8 @@ def test_migration_v37_rebuilds_media_tables_without_legacy_description(db_path:
         conn.execute("CREATE INDEX idx_scheduled_messages_active ON scheduled_messages(dialog_id, scheduled_at)")
         # Replay the migration tail from a genuine pre-v39 activity table so
         # the additive v39 columns are exercised exactly once.
-        conn.execute("DROP TABLE activity_dialog_state")
-        conn.execute(_V23_ACTIVITY_DIALOG_STATE_DDL)
+        conn.executescript("DROP TABLE activity_dialog_state;" + _V23_ACTIVITY_DIALOG_STATE_DDL)
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version >= 37")
 
         # FTS is a separate contentless table and must survive the physical
@@ -436,6 +437,7 @@ def test_migration_v44_accepts_custom_emoji_and_preserves_media_artifacts(db_pat
                 "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
                 "VALUES (1, 3, 1700000001, 'custom_emoji', '{\"alt\":\"📊\"}')"
             )
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version >= 44")
         conn.commit()
 
@@ -565,6 +567,7 @@ def test_v41_shape_seeds_voice_transcription_hydration_as_backfill(tmp_path: Pat
         )
         conn.execute("DROP TABLE hydration_jobs_v41")
         assert "terminal" not in [row[1] for row in _table_info(conn, "hydration_jobs")]
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version >= 41")
         conn.commit()
 
@@ -820,7 +823,6 @@ def test_schema_version_records_current(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-    assert _CURRENT_SCHEMA_VERSION == 79
 
 
 def test_migration_v77_creates_retained_linked_chat_fact_ledger() -> None:
@@ -1631,7 +1633,6 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-    assert _CURRENT_SCHEMA_VERSION == 79
 
 
 def test_migration_v78_rollback_then_reopen_applies_atomically(tmp_path: Path) -> None:
@@ -1662,6 +1663,7 @@ def test_migration_v78_rollback_then_reopen_applies_atomically(tmp_path: Path) -
             "baseline_revision INTEGER NOT NULL,seen INTEGER NOT NULL DEFAULT 0,"
             "PRIMARY KEY(generation,dialog_id)) WITHOUT ROWID"
         )
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version>=78")
         conn.execute(
             "UPDATE dialog_directory_state SET generation=8,status='in_progress',"
@@ -1728,6 +1730,7 @@ def test_migration_v73_removes_persisted_campaign_state(tmp_path: Path) -> None:
         conn.execute(
             "INSERT INTO daemon_state(key, value) VALUES ('topic_attribution_campaign_v1', '{\"state\":\"complete\"}')"
         )
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version = 73")
         conn.commit()
 
@@ -1801,6 +1804,7 @@ def test_migration_v70_is_idempotent_after_partial_ledger_replay() -> None:
             "SELECT read_at, checked_at, status, reason, next_attempt_at FROM message_read_facts ORDER BY message_id"
         ).fetchall()
 
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version = 70")
         assert _apply_migration_70(conn, 69) == 70
 
@@ -1839,6 +1843,7 @@ def test_migration_v71_seeds_cutoff_and_prunes_only_eligible_tail() -> None:
             ],
         )
         conn.commit()
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version=71")
         conn.commit()
         assert _apply_migration_71(conn, 70) == 71
@@ -1860,6 +1865,7 @@ def test_migration_v71_seeds_cutoff_and_prunes_only_eligible_tail() -> None:
                 "SELECT expired_through_sent_at, witness_dialog_id, witness_message_id FROM read_date_expiry_state"
             ).fetchone(),
         )
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version=71")
         conn.commit()
         assert _apply_migration_71(conn, 70) == 71
@@ -1893,6 +1899,7 @@ def test_migration_v71_ignores_invalid_witnesses_and_uses_newest_valid_witness()
             [(1, 100), (2, 300), (3, 100), (4, 100)],
         )
         conn.commit()
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version=71")
         conn.commit()
 
@@ -1929,6 +1936,7 @@ def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: P
         conn.execute(_V36_SCHEDULED_MESSAGES_DDL)
         conn.execute("DROP TABLE activity_dialog_state")
         conn.execute(_V23_ACTIVITY_DIALOG_STATE_DDL)
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version >= 34")
         conn.commit()
 
@@ -2111,6 +2119,7 @@ def test_migration_v63_repairs_positive_synced_dialog_orphans(tmp_path: Path) ->
             (12347,),
         )
         conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (?, 'synced')", (12347,))
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version = 63")
         conn.commit()
 
@@ -2225,6 +2234,7 @@ def test_v51_replay_does_not_clear_new_alerts(tmp_path: Path) -> None:
         conn.execute(
             "INSERT INTO conversation_history_events(kind,occurred_at,time_basis,dialog_id,message_id) VALUES ('deleted_message',1,'observed',1,1)"
         )
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version >= 51")
         conn.commit()
     ensure_sync_schema(db_path)
@@ -2256,6 +2266,7 @@ def _downgrade_event_tables_to_v50(conn: sqlite3.Connection) -> None:
                seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, occurred_at INTEGER NOT NULL,
                dialog_id INTEGER NOT NULL, message_id INTEGER, version INTEGER, daemon_event_id INTEGER);"""
     )
+    remove_v80_schema_for_historical_fixture(conn)
     conn.execute("DELETE FROM schema_version WHERE version >= 51")
 
 
@@ -2288,6 +2299,7 @@ def _downgrade_event_tables_to_v53(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE event_recovery_ledger")
     conn.execute("ALTER TABLE runtime_observations RENAME TO runtime_events")
     conn.execute("ALTER TABLE conversation_history_events RENAME TO sync_alert_events")
+    remove_v80_schema_for_historical_fixture(conn)
     conn.execute("DELETE FROM schema_version WHERE version >= 54")
 
 
@@ -2404,6 +2416,7 @@ def test_v52_expands_origin_contract_without_guessing_from_edit_date(tmp_path: P
             ],
         )
         conn.execute("DROP TABLE message_versions_current")
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version >= 52")
         conn.commit()
 
@@ -2434,6 +2447,7 @@ def test_v52_origin_repair_rolls_back_before_replacing_versions(tmp_path: Path) 
         conn.execute("INSERT INTO message_versions VALUES (1, 1, 1, 'old', 1, 'telegram_edit')")
         conn.execute("DROP TABLE message_versions_current")
         conn.execute("CREATE TABLE message_versions_origin_migration(blocker INTEGER)")
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version >= 52")
         conn.commit()
 
@@ -2673,6 +2687,7 @@ def test_v52_failure_after_rename_rolls_back_original_contract(tmp_path: Path) -
         )
         conn.execute("INSERT INTO message_versions VALUES (1,1,1,'old',1,'telegram_edit')")
         conn.execute("DROP TABLE message_versions_current")
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version >= 52")
         conn.commit()
 
@@ -2715,6 +2730,7 @@ def test_v54_ledger_damage_does_not_replay_destructive_v53_cleanup(tmp_path: Pat
         conn.execute(
             "INSERT INTO conversation_history_events(kind,occurred_at,time_basis,dialog_id,message_id,version) VALUES ('edit',10,'telegram',1,1,1)"
         )
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version=53")
         conn.commit()
 
@@ -2734,6 +2750,7 @@ def test_v53_delete_failure_rolls_back_all_version_history(tmp_path: Path) -> No
             "INSERT INTO message_versions(dialog_id,message_id,version,old_text,edit_date,origin) "
             "VALUES (1,1,1,'first',10,'legacy_unknown'),(2,1,1,'second',10,'legacy_unknown')"
         )
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version=53")
         conn.commit()
 
@@ -2838,6 +2855,7 @@ def test_v55_adds_access_cause_and_actor_atomically(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         conn.execute("ALTER TABLE conversation_history_events DROP COLUMN actor_id")
         conn.execute("ALTER TABLE conversation_history_events DROP COLUMN access_change_cause")
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version=55")
         conn.commit()
         _apply_migration_55(conn, 54)
@@ -2850,6 +2868,7 @@ def test_v56_adds_stable_tool_telemetry_identity(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version=56")
         conn.execute("UPDATE runtime_observations SET tool_capability=NULL,contract_version=NULL")
         conn.execute(
@@ -2872,6 +2891,7 @@ def test_v58_adds_account_trace_author_indexes(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         conn.execute("DROP INDEX idx_messages_account_trace_sender")
         conn.execute("DROP INDEX idx_messages_account_trace_post_author")
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version=58")
         conn.commit()
 
@@ -2896,6 +2916,7 @@ def test_v59_seeds_active_scheduled_repairs_and_staggers_discovery(tmp_path: Pat
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         conn.execute("DROP TABLE scheduled_reconciliation_state")
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version=59")
         conn.execute("INSERT INTO dialogs(dialog_id, type, hidden) VALUES (42, 'user', 0)")
         conn.execute(
@@ -2926,6 +2947,7 @@ def test_v60_adds_restart_safe_domain_state_and_preserves_profile_retry(tmp_path
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
+        remove_v80_schema_for_historical_fixture(conn)
         conn.executescript(
             """
             DROP TRIGGER dialogs_revision_after_update;
@@ -3067,6 +3089,7 @@ def test_v64_preserves_legacy_generation_one_without_manufacturing_a_receipt(tmp
         conn.execute("DROP TABLE dialog_directory_staging")
         conn.execute("DROP TABLE dialog_directory_baseline")
         conn.execute("DROP TABLE dialog_directory_state")
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version=64")
         conn.execute(
             "UPDATE dialog_full_reconciliation_state SET generation=1,status='in_progress',offset_date=NULL,"
@@ -3092,6 +3115,7 @@ def test_v64_keeps_completed_legacy_generation_one_pending_for_raw_proof(tmp_pat
         conn.execute("DROP TABLE dialog_directory_staging")
         conn.execute("DROP TABLE dialog_directory_baseline")
         conn.execute("DROP TABLE dialog_directory_state")
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version=64")
         conn.execute(
             "UPDATE dialog_full_reconciliation_state SET generation=1,status='idle',observed_count=0 WHERE singleton=1"
@@ -3113,6 +3137,7 @@ def test_v66_preserves_legacy_identity_without_fabricating_provenance(tmp_path: 
     with _sync_db_connection(db_path) as conn:
         conn.execute("INSERT INTO dialogs(dialog_id,name,type) VALUES (99,'legacy','user')")
         conn.execute("DROP TABLE dialog_directory_facts")
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version=66")
         conn.commit()
 
@@ -3122,3 +3147,22 @@ def test_v66_preserves_legacy_identity_without_fabricating_provenance(tmp_path: 
             "SELECT name,type,username,identity_observed_at,identity_complete,identity_source FROM dialogs WHERE dialog_id=99",
         ) == ("legacy", "user", None, None, 0, None)
         assert _fetchone_int(conn, "SELECT COUNT(*) FROM dialog_directory_facts") == 0
+
+
+def test_v79_upgrade_without_fts_cache_rebuilds_only_live_messages(db_path: Path) -> None:
+    from mcp_telegram.fts import backfill_fts_index
+
+    ensure_sync_schema(db_path)
+    with _sqlite_connection(db_path) as conn:
+        remove_v80_schema_for_historical_fixture(conn)
+        conn.execute("DROP TABLE messages_fts")
+        conn.execute(
+            "INSERT INTO messages(dialog_id,message_id,sent_at,text,is_deleted) VALUES(42,1,1,'live',0),(42,2,2,'deleted',1)"
+        )
+        conn.commit()
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM message_fts_keys").fetchone() == (2,)
+        assert backfill_fts_index(conn) == 1
+        assert conn.execute("SELECT dialog_id,message_id FROM messages_fts").fetchall() == [(42, 1)]
+        assert backfill_fts_index(conn) == 0

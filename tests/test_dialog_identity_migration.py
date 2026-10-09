@@ -9,8 +9,10 @@ from typing import cast
 import pytest
 from telethon.tl import functions, types  # type: ignore[import-untyped]
 
+from helpers import remove_v80_schema_for_historical_fixture
 from mcp_telegram.dialog_directory import CanonicalDialogDirectory
 from mcp_telegram.sync_db import (
+    _CURRENT_SCHEMA_VERSION,
     _DIALOG_DIRECTORY_STATE_DDL,
     _DIALOGS_V74_DDL,
     _apply_migration_78,
@@ -60,6 +62,7 @@ def _create_paused_v77_database(db_path: Path) -> None:
             "archived,pinned,snapshot_at) VALUES (9,99,'ordinary','PeerUser',7,'user',0,0,123)"
         )
         conn.execute("INSERT INTO dialog_directory_pins(generation,folder_id,dialog_id,position) VALUES (9,0,99,0)")
+        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version=78")
         conn.commit()
     finally:
@@ -89,7 +92,7 @@ def test_fresh_schema_has_separate_identity_fence_and_complete_presence_trigger(
     request.addfinalizer(conn.close)
     _apply_migrations(conn)
     version_row = cast(tuple[int], conn.execute("SELECT MAX(version) FROM schema_version").fetchone())
-    assert version_row[0] == 79
+    assert version_row[0] == _CURRENT_SCHEMA_VERSION
     dialog_columns = cast(list[tuple[object, str]], conn.execute("PRAGMA table_info(dialogs)").fetchall())
     columns = {row[1] for row in dialog_columns}
     assert "identity_revision" in columns
@@ -152,6 +155,7 @@ def test_v77_upgrade_seeds_only_legacy_dialog_facts_and_restarts_incomplete_gene
     )
     conn.execute("INSERT INTO dialog_directory_baseline VALUES (4,1,2,0)")
     conn.execute("INSERT INTO dialog_directory_pins VALUES (4,0,1,0)")
+    remove_v80_schema_for_historical_fixture(conn)
     conn.execute("DELETE FROM schema_version WHERE version=78")
     conn.commit()
     assert _apply_migration_78(conn, 77) == 78
