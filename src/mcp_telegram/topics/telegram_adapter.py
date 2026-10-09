@@ -59,15 +59,25 @@ class TelethonTelegramTopicGateway(TelegramTopicGateway):
         self._emoji_alt_by_id: dict[int, str] = {}
 
     async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
-        result_topics: list[_TopicLike] = []
-        seen_ids: set[int] = set()
+        try:
+            peer = cast(TypeInputPeer, await self._client.get_input_entity(entity))
+            topics = await self._fetch_topic_pages(peer)
+        except TelegramRpcThrottled:
+            raise
+        except (RPCError, TypeError) as exc:
+            raise TopicSourceUnavailableError("Telegram topic source is unavailable") from exc
+        emoji_by_id = await self._resolve_icon_emojis(topics)
+        return tuple(_topic_fact(topic, emoji_by_id) for topic in topics)
+
+    async def _fetch_topic_pages(self, peer: TypeInputPeer) -> tuple[_TopicLike, ...]:
+        topics: dict[int, _TopicLike] = {}
         seen_cursors: set[tuple[int | None, int, int]] = set()
         offset_date = None
         offset_id = offset_topic = 0
-        try:
-            peer = cast(TypeInputPeer, await self._client.get_input_entity(entity))
-            while True:
-                result = await self._client(
+        while True:
+            result = cast(
+                _TopicsResultLike,
+                await self._client(
                     GetForumTopicsRequest(
                         peer=peer,
                         offset_date=offset_date,
@@ -75,70 +85,70 @@ class TelethonTelegramTopicGateway(TelegramTopicGateway):
                         offset_topic=offset_topic,
                         limit=_TOPIC_PAGE_SIZE,
                     )
-                )
-                page = cast(_TopicsResultLike, result).topics or ()
-                count = _optional_int(getattr(result, "count", None))
-                if not page:
-                    if count is not None and len(seen_ids) < count:
-                        raise TopicSourceUnavailableError(
-                            "Telegram topic pagination ended before the complete snapshot"
-                        )
-                    break
-                unseen = [topic for topic in page if int(topic.id) not in seen_ids]
-                if not unseen:
-                    raise TopicSourceUnavailableError("Telegram topic pagination made no progress")
-                for topic in unseen:
-                    if int(topic.id) not in seen_ids:
-                        result_topics.append(topic)
-                        seen_ids.add(int(topic.id))
-                if count is not None and len(seen_ids) >= count:
-                    break
-                if count is None and len(page) < _TOPIC_PAGE_SIZE:
-                    break
-                offset_date, offset_id, offset_topic = _topic_cursor(cast(_TopicsResultLike, result), page[-1])
-                cursor = (_timestamp(offset_date), offset_id, offset_topic)
-                if cursor in seen_cursors:
-                    raise TopicSourceUnavailableError("Telegram topic pagination repeated its cursor")
-                seen_cursors.add(cursor)
-        except TelegramRpcThrottled:
-            raise
-        except (RPCError, TypeError) as exc:
-            raise TopicSourceUnavailableError("Telegram topic source is unavailable") from exc
-
-        emoji_by_id = await self._resolve_icon_emojis(result_topics)
-        return tuple(
-            TopicFact(
-                topic_id=int(topic.id),
-                title=topic.title or "",
-                icon_emoji_id=topic.icon_emoji_id,
-                icon_emoji=emoji_by_id.get(topic.icon_emoji_id) if topic.icon_emoji_id is not None else None,
-                icon_color=_optional_int(getattr(topic, "icon_color", None)),
-                date=_timestamp(topic.date),
-                is_general=_is_general(topic),
+                ),
             )
-            for topic in result_topics
-        )
+            page = result.topics or []
+            if _merge_topic_page(topics, page, _optional_int(getattr(result, "count", None))):
+                return tuple(topics.values())
+            offset_date, offset_id, offset_topic = _topic_cursor(result, page[-1])
+            cursor = (_timestamp(offset_date), offset_id, offset_topic)
+            if cursor in seen_cursors:
+                raise TopicSourceUnavailableError("Telegram topic pagination repeated its cursor")
+            seen_cursors.add(cursor)
 
     async def _resolve_icon_emojis(self, topics: tuple[_TopicLike, ...] | list[_TopicLike]) -> dict[int, str]:
         icon_ids = {int(topic.icon_emoji_id) for topic in topics if topic.icon_emoji_id is not None}
         missing_ids = sorted(icon_ids - self._emoji_alt_by_id.keys())
-        try:
-            bounded_discovery = current_rpc_scope().demand_kind is not None
-        except UnclassifiedTelegramDemandError:
-            bounded_discovery = False
         # Optional icon labels must never spend the topic discovery demand's RPC allowance.
-        if missing_ids and not bounded_discovery:
+        if missing_ids and not _is_bounded_discovery():
             try:
                 documents = cast(
                     list[_DocumentLike],
                     await self._client(GetCustomEmojiDocumentsRequest(document_id=missing_ids)),
                 )
             except TelegramRpcThrottled, RPCError, TypeError:
-                return {
-                    icon_id: self._emoji_alt_by_id[icon_id] for icon_id in icon_ids if icon_id in self._emoji_alt_by_id
-                }
-            self._emoji_alt_by_id.update(_custom_emoji_alts(documents))
+                pass
+            else:
+                self._emoji_alt_by_id.update(_custom_emoji_alts(documents))
         return {icon_id: self._emoji_alt_by_id[icon_id] for icon_id in icon_ids if icon_id in self._emoji_alt_by_id}
+
+
+def _merge_topic_page(
+    topics: dict[int, _TopicLike],
+    page: tuple[_TopicLike, ...] | list[_TopicLike],
+    count: int | None,
+) -> bool:
+    if not page:
+        if count is not None and len(topics) < count:
+            raise TopicSourceUnavailableError("Telegram topic pagination ended before the complete snapshot")
+        return True
+    previous_count = len(topics)
+    for topic in page:
+        topics.setdefault(int(topic.id), topic)
+    if len(topics) == previous_count:
+        raise TopicSourceUnavailableError("Telegram topic pagination made no progress")
+    if count is not None:
+        return len(topics) >= count
+    return len(page) < _TOPIC_PAGE_SIZE
+
+
+def _topic_fact(topic: _TopicLike, emoji_by_id: dict[int, str]) -> TopicFact:
+    return TopicFact(
+        topic_id=int(topic.id),
+        title=topic.title or "",
+        icon_emoji_id=topic.icon_emoji_id,
+        icon_emoji=emoji_by_id.get(topic.icon_emoji_id) if topic.icon_emoji_id is not None else None,
+        icon_color=_optional_int(getattr(topic, "icon_color", None)),
+        date=_timestamp(topic.date),
+        is_general=_is_general(topic),
+    )
+
+
+def _is_bounded_discovery() -> bool:
+    try:
+        return current_rpc_scope().demand_kind is not None
+    except UnclassifiedTelegramDemandError:
+        return False
 
 
 def _topic_cursor(result: _TopicsResultLike, last: _TopicLike) -> tuple[datetime | None, int, int]:
