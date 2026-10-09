@@ -10,9 +10,14 @@ from telethon.tl.functions.messages import GetCustomEmojiDocumentsRequest, GetFo
 from telethon.tl.types import DocumentAttributeCustomEmoji, InputStickerSetEmpty
 
 from mcp_telegram.flood import TelegramRpcThrottled
-from mcp_telegram.telegram_demand import AcquisitionKind
+from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind
-from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope, rpc_scope
+from mcp_telegram.telegram_rpc_scheduler import (
+    TelegramRpcSource,
+    current_rpc_scope,
+    rpc_attempt_budget,
+    rpc_scope,
+)
 from mcp_telegram.topics.contracts import TopicFact, is_topic_capable
 from mcp_telegram.topics.refresh import TopicRefresher
 from mcp_telegram.topics.telegram_adapter import TelethonTelegramTopicGateway
@@ -42,7 +47,12 @@ class _Repository:
     def __init__(self) -> None:
         self.writes: list[tuple[int, tuple[TopicFact, ...]]] = []
 
-    def upsert_topics(self, dialog_id: int, topics: tuple[TopicFact, ...]) -> None:
+    def begin_snapshot(self) -> int:
+        return 1
+
+    def upsert_topics(
+        self, dialog_id: int, topics: tuple[TopicFact, ...], *, observation_order: int | None = None
+    ) -> None:
         self.writes.append((dialog_id, topics))
 
 
@@ -182,3 +192,109 @@ async def test_telethon_gateway_does_not_mask_flood_wait() -> None:
 
     with pytest.raises(TelegramRpcThrottled):
         await TelethonTelegramTopicGateway(Client()).fetch_topics(object())
+
+
+def _page(topic_ids: list[int], *, count: int, create_order: bool = False) -> SimpleNamespace:
+    from datetime import UTC, datetime
+
+    return SimpleNamespace(
+        topics=[
+            SimpleNamespace(
+                id=topic_id,
+                title=str(topic_id),
+                icon_emoji_id=987,
+                date=datetime(2020, 1, 1, tzinfo=UTC),
+                top_message=topic_id + 1000,
+            )
+            for topic_id in topic_ids
+        ],
+        messages=[SimpleNamespace(id=topic_id + 1000, date=datetime(2026, 1, 1, tzinfo=UTC)) for topic_id in topic_ids],
+        count=count,
+        order_by_create_date=create_order,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("create_order", [False, True])
+async def test_topic_pagination_preserves_demand_and_deduplicates(create_order: bool) -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.requests: list[GetForumTopicsRequest] = []
+            self.scopes: list[object] = []
+
+        async def get_input_entity(self, entity: object) -> object:
+            return entity
+
+        async def __call__(self, request: object) -> object:
+            assert isinstance(request, GetForumTopicsRequest)
+            assert isinstance(request, GetForumTopicsRequest)  # No optional emoji RPC spends discovery budget.
+            self.requests.append(request)
+            scope = current_rpc_scope()
+            self.scopes.append(scope.demand_kind)
+            assert scope.attempt_budget is not None
+            scope.attempt_budget.debit()
+            if len(self.requests) == 1:
+                return _page(list(range(1, 101)), count=150, create_order=create_order)
+            return _page(list(range(100, 151)), count=150, create_order=create_order)
+
+    client = Client()
+    budget = RpcAttemptBudget(limit=2)
+    with rpc_scope(TelegramRpcSource.TOPIC_RECONCILIATION), rpc_attempt_budget(budget):
+        topics = await TelethonTelegramTopicGateway(client).fetch_topics(object())
+    assert budget.attempts == 2
+    assert len(topics) == 150
+    assert len(client.requests) == 2
+    assert client.scopes == [DemandKind.TOPIC_SNAPSHOT, DemandKind.TOPIC_SNAPSHOT]
+    assert client.requests[1].offset_id == 1100
+    assert client.requests[1].offset_topic == 100
+    assert client.requests[1].offset_date is not None
+    assert client.requests[1].offset_date.year == (2020 if create_order else 2026)
+
+
+@pytest.mark.asyncio
+async def test_topic_short_server_pages_continue_until_count() -> None:
+    class Client:
+        async def get_input_entity(self, entity: object) -> object:
+            return entity
+
+        async def __call__(self, request: object) -> object:
+            assert isinstance(request, GetForumTopicsRequest)
+            return _page([request.offset_topic + 1], count=3)
+
+    with rpc_scope(TelegramRpcSource.TOPIC_RECONCILIATION):
+        topics = await TelethonTelegramTopicGateway(Client()).fetch_topics(object())
+    assert [topic.topic_id for topic in topics] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["deferred", "budget", "nonprogress", "empty"])
+async def test_partial_topic_pages_never_publish_snapshot(failure: str) -> None:
+    from mcp_telegram.telegram_demand import RpcAttemptBudgetExhaustedError
+    from mcp_telegram.topics.contracts import TopicSourceUnavailableError
+
+    class Client:
+        async def get_input_entity(self, entity: object) -> object:
+            return entity
+
+        async def __call__(self, request: object) -> object:
+            assert isinstance(request, GetForumTopicsRequest)
+            if request.offset_topic:
+                if failure == "deferred":
+                    raise TelegramRpcThrottled(retry_after_seconds=3)
+                if failure == "budget":
+                    raise RpcAttemptBudgetExhaustedError("budget exhausted")
+                if failure == "empty":
+                    return _page([], count=200)
+            return _page(list(range(1, 101)), count=200)
+
+    repository = _Repository()
+    error = (
+        TelegramRpcThrottled
+        if failure == "deferred"
+        else RpcAttemptBudgetExhaustedError
+        if failure == "budget"
+        else TopicSourceUnavailableError
+    )
+    with pytest.raises(error):
+        await TopicRefresher(TelethonTelegramTopicGateway(Client()), repository).refresh(1, _Entity(forum=True))
+    assert repository.writes == []
