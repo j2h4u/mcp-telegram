@@ -339,6 +339,7 @@ async def test_dm_enrollment_restarts_after_interruption_without_replaying_teleg
 
 def test_delta_gap_status_uses_two_hour_fallback_and_immediate_explicit_refresh(conn: sqlite3.Connection) -> None:
     _seed_history_dialog(conn, 201, status="synced", last_delta_checked_at=100)
+    conn.execute("UPDATE synced_dialogs SET delta_message_id=0 WHERE dialog_id=201")
     conn.execute(
         "INSERT INTO daemon_state(key, value) VALUES ('delta_dm_gap_scan_state', ?)",
         (
@@ -379,6 +380,32 @@ def test_delta_gap_status_uses_two_hour_fallback_and_immediate_explicit_refresh(
     conn.commit()
     assert adapter.status(200.0).release_at == 75.0  # type: ignore[union-attr]
     assert adapter.status(200.0).is_ready(200.0)  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_legacy_delta_cursor_rescans_immediately_despite_recent_check(conn: sqlite3.Connection) -> None:
+    dialog_id = 299
+    _seed_history_dialog(conn, dialog_id, status="synced", last_delta_checked_at=100)
+    conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (?,999999,1)", (dialog_id,))
+    conn.commit()
+    requests: list[GetHistoryRequest] = []
+
+    async def send_history(request: GetHistoryRequest) -> object:
+        requests.append(request)
+        return types.messages.Messages(messages=[], topics=[], chats=[], users=[])
+
+    worker = DeltaSyncWorker(TelethonForwardGapPageAdapter(_ForwardHistoryClient(send_history)), conn, asyncio.Event())
+    adapter = DeltaGapFillDemandAdapter(worker)
+    changes_before = conn.total_changes
+    assert adapter.status(101.0).is_ready(101.0)  # type: ignore[union-attr]
+    assert conn.total_changes == changes_before
+    with patch("mcp_telegram.delta_sync.time.time", return_value=101):
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+    assert len(requests) == 1 and requests[0].min_id == 0
+    assert conn.execute(
+        "SELECT delta_message_id,last_delta_checked_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (0, 101)
+    assert adapter.status(101.0).release_at == 7301.0  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio

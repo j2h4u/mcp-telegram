@@ -375,13 +375,18 @@ def test_adapter_composition_contains_invalid_dm_checkpoint_to_its_domain(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("delta_cursor", [None, 1])
 async def test_invalid_dm_checkpoint_does_not_block_forward_delta_coordinator(
     composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
+    delta_cursor: int | None,
 ) -> None:
     dependencies, objects = composition_dependencies
     dialog_id = 7123
     dependencies.conn.execute("INSERT INTO daemon_state(key, value) VALUES ('delta_dm_gap_scan_state', NULL)")
-    dependencies.conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?,'synced')", (dialog_id,))
+    dependencies.conn.execute(
+        "INSERT INTO synced_dialogs(dialog_id,status,delta_message_id) VALUES (?,'synced',?)",
+        (dialog_id, delta_cursor),
+    )
     dependencies.conn.execute(
         "INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (?,1,'explicit',0)",
         (dialog_id,),
@@ -393,7 +398,7 @@ async def test_invalid_dm_checkpoint_does_not_block_forward_delta_coordinator(
         async def fetch_page(
             self, _dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
         ) -> ForwardGapPage:
-            assert after_message_id == 1
+            assert after_message_id == (delta_cursor or 0)
             assert not should_stop()
             return ForwardGapPage(messages=(), complete=True)
 
@@ -413,6 +418,14 @@ async def test_invalid_dm_checkpoint_does_not_block_forward_delta_coordinator(
         "SELECT delta_refresh_requested_at,last_delta_checked_at FROM synced_dialogs WHERE dialog_id=?",
         (dialog_id,),
     ).fetchone() == (None, 1_000)
+
+    assert dependencies.conn.execute(
+        "SELECT delta_message_id FROM synced_dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone() == (delta_cursor or 0,)
+    assert dependencies.conn.execute(
+        "SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'"
+    ).fetchone() == (None,)
 
 
 @pytest.mark.asyncio
