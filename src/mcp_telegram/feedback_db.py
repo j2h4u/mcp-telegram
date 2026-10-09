@@ -112,7 +112,11 @@ def ensure_feedback_schema(db_path: Path) -> sqlite3.Connection:
             conn.execute(_FEEDBACK_DDL)
             conn.execute("INSERT INTO schema_version VALUES (1, strftime('%s', 'now'))")
         if current < _FEEDBACK_SCHEMA_VERSION:
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(feedback)").fetchall()}
+            table_info = cast(
+                list[tuple[int, str, str, int, object, int]],
+                conn.execute("PRAGMA table_info(feedback)").fetchall(),
+            )
+            columns = {row[1] for row in table_info}
             for name, definition in (
                 ("status", "TEXT NOT NULL DEFAULT 'open'"),
                 ("status_changed_at", "INTEGER"),

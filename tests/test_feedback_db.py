@@ -261,7 +261,11 @@ def test_feedback_schema_v2_interruption_rolls_back_and_replays(
 
     conn = sqlite3.connect(db_path)
     try:
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(feedback)").fetchall()}
+        table_info = cast(
+            list[tuple[int, str, str, int, object, int]],
+            conn.execute("PRAGMA table_info(feedback)").fetchall(),
+        )
+        columns = {row[1] for row in table_info}
         assert "status" not in columns
         assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (1,)
         assert conn.execute("SELECT message FROM feedback").fetchone() == ("keep me",)
@@ -296,7 +300,11 @@ def test_feedback_schema_v2_repairs_partial_v1_without_overwriting_status(tmp_pa
 
     conn = ensure_feedback_schema(db_path)
     try:
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(feedback)").fetchall()}
+        table_info = cast(
+            list[tuple[int, str, str, int, object, int]],
+            conn.execute("PRAGMA table_info(feedback)").fetchall(),
+        )
+        columns = {row[1] for row in table_info}
         assert {"status", "status_changed_at", "status_comment"} <= columns
         assert conn.execute("SELECT message, status FROM feedback").fetchone() == ("keep status", "done")
         assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (_FEEDBACK_SCHEMA_VERSION,)
