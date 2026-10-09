@@ -217,7 +217,7 @@ RECORD_SCHEMAS = V5_RECORD_SCHEMAS
 EXPORT_SCHEMA: Facts = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
-    "required": ["format_version", "group", "metadata", "identities", "admin_events", "messages", "export"],
+    "required": ["format_version", "group", "metadata", "identities", "messages", "export"],
     "additionalProperties": False,
     "properties": {
         "format_version": {"const": CURRENT_FORMAT_VERSION, "type": "integer"},
@@ -232,6 +232,7 @@ EXPORT_SCHEMA: Facts = {
 Draft202012Validator.check_schema(EXPORT_SCHEMA)
 V4_EXPORT_SCHEMA: Facts = {
     **EXPORT_SCHEMA,
+    "required": ["format_version", "group", "metadata", "identities", "admin_events", "messages", "export"],
     "properties": {
         **cast(Facts, EXPORT_SCHEMA["properties"]),
         "format_version": {"const": 4, "type": "integer"},

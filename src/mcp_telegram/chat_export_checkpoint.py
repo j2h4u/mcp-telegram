@@ -51,15 +51,14 @@ def _validated_events(path: Path) -> Iterator[tuple[str, str, object]]:
                 shapes.add(prefix)
             yield prefix, event, value
     version = read_export_version(path)
-    expected_shapes = {"format_version", "messages", "admin_events", "group", "metadata", "export"}
-    if version >= IDENTITY_FORMAT_VERSION:
-        expected_shapes.add("identities")
-    if shapes != expected_shapes:
-        raise ValueError("Malformed base export field types")
     expected_keys = ["format_version", "group", "metadata"]
     if version >= IDENTITY_FORMAT_VERSION:
         expected_keys.append("identities")
-    expected_keys.extend(["admin_events", "messages", "export"])
+    if version < SPARSE_FORMAT_VERSION or "admin_events" in keys:
+        expected_keys.append("admin_events")
+    expected_keys.extend(["messages", "export"])
+    if shapes != set(expected_keys):
+        raise ValueError("Malformed base export field types")
     if keys != expected_keys:
         raise ValueError("Malformed base export structure")
 

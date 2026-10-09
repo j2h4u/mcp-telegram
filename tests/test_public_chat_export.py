@@ -17,6 +17,7 @@ class ExportDocument(TypedDict):
     messages: list[dict[str, object]]
     admin_events: list[dict[str, object]]
     metadata: dict[str, object]
+    export: dict[str, int]
 
 
 def test_public_normalized_export_keeps_references_and_removes_admin_only_identities(tmp_path: Path) -> None:
@@ -53,7 +54,7 @@ def test_public_normalized_export_keeps_references_and_removes_admin_only_identi
     sanitize_export(source, output, removed)
     census(output, 0)
     raw = cast(ExportDocument, json.loads(output.read_text()))
-    assert raw["format_version"] == 5 and raw["admin_events"] == []
+    assert raw["format_version"] == 5 and "admin_events" not in raw
     assert "Private actor" not in output.read_text()
     assert "Public member" in output.read_text()
     assert raw["identities"][cast(int, raw["messages"][0]["author"])]["id"] == "43"
@@ -65,6 +66,7 @@ def test_public_normalized_export_keeps_references_and_removes_admin_only_identi
     assert "exporter" not in raw["metadata"]  # A privacy filter adds no data.
     assert "Private actor" in removed.read_text()
     assert source.read_bytes() == before
+    assert _restore_export(output, removed) == json.loads(source.read_text())
     repeated = tmp_path / "again.json"
     sanitize_export(output, repeated)
     assert repeated.read_bytes() == output.read_bytes()
@@ -132,6 +134,19 @@ def test_public_identity_order_is_independent_of_admin_log_and_private_snapshots
         original = cast(ExportDocument, json.loads(stream.getvalue()))
         original["format_version"] = format_version
         if format_version == 4:
+            original = cast(
+                ExportDocument,
+                {
+                    **{
+                        key: value
+                        for key, value in original.items()
+                        if key not in {"admin_events", "messages", "export"}
+                    },
+                    "admin_events": original.get("admin_events", []),
+                    "messages": original["messages"],
+                    "export": original["export"],
+                },
+            )
             for identity in original["identities"]:
                 identity["username"] = None
         source = tmp_path / f"source-{variant}.json"

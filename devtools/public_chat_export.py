@@ -13,6 +13,8 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import TextIO, cast
 
+import ijson  # type: ignore[import-untyped]
+
 from mcp_telegram.chat_export_checkpoint import base_records, fingerprint
 from mcp_telegram.chat_export_identity import IdentityIndex
 from mcp_telegram.chat_export_projection import omit_empty_fields
@@ -668,8 +670,35 @@ def _write_public_export(  # noqa: PLR0912, PLR0915
     def start_messages() -> None:
         nonlocal messages_started
         if not messages_started:
-            stream.write('],"admin_events":[],"messages":[')
+            stream.write(
+                '],"messages":[' if format_version >= SPARSE_FORMAT_VERSION else '],"admin_events":[],"messages":['
+            )
             messages_started = True
+
+    if format_version >= SPARSE_FORMAT_VERSION:
+        with path.open("rb") as source:
+            has_admins = False
+            events = cast(Iterator[tuple[str, str, object]], ijson.parse(source))  # pyright: ignore[reportAny]
+            for prefix, event, value in events:
+                if prefix == "" and event == "map_key":
+                    if value == "admin_events":
+                        has_admins = True
+                        break
+                    if value == "messages":
+                        break
+        if has_admins:
+            removed_stream.write('{"path":"/admin_events","value":[')
+            first_admin = True
+            for kind, record in base_records(path, expand_identities=False):
+                if kind == "admin_events.item":
+                    if not first_admin:
+                        removed_stream.write(",")
+                    json.dump(record, removed_stream, ensure_ascii=False, separators=(",", ":"))
+                    first_admin = False
+                elif kind == "messages.item":
+                    break
+            removed_stream.write("]}")
+            first_removed = False
 
     for kind, record in base_records(path, expand_identities=False):
         if kind in {"group", "metadata"}:
@@ -690,7 +719,8 @@ def _write_public_export(  # noqa: PLR0912, PLR0915
         elif kind == "identities.item":
             continue
         elif kind == "admin_events.item":
-            write_removed(iter([{"path": f"/admin_events/{counts['admin_events']}", "value": record}]))
+            if format_version < SPARSE_FORMAT_VERSION:
+                write_removed(iter([{"path": f"/admin_events/{counts['admin_events']}", "value": record}]))
             counts["admin_events"] += 1
         elif kind == "messages.item":
             start_messages()
