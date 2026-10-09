@@ -89,23 +89,6 @@ def read_message_out(conn: sqlite3.Connection, dialog_id: int, message_id: int) 
     return MessageOutLookup(found=row is not None, outgoing=bool(row[0]) if row is not None else False)
 
 
-def persist_message_composition(
-    conn: sqlite3.Connection,
-    dialog_id: int,
-    message_id: int,
-    formatting_entities: str | None,
-    service_action: str | None,
-) -> bool:
-    """Update composition facts without disturbing text, reactions or edit history."""
-    cursor = conn.execute(
-        "UPDATE messages SET formatting_entities = ?, service_action = ? "
-        "WHERE dialog_id = ? AND message_id = ? "
-        "AND (formatting_entities IS NOT ? OR service_action IS NOT ?)",
-        (formatting_entities, service_action, dialog_id, message_id, formatting_entities, service_action),
-    )
-    return cursor.rowcount > 0
-
-
 def _is_current_observation(
     conn: sqlite3.Connection,
     item: _message_contracts.ExtractedMessage,
@@ -113,13 +96,17 @@ def _is_current_observation(
 ) -> bool:
     message = item.message
     key = (message.dialog_id, message.message_id)
-    state = conn.execute(
-        "SELECT observation_order,is_deleted,source_rank FROM message_observations WHERE dialog_id=? AND message_id=?",
-        key,
-    ).fetchone()
-    current = conn.execute(
-        "SELECT edit_date,is_deleted FROM messages WHERE dialog_id=? AND message_id=?", key
-    ).fetchone()
+    state = cast(
+        tuple[int, int, int] | None,
+        conn.execute(
+            "SELECT observation_order,is_deleted,source_rank FROM message_observations WHERE dialog_id=? AND message_id=?",
+            key,
+        ).fetchone(),
+    )
+    current = cast(
+        tuple[int | None, int] | None,
+        conn.execute("SELECT edit_date,is_deleted FROM messages WHERE dialog_id=? AND message_id=?", key).fetchone(),
+    )
     if (state is not None and state[1]) or (current is not None and current[1]):
         return False
     if current is not None:

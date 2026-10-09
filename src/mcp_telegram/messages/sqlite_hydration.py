@@ -24,10 +24,13 @@ _SELECT_MESSAGE_MEDIA_SQL = (
 def hydration_observation_current(
     conn: sqlite3.Connection, dialog_id: int, message_id: int, observation_order: int | None
 ) -> bool:
-    row = conn.execute(
-        "SELECT observation_order,is_deleted FROM message_observations WHERE dialog_id=? AND message_id=?",
-        (dialog_id, message_id),
-    ).fetchone()
+    row = cast(
+        tuple[int, int] | None,
+        conn.execute(
+            "SELECT observation_order,is_deleted FROM message_observations WHERE dialog_id=? AND message_id=?",
+            (dialog_id, message_id),
+        ).fetchone(),
+    )
     return row is None or (not row[1] and (observation_order is None or observation_order >= row[0]))
 
 

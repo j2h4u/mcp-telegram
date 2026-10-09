@@ -19,6 +19,7 @@ Design:
 
 import re
 import sqlite3
+from typing import cast
 
 import snowballstemmer  # type: ignore[import-untyped]
 
@@ -106,13 +107,16 @@ def backfill_fts_index(conn: sqlite3.Connection) -> int:
     """Repair live key coverage and remove duplicate/deleted rows in bounded batches."""
     last_rowid = 0
     while True:
-        rows = conn.execute(
-            "SELECT f.rowid FROM messages_fts f LEFT JOIN message_fts_keys k ON k.id=f.rowid "
-            "LEFT JOIN messages m ON m.dialog_id=k.dialog_id AND m.message_id=k.message_id "
-            "WHERE f.rowid>? AND (m.message_id IS NULL OR m.is_deleted=1 "
-            "OR f.dialog_id!=k.dialog_id OR f.message_id!=k.message_id) ORDER BY f.rowid LIMIT 500",
-            (last_rowid,),
-        ).fetchall()
+        rows = cast(
+            list[tuple[int]],
+            conn.execute(
+                "SELECT f.rowid FROM messages_fts f LEFT JOIN message_fts_keys k ON k.id=f.rowid "
+                "LEFT JOIN messages m ON m.dialog_id=k.dialog_id AND m.message_id=k.message_id "
+                "WHERE f.rowid>? AND (m.message_id IS NULL OR m.is_deleted=1 "
+                "OR f.dialog_id!=k.dialog_id OR f.message_id!=k.message_id) ORDER BY f.rowid LIMIT 500",
+                (last_rowid,),
+            ).fetchall(),
+        )
         if not rows:
             break
         with write_transaction(conn):
@@ -121,15 +125,18 @@ def backfill_fts_index(conn: sqlite3.Connection) -> int:
     inserted = 0
     last_key_id = 0
     while True:
-        rows = conn.execute(
-            "SELECT k.id,m.dialog_id,m.message_id,m.text FROM message_fts_keys k "
-            "JOIN messages m ON k.dialog_id=m.dialog_id AND k.message_id=m.message_id "
-            "LEFT JOIN messages_fts f ON f.rowid=k.id WHERE k.id>? AND m.is_deleted=0 AND f.rowid IS NULL ORDER BY k.id LIMIT 500",
-            (last_key_id,),
-        ).fetchall()
-        if not rows:
+        rows_to_insert = cast(
+            list[tuple[int, int, int, str | None]],
+            conn.execute(
+                "SELECT k.id,m.dialog_id,m.message_id,m.text FROM message_fts_keys k "
+                "JOIN messages m ON k.dialog_id=m.dialog_id AND k.message_id=m.message_id "
+                "LEFT JOIN messages_fts f ON f.rowid=k.id WHERE k.id>? AND m.is_deleted=0 AND f.rowid IS NULL ORDER BY k.id LIMIT 500",
+                (last_key_id,),
+            ).fetchall(),
+        )
+        if not rows_to_insert:
             return inserted
         with write_transaction(conn):
-            conn.executemany(INSERT_FTS_SQL, ((d, m, stem_text(t)) for _, d, m, t in rows))
-        inserted += len(rows)
-        last_key_id = rows[-1][0]
+            conn.executemany(INSERT_FTS_SQL, ((d, m, stem_text(t)) for _, d, m, t in rows_to_insert))
+        inserted += len(rows_to_insert)
+        last_key_id = rows_to_insert[-1][0]

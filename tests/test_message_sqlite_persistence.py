@@ -907,7 +907,7 @@ def test_hydration_raw_seek_crosses_equal_peer_and_older_time_without_skips(conn
     ]
 
 
-def test_delayed_bundles_cannot_overwrite_edits_or_resurrect_deletions(conn):
+def test_delayed_bundles_cannot_overwrite_edits_or_resurrect_deletions(conn: sqlite3.Connection) -> None:
     original = replace(_message(90, text="original"), observation_order=1)
     edited = replace(_message(90, text="edited"), observation_order=3)
     edited = replace(edited, message=replace(edited.message, edit_date=200))
@@ -930,7 +930,7 @@ def test_delayed_bundles_cannot_overwrite_edits_or_resurrect_deletions(conn):
     ).fetchone() == (0,)
 
 
-def test_same_caption_edit_persists_full_bundle_without_version(conn):
+def test_same_caption_edit_persists_full_bundle_without_version(conn: sqlite3.Connection) -> None:
     with write_transaction(conn):
         original = _message(92, text="same", media_kind="video", media_payload='{"duration":12}')
         insert_messages_with_fts(conn, [original])
@@ -945,7 +945,7 @@ def test_same_caption_edit_persists_full_bundle_without_version(conn):
     assert conn.execute("SELECT COUNT(*) FROM message_versions WHERE message_id=92").fetchone() == (0,)
 
 
-def test_fts_repair_handles_missing_keys_masked_by_duplicates_and_deleted(conn):
+def test_fts_repair_handles_missing_keys_masked_by_duplicates_and_deleted(conn: sqlite3.Connection) -> None:
     from mcp_telegram.fts import DELETE_FTS_SQL, backfill_fts_index
 
     with write_transaction(conn):
@@ -962,11 +962,13 @@ def test_fts_repair_handles_missing_keys_masked_by_duplicates_and_deleted(conn):
         (42, 94),
     ]
     assert backfill_fts_index(conn) == 0
-    plan = conn.execute("EXPLAIN QUERY PLAN " + DELETE_FTS_SQL, (42, 93)).fetchall()
+    plan = cast(
+        list[tuple[int, int, int, str]], conn.execute("EXPLAIN QUERY PLAN " + DELETE_FTS_SQL, (42, 93)).fetchall()
+    )
     assert any("VIRTUAL TABLE INDEX" in row[3] and "=" in row[3] for row in plan)
 
 
-def test_hydration_rejects_observation_started_before_newer_message(conn):
+def test_hydration_rejects_observation_started_before_newer_message(conn: sqlite3.Connection) -> None:
     from mcp_telegram.messages.sqlite_hydration import apply_hydrated_media_fact, apply_message_transcription_if_absent
 
     with write_transaction(conn):
@@ -982,7 +984,7 @@ def test_hydration_rejects_observation_started_before_newer_message(conn):
     assert conn.execute("SELECT COUNT(*) FROM message_transcriptions WHERE message_id=96").fetchone() == (0,)
 
 
-def test_migration_helper_rolls_back_ddl_on_failure(tmp_path):
+def test_migration_helper_rolls_back_ddl_on_failure(tmp_path: Path) -> None:
     from mcp_telegram.sync_db import _apply_migration
 
     path = tmp_path / "interrupted.db"
@@ -997,13 +999,14 @@ def test_migration_helper_rolls_back_ddl_on_failure(tmp_path):
         )
     db.close()
     db = sqlite3.connect(path)
-    assert [r[1] for r in db.execute("PRAGMA table_info(retained)")] == ["value"]
+    rows = cast(list[tuple[int, str, str, int, str | None, int]], db.execute("PRAGMA table_info(retained)").fetchall())
+    assert [r[1] for r in rows] == ["value"]
     _apply_migration(db, 79, 80, ["ALTER TABLE retained ADD COLUMN observation_order INTEGER"])
     assert db.execute("SELECT value FROM retained").fetchone() == ("keep",)
     db.close()
 
 
-def test_same_second_delayed_observation_cannot_replace_newer_bundle(conn):
+def test_same_second_delayed_observation_cannot_replace_newer_bundle(conn: sqlite3.Connection) -> None:
     from mcp_telegram.observation_order import allocate_observation_order
 
     older = allocate_observation_order(conn)
@@ -1018,7 +1021,7 @@ def test_same_second_delayed_observation_cannot_replace_newer_bundle(conn):
     assert read_message_text(conn, 42, 97).text == "newer"
 
 
-def test_newer_telegram_version_resets_observation_order(conn):
+def test_newer_telegram_version_resets_observation_order(conn: sqlite3.Connection) -> None:
     old_version = replace(_message(98, text="old"), observation_order=30)
     new_version = replace(
         old_version, observation_order=10, message=replace(old_version.message, text="new", edit_date=200)
