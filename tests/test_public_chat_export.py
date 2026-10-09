@@ -941,3 +941,104 @@ def test_public_rich_content_media_and_buttons_are_preserved(tmp_path: Path) -> 
     repeated = tmp_path / "repeated.json"
     sanitize_export(output, repeated)
     assert output.read_bytes() == repeated.read_bytes()
+
+
+def test_public_location_contact_dice_and_service_events_preserve_safe_facts(tmp_path: Path) -> None:
+    geo = {"_": "GeoPoint", "lat": 51.1, "long": 71.4, "accuracy_radius": 20}
+    call = {"_": "InputGroupCall", "id": "91"}
+    public_media = [
+        {"_": "MessageMediaGeo", "geo": geo},
+        {"_": "MessageMediaGeoLive", "geo": geo, "period": 900, "heading": 180, "proximity_notification_radius": 100},
+        {
+            "_": "MessageMediaVenue",
+            "geo": geo,
+            "title": "Cafe",
+            "address": "Main St",
+            "provider": "provider",
+            "venue_id": "2",
+            "venue_type": "food",
+        },
+        {
+            "_": "MessageMediaContact",
+            "phone_number": "+1234",
+            "first_name": "Ada",
+            "last_name": "L",
+            "vcard": "BEGIN:VCARD\nFN:Ada\nEND:VCARD",
+            "user_id": "42",
+        },
+        {"_": "MessageMediaDice", "value": 5, "emoticon": "🎲"},
+    ]
+    public_actions = [
+        {"_": "MessageActionSetMessagesTTL", "period": 86400},
+        {"_": "MessageActionGroupCall", "call": call, "duration": 45},
+        {"_": "MessageActionGroupCallScheduled", "call": call, "schedule_date": "2026-10-10T10:00:00+00:00"},
+        {"_": "MessageActionInviteToGroupCall", "call": call, "users": ["42"]},
+    ]
+    private = {"novel_sensitive_field": "private", "access_hash": "secret", "out": True, "recent_voters": ["42"]}
+    messages = []
+    for number, media in enumerate(public_media, start=1):
+        raw_media = {**media, **private}
+        if "geo" in media:
+            raw_media["geo"] = {**geo, **private}
+        messages.append({"dialog_id": "-1001", "message_id": str(number), "metadata": {"media": raw_media}})
+        # Attached and reply media use the same constructor-specific boundary.
+        projected = public_facts(
+            {"metadata": {"reply_to": {"reply_media": raw_media}, "media": {"attached_media": raw_media}}}, MESSAGE
+        )
+        assert projected == {"metadata": {"reply_to": {"reply_media": media}, "media": {"attached_media": media}}}
+    for number, action in enumerate(public_actions, start=len(messages) + 1):
+        raw_action = {**action, **private, "auto_setting_from": "account provenance"}
+        if "call" in action:
+            raw_action["call"] = {**call, **private}
+        messages.append(
+            {"dialog_id": "-1001", "message_id": str(number), "kind": "service", "service_action": raw_action}
+        )
+    for message in messages:
+        message.update({"message_key": f"-1001:{message['message_id']}", "reactors": []})
+    data = {
+        "format_version": 1,
+        "group": {"dialog_id": "-1001"},
+        "metadata": {"order": ORDER, "peers": [{"dialog_id": "-1001"}]},
+        "admin_events": [{"event_id": "1", "dialog_id": "-1001", **private}],
+        "messages": messages,
+        "export": {"messages": len(messages), "admin_events": 1, "reactors": 0},
+    }
+    source = tmp_path / "original.json"
+    source.write_text(json.dumps(data))
+    original = source.read_bytes()
+    output = tmp_path / "public.json"
+    removed = tmp_path / "removed.json"
+
+    sanitize_export(source, output, removed)
+
+    published = cast(ExportDocument, json.loads(output.read_text()))
+    assert [
+        cast(dict[str, object], message["metadata"])["media"] for message in published["messages"][: len(public_media)]
+    ] == public_media
+    assert [message["service_action"] for message in published["messages"][len(public_media) :]] == public_actions
+    assert all(message["kind"] == "service" for message in published["messages"][len(public_media) :])
+    assert published["admin_events"] == []
+    assert "private" not in output.read_text() and "secret" not in output.read_text()
+    assert "account provenance" not in output.read_text()
+    assert _restore_export(output, removed) == data
+    assert source.read_bytes() == original
+    sanitize_export(output, tmp_path / "repeated.json")
+    assert (tmp_path / "repeated.json").read_bytes() == output.read_bytes()
+
+
+def test_public_new_media_rejects_wrong_nested_constructors_and_scalar_containers() -> None:
+    assert public_facts(
+        {
+            "metadata": {
+                "media": {"_": "MessageMediaGeo", "geo": {"_": "UnknownGeo", "lat": 51, "access_hash": "private"}}
+            }
+        },
+        MESSAGE,
+    ) == {"metadata": {"media": {"_": "MessageMediaGeo", "geo": {}}}}
+    assert public_facts(
+        {"metadata": {"media": {"_": "MessageMediaContact", "phone_number": {"private": "secret"}, "user_id": [42]}}},
+        MESSAGE,
+    ) == {"metadata": {"media": {"_": "MessageMediaContact"}}}
+    assert public_facts({"metadata": {"media": {"_": {"private": "secret"}, "geo": {"lat": 51}}}}, MESSAGE) == {
+        "metadata": {"media": {}}
+    }
