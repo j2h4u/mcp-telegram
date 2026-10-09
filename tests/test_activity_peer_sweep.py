@@ -18,6 +18,7 @@ from typing import cast
 
 import pytest
 
+from helpers import build_mock_message
 from mcp_telegram.activity_peer_sweep import (
     _DIALOG_STATE_COLUMNS,
     _PACING,
@@ -32,6 +33,8 @@ from mcp_telegram.activity_peer_sweep import (
     working_set_enrollment_release_at,
 )
 from mcp_telegram.linked_chat_fact import LinkedChatState, linked_chat_fact_owner
+from mcp_telegram.message_contracts import ExtractedMessage
+from mcp_telegram.messages.telegram_adapter import extract_message_row
 from mcp_telegram.sync_db import _apply_migrations
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource
 
@@ -444,11 +447,11 @@ def test_sweep_peer_once_success_invokes_pacing_sleep(
         def fake_extract_dialog_id(message: _FakeSweepMessage) -> int | None:
             return 101 if message.peer_id == "keep" else None
 
-        def fake_extract_message_row(dialog_id: int, message: _FakeSweepMessage) -> tuple[int, str]:
-            return (dialog_id, f"msg-{message.id}")
+        def fake_extract_message_row(dialog_id: int, message: _FakeSweepMessage) -> ExtractedMessage:
+            return extract_message_row(dialog_id, build_mock_message(id=message.id, text=f"msg-{message.id}"))
 
         def fake_insert_messages_with_fts(
-            conn: sqlite3.Connection, rows: list[tuple[int, str]], **_kwargs: object
+            conn: sqlite3.Connection, rows: list[ExtractedMessage], **_kwargs: object
         ) -> None:
             del conn, rows
 
@@ -749,14 +752,15 @@ def test_sweep_peer_once_persists_only_extractable_messages(monkeypatch: pytest.
         def fake_extract_dialog_id(message: _FakeSweepMessage) -> int | None:
             return 101 if message.peer_id == "keep" else None
 
-        def fake_extract_message_row(dialog_id: int, message: _FakeSweepMessage) -> tuple[int, str]:
-            return (dialog_id, f"msg-{message.id}")
+        def fake_extract_message_row(dialog_id: int, message: _FakeSweepMessage) -> ExtractedMessage:
+            return extract_message_row(dialog_id, build_mock_message(id=message.id, text=f"msg-{message.id}"))
 
         def fake_insert_messages_with_fts(
-            conn: sqlite3.Connection, rows: list[tuple[int, str]], **_kwargs: object
+            conn: sqlite3.Connection, rows: list[ExtractedMessage], **_kwargs: object
         ) -> None:
             del conn
-            inserted.append(rows)
+            assert all(row.observation_order is not None for row in rows)
+            inserted.append([(row.message.dialog_id, row.message.text or "") for row in rows])
 
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
@@ -812,14 +816,15 @@ def test_sweep_peer_once_counts_unique_genuinely_new_keys_before_replacement(
         def fake_extract_dialog_id(message: _FakeSweepMessage) -> int | None:
             return 101 if message.peer_id == "keep" else None
 
-        def fake_extract_message_row(dialog_id: int, message: _FakeSweepMessage) -> tuple[int, str]:
-            return (dialog_id, f"msg-{message.id}")
+        def fake_extract_message_row(dialog_id: int, message: _FakeSweepMessage) -> ExtractedMessage:
+            return extract_message_row(dialog_id, build_mock_message(id=message.id, text=f"msg-{message.id}"))
 
         def fake_insert_messages_with_fts(
-            conn: sqlite3.Connection, rows: list[tuple[int, str]], **_kwargs: object
+            conn: sqlite3.Connection, rows: list[ExtractedMessage], **_kwargs: object
         ) -> None:
             del conn
-            inserted.append(rows)
+            assert all(row.observation_order is not None for row in rows)
+            inserted.append([(row.message.dialog_id, row.message.text or "") for row in rows])
 
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)

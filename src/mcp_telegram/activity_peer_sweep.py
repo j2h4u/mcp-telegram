@@ -25,7 +25,7 @@ import math
 import sqlite3
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Protocol, cast
 
@@ -40,6 +40,7 @@ from .linked_chat_fact import LinkedChatState
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_bundle import insert_messages_with_fts, message_exists
 from .messages.telegram_adapter import extract_dialog_id, extract_message_row
+from .observation_order import allocate_observation_order
 from .own_only import enroll_own_only_sync_dialog
 from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
@@ -220,7 +221,7 @@ def _extract_sweep_messages(
 
 
 def _extract_and_persist_sweep_messages(
-    request: PeerSweepRequest, batch: Sequence[_SweepMessageLike]
+    request: PeerSweepRequest, batch: Sequence[_SweepMessageLike], observation_order: int
 ) -> tuple[list[ExtractedMessage], frozenset[tuple[int, int]]] | SweepResult:
     """Return page rows or an explicit non-completion processing error."""
     try:
@@ -233,7 +234,7 @@ def _extract_and_persist_sweep_messages(
             if extracted:
                 insert_messages_with_fts(
                     request.conn,
-                    extracted,
+                    [replace(row, observation_order=observation_order) for row in extracted],
                     priority=request.hydration_priority,
                 )
     except Exception:
@@ -421,6 +422,7 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
 
     # Step 2: issue per-peer self-search with concrete peer (not InputPeerEmpty)
     rpc_calls += 1  # SearchRequest is a governed Telegram call attempt.
+    observation_order = allocate_observation_order(request.conn)
     search = await _search_self_messages(request, peer, rpc_calls=rpc_calls)
     if search.early_result is not None:
         return search.early_result
@@ -453,7 +455,7 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
         )
 
     # Step 3-4: extract and persist via canonical pipeline
-    page_rows = _extract_and_persist_sweep_messages(request, batch)
+    page_rows = _extract_and_persist_sweep_messages(request, batch, observation_order)
     if isinstance(page_rows, SweepResult):
         return page_rows
     extracted, genuinely_new_keys = page_rows

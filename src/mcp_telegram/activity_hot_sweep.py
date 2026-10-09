@@ -223,7 +223,7 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
                                 self.conn,
                                 state.dialog_id,
                                 offset_id=state.page_offset_id,
-                                min_id=state.committed_cursor + 1 if state.committed_cursor else 0,
+                                min_id=state.committed_cursor,
                                 limit=_BACKFILL_BATCH_LIMIT,
                                 timeout_s=self.timeout_s,
                                 hydration_priority=HydrationPriority.FOREGROUND,

@@ -12,7 +12,7 @@ import sqlite3
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Protocol, cast
 
@@ -27,6 +27,7 @@ from .message_contracts import ExtractedMessage
 from .messages.sqlite_bundle import insert_messages_with_fts
 from .messages.telegram_adapter import extract_dialog_id, extract_message_row
 from .models import DialogType
+from .observation_order import allocate_observation_order
 from .own_only import enroll_own_only_sync_dialog
 from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_demand import (
@@ -55,6 +56,7 @@ _SECONDS_PER_MINUTE = 60
 _SECONDS_PER_HOUR = 60 * _SECONDS_PER_MINUTE
 _INCREMENTAL_MIN_DATE_KEY = "incremental_min_date"
 _INCREMENTAL_OFFSET_ID_KEY = "incremental_offset_id"
+_INCREMENTAL_STARTED_AT_KEY = "incremental_started_at"
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,13 +244,16 @@ def _set_state(conn: sqlite3.Connection, key: str, value: str | None) -> None:
 def _finish_incremental_slice(conn: sqlite3.Connection) -> None:
     """Atomically finish one incremental window and publish its next cadence anchor."""
     require_write_transaction(conn)
+    state = _load_state(conn)
+    # Legacy unfinished windows rescan conservatively when their start is unknown.
+    next_anchor = state.get(_INCREMENTAL_STARTED_AT_KEY) or state.get("last_sync_at") or "0"
     conn.execute(
-        "DELETE FROM activity_sync_state WHERE key IN (?, ?)",
-        (_INCREMENTAL_MIN_DATE_KEY, _INCREMENTAL_OFFSET_ID_KEY),
+        "DELETE FROM activity_sync_state WHERE key IN (?, ?, ?)",
+        (_INCREMENTAL_MIN_DATE_KEY, _INCREMENTAL_OFFSET_ID_KEY, _INCREMENTAL_STARTED_AT_KEY),
     )
     conn.execute(
         "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('last_sync_at', ?)",
-        (str(int(time.time())),),
+        (next_anchor,),
     )
 
 
@@ -574,6 +579,7 @@ def _prepare_incremental_slice(
         min_date = int(raw_min_date) if raw_min_date is not None else max(0, last_sync_at - 60)
         offset_id = int(state.get(_INCREMENTAL_OFFSET_ID_KEY) or 0)
         if raw_min_date is None:
+            _set_state(conn, _INCREMENTAL_STARTED_AT_KEY, str(int(time.time())))
             conn.execute(
                 "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
                 (_INCREMENTAL_MIN_DATE_KEY, str(min_date)),
@@ -590,6 +596,7 @@ def _commit_incremental_slice_result(
     search_result: _SearchResultLike,
     min_date: int,
     batch_started_at: float,
+    observation_order: int,
 ) -> None:
     """Persist one incremental page and its restart-safe continuation."""
     with write_transaction(conn):
@@ -599,7 +606,7 @@ def _commit_incremental_slice_result(
             return
 
         in_window, past_window = _trim_incremental_batch(batch, min_date)
-        extracted = _extract_own_message_rows(in_window)
+        extracted = [replace(row, observation_order=observation_order) for row in _extract_own_message_rows(in_window)]
         _persist_own_message_rows(conn, extracted, priority=HydrationPriority.FOREGROUND)
         _upsert_entities_from_search(conn, search_result)
         next_offset_id = min(message.id for message in batch)
@@ -644,7 +651,9 @@ async def _run_backfill_slice(
             "INSERT OR IGNORE INTO activity_sync_state (key, value) VALUES ('backfill_started_at', ?)",
             (str(int(time.time())),),
         )
+        state = _load_state(conn)
     batch_started_at = time.monotonic()
+    observation_order = allocate_observation_order(conn)
     result = await _search_backfill_batch(
         client,
         checkpoint,
@@ -661,11 +670,11 @@ async def _run_backfill_slice(
             conn.execute("INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('backfill_complete', '1')")
             conn.execute(
                 "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('last_sync_at', ?)",
-                (str(int(time.time())),),
+                (state["backfill_started_at"] or "0",),
             )
         return
     with write_transaction(conn):
-        extracted = _extract_own_message_rows(batch)
+        extracted = [replace(row, observation_order=observation_order) for row in _extract_own_message_rows(batch)]
         _persist_own_message_rows(conn, extracted, priority=HydrationPriority.BACKFILL)
         _upsert_entities_from_search(conn, search_result)
         checkpoint = min(message.id for message in batch)
@@ -696,6 +705,7 @@ async def _run_incremental_slice(
     min_date, offset_id = window
 
     batch_started_at = time.monotonic()
+    observation_order = allocate_observation_order(conn)
     result = await _search_incremental_batch(
         client,
         min_date,
@@ -704,10 +714,8 @@ async def _run_incremental_slice(
         inserted=0,
         timeout_s=timeout_s,
     )
-    if result is _SEARCH_BATCH_RETRY:
+    if result is _SEARCH_BATCH_RETRY or result is _SEARCH_BATCH_STOP:
         return
-    if result is _SEARCH_BATCH_STOP:
-        with write_transaction(conn):
-            _finish_incremental_slice(conn)
-        return
-    _commit_incremental_slice_result(conn, cast(_SearchResultLike, result), min_date, batch_started_at)
+    _commit_incremental_slice_result(
+        conn, cast(_SearchResultLike, result), min_date, batch_started_at, observation_order
+    )
