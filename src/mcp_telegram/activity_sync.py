@@ -634,6 +634,24 @@ def _commit_incremental_slice_result(
         _set_state(conn, _INCREMENTAL_OFFSET_ID_KEY, str(next_offset_id))
 
 
+def _prepare_backfill_slice(
+    conn: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> tuple[int, str] | None:
+    """Load the checkpoint and retain the original backfill window start."""
+    with write_transaction(conn):
+        state = _load_state(conn)
+        if shutdown_event.is_set() or state.get("backfill_complete") == "1":
+            return None
+        checkpoint = int(state.get("backfill_offset_id") or 0)
+        conn.execute(
+            "INSERT OR IGNORE INTO activity_sync_state (key, value) VALUES ('backfill_started_at', ?)",
+            (str(int(time.time())),),
+        )
+        state = _load_state(conn)
+    return checkpoint, state["backfill_started_at"] or "0"
+
+
 async def _run_backfill_slice(
     client: ActivityClient,
     conn: sqlite3.Connection,
@@ -642,16 +660,10 @@ async def _run_backfill_slice(
     timeout_s: float,
 ) -> None:
     """Fetch one restart-safe archive-backfill page."""
-    with write_transaction(conn):
-        state = _load_state(conn)
-        if shutdown_event.is_set() or state.get("backfill_complete") == "1":
-            return
-        checkpoint = int(state.get("backfill_offset_id") or 0)
-        conn.execute(
-            "INSERT OR IGNORE INTO activity_sync_state (key, value) VALUES ('backfill_started_at', ?)",
-            (str(int(time.time())),),
-        )
-        state = _load_state(conn)
+    window = _prepare_backfill_slice(conn, shutdown_event)
+    if window is None:
+        return
+    checkpoint, started_at = window
     batch_started_at = time.monotonic()
     observation_order = allocate_observation_order(conn)
     result = await _search_backfill_batch(
@@ -670,7 +682,7 @@ async def _run_backfill_slice(
             conn.execute("INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('backfill_complete', '1')")
             conn.execute(
                 "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('last_sync_at', ?)",
-                (state["backfill_started_at"] or "0",),
+                (started_at,),
             )
         return
     with write_transaction(conn):
