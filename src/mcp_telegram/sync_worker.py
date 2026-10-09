@@ -23,7 +23,7 @@ import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import wraps
 from typing import Protocol, cast
 
@@ -46,6 +46,7 @@ from .message_history.contracts import (
 )
 from .message_history.ports import FullHistoryPagePort
 from .messages.sqlite_bundle import insert_messages_with_fts
+from .observation_order import allocate_observation_order
 from .read_state import apply_read_cursor
 from .resolver import latinize
 from .sync_transactions import require_write_transaction, write_transaction
@@ -619,6 +620,7 @@ class FullSyncWorker:
     async def _fetch_batch_page(self, dialog_id: int, sync_progress: int) -> _FetchedBatchPage:
         self._last_page_error = None
         reaction_observed_at = int(time.time())
+        observation_order = allocate_observation_order(self._conn)
         try:
             page = await self._history_port.fetch_page(dialog_id, before_message_id=sync_progress)
         except MessageHistoryAccessLostError as exc:
@@ -643,7 +645,7 @@ class FullSyncWorker:
             return _FetchedBatchPage(None, (), None, (sync_progress, False))
         return _FetchedBatchPage(
             total_messages,
-            page.messages,
+            tuple(replace(item, observation_order=observation_order) for item in page.messages),
             page.next_before_message_id,
             reaction_observed_at=reaction_observed_at,
         )
@@ -695,6 +697,11 @@ class FullSyncWorker:
         page: _FetchedBatchPage,
     ) -> tuple[int, bool]:
         require_write_transaction(self._conn)
+        if sync_progress == 0 and full_history_enabled(self._conn, dialog_id):
+            self._conn.execute(
+                "UPDATE synced_dialogs SET delta_message_id=? WHERE dialog_id=? AND delta_message_id IS NULL",
+                (max((item.message.message_id for item in page.batch), default=0), dialog_id),
+            )
         if page.next_before_message_id is None:
             if not full_history_enabled(self._conn, dialog_id):
                 logger.info("sync_batch_discarded_disabled dialog_id=%d fetched=0", dialog_id)

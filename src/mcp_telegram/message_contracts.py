@@ -83,6 +83,8 @@ class ExtractedMessage:
 
     message: StoredMessage
     reply_count: int
+    observation_order: int | None = None
+    reactions_observed: bool = True
     reactions: list[ReactionRecord] = field(default_factory=list)
     entities: list[EntityRecord] = field(default_factory=list)
     forward: ForwardRecord | None = None

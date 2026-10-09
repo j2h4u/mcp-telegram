@@ -751,7 +751,7 @@ def test_unrelated_media_caption_can_be_removed_on_reimport(conn: sqlite3.Connec
     assert conn.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=16").fetchone() == (None,)
 
 
-def test_mark_message_deleted_is_idempotent_and_retains_text_and_fts(conn: sqlite3.Connection) -> None:
+def test_mark_message_deleted_is_idempotent_and_retains_text(conn: sqlite3.Connection) -> None:
     with write_transaction(conn):
         insert_messages_with_fts(conn, [_message(13, text="retain me")])
     with write_transaction(conn):
@@ -765,7 +765,7 @@ def test_mark_message_deleted_is_idempotent_and_retains_text_and_fts(conn: sqlit
         1,
         500,
     )
-    assert conn.execute("SELECT COUNT(*) FROM messages_fts WHERE dialog_id=42 AND message_id=13").fetchone() == (1,)
+    assert conn.execute("SELECT COUNT(*) FROM messages_fts WHERE dialog_id=42 AND message_id=13").fetchone() == (0,)
 
 
 def test_find_unique_incoming_human_dm_dialogs_requires_one_policy_match(conn: sqlite3.Connection) -> None:
@@ -905,3 +905,127 @@ def test_hydration_raw_seek_crosses_equal_peer_and_older_time_without_skips(conn
     assert _repair_raw_page(conn, _REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL, HydrationRepairCursor(*page[-1]), 4) == [
         (9, 42, 4)
     ]
+
+
+def test_delayed_bundles_cannot_overwrite_edits_or_resurrect_deletions(conn):
+    original = replace(_message(90, text="original"), observation_order=1)
+    edited = replace(_message(90, text="edited"), observation_order=3)
+    edited = replace(edited, message=replace(edited.message, edit_date=200))
+    with write_transaction(conn):
+        insert_messages_with_fts(conn, [original])
+        insert_messages_with_fts(conn, [edited])
+        insert_messages_with_fts(conn, [replace(original, observation_order=4)])
+    assert read_message_text(conn, 42, 90).text == "edited"
+    with write_transaction(conn):
+        mark_message_deleted(conn, 42, 90, 300)
+        mark_message_deleted(conn, 42, 91, 300)
+        insert_messages_with_fts(conn, [replace(edited, observation_order=100), _message(91, text="late")])
+    assert conn.execute("SELECT is_deleted,text FROM messages WHERE dialog_id=42 AND message_id=90").fetchone() == (
+        1,
+        "edited",
+    )
+    assert not read_message_text(conn, 42, 91).found
+    assert conn.execute(
+        "SELECT COUNT(*) FROM messages_fts WHERE dialog_id=42 AND message_id IN (90,91)"
+    ).fetchone() == (0,)
+
+
+def test_same_caption_edit_persists_full_bundle_without_version(conn):
+    with write_transaction(conn):
+        original = _message(92, text="same", media_kind="video", media_payload='{"duration":12}')
+        insert_messages_with_fts(conn, [original])
+        edited = replace(
+            original,
+            message=replace(original.message, edit_date=200, reply_to_msg_id=10, media_payload='{"duration":24}'),
+        )
+        assert persist_edited_message(conn, edited, old_text="same", edit_date=200) is None
+    assert conn.execute(
+        "SELECT edit_date,reply_to_msg_id,media_payload FROM messages WHERE message_id=92"
+    ).fetchone() == (200, 10, '{"duration":24}')
+    assert conn.execute("SELECT COUNT(*) FROM message_versions WHERE message_id=92").fetchone() == (0,)
+
+
+def test_fts_repair_handles_missing_keys_masked_by_duplicates_and_deleted(conn):
+    from mcp_telegram.fts import DELETE_FTS_SQL, backfill_fts_index
+
+    with write_transaction(conn):
+        insert_messages_with_fts(
+            conn, [_message(93, text="live"), _message(94, text="missing"), _message(95, text="deleted")]
+        )
+        conn.execute(DELETE_FTS_SQL, (42, 94))
+        mark_message_deleted(conn, 42, 95, 300)
+        conn.execute("INSERT INTO messages_fts(dialog_id,message_id,stemmed_text) VALUES(42,93,'duplicate')")
+        conn.execute("INSERT INTO messages_fts(dialog_id,message_id,stemmed_text) VALUES(42,95,'deleted')")
+    assert backfill_fts_index(conn) == 1
+    assert conn.execute("SELECT dialog_id,message_id FROM messages_fts ORDER BY message_id").fetchall() == [
+        (42, 93),
+        (42, 94),
+    ]
+    assert backfill_fts_index(conn) == 0
+    plan = conn.execute("EXPLAIN QUERY PLAN " + DELETE_FTS_SQL, (42, 93)).fetchall()
+    assert any("VIRTUAL TABLE INDEX" in row[3] and "=" in row[3] for row in plan)
+
+
+def test_hydration_rejects_observation_started_before_newer_message(conn):
+    from mcp_telegram.messages.sqlite_hydration import apply_hydrated_media_fact, apply_message_transcription_if_absent
+
+    with write_transaction(conn):
+        insert_messages_with_fts(conn, [replace(_message(96, text="newer"), observation_order=20)])
+        assert not apply_hydrated_media_fact(conn, 42, 96, None, None, observation_order=10)
+        assert (
+            apply_message_transcription_if_absent(
+                conn, 42, 96, transcribed_text="oldvoice", transcription_id=1, received_at=1, observation_order=10
+            )
+            == "not_applied"
+        )
+    assert read_message_text(conn, 42, 96).text == "newer"
+    assert conn.execute("SELECT COUNT(*) FROM message_transcriptions WHERE message_id=96").fetchone() == (0,)
+
+
+def test_migration_helper_rolls_back_ddl_on_failure(tmp_path):
+    from mcp_telegram.sync_db import _apply_migration
+
+    path = tmp_path / "interrupted.db"
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE schema_version(version INTEGER PRIMARY KEY,applied_at INTEGER)")
+    db.execute("CREATE TABLE retained(value TEXT)")
+    db.execute("INSERT INTO retained VALUES ('keep')")
+    db.commit()
+    with pytest.raises(sqlite3.OperationalError):
+        _apply_migration(
+            db, 79, 80, ["ALTER TABLE retained ADD COLUMN observation_order INTEGER", "INSERT INTO absent VALUES (1)"]
+        )
+    db.close()
+    db = sqlite3.connect(path)
+    assert [r[1] for r in db.execute("PRAGMA table_info(retained)")] == ["value"]
+    _apply_migration(db, 79, 80, ["ALTER TABLE retained ADD COLUMN observation_order INTEGER"])
+    assert db.execute("SELECT value FROM retained").fetchone() == ("keep",)
+    db.close()
+
+
+def test_same_second_delayed_observation_cannot_replace_newer_bundle(conn):
+    from mcp_telegram.observation_order import allocate_observation_order
+
+    older = allocate_observation_order(conn)
+    newer = allocate_observation_order(conn)
+    base = _message(97, text="newer")
+    base = replace(base, message=replace(base.message, edit_date=500))
+    with write_transaction(conn):
+        insert_messages_with_fts(conn, [replace(base, observation_order=newer)])
+        insert_messages_with_fts(
+            conn, [replace(base, observation_order=older, message=replace(base.message, text="delayed"))]
+        )
+    assert read_message_text(conn, 42, 97).text == "newer"
+
+
+def test_newer_telegram_version_resets_observation_order(conn):
+    old_version = replace(_message(98, text="old"), observation_order=30)
+    new_version = replace(
+        old_version, observation_order=10, message=replace(old_version.message, text="new", edit_date=200)
+    )
+    same_new_version = replace(new_version, observation_order=20, message=replace(new_version.message, text="latest"))
+    with write_transaction(conn):
+        insert_messages_with_fts(conn, [old_version])
+        insert_messages_with_fts(conn, [new_version])
+        insert_messages_with_fts(conn, [same_new_version])
+    assert read_message_text(conn, 42, 98).text == "latest"

@@ -13,6 +13,7 @@ from ..alert_policy import incoming_human_dm_sql
 from ..fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
 from ..hydration_queue import HydrationPriority, HydrationQueueRepository
 from ..media_fact import decode_media_fact, is_transcribable_telegram_media
+from ..observation_order import allocate_observation_order
 from ..reactions.contracts import ReactionAggregate, ReactionAggregateSource
 from ..reactions.persistence import replace_reaction_aggregates
 from .sqlite_hydration_jobs import _FACT_HYDRATION_EMPTY_KINDS, _is_canonical_media_pair, reconcile_fact_hydration_job
@@ -105,6 +106,39 @@ def persist_message_composition(
     return cursor.rowcount > 0
 
 
+def _is_current_observation(
+    conn: sqlite3.Connection,
+    item: _message_contracts.ExtractedMessage,
+    source: ReactionAggregateSource | str = ReactionAggregateSource.HISTORY,
+) -> bool:
+    message = item.message
+    key = (message.dialog_id, message.message_id)
+    state = conn.execute(
+        "SELECT observation_order,is_deleted,source_rank FROM message_observations WHERE dialog_id=? AND message_id=?",
+        key,
+    ).fetchone()
+    current = conn.execute(
+        "SELECT edit_date,is_deleted FROM messages WHERE dialog_id=? AND message_id=?", key
+    ).fetchone()
+    if (state is not None and state[1]) or (current is not None and current[1]):
+        return False
+    if current is not None:
+        incoming_version, current_version = message.edit_date or 0, current[0] or 0
+        if incoming_version < current_version:
+            return False
+        if incoming_version > current_version:
+            return True
+    return _follows_stored_observation(state, item.observation_order, ReactionAggregateSource(source).rank)
+
+
+def _follows_stored_observation(state: tuple[int, int, int] | None, order: int | None, source_rank: int) -> bool:
+    if state is None:
+        return True
+    if source_rank < state[2]:
+        return False
+    return order is None or order >= state[0]
+
+
 def persist_edited_message(  # noqa: PLR0913
     conn: sqlite3.Connection,
     extracted: _message_contracts.ExtractedMessage,
@@ -116,12 +150,14 @@ def persist_edited_message(  # noqa: PLR0913
 ) -> int | None:
     """Version and persist a changed message in the caller's transaction."""
     dialog_id, message_id = extracted.message.dialog_id, extracted.message.message_id
+    if not _is_current_observation(conn, extracted, reaction_source):
+        return None
     current = read_message_text(conn, dialog_id, message_id)
     if not current.found:
         return None
     if current.text == extracted.message.text:
-        persist_message_composition(
-            conn, dialog_id, message_id, extracted.message.formatting_entities, extracted.message.service_action
+        insert_messages_with_fts(
+            conn, [extracted], priority=priority, reaction_source=reaction_source, reaction_observed_at=edit_date
         )
         return None
     old_text = current.text
@@ -163,7 +199,13 @@ def persist_transcribed_text(
 
 def mark_message_deleted(conn: sqlite3.Connection, dialog_id: int, message_id: int, deleted_at: int) -> bool:
     """Tombstone one message and report whether this call changed its state."""
+    observation_order = allocate_observation_order(conn)
+    conn.execute(
+        "INSERT INTO message_observations(dialog_id,message_id,observation_order,is_deleted) VALUES(?,?,?,1) ON CONFLICT(dialog_id,message_id) DO UPDATE SET is_deleted=1,observation_order=excluded.observation_order",
+        (dialog_id, message_id, observation_order),
+    )
     cursor = conn.execute(_MARK_DELETED_SQL, (deleted_at, dialog_id, message_id))
+    conn.execute(DELETE_FTS_SQL, (dialog_id, message_id))
     if cursor.rowcount > 0:
         HydrationQueueRepository(conn).remove_for_message(dialog_id, message_id)
     return cursor.rowcount > 0
@@ -197,6 +239,24 @@ def list_undeleted_message_ids(conn: sqlite3.Connection, dialog_id: int, sent_be
     return tuple(int(message_id) for (message_id,) in rows)
 
 
+def _accepted_message_bundles(
+    conn: sqlite3.Connection,
+    extracted: Sequence[_message_contracts.ExtractedMessage],
+    source: ReactionAggregateSource | str,
+) -> list[_message_contracts.ExtractedMessage]:
+    accepted_by_key: dict[tuple[int, int], _message_contracts.ExtractedMessage] = {}
+    for item in extracted:
+        if _is_current_observation(conn, item, source):
+            key = (item.message.dialog_id, item.message.message_id)
+            prior = accepted_by_key.get(key)
+            if prior is None or (item.message.edit_date or 0, item.observation_order or 0) >= (
+                prior.message.edit_date or 0,
+                prior.observation_order or 0,
+            ):
+                accepted_by_key[key] = item
+    return list(accepted_by_key.values())
+
+
 def insert_messages_with_fts(
     conn: sqlite3.Connection,
     extracted: Sequence[_message_contracts.ExtractedMessage],
@@ -204,13 +264,24 @@ def insert_messages_with_fts(
     priority: HydrationPriority = HydrationPriority.FOREGROUND,
     reaction_source: ReactionAggregateSource | str = ReactionAggregateSource.HISTORY,
     reaction_observed_at: int | None = None,
-) -> None:
-    """Persist message bundles in the caller-owned transaction."""
-    projected = _overlay_message_transcriptions(conn, _preserve_transcribed_texts(conn, extracted))
+) -> int:
+    """Persist accepted bundles and return their unique key count."""
+    accepted = _accepted_message_bundles(conn, extracted, reaction_source)
+    fallback_sequence = (
+        allocate_observation_order(conn) if any(item.observation_order is None for item in accepted) else 0
+    )
+    for item in accepted:
+        sequence = item.observation_order if item.observation_order is not None else fallback_sequence
+        conn.execute(
+            "INSERT INTO message_observations(dialog_id,message_id,observation_order,source_rank) VALUES(?,?,?,?) ON CONFLICT(dialog_id,message_id) DO UPDATE SET observation_order=excluded.observation_order,source_rank=excluded.source_rank",
+            (item.message.dialog_id, item.message.message_id, sequence, ReactionAggregateSource(reaction_source).rank),
+        )
+    projected = _overlay_message_transcriptions(conn, _preserve_transcribed_texts(conn, accepted))
     _write_message_rows_and_fts(conn, projected, priority=priority)
     _delete_entity_and_forward_projections(conn, projected)
     _replace_reaction_projections(conn, projected, source=reaction_source, observed_at=reaction_observed_at)
     _insert_entity_and_forward_projections(conn, projected)
+    return len(projected)
 
 
 def _write_message_rows_and_fts(
@@ -271,6 +342,8 @@ def _replace_reaction_projections(
     observed_at: int | None = None,
 ) -> None:
     for item in extracted:
+        if not item.reactions_observed:
+            continue
         replace_reaction_aggregates(
             conn,
             item.message.dialog_id,
