@@ -7,7 +7,7 @@ from typing import cast
 
 from ..hydration_queue import TRANSCRIPTION_HYDRATION_KIND, HydrationJob, HydrationPriority, HydrationQueueRepository
 from ..media_fact import decode_media_fact, is_transcribable_telegram_media
-from .sqlite_bundle import persist_transcribed_text, read_message_text
+from .sqlite_bundle import has_nonchannel_deletion, persist_transcribed_text, read_message_text
 from .sqlite_hydration_jobs import (
     _FACT_HYDRATION_ELIGIBILITY_SQL,
     _MEDIA_METADATA_HYDRATION_ELIGIBILITY_SQL,
@@ -24,6 +24,8 @@ _SELECT_MESSAGE_MEDIA_SQL = (
 def hydration_observation_current(
     conn: sqlite3.Connection, dialog_id: int, message_id: int, observation_order: int | None
 ) -> bool:
+    if has_nonchannel_deletion(conn, dialog_id, message_id):
+        return False
     row = cast(
         tuple[int, int] | None,
         conn.execute(
@@ -64,6 +66,8 @@ def apply_message_transcription(  # noqa: PLR0913
     received_at: int,
 ) -> bool:
     """Apply one final Telegram transcription through the canonical path."""
+    if not hydration_observation_current(conn, dialog_id, message_id, None):
+        return False
     text = transcribed_text.strip()
     if not text:
         return False

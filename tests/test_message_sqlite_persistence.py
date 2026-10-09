@@ -13,13 +13,14 @@ from mcp_telegram.fts import stem_text
 from mcp_telegram.hydration_queue import HydrationPriority
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
 from mcp_telegram.messages.sqlite_bundle import (
-    find_unique_incoming_human_dm_dialogs,
+    find_unique_nonchannel_message_dialogs,
     insert_messages_with_fts,
     list_undeleted_message_ids,
     mark_message_deleted,
     persist_edited_message,
     persist_transcribed_text,
     read_message_text,
+    record_nonchannel_deletions,
 )
 from mcp_telegram.messages.sqlite_hydration import (
     apply_message_transcription,
@@ -768,19 +769,19 @@ def test_mark_message_deleted_is_idempotent_and_retains_text(conn: sqlite3.Conne
     assert conn.execute("SELECT COUNT(*) FROM messages_fts WHERE dialog_id=42 AND message_id=13").fetchone() == (0,)
 
 
-def test_find_unique_incoming_human_dm_dialogs_requires_one_policy_match(conn: sqlite3.Connection) -> None:
+def test_find_unique_nonchannel_message_dialogs_requires_one_policy_match(conn: sqlite3.Connection) -> None:
     with write_transaction(conn):
         conn.execute("INSERT INTO dialogs(dialog_id, type) VALUES (42, 'user'), (43, 'user')")
         conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (42, 'user', 1), (43, 'user', 1)")
         insert_messages_with_fts(conn, [_message(13, text="one")])
-    assert find_unique_incoming_human_dm_dialogs(conn, [13]) == {13: 42}
+    assert find_unique_nonchannel_message_dialogs(conn, [13]) == {13: 42}
     with write_transaction(conn):
         duplicate = replace(
             _message(13, text="two"),
             message=replace(_message(13, text="two").message, dialog_id=43, sender_id=43),
         )
         insert_messages_with_fts(conn, [duplicate])
-    assert find_unique_incoming_human_dm_dialogs(conn, [13]) == {}
+    assert find_unique_nonchannel_message_dialogs(conn, [13]) == {}
 
 
 def test_list_undeleted_message_ids_uses_strict_cutoff(conn: sqlite3.Connection) -> None:
@@ -1032,3 +1033,129 @@ def test_newer_telegram_version_resets_observation_order(conn: sqlite3.Connectio
         insert_messages_with_fts(conn, [new_version])
         insert_messages_with_fts(conn, [same_new_version])
     assert read_message_text(conn, 42, 98).text == "latest"
+
+
+@pytest.mark.parametrize("dialog_id", [42, -42])
+def test_peerless_deletion_blocks_unknown_nonchannel_body_but_not_channel(
+    conn: sqlite3.Connection, dialog_id: int
+) -> None:
+    unknown = replace(
+        _message(901, text="late"), message=replace(_message(901, text="late").message, dialog_id=dialog_id)
+    )
+    channel = replace(unknown, message=replace(unknown.message, dialog_id=-1000000000042))
+    with write_transaction(conn):
+        assert record_nonchannel_deletions(conn, [901, 901, 0, -1, True], 100) == (901,)
+        assert insert_messages_with_fts(conn, [unknown]) == 0
+        assert insert_messages_with_fts(conn, [channel]) == 1
+        assert not stage_message_transcription(
+            conn, dialog_id, 901, transcribed_text="late voice", transcription_id=1, received_at=200
+        )
+    assert conn.execute("SELECT dialog_id,message_id FROM messages").fetchall() == [(-1000000000042, 901)]
+    assert conn.execute("SELECT dialog_id,message_id FROM messages_fts").fetchall() == [(-1000000000042, 901)]
+    assert conn.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == (0,)
+
+
+def test_peerless_deletion_is_terminal_after_restart(tmp_path: Path) -> None:
+    path = tmp_path / "peerless.db"
+    ensure_sync_schema(path)
+    first = _open_sync_db(path)
+    try:
+        enable_runtime_writes(first)
+        with write_transaction(first):
+            record_nonchannel_deletions(first, [902], 100)
+    finally:
+        first.close()
+    second = _open_sync_db(path)
+    try:
+        enable_runtime_writes(second)
+        with write_transaction(second):
+            record_nonchannel_deletions(second, [902], 200)
+            assert insert_messages_with_fts(second, [_message(902, text="late")]) == 0
+        assert second.execute("SELECT message_id,deleted_at FROM nonchannel_message_deletions").fetchone() == (902, 100)
+    finally:
+        second.close()
+
+
+def test_peerless_deletion_rejects_all_hydration_fact_paths(conn: sqlite3.Connection) -> None:
+    from mcp_telegram.messages.sqlite_hydration import (
+        apply_hydrated_media_fact,
+        apply_message_transcription_if_absent,
+        hydration_observation_current,
+    )
+
+    with write_transaction(conn):
+        insert_messages_with_fts(conn, [_message(903, text=None, media_kind="voice", media_payload="{}")])
+        record_nonchannel_deletions(conn, [903], 100)
+        assert not hydration_observation_current(conn, 42, 903, 1000)
+        assert not apply_hydrated_media_fact(conn, 42, 903, None, None, observation_order=1000)
+        assert not apply_message_transcription(
+            conn, 42, 903, transcribed_text="late", transcription_id=1, received_at=200
+        )
+        assert (
+            apply_message_transcription_if_absent(
+                conn, 42, 903, transcribed_text="late", transcription_id=1, received_at=200, observation_order=1000
+            )
+            == "not_applied"
+        )
+    assert conn.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == (0,)
+
+
+def test_nonchannel_peer_classifier_matches_telethon_namespace() -> None:
+    from telethon import utils
+    from telethon.tl import types
+
+    from mcp_telegram.own_only_contracts import is_channel_peer_id
+
+    for peer in (types.PeerUser(42), types.PeerChat(42), types.PeerChannel(42)):
+        marked_id = cast(int, utils.get_peer_id(peer))
+        assert is_channel_peer_id(marked_id) == (utils.resolve_id(marked_id)[1] is types.PeerChannel)
+
+
+def test_peerless_known_message_lookup_is_indexed(conn: sqlite3.Connection) -> None:
+    rows = cast(
+        list[tuple[int, int, int, str]],
+        conn.execute(
+            "EXPLAIN QUERY PLAN SELECT message_id,dialog_id FROM messages WHERE message_id IN (?) AND dialog_id >= -1000000000000 AND is_deleted=0",
+            (904,),
+        ).fetchall(),
+    )
+    assert any("idx_messages_nonchannel_message_id" in row[3] for row in rows)
+
+
+def test_known_peer_deletion_survives_restart_without_body_or_enrollment(tmp_path: Path) -> None:
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from mcp_telegram.activity_sync import _persist_own_message_rows
+    from mcp_telegram.event_handlers import EventHandlerManager, _DeletedMessagesEvent
+
+    path = tmp_path / "known_peer.db"
+    ensure_sync_schema(path)
+    channel_id = -1000000000044
+    first = _open_sync_db(path)
+    try:
+        enable_runtime_writes(first)
+        manager = EventHandlerManager(MagicMock(), first, asyncio.Event())
+        asyncio.run(
+            manager.on_message_deleted(
+                cast(_DeletedMessagesEvent, SimpleNamespace(chat_id=channel_id, deleted_ids=[905]))
+            )
+        )
+        assert first.execute("SELECT COUNT(*) FROM messages").fetchone() == (0,)
+        assert first.execute("SELECT COUNT(*) FROM synced_dialogs").fetchone() == (0,)
+    finally:
+        first.close()
+    second = _open_sync_db(path)
+    try:
+        enable_runtime_writes(second)
+        late = replace(
+            _message(905, text="late", out=1),
+            message=replace(_message(905, text="late", out=1).message, dialog_id=channel_id),
+        )
+        with write_transaction(second):
+            _persist_own_message_rows(second, [late], priority=HydrationPriority.BACKFILL)
+        assert second.execute("SELECT COUNT(*) FROM messages").fetchone() == (0,)
+        assert second.execute("SELECT COUNT(*) FROM messages_fts").fetchone() == (0,)
+    finally:
+        second.close()

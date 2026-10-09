@@ -637,7 +637,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.messages.sqlite_bundle"
 layer = "persistence"
-depends_on = ["mcp_telegram.alert_policy", "mcp_telegram.fts", "mcp_telegram.hydration_queue", "mcp_telegram.media_fact", "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_hydration_jobs", "mcp_telegram.reactions.contracts", "mcp_telegram.reactions.persistence", "mcp_telegram.observation_order"]
+depends_on = ["mcp_telegram.alert_policy", "mcp_telegram.fts", "mcp_telegram.hydration_queue", "mcp_telegram.media_fact", "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_hydration_jobs", "mcp_telegram.reactions.contracts", "mcp_telegram.reactions.persistence", "mcp_telegram.observation_order", "mcp_telegram.own_only_contracts"]
 
 [[modules]]
 path = "mcp_telegram.messages.sqlite_hydration"

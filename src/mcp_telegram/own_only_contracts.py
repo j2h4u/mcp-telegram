@@ -4,13 +4,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+CHANNEL_PEER_ID_OFFSET = 10**12
+
+
+def is_channel_peer_id(value: int) -> bool:
+    """Classify the canonical marked peer namespace used by Telethon."""
+    return value < -CHANNEL_PEER_ID_OFFSET
+
 
 def normalize_channel_peer_id(value: int | None) -> int | None:
     """Normalize a raw channel id without requiring a Telethon entity."""
     if value is None:
         return None
     value = int(value)
-    return value if value <= 0 else -1000000000000 - value
+    return value if value <= 0 else -CHANNEL_PEER_ID_OFFSET - value
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,4 +43,4 @@ class OwnOnlyContext:
         )
 
 
-__all__ = ["OwnOnlyContext", "normalize_channel_peer_id"]
+__all__ = ["CHANNEL_PEER_ID_OFFSET", "OwnOnlyContext", "is_channel_peer_id", "normalize_channel_peer_id"]

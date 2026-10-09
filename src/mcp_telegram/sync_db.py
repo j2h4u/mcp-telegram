@@ -4685,6 +4685,8 @@ def _apply_migration_80(conn: sqlite3.Connection, current: int) -> int:
         current,
         80,
         [
+            "CREATE TABLE nonchannel_message_deletions(message_id INTEGER PRIMARY KEY,deleted_at INTEGER NOT NULL)",
+            "CREATE INDEX idx_messages_nonchannel_message_id ON messages(message_id,dialog_id) WHERE dialog_id >= -1000000000000",
             "ALTER TABLE synced_dialogs ADD COLUMN delta_message_id INTEGER",
             "ALTER TABLE topic_metadata ADD COLUMN observation_order INTEGER NOT NULL DEFAULT 0",
             "CREATE TABLE message_observations (dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL, observation_order INTEGER NOT NULL, is_deleted INTEGER NOT NULL DEFAULT 0, source_rank INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(dialog_id,message_id)) WITHOUT ROWID",

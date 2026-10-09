@@ -683,6 +683,9 @@ async def test_daemon_api_projects_gate_admission_deferral_without_internal_name
 
 
 def _install_message_observation_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE TABLE nonchannel_message_deletions(message_id INTEGER PRIMARY KEY,deleted_at INTEGER NOT NULL)"
+    )
     conn.execute("CREATE TABLE IF NOT EXISTS daemon_state(key TEXT PRIMARY KEY,value TEXT)")
     conn.execute(
         "CREATE TABLE message_observations(dialog_id INTEGER,message_id INTEGER,observation_order INTEGER NOT NULL,is_deleted INTEGER NOT NULL DEFAULT 0,source_rank INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(dialog_id,message_id)) WITHOUT ROWID"

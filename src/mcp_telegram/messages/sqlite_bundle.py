@@ -14,6 +14,7 @@ from ..fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
 from ..hydration_queue import HydrationPriority, HydrationQueueRepository
 from ..media_fact import decode_media_fact, is_transcribable_telegram_media
 from ..observation_order import allocate_observation_order
+from ..own_only_contracts import CHANNEL_PEER_ID_OFFSET, is_channel_peer_id
 from ..reactions.contracts import ReactionAggregate, ReactionAggregateSource
 from ..reactions.persistence import replace_reaction_aggregates
 from .sqlite_hydration_jobs import _FACT_HYDRATION_EMPTY_KINDS, _is_canonical_media_pair, reconcile_fact_hydration_job
@@ -89,12 +90,67 @@ def read_message_out(conn: sqlite3.Connection, dialog_id: int, message_id: int) 
     return MessageOutLookup(found=row is not None, outgoing=bool(row[0]) if row is not None else False)
 
 
+def has_nonchannel_deletion(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
+    """Channel message IDs are independent of the account's nonchannel namespace."""
+    if is_channel_peer_id(dialog_id):
+        return False
+    return (
+        conn.execute("SELECT 1 FROM nonchannel_message_deletions WHERE message_id=?", (message_id,)).fetchone()
+        is not None
+    )
+
+
+def _validated_message_ids(message_ids: Sequence[int]) -> tuple[int, ...]:
+    return tuple(
+        dict.fromkeys(
+            message_id
+            for message_id in message_ids
+            if isinstance(message_id, int) and not isinstance(message_id, bool) and message_id > 0
+        )
+    )
+
+
+def record_nonchannel_deletions(
+    conn: sqlite3.Connection, message_ids: Sequence[int], deleted_at: int
+) -> tuple[int, ...]:
+    """Retain terminal evidence even before the canonical peer/body is known."""
+    ids = _validated_message_ids(message_ids)
+    conn.executemany(
+        "INSERT OR IGNORE INTO nonchannel_message_deletions(message_id,deleted_at) VALUES(?,?)",
+        ((message_id, deleted_at) for message_id in ids),
+    )
+    return ids
+
+
+def record_message_deletions(conn: sqlite3.Connection, dialog_id: int, message_ids: Sequence[int]) -> tuple[int, ...]:
+    """Retain known-peer terminal keys independently of message-body coverage."""
+    ids = _validated_message_ids(message_ids)
+    pending = [
+        message_id
+        for message_id in ids
+        if conn.execute(
+            "SELECT 1 FROM message_observations WHERE dialog_id=? AND message_id=? AND is_deleted=1",
+            (dialog_id, message_id),
+        ).fetchone()
+        is None
+    ]
+    if pending:
+        observation_order = allocate_observation_order(conn)
+        conn.executemany(
+            "INSERT INTO message_observations(dialog_id,message_id,observation_order,is_deleted) VALUES(?,?,?,1) ON CONFLICT(dialog_id,message_id) DO UPDATE SET is_deleted=1,observation_order=excluded.observation_order",
+            ((dialog_id, message_id, observation_order) for message_id in pending),
+        )
+    return ids
+
+
 def _is_current_observation(
     conn: sqlite3.Connection,
     item: _message_contracts.ExtractedMessage,
     source: ReactionAggregateSource | str = ReactionAggregateSource.HISTORY,
 ) -> bool:
     message = item.message
+    if has_nonchannel_deletion(conn, message.dialog_id, message.message_id):
+        return False
     key = (message.dialog_id, message.message_id)
     state = cast(
         tuple[int, int, int] | None,
@@ -107,7 +163,7 @@ def _is_current_observation(
         tuple[int | None, int] | None,
         conn.execute("SELECT edit_date,is_deleted FROM messages WHERE dialog_id=? AND message_id=?", key).fetchone(),
     )
-    if (state is not None and state[1]) or (current is not None and current[1]):
+    if _stored_message_deleted(state, current):
         return False
     if current is not None:
         incoming_version, current_version = message.edit_date or 0, current[0] or 0
@@ -116,6 +172,10 @@ def _is_current_observation(
         if incoming_version > current_version:
             return True
     return _follows_stored_observation(state, item.observation_order, ReactionAggregateSource(source).rank)
+
+
+def _stored_message_deleted(state: tuple[int, int, int] | None, current: tuple[int | None, int] | None) -> bool:
+    return (state is not None and bool(state[1])) or (current is not None and bool(current[1]))
 
 
 def _follows_stored_observation(state: tuple[int, int, int] | None, order: int | None, source_rank: int) -> bool:
@@ -186,11 +246,8 @@ def persist_transcribed_text(
 
 def mark_message_deleted(conn: sqlite3.Connection, dialog_id: int, message_id: int, deleted_at: int) -> bool:
     """Tombstone one message and report whether this call changed its state."""
-    observation_order = allocate_observation_order(conn)
-    conn.execute(
-        "INSERT INTO message_observations(dialog_id,message_id,observation_order,is_deleted) VALUES(?,?,?,1) ON CONFLICT(dialog_id,message_id) DO UPDATE SET is_deleted=1,observation_order=excluded.observation_order",
-        (dialog_id, message_id, observation_order),
-    )
+    if not record_message_deletions(conn, dialog_id, (message_id,)):
+        return False
     cursor = conn.execute(_MARK_DELETED_SQL, (deleted_at, dialog_id, message_id))
     conn.execute(DELETE_FTS_SQL, (dialog_id, message_id))
     if cursor.rowcount > 0:
@@ -198,8 +255,8 @@ def mark_message_deleted(conn: sqlite3.Connection, dialog_id: int, message_id: i
     return cursor.rowcount > 0
 
 
-def find_unique_incoming_human_dm_dialogs(conn: sqlite3.Connection, message_ids: Sequence[int]) -> dict[int, int]:
-    """Resolve peer-less Telegram deletions whose local DM rows are unique."""
+def find_unique_nonchannel_message_dialogs(conn: sqlite3.Connection, message_ids: Sequence[int]) -> dict[int, int]:
+    """Resolve only unique cached keys in Telegram's nonchannel ID namespace."""
     unique_ids = tuple(dict.fromkeys(int(message_id) for message_id in message_ids))
     if not unique_ids:
         return {}
@@ -210,7 +267,7 @@ def find_unique_incoming_human_dm_dialogs(conn: sqlite3.Connection, message_ids:
             f"""SELECT m.message_id, m.dialog_id
                 FROM messages m
                 WHERE m.message_id IN ({placeholders}) AND m.is_deleted = 0
-                  AND {incoming_human_dm_sql("m")}""",
+                  AND m.dialog_id >= {-CHANNEL_PEER_ID_OFFSET}""",
             unique_ids,
         ).fetchall(),
     )

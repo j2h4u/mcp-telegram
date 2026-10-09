@@ -88,16 +88,19 @@ from .hydration_queue import HydrationPriority
 from .identity_observation import USERNAME_UNOBSERVED, observe_username
 from .linked_chat_fact import LinkedChatWork, linked_chat_fact_owner
 from .messages.sqlite_bundle import (
-    find_unique_incoming_human_dm_dialogs,
+    find_unique_nonchannel_message_dialogs,
     insert_messages_with_fts,
     list_undeleted_message_ids,
     mark_message_deleted,
     persist_edited_message,
     read_message_out,
     read_message_text,
+    record_message_deletions,
+    record_nonchannel_deletions,
 )
 from .messages.sqlite_hydration import (
     apply_message_transcription,
+    hydration_observation_current,
     stage_message_transcription,
 )
 from .messages.telegram_adapter import (
@@ -1436,31 +1439,33 @@ class EventHandlerManager:
     async def on_message_deleted(self, event: _DeletedMessagesEvent) -> None:
         """Handle a MessageDeleted event and preserve the last known text.
 
-        When Telegram omits the peer, only a unique incoming human-DM candidate
-        is accepted. Ambiguous and irrelevant IDs remain for the gap scan.
+        Peerless nonchannel IDs retain terminal evidence; unique cached peers
+        receive ordinary deletion cleanup. Ambiguous IDs remain unattributed.
         Preserves the last known text column.
         Only updates rows where is_deleted=0 to avoid re-stamping deleted_at.
         """
         dialog_id = event.chat_id
 
         if dialog_id is None:
-            self._handle_peerless_deletions(event.deleted_ids)
-            return
-
-        coverage = self._realtime_coverage(dialog_id)
-        if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
+            try:
+                self._handle_peerless_deletions(event.deleted_ids)
+            except Exception:
+                logger.exception("event_delete_failed dialog_id=%s", dialog_id)
             return
 
         try:
             now = int(time.time())
             with write_transaction(self._conn):
-                allowed_ids = list(event.deleted_ids)
+                allowed_ids = record_message_deletions(self._conn, dialog_id, event.deleted_ids)
+                coverage = self._realtime_coverage(dialog_id)
+                if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
+                    return
                 if coverage is RealtimeHistoryCoverage.OWN_OUTGOING:
-                    allowed_ids = [
+                    allowed_ids = tuple(
                         msg_id
                         for msg_id in allowed_ids
                         if read_message_out(self._conn, dialog_id, int(msg_id)).outgoing
-                    ]
+                    )
                 if not allowed_ids:
                     return
 
@@ -1476,8 +1481,9 @@ class EventHandlerManager:
         now = int(time.time())
         resolved: list[tuple[int, int]] = []
         with write_transaction(self._conn):
-            candidate_dialogs = find_unique_incoming_human_dm_dialogs(self._conn, deleted_ids)
-            for raw_message_id in deleted_ids:
+            accepted_ids = record_nonchannel_deletions(self._conn, deleted_ids, now)
+            candidate_dialogs = find_unique_nonchannel_message_dialogs(self._conn, accepted_ids)
+            for raw_message_id in accepted_ids:
                 message_id = int(raw_message_id)
                 dialog_id = candidate_dialogs.get(message_id)
                 if dialog_id is not None and mark_message_deleted(self._conn, dialog_id, message_id, now):
@@ -1718,6 +1724,8 @@ class EventHandlerManager:
         boundary: ReactionObservationBoundary | None = None,
     ) -> bool:
         with write_transaction(self._conn):
+            if not hydration_observation_current(self._conn, dialog_id, msg_id, None):
+                return False
             coverage = self._realtime_coverage(dialog_id)
             existing_out = read_message_out(self._conn, dialog_id, msg_id)
             if not allows_existing_body_update(coverage, RealtimeBodyEvent.REACTION, outgoing=existing_out.outgoing):
@@ -1802,14 +1810,15 @@ class EventHandlerManager:
                 return
             if read_message_text(self._conn, event.dialog_id, event.message_id).found:
                 return
-            stage_message_transcription(
+            if not stage_message_transcription(
                 self._conn,
                 event.dialog_id,
                 event.message_id,
                 transcribed_text=event.text,
                 transcription_id=event.transcription_id,
                 received_at=now,
-            )
+            ):
+                return
             self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, event.dialog_id))
 
     def _update_existing_transcription(
@@ -1835,14 +1844,15 @@ class EventHandlerManager:
                 outgoing=existing_out.outgoing,
             ):
                 return
-            apply_message_transcription(
+            if not apply_message_transcription(
                 self._conn,
                 event.dialog_id,
                 event.message_id,
                 transcribed_text=event.text,
                 transcription_id=event.transcription_id,
                 received_at=now,
-            )
+            ):
+                return
             if old_text != event.text:
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, event.dialog_id))
 

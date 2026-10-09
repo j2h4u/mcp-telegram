@@ -1369,13 +1369,13 @@ async def test_on_message_deleted_updates_last_event_at(
 
 
 @pytest.mark.asyncio
-async def test_on_message_deleted_peerless_without_candidate_is_ignored(
+async def test_on_message_deleted_peerless_without_candidate_retains_terminal_evidence(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A peer-less deletion without one safe DM candidate makes no DB changes."""
+    """Unknown peers retain terminal IDs without fabricating message/history rows."""
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
@@ -1390,6 +1390,11 @@ async def test_on_message_deleted_peerless_without_candidate_is_ignored(
     assert count == 0
 
     assert any("resolved=0 unresolved=2" in r.message for r in caplog.records)
+    assert sync_db.execute("SELECT message_id FROM nonchannel_message_deletions ORDER BY message_id").fetchall() == [
+        (555,),
+        (556,),
+    ]
+    assert sync_db.execute("SELECT COUNT(*) FROM conversation_history_events").fetchone() == (0,)
 
 
 @pytest.mark.asyncio
@@ -2105,3 +2110,103 @@ def test_stale_linked_chat_publication_offers_no_followup_work(
     manager._publish_linked_chat_observation(work, work.generation, siblings_token, full_result, now)
 
     assert sink.offered == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dialog_id,outgoing", [(-42, False), (42, True)])
+async def test_peerless_known_nonchannel_delete_cleans_body_without_new_notifications(
+    mock_client: MagicMock, sync_db: _SQLiteConnection, shutdown_event: asyncio.Event, dialog_id: int, outgoing: bool
+) -> None:
+    from mcp_telegram.fts import INSERT_FTS_SQL
+
+    insert_synced_dialog(sync_db, dialog_id)
+    insert_message(sync_db, dialog_id, 999)
+    sync_db.execute("UPDATE messages SET out=? WHERE dialog_id=? AND message_id=999", (int(outgoing), dialog_id))
+    sync_db.execute(INSERT_FTS_SQL, (dialog_id, 999, "old"))
+    sync_db.commit()
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    await manager.on_message_deleted(make_message_deleted_event(chat_id=None, deleted_ids=[999]))
+    assert sync_db.execute(
+        "SELECT is_deleted FROM messages WHERE dialog_id=? AND message_id=999", (dialog_id,)
+    ).fetchone() == (1,)
+    assert sync_db.execute(
+        "SELECT COUNT(*) FROM messages_fts WHERE dialog_id=? AND message_id=999", (dialog_id,)
+    ).fetchone() == (0,)
+    assert sync_db.execute("SELECT COUNT(*) FROM conversation_history_events").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_peerless_deletion_before_body_blocks_private_and_group_but_not_channel(
+    mock_client: MagicMock, sync_db: _SQLiteConnection, shutdown_event: asyncio.Event
+) -> None:
+    channel_id = -1000000000042
+    for dialog_id in (42, -42, channel_id):
+        insert_synced_dialog(sync_db, dialog_id)
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    await manager.on_message_deleted(make_message_deleted_event(chat_id=None, deleted_ids=[998]))
+    for dialog_id in (42, -42, channel_id):
+        await manager.on_new_message(
+            make_new_message_event(dialog_id, build_mock_message(id=998, text="arrived after delete"))
+        )
+    assert sync_db.execute("SELECT dialog_id,message_id FROM messages").fetchall() == [(channel_id, 998)]
+    assert sync_db.execute("SELECT dialog_id,message_id FROM messages_fts").fetchall() == [(channel_id, 998)]
+    assert sync_db.execute("SELECT COUNT(*) FROM conversation_history_events").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["synced", "own_only", None])
+async def test_known_channel_unknown_deletion_blocks_delayed_own_archive_in_all_scopes(
+    mock_client: MagicMock, sync_db: _SQLiteConnection, shutdown_event: asyncio.Event, status: str | None
+) -> None:
+    from mcp_telegram.activity_sync import _persist_own_message_rows
+    from mcp_telegram.hydration_queue import HydrationPriority
+    from mcp_telegram.messages.telegram_adapter import extract_message_row
+    from mcp_telegram.sync_transactions import write_transaction
+
+    channel_id = -1000000000043
+    if status == "synced":
+        insert_synced_dialog(sync_db, channel_id)
+    elif status is not None:
+        sync_db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(?,?)", (channel_id, status))
+        sync_db.commit()
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    await manager.on_message_deleted(make_message_deleted_event(chat_id=channel_id, deleted_ids=[997]))
+    message = build_mock_message(id=997, text="delayed own channel message")
+    message.out = True
+    extracted = extract_message_row(channel_id, message)
+    with write_transaction(sync_db):
+        _persist_own_message_rows(sync_db, [extracted], priority=HydrationPriority.BACKFILL)
+    assert sync_db.execute(
+        "SELECT COUNT(*) FROM messages WHERE dialog_id=? AND message_id=997", (channel_id,)
+    ).fetchone() == (0,)
+    assert sync_db.execute(
+        "SELECT is_deleted FROM message_observations WHERE dialog_id=? AND message_id=997", (channel_id,)
+    ).fetchone() == (1,)
+    assert sync_db.execute(
+        "SELECT COUNT(*) FROM messages_fts WHERE dialog_id=? AND message_id=997", (channel_id,)
+    ).fetchone() == (0,)
+    assert sync_db.execute("SELECT COUNT(*) FROM conversation_history_events").fetchone() == (0,)
+    from helpers import build_mock_reactions
+    from mcp_telegram.event_handlers import _RawReactionUpdate
+
+    before = sync_db.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (channel_id,)).fetchone()
+    await manager.on_raw_reaction_update(
+        cast(
+            _RawReactionUpdate,
+            SimpleNamespace(peer=types.PeerChannel(43), msg_id=997, reactions=build_mock_reactions({"👍": 1})),
+        )
+    )
+    await manager.on_raw_transcribed_audio(
+        cast(
+            types.UpdateTranscribedAudio,
+            SimpleNamespace(
+                peer=types.PeerChannel(43), msg_id=997, text="late voice fact", transcription_id=1, pending=False
+            ),
+        )
+    )
+    assert sync_db.execute("SELECT COUNT(*) FROM message_reactions").fetchone() == (0,)
+    assert sync_db.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == (0,)
+    assert (
+        sync_db.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (channel_id,)).fetchone()
+        == before
+    )

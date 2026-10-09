@@ -311,7 +311,13 @@ class FakeUserProfilePort:
 def remove_v80_schema_for_historical_fixture(conn: sqlite3.Connection) -> None:
     """Reconstruct pre-v80 physical ownership before rewinding its migration ledger."""
     conn.execute("DROP TRIGGER IF EXISTS message_fts_key_insert")
-    for table in ("message_fts_keys", "message_observations", "scheduled_publication_evidence"):
+    conn.execute("DROP INDEX IF EXISTS idx_messages_nonchannel_message_id")
+    for table in (
+        "message_fts_keys",
+        "message_observations",
+        "scheduled_publication_evidence",
+        "nonchannel_message_deletions",
+    ):
         conn.execute(f"DROP TABLE IF EXISTS {table}")
     for table, column in (("synced_dialogs", "delta_message_id"), ("topic_metadata", "observation_order")):
         rows = cast(
