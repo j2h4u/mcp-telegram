@@ -44,9 +44,11 @@ MESSAGES_FTS_DDL = (
     "tokenize='unicode61')"
 )
 
-INSERT_FTS_SQL = "INSERT INTO messages_fts(dialog_id, message_id, stemmed_text) VALUES (?, ?, ?)"
+INSERT_FTS_SQL = "INSERT INTO messages_fts(rowid, dialog_id, message_id, stemmed_text) SELECT id, dialog_id, message_id, ?3 FROM message_fts_keys WHERE dialog_id=?1 AND message_id=?2"
 
-DELETE_FTS_SQL = "DELETE FROM messages_fts WHERE dialog_id=? AND message_id=?"
+DELETE_FTS_SQL = (
+    "DELETE FROM messages_fts WHERE rowid=(SELECT id FROM message_fts_keys WHERE dialog_id=? AND message_id=?)"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -102,46 +104,41 @@ def _row_first_int(row: tuple[object | None, ...] | None) -> int:
 
 
 def backfill_fts_index(conn: sqlite3.Connection) -> int:
-    """Index messages that are missing from messages_fts.
-
-    Only inserts rows where the (dialog_id, message_id) pair has no
-    corresponding FTS entry — safe to call on every daemon startup without
-    creating duplicates.  Returns 0 when the index is fully caught up.
-
-    Uses a fast count comparison first to skip the expensive LEFT JOIN
-    when the index is already complete (common case on restart).
-
-    Returns the number of rows inserted.
-    """
-    msg_row = cast(
-        tuple[object | None, ...] | None, conn.execute("SELECT COUNT(*) FROM messages WHERE is_deleted = 0").fetchone()
-    )
-    fts_row = cast(tuple[object | None, ...] | None, conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone())
-    msg_count = _row_first_int(msg_row)
-    fts_count = _row_first_int(fts_row)
-
-    if msg_count == 0 or fts_count >= msg_count:
-        return 0
-
-    # Avoid LEFT JOIN against FTS5 — the FTS virtual table has no B-tree index
-    # for the planner, making a JOIN O(n*m). Instead: fetch both key sets into
-    # Python, compute the difference, then load text only for missing rows.
-    fts_keys = cast(
-        set[tuple[int, int]], set(conn.execute("SELECT dialog_id, message_id FROM messages_fts").fetchall())
-    )
-    all_rows = cast(
-        list[tuple[int, int, str | None]],
-        conn.execute("SELECT dialog_id, message_id, text FROM messages WHERE is_deleted = 0").fetchall(),
-    )
-    rows = [(d, m, t) for d, m, t in all_rows if (d, m) not in fts_keys]
-
-    if not rows:
-        return 0
-
+    """Repair live key coverage and remove duplicate/deleted rows in bounded batches."""
     with write_transaction(conn):
-        conn.executemany(
-            INSERT_FTS_SQL,
-            ((dialog_id, message_id, stem_text(text)) for dialog_id, message_id, text in rows),
+        conn.execute(MESSAGES_FTS_DDL)
+    last_rowid = 0
+    while True:
+        rows = cast(
+            list[tuple[int]],
+            conn.execute(
+                "SELECT f.rowid FROM messages_fts f LEFT JOIN message_fts_keys k ON k.id=f.rowid "
+                "LEFT JOIN messages m ON m.dialog_id=k.dialog_id AND m.message_id=k.message_id "
+                "WHERE f.rowid>? AND (m.message_id IS NULL OR m.is_deleted=1 "
+                "OR f.dialog_id!=k.dialog_id OR f.message_id!=k.message_id) ORDER BY f.rowid LIMIT 500",
+                (last_rowid,),
+            ).fetchall(),
         )
-
-    return len(rows)
+        if not rows:
+            break
+        with write_transaction(conn):
+            conn.executemany("DELETE FROM messages_fts WHERE rowid=?", rows)
+        last_rowid = rows[-1][0]
+    inserted = 0
+    last_key_id = 0
+    while True:
+        rows_to_insert = cast(
+            list[tuple[int, int, int, str | None]],
+            conn.execute(
+                "SELECT k.id,m.dialog_id,m.message_id,m.text FROM message_fts_keys k "
+                "JOIN messages m ON k.dialog_id=m.dialog_id AND k.message_id=m.message_id "
+                "LEFT JOIN messages_fts f ON f.rowid=k.id WHERE k.id>? AND m.is_deleted=0 AND f.rowid IS NULL ORDER BY k.id LIMIT 500",
+                (last_key_id,),
+            ).fetchall(),
+        )
+        if not rows_to_insert:
+            return inserted
+        with write_transaction(conn):
+            conn.executemany(INSERT_FTS_SQL, ((d, m, stem_text(t)) for _, d, m, t in rows_to_insert))
+        inserted += len(rows_to_insert)
+        last_key_id = rows_to_insert[-1][0]

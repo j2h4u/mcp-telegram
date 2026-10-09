@@ -174,12 +174,94 @@ def test_removal_retains_cancel_and_unverified_publication_evidence(conn: sqlite
     ]
     conn.commit()
     with write_transaction(conn):
-        assert verify_scheduled_publication(conn, 42, 901, now=201) == 1
+        assert verify_scheduled_publication(conn, 42, 901, published_at=199, now=201) == 1
     assert conn.execute(
         "SELECT message_state, visibility, unpublished, unseen, published_message_id, published_at "
         "FROM scheduled_messages WHERE message_id=11"
-    ).fetchone() == ("published", "chat_visible", 0, 0, 901, 201)
+    ).fetchone() == ("published", "chat_visible", 0, 0, 901, 199)
     assert conn.execute("SELECT COUNT(*) FROM scheduled_messages_fts").fetchone() == (0,)
+
+
+@pytest.mark.parametrize("publication_first", [False, True])
+def test_publication_evidence_reconciles_either_order_across_restart(tmp_path: Path, publication_first: bool) -> None:
+    path = tmp_path / "publication.db"
+    ensure_sync_schema(path)
+    connection = _open_sync_db(path)
+    with write_transaction(connection):
+        upsert_scheduled_message(connection, 42, _message(11), now=100)
+        if publication_first:
+            assert verify_scheduled_publication(connection, 42, 901, published_at=190, now=200) == 0
+        else:
+            mark_scheduled_messages_removed(connection, 42, [11], [901], now=200)
+    connection.close()
+    ensure_sync_schema(path)
+    connection = _open_sync_db(path)
+    try:
+        with write_transaction(connection):
+            if publication_first:
+                mark_scheduled_messages_removed(connection, 42, [11], [901], now=210)
+            else:
+                assert verify_scheduled_publication(connection, 42, 901, published_at=190, now=210) == 1
+        assert connection.execute(
+            "SELECT message_state, published_message_id, published_at, publication_verified_at "
+            "FROM scheduled_messages WHERE dialog_id=42 AND message_id=11"
+        ).fetchone() == ("published", 901, 190, 200 if publication_first else 210)
+        assert connection.execute("SELECT COUNT(*) FROM scheduled_messages_fts").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+def test_duplicate_queue_events_do_not_regress_verified_publication(conn: sqlite3.Connection) -> None:
+    conn.commit()
+    with write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(11), now=100)
+        mark_scheduled_messages_removed(conn, 42, [11], [901], now=200)
+        verify_scheduled_publication(conn, 42, 901, published_at=190, now=201)
+    before = conn.execute("SELECT * FROM scheduled_messages").fetchone()
+    with write_transaction(conn):
+        assert verify_scheduled_publication(conn, 42, 901, published_at=999, now=300) == 0
+        mark_scheduled_messages_removed(conn, 42, [11], [901], now=301)
+        mark_scheduled_messages_removed(conn, 42, [11], now=302)
+        mark_scheduled_messages_removed(conn, 42, [11], [902], now=303)
+        upsert_scheduled_message(conn, 42, _message(11, "stale queue"), now=304)
+    assert conn.execute("SELECT * FROM scheduled_messages").fetchone() == before
+    assert conn.execute("SELECT published_at, verified_at FROM scheduled_publication_evidence").fetchone() == (190, 201)
+    assert conn.execute("SELECT COUNT(*) FROM scheduled_messages_fts").fetchone() == (0,)
+
+
+def test_publication_hint_cannot_use_other_dialog_or_ordinary_archive_message(conn: sqlite3.Connection) -> None:
+    conn.commit()
+    with write_transaction(conn):
+        conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at,text) VALUES (42,901,190,'ordinary')")
+        verify_scheduled_publication(conn, 43, 901, published_at=190, now=200)
+        mark_scheduled_messages_removed(conn, 42, [11], [901], now=201)
+    assert conn.execute(
+        "SELECT message_state,published_message_id,publication_verified_at FROM scheduled_messages"
+    ).fetchone() == ("unknown_missing", None, None)
+
+
+def test_publication_without_telegram_date_keeps_publication_time_unknown(conn: sqlite3.Connection) -> None:
+    conn.commit()
+    with write_transaction(conn):
+        mark_scheduled_messages_removed(conn, 42, [11], [901], now=200)
+        verify_scheduled_publication(conn, 42, 901, now=201)
+    assert conn.execute(
+        "SELECT message_state,published_at,publication_verified_at FROM scheduled_messages"
+    ).fetchone() == ("published", None, 201)
+
+
+def test_verified_evidence_and_publication_transition_rollback_together(conn: sqlite3.Connection) -> None:
+    conn.commit()
+    with write_transaction(conn):
+        mark_scheduled_messages_removed(conn, 42, [11], [901], now=200)
+        conn.execute(
+            "CREATE TRIGGER reject_publication BEFORE UPDATE ON scheduled_messages "
+            "WHEN NEW.message_state='published' BEGIN SELECT RAISE(ABORT,'publication rejected'); END"
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="publication rejected"), write_transaction(conn):
+        verify_scheduled_publication(conn, 42, 901, published_at=190, now=201)
+    assert conn.execute("SELECT COUNT(*) FROM scheduled_publication_evidence").fetchone() == (0,)
+    assert conn.execute("SELECT message_state FROM scheduled_messages").fetchone() == ("unknown_missing",)
 
 
 @pytest.mark.asyncio
@@ -614,8 +696,27 @@ async def test_publication_reconciliation_runs_before_sync_enrollment(conn: sqli
     await manager.on_new_message(cast(_NewMessageEvent, SimpleNamespace(chat_id=42, is_private=False, message=message)))
 
     assert conn.execute(
-        "SELECT message_state, published_message_id FROM scheduled_messages WHERE dialog_id=42 AND message_id=21"
-    ).fetchone() == ("published", 901)
+        "SELECT message_state, published_message_id, published_at "
+        "FROM scheduled_messages WHERE dialog_id=42 AND message_id=21"
+    ).fetchone() == ("published", 901, 1_900_000_000)
+
+
+@pytest.mark.asyncio
+async def test_publication_event_before_hint_is_retained_without_sync_enrollment(conn: sqlite3.Connection) -> None:
+    client = MagicMock()
+    manager = EventHandlerManager(client, conn, asyncio.Event())
+    manager.bind_demand_sink(MagicMock())
+    message = _message(901, "published", scheduled_at=190)
+    message.from_scheduled = True
+    await manager.on_new_message(cast(_NewMessageEvent, SimpleNamespace(chat_id=42, is_private=False, message=message)))
+    await manager.on_raw_delete_scheduled_messages(
+        SimpleNamespace(peer=PeerUser(user_id=42), messages=[21], sent_messages=[901])
+    )
+    assert conn.execute(
+        "SELECT message_state, published_message_id, published_at "
+        "FROM scheduled_messages WHERE dialog_id=42 AND message_id=21"
+    ).fetchone() == ("published", 901, 190)
+    assert conn.execute("SELECT COUNT(*) FROM messages").fetchone() == (0,)
 
 
 # ---------------------------------------------------------------------------

@@ -147,7 +147,7 @@ ENTITY_DIALOG_ROLE_PATHS = frozenset(
     }
 )
 
-CONTENT_WRAPPER_PATH = "tools/structured.py"
+CONTENT_WRAPPER_PATH = "structured.py"
 CONTENT_PROJECTOR_PATH = "message_content.py"
 RAW_PROJECTOR_PATH = "telegram_message_projection.py"
 SCHEDULED_CONTENT_PATH = "reading/scheduled_projection.py"
@@ -159,20 +159,20 @@ RAW_PROJECTOR_IMPORTERS = frozenset({"daemon_message.py", "telegram_history.py"}
 MESSAGE_BODY_SERIALIZER_PATHS = frozenset(
     {
         "tools/reading.py",
-        "tools/unread.py",
+        "inbox_projection.py",
         "tools/activity.py",
         "tools/account_trace.py",
     }
 )
 MESSAGE_BODY_ENTRYPOINTS = {
     "tools/reading.py": frozenset({"_list_message_structured_item"}),
-    "tools/unread.py": frozenset({"_structured_messages"}),
+    "inbox_projection.py": frozenset({"_structured_messages"}),
     "tools/activity.py": frozenset({"_structured_comment"}),
     "tools/account_trace.py": frozenset({"_attach_trace_content_metadata"}),
 }
 CANONICAL_MESSAGE_VIEW_ENTRYPOINTS = {
     "tools/reading.py": frozenset({"_list_message_structured_item"}),
-    "tools/unread.py": frozenset({"_structured_messages"}),
+    "inbox_projection.py": frozenset({"_structured_messages"}),
 }
 CANONICAL_MESSAGE_VIEW_FIELDS = frozenset(
     {
@@ -204,7 +204,7 @@ CANONICAL_MESSAGE_VIEW_FIELDS = frozenset(
         "read_markers",
     }
 )
-CANONICAL_MESSAGE_VIEW_CONSUMER_PATHS = frozenset(CANONICAL_MESSAGE_VIEW_ENTRYPOINTS)
+CANONICAL_MESSAGE_VIEW_CONSUMER_PATHS = frozenset(CANONICAL_MESSAGE_VIEW_ENTRYPOINTS) | {"tools/unread.py"}
 SEARCH_HIT_CONSUMER_PATH = "tools/reading.py"
 SEARCH_HIT_ENTRYPOINT = "_search_result_structured_rows"
 LIST_MESSAGE_LIFECYCLE_FIELDS = frozenset(
@@ -232,7 +232,7 @@ MESSAGE_VIEW_BYPASS_NAMES = frozenset(
 TOOL_MESSAGE_PROJECTOR_PATHS = frozenset({"tools/activity.py", "tools/account_trace.py"})
 MESSAGE_METADATA_FUNCTIONS = {
     "tools/reading.py": frozenset({"_topic_candidate_payload"}),
-    "tools/unread.py": frozenset({"_structured_reactions"}),
+    "inbox_projection.py": frozenset({"_structured_reactions"}),
 }
 MESSAGE_BODY_SURFACE_FUNCTION_NAMES = frozenset({"get_inbox", "list_messages", "_structured_messages"})
 
@@ -856,13 +856,11 @@ def _content_violations(path: str, tree: ast.AST) -> list[Finding]:
             keys = _dict_string_keys(node)
             if _is_true(keys.get("is_telegram_content")) and "content_kind" in keys and path != CONTENT_WRAPPER_PATH:
                 findings.append(
-                    Finding(
-                        path, node.lineno, "Telegram content dictionaries must use tools.structured.telegram_content"
-                    )
+                    Finding(path, node.lineno, "Telegram content dictionaries must use structured.telegram_content")
                 )
         elif isinstance(node, ast.Call) and _is_content_wrapper_call(node) and path != CONTENT_WRAPPER_PATH:
             findings.append(
-                Finding(path, node.lineno, "Telegram content dictionaries must use tools.structured.telegram_content")
+                Finding(path, node.lineno, "Telegram content dictionaries must use structured.telegram_content")
             )
         elif (
             isinstance(node, ast.Call)
@@ -1207,7 +1205,11 @@ def _canonical_message_view_violations(path: str, tree: ast.AST) -> list[Finding
         def _record_mutation(self, node: ast.AST, key: str | None) -> None:
             # Inbox bounds cosmetic identities after the canonical projection;
             # other presenter fields retain their single rich-message owner.
-            if path == "tools/unread.py" and self.function == "_project_inbox_message" and key in {"sender", "topic"}:
+            if (
+                path == "inbox_projection.py"
+                and self.function == "_project_inbox_message"
+                and key in {"sender", "topic"}
+            ):
                 return
             if key in CANONICAL_MESSAGE_VIEW_FIELDS:
                 findings.append(
@@ -1309,7 +1311,7 @@ def _canonical_message_view_violations(path: str, tree: ast.AST) -> list[Finding
 
     visitor = Visitor()
     visitor.visit(tree)
-    if visitor.canonical_import_count != 1:
+    if path in CANONICAL_MESSAGE_VIEW_ENTRYPOINTS and visitor.canonical_import_count != 1:
         findings.append(Finding(path, 1, "consumer must import project_message_view directly exactly once"))
     return findings
 

@@ -11,7 +11,7 @@ from telethon.tl.types import TypeInputPeer  # type: ignore[import-untyped]
 
 from .fact_hydration import AppliedFacts, HydrationDropObservation
 from .hydration_queue import TRANSCRIPTION_HYDRATION_KIND, HydrationJob, HydrationQueueRepository
-from .messages.sqlite_hydration import apply_message_transcription_if_absent
+from .messages.sqlite_hydration import apply_message_transcription_if_absent, hydration_observation_current
 from .messages.sqlite_hydration_jobs import (
     transcription_hydration_eligible,
 )
@@ -57,7 +57,7 @@ class TranscriptionHydrationHandler:
             TranscribeAudioRequest(peer=peer, msg_id=job.message_id),
         )
 
-    def apply(
+    def apply(  # noqa: PLR0913 - request boundary accompanies the existing fact application contract
         self,
         conn: sqlite3.Connection,
         queue: HydrationQueueRepository,
@@ -65,8 +65,18 @@ class TranscriptionHydrationHandler:
         result: object,
         *,
         now: int,
+        observation_order: int | None = None,
     ) -> AppliedFacts:
         job = jobs[0]
+        if not hydration_observation_current(conn, job.dialog_id, job.message_id, observation_order):
+            if not self.eligible(conn, job):
+                queue.remove(job)
+            return AppliedFacts(
+                dropped=1,
+                drop_observations=(
+                    HydrationDropObservation("not_applied", job.message_id, job.kind, job.dialog_id, job.attempts),
+                ),
+            )
         if bool(getattr(result, "pending", False)):
             return AppliedFacts(pending=True)
         text = getattr(result, "text", None)
@@ -91,6 +101,7 @@ class TranscriptionHydrationHandler:
             transcribed_text=text,
             transcription_id=transcription_id,
             received_at=now,
+            observation_order=observation_order,
         )
         if applied == "already_applied":
             queue.remove(job)

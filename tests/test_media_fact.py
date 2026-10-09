@@ -14,6 +14,7 @@ from mcp_telegram.media_fact import (
     MEDIA_KIND_VALUES,
     MEDIA_KINDS,
     MediaFact,
+    MediaKind,
     decode_media_fact,
     encode_media_fact,
     encode_media_payload,
@@ -174,7 +175,7 @@ def test_extractor_preserves_only_agent_useful_frequent_media_facts() -> None:
         "sticker", {"size": 1024, "alt": "🙂", "set_name": "friendly_faces"}
     )
     assert extract_media_fact(MagicMock(spec=tl.MessageMediaDocument, document=video_document)) == MediaFact(
-        "video", {"size": 2048, "duration": 65, "round_message": True}
+        "video", {"size": 2048, "duration": 65, "w": 320, "h": 320, "round_message": True}
     )
 
 
@@ -210,6 +211,8 @@ def test_extractor_and_projector_enrich_new_video_with_filename_and_wrapper_flag
         {
             "size": 2048,
             "duration": 65,
+            "w": 1920,
+            "h": 1080,
             "round_message": False,
             "file_name": "report.mp4",
             "spoiler": True,
@@ -228,7 +231,9 @@ def test_round_video_keeps_round_label_and_filename() -> None:
 
     fact = extract_media_fact(media)
 
-    assert fact == MediaFact("video", {"size": 512, "duration": 5, "round_message": True, "file_name": "circle.mp4"})
+    assert fact == MediaFact(
+        "video", {"size": 512, "duration": 5, "w": 320, "h": 320, "round_message": True, "file_name": "circle.mp4"}
+    )
     assert media_description(fact) == "[кружок: 0:05; circle.mp4]"
 
 
@@ -265,3 +270,50 @@ def test_video_filename_description_is_compact_and_single_line() -> None:
     assert media_description(fact) == "[видео: report evil .mp4]"
     assert "\n" not in (media_description(fact) or "")
     assert "[evil]" not in (media_description(fact) or "")
+
+
+@pytest.mark.parametrize(
+    ("animated", "round_message", "expected_kind"),
+    [(True, False, "animation"), (False, False, "video"), (True, True, "video")],
+)
+def test_mp4_animation_precedes_video_except_round_messages(
+    animated: bool, round_message: bool, expected_kind: MediaKind
+) -> None:
+    document = MagicMock(spec=tl.Document, size=2048, mime_type="video/mp4")
+    attributes: list[object] = [
+        tl.DocumentAttributeVideo(duration=6, w=640, h=360, round_message=round_message),
+        tl.DocumentAttributeFilename("clip.mp4"),
+    ]
+    if animated:
+        attributes.append(tl.DocumentAttributeAnimated())
+    document.attributes = attributes
+    media = tl.MessageMediaDocument(document=document, video=True, spoiler=True, ttl_seconds=30)
+
+    fact = extract_media_fact(media)
+
+    payload = {
+        "size": 2048,
+        "duration": 6,
+        "w": 640,
+        "h": 360,
+        "file_name": "clip.mp4",
+        "spoiler": True,
+        "ttl_seconds": 30,
+    }
+    if expected_kind == "video":
+        payload["round_message"] = round_message
+    assert fact == MediaFact(expected_kind, payload)
+    assert media_description(fact) == (
+        "[анимация]"
+        if expected_kind == "animation"
+        else f"[{'кружок' if round_message else 'видео'}: 0:06; clip.mp4; спойлер; исчезающее]"
+    )
+
+
+def test_round_wrapper_takes_precedence_over_animated_attribute() -> None:
+    document = MagicMock(spec=tl.Document, size=512, mime_type="video/mp4")
+    document.attributes = [tl.DocumentAttributeAnimated()]
+
+    assert extract_media_fact(tl.MessageMediaDocument(document=document, round=True)) == MediaFact(
+        "video", {"size": 512, "round_message": True}
+    )

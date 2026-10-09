@@ -27,7 +27,7 @@ from mcp_telegram.message_fact_refresh import (
 )
 from mcp_telegram.messages import sqlite_hydration_jobs
 from mcp_telegram.messages.sqlite_hydration_jobs import HydrationRepairCursor
-from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.sync_db import _apply_migrations, _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import enable_runtime_writes
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
@@ -49,27 +49,14 @@ from mcp_telegram.telegram_rpc_scheduler import (
 
 def _hydration_db() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
-    conn.execute(
-        """CREATE TABLE hydration_jobs (
-            kind TEXT NOT NULL,
-            dialog_id INTEGER NOT NULL,
-            message_id INTEGER NOT NULL,
-            due_at INTEGER NOT NULL,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            message_sent_at INTEGER NOT NULL DEFAULT 0,
-            priority INTEGER NOT NULL DEFAULT 1,
-            terminal INTEGER NOT NULL DEFAULT 0,
-            last_outcome TEXT,
-            last_error_code TEXT,
-            PRIMARY KEY (kind, dialog_id, message_id)
-        ) WITHOUT ROWID"""
-    )
+    _apply_migrations(conn)
     return conn
 
 
 @pytest.mark.asyncio
-async def test_hydration_adapters_partition_existing_queue_without_mutation() -> None:
+async def test_hydration_adapters_partition_existing_queue_without_mutation(request: pytest.FixtureRequest) -> None:
     conn = _hydration_db()
+    request.addfinalizer(conn.close)
     conn.executemany(
         "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, priority, terminal) "
         "VALUES ('test', 1, ?, ?, ?, ?)",
@@ -120,7 +107,7 @@ class _HydrationHandler:
             self.scope.attempt_budget.debit()
         return object()
 
-    def apply(
+    def apply(  # noqa: PLR0913
         self,
         conn: sqlite3.Connection,
         queue: HydrationQueueRepository,
@@ -128,8 +115,9 @@ class _HydrationHandler:
         result: object,
         *,
         now: int,
+        observation_order: int | None = None,
     ) -> AppliedFacts:
-        del conn, result, now
+        del conn, result, now, observation_order
         for job in jobs:
             queue.remove(job)
         return AppliedFacts(completed=len(jobs))
@@ -256,7 +244,7 @@ async def test_hydration_latched_throttle_restores_undispatched_job_and_stops_co
         shutdown_event = asyncio.Event()
         coordinator = _hydration_coordinator(adapter, observer=observer, shutdown_event=shutdown_event)
 
-        await coordinator.run()
+        await asyncio.wait_for(coordinator.run(), timeout=1.0)
 
         assert coordinator.state is CoordinatorState.STOPPED
         assert shutdown_event.is_set() is False
@@ -319,7 +307,7 @@ async def test_hydration_reschedules_from_slow_request_completion(
                 raise TelegramRpcThrottled(retry_after_seconds=17)
             return result
 
-        def apply(
+        def apply(  # noqa: PLR0913
             self,
             conn: sqlite3.Connection,
             queue: HydrationQueueRepository,
@@ -327,6 +315,7 @@ async def test_hydration_reschedules_from_slow_request_completion(
             result: object,
             *,
             now: int,
+            observation_order: int | None = None,
         ) -> AppliedFacts:
             assert now == 400
             clock[0] += 50

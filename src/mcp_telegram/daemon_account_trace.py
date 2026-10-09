@@ -50,6 +50,7 @@ from .message_contracts import ExtractedMessage
 from .messages.sqlite_bundle import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
 from .models import DialogType
+from .observation_order import allocate_observation_order
 from .resolver import Candidates, Resolved, _parse_tme_link, latinize, resolve
 from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
@@ -740,8 +741,7 @@ class DaemonAccountTraceService:
             result["duplicates_skipped"] += persisted_duplicate_count
 
             if changed:
-                _persist_trace_messages(self._deps.conn, changed)
-                result["messages_persisted"] = len(changed)
+                result["messages_persisted"] = _persist_trace_messages(self._deps.conn, changed)
 
             status = _trace_candidate_status_after_fetch(
                 fetched_count=len(fetched),
@@ -1524,11 +1524,17 @@ async def _trace_enrich_candidate_messages(
     request: _TraceCandidateMessagesContext,
 ) -> tuple[list[ExtractedMessage], str | None]:
     fetched: list[ExtractedMessage] = []
+    observation_order = allocate_observation_order(request.conn)
     try:
         async for msg in request.client.iter_messages(request.dialog_id, **request.iter_kwargs):
             if time.monotonic() >= request.deadline_at:
                 break
-            fetched.append(extract_message_row(request.dialog_id, msg, entity_name_map={}))
+            fetched.append(
+                dataclasses.replace(
+                    extract_message_row(request.dialog_id, msg, entity_name_map={}),
+                    observation_order=observation_order,
+                )
+            )
     except TelegramRpcThrottled as exc:
         _raise_if_latched(exc)
         seconds = exc.retry_after_seconds
@@ -1632,9 +1638,9 @@ def _split_trace_duplicate_messages(
     return changed, duplicates
 
 
-def _persist_trace_messages(conn: sqlite3.Connection, messages: list[ExtractedMessage]) -> None:
+def _persist_trace_messages(conn: sqlite3.Connection, messages: list[ExtractedMessage]) -> int:
     require_write_transaction(conn)
-    insert_messages_with_fts(conn, messages, priority=HydrationPriority.BACKFILL)
+    return insert_messages_with_fts(conn, messages, priority=HydrationPriority.BACKFILL)
 
 
 _TRACE_FRAGMENT_STATUSES = {

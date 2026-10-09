@@ -12,6 +12,7 @@ from typing import cast
 import pytest
 from telethon.tl import types  # type: ignore[import-untyped]
 
+from helpers import remove_v80_schema_for_historical_fixture
 from mcp_telegram.config import DraftRecoveryConfig
 from mcp_telegram.drafts.contracts import (
     DraftComposition,
@@ -282,10 +283,15 @@ def test_repeated_claim_collisions_advance_backoff_and_converge(
     assert first_claim != second_claim
 
 
-def test_migrated_v75_null_order_rows_are_fenced_until_authoritative_bootstrap(tmp_path: Path) -> None:
+def test_migrated_v75_null_order_rows_are_fenced_until_authoritative_bootstrap(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
     database = tmp_path / "legacy.db"
     ensure_sync_schema(database)
     conn = sqlite3.connect(database)
+    request.addfinalizer(conn.close)
+    remove_v80_schema_for_historical_fixture(conn)
+    conn.commit()
     conn.execute("ALTER TABLE draft_current DROP COLUMN source_order_at")
     conn.execute("ALTER TABLE draft_sync_state DROP COLUMN source_order_floor")
     conn.execute("DELETE FROM schema_version WHERE version=76")
@@ -293,6 +299,7 @@ def test_migrated_v75_null_order_rows_are_fenced_until_authoritative_bootstrap(t
     conn.close()
     ensure_sync_schema(database)
     conn = sqlite3.connect(database)
+    request.addfinalizer(conn.close)
     repository = SQLiteDraftProjection(conn, DraftRecoveryConfig())
     repository.bind_account(100)
     conn.execute(

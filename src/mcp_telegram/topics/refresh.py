@@ -16,10 +16,11 @@ class TopicRefresher:
     async def refresh(self, dialog_id: int, entity: object) -> int:
         if not is_topic_capable(entity):
             return 0
+        observation_order = self._repository.begin_snapshot()
         with rpc_scope(
             TelegramRpcSource.TOPIC_RECONCILIATION,
             acquisition_kind=AcquisitionKind.TOPIC_SNAPSHOT,
         ):
             topics = await self._gateway.fetch_topics(entity)
-        self._repository.upsert_topics(dialog_id, topics)
+        self._repository.upsert_topics(dialog_id, topics, observation_order=observation_order)
         return len(topics)

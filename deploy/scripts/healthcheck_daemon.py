@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
-import socket
 import sys
 import tomllib
 from pathlib import Path
@@ -40,35 +40,34 @@ def _load_socket_path() -> Path:
     return Path(state_dir).expanduser() / "daemon.sock"
 
 
+async def _probe(socket_path: Path) -> _HealthcheckResponse:
+    from mcp_telegram.daemon_ipc import REQUEST_LIMIT, read_response
+
+    reader, writer = await asyncio.open_unix_connection(str(socket_path), limit=REQUEST_LIMIT)
+    try:
+        writer.write(json.dumps({"method": "get_sync_status", "params": {}}).encode() + b"\n")
+        await writer.drain()
+        data = await read_response(reader)
+        if not data:
+            raise RuntimeError("daemon closed connection before sending response")
+        return cast(_HealthcheckResponse, json.loads(data))
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
 def main() -> int:
-    """Send get_sync_status via newline-delimited JSON (matching daemon_client protocol)."""
-    sock: socket.socket | None = None
+    """Send get_sync_status using the installed daemon response transport."""
     socket_path: Path | None = None
     try:
         socket_path = _load_socket_path()
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(TIMEOUT_SECONDS)
-        sock.connect(str(socket_path))
-
-        request = json.dumps({"method": "get_sync_status", "params": {}}).encode("utf-8") + b"\n"
-        sock.sendall(request)
-
-        # Read response until newline (daemon sends JSON + \n)
-        buf = b""
-        while b"\n" not in buf:
-            chunk = sock.recv(4096)
-            if not chunk:
-                raise RuntimeError("daemon closed connection before sending response")
-            buf += chunk
-
-        response = cast(_HealthcheckResponse, json.loads(buf.strip()))
+        response = asyncio.run(asyncio.wait_for(_probe(socket_path), TIMEOUT_SECONDS))
         if not response.get("ok"):
             error = response.get("error", "unknown")
             detail = response.get("detail", "")
             msg = f"daemon not ready: {detail}" if error == "daemon_not_ready" else f"daemon error: {error}"
             print(msg, file=sys.stderr)
             return 1
-
         return 0
 
     except FileNotFoundError:
@@ -80,15 +79,17 @@ def main() -> int:
     except TimeoutError:
         print("daemon did not respond within timeout", file=sys.stderr)
         return 1
-    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, json.JSONDecodeError) as error:
+    except (
+        AttributeError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        asyncio.IncompleteReadError,
+    ) as error:
         print(f"healthcheck failed: {error}", file=sys.stderr)
         return 1
-    finally:
-        if sock is not None:
-            try:
-                sock.close()
-            except OSError:
-                pass
 
 
 if __name__ == "__main__":

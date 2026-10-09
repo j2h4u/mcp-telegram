@@ -22,7 +22,7 @@ from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import DemandStatus, DurableDemandAdapter, RpcAttemptBudget
 from mcp_telegram.telegram_demand_coordinator import CoordinatorState, TelegramDemandCoordinator
 from mcp_telegram.telegram_rpc_consumers import DURABLE_DEMAND_ORDER, DemandKind
-from mcp_telegram.telegram_rpc_scheduler import TelegramRpcScope, current_rpc_scope
+from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred, TelegramRpcScope, current_rpc_scope
 
 _TEST_TIMEOUT_S = 0.05
 
@@ -344,3 +344,99 @@ async def test_archive_page_failure_rolls_back_messages_and_checkpoint(conn: sql
     assert conn.execute("SELECT value FROM activity_sync_state WHERE key='backfill_offset_id'").fetchone() == ("0",)
     assert not conn.in_transaction
     assert conn.execute("PRAGMA query_only").fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+async def test_incremental_timeout_preserves_page_and_anchor(conn: sqlite3.Connection) -> None:
+    with conn:
+        conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        conn.executemany(
+            "INSERT OR REPLACE INTO activity_sync_state(key,value) VALUES (?,?)",
+            [
+                ("last_sync_at", "100"),
+                ("incremental_min_date", "40"),
+                ("incremental_offset_id", "12"),
+                ("incremental_started_at", "200"),
+            ],
+        )
+    before = activity_sync._load_state(conn)
+    with patch.object(activity_sync, "call_with_timeout", new=AsyncMock(side_effect=TimeoutError)):
+        await ArchiveIncrementalDemandAdapter(_FakeClient([]), conn, asyncio.Event(), 10, _TEST_TIMEOUT_S).run_slice(
+            RpcAttemptBudget(1)
+        )
+    assert activity_sync._load_state(conn) == before
+
+
+@pytest.mark.asyncio
+async def test_incremental_next_window_starts_before_scan_arrivals(conn: sqlite3.Connection) -> None:
+    with conn:
+        conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        conn.execute("INSERT OR REPLACE INTO activity_sync_state(key,value) VALUES ('last_sync_at','100')")
+    client = _FakeClient([FakeSearchResult(messages=[_msg(12, 42, 190)]), FakeSearchResult(messages=[])])
+    adapter = ArchiveIncrementalDemandAdapter(client, conn, asyncio.Event(), 10, _TEST_TIMEOUT_S)
+    with patch.object(activity_sync.time, "time", return_value=200):
+        await adapter.run_slice(RpcAttemptBudget(1))
+    restarted = ArchiveIncrementalDemandAdapter(client, conn, asyncio.Event(), 10, _TEST_TIMEOUT_S)
+    with patch.object(activity_sync.time, "time", return_value=1000):
+        await restarted.run_slice(RpcAttemptBudget(1))
+        assert activity_sync._load_state(conn)["last_sync_at"] == "200"
+        window = activity_sync._prepare_incremental_slice(conn, asyncio.Event())
+    assert window == (140, 0)
+
+
+@pytest.mark.asyncio
+async def test_backfill_completion_anchors_original_start(conn: sqlite3.Connection) -> None:
+    client = _FakeClient([FakeSearchResult(messages=[_msg(12, 42, 190)]), FakeSearchResult(messages=[])])
+    adapter = ArchiveBackfillDemandAdapter(client, conn, asyncio.Event(), _TEST_TIMEOUT_S)
+    with patch.object(activity_sync.time, "time", return_value=200):
+        await adapter.run_slice(RpcAttemptBudget(1))
+    with patch.object(activity_sync.time, "time", return_value=1000):
+        await ArchiveBackfillDemandAdapter(client, conn, asyncio.Event(), _TEST_TIMEOUT_S).run_slice(
+            RpcAttemptBudget(1)
+        )
+    assert activity_sync._load_state(conn)["last_sync_at"] == "200"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [asyncio.CancelledError(), TelegramRpcAdmissionDeferred(retry_after_seconds=7)])
+async def test_incremental_interruption_keeps_window(conn: sqlite3.Connection, error: BaseException) -> None:
+    with conn:
+        conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        conn.executemany(
+            "INSERT OR REPLACE INTO activity_sync_state(key,value) VALUES (?,?)",
+            [
+                ("last_sync_at", "100"),
+                ("incremental_min_date", "40"),
+                ("incremental_offset_id", "12"),
+                ("incremental_started_at", "200"),
+            ],
+        )
+    before = activity_sync._load_state(conn)
+    with patch.object(activity_sync, "call_with_timeout", new=AsyncMock(side_effect=error)):
+        with pytest.raises(type(error)):
+            await ArchiveIncrementalDemandAdapter(
+                _FakeClient([]), conn, asyncio.Event(), 10, _TEST_TIMEOUT_S
+            ).run_slice(RpcAttemptBudget(1))
+    assert activity_sync._load_state(conn) == before
+
+
+@pytest.mark.asyncio
+async def test_incremental_shutdown_keeps_window(conn: sqlite3.Connection) -> None:
+    with conn:
+        conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        conn.executemany(
+            "INSERT OR REPLACE INTO activity_sync_state(key,value) VALUES (?,?)",
+            [
+                ("last_sync_at", "100"),
+                ("incremental_min_date", "40"),
+                ("incremental_offset_id", "12"),
+                ("incremental_started_at", "200"),
+            ],
+        )
+    before = activity_sync._load_state(conn)
+    shutdown = asyncio.Event()
+    shutdown.set()
+    await ArchiveIncrementalDemandAdapter(_FakeClient([]), conn, shutdown, 10, _TEST_TIMEOUT_S).run_slice(
+        RpcAttemptBudget(1)
+    )
+    assert activity_sync._load_state(conn) == before

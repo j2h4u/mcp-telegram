@@ -5,10 +5,11 @@
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import TypedDict, Unpack
+from typing import TypedDict, Unpack, cast
 
 from mcp_telegram.entity_profile.contracts import (
     ChannelContactOverlapObservation,
@@ -305,3 +306,23 @@ class FakeUserProfilePort:
         if self.post is not None and self.post.message_id != message_id:
             return None
         return self.post
+
+
+def remove_v80_schema_for_historical_fixture(conn: sqlite3.Connection) -> None:
+    """Reconstruct pre-v80 physical ownership before rewinding its migration ledger."""
+    conn.execute("DROP TRIGGER IF EXISTS message_fts_key_insert")
+    conn.execute("DROP INDEX IF EXISTS idx_messages_nonchannel_message_id")
+    for table in (
+        "message_fts_keys",
+        "message_observations",
+        "scheduled_publication_evidence",
+        "nonchannel_message_deletions",
+    ):
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+    for table, column in (("synced_dialogs", "delta_message_id"), ("topic_metadata", "observation_order")):
+        rows = cast(
+            list[tuple[int, str, str, int, str | None, int]], conn.execute(f"PRAGMA table_info({table})").fetchall()
+        )
+        if column in {row[1] for row in rows}:
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    conn.execute("DELETE FROM schema_version WHERE version=80")

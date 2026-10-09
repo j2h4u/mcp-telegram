@@ -253,6 +253,7 @@ ON CONFLICT(dialog_id, message_id) DO UPDATE SET
     published_at = NULL,
     deleted_at = NULL,
     updated_at = excluded.updated_at
+WHERE scheduled_messages.message_state != 'published'
 """
 
 
@@ -271,7 +272,9 @@ def upsert_scheduled_message(
     scheduled_at = _unix_timestamp(getattr(extracted, "scheduled_at", None)) or extracted.message.sent_at
     if scheduled_at is None or scheduled_at <= timestamp:
         return
-    conn.execute(_UPSERT_SCHEDULED_SQL, _scheduled_params(dialog_id, extracted, message, timestamp))
+    cursor = conn.execute(_UPSERT_SCHEDULED_SQL, _scheduled_params(dialog_id, extracted, message, timestamp))
+    if not cursor.rowcount:
+        return
     conn.execute(_DELETE_SCHEDULED_FTS_SQL, (dialog_id, extracted.message.message_id))
     conn.execute(
         _INSERT_SCHEDULED_FTS_SQL,
@@ -317,16 +320,18 @@ def mark_scheduled_messages_removed(
         if hint is None:
             conn.execute(
                 "UPDATE scheduled_messages SET message_state='cancelled', unpublished=1, "
-                "unseen=1, deleted_at=?, updated_at=? WHERE dialog_id=? AND message_id=?",
+                "unseen=1, deleted_at=?, updated_at=? WHERE dialog_id=? AND message_id=? "
+                "AND message_state != 'published'",
                 (timestamp, timestamp, dialog_id, message_id),
             )
         else:
             conn.execute(
                 "UPDATE scheduled_messages SET message_state='unknown_missing', unpublished=1, "
                 "unseen=1, publication_hint_message_id=?, deleted_at=NULL, updated_at=? "
-                "WHERE dialog_id=? AND message_id=?",
+                "WHERE dialog_id=? AND message_id=? AND message_state != 'published'",
                 (hint, timestamp, dialog_id, message_id),
             )
+            _reconcile_scheduled_publication(conn, dialog_id, hint, timestamp)
         conn.execute(_DELETE_SCHEDULED_FTS_SQL, (dialog_id, message_id))
     _mark_scheduled_dialog_dirty(conn, dialog_id, timestamp)
 
@@ -336,11 +341,34 @@ def verify_scheduled_publication(
     dialog_id: int,
     published_message_id: int,
     *,
+    published_at: int | None = None,
     now: int | None = None,
 ) -> int:
-    """Confirm a publication hint after a normal ``from_scheduled`` message."""
+    """Retain verified ``from_scheduled`` evidence, even before its queue hint."""
     require_write_transaction(conn)
     timestamp = int(time.time()) if now is None else int(now)
+    conn.execute(
+        "INSERT INTO scheduled_publication_evidence(dialog_id, published_message_id, published_at, verified_at) "
+        "VALUES (?, ?, ?, ?) ON CONFLICT(dialog_id, published_message_id) DO UPDATE SET "
+        "published_at=COALESCE(scheduled_publication_evidence.published_at, excluded.published_at)",
+        (dialog_id, int(published_message_id), published_at, timestamp),
+    )
+    return _reconcile_scheduled_publication(conn, dialog_id, int(published_message_id), timestamp)
+
+
+def _reconcile_scheduled_publication(
+    conn: sqlite3.Connection, dialog_id: int, published_message_id: int, timestamp: int
+) -> int:
+    evidence = cast(
+        tuple[int | None, int] | None,
+        conn.execute(
+            "SELECT published_at, verified_at FROM scheduled_publication_evidence "
+            "WHERE dialog_id=? AND published_message_id=?",
+            (dialog_id, published_message_id),
+        ).fetchone(),
+    )
+    if evidence is None:
+        return 0
     rows = cast(
         list[tuple[object]],
         conn.execute(
@@ -355,7 +383,7 @@ def verify_scheduled_publication(
         "unseen=0, published_message_id=?, publication_verified_at=?, published_at=?, updated_at=? "
         "WHERE dialog_id=? "
         "AND publication_hint_message_id=? AND message_state='unknown_missing'",
-        (int(published_message_id), timestamp, timestamp, timestamp, dialog_id, int(published_message_id)),
+        (published_message_id, evidence[1], evidence[0], timestamp, dialog_id, published_message_id),
     )
     if scheduled_ids:
         conn.executemany(_DELETE_SCHEDULED_FTS_SQL, ((dialog_id, message_id) for message_id in scheduled_ids))

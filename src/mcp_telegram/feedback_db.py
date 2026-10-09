@@ -91,26 +91,45 @@ def _row_first_int(row: tuple[object | None, ...] | None) -> int:
 def ensure_feedback_schema(db_path: Path) -> sqlite3.Connection:
     """Open feedback.db, apply WAL, and run any pending migrations.
 
-    Idempotent — calling twice on the same path is a no-op; schema_version
-    table will have exactly one row with version=1.
+    Bootstrap and migrations are atomic. A partially applied v2 migration is
+    repaired by adding only missing columns before advancing the version.
 
     Returns the open connection.  Caller is responsible for closing it.
     """
     conn = _open_feedback_db(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)")
-    row = cast(tuple[object | None, ...] | None, conn.execute("SELECT MAX(version) FROM schema_version").fetchone())
-    current = _row_first_int(row)
-    if current < 1:
-        conn.execute(_FEEDBACK_DDL)
-        conn.execute("INSERT INTO schema_version VALUES (1, strftime('%s', 'now'))")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)"
+        )
+        row = cast(
+            tuple[object | None, ...] | None,
+            conn.execute("SELECT MAX(version) FROM schema_version").fetchone(),
+        )
+        current = _row_first_int(row)
+        if current < 1:
+            conn.execute(_FEEDBACK_DDL)
+            conn.execute("INSERT INTO schema_version VALUES (1, strftime('%s', 'now'))")
+        if current < _FEEDBACK_SCHEMA_VERSION:
+            table_info = cast(
+                list[tuple[int, str, str, int, object, int]],
+                conn.execute("PRAGMA table_info(feedback)").fetchall(),
+            )
+            columns = {row[1] for row in table_info}
+            for name, definition in (
+                ("status", "TEXT NOT NULL DEFAULT 'open'"),
+                ("status_changed_at", "INTEGER"),
+                ("status_comment", "TEXT"),
+            ):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE feedback ADD COLUMN {name} {definition}")
+            conn.execute("INSERT INTO schema_version VALUES (?, strftime('%s', 'now'))", (_FEEDBACK_SCHEMA_VERSION,))
         conn.commit()
-    if current < _FEEDBACK_SCHEMA_VERSION:
-        conn.execute("ALTER TABLE feedback ADD COLUMN status TEXT NOT NULL DEFAULT 'open'")
-        conn.execute("ALTER TABLE feedback ADD COLUMN status_changed_at INTEGER")
-        conn.execute("ALTER TABLE feedback ADD COLUMN status_comment TEXT")
-        conn.execute("INSERT INTO schema_version VALUES (?, strftime('%s', 'now'))", (_FEEDBACK_SCHEMA_VERSION,))
-        conn.commit()
+    except BaseException:
+        conn.rollback()
+        conn.close()
+        raise
     return conn
 
 

@@ -12,6 +12,7 @@ from .media_fact import encode_media_payload
 from .messages.sqlite_hydration import (
     apply_hydrated_media_fact,
     enqueue_transcription_for_hydrated_media,
+    hydration_observation_current,
 )
 from .messages.sqlite_hydration_jobs import (
     media_fact_hydration_eligible,
@@ -50,7 +51,7 @@ class MediaFactHydrationHandler:
         telegram = cast(MediaHydrationClient, client)
         return await telegram.get_messages(entity=jobs[0].dialog_id, ids=[job.message_id for job in jobs])
 
-    def apply(
+    def apply(  # noqa: PLR0913 - request boundary accompanies the existing fact application contract
         self,
         conn: sqlite3.Connection,
         queue: HydrationQueueRepository,
@@ -58,10 +59,13 @@ class MediaFactHydrationHandler:
         result: object,
         *,
         now: int,
+        observation_order: int | None = None,
     ) -> AppliedFacts:
+        jobs, stale_observations = self._current_jobs(conn, queue, jobs, observation_order)
         by_id, valid_response = _response_map(result)
-        hydrated = completed = dropped = 0
-        drop_observations: list[HydrationDropObservation] = []
+        hydrated = completed = 0
+        dropped = len(stale_observations)
+        drop_observations: list[HydrationDropObservation] = stale_observations
         if not valid_response:
             drop_observations.extend(
                 HydrationDropObservation("invalid_result", job.message_id, job.kind, job.dialog_id, job.attempts)
@@ -69,7 +73,7 @@ class MediaFactHydrationHandler:
             )
             for job in jobs:
                 queue.mark_terminal(job)
-            return AppliedFacts(dropped=len(jobs), drop_observations=tuple(drop_observations))
+            return AppliedFacts(dropped=dropped + len(jobs), drop_observations=tuple(drop_observations))
         for job in jobs:
             message = by_id.get(job.message_id)
             if message is None:
@@ -82,7 +86,9 @@ class MediaFactHydrationHandler:
             fact = extract_media_fact(getattr(message, "media", None))
             kind = None if fact is None else fact.kind
             payload = encode_media_payload(fact)
-            applied = apply_hydrated_media_fact(conn, job.dialog_id, job.message_id, kind, payload)
+            applied = apply_hydrated_media_fact(
+                conn, job.dialog_id, job.message_id, kind, payload, observation_order=observation_order
+            )
             queue.remove(job)
             if not applied:
                 dropped += 1
@@ -100,6 +106,26 @@ class MediaFactHydrationHandler:
             dropped=dropped,
             drop_observations=tuple(drop_observations),
         )
+
+    def _current_jobs(
+        self,
+        conn: sqlite3.Connection,
+        queue: HydrationQueueRepository,
+        jobs: Sequence[HydrationJob],
+        observation_order: int | None,
+    ) -> tuple[list[HydrationJob], list[HydrationDropObservation]]:
+        current_jobs = []
+        stale_observations = []
+        for job in jobs:
+            if hydration_observation_current(conn, job.dialog_id, job.message_id, observation_order):
+                current_jobs.append(job)
+            else:
+                if not self.eligible(conn, job):
+                    queue.remove(job)
+                stale_observations.append(
+                    HydrationDropObservation("not_applied", job.message_id, job.kind, job.dialog_id, job.attempts)
+                )
+        return current_jobs, stale_observations
 
     def is_terminal_error(self, exc: BaseException) -> bool:
         return _has_terminal_rpc_symbol(exc, _TERMINAL_RPC_SYMBOLS)

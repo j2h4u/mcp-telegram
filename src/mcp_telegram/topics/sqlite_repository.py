@@ -6,6 +6,7 @@ import sqlite3
 import time
 from typing import cast
 
+from ..observation_order import allocate_observation_order
 from ..sync_transactions import require_write_transaction, write_savepoint
 from .contracts import TopicFact
 from .ports import TopicMetadataRepository, TopicSnapshotRepository
@@ -15,12 +16,12 @@ INSERT INTO topic_metadata
     (dialog_id, topic_id, title, top_message_id,
      is_general, is_deleted, updated_at,
      icon_emoji_id, icon_emoji, icon_color,
-     pinned, hidden, snapshot_at, date)
+     pinned, hidden, snapshot_at, date, observation_order)
 VALUES
     (:dialog_id, :topic_id, :title, NULL,
      :is_general, 0, :updated_at,
      :icon_emoji_id, :icon_emoji, :icon_color,
-     0, 0, :snapshot_at, :date)
+     0, 0, :snapshot_at, :date, :observation_order)
 ON CONFLICT(dialog_id, topic_id) DO UPDATE SET
     title          = COALESCE(excluded.title, topic_metadata.title),
     icon_emoji_id  = COALESCE(excluded.icon_emoji_id, topic_metadata.icon_emoji_id),
@@ -29,9 +30,9 @@ ON CONFLICT(dialog_id, topic_id) DO UPDATE SET
     is_general     = excluded.is_general,
     updated_at     = excluded.updated_at,
     snapshot_at    = excluded.snapshot_at,
-    date           = COALESCE(excluded.date, topic_metadata.date)
-WHERE topic_metadata.snapshot_at IS NULL
-   OR topic_metadata.snapshot_at < excluded.snapshot_at
+    date           = COALESCE(excluded.date, topic_metadata.date),
+    observation_order = excluded.observation_order
+WHERE topic_metadata.observation_order < excluded.observation_order
 """
 
 
@@ -39,7 +40,15 @@ class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataReposi
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
-    def upsert_topics(self, dialog_id: int, topics: tuple[TopicFact, ...]) -> None:
+    def begin_snapshot(self) -> int:
+        with write_savepoint(self._conn):
+            return allocate_observation_order(self._conn)
+
+    def upsert_topics(
+        self, dialog_id: int, topics: tuple[TopicFact, ...], *, observation_order: int | None = None
+    ) -> None:
+        if observation_order is None:
+            observation_order = self.begin_snapshot()
         now = int(time.time())
         rows = (
             {
@@ -53,6 +62,7 @@ class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataReposi
                 "updated_at": now,
                 "snapshot_at": now,
                 "date": topic.date,
+                "observation_order": observation_order,
             }
             for topic in topics
         )
@@ -68,25 +78,28 @@ class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataReposi
         icon_emoji_id: int | None,
         date: int | None,
         observed_at: int,
+        observation_order: int | None = None,
     ) -> None:
         require_write_transaction(self._conn)
+        if observation_order is None:
+            observation_order = allocate_observation_order(self._conn)
         self._conn.execute(
             """
             INSERT INTO topic_metadata
                 (dialog_id, topic_id, title, top_message_id,
                  is_general, is_deleted, updated_at,
-                 icon_emoji_id, pinned, hidden, snapshot_at, date)
-            VALUES (?, ?, ?, NULL, 0, 0, ?, ?, 0, 0, ?, ?)
+                 icon_emoji_id, pinned, hidden, snapshot_at, date, observation_order)
+            VALUES (?, ?, ?, NULL, 0, 0, ?, ?, 0, 0, ?, ?, ?)
             ON CONFLICT(dialog_id, topic_id) DO UPDATE SET
                 title = COALESCE(excluded.title, topic_metadata.title),
                 icon_emoji_id = COALESCE(excluded.icon_emoji_id, topic_metadata.icon_emoji_id),
                 updated_at = excluded.updated_at,
                 snapshot_at = excluded.snapshot_at,
-                date = COALESCE(excluded.date, topic_metadata.date)
-            WHERE topic_metadata.snapshot_at IS NULL
-               OR topic_metadata.snapshot_at < excluded.snapshot_at
+                date = COALESCE(excluded.date, topic_metadata.date),
+                observation_order = excluded.observation_order
+            WHERE topic_metadata.observation_order < excluded.observation_order
             """,
-            (dialog_id, topic_id, title, observed_at, icon_emoji_id, observed_at, date),
+            (dialog_id, topic_id, title, observed_at, icon_emoji_id, observed_at, date, observation_order),
         )
 
     def apply_topic_edit(  # noqa: PLR0913
@@ -98,32 +111,59 @@ class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataReposi
         icon_emoji_id: int | None,
         hidden: bool | None,
         observed_at: int,
+        observation_order: int | None = None,
     ) -> None:
         require_write_transaction(self._conn)
-        if hidden:
-            self._conn.execute(
-                "UPDATE topic_metadata SET hidden=1, snapshot_at=?, updated_at=? WHERE dialog_id=? AND topic_id=?",
-                (observed_at, observed_at, dialog_id, topic_id),
-            )
-            return
+        if observation_order is None:
+            observation_order = allocate_observation_order(self._conn)
         self._conn.execute(
             "UPDATE topic_metadata SET title=COALESCE(?, title), "
-            "icon_emoji_id=COALESCE(?, icon_emoji_id), updated_at=?, snapshot_at=? "
-            "WHERE dialog_id=? AND topic_id=? "
-            "AND (snapshot_at IS NULL OR snapshot_at < ?)",
-            (title, icon_emoji_id, observed_at, observed_at, dialog_id, topic_id, observed_at),
+            "icon_emoji_id=COALESCE(?, icon_emoji_id), hidden=COALESCE(?, hidden), "
+            "updated_at=?, snapshot_at=?, observation_order=? "
+            "WHERE dialog_id=? AND topic_id=? AND observation_order < ?",
+            (
+                title,
+                icon_emoji_id,
+                hidden,
+                observed_at,
+                observed_at,
+                observation_order,
+                dialog_id,
+                topic_id,
+                observation_order,
+            ),
         )
 
-    def apply_topic_pin(self, dialog_id: int, topic_id: int, *, pinned: bool, observed_at: int) -> None:
+    def apply_topic_pin(
+        self,
+        dialog_id: int,
+        topic_id: int,
+        *,
+        pinned: bool,
+        observed_at: int,
+        observation_order: int | None = None,
+    ) -> None:
         require_write_transaction(self._conn)
+        if observation_order is None:
+            observation_order = allocate_observation_order(self._conn)
         self._conn.execute(
-            "UPDATE topic_metadata SET pinned=?, snapshot_at=?, updated_at=? WHERE dialog_id=? AND topic_id=?",
-            (int(pinned), observed_at, observed_at, dialog_id, topic_id),
+            "UPDATE topic_metadata SET pinned=?, snapshot_at=?, updated_at=?, observation_order=? "
+            "WHERE dialog_id=? AND topic_id=? AND observation_order < ?",
+            (int(pinned), observed_at, observed_at, observation_order, dialog_id, topic_id, observation_order),
         )
 
-    def apply_topic_pins(self, dialog_id: int, order: tuple[int, ...], *, observed_at: int) -> None:
+    def apply_topic_pins(
+        self,
+        dialog_id: int,
+        order: tuple[int, ...],
+        *,
+        observed_at: int,
+        observation_order: int | None = None,
+    ) -> None:
         """Apply a complete pin membership set without creating unknown topics."""
         require_write_transaction(self._conn)
+        if observation_order is None:
+            observation_order = allocate_observation_order(self._conn)
         rows = cast(
             list[tuple[int]],
             self._conn.execute("SELECT topic_id FROM topic_metadata WHERE dialog_id=?", (dialog_id,)).fetchall(),
@@ -134,8 +174,10 @@ class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataReposi
         pinned_ids = known.intersection(order)
         self._conn.execute(
             "UPDATE topic_metadata SET pinned=CASE WHEN topic_id IN ({}) THEN 1 ELSE 0 END, "
-            "snapshot_at=?, updated_at=? WHERE dialog_id=?".format(",".join("?" for _ in pinned_ids) or "NULL"),
-            (*sorted(pinned_ids), observed_at, observed_at, dialog_id),
+            "snapshot_at=?, updated_at=?, observation_order=? WHERE dialog_id=? AND observation_order < ?".format(
+                ",".join("?" for _ in pinned_ids) or "NULL"
+            ),
+            (*sorted(pinned_ids), observed_at, observed_at, observation_order, dialog_id, observation_order),
         )
 
 

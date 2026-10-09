@@ -15,7 +15,8 @@ from .dialog_classification import (
 from .sync_transactions import enable_runtime_writes, write_transaction
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 79
+_CURRENT_SCHEMA_VERSION = 80
+_MESSAGE_OBSERVATION_MIGRATION = 80
 _MESSAGE_COMPOSITION_MIGRATION = 79
 _LINKED_CHAT_FACT_DEMAND_MIGRATION = 77
 _DIALOG_IDENTITY_OWNER_MIGRATION = 78
@@ -1639,6 +1640,8 @@ def _apply_migration(
     if current >= version:
         return current
     try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
         for stmt in stmts:
             if ignore_duplicate_column:
                 try:
@@ -4673,6 +4676,36 @@ def _repair_v54_schema_ledger(conn: sqlite3.Connection, current: int) -> int:
     return current
 
 
+def _apply_migration_80(conn: sqlite3.Connection, current: int) -> int:
+    fts_exists = (
+        conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts'").fetchone() is not None
+    )
+    return _apply_migration(
+        conn,
+        current,
+        80,
+        [
+            "CREATE TABLE nonchannel_message_deletions(message_id INTEGER PRIMARY KEY,deleted_at INTEGER NOT NULL)",
+            "CREATE INDEX idx_messages_nonchannel_message_id ON messages(message_id,dialog_id) WHERE dialog_id >= -1000000000000",
+            "ALTER TABLE synced_dialogs ADD COLUMN delta_message_id INTEGER",
+            "ALTER TABLE topic_metadata ADD COLUMN observation_order INTEGER NOT NULL DEFAULT 0",
+            "CREATE TABLE message_observations (dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL, observation_order INTEGER NOT NULL, is_deleted INTEGER NOT NULL DEFAULT 0, source_rank INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(dialog_id,message_id)) WITHOUT ROWID",
+            "INSERT INTO message_observations(dialog_id,message_id,observation_order,is_deleted) SELECT dialog_id,message_id,0,is_deleted FROM messages",
+            "CREATE TABLE scheduled_publication_evidence (dialog_id INTEGER NOT NULL,published_message_id INTEGER NOT NULL,published_at INTEGER,verified_at INTEGER NOT NULL,PRIMARY KEY(dialog_id,published_message_id)) WITHOUT ROWID",
+            "CREATE TABLE message_fts_keys (id INTEGER PRIMARY KEY,dialog_id INTEGER NOT NULL,message_id INTEGER NOT NULL,UNIQUE(dialog_id,message_id))",
+            *(
+                [
+                    "INSERT INTO message_fts_keys(id,dialog_id,message_id) SELECT MIN(rowid),dialog_id,message_id FROM messages_fts GROUP BY dialog_id,message_id"
+                ]
+                if fts_exists
+                else []
+            ),
+            "INSERT OR IGNORE INTO message_fts_keys(dialog_id,message_id) SELECT dialog_id,message_id FROM messages",
+            "CREATE TRIGGER message_fts_key_insert AFTER INSERT ON messages BEGIN INSERT INTO message_fts_keys(dialog_id,message_id) VALUES(NEW.dialog_id,NEW.message_id) ON CONFLICT(dialog_id,message_id) DO NOTHING; END",
+        ],
+    )
+
+
 def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
     """Apply the conditional current-schema migration tail."""
     if _CURRENT_SCHEMA_VERSION >= _ENTITY_PROFILE_ACQUISITION_MIGRATION_61:
@@ -4690,6 +4723,8 @@ def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
         current = _apply_migration_78(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _MESSAGE_COMPOSITION_MIGRATION:
         current = _apply_migration_79(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _MESSAGE_OBSERVATION_MIGRATION:
+        current = _apply_migration_80(conn, current)
     return current
 
 

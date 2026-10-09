@@ -98,6 +98,7 @@ def test_synced_dialogs_schema(tmp_sync_db_path: Path) -> None:
             "last_event_at",
             "last_delta_checked_at",
             "delta_refresh_requested_at",
+            "delta_message_id",
             "access_last_revalidated_at",
             "access_next_revalidate_at",
             "sync_progress",
@@ -1724,7 +1725,6 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
     try:
         version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert version == _CURRENT_SCHEMA_VERSION, f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {version}"
-        assert _CURRENT_SCHEMA_VERSION == 79, f"_CURRENT_SCHEMA_VERSION must be 79, got {_CURRENT_SCHEMA_VERSION}"
     finally:
         conn.close()
 

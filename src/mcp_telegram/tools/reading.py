@@ -16,7 +16,7 @@ from ..dialog_selector import (
     required_dialog_selector,
 )
 from ..drafts.contracts import DraftCoverageFreshness, DraftCoveragePresence
-from ..errors import dialog_not_found_text, invalid_navigation_text
+from ..errors import dialog_not_found_text
 from ..formatter import (
     _render_read_state_header,
     format_messages,
@@ -24,7 +24,6 @@ from ..formatter import (
     resolve_sender_label,
 )
 from ..models import DialogType, ReadMessage
-from ..pagination import NavigationToken
 from ..search_contracts import SEARCHABLE_QUERY_TOKEN_PATTERN
 from ..temporal import parse_utc_boundary
 from ._base import (
@@ -982,28 +981,6 @@ def _search_scope_payload(ctx: _SearchStructuredContentContext) -> dict[str, obj
     }
 
 
-def _search_navigation_error(
-    navigation: NavigationToken,
-    args: SearchMessages,
-    *,
-    global_mode: bool,
-    dialog_id: int | None,
-) -> str | None:
-    if navigation.kind != "search":
-        return f"Navigation token is for {navigation.kind}, not search"
-    if navigation.query != args.query:
-        return "Navigation token belongs to a different search query"
-    if navigation.message_state != args.message_state:
-        return f"Navigation token belongs to message_state {navigation.message_state!r}, not {args.message_state!r}"
-    since_utc = parse_utc_boundary(args.since_utc, field="since_utc")
-    until_utc = parse_utc_boundary(args.until_utc, field="until_utc")
-    if navigation.since_utc != since_utc or navigation.until_utc != until_utc:
-        return "Navigation token belongs to a different UTC time range"
-    if (global_mode and navigation.dialog_id != 0) or (dialog_id is not None and navigation.dialog_id != dialog_id):
-        return "Navigation token belongs to a different dialog scope"
-    return None
-
-
 def _search_messages_request_context(args: SearchMessages) -> _SearchMessagesRequestContext | ToolResult:
     try:
         selector = optional_dialog_selector(dialog=args.dialog)
@@ -1012,43 +989,12 @@ def _search_messages_request_context(args: SearchMessages) -> _SearchMessagesReq
     global_mode = selector is None
     dialog_id = selector.exact_id if selector is not None else None
 
-    offset = 0
-    if args.navigation:
-        try:
-            from ..pagination import decode_navigation_token
-
-            nav = decode_navigation_token(args.navigation)
-            error_message = _search_navigation_error(
-                nav,
-                args,
-                global_mode=global_mode,
-                dialog_id=dialog_id,
-            )
-            if error_message is not None:
-                return error_result(
-                    invalid_navigation_text(error_message, retry_tool="SearchMessages"),
-                    has_cursor=True,
-                )
-            if nav.value is None:
-                return error_result(
-                    invalid_navigation_text(
-                        "Search navigation token is missing its offset", retry_tool="SearchMessages"
-                    ),
-                    has_cursor=True,
-                )
-            offset = nav.value
-        except ValueError as exc:
-            return error_result(
-                invalid_navigation_text(str(exc), retry_tool="SearchMessages"),
-                has_cursor=True,
-            )
-
     return _SearchMessagesRequestContext(
         args=args,
         dialog_id=dialog_id,
         dialog_label=selector.label if selector is not None else None,
         global_mode=global_mode,
-        offset=offset,
+        offset=0,
     )
 
 
@@ -1840,7 +1786,7 @@ async def search_messages(args: SearchMessages) -> ToolResult:
             dialog_id=request_context.dialog_id,
             dialog_label=request_context.dialog_label,
             global_mode=request_context.global_mode,
-            offset=request_context.offset,
+            offset=data.get("offset", 0),
             next_navigation=next_nav,
         )
     )

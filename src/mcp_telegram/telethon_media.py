@@ -150,13 +150,17 @@ def _extract_visual(
     media: object,
 ) -> MediaFact | None:
     video = _first_attribute(attrs, tl.DocumentAttributeVideo)
+    round_message = _attr(media, "round") is True or _attr(video, "round_message") is True
+    mime_type = _attr(document, "mime_type")
+    animated = any(isinstance(attribute, tl.DocumentAttributeAnimated) for attribute in attrs) or (
+        isinstance(mime_type, str) and mime_type.lower() == "image/gif"
+    )
+    if animated and not round_message:
+        payload = _video_fact(attrs, base, media, video).payload
+        payload.pop("round_message", None)
+        return MediaFact("animation", payload)
     if video is not None or _is_wrapper_video(media):
         return _video_fact(attrs, base, media, video)
-    if any(isinstance(attribute, tl.DocumentAttributeAnimated) for attribute in attrs):
-        return MediaFact("animation", base)
-    mime_type = _attr(document, "mime_type")
-    if isinstance(mime_type, str) and mime_type.lower() == "image/gif":
-        return MediaFact("animation", base)
     return None
 
 
@@ -166,9 +170,10 @@ def _is_wrapper_video(media: object) -> bool:
 
 def _video_fact(attrs: Sequence[object], base: dict[str, object], media: object, video: object | None) -> MediaFact:
     _add_filename(base, _first_attribute(attrs, tl.DocumentAttributeFilename))
-    duration = _number(_attr(video, "duration")) if video is not None else None
-    if duration is not None:
-        base["duration"] = duration
+    for key in ("duration", "w", "h"):
+        value = _number(_attr(video, key))
+        if value is not None:
+            base[key] = value
     base["round_message"] = _attr(media, "round") is True or _attr(video, "round_message") is True
     _add_visual_wrapper_flags(base, media)
     return MediaFact("video", base)

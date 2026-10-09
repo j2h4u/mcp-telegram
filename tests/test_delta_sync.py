@@ -113,14 +113,14 @@ class _DeltaObserver:
 
 
 @pytest.mark.asyncio
-async def test_zero_baseline_clears_refresh_without_rpc(sync_db: _SQLiteConnection) -> None:
+async def test_zero_baseline_checks_empty_history(sync_db: _SQLiteConnection) -> None:
     dialog_id = 100
     _seed_dialog(sync_db, dialog_id, refresh_requested_at=1)
-    port = _ForwardPort([])
+    port = _ForwardPort([ForwardGapPage((), complete=True)])
     worker = DeltaSyncWorker(port, cast(sqlite3.Connection, sync_db), asyncio.Event())
 
     assert await worker.fetch_delta_slice_for_dialog(dialog_id) == 0
-    assert port.calls == []
+    assert port.calls == [(0, False)]
     row = sync_db.execute(
         "SELECT last_delta_checked_at, delta_refresh_requested_at FROM synced_dialogs WHERE dialog_id=?",
         (dialog_id,),
@@ -148,7 +148,7 @@ async def test_exact_page_continues_then_partial_page_completes(sync_db: _SQLite
     ).fetchone()
     assert first_checkpoint is not None and first_checkpoint[0] is not None
     assert await worker.fetch_delta_slice_for_dialog(dialog_id) == 1
-    assert port.calls == [(100, False), (200, False)]
+    assert port.calls == [(0, False), (200, False)]
     assert sync_db.execute("SELECT MAX(message_id) FROM messages WHERE dialog_id=?", (dialog_id,)).fetchone() == (201,)
     final_checkpoint = sync_db.execute(
         "SELECT delta_refresh_requested_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id=?",
@@ -419,3 +419,60 @@ async def test_delta_sync_without_observer_skips_telemetry_lookup_and_still_comm
         "SELECT message_id FROM messages WHERE dialog_id" in statement and " IN (" in statement
         for statement in statements
     )
+
+
+@pytest.mark.asyncio
+async def test_delta_cursor_ignores_realtime_rows_and_commits_duplicate_pages(sync_db: _SQLiteConnection) -> None:
+    dialog_id = 501
+    _seed_dialog(sync_db, dialog_id, refresh_requested_at=1)
+    sync_db.execute("UPDATE synced_dialogs SET delta_message_id=200 WHERE dialog_id=?", (dialog_id,))
+    sync_db.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (?, 300, 1)", (dialog_id,))
+    sync_db.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (?, 201, 1)", (dialog_id,))
+    sync_db.commit()
+    port = _ForwardPort([ForwardGapPage((_message(dialog_id, 201),), complete=False)])
+    await DeltaSyncWorker(port, cast(sqlite3.Connection, sync_db), asyncio.Event()).fetch_delta_slice_for_dialog(
+        dialog_id
+    )
+    restarted_port = _ForwardPort([ForwardGapPage((_message(dialog_id, 202),), complete=True)])
+    await DeltaSyncWorker(
+        restarted_port, cast(sqlite3.Connection, sync_db), asyncio.Event()
+    ).fetch_delta_slice_for_dialog(dialog_id)
+    assert port.calls == [(200, False)]
+    assert restarted_port.calls == [(201, False)]
+    assert sync_db.execute(
+        "SELECT delta_message_id FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (202,)
+
+
+@pytest.mark.asyncio
+async def test_legacy_delta_cursor_rescans_and_resumes_despite_shared_max(sync_db: _SQLiteConnection) -> None:
+    dialog_id = 502
+    _seed_dialog(sync_db, dialog_id)
+    sync_db.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (?, 999999, 1)", (dialog_id,))
+    sync_db.commit()
+    port = _ForwardPort([ForwardGapPage((_message(dialog_id, 1),), complete=False)])
+    await DeltaSyncWorker(port, cast(sqlite3.Connection, sync_db), asyncio.Event()).fetch_delta_slice_for_dialog(
+        dialog_id
+    )
+    restarted = _ForwardPort([ForwardGapPage((_message(dialog_id, 2),), complete=True)])
+    await DeltaSyncWorker(restarted, cast(sqlite3.Connection, sync_db), asyncio.Event()).fetch_delta_slice_for_dialog(
+        dialog_id
+    )
+    assert port.calls == [(0, False)]
+    assert restarted.calls == [(1, False)]
+
+
+@pytest.mark.asyncio
+async def test_empty_archive_accepts_new_history(sync_db: _SQLiteConnection) -> None:
+    dialog_id = 503
+    _seed_dialog(sync_db, dialog_id)
+    sync_db.execute("UPDATE synced_dialogs SET delta_message_id=0 WHERE dialog_id=?", (dialog_id,))
+    sync_db.commit()
+    port = _ForwardPort([ForwardGapPage((_message(dialog_id, 1),), complete=True)])
+    assert (
+        await DeltaSyncWorker(port, cast(sqlite3.Connection, sync_db), asyncio.Event()).fetch_delta_slice_for_dialog(
+            dialog_id
+        )
+        == 1
+    )
+    assert port.calls == [(0, False)]

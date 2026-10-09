@@ -13,6 +13,8 @@ from ..alert_policy import incoming_human_dm_sql
 from ..fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
 from ..hydration_queue import HydrationPriority, HydrationQueueRepository
 from ..media_fact import decode_media_fact, is_transcribable_telegram_media
+from ..observation_order import allocate_observation_order
+from ..own_only_contracts import CHANNEL_PEER_ID_OFFSET, is_channel_peer_id
 from ..reactions.contracts import ReactionAggregate, ReactionAggregateSource
 from ..reactions.persistence import replace_reaction_aggregates
 from .sqlite_hydration_jobs import _FACT_HYDRATION_EMPTY_KINDS, _is_canonical_media_pair, reconcile_fact_hydration_job
@@ -88,21 +90,100 @@ def read_message_out(conn: sqlite3.Connection, dialog_id: int, message_id: int) 
     return MessageOutLookup(found=row is not None, outgoing=bool(row[0]) if row is not None else False)
 
 
-def persist_message_composition(
-    conn: sqlite3.Connection,
-    dialog_id: int,
-    message_id: int,
-    formatting_entities: str | None,
-    service_action: str | None,
-) -> bool:
-    """Update composition facts without disturbing text, reactions or edit history."""
-    cursor = conn.execute(
-        "UPDATE messages SET formatting_entities = ?, service_action = ? "
-        "WHERE dialog_id = ? AND message_id = ? "
-        "AND (formatting_entities IS NOT ? OR service_action IS NOT ?)",
-        (formatting_entities, service_action, dialog_id, message_id, formatting_entities, service_action),
+def has_nonchannel_deletion(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
+    """Channel message IDs are independent of the account's nonchannel namespace."""
+    if is_channel_peer_id(dialog_id):
+        return False
+    return (
+        conn.execute("SELECT 1 FROM nonchannel_message_deletions WHERE message_id=?", (message_id,)).fetchone()
+        is not None
     )
-    return cursor.rowcount > 0
+
+
+def _validated_message_ids(message_ids: Sequence[int]) -> tuple[int, ...]:
+    return tuple(
+        dict.fromkeys(
+            message_id
+            for message_id in message_ids
+            if isinstance(message_id, int) and not isinstance(message_id, bool) and message_id > 0
+        )
+    )
+
+
+def record_nonchannel_deletions(
+    conn: sqlite3.Connection, message_ids: Sequence[int], deleted_at: int
+) -> tuple[int, ...]:
+    """Retain terminal evidence even before the canonical peer/body is known."""
+    ids = _validated_message_ids(message_ids)
+    conn.executemany(
+        "INSERT OR IGNORE INTO nonchannel_message_deletions(message_id,deleted_at) VALUES(?,?)",
+        ((message_id, deleted_at) for message_id in ids),
+    )
+    return ids
+
+
+def record_message_deletions(conn: sqlite3.Connection, dialog_id: int, message_ids: Sequence[int]) -> tuple[int, ...]:
+    """Retain known-peer terminal keys independently of message-body coverage."""
+    ids = _validated_message_ids(message_ids)
+    pending = [
+        message_id
+        for message_id in ids
+        if conn.execute(
+            "SELECT 1 FROM message_observations WHERE dialog_id=? AND message_id=? AND is_deleted=1",
+            (dialog_id, message_id),
+        ).fetchone()
+        is None
+    ]
+    if pending:
+        observation_order = allocate_observation_order(conn)
+        conn.executemany(
+            "INSERT INTO message_observations(dialog_id,message_id,observation_order,is_deleted) VALUES(?,?,?,1) ON CONFLICT(dialog_id,message_id) DO UPDATE SET is_deleted=1,observation_order=excluded.observation_order",
+            ((dialog_id, message_id, observation_order) for message_id in pending),
+        )
+    return ids
+
+
+def _is_current_observation(
+    conn: sqlite3.Connection,
+    item: _message_contracts.ExtractedMessage,
+    source: ReactionAggregateSource | str = ReactionAggregateSource.HISTORY,
+) -> bool:
+    message = item.message
+    if has_nonchannel_deletion(conn, message.dialog_id, message.message_id):
+        return False
+    key = (message.dialog_id, message.message_id)
+    state = cast(
+        tuple[int, int, int] | None,
+        conn.execute(
+            "SELECT observation_order,is_deleted,source_rank FROM message_observations WHERE dialog_id=? AND message_id=?",
+            key,
+        ).fetchone(),
+    )
+    current = cast(
+        tuple[int | None, int] | None,
+        conn.execute("SELECT edit_date,is_deleted FROM messages WHERE dialog_id=? AND message_id=?", key).fetchone(),
+    )
+    if _stored_message_deleted(state, current):
+        return False
+    if current is not None:
+        incoming_version, current_version = message.edit_date or 0, current[0] or 0
+        if incoming_version < current_version:
+            return False
+        if incoming_version > current_version:
+            return True
+    return _follows_stored_observation(state, item.observation_order, ReactionAggregateSource(source).rank)
+
+
+def _stored_message_deleted(state: tuple[int, int, int] | None, current: tuple[int | None, int] | None) -> bool:
+    return (state is not None and bool(state[1])) or (current is not None and bool(current[1]))
+
+
+def _follows_stored_observation(state: tuple[int, int, int] | None, order: int | None, source_rank: int) -> bool:
+    if state is None:
+        return True
+    if source_rank < state[2]:
+        return False
+    return order is None or order >= state[0]
 
 
 def persist_edited_message(  # noqa: PLR0913
@@ -116,12 +197,14 @@ def persist_edited_message(  # noqa: PLR0913
 ) -> int | None:
     """Version and persist a changed message in the caller's transaction."""
     dialog_id, message_id = extracted.message.dialog_id, extracted.message.message_id
+    if not _is_current_observation(conn, extracted, reaction_source):
+        return None
     current = read_message_text(conn, dialog_id, message_id)
     if not current.found:
         return None
     if current.text == extracted.message.text:
-        persist_message_composition(
-            conn, dialog_id, message_id, extracted.message.formatting_entities, extracted.message.service_action
+        insert_messages_with_fts(
+            conn, [extracted], priority=priority, reaction_source=reaction_source, reaction_observed_at=edit_date
         )
         return None
     old_text = current.text
@@ -163,14 +246,17 @@ def persist_transcribed_text(
 
 def mark_message_deleted(conn: sqlite3.Connection, dialog_id: int, message_id: int, deleted_at: int) -> bool:
     """Tombstone one message and report whether this call changed its state."""
+    if not record_message_deletions(conn, dialog_id, (message_id,)):
+        return False
     cursor = conn.execute(_MARK_DELETED_SQL, (deleted_at, dialog_id, message_id))
+    conn.execute(DELETE_FTS_SQL, (dialog_id, message_id))
     if cursor.rowcount > 0:
         HydrationQueueRepository(conn).remove_for_message(dialog_id, message_id)
     return cursor.rowcount > 0
 
 
-def find_unique_incoming_human_dm_dialogs(conn: sqlite3.Connection, message_ids: Sequence[int]) -> dict[int, int]:
-    """Resolve peer-less Telegram deletions whose local DM rows are unique."""
+def find_unique_nonchannel_message_dialogs(conn: sqlite3.Connection, message_ids: Sequence[int]) -> dict[int, int]:
+    """Resolve only unique cached keys in Telegram's nonchannel ID namespace."""
     unique_ids = tuple(dict.fromkeys(int(message_id) for message_id in message_ids))
     if not unique_ids:
         return {}
@@ -181,7 +267,7 @@ def find_unique_incoming_human_dm_dialogs(conn: sqlite3.Connection, message_ids:
             f"""SELECT m.message_id, m.dialog_id
                 FROM messages m
                 WHERE m.message_id IN ({placeholders}) AND m.is_deleted = 0
-                  AND {incoming_human_dm_sql("m")}""",
+                  AND m.dialog_id >= {-CHANNEL_PEER_ID_OFFSET}""",
             unique_ids,
         ).fetchall(),
     )
@@ -197,6 +283,24 @@ def list_undeleted_message_ids(conn: sqlite3.Connection, dialog_id: int, sent_be
     return tuple(int(message_id) for (message_id,) in rows)
 
 
+def _accepted_message_bundles(
+    conn: sqlite3.Connection,
+    extracted: Sequence[_message_contracts.ExtractedMessage],
+    source: ReactionAggregateSource | str,
+) -> list[_message_contracts.ExtractedMessage]:
+    accepted_by_key: dict[tuple[int, int], _message_contracts.ExtractedMessage] = {}
+    for item in extracted:
+        if _is_current_observation(conn, item, source):
+            key = (item.message.dialog_id, item.message.message_id)
+            prior = accepted_by_key.get(key)
+            if prior is None or (item.message.edit_date or 0, item.observation_order or 0) >= (
+                prior.message.edit_date or 0,
+                prior.observation_order or 0,
+            ):
+                accepted_by_key[key] = item
+    return list(accepted_by_key.values())
+
+
 def insert_messages_with_fts(
     conn: sqlite3.Connection,
     extracted: Sequence[_message_contracts.ExtractedMessage],
@@ -204,13 +308,24 @@ def insert_messages_with_fts(
     priority: HydrationPriority = HydrationPriority.FOREGROUND,
     reaction_source: ReactionAggregateSource | str = ReactionAggregateSource.HISTORY,
     reaction_observed_at: int | None = None,
-) -> None:
-    """Persist message bundles in the caller-owned transaction."""
-    projected = _overlay_message_transcriptions(conn, _preserve_transcribed_texts(conn, extracted))
+) -> int:
+    """Persist accepted bundles and return their unique key count."""
+    accepted = _accepted_message_bundles(conn, extracted, reaction_source)
+    fallback_sequence = (
+        allocate_observation_order(conn) if any(item.observation_order is None for item in accepted) else 0
+    )
+    for item in accepted:
+        sequence = item.observation_order if item.observation_order is not None else fallback_sequence
+        conn.execute(
+            "INSERT INTO message_observations(dialog_id,message_id,observation_order,source_rank) VALUES(?,?,?,?) ON CONFLICT(dialog_id,message_id) DO UPDATE SET observation_order=excluded.observation_order,source_rank=excluded.source_rank",
+            (item.message.dialog_id, item.message.message_id, sequence, ReactionAggregateSource(reaction_source).rank),
+        )
+    projected = _overlay_message_transcriptions(conn, _preserve_transcribed_texts(conn, accepted))
     _write_message_rows_and_fts(conn, projected, priority=priority)
     _delete_entity_and_forward_projections(conn, projected)
     _replace_reaction_projections(conn, projected, source=reaction_source, observed_at=reaction_observed_at)
     _insert_entity_and_forward_projections(conn, projected)
+    return len(projected)
 
 
 def _write_message_rows_and_fts(
@@ -271,6 +386,8 @@ def _replace_reaction_projections(
     observed_at: int | None = None,
 ) -> None:
     for item in extracted:
+        if not item.reactions_observed:
+            continue
         replace_reaction_aggregates(
             conn,
             item.message.dialog_id,

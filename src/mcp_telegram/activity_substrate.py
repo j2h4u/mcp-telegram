@@ -42,7 +42,12 @@ async def call_with_timeout(client: ActivityClient, request: object, *, timeout_
         demand_token=token,
         attempt_budget=attempt_budget,
     )
-    done, _pending = await asyncio.wait({task}, timeout=timeout_s)
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=timeout_s)
+    except asyncio.CancelledError:
+        task.cancel()
+        task.add_done_callback(_consume_cancelled_task)
+        raise
     if not done:
         task.cancel()
         task.add_done_callback(_consume_cancelled_task)

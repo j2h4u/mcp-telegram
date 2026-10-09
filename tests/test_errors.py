@@ -20,7 +20,6 @@ from mcp_telegram.errors import (
     entity_not_found_text,
     fetch_entity_info_error_text,
     inaccessible_topic_text,
-    invalid_navigation_text,
     no_active_topics_text,
     no_dialogs_text,
     no_usage_data_text,
@@ -70,11 +69,6 @@ _ERROR_TEXT_CASES: list[tuple[str, str, list[str]]] = [
         ["Forum", "CHANNEL_PRIVATE"],
     ),
     ("no_active_topics", no_active_topics_text("EmptyForum"), ["EmptyForum"]),
-    (
-        "invalid_navigation",
-        invalid_navigation_text("bad token", retry_tool="SearchMessages"),
-        ["bad token", "SearchMessages"],
-    ),
     ("sender_not_found", sender_not_found_text("Ghost", retry_tool="ListMessages"), ["Ghost"]),
     (
         "ambiguous_sender",

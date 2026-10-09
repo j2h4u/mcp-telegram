@@ -682,6 +682,22 @@ async def test_daemon_api_projects_gate_admission_deferral_without_internal_name
     }
 
 
+def _install_message_observation_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE TABLE nonchannel_message_deletions(message_id INTEGER PRIMARY KEY,deleted_at INTEGER NOT NULL)"
+    )
+    conn.execute("CREATE TABLE IF NOT EXISTS daemon_state(key TEXT PRIMARY KEY,value TEXT)")
+    conn.execute(
+        "CREATE TABLE message_observations(dialog_id INTEGER,message_id INTEGER,observation_order INTEGER NOT NULL,is_deleted INTEGER NOT NULL DEFAULT 0,source_rank INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(dialog_id,message_id)) WITHOUT ROWID"
+    )
+    conn.execute(
+        "CREATE TABLE message_fts_keys(id INTEGER PRIMARY KEY,dialog_id INTEGER,message_id INTEGER,UNIQUE(dialog_id,message_id))"
+    )
+    conn.execute(
+        "CREATE TRIGGER message_fts_key_insert AFTER INSERT ON messages BEGIN INSERT INTO message_fts_keys(dialog_id,message_id) VALUES(NEW.dialog_id,NEW.message_id) ON CONFLICT(dialog_id,message_id) DO NOTHING; END"
+    )
+
+
 def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.Connection:
     """Return an in-memory SQLite connection with the required schema."""
     conn = _register_sqlite_connection(sqlite3.connect(":memory:"))
@@ -929,6 +945,7 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
     if with_fts:
         conn.execute(MESSAGES_FTS_DDL)
     install_dialog_directory_coverage_schema(conn)
+    _install_message_observation_schema(conn)
     conn.commit()
     return conn
 
@@ -1235,6 +1252,7 @@ def _make_db_with_topics() -> sqlite3.Connection:
     conn.execute(
         """
         CREATE TABLE topic_metadata (
+            observation_order INTEGER NOT NULL DEFAULT 0,
             dialog_id      INTEGER NOT NULL,
             topic_id       INTEGER NOT NULL,
             title          TEXT NOT NULL,
@@ -8658,6 +8676,7 @@ def _make_trace_db() -> sqlite3.Connection:
         );
 
         CREATE TABLE topic_metadata (
+            observation_order INTEGER NOT NULL DEFAULT 0,
             dialog_id   INTEGER NOT NULL,
             topic_id    INTEGER NOT NULL,
             title       TEXT NOT NULL,
@@ -8723,6 +8742,7 @@ def _make_trace_db() -> sqlite3.Connection:
         ) WITHOUT ROWID;
         """
     )
+    _install_message_observation_schema(conn)
     conn.commit()
     return conn
 

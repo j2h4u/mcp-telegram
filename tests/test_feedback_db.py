@@ -7,6 +7,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
+import pytest
+
+from mcp_telegram import feedback_db
 from mcp_telegram.feedback_db import (
     _FEEDBACK_SCHEMA_VERSION,
     VALID_SEVERITIES,
@@ -28,7 +31,7 @@ def test_ensure_feedback_schema_creates_table(
 def test_ensure_feedback_schema_records_version(
     make_feedback_db: Callable[[], tuple[sqlite3.Connection, Path]],
 ) -> None:
-    """After ensure_feedback_schema, schema_version table has MAX(version) == 1."""
+    """After ensure_feedback_schema, schema_version reaches the current version."""
     conn, _ = make_feedback_db()
     row = cast(tuple[int] | None, conn.execute("SELECT MAX(version) FROM schema_version").fetchone())
     assert row is not None
@@ -208,5 +211,102 @@ def test_feedback_schema_v1_to_v2_preserves_rows(tmp_path: Path) -> None:
         max_v_row = cast(tuple[int] | None, conn.execute("SELECT MAX(version) FROM schema_version").fetchone())
         assert max_v_row is not None
         assert max_v_row[0] == 2
+    finally:
+        conn.close()
+
+
+def test_feedback_schema_v2_interruption_rolls_back_and_replays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed v2 step rolls back its DDL and ledger update, then a retry completes."""
+    db_path = tmp_path / "feedback_interrupted.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)")
+    conn.execute(
+        "CREATE TABLE feedback ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, submitted_at INTEGER NOT NULL, message TEXT NOT NULL, "
+        "severity TEXT, context TEXT, model TEXT, harness TEXT)"
+    )
+    conn.execute("INSERT INTO schema_version VALUES (1, strftime('%s', 'now'))")
+    conn.execute("INSERT INTO feedback (submitted_at, message, severity) VALUES (1, 'keep me', 'bug')")
+    conn.commit()
+    conn.close()
+
+    open_feedback_db = feedback_db._open_feedback_db
+
+    def open_failing_connection(path: Path) -> sqlite3.Connection:
+        conn = sqlite3.connect(path)
+        alters = 0
+
+        def deny_second_alter(
+            action: int,
+            _first: str | None,
+            _second: str | None,
+            _database: str | None,
+            _trigger: str | None,
+        ) -> int:
+            nonlocal alters
+            if action == sqlite3.SQLITE_ALTER_TABLE:
+                alters += 1
+                if alters == 2:
+                    return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(deny_second_alter)
+        return conn
+
+    monkeypatch.setattr(feedback_db, "_open_feedback_db", open_failing_connection)
+    with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+        ensure_feedback_schema(db_path)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        table_info = cast(
+            list[tuple[int, str, str, int, object, int]],
+            conn.execute("PRAGMA table_info(feedback)").fetchall(),
+        )
+        columns = {row[1] for row in table_info}
+        assert "status" not in columns
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (1,)
+        assert conn.execute("SELECT message FROM feedback").fetchone() == ("keep me",)
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(feedback_db, "_open_feedback_db", open_feedback_db)
+    conn = ensure_feedback_schema(db_path)
+    try:
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (_FEEDBACK_SCHEMA_VERSION,)
+        assert conn.execute("SELECT message, status FROM feedback").fetchone() == ("keep me", "open")
+    finally:
+        conn.close()
+
+
+def test_feedback_schema_v2_repairs_partial_v1_without_overwriting_status(tmp_path: Path) -> None:
+    """A status column left by an older interrupted v2 migration is preserved and completed."""
+    db_path = tmp_path / "feedback_partial.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)")
+    conn.execute(
+        "CREATE TABLE feedback ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, submitted_at INTEGER NOT NULL, message TEXT NOT NULL, "
+        "severity TEXT, context TEXT, model TEXT, harness TEXT, status TEXT NOT NULL DEFAULT 'open')"
+    )
+    conn.execute("INSERT INTO schema_version VALUES (1, strftime('%s', 'now'))")
+    conn.execute(
+        "INSERT INTO feedback (submitted_at, message, severity, status) VALUES (1, 'keep status', 'bug', 'done')"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = ensure_feedback_schema(db_path)
+    try:
+        table_info = cast(
+            list[tuple[int, str, str, int, object, int]],
+            conn.execute("PRAGMA table_info(feedback)").fetchall(),
+        )
+        columns = {row[1] for row in table_info}
+        assert {"status", "status_changed_at", "status_comment"} <= columns
+        assert conn.execute("SELECT message, status FROM feedback").fetchone() == ("keep status", "done")
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (_FEEDBACK_SCHEMA_VERSION,)
     finally:
         conn.close()

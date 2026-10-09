@@ -197,14 +197,14 @@ def test_raw_message_body_wrapper_is_rejected_in_delivery_tools() -> None:
 )
 def test_message_body_wrapper_aliases_and_helpers_are_rejected(source: str) -> None:
     gate = _gate()
-    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    findings = gate.violations_for(gate.SOURCE_ROOT / "inbox_projection.py", source)
     assert any("message bodies must use serialize_message_content" in finding.message for finding in findings)
 
 
 def test_message_entrypoint_must_call_shared_serializer() -> None:
     gate = _gate()
     source = "def _structured_messages(message):\n    return {'text': message.text}\n"
-    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    findings = gate.violations_for(gate.SOURCE_ROOT / "inbox_projection.py", source)
     assert any("must call project_message_view" in finding.message for finding in findings)
 
 
@@ -215,7 +215,7 @@ def test_metadata_wrapper_allowlist_does_not_hide_message_body_bypass() -> None:
         "def _structured_reactions(message):\n"
         "    return telegram_content(message.text, 'reaction')\n"
     )
-    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    findings = gate.violations_for(gate.SOURCE_ROOT / "inbox_projection.py", source)
     assert any("message bodies must use serialize_message_content" in finding.message for finding in findings)
 
 
@@ -228,7 +228,7 @@ def test_legitimate_metadata_call_remains_allowed_with_serializer_entrypoint() -
         "def _structured_reactions(display):\n"
         "    return display\n"
     )
-    assert gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source) == []
+    assert gate.violations_for(gate.SOURCE_ROOT / "inbox_projection.py", source) == []
 
 
 @pytest.mark.parametrize(
@@ -254,7 +254,7 @@ def test_canonical_message_entrypoint_cannot_overwrite_presenter_fields(write: s
         f"    {write}\n"
         "    return item\n"
     )
-    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    findings = gate.violations_for(gate.SOURCE_ROOT / "inbox_projection.py", source)
     assert any("must be owned by project_message_view" in finding.message for finding in findings)
 
 
@@ -310,7 +310,7 @@ def test_message_view_update_fails_closed_for_unknown_mapping_keys(merge: str) -
         f"    {merge}\n"
         "    return item\n"
     )
-    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    findings = gate.violations_for(gate.SOURCE_ROOT / "inbox_projection.py", source)
     assert any("update keys must be a statically known literal mapping" in finding.message for finding in findings)
 
 
@@ -324,7 +324,7 @@ def test_filter_shaped_literal_cannot_be_merged_into_message_view() -> None:
         "'exact_topic_id': 3, 'topic': 'parallel'})\n"
         "    return item\n"
     )
-    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    findings = gate.violations_for(gate.SOURCE_ROOT / "inbox_projection.py", source)
     assert any("canonical field 'sender'" in finding.message for finding in findings)
     assert any("canonical field 'topic'" in finding.message for finding in findings)
     assert not any("update keys must be a statically known literal mapping" in finding.message for finding in findings)
@@ -346,7 +346,7 @@ def test_opaque_update_preserves_known_presenter_overwrite_keys(merge: str) -> N
         f"    {merge}\n"
         "    return item\n"
     )
-    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    findings = gate.violations_for(gate.SOURCE_ROOT / "inbox_projection.py", source)
     assert any("canonical field 'sender'" in finding.message for finding in findings)
     assert any("update keys must be a statically known literal mapping" in finding.message for finding in findings)
 
@@ -365,7 +365,7 @@ def test_opaque_construction_preserves_known_presenter_overwrite_keys(constructi
         "def _structured_messages(message):\n"
         f"    return {construction}\n"
     )
-    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    findings = gate.violations_for(gate.SOURCE_ROOT / "inbox_projection.py", source)
     assert any("canonical field 'sender'" in finding.message for finding in findings)
 
 
@@ -378,7 +378,7 @@ def test_message_view_ior_fails_closed_for_unknown_mapping_keys() -> None:
         "    item |= patch\n"
         "    return item\n"
     )
-    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    findings = gate.violations_for(gate.SOURCE_ROOT / "inbox_projection.py", source)
     assert any("|= keys must be a statically known literal mapping" in finding.message for finding in findings)
 
 
@@ -406,7 +406,7 @@ def test_noop_presenter_call_does_not_excuse_manually_returned_envelope() -> Non
         "    project_message_view(message)\n"
         "    return dict(dialog_id=message.dialog_id, sent_at=message.sent_at)\n"
     )
-    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    findings = gate.violations_for(gate.SOURCE_ROOT / "inbox_projection.py", source)
     assert any("canonical field 'sent_at'" in finding.message for finding in findings)
 
 
@@ -420,7 +420,7 @@ def test_local_helper_cannot_hide_presenter_field_mutation() -> None:
         "def _structured_messages(message):\n"
         "    return _manual_sender(project_message_view(message))\n"
     )
-    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    findings = gate.violations_for(gate.SOURCE_ROOT / "inbox_projection.py", source)
     assert any("canonical field 'sender'" in finding.message for finding in findings)
 
 
@@ -436,7 +436,7 @@ def test_inbox_compact_adapter_only_exempts_bounded_identity_fields() -> None:
         "    item['formatting_text'] = 'full original'\n"
         "    return item\n"
     )
-    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    findings = gate.violations_for(gate.SOURCE_ROOT / "inbox_projection.py", source)
     assert [finding.message for finding in findings] == [
         "canonical field 'formatting_text' must be owned by project_message_view"
     ]
@@ -459,7 +459,7 @@ def test_inbox_compact_adapter_only_exempts_bounded_identity_fields() -> None:
 )
 def test_presenter_alias_and_module_qualified_calls_are_noncanonical(source: str) -> None:
     gate = _gate()
-    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    findings = gate.violations_for(gate.SOURCE_ROOT / "inbox_projection.py", source)
     assert any("canonical direct import and name" in finding.message for finding in findings)
     assert any("must call project_message_view" in finding.message for finding in findings)
 
@@ -557,7 +557,7 @@ def test_serializer_call_does_not_excuse_second_raw_wrapper() -> None:
         "    serialize_message_content(row.get('text'), row.get('media_description'))\n"
         "    return telegram_content(str(row.get('text')), 'message_text')\n"
     )
-    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    findings = gate.violations_for(gate.SOURCE_ROOT / "inbox_projection.py", source)
     assert any("message bodies must use serialize_message_content" in finding.message for finding in findings)
 
 
@@ -569,7 +569,7 @@ def test_module_alias_and_row_subscript_body_bypass_is_rejected() -> None:
         "    body = str(row['text'])\n"
         "    return structured.telegram_content(body, 'message_text')\n"
     )
-    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    findings = gate.violations_for(gate.SOURCE_ROOT / "inbox_projection.py", source)
     assert any("message bodies must use serialize_message_content" in finding.message for finding in findings)
 
 
@@ -596,9 +596,10 @@ def test_manual_content_constructor_is_rejected_outside_projector() -> None:
 
 def test_content_wrapper_and_schema_are_allowed() -> None:
     gate = _gate()
-    wrapper = gate.SOURCE_ROOT / "tools" / "structured.py"
+    wrapper = gate.SOURCE_ROOT / "structured.py"
     wrapper_source = 'return {"text": text, "is_telegram_content": True, "content_kind": content_kind}'
     assert not gate.violations_for(wrapper, wrapper_source)
+    assert gate.violations_for(gate.SOURCE_ROOT / "tools" / "structured.py", wrapper_source)
 
     schema = gate.SOURCE_ROOT / "tools" / "discovery.py"
     schema_source = '{"is_telegram_content": {"type": "boolean"}, "content_kind": {"type": "string"}}'
@@ -774,3 +775,17 @@ def test_activity_trace_delivery_forbids_projector_imports_and_calls(relative_pa
     alias_findings = gate.violations_for(path, module_alias)
     assert any("must not import message_content projectors" in finding.message for finding in alias_findings)
     assert any("must not call message_content projectors" in finding.message for finding in alias_findings)
+
+
+@pytest.mark.parametrize("field", ["sender", "topic"])
+def test_inbox_delivery_facade_cannot_mutate_canonical_fields(field: str) -> None:
+    gate = _gate()
+    source = (
+        "from ..inbox_projection import project_inbox_payload\n"
+        "def _project_inbox_response(args, response):\n"
+        "    payload = project_inbox_payload(args, response['data'])\n"
+        f"    payload[{field!r}] = 'parallel identity'\n"
+        "    return payload\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any(f"canonical field {field!r} must be owned" in finding.message for finding in findings)

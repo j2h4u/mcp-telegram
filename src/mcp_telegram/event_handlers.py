@@ -87,19 +87,20 @@ from .history_enrollment import EnrollmentOutcome, ensure_automatic_dm_enrollmen
 from .hydration_queue import HydrationPriority
 from .identity_observation import USERNAME_UNOBSERVED, observe_username
 from .linked_chat_fact import LinkedChatWork, linked_chat_fact_owner
-from .message_composition import extract_message_composition
 from .messages.sqlite_bundle import (
-    find_unique_incoming_human_dm_dialogs,
+    find_unique_nonchannel_message_dialogs,
     insert_messages_with_fts,
     list_undeleted_message_ids,
     mark_message_deleted,
     persist_edited_message,
-    persist_message_composition,
     read_message_out,
     read_message_text,
+    record_message_deletions,
+    record_nonchannel_deletions,
 )
 from .messages.sqlite_hydration import (
     apply_message_transcription,
+    hydration_observation_current,
     stage_message_transcription,
 )
 from .messages.telegram_adapter import (
@@ -111,6 +112,7 @@ from .messages.telegram_adapter import (
 from .messages.telegram_adapter import (
     extract_message_row,
 )
+from .observation_order import allocate_observation_order
 from .reactions.contracts import ReactionAggregate, ReactionAggregateSource, ReactionObservationBoundary
 from .reactions.persistence import allocate_observation_boundary, replace_reaction_aggregates
 from .reactions.projection import project_reaction_aggregates
@@ -1006,9 +1008,20 @@ class EventHandlerManager:
             return
         with write_savepoint(conn):
             if now is None:
-                verify_scheduled_publication(conn, dialog_id, int(message.id))
+                verify_scheduled_publication(
+                    conn,
+                    dialog_id,
+                    int(message.id),
+                    published_at=int(message.date.timestamp()) if isinstance(message.date, datetime) else None,
+                )
             else:
-                verify_scheduled_publication(conn, dialog_id, int(message.id), now=now)
+                verify_scheduled_publication(
+                    conn,
+                    dialog_id,
+                    int(message.id),
+                    now=now,
+                    published_at=int(message.date.timestamp()) if isinstance(message.date, datetime) else None,
+                )
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     @_acquisition(AcquisitionKind.ENTITY_LOOKUP)
@@ -1023,23 +1036,27 @@ class EventHandlerManager:
         dialog_id = event.chat_id
         if dialog_id is None:
             return
-        reaction_observed_at = int(time.time())
-        msg = event.message
-        identity_baseline = _IdentityBaseline(capture_identity_baseline(self._conn, dialog_id))
-        coverage = await self._new_message_coverage(dialog_id, event, identity_baseline=identity_baseline)
-        if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
-            return
         try:
+            reaction_observed_at = int(time.time())
+            observation_order = allocate_observation_order(self._conn)
+            msg = event.message
+            identity_baseline = _IdentityBaseline(capture_identity_baseline(self._conn, dialog_id))
+            coverage = await self._new_message_coverage(dialog_id, event, identity_baseline=identity_baseline)
+            if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
+                return
             if not allows_new_message(coverage, outgoing=bool(getattr(msg, "out", False))):
-                self._project_denied_new_message_metadata(dialog_id, msg, coverage)
+                self._project_denied_new_message_metadata(dialog_id, msg, coverage, observation_order=observation_order)
                 return
             entity_name_map = await _build_fwd_entity_map(msg, cast(_PeerNameClient, self._client))
-            extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
+            extracted = replace(
+                extract_message_row(dialog_id, msg, entity_name_map=entity_name_map),
+                observation_order=observation_order,
+            )
             # Forward enrichment suspends the handler; status may have changed
             # while Telegram was queried, so gate the mutation again.
             coverage = self._realtime_coverage(dialog_id)
             if not allows_new_message(coverage, outgoing=bool(getattr(msg, "out", False))):
-                self._project_denied_new_message_metadata(dialog_id, msg, coverage)
+                self._project_denied_new_message_metadata(dialog_id, msg, coverage, observation_order=observation_order)
                 return
             now = int(time.time())
 
@@ -1063,7 +1080,7 @@ class EventHandlerManager:
                 # MAX(COALESCE(..., 0), new_ts) ensures no regression on out-of-order
                 # events. UPDATE matches 0 rows when the dialog is not yet bootstrapped
                 # (no dialogs row) — silent no-op; bootstrap is the sole row creator.
-                self._project_new_message_metadata(dialog_id, msg, now)
+                self._project_new_message_metadata(dialog_id, msg, now, observation_order=observation_order)
                 self._record_body_event(dialog_id, now)
 
             self._offer_message_ingestion()
@@ -1121,12 +1138,14 @@ class EventHandlerManager:
         dialog_id: int,
         msg: _MessageLike,
         coverage: RealtimeHistoryCoverage,
+        *,
+        observation_order: int | None = None,
     ) -> None:
         if not self._metadata_realtime_allowed(coverage):
             return
         now = int(time.time())
         with write_transaction(self._conn):
-            self._project_new_message_metadata(dialog_id, msg, now)
+            self._project_new_message_metadata(dialog_id, msg, now, observation_order=observation_order)
 
     def _update_last_message_timestamp(self, dialog_id: int, now: int, msg_date: datetime | None) -> None:
         require_write_transaction(self._conn)
@@ -1140,10 +1159,12 @@ class EventHandlerManager:
         require_write_transaction(self._conn)
         self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 
-    def _project_new_message_metadata(self, dialog_id: int, msg: _MessageLike, now: int) -> None:
+    def _project_new_message_metadata(
+        self, dialog_id: int, msg: _MessageLike, now: int, *, observation_order: int | None = None
+    ) -> None:
         """Project dialog/topic metadata independently of message-body scope."""
         self._update_last_message_timestamp(dialog_id, now, msg.date)
-        self._handle_topic_message_action(dialog_id, msg, now)
+        self._handle_topic_message_action(dialog_id, msg, now, observation_order=observation_order)
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_topic_message(self, update: object) -> None:
@@ -1165,9 +1186,12 @@ class EventHandlerManager:
                 return
             now = int(time.time())
             with write_transaction(self._conn):
+                observation_order = allocate_observation_order(self._conn)
                 if not self._metadata_realtime_allowed(self._realtime_coverage(dialog_id)):
                     return
-                self._handle_topic_message_action(dialog_id, cast(_MessageLike, msg), now)
+                self._handle_topic_message_action(
+                    dialog_id, cast(_MessageLike, msg), now, observation_order=observation_order
+                )
         except Exception:
             logger.exception("event_raw_topic_message_failed update=%r", type(update).__name__)
 
@@ -1176,14 +1200,16 @@ class EventHandlerManager:
         dialog_id: int,
         msg: _MessageLike,
         now: int,
+        *,
+        observation_order: int | None = None,
     ) -> None:
         require_write_transaction(self._conn)
         action = cast(object | None, getattr(msg, "action", None))
         if isinstance(action, MessageActionTopicCreate):
-            self._handle_topic_create_action(dialog_id, msg, now, action)
+            self._handle_topic_create_action(dialog_id, msg, now, action, observation_order=observation_order)
             return
         if isinstance(action, MessageActionTopicEdit):
-            self._handle_topic_edit_action(dialog_id, msg, now, action)
+            self._handle_topic_edit_action(dialog_id, msg, now, action, observation_order=observation_order)
 
     def _handle_topic_create_action(
         self,
@@ -1191,6 +1217,8 @@ class EventHandlerManager:
         msg: _MessageLike,
         now: int,
         action: MessageActionTopicCreate,
+        *,
+        observation_order: int | None = None,
     ) -> None:
         topic_id = int(msg.id)
         if topic_id <= 0:
@@ -1204,6 +1232,7 @@ class EventHandlerManager:
             icon_emoji_id=action.icon_emoji_id,
             date=topic_timestamp,
             observed_at=now,
+            observation_order=observation_order,
         )
         logger.info(
             "event_topic_create dialog_id=%d topic_id=%d",
@@ -1217,6 +1246,8 @@ class EventHandlerManager:
         msg: _MessageLike,
         now: int,
         action: MessageActionTopicEdit,
+        *,
+        observation_order: int | None = None,
     ) -> None:
         reply_to = msg.reply_to
         if reply_to is None:
@@ -1246,6 +1277,7 @@ class EventHandlerManager:
             icon_emoji_id=action.icon_emoji_id,
             hidden=action.hidden,
             observed_at=now,
+            observation_order=observation_order,
         )
         if action.hidden:
             logger.info("event_topic_hidden dialog_id=%d topic_id=%d", dialog_id, topic_id)
@@ -1273,9 +1305,9 @@ class EventHandlerManager:
             return
 
         try:
+            observation_order = allocate_observation_order(self._conn)
             msg = event.message
             message_id = int(msg.id)
-            new_text = msg.message
             now = int(time.time())
             coverage = self._realtime_coverage(dialog_id)
             if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
@@ -1288,7 +1320,7 @@ class EventHandlerManager:
             existing_out = read_message_out(self._conn, dialog_id, message_id)
 
             if not existing.found:
-                if await self._insert_missing_edited_message(dialog_id, msg, coverage, now):
+                if await self._insert_missing_edited_message(dialog_id, msg, coverage, now, observation_order):
                     logger.info(
                         "event_edit_new dialog_id=%d message_id=%d (not in sync.db, inserted)",
                         dialog_id,
@@ -1297,21 +1329,6 @@ class EventHandlerManager:
                 return
 
             old_text = existing.text
-            if old_text == new_text:
-                formatting_entities, service_action = extract_message_composition(msg)
-                with write_transaction(self._conn):
-                    existing_out = read_message_out(self._conn, dialog_id, message_id)
-                    if allows_existing_body_update(
-                        self._realtime_coverage(dialog_id),
-                        RealtimeBodyEvent.EDIT,
-                        outgoing=existing_out.outgoing,
-                    ):
-                        persist_message_composition(
-                            self._conn, dialog_id, message_id, formatting_entities, service_action
-                        )
-                self._apply_reaction_only_edit(dialog_id, message_id, msg, coverage, existing_out.outgoing, now)
-                return
-
             next_ver = await self._persist_changed_edit(
                 dialog_id,
                 msg,
@@ -1319,6 +1336,7 @@ class EventHandlerManager:
                 existing_out.outgoing,
                 old_text,
                 now,
+                observation_order,
             )
             if next_ver is None:
                 return
@@ -1340,12 +1358,15 @@ class EventHandlerManager:
         msg: _MessageLike,
         coverage: RealtimeHistoryCoverage,
         now: int,
+        observation_order: int,
     ) -> bool:
         outgoing = bool(getattr(msg, "out", False))
         if not allows_missing_body_insert(coverage, RealtimeBodyEvent.EDIT, outgoing=outgoing):
             return False
         entity_name_map = await _build_fwd_entity_map(msg, cast(_PeerNameClient, self._client))
-        extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
+        extracted = replace(
+            extract_message_row(dialog_id, msg, entity_name_map=entity_name_map), observation_order=observation_order
+        )
         coverage = self._realtime_coverage(dialog_id)
         if not allows_missing_body_insert(coverage, RealtimeBodyEvent.EDIT, outgoing=outgoing):
             return False
@@ -1365,45 +1386,6 @@ class EventHandlerManager:
         self._offer_message_ingestion()
         return True
 
-    def _apply_reaction_only_edit(  # noqa: PLR0913, PLR0917
-        self,
-        dialog_id: int,
-        message_id: int,
-        msg: _MessageLike,
-        coverage: RealtimeHistoryCoverage,
-        outgoing: bool,
-        now: int,
-    ) -> None:
-        reactions_obj = msg.reactions
-        if reactions_obj is None or not allows_existing_body_update(
-            coverage,
-            RealtimeBodyEvent.REACTION,
-            outgoing=outgoing,
-        ):
-            return
-        aggregates = project_reaction_aggregates(reactions_obj)
-        with write_transaction(self._conn):
-            outgoing = read_message_out(self._conn, dialog_id, message_id).outgoing
-            if not allows_existing_body_update(
-                self._realtime_coverage(dialog_id), RealtimeBodyEvent.REACTION, outgoing=outgoing
-            ):
-                return
-            replace_reaction_aggregates(
-                self._conn,
-                dialog_id,
-                message_id,
-                aggregates,
-                source=ReactionAggregateSource.MESSAGE_EDIT,
-                observed_at=now,
-            )
-            self._record_body_event(dialog_id, now)
-        logger.debug(
-            "event_edit_reactions dialog_id=%d message_id=%d count=%d",
-            dialog_id,
-            message_id,
-            len(aggregates),
-        )
-
     async def _persist_changed_edit(  # noqa: PLR0913, PLR0917
         self,
         dialog_id: int,
@@ -1412,11 +1394,15 @@ class EventHandlerManager:
         outgoing: bool,
         old_text: str | None,
         now: int,
+        observation_order: int,
     ) -> int | None:
         edit_date_raw = msg.edit_date
         edit_date_unix = int(edit_date_raw.timestamp()) if edit_date_raw is not None else now
         entity_name_map = await _build_fwd_entity_map(msg, cast(_PeerNameClient, self._client))
-        extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
+        extracted = replace(
+            extract_message_row(dialog_id, msg, entity_name_map=entity_name_map), observation_order=observation_order
+        )
+        extracted = replace(extracted, reactions_observed=msg.reactions is not None)
         coverage = self._realtime_coverage(dialog_id)
         if not allows_existing_body_update(coverage, RealtimeBodyEvent.EDIT, outgoing=outgoing):
             return None
@@ -1437,39 +1423,49 @@ class EventHandlerManager:
                 edit_date=edit_date_unix,
                 priority=HydrationPriority.FOREGROUND,
             )
-            self._record_body_event(dialog_id, now)
+            if old_text != extracted.message.text or msg.edit_date is not None or msg.reactions is not None:
+                self._record_body_event(dialog_id, now)
         self._offer_message_ingestion()
+        if msg.reactions is not None and old_text == extracted.message.text:
+            logger.debug(
+                "event_edit_reactions dialog_id=%d message_id=%d count=%d",
+                dialog_id,
+                int(msg.id),
+                len(extracted.reactions),
+            )
         return next_ver
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_message_deleted(self, event: _DeletedMessagesEvent) -> None:
         """Handle a MessageDeleted event and preserve the last known text.
 
-        When Telegram omits the peer, only a unique incoming human-DM candidate
-        is accepted. Ambiguous and irrelevant IDs remain for the gap scan.
+        Peerless nonchannel IDs retain terminal evidence; unique cached peers
+        receive ordinary deletion cleanup. Ambiguous IDs remain unattributed.
         Preserves the last known text column.
         Only updates rows where is_deleted=0 to avoid re-stamping deleted_at.
         """
         dialog_id = event.chat_id
 
         if dialog_id is None:
-            self._handle_peerless_deletions(event.deleted_ids)
-            return
-
-        coverage = self._realtime_coverage(dialog_id)
-        if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
+            try:
+                self._handle_peerless_deletions(event.deleted_ids)
+            except Exception:
+                logger.exception("event_delete_failed dialog_id=%s", dialog_id)
             return
 
         try:
             now = int(time.time())
             with write_transaction(self._conn):
-                allowed_ids = list(event.deleted_ids)
+                allowed_ids = record_message_deletions(self._conn, dialog_id, event.deleted_ids)
+                coverage = self._realtime_coverage(dialog_id)
+                if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
+                    return
                 if coverage is RealtimeHistoryCoverage.OWN_OUTGOING:
-                    allowed_ids = [
+                    allowed_ids = tuple(
                         msg_id
                         for msg_id in allowed_ids
                         if read_message_out(self._conn, dialog_id, int(msg_id)).outgoing
-                    ]
+                    )
                 if not allowed_ids:
                     return
 
@@ -1485,8 +1481,9 @@ class EventHandlerManager:
         now = int(time.time())
         resolved: list[tuple[int, int]] = []
         with write_transaction(self._conn):
-            candidate_dialogs = find_unique_incoming_human_dm_dialogs(self._conn, deleted_ids)
-            for raw_message_id in deleted_ids:
+            accepted_ids = record_nonchannel_deletions(self._conn, deleted_ids, now)
+            candidate_dialogs = find_unique_nonchannel_message_dialogs(self._conn, accepted_ids)
+            for raw_message_id in accepted_ids:
                 message_id = int(raw_message_id)
                 dialog_id = candidate_dialogs.get(message_id)
                 if dialog_id is not None and mark_message_deleted(self._conn, dialog_id, message_id, now):
@@ -1727,6 +1724,8 @@ class EventHandlerManager:
         boundary: ReactionObservationBoundary | None = None,
     ) -> bool:
         with write_transaction(self._conn):
+            if not hydration_observation_current(self._conn, dialog_id, msg_id, None):
+                return False
             coverage = self._realtime_coverage(dialog_id)
             existing_out = read_message_out(self._conn, dialog_id, msg_id)
             if not allows_existing_body_update(coverage, RealtimeBodyEvent.REACTION, outgoing=existing_out.outgoing):
@@ -1811,14 +1810,15 @@ class EventHandlerManager:
                 return
             if read_message_text(self._conn, event.dialog_id, event.message_id).found:
                 return
-            stage_message_transcription(
+            if not stage_message_transcription(
                 self._conn,
                 event.dialog_id,
                 event.message_id,
                 transcribed_text=event.text,
                 transcription_id=event.transcription_id,
                 received_at=now,
-            )
+            ):
+                return
             self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, event.dialog_id))
 
     def _update_existing_transcription(
@@ -1844,14 +1844,15 @@ class EventHandlerManager:
                 outgoing=existing_out.outgoing,
             ):
                 return
-            apply_message_transcription(
+            if not apply_message_transcription(
                 self._conn,
                 event.dialog_id,
                 event.message_id,
                 transcribed_text=event.text,
                 transcription_id=event.transcription_id,
                 received_at=now,
-            )
+            ):
+                return
             if old_text != event.text:
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, event.dialog_id))
 
@@ -2525,11 +2526,13 @@ class EventHandlerManager:
             topic_id = int(topic_id_raw)
             now = int(time.time())
             with write_transaction(self._conn):
+                observation_order = allocate_observation_order(self._conn)
                 self._topic_metadata.apply_topic_pin(
                     dialog_id,
                     topic_id,
                     pinned=bool(singular_update.pinned),
                     observed_at=now,
+                    observation_order=observation_order,
                 )
             logger.info(
                 "event_forum_topic_pinned dialog_id=%d topic_id=%d pinned=%d",
@@ -2560,10 +2563,12 @@ class EventHandlerManager:
                 return
             now = int(time.time())
             with write_transaction(self._conn):
+                observation_order = allocate_observation_order(self._conn)
                 self._topic_metadata.apply_topic_pins(
                     dialog_id,
                     order,
                     observed_at=now,
+                    observation_order=observation_order,
                 )
             logger.info(
                 "event_forum_topics_pinned dialog_id=%d pinned_count=%d",

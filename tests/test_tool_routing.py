@@ -1744,14 +1744,17 @@ async def test_search_messages_rejects_history_navigation_token():
     from mcp_telegram.pagination import HistoryDirection, encode_history_navigation
 
     token = encode_history_navigation(5, dialog_id=123, direction=HistoryDirection.NEWEST, message_state="sent")
-    conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "total": 0}})
+    conn = _make_daemon_conn(
+        {"ok": False, "error": "invalid_navigation", "message": "Navigation token is for history, not search"}
+    )
 
     with _patch_daemon(conn):
         result = await search_messages(SearchMessages(dialog="123", query="needle", navigation=token))
 
     assert result.is_error is True
     assert "not search" in _result_text(result)
-    conn.search_messages.assert_not_called()
+    assert conn.search_messages.call_args is not None
+    assert conn.search_messages.call_args[1]["navigation"] == token
 
 
 # ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@ from typing import cast
 
 from ..hydration_queue import TRANSCRIPTION_HYDRATION_KIND, HydrationJob, HydrationPriority, HydrationQueueRepository
 from ..media_fact import decode_media_fact, is_transcribable_telegram_media
-from .sqlite_bundle import persist_transcribed_text, read_message_text
+from .sqlite_bundle import has_nonchannel_deletion, persist_transcribed_text, read_message_text
 from .sqlite_hydration_jobs import (
     _FACT_HYDRATION_ELIGIBILITY_SQL,
     _MEDIA_METADATA_HYDRATION_ELIGIBILITY_SQL,
@@ -16,7 +16,24 @@ from .sqlite_hydration_jobs import (
     _is_transcribable_media_pair,
 )
 
-_SELECT_MESSAGE_MEDIA_SQL = "SELECT media_kind, media_payload FROM messages WHERE dialog_id = ? AND message_id = ?"
+_SELECT_MESSAGE_MEDIA_SQL = (
+    "SELECT media_kind, media_payload FROM messages WHERE dialog_id = ? AND message_id = ? AND is_deleted=0"
+)
+
+
+def hydration_observation_current(
+    conn: sqlite3.Connection, dialog_id: int, message_id: int, observation_order: int | None
+) -> bool:
+    if has_nonchannel_deletion(conn, dialog_id, message_id):
+        return False
+    row = cast(
+        tuple[int, int] | None,
+        conn.execute(
+            "SELECT observation_order,is_deleted FROM message_observations WHERE dialog_id=? AND message_id=?",
+            (dialog_id, message_id),
+        ).fetchone(),
+    )
+    return row is None or (not row[1] and (observation_order is None or observation_order >= row[0]))
 
 
 def upsert_message_transcription(  # noqa: PLR0913
@@ -49,6 +66,8 @@ def apply_message_transcription(  # noqa: PLR0913
     received_at: int,
 ) -> bool:
     """Apply one final Telegram transcription through the canonical path."""
+    if not hydration_observation_current(conn, dialog_id, message_id, None):
+        return False
     text = transcribed_text.strip()
     if not text:
         return False
@@ -77,6 +96,8 @@ def stage_message_transcription(  # noqa: PLR0913
     received_at: int,
 ) -> bool:
     """Store a final event whose canonical message has not arrived yet."""
+    if not hydration_observation_current(conn, dialog_id, message_id, None):
+        return False
     text = transcribed_text.strip()
     if not text or read_message_text(conn, dialog_id, message_id).found:
         return False
@@ -95,8 +116,11 @@ def apply_message_transcription_if_absent(  # noqa: PLR0913
     transcribed_text: str,
     transcription_id: int,
     received_at: int,
+    observation_order: int | None = None,
 ) -> str:
     """Atomically apply a worker result only when no final fact won the race."""
+    if not hydration_observation_current(conn, dialog_id, message_id, observation_order):
+        return "not_applied"
     text = transcribed_text.strip()
     if not text:
         return "not_applied"
@@ -139,10 +163,18 @@ def _remove_transcription_hydration_job(conn: sqlite3.Connection, dialog_id: int
         )
 
 
-def apply_hydrated_media_fact(
-    conn: sqlite3.Connection, dialog_id: int, message_id: int, media_kind: str | None, media_payload: str | None
+def apply_hydrated_media_fact(  # noqa: PLR0913
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    media_kind: str | None,
+    media_payload: str | None,
+    *,
+    observation_order: int | None = None,
 ) -> bool:
     """Apply one media fact only while full-history access remains current."""
+    if not hydration_observation_current(conn, dialog_id, message_id, observation_order):
+        return False
     cursor = conn.execute(
         "UPDATE messages SET media_kind = ?, media_payload = ? WHERE dialog_id = ? AND message_id = ? AND "
         + _MEDIA_METADATA_HYDRATION_ELIGIBILITY_SQL.replace("m.", "")

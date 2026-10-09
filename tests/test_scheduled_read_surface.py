@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
+from contextlib import asynccontextmanager
 from typing import Literal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from mcp_telegram.fts import INSERT_FTS_SQL, stem_text
 from mcp_telegram.pagination import decode_navigation_token, encode_history_navigation, encode_search_navigation
 from mcp_telegram.reading import ReadingService
 from mcp_telegram.reading.scheduled_projection import scheduled_row_to_wire
@@ -15,8 +17,8 @@ from mcp_telegram.tools.reading import (
     SearchMessages,
     _list_messages_structured_messages,
     _message_lifecycle_fields,
-    _search_messages_request_context,
     _search_result_structured_rows,
+    search_messages,
 )
 from tests.test_daemon_api import (
     _insert_message,
@@ -942,6 +944,36 @@ async def test_list_and_search_scheduled_rows_have_identical_wire_shape() -> Non
     assert listed["data"]["messages"] == searched["data"]["messages"]
 
 
+@pytest.fixture
+def _daemon_search_surface(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Route MCP search through the real daemon validator and local FTS page."""
+    conn = _make_db_with_dialogs(with_fts=True)
+    _seed_dialog_row(conn, 123, name="Search scope")
+    for message_id in range(1, 22):
+        text = f"needle {message_id}"
+        _insert_message(conn, 123, message_id, text=text)
+        conn.execute(INSERT_FTS_SQL, (123, message_id, stem_text(text)))
+    conn.commit()
+    server = make_server(conn)
+
+    async def daemon_search(**request: object) -> dict:
+        return await server._search_messages(request)
+
+    connection = MagicMock()
+    connection.search_messages = AsyncMock(side_effect=daemon_search)
+
+    @asynccontextmanager
+    async def daemon_connection() -> AsyncIterator[MagicMock]:
+        yield connection
+
+    monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", daemon_connection)
+    try:
+        yield
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("token_dialog", "token_query", "token_state", "dialog", "query", "state"),
     [
@@ -951,7 +983,8 @@ async def test_list_and_search_scheduled_rows_have_identical_wire_shape() -> Non
     ],
     ids=["query", "message-state", "dialog-scope"],
 )
-def test_search_navigation_rejects_mismatched_context(  # noqa: PLR0913
+async def test_search_navigation_rejects_mismatched_context(  # noqa: PLR0913
+    _daemon_search_surface: None,
     token_dialog: int,
     token_query: str,
     token_state: str,
@@ -961,13 +994,13 @@ def test_search_navigation_rejects_mismatched_context(  # noqa: PLR0913
 ) -> None:
     """Search cursors are bound to query, lifecycle, and dialog scope."""
     token = encode_search_navigation(20, token_dialog, token_query, token_state)
-    result = _search_messages_request_context(
-        SearchMessages(dialog=dialog, query=query, message_state=state, navigation=token)
-    )
+    result = await search_messages(SearchMessages(dialog=dialog, query=query, message_state=state, navigation=token))
 
-    assert getattr(result, "is_error", False) is True
+    assert result.is_error is True
+    assert result.error_code == "invalid_navigation"
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("token", "dialog", "query", "state", "expected_offset"),
     [
@@ -977,21 +1010,34 @@ def test_search_navigation_rejects_mismatched_context(  # noqa: PLR0913
     ],
     ids=["malformed", "wrong-kind", "valid-global"],
 )
-def test_search_navigation_context_handles_decode_and_success_paths(
+async def test_search_navigation_context_handles_decode_and_success_paths(
+    _daemon_search_surface: None,
     token: str,
     dialog: str | None,
     query: str,
     state: Literal["sent", "scheduled", "all"],
     expected_offset: int | None,
 ) -> None:
-    result = _search_messages_request_context(
-        SearchMessages(dialog=dialog, query=query, message_state=state, navigation=token)
-    )
+    result = await search_messages(SearchMessages(dialog=dialog, query=query, message_state=state, navigation=token))
 
     if expected_offset is None:
-        assert getattr(result, "is_error", False) is True
+        assert result.is_error is True
+        assert result.error_code == "invalid_navigation"
     else:
-        assert getattr(result, "offset", None) == expected_offset
+        assert result.is_error is False
+        payload = result.structured_content
+        assert payload is not None
+        navigation = payload["navigation"]
+        assert isinstance(navigation, dict)
+        assert navigation["offset"] == expected_offset
+        first = await search_messages(SearchMessages(dialog=dialog, query=query, message_state=state))
+        assert first.structured_content is not None
+        first_rows = first.structured_content["results"]
+        second_rows = payload["results"]
+        assert isinstance(first_rows, list) and isinstance(second_rows, list)
+        assert len(first_rows) == expected_offset
+        assert len(second_rows) == 1
+        assert {row["msg_id"] for row in first_rows + second_rows} == set(range(1, 22))
 
 
 def test_history_navigation_rejects_mismatched_topic_scope() -> None:

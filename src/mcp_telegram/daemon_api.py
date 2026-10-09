@@ -65,6 +65,7 @@ from .daemon_dialog_queries import (
     _LIST_TOPICS_SQL,
 )
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
+from .daemon_ipc import write_response
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_directory import recover_invalid_generation_in_transaction
 from .dialog_directory_coverage import DialogDirectoryCoverage, read_dialog_directory_coverage
@@ -685,6 +686,47 @@ def _resolve_sync_db_path(conn: sqlite3.Connection, explicit_path: Path | None) 
 # ---------------------------------------------------------------------------
 
 
+def _parse_inbox_projection_options(req: dict[str, object]) -> object:
+    """Validate the requested wire budgets and presentation before inbox acquisition."""
+    from types import SimpleNamespace
+
+    from .inbox_projection import InboxProjectionOptions
+    from .models import DialogType
+    from .temporal import validate_timezone
+
+    preview_chars = req.get("preview_chars")
+    response_chars = req.get("response_chars", 24000)
+    if preview_chars is not None and (
+        type(preview_chars) is not int
+        or not 32 <= preview_chars <= 4000  # noqa: PLR2004
+        or type(response_chars) is not int
+        or not 4000 <= response_chars <= 64000  # noqa: PLR2004
+    ):
+        return {"ok": False, "error": "invalid_params", "message": "Invalid inbox projection budgets"}
+    try:
+        timezone_raw = req.get("timezone", "UTC")
+        if not isinstance(timezone_raw, str):
+            raise TypeError("timezone must be a string")
+        timezone = validate_timezone(timezone_raw)
+    except ValueError, TypeError:
+        return {"ok": False, "error": "invalid_params", "message": "Invalid inbox timezone"}
+    options = SimpleNamespace(
+        limit=req.get("limit", 40),
+        group_size_threshold=req.get("group_size_threshold", 100),
+        dialogs_per_page=req.get("dialogs_per_page", 20),
+        messages_per_dialog=req.get("messages_per_dialog", 5),
+        preview_chars=preview_chars,
+        response_chars=response_chars,
+        timezone=timezone,
+        include_dialog_types=(
+            [DialogType(value) for value in cast(list[str], req["include_dialog_types"])]
+            if req.get("include_dialog_types") is not None
+            else None
+        ),
+    )
+    return cast(InboxProjectionOptions, options)
+
+
 class DaemonAPIServer:
     """Unix socket server that dispatches JSON requests to Telegram/sync.db.
 
@@ -1132,16 +1174,14 @@ class DaemonAPIServer:
 
         DaemonConnection supports multiple sequential request() calls inside one
         async-with block, so the server keeps the stream open and returns one
-        response line per request line.
+        logical response per request line (large responses use bounded frames).
         """
         method = ""
         request_id: str | None = None
         try:
             while line := await reader.readline():
                 response, method, request_id = await self._handle_client_line(line, method, request_id)
-                encoded = json.dumps(response).encode() + b"\n"
-                writer.write(encoded)
-                await writer.drain()
+                await write_response(writer, response)
         except ConnectionResetError, BrokenPipeError:
             # MCP client (or healthcheck) disconnected before we finished
             # writing the response — expected on tool-call timeouts and
@@ -2036,8 +2076,29 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _list_unread_messages(self, req: dict[str, object]) -> dict:
-        """Delegate get_inbox orchestration to the reading application service."""
-        return await self._get_reading_service().list_unread_messages(req)
+        """Acquire unread facts and apply the MCP projection before Unix IPC."""
+        from .inbox_projection import InboxProjectionOptions, project_inbox_payload
+
+        if req.get("preview_chars") is None:
+            return await self._get_reading_service().list_unread_messages(req)
+        options = _parse_inbox_projection_options(req)
+        if isinstance(options, dict):
+            return options
+        response = await self._get_reading_service().list_unread_messages(req)
+        if not response.get("ok"):
+            return response
+        payload = project_inbox_payload(
+            cast(InboxProjectionOptions, options),
+            response["data"],
+            applied_since_utc=cast(str | None, req.get("since_utc")),
+        )
+        if payload is None:
+            return {
+                "ok": False,
+                "error": "response_budget_exceeded",
+                "message": "Inbox metadata exceeds response_chars. Action: narrow include_dialog_types or reduce dialogs_per_page.",
+            }
+        return {"ok": True, "data": payload, "inbox_projected": True}
 
     # ------------------------------------------------------------------
     # record_telemetry

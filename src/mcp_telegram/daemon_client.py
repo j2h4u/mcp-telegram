@@ -3,7 +3,7 @@
 MCP tools use daemon_connection() to send requests over the Unix socket to
 DaemonAPIServer and receive JSON responses.
 
-Protocol: newline-delimited JSON over Unix socket.  Each DaemonConnection
+Protocol: JSON-line requests and bounded framed JSON responses over Unix socket. Each DaemonConnection
 opens a fresh socket, supports multiple sequential request() calls within
 the same async-with block, then closes the socket on exit.
 
@@ -30,7 +30,7 @@ from typing import Literal, NotRequired, TypedDict, Unpack, cast
 from . import config as _config
 from .config import ENTITY_PROFILE_DAEMON_TIMEOUT_SECONDS, load_config
 from .correlation import current_operation_id, record_correlation_id
-from .daemon_ipc import get_daemon_socket_path
+from .daemon_ipc import REQUEST_LIMIT, get_daemon_socket_path, read_response
 
 logger = logging.getLogger(__name__)
 DEFAULT_DAEMON_TIMEOUT_SECONDS = ENTITY_PROFILE_DAEMON_TIMEOUT_SECONDS
@@ -200,7 +200,7 @@ class AccountProtectionError(Exception):
 
 
 class DaemonConnection:
-    """Wraps a asyncio stream pair for JSON-line request/response exchanges."""
+    """Wrap an asyncio stream pair for bounded requests and framed responses."""
 
     def __init__(
         self,
@@ -218,8 +218,37 @@ class DaemonConnection:
         self._last_request_id = "-"
         self._last_operation_id: str | None = None
 
-    async def request(self, payload: dict) -> dict[str, object]:  # noqa: PLR0915 -- stage timers belong at IPC boundaries
-        """Send *payload* as a JSON line, read one JSON response line, return dict.
+    async def _receive_response(self) -> bytes:
+        """Translate transport failures and close an interrupted response stream."""
+        try:
+            line = await asyncio.wait_for(read_response(self._reader), timeout=self._timeout_seconds)
+        except TimeoutError as exc:
+            self._writer.close()
+            raise DaemonNotRunningError(
+                "Sync daemon timed out waiting for response. Restart it with: mcp-telegram sync",
+                kind="response_timeout",
+            ) from exc
+        except (ValueError, asyncio.IncompleteReadError) as exc:
+            self._writer.close()
+            raise DaemonNotRunningError(
+                f"Daemon returned invalid or interrupted response: {exc}", kind="malformed_response"
+            ) from exc
+        except OSError as exc:
+            self._writer.close()
+            raise DaemonNotRunningError(
+                "Sync daemon closed the connection unexpectedly. Restart it with: mcp-telegram sync",
+                kind="connection_broken",
+            ) from exc
+        if not line:
+            self._writer.close()
+            raise DaemonNotRunningError(
+                "Sync daemon closed the connection unexpectedly. Restart it with: mcp-telegram sync",
+                kind="connection_broken",
+            )
+        return line
+
+    async def request(self, payload: dict) -> dict[str, object]:  # noqa: PLR0912, PLR0915 -- stage timers belong at IPC boundaries
+        """Send a bounded JSON line and read one complete JSON response, return dict.
 
         A request_id (8 hex chars) is added to every outgoing payload for
         cross-process log correlation. The daemon echoes it back in the response.
@@ -237,8 +266,9 @@ class DaemonConnection:
         self._last_request_id = rid
         self._last_operation_id = operation_id
         encoded = json.dumps(payload).encode() + b"\n"
+        if len(encoded) > REQUEST_LIMIT:
+            raise ValueError("Daemon request exceeds request limit")
         logger.debug("daemon_request method=%s request_id=%s", method, rid)
-        self._writer.write(encoded)
         stage_seconds = {
             "config_path": self._config_path_seconds,
             "socket_connect": self._socket_connect_seconds,
@@ -247,6 +277,7 @@ class DaemonConnection:
             "response_parse": 0.0,
         }
         try:
+            self._writer.write(encoded)
             send_started = time.perf_counter()
             try:
                 await asyncio.wait_for(
@@ -254,6 +285,7 @@ class DaemonConnection:
                     timeout=self._timeout_seconds,
                 )
             except TimeoutError as exc:
+                self._writer.close()
                 raise DaemonNotRunningError(
                     "Sync daemon timed out while sending request. Restart it with: mcp-telegram sync",
                     kind="send_timeout",
@@ -263,35 +295,21 @@ class DaemonConnection:
 
             response_started = time.perf_counter()
             try:
-                line = await asyncio.wait_for(
-                    self._reader.readline(),
-                    timeout=self._timeout_seconds,
-                )
-            except TimeoutError as exc:
-                raise DaemonNotRunningError(
-                    "Sync daemon timed out waiting for response. Restart it with: mcp-telegram sync",
-                    kind="response_timeout",
-                ) from exc
-            except (ConnectionResetError, BrokenPipeError, OSError) as exc:
-                raise DaemonNotRunningError(
-                    "Sync daemon closed the connection unexpectedly. Restart it with: mcp-telegram sync",
-                    kind="connection_broken",
-                ) from exc
+                line = await self._receive_response()
             finally:
                 stage_seconds["response_wait"] = time.perf_counter() - response_started
 
-            if not line:
-                raise DaemonNotRunningError(
-                    "Sync daemon closed the connection unexpectedly. Restart it with: mcp-telegram sync",
-                    kind="connection_broken",
-                )
             parse_started = time.perf_counter()
             try:
                 response = _parse_response_line(line)
-            except json.JSONDecodeError as exc:
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                self._writer.close()
                 raise DaemonNotRunningError(
                     f"Daemon returned malformed JSON: {exc}", kind="malformed_response"
                 ) from exc
+            except DaemonNotRunningError:
+                self._writer.close()
+                raise
             finally:
                 stage_seconds["response_parse"] = time.perf_counter() - parse_started
             logger.debug(
@@ -304,6 +322,14 @@ class DaemonConnection:
             if result.get("ok") is False and result.get("error") == "flood_wait_kill_switch_open":
                 raise AccountProtectionError(result)
             return result
+        except asyncio.CancelledError:
+            self._writer.close()
+            raise
+        except OSError as exc:
+            self._writer.close()
+            raise DaemonNotRunningError(
+                "Sync daemon connection failed while sending request", kind="connection_broken"
+            ) from exc
         finally:
             _log_request_stage_timing(
                 method=method,
@@ -506,6 +532,9 @@ class DaemonConnection:
         self,
         *,
         limit: int = 40,
+        preview_chars: int | None = None,
+        timezone: str = "UTC",
+        response_chars: int = 24000,
         messages_per_dialog: int = 5,
         dialogs_per_page: int = 20,
         page: int = 1,
@@ -522,6 +551,10 @@ class DaemonConnection:
             "page": page,
             "group_size_threshold": group_size_threshold,
         }
+        if preview_chars is not None:
+            payload["preview_chars"] = preview_chars
+            payload["timezone"] = timezone
+            payload["response_chars"] = response_chars
         if since_utc is not None:
             payload["since_utc"] = since_utc
         if include_dialog_types is not None:
@@ -675,7 +708,7 @@ async def daemon_connection(
     connect_started = time.perf_counter()
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_unix_connection(str(socket_path), limit=2 * 1024 * 1024),
+            asyncio.open_unix_connection(str(socket_path), limit=REQUEST_LIMIT),
             timeout=timeout_seconds,
         )
     except TimeoutError as exc:

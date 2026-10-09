@@ -161,7 +161,7 @@ async def test_hot_activity_adapter_resumes_page_window_before_advancing_cursor(
                 (dialog_id,),
             ).fetchone(),
         )
-        assert call_log[dialog_id] == [(0, 11), (min(first_page), 11)]
+        assert call_log[dialog_id] == [(0, 10), (min(first_page), 10)]
         assert state["hot_cursor"] == max(first_page)
         assert resume == (None, None)
 
@@ -218,3 +218,24 @@ async def test_hot_activity_adapter_full_page_without_min_id_retries(monkeypatch
         assert cast(int, state["hot_next_retry_at"]) > int(time.time())
         assert state["cold_status"] == "pending"
         assert state["cold_next_retry_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_hot_sweep_includes_adjacent_id_with_exclusive_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    fetched: list[int] = []
+
+    async def exclusive_sweep(*args: object, min_id: int, **kwargs: object) -> SweepResult:
+        del args, kwargs
+        page = [message_id for message_id in [11] if message_id > min_id]
+        fetched.extend(page)
+        return _make_sweep_result(page)
+
+    monkeypatch.setattr("mcp_telegram.activity_hot_sweep.sweep_peer_once", exclusive_sweep)
+    with _make_db() as conn:
+        dialog_id = -100100000088
+        _enroll(conn, dialog_id, hot_cursor=10)
+        await HotActivityDemandAdapter(_FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S).run_slice(
+            RpcAttemptBudget(1)
+        )
+        assert fetched == [11]
+        assert _get_state(conn, dialog_id)["hot_cursor"] == 11

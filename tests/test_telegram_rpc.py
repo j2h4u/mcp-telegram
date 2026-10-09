@@ -2542,6 +2542,8 @@ async def _dispatch_forward_history_sibling(
     gate: TelegramRpcGate,
     sender: _DmPageFutureSender,
     conn: sqlite3.Connection,
+    *,
+    expected_cursor: int,
 ) -> None:
     """Run one normal durable sibling after the shared cooldown has expired."""
 
@@ -2554,7 +2556,7 @@ async def _dispatch_forward_history_sibling(
             should_stop: Callable[[], bool],
         ) -> ForwardGapPage:
             assert dialog_id == 211
-            assert after_message_id == 1
+            assert after_message_id == expected_cursor
             assert not should_stop()
             await gate(
                 functions.messages.GetHistoryRequest(
@@ -2574,10 +2576,14 @@ async def _dispatch_forward_history_sibling(
     sibling = asyncio.create_task(forward_adapter.run_slice(RpcAttemptBudget(limit=1)))
     await _wait_for(lambda: sender.calls == 2)
     assert isinstance(sender.requests[1], functions.messages.GetHistoryRequest)
+    assert sender.requests[1].min_id == expected_cursor
     assert sender.scopes[1].demand_kind is DemandKind.DELTA_GAP_FILL
     assert sender.scopes[1].acquisition_kind is AcquisitionKind.MESSAGE_HISTORY_PAGE
     sender.futures[1].set_result(types.messages.Messages(messages=[], topics=[], chats=[], users=[]))
     await sibling
+    assert conn.execute("SELECT delta_message_id FROM synced_dialogs WHERE dialog_id=211").fetchone() == (
+        expected_cursor,
+    )
 
 
 @pytest.mark.asyncio
@@ -2653,12 +2659,15 @@ async def test_dm_page_cursor_commit_failure_preserves_tombstone_and_blocks_reco
 
 
 @pytest.mark.asyncio
-async def test_dm_page_flood_crosses_gate_with_durable_demand_and_acquisition() -> None:
+@pytest.mark.parametrize("delta_cursor", [None, 1])
+async def test_dm_page_flood_crosses_gate_with_durable_demand_and_acquisition(delta_cursor: int | None) -> None:
     accumulator = FloodWaitAccumulator()
     accumulator.configure_kill_switch(
         FloodWaitKillSwitchPolicy(enabled=True, window_seconds=600, max_events=5, max_wait_seconds=900)
     )
     conn = _dm_reconciliation_test_db()
+    conn.execute("UPDATE synced_dialogs SET delta_message_id=? WHERE dialog_id=211", (delta_cursor,))
+    conn.commit()
     gate, sender, adapter, scanner = _real_dm_page_adapter(conn)
     try:
         gate._rpc_circuit_status = accumulator.kill_switch_status
@@ -2690,7 +2699,7 @@ async def test_dm_page_flood_crosses_gate_with_durable_demand_and_acquisition() 
         import mcp_telegram.telegram_rpc as rpc
 
         rpc._COOLDOWN_DEADLINE = rpc.time.monotonic() - 1
-        await _dispatch_forward_history_sibling(gate, sender, conn)
+        await _dispatch_forward_history_sibling(gate, sender, conn, expected_cursor=delta_cursor or 0)
 
         await adapter.run_slice(RpcAttemptBudget(limit=1))
         assert scanner.calls == 1

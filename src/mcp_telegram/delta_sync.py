@@ -1,6 +1,6 @@
 """DeltaSyncWorker — forward gap-fill engine for v1.5 Persistent Sync.
 
-Fetches messages newer than the max known message_id per dialog in bounded
+Fetches messages newer than the committed forward cursor per dialog in bounded
 maintenance cycles. Idempotent: dialogs with no gap complete instantly when
 the forward history port returns an empty page.
 
@@ -18,7 +18,7 @@ import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import wraps
 from typing import Protocol, cast
 
@@ -35,6 +35,7 @@ from .message_contracts import ExtractedMessage
 from .message_history.contracts import MessageHistoryAccessLostError, MessageHistoryUnavailableError
 from .message_history.ports import ForwardGapPagePort
 from .messages.sqlite_bundle import insert_messages_with_fts
+from .observation_order import allocate_observation_order
 from .reactions.contracts import ReactionAggregateSource
 from .sync_read_model import (
     DM_DELETION_POLICY_VERSION,
@@ -132,7 +133,7 @@ _DM_GAP_SCAN_STATE_KEY = DM_DELETION_RECONCILIATION_STATE_KEY
 _DM_GAP_SCAN_POLICY_VERSION = DM_DELETION_POLICY_VERSION
 
 _SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL = """
-SELECT sd.dialog_id, sd.last_synced_at, sd.last_delta_checked_at, sd.delta_refresh_requested_at
+SELECT sd.dialog_id, sd.last_synced_at, sd.last_delta_checked_at, sd.delta_refresh_requested_at, sd.delta_message_id
 FROM synced_dialogs sd
 JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
 WHERE sd.status = 'synced'
@@ -142,17 +143,13 @@ ORDER BY
     COALESCE(sd.delta_refresh_requested_at, sd.last_delta_checked_at, sd.last_synced_at, 0),
     sd.dialog_id
 """
-_SELECT_MAX_MESSAGE_ID_SQL = "SELECT COALESCE(MAX(message_id), 0) FROM messages WHERE dialog_id = ?"
+_SELECT_DELTA_MESSAGE_ID_SQL = "SELECT COALESCE(delta_message_id, 0) FROM synced_dialogs WHERE dialog_id = ?"
 # Stamp delta checkpoint on successful delta completion.
 # Distinct from FullSyncWorker's _UPDATE_PROGRESS_DONE_SQL (different column set).
 _UPDATE_DELTA_CHECKPOINT_SQL = (
     "UPDATE synced_dialogs "
     "SET last_synced_at = ?, last_delta_checked_at = ?, delta_refresh_requested_at = NULL "
     "WHERE dialog_id = ? AND EXISTS (SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1)"
-)
-_UPDATE_DELTA_CHECKED_SQL = (
-    "UPDATE synced_dialogs SET last_delta_checked_at = ?, delta_refresh_requested_at = NULL WHERE dialog_id = ? "
-    "AND EXISTS (SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1)"
 )
 _REQUEST_DELTA_CONTINUATION_SQL = (
     "UPDATE synced_dialogs SET delta_refresh_requested_at = COALESCE(delta_refresh_requested_at, ?) "
@@ -384,22 +381,14 @@ class DeltaSyncWorker:
         require_write_transaction(self._conn)
         self._conn.execute(_UPDATE_DELTA_CHECKPOINT_SQL, (checked_at, checked_at, dialog_id, dialog_id))
 
-    def _stamp_delta_checked(self, dialog_id: int, checked_at: int) -> None:
-        require_write_transaction(self._conn)
-        self._conn.execute(_UPDATE_DELTA_CHECKED_SQL, (checked_at, dialog_id, dialog_id))
-
     @_delta_rpc_scope(DemandKind.DELTA_GAP_FILL, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def fetch_delta_slice_for_dialog(self, dialog_id: int) -> int:
         """Fetch and commit one resumable forward-history page."""
         self._reset_delta_slice_state()
         if not full_history_enabled(self._conn, dialog_id):
             return 0
-        max_known_id = self._max_known_message_id(dialog_id)
-        if max_known_id == 0:
-            self._complete_empty_delta_slice(dialog_id)
-            return 0
-
-        outcome = await self._collect_delta_slice(dialog_id, max_known_id)
+        cursor = self._delta_message_id(dialog_id)
+        outcome = await self._collect_delta_slice(dialog_id, cursor)
         if outcome.result is not None:
             return outcome.result
         return self._commit_delta_slice(dialog_id, outcome)
@@ -412,21 +401,16 @@ class DeltaSyncWorker:
         self._last_delta_slice_skipped = False
         self._last_delta_page_metrics = {}
 
-    def _max_known_message_id(self, dialog_id: int) -> int:
+    def _delta_message_id(self, dialog_id: int) -> int:
         row = cast(
             tuple[object | None, ...] | None,
-            self._conn.execute(_SELECT_MAX_MESSAGE_ID_SQL, (dialog_id,)).fetchone(),
+            self._conn.execute(_SELECT_DELTA_MESSAGE_ID_SQL, (dialog_id,)).fetchone(),
         )
         return _row_first_int(row)
 
-    def _complete_empty_delta_slice(self, dialog_id: int) -> None:
-        with write_transaction(self._conn):
-            self._stamp_delta_checked(dialog_id, int(time.time()))
-        self._last_delta_slice_completed = True
-        self._last_delta_slice_succeeded = True
-
     async def _collect_delta_slice(self, dialog_id: int, max_known_id: int) -> _DeltaFetchOutcome:
         reaction_observed_at = int(time.time())
+        observation_order = allocate_observation_order(self._conn)
         try:
             page = await self._history_port.fetch_page(
                 dialog_id,
@@ -452,7 +436,7 @@ class DeltaSyncWorker:
             logger.warning("delta_slice_rpc_error dialog_id=%d error=%s", dialog_id, exc)
             self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
-        rows = list(page.messages)
+        rows = [replace(row, observation_order=observation_order) for row in page.messages]
         if self._delta_gap_fill_observation_enabled:
             unique_keys = {(row.message.dialog_id, row.message.message_id) for row in rows}
             self._last_delta_page_metrics = {
@@ -491,6 +475,12 @@ class DeltaSyncWorker:
                 self._record_uncommitted_delta_counts(unique_message_ids, existing_ids)
                 return None
             committed_new_count = self._insert_delta_messages(dialog_id, outcome, unique_message_ids, existing_ids, now)
+            next_cursor = max((row.message.message_id for row in outcome.rows), default=0)
+            self._conn.execute(
+                "UPDATE synced_dialogs SET delta_message_id = MAX(COALESCE(delta_message_id, 0), ?) "
+                "WHERE dialog_id = ?",
+                (next_cursor, dialog_id),
+            )
             if continuation_required:
                 self._conn.execute(_REQUEST_DELTA_CONTINUATION_SQL, (now, dialog_id, dialog_id))
             else:
@@ -639,12 +629,12 @@ class DeltaGapFillDemandAdapter:
 
     def _ordinary_candidate(self, now: float) -> tuple[float, int] | None:
         rows = cast(
-            list[tuple[int, int | None, int | None, int | None]],
+            list[tuple[int, int | None, int | None, int | None, int | None]],
             self._worker._conn.execute(_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL).fetchall(),
         )
         candidates = [
-            (_delta_release_at(last_synced, last_checked, requested), int(dialog_id))
-            for dialog_id, last_synced, last_checked, requested in rows
+            (0.0 if cursor is None else _delta_release_at(last_synced, last_checked, requested), int(dialog_id))
+            for dialog_id, last_synced, last_checked, requested, cursor in rows
         ]
         return min(candidates, key=lambda candidate: (candidate[0], candidate[1])) if candidates else None
 

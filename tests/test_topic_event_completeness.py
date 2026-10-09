@@ -193,3 +193,71 @@ def test_snapshot_upsert_preserves_realtime_pin_state(db: sqlite3.Connection) ->
     )
 
     assert _topic_rows(db)[1][1:] == ("refreshed", None, 1, 0)
+
+
+def test_topic_hidden_false_and_other_fields_apply_at_same_second(db: sqlite3.Connection) -> None:
+    from mcp_telegram.sync_transactions import write_transaction
+
+    repository = SQLiteTopicSnapshotRepository(db)
+    _seed_topics(db, 1)
+    with write_transaction(db):
+        repository.apply_topic_edit(-1000000000123, 1, title="hidden", icon_emoji_id=7, hidden=True, observed_at=100)
+        repository.apply_topic_edit(-1000000000123, 1, title="visible", icon_emoji_id=8, hidden=False, observed_at=100)
+    assert _topic_rows(db)[1][1:] == ("visible", 8, 0, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["create", "edit", "hide", "pin", "pins"])
+async def test_topic_snapshot_captured_before_fetch_cannot_replace_realtime(
+    db: sqlite3.Connection,
+    mutation: str,
+) -> None:
+    from types import SimpleNamespace
+
+    from mcp_telegram.sync_transactions import write_transaction
+    from mcp_telegram.topics.refresh import TopicRefresher
+
+    repository = SQLiteTopicSnapshotRepository(db)
+    _seed_topics(db, 1)
+
+    class Gateway:
+        async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
+            with write_transaction(db):
+                if mutation == "create":
+                    repository.apply_topic_create(
+                        -1000000000123, 1, title="realtime", icon_emoji_id=8, date=100, observed_at=100
+                    )
+                elif mutation in {"edit", "hide"}:
+                    repository.apply_topic_edit(
+                        -1000000000123, 1, title="realtime", icon_emoji_id=8, hidden=mutation == "hide", observed_at=100
+                    )
+                elif mutation == "pin":
+                    repository.apply_topic_pin(-1000000000123, 1, pinned=True, observed_at=100)
+                else:
+                    repository.apply_topic_pins(-1000000000123, (1,), observed_at=100)
+            return (TopicFact(topic_id=1, title="stale snapshot", icon_emoji_id=5),)
+
+    await TopicRefresher(Gateway(), repository).refresh(-1000000000123, SimpleNamespace(forum=True))
+    row = _topic_rows(db)[1]
+    assert row[1] == ("realtime" if mutation in {"create", "edit", "hide"} else "topic")
+    if mutation in {"pin", "pins"}:
+        assert row[3] == 1
+    if mutation == "hide":
+        assert row[4] == 1
+
+
+def test_reserved_topic_event_order_rejects_older_event(db: sqlite3.Connection) -> None:
+    from mcp_telegram.sync_transactions import write_transaction
+
+    repository = SQLiteTopicSnapshotRepository(db)
+    _seed_topics(db, 1)
+    older = repository.begin_snapshot()
+    newer = repository.begin_snapshot()
+    with write_transaction(db):
+        repository.apply_topic_edit(
+            -1000000000123, 1, title="newer", icon_emoji_id=None, hidden=None, observed_at=100, observation_order=newer
+        )
+        repository.apply_topic_edit(
+            -1000000000123, 1, title="older", icon_emoji_id=None, hidden=None, observed_at=100, observation_order=older
+        )
+    assert _topic_rows(db)[1][1] == "newer"

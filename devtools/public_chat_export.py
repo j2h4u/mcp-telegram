@@ -172,7 +172,22 @@ DOCUMENT = {
 
 
 def _media(value: object) -> object:
+    if isinstance(value, dict) and isinstance(value.get("_"), str) and value["_"] in PUBLIC_MEDIA_CONSTRUCTORS:
+        return _constructors(value, PUBLIC_MEDIA_CONSTRUCTORS)
     return _project(value, MEDIA)
+
+
+def _geo(value: object) -> object:
+    return _constructors(value, {"GeoPoint": ("_", "lat", "long", "accuracy_radius"), "GeoPointEmpty": ("_",)})
+
+
+PUBLIC_MEDIA_CONSTRUCTORS: dict[str, Projection] = {
+    "MessageMediaGeo": {"_": _scalar, "geo": _geo},
+    "MessageMediaGeoLive": {**_fields("_", "period", "heading", "proximity_notification_radius"), "geo": _geo},
+    "MessageMediaVenue": {**_fields("_", "title", "address", "provider", "venue_id", "venue_type"), "geo": _geo},
+    "MessageMediaContact": ("_", "phone_number", "first_name", "last_name", "vcard", "user_id"),
+    "MessageMediaDice": ("_", "value", "emoticon"),
+}
 
 
 def _photo(value: object) -> object:
@@ -479,11 +494,14 @@ MESSAGE_METADATA = {
         "quote_entities": [ENTITY],
         "reply_from": FORWARD,
     },
-    "media": MEDIA,
+    "media": _media,
 }
 ACTION_CONSTRUCTORS: dict[str, Projection] = {
     "MessageActionPinMessage": ("_",),
     "MessageActionInviteToGroupCall": {"_": _scalar, "users": [_scalar], "call": ("_", "id")},
+    "MessageActionSetMessagesTTL": ("_", "period"),
+    "MessageActionGroupCall": {**_fields("_", "duration"), "call": ("_", "id")},
+    "MessageActionGroupCallScheduled": {**_fields("_", "schedule_date"), "call": ("_", "id")},
     "MessageActionTopicCreate": ("_", "title", "icon_color", "icon_emoji_id", "title_missing"),
     "MessageActionTopicEdit": ("_", "title", "icon_emoji_id", "closed", "hidden", "title_missing"),
     "MessageActionChatAddUser": {"_": _scalar, "users": [_scalar]},
