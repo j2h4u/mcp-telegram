@@ -1,13 +1,16 @@
 import functools
+import json
 import logging
 import re
 import typing as t
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
-from functools import singledispatch
+from functools import cache, singledispatch
 from typing import TypedDict, Unpack
 
+from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
+from jsonschema.exceptions import ValidationError as SchemaValidationError  # type: ignore[import-untyped]
 from mcp.types import (
     EmbeddedResource,
     ImageContent,
@@ -283,7 +286,7 @@ def _protection_output_schema(schema: dict[str, object] | None) -> dict[str, obj
 
 
 class ToolArgs(BaseModel):
-    model_config = ConfigDict()
+    model_config = ConfigDict(extra="forbid")
 
     timezone: str = Field(
         default="UTC",
@@ -296,7 +299,10 @@ class ToolArgs(BaseModel):
     @field_validator("timezone")
     @classmethod
     def _validate_timezone(cls, value: str) -> str:
-        return validate_timezone(value)
+        try:
+            return validate_timezone(value)
+        except ValueError as exc:
+            raise ValueError("timezone must be a known IANA timezone") from exc
 
 
 class ToolResultMetadata(TypedDict, total=False):
@@ -606,6 +612,8 @@ def _sanitize_tool_schema(value: object) -> object:
 
 
 def _sanitize_schema_dict(sanitized: dict[object, object]) -> object:
+    if sanitized.get("type") == "object" and "properties" in sanitized:
+        sanitized["additionalProperties"] = False
     has_replacement, replacement = _nullable_schema_replacement(sanitized.get("anyOf"))
     if has_replacement:
         if not isinstance(replacement, dict):
@@ -631,13 +639,31 @@ def _is_null_schema_variant(item: object) -> bool:
     return isinstance(item, dict) and item.get("type") == "null"
 
 
-def tool_args(tool: Tool, *args: object, **kwargs: object) -> ToolArgs:
-    """Instantiate the ToolArgs subclass registered for *tool*."""
+@cache
+def _tool_input_validator(cls: type[ToolArgs]) -> Draft202012Validator:
+    schema = t.cast(dict[str, object], _sanitize_tool_schema(cls.model_json_schema()))
+    return Draft202012Validator(schema)
+
+
+def tool_args(tool: Tool, **kwargs: object) -> ToolArgs:
+    """Validate the complete wire arguments before constructing handler arguments."""
     entry = TOOL_REGISTRY.get(tool.name)
     if entry is None:
         raise ValueError(f"Unknown tool: {tool.name}")
-    cls = entry.cls
-    return t.cast(ToolArgs, cls(*args, **kwargs))
+    try:
+        _tool_input_validator(entry.cls).validate(kwargs)
+    except SchemaValidationError as exc:
+        path = (
+            ".".join(
+                part
+                for part in exc.absolute_schema_path
+                if isinstance(part, str) and part not in {"properties", "items", exc.validator}
+            )
+            or "arguments"
+        )
+        raise ValueError(f"{path} violates {exc.validator} in the tool schema") from exc
+    # JSON strict mode accepts schema-defined enum/date strings without scalar coercion.
+    return entry.cls.model_validate_json(json.dumps(kwargs), strict=True)
 
 
 def verify_tool_registry() -> None:

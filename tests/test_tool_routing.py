@@ -750,7 +750,7 @@ async def test_registered_tool_outputs_match_their_null_free_schemas(tool_name: 
     conn = _make_daemon_conn(response)
 
     with _patch_daemon(conn):
-        result = await server.call_tool(tool_name, args.model_dump())
+        result = await server.call_tool(tool_name, args.model_dump(mode="json", exclude_none=True))
 
     payload = assert_structured_success_payload(result)
     _assert_null_free(payload)

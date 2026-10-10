@@ -263,7 +263,7 @@ async def test_call_tool_validation_rejects_conflicting_list_messages_selectors(
 @pytest.mark.parametrize(
     ("tool_name", "arguments", "expected_fragment"),
     [
-        ("search_messages", {"query": "😀👍"}, "Cyrillic or Latin letter or ASCII digit"),
+        ("search_messages", {"query": "😀👍"}, "query violates pattern"),
         ("trace_account_messages", {"exact_account_id": True}, "exact_account_id"),
     ],
 )
