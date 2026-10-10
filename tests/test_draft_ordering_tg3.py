@@ -24,7 +24,7 @@ from mcp_telegram.drafts.contracts import (
 )
 from mcp_telegram.drafts.sqlite_projection import SQLiteDraftProjection
 from mcp_telegram.drafts.telethon_adapter import normalize_update_draft
-from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.sync_db import _CURRENT_SCHEMA_VERSION, ensure_sync_schema
 
 
 @pytest.fixture()
@@ -294,14 +294,13 @@ def test_migrated_v75_null_order_rows_are_fenced_until_authoritative_bootstrap(
     conn.commit()
     conn.execute("ALTER TABLE draft_current DROP COLUMN source_order_at")
     conn.execute("ALTER TABLE draft_sync_state DROP COLUMN source_order_floor")
-    conn.execute("DELETE FROM schema_version WHERE version=76")
-    conn.commit()
-    conn.close()
-    ensure_sync_schema(database)
-    conn = sqlite3.connect(database)
-    request.addfinalizer(conn.close)
-    repository = SQLiteDraftProjection(conn, DraftRecoveryConfig())
-    repository.bind_account(100)
+    conn.execute("DROP TABLE draft_order_uncertainty")
+    conn.execute("DELETE FROM schema_version WHERE version>=76")
+    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (75,)
+    current_columns = cast(list[tuple[int, str]], conn.execute("PRAGMA table_info(draft_current)").fetchall())
+    state_columns = cast(list[tuple[int, str]], conn.execute("PRAGMA table_info(draft_sync_state)").fetchall())
+    assert "source_order_at" not in {row[1] for row in current_columns}
+    assert "source_order_floor" not in {row[1] for row in state_columns}
     conn.execute(
         "INSERT INTO draft_current(account_id,dialog_id,state,text,composition_complete,source_kind,"
         "source_observed_at,observation_started_at,observation_completed_at,projection_revision,normalization_version) "
@@ -313,6 +312,15 @@ def test_migrated_v75_null_order_rows_are_fenced_until_authoritative_bootstrap(
         "VALUES (100,402,'empty',1,'realtime_empty',1,1,1,2,1)"
     )
     conn.commit()
+    conn.close()
+    ensure_sync_schema(database)
+    conn = sqlite3.connect(database)
+    request.addfinalizer(conn.close)
+    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (_CURRENT_SCHEMA_VERSION,)
+    assert conn.execute(
+        "SELECT dialog_id,state,text,source_order_at FROM draft_current ORDER BY dialog_id"
+    ).fetchall() == [(401, "present", "legacy", None), (402, "empty", None, None)]
+    repository = SQLiteDraftProjection(conn, DraftRecoveryConfig())
     repository.bind_account(100)
     blocked_present = repository.apply_realtime(_present(DraftScope(100, 401), 10, "replay"))
     blocked_clear = repository.apply_realtime(_present(DraftScope(100, 402), 10, "resurrect"))

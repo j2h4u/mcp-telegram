@@ -325,8 +325,8 @@ _SELECT_MESSAGES_SQL = (
     f"ORDER BY m.sent_at DESC LIMIT :limit"
 )
 
-_SELECT_FTS_SQL = (
-    f"SELECT f.message_id, m.text, "
+_FTS_SCOPED_QUERY_BODY_SQL = (
+    f"f.message_id, m.text, "
     f"{_SENDER_FIRST_NAME_SQL}, "
     f"m.sent_at, m.media_kind, m.media_payload, NULL AS content_kind, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
     f"COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
@@ -339,12 +339,11 @@ _SELECT_FTS_SQL = (
     f"WHERE messages_fts MATCH :query AND f.dialog_id = :dialog_id "
     f"AND (:since_utc IS NULL OR m.sent_at >= :since_utc) "
     f"AND (:until_utc IS NULL OR m.sent_at < :until_utc) "
-    f"ORDER BY rank LIMIT :limit OFFSET :offset"
 )
 
 # _SELECT_FTS_ALL_SQL keeps entity joins only for sender identity.
-_SELECT_FTS_ALL_SQL = (
-    f"SELECT f.message_id, m.text, "
+_FTS_GLOBAL_QUERY_BODY_SQL = (
+    f"f.message_id, m.text, "
     f"{_SENDER_FIRST_NAME_SQL}, "
     f"m.sent_at, m.media_kind, m.media_payload, NULL AS content_kind, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
     f"COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
@@ -358,15 +357,14 @@ _SELECT_FTS_ALL_SQL = (
     f"WHERE messages_fts MATCH :query "
     f"AND (:since_utc IS NULL OR m.sent_at >= :since_utc) "
     f"AND (:until_utc IS NULL OR m.sent_at < :until_utc) "
-    f"ORDER BY rank LIMIT :limit OFFSET :offset"
 )
 
-_SELECT_FTS_CHRONOLOGICAL_SQL = _SELECT_FTS_SQL.replace(
-    "SELECT f.message_id", "SELECT DISTINCT f.message_id", 1
-).replace("ORDER BY rank", "ORDER BY m.sent_at ASC, m.message_id ASC, m.dialog_id ASC")
-_SELECT_FTS_ALL_CHRONOLOGICAL_SQL = _SELECT_FTS_ALL_SQL.replace(
-    "SELECT f.message_id", "SELECT DISTINCT f.message_id", 1
-).replace("ORDER BY rank", "ORDER BY m.sent_at ASC, m.message_id ASC, m.dialog_id ASC")
+_FTS_RELEVANCE_ORDER_SQL = "ORDER BY rank LIMIT :limit OFFSET :offset"
+_FTS_CHRONOLOGICAL_ORDER_SQL = "ORDER BY m.sent_at ASC, m.message_id ASC, m.dialog_id ASC LIMIT :limit OFFSET :offset"
+_SELECT_FTS_SQL = "SELECT " + _FTS_SCOPED_QUERY_BODY_SQL + _FTS_RELEVANCE_ORDER_SQL
+_SELECT_FTS_ALL_SQL = "SELECT " + _FTS_GLOBAL_QUERY_BODY_SQL + _FTS_RELEVANCE_ORDER_SQL
+_SELECT_FTS_CHRONOLOGICAL_SQL = "SELECT DISTINCT " + _FTS_SCOPED_QUERY_BODY_SQL + _FTS_CHRONOLOGICAL_ORDER_SQL
+_SELECT_FTS_ALL_CHRONOLOGICAL_SQL = "SELECT DISTINCT " + _FTS_GLOBAL_QUERY_BODY_SQL + _FTS_CHRONOLOGICAL_ORDER_SQL
 
 _EDIT_DATE_SQL = (
     "COALESCE("
