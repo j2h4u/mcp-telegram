@@ -2708,3 +2708,82 @@ async def test_full_history_null_topic_completes_current_receipt_with_evaluated_
         "FROM synced_dialogs WHERE dialog_id=?",
         (dialog_id,),
     ).fetchone() == (1, "complete", 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [MessageHistoryUnavailableError, TimeoutError])
+async def test_failed_history_peer_does_not_starve_ready_peer(
+    sync_db: sqlite3.Connection, failure: type[Exception]
+) -> None:
+    for dialog_id in (1, 2):
+        sync_db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?,'syncing')", (dialog_id,))
+        seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
+    sync_db.commit()
+    calls = []
+
+    class Port:
+        async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            calls.append(dialog_id)
+            if dialog_id == 1:
+                raise failure("retry")
+            return FullHistoryPage(messages=(), next_before_message_id=None, total_messages=0)
+
+    worker = FullSyncWorker(Port(), sync_db, asyncio.Event())
+    await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+    await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+    assert calls == [1, 2]
+    assert sync_db.execute("SELECT full_sync_retry_at FROM synced_dialogs WHERE dialog_id=1").fetchone()[0] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [MessageHistoryUnavailableError, TimeoutError])
+async def test_failed_total_repair_peer_does_not_starve_ready_peer(
+    sync_db: sqlite3.Connection, failure: type[Exception]
+) -> None:
+    for dialog_id in (1, 2):
+        sync_db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?,'synced')", (dialog_id,))
+        seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
+    sync_db.commit()
+    calls: list[int] = []
+
+    class Port:
+        async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            raise AssertionError("unexpected history")
+
+    class Probe:
+        async def probe_total_messages(self, dialog_id: int) -> int | None:
+            calls.append(dialog_id)
+            if dialog_id == 1:
+                raise failure("retry")
+            return 10
+
+    worker = FullSyncWorker(Port(), sync_db, asyncio.Event(), total_messages_probe=Probe())
+    await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+    await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+    assert calls == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_full_page_rotates_peer_and_resumes_checkpoint(sync_db: sqlite3.Connection) -> None:
+    for dialog_id in (1, 2):
+        sync_db.execute(
+            "INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (?,'syncing',12)", (dialog_id,)
+        )
+        seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
+    sync_db.commit()
+    calls: list[tuple[int, int]] = []
+
+    class Port:
+        async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            calls.append((dialog_id, before_message_id))
+            if len(calls) == 1:
+                raise asyncio.CancelledError
+            return FullHistoryPage(messages=(), next_before_message_id=None, total_messages=0)
+
+    worker = FullSyncWorker(Port(), sync_db, asyncio.Event())
+    with pytest.raises(asyncio.CancelledError):
+        await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+    assert sync_db.execute("SELECT sync_progress FROM synced_dialogs WHERE dialog_id=1").fetchone() == (12,)
+    await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+    await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+    assert calls == [(1, 12), (2, 12), (1, 12)]

@@ -1165,7 +1165,6 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
                 foreground_refresh_wait_seconds=config.entity_profile.foreground_refresh_wait_seconds,
                 per_rpc_seconds=config.entity_profile.rpc_timeout_seconds,
                 whole_refresh_seconds=config.entity_profile.refresh_timeout_seconds,
-                max_concurrent_refreshes=config.entity_profile.max_concurrent_refreshes,
                 max_queued_refreshes=config.entity_profile.max_queued_refreshes,
             ),
             full_user_pair_enabled=config.entity_profile.full_user_pair_enabled,

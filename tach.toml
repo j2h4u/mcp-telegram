@@ -521,7 +521,7 @@ depends_on = ["mcp_telegram.telegram_gateway", "mcp_telegram.telegram_message_pr
 [[modules]]
 path = "mcp_telegram.telegram_message_projection"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.message_composition", "mcp_telegram.formatter", "mcp_telegram.media_fact", "mcp_telegram.message_content", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.telethon_media", "mcp_telegram.telethon_message"]
+depends_on = ["mcp_telegram.message_composition", "mcp_telegram.formatter", "mcp_telegram.media_fact", "mcp_telegram.message_content", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.reactions.projection", "mcp_telegram.telethon_media", "mcp_telegram.telethon_message"]
 
 [[modules]]
 path = "mcp_telegram.telegram_read_receipts"
@@ -566,7 +566,7 @@ depends_on = ["mcp_telegram.reactions.contracts"]
 [[modules]]
 path = "mcp_telegram.reactions.telegram_adapter"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.reactions.contracts", "mcp_telegram.reactions.ports", "mcp_telegram.telegram_gateway", "mcp_telegram.telegram_rpc_error", "mcp_telegram.telegram_rpc_scheduler"]
+depends_on = ["mcp_telegram.reactions.contracts", "mcp_telegram.reactions.ports", "mcp_telegram.reactions.projection", "mcp_telegram.telegram_gateway", "mcp_telegram.telegram_rpc_error", "mcp_telegram.telegram_rpc_scheduler"]
 
 [[modules]]
 path = "mcp_telegram.topics.telegram_adapter"
@@ -923,7 +923,7 @@ expose = ["AccountProtectionError", "DaemonConnection", "DaemonNotRunningError",
 
 [[interfaces]]
 from = ["mcp_telegram.history_enrollment"]
-expose = ["EnrollmentIntent", "EnrollmentOutcome", "EnrollmentSource", "disable_history", "enable_history", "ensure_automatic_dm_enrollment", "full_history_enabled", "read_intent", "record_automatic_group_decision", "reset_read_position_retry", "restore_access_status"]
+expose = ["EnrollmentIntent", "EnrollmentOutcome", "EnrollmentSource", "disable_history", "enable_history", "ensure_automatic_dm_enrollment", "full_history_enabled", "read_intent", "record_automatic_group_decision", "request_delta_refresh", "reset_read_position_retry", "restore_access_status"]
 
 [[interfaces]]
 from = ["mcp_telegram.reading"]

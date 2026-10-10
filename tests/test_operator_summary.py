@@ -226,6 +226,74 @@ def test_summary_reconciles_get_full_channel_attempts_by_source_and_demand(tmp_p
     )
 
 
+def test_summary_sorts_legacy_null_optional_fields_with_current_strings(tmp_path: Path) -> None:
+    now = 2_000_000_000.0
+    db_path = tmp_path / "sync.db"
+    _database(db_path, now_ms=int(now * 1000))
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.executemany(
+            "INSERT INTO runtime_observations(observed_at_ms,kind,runtime_instance_id,outcome,payload_json) "
+            "VALUES (?,?,'current',?,?)",
+            [
+                (
+                    int(now * 1000) - 4_000,
+                    "telegram.rpc_request",
+                    "summary",
+                    json.dumps(
+                        {
+                            "request_class": "get_full_channel",
+                            "source": "same_source",
+                            "demand_kind": "same_demand",
+                            "actual_attempts": 1,
+                        }
+                    ),
+                ),
+                (
+                    int(now * 1000) - 3_000,
+                    "telegram.rpc_request",
+                    "summary",
+                    json.dumps(
+                        {
+                            "request_class": "get_full_channel",
+                            "source": "same_source",
+                            "demand_kind": "same_demand",
+                            "acquisition_kind": "current",
+                            "actual_attempts": 2,
+                        }
+                    ),
+                ),
+                (
+                    int(now * 1000) - 2_000,
+                    "telegram.demand",
+                    "selected",
+                    json.dumps({"demand_kind": "same_demand", "demand_units": 1}),
+                ),
+                (
+                    int(now * 1000) - 1_000,
+                    "telegram.demand",
+                    "selected",
+                    json.dumps(
+                        {
+                            "demand_kind": "same_demand",
+                            "acquisition_kind": "current",
+                            "demand_units": 2,
+                        }
+                    ),
+                ),
+            ],
+        )
+        conn.commit()
+
+    report = build_operator_summary(db_path, since_seconds=15 * 3600, now=now)
+    repeated = build_operator_summary(db_path, since_seconds=15 * 3600, now=now)
+
+    assert report.text == repeated.text
+    assert (
+        "GetFullChannel RPC attempts: 3 (same_source/same_demand=1, same_source/same_demand/current=2)" in report.text
+    )
+    assert "same_demand: selected=1\n  same_demand/current: selected=2" in report.text
+
+
 def test_summary_reports_final_demand_outcomes_and_freshness_reason(tmp_path: Path) -> None:
     now = 2_000_000_000.0
     db_path = tmp_path / "sync.db"

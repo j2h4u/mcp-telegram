@@ -1,4 +1,7 @@
+import os
 import re
+import subprocess
+import textwrap
 import tomllib
 from pathlib import Path
 from typing import TypedDict, cast
@@ -91,3 +94,52 @@ def test_import_linter_and_tach_are_both_required_static_gates() -> None:
     assert "module-boundaries" in check_recipe
     assert "uv run lint-imports" in justfile
     assert "uv run tach check --dependencies --interfaces --exact" in justfile
+
+
+def test_changed_file_lookup_failure_cannot_skip_heavy_ci(tmp_path: Path) -> None:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    filter_step = workflow.partition("id: filter")[2].partition("run: |")[2]
+    script_lines = []
+    for line in filter_step.splitlines():
+        if line and not line.startswith("          "):
+            break
+        script_lines.append(line[10:] if line else "")
+    script = textwrap.dedent("\n".join(script_lines)).replace("${{ github.repository }}", "example/repo")
+    gh = tmp_path / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        'case "$GH_MODE" in\n'
+        "  failure) exit 22 ;;\n"
+        "  docs) printf '%s\\n' README.md docs/guide.md ;;\n"
+        "  code) printf '%s\\n' README.md src/module.py ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    gh.chmod(0o755)
+
+    def run_filter(mode: str) -> subprocess.CompletedProcess[str]:
+        output = tmp_path / f"{mode}.output"
+        env = os.environ.copy()
+        env.update(
+            {
+                "PATH": f"{tmp_path}:{env['PATH']}",
+                "GITHUB_OUTPUT": str(output),
+                "EVENT_NAME": "pull_request",
+                "PR_NUMBER": "123",
+                "GH_MODE": mode,
+            }
+        )
+        return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, check=False)
+
+    failed = run_filter("failure")
+    assert failed.returncode != 0
+    failure_output = tmp_path / "failure.output"
+    assert not failure_output.exists() or "run_heavy=false" not in failure_output.read_text(encoding="utf-8")
+
+    docs = run_filter("docs")
+    assert docs.returncode == 0
+    assert (tmp_path / "docs.output").read_text(encoding="utf-8") == "run_heavy=false\n"
+
+    code = run_filter("code")
+    assert code.returncode == 0
+    assert (tmp_path / "code.output").read_text(encoding="utf-8") == "run_heavy=true\n"

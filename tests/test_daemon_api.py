@@ -711,6 +711,7 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             last_event_at       INTEGER,
             last_delta_checked_at INTEGER,
             delta_refresh_requested_at INTEGER,
+            delta_refresh_generation INTEGER NOT NULL DEFAULT 0,
             sync_progress       INTEGER DEFAULT 0,
             total_messages      INTEGER,
             access_lost_at      INTEGER,
@@ -9198,3 +9199,115 @@ def test_telemetry_writes_with_runtime_guard_and_restores_it() -> None:
     assert not conn.in_transaction
     assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
     assert conn.execute("SELECT tool_name FROM runtime_observations").fetchone()[0] == "Current"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method,foreground", [("get_entity_info", True), ("list_messages", True), ("mark_dialog_for_sync", False)]
+)
+@pytest.mark.parametrize("disconnect", ["eof", "reset"])
+async def test_client_eof_cancels_only_owned_foreground_work(method: str, foreground: bool, disconnect: str) -> None:
+    server = make_server()
+    started = asyncio.Event()
+    finished = asyncio.Event()
+    release = asyncio.Event()
+    committed: list[str] = []
+
+    async def dispatch(req: dict) -> dict:
+        started.set()
+        try:
+            await release.wait()
+            committed.append(method)
+            return {"ok": True}
+        finally:
+            finished.set()
+
+    server._dispatch = dispatch  # type: ignore[method-assign]
+    reader = asyncio.StreamReader()
+    reader.feed_data(json.dumps({"method": method}).encode() + b"\n")
+    writer = MagicMock()
+    writer.drain = AsyncMock()
+    writer.wait_closed = AsyncMock()
+    task = asyncio.create_task(server.handle_client(reader, writer))
+    await started.wait()
+    if disconnect == "eof":
+        reader.feed_eof()
+    else:
+        reader.set_exception(ConnectionResetError("client reset"))
+    if foreground:
+        await asyncio.wait_for(task, 0.5)
+        assert committed == []
+        writer.write.assert_not_called()
+    else:
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        await asyncio.wait_for(task, 0.5)
+        assert committed == [method]
+        writer.write.assert_called()
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_client_prefetch_preserves_next_request() -> None:
+    server = make_server()
+    seen: list[int] = []
+
+    async def dispatch(req: dict) -> dict:
+        await asyncio.sleep(0)
+        seen.append(req["sequence"])
+        return {"ok": True}
+
+    server._dispatch = dispatch  # type: ignore[method-assign]
+    reader = asyncio.StreamReader()
+    for sequence in (1, 2):
+        reader.feed_data(json.dumps({"method": "get_me", "sequence": sequence}).encode() + b"\n")
+
+    writer = MagicMock()
+    writer.drain = AsyncMock()
+    writer.wait_closed = AsyncMock()
+    task = asyncio.create_task(server.handle_client(reader, writer))
+    async with asyncio.timeout(0.5):
+        while writer.write.call_count < 2:
+            await asyncio.sleep(0)
+    reader.feed_eof()
+    await task
+    assert seen == [1, 2]
+    assert writer.write.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_client_eof_keeps_dispatched_raw_rpc_lease_and_prevents_followup() -> None:
+    from mcp_telegram.telegram_rpc import _MainSender
+    from mcp_telegram.telegram_rpc_consumers import RpcServiceClass
+    from tests.test_telegram_rpc import _call, _gate, _RawFutureSender, _TestRequest, _wait_for
+
+    server = make_server()
+    gate = _gate()
+    sender = _RawFutureSender()
+    gate._main_sender = cast(_MainSender, sender)
+
+    async def dispatch(req: dict) -> dict:
+        await _call(gate, _TestRequest("first"))
+        await _call(gate, _TestRequest("followup"))
+        return {"ok": True}
+
+    server._dispatch = dispatch  # type: ignore[method-assign]
+    reader = asyncio.StreamReader()
+    reader.feed_data(b'{"method":"get_entity_info"}\n')
+    writer = MagicMock()
+    writer.drain = AsyncMock()
+    writer.wait_closed = AsyncMock()
+    task = asyncio.create_task(server.handle_client(reader, writer))
+    await _wait_for(lambda: sender.calls == 1)
+    reader.feed_eof()
+    await asyncio.wait_for(task, 0.5)
+    raw_future = sender.futures[0]
+    assert not raw_future.done()
+    assert gate._admission_scheduler.active_depths()[RpcServiceClass.INTERACTIVE] == 1
+    assert sender.calls == 1
+    raw_future.set_result("late completion")
+    await _wait_for(lambda: not gate._pending_scalar_dispatches)
+    assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
+    writer.write.assert_not_called()
+    await gate.close_rpc_scheduler()

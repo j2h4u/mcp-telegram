@@ -22,7 +22,7 @@ from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
 from mcp_telegram.messages.telegram_adapter import extract_message_row
 from mcp_telegram.models import ReadMessage
 from mcp_telegram.observation_order import allocate_observation_order
-from mcp_telegram.reactions.telegram_adapter import TelethonTelegramReactionGateway
+from mcp_telegram.reactions.projection import project_reaction_event
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
 from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudgetExhaustedError
 from mcp_telegram.telegram_fact_queries import enrich_read_at, persist_read_at, stale_read_at_ids
@@ -167,7 +167,7 @@ async def test_history_gateway_streams_prefix_before_structured_failure() -> Non
     ],
 )
 def test_reaction_gateway_peer_id_normalizes_telethon_and_narrow_doubles(peer: object, expected: int | None) -> None:
-    assert TelethonTelegramReactionGateway._peer_id(peer) == expected
+    assert project_reaction_event(SimpleNamespace(peer_id=peer, reaction=None, date=None)).reactor_id == expected
 
 
 @pytest.mark.asyncio

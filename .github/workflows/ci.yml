@@ -41,17 +41,22 @@ jobs:
             exit 0
           fi
 
+          changed_files=$(gh api --paginate \
+            "repos/${{ github.repository }}/pulls/$PR_NUMBER/files" \
+            --jq '.[].filename') || {
+              echo "Failed to retrieve pull request changed files" >&2
+              exit 1
+            }
+
           run_heavy=false
-          while IFS= read -r path; do
-            case "$path" in
-              *.md|docs/*|.planning/*) ;;
-              *) run_heavy=true; break ;;
-            esac
-          done < <(
-            gh api --paginate \
-              "repos/${{ github.repository }}/pulls/$PR_NUMBER/files" \
-              --jq '.[].filename'
-          )
+          if [ -n "$changed_files" ]; then
+            while IFS= read -r path; do
+              case "$path" in
+                *.md|docs/*|.planning/*) ;;
+                *) run_heavy=true; break ;;
+              esac
+            done <<< "$changed_files"
+          fi
           echo "run_heavy=$run_heavy" >> "$GITHUB_OUTPUT"
 
   quality:

@@ -15,7 +15,8 @@ from .dialog_classification import (
 from .sync_transactions import enable_runtime_writes, write_transaction
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 80
+_CURRENT_SCHEMA_VERSION = 81
+_HISTORY_PEER_FAIRNESS_MIGRATION = 81
 _MESSAGE_OBSERVATION_MIGRATION = 80
 _MESSAGE_COMPOSITION_MIGRATION = 79
 _LINKED_CHAT_FACT_DEMAND_MIGRATION = 77
@@ -4672,7 +4673,7 @@ def _repair_v54_schema_ledger(conn: sqlite3.Connection, current: int) -> int:
                 (version,),
             )
         conn.commit()
-        return 54
+        return max(current, 54)
     return current
 
 
@@ -4706,6 +4707,21 @@ def _apply_migration_80(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_81(conn: sqlite3.Connection, current: int) -> int:
+    """Fence refresh completion and retain peer-local history retry state."""
+    return _apply_migration(
+        conn,
+        current,
+        81,
+        [
+            "ALTER TABLE synced_dialogs ADD COLUMN delta_refresh_generation INTEGER NOT NULL DEFAULT 0 CHECK(delta_refresh_generation >= 0)",
+            "UPDATE synced_dialogs SET delta_refresh_generation=1 WHERE delta_refresh_requested_at IS NOT NULL",
+            "ALTER TABLE synced_dialogs ADD COLUMN full_sync_retry_at INTEGER",
+            "ALTER TABLE synced_dialogs ADD COLUMN delta_retry_at INTEGER",
+        ],
+    )
+
+
 def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
     """Apply the conditional current-schema migration tail."""
     if _CURRENT_SCHEMA_VERSION >= _ENTITY_PROFILE_ACQUISITION_MIGRATION_61:
@@ -4725,6 +4741,8 @@ def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
         current = _apply_migration_79(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _MESSAGE_OBSERVATION_MIGRATION:
         current = _apply_migration_80(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _HISTORY_PEER_FAIRNESS_MIGRATION:
+        current = _apply_migration_81(conn, current)
     return current
 
 
