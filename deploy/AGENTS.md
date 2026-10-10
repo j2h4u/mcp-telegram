@@ -22,6 +22,16 @@ This directory is the live deployment workspace, not the source checkout.
 
 ## Operations
 
+### SQLite backup retention
+
+Take a SQLite backup in the operator-owned `backups/` directory before a
+schema-changing deployment; code-only rebuilds do not need one. After the
+service is healthy, the expected migration version is confirmed, and the
+official MCP smoke succeeds, remove only the backup and verification sidecars
+created for that rollout. Keep a copy needed for a failed deployment or
+rollback until the issue is resolved. Never use a blanket glob that could
+remove historical backups or exports.
+
 ### Entity Profile rollout and rollback
 
 The profile pair switch is safe to roll back at the configuration level. Keep
@@ -35,8 +45,7 @@ step.
 
 Arbitrary older binaries are unsupported after this migration. Roll back the
 configuration before reverting the binary, and use a binary that understands
-the v62 schema and pair-mode records. Take the normal SQLite backup before a
-production rollout.
+the v62 schema and pair-mode records.
 
 - Rebuild and restart after source changes:
   ```bash
