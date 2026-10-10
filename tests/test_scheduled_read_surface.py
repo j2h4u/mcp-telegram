@@ -1250,3 +1250,53 @@ def test_tool_read_and_search_route_lifecycle_through_shared_helper(monkeypatch:
     assert {field: listed[field] for field in LIFECYCLE_FIELDS} == projected
     assert {field: searched[field] for field in LIFECYCLE_FIELDS} == projected
     assert calls == [(row, FUTURE_BASE + 200), (row, FUTURE_BASE + 200)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("global_mode", [False, True], ids=["scoped", "global"])
+@pytest.mark.parametrize("limit", [1, 2])
+async def test_search_all_pages_chronological_prefix_before_merge(global_mode: bool, limit: int) -> None:
+    conn = _make_db_with_dialogs(with_fts=True)
+    server = make_server(conn)
+    _create_scheduled_table(conn)
+    for message_id, timestamp, text in [
+        (1, 100, "needle"),
+        (2, 200, "needle filler"),
+        (3, 50, "needle filler filler filler"),
+    ]:
+        _insert_message(conn, 1, message_id, sent_at=FUTURE_BASE + timestamp, text=text)
+        conn.execute("INSERT INTO messages_fts VALUES (1, ?, ?)", (message_id, text))
+    _insert_scheduled(conn, 1, FUTURE_BASE + 100, "needle scheduled")
+    if global_mode:
+        _seed_dialog_row(conn, 2, name="Other peer")
+        _insert_message(conn, 2, 1, sent_at=FUTURE_BASE + 100, text="needle peer")
+        conn.execute("INSERT INTO messages_fts VALUES (2, 1, 'needle peer')")
+        _insert_scheduled(conn, 1, FUTURE_BASE + 100, "needle peer scheduled", dialog_id=2)
+    # Duplicate FTS rows must not consume the bounded chronological prefix.
+    conn.execute("INSERT INTO messages_fts VALUES (1, 3, 'needle filler filler filler')")
+    conn.execute("INSERT INTO scheduled_messages_fts VALUES (1, 1, 'needle scheduled')")
+    conn.commit()
+    request = {"query": "needle", "message_state": "all", "limit": limit}
+    if not global_mode:
+        request["dialog_id"] = 1
+    seen = []
+    for _ in range(10):
+        result = await server._search_messages(request)
+        assert result["ok"]
+        seen.extend(
+            (row["dialog_id"], row.get("message_state", "sent"), row["message_id"])
+            for row in result["data"]["messages"]
+        )
+        token = result["data"]["next_navigation"]
+        if token is None:
+            break
+        request["offset"] = decode_navigation_token(token).value
+    else:
+        pytest.fail("search navigation did not terminate")
+    expected = [(1, "sent", 3), (1, "scheduled", 1), (1, "sent", 1)]
+    if global_mode:
+        expected.extend([(2, "scheduled", 1), (2, "sent", 1)])
+    expected.append((1, "sent", 2))
+    assert seen == expected
+    sent = await server._search_messages({"query": "needle", "dialog_id": 1, "message_state": "sent", "limit": 1})
+    assert sent["data"]["messages"][0]["message_id"] == 1

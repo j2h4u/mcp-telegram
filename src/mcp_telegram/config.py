@@ -69,13 +69,12 @@ class EntityProfileConfig:
     foreground_refresh_wait_seconds: float = 15.0
     rpc_timeout_seconds: float = 8.0
     refresh_timeout_seconds: float = 25.0
-    max_concurrent_refreshes: int = 1
     max_queued_refreshes: int = 128
 
     def __post_init__(self) -> None:
         self._validate_durations()
         self._validate_caps()
-        self._validate_concurrency()
+        self._validate_queue_capacity()
 
     def _validate_durations(self) -> None:
         durations = (
@@ -109,10 +108,13 @@ class EntityProfileConfig:
             if value > cap:
                 raise ValueError(f"entity profile {name} budget cannot exceed {cap:g} seconds")
 
-    def _validate_concurrency(self) -> None:
-        bounds = (self.max_concurrent_refreshes, self.max_queued_refreshes)
-        if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in bounds):
-            raise ValueError("entity profile concurrency and queue capacity must be positive integers")
+    def _validate_queue_capacity(self) -> None:
+        if (
+            isinstance(self.max_queued_refreshes, bool)
+            or not isinstance(self.max_queued_refreshes, int)
+            or self.max_queued_refreshes < 1
+        ):
+            raise ValueError("entity profile queue capacity must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -942,7 +944,6 @@ def _parse_entity_profile(data: dict[str, object], path: Path) -> EntityProfileC
             "foreground_refresh_wait_seconds",
             "rpc_timeout_seconds",
             "refresh_timeout_seconds",
-            "max_concurrent_refreshes",
             "max_queued_refreshes",
         },
         "entity_profile",
@@ -969,9 +970,6 @@ def _parse_entity_profile(data: dict[str, object], path: Path) -> EntityProfileC
             ),
             refresh_timeout_seconds=_positive_float(
                 section, "refresh_timeout_seconds", "entity_profile", path, defaults.refresh_timeout_seconds
-            ),
-            max_concurrent_refreshes=_positive_int(
-                section, "max_concurrent_refreshes", "entity_profile", path, defaults.max_concurrent_refreshes
             ),
             max_queued_refreshes=_positive_int(
                 section, "max_queued_refreshes", "entity_profile", path, defaults.max_queued_refreshes

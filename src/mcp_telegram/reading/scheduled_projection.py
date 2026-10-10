@@ -212,11 +212,11 @@ def build_scheduled_search_query(  # noqa: PLR0913
             clauses.append("sm.dialog_id IN (" + ", ".join(names) + ")")
             params.update({"own_scope_" + str(index): value for index, value in enumerate(own_dialog_ids)})
     sql = (
-        _SCHEDULED_MESSAGE_SELECT_SQL
+        _SCHEDULED_MESSAGE_SELECT_SQL.replace("SELECT\n", "SELECT DISTINCT\n", 1)
         + _SCHEDULED_MESSAGE_SEARCH_FROM_SQL
         + "WHERE "
         + " AND ".join(clauses)
-        + " ORDER BY sm.scheduled_at ASC, sm.message_id ASC LIMIT :limit OFFSET :offset"
+        + " ORDER BY sm.scheduled_at ASC, sm.message_id ASC, sm.dialog_id ASC LIMIT :limit OFFSET :offset"
     )
     return sql, params
 

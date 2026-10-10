@@ -21,7 +21,7 @@ def _db() -> sqlite3.Connection:
     conn.executescript(
         """CREATE TABLE synced_dialogs (
              dialog_id INTEGER PRIMARY KEY, status TEXT, access_lost_at INTEGER,
-             delta_refresh_requested_at INTEGER, access_last_revalidated_at INTEGER,
+             delta_refresh_requested_at INTEGER, delta_refresh_generation INTEGER NOT NULL DEFAULT 0, access_last_revalidated_at INTEGER,
              access_next_revalidate_at INTEGER, total_messages INTEGER,
              read_position_next_attempt_at INTEGER, read_position_attempt_count INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE full_history_enrollment (

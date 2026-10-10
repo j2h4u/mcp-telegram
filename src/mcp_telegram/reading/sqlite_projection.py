@@ -361,9 +361,26 @@ _SELECT_FTS_ALL_SQL = (
     f"ORDER BY rank LIMIT :limit OFFSET :offset"
 )
 
+_SELECT_FTS_CHRONOLOGICAL_SQL = _SELECT_FTS_SQL.replace(
+    "SELECT f.message_id", "SELECT DISTINCT f.message_id", 1
+).replace("ORDER BY rank", "ORDER BY m.sent_at ASC, m.message_id ASC, m.dialog_id ASC")
+_SELECT_FTS_ALL_CHRONOLOGICAL_SQL = _SELECT_FTS_ALL_SQL.replace(
+    "SELECT f.message_id", "SELECT DISTINCT f.message_id", 1
+).replace("ORDER BY rank", "ORDER BY m.sent_at ASC, m.message_id ASC, m.dialog_id ASC")
+
+_EDIT_DATE_SQL = (
+    "COALESCE("
+    "  (SELECT MAX(mv.edit_date) FROM message_versions mv "
+    "   WHERE mv.dialog_id = m.dialog_id AND mv.message_id = m.message_id), "
+    "  m.edit_date"
+    ") AS edit_date"
+)
+
+
 _FETCH_UNREAD_MESSAGES_SQL = (
     f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
     f"{_SENDER_FIRST_NAME_SQL}, {_SENDER_USERNAME_SQL}, m.media_kind, m.media_payload, NULL AS content_kind, "
+    f"m.reply_to_msg_id, {_EDIT_DATE_SQL}, "
     f"m.forum_topic_id, COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id, m.is_deleted, m.deleted_at, m.service_action, m.formatting_entities "
     f"FROM messages m "
@@ -387,11 +404,7 @@ _LIST_MESSAGES_BASE_SQL = (
     f"{_SENDER_FIRST_NAME_SQL}, "
     f"m.media_kind, m.media_payload, NULL AS content_kind, m.reply_to_msg_id, m.forum_topic_id, "
     f"m.is_deleted, m.deleted_at, "
-    f"COALESCE("
-    f"  (SELECT MAX(mv.edit_date) FROM message_versions mv "
-    f"   WHERE mv.dialog_id = m.dialog_id AND mv.message_id = m.message_id), "
-    f"  m.edit_date"
-    f") AS edit_date, "
+    f"{_EDIT_DATE_SQL}, "
     f"COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id, "
     f"mf.fwd_from_name, m.post_author, m.service_action, m.formatting_entities "

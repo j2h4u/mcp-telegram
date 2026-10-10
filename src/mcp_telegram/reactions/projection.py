@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from typing import cast
 
-from .contracts import ReactionAggregate
+from .contracts import ReactionAggregate, ReactionEvent
 
 
 def project_reaction_aggregates(reactions: object | None) -> tuple[ReactionAggregate, ...]:
@@ -40,3 +41,26 @@ def _emoji(reaction: object | None) -> str | None:
     if reaction.__class__.__name__ == "ReactionPaid":
         return "paid"
     return None
+
+
+def project_reaction_event(item: object) -> ReactionEvent:
+    """Preserve one returned reaction actor without implying list completeness."""
+    peer = getattr(item, "peer_id", None)
+    user_id = getattr(peer, "user_id", None)
+    chat_id = getattr(peer, "chat_id", None)
+    channel_id = getattr(peer, "channel_id", None)
+    reactor_id = None
+    if isinstance(user_id, int):
+        reactor_id = user_id
+    elif isinstance(chat_id, int):
+        reactor_id = -chat_id
+    elif isinstance(channel_id, int):
+        reactor_id = -1000000000000 - channel_id
+    reaction = getattr(item, "reaction", None)
+    date = getattr(item, "date", None)
+    emoji = _emoji(reaction)
+    return ReactionEvent(
+        reactor_id=reactor_id,
+        emoji=emoji if emoji is not None else str(reaction),
+        reacted_at=int(date.timestamp()) if isinstance(date, datetime) else None,
+    )

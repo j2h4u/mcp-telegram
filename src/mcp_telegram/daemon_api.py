@@ -1165,6 +1165,34 @@ class DaemonAPIServer:
             response.get("error"),
         )
 
+    @staticmethod
+    async def _cancel_abandoned_foreground_request(
+        line: bytes,
+        pending_read: asyncio.Task[bytes],
+        request_task: asyncio.Task[tuple[dict, str, str | None]],
+    ) -> bool:
+        """Drain disconnected foreground work while preserving durable mutation ownership."""
+        await asyncio.wait((request_task, pending_read), return_when=asyncio.FIRST_COMPLETED)
+        if not pending_read.done() or pending_read.result() or request_task.done():
+            return False
+        try:
+            request = cast(object, json.loads(line))
+        except ValueError:
+            request = {}
+        # Enrollment commits outlive their caller; only foreground work is owned here.
+        foreground = isinstance(request, dict) and request.get("method") not in {
+            "mark_dialog_for_sync",
+            "recover_dialog_directory",
+            "record_telemetry",
+            "upsert_entities",
+            "submit_feedback",
+            "update_feedback_status",
+        }
+        if foreground:
+            request_task.cancel()
+            await asyncio.gather(request_task, return_exceptions=True)
+        return foreground
+
     async def handle_client(
         self,
         reader: asyncio.StreamReader,
@@ -1178,10 +1206,27 @@ class DaemonAPIServer:
         """
         method = ""
         request_id: str | None = None
+        pending_read: asyncio.Task[bytes] | None = None
+        request_task: asyncio.Task[tuple[dict, str, str | None]] | None = None
+
+        async def read_line() -> bytes:
+            try:
+                return await reader.readline()
+            except ConnectionResetError:
+                return b""
+
         try:
-            while line := await reader.readline():
-                response, method, request_id = await self._handle_client_line(line, method, request_id)
+            line = await read_line()
+            while line:
+                pending_read = asyncio.create_task(read_line())
+                request_task = asyncio.create_task(self._handle_client_line(line, method, request_id))
+                if await self._cancel_abandoned_foreground_request(line, pending_read, request_task):
+                    break
+                response, method, request_id = await request_task
                 await write_response(writer, response)
+                line = await pending_read
+                pending_read = None
+                request_task = None
         except ConnectionResetError, BrokenPipeError:
             # MCP client (or healthcheck) disconnected before we finished
             # writing the response — expected on tool-call timeouts and
@@ -1198,6 +1243,11 @@ class DaemonAPIServer:
                 request_id,
             )
         finally:
+            tasks: list[asyncio.Task[object]] = [task for task in (pending_read, request_task) if task is not None]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             writer.close()
             try:
                 await writer.wait_closed()
