@@ -29,7 +29,7 @@ from .access_lifecycle import (
     stamp_access_revalidation,
 )
 from .flood import TelegramRpcThrottled, _raise_if_latched
-from .history_enrollment import full_history_enabled
+from .history_enrollment import full_history_enabled, request_delta_refresh
 from .hydration_queue import HydrationPriority
 from .message_contracts import ExtractedMessage
 from .message_history.contracts import MessageHistoryAccessLostError, MessageHistoryUnavailableError
@@ -133,7 +133,7 @@ _DM_GAP_SCAN_STATE_KEY = DM_DELETION_RECONCILIATION_STATE_KEY
 _DM_GAP_SCAN_POLICY_VERSION = DM_DELETION_POLICY_VERSION
 
 _SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL = """
-SELECT sd.dialog_id, sd.last_synced_at, sd.last_delta_checked_at, sd.delta_refresh_requested_at, sd.delta_message_id
+SELECT sd.dialog_id, sd.last_synced_at, sd.last_delta_checked_at, sd.delta_refresh_requested_at, sd.delta_message_id, sd.delta_retry_at
 FROM synced_dialogs sd
 JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
 WHERE sd.status = 'synced'
@@ -148,13 +148,8 @@ _SELECT_DELTA_MESSAGE_ID_SQL = "SELECT COALESCE(delta_message_id, 0) FROM synced
 # Distinct from FullSyncWorker's _UPDATE_PROGRESS_DONE_SQL (different column set).
 _UPDATE_DELTA_CHECKPOINT_SQL = (
     "UPDATE synced_dialogs "
-    "SET last_synced_at = ?, last_delta_checked_at = ?, delta_refresh_requested_at = NULL "
+    "SET last_synced_at = ?, last_delta_checked_at = ?, delta_refresh_requested_at = CASE WHEN delta_refresh_generation=? THEN NULL ELSE delta_refresh_requested_at END "
     "WHERE dialog_id = ? AND EXISTS (SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1)"
-)
-_REQUEST_DELTA_CONTINUATION_SQL = (
-    "UPDATE synced_dialogs SET delta_refresh_requested_at = COALESCE(delta_refresh_requested_at, ?) "
-    "WHERE dialog_id = ? "
-    "AND EXISTS (SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1)"
 )
 
 _SELECT_DM_GAP_DIALOGS_SQL = """
@@ -377,9 +372,9 @@ class DeltaSyncWorker:
         self._last_delta_page_metrics: dict[str, int] = {}
         self._delta_gap_fill_observation_enabled = False
 
-    def _stamp_delta_checkpoint(self, dialog_id: int, checked_at: int) -> None:
+    def _stamp_delta_checkpoint(self, dialog_id: int, checked_at: int, generation: int) -> None:
         require_write_transaction(self._conn)
-        self._conn.execute(_UPDATE_DELTA_CHECKPOINT_SQL, (checked_at, checked_at, dialog_id, dialog_id))
+        self._conn.execute(_UPDATE_DELTA_CHECKPOINT_SQL, (checked_at, checked_at, generation, dialog_id, dialog_id))
 
     @_delta_rpc_scope(DemandKind.DELTA_GAP_FILL, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def fetch_delta_slice_for_dialog(self, dialog_id: int) -> int:
@@ -388,10 +383,17 @@ class DeltaSyncWorker:
         if not full_history_enabled(self._conn, dialog_id):
             return 0
         cursor = self._delta_message_id(dialog_id)
-        outcome = await self._collect_delta_slice(dialog_id, cursor)
+        generation_row = cast(
+            tuple[int],
+            self._conn.execute(
+                "SELECT delta_refresh_generation FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+            ).fetchone(),
+        )
+        generation = generation_row[0]
+        outcome = await self._collect_delta_slice(dialog_id, cursor, generation)
         if outcome.result is not None:
             return outcome.result
-        return self._commit_delta_slice(dialog_id, outcome)
+        return self._commit_delta_slice(dialog_id, outcome, generation)
 
     def _reset_delta_slice_state(self) -> None:
         self._last_delta_slice_completed = False
@@ -408,7 +410,7 @@ class DeltaSyncWorker:
         )
         return _row_first_int(row)
 
-    async def _collect_delta_slice(self, dialog_id: int, max_known_id: int) -> _DeltaFetchOutcome:
+    async def _collect_delta_slice(self, dialog_id: int, max_known_id: int, generation: int) -> _DeltaFetchOutcome:
         reaction_observed_at = int(time.time())
         observation_order = allocate_observation_order(self._conn)
         try:
@@ -430,9 +432,11 @@ class DeltaSyncWorker:
         except MessageHistoryAccessLostError as exc:
             self._last_delta_slice_access_lost = True
             with write_transaction(self._conn):
-                set_access_lost(self._conn, dialog_id, int(time.time()), reason=exc.reason_code)
+                set_access_lost(
+                    self._conn, dialog_id, int(time.time()), reason=exc.reason_code, refresh_generation=generation
+                )
             return _DeltaFetchOutcome([], 0)
-        except MessageHistoryUnavailableError as exc:
+        except (MessageHistoryUnavailableError, TimeoutError) as exc:
             logger.warning("delta_slice_rpc_error dialog_id=%d error=%s", dialog_id, exc)
             self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
@@ -450,10 +454,10 @@ class DeltaSyncWorker:
             }
         return _DeltaFetchOutcome(rows, completed=page.complete, reaction_observed_at=reaction_observed_at)
 
-    def _commit_delta_slice(self, dialog_id: int, outcome: _DeltaFetchOutcome) -> int:
+    def _commit_delta_slice(self, dialog_id: int, outcome: _DeltaFetchOutcome, generation: int) -> int:
         continuation_required = not outcome.completed or len(outcome.rows) == _DELTA_SLICE_MESSAGE_LIMIT
         now = int(time.time())
-        result = self._commit_delta_transaction(dialog_id, outcome, continuation_required, now)
+        result = self._commit_delta_transaction(dialog_id, outcome, continuation_required, now, generation)
         if result is None:
             return 0
         unique_message_ids, existing_ids, committed_new_count = result
@@ -467,7 +471,7 @@ class DeltaSyncWorker:
         return len(outcome.rows)
 
     def _commit_delta_transaction(
-        self, dialog_id: int, outcome: _DeltaFetchOutcome, continuation_required: bool, now: int
+        self, dialog_id: int, outcome: _DeltaFetchOutcome, continuation_required: bool, now: int, generation: int
     ) -> tuple[list[int], set[int], int] | None:
         with write_transaction(self._conn):
             unique_message_ids, existing_ids = self._existing_delta_message_ids(dialog_id, outcome.rows)
@@ -482,9 +486,15 @@ class DeltaSyncWorker:
                 (next_cursor, dialog_id),
             )
             if continuation_required:
-                self._conn.execute(_REQUEST_DELTA_CONTINUATION_SQL, (now, dialog_id, dialog_id))
+                if (
+                    self._conn.execute(
+                        "SELECT delta_refresh_requested_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+                    ).fetchone()[0]
+                    is None
+                ):
+                    request_delta_refresh(self._conn, dialog_id, now)
             else:
-                self._stamp_delta_checkpoint(dialog_id, now)
+                self._stamp_delta_checkpoint(dialog_id, now, generation)
         return unique_message_ids, existing_ids, committed_new_count
 
     def _existing_delta_message_ids(
@@ -629,14 +639,25 @@ class DeltaGapFillDemandAdapter:
 
     def _ordinary_candidate(self, now: float) -> tuple[float, int] | None:
         rows = cast(
-            list[tuple[int, int | None, int | None, int | None, int | None]],
+            list[tuple[int, int | None, int | None, int | None, int | None, int | None]],
             self._worker._conn.execute(_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL).fetchall(),
         )
+        cursor_row = cast(
+            tuple[str] | None,
+            self._worker._conn.execute("SELECT value FROM daemon_state WHERE key='delta_peer_cursor'").fetchone(),
+        )
+        peer_cursor = int(cursor_row[0]) if cursor_row else 0
         candidates = [
-            (0.0 if cursor is None else _delta_release_at(last_synced, last_checked, requested), int(dialog_id))
-            for dialog_id, last_synced, last_checked, requested, cursor in rows
+            (
+                max(0.0 if cursor is None else _delta_release_at(last_synced, last_checked, requested), retry or 0),
+                int(dialog_id),
+            )
+            for dialog_id, last_synced, last_checked, requested, cursor, retry in rows
         ]
-        return min(candidates, key=lambda candidate: (candidate[0], candidate[1])) if candidates else None
+        ready = [candidate for candidate in candidates if candidate[0] <= now]
+        if ready:
+            return min(ready, key=lambda candidate: (candidate[1] <= peer_cursor, candidate[1]))
+        return min(candidates) if candidates else None
 
     def status(self, now: float) -> DemandStatus | None:
         """Report the oldest local delta release boundary without writes."""
@@ -655,7 +676,25 @@ class DeltaGapFillDemandAdapter:
             return
         with demand_context(DemandKind.DELTA_GAP_FILL):
             with rpc_attempt_budget(budget):
-                await self._run_forward_slice(budget, candidate[1])
+                dialog_id = candidate[1]
+                with write_transaction(self._worker._conn):
+                    self._worker._conn.execute(
+                        "INSERT OR REPLACE INTO daemon_state(key,value) VALUES('delta_peer_cursor',?)",
+                        (str(dialog_id),),
+                    )
+                try:
+                    await self._run_forward_slice(budget, dialog_id)
+                except MessageHistoryUnavailableError, TimeoutError:
+                    with write_transaction(self._worker._conn):
+                        self._worker._conn.execute(
+                            "UPDATE synced_dialogs SET delta_retry_at=? WHERE dialog_id=?",
+                            (int(time.time()) + 60, dialog_id),
+                        )
+                else:
+                    with write_transaction(self._worker._conn):
+                        self._worker._conn.execute(
+                            "UPDATE synced_dialogs SET delta_retry_at=NULL WHERE dialog_id=?", (dialog_id,)
+                        )
 
 
 class DmDeletionReconciliationDemandAdapter:

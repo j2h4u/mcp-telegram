@@ -281,7 +281,8 @@ class TelegramDemandCoordinator:
         self._active_kind = kind
         self._observe("selected", kind, queue_age_seconds=max(0.0, selected_at - queued_at), status=status)
         try:
-            await self._adapters[kind].run_slice(budget)
+            async with asyncio.timeout(contract.admission_timeout_seconds):
+                await self._adapters[kind].run_slice(budget)
         except asyncio.CancelledError:
             raise
         except RpcAdmissionClosedError:

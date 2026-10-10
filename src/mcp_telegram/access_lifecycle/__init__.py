@@ -42,13 +42,14 @@ def _rearm_terminal_reaction_details(conn: sqlite3.Connection, dialog_id: int, n
     )
 
 
-def set_access_lost(
+def set_access_lost(  # noqa: PLR0913
     conn: sqlite3.Connection,
     dialog_id: int,
     now: int,
     *,
     reason: str | None = None,
     evidence: AccessLossEvidence | None = None,
+    refresh_generation: int | None = None,
 ) -> bool:
     """Atomically mark a peer inaccessible and hide its local snapshot."""
     changed = False
@@ -66,8 +67,8 @@ def set_access_lost(
             )
         else:
             conn.execute(
-                "UPDATE synced_dialogs SET status = 'access_lost', access_lost_at = ?, delta_refresh_requested_at = NULL WHERE dialog_id = ?",
-                (now, dialog_id),
+                "UPDATE synced_dialogs SET status = 'access_lost', access_lost_at = ?, delta_refresh_requested_at = CASE WHEN ? IS NULL OR delta_refresh_generation=? THEN NULL ELSE delta_refresh_requested_at END WHERE dialog_id = ?",
+                (now, refresh_generation, refresh_generation, dialog_id),
             )
         reset_read_position_retry(conn, dialog_id)
         _purge_hydration_jobs(conn, dialog_id)

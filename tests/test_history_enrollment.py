@@ -25,7 +25,7 @@ def conn() -> sqlite3.Connection:
             dialog_id INTEGER PRIMARY KEY,
             status TEXT NOT NULL,
             sync_progress INTEGER,
-            delta_refresh_requested_at INTEGER,
+            delta_refresh_requested_at INTEGER, delta_refresh_generation INTEGER NOT NULL DEFAULT 0,
             read_position_next_attempt_at INTEGER,
             read_position_attempt_count INTEGER NOT NULL DEFAULT 0
         );

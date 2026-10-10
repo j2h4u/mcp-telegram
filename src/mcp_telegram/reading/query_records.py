@@ -7,7 +7,7 @@ from typing import cast
 
 from ..media_fact import decode_media_fact, media_description
 from ..message_composition import decode_formatting_entities, decode_service_action
-from ..models import ContentKind, ReadMessage
+from ..models import ContentKind, ReadMessage, ReadReactionEvent
 
 
 def _row_value(row: object, key: str, default: object | None = None) -> object | None:
@@ -63,6 +63,11 @@ def read_message_from_row(row: Mapping[str, object] | object, *, reactions_displ
         post_author=cast(str | None, _row_value(row, "post_author")),
         read_at=_coerce_optional_int(_row_value(row, "read_at")),
         reactions_display=reactions_display,
+        reaction_events=tuple(
+            event if isinstance(event, ReadReactionEvent) else ReadReactionEvent(**event)
+            for event in cast(tuple[ReadReactionEvent | dict, ...], _row_value(row, "reaction_events") or ())
+        ),
+        reaction_events_status=cast(str, _row_value(row, "reaction_events_status") or "unavailable"),
         dialog_name=cast(str | None, _row_value(row, "dialog_name")),
         dialog_name_source=cast(str | None, _row_value(row, "dialog_name_source")),
     )

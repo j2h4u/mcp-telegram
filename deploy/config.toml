@@ -25,7 +25,6 @@ foreground_resolve_seconds = 3.0
 foreground_refresh_wait_seconds = 15.0
 rpc_timeout_seconds = 8.0
 refresh_timeout_seconds = 25.0
-max_concurrent_refreshes = 1
 max_queued_refreshes = 128
 
 [telemetry]

@@ -4026,3 +4026,25 @@ async def test_telethon_update_child_task_owns_realtime_scope(monkeypatch: pytes
     await child
 
     assert seen == [(DemandKind.REALTIME_EVENT_ACQUISITION, TelegramRpcSource.REALTIME_EVENT, child, child)]
+
+
+@pytest.mark.asyncio
+async def test_execution_deadline_keeps_raw_response_lease_until_completion() -> None:
+    gate = _gate()
+    sender = _RawFutureSender()
+    gate._main_sender = sender
+    with rpc_scope(TelegramRpcSource.MCP_INTERACTIVE, timeout_seconds=0.005):
+        with pytest.raises(TimeoutError):
+            await gate(_TestRequest("slow"))
+    assert sender.calls == 1
+    raw_future = sender.futures[0]
+    assert not raw_future.done()
+    assert gate._admission_scheduler.active_depths()[RpcServiceClass.INTERACTIVE] == 1
+    await asyncio.sleep(0.05)
+    assert not raw_future.done()
+    raw_future.set_result("late success")
+    await _wait_for(lambda: not gate._pending_scalar_dispatches)
+    assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
+    gate._finalize_scalar_dispatch(raw_future)
+    assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
+    await gate.close_rpc_scheduler()

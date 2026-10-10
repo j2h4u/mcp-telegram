@@ -508,3 +508,42 @@ def _restore_link_callback(
         shutdown.set()
 
     return restore_link
+
+
+@pytest.mark.asyncio
+async def test_callback_execution_deadline_resumes_sibling_demand(monkeypatch: pytest.MonkeyPatch) -> None:
+    from dataclasses import replace
+
+    import mcp_telegram.telegram_demand_coordinator as module
+
+    target, sibling = DURABLE_DEMAND_ORDER[:2]
+    adapters = _adapters({target: DemandStatus(0), sibling: DemandStatus(0)})
+    contract = module.demand_contract
+    monkeypatch.setattr(
+        module,
+        "demand_contract",
+        lambda kind: replace(
+            contract(kind),
+            admission_timeout_seconds=0.005,
+        ),
+    )
+    cancelled = asyncio.Event()
+    shutdown = asyncio.Event()
+
+    async def slow_slice() -> None:
+        try:
+            await asyncio.sleep(0.05)
+        finally:
+            cancelled.set()
+
+    async def sibling_slice() -> None:
+        shutdown.set()
+
+    adapters[target].on_run = slow_slice
+    adapters[sibling].on_run = sibling_slice
+    coordinator = TelegramDemandCoordinator(adapters, shutdown, clock=_Clock())
+    await asyncio.wait_for(coordinator.run(), 0.5)
+    assert cancelled.is_set()
+    assert len(adapters[target].run_calls) == 1
+    assert len(adapters[sibling].run_calls) == 1
+    assert coordinator.state is CoordinatorState.STOPPED

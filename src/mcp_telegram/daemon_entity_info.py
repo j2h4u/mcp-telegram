@@ -848,7 +848,8 @@ class DaemonEntityInfoService:
         """Acquire one legacy group envelope for independent profile projections."""
         context = self._profile_section_context(cursor, DialogType.GROUP)
         try:
-            full_profile, contact_overlap = await self._acquire_group_full_chat_pair(cursor)
+            async with asyncio.timeout(self._deps.refresh_limits.per_rpc_seconds):
+                full_profile, contact_overlap = await self._acquire_group_full_chat_pair(cursor)
         except RpcAttemptBudgetExhaustedError:
             self._observe_profile_section_failure(cursor, DialogType.GROUP, actual_attempts=0)
             raise
@@ -1043,10 +1044,11 @@ class DaemonEntityInfoService:
         context = self._profile_section_context(cursor, entity_type)
         identity_baseline = capture_identity_baseline(self._deps.conn, cursor.entity_id)
         try:
-            if entity_type is DialogType.CHANNEL and cursor.next_section == "full_profile":
-                result = await self._acquire_profile_section(cursor, entity_type, context=context)
-            else:
-                result = await self._acquire_profile_section(cursor, entity_type)
+            async with asyncio.timeout(self._deps.refresh_limits.per_rpc_seconds):
+                if entity_type is DialogType.CHANNEL and cursor.next_section == "full_profile":
+                    result = await self._acquire_profile_section(cursor, entity_type, context=context)
+                else:
+                    result = await self._acquire_profile_section(cursor, entity_type)
         except RpcAttemptBudgetExhaustedError:
             self._observe_profile_section_failure(cursor, entity_type, actual_attempts=0)
             raise
@@ -1204,7 +1206,8 @@ class DaemonEntityInfoService:
         attempt_start = self._rpc_attempt_count()
         pair_mode = cursor.pair_mode or "enabled"
         try:
-            full_profile, personal_channel = await self._acquire_full_user_pair(cursor)
+            async with asyncio.timeout(self._deps.refresh_limits.per_rpc_seconds):
+                full_profile, personal_channel = await self._acquire_full_user_pair(cursor)
         except RpcAttemptBudgetExhaustedError:
             self._record_full_user_pair_failure(cursor, pair_mode, attempt_start, reuse_rejection_reason)
             raise
@@ -2733,7 +2736,8 @@ class DaemonEntityInfoService:
 
     async def _resolve_entity(self, entity_id: int) -> tuple[object | None, dict[str, object] | None]:
         try:
-            entity = await self._deps.client.get_entity(entity_id)
+            async with asyncio.timeout(self._deps.refresh_limits.per_rpc_seconds):
+                entity = await self._deps.client.get_entity(entity_id)
         except (ValueError, KeyError, *_ENTITY_NOT_FOUND_ERRORS) as exc:
             self._deps.logger.warning(
                 "entity_info entity_not_found entity_id=%r error=%s%s",

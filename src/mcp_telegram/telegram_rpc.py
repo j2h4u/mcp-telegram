@@ -190,7 +190,8 @@ class _AdmissionAwareSender:
                 raw_future = self._start_dispatched_send(request, ordered=ordered, admission=admission)
                 completion_transferred = True
                 with timing_phase("rpc_execution"):
-                    await asyncio.wait({raw_future})
+                    async with asyncio.timeout_at(self._scope.deadline):
+                        await asyncio.wait({raw_future})
                     return raw_future.result()
             finally:
                 if not completion_transferred:

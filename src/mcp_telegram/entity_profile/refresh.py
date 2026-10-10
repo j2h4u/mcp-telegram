@@ -53,7 +53,6 @@ class RefreshLimits:
     foreground_resolve_seconds: float = 3.0
     per_rpc_seconds: float = 8.0
     whole_refresh_seconds: float = 25.0
-    max_concurrent_refreshes: int = 1
     max_queued_refreshes: int = 128
     foreground_refresh_wait_seconds: float = 15.0
 
@@ -69,7 +68,6 @@ class RefreshLimits:
             raise ValueError("foreground resolve budget cannot exceed per-RPC budget")
         if self.per_rpc_seconds > self.whole_refresh_seconds:
             raise ValueError("per-RPC budget cannot exceed whole-refresh budget")
-        _validate_positive_integer(self.max_concurrent_refreshes, "refresh concurrency")
         _validate_positive_integer(self.max_queued_refreshes, "refresh queue capacity")
 
 
@@ -160,7 +158,10 @@ class EntityRefreshCoordinator:
             return None
         if self._durable_slice_callback is None:
             return None
-        return await self._durable_slice_callback(budget)
+        timeout_seconds = self._limits.per_rpc_seconds
+        with rpc_scope(TelegramRpcSource.ENTITY_INFO_REFRESH, timeout_seconds=timeout_seconds):
+            async with asyncio.timeout(self._limits.whole_refresh_seconds):
+                return await self._durable_slice_callback(budget)
 
     async def wait_for_completion(self, entity_id: int, timeout_seconds: float) -> bool:
         """Wait for an admitted refresh; true only when the wait ended normally."""

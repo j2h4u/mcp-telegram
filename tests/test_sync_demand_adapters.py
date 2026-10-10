@@ -32,7 +32,6 @@ from mcp_telegram.dialog_sync import DialogLightReconciliationDemandAdapter, Dia
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.message_history.contracts import (
     MessageHistoryAccessLostError,
-    MessageHistoryUnavailableError,
 )
 from mcp_telegram.message_history.ports import ForwardGapPagePort, FullHistoryPagePort
 from mcp_telegram.message_history.telegram_adapter import (
@@ -1168,14 +1167,30 @@ async def test_delta_gap_adapter_propagates_coordinator_outcomes_without_checkpo
         DeltaSyncWorker(TelethonForwardGapPageAdapter(_ForwardHistoryClient(send_history)), conn, asyncio.Event())
     )
 
-    expected_failure = MessageHistoryUnavailableError if failure_type is RPCError else failure_type
-    with pytest.raises(expected_failure):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
+        if failure_type is RPCError:
+            await adapter.run_slice(RpcAttemptBudget(limit=1))
+        else:
+            with pytest.raises(failure_type):
+                await adapter.run_slice(RpcAttemptBudget(limit=1))
     assert conn.execute(
         "SELECT delta_refresh_requested_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id=?",
         (dialog_id,),
     ).fetchone() == (1, None)
-    assert adapter.status(1000.0).is_ready(1000.0)  # type: ignore[union-attr]
+    if failure_type is RPCError:
+        assert conn.execute("SELECT delta_retry_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+            1060,
+        )
+        assert not adapter.status(1000.0).is_ready(1000.0)  # type: ignore[union-attr]
+        restarted = DeltaGapFillDemandAdapter(
+            DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event())
+        )
+        assert restarted.status(1060.0).is_ready(1060.0)  # type: ignore[union-attr]
+    else:
+        assert conn.execute("SELECT delta_retry_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+            None,
+        )
+        assert adapter.status(1000.0).is_ready(1000.0)  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio
@@ -1203,12 +1218,15 @@ async def test_full_sync_total_repair_uses_durable_retry_boundary(conn: sqlite3.
     )
     adapter = FullSyncDemandAdapter(worker)
     with patch("mcp_telegram.sync_worker.time.time", return_value=1000):
-        with pytest.raises(MessageHistoryUnavailableError):
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
     assert calls == 1
     assert conn.execute(
-        "SELECT value FROM daemon_state WHERE key='full_sync_total_messages_repair_retry_at'"
-    ).fetchone() == ("1060",)
+        "SELECT full_sync_retry_at,total_messages FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (1060, None)
+    assert (
+        conn.execute("SELECT value FROM daemon_state WHERE key='full_sync_total_messages_repair_retry_at'").fetchone()
+        is None
+    )
 
     with patch("mcp_telegram.sync_worker.time.time", return_value=1001):
         assert adapter.status(1001.0).release_at == 1060.0  # type: ignore[union-attr]
@@ -1249,7 +1267,7 @@ async def test_full_sync_total_repair_persists_access_loss_reason(conn: sqlite3.
 
 
 @pytest.mark.asyncio
-async def test_full_sync_page_adapter_propagates_rpc_failure_and_preserves_progress(conn: sqlite3.Connection) -> None:
+async def test_full_sync_page_adapter_defers_failed_peer_and_preserves_progress(conn: sqlite3.Connection) -> None:
     dialog_id = 207
     _seed_history_dialog(conn, dialog_id, status="syncing")
     conn.execute("UPDATE synced_dialogs SET sync_progress=77 WHERE dialog_id=?", (dialog_id,))
@@ -1260,8 +1278,13 @@ async def test_full_sync_page_adapter_propagates_rpc_failure_and_preserves_progr
 
     client = _RawHistoryClient(get_messages)
     adapter = FullSyncDemandAdapter(FullSyncWorker(TelethonFullHistoryPageAdapter(client), conn, asyncio.Event()))
-    with pytest.raises(MessageHistoryUnavailableError):
+    with patch("mcp_telegram.sync_worker.time.time", return_value=1000):
         await adapter.run_slice(RpcAttemptBudget(limit=1))
+    assert conn.execute("SELECT full_sync_retry_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        1060,
+    )
+    with patch("mcp_telegram.sync_worker.time.time", return_value=1001):
+        assert not adapter.status(1001.0).is_ready(1001.0)  # type: ignore[union-attr]
     assert conn.execute(
         "SELECT status, sync_progress FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
     ).fetchone() == (

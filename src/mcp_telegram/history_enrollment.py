@@ -57,6 +57,16 @@ _ENROLLMENT_SOURCES = frozenset(
 )
 
 
+def request_delta_refresh(conn: sqlite3.Connection, dialog_id: int, now: int) -> None:
+    """Queue a new refresh generation in the caller's write unit."""
+    require_write_transaction(conn)
+    conn.execute(
+        "UPDATE synced_dialogs SET delta_refresh_requested_at=?, "
+        "delta_refresh_generation=delta_refresh_generation+1 WHERE dialog_id=?",
+        (now, dialog_id),
+    )
+
+
 def reset_read_position_retry(conn: sqlite3.Connection, dialog_id: int) -> int:
     """Clear reconciliation backoff when enrollment or access makes work relevant."""
     require_write_transaction(conn)
@@ -214,10 +224,7 @@ def enable_history(
             )
             coverage = decision.next_status
         elif decision.action == "request_delta_refresh":
-            conn.execute(
-                "UPDATE synced_dialogs SET delta_refresh_requested_at = ? WHERE dialog_id = ?",
-                (timestamp, dialog_id),
-            )
+            request_delta_refresh(conn, dialog_id, timestamp)
         return _outcome(
             dialog_id,
             enabled=True,
@@ -337,6 +344,7 @@ __all__ = [
     "full_history_enabled",
     "read_intent",
     "record_automatic_group_decision",
+    "request_delta_refresh",
     "reset_read_position_retry",
     "restore_access_status",
 ]

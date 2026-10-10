@@ -181,9 +181,9 @@ def _stored_message_deleted(state: tuple[int, int, int] | None, current: tuple[i
 def _follows_stored_observation(state: tuple[int, int, int] | None, order: int | None, source_rank: int) -> bool:
     if state is None:
         return True
-    if source_rank < state[2]:
-        return False
-    return order is None or order >= state[0]
+    if order is not None and order != state[0]:
+        return order > state[0]
+    return source_rank >= state[2]
 
 
 def persist_edited_message(  # noqa: PLR0913

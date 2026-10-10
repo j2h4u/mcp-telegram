@@ -2119,9 +2119,8 @@ def test_migration_v63_repairs_positive_synced_dialog_orphans(tmp_path: Path) ->
             (12347,),
         )
         conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (?, 'synced')", (12347,))
-        remove_v80_schema_for_historical_fixture(conn)
-        conn.execute("DELETE FROM schema_version WHERE version = 63")
         conn.commit()
+        sync_db_module._apply_migration_63(conn, 62)
 
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
@@ -3166,3 +3165,40 @@ def test_v79_upgrade_without_fts_cache_rebuilds_only_live_messages(db_path: Path
         assert backfill_fts_index(conn) == 1
         assert conn.execute("SELECT dialog_id,message_id FROM messages_fts").fetchall() == [(42, 1)]
         assert backfill_fts_index(conn) == 0
+
+
+def test_v81_refresh_generation_preserves_legacy_request_and_cursor(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    conn = _open_sync_db(path)
+    conn.execute(
+        "INSERT INTO synced_dialogs(dialog_id,status,delta_refresh_requested_at,delta_message_id) VALUES (1,'synced',100,42),(2,'synced',NULL,7)"
+    )
+    for column in ("delta_refresh_generation", "full_sync_retry_at", "delta_retry_at"):
+        conn.execute(f"ALTER TABLE synced_dialogs DROP COLUMN {column}")
+    conn.execute("DELETE FROM schema_version WHERE version=81")
+    conn.commit()
+    conn.close()
+    ensure_sync_schema(path)
+    conn = _open_sync_db(path)
+    assert conn.execute(
+        "SELECT dialog_id,delta_refresh_requested_at,delta_refresh_generation,delta_message_id,full_sync_retry_at,delta_retry_at FROM synced_dialogs ORDER BY dialog_id"
+    ).fetchall() == [(1, 100, 1, 42, None, None), (2, None, 0, 7, None, None)]
+    conn.close()
+
+
+def test_v81_upgrade_is_idempotent_and_preserves_request_generation(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    conn = _open_sync_db(path)
+    conn.execute(
+        "INSERT INTO synced_dialogs(dialog_id,status,delta_refresh_requested_at,delta_refresh_generation) VALUES (1,'synced',100,9)"
+    )
+    conn.commit()
+    conn.close()
+    ensure_sync_schema(path)
+    conn = _open_sync_db(path)
+    assert conn.execute(
+        "SELECT delta_refresh_requested_at,delta_refresh_generation FROM synced_dialogs WHERE dialog_id=1"
+    ).fetchone() == (100, 9)
+    conn.close()

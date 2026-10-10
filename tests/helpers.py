@@ -319,10 +319,16 @@ def remove_v80_schema_for_historical_fixture(conn: sqlite3.Connection) -> None:
         "nonchannel_message_deletions",
     ):
         conn.execute(f"DROP TABLE IF EXISTS {table}")
-    for table, column in (("synced_dialogs", "delta_message_id"), ("topic_metadata", "observation_order")):
+    for table, column in (
+        ("synced_dialogs", "delta_refresh_generation"),
+        ("synced_dialogs", "full_sync_retry_at"),
+        ("synced_dialogs", "delta_retry_at"),
+        ("synced_dialogs", "delta_message_id"),
+        ("topic_metadata", "observation_order"),
+    ):
         rows = cast(
             list[tuple[int, str, str, int, str | None, int]], conn.execute(f"PRAGMA table_info({table})").fetchall()
         )
         if column in {row[1] for row in rows}:
             conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
-    conn.execute("DELETE FROM schema_version WHERE version=80")
+    conn.execute("DELETE FROM schema_version WHERE version>=80")

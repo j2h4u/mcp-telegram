@@ -21,7 +21,7 @@ from mcp.types import CallToolResult, Prompt, TextContent, Tool
 from mcp_telegram import server
 from mcp_telegram.daemon_client import AccountProtectionError
 from mcp_telegram.request_timing import is_valid_operation_id
-from mcp_telegram.tools._base import ToolRegistryEntry, ToolResult, tool_description
+from mcp_telegram.tools._base import ToolRegistryEntry, ToolResult, error_result, tool_description
 from mcp_telegram.tools.discovery import ListDialogs
 
 INVENTORY_PATH = Path(__file__).parent / "fixtures" / "52-TOOL-OUTPUT-INVENTORY.md"
@@ -924,6 +924,32 @@ def test_expected_tool_error_completion_remains_info(
     assert records[0].levelno == logging.INFO
     assert "tool_error" in records[0].getMessage()
     assert "error=invalid_query" in records[0].getMessage()
+
+
+def test_tool_error_action_is_projected_to_structured_error_action() -> None:
+    action = "Retry with an exact dialog id from structuredContent.error.details.candidates."
+    tool_result = error_result(f"Multiple dialogs match.\nAction: {action}", error_code="ambiguous_dialog")
+
+    result = server._project_tool_result("list_dialogs", tool_result, server._CallTelemetry(), 10.0)
+
+    assert result.is_error is True
+    payload = cast(dict[str, object], result.structured_content)
+    error = cast(dict[str, object], payload["error"])
+    assert error == {
+        "code": "ambiguous_dialog",
+        "message": "Multiple dialogs match.",
+        "action": action,
+    }
+
+
+def test_tool_error_without_action_uses_valid_fallback() -> None:
+    tool_result = error_result("Request failed.", error_code="tool_error")
+
+    result = server._project_tool_result("list_dialogs", tool_result, server._CallTelemetry(), 10.0)
+
+    payload = cast(dict[str, object], result.structured_content)
+    error = cast(dict[str, object], payload["error"])
+    assert error["action"] == "Check the tool response and retry."
 
 
 def test_http_server_rejects_non_loopback_bind_without_explicit_opt_in(

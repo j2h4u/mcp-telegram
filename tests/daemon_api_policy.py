@@ -25,6 +25,5 @@ def make_daemon_api_policy() -> DaemonApiPolicy:
             foreground_refresh_wait_seconds=entity_profile.foreground_refresh_wait_seconds,
             per_rpc_seconds=entity_profile.rpc_timeout_seconds,
             whole_refresh_seconds=entity_profile.refresh_timeout_seconds,
-            max_concurrent_refreshes=entity_profile.max_concurrent_refreshes,
         ),
     )

@@ -335,4 +335,4 @@ def test_uncached_telegram_projection_derives_sender_and_reaction_display() -> N
     projected = message_to_dict(cast(MessageLike, message), dialog_id=7, self_id=100)
 
     assert projected["effective_sender_id"] == 100
-    assert projected["reactions_display"] == "[👍×2]"
+    assert projected["reactions_display"] == "[👍×2 custom:123×1]"

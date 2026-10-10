@@ -64,7 +64,9 @@ from .sqlite_projection import (
     _LIST_DIALOGS_SQL,
     _LIST_MESSAGES_BASE_SQL,
     _READ_POSITION_PENDING_IDENTITIES_SQL,
+    _SELECT_FTS_ALL_CHRONOLOGICAL_SQL,
     _SELECT_FTS_ALL_SQL,
+    _SELECT_FTS_CHRONOLOGICAL_SQL,
     _SELECT_FTS_SQL,
     _SELECT_SYNC_STATUS_SQL,
     _UNREAD_SUMMARY_SQL,
@@ -962,7 +964,7 @@ class ReadingService:
         with timing_phase("local_projection"):
             rows = _fetchall_rows(
                 self._conn.execute(
-                    _SELECT_FTS_ALL_SQL,
+                    _SELECT_FTS_ALL_CHRONOLOGICAL_SQL if request.message_state == "all" else _SELECT_FTS_ALL_SQL,
                     {
                         "query": stemmed,
                         "limit": request.limit,
@@ -1005,7 +1007,7 @@ class ReadingService:
         with timing_phase("local_projection"):
             rows = _fetchall_rows(
                 self._conn.execute(
-                    _SELECT_FTS_SQL,
+                    _SELECT_FTS_CHRONOLOGICAL_SQL if request.message_state == "all" else _SELECT_FTS_SQL,
                     {
                         "query": stemmed,
                         "dialog_id": request.dialog_id,
@@ -1184,7 +1186,17 @@ class ReadingService:
         sent_data = sent_result.get("data", {})
         scheduled_data = scheduled_result.get("data", {})
         rows = [*sent_data.get("messages", []), *scheduled_data.get("messages", [])]
-        rows.sort(key=lambda row: (int(row.get("sent_at") or 0), int(row.get("message_id") or 0)))
+        rows = list(
+            {(row["dialog_id"], row.get("message_state", "sent"), row["message_id"]): row for row in rows}.values()
+        )
+        rows.sort(
+            key=lambda row: (
+                int(row.get("sent_at") or 0),
+                int(row["message_id"]),
+                int(row["dialog_id"]),
+                row.get("message_state", "sent"),
+            )
+        )
         page = rows[request.offset : request.offset + request.limit]
         next_navigation = (
             encode_search_navigation(
@@ -2327,7 +2339,7 @@ class ReadingService:
             return self._attach_directory_coverage(self._search_scheduled_messages(request), directory_coverage)
         if request.message_state == "all":
             sent_result = await self._search_messages_scoped_result(
-                dataclasses.replace(request, message_state="sent", offset=0, limit=request.offset + request.limit),
+                dataclasses.replace(request, offset=0, limit=request.offset + request.limit),
                 stemmed,
             )
             return self._attach_directory_coverage(
@@ -2382,7 +2394,7 @@ class ReadingService:
         if global_mode and request.message_state == "all":
             return self._merge_search_results(
                 await self._search_messages_global_result(
-                    dataclasses.replace(request, message_state="sent", offset=0, limit=request.offset + request.limit),
+                    dataclasses.replace(request, offset=0, limit=request.offset + request.limit),
                     stemmed,
                 ),
                 self._search_scheduled_messages(

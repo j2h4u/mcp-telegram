@@ -92,17 +92,6 @@ def stem_query(query: str) -> str:
     return " ".join(quoted)
 
 
-def _row_first_int(row: tuple[object | None, ...] | None) -> int:
-    if row is None:
-        return 0
-    value = row[0]
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.isdecimal():
-        return int(value)
-    return 0
-
-
 def backfill_fts_index(conn: sqlite3.Connection) -> int:
     """Repair live key coverage and remove duplicate/deleted rows in bounded batches."""
     with write_transaction(conn):

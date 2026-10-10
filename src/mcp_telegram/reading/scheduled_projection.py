@@ -15,8 +15,7 @@ SCHEDULED_MESSAGES_FTS_TABLE_SQL = (
     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'scheduled_messages_fts'"
 )
 
-_SCHEDULED_MESSAGE_SELECT_SQL = """
-SELECT
+_SCHEDULED_MESSAGE_COLUMNS_SQL = """
     sm.message_id AS message_id,
     sm.scheduled_at AS sent_at,
     sm.text,
@@ -42,6 +41,8 @@ SELECT
     sm.service_action,
     sm.formatting_entities
 """
+_SCHEDULED_MESSAGE_SELECT_SQL = "SELECT" + _SCHEDULED_MESSAGE_COLUMNS_SQL
+_SCHEDULED_MESSAGE_SEARCH_SELECT_SQL = "SELECT DISTINCT" + _SCHEDULED_MESSAGE_COLUMNS_SQL
 _SCHEDULED_MESSAGE_LIST_FROM_SQL = """
 FROM scheduled_messages sm
 """
@@ -212,11 +213,11 @@ def build_scheduled_search_query(  # noqa: PLR0913
             clauses.append("sm.dialog_id IN (" + ", ".join(names) + ")")
             params.update({"own_scope_" + str(index): value for index, value in enumerate(own_dialog_ids)})
     sql = (
-        _SCHEDULED_MESSAGE_SELECT_SQL
+        _SCHEDULED_MESSAGE_SEARCH_SELECT_SQL
         + _SCHEDULED_MESSAGE_SEARCH_FROM_SQL
         + "WHERE "
         + " AND ".join(clauses)
-        + " ORDER BY sm.scheduled_at ASC, sm.message_id ASC LIMIT :limit OFFSET :offset"
+        + " ORDER BY sm.scheduled_at ASC, sm.message_id ASC, sm.dialog_id ASC LIMIT :limit OFFSET :offset"
     )
     return sql, params
 

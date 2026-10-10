@@ -268,7 +268,7 @@ async def test_get_entity_info_waits_for_fresh_profile_after_cache_miss() -> Non
 @pytest.mark.asyncio
 async def test_refresh_coordinator_reports_coalescing_and_queue_saturation() -> None:
     coordinator = EntityRefreshCoordinator(
-        limits=RefreshLimits(max_concurrent_refreshes=1, max_queued_refreshes=1),
+        limits=RefreshLimits(max_queued_refreshes=1),
     )
     assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
     assert coordinator.enqueue(42) is RefreshEnqueueResult.COALESCED
@@ -290,7 +290,7 @@ async def test_rejected_refresh_is_not_reported_as_queued() -> None:
     _sections_schema(conn)
     service = _test_service(
         conn,
-        limits=RefreshLimits(max_concurrent_refreshes=1, max_queued_refreshes=1),
+        limits=RefreshLimits(max_queued_refreshes=1),
     )
     service._deps = replace(service._deps, get_dialog_placement=lambda _entity_id: {})
     assert service._refresh is not None
@@ -337,7 +337,7 @@ async def test_progressive_miss_persists_rejected_admission() -> None:
     _sections_schema(conn)
     service = _test_service(
         conn,
-        limits=RefreshLimits(max_concurrent_refreshes=1, max_queued_refreshes=1),
+        limits=RefreshLimits(max_queued_refreshes=1),
     )
     service._deps = replace(
         service._deps,
@@ -378,7 +378,7 @@ async def test_self_profile_rejection_persists_unavailable_sections() -> None:
     _sections_schema(conn)
     service = _test_service(
         conn,
-        limits=RefreshLimits(max_concurrent_refreshes=1, max_queued_refreshes=1),
+        limits=RefreshLimits(max_queued_refreshes=1),
     )
     service._deps = replace(
         service._deps,
@@ -2087,6 +2087,8 @@ def test_progressive_projection_schema_upgrades_from_v56(tmp_path: Path, request
     with write_savepoint(conn):
         conn.execute("DELETE FROM schema_version WHERE version = 57")
     conn.commit()
+    _apply_migration_57(conn, 56)
+    conn.commit()
     _apply_migrations(conn)
     assert conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_detail_sections'"
@@ -2117,3 +2119,106 @@ def test_progressive_payload_validates_against_real_mcp_schema() -> None:
         resolution="exact_id",
     )
     validate(instance=payload, schema=GET_ENTITY_INFO_OUTPUT_SCHEMA)
+
+
+@pytest.mark.asyncio
+async def test_configured_whole_refresh_timeout_bounds_non_rpc_callback() -> None:
+    coordinator = EntityRefreshCoordinator(
+        limits=RefreshLimits(
+            foreground_resolve_seconds=0.001,
+            per_rpc_seconds=0.005,
+            whole_refresh_seconds=0.005,
+        )
+    )
+    cancelled = asyncio.Event()
+
+    async def slow_slice(budget: RpcAttemptBudget) -> DurableRefreshSliceResult | None:
+        try:
+            await asyncio.sleep(0.05)
+        finally:
+            cancelled.set()
+        return None
+
+    coordinator.bind_durable_executor(lambda now: DemandStatus(0), slow_slice)
+    with pytest.raises(TimeoutError):
+        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    assert cancelled.is_set()
+    assert not coordinator.is_closed
+    await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("known", [False, True])
+async def test_entity_acquisition_timeout_persists_retry_and_keeps_cursor(known: bool) -> None:
+    conn = sqlite3.connect(":memory:")
+    _apply_migrations(conn)
+    conn.commit()
+    limits = RefreshLimits(
+        foreground_resolve_seconds=0.001,
+        per_rpc_seconds=0.005,
+        whole_refresh_seconds=0.1,
+    )
+    service = _test_service(conn, limits=limits)
+
+    class SlowClient(_UnusedClient):
+        async def get_entity(self, entity_id: int) -> object:
+            await asyncio.sleep(0.05)
+            return User(id=42, first_name="Slow")
+
+        async def __call__(self, request: object) -> object:
+            await asyncio.sleep(0.05)
+            return SimpleNamespace(full_user=SimpleNamespace(about="late"), users=[], chats=[])
+
+    service._deps = replace(service._deps, client=SlowClient(), user_profile_port=_UserProfilePort(SlowClient()))
+    if known:
+        with write_savepoint(conn):
+            conn.execute("INSERT INTO entities(id,type,name,updated_at) VALUES (42,'user','Known',100)")
+    service._profiles.mark_pending(42, now=100)
+    before = service._profiles.next_due_refresh(now=100)
+    assert before is not None
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    assert service._profiles.next_due_refresh(now=100) is None
+    retried = service._profiles.next_due_refresh(now=160)
+    assert retried is not None
+    assert (retried.entity_id, retried.next_section, retried.acquisition_cursor) == (
+        before.entity_id,
+        before.next_section,
+        before.acquisition_cursor,
+    )
+    await service.shutdown()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_entity_foreground_wait_keeps_persisted_refresh_enrollment() -> None:
+    conn = sqlite3.connect(":memory:")
+    _apply_migrations(conn)
+    conn.commit()
+    service = _test_service(conn, limits=RefreshLimits())
+    service._deps = replace(service._deps, get_dialog_placement=lambda _entity_id: {})
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities(id,type,name,updated_at) VALUES (42,'user','Known',100)")
+    request = asyncio.create_task(service.get_entity_info({"entity_id": 42}))
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    async with asyncio.timeout(0.5):
+        while coordinator.queue_depth == 0:
+            await asyncio.sleep(0)
+    before = service._profiles.next_due_refresh(now=100)
+    assert before is not None
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    after = service._profiles.next_due_refresh(now=100)
+    assert after is not None
+    assert (after.entity_id, after.generation, after.acquisition_cursor) == (
+        before.entity_id,
+        before.generation,
+        before.acquisition_cursor,
+    )
+    assert coordinator.queue_depth == 1
+    assert not coordinator.is_closed
+    await service.shutdown()
+    conn.close()

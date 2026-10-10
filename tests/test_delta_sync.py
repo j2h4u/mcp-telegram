@@ -278,8 +278,15 @@ async def test_page_failures_preserve_checkpoint_and_reach_demand_coordinator(
         "error": RuntimeError("private exception detail"),
     }.get(error_kind, error_kind)
     worker._history_port = _ForwardPort([page_error])
-    with pytest.raises(expected_error):
+    if error_kind == "ordinary":
         await adapter.run_slice(RpcAttemptBudget(limit=1))
+        retry_row = sync_db.execute(
+            "SELECT delta_retry_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+        ).fetchone()
+        assert retry_row is not None and retry_row[0] is not None
+    else:
+        with pytest.raises(expected_error):
+            await adapter.run_slice(RpcAttemptBudget(limit=1))
     assert len(observer.rows) == 1
     observed, reason = observer.rows[0]
     assert observed["slice_count"] == observed["deferred"] + observed["failed"] == 1
@@ -476,3 +483,55 @@ async def test_empty_archive_accepts_new_history(sync_db: _SQLiteConnection) -> 
         == 1
     )
     assert port.calls == [(0, False)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("access_lost", [False, True])
+async def test_terminal_old_page_preserves_same_second_refresh(sync_db: sqlite3.Connection, access_lost: bool) -> None:
+    from mcp_telegram.history_enrollment import request_delta_refresh
+    from mcp_telegram.sync_transactions import write_transaction
+
+    _seed_dialog(cast(_SQLiteConnection, sync_db), 501)
+    with write_transaction(sync_db):
+        request_delta_refresh(sync_db, 501, 100)
+
+    class Port:
+        async def fetch_page(
+            self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
+        ) -> ForwardGapPage:
+            with write_transaction(sync_db):
+                request_delta_refresh(sync_db, dialog_id, 100)
+            if access_lost:
+                raise MessageHistoryAccessLostError("private", reason_code="private")
+            return ForwardGapPage(messages=(), complete=True)
+
+    worker = DeltaSyncWorker(Port(), sync_db, asyncio.Event())
+    await worker.fetch_delta_slice_for_dialog(501)
+    assert sync_db.execute(
+        "SELECT delta_refresh_requested_at,delta_refresh_generation FROM synced_dialogs WHERE dialog_id=501"
+    ).fetchone() == (100, 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [MessageHistoryUnavailableError, TimeoutError])
+async def test_failed_peer_does_not_starve_ready_peer_after_adapter_restart(
+    sync_db: sqlite3.Connection, failure: type[Exception]
+) -> None:
+    _seed_dialog(cast(_SQLiteConnection, sync_db), 1, refresh_requested_at=1)
+    _seed_dialog(cast(_SQLiteConnection, sync_db), 2, refresh_requested_at=1)
+    calls = []
+
+    class Port:
+        async def fetch_page(
+            self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
+        ) -> ForwardGapPage:
+            calls.append(dialog_id)
+            if dialog_id == 1:
+                raise failure("retry")
+            return ForwardGapPage(messages=(), complete=True)
+
+    worker = DeltaSyncWorker(Port(), sync_db, asyncio.Event())
+    await DeltaGapFillDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+    await DeltaGapFillDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+    assert calls == [1, 2]
+    assert sync_db.execute("SELECT delta_retry_at FROM synced_dialogs WHERE dialog_id=1").fetchone()[0] is not None

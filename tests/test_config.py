@@ -91,7 +91,6 @@ foreground_resolve_seconds = 2
 foreground_refresh_wait_seconds = 12
 rpc_timeout_seconds = 6
 refresh_timeout_seconds = 20
-max_concurrent_refreshes = 1
 max_queued_refreshes = 7
 """,
     )
@@ -101,7 +100,6 @@ max_queued_refreshes = 7
         foreground_refresh_wait_seconds=12.0,
         rpc_timeout_seconds=6.0,
         refresh_timeout_seconds=20.0,
-        max_concurrent_refreshes=1,
         max_queued_refreshes=7,
     )
 
@@ -642,4 +640,11 @@ def test_load_config_reports_malformed_toml_with_path(tmp_path: Path) -> None:
     path = _write_config(tmp_path, '[state\ndir = "/state"\n')
 
     with pytest.raises(ConfigError, match=f"Could not read config {path}"):
+        load_config(path)
+
+
+def test_load_config_rejects_removed_entity_refresh_concurrency(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[state]\ndir = "/state"\n\n[entity_profile]\nmax_concurrent_refreshes = 1\n')
+    with pytest.raises(ConfigError, match="max_concurrent_refreshes"):
         load_config(path)

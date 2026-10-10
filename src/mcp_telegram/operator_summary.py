@@ -539,7 +539,9 @@ def _linked_chat_rpc_lines(observations: list[Observation]) -> list[str]:
     total = sum(attempts.values())
     dimensions = ", ".join(
         f"{source}/{demand_kind}{f'/{acquisition}' if acquisition else ''}={count}"
-        for (source, demand_kind, acquisition), count in sorted(attempts.items())
+        for (source, demand_kind, acquisition), count in sorted(
+            attempts.items(), key=lambda item: (*item[0][:2], item[0][2] or "")
+        )
     )
     return [f"GetFullChannel RPC attempts: {total} ({dimensions})"]
 
@@ -581,7 +583,9 @@ def _demand_fields(summary: DemandSummary, labels: tuple[str, ...]) -> list[str]
 
 def _demand_kind_lines(summary: DemandSummary, labels: tuple[str, ...]) -> list[str]:
     lines: list[str] = []
-    for (demand_kind, acquisition_kind), counts in sorted(summary.by_kind.items()):
+    for (demand_kind, acquisition_kind), counts in sorted(
+        summary.by_kind.items(), key=lambda item: (item[0][0], item[0][1] or "")
+    ):
         detail = ", ".join(f"{label.replace('_', ' ')}={counts[label]}" for label in labels if counts.get(label))
         if detail:
             suffix = f"/{acquisition_kind}" if acquisition_kind else ""

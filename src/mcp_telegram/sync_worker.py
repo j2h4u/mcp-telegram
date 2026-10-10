@@ -128,14 +128,18 @@ _NEXT_PENDING_SQL = (
     "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
     "WHERE sd.status IN ('syncing', 'not_synced') "
     "AND NOT EXISTS (SELECT 1 FROM dialogs directory WHERE directory.dialog_id=sd.dialog_id AND directory.hidden=1) "
-    "ORDER BY rowid LIMIT 1"
+    "AND COALESCE(sd.full_sync_retry_at,0) <= ? "
+    "ORDER BY CASE WHEN sd.dialog_id > COALESCE((SELECT CAST(value AS INTEGER) FROM daemon_state "
+    "WHERE key='full_sync_peer_cursor'),0) THEN 0 ELSE 1 END, sd.dialog_id LIMIT 1"
 )
 _NEXT_TOTAL_MESSAGES_REPAIR_SQL = (
     "SELECT sd.dialog_id FROM synced_dialogs sd "
     "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
     "WHERE sd.total_messages IS NULL AND sd.status NOT IN ('not_synced', 'access_lost') "
     "AND NOT EXISTS (SELECT 1 FROM dialogs directory WHERE directory.dialog_id=sd.dialog_id AND directory.hidden=1) "
-    "ORDER BY sd.rowid LIMIT 1"
+    "AND COALESCE(sd.full_sync_retry_at,0) <= ? "
+    "ORDER BY CASE WHEN sd.dialog_id > COALESCE((SELECT CAST(value AS INTEGER) FROM daemon_state "
+    "WHERE key='full_sync_total_peer_cursor'),0) THEN 0 ELSE 1 END, sd.dialog_id LIMIT 1"
 )
 _UPDATE_TOTAL_MESSAGES_SQL = (
     "UPDATE synced_dialogs SET total_messages = ? WHERE dialog_id = ? AND total_messages IS NULL "
@@ -332,7 +336,19 @@ class FullSyncWorker:
             return not await self._process_one_automatic_group()
 
         dialog_id, sync_progress = pending
+        with write_transaction(self._conn):
+            _set_dm_enrollment_state(self._conn, "full_sync_peer_cursor", str(dialog_id))
         _, is_done = await self._fetch_batch(dialog_id, sync_progress)
+        with write_transaction(self._conn):
+            self._conn.execute(
+                "UPDATE synced_dialogs SET full_sync_retry_at=? WHERE dialog_id=?",
+                (
+                    int(time.time()) + 60
+                    if isinstance(self._last_page_error, (MessageHistoryUnavailableError, TimeoutError))
+                    else None,
+                    dialog_id,
+                ),
+            )
         if not is_done:
             return False  # more batches needed for this dialog
         # Dialog done — check if more pending dialogs remain
@@ -349,6 +365,8 @@ class FullSyncWorker:
             error = RuntimeError("total-message repair requires an explicit access probe")
             self._last_total_repair_error = error
             return False
+        with write_transaction(self._conn):
+            _set_dm_enrollment_state(self._conn, "full_sync_total_peer_cursor", str(dialog_id))
         try:
             total_messages = await self._total_messages_probe.probe_total_messages(dialog_id)
         except RpcAttemptBudgetExhaustedError:
@@ -378,15 +396,23 @@ class FullSyncWorker:
             with write_transaction(self._conn):
                 set_access_lost(self._conn, dialog_id, int(time.time()), reason=exc.reason_code)
             return False
-        except MessageHistoryUnavailableError as exc:
+        except (MessageHistoryUnavailableError, TimeoutError) as exc:
             logger.warning("sync_total_repair_failed dialog_id=%d error=%s", dialog_id, exc)
-            self._set_total_repair_retry(None)
+            with write_transaction(self._conn):
+                self._conn.execute(
+                    "UPDATE synced_dialogs SET full_sync_retry_at=? WHERE dialog_id=?",
+                    (int(time.time()) + 60, dialog_id),
+                )
             self._last_total_repair_error = exc
             return False
 
         if total_messages is None:
             logger.warning("sync_total_repair_missing_total dialog_id=%d", dialog_id)
-            self._set_total_repair_retry(None)
+            with write_transaction(self._conn):
+                self._conn.execute(
+                    "UPDATE synced_dialogs SET full_sync_retry_at=? WHERE dialog_id=?",
+                    (int(time.time()) + 60, dialog_id),
+                )
             return False
         with write_transaction(self._conn):
             self._conn.execute(
@@ -394,6 +420,7 @@ class FullSyncWorker:
                 (total_messages, dialog_id, "access_lost", dialog_id),
             )
             _set_total_messages_repair_retry(self._conn, None)
+            self._conn.execute("UPDATE synced_dialogs SET full_sync_retry_at=NULL WHERE dialog_id=?", (dialog_id,))
         logger.info("sync_total_repair_complete dialog_id=%d total_messages=%d", dialog_id, total_messages)
         return self._next_total_messages_repair_dialog() is None
 
@@ -413,10 +440,10 @@ class FullSyncWorker:
     def _next_pending_dialog(self) -> tuple[int, int] | None:
         """Return (dialog_id, sync_progress) for the next pending dialog.
 
-        Selects in rowid (insertion) order — no prioritization.
+        Rotates eligible peers after the durable last-attempted peer.
         Returns None when no dialogs have status in ('syncing', 'not_synced').
         """
-        row = cast(tuple[int, int | None] | None, self._conn.execute(_NEXT_PENDING_SQL).fetchone())
+        row = cast(tuple[int, int | None] | None, self._conn.execute(_NEXT_PENDING_SQL, (time.time(),)).fetchone())
         if row is None:
             return None
         return int(row[0]), int(row[1]) if row[1] is not None else 0
@@ -562,11 +589,11 @@ class FullSyncWorker:
         retry_at = _total_messages_repair_retry_at(self._conn)
         if retry_at is not None and retry_at > int(time.time()):
             return None
-        row = cast(tuple[int] | None, self._conn.execute(_NEXT_TOTAL_MESSAGES_REPAIR_SQL).fetchone())
+        row = cast(tuple[int] | None, self._conn.execute(_NEXT_TOTAL_MESSAGES_REPAIR_SQL, (time.time(),)).fetchone())
         return None if row is None else int(row[0])
 
     def _total_messages_repair_release_at(self, now: float) -> float | None:
-        row = cast(tuple[int] | None, self._conn.execute(_NEXT_TOTAL_MESSAGES_REPAIR_SQL).fetchone())
+        row = cast(tuple[int] | None, self._conn.execute(_NEXT_TOTAL_MESSAGES_REPAIR_SQL, (time.time(),)).fetchone())
         if row is None:
             return None
         retry_at = _total_messages_repair_retry_at(self._conn)
@@ -627,7 +654,7 @@ class FullSyncWorker:
             return await self._handle_batch_page_error(dialog_id, sync_progress, exc)
         except (TelegramRpcThrottled, RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
             return await self._handle_batch_page_error(dialog_id, sync_progress, exc)
-        except MessageHistoryUnavailableError as exc:
+        except (MessageHistoryUnavailableError, TimeoutError) as exc:
             logger.exception(
                 "sync_batch_rpc_error dialog_id=%d error=%s — dialog NOT marked synced, will retry",
                 dialog_id,
@@ -795,7 +822,17 @@ class FullSyncDemandAdapter:
             return DemandStatus(release_at=0.0)
         retry_at = self._worker._automatic_group_earliest_retry()
         repair_release_at = self._worker._total_messages_repair_release_at(now)
-        releases = [release for release in (retry_at, repair_release_at) if release is not None]
+        peer_retry_row = cast(
+            tuple[int | None],
+            self._worker._conn.execute(
+                "SELECT MIN(sd.full_sync_retry_at) FROM synced_dialogs sd "
+                "JOIN full_history_enrollment fhe ON fhe.dialog_id=sd.dialog_id AND fhe.enabled=1 "
+                "WHERE (sd.status IN ('syncing','not_synced') OR (sd.total_messages IS NULL AND sd.status != 'access_lost')) AND NOT EXISTS "
+                "(SELECT 1 FROM dialogs d WHERE d.dialog_id=sd.dialog_id AND d.hidden=1)"
+            ).fetchone(),
+        )
+        peer_retry = peer_retry_row[0]
+        releases = [release for release in (retry_at, repair_release_at, peer_retry) if release is not None]
         return None if not releases else DemandStatus(release_at=min(releases))
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
@@ -808,14 +845,15 @@ class FullSyncDemandAdapter:
             return
         with demand_context(DemandKind.FULL_SYNC_PAGE):
             with rpc_attempt_budget(budget):
+                error: BaseException | None = None
                 if self._worker._next_pending_dialog() is not None or self._worker._next_automatic_group() is not None:
                     await self._worker.process_one_batch()
-                    if self._worker._last_page_error is not None:
-                        raise self._worker._last_page_error
+                    error = self._worker._last_page_error
                 elif self._worker._next_total_messages_repair_dialog() is not None:
                     await self._worker.repair_one_total_messages()
-                    if self._worker._last_total_repair_error is not None:
-                        raise self._worker._last_total_repair_error
+                    error = self._worker._last_total_repair_error
+                if error is not None and not isinstance(error, (MessageHistoryUnavailableError, TimeoutError)):
+                    raise error
 
 
 class FullSyncDmEnrollmentDemandAdapter:

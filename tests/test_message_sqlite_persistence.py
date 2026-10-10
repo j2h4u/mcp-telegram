@@ -41,6 +41,7 @@ from mcp_telegram.messages.sqlite_hydration_jobs import (
     repair_transcription_hydration_jobs,
     transcription_hydration_eligible,
 )
+from mcp_telegram.reactions.contracts import ReactionAggregateSource
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
 
@@ -929,6 +930,24 @@ def test_delayed_bundles_cannot_overwrite_edits_or_resurrect_deletions(conn: sql
     assert conn.execute(
         "SELECT COUNT(*) FROM messages_fts WHERE dialog_id=42 AND message_id IN (90,91)"
     ).fetchone() == (0,)
+
+
+def test_mutable_bundle_order_precedes_source_rank(conn: sqlite3.Connection) -> None:
+    original = _message(904, text="reply")
+    realtime = replace(original, observation_order=1, message=replace(original.message, reply_to_msg_id=0))
+    delta = replace(realtime, observation_order=2, message=replace(realtime.message, reply_to_msg_id=5))
+    equal_order_lower_rank = replace(delta, observation_order=2, message=replace(delta.message, reply_to_msg_id=6))
+    stale_order_higher_rank = replace(delta, observation_order=1, message=replace(delta.message, reply_to_msg_id=7))
+    with write_transaction(conn):
+        insert_messages_with_fts(conn, [realtime], reaction_source=ReactionAggregateSource.REALTIME_MESSAGE)
+        insert_messages_with_fts(conn, [delta], reaction_source=ReactionAggregateSource.DELTA)
+        insert_messages_with_fts(conn, [equal_order_lower_rank], reaction_source=ReactionAggregateSource.BACKGROUND)
+        insert_messages_with_fts(conn, [stale_order_higher_rank], reaction_source=ReactionAggregateSource.RAW_UPDATE)
+
+    assert conn.execute("SELECT reply_to_msg_id FROM messages WHERE dialog_id=42 AND message_id=904").fetchone() == (5,)
+    assert conn.execute(
+        "SELECT observation_order,source_rank FROM message_observations WHERE dialog_id=42 AND message_id=904"
+    ).fetchone() == (2, ReactionAggregateSource.DELTA.rank)
 
 
 def test_same_caption_edit_persists_full_bundle_without_version(conn: sqlite3.Connection) -> None:
