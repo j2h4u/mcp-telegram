@@ -52,6 +52,7 @@ def test_timing_payload_keeps_missing_boundaries_unavailable_and_is_private() ->
 
     payload = timing.payload()
 
+    assert payload["timing_scope"] == "daemon_dispatch"
     assert payload["route_attempted"] == "local_history"
     assert payload["local_projection_ms"] == 12.5
     assert payload["rpc_admission_ms"] is None
@@ -317,7 +318,7 @@ def test_mcp_telemetry_persists_operation_id_without_product_content() -> None:
     row = cast(
         tuple[str, str] | None, conn.execute("SELECT operation_id, payload_json FROM runtime_observations").fetchone()
     )
-    assert row == ("b" * 32, "{}")
+    assert row == ("b" * 32, '{"timing_scope":"mcp_call"}')
     conn.close()
 
 
@@ -687,3 +688,34 @@ async def test_timing_sink_failure_does_not_change_product_result() -> None:
     )
 
     assert response["ok"] is True
+
+
+def test_mcp_phase_timing_is_retained_without_arbitrary_payload() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(_RUNTIME_OBSERVATIONS_V54_DDL.replace("runtime_observations_v54", "runtime_observations"))
+    conn.execute("ALTER TABLE runtime_observations ADD COLUMN tool_capability TEXT")
+    conn.execute("ALTER TABLE runtime_observations ADD COLUMN contract_version INTEGER")
+    _insert_telemetry_row(
+        conn,
+        {
+            "tool_name": "get_entity_info",
+            "timestamp": 1.0,
+            "primary_duration_ms": 89.0,
+            "account_protection_ms": 1000.0,
+            "payload": {"secret": "DO_NOT_RETAIN"},
+        },
+    )
+    row = cast(tuple[str], conn.execute("SELECT payload_json FROM runtime_observations").fetchone())
+    assert json.loads(row[0]) == {
+        "timing_scope": "mcp_call",
+        "primary_duration_ms": 89.0,
+        "account_protection_ms": 1000.0,
+    }
+    conn.close()
+
+
+@pytest.mark.parametrize("value", [-1, True, "DO_NOT_RETAIN", float("inf"), float("nan"), 10**400])
+def test_mcp_phase_timing_discards_invalid_measurements(value: object) -> None:
+    from mcp_telegram.daemon_api import _mcp_timing_payload
+
+    assert _mcp_timing_payload({"primary_duration_ms": value}) == {"timing_scope": "mcp_call"}

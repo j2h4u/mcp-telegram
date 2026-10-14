@@ -16,7 +16,8 @@ from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 81
+_CURRENT_SCHEMA_VERSION = 82
+_REACTION_VISIBILITY_MIGRATION = 82
 _HISTORY_PEER_FAIRNESS_MIGRATION = 81
 _MESSAGE_OBSERVATION_MIGRATION = 80
 _MESSAGE_COMPOSITION_MIGRATION = 79
@@ -4712,6 +4713,25 @@ def _apply_migration_81(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_82(conn: sqlite3.Connection, current: int) -> int:
+    """Retain per-message reaction list capability; old observations stay unknown."""
+    if current >= _REACTION_VISIBILITY_MIGRATION:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if "can_see_list" not in _table_column_names(conn, "message_reaction_aggregate_state"):
+            conn.execute(
+                "ALTER TABLE message_reaction_aggregate_state "
+                "ADD COLUMN can_see_list INTEGER CHECK (can_see_list IN (0, 1))"
+            )
+        conn.execute("INSERT OR IGNORE INTO schema_version VALUES (82, strftime('%s','now'))")
+        conn.commit()
+        return 82
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
     """Apply the conditional current-schema migration tail."""
     if _CURRENT_SCHEMA_VERSION >= _ENTITY_PROFILE_ACQUISITION_MIGRATION_61:
@@ -4733,6 +4753,8 @@ def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
         current = _apply_migration_80(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _HISTORY_PEER_FAIRNESS_MIGRATION:
         current = _apply_migration_81(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _REACTION_VISIBILITY_MIGRATION:
+        current = _apply_migration_82(conn, current)
     return current
 
 

@@ -28,6 +28,7 @@ class HydrationOutcome(StrEnum):
     """Privacy-safe operational outcome of the latest queue attempt."""
 
     PROCESSING = "processing"
+    NOT_APPLIED = "not_applied"
     TELEGRAM_PENDING = "telegram_pending"
     TEMPORARY_FAILURE = "temporary_failure"
     RPC_PAUSED = "rpc_paused"
@@ -194,7 +195,7 @@ class HydrationQueueRepository:
         )
 
     def enqueue(self, job: HydrationJob) -> None:
-        """Insert *job*, or move an existing job's due time earlier.
+        """Insert *job*, or accelerate a job that has never started.
 
         A retry count belongs to the queue identity, so re-enqueueing an
         existing job never resets ``attempts``.
@@ -203,7 +204,8 @@ class HydrationQueueRepository:
         self._conn.execute(
             f"INSERT INTO {HYDRATION_QUEUE_TABLE} ({_JOB_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(kind, dialog_id, message_id) DO UPDATE SET "
-            "due_at = CASE WHEN excluded.due_at < due_at THEN excluded.due_at ELSE due_at END, "
+            "due_at = CASE WHEN terminal = 0 AND attempts = 0 AND last_outcome = 'queued' "
+            "AND excluded.due_at < due_at THEN excluded.due_at ELSE due_at END, "
             "message_sent_at = MAX(message_sent_at, excluded.message_sent_at), "
             "priority = MAX(priority, excluded.priority)",
             (
@@ -334,6 +336,25 @@ class HydrationQueueRepository:
             "last_outcome = ?, last_error_code = ? "
             "WHERE kind = ? AND dialog_id = ? AND message_id = ? AND terminal = 0 AND attempts > 0",
             (due_at, outcome, error_code, *_identity(job)),
+        )
+        return cursor.rowcount > 0
+
+    def requeue_not_applied(self, job: HydrationJob, due_at: int) -> bool:
+        """Refund an obsolete observation only while its started row is unchanged."""
+        require_write_transaction(self._conn)
+        cursor = self._conn.execute(
+            f"UPDATE {HYDRATION_QUEUE_TABLE} SET attempts = attempts - 1, due_at = ?, "
+            "last_outcome = ?, last_error_code = NULL "
+            "WHERE kind = ? AND dialog_id = ? AND message_id = ? AND terminal = 0 "
+            "AND attempts = ? AND attempts > 0 AND due_at = ? AND last_outcome = ?",
+            (
+                due_at,
+                HydrationOutcome.NOT_APPLIED,
+                *_identity(job),
+                job.attempts,
+                job.due_at,
+                HydrationOutcome.PROCESSING,
+            ),
         )
         return cursor.rowcount > 0
 

@@ -408,6 +408,22 @@ class RpcAdmissionEvent:
     acquisition_kind: AcquisitionKind | None = None
 
 
+def _admission_log_level(event: RpcAdmissionEvent) -> int:
+    if (
+        event.kind is RpcAdmissionEventKind.REJECTED
+        and event.reason == "attempt_budget_exhausted"
+        and event.acquisition_kind is AcquisitionKind.FORWARD_NAME_LOOKUP
+    ):
+        return logging.DEBUG
+    if event.kind in {
+        RpcAdmissionEventKind.REJECTED,
+        RpcAdmissionEventKind.EXPIRED,
+        RpcAdmissionEventKind.UNCLASSIFIED,
+    }:
+        return logging.WARNING
+    return logging.DEBUG
+
+
 @dataclass(frozen=True, slots=True)
 class RpcAdmission:
     """Proof that one scalar RPC attempt crossed the admission arbiter."""
@@ -1008,17 +1024,8 @@ class TelegramRpcAdmissionScheduler:
         )
 
     def _emit(self, event: RpcAdmissionEvent) -> None:
-        log = (
-            logger.warning
-            if event.kind
-            in {
-                RpcAdmissionEventKind.REJECTED,
-                RpcAdmissionEventKind.EXPIRED,
-                RpcAdmissionEventKind.UNCLASSIFIED,
-            }
-            else logger.debug
-        )
-        log(
+        logger.log(
+            _admission_log_level(event),
             "telegram_rpc_admission event=%s kind=%s acquisition=%s source=%s class=%s "
             "queue_depth=%d total_depth=%d active_depth=%d total_outstanding=%d wait_seconds=%s reason=%s",
             event.kind.value,

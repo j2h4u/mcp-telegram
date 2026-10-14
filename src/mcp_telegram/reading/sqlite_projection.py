@@ -254,6 +254,12 @@ _SELECT_DIALOG_ACCESS_META_SQL = (
 )
 
 # Unread SQL - zero Telegram API calls.
+_COLLECT_UNREAD_DIALOG_CANDIDATES_SQL = (
+    "SELECT sd.dialog_id, d.members FROM synced_dialogs sd "
+    "LEFT JOIN dialogs d ON d.dialog_id = sd.dialog_id "
+    "WHERE sd.status = 'synced' AND sd.read_inbox_max_id IS NOT NULL"
+)
+
 _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL = (
     "SELECT sd.dialog_id, sd.read_inbox_max_id, sd.last_event_at, "
     "d.members AS participants_count, "
@@ -269,7 +275,8 @@ _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL = (
     "FROM synced_dialogs sd "
     "LEFT JOIN dialogs d ON d.dialog_id = sd.dialog_id "
     "WHERE sd.status = 'synced' "
-    "AND sd.read_inbox_max_id IS NOT NULL"
+    "AND sd.read_inbox_max_id IS NOT NULL "
+    "AND sd.dialog_id IN (SELECT CAST(value AS INTEGER) FROM json_each(:dialog_ids))"
 )
 
 _GET_READ_POSITION_SQL = "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?"

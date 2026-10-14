@@ -844,3 +844,55 @@ def test_entity_structured_content_uses_exact_input_for_numeric_lookup() -> None
         "entity_id": 7,
         "display_name": "Seven",
     }
+
+
+@pytest.mark.parametrize(
+    "code", ["entity_not_found", "entity_info_pending", "rpc_busy", "internal", "DO_NOT_LOG secret", None]
+)
+def test_entity_info_fetch_error_preserves_only_safe_reason_codes(code: object) -> None:
+    from mcp_telegram.tools.entity_info import _entity_info_fetch_error
+
+    result = _entity_info_fetch_error(GetEntityInfo(exact_entity_id=42), {"ok": False, "error": code})
+    assert result is not None
+    assert result.is_error
+    assert result.error_code == (
+        code if code in {"entity_not_found", "entity_info_pending", "rpc_busy", "internal"} else "entity_info_failed"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["not_running", "response_timeout", "malformed_response"])
+async def test_entity_info_preserves_daemon_failure_kind(kind: str) -> None:
+    from mcp_telegram.daemon_client import DaemonFailureKind, DaemonNotRunningError
+
+    @asynccontextmanager
+    async def unavailable():
+        raise DaemonNotRunningError("private failure detail", kind=cast(DaemonFailureKind, kind))
+        yield
+
+    with patch("mcp_telegram.tools.entity_info.daemon_connection", unavailable):
+        result = await get_entity_info(GetEntityInfo(exact_entity_id=42))
+    assert result.error_code == f"daemon_{kind}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response,code",
+    [
+        ({"ok": False, "error": "rpc_busy"}, "rpc_busy"),
+        ({"ok": False, "error": "DO_NOT_LOG secret"}, "entity_resolution_failed"),
+        ({"ok": True, "data": {"result": "not_found"}}, "entity_not_found"),
+    ],
+)
+async def test_entity_lookup_retains_reason_without_parsing_message(response: dict[str, object], code: str) -> None:
+    with _patch_daemon(response, {}):
+        result = await _resolve_entity_lookup("private query")
+    assert isinstance(result, ToolResult)
+    assert result.error_code == code
+
+
+@pytest.mark.asyncio
+async def test_entity_info_endpoint_budget_returns_specific_code() -> None:
+    with patch("mcp_telegram.tools.entity_info._get_entity_info_within_budget", side_effect=TimeoutError):
+        result = await get_entity_info(GetEntityInfo(exact_entity_id=42))
+    assert result.error_code == "entity_info_timeout"

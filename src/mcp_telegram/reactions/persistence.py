@@ -36,6 +36,7 @@ def replace_reaction_aggregates(  # noqa: PLR0913
     source: ReactionAggregateSource | str = ReactionAggregateSource.HISTORY,
     observed_at: int | None = None,
     observation_sequence: int | None = None,
+    can_see_list: bool | None = None,
 ) -> bool:
     """Apply one aggregate observation under the durable ordering contract.
 
@@ -52,6 +53,7 @@ def replace_reaction_aggregates(  # noqa: PLR0913
         source=source,
         observed_at=observed_at,
         observation_sequence=observation_sequence,
+        can_see_list=can_see_list,
     )
 
 
@@ -109,27 +111,26 @@ def apply_aggregate_observation(  # noqa: PLR0913
     source: ReactionAggregateSource | str,
     observed_at: int | None = None,
     observation_sequence: int | None = None,
+    can_see_list: bool | None = None,
 ) -> bool:
     """Persist an aggregate and invalidate detail only for a newer boundary."""
     if not _has_aggregate_state_table(conn):
         _replace_projection(conn, dialog_id, message_id, aggregates)
         return True
     boundary = _boundary_from_values(source, observed_at, observation_sequence, conn)
-    try:
-        existing = _load_aggregate_state(conn, dialog_id, message_id)
-    except sqlite3.OperationalError as exc:
-        if "no such table" not in str(exc).lower():
-            raise
-        # Small isolated unit fixtures may intentionally model only the legacy
-        # projection. Production connections always run migration 68.
-        _replace_projection(conn, dialog_id, message_id, aggregates)
-        return True
+    existing = _load_aggregate_state(conn, dialog_id, message_id)
     generation_info = _accepted_generation(existing, boundary)
     if generation_info is None:
         return False
     previous_generation, generation = generation_info
+    previous_visibility = _stored_visibility(existing)
+    visibility = previous_visibility if can_see_list is None else can_see_list
     state_key = _AggregateStateKey(dialog_id, message_id, generation)
-    if existing is not None and _projection_matches(conn, dialog_id, message_id, aggregates):
+    if (
+        existing is not None
+        and visibility == previous_visibility
+        and _projection_matches(conn, dialog_id, message_id, aggregates)
+    ):
         _update_identical_observation(
             conn,
             _AggregateStateKey(dialog_id, message_id, previous_generation),
@@ -138,9 +139,16 @@ def apply_aggregate_observation(  # noqa: PLR0913
         )
         return True
     _replace_projection(conn, dialog_id, message_id, aggregates)
-    _store_aggregate_state(conn, state_key, boundary, len(aggregates))
-    _finish_detail_for_aggregate(conn, dialog_id, message_id, generation, boundary.observed_at, aggregates)
+    _store_aggregate_state(conn, state_key, boundary, len(aggregates), visibility)
+    if visibility is False and aggregates:
+        _mark_hidden_detail_terminal(conn, dialog_id, message_id, generation, boundary.observed_at)
+    else:
+        _finish_detail_for_aggregate(conn, dialog_id, message_id, generation, boundary.observed_at, aggregates)
     return True
+
+
+def _stored_visibility(existing: tuple[object, ...] | None) -> bool | None:
+    return None if existing is None or existing[5] is None else bool(existing[5])
 
 
 def _has_aggregate_state_table(conn: sqlite3.Connection) -> bool:
@@ -156,7 +164,7 @@ def _load_aggregate_state(conn: sqlite3.Connection, dialog_id: int, message_id: 
     return cast(
         tuple[object, ...] | None,
         conn.execute(
-            "SELECT generation, observed_at, source_rank, observation_sequence, source "
+            "SELECT generation, observed_at, source_rank, observation_sequence, source, can_see_list "
             "FROM message_reaction_aggregate_state WHERE dialog_id = ? AND message_id = ?",
             (dialog_id, message_id),
         ).fetchone(),
@@ -243,14 +251,16 @@ def _store_aggregate_state(
     state_key: _AggregateStateKey,
     boundary: ReactionObservationBoundary,
     aggregate_count: int,
+    can_see_list: bool | None,
 ) -> None:
     conn.execute(
         "INSERT INTO message_reaction_aggregate_state "
-        "(dialog_id, message_id, generation, observed_at, observation_sequence, source, source_rank, aggregate_row_count) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "(dialog_id, message_id, generation, observed_at, observation_sequence, source, source_rank, aggregate_row_count, can_see_list) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(dialog_id, message_id) DO UPDATE SET generation=excluded.generation, "
         "observed_at=excluded.observed_at, observation_sequence=excluded.observation_sequence, "
-        "source=excluded.source, source_rank=excluded.source_rank, aggregate_row_count=excluded.aggregate_row_count",
+        "source=excluded.source, source_rank=excluded.source_rank, aggregate_row_count=excluded.aggregate_row_count, "
+        "can_see_list=excluded.can_see_list",
         (
             state_key.dialog_id,
             state_key.message_id,
@@ -260,7 +270,20 @@ def _store_aggregate_state(
             boundary.source,
             boundary.source_rank,
             aggregate_count,
+            can_see_list,
         ),
+    )
+
+
+def _mark_hidden_detail_terminal(
+    conn: sqlite3.Connection, dialog_id: int, message_id: int, generation: int, now: int
+) -> None:
+    """Withdraw staged and published actors when Telegram denies list access."""
+    _mark_empty_detail_terminal(conn, dialog_id, message_id, generation, now)
+    conn.execute(
+        "UPDATE message_reaction_event_status SET status='unavailable', failure_kind='visibility_unavailable' "
+        "WHERE dialog_id=? AND message_id=?",
+        (dialog_id, message_id),
     )
 
 

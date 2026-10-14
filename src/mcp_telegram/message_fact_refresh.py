@@ -43,6 +43,7 @@ JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled
 JOIN message_reaction_aggregate_state a ON a.dialog_id=m.dialog_id AND a.message_id=m.message_id
 LEFT JOIN message_reaction_event_status d ON d.dialog_id=m.dialog_id AND d.message_id=m.message_id
 WHERE sd.status = 'synced'
+  AND a.can_see_list IS NOT 0
   AND NOT EXISTS (
       SELECT 1 FROM dialogs directory
       WHERE directory.dialog_id=m.dialog_id AND directory.type='channel'
@@ -75,7 +76,7 @@ _REACTION_DISCOVERY_PAGE_SIZE = 256
 _REACTION_DISCOVERY_REFRESH_SECONDS = 60
 _REACTION_DISCOVERY_PAGE_SQL = """
 WITH aggregate_page AS MATERIALIZED (
-  SELECT dialog_id, message_id, generation, aggregate_row_count
+  SELECT dialog_id, message_id, generation, aggregate_row_count, can_see_list
   FROM message_reaction_aggregate_state
   {keyset}
   ORDER BY dialog_id, message_id
@@ -83,7 +84,7 @@ WITH aggregate_page AS MATERIALIZED (
 )
 SELECT p.dialog_id, p.message_id, p.generation, p.aggregate_row_count,
        sd.status, fhe.enabled, m.is_deleted, m.sent_at,
-       d.aggregate_generation, d.status, d.next_offset, d.next_attempt_at, d.checked_at
+       d.aggregate_generation, d.status, d.next_offset, d.next_attempt_at, d.checked_at, p.can_see_list
 FROM aggregate_page p
 LEFT JOIN synced_dialogs sd ON sd.dialog_id=p.dialog_id
   AND NOT EXISTS (
@@ -145,6 +146,7 @@ WHERE EXISTS (
     SELECT 1 FROM messages m
     WHERE m.dialog_id=a.dialog_id AND m.message_id=a.message_id AND m.is_deleted=0
   )
+  AND a.can_see_list IS NOT 0
   AND (a.aggregate_row_count > 0 OR d.status IN ('partial','unavailable'))
   AND (d.dialog_id IS NULL OR d.aggregate_generation < a.generation
        OR d.status = 'stale'
@@ -278,11 +280,15 @@ def _reaction_discovery_page(
     return cast(list[tuple[object, ...]], conn.execute(query, params).fetchall())
 
 
+def _reaction_dialog_is_eligible(row: tuple[object, ...]) -> bool:
+    return row[4] == "synced" and row[5] == 1 and row[6] == 0 and row[7] is not None and row[13] != 0
+
+
 def _reaction_page_identity(
     row: tuple[object, ...],
 ) -> tuple[int, int, int, int, str | None, int, object, int] | None:
     dialog_id, message_id, generation, aggregate_count = (int(cast(int, row[i])) for i in range(4))
-    if row[4] != "synced" or row[5] != 1 or row[6] != 0 or row[7] is None:
+    if not _reaction_dialog_is_eligible(row):
         return None
     detail_status = None if row[9] is None else str(row[9])
     if aggregate_count <= 0 and detail_status not in {"partial", "unavailable"}:

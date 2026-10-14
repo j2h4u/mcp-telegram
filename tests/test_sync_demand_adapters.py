@@ -214,7 +214,7 @@ async def test_full_history_forward_name_enrichment_keeps_entity_lookup_attribut
     await FullSyncDemandAdapter(worker).run_slice(budget)
 
     assert observed_scopes[0].demand_kind is DemandKind.FULL_SYNC_PAGE
-    assert observed_scopes[0].acquisition_kind is AcquisitionKind.ENTITY_LOOKUP
+    assert observed_scopes[0].acquisition_kind is AcquisitionKind.FORWARD_NAME_LOOKUP
     assert observed_scopes[0].attempt_budget is budget
 
 

@@ -757,7 +757,7 @@ def _log_request_stage_timing(
     level = logging.WARNING if sum(durations.values()) >= 1.0 else logging.DEBUG
     logger.log(
         level,
-        "daemon_client_request_timing method=%s request_id=%s operation_id=%s "
+        "daemon_client_request_timing timing_scope=client_request method=%s request_id=%s operation_id=%s "
         "config_path_s=%.3f socket_connect_s=%.3f send_drain_s=%.3f "
         "response_wait_s=%.3f response_parse_s=%.3f",
         method,

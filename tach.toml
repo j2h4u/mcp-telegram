@@ -148,7 +148,7 @@ depends_on = ["mcp_telegram.feedback_contracts"]
 [[modules]]
 path = "mcp_telegram.daemon_activity_stats"
 layer = "application"
-depends_on = ["mcp_telegram.activity_dialog_kinds", "mcp_telegram.daemon_message", "mcp_telegram.dialog_directory_coverage", "mcp_telegram.dialog_selector", "mcp_telegram.message_content", "mcp_telegram.dialog_identity", "mcp_telegram.dialog_identity_contracts", "mcp_telegram.models"]
+depends_on = ["mcp_telegram.sync_db", "mcp_telegram.activity_dialog_kinds", "mcp_telegram.daemon_message", "mcp_telegram.dialog_directory_coverage", "mcp_telegram.dialog_selector", "mcp_telegram.message_content", "mcp_telegram.dialog_identity", "mcp_telegram.dialog_identity_contracts", "mcp_telegram.models"]
 cannot_depend_on = ["mcp_telegram.folders.sqlite_repository", "mcp_telegram.messages", "mcp_telegram.topics.sqlite_repository"]
 
 [[modules]]
@@ -546,7 +546,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.messages.telegram_adapter"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.message_composition", "mcp_telegram.flood", "mcp_telegram.media_fact", "mcp_telegram.message_contracts", "mcp_telegram.telegram_demand", "mcp_telegram.telethon_media", "mcp_telegram.telethon_message"]
+depends_on = ["mcp_telegram.reactions.projection", "mcp_telegram.message_composition", "mcp_telegram.flood", "mcp_telegram.media_fact", "mcp_telegram.message_contracts", "mcp_telegram.telegram_demand", "mcp_telegram.telethon_media", "mcp_telegram.telethon_message"]
 
 [[modules]]
 path = "mcp_telegram.message_history.telegram_adapter"
@@ -961,7 +961,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.chat_export"
 layer = "application"
-depends_on = ["mcp_telegram.message_history.contracts", "mcp_telegram.telegram_gateway", "mcp_telegram.entity_identity", "mcp_telegram.flood", "mcp_telegram.message_composition", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_error", "mcp_telegram.telegram_rpc_scheduler"]
+depends_on = ["mcp_telegram.reactions.projection", "mcp_telegram.message_history.contracts", "mcp_telegram.telegram_gateway", "mcp_telegram.entity_identity", "mcp_telegram.flood", "mcp_telegram.message_composition", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_error", "mcp_telegram.telegram_rpc_scheduler"]
 
 [[modules]]
 path = "mcp_telegram.chat_export_checkpoint"

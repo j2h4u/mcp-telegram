@@ -461,6 +461,12 @@ async def test_build_read_messages_projects_persisted_reaction_events() -> None:
         CREATE INDEX idx_message_read_facts_next_attempt
         ON message_read_facts(dialog_id, next_attempt_at)
         WHERE next_attempt_at IS NOT NULL;
+        CREATE TABLE message_reaction_aggregate_state (
+            dialog_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            can_see_list INTEGER,
+            PRIMARY KEY (dialog_id, message_id)
+        );
         CREATE TABLE message_reaction_events (
             event_id INTEGER PRIMARY KEY AUTOINCREMENT,
             dialog_id INTEGER NOT NULL,

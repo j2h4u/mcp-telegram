@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime
 from typing import Protocol, TypeVar, cast
 
@@ -23,7 +24,14 @@ from .. import message_contracts as _message_contracts
 from ..flood import TelegramRpcThrottled, _raise_if_latched
 from ..media_fact import encode_media_payload
 from ..message_composition import extract_message_composition
-from ..telegram_demand import RpcAttemptBudgetExhaustedError
+from ..reactions.projection import project_reaction_aggregates, project_reaction_visibility
+from ..telegram_demand import (
+    AcquisitionKind,
+    MissingTelegramDemandContextError,
+    RpcAttemptBudgetExhaustedError,
+    acquisition_context,
+    current_demand_token,
+)
 from ..telethon_media import extract_media_fact
 from ..telethon_message import is_service_message
 
@@ -228,25 +236,12 @@ def extract_reactions_rows(
 
     Returns empty list if reactions is None or has no results.
     """
-    if reactions is None:
-        return []
-    results = cast(Sequence[object], _attr(reactions, "results", ()))
-    if not results:
-        return []
-    rows: list[_message_contracts.ReactionRecord] = []
-    for item in results:
-        reaction = _attr(item, "reaction", None)
-        emoticon = _attr(reaction, "emoticon", None) if reaction is not None else None
-        count = _attr(item, "count", 0)
-        if emoticon is not None:
-            record = _message_contracts.ReactionRecord(
-                dialog_id=dialog_id,
-                message_id=message_id,
-                emoji=emoticon,
-                count=int(count),
-            )
-            rows.append(record)
-    return rows
+    return [
+        _message_contracts.ReactionRecord(
+            dialog_id=dialog_id, message_id=message_id, emoji=aggregate.emoji, count=aggregate.count
+        )
+        for aggregate in project_reaction_aggregates(reactions)
+    ]
 
 
 # Telethon entity types worth capturing for analytics.
@@ -405,6 +400,14 @@ def _marked_peer_id(from_id: object) -> int | None:
     return None
 
 
+def _forward_name_context() -> AbstractContextManager[object]:
+    try:
+        current_demand_token()
+    except MissingTelegramDemandContextError:
+        return nullcontext()
+    return acquisition_context(AcquisitionKind.FORWARD_NAME_LOOKUP)
+
+
 async def _resolve_peer_name(client: PeerNameClient, peer: _PeerLike) -> str | None:
     """Return display name for a Telegram peer.
 
@@ -420,7 +423,8 @@ async def _resolve_peer_name(client: PeerNameClient, peer: _PeerLike) -> str | N
     """
     log_id = tl_utils.get_peer_id(peer)
     try:
-        entity = await client.get_entity(peer)
+        with _forward_name_context():
+            entity = await client.get_entity(peer)
         title = _attr(entity, "title", None)
         name = title or _attr(entity, "first_name", None) or ""
         last = _attr(entity, "last_name", None)
@@ -650,6 +654,7 @@ def extract_message_row(
         reactions=reactions,
         entities=entities,
         forward=forward,
+        reaction_can_see_list=project_reaction_visibility(_attr(msg, "reactions", None)),
     )
 
 

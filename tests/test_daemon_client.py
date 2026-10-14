@@ -194,6 +194,7 @@ async def test_request_logs_slow_stage_with_correlation_and_without_payload(
     assert "method=get_entity_info" in record.getMessage()
     assert "request_id=01234567" in record.getMessage()
     assert "operation_id=operation-1" in record.getMessage()
+    assert "timing_scope=client_request" in record.getMessage()
     assert "send_drain_s=1.250" in record.getMessage()
     assert "DO_NOT_LOG" not in caplog.text
 

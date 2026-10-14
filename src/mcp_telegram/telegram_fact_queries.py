@@ -75,8 +75,8 @@ def reaction_event_projection(
 ) -> tuple[dict[int, tuple[ReadReactionEvent, ...]], dict[int, str]]:
     """Load daemon-owned individual reaction facts and completeness status.
 
-    Aggregate rows deliberately are not joined here: their contract contains
-    only emoji/count.  Missing v28 tables or status rows are represented as
+    Aggregate counters remain separate; per-message capability gates actor
+    visibility. Missing fact tables or status rows are represented as
     ``unavailable`` rather than causing a read response to fail.
     """
     if not message_ids:
@@ -89,8 +89,11 @@ def reaction_event_projection(
                 f"SELECT e.message_id, e.reactor_id, e.emoji, e.reacted_at "
                 f"FROM message_reaction_events e JOIN message_reaction_event_status s "
                 f"ON s.dialog_id=e.dialog_id AND s.message_id=e.message_id "
+                "LEFT JOIN message_reaction_aggregate_state a "
+                "ON a.dialog_id=e.dialog_id AND a.message_id=e.message_id "
                 f"WHERE e.dialog_id = ? AND e.message_id IN ({placeholders}) "
                 "AND e.display_generation = s.display_generation AND e.display_generation > 0 "
+                "AND a.can_see_list IS NOT 0 "
                 "ORDER BY e.message_id, e.event_id",
                 [dialog_id, *message_ids],
             ).fetchall(),

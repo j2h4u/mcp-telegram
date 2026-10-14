@@ -201,6 +201,14 @@ async def flush_telemetry(*, timeout_seconds: float = _TELEMETRY_FLUSH_TIMEOUT_S
         await asyncio.gather(*pending, return_exceptions=True)
 
 
+def _telemetry_timing_fields(
+    primary_duration_ms: float | None, account_protection_ms: float | None
+) -> dict[str, object]:
+    if primary_duration_ms is None or account_protection_ms is None:
+        return {}
+    return {"primary_duration_ms": primary_duration_ms, "account_protection_ms": account_protection_ms}
+
+
 def _telemetry_event(  # noqa: PLR0913 - explicit telemetry fields keep the contract visible
     *,
     tool_name: str,
@@ -210,6 +218,8 @@ def _telemetry_event(  # noqa: PLR0913 - explicit telemetry fields keep the cont
     error_type: str | None = None,
     error_code: object = None,
     operation_id: str | None = None,
+    primary_duration_ms: float | None = None,
+    account_protection_ms: float | None = None,
 ) -> dict[str, object]:
     """Build the privacy-safe event shared by all MCP boundary outcomes."""
     if outcome not in _TELEMETRY_OUTCOMES:
@@ -240,6 +250,7 @@ def _telemetry_event(  # noqa: PLR0913 - explicit telemetry fields keep the cont
         "error_code": machine_code,
         "operation_id": operation_id,
     }
+    event.update(_telemetry_timing_fields(primary_duration_ms, account_protection_ms))
     return event
 
 
@@ -480,17 +491,13 @@ def _log_tool_failure(name: str, exc: Exception, *, stage: str, started_at: floa
     )
 
 
-def _project_tool_result(
-    name: str, tool_result: object, telemetry: _CallTelemetry, started_at: float
-) -> CallToolResult:
+def _project_tool_result(name: str, tool_result: object, telemetry: _CallTelemetry) -> CallToolResult:
     if not isinstance(tool_result, tools.ToolResult):
         raise TypeError("tool runner returned an invalid result")
     if not tool_result.is_error and tool_result.structured_content and "error" in tool_result.structured_content:
         raise ValueError("Successful tool result uses the reserved top-level error property")
     telemetry.outcome = "tool_error" if tool_result.is_error else "success"
     telemetry.error_code = tool_result.error_code
-    elapsed = time.monotonic() - started_at
-    _log_tool_result(name, tool_result, elapsed)
     structured_content = (
         t.cast(dict[str, object], tools.omit_none_mapping_values(tool_result.structured_content))
         if tool_result.structured_content is not None
@@ -505,26 +512,42 @@ def _project_tool_result(
     )
 
 
-def _log_tool_result(name: str, tool_result: tools.ToolResult, elapsed: float) -> None:
+def _log_tool_result(
+    name: str, tool_result: tools.ToolResult, elapsed: float, *, primary_elapsed: float, protection_elapsed: float
+) -> None:
     rid_str = ",".join(current_correlation_ids()) or "-"
     if tool_result.is_error:
         logger.info(
-            "call_tool[%s] tool_error duration_s=%.3f rids=%s error=%s",
+            "call_tool[%s] tool_error duration_s=%.3f rids=%s error=%s "
+            "timing_scope=mcp_call primary_s=%.3f account_protection_s=%.3f",
             name,
             elapsed,
             rid_str,
             safe_error_code(tool_result.error_code),
+            primary_elapsed,
+            protection_elapsed,
         )
     elif elapsed >= _SLOW_TOOL_CALL_SECONDS:
         logger.warning(
-            "call_tool[%s] slow_completed duration_s=%.3f threshold_s=%.3f rids=%s",
+            "call_tool[%s] slow_completed duration_s=%.3f threshold_s=%.3f rids=%s "
+            "timing_scope=mcp_call primary_s=%.3f account_protection_s=%.3f",
             name,
             elapsed,
             _SLOW_TOOL_CALL_SECONDS,
             rid_str,
+            primary_elapsed,
+            protection_elapsed,
         )
     else:
-        logger.debug("call_tool[%s] completed duration_s=%.3f rids=%s", name, elapsed, rid_str)
+        logger.debug(
+            "call_tool[%s] completed duration_s=%.3f rids=%s "
+            "timing_scope=mcp_call primary_s=%.3f account_protection_s=%.3f",
+            name,
+            elapsed,
+            rid_str,
+            primary_elapsed,
+            protection_elapsed,
+        )
 
 
 def _canonical_tool_error(
@@ -610,7 +633,7 @@ async def _execute_tool(
         )
 
     try:
-        return _project_tool_result(name, tool_result, telemetry, started_at)
+        return _project_tool_result(name, tool_result, telemetry)
     except asyncio.CancelledError:
         telemetry.outcome = "cancelled"
         raise
@@ -638,6 +661,9 @@ async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:
     deadline = asyncio.get_running_loop().time() + _TOOL_CALL_TIMEOUT_SECONDS
     operation_id = standalone_operation_id(None)
     telemetry = _CallTelemetry()
+    primary_elapsed: float | None = None
+    protection_started: float | None = None
+    protection_elapsed: float | None = None
     try:
         with correlation_context(operation_id):
             try:
@@ -650,6 +676,8 @@ async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:
                     _safe_boundary_error_text(tool_name=name, stage="runtime", exc=exc),
                     code="tool_error",
                 )
+            primary_elapsed = time.monotonic() - t0
+            protection_started = time.monotonic()
             status = _account_protection_unavailable()
             if asyncio.get_running_loop().time() < deadline:
                 try:
@@ -659,20 +687,38 @@ async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:
                         status = await _account_protection_status()
                 except TimeoutError:
                     pass
-            return _attach_account_protection(result, status)
+            protection_elapsed = time.monotonic() - protection_started
+            final_result = _attach_account_protection(result, status)
+            _log_tool_result(
+                name,
+                tools.ToolResult(
+                    is_error=bool(final_result.is_error), error_code=safe_error_code(telemetry.error_code)
+                ),
+                time.monotonic() - t0,
+                primary_elapsed=primary_elapsed,
+                protection_elapsed=protection_elapsed,
+            )
+            return final_result
     except asyncio.CancelledError:
         telemetry.outcome = "cancelled"
         raise
     finally:
+        elapsed = time.monotonic() - t0
+        if primary_elapsed is None:
+            primary_elapsed = elapsed
+        if protection_elapsed is None:
+            protection_elapsed = 0.0 if protection_started is None else time.monotonic() - protection_started
         _schedule_telemetry(
             _telemetry_event(
                 tool_name=name,
                 operation_id=operation_id,
                 outcome=telemetry.outcome,
-                duration_ms=(time.monotonic() - t0) * 1000,
+                duration_ms=elapsed * 1000,
                 result=telemetry.result,
                 error_type=telemetry.error_type,
                 error_code=telemetry.error_code,
+                primary_duration_ms=primary_elapsed * 1000,
+                account_protection_ms=protection_elapsed * 1000,
             )
         )
 

@@ -30,7 +30,8 @@ TRANSACTION_EXCEPTIONS: dict[Path, frozenset[str]] = {
         }
     ),
     Path("sqlite_checkpoint.py"): frozenset({"checkpoint_sqlite_connection"}),
-    Path("reading/service.py"): frozenset({"_get_unread_summary_sync"}),
+    Path("reading/service.py"): frozenset({"_get_unread_summary_sync", "_list_unread_messages_from_reader"}),
+    Path("daemon_activity_stats.py"): frozenset({"_recent_activity_from_reader"}),
 }
 
 _SYNC_DB_BOOTSTRAP_TRANSACTIONS = frozenset(
@@ -58,6 +59,7 @@ _SYNC_DB_BOOTSTRAP_TRANSACTIONS = frozenset(
         "_apply_migration_74",
         "_apply_migration_78",
         "_apply_migration_79",
+        "_apply_migration_82",
     }
     | TRANSACTION_EXCEPTIONS[Path("sync_db.py")]
 )

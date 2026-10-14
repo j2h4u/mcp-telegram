@@ -81,6 +81,7 @@ def _make_db(path: str | Path = ":memory:") -> sqlite3.Connection:
             source TEXT NOT NULL,
             source_rank INTEGER NOT NULL,
             aggregate_row_count INTEGER NOT NULL,
+            can_see_list INTEGER,
             PRIMARY KEY (dialog_id, message_id)
         );
         CREATE TABLE message_reaction_event_status (
@@ -190,7 +191,7 @@ def _seed_reaction_candidates(conn: sqlite3.Connection, count: int = 8) -> None:
     for message_id in range(1, count + 1):
         conn.execute("INSERT INTO messages VALUES (1, ?, ?, 0, NULL, 0)", (message_id, message_id))
         conn.execute(
-            "INSERT INTO message_reaction_aggregate_state VALUES (1, ?, 1, 1, ?, 'history', 1, 1)",
+            "INSERT INTO message_reaction_aggregate_state VALUES (1, ?, 1, 1, ?, 'history', 1, 1, NULL)",
             (message_id, message_id),
         )
         conn.execute(
@@ -307,7 +308,7 @@ async def test_open_reaction_window_accepts_only_one_claim_batch() -> None:
     conn.commit()
     await refresh_message_facts_once(deps, policy, now=100)
     conn.execute("INSERT INTO messages VALUES (1, 3, 3, 0, NULL, 0)")
-    conn.execute("INSERT INTO message_reaction_aggregate_state VALUES (1, 3, 1, 1, 3, 'history', 1, 1)")
+    conn.execute("INSERT INTO message_reaction_aggregate_state VALUES (1, 3, 1, 1, 3, 'history', 1, 1, NULL)")
     conn.execute(
         "INSERT INTO message_reaction_event_status "
         "(dialog_id, message_id, aggregate_generation, status, checked_at, next_attempt_at) "
@@ -596,8 +597,8 @@ def test_due_reaction_window_without_pacing_reads_normal_release() -> None:
 
 
 def test_terminal_reaction_does_not_hide_future_retry_release() -> None:
-    terminal = (1, 1, 1, 1, "synced", 1, 0, 100, 1, "unavailable", None, None, 50)
-    retry = (1, 2, 1, 1, "synced", 1, 0, 100, 1, "partial", None, 120, 50)
+    terminal = (1, 1, 1, 1, "synced", 1, 0, 100, 1, "unavailable", None, None, 50, None)
+    retry = (1, 2, 1, 1, "synced", 1, 0, 100, 1, "partial", None, 120, 50, None)
 
     assert _reaction_page_candidate(terminal, now=100) is None
     retry_entry = _reaction_page_candidate(retry, now=100)
@@ -644,7 +645,7 @@ def test_read_at_status_cache_keeps_release_without_requerying() -> None:
 async def test_empty_reaction_pages_have_bounded_vm_and_read_at_status_work() -> None:
     conn = _make_db()
     conn.executemany(
-        "INSERT INTO message_reaction_aggregate_state VALUES (?, ?, 1, 1, ?, 'history', 1, 1)",
+        "INSERT INTO message_reaction_aggregate_state VALUES (?, ?, 1, 1, ?, 'history', 1, 1, NULL)",
         ((dialog_id, message_id, message_id) for message_id in range(1, 6001) for dialog_id in (1,)),
     )
     conn.commit()
@@ -697,7 +698,7 @@ async def test_frozen_reaction_upper_and_claim_revalidation() -> None:
     seed_full_history_enrollment(conn, 1, enabled=True)
     conn.execute("INSERT INTO entities VALUES (1, 'channel')")
     conn.executemany(
-        "INSERT INTO message_reaction_aggregate_state VALUES (1, ?, 1, 1, ?, 'history', 1, 1)",
+        "INSERT INTO message_reaction_aggregate_state VALUES (1, ?, 1, 1, ?, 'history', 1, 1, NULL)",
         ((message_id, message_id) for message_id in range(1, 257)),
     )
     conn.commit()
@@ -715,7 +716,7 @@ async def test_frozen_reaction_upper_and_claim_revalidation() -> None:
 
     conn.commit()
     await adapter.run_slice(RpcAttemptBudget(limit=1))
-    conn.execute("INSERT INTO message_reaction_aggregate_state VALUES (1, 257, 2, 1, 257, 'history', 1, 1)")
+    conn.execute("INSERT INTO message_reaction_aggregate_state VALUES (1, 257, 2, 1, 257, 'history', 1, 1, NULL)")
     conn.execute("INSERT INTO messages VALUES (1, 257, 257, 0, NULL, 0)")
     conn.commit()
     conn.commit()
@@ -768,7 +769,7 @@ def test_broadcast_reaction_details_are_excluded_from_all_scheduler_paths() -> N
             seed_full_history_enrollment(conn, dialog_id, enabled=True)
             conn.execute("INSERT INTO messages VALUES (?,1,1,0,NULL,0)", (dialog_id,))
             conn.execute(
-                "INSERT INTO message_reaction_aggregate_state VALUES (?,1,1,1,1,'history',1,1)",
+                "INSERT INTO message_reaction_aggregate_state VALUES (?,1,1,1,1,'history',1,1,NULL)",
                 (dialog_id,),
             )
             conn.execute(
@@ -787,7 +788,7 @@ def test_broadcast_reaction_details_are_excluded_from_all_scheduler_paths() -> N
 
         page_rows = _reaction_discovery_page(conn, None, (3, 1))
         assert len(page_rows) == 3
-        assert all(len(row) == 13 for row in page_rows)
+        assert all(len(row) == 14 for row in page_rows)
         discovered = [_reaction_page_candidate(row, 1_000) for row in page_rows]
         assert [item[1][1][0] for item in discovered if item is not None and item[1] is not None] == [2, 3]
         assert conn.execute("SELECT COUNT(*) FROM message_reaction_aggregate_state").fetchone() == (3,)

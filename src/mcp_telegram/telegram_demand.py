@@ -30,6 +30,7 @@ class AcquisitionKind(StrEnum):
     CONNECTION_BOOTSTRAP = "connection_bootstrap"
     DIALOG_TRAVERSAL = "dialog_traversal"
     ENTITY_LOOKUP = "entity_lookup"
+    FORWARD_NAME_LOOKUP = "forward_name_lookup"
     FOLDER_SNAPSHOT = "folder_snapshot"
     MESSAGE_HISTORY_PAGE = "message_history_page"
     PARTICIPANT_LOOKUP = "participant_lookup"

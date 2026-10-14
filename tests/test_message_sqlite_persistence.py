@@ -10,7 +10,7 @@ from typing import cast
 import pytest
 
 from mcp_telegram.fts import stem_text
-from mcp_telegram.hydration_queue import HydrationPriority
+from mcp_telegram.hydration_queue import HydrationOutcome, HydrationPriority, HydrationQueueRepository
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
 from mcp_telegram.messages.sqlite_bundle import (
     find_unique_nonchannel_message_dialogs,
@@ -228,6 +228,52 @@ def test_foreground_voice_persistence_keeps_transcription_foreground(conn: sqlit
         )
 
     assert conn.execute("SELECT kind, priority FROM hydration_jobs").fetchall() == [("transcription", 1)]
+
+
+@pytest.mark.parametrize(
+    ("media_kind", "outcome", "due_at"),
+    [
+        ("voice", HydrationOutcome.TELEGRAM_PENDING, 86_410),
+        ("voice", HydrationOutcome.TEMPORARY_FAILURE, 21_610),
+        ("other", HydrationOutcome.TEMPORARY_FAILURE, 21_610),
+    ],
+)
+def test_repeated_message_persistence_preserves_hydration_schedule(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, media_kind: str, outcome: HydrationOutcome, due_at: int
+) -> None:
+    _make_hydration_eligible(conn)
+    monkeypatch.setattr("mcp_telegram.messages.sqlite_bundle.time.time", lambda: 10.0)
+    message = _message(91, text=None, media_kind=media_kind, media_payload="{}")
+    queue = HydrationQueueRepository(conn)
+    with write_transaction(conn):
+        insert_messages_with_fts(conn, [message])
+        job = queue.due_jobs(10, 1)[0]
+        started = queue.start(job)
+        assert started is not None
+        assert queue.reschedule(started, due_at, outcome=outcome)
+    for _ in range(3):
+        with write_transaction(conn):
+            insert_messages_with_fts(conn, [message])
+            reconcile_fact_hydration_jobs_for_dialog(conn, 42, due_at=10)
+    assert conn.execute("SELECT due_at,attempts,last_outcome FROM hydration_jobs").fetchone() == (due_at, 1, outcome)
+    assert queue.due_jobs(due_at - 1, 10) == []
+    assert len(queue.due_jobs(due_at, 10)) == 1
+
+
+def test_changed_eligibility_recreates_a_terminal_hydration_generation(conn: sqlite3.Connection) -> None:
+    _make_hydration_eligible(conn)
+    queue = HydrationQueueRepository(conn)
+    voice = _message(92, text=None, media_kind="voice", media_payload="{}")
+    with write_transaction(conn):
+        insert_messages_with_fts(conn, [voice])
+        job = queue.due_jobs(2**62, 1)[0]
+        started = queue.start(job)
+        assert started is not None
+        queue.mark_terminal(started)
+        insert_messages_with_fts(conn, [_message(92, text="plain message")])
+        assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+        insert_messages_with_fts(conn, [voice])
+    assert conn.execute("SELECT attempts,terminal,last_outcome FROM hydration_jobs").fetchone() == (0, 0, "queued")
 
 
 def test_foreground_round_video_persistence_enqueues_transcription(conn: sqlite3.Connection) -> None:

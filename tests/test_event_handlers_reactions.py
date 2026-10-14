@@ -158,6 +158,26 @@ def _make_manager(client: MagicMock, conn: _SQLiteConnection, ev: asyncio.Event)
     return m
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [(False, False, 0), (False, True, None), (True, True, 1)])
+async def test_raw_reactions_preserve_message_visibility(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+    case: tuple[bool, bool, int | None],
+) -> None:
+    visibility, min_flag, expected = case
+    _enroll(sync_db, 12345)
+    _insert_msg(sync_db, 12345, 100)
+    reactions = build_mock_reactions({"👍": 2})
+    reactions.can_see_list = visibility
+    reactions.min = min_flag
+    update = cast(_RawReactionUpdate, SimpleNamespace(peer=PeerUser(12345), msg_id=100, reactions=reactions))
+    await _make_manager(mock_client, sync_db, shutdown_event).on_raw_reaction_update(update)
+    assert sync_db.execute("SELECT can_see_list FROM message_reaction_aggregate_state").fetchone() == (expected,)
+    assert _reactions(sync_db, 12345, 100) == [("👍", 2)]
+
+
 # ---------------------------------------------------------------------------
 # MessageEdited reactions branch
 # ---------------------------------------------------------------------------

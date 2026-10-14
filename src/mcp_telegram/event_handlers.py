@@ -115,7 +115,7 @@ from .messages.telegram_adapter import (
 from .observation_order import allocate_observation_order
 from .reactions.contracts import ReactionAggregate, ReactionAggregateSource, ReactionObservationBoundary
 from .reactions.persistence import allocate_observation_boundary, replace_reaction_aggregates
-from .reactions.projection import project_reaction_aggregates
+from .reactions.projection import project_reaction_aggregates, project_reaction_visibility
 from .read_state import apply_read_cursor
 from .realtime_history_policy import (
     RealtimeBodyEvent,
@@ -1658,7 +1658,9 @@ class EventHandlerManager:
         try:
             aggregates = project_reaction_aggregates(update.reactions)
             previous_generation = self._reaction_generation(dialog_id, msg_id)
-            if not self._apply_reaction_event(dialog_id, msg_id, aggregates):
+            if not self._apply_reaction_event(
+                dialog_id, msg_id, aggregates, can_see_list=project_reaction_visibility(update.reactions)
+            ):
                 _record_runtime_observation_best_effort(
                     self._conn,
                     kind="reaction.aggregate",
@@ -1722,6 +1724,8 @@ class EventHandlerManager:
         msg_id: int,
         aggregates: Sequence[ReactionAggregate],
         boundary: ReactionObservationBoundary | None = None,
+        *,
+        can_see_list: bool | None = None,
     ) -> bool:
         with write_transaction(self._conn):
             if not hydration_observation_current(self._conn, dialog_id, msg_id, None):
@@ -1743,6 +1747,7 @@ class EventHandlerManager:
                 source=ReactionAggregateSource.RAW_UPDATE,
                 observed_at=None if boundary is None else boundary.observed_at,
                 observation_sequence=None if boundary is None else boundary.sequence,
+                can_see_list=can_see_list,
             )
             if not accepted:
                 return False

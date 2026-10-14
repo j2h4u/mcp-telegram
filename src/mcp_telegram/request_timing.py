@@ -197,6 +197,7 @@ class DaemonRequestTiming:
         return {
             "version": TIMING_VERSION,
             "phase_model": "top_level_with_nested_rpc",
+            "timing_scope": "daemon_dispatch",
             "request_id": request_id,
             "route_attempted": route_attempted,
             "served_source": served_source,

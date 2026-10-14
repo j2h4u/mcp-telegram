@@ -17,7 +17,7 @@ from .messages.telegram_adapter import (
     extract_message_text,
     extract_reply_and_topic,
 )
-from .reactions.projection import project_reaction_aggregates, project_reaction_event
+from .reactions.projection import project_reaction_aggregates, project_reaction_event, project_reaction_visibility
 from .telethon_media import extract_media_fact
 from .telethon_message import is_service_message
 
@@ -86,9 +86,11 @@ def _timestamp_to_int(value: SupportsTimestamp | None, *, msg_id: object = None)
 
 
 def _extract_reaction_facts(msg: MessageLike) -> dict[str, object]:
+    can_see_list = project_reaction_visibility(msg.reactions)
     events = tuple(
         dataclasses.asdict(project_reaction_event(item))
         for item in cast(Sequence[object], getattr(msg.reactions, "recent_reactions", ()) or ())
+        if can_see_list is not False
     )
     return {
         "reactions_display": format_reaction_counts(

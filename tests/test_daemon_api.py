@@ -6556,6 +6556,12 @@ async def test_global_search_projects_cached_reaction_events_and_read_at() -> No
     conn.execute(INSERT_FTS_SQL, (5, 301, stem_text("global cached facts")))
     conn.executescript(
         """
+        CREATE TABLE message_reaction_aggregate_state (
+            dialog_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            can_see_list INTEGER,
+            PRIMARY KEY (dialog_id, message_id)
+        );
         CREATE TABLE message_reaction_events (
             event_id INTEGER PRIMARY KEY AUTOINCREMENT,
             dialog_id INTEGER NOT NULL,

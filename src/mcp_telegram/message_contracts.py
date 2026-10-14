@@ -88,3 +88,4 @@ class ExtractedMessage:
     reactions: list[ReactionRecord] = field(default_factory=list)
     entities: list[EntityRecord] = field(default_factory=list)
     forward: ForwardRecord | None = None
+    reaction_can_see_list: bool | None = None
