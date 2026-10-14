@@ -37,6 +37,7 @@ from .message_history.ports import ForwardGapPagePort
 from .messages.sqlite_bundle import insert_messages_with_fts
 from .observation_order import allocate_observation_order
 from .reactions.contracts import ReactionAggregateSource
+from .sqlite_values import row_first_int
 from .sync_read_model import (
     DM_DELETION_POLICY_VERSION,
     DM_DELETION_RECONCILIATION_STATE_KEY,
@@ -316,17 +317,6 @@ class _DeltaGapFillSliceOutcome:
     recovery_completed: bool | None = None
 
 
-def _row_first_int(row: tuple[object | None, ...] | None) -> int:
-    if row is None:
-        return 0
-    value = row[0]
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.isdecimal():
-        return int(value)
-    return 0
-
-
 def _delta_skip_anchor(last_synced_at: int | None, last_delta_checked_at: int | None) -> int | None:
     """Return the durable checkpoint anchoring the automatic refresh cadence."""
     if last_delta_checked_at is not None:
@@ -408,7 +398,7 @@ class DeltaSyncWorker:
             tuple[object | None, ...] | None,
             self._conn.execute(_SELECT_DELTA_MESSAGE_ID_SQL, (dialog_id,)).fetchone(),
         )
-        return _row_first_int(row)
+        return row_first_int(row)
 
     async def _collect_delta_slice(self, dialog_id: int, max_known_id: int, generation: int) -> _DeltaFetchOutcome:
         reaction_observed_at = int(time.time())

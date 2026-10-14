@@ -73,7 +73,12 @@ from .entity_profile.refresh import (
     scope_changed_retry_at,
     throttled_retry_at,
 )
-from .entity_profile.repository import EntityProfileRepository, EntityRefreshCursor, EntitySectionCommit
+from .entity_profile.repository import (
+    EntityProfileRepository,
+    EntityRefreshCursor,
+    EntitySectionCommit,
+    pair_readiness_latency_ms,
+)
 from .entity_store import EntitySnapshot, ensure_entity_stub
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .folders.read_model import dialog_placement
@@ -1355,7 +1360,7 @@ class DaemonEntityInfoService:
     def _record_full_user_pair_commit(self, measurement: _PairMeasurement) -> dict[str, object] | None:
         if not measurement.committed:
             return None
-        latency = self._pair_readiness_latency_ms(measurement.full_profile, measurement.personal_channel)
+        latency = pair_readiness_latency_ms(measurement.full_profile, measurement.personal_channel)
         self._profiles.record_pair_section_outcome(
             measurement.cursor,
             "full_profile",
@@ -1621,18 +1626,6 @@ class DaemonEntityInfoService:
         if evidence is None or evidence.outcome not in {"usable", "partial", "absent", "unavailable"}:
             return None
         return evidence.outcome
-
-    @staticmethod
-    def _pair_readiness_latency_ms(
-        full_profile: EntitySectionCommit,
-        personal_channel: EntitySectionCommit,
-    ) -> float | None:
-        boundaries = [commit.evidence for commit in (full_profile, personal_channel) if commit.evidence is not None]
-        starts = [evidence.observation_started_at for evidence in boundaries]
-        completes = [evidence.observation_completed_at for evidence in boundaries]
-        if not starts or any(value is None for value in starts + completes):
-            return None
-        return max(cast(list[int], completes)) * 1000 - min(cast(list[int], starts)) * 1000
 
     def _pair_reused_age_ms(self, cursor: EntityRefreshCursor, *, now: int) -> float | None:
         starts: list[int] = []

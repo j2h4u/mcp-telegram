@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol, cast
 
+from .activity_dialog_kinds import normalize_activity_dialog_kinds
 from .daemon_message import fetch_text_links
 from .dialog_directory_coverage import DialogDirectoryCoverage
 from .dialog_identity import read_dialog_identities
@@ -28,22 +29,6 @@ class _LoggerLike(Protocol):
 
     def exception(self, msg: str, *_args: object, **_kwargs: object) -> None: ...
 
-
-DEFAULT_ACTIVITY_DIALOG_KINDS = ("group", "forum")
-_ALLOWED_ACTIVITY_DIALOG_KINDS = {"all", "user", "bot", "group", "forum", "channel", "unknown"}
-_ACTIVITY_DIALOG_KIND_ALIASES = {
-    "dm": ("user", "bot"),
-    "dms": ("user", "bot"),
-    "private": ("user", "bot"),
-    "personal": ("user", "bot"),
-    "direct": ("user", "bot"),
-    "groups": ("group", "forum"),
-    "supergroup": ("group",),
-    "supergroups": ("group",),
-    "chat": ("group",),
-    "chats": ("group",),
-    "forums": ("forum",),
-}
 
 _SELECT_SYNC_STATUS_SQL = "SELECT status FROM synced_dialogs WHERE dialog_id = ?"
 _GET_DIALOG_TOP_REACTIONS_SQL = (
@@ -236,49 +221,6 @@ def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict[str, object]:
     }
 
 
-def _coerce_activity_dialog_kind_values(value: object) -> tuple[list[object] | None, str | None]:
-    if value is None:
-        return list(DEFAULT_ACTIVITY_DIALOG_KINDS), None
-    if isinstance(value, str):
-        raw_values: list[object] = [value]
-    elif isinstance(value, (list, tuple, set)):
-        raw_values = list(value)
-    else:
-        return None, "dialog_kinds must be a list of strings"
-
-    return raw_values, None
-
-
-def _normalize_activity_dialog_kind_values(raw_values: list[object]) -> tuple[list[str] | None, str | None]:
-    normalized_values: list[str] = []
-    for raw in raw_values:
-        if not isinstance(raw, str):
-            return None, "dialog_kinds entries must be strings"
-        normalized = raw.strip().lower()
-        if not normalized:
-            continue
-        expanded = _ACTIVITY_DIALOG_KIND_ALIASES.get(normalized, (normalized,))
-        for kind in expanded:
-            if kind not in _ALLOWED_ACTIVITY_DIALOG_KINDS:
-                allowed = ", ".join(sorted(_ALLOWED_ACTIVITY_DIALOG_KINDS))
-                return None, f"dialog_kinds entries must be one of: {allowed}"
-            if kind not in normalized_values:
-                normalized_values.append(kind)
-
-    if "all" in normalized_values:
-        return ["all"], None
-    if not normalized_values:
-        return None, "dialog_kinds must include at least one kind"
-    return normalized_values, None
-
-
-def _normalize_activity_dialog_kinds(value: object) -> tuple[list[str] | None, str | None]:
-    raw_values, error = _coerce_activity_dialog_kind_values(value)
-    if error is not None or raw_values is None:
-        return None, error
-    return _normalize_activity_dialog_kind_values(raw_values)
-
-
 def _parse_recent_activity_time_bound(value: object) -> int | None:
     if value is None:
         return None
@@ -330,10 +272,9 @@ def _parse_recent_activity_limits(
     since_hours = _clamp(_coerce_int(req.get("since_hours", 168), 168), 1, 8760)
     limit = _clamp(_coerce_int(req.get("limit", 500), 500), 1, 2000)
 
-    dialog_kinds, dialog_kind_error = _normalize_activity_dialog_kinds(
-        req.get("dialog_kinds", list(DEFAULT_ACTIVITY_DIALOG_KINDS))
-    )
-    if dialog_kind_error is not None or dialog_kinds is None:
+    try:
+        dialog_kinds = normalize_activity_dialog_kinds(req.get("dialog_kinds"))
+    except ValueError as error:
         return (
             None,
             None,
@@ -341,7 +282,7 @@ def _parse_recent_activity_limits(
             {
                 "ok": False,
                 "error": "invalid_dialog_kinds",
-                "message": dialog_kind_error or "invalid dialog_kinds",
+                "message": str(error),
             },
         )
     return since_hours, limit, dialog_kinds, None

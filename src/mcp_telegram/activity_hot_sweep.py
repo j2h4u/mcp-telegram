@@ -278,25 +278,19 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
             return
         with _hot_demand_scope():
             with rpc_attempt_budget(budget):
-                enrollment_release_at = working_set_enrollment_release_at(
+                enrollment = await run_working_set_enrollment_slice(
+                    self.client,
                     self.conn,
-                    now=float(int(time.time())),
+                    source=TelegramRpcSource.ACTIVITY_HOT_SWEEP,
                     cadence_s=self.policy.loop_interval_seconds,
+                    timeout_s=self.timeout_s,
                 )
-                if enrollment_release_at is not None and enrollment_release_at <= time.time():
-                    enrollment = await run_working_set_enrollment_slice(
-                        self.client,
-                        self.conn,
-                        source=TelegramRpcSource.ACTIVITY_HOT_SWEEP,
-                        cadence_s=self.policy.loop_interval_seconds,
-                        timeout_s=self.timeout_s,
-                    )
-                    if enrollment.consumed:
-                        # A due candidate, including a channel with no linked
-                        # discussion group, consumed this bounded unit. Budget
-                        # exhaustion leaves its durable cursor unchanged. The
-                        # terminal scan marker also occupies this slice.
-                        return
+                if enrollment.consumed:
+                    # A due candidate, including a channel with no linked
+                    # discussion group, consumed this bounded unit. Budget
+                    # exhaustion leaves its durable cursor unchanged. The
+                    # terminal scan marker also occupies this slice.
+                    return
 
                 state = _select_due_hot_window(self.conn, now=int(time.time()))
                 if state is None or self.shutdown_event.is_set():

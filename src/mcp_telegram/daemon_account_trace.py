@@ -1566,20 +1566,7 @@ async def _trace_enrich_candidate_messages(
                 )
             )
         return fetched, "access_lost"
-    except RPCError as exc:
-        with write_transaction(request.conn):
-            _upsert_trace_coverage_fragment(
-                _TraceCoverageFragmentUpsertRequest(
-                    conn=request.conn,
-                    target_user_id=request.target_user_id,
-                    dialog_id=request.dialog_id,
-                    status="partial",
-                    last_error=type(exc).__name__,
-                    now=request.now,
-                )
-            )
-        return fetched, "partial"
-    except (RuntimeError, TypeError, AttributeError, ValueError, sqlite3.Error) as exc:
+    except (RPCError, RuntimeError, TypeError, AttributeError, ValueError, sqlite3.Error) as exc:
         with write_transaction(request.conn):
             _upsert_trace_coverage_fragment(
                 _TraceCoverageFragmentUpsertRequest(

@@ -12,6 +12,7 @@ from typing import TypedDict, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from telethon.errors import RPCError
 
 from account_trace_fixtures import (
     open_trace_db,
@@ -651,6 +652,41 @@ async def test_trace_enrichment_channel_is_unsupported_without_search(
     assert result["fragment_status_counts"]["unsupported"] == 1
     assert fragment[0] == "unsupported"
     assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [RPCError(None, "boom"), RuntimeError("boom"), sqlite3.OperationalError("boom")])
+async def test_trace_enrichment_partial_error_preserves_accumulated_messages(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+    error: Exception,
+) -> None:
+    _, conn, _ = trace_enrichment_server
+
+    class PartialClient(FakeTraceClient):
+        async def iter_messages(self, dialog_id: int, **kwargs: object) -> AsyncIterator[object]:
+            yield fake_message(message_id=1, text="before failure")
+            raise error
+
+    fetched, status = await _trace_enrich_candidate_messages(
+        _TraceCandidateMessagesContext(
+            client=PartialClient(),
+            conn=conn,
+            dialog_id=222,
+            iter_kwargs={"limit": 100},
+            target_user_id=101,
+            now=1_700_000_000,
+            deadline_at=float("inf"),
+        )
+    )
+    assert len(fetched) == 1
+    assert fetched[0].message.message_id == 1
+    assert status == "partial"
+    fragment = cast(
+        tuple[str, str] | None,
+        conn.execute("SELECT status, last_error FROM trace_coverage_fragments WHERE target_user_id = 101").fetchone(),
+    )
+    assert fragment is not None
+    assert tuple(fragment) == ("partial", type(error).__name__)
 
 
 @pytest.mark.asyncio

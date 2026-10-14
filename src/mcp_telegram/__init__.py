@@ -6,6 +6,7 @@ from typing import Annotated, cast
 from typer import Argument, BadParameter, Option, Typer
 
 from .config import ConfigError, HttpServerConfig, load_config, resolve_http_server_config, resolve_logging_config
+from .sqlite_values import row_first_int
 
 app = Typer(no_args_is_help=True)
 
@@ -73,17 +74,6 @@ def _resolve_http_port(port: int | None, *, base: HttpServerConfig | None = None
         return resolve_http_server_config(port=port, base=base).port
     except ConfigError as exc:
         raise BadParameter(str(exc)) from exc
-
-
-def _row_first_int(row: tuple[object | None, ...] | None) -> int:
-    if row is None:
-        return 0
-    value = row[0]
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.isdecimal():
-        return int(value)
-    return 0
 
 
 @app.command()
@@ -238,7 +228,7 @@ def _feedback_list_empty_message(conn: sqlite3.Connection, show_all: bool) -> st
 
 def _feedback_list_default_empty_message(conn: sqlite3.Connection) -> str:
     row = cast(tuple[object | None, ...] | None, conn.execute("SELECT COUNT(*) FROM feedback").fetchone())
-    total = _row_first_int(row)
+    total = row_first_int(row)
     if total == 0:
         return "No feedback recorded yet."
     visible_open_row = cast(
@@ -248,7 +238,7 @@ def _feedback_list_default_empty_message(conn: sqlite3.Connection) -> str:
             (_SMOKE_FEEDBACK_CONTEXT, _SMOKE_FEEDBACK_HARNESS),
         ).fetchone(),
     )
-    if _row_first_int(visible_open_row) > 0:
+    if row_first_int(visible_open_row) > 0:
         return "No feedback shown. Increase --limit to display open feedback."
     smoke_open_row = cast(
         tuple[object | None, ...] | None,
@@ -257,7 +247,7 @@ def _feedback_list_default_empty_message(conn: sqlite3.Connection) -> str:
             (_SMOKE_FEEDBACK_CONTEXT, _SMOKE_FEEDBACK_HARNESS),
         ).fetchone(),
     )
-    if _row_first_int(smoke_open_row) > 0:
+    if row_first_int(smoke_open_row) > 0:
         return "No operator-actionable feedback. Use --all to show automated smoke entries and history."
     return "No open or in-progress feedback. Use --all to show history."
 

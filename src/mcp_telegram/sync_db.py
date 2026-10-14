@@ -12,6 +12,7 @@ from .dialog_classification import (
     is_bot_dialog_type,
     is_reserved_replies_username,
 )
+from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
@@ -1494,17 +1495,6 @@ def _open_sync_db(db_path: Path, *, read_only: bool = False) -> sqlite3.Connecti
     return conn
 
 
-def _row_first_int(row: tuple[object | None, ...] | None) -> int:
-    if row is None:
-        return 0
-    value = row[0]
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.isdecimal():
-        return int(value)
-    return 0
-
-
 def open_sync_db_reader(db_path: Path) -> sqlite3.Connection:
     """Open sync.db read-only for MCP server process.
 
@@ -1615,7 +1605,7 @@ def _schema_ready(conn: sqlite3.Connection) -> bool:
             conn.execute("SELECT MAX(version), COUNT(DISTINCT version) FROM schema_version").fetchone(),
         )
         return bool(
-            row and _row_first_int(row) >= _CURRENT_SCHEMA_VERSION and int(cast(int, row[1])) == _CURRENT_SCHEMA_VERSION
+            row and row_first_int(row) >= _CURRENT_SCHEMA_VERSION and int(cast(int, row[1])) == _CURRENT_SCHEMA_VERSION
         )
     except sqlite3.OperationalError:
         return False
@@ -3426,7 +3416,7 @@ def _apply_migration_59(conn: sqlite3.Connection, current: int) -> int:
         conn.execute(_SCHEDULED_RECONCILIATION_REPAIR_INDEX_DDL)
         conn.execute(_SCHEDULED_RECONCILIATION_DISCOVERY_INDEX_DDL)
         conn.execute(_OWN_ONLY_DIALOGS_DDL)
-        now = _row_first_int(cast(tuple[object] | None, conn.execute("SELECT unixepoch()").fetchone()))
+        now = row_first_int(cast(tuple[object] | None, conn.execute("SELECT unixepoch()").fetchone()))
         conn.execute(
             """
             INSERT OR IGNORE INTO scheduled_reconciliation_state (
@@ -4793,7 +4783,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     )
 
     row = cast(tuple[object | None, ...] | None, conn.execute("SELECT MAX(version) FROM schema_version").fetchone())
-    current = _row_first_int(row)
+    current = row_first_int(row)
     current = _apply_migrations_1_to_5(conn, current)
     current = _apply_migrations_6_to_10(conn, current)
     current = _apply_migrations_11_to_15(conn, current)
