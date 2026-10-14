@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import cast
 
 from .feedback_contracts import VALID_SEVERITIES, VALID_STATUSES
+from .sqlite_values import row_first_int
 
 __all__ = [
     "VALID_SEVERITIES",
@@ -72,17 +73,6 @@ def _open_feedback_db(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _row_first_int(row: tuple[object | None, ...] | None) -> int:
-    if row is None:
-        return 0
-    value = row[0]
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.isdecimal():
-        return int(value)
-    return 0
-
-
 # ---------------------------------------------------------------------------
 # Schema bootstrap
 # ---------------------------------------------------------------------------
@@ -107,7 +97,7 @@ def ensure_feedback_schema(db_path: Path) -> sqlite3.Connection:
             tuple[object | None, ...] | None,
             conn.execute("SELECT MAX(version) FROM schema_version").fetchone(),
         )
-        current = _row_first_int(row)
+        current = row_first_int(row)
         if current < 1:
             conn.execute(_FEEDBACK_DDL)
             conn.execute("INSERT INTO schema_version VALUES (1, strftime('%s', 'now'))")

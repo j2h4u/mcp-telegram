@@ -7,7 +7,9 @@ from typing import cast
 import pytest
 
 from mcp_telegram.config import RuntimeObservationConfig
+from mcp_telegram.entity_profile.contracts import ProfileAcquisitionEvidence
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
+from mcp_telegram.entity_profile.repository import EntitySectionCommit, pair_readiness_latency_ms
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 from tests.test_entity_profile_full_user_pair import _PairClient, _prepare
@@ -158,3 +160,44 @@ async def test_broken_profile_observer_does_not_change_pair_commit(tmp_path: Pat
     assert cast(_PairClient, service._deps.client).full_user_calls == 1  # type: ignore[attr-defined]
     await service.shutdown()  # type: ignore[attr-defined]
     conn.close()
+
+
+@pytest.mark.parametrize(
+    ("first_bounds", "second_bounds", "expected"),
+    [
+        (None, None, None),
+        ((None, 11), (10, 12), None),
+        ((10, None), (10, 12), None),
+        ((10, 11), (None, 12), None),
+        ((10, 11), (10, None), None),
+        ((10, 12), None, 2000.0),
+        (None, (10, 12), 2000.0),
+        ((0, 0), (0, 0), 0.0),
+        ((12, 13), (10, 11), 3000.0),
+        ((2**60, 2**60 + 1), (2**60 + 2, 2**60 + 3), 3000.0),
+        ((0, 2**53 + 1), None, float((2**53 + 1) * 1000)),
+    ],
+)
+def test_pair_readiness_latency_uses_all_available_evidence_bounds(
+    first_bounds: tuple[int | None, int | None] | None,
+    second_bounds: tuple[int | None, int | None] | None,
+    expected: float | None,
+) -> None:
+    commits = [
+        EntitySectionCommit(
+            detail_patch={},
+            evidence=None
+            if bounds is None
+            else ProfileAcquisitionEvidence(
+                generation=1,
+                outcome="usable",
+                observation_started_at=bounds[0],
+                observation_completed_at=bounds[1],
+            ),
+        )
+        for bounds in (first_bounds, second_bounds)
+    ]
+    latency = pair_readiness_latency_ms(*commits)
+    assert latency == expected
+    if latency is not None:
+        assert isinstance(latency, float)

@@ -1650,19 +1650,7 @@ class EntityProfileRepository:
         detail.update(full_profile.detail_patch)
         detail.update({"common_chats": []})
         detail.update(contact_overlap.detail_patch)
-        owner_account_id, observation_scope, ownership_observed = _commit_metadata(full_profile, contact_overlap)
-        if not self._write_detail(
-            cursor.entity_id,
-            detail,
-            now=now,
-            expected_revision=cursor.profile_revision,
-            owner_account_id=owner_account_id,
-            observation_scope=observation_scope,
-            ownership_observed=ownership_observed,
-            identity_patch=_combine_identity_patches(full_profile.identity_patch, contact_overlap.identity_patch),
-            dialog_identity_observation=full_profile.dialog_identity_observation,
-            dialog_identity_baseline_revision=full_profile.dialog_identity_baseline_revision,
-        ):
+        if not self._write_pair_detail(cursor, detail, full_profile, contact_overlap, now=now):
             return None
         return detail
 
@@ -1770,8 +1758,23 @@ class EntityProfileRepository:
         detail = _strip_schema(detail)
         detail.update(full_profile.detail_patch)
         detail.update(personal_channel.detail_patch)
-        owner_account_id, observation_scope, ownership_observed = _commit_metadata(full_profile, personal_channel)
-        if not self._write_detail(
+        if not self._write_pair_detail(cursor, detail, full_profile, personal_channel, now=now):
+            return None
+        self._write_pair_section(cursor.entity_id, "full_profile", full_profile, detail, now=now)
+        self._write_pair_section(cursor.entity_id, "personal_channel", personal_channel, detail, now=now)
+        return detail
+
+    def _write_pair_detail(
+        self,
+        cursor: EntityRefreshCursor,
+        detail: Mapping[str, object],
+        full_profile: EntitySectionCommit,
+        companion: EntitySectionCommit,
+        *,
+        now: int,
+    ) -> bool:
+        owner_account_id, observation_scope, ownership_observed = _commit_metadata(full_profile, companion)
+        return self._write_detail(
             cursor.entity_id,
             detail,
             now=now,
@@ -1779,14 +1782,10 @@ class EntityProfileRepository:
             owner_account_id=owner_account_id,
             observation_scope=observation_scope,
             ownership_observed=ownership_observed,
-            identity_patch=_combine_identity_patches(full_profile.identity_patch, personal_channel.identity_patch),
+            identity_patch=_combine_identity_patches(full_profile.identity_patch, companion.identity_patch),
             dialog_identity_observation=full_profile.dialog_identity_observation,
             dialog_identity_baseline_revision=full_profile.dialog_identity_baseline_revision,
-        ):
-            return None
-        self._write_pair_section(cursor.entity_id, "full_profile", full_profile, detail, now=now)
-        self._write_pair_section(cursor.entity_id, "personal_channel", personal_channel, detail, now=now)
-        return detail
+        )
 
     def _write_pair_section(
         self,
@@ -1834,7 +1833,7 @@ class EntityProfileRepository:
                 full_outcome,
                 personal_outcome,
                 now,
-                _pair_readiness_latency_ms(full_profile, personal_channel),
+                pair_readiness_latency_ms(full_profile, personal_channel),
                 now,
                 cursor.entity_id,
                 cursor.generation,
@@ -2684,13 +2683,14 @@ def _commit_metadata(
     return first.observation_owner_account_id, first.observation_auth_scope, True
 
 
-def _pair_readiness_latency_ms(
+def pair_readiness_latency_ms(
     full_profile: EntitySectionCommit,
     personal_channel: EntitySectionCommit,
 ) -> float | None:
+    """Measure the evidence span in milliseconds, subtracting before float conversion."""
     evidences = [commit.evidence for commit in (full_profile, personal_channel) if commit.evidence is not None]
     starts = [evidence.observation_started_at for evidence in evidences]
     completes = [evidence.observation_completed_at for evidence in evidences]
     if not starts or any(value is None for value in starts + completes):
         return None
-    return float(max(cast(list[int], completes)) - min(cast(list[int], starts))) * 1000.0
+    return float((max(cast(list[int], completes)) - min(cast(list[int], starts))) * 1000)

@@ -150,24 +150,18 @@ class ColdPeerPageDemandAdapter(DurableDemandAdapter):
             return
         with _cold_demand_scope():
             with rpc_attempt_budget(budget):
-                enrollment_release_at = working_set_enrollment_release_at(
+                enrollment = await run_working_set_enrollment_slice(
+                    self.client,
                     self.conn,
-                    now=float(int(time.time())),
+                    source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
                     cadence_s=self.pacing.history.enroll_s,
+                    timeout_s=self.timeout_s,
                 )
-                if enrollment_release_at is not None and enrollment_release_at <= time.time():
-                    enrollment = await run_working_set_enrollment_slice(
-                        self.client,
-                        self.conn,
-                        source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
-                        cadence_s=self.pacing.history.enroll_s,
-                        timeout_s=self.timeout_s,
-                    )
-                    if enrollment.consumed:
-                        # Keep the enrollment cursor at the candidate when the
-                        # local attempt budget is exhausted; the next slice gets
-                        # a fresh budget and resumes the same bounded unit.
-                        return
+                if enrollment.consumed:
+                    # Keep the enrollment cursor at the candidate when the
+                    # local attempt budget is exhausted; the next slice gets
+                    # a fresh budget and resumes the same bounded unit.
+                    return
                 await run_cold_backfill_pass(
                     self.client,
                     self.conn,
