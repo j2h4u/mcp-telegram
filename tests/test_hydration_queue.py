@@ -227,7 +227,7 @@ def test_obsolete_refund_changes_only_original_processing_row(db: sqlite3.Connec
             repository.enqueue(job)
         elif change == "terminal":
             repository.mark_terminal(started)
-        before = db.execute("SELECT * FROM hydration_jobs").fetchone()
+        before = cast(tuple[object, ...], db.execute("SELECT * FROM hydration_jobs").fetchone())
         assert repository.requeue_not_applied(started, 200) is (change == "none")
         if change == "none":
             assert db.execute("SELECT due_at,attempts,last_outcome FROM hydration_jobs").fetchone() == (

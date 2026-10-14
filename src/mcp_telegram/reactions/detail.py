@@ -100,10 +100,13 @@ class ReactionDetailRefresher:
         when = int(self._now() if now is None else now)
         if cancellation_event is not None and cancellation_event.is_set():
             return ReactionDetailResult("cancelled")
-        visibility = self._conn.execute(
-            "SELECT can_see_list FROM message_reaction_aggregate_state WHERE dialog_id=? AND message_id=?",
-            (dialog_id, message_id),
-        ).fetchone()
+        visibility = cast(
+            tuple[int | None] | None,
+            self._conn.execute(
+                "SELECT can_see_list FROM message_reaction_aggregate_state WHERE dialog_id=? AND message_id=?",
+                (dialog_id, message_id),
+            ).fetchone(),
+        )
         if visibility is not None and visibility[0] == 0:
             return ReactionDetailResult("unavailable", failure_kind="visibility_unavailable")
         state = self._expected_state(dialog_id, message_id, generation)

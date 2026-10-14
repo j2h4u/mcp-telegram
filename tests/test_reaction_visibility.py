@@ -179,7 +179,10 @@ def test_sync_and_direct_reads_share_visibility(
     assert extracted.reaction_can_see_list is visibility
     with write_transaction(conn):
         insert_messages_with_fts(conn, [extracted])
-    row = conn.execute("SELECT can_see_list FROM message_reaction_aggregate_state").fetchone()
+    row = cast(
+        tuple[int | None] | None,
+        conn.execute("SELECT can_see_list FROM message_reaction_aggregate_state").fetchone(),
+    )
     assert row == (visibility,)
     direct = message_to_dict(cast(MessageLike, message), dialog_id=1)
     assert bool(direct["reaction_events"]) is (visibility is not False)

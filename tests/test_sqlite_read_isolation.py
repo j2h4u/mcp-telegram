@@ -6,9 +6,10 @@ import asyncio
 import sqlite3
 import threading
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Callable, Coroutine, Iterator
 from pathlib import Path
 from types import ModuleType
+from typing import cast
 
 import pytest
 
@@ -45,7 +46,7 @@ def archive(tmp_path: Path) -> Iterator[tuple[sqlite3.Connection, sqlite3.Connec
         writer.close()
 
 
-def _operation(server: DaemonAPIServer, method: str) -> Callable[[dict], Awaitable[dict]]:
+def _operation(server: DaemonAPIServer, method: str) -> Callable[[dict], Coroutine[None, None, dict]]:
     if method == "get_inbox":
         return server._get_reading_service().list_unread_messages
     return server._get_activity_stats_service().get_my_recent_activity
@@ -124,8 +125,8 @@ async def test_projection_uses_one_snapshot_while_daemon_writes(
     expected = await _operation(make_server(source), method)({})
     server = make_server(writer)
     _module, service_type, projection_name = _projection_target(method)
-    service = server._get_reading_service() if method == "get_inbox" else server._get_activity_stats_service()
-    original = getattr(service, projection_name)
+    inbox_projection = server._get_reading_service()._list_unread_messages_sync
+    activity_projection = server._get_activity_stats_service()._recent_activity_sync
     started = asyncio.Event()
     release = threading.Event()
     loop = asyncio.get_running_loop()
@@ -134,7 +135,10 @@ async def test_projection_uses_one_snapshot_while_daemon_writes(
         conn.execute("SELECT COUNT(*) FROM messages").fetchone()
         loop.call_soon_threadsafe(started.set)
         assert release.wait(timeout=5)
-        return original(conn, request)
+        if isinstance(request, daemon_activity_stats._RecentActivityRequest):
+            return activity_projection(conn, request)
+        assert isinstance(request, dict)
+        return inbox_projection(conn, cast(dict[str, object], request))
 
     monkeypatch.setattr(service_type, projection_name, staticmethod(project_snapshot))
     task = asyncio.create_task(_operation(server, method)({}))
@@ -219,7 +223,8 @@ def test_activity_peer_discovery_searches_recent_own_index(
 
     def collect_plan(statement: str) -> None:
         if statement.startswith("SELECT DISTINCT m.dialog_id"):
-            plans.extend(str(row[3]) for row in writer.execute("EXPLAIN QUERY PLAN " + statement))
+            rows = cast(list[tuple[int, int, int, str]], writer.execute("EXPLAIN QUERY PLAN " + statement).fetchall())
+            plans.extend(row[3] for row in rows)
 
     writer.set_trace_callback(collect_plan)
     try:
