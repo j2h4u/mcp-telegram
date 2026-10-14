@@ -17,14 +17,18 @@ _ACTIVITY_DIALOG_KIND_ALIASES = {
 }
 
 
-def normalize_activity_dialog_kinds(value: object) -> list[str]:
-    """Normalize supported filters, rejecting invalid input before removing filters."""
+def _coerce_activity_dialog_kinds(value: object) -> list[object]:
     if value is None:
         return list(DEFAULT_ACTIVITY_DIALOG_KINDS)
     raw_values = [value] if isinstance(value, str) else value
     if not isinstance(raw_values, list | tuple | set):
         raise ValueError("dialog_kinds must be a list of strings")
+    return list(raw_values)
 
+
+def normalize_activity_dialog_kinds(value: object) -> list[str]:
+    """Normalize supported filters, rejecting invalid input before removing filters."""
+    raw_values = _coerce_activity_dialog_kinds(value)
     normalized_values: list[str] = []
     for raw in raw_values:
         if not isinstance(raw, str):
