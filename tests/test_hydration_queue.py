@@ -71,23 +71,24 @@ def _job(  # noqa: PLR0913
     )
 
 
-def test_enqueue_is_idempotent_moves_due_time_earlier_and_preserves_attempts(db: sqlite3.Connection) -> None:
+def test_enqueue_accelerates_only_before_first_attempt(db: sqlite3.Connection) -> None:
     conn = db
     repository = HydrationQueueRepository(conn)
     with write_savepoint(db):
         repository.enqueue(_job("media", -100, 7, 400))
+        repository.enqueue(_job("media", -100, 7, 350))
     with write_savepoint(db):
         started = repository.start(_job("media", -100, 7, 400))
-    assert started == _job("media", -100, 7, 400, attempts=1)
+    assert started == _job("media", -100, 7, 350, attempts=1)
 
     with write_savepoint(db):
         repository.enqueue(_job("media", -100, 7, 300, attempts=99))
     assert repository.due_jobs(299, 10) == []
-    assert repository.due_jobs(300, 10) == [_job("media", -100, 7, 300, attempts=1)]
+    assert repository.due_jobs(300, 10) == []
 
     with write_savepoint(db):
         repository.enqueue(_job("media", -100, 7, 500, attempts=99))
-    assert repository.due_jobs(499, 10) == [_job("media", -100, 7, 300, attempts=1)]
+    assert repository.due_jobs(499, 10) == [_job("media", -100, 7, 350, attempts=1)]
 
 
 def test_due_jobs_are_deterministically_ordered_and_limited(db: sqlite3.Connection) -> None:
@@ -176,11 +177,13 @@ def test_enqueue_promotes_existing_backfill_without_resetting_attempts(db: sqlit
 
     with write_savepoint(db):
         repository.enqueue(_job("media", 1, 1, 50))
-    assert repository.due_jobs(50, 10) == [_job("media", 1, 1, 50, attempts=1)]
+    assert repository.due_jobs(50, 10) == []
+    assert repository.due_jobs(100, 10) == [_job("media", 1, 1, 100, attempts=1)]
 
     with write_savepoint(db):
         repository.enqueue(_job("media", 1, 1, 25, priority=HydrationPriority.BACKFILL))
-    assert repository.due_jobs(25, 10) == [_job("media", 1, 1, 25, attempts=1)]
+    assert repository.due_jobs(25, 10) == []
+    assert repository.due_jobs(100, 10) == [_job("media", 1, 1, 100, attempts=1)]
 
 
 def test_terminal_job_is_suppressed_and_enqueue_preserves_state(db: sqlite3.Connection) -> None:
@@ -193,7 +196,50 @@ def test_terminal_job_is_suppressed_and_enqueue_preserves_state(db: sqlite3.Conn
     with write_savepoint(db):
         repository.enqueue(_job(TRANSCRIPTION_HYDRATION_KIND, 1, 1, 1, attempts=99))
     assert repository.due_jobs(100, 10) == []
-    assert db.execute("SELECT due_at, attempts, terminal FROM hydration_jobs").fetchone() == (1, 2, 1)
+    assert db.execute("SELECT due_at, attempts, terminal FROM hydration_jobs").fetchone() == (100, 2, 1)
+
+
+def test_admission_delay_survives_reenqueue_with_zero_attempts(db: sqlite3.Connection) -> None:
+    repository = HydrationQueueRepository(db)
+    job = _job(TRANSCRIPTION_HYDRATION_KIND, 1, 1, 10)
+    with write_savepoint(db):
+        repository.enqueue(job)
+        started = repository.start(job)
+        assert started is not None
+        assert repository.requeue_undispatched(started, 100)
+        repository.enqueue(job)
+    assert repository.due_jobs(99, 10) == []
+    assert repository.due_jobs(100, 10) == [_job(TRANSCRIPTION_HYDRATION_KIND, 1, 1, 100)]
+
+
+@pytest.mark.parametrize("change", ["none", "reschedule", "recreate", "terminal"])
+def test_obsolete_refund_changes_only_original_processing_row(db: sqlite3.Connection, change: str) -> None:
+    repository = HydrationQueueRepository(db)
+    job = _job(TRANSCRIPTION_HYDRATION_KIND, 1, 1, 10)
+    with write_savepoint(db):
+        repository.enqueue(job)
+        started = repository.start(job)
+        assert started is not None
+        if change == "reschedule":
+            repository.reschedule(started, 100)
+        elif change == "recreate":
+            repository.remove(started)
+            repository.enqueue(job)
+        elif change == "terminal":
+            repository.mark_terminal(started)
+        before = db.execute("SELECT * FROM hydration_jobs").fetchone()
+        assert repository.requeue_not_applied(started, 200) is (change == "none")
+        if change == "none":
+            assert db.execute("SELECT due_at,attempts,last_outcome FROM hydration_jobs").fetchone() == (
+                200,
+                0,
+                "not_applied",
+            )
+            assert repository.requeue_not_applied(started, 300) is False
+            repository.enqueue(job)
+            assert repository.due_jobs(199, 10) == []
+        else:
+            assert db.execute("SELECT * FROM hydration_jobs").fetchone() == before
 
 
 def test_start_increments_attempts_atomically_and_missing_job_returns_none(db: sqlite3.Connection) -> None:

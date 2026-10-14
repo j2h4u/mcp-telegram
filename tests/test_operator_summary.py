@@ -455,6 +455,7 @@ def test_summary_attributes_nested_rpc_leaf_and_only_computable_remainder(tmp_pa
     report = build_operator_summary(db_path, since_seconds=15 * 3600, now=now)
 
     assert "contributor=resolution_exclusive=900ms" in report.text
+    assert "timing_scope=daemon_dispatch, dispatch_duration=" in report.text
     assert "attribution=complete, completeness=4/4, unattributed=250ms" in report.text
     assert "request_id=22222222" in report.text
     assert "timing_rows=2/4, discarded=2, aggregation=largest_request" in report.text
@@ -658,3 +659,14 @@ def test_summary_cli_defaults_to_one_day(tmp_path: Path, monkeypatch: pytest.Mon
 
     assert result.exit_code == 0, result.output
     assert captured == [24 * 3600]
+
+
+def test_slow_call_reports_primary_and_optional_probe_separately() -> None:
+    row: dict[str, object] = {
+        "tool_name": "get_entity_info",
+        "duration_ms": 4727.0,
+        "payload_json": json.dumps({"primary_duration_ms": 3679.0, "account_protection_ms": 1048.0}),
+    }
+    assert _slow_call_detail(row) == (
+        "get_entity_info=4.7s, primary=3.7s, account_protection=1.0s, attribution=unavailable"
+    )

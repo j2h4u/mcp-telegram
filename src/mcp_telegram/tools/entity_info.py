@@ -29,6 +29,7 @@ from ._base import (
     daemon_connection,
     error_result,
     mcp_tool,
+    safe_error_code,
     structured_result,
 )
 from .structured import (
@@ -709,16 +710,19 @@ async def _resolve_entity_lookup(entity: str) -> ToolResult | _EntityLookup:
         async with daemon_connection() as conn:
             resolve_response = await conn.resolve_entity(query=entity)
     except DaemonNotRunningError as exc:
-        return error_result(_daemon_not_running_text(exc))
+        return error_result(_daemon_not_running_text(exc), error_code=f"daemon_{exc.kind}")
 
     if not resolve_response.get("ok"):
-        return error_result(entity_not_found_text(entity, retry_tool="GetEntityInfo"))
+        return error_result(
+            entity_not_found_text(entity, retry_tool="GetEntityInfo"),
+            error_code=safe_error_code(resolve_response.get("error"), fallback="entity_resolution_failed"),
+        )
 
     resolve_data = resolve_response.get("data", {})
     resolve_status = resolve_data.get("result", "not_found")
 
     if resolve_status == "not_found":
-        return error_result(entity_not_found_text(entity, retry_tool="GetEntityInfo"))
+        return error_result(entity_not_found_text(entity, retry_tool="GetEntityInfo"), error_code="entity_not_found")
 
     if resolve_status == "candidates":
         matches = resolve_data.get("matches", [])
@@ -752,10 +756,13 @@ def _entity_info_fetch_error(args: GetEntityInfo, response: dict) -> ToolResult 
     entity = args.entity if args.entity is not None else str(args.exact_entity_id)
     error_code = response.get("error", "")
     if error_code == "entity_not_found":
-        return error_result(entity_not_found_text(entity, retry_tool="GetEntityInfo"))
+        return error_result(entity_not_found_text(entity, retry_tool="GetEntityInfo"), error_code="entity_not_found")
 
     error_msg = response.get("message", "Request failed.")
-    return error_result(fetch_entity_info_error_text(entity, error_msg))
+    return error_result(
+        fetch_entity_info_error_text(entity, error_msg),
+        error_code=safe_error_code(error_code, fallback="entity_info_failed"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -855,7 +862,10 @@ async def get_entity_info(args: GetEntityInfo) -> ToolResult:
             return await _get_entity_info_within_budget(args)
     except TimeoutError:
         entity = args.entity if args.entity is not None else str(args.exact_entity_id)
-        return error_result(fetch_entity_info_error_text(entity, "entity info exceeded the endpoint time budget"))
+        return error_result(
+            fetch_entity_info_error_text(entity, "entity info exceeded the endpoint time budget"),
+            error_code="entity_info_timeout",
+        )
 
 
 async def _get_entity_info_within_budget(args: GetEntityInfo) -> ToolResult:
@@ -868,7 +878,7 @@ async def _get_entity_info_within_budget(args: GetEntityInfo) -> ToolResult:
         async with _bounded_daemon_connection() as conn:
             response = await conn.get_entity_info(entity_id=lookup.entity_id)
     except DaemonNotRunningError as exc:
-        return error_result(_daemon_not_running_text(exc))
+        return error_result(_daemon_not_running_text(exc), error_code=f"daemon_{exc.kind}")
 
     if err := _entity_info_fetch_error(args, response):
         return err

@@ -1,11 +1,13 @@
 """Activity and stats service extracted from daemon_api."""
 
+import asyncio
 import json
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Protocol, cast
 
 from .activity_dialog_kinds import normalize_activity_dialog_kinds
@@ -16,6 +18,7 @@ from .dialog_identity_contracts import DialogIdentity
 from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
 from .message_content import MessageSnapshot, project_message_content
 from .models import DialogType
+from .sync_db import open_sync_db_reader
 
 
 class _LoggerLike(Protocol):
@@ -61,6 +64,7 @@ class DaemonActivityStatsDeps:
     conn: sqlite3.Connection
     resolve_dialog_id: Callable[[DialogSelector], Awaitable[int | dict]]
     logger: _LoggerLike
+    sync_db_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -438,7 +442,8 @@ def _matching_activity_dialog_ids(
     rows = cast(
         list[tuple[object, ...]],
         conn.execute(
-            f"SELECT DISTINCT m.dialog_id FROM messages m {_where_clause(filters)}",
+            # Discovery order lets SQLite use the recent own-message range index.
+            f"SELECT DISTINCT m.dialog_id FROM messages m {_where_clause(filters)} ORDER BY m.sent_at DESC",
             params,
         ).fetchall(),
     )
@@ -646,12 +651,25 @@ class DaemonActivityStatsService:
         if error is not None or parsed is None:
             return error or {"ok": False, "error": "internal", "message": "internal error"}
 
-        rows = _query_activity_rows(self._deps.conn, parsed)
+        db_path = self._deps.sync_db_path
+        if db_path is not None:
+            return await asyncio.to_thread(self._recent_activity_from_reader, db_path, parsed)
+        return self._recent_activity_sync(self._deps.conn, parsed)
+
+    def _recent_activity_from_reader(self, db_path: Path, request: _RecentActivityRequest) -> dict[str, object]:
+        conn = open_sync_db_reader(db_path)
+        try:
+            conn.execute("BEGIN")
+            return self._recent_activity_sync(conn, request)
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _recent_activity_sync(conn: sqlite3.Connection, parsed: _RecentActivityRequest) -> dict[str, object]:
+        rows = _query_activity_rows(conn, parsed)
 
         state_rows = dict(
-            cast(
-                list[tuple[str, str]], self._deps.conn.execute("SELECT key, value FROM activity_sync_state").fetchall()
-            )
+            cast(list[tuple[str, str]], conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
         )
         backfill_complete = state_rows.get("backfill_complete") == "1"
         backfill_started = state_rows.get("backfill_started_at") is not None
@@ -665,9 +683,9 @@ class DaemonActivityStatsService:
         else:
             scan_status = "never_run"
 
-        links_by_msg = _activity_text_links(self._deps.conn, rows)
+        links_by_msg = _activity_text_links(conn, rows)
 
-        reactions_by_msg = _activity_reactions_by_message(self._deps.conn, rows)
+        reactions_by_msg = _activity_reactions_by_message(conn, rows)
 
         comments = _project_activity_comments(rows, links_by_msg, reactions_by_msg)
 

@@ -54,6 +54,9 @@ class _ExpectedDetailState:
     offset: str | None
     staged_count: int
 
+    def matches_request(self, generation: int, offset: str | None) -> bool:
+        return self.aggregate_generation in (None, generation) and self.offset == offset
+
 
 class ReactionDetailRefresher:
     """Acquire one page at a time and commit it with generation/offset CAS."""
@@ -97,10 +100,14 @@ class ReactionDetailRefresher:
         when = int(self._now() if now is None else now)
         if cancellation_event is not None and cancellation_event.is_set():
             return ReactionDetailResult("cancelled")
+        visibility = self._conn.execute(
+            "SELECT can_see_list FROM message_reaction_aggregate_state WHERE dialog_id=? AND message_id=?",
+            (dialog_id, message_id),
+        ).fetchone()
+        if visibility is not None and visibility[0] == 0:
+            return ReactionDetailResult("unavailable", failure_kind="visibility_unavailable")
         state = self._expected_state(dialog_id, message_id, generation)
-        if state.aggregate_generation is not None and state.aggregate_generation != generation:
-            return ReactionDetailResult("stale_writer")
-        if state.offset != offset:
+        if not state.matches_request(generation, offset):
             return ReactionDetailResult("stale_writer")
         self._observe("reaction.detail", "attempt")
         fetched = await self._fetch_page(entity, message_id, offset)

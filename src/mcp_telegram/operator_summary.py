@@ -347,14 +347,22 @@ def _mcp_lines(summary: McpSummary) -> list[str]:
 
 def _slow_call_detail(row: Observation) -> str:
     detail = f"{row['tool_name']}={_ms(_as_float(row['duration_ms']))}"
+    mcp_payload = _timing_payload(row) or {}
+    for label, field in (("primary", "primary_duration_ms"), ("account_protection", "account_protection_ms")):
+        duration = _finite_nonnegative(mcp_payload.get(field))
+        if duration is not None:
+            detail += f", {label}={_ms(duration)}"
     timing = row.get("_timing")
     if not isinstance(timing, dict):
         return detail + ", attribution=unavailable" + _timing_detail_metadata(None, row)
     payload = _timing_payload(timing)
     if payload is None:
         return detail + ", attribution=unavailable" + _timing_detail_metadata(None, row)
+    dispatch_duration = _finite_nonnegative(timing.get("duration_ms"))
     detail += (
-        f", contributor={_timing_contributor(payload)}, attribution={_timing_attribution(payload)}, "
+        f", timing_scope=daemon_dispatch, dispatch_duration={_ms(dispatch_duration)}, "
+        f"contributor={_timing_contributor(payload)}, "
+        f"attribution={_timing_attribution(payload)}, "
         f"completeness={_timing_completeness(payload)}"
     )
     return detail + _timing_detail_metadata(payload, row)

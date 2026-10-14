@@ -608,8 +608,10 @@ async def test_call_tool_primary_timeout_returns_schema_valid_error(monkeypatch:
 @pytest.mark.parametrize("tool_error", [False, True])
 @pytest.mark.parametrize("primary_delay", [0.0, 0.06])
 async def test_call_tool_delayed_protection_preserves_result_within_total_budget(
-    monkeypatch: pytest.MonkeyPatch, tool_error: bool, primary_delay: float
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tool_error: bool, primary_delay: float
 ) -> None:
+    caplog.set_level(logging.DEBUG, logger="mcp_telegram.server")
+    monkeypatch.setattr(server, "_SLOW_TOOL_CALL_SECONDS", 0.01)
     monkeypatch.setattr(server, "_TOOL_CALL_TIMEOUT_SECONDS", 0.08)
     monkeypatch.setattr(server, "_OPTIONAL_DAEMON_TIMEOUT_SECONDS", 0.04)
     monkeypatch.setattr(server.tools, "tool_args", lambda tool, **kwargs: object())
@@ -632,6 +634,7 @@ async def test_call_tool_delayed_protection_preserves_result_within_total_budget
         return ToolResult(structured_content=payload)
 
     async def blocked_protection() -> dict[str, object]:
+        assert not any("call_tool[submit_feedback]" in record.message for record in caplog.records)
         await asyncio.Future()
         return {}
 
@@ -646,6 +649,15 @@ async def test_call_tool_delayed_protection_preserves_result_within_total_budget
     assert result.is_error is tool_error
     assert len(writes) == (0 if tool_error else 1)
     assert events[0]["outcome"] == ("tool_error" if tool_error else "success")
+    assert cast(float, events[0]["primary_duration_ms"]) >= primary_delay * 1000
+    assert cast(float, events[0]["account_protection_ms"]) >= 10
+    completed = [record for record in caplog.records if "call_tool[submit_feedback]" in record.message]
+    assert len(completed) == 1
+    assert "timing_scope=mcp_call" in completed[0].message
+    assert "primary_s=" in completed[0].message
+    assert "account_protection_s=" in completed[0].message
+    logged_elapsed = cast(float, cast(tuple[object, ...], completed[0].args)[1])
+    assert abs(logged_elapsed - cast(float, events[0]["duration_ms"]) / 1000) < 0.01
     if not tool_error:
         assert result.content == []
         assert cast(dict[str, object], result.structured_content)["accepted"] is True
@@ -883,7 +895,7 @@ def test_fast_successful_tool_completion_is_debug_only(
     monkeypatch.setattr(server.time, "monotonic", lambda: 10.1)
     monkeypatch.setattr(server, "_SLOW_TOOL_CALL_SECONDS", 1.0)
     with caplog.at_level(logging.DEBUG, logger="mcp_telegram.server"):
-        server._project_tool_result("list_dialogs", ToolResult(), server._CallTelemetry(), 10.0)
+        server._log_tool_result("list_dialogs", ToolResult(), 0.1, primary_elapsed=0.1, protection_elapsed=0.0)
 
     records = [record for record in caplog.records if "call_tool[list_dialogs]" in record.getMessage()]
     assert len(records) == 1
@@ -897,7 +909,7 @@ def test_slow_successful_tool_completion_is_warning(
     monkeypatch.setattr(server.time, "monotonic", lambda: 11.001)
     monkeypatch.setattr(server, "_SLOW_TOOL_CALL_SECONDS", 1.0)
     with caplog.at_level(logging.INFO, logger="mcp_telegram.server"):
-        server._project_tool_result("list_dialogs", ToolResult(), server._CallTelemetry(), 10.0)
+        server._log_tool_result("list_dialogs", ToolResult(), 1.001, primary_elapsed=1.001, protection_elapsed=0.0)
 
     records = [record for record in caplog.records if "call_tool[list_dialogs]" in record.getMessage()]
     assert len(records) == 1
@@ -912,11 +924,12 @@ def test_expected_tool_error_completion_remains_info(
     monkeypatch.setattr(server.time, "monotonic", lambda: 10.1)
     monkeypatch.setattr(server, "_SLOW_TOOL_CALL_SECONDS", 1.0)
     with caplog.at_level(logging.INFO, logger="mcp_telegram.server"):
-        server._project_tool_result(
+        server._log_tool_result(
             "list_dialogs",
             ToolResult(is_error=True, error_code="invalid_query"),
-            server._CallTelemetry(),
-            10.0,
+            0.1,
+            primary_elapsed=0.1,
+            protection_elapsed=0.0,
         )
 
     records = [record for record in caplog.records if "call_tool[list_dialogs]" in record.getMessage()]
@@ -930,7 +943,7 @@ def test_tool_error_action_is_projected_to_structured_error_action() -> None:
     action = "Retry with an exact dialog id from structuredContent.error.details.candidates."
     tool_result = error_result(f"Multiple dialogs match.\nAction: {action}", error_code="ambiguous_dialog")
 
-    result = server._project_tool_result("list_dialogs", tool_result, server._CallTelemetry(), 10.0)
+    result = server._project_tool_result("list_dialogs", tool_result, server._CallTelemetry())
 
     assert result.is_error is True
     payload = cast(dict[str, object], result.structured_content)
@@ -945,7 +958,7 @@ def test_tool_error_action_is_projected_to_structured_error_action() -> None:
 def test_tool_error_without_action_uses_valid_fallback() -> None:
     tool_result = error_result("Request failed.", error_code="tool_error")
 
-    result = server._project_tool_result("list_dialogs", tool_result, server._CallTelemetry(), 10.0)
+    result = server._project_tool_result("list_dialogs", tool_result, server._CallTelemetry())
 
     payload = cast(dict[str, object], result.structured_content)
     error = cast(dict[str, object], payload["error"])

@@ -56,6 +56,7 @@ from .scheduled_projection import (
     scheduled_summary_by_dialog,
 )
 from .sqlite_projection import (
+    _COLLECT_UNREAD_DIALOG_CANDIDATES_SQL,
     _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL,
     _COUNT_READ_POSITION_PENDING_SQL,
     _FETCH_UNREAD_MESSAGES_SQL,
@@ -2481,6 +2482,21 @@ class ReadingService:
 
     async def list_unread_messages(self, req: dict[str, object]) -> dict:
         """Return prioritized unread messages across dialogs from sync.db."""
+        db_path = self._deps.sync_db_path
+        if db_path is not None:
+            return await asyncio.to_thread(self._list_unread_messages_from_reader, db_path, req)
+        return self._list_unread_messages_sync(self._conn, req)
+
+    def _list_unread_messages_from_reader(self, db_path: Path, req: dict[str, object]) -> dict:
+        conn = open_sync_db_reader(db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN")
+            return self._list_unread_messages_sync(conn, req)
+        finally:
+            conn.close()
+
+    def _list_unread_messages_sync(self, conn: sqlite3.Connection, req: dict[str, object]) -> dict:
         if "scope" in req:
             return {
                 "ok": False,
@@ -2498,12 +2514,13 @@ class ReadingService:
             since_utc = _parse_request_boundary(req, "since_utc")
         except ValueError as exc:
             return {"ok": False, "error": "invalid_input", "message": str(exc)}
-        entries, counts = self._collect_unread_dialogs(group_size_threshold, since_utc, include_dialog_types)
+        entries, counts = self._collect_unread_dialogs(group_size_threshold, since_utc, include_dialog_types, conn=conn)
         self._rank_unread_entries(entries)
         page_data = self._paginate_unread_entries(
             entries, counts, page, _clamp(_coerce_int(req.get("dialogs_per_page", 20), 20), 1, 20)
         )
-        groups = await self._fetch_unread_groups(
+        groups = self._fetch_unread_groups(
+            conn,
             cast(list[dict], page_data["entries"]),
             allocate_message_budget_round_robin(
                 cast(dict[int, int], page_data["counts"]),
@@ -2513,14 +2530,14 @@ class ReadingService:
             ),
             since_utc,
         )
-        pending_row = cast(tuple[object] | None, self._conn.execute(_COUNT_READ_POSITION_PENDING_SQL).fetchone())
+        pending_row = cast(tuple[object] | None, conn.execute(_COUNT_READ_POSITION_PENDING_SQL).fetchone())
         pending_count = int(cast(int | str, pending_row[0])) if pending_row else 0
         pending_rows = cast(
             list[tuple[object]],
-            self._conn.execute(_READ_POSITION_PENDING_IDENTITIES_SQL).fetchall(),
+            conn.execute(_READ_POSITION_PENDING_IDENTITIES_SQL).fetchall(),
         )
         pending_ids = [int(cast(int | str, row[0])) for row in pending_rows]
-        pending_identities = read_dialog_identities(self._conn, pending_ids)
+        pending_identities = read_dialog_identities(conn, pending_ids)
         pending_entities = [
             {
                 "dialog_id": dialog_id,
@@ -2605,43 +2622,63 @@ class ReadingService:
             and participants_count > group_size_threshold
         )
 
+    @staticmethod
+    def _eligible_unread_dialogs(
+        conn: sqlite3.Connection,
+        group_size_threshold: int,
+        include_dialog_types: tuple[DialogType, ...] | None,
+    ) -> dict[int, DialogIdentity]:
+        candidates = cast(
+            list[tuple[int, int | None]],
+            conn.execute(_COLLECT_UNREAD_DIALOG_CANDIDATES_SQL).fetchall(),
+        )
+        identities = read_dialog_identities(conn, [row[0] for row in candidates])
+        return {
+            dialog_id: identities[dialog_id]
+            for dialog_id, participants_count in candidates
+            if (include_dialog_types is None or identities[dialog_id].dialog_type in include_dialog_types)
+            and ReadingService._should_include_unread_dialog(
+                identities[dialog_id].dialog_type,
+                participants_count,
+                group_size_threshold,
+                allow_channel=include_dialog_types is not None and DialogType.CHANNEL in include_dialog_types,
+            )
+        }
+
     def _collect_unread_dialogs(
         self,
         group_size_threshold: int,
         since_utc: int | None = None,
         include_dialog_types: tuple[DialogType, ...] | None = None,
+        *,
+        conn: sqlite3.Connection | None = None,
     ) -> tuple[list[dict], dict[int, int]]:
+        if conn is None:
+            conn = self._conn
+        identities = ReadingService._eligible_unread_dialogs(conn, group_size_threshold, include_dialog_types)
+        if not identities:
+            return [], {}
         rows = cast(
             list[tuple[object, object, object, object, object]],
-            self._conn.execute(
+            conn.execute(
                 _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL,
                 {
+                    "dialog_ids": json.dumps(list(identities)),
                     "since_utc": since_utc,
                     "deleted_since_utc": int(time.time()) - self._deps.deleted_message_visibility_seconds,
                 },
             ).fetchall(),
         )
-        mention_counts = ReadingService._unread_mention_counts(self._conn, rows)
-        identities = read_dialog_identities(self._conn, [int(cast(int | str, row[0])) for row in rows])
+        mention_counts = ReadingService._unread_mention_counts(conn, rows)
         entries: list[dict] = []
         counts: dict[int, int] = {}
         for row in rows:
-            dialog_id, read_max, last_event_at, participants_count, unread_count = row
-            dialog_id_i = int(cast(int | str, dialog_id))
+            dialog_id_i = int(cast(int | str, row[0]))
             identity = identities[dialog_id_i]
-            unread_count_i = int(cast(int | str, unread_count))
+            unread_count_i = int(cast(int | str, row[4]))
             if unread_count_i == 0:
                 continue
             category = identity.dialog_type
-            if include_dialog_types is not None and category not in include_dialog_types:
-                continue
-            if not self._should_include_unread_dialog(
-                category,
-                cast(int | None, participants_count),
-                group_size_threshold,
-                allow_channel=include_dialog_types is not None and DialogType.CHANNEL in include_dialog_types,
-            ):
-                continue
             entries.append(
                 {
                     "chat_id": dialog_id_i,
@@ -2652,8 +2689,8 @@ class ReadingService:
                     "unread_count": unread_count_i,
                     "unread_mentions_count": mention_counts.get(dialog_id_i, 0),
                     "category": category,
-                    "date": last_event_at,
-                    "read_inbox_max_id": read_max,
+                    "date": row[2],
+                    "read_inbox_max_id": row[1],
                 }
             )
             counts[dialog_id_i] = unread_count_i
@@ -2684,8 +2721,12 @@ class ReadingService:
             )
         entries.sort(key=lambda entry: (entry["tier"], -(entry["date"] or 0), entry["chat_id"]))
 
-    async def _fetch_unread_groups(
-        self, entries: list[dict], allocation: dict[int, int], since_utc: int | None = None
+    def _fetch_unread_groups(
+        self,
+        conn: sqlite3.Connection,
+        entries: list[dict],
+        allocation: dict[int, int],
+        since_utc: int | None = None,
     ) -> list[dict]:
         groups: list[dict] = []
         for entry in entries:
@@ -2702,13 +2743,13 @@ class ReadingService:
                 "unread_count": entry["unread_count"],
                 "unread_mentions_count": entry["unread_mentions_count"],
                 "dialog_type": dialog_type,
-                "read_state": _read_state_for_dialog(self._conn, chat_id, dialog_type),
+                "read_state": _read_state_for_dialog(conn, chat_id, dialog_type),
                 "messages": [],
             }
             if budget:
                 rows = cast(
                     list[Mapping[str, object]],
-                    self._conn.execute(
+                    conn.execute(
                         _FETCH_UNREAD_MESSAGES_SQL,
                         {
                             "dialog_id": chat_id,
@@ -2720,20 +2761,21 @@ class ReadingService:
                         },
                     ).fetchall(),
                 )
-                messages, freshness = await self._enrich_unread_rows(chat_id, rows)
+                messages, freshness = self._enrich_unread_rows(conn, chat_id, rows)
                 group["messages"] = [dataclasses.asdict(message) for message in reversed(messages)]
                 if freshness is not None:
                     group["reaction_freshness"] = freshness.as_dict()
             groups.append(group)
         return groups
 
-    async def _enrich_unread_rows(
-        self, dialog_id: int, rows: list[Mapping[str, object]]
+    @staticmethod
+    def _enrich_unread_rows(
+        conn: sqlite3.Connection, dialog_id: int, rows: list[Mapping[str, object]]
     ) -> tuple[list[ReadMessage], ReactionFreshness | None]:
         messages = [read_message_from_row(row) for row in rows]
         if not messages:
             return messages, None
-        enriched = project_cached_message_facts(self._conn, dialog_id, messages)
+        enriched = project_cached_message_facts(conn, dialog_id, messages)
         return enriched, cached_reaction_freshness(len(enriched))
 
     # Public facade methods keep daemon_api free of reading request types and internals.

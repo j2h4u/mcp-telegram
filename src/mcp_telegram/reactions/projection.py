@@ -9,6 +9,16 @@ from typing import cast
 from .contracts import ReactionAggregate, ReactionEvent
 
 
+def project_reaction_visibility(reactions: object | None) -> bool | None:
+    """Preserve permission without interpreting a partial absence as denial."""
+    value = getattr(reactions, "can_see_list", None)
+    if value is True:
+        return True
+    if value is False and not getattr(reactions, "min", False):
+        return False
+    return None
+
+
 def project_reaction_aggregates(reactions: object | None) -> tuple[ReactionAggregate, ...]:
     """Project only Telegram's aggregate reaction fields.
 

@@ -26,6 +26,7 @@ from mcp_telegram.hydration_queue import (
 )
 from mcp_telegram.media_hydration import MediaFactHydrationHandler
 from mcp_telegram.messages.sqlite_bundle import mark_message_deleted
+from mcp_telegram.messages.sqlite_hydration import apply_message_transcription
 from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
@@ -93,17 +94,18 @@ def _enqueue(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", [MEDIA_METADATA_KIND, TRANSCRIPTION_HYDRATION_KIND])
-@pytest.mark.parametrize("newer", ["edit", "delete"])
-@pytest.mark.parametrize("valid_result", [True, False])
+@pytest.mark.parametrize("newer", ["edit", "replace", "delete"])
+@pytest.mark.parametrize("valid_result", [True, False, "pending"])
 async def test_worker_reserves_before_request_and_rejects_late_fact_and_queue_effects(
     db: sqlite3.Connection,
     kind: str,
     newer: str,
-    valid_result: bool,
+    valid_result: bool | str,
 ) -> None:
     _seed_dialog(db)
     _seed_message(db, 1, media_kind="voice" if kind == TRANSCRIPTION_HYDRATION_KIND else "other")
-    job = _enqueue(db, kind, 1)
+    job = _enqueue(db, kind, 1, attempts=2)
+    clock = [100.0]
     handler = (
         TranscriptionHydrationHandler(recheck_delay_seconds=30)
         if kind == TRANSCRIPTION_HYDRATION_KIND
@@ -122,9 +124,11 @@ async def test_worker_reserves_before_request_and_rejects_late_fact_and_queue_ef
         max_attempts=3,
         pause_between_requests_seconds=0,
         backfill_debt_limit=1,
+        clock=lambda: clock[0],
     )
 
     async def request(*args: object, **kwargs: object) -> object:
+        clock[0] += 300
         assert db.execute("SELECT value FROM daemon_state WHERE key='canonical_observation_sequence'").fetchone() == (
             "1",
         )
@@ -139,10 +143,14 @@ async def test_worker_reserves_before_request_and_rejects_late_fact_and_queue_ef
                     (sequence,),
                 )
                 db.execute("UPDATE messages SET text='newer', edit_date=30 WHERE dialog_id=1 AND message_id=1")
+                if newer == "replace":
+                    queue = HydrationQueueRepository(db)
+                    queue.remove(job)
+                    queue.enqueue(HydrationJob(kind, 1, 1, due_at=700, attempts=0))
         if not valid_result:
             return None
         if kind == TRANSCRIPTION_HYDRATION_KIND:
-            return SimpleNamespace(text="older transcription", pending=False, transcription_id=5)
+            return SimpleNamespace(text="older transcription", pending=valid_result == "pending", transcription_id=5)
         return SimpleNamespace(id=1, media=None)
 
     with patch.object(worker, "_request_batch", side_effect=request):
@@ -152,12 +160,33 @@ async def test_worker_reserves_before_request_and_rejects_late_fact_and_queue_ef
     if newer == "delete":
         assert db.execute("SELECT is_deleted FROM messages").fetchone() == (1,)
         assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+    elif newer == "replace":
+        assert db.execute("SELECT due_at,attempts,terminal,last_outcome FROM hydration_jobs").fetchone() == (
+            700,
+            0,
+            0,
+            "queued",
+        )
     else:
         assert db.execute("SELECT text, media_payload FROM messages").fetchone() == ("newer", "{}")
-        assert db.execute("SELECT terminal FROM hydration_jobs").fetchone() == (0,)
+        assert db.execute("SELECT due_at,attempts,terminal,last_outcome FROM hydration_jobs").fetchone() == (
+            401,
+            2,
+            0,
+            "not_applied",
+        )
+        assert HydrationQueueRepository(db).due_jobs(400, 10) == []
+        assert HydrationQueueRepository(db).due_jobs(401, 10)
+        if kind == TRANSCRIPTION_HYDRATION_KIND:
+            with write_transaction(db):
+                assert apply_message_transcription(
+                    db, 1, 1, transcribed_text="final words", transcription_id=8, received_at=410
+                )
+            assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("recreate", [False, True])
 @pytest.mark.parametrize(
     "failure",
     [
@@ -173,7 +202,9 @@ async def test_worker_reserves_before_request_and_rejects_late_fact_and_queue_ef
         "undispatched",
     ],
 )
-async def test_old_request_error_preserves_replacement_job(db: sqlite3.Connection, failure: str) -> None:
+async def test_old_request_error_refunds_original_and_preserves_replacement(  # noqa: PLR0915
+    db: sqlite3.Connection, failure: str, recreate: bool
+) -> None:
     _seed_dialog(db)
     _seed_message(db, 1, media_kind="voice")
     job = _enqueue(db, TRANSCRIPTION_HYDRATION_KIND, 1)
@@ -191,6 +222,7 @@ async def test_old_request_error_preserves_replacement_job(db: sqlite3.Connectio
         max_attempts=3,
         pause_between_requests_seconds=0,
         backfill_debt_limit=1,
+        clock=lambda: 100.0,
     )
     budget = RpcAttemptBudget(limit=2)
     replacement: list[tuple[object, ...]] = []
@@ -202,9 +234,10 @@ async def test_old_request_error_preserves_replacement_job(db: sqlite3.Connectio
                 "INSERT INTO message_observations(dialog_id,message_id,observation_order) VALUES (1,1,?)", (sequence,)
             )
             db.execute("UPDATE messages SET text='new voice',edit_date=30 WHERE dialog_id=1 AND message_id=1")
-            queue = HydrationQueueRepository(db)
-            queue.remove(job)
-            queue.enqueue(HydrationJob(TRANSCRIPTION_HYDRATION_KIND, 1, 1, due_at=73, attempts=2))
+            if recreate:
+                queue = HydrationQueueRepository(db)
+                queue.remove(job)
+                queue.enqueue(HydrationJob(TRANSCRIPTION_HYDRATION_KIND, 1, 1, due_at=73, attempts=2))
         replacement.append(cast(tuple[object, ...], db.execute("SELECT * FROM hydration_jobs").fetchone()))
         if failure != "undispatched":
             budget.debit()
@@ -235,9 +268,58 @@ async def test_old_request_error_preserves_replacement_job(db: sqlite3.Connectio
                 await worker._process_batch(handler, [job], 20, attempt_budget=budget)
         else:
             await worker._process_batch(handler, [job], 20, attempt_budget=budget)
-    assert cast(tuple[object, ...], db.execute("SELECT * FROM hydration_jobs").fetchone()) == replacement[0]
+    if recreate:
+        assert cast(tuple[object, ...], db.execute("SELECT * FROM hydration_jobs").fetchone()) == replacement[0]
+    else:
+        assert db.execute("SELECT due_at,attempts,terminal,last_outcome FROM hydration_jobs").fetchone() == (
+            101,
+            0,
+            0,
+            "not_applied",
+        )
     assert db.execute("SELECT status FROM synced_dialogs").fetchone() == ("synced",)
     assert not db.in_transaction
+
+
+@pytest.mark.asyncio
+async def test_pending_attempts_remain_bounded_and_final_event_can_complete(db: sqlite3.Connection) -> None:
+    _seed_dialog(db)
+    _seed_message(db, 1, media_kind="voice")
+    original = _enqueue(db, TRANSCRIPTION_HYDRATION_KIND, 1)
+    handler = TranscriptionHydrationHandler(recheck_delay_seconds=86_400)
+    clock = [100.0]
+    worker = MessageFactHydrationWorker(
+        object(),
+        db,
+        asyncio.Event(),
+        handlers=(handler,),
+        interval_seconds=1,
+        max_requests_per_cycle=2,
+        max_jobs_per_cycle=1,
+        retry_delay_seconds=21_600,
+        circuit_retry_seconds=1,
+        max_attempts=3,
+        pause_between_requests_seconds=0,
+        backfill_debt_limit=1,
+        clock=lambda: clock[0],
+    )
+    queue = HydrationQueueRepository(db)
+    with patch.object(worker, "_request_batch", return_value=SimpleNamespace(pending=True)) as request:
+        for attempt in range(1, 4):
+            job = queue.due_jobs(int(clock[0]), 1)[0]
+            await worker._process_batch(handler, [job], int(clock[0]))
+            assert db.execute("SELECT attempts,terminal FROM hydration_jobs").fetchone() == (attempt, int(attempt == 3))
+            with write_transaction(db):
+                queue.enqueue(original)
+            assert queue.due_jobs(int(clock[0]), 1) == []
+            clock[0] += 86_400
+        assert request.call_count == 3
+    assert db.execute("SELECT last_outcome FROM hydration_jobs").fetchone() == ("exhausted",)
+    with write_transaction(db):
+        assert apply_message_transcription(
+            db, 1, 1, transcribed_text="final speech", transcription_id=4, received_at=int(clock[0])
+        )
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
 
 
 def test_media_apply_maps_single_result_and_persists_empty_and_unknown_facts(

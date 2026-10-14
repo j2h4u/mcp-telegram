@@ -395,6 +395,7 @@ def _replace_reaction_projections(
             tuple(ReactionAggregate(emoji=row.emoji, count=row.count) for row in item.reactions),
             source=source,
             observed_at=observed_at,
+            can_see_list=item.reaction_can_see_list,
         )
 
 

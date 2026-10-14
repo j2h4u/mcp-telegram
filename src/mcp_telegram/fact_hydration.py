@@ -425,6 +425,10 @@ class MessageFactHydrationWorker:
             failure = exc
         finally:
             effective_now = int(self._clock())
+        with write_transaction(self._conn):
+            for job in started:
+                if not hydration_observation_current(self._conn, job.dialog_id, job.message_id, observation_order):
+                    self._queue.requeue_not_applied(job, effective_now + self._retry_delay_seconds)
         if failure is not None:
             return self._handle_batch_error(
                 handler,

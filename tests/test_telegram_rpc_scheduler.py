@@ -735,3 +735,39 @@ def test_daemon_observer_forwards_dispatch_event_to_aggregator() -> None:
     observer.flush(now=300.0)
 
     assert recorder.rows[0]["result_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "acquisition,reason,level",
+    [
+        (AcquisitionKind.FORWARD_NAME_LOOKUP, "attempt_budget_exhausted", "DEBUG"),
+        (AcquisitionKind.ENTITY_LOOKUP, "attempt_budget_exhausted", "WARNING"),
+        (AcquisitionKind.FORWARD_NAME_LOOKUP, "queue_saturated", "WARNING"),
+    ],
+)
+def test_only_optional_forward_budget_rejection_is_debug(
+    acquisition: AcquisitionKind,
+    reason: str,
+    level: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    events: list[RpcAdmissionEvent] = []
+    scheduler = TelegramRpcAdmissionScheduler(
+        policy=TelegramRpcSchedulerConfig(),
+        limiter=None,
+        observer=events.append,
+    )
+    event = RpcAdmissionEvent(
+        kind=RpcAdmissionEventKind.REJECTED,
+        source=TelegramRpcSource.FULL_SYNC,
+        service_class=RpcServiceClass.BACKGROUND,
+        queue_depth=0,
+        total_depth=0,
+        reason=reason,
+        acquisition_kind=acquisition,
+    )
+    with caplog.at_level("DEBUG", logger="mcp_telegram.telegram_rpc_scheduler"):
+        scheduler._emit(event)
+    assert events == [event]
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelname == level

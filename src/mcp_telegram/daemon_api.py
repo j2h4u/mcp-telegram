@@ -338,6 +338,15 @@ def _normalize_telemetry_event(
     return event, None
 
 
+def _mcp_timing_payload(event: Mapping[str, object]) -> dict[str, object]:
+    payload: dict[str, object] = {"timing_scope": "mcp_call"}
+    for field in ("primary_duration_ms", "account_protection_ms"):
+        value = event.get(field)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= sys.float_info.max:
+            payload[field] = value
+    return payload
+
+
 def _insert_telemetry_row(
     conn: sqlite3.Connection,
     event: Mapping[str, object],
@@ -358,6 +367,7 @@ def _insert_telemetry_row(
         outcome=str(event.get("outcome", "success")),
         reason_code=cast(str | None, event.get("error_code")),
         error_type=cast(str | None, event.get("error_type")),
+        payload=_mcp_timing_payload(event),
     )
 
 
@@ -853,6 +863,7 @@ class DaemonAPIServer:
             self._activity_stats_service = _activity_stats.DaemonActivityStatsService(
                 _activity_stats.DaemonActivityStatsDeps(
                     conn=self._conn,
+                    sync_db_path=self._sync_db_path,
                     resolve_dialog_id=self._resolve_dialog_id,
                     logger=cast(_activity_stats._LoggerLike, logger),
                 )
@@ -1155,7 +1166,7 @@ class DaemonAPIServer:
         log = logger.warning if ok else logger.info
         event = "daemon_api_slow_request" if ok else "daemon_api_request_complete"
         log(
-            "%s method=%s ok=%s duration_s=%.3f threshold_s=%.3f request_id=%s error=%s",
+            "%s timing_scope=daemon_dispatch method=%s ok=%s duration_s=%.3f threshold_s=%.3f request_id=%s error=%s",
             event,
             method,
             ok,

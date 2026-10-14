@@ -21,6 +21,7 @@ from .flood import TelegramRpcThrottled
 from .message_composition import normalize_telegram_fact
 from .message_history.contracts import MESSAGE_HISTORY_PAGE_SIZE
 from .messages.telegram_adapter import extract_message_row
+from .reactions.projection import project_reaction_visibility
 from .telegram_demand import AcquisitionKind, RpcAttemptBudget, RpcAttemptBudgetExhaustedError, acquisition_context
 from .telegram_gateway import fetch_group_profile_response
 from .telegram_rpc_error import describe_telegram_rpc_error
@@ -292,7 +293,7 @@ def _recent_reactor_key(item: object, entities: Mapping[int, object]) -> tuple[i
 def _reaction_counts(reactions: object) -> dict[str, int] | None:
     if not isinstance(reactions, types.MessageReactions):
         return None
-    if reactions.min or not reactions.can_see_list or reactions.top_reactors:
+    if reactions.min or project_reaction_visibility(reactions) is not True or reactions.top_reactors:
         return None
     expected: dict[str, int] = {}
     for result in reactions.results:
@@ -329,7 +330,7 @@ def _message_reactions(
     return {
         "status": "complete" if complete is not None else status,
         "aggregate": _raw(reactions),
-        "can_view_list": bool(getattr(reactions, "can_see_list", False)),
+        "can_view_list": project_reaction_visibility(reactions),
         **({"items": complete} if complete is not None else {}),
     }
 

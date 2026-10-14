@@ -3176,7 +3176,7 @@ def test_v81_refresh_generation_preserves_legacy_request_and_cursor(tmp_path: Pa
     )
     for column in ("delta_refresh_generation", "full_sync_retry_at", "delta_retry_at"):
         conn.execute(f"ALTER TABLE synced_dialogs DROP COLUMN {column}")
-    conn.execute("DELETE FROM schema_version WHERE version=81")
+    conn.execute("DELETE FROM schema_version WHERE version>=81")
     conn.commit()
     conn.close()
     ensure_sync_schema(path)
