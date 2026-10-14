@@ -6,8 +6,7 @@ updates:
   - package-ecosystem: "uv"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "daily"
       time: "07:00"
       timezone: "Asia/Almaty"
     # Cooldown applies to version updates only; security updates remain immediate.
@@ -32,8 +31,7 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "daily"
       time: "07:00"
       timezone: "Asia/Almaty"
     open-pull-requests-limit: 5
@@ -53,8 +51,7 @@ updates:
   - package-ecosystem: "docker"
     directory: "/deploy"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "daily"
       time: "07:00"
       timezone: "Asia/Almaty"
     open-pull-requests-limit: 5
