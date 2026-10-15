@@ -54,8 +54,12 @@ GET_INBOX_OUTPUT_SCHEMA = {
                 "properties": {
                     "entity": ENTITY_IDENTITY_SCHEMA,
                     "display_name_source": {"type": "string", "enum": ["name", "username", "numeric"]},
+                    "name_unavailable_reason": {
+                        "type": ["string", "null"],
+                        "enum": ["identity_not_observed", "name_not_available", None],
+                    },
                 },
-                "required": ["entity", "display_name_source"],
+                "required": ["entity", "display_name_source", "name_unavailable_reason"],
                 "additionalProperties": False,
             },
         },
@@ -73,8 +77,12 @@ GET_INBOX_OUTPUT_SCHEMA = {
                         "properties": {
                             "entity": ENTITY_IDENTITY_SCHEMA,
                             "display_name_source": {"type": "string", "enum": ["name", "username", "numeric"]},
+                            "name_unavailable_reason": {
+                                "type": ["string", "null"],
+                                "enum": ["identity_not_observed", "name_not_available", None],
+                            },
                         },
-                        "required": ["entity", "display_name_source"],
+                        "required": ["entity", "display_name_source", "name_unavailable_reason"],
                         "additionalProperties": False,
                     },
                 },
@@ -110,9 +118,13 @@ GET_INBOX_OUTPUT_SCHEMA = {
                         "properties": {
                             "entity": ENTITY_IDENTITY_SCHEMA,
                             "display_name_source": {"type": "string", "enum": ["name", "username", "numeric"]},
+                            "name_unavailable_reason": {
+                                "type": ["string", "null"],
+                                "enum": ["identity_not_observed", "name_not_available", None],
+                            },
                             "hidden_count": {"type": "integer"},
                         },
-                        "required": ["entity", "display_name_source", "hidden_count"],
+                        "required": ["entity", "display_name_source", "name_unavailable_reason", "hidden_count"],
                         "additionalProperties": False,
                     },
                 },

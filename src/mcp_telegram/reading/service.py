@@ -2557,6 +2557,7 @@ class ReadingService:
                     "display_name": pending_identities[dialog_id].display_name,
                     "username": pending_identities[dialog_id].username,
                     "display_name_source": pending_identities[dialog_id].display_name_source,
+                    "name_unavailable_reason": pending_identities[dialog_id].name_unavailable_reason,
                 }
                 for dialog_id in pending_ids
             ]
