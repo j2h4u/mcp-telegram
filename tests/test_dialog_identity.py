@@ -179,3 +179,71 @@ def test_owner_joins_caller_transaction_and_presence_revision_is_independent(
         0,
         0,
     )
+
+
+@pytest.mark.parametrize("profile_type", ["user", "User"])
+def test_unobserved_nameless_legacy_identity_uses_retained_profile_name(
+    make_synced_db: Callable[[], sqlite3.Connection], profile_type: str
+) -> None:
+    conn = make_synced_db()
+    _dialog(conn, 211, name=None, type="user", username="canonical", identity_source="legacy")
+    conn.execute(
+        "INSERT INTO entities(id,type,name,username,updated_at) VALUES (211,?,'Retained name','stale_alias',999)",
+        (profile_type,),
+    )
+    identity = read_dialog_identities(conn, [211])[211]
+    assert (identity.name, identity.username, identity.dialog_type) == ("Retained name", "canonical", DialogType.USER)
+    assert (identity.observed_at, identity.complete, identity.source) == (None, False, "mixed")
+    assert identity.display_name_source == "name"
+    assert read_local_dialog_identities(conn)[211] == identity
+    assert conn.execute("SELECT name,identity_source FROM dialogs WHERE dialog_id=211").fetchone() == (None, "legacy")
+
+
+@pytest.mark.parametrize(
+    ("source", "observed_at", "complete"),
+    [
+        ("directory", None, 0),
+        ("profile", None, 0),
+        ("mixed", None, 0),
+        ("realtime", None, 0),
+        ("legacy", 1, 0),
+        ("legacy", None, 1),
+    ],
+)
+def test_retained_profile_never_overrides_observed_missing_canonical_name(
+    make_synced_db: Callable[[], sqlite3.Connection], source: str, observed_at: int | None, complete: int
+) -> None:
+    conn = make_synced_db()
+    _dialog(
+        conn,
+        212,
+        name=None,
+        type="user",
+        identity_source=source,
+        identity_observed_at=observed_at,
+        identity_complete=complete,
+    )
+    conn.execute("INSERT INTO entities(id,type,name,updated_at) VALUES (212,'user','Stale name',999)")
+    assert read_dialog_identities(conn, [212])[212].name is None
+
+
+@pytest.mark.parametrize("profile_name", [None, "", "   "])
+def test_legacy_fallback_preserves_known_type_without_retained_name(
+    make_synced_db: Callable[[], sqlite3.Connection], profile_name: str | None
+) -> None:
+    conn = make_synced_db()
+    _dialog(conn, 213, name=None, type="supergroup", identity_source="legacy")
+    conn.execute("INSERT INTO entities(id,type,name,updated_at) VALUES (213,'user',?,999)", (profile_name,))
+    identity = read_dialog_identities(conn, [213])[213]
+    assert identity.name is None
+    assert identity.dialog_type is DialogType.SUPERGROUP
+    assert identity.source == "legacy"
+
+
+def test_legacy_fallback_preserves_existing_name(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
+    conn = make_synced_db()
+    _dialog(conn, 214, name="Canonical", type="supergroup", identity_source="legacy")
+    conn.execute("INSERT INTO entities(id,type,name,updated_at) VALUES (214,'user','Other name',999)")
+    identity = read_dialog_identities(conn, [214])[214]
+    assert identity.name == "Canonical"
+    assert identity.dialog_type is DialogType.SUPERGROUP

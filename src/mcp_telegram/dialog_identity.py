@@ -96,10 +96,18 @@ def _select(rows: list[_JoinedIdentityRow]) -> dict[int, DialogIdentity]:
             raw
         )
         dialog_id = _dialog_id(raw_id)
-        canonical = (
-            source is not None or observed_at is not None or bool(complete) or _is_material(name, username, raw_type)
+        canonical = any(
+            (source is not None, observed_at is not None, bool(complete), _is_material(name, username, raw_type))
         )
-        if canonical:
+        legacy_profile_name = (
+            (source, observed_at, bool(complete)) == ("legacy", None, False)
+            and not _is_material(name, None, None)
+            and _complete_profile(entity_type)
+            and _is_material(entity_name, None, None)
+        )
+        if legacy_profile_name:
+            result[dialog_id] = _bundle(dialog_id, entity_name, username, raw_type, None, False, "mixed")
+        elif canonical:
             result[dialog_id] = _bundle(dialog_id, name, username, raw_type, observed_at, bool(complete), source)
         elif _complete_profile(entity_type):
             result[dialog_id] = _bundle(dialog_id, entity_name, entity_username, entity_type, None, False, "profile")

@@ -13,10 +13,9 @@ from telethon.tl.functions.messages import GetHistoryRequest  # type: ignore[imp
 from telethon.tl.types import TypeInputPeer  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
-from ..dialog_identity_contracts import DialogIdentityObservation
 from ..messages.telegram_adapter import PeerNameClient, extract_message_row, resolve_forward_entity_name_map
 from ..telegram_access import ACCESS_LOST_ERRORS
-from ..telethon_dialog import observe_dialog_identity
+from ..telethon_dialog import observe_response_dialog_identity
 from .contracts import (
     MESSAGE_HISTORY_PAGE_SIZE,
     ExtractedMessage,
@@ -76,18 +75,10 @@ class TelethonFullHistoryPageAdapter(FullHistoryPagePort):
             messages=messages,
             total_messages=total_messages,
             next_before_message_id=next_cursor,
-            identity=_history_identity(response, dialog_id),
+            identity=observe_response_dialog_identity(
+                response, dialog_id, source="profile", observed_at=int(time.time())
+            ),
         )
-
-
-def _history_identity(response: object, dialog_id: int) -> DialogIdentityObservation | None:
-    for entity in (
-        *cast(Sequence[object], getattr(response, "users", ()) or ()),
-        *cast(Sequence[object], getattr(response, "chats", ()) or ()),
-    ):
-        if get_peer_id(entity) == dialog_id:
-            return observe_dialog_identity(entity, dialog_id=dialog_id, source="profile", observed_at=int(time.time()))
-    return None
 
 
 async def _fetch_raw_history_page(
@@ -212,7 +203,11 @@ def _build_forward_gap_page(
     if raw_messages and isinstance(response, (types.messages.MessagesSlice, types.messages.ChannelMessages)):
         complete = False
     normalized = tuple(extract_message_row(dialog_id, message) for message in messages)
-    return ForwardGapPage(messages=normalized, complete=complete, identity=_history_identity(response, dialog_id))
+    return ForwardGapPage(
+        messages=normalized,
+        complete=complete,
+        identity=observe_response_dialog_identity(response, dialog_id, source="profile", observed_at=int(time.time())),
+    )
 
 
 def _forward_raw_messages(
