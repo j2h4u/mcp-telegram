@@ -72,6 +72,7 @@ def test_unread_summary_projection_helper_keeps_identity_contract_and_skips_bad_
     assert _project_unread_summary_dialog({"dialog_id": 42, "name": 123, "username": False}) == {
         "entity": {"display_name": "42", "telegram_id": 42},
         "display_name_source": "numeric",
+        "name_unavailable_reason": None,
         "dialog_type": None,
         "unread_count": None,
         "unread_mark": None,
@@ -84,6 +85,7 @@ def test_unread_summary_projection_helper_keeps_identity_contract_and_skips_bad_
         {
             "entity": {"display_name": "Alice", "telegram_id": 42},
             "display_name_source": "numeric",
+            "name_unavailable_reason": None,
             "dialog_type": None,
             "unread_count": None,
             "unread_mark": None,
@@ -93,6 +95,27 @@ def test_unread_summary_projection_helper_keeps_identity_contract_and_skips_bad_
             "last_message_at": None,
         }
     ]
+
+
+def test_username_fallback_explicitly_reports_missing_name() -> None:
+    from mcp_telegram.tools.unread import _structured_inbox_group
+
+    raw = {
+        "dialog_id": 42,
+        "display_name": "@alice",
+        "name": "@alice",
+        "username": "alice",
+        "display_name_source": "username",
+        "name_unavailable_reason": "name_not_available",
+        "dialog_type": "user",
+    }
+    inbox, _, _ = _structured_inbox_group(raw)
+    summary = _project_unread_summary_dialog(raw)
+    assert summary is not None
+    for row in (inbox, summary):
+        assert row["entity"] == {"display_name": "@alice", "username": "@alice"}
+        assert row["display_name_source"] == "username"
+        assert row["name_unavailable_reason"] == "name_not_available"
 
 
 @pytest.mark.parametrize(

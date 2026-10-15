@@ -16,7 +16,16 @@ import pytest
 from mcp_telegram import daemon_activity_stats
 from mcp_telegram.daemon_api import DaemonAPIServer
 from mcp_telegram.reading import service as reading_service
+from mcp_telegram.runtime_observations import RuntimeObservationSink
 from test_daemon_api import _make_db_with_activity, _seed_unread_dialog, _seed_unread_state, make_server
+
+
+class _TimingSink:
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+
+    def record(self, **kwargs: object) -> None:
+        self.events.append(kwargs)
 
 
 @pytest.fixture
@@ -238,3 +247,112 @@ def test_activity_peer_discovery_searches_recent_own_index(
     assert set(ids) == {101, -102, -103}
     assert any("SEARCH m USING INDEX idx_messages_own_activity_sent (sent_at>?)" in plan for plan in plans)
     assert not any("SCAN m" in plan for plan in plans)
+
+
+@pytest.mark.asyncio
+async def test_inbox_persists_worker_boundaries_and_final_projection(
+    archive: tuple[sqlite3.Connection, sqlite3.Connection, Path],
+) -> None:
+    import json
+
+    from mcp_telegram.runtime_observations import MAX_PAYLOAD_BYTES
+
+    _source, writer, _path = archive
+    server = make_server(writer)
+    sink = _TimingSink()
+    server._runtime_observation_sink = cast(RuntimeObservationSink, sink)
+    response, _, _ = await server._handle_client_line(
+        json.dumps({"method": "get_inbox", "preview_chars": 32, "request_id": "dbab88a7"}).encode(), "", None
+    )
+    assert response["ok"] is True
+    assert len(sink.events) == 1
+    observation = sink.events[0]
+    payload = cast(dict[str, object], observation["payload"])
+    assert observation["kind"] == "daemon.request_timing"
+    assert payload["route_attempted"] == "local_inbox"
+    assert payload["served_source"] == "local"
+    assert payload["request_id"] == "dbab88a7"
+    assert payload["measured_required_phase_count"] == payload["required_phase_count"] == 2
+    assert cast(float, payload["response_shape_ms"]) >= 0
+    nested = cast(dict[str, dict[str, float]], payload["nested_phases"])["local_projection"]
+    assert set(nested) == {
+        "executor_queue_ms",
+        "reader_open_ms",
+        "dialog_selection_ms",
+        "message_projection_ms",
+        "pending_read_positions_ms",
+    }
+    assert all(value >= 0 for value in nested.values())
+    assert sum(nested.values()) <= cast(float, payload["local_projection_ms"])
+    assert len(json.dumps(payload, separators=(",", ":")).encode()) <= MAX_PAYLOAD_BYTES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_inbox_worker_failure_or_cancellation_persists_partial_timing(
+    archive: tuple[sqlite3.Connection, sqlite3.Connection, Path], cancel: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    from mcp_telegram.request_timing import current_timing
+
+    _source, writer, _path = archive
+    server = make_server(writer)
+    sink = _TimingSink()
+    server._runtime_observation_sink = cast(RuntimeObservationSink, sink)
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def fail_projection(_conn: sqlite3.Connection, _req: object) -> dict:
+        assert current_timing() is not None
+        loop.call_soon_threadsafe(started.set)
+        try:
+            assert release.wait(timeout=5)
+            raise ValueError("controlled projection failure")
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(reading_service.ReadingService, "_list_unread_messages_sync", staticmethod(fail_projection))
+    task = asyncio.create_task(
+        server._handle_client_line(json.dumps({"method": "get_inbox", "preview_chars": 32}).encode(), "", None)
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        if cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            release.set()
+            response, _, _ = await task
+            assert response["ok"] is False
+        assert len(sink.events) == 1
+        observation = sink.events[0]
+        assert observation["outcome"] == ("cancelled" if cancel else "tool_error")
+        payload = cast(dict[str, object], observation["payload"])
+        assert payload["measured_required_phase_count"] == 1 < cast(int, payload["required_phase_count"]) == 2
+        assert payload["response_shape_ms"] is None
+        assert payload["unattributed_ms"] is None
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+        if not task.done():
+            await task
+
+
+@pytest.mark.asyncio
+async def test_inbox_executor_wait_uses_submission_time_and_propagates_context(
+    archive: tuple[sqlite3.Connection, sqlite3.Connection, Path],
+) -> None:
+    from mcp_telegram.request_timing import timing_context
+
+    _source, writer, path = archive
+    service = make_server(writer)._get_reading_service()
+    with timing_context("1" * 32) as timing:
+        assert timing is not None
+        await asyncio.to_thread(service._list_unread_messages_from_reader, path, {}, time.monotonic() - 1)
+        queue_ms = timing.nested_phases["local_projection"]["executor_queue"]
+        assert queue_ms >= 1000
+        assert timing._active_phases == []

@@ -122,6 +122,7 @@ def _project_read_position_pending_entity(
     return key, {
         "entity": identity,
         "display_name_source": _display_name_source(raw.get("display_name_source")),
+        "name_unavailable_reason": raw.get("name_unavailable_reason"),
     }
 
 
@@ -162,6 +163,7 @@ def _structured_inbox_group(
     dialog = {
         "entity": entity,
         "display_name_source": _display_name_source(group.get("display_name_source")),
+        "name_unavailable_reason": group.get("name_unavailable_reason"),
         "category": category,
         "dialog_type": dialog_type,
         "unread_count": group.get("unread_count", 0),
@@ -187,6 +189,7 @@ def _structured_inbox_group(
         hidden_entry = {
             "entity": entity,
             "display_name_source": _display_name_source(group.get("display_name_source")),
+            "name_unavailable_reason": group.get("name_unavailable_reason"),
             "hidden_count": hidden_count,
         }
     return dialog, hidden_entry, len(message_rows)
@@ -325,6 +328,7 @@ def _inbox_hidden_entry(dialog: dict[str, object]) -> dict[str, object] | None:
     return {
         "entity": dialog["entity"],
         "display_name_source": dialog["display_name_source"],
+        "name_unavailable_reason": dialog["name_unavailable_reason"],
         "hidden_count": budget["hidden_count"],
     }
 

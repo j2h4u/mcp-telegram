@@ -10,13 +10,13 @@ from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from functools import wraps
-from typing import Protocol, TypeVar, cast
+from typing import Protocol, cast
 
 from telethon.errors import PeerIdInvalidError, RPCError  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
 
 from .access_lifecycle import set_access_lost
-from .dialog_classification import EntityKind, classify_dialog_type
+from .dialog_identity import capture_identity_baseline, publish_dialog_identity
 from .flood import TelegramRpcThrottled, sleep_through_flood
 from .maintenance_logging import log_maintenance_cycle
 from .sync_transactions import write_transaction
@@ -39,11 +39,11 @@ from .telegram_rpc_scheduler import (
     rpc_attempt_budget,
     rpc_scope,
 )
+from .telethon_dialog import observe_dialog_identity
 from .topics.contracts import TopicSourceUnavailableError, is_topic_capable
 from .topics.refresh import TopicRefresher
 
 logger = logging.getLogger(__name__)
-T = TypeVar("T")
 
 
 @contextmanager
@@ -98,10 +98,6 @@ class _DialogSyncClient(Protocol):
 _EntityFields = dict[str, object]
 
 
-def _attr[T](obj: object, name: str, default: T) -> T:
-    return cast(T, getattr(obj, name, default))
-
-
 _SELECT_DIRTY_DIALOGS_SQL = "SELECT dialog_id FROM dialogs WHERE needs_refresh = 1 AND hidden = 0"
 _SELECT_DIRTY_DIALOG_EXISTS_SQL = "SELECT 1 FROM dialogs WHERE needs_refresh = 1 AND hidden = 0 LIMIT 1"
 _UPDATE_DIALOG_ENTITY_SQL = (
@@ -110,41 +106,14 @@ _UPDATE_DIALOG_ENTITY_SQL = (
 
 
 def _extract_entity_fields(entity: _EntityLike) -> _EntityFields:
-    """Return canonical entity-derived dialog fields for the light pass."""
-    if isinstance(entity, types.User):
-        dialog_type = classify_dialog_type(entity, entity_kind=EntityKind.USER).value
-        members = None
-        created = None
-    elif isinstance(entity, types.Chat):
-        dialog_type = classify_dialog_type(entity, entity_kind=EntityKind.CHAT).value
+    """Return non-identity metadata from the fetched entity."""
+    if isinstance(entity, (types.Chat, types.Channel)):
         members = entity.participants_count
         created = int(entity.date.timestamp()) if entity.date else None
-    elif isinstance(entity, types.Channel):
-        dialog_type = classify_dialog_type(entity, entity_kind=EntityKind.CHANNEL).value
-        members = entity.participants_count
-        date = entity.date
-        created = int(date.timestamp()) if date else None
     else:
-        dialog_type = classify_dialog_type(entity, entity_kind=EntityKind.UNKNOWN).value
         members = None
         created = None
-    return {
-        "name": _extract_name(entity),
-        "type": dialog_type,
-        "members": members,
-        "created": created,
-    }
-
-
-def _extract_name(entity: _EntityLike) -> str | None:
-    """Build a display name from a Telethon entity."""
-    title = _attr(entity, "title", None)
-    if title:
-        return title
-    first = _attr(entity, "first_name", None) or ""
-    last = _attr(entity, "last_name", None) or ""
-    name = f"{first} {last}".strip()
-    return name or None
+    return {"members": members, "created": created}
 
 
 class DialogReconciliationWorker:
@@ -169,22 +138,24 @@ class DialogReconciliationWorker:
         logger.warning("recon_light_flood_wait dialog_id=%d wait=%ds", dialog_id, wait_s)
         return await sleep_through_flood(self._shutdown_event, wait_s)
 
+    def _persist_light_dialog(self, dialog_id: int, entity: _EntityLike, identity_revision: int | None) -> None:
+        fields = _extract_entity_fields(entity)
+        snapshot_at = int(time.time())
+        observation = observe_dialog_identity(entity, dialog_id=dialog_id, source="profile", observed_at=snapshot_at)
+        with write_transaction(self._conn):
+            self._conn.execute(
+                _UPDATE_DIALOG_ENTITY_SQL,
+                (fields["members"], fields["created"], snapshot_at, dialog_id),
+            )
+            if observation is not None:
+                publish_dialog_identity(self._conn, dialog_id, observation, identity_revision)
+
     async def _refresh_light_dialog(self, dialog_id: int, *, refresh_topics: bool = True) -> bool | None:
         """Refresh one dirty dialog; None means shutdown interrupted a wait."""
+        identity_revision = capture_identity_baseline(self._conn, dialog_id)
         try:
             entity = await self._client.get_entity(dialog_id)
-            fields = _extract_entity_fields(entity)
-            snapshot_at = int(time.time())
-            with write_transaction(self._conn):
-                self._conn.execute(
-                    _UPDATE_DIALOG_ENTITY_SQL,
-                    (
-                        fields["members"],
-                        fields["created"],
-                        snapshot_at,
-                        dialog_id,
-                    ),
-                )
+            self._persist_light_dialog(dialog_id, entity, identity_revision)
             if refresh_topics and self._topic_refresher is not None and is_topic_capable(entity):
                 topic_count = await self._refresh_forum_topics(dialog_id, entity)
                 logger.debug(

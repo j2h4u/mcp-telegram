@@ -2,17 +2,20 @@ import json
 from typing import cast
 
 import pytest
+from jsonschema import validate
 from mcp.types import TextContent
 from pydantic import ValidationError
 
-from mcp_telegram.temporal import response_timezone
+from mcp_telegram.temporal import normalize_temporal_output_schema, response_timezone
 from mcp_telegram.tools._base import ToolResult
 from mcp_telegram.tools.unread import (
+    GET_INBOX_OUTPUT_SCHEMA,
     INBOX_MESSAGE_FIELDS,
     GetInbox,
     _drop_largest_inbox_preview,
     _project_inbox_response,
     _project_read_position_pending_entities,
+    _structured_inbox_group,
     _structured_messages,
 )
 
@@ -154,7 +157,16 @@ def test_lower_tier_previews_are_removed_before_human_messages() -> None:
 
 def test_final_ascii_size_and_all_receipts_include_warnings_and_timezone() -> None:
     groups = [
-        _group(i, unread_count=5, messages=[_message(dialog_id=i, message_id=j, text="Ж" * 1000) for j in range(1, 6)])
+        _group(
+            i,
+            unread_count=5,
+            display_name=str(i),
+            display_name_source="numeric",
+            category="unknown",
+            dialog_type="unknown",
+            name_unavailable_reason="identity_not_observed",
+            messages=[_message(dialog_id=i, message_id=j, text="Ж" * 1000) for j in range(1, 6)],
+        )
         for i in range(20)
     ]
     result = _project(_response(groups), response_chars=24000, timezone="Asia/Almaty")
@@ -169,6 +181,13 @@ def test_final_ascii_size_and_all_receipts_include_warnings_and_timezone() -> No
     assert shown + cast(int, budget["hidden_count"]) == 100
     assert sum(cast(int, _dict(row)["hidden_count"]) for row in _list(budget["hidden_count_by_dialog"])) == 100 - shown
     assert payload["content_truncated_count"] == shown
+    assert all(
+        _dict(row)["name_unavailable_reason"] == "identity_not_observed"
+        for row in _list(budget["hidden_count_by_dialog"])
+    )
+    output_schema = normalize_temporal_output_schema(GET_INBOX_OUTPUT_SCHEMA)
+    assert output_schema is not None
+    validate(instance=payload, schema=output_schema)
     assert len(warnings) == 1
     assert "list_messages" in _text(warnings[0]["action"])
     assert "list_conversation_changes" in _text(warnings[0]["action"])
@@ -271,3 +290,43 @@ def test_response_budget_shortens_human_preview_before_discarding_it(preview_cha
     assert _dict(human[0]["content"])["text"]
     assert human[0]["content_source_length"] == 400
     assert human[0]["content_truncated"] is True
+
+
+@pytest.mark.parametrize("reason", [None, "identity_not_observed", "name_not_available"])
+def test_dialog_name_reason_survives_hidden_and_pending_reference_projection(reason: str | None) -> None:
+    group = _group(
+        unread_count=2,
+        messages=[_message()],
+        display_name="Alice" if reason is None else "@alice" if reason == "name_not_available" else "10",
+        username="alice" if reason == "name_not_available" else None,
+        display_name_source="name" if reason is None else "username" if reason == "name_not_available" else "numeric",
+        name_unavailable_reason=reason,
+    )
+    visible, hidden, _ = _structured_inbox_group(group)
+    assert hidden is not None
+    assert visible["name_unavailable_reason"] == hidden["name_unavailable_reason"] == reason
+    result = _project(
+        _response(
+            [group],
+            read_position_pending_count=1,
+            read_position_pending_entities=[
+                {
+                    "dialog_id": 99,
+                    "display_name_source": "numeric",
+                    "name_unavailable_reason": reason,
+                }
+            ],
+        )
+    )
+    assert not result.is_error
+    payload = _dict(result.structured_content)
+    output_schema = normalize_temporal_output_schema(GET_INBOX_OUTPUT_SCHEMA)
+    assert output_schema is not None
+    validate(instance=payload, schema=output_schema)
+    hidden_refs = _list(_dict(payload["budget"])["hidden_count_by_dialog"])
+    assert _dict(hidden_refs[0])["name_unavailable_reason"] == reason
+    for pending in (
+        payload["read_position_pending_entities"],
+        _dict(payload["coverage"])["read_position_pending_entities"],
+    ):
+        assert _dict(_list(pending)[0])["name_unavailable_reason"] == reason

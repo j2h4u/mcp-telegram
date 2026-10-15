@@ -256,3 +256,76 @@ async def test_light_pass_refreshes_forum_topics(
         await worker.run_light_pass()
 
     refresh.assert_called_once_with(777, entity)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["user", "chat", "channel", "min_channel"])
+async def test_light_reconciliation_publishes_identity_from_actual_fetched_entity(
+    sync_db: sqlite3.Connection, mock_client: _MockClient, shutdown_event: asyncio.Event, kind: str
+) -> None:
+    from mcp_telegram.dialog_identity import read_dialog_identities
+    from mcp_telegram.models import DialogType
+
+    now = datetime.now(UTC)
+    if kind == "user":
+        peer, entity = 301, types.User(id=301, first_name="Fetched user", username="fetched")
+        expected_type = DialogType.USER
+    elif kind == "chat":
+        peer = -301
+        entity = types.Chat(
+            id=301, title="Fetched group", photo=types.ChatPhotoEmpty(), participants_count=2, date=now, version=1
+        )
+        expected_type = DialogType.GROUP
+    else:
+        peer = -1000000000301
+        entity = types.Channel(
+            id=301,
+            title="Fetched channel",
+            photo=types.ChatPhotoEmpty(),
+            date=now,
+            broadcast=True,
+            min=kind == "min_channel",
+        )
+        expected_type = DialogType.SUPERGROUP if kind == "min_channel" else DialogType.CHANNEL
+    _seed_dialog(sync_db, peer, needs_refresh=1)
+    sync_db.execute("UPDATE dialogs SET name=NULL,type='supergroup' WHERE dialog_id=?", (peer,))
+    sync_db.commit()
+    mock_client.get_entity.return_value = entity
+
+    assert (
+        await DialogReconciliationWorker(mock_client, sync_db, shutdown_event).run_light_pass(refresh_topics=False) == 1
+    )
+    identity = read_dialog_identities(sync_db, [peer])[peer]
+    assert identity.name is not None and identity.name.startswith("Fetched")
+    assert identity.dialog_type is expected_type
+    assert identity.complete is (kind != "min_channel")
+    assert sync_db.execute("SELECT needs_refresh FROM dialogs WHERE dialog_id=?", (peer,)).fetchone() == (0,)
+    mock_client.get_entity.assert_awaited_once_with(peer)
+
+
+@pytest.mark.asyncio
+async def test_light_reconciliation_does_not_overwrite_identity_refreshed_during_fetch(
+    sync_db: sqlite3.Connection, mock_client: _MockClient, shutdown_event: asyncio.Event
+) -> None:
+    from mcp_telegram.dialog_identity import capture_identity_baseline, publish_dialog_identity, read_dialog_identities
+    from mcp_telegram.dialog_identity_contracts import DialogIdentityObservation
+    from mcp_telegram.sync_transactions import write_transaction
+
+    _seed_dialog(sync_db, 302, needs_refresh=1)
+
+    async def fetch_entity(peer: int) -> object:
+        revision = capture_identity_baseline(sync_db, peer)
+        with write_transaction(sync_db):
+            assert publish_dialog_identity(
+                sync_db,
+                peer,
+                DialogIdentityObservation(peer, "Directory name", "directory", "user", True, "directory", 100),
+                revision,
+            )
+        return types.User(id=peer, first_name="Older response", username="older")
+
+    mock_client.get_entity.side_effect = fetch_entity
+    assert await DialogReconciliationWorker(mock_client, sync_db, shutdown_event).run_light_pass() == 1
+    identity = read_dialog_identities(sync_db, [302])[302]
+    assert (identity.name, identity.username, identity.source) == ("Directory name", "directory", "directory")
+    assert sync_db.execute("SELECT needs_refresh FROM dialogs WHERE dialog_id=302").fetchone() == (0,)

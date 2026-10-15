@@ -670,3 +670,48 @@ def test_slow_call_reports_primary_and_optional_probe_separately() -> None:
     assert _slow_call_detail(row) == (
         "get_entity_info=4.7s, primary=3.7s, account_protection=1.0s, attribution=unavailable"
     )
+
+
+@pytest.mark.parametrize(
+    "dominant", ["executor_queue", "dialog_selection", "message_projection", "pending_read_positions"]
+)
+def test_summary_attributes_slow_inbox_to_worker_boundary(tmp_path: Path, dominant: str) -> None:
+    now = 2_000_000_000.0
+    db_path = tmp_path / "sync.db"
+    _database(db_path, now_ms=int(now * 1000))
+    payload = {
+        "route_attempted": "local_inbox",
+        "served_source": "local",
+        "request_id": "dbab88a7",
+        "local_projection_ms": 2400,
+        "response_shape_ms": 20,
+        "nested_phases": {"local_projection": {f"{dominant}_ms": 2200, "reader_open_ms": 100}},
+        "measured_required_phase_count": 2,
+        "required_phase_count": 2,
+        "unattributed_ms": 26,
+    }
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.executemany(
+            "INSERT INTO runtime_observations("
+            "observed_at_ms,kind,runtime_instance_id,operation_id,outcome,duration_ms,tool_name,payload_json"
+            ") VALUES (?,?,?,?,?,?,?,?)",
+            [
+                (int(now * 1000) - 1000, "mcp.call", "current", "inbox", "success", 2493, "get_inbox", "{}"),
+                (
+                    int(now * 1000) - 900,
+                    "daemon.request_timing",
+                    "current",
+                    "inbox",
+                    "success",
+                    2446,
+                    None,
+                    json.dumps(payload),
+                ),
+            ],
+        )
+        conn.commit()
+    report = build_operator_summary(db_path, since_seconds=3600, now=now)
+    assert "get_inbox" in report.text
+    assert f"contributor=local_projection.{dominant}=2.2s" in report.text
+    assert "attribution=complete, completeness=2/2, unattributed=26ms" in report.text
+    assert "attempted=local_inbox, served=local, request_id=dbab88a7" in report.text

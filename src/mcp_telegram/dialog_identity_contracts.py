@@ -28,6 +28,12 @@ class DialogIdentity:
     display_name: str
     display_name_source: str
 
+    @property
+    def name_unavailable_reason(self) -> str | None:
+        if self.name is not None:
+            return None
+        return "identity_not_observed" if self.source is None else "name_not_available"
+
 
 @dataclass(frozen=True, slots=True)
 class DialogIdentityObservation:

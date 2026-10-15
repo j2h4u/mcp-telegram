@@ -34,6 +34,8 @@ from telethon.tl.types import TypeInputPeer
 from .access_lifecycle import set_access_lost
 from .activity_peer_resolve import resolve_input_peer, resolve_linked_chat_id
 from .activity_substrate import ActivityClient, call_with_timeout
+from .dialog_identity import ensure_dialog_identity_baseline, publish_dialog_identity
+from .dialog_identity_contracts import DialogIdentityObservation
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
 from .linked_chat_fact import LinkedChatState
@@ -46,6 +48,7 @@ from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import RpcAttemptBudgetExhaustedError
 from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource
+from .telethon_dialog import observe_response_dialog_identity
 
 logger = logging.getLogger(__name__)
 
@@ -221,7 +224,11 @@ def _extract_sweep_messages(
 
 
 def _extract_and_persist_sweep_messages(
-    request: PeerSweepRequest, batch: Sequence[_SweepMessageLike], observation_order: int
+    request: PeerSweepRequest,
+    batch: Sequence[_SweepMessageLike],
+    observation_order: int,
+    identity: DialogIdentityObservation | None,
+    identity_revision: int,
 ) -> tuple[list[ExtractedMessage], frozenset[tuple[int, int]]] | SweepResult:
     """Return page rows or an explicit non-completion processing error."""
     try:
@@ -237,6 +244,8 @@ def _extract_and_persist_sweep_messages(
                     [replace(row, observation_order=observation_order) for row in extracted],
                     priority=request.hydration_priority,
                 )
+            if identity is not None:
+                publish_dialog_identity(request.conn, request.dialog_id, identity, identity_revision)
     except Exception:
         logger.warning("sweep_peer_once_persistence_error dialog_id=%r", request.dialog_id, exc_info=True)
         return _access_skip_result(rpc_calls=2, pages_fetched=1)
@@ -422,6 +431,8 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
 
     # Step 2: issue per-peer self-search with concrete peer (not InputPeerEmpty)
     rpc_calls += 1  # SearchRequest is a governed Telegram call attempt.
+    with write_transaction(request.conn):
+        identity_revision = ensure_dialog_identity_baseline(request.conn, request.dialog_id)
     observation_order = allocate_observation_order(request.conn)
     search = await _search_self_messages(request, peer, rpc_calls=rpc_calls)
     if search.early_result is not None:
@@ -429,8 +440,19 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
 
     rpc_duration_s = search.rpc_duration_s
     await _pace_successful_search_request()
-    search_result = cast(_SweepResultLike, search.result)
-    batch = list(search_result.messages or [])
+    batch = list(cast(_SweepResultLike, search.result).messages or [])
+    page_rows = _extract_and_persist_sweep_messages(
+        request,
+        batch,
+        observation_order,
+        observe_response_dialog_identity(
+            search.result, request.dialog_id, source="profile", observed_at=int(time.time())
+        ),
+        identity_revision,
+    )
+    if isinstance(page_rows, SweepResult):
+        return page_rows
+    extracted, genuinely_new_keys = page_rows
 
     # Step 5: genuinely empty batch from a reachable peer → history floor
     if not batch:
@@ -454,11 +476,6 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
             completed=True,
         )
 
-    # Step 3-4: extract and persist via canonical pipeline
-    page_rows = _extract_and_persist_sweep_messages(request, batch, observation_order)
-    if isinstance(page_rows, SweepResult):
-        return page_rows
-    extracted, genuinely_new_keys = page_rows
     genuinely_new = len(genuinely_new_keys)
 
     persisted = len(extracted)

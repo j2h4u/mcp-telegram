@@ -1,5 +1,8 @@
 """Telethon entity classification adapter."""
 
+from collections.abc import Sequence
+from typing import cast
+
 from telethon.tl.types import (  # type: ignore[import-untyped]
     Channel,
     ChannelForbidden,
@@ -7,6 +10,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     ChatForbidden,
     User,
 )
+from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .dialog_classification import (
     RESERVED_REPLIES_USERNAME,
@@ -31,6 +35,19 @@ def classify_dialog_type(entity: object | None) -> DialogType:
     else:
         kind = EntityKind.UNKNOWN
     return _classify_dialog_type(entity, entity_kind=kind)
+
+
+def observe_response_dialog_identity(
+    response: object, dialog_id: int, *, source: str, observed_at: int
+) -> DialogIdentityObservation | None:
+    """Retain only the target peer's identity supplied by this RPC response."""
+    for entity in (
+        *cast(Sequence[object], getattr(response, "users", ()) or ()),
+        *cast(Sequence[object], getattr(response, "chats", ()) or ()),
+    ):
+        if get_peer_id(entity) == dialog_id:
+            return observe_dialog_identity(entity, dialog_id=dialog_id, source=source, observed_at=observed_at)
+    return None
 
 
 def observe_dialog_identity(
@@ -190,4 +207,5 @@ __all__ = [
     "is_reserved_replies_username",
     "normalize_telegram_username",
     "observe_dialog_identity",
+    "observe_response_dialog_identity",
 ]

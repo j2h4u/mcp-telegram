@@ -4063,6 +4063,9 @@ async def test_list_unread_messages_response_reports_read_position_pending() -> 
     _seed_unread_state(conn, 1002, read_inbox_max_id=None)
     _seed_unread_state(conn, 1003, read_inbox_max_id=None)
 
+    conn.execute("DELETE FROM dialogs WHERE dialog_id=1003")
+    conn.execute("DELETE FROM entities WHERE id=1003")
+
     client = _TestClient()
     server = make_server(conn, client)
 
@@ -4079,6 +4082,9 @@ async def test_list_unread_messages_response_reports_read_position_pending() -> 
     assert len(cast(list[dict[str, object]], data["groups"])) == 1
     assert data["read_position_pending_count"] == 2
     assert len(cast(list[dict[str, object]], data["read_position_pending_entities"])) == 2
+    pending = {row["dialog_id"]: row for row in cast(list[dict[str, object]], data["read_position_pending_entities"])}
+    assert pending[1002]["name_unavailable_reason"] is None
+    assert pending[1003]["name_unavailable_reason"] == "identity_not_observed"
     cast(MagicMock, client).assert_not_called()
 
 

@@ -6,6 +6,7 @@ import json
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
@@ -2482,13 +2483,21 @@ class ReadingService:
 
     async def list_unread_messages(self, req: dict[str, object]) -> dict:
         """Return prioritized unread messages across dialogs from sync.db."""
-        db_path = self._deps.sync_db_path
-        if db_path is not None:
-            return await asyncio.to_thread(self._list_unread_messages_from_reader, db_path, req)
-        return self._list_unread_messages_sync(self._conn, req)
+        timing = current_timing()
+        if timing is not None:
+            timing.set_route("local_inbox")
+        with timing_phase("local_projection"):
+            db_path = self._deps.sync_db_path
+            if db_path is not None:
+                return await asyncio.to_thread(self._list_unread_messages_from_reader, db_path, req, time.monotonic())
+            return self._list_unread_messages_sync(self._conn, req)
 
-    def _list_unread_messages_from_reader(self, db_path: Path, req: dict[str, object]) -> dict:
-        conn = open_sync_db_reader(db_path)
+    def _list_unread_messages_from_reader(self, db_path: Path, req: dict[str, object], submitted_at: float) -> dict:
+        timing = current_timing()
+        if timing is not None:
+            timing.add_nested_phase("local_projection", "executor_queue", (time.monotonic() - submitted_at) * 1000)
+        with timing.nested_phase("local_projection", "reader_open") if timing is not None else nullcontext():
+            conn = open_sync_db_reader(db_path)
         try:
             conn.row_factory = sqlite3.Row
             conn.execute("BEGIN")
@@ -2514,39 +2523,44 @@ class ReadingService:
             since_utc = _parse_request_boundary(req, "since_utc")
         except ValueError as exc:
             return {"ok": False, "error": "invalid_input", "message": str(exc)}
-        entries, counts = self._collect_unread_dialogs(group_size_threshold, since_utc, include_dialog_types, conn=conn)
-        self._rank_unread_entries(entries)
-        page_data = self._paginate_unread_entries(
-            entries, counts, page, _clamp(_coerce_int(req.get("dialogs_per_page", 20), 20), 1, 20)
-        )
-        groups = self._fetch_unread_groups(
-            conn,
-            cast(list[dict], page_data["entries"]),
-            allocate_message_budget_round_robin(
-                cast(dict[int, int], page_data["counts"]),
-                limit,
-                tiers={entry["chat_id"]: entry["tier"] for entry in cast(list[dict], page_data["entries"])},
-                max_per_chat=_clamp(_coerce_int(req.get("messages_per_dialog", 5), 5), 1, 20),
-            ),
-            since_utc,
-        )
-        pending_row = cast(tuple[object] | None, conn.execute(_COUNT_READ_POSITION_PENDING_SQL).fetchone())
-        pending_count = int(cast(int | str, pending_row[0])) if pending_row else 0
-        pending_rows = cast(
-            list[tuple[object]],
-            conn.execute(_READ_POSITION_PENDING_IDENTITIES_SQL).fetchall(),
-        )
-        pending_ids = [int(cast(int | str, row[0])) for row in pending_rows]
-        pending_identities = read_dialog_identities(conn, pending_ids)
-        pending_entities = [
-            {
-                "dialog_id": dialog_id,
-                "display_name": pending_identities[dialog_id].display_name,
-                "username": pending_identities[dialog_id].username,
-                "display_name_source": pending_identities[dialog_id].display_name_source,
-            }
-            for dialog_id in pending_ids
-        ]
+        with timing_phase("dialog_selection", parent="local_projection"):
+            entries, counts = self._collect_unread_dialogs(
+                group_size_threshold, since_utc, include_dialog_types, conn=conn
+            )
+            self._rank_unread_entries(entries)
+            page_data = self._paginate_unread_entries(
+                entries, counts, page, _clamp(_coerce_int(req.get("dialogs_per_page", 20), 20), 1, 20)
+            )
+        with timing_phase("message_projection", parent="local_projection"):
+            groups = self._fetch_unread_groups(
+                conn,
+                cast(list[dict], page_data["entries"]),
+                allocate_message_budget_round_robin(
+                    cast(dict[int, int], page_data["counts"]),
+                    limit,
+                    tiers={entry["chat_id"]: entry["tier"] for entry in cast(list[dict], page_data["entries"])},
+                    max_per_chat=_clamp(_coerce_int(req.get("messages_per_dialog", 5), 5), 1, 20),
+                ),
+                since_utc,
+            )
+        with timing_phase("pending_read_positions", parent="local_projection"):
+            pending_row = cast(tuple[object] | None, conn.execute(_COUNT_READ_POSITION_PENDING_SQL).fetchone())
+            pending_count = int(cast(int | str, pending_row[0])) if pending_row else 0
+            pending_ids = [
+                int(cast(int | str, row[0]))
+                for row in cast(list[tuple[object]], conn.execute(_READ_POSITION_PENDING_IDENTITIES_SQL).fetchall())
+            ]
+            pending_identities = read_dialog_identities(conn, pending_ids)
+            pending_entities = [
+                {
+                    "dialog_id": dialog_id,
+                    "display_name": pending_identities[dialog_id].display_name,
+                    "username": pending_identities[dialog_id].username,
+                    "display_name_source": pending_identities[dialog_id].display_name_source,
+                    "name_unavailable_reason": pending_identities[dialog_id].name_unavailable_reason,
+                }
+                for dialog_id in pending_ids
+            ]
         return {
             "ok": True,
             "data": {
@@ -2685,6 +2699,7 @@ class ReadingService:
                     "display_name": identity.display_name,
                     "username": identity.username,
                     "display_name_source": identity.display_name_source,
+                    "name_unavailable_reason": identity.name_unavailable_reason,
                     "dialog_type": category.value,
                     "unread_count": unread_count_i,
                     "unread_mentions_count": mention_counts.get(dialog_id_i, 0),
@@ -2738,6 +2753,7 @@ class ReadingService:
                 "display_name": entry["display_name"],
                 "username": entry["username"],
                 "display_name_source": entry["display_name_source"],
+                "name_unavailable_reason": entry["name_unavailable_reason"],
                 "tier": entry["tier"],
                 "category": entry["category"],
                 "unread_count": entry["unread_count"],
@@ -2879,6 +2895,7 @@ class ReadingService:
                         "username": identity.username,
                         "dialog_type": identity.dialog_type.value,
                         "display_name_source": identity.display_name_source,
+                        "name_unavailable_reason": identity.name_unavailable_reason,
                         "unread_count": _object_to_int_or_none(_row_value(row, "unread_count")),
                         "unread_mark": (None if unread_mark_raw is None else bool(_object_to_int(unread_mark_raw, 0))),
                         "unread_mentions_count": _object_to_int(_row_value(row, "unread_mentions_count"), 0),

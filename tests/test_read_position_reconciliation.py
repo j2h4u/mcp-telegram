@@ -472,9 +472,27 @@ def test_inbox_projection_uses_read_position_identity_contract() -> None:
             "groups": [],
             "read_position_pending_count": 3,
             "read_position_pending_entities": [
-                {"dialog_id": 10, "display_name": "Alice", "username": "alice", "display_name_source": "name"},
-                {"dialog_id": 11, "display_name": "Alias", "username": "@alice", "display_name_source": "name"},
-                {"dialog_id": 12, "display_name": None, "username": None},
+                {
+                    "dialog_id": 10,
+                    "display_name": "Alice",
+                    "username": "alice",
+                    "display_name_source": "name",
+                    "name_unavailable_reason": None,
+                },
+                {
+                    "dialog_id": 11,
+                    "display_name": "Alias",
+                    "username": "@alice",
+                    "display_name_source": "name",
+                    "name_unavailable_reason": None,
+                },
+                {
+                    "dialog_id": 12,
+                    "display_name": None,
+                    "username": None,
+                    "display_name_source": "numeric",
+                    "name_unavailable_reason": "identity_not_observed",
+                },
                 {"dialog_id": None, "display_name": "invalid", "username": None},
             ],
         },
@@ -488,9 +506,19 @@ def test_inbox_projection_uses_read_position_identity_contract() -> None:
     assert payload["coverage"]["read_position_pending_count"] == 3
     identities = payload["read_position_pending_entities"]
     assert identities == [
-        {"entity": {"display_name": "Alice", "username": "@alice"}, "display_name_source": "name"},
-        {"entity": {"display_name": "12", "telegram_id": 12}, "display_name_source": "numeric"},
+        {
+            "entity": {"display_name": "Alice", "username": "@alice"},
+            "display_name_source": "name",
+            "name_unavailable_reason": None,
+        },
+        {
+            "entity": {"display_name": "12", "telegram_id": 12},
+            "display_name_source": "numeric",
+            "name_unavailable_reason": "identity_not_observed",
+        },
     ]
+
+    assert payload["coverage"]["read_position_pending_entities"] == identities
 
 
 def test_inbox_projection_rejects_missing_read_position_contract() -> None:

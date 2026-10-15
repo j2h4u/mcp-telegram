@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from typing import Protocol, cast
@@ -14,6 +15,7 @@ from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from ..messages.telegram_adapter import PeerNameClient, extract_message_row, resolve_forward_entity_name_map
 from ..telegram_access import ACCESS_LOST_ERRORS
+from ..telethon_dialog import observe_response_dialog_identity
 from .contracts import (
     MESSAGE_HISTORY_PAGE_SIZE,
     ExtractedMessage,
@@ -69,7 +71,14 @@ class TelethonFullHistoryPageAdapter(FullHistoryPagePort):
             raise MessageHistoryUnavailableError(f"message history unavailable for dialog {dialog_id}") from exc
         raw_total = cast(object, getattr(response, "count", getattr(response, "total", None)))
         total_messages = raw_count if raw_total is None else _optional_nonnegative_int(raw_total)
-        return FullHistoryPage(messages=messages, total_messages=total_messages, next_before_message_id=next_cursor)
+        return FullHistoryPage(
+            messages=messages,
+            total_messages=total_messages,
+            next_before_message_id=next_cursor,
+            identity=observe_response_dialog_identity(
+                response, dialog_id, source="profile", observed_at=int(time.time())
+            ),
+        )
 
 
 async def _fetch_raw_history_page(
@@ -194,7 +203,11 @@ def _build_forward_gap_page(
     if raw_messages and isinstance(response, (types.messages.MessagesSlice, types.messages.ChannelMessages)):
         complete = False
     normalized = tuple(extract_message_row(dialog_id, message) for message in messages)
-    return ForwardGapPage(messages=normalized, complete=complete)
+    return ForwardGapPage(
+        messages=normalized,
+        complete=complete,
+        identity=observe_response_dialog_identity(response, dialog_id, source="profile", observed_at=int(time.time())),
+    )
 
 
 def _forward_raw_messages(

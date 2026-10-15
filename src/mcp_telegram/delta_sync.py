@@ -28,6 +28,7 @@ from .access_lifecycle import (
     set_access_lost,
     stamp_access_revalidation,
 )
+from .dialog_identity import ensure_dialog_identity_baseline, publish_dialog_identity
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .history_enrollment import full_history_enabled, request_delta_refresh
 from .hydration_queue import HydrationPriority
@@ -401,6 +402,8 @@ class DeltaSyncWorker:
         return row_first_int(row)
 
     async def _collect_delta_slice(self, dialog_id: int, max_known_id: int, generation: int) -> _DeltaFetchOutcome:
+        with write_transaction(self._conn):
+            identity_revision = ensure_dialog_identity_baseline(self._conn, dialog_id)
         reaction_observed_at = int(time.time())
         observation_order = allocate_observation_order(self._conn)
         try:
@@ -430,6 +433,9 @@ class DeltaSyncWorker:
             logger.warning("delta_slice_rpc_error dialog_id=%d error=%s", dialog_id, exc)
             self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
+        if page.identity is not None:
+            with write_transaction(self._conn):
+                publish_dialog_identity(self._conn, dialog_id, page.identity, identity_revision)
         rows = [replace(row, observation_order=observation_order) for row in page.messages]
         if self._delta_gap_fill_observation_enabled:
             unique_keys = {(row.message.dialog_id, row.message.message_id) for row in rows}
