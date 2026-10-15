@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final
 
+from ..dialog_identity_contracts import DialogIdentityObservation
 from ..message_contracts import ExtractedMessage
 
 MESSAGE_HISTORY_PAGE_SIZE: Final = 100
@@ -32,6 +33,7 @@ class FullHistoryPage:
     messages: tuple[ExtractedMessage, ...]
     total_messages: int | None
     next_before_message_id: int | None
+    identity: DialogIdentityObservation | None = None
 
     def __post_init__(self) -> None:
         _validate_full_history_messages(self.messages)
@@ -68,6 +70,7 @@ class ForwardGapPage:
 
     messages: tuple[ExtractedMessage, ...]
     complete: bool
+    identity: DialogIdentityObservation | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.messages, tuple):

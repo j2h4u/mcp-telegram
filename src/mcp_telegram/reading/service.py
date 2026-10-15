@@ -6,6 +6,7 @@ import json
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
@@ -2482,17 +2483,26 @@ class ReadingService:
 
     async def list_unread_messages(self, req: dict[str, object]) -> dict:
         """Return prioritized unread messages across dialogs from sync.db."""
-        db_path = self._deps.sync_db_path
-        if db_path is not None:
-            return await asyncio.to_thread(self._list_unread_messages_from_reader, db_path, req)
-        return self._list_unread_messages_sync(self._conn, req)
+        timing = current_timing()
+        if timing is not None:
+            timing.set_route("local_inbox")
+        with timing_phase("local_projection"):
+            db_path = self._deps.sync_db_path
+            if db_path is not None:
+                return await asyncio.to_thread(self._list_unread_messages_from_reader, db_path, req, time.monotonic())
+            return self._list_unread_messages_sync(self._conn, req)
 
-    def _list_unread_messages_from_reader(self, db_path: Path, req: dict[str, object]) -> dict:
-        conn = open_sync_db_reader(db_path)
+    def _list_unread_messages_from_reader(self, db_path: Path, req: dict[str, object], submitted_at: float) -> dict:
+        timing = current_timing()
+        if timing is not None:
+            timing.add_nested_phase("local_projection", "executor_queue", (time.monotonic() - submitted_at) * 1000)
+        with timing.nested_phase("local_projection", "reader_open") if timing is not None else nullcontext():
+            conn = open_sync_db_reader(db_path)
         try:
             conn.row_factory = sqlite3.Row
             conn.execute("BEGIN")
-            return self._list_unread_messages_sync(conn, req)
+            with timing.nested_phase("local_projection", "query_projection") if timing is not None else nullcontext():
+                return self._list_unread_messages_sync(conn, req)
         finally:
             conn.close()
 
@@ -2685,6 +2695,7 @@ class ReadingService:
                     "display_name": identity.display_name,
                     "username": identity.username,
                     "display_name_source": identity.display_name_source,
+                    "name_unavailable_reason": identity.name_unavailable_reason,
                     "dialog_type": category.value,
                     "unread_count": unread_count_i,
                     "unread_mentions_count": mention_counts.get(dialog_id_i, 0),
@@ -2738,6 +2749,7 @@ class ReadingService:
                 "display_name": entry["display_name"],
                 "username": entry["username"],
                 "display_name_source": entry["display_name_source"],
+                "name_unavailable_reason": entry["name_unavailable_reason"],
                 "tier": entry["tier"],
                 "category": entry["category"],
                 "unread_count": entry["unread_count"],
@@ -2879,6 +2891,7 @@ class ReadingService:
                         "username": identity.username,
                         "dialog_type": identity.dialog_type.value,
                         "display_name_source": identity.display_name_source,
+                        "name_unavailable_reason": identity.name_unavailable_reason,
                         "unread_count": _object_to_int_or_none(_row_value(row, "unread_count")),
                         "unread_mark": (None if unread_mark_raw is None else bool(_object_to_int(unread_mark_raw, 0))),
                         "unread_mentions_count": _object_to_int(_row_value(row, "unread_mentions_count"), 0),

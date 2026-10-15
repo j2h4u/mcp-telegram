@@ -31,10 +31,11 @@ TIMING_PHASES = (
     "response_shape",
 )
 TIMING_TOP_LEVEL_PHASES = ("resolution", "local_projection", "telegram_fallback", "response_shape")
-TIMING_NESTED_LEAF_PHASES = ("rpc_admission", "rpc_execution")
-TIMING_NESTED_PARENTS = ("resolution", "telegram_fallback")
+TIMING_NESTED_LEAF_PHASES = ("rpc_admission", "rpc_execution", "executor_queue", "reader_open", "query_projection")
+TIMING_NESTED_PARENTS = ("resolution", "telegram_fallback", "local_projection")
 TIMING_REQUIRED_PHASES_BY_ROUTE = MappingProxyType(
     {
+        "local_inbox": ("local_projection", "response_shape"),
         "local_history": ("resolution", "local_projection", "response_shape"),
         "local_context": ("resolution", "local_projection", "response_shape"),
         "local_non_sent_state": ("resolution", "local_projection", "response_shape"),
@@ -44,6 +45,7 @@ TIMING_REQUIRED_PHASES_BY_ROUTE = MappingProxyType(
 )
 TIMING_ROUTES = frozenset(
     {
+        "local_inbox",
         "local_history",
         "local_context",
         "local_non_sent_state",
@@ -100,8 +102,10 @@ def _unattributed_duration(
 
 def _nested_payload(nested_phases: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
     return {
-        parent: {f"{phase}_ms": duration for phase, duration in phases.items() if phase in TIMING_NESTED_LEAF_PHASES}
-        for parent, phases in nested_phases.items()
+        parent: {
+            f"{phase}_ms": duration for phase, duration in phases.copy().items() if phase in TIMING_NESTED_LEAF_PHASES
+        }
+        for parent, phases in nested_phases.copy().items()
         if parent in TIMING_NESTED_PARENTS
     }
 
@@ -163,6 +167,23 @@ class DaemonRequestTiming:
                     nested = self.nested_phases.setdefault(parent, {})
                     nested[phase] = nested.get(phase, 0.0) + duration_ms
             self._active_phases.pop()
+
+    def add_nested_phase(self, parent: str, phase: str, duration_ms: float) -> None:
+        """Record a worker boundary without sharing the task's active phase stack."""
+        if parent not in TIMING_NESTED_PARENTS or phase not in TIMING_NESTED_LEAF_PHASES:
+            return
+        if not math.isfinite(duration_ms) or duration_ms < 0:
+            return
+        nested = self.nested_phases.setdefault(parent, {})
+        nested[phase] = nested.get(phase, 0.0) + duration_ms
+
+    @contextmanager
+    def nested_phase(self, parent: str, phase: str) -> Iterator[None]:
+        started_at = time.monotonic()
+        try:
+            yield
+        finally:
+            self.add_nested_phase(parent, phase, _duration_ms(started_at))
 
     def record_rpc_attempt(self) -> None:
         if self.rpc_attempts >= _MAX_RPC_ATTEMPTS:

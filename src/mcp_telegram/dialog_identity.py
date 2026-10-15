@@ -125,6 +125,18 @@ def capture_identity_baseline(conn: sqlite3.Connection, dialog_id: int) -> int |
     return None if row is None else int(row[0])
 
 
+def ensure_dialog_identity_baseline(conn: sqlite3.Connection, dialog_id: int) -> int:
+    """Enroll a thin refreshable identity row before an asynchronous acquisition."""
+    dialog_id = _dialog_id(dialog_id)
+    conn.execute(
+        "INSERT OR IGNORE INTO dialogs(dialog_id,needs_refresh,snapshot_at) VALUES (?,1,NULL)",
+        (dialog_id,),
+    )
+    revision = capture_identity_baseline(conn, dialog_id)
+    assert revision is not None
+    return revision
+
+
 def read_dialog_identities(conn: sqlite3.Connection, dialog_ids: Iterable[int]) -> dict[int, DialogIdentity]:
     ids = list(dict.fromkeys(_dialog_id(value) for value in dialog_ids))
     result: dict[int, DialogIdentity] = {}

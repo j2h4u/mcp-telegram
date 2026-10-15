@@ -107,6 +107,7 @@ def test_missing_dialog_name_keeps_numeric_display_provenance(
     assert entries[0]["display_name"] == "-1003"
     assert entries[0]["display_name_source"] == "numeric"
     assert entries[0]["category"] is DialogType.SUPERGROUP
+    assert entries[0]["name_unavailable_reason"] == "name_not_available"
 
 
 def test_inbox_uses_persisted_dialog_mention_count(

@@ -719,3 +719,23 @@ def test_mcp_phase_timing_discards_invalid_measurements(value: object) -> None:
     from mcp_telegram.daemon_api import _mcp_timing_payload
 
     assert _mcp_timing_payload({"primary_duration_ms": value}) == {"timing_scope": "mcp_call"}
+
+
+def test_inbox_worker_boundaries_are_attributed_without_double_counting() -> None:
+    timing = DaemonRequestTiming(operation_id="1" * 32)
+    timing.set_route("local_inbox")
+    timing.add_phase("local_projection", 2400)
+    timing.add_phase("response_shape", 20)
+    timing.add_nested_phase("local_projection", "executor_queue", 100)
+    timing.add_nested_phase("local_projection", "reader_open", 2000)
+    timing.add_nested_phase("local_projection", "query_projection", 300)
+    timing.add_nested_phase("local_projection", "untrusted_name", 5000)
+    timing.add_nested_phase("local_projection", "reader_open", float("nan"))
+    payload = timing.payload()
+    assert payload["measured_required_phase_count"] == payload["required_phase_count"] == 2
+    assert _timing_contributor(payload) == "local_projection.reader_open=2.0s"
+    assert set(cast(dict, payload["nested_phases"])["local_projection"]) == {
+        "executor_queue_ms",
+        "reader_open_ms",
+        "query_projection_ms",
+    }

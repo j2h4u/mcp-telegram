@@ -162,6 +162,7 @@ def _structured_inbox_group(
     dialog = {
         "entity": entity,
         "display_name_source": _display_name_source(group.get("display_name_source")),
+        "name_unavailable_reason": group.get("name_unavailable_reason"),
         "category": category,
         "dialog_type": dialog_type,
         "unread_count": group.get("unread_count", 0),

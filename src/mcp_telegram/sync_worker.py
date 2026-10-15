@@ -28,6 +28,7 @@ from functools import wraps
 from typing import Protocol, cast
 
 from .access_lifecycle import set_access_lost
+from .dialog_identity import ensure_dialog_identity_baseline, publish_dialog_identity
 from .entity_store import EntitySnapshot, upsert_entity_stub
 from .flood import TelegramRpcThrottled, _raise_if_latched, sleep_through_flood
 from .history_enrollment import (
@@ -646,6 +647,8 @@ class FullSyncWorker:
 
     async def _fetch_batch_page(self, dialog_id: int, sync_progress: int) -> _FetchedBatchPage:
         self._last_page_error = None
+        with write_transaction(self._conn):
+            identity_revision = ensure_dialog_identity_baseline(self._conn, dialog_id)
         reaction_observed_at = int(time.time())
         observation_order = allocate_observation_order(self._conn)
         try:
@@ -662,6 +665,9 @@ class FullSyncWorker:
             )
             self._last_page_error = exc
             return _FetchedBatchPage(None, (), None, (sync_progress, False))
+        if page.identity is not None:
+            with write_transaction(self._conn):
+                publish_dialog_identity(self._conn, dialog_id, page.identity, identity_revision)
         total_messages = page.total_messages if sync_progress == 0 else None
         if (
             page.next_before_message_id is not None

@@ -96,6 +96,7 @@ from .request_timing import (
     standalone_operation_id,
     standalone_request_id,
     timing_context,
+    timing_phase,
 )
 from .runtime_observations import (
     RuntimeObservationPolicy,
@@ -985,8 +986,10 @@ class DaemonAPIServer:
                     raise
                 finally:
                     _current_request_id.reset(request_token)
-                    if method == "list_messages" and timing is not None:
-                        timing.set_served_source(_served_source(response))
+                    if method in {"list_messages", "get_inbox"} and timing is not None:
+                        timing.set_served_source(
+                            "local" if method == "get_inbox" and response.get("ok") else _served_source(response)
+                        )
                         self._record_request_timing(timing, response, cancelled=cancelled)
                     if method == "export_chat" and timing is not None:
                         self._record_export_observation(req, timing, response, cancelled=cancelled)
@@ -1083,7 +1086,7 @@ class DaemonAPIServer:
         *,
         cancelled: bool = False,
     ) -> None:
-        """Enqueue one content-free list_messages timing observation."""
+        """Enqueue one content-free reading timing observation."""
         if self._runtime_observation_sink is None:
             return
         try:
@@ -2148,18 +2151,19 @@ class DaemonAPIServer:
         response = await self._get_reading_service().list_unread_messages(req)
         if not response.get("ok"):
             return response
-        payload = project_inbox_payload(
-            cast(InboxProjectionOptions, options),
-            response["data"],
-            applied_since_utc=cast(str | None, req.get("since_utc")),
-        )
-        if payload is None:
-            return {
-                "ok": False,
-                "error": "response_budget_exceeded",
-                "message": "Inbox metadata exceeds response_chars. Action: narrow include_dialog_types or reduce dialogs_per_page.",
-            }
-        return {"ok": True, "data": payload, "inbox_projected": True}
+        with timing_phase("response_shape"):
+            payload = project_inbox_payload(
+                cast(InboxProjectionOptions, options),
+                response["data"],
+                applied_since_utc=cast(str | None, req.get("since_utc")),
+            )
+            if payload is None:
+                return {
+                    "ok": False,
+                    "error": "response_budget_exceeded",
+                    "message": "Inbox metadata exceeds response_chars. Action: narrow include_dialog_types or reduce dialogs_per_page.",
+                }
+            return {"ok": True, "data": payload, "inbox_projected": True}
 
     # ------------------------------------------------------------------
     # record_telemetry
