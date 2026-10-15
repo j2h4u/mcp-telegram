@@ -31,7 +31,15 @@ TIMING_PHASES = (
     "response_shape",
 )
 TIMING_TOP_LEVEL_PHASES = ("resolution", "local_projection", "telegram_fallback", "response_shape")
-TIMING_NESTED_LEAF_PHASES = ("rpc_admission", "rpc_execution", "executor_queue", "reader_open", "query_projection")
+TIMING_NESTED_LEAF_PHASES = (
+    "rpc_admission",
+    "rpc_execution",
+    "executor_queue",
+    "reader_open",
+    "dialog_selection",
+    "message_projection",
+    "pending_read_positions",
+)
 TIMING_NESTED_PARENTS = ("resolution", "telegram_fallback", "local_projection")
 TIMING_REQUIRED_PHASES_BY_ROUTE = MappingProxyType(
     {
@@ -266,13 +274,13 @@ def current_timing() -> DaemonRequestTiming | None:
 
 
 @contextmanager
-def timing_phase(phase: str) -> Iterator[None]:
+def timing_phase(phase: str, *, parent: str | None = None) -> Iterator[None]:
     """Measure a named phase when a daemon request is active."""
     timing = current_timing()
     if timing is None:
         yield
         return
-    with timing.phase(phase):
+    with timing.nested_phase(parent, phase) if parent is not None else timing.phase(phase):
         yield
 
 

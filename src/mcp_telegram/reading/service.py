@@ -2501,8 +2501,7 @@ class ReadingService:
         try:
             conn.row_factory = sqlite3.Row
             conn.execute("BEGIN")
-            with timing.nested_phase("local_projection", "query_projection") if timing is not None else nullcontext():
-                return self._list_unread_messages_sync(conn, req)
+            return self._list_unread_messages_sync(conn, req)
         finally:
             conn.close()
 
@@ -2524,39 +2523,43 @@ class ReadingService:
             since_utc = _parse_request_boundary(req, "since_utc")
         except ValueError as exc:
             return {"ok": False, "error": "invalid_input", "message": str(exc)}
-        entries, counts = self._collect_unread_dialogs(group_size_threshold, since_utc, include_dialog_types, conn=conn)
-        self._rank_unread_entries(entries)
-        page_data = self._paginate_unread_entries(
-            entries, counts, page, _clamp(_coerce_int(req.get("dialogs_per_page", 20), 20), 1, 20)
-        )
-        groups = self._fetch_unread_groups(
-            conn,
-            cast(list[dict], page_data["entries"]),
-            allocate_message_budget_round_robin(
-                cast(dict[int, int], page_data["counts"]),
-                limit,
-                tiers={entry["chat_id"]: entry["tier"] for entry in cast(list[dict], page_data["entries"])},
-                max_per_chat=_clamp(_coerce_int(req.get("messages_per_dialog", 5), 5), 1, 20),
-            ),
-            since_utc,
-        )
-        pending_row = cast(tuple[object] | None, conn.execute(_COUNT_READ_POSITION_PENDING_SQL).fetchone())
-        pending_count = int(cast(int | str, pending_row[0])) if pending_row else 0
-        pending_rows = cast(
-            list[tuple[object]],
-            conn.execute(_READ_POSITION_PENDING_IDENTITIES_SQL).fetchall(),
-        )
-        pending_ids = [int(cast(int | str, row[0])) for row in pending_rows]
-        pending_identities = read_dialog_identities(conn, pending_ids)
-        pending_entities = [
-            {
-                "dialog_id": dialog_id,
-                "display_name": pending_identities[dialog_id].display_name,
-                "username": pending_identities[dialog_id].username,
-                "display_name_source": pending_identities[dialog_id].display_name_source,
-            }
-            for dialog_id in pending_ids
-        ]
+        with timing_phase("dialog_selection", parent="local_projection"):
+            entries, counts = self._collect_unread_dialogs(
+                group_size_threshold, since_utc, include_dialog_types, conn=conn
+            )
+            self._rank_unread_entries(entries)
+            page_data = self._paginate_unread_entries(
+                entries, counts, page, _clamp(_coerce_int(req.get("dialogs_per_page", 20), 20), 1, 20)
+            )
+        with timing_phase("message_projection", parent="local_projection"):
+            groups = self._fetch_unread_groups(
+                conn,
+                cast(list[dict], page_data["entries"]),
+                allocate_message_budget_round_robin(
+                    cast(dict[int, int], page_data["counts"]),
+                    limit,
+                    tiers={entry["chat_id"]: entry["tier"] for entry in cast(list[dict], page_data["entries"])},
+                    max_per_chat=_clamp(_coerce_int(req.get("messages_per_dialog", 5), 5), 1, 20),
+                ),
+                since_utc,
+            )
+        with timing_phase("pending_read_positions", parent="local_projection"):
+            pending_row = cast(tuple[object] | None, conn.execute(_COUNT_READ_POSITION_PENDING_SQL).fetchone())
+            pending_count = int(cast(int | str, pending_row[0])) if pending_row else 0
+            pending_ids = [
+                int(cast(int | str, row[0]))
+                for row in cast(list[tuple[object]], conn.execute(_READ_POSITION_PENDING_IDENTITIES_SQL).fetchall())
+            ]
+            pending_identities = read_dialog_identities(conn, pending_ids)
+            pending_entities = [
+                {
+                    "dialog_id": dialog_id,
+                    "display_name": pending_identities[dialog_id].display_name,
+                    "username": pending_identities[dialog_id].username,
+                    "display_name_source": pending_identities[dialog_id].display_name_source,
+                }
+                for dialog_id in pending_ids
+            ]
         return {
             "ok": True,
             "data": {

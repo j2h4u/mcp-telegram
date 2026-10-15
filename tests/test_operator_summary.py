@@ -672,7 +672,9 @@ def test_slow_call_reports_primary_and_optional_probe_separately() -> None:
     )
 
 
-@pytest.mark.parametrize("dominant", ["executor_queue", "query_projection"])
+@pytest.mark.parametrize(
+    "dominant", ["executor_queue", "dialog_selection", "message_projection", "pending_read_positions"]
+)
 def test_summary_attributes_slow_inbox_to_worker_boundary(tmp_path: Path, dominant: str) -> None:
     now = 2_000_000_000.0
     db_path = tmp_path / "sync.db"

@@ -275,7 +275,13 @@ async def test_inbox_persists_worker_boundaries_and_final_projection(
     assert payload["measured_required_phase_count"] == payload["required_phase_count"] == 2
     assert cast(float, payload["response_shape_ms"]) >= 0
     nested = cast(dict[str, dict[str, float]], payload["nested_phases"])["local_projection"]
-    assert set(nested) == {"executor_queue_ms", "reader_open_ms", "query_projection_ms"}
+    assert set(nested) == {
+        "executor_queue_ms",
+        "reader_open_ms",
+        "dialog_selection_ms",
+        "message_projection_ms",
+        "pending_read_positions_ms",
+    }
     assert all(value >= 0 for value in nested.values())
     assert sum(nested.values()) <= cast(float, payload["local_projection_ms"])
     assert len(json.dumps(payload, separators=(",", ":")).encode()) <= MAX_PAYLOAD_BYTES

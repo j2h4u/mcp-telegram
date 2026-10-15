@@ -728,7 +728,7 @@ def test_inbox_worker_boundaries_are_attributed_without_double_counting() -> Non
     timing.add_phase("response_shape", 20)
     timing.add_nested_phase("local_projection", "executor_queue", 100)
     timing.add_nested_phase("local_projection", "reader_open", 2000)
-    timing.add_nested_phase("local_projection", "query_projection", 300)
+    timing.add_nested_phase("local_projection", "message_projection", 300)
     timing.add_nested_phase("local_projection", "untrusted_name", 5000)
     timing.add_nested_phase("local_projection", "reader_open", float("nan"))
     payload = timing.payload()
@@ -737,5 +737,18 @@ def test_inbox_worker_boundaries_are_attributed_without_double_counting() -> Non
     assert set(cast(dict, payload["nested_phases"])["local_projection"]) == {
         "executor_queue_ms",
         "reader_open_ms",
-        "query_projection_ms",
+        "message_projection_ms",
     }
+
+
+def test_explicit_parent_timing_preserves_task_stack_and_is_optional() -> None:
+    with timing_phase("dialog_selection", parent="local_projection"):
+        assert current_timing() is None
+    with timing_context("1" * 32) as timing:
+        assert timing is not None
+        with timing_phase("local_projection"):
+            with timing_phase("dialog_selection", parent="local_projection"):
+                assert timing._active_phases == ["local_projection"]
+        assert timing._active_phases == []
+        assert timing.nested_phases["local_projection"]["dialog_selection"] >= 0
+        assert "dialog_selection" not in timing.phases
