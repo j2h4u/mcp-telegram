@@ -185,7 +185,9 @@ def test_final_ascii_size_and_all_receipts_include_warnings_and_timezone() -> No
         _dict(row)["name_unavailable_reason"] == "identity_not_observed"
         for row in _list(budget["hidden_count_by_dialog"])
     )
-    validate(instance=payload, schema=normalize_temporal_output_schema(GET_INBOX_OUTPUT_SCHEMA))
+    output_schema = normalize_temporal_output_schema(GET_INBOX_OUTPUT_SCHEMA)
+    assert output_schema is not None
+    validate(instance=payload, schema=output_schema)
     assert len(warnings) == 1
     assert "list_messages" in _text(warnings[0]["action"])
     assert "list_conversation_changes" in _text(warnings[0]["action"])
@@ -318,7 +320,9 @@ def test_dialog_name_reason_survives_hidden_and_pending_reference_projection(rea
     )
     assert not result.is_error
     payload = _dict(result.structured_content)
-    validate(instance=payload, schema=normalize_temporal_output_schema(GET_INBOX_OUTPUT_SCHEMA))
+    output_schema = normalize_temporal_output_schema(GET_INBOX_OUTPUT_SCHEMA)
+    assert output_schema is not None
+    validate(instance=payload, schema=output_schema)
     hidden_refs = _list(_dict(payload["budget"])["hidden_count_by_dialog"])
     assert _dict(hidden_refs[0])["name_unavailable_reason"] == reason
     for pending in (
