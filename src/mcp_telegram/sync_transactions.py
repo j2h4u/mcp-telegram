@@ -1,10 +1,14 @@
 """Synchronous, explicitly owned SQLite write units for the sync database."""
 
+import logging
 import sqlite3
+import sys
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from itertools import count
+from types import FrameType
 from typing import cast
 
 
@@ -15,6 +19,128 @@ class _WriteOwners(threading.local):
 
 _owners = _WriteOwners()
 _savepoint_ids = count()
+_SLOW_WRITE_SECONDS = 1.0
+_INTERNAL_MODULES = frozenset({"contextlib", __name__})
+logger = logging.getLogger(__name__)
+
+
+def _caller_identity() -> tuple[str, str, int]:
+    """Capture only the first caller outside this module and contextlib."""
+    frame: FrameType | None = sys._getframe()
+    while frame is not None and frame.f_globals.get("__name__") in _INTERNAL_MODULES:
+        frame = frame.f_back
+    if frame is None:
+        return "<unknown>", "<unknown>", 0
+    try:
+        return frame.f_globals.get("__name__", "<unknown>"), frame.f_code.co_name, frame.f_lineno
+    finally:
+        del frame
+
+
+def _log_transaction_event(  # noqa: PLR0913
+    event: str,
+    stage: str,
+    wait_seconds: float,
+    held_seconds: float,
+    *,
+    error: BaseException | None = None,
+    level: int = logging.WARNING,
+) -> None:
+    """Emit content-free transaction diagnostics without changing write semantics."""
+    try:
+        caller = _caller_identity()
+        logger.log(
+            level,
+            (
+                "%s stage=%s caller_module=%s caller_function=%s caller_line=%d "
+                "thread_name=%s thread_native_id=%s wait_seconds=%.3f held_seconds=%.3f "
+                "error_type=%s sqlite_errorcode=%s sqlite_errorname=%s"
+            ),
+            event,
+            stage,
+            caller[0],
+            caller[1],
+            caller[2],
+            threading.current_thread().name,
+            threading.get_native_id(),
+            wait_seconds,
+            held_seconds,
+            None if error is None else type(error).__name__,
+            getattr(error, "sqlite_errorcode", None),
+            getattr(error, "sqlite_errorname", None),
+        )
+    except BaseException:  # noqa: BLE001 - diagnostics must not replace a transaction error
+        return
+
+
+def _is_fast_busy(error: BaseException, wait_seconds: float, held_seconds: float) -> bool:
+    code = getattr(error, "sqlite_errorcode", None)
+    return code == sqlite3.SQLITE_BUSY and wait_seconds < _SLOW_WRITE_SECONDS and held_seconds < _SLOW_WRITE_SECONDS
+
+
+def _elapsed(started_at: float | None) -> float:
+    return 0.0 if started_at is None else max(0.0, time.monotonic() - started_at)
+
+
+def _transaction_timings(wait_started: float, held_started: float | None) -> tuple[float, float]:
+    wait_anchor = held_started if held_started is not None else time.monotonic()
+    return max(0.0, wait_anchor - wait_started), _elapsed(held_started)
+
+
+def _read_query_only(conn: sqlite3.Connection, wait_started: float) -> bool:
+    try:
+        return bool(cast(tuple[int], conn.execute("PRAGMA query_only").fetchone())[0])
+    except BaseException as error:
+        if isinstance(error, sqlite3.Error):
+            _log_failure("guard_read", _elapsed(wait_started), 0.0, error)
+        raise
+
+
+def _log_failure(
+    stage: str,
+    wait_seconds: float,
+    held_seconds: float,
+    error: BaseException,
+) -> None:
+    if isinstance(error, sqlite3.Error):
+        _log_transaction_event(
+            "sqlite_write_failure",
+            stage,
+            wait_seconds,
+            held_seconds,
+            error=error,
+            level=logging.DEBUG if _is_fast_busy(error, wait_seconds, held_seconds) else logging.WARNING,
+        )
+    elif wait_seconds >= _SLOW_WRITE_SECONDS or held_seconds >= _SLOW_WRITE_SECONDS:
+        _log_transaction_event("sqlite_write_slow", stage, wait_seconds, held_seconds, error=error)
+
+
+def _rollback_after_failure(
+    conn: sqlite3.Connection,
+) -> BaseException | None:
+    try:
+        conn.rollback()
+    except BaseException as rollback_error:  # noqa: BLE001 - preserve the primary failure below
+        return rollback_error
+    return None
+
+
+def _restore_guard(
+    conn: sqlite3.Connection,
+    query_only: bool,
+    primary: BaseException | None,
+    wait_seconds: float,
+    held_seconds: float,
+) -> None:
+    try:
+        conn.execute(f"PRAGMA query_only = {int(query_only)}")
+    except BaseException as restore_error:
+        _log_failure("guard_restore", wait_seconds, held_seconds, restore_error)
+        if primary is not None:
+            primary.add_note(f"Restoring SQLite query_only failed: {restore_error!r}")
+        _retire_connection(conn, primary or restore_error)
+        if primary is None:
+            raise
 
 
 def enable_runtime_writes(conn: sqlite3.Connection) -> None:
@@ -48,37 +174,47 @@ def write_transaction(conn: sqlite3.Connection) -> Iterator[None]:
     """
     if conn.in_transaction or conn in _owners.connections:
         raise RuntimeError("write_transaction requires an idle connection")
-    query_only = bool(cast(tuple[int], conn.execute("PRAGMA query_only").fetchone())[0])
+    wait_started = time.monotonic()
+    query_only = _read_query_only(conn, wait_started)
     primary: BaseException | None = None
-    retired = False
+    retired, stage, held_started = False, "guard_disable", None
     try:
         conn.execute("PRAGMA query_only = OFF")
+        stage = "begin"
         conn.execute("BEGIN IMMEDIATE")
+        held_started = time.monotonic()
         _owners.connections.add(conn)
+        wait_seconds = max(0.0, held_started - wait_started)
+        stage = "body"
         yield
+        stage = "guard_check"
         require_write_transaction(conn)
+        stage = "commit"
         conn.commit()
+        held_seconds = _elapsed(held_started)
+        if wait_seconds >= _SLOW_WRITE_SECONDS:
+            _log_transaction_event("sqlite_write_slow", "begin", wait_seconds, held_seconds)
+        if held_seconds >= _SLOW_WRITE_SECONDS:
+            _log_transaction_event("sqlite_write_slow", "commit", max(0.0, held_started - wait_started), held_seconds)
     except BaseException as error:
         primary = error
-        try:
-            conn.rollback()
-        except BaseException as rollback_error:
-            error.add_note(f"SQLite rollback failed: {rollback_error!r}")
+        wait_seconds = _transaction_timings(wait_started, held_started)[0]
+        rollback_error = _rollback_after_failure(conn)
+        held_seconds = _elapsed(held_started)
+        if rollback_error is not None:
             retired = True
+            error.add_note(f"SQLite rollback failed: {rollback_error!r}")
             _retire_connection(conn, error)
+            held_seconds = _elapsed(held_started)
+            _log_failure(stage, wait_seconds, held_seconds, error)
+            _log_failure("rollback", wait_seconds, held_seconds, rollback_error)
             raise error from rollback_error
+        _log_failure(stage, wait_seconds, held_seconds, error)
         raise
     finally:
         _owners.connections.discard(conn)
         if not retired:
-            try:
-                conn.execute(f"PRAGMA query_only = {int(query_only)}")
-            except BaseException as restore_error:
-                if primary is not None:
-                    primary.add_note(f"Restoring SQLite query_only failed: {restore_error!r}")
-                _retire_connection(conn, primary or restore_error)
-                if primary is None:
-                    raise
+            _restore_guard(conn, query_only, primary, *_transaction_timings(wait_started, held_started))
 
 
 @contextmanager

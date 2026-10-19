@@ -23,7 +23,7 @@ import pytest
 from telethon.tl.types import PeerUser, UpdateReadHistoryInbox
 
 from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
-from mcp_telegram.config import RuntimeObservationConfig, TelemetryConfig
+from mcp_telegram.config import RuntimeObservationConfig
 from mcp_telegram.daemon_api import (
     DaemonAPIServer,
     DaemonClientLike,
@@ -46,7 +46,7 @@ from mcp_telegram.reading.sqlite_projection import (
     _build_list_messages_query,
     _ListMessagesDbRequest,
 )
-from mcp_telegram.runtime_observations import record_runtime_observation
+from mcp_telegram.runtime_observations import RuntimeObservationSink, record_runtime_observation
 from mcp_telegram.sync_db import _RUNTIME_OBSERVATIONS_V54_DDL, ensure_sync_schema
 from mcp_telegram.sync_read_model import compute_sync_coverage as _compute_sync_coverage
 from mcp_telegram.sync_transactions import enable_runtime_writes
@@ -4156,6 +4156,7 @@ def _make_db_with_entities(*, with_fts: bool = False) -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_type_updated ON entities(type, updated_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_username ON entities(username)")
     conn.execute(_RUNTIME_OBSERVATIONS_V54_DDL.replace("runtime_observations_v54", "runtime_observations"))
+    conn.execute("CREATE INDEX idx_runtime_observations_time ON runtime_observations(observed_at_ms DESC, id DESC)")
     conn.execute("ALTER TABLE runtime_observations ADD COLUMN tool_capability TEXT")
     conn.execute("ALTER TABLE runtime_observations ADD COLUMN contract_version INTEGER")
     conn.execute("CREATE TABLE IF NOT EXISTS daemon_state (key TEXT PRIMARY KEY, value TEXT)")
@@ -4331,27 +4332,24 @@ async def test_record_telemetry_returns_ok() -> None:
 async def test_record_telemetry_does_not_prune_on_hot_write_path() -> None:
     """The hot telemetry writer leaves batched retention to maintenance."""
     conn = _make_db_with_entities()
-    now = 2_000_000_000
-    ttl = make_daemon_api_policy().telemetry.retention_ttl_seconds
-    _insert_telemetry(conn, tool_name="AtBoundary", timestamp=now - ttl)
-    _insert_telemetry(conn, tool_name="Expired", timestamp=now - ttl - 1)
+    _insert_telemetry(conn, tool_name="AtBoundary")
+    _insert_telemetry(conn, tool_name="Expired")
     server = make_server(conn)
 
-    with patch("mcp_telegram.daemon_api.time.time", return_value=now):
-        result = await server._record_telemetry(
-            {
-                "event": {
-                    "tool_name": "Current",
-                    "timestamp": now,
-                    "duration_ms": 50.0,
-                    "result_count": 0,
-                    "has_cursor": False,
-                    "page_depth": 1,
-                    "has_filter": False,
-                    "error_type": None,
-                }
+    result = await server._record_telemetry(
+        {
+            "event": {
+                "tool_name": "Current",
+                "timestamp": time.time(),
+                "duration_ms": 50.0,
+                "result_count": 0,
+                "has_cursor": False,
+                "page_depth": 1,
+                "has_filter": False,
+                "error_type": None,
             }
-        )
+        }
+    )
 
     assert result == {"ok": True}
     tool_name_rows = cast(
@@ -4361,20 +4359,91 @@ async def test_record_telemetry_does_not_prune_on_hot_write_path() -> None:
     assert [row[0] for row in tool_name_rows] == ["AtBoundary", "Current", "Expired"]
 
 
-def test_batched_daemon_api_prune_uses_configured_row_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+async def test_record_telemetry_signals_bound_sink_for_idle_retention(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    sink = RuntimeObservationSink(
+        db_path,
+        retention_ttl_seconds=3600,
+        policy=replace(RuntimeObservationConfig(), prune_every_writes=1, row_cap=2),
+    )
+    server = make_server(conn)
+    server.bind_runtime_observation_sink(sink)
+    try:
+        for tool_name in ("Oldest", "Older"):
+            record_runtime_observation(conn, kind="mcp.call", tool_name=tool_name)
+        conn.commit()
+
+        result = await server._record_telemetry(
+            {
+                "event": {
+                    "tool_name": "DirectMcpOnly",
+                    "timestamp": time.time(),
+                    "duration_ms": 1.0,
+                    "result_count": 0,
+                    "has_cursor": False,
+                    "page_depth": 1,
+                    "has_filter": False,
+                    "error_type": None,
+                }
+            }
+        )
+        assert result == {"ok": True}
+
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            remaining = conn.execute("SELECT COUNT(*) FROM runtime_observations").fetchone()
+            if remaining is not None and remaining[0] == 2:
+                break
+            await asyncio.sleep(0.01)
+        remaining = conn.execute("SELECT COUNT(*) FROM runtime_observations").fetchone()
+        assert remaining is not None and remaining[0] == 2
+        rows = conn.execute("SELECT tool_name FROM runtime_observations ORDER BY id").fetchall()
+        assert [row[0] for row in rows] == ["Older", "DirectMcpOnly"]
+    finally:
+        await sink.aclose()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_record_telemetry_keeps_committed_result_when_sink_signal_fails() -> None:
+    conn = _make_db_with_entities()
+    server = make_server(conn)
+    sink = MagicMock()
+    sink.note_external_write.side_effect = RuntimeError("signal failed")
+    server.bind_runtime_observation_sink(cast(RuntimeObservationSink, sink))
+
+    result = await server._record_telemetry(
+        {
+            "event": {
+                "tool_name": "SignalFailure",
+                "timestamp": time.time(),
+                "duration_ms": 1.0,
+                "result_count": 0,
+                "has_cursor": False,
+                "page_depth": 1,
+                "has_filter": False,
+                "error_type": None,
+            }
+        }
+    )
+
+    assert result == {"ok": True}
+    assert conn.execute("SELECT tool_name FROM runtime_observations").fetchall()[0][0] == "SignalFailure"
+
+
+def test_daemon_api_telemetry_insert_is_not_pruned_on_hot_path() -> None:
     conn = _make_db_with_entities()
     for tool_name in ("Oldest", "Older", "Recent"):
         record_runtime_observation(conn, kind="mcp.call", tool_name=tool_name)
     conn.commit()
-    telemetry = TelemetryConfig(
-        runtime_observations=replace(RuntimeObservationConfig(), row_cap=2),
-    )
-    policy = replace(make_daemon_api_policy(), telemetry=telemetry)
-    monkeypatch.setattr("mcp_telegram.daemon_api._runtime_event_write_count", 127)
-
-    _write_telemetry(conn, policy, {"tool_name": "Current"})
+    _write_telemetry(conn, {"tool_name": "Current"})
 
     assert conn.execute("SELECT tool_name FROM runtime_observations ORDER BY id").fetchall() == [
+        ("Oldest",),
+        ("Older",),
         ("Recent",),
         ("Current",),
     ]
@@ -9196,7 +9265,7 @@ def test_telemetry_rejects_foreign_transaction_without_committing() -> None:
     conn = _make_db_with_entities()
     conn.execute("INSERT INTO daemon_state(key,value) VALUES ('foreign', 'pending')")
     with pytest.raises(RuntimeError, match="idle connection"):
-        _write_telemetry(conn, make_daemon_api_policy(), {"tool_name": "Current"})
+        _write_telemetry(conn, {"tool_name": "Current"})
     assert conn.in_transaction
     assert conn.execute("SELECT COUNT(*) FROM runtime_observations").fetchone()[0] == 0
     conn.rollback()
@@ -9207,7 +9276,7 @@ def test_telemetry_writes_with_runtime_guard_and_restores_it() -> None:
     conn = _make_db_with_entities()
     conn.commit()
     enable_runtime_writes(conn)
-    _write_telemetry(conn, make_daemon_api_policy(), {"tool_name": "Current"})
+    _write_telemetry(conn, {"tool_name": "Current"})
     assert not conn.in_transaction
     assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
     assert conn.execute("SELECT tool_name FROM runtime_observations").fetchone()[0] == "Current"

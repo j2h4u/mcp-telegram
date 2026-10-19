@@ -203,3 +203,7 @@ The agent owns the full development cycle end to end: writing code, running test
   re-register its daemon methods without an explicit replacement design.
 - Avoid logging Telegram message content or other sensitive data.
 - Treat session files and `.env` credentials as secrets.
+- Shared `write_transaction` diagnostics use `sqlite_write_slow` and
+  `sqlite_write_failure` with safe caller/thread/timing fields plus SQLite
+  error classification and exception type only; fast ordinary `SQLITE_BUSY`
+  entry failures remain DEBUG.

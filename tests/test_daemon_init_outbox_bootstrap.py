@@ -25,12 +25,14 @@ from __future__ import annotations
 import asyncio
 import math
 import sqlite3
+import time
 from collections.abc import Iterable
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from telethon.errors.rpcerrorlist import RPCError
 
 from mcp_telegram.sync_transactions import write_transaction
 from tests.history_enrollment_helpers import seed_full_history_enrollment
@@ -427,3 +429,62 @@ async def test_bootstrap_live_event_race_newer_wins():
             f"Expected 999 (newer live event wins via monotonic MAX), got {outbox} "
             "— bootstrap's stale 500 must not regress the cursor"
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_cooldown_seconds", [None, 3600])
+async def test_bootstrap_success_skips_empty_retry_transaction(failure_cooldown_seconds: float | None):
+    """A fully returned peer needs only the transaction that applies its cursors."""
+    from mcp_telegram.daemon import _initialize_read_positions
+
+    with _make_conn() as conn:
+        _seed(conn, [(1001, None, None, "synced")])
+        client = _fake_client_with_dialogs(
+            [[SimpleNamespace(peer=SimpleNamespace(), read_inbox_max_id=42, read_outbox_max_id=43)]]
+        )
+
+        with (
+            _patch_get_peer_id([1001]),
+            patch("mcp_telegram.daemon.write_transaction", wraps=write_transaction) as transactions,
+        ):
+            await _initialize_read_positions(
+                client,
+                conn,
+                asyncio.Event(),
+                failure_cooldown_seconds=failure_cooldown_seconds,
+                batch_pause_seconds=0.001,
+            )
+
+        assert transactions.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["unresolved", "rpc"])
+async def test_bootstrap_failure_persists_retry_cooldown(failure_mode: str):
+    """Unresolved peers and request failures still use durable retry bookkeeping."""
+    from mcp_telegram.daemon import _initialize_read_positions
+
+    with _make_conn() as conn:
+        _seed(conn, [(1001, None, None, "synced")])
+        client = AsyncMock()
+        if failure_mode == "unresolved":
+            client.get_input_entity.return_value = None
+        else:
+            client.get_input_entity.return_value = SimpleNamespace(_did=1001)
+            client.side_effect = RPCError(None, "request failed")
+
+        await _initialize_read_positions(
+            client,
+            conn,
+            asyncio.Event(),
+            failure_cooldown_seconds=3600,
+            batch_pause_seconds=0.001,
+        )
+
+        retry_at, attempts = conn.execute(
+            "SELECT read_position_next_attempt_at, read_position_attempt_count "
+            "FROM synced_dialogs WHERE dialog_id = 1001"
+        ).fetchone()
+        assert retry_at is not None
+        assert retry_at > int(time.time())
+        assert attempts == 1

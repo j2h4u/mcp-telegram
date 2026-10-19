@@ -107,7 +107,11 @@ from .reactions.telegram_adapter import TelethonTelegramReactionGateway
 from .read_state import apply_read_cursor, apply_reconciled_unread_count
 from .reconnect import run_reconnect_catch_up_loop
 from .rpc_admission_observations import RpcAdmissionObservationAggregator
-from .runtime_observations import RuntimeObservationSink, prune_runtime_observations, record_runtime_observation
+from .runtime_observations import (
+    RuntimeObservationSink,
+    _prune_runtime_observations_batch,
+    record_runtime_observation,
+)
 from .scheduled_messages import ScheduledMessageReconciler, ScheduledReconciliationPolicy
 from .self_profile_maintenance import (
     SelfProfileMaintenanceDemandAdapter,
@@ -519,12 +523,10 @@ async def _reconcile_read_position_batch(  # noqa: PLR0913
             raise
         logger.warning("read_pos_bootstrap flood_wait seconds=%s", exc.retry_after_seconds)
         retry_ids.update(batch_ids)
-        with write_transaction(conn):
-            _mark_read_position_retry(
-                conn,
-                retry_ids,
-                _read_position_retry_at(int(time.time()), failure_cooldown_seconds),
-            )
+        retry_at = _read_position_retry_at(int(time.time()), failure_cooldown_seconds)
+        if retry_ids and retry_at is not None:
+            with write_transaction(conn):
+                _mark_read_position_retry(conn, retry_ids, retry_at)
         if exc.retry_after_seconds is not None:
             await sleep_through_flood(shutdown_event, exc.retry_after_seconds)
         return 0, True
@@ -532,12 +534,10 @@ async def _reconcile_read_position_batch(  # noqa: PLR0913
         logger.debug("read_pos_bootstrap batch_failed error=%s", exc)
         retry_ids.update(batch_ids)
         filled = 0
-    with write_transaction(conn):
-        _mark_read_position_retry(
-            conn,
-            retry_ids,
-            _read_position_retry_at(int(time.time()), failure_cooldown_seconds),
-        )
+    retry_at = _read_position_retry_at(int(time.time()), failure_cooldown_seconds)
+    if retry_ids and retry_at is not None:
+        with write_transaction(conn):
+            _mark_read_position_retry(conn, retry_ids, retry_at)
     return filled, False
 
 
@@ -1081,12 +1081,17 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         telemetry_retention_ttl_seconds=config.telemetry.retention_ttl_seconds,
     )
     enable_runtime_writes(conn)
-    with write_transaction(conn):
-        prune_runtime_observations(
+    startup_now_ms = int(time.time() * 1000)
+    while True:
+        prune_result = _prune_runtime_observations_batch(
             conn,
             ttl_seconds=config.telemetry.retention_ttl_seconds,
             row_cap=config.telemetry.runtime_observations.row_cap,
+            now_ms=startup_now_ms,
         )
+        if not prune_result.has_more:
+            break
+    with write_transaction(conn):
         record_runtime_observation(conn, kind="runtime.started", outcome="observed")
 
     # Open feedback.db before registering the shutdown handler so the SIGTERM
