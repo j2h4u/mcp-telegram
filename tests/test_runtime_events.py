@@ -18,11 +18,15 @@ from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggre
 from mcp_telegram.runtime_observations import (
     ALLOWED_KINDS,
     RuntimeObservationSink,
+    _apply_runtime_observations_plan,
+    _plan_runtime_observations_batch,
+    _prune_runtime_observations_batch,
     encode_payload,
     prune_runtime_observations,
     record_runtime_observation,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.sync_transactions import write_transaction
 
 
 def test_runtime_event_payload_is_bounded_and_kind_is_allowlisted() -> None:
@@ -60,6 +64,152 @@ def test_runtime_event_pruning_applies_ttl_and_cap(tmp_path: Path) -> None:
         ).fetchone() == ("10000",)
     finally:
         conn.close()
+
+
+def test_runtime_event_pruning_batches_ttl_and_cap_without_overdeleting(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    conn = _open_sync_db(path)
+    try:
+        for event_id in range(900):
+            record_runtime_observation(
+                conn,
+                kind="mcp.call",
+                tool_name=f"expired_{event_id}",
+                observed_at_ms=1_000,
+            )
+        for event_id in range(200):
+            record_runtime_observation(
+                conn,
+                kind="mcp.call",
+                tool_name=f"recent_{event_id}",
+                observed_at_ms=10_000,
+            )
+        conn.commit()
+
+        batches: list[runtime_observations._PruneBatchResult] = []
+        while True:
+            with conn:
+                result = _prune_runtime_observations_batch(
+                    conn,
+                    ttl_seconds=5,
+                    row_cap=10,
+                    now_ms=10_000,
+                )
+            batches.append(result)
+            if not result.has_more:
+                break
+
+        assert all(result.deleted <= 1_000 for result in batches)
+        assert batches[0].cap_deleted == 0
+        assert any(result.cap_deleted > 0 for result in batches[1:])
+        assert len(batches) > 1
+        assert conn.execute("SELECT COUNT(*) FROM runtime_observations").fetchone() == (10,)
+        assert conn.execute(
+            "SELECT value FROM daemon_state WHERE key='runtime_observations_last_cap_truncation_ms'"
+        ).fetchone() == ("10000",)
+    finally:
+        conn.close()
+
+
+def test_runtime_event_pruning_does_not_mark_ttl_only_cleanup_as_cap_truncation(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    conn = _open_sync_db(path)
+    try:
+        for event_id in range(20):
+            record_runtime_observation(
+                conn,
+                kind="mcp.call",
+                tool_name=f"expired_{event_id}",
+                observed_at_ms=1_000,
+            )
+        conn.commit()
+        prune_runtime_observations(conn, ttl_seconds=5, row_cap=100, now_ms=10_000)
+        assert (
+            conn.execute(
+                "SELECT value FROM daemon_state WHERE key='runtime_observations_last_cap_truncation_ms'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        conn.close()
+
+
+def test_runtime_event_prune_planning_does_not_block_competing_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    setup = _open_sync_db(path)
+    record_runtime_observation(setup, kind="mcp.call", tool_name="old", observed_at_ms=1_000)
+    setup.commit()
+    setup.close()
+    planned = threading.Event()
+    release = threading.Event()
+    original_plan = runtime_observations._plan_runtime_observations_batch
+
+    def slow_plan(*args: object, **kwargs: object) -> runtime_observations._PrunePlan:
+        planned.set()
+        release.wait(timeout=2)
+        return original_plan(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runtime_observations, "_plan_runtime_observations_batch", slow_plan)
+    prune_result: list[runtime_observations._PruneBatchResult] = []
+
+    def run_prune() -> None:
+        prune_conn = _open_sync_db(path)
+        prune_result.append(
+            _prune_runtime_observations_batch(
+                prune_conn,
+                ttl_seconds=5,
+                row_cap=1,
+                now_ms=10_000,
+            )
+        )
+        prune_conn.close()
+
+    worker = threading.Thread(target=run_prune)
+    worker.start()
+    assert planned.wait(timeout=0.5)
+    with closing(sqlite3.connect(path)) as competitor:
+        record_runtime_observation(competitor, kind="mcp.call", tool_name="competitor", observed_at_ms=10_000)
+        competitor.commit()
+    release.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert prune_result[0].deleted == 1
+    with closing(sqlite3.connect(path)) as check:
+        assert check.execute("SELECT tool_name FROM runtime_observations").fetchall() == [("competitor",)]
+
+
+def test_runtime_event_prune_applies_only_planned_ids_after_concurrent_append(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    planner = _open_sync_db(path)
+    for event_id in range(5):
+        record_runtime_observation(planner, kind="mcp.call", tool_name=f"old-{event_id}", observed_at_ms=10_000)
+    planner.commit()
+    plan = _plan_runtime_observations_batch(planner, ttl_seconds=5, row_cap=2, now_ms=10_000)
+    assert plan.cap is True
+    assert len(plan.ids) == 3
+
+    with closing(sqlite3.connect(path)) as competitor:
+        record_runtime_observation(competitor, kind="mcp.call", tool_name="fresh", observed_at_ms=10_000)
+        competitor.commit()
+    with write_transaction(planner):
+        result = _apply_runtime_observations_plan(planner, plan, now_ms=10_000)
+    planner.close()
+
+    assert result.deleted == 3
+    with closing(sqlite3.connect(path)) as check:
+        assert check.execute("SELECT tool_name FROM runtime_observations ORDER BY id").fetchall() == [
+            ("old-3",),
+            ("old-4",),
+            ("fresh",),
+        ]
 
 
 @pytest.mark.asyncio
@@ -111,14 +261,20 @@ async def test_runtime_observation_sink_waits_for_python_prune_then_joins_writer
     ensure_sync_schema(path)
     started = threading.Event()
     release = threading.Event()
-    original_prune = runtime_observations.prune_runtime_observations
+    original_prune = runtime_observations._prune_runtime_observations_batch
 
-    def blocked_prune(conn: sqlite3.Connection, *, ttl_seconds: int, row_cap: int) -> int:
+    def blocked_prune(
+        conn: sqlite3.Connection,
+        *,
+        ttl_seconds: int,
+        row_cap: int,
+        now_ms: int,
+    ) -> runtime_observations._PruneBatchResult:
         started.set()
         release.wait(timeout=2)
-        return original_prune(conn, ttl_seconds=ttl_seconds, row_cap=row_cap)
+        return original_prune(conn, ttl_seconds=ttl_seconds, row_cap=row_cap, now_ms=now_ms)
 
-    monkeypatch.setattr(runtime_observations, "prune_runtime_observations", blocked_prune)
+    monkeypatch.setattr(runtime_observations, "_prune_runtime_observations_batch", blocked_prune)
     sink = RuntimeObservationSink(
         path,
         retention_ttl_seconds=5,
@@ -137,6 +293,225 @@ async def test_runtime_observation_sink_waits_for_python_prune_then_joins_writer
     release.set()
     await asyncio.wait_for(close_task, timeout=1.0)
     assert not sink._writer.is_alive()
+
+
+@pytest.mark.asyncio
+async def test_runtime_observation_sink_external_signal_is_nonblocking_during_prune(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    started = threading.Event()
+    release = threading.Event()
+    original_prune = runtime_observations._prune_runtime_observations_batch
+
+    def blocked_prune(
+        conn: sqlite3.Connection,
+        *,
+        ttl_seconds: int,
+        row_cap: int,
+        now_ms: int,
+    ) -> runtime_observations._PruneBatchResult:
+        started.set()
+        release.wait(timeout=2)
+        return original_prune(conn, ttl_seconds=ttl_seconds, row_cap=row_cap, now_ms=now_ms)
+
+    monkeypatch.setattr(runtime_observations, "_prune_runtime_observations_batch", blocked_prune)
+    sink = RuntimeObservationSink(
+        path,
+        retention_ttl_seconds=5,
+        policy=replace(RuntimeObservationConfig(), prune_every_writes=1),
+    )
+    sink.record(kind="telegram.rpc_admission", outcome="queued")
+    assert started.wait(timeout=0.5)
+
+    started_at = time.monotonic()
+    sink.note_external_write()
+    assert time.monotonic() - started_at < 0.1
+
+    release.set()
+    await sink.aclose()
+    sink.note_external_write()
+    assert not sink._maintenance_requested.is_set()
+
+
+@pytest.mark.asyncio
+async def test_runtime_observation_sink_commits_before_maintenance_and_drains_idle_backlog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    observed_at_ms = int(time.time() * 1000)
+    setup = _open_sync_db(path)
+    for event_id in range(2_205):
+        record_runtime_observation(
+            setup,
+            kind="telegram.rpc_admission",
+            outcome=f"old-{event_id}",
+            observed_at_ms=observed_at_ms,
+        )
+    setup.commit()
+    setup.close()
+
+    maintenance_started = threading.Event()
+    release_maintenance = threading.Event()
+    original_prune = runtime_observations._prune_runtime_observations_batch
+
+    def block_maintenance(
+        conn: sqlite3.Connection,
+        *,
+        ttl_seconds: int,
+        row_cap: int,
+        now_ms: int,
+    ) -> runtime_observations._PruneBatchResult:
+        maintenance_started.set()
+        release_maintenance.wait(timeout=2)
+        return original_prune(conn, ttl_seconds=ttl_seconds, row_cap=row_cap, now_ms=now_ms)
+
+    monkeypatch.setattr(runtime_observations, "_prune_runtime_observations_batch", block_maintenance)
+    sink = RuntimeObservationSink(
+        path,
+        retention_ttl_seconds=5,
+        policy=replace(RuntimeObservationConfig(), prune_every_writes=1, row_cap=2),
+    )
+    sink.record(kind="telegram.rpc_admission", outcome="new-0", observed_at_ms=observed_at_ms)
+    assert maintenance_started.wait(timeout=0.5)
+
+    with closing(sqlite3.connect(path)) as observer:
+        assert observer.execute("SELECT outcome FROM runtime_observations WHERE outcome='new-0'").fetchone() == (
+            "new-0",
+        )
+
+    release_maintenance.set()
+    await asyncio.to_thread(sink._jobs.join)
+    await asyncio.sleep(0.15)
+    sink.close()
+
+    with closing(sqlite3.connect(path)) as check:
+        rows = check.execute("SELECT outcome FROM runtime_observations ORDER BY id").fetchall()
+    assert rows == [("old-2204",), ("new-0",)]
+
+
+@pytest.mark.asyncio
+async def test_runtime_observation_sink_busy_maintenance_retries_without_duplicate_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    observed_at_ms = int(time.time() * 1000)
+    original_prune = runtime_observations._prune_runtime_observations_batch
+    calls = 0
+    maintenance_started = threading.Event()
+    second_maintenance = threading.Event()
+
+    def fail_once(
+        conn: sqlite3.Connection,
+        *,
+        ttl_seconds: int,
+        row_cap: int,
+        now_ms: int,
+    ) -> runtime_observations._PruneBatchResult:
+        nonlocal calls
+        calls += 1
+        maintenance_started.set()
+        if calls >= 2:
+            second_maintenance.set()
+        if calls == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return original_prune(conn, ttl_seconds=ttl_seconds, row_cap=row_cap, now_ms=now_ms)
+
+    monkeypatch.setattr(runtime_observations, "_prune_runtime_observations_batch", fail_once)
+    sink = RuntimeObservationSink(
+        path,
+        retention_ttl_seconds=5,
+        policy=replace(RuntimeObservationConfig(), prune_every_writes=1),
+    )
+    sink.record(kind="telegram.rpc_admission", outcome="once", observed_at_ms=observed_at_ms)
+    assert maintenance_started.wait(timeout=0.5)
+    sink.record(kind="telegram.rpc_admission", outcome="twice", observed_at_ms=observed_at_ms)
+    assert second_maintenance.wait(timeout=0.5)
+    await sink.aclose()
+
+    with closing(sqlite3.connect(path)) as check:
+        assert check.execute("SELECT outcome FROM runtime_observations ORDER BY id").fetchall() == [
+            ("once",),
+            ("twice",),
+        ]
+    assert calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_runtime_observation_sink_prune_failure_does_not_report_committed_event_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+
+    def fail_prune(*_args: object, **_kwargs: object) -> object:
+        raise ValueError("injected maintenance failure")
+
+    monkeypatch.setattr(runtime_observations, "_prune_runtime_observations_batch", fail_prune)
+    sink = RuntimeObservationSink(
+        path,
+        retention_ttl_seconds=5,
+        policy=replace(RuntimeObservationConfig(), prune_every_writes=1),
+    )
+    sink.record(kind="telegram.rpc_admission", outcome="committed", observed_at_ms=int(time.time() * 1000))
+    await sink.aclose()
+
+    with closing(sqlite3.connect(path)) as check:
+        assert check.execute("SELECT outcome FROM runtime_observations").fetchall() == [("committed",)]
+    assert sink.permanent_failures == 0
+    assert sink.shutdown_grace_drops == 0
+
+
+@pytest.mark.asyncio
+async def test_runtime_observation_sink_interrupting_prune_keeps_committed_event_without_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    started = threading.Event()
+    original = runtime_observations._prune_runtime_observations_batch
+
+    def long_prune(
+        conn: sqlite3.Connection,
+        *,
+        ttl_seconds: int,
+        row_cap: int,
+        now_ms: int,
+    ) -> runtime_observations._PruneBatchResult:
+        started.set()
+        conn.execute(
+            "WITH RECURSIVE counter(n) AS ("
+            "SELECT 1 UNION ALL SELECT n + 1 FROM counter WHERE n < 1000000000"
+            ") SELECT sum(n) FROM counter"
+        ).fetchone()
+        return original(conn, ttl_seconds=ttl_seconds, row_cap=row_cap, now_ms=now_ms)
+
+    monkeypatch.setattr(runtime_observations, "_prune_runtime_observations_batch", long_prune)
+    sink = RuntimeObservationSink(
+        path,
+        retention_ttl_seconds=5,
+        policy=replace(
+            RuntimeObservationConfig(),
+            prune_every_writes=1,
+            shutdown_drain_grace_seconds=0.05,
+        ),
+    )
+    sink.record(kind="telegram.rpc_admission", outcome="committed", observed_at_ms=int(time.time() * 1000))
+    assert started.wait(timeout=0.5)
+    await asyncio.wait_for(sink.aclose(), timeout=1.0)
+
+    with closing(sqlite3.connect(path)) as check:
+        assert check.execute("SELECT outcome FROM runtime_observations").fetchall() == [("committed",)]
+    assert sink.permanent_failures == 0
+    assert sink.shutdown_grace_drops == 0
 
 
 @pytest.mark.asyncio
@@ -272,14 +647,13 @@ def test_delta_gap_fill_summary_requeues_after_production_sink_queue_saturation(
     def block_first_write(
         conn: sqlite3.Connection,
         job: runtime_observations._ObservationJob,
-        writes_since_prune: int,
     ) -> bool | None:
         nonlocal first_write
         if first_write:
             first_write = False
             writer_started.set()
             release_writer.wait(timeout=2)
-        return original_write(conn, job, writes_since_prune)
+        return original_write(conn, job)
 
     monkeypatch.setattr(sink, "_write_job", block_first_write)
     assert sink.record(kind="telegram.rpc_admission", outcome="head") is True

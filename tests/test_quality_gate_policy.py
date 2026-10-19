@@ -55,9 +55,10 @@ def test_fixed_metric_thresholds_and_coverage_informed_crap_gate() -> None:
 
     assert re.search(r"(?m)^  crap-threshold:\s*$", workflow) is not None
     assert "run: python3 scripts/ci_pytest_runner.py run -- just crap-threshold" in workflow
-    assert workflow.count("needs: changes") == 4
-    assert workflow.count("if: needs.changes.outputs.run_heavy == 'true'") == 4
-    assert "needs: [changes, quality, unit, crap-threshold, docker-build]" in workflow
+    assert workflow.count("needs: changes") == 3
+    assert workflow.count("if: needs.changes.outputs.run_heavy == 'true'") == 3
+    assert "needs: [changes, quality, crap-threshold, docker-build]" in workflow
+    assert re.search(r"(?m)^  unit:\s*$", workflow) is None
     assert re.search(r"(?m)^radon-threshold:\s*$", justfile) is not None
     assert re.search(r"(?m)^crap-threshold:\s*$", justfile) is not None
     assert "pytest-crap" not in pyproject_text

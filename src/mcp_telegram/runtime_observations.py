@@ -20,6 +20,7 @@ from .sync_transactions import enable_runtime_writes, write_transaction
 RUNTIME_INSTANCE_ID = uuid.uuid4().hex
 MAX_PAYLOAD_BYTES = 1024
 DEFAULT_ROW_CAP = 100_000
+_PRUNE_BATCH_SIZE = 1_000
 _WRITER_POLL_SECONDS = 0.05
 ALLOWED_KINDS = frozenset(
     {
@@ -214,6 +215,20 @@ class RuntimeObservationCounters:
     startup_drops: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class _PruneBatchResult:
+    deleted: int
+    cap_deleted: int
+    has_more: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PrunePlan:
+    ids: tuple[int, ...]
+    cap: bool
+    has_more: bool
+
+
 class RuntimeObservationSink:
     """Accept bounded observations without doing SQLite work in callbacks."""
 
@@ -258,6 +273,10 @@ class RuntimeObservationSink:
         self._writer_error: BaseException | None = None
         self._writer_connection: sqlite3.Connection | None = None
         self._counters = RuntimeObservationCounters()
+        self._prune_pending = False
+        self._prune_now_ms: int | None = None
+        self._external_writes_since_prune = 0
+        self._maintenance_requested = threading.Event()
         self._writer = threading.Thread(
             target=self._writer_main,
             name="runtime-observation-writer",
@@ -335,6 +354,16 @@ class RuntimeObservationSink:
                 self._increment("queue_full_drops")
                 return False
         return True
+
+    def note_external_write(self) -> None:
+        """Request maintenance after committed observations written elsewhere."""
+        with self._state_lock:
+            if self._closed or not self._accepting or self._writer_error is not None:
+                return
+            self._external_writes_since_prune += 1
+            if self._external_writes_since_prune >= self._prune_every_writes:
+                self._external_writes_since_prune = 0
+                self._maintenance_requested.set()
 
     def close(self) -> None:
         """Synchronously close the sink for non-async callers."""
@@ -545,11 +574,15 @@ class RuntimeObservationSink:
     def _run_writer_loop(self, conn: sqlite3.Connection) -> None:
         writes_since_prune = 0
         while not self._abort_requested.is_set():
+            self._consume_external_write_request()
             try:
                 job = self._jobs.get(True, _WRITER_POLL_SECONDS)
             except queue.Empty:
                 if self._close_requested.is_set():
                     return
+                if self._prune_pending:
+                    self._run_prune_batch(conn)
+                    self._maybe_log_summary()
                 continue
             try:
                 writes_since_prune = self._process_job(conn, job, writes_since_prune)
@@ -557,15 +590,65 @@ class RuntimeObservationSink:
             finally:
                 self._jobs.task_done()
 
+    def _consume_external_write_request(self) -> None:
+        with self._state_lock:
+            if not self._maintenance_requested.is_set():
+                return
+            self._maintenance_requested.clear()
+        self._prune_pending = True
+        if self._prune_now_ms is None:
+            self._prune_now_ms = int(time.time() * 1000)
+
     def _process_job(self, conn: sqlite3.Connection, job: _ObservationJob, writes_since_prune: int) -> int:
-        result = self._write_job(conn, job, writes_since_prune)
+        result = self._write_job(conn, job)
         if result is None:
             self._increment("shutdown_grace_drops")
         elif result:
             writes_since_prune += 1
             if writes_since_prune >= self._prune_every_writes:
                 writes_since_prune = 0
+                self._prune_pending = True
+                if self._prune_now_ms is None:
+                    self._prune_now_ms = int(time.time() * 1000)
+            if self._prune_pending and not self._close_requested.is_set():
+                self._run_prune_batch(conn)
         return writes_since_prune
+
+    def _run_prune_batch(self, conn: sqlite3.Connection) -> None:
+        """Run one maintenance transaction; committed observations stay committed."""
+        if self._close_requested.is_set() or self._abort_requested.is_set():
+            return
+        try:
+            effective_now = self._prune_now_ms if self._prune_now_ms is not None else int(time.time() * 1000)
+            result = _prune_runtime_observations_batch(
+                conn,
+                ttl_seconds=self._retention_ttl_seconds,
+                row_cap=self._row_cap,
+                now_ms=effective_now,
+            )
+        except Exception as exc:  # noqa: BLE001 - maintenance failure must not retire committed observations
+            self._handle_prune_failure(conn, exc)
+            return
+        self._prune_pending = result.has_more
+        if not result.has_more:
+            self._prune_now_ms = None
+
+    def _handle_prune_failure(self, conn: sqlite3.Connection, exc: Exception) -> None:
+        _raise_if_writer_retired(conn, exc)
+        if self._abort_requested.is_set():
+            self._prune_pending = False
+            self._prune_now_ms = None
+            return
+        if isinstance(exc, sqlite3.OperationalError) and {"locked", "busy"}.intersection(str(exc).lower().split()):
+            self._increment("busy_retries")
+            return
+        self._prune_pending = False
+        self._prune_now_ms = None
+        logger.warning(
+            "runtime_observation_prune_failed error_type=%s sqlite_errorcode=%s",
+            type(exc).__name__,
+            getattr(exc, "sqlite_errorcode", None),
+        )
 
     def _handle_writer_failure(self, exc: BaseException, *, startup_complete: bool) -> None:
         with self._state_lock:
@@ -584,7 +667,7 @@ class RuntimeObservationSink:
         )
         self._maybe_log_summary()
 
-    def _write_job(self, conn: sqlite3.Connection, job: _ObservationJob, writes_since_prune: int) -> bool | None:
+    def _write_job(self, conn: sqlite3.Connection, job: _ObservationJob) -> bool | None:
         payload = cast(Mapping[str, object], json.loads(job.payload_json))
         attempt = 0
         while not self._abort_requested.is_set():
@@ -609,12 +692,6 @@ class RuntimeObservationSink:
                         payload=payload,
                         observed_at_ms=job.observed_at_ms,
                     )
-                    if writes_since_prune + 1 >= self._prune_every_writes and not self._close_requested.is_set():
-                        prune_runtime_observations(
-                            conn,
-                            ttl_seconds=self._retention_ttl_seconds,
-                            row_cap=self._row_cap,
-                        )
                 self._increment("successful_writes")
                 return True
             except sqlite3.OperationalError as exc:
@@ -637,6 +714,90 @@ class RuntimeObservationSink:
         return None
 
 
+def _plan_runtime_observations_batch(
+    conn: sqlite3.Connection,
+    *,
+    ttl_seconds: int,
+    row_cap: int,
+    now_ms: int,
+) -> _PrunePlan:
+    """Select immutable ids without reserving SQLite's writer."""
+    if ttl_seconds < 1 or row_cap < 1:
+        raise ValueError("runtime event retention limits must be positive")
+    cutoff_ms = now_ms - ttl_seconds * 1000
+    ttl_rows = cast(
+        list[tuple[int]],
+        conn.execute(
+            "SELECT id FROM runtime_observations "
+            "INDEXED BY idx_runtime_observations_time "
+            "WHERE observed_at_ms < ? ORDER BY observed_at_ms, id LIMIT ?",
+            (cutoff_ms, _PRUNE_BATCH_SIZE + 1),
+        ).fetchall(),
+    )
+    if ttl_rows:
+        return _PrunePlan(tuple(row[0] for row in ttl_rows[:_PRUNE_BATCH_SIZE]), False, True)
+
+    cap_rows = cast(
+        list[tuple[int]],
+        conn.execute(
+            "SELECT id FROM runtime_observations ORDER BY id LIMIT ("
+            "SELECT MAX(COUNT(*) - ?, 0) FROM ("
+            "SELECT 1 FROM runtime_observations INDEXED BY idx_runtime_observations_time LIMIT ?"
+            "))",
+            (row_cap, row_cap + _PRUNE_BATCH_SIZE + 1),
+        ).fetchall(),
+    )
+    return _PrunePlan(
+        tuple(row[0] for row in cap_rows[:_PRUNE_BATCH_SIZE]),
+        True,
+        len(cap_rows) > _PRUNE_BATCH_SIZE,
+    )
+
+
+def _apply_runtime_observations_plan(
+    conn: sqlite3.Connection,
+    plan: _PrunePlan,
+    *,
+    now_ms: int,
+) -> _PruneBatchResult:
+    """Apply exact planned ids in the caller-owned transaction."""
+    if not plan.ids:
+        return _PruneBatchResult(0, 0, plan.has_more)
+    placeholders = ",".join("?" for _ in plan.ids)
+    cursor = conn.execute(
+        f"DELETE FROM runtime_observations WHERE id IN ({placeholders})",
+        plan.ids,
+    )
+    deleted = max(cursor.rowcount, 0)
+    cap_deleted = deleted if plan.cap else 0
+    if cap_deleted:
+        conn.execute(
+            "INSERT OR REPLACE INTO daemon_state(key, value) VALUES ('runtime_observations_last_cap_truncation_ms', ?)",
+            (str(now_ms),),
+        )
+    return _PruneBatchResult(deleted, cap_deleted, plan.has_more)
+
+
+def _prune_runtime_observations_batch(
+    conn: sqlite3.Connection,
+    *,
+    ttl_seconds: int,
+    row_cap: int,
+    now_ms: int,
+) -> _PruneBatchResult:
+    """Plan outside the lock, then apply one bounded deletion transaction."""
+    plan = _plan_runtime_observations_batch(
+        conn,
+        ttl_seconds=ttl_seconds,
+        row_cap=row_cap,
+        now_ms=now_ms,
+    )
+    if not plan.ids:
+        return _PruneBatchResult(0, 0, plan.has_more)
+    with write_transaction(conn):
+        return _apply_runtime_observations_plan(conn, plan, now_ms=now_ms)
+
+
 def prune_runtime_observations(
     conn: sqlite3.Connection, *, ttl_seconds: int, row_cap: int = DEFAULT_ROW_CAP, now_ms: int | None = None
 ) -> int:
@@ -644,23 +805,18 @@ def prune_runtime_observations(
     if ttl_seconds < 1 or row_cap < 1:
         raise ValueError("runtime event retention limits must be positive")
     effective_now = int(time.time() * 1000) if now_ms is None else now_ms
-    deleted = conn.execute(
-        "DELETE FROM runtime_observations WHERE observed_at_ms < ?", (effective_now - ttl_seconds * 1000,)
-    ).rowcount
-    count_row = cast(tuple[int] | None, conn.execute("SELECT COUNT(*) FROM runtime_observations").fetchone())
-    event_count = int(count_row[0] or 0) if count_row is not None else 0
-    excess = max(event_count - row_cap, 0)
-    if excess:
-        conn.execute(
-            "DELETE FROM runtime_observations WHERE id IN (SELECT id FROM runtime_observations ORDER BY id LIMIT ?)",
-            (excess,),
+    deleted = 0
+    while True:
+        plan = _plan_runtime_observations_batch(
+            conn,
+            ttl_seconds=ttl_seconds,
+            row_cap=row_cap,
+            now_ms=effective_now,
         )
-        deleted += excess
-        conn.execute(
-            "INSERT OR REPLACE INTO daemon_state(key, value) VALUES ('runtime_observations_last_cap_truncation_ms', ?)",
-            (str(effective_now),),
-        )
-    return deleted
+        result = _apply_runtime_observations_plan(conn, plan, now_ms=effective_now)
+        deleted += result.deleted
+        if not result.has_more:
+            return deleted
 
 
 __all__ = [

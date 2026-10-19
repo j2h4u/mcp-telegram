@@ -101,7 +101,6 @@ from .request_timing import (
 from .runtime_observations import (
     RuntimeObservationPolicy,
     RuntimeObservationSink,
-    prune_runtime_observations,
     record_runtime_observation,
     tool_telemetry_identity,
 )
@@ -160,7 +159,6 @@ _ALL_ENTITY_NAMES_NORMALIZED_SQL = (
 _ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, type FROM entities WHERE username = ? COLLATE NOCASE"
 _TELEMETRY_OUTCOMES = frozenset({"success", "tool_error", "validation_error", "exception", "cancelled"})
 _TELEMETRY_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
-_runtime_event_write_count = 0
 _EXPORT_STACK_FRAMES = 20
 _EXPORT_LOOP_STALL_SECONDS = 10
 
@@ -374,23 +372,14 @@ def _insert_telemetry_row(
 
 def _write_telemetry(
     conn: sqlite3.Connection,
-    policy: DaemonApiPolicy,
     event: Mapping[str, object],
 ) -> None:
-    global _runtime_event_write_count
     with write_transaction(conn):
         _insert_telemetry_row(conn, event)
-        _runtime_event_write_count += 1
-        if _runtime_event_write_count % 128 == 0:
-            prune_runtime_observations(
-                conn,
-                ttl_seconds=policy.telemetry.retention_ttl_seconds,
-                row_cap=policy.telemetry.runtime_observations.row_cap,
-            )
 
 
 class TelemetryPolicy(Protocol):
-    """Hierarchical telemetry policy supplied by the typed config root."""
+    """Typed telemetry policy retained at the daemon composition boundary."""
 
     @property
     def retention_ttl_seconds(self) -> int: ...
@@ -2172,7 +2161,7 @@ class DaemonAPIServer:
     async def _record_telemetry(self, req: dict[str, object]) -> dict:
         """Write one bounded ``mcp.call`` observation to ``runtime_observations``.
 
-        Retention runs on startup and every 128 MCP observations.
+        Retention is owned by the asynchronous runtime observation sink.
         """
         event, error = _normalize_telemetry_event(req)
         if error is not None:
@@ -2183,11 +2172,20 @@ class DaemonAPIServer:
             return outcome
         event["outcome"], event["error_code"] = outcome
         try:
-            _write_telemetry(self._conn, self._policy, event)
-            return {"ok": True}
+            _write_telemetry(self._conn, event)
         except Exception as exc:
             logger.exception("record_telemetry failed: %s", exc)
             return {"ok": False, "error": "internal", "message": "internal error"}
+        sink = self._runtime_observation_sink
+        if sink is not None:
+            try:
+                sink.note_external_write()
+            except Exception as exc:  # noqa: BLE001 - the insert already committed
+                logger.warning(
+                    "runtime_observation_maintenance_signal_failed error_type=%s",
+                    type(exc).__name__,
+                )
+        return {"ok": True}
 
     # ------------------------------------------------------------------
     # submit_feedback

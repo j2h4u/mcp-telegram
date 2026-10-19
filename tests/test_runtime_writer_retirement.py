@@ -101,3 +101,31 @@ def test_interrupt_tolerates_retirement_before_writer_reference_is_cleared() -> 
     sink._connection_lock = threading.Lock()
     sink._writer_connection = conn
     sink._interrupt_writer()
+
+
+def test_prune_retirement_preserves_primary_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    primary = ValueError("injected prune failure")
+
+    def fail_after_retirement(conn: sqlite3.Connection, **_kwargs: object) -> object:
+        conn.close()
+        raise primary
+
+    monkeypatch.setattr(runtime_observations, "_prune_runtime_observations_batch", fail_after_retirement)
+    sink = RuntimeObservationSink(
+        path,
+        retention_ttl_seconds=5,
+        policy=RuntimeObservationConfig(prune_every_writes=1),
+    )
+    try:
+        assert sink.record(kind="telegram.rpc_admission", outcome="committed")
+        sink._writer.join(timeout=2)
+        assert not sink._writer.is_alive()
+        assert sink._writer_error is primary
+        assert sink.writer_error == str(primary)
+    finally:
+        sink.close()

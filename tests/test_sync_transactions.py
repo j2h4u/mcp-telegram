@@ -1,10 +1,13 @@
+import logging
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
+import mcp_telegram.sync_transactions as sync_transactions
 from mcp_telegram.sync_transactions import (
     enable_runtime_writes,
     require_write_transaction,
@@ -91,15 +94,19 @@ def test_base_exception_rolls_back_and_restores_original_guard(guarded: bool, er
         assert _query_only(conn) is guarded
 
 
-def test_deferred_foreign_key_commit_failure_rolls_back() -> None:
+def test_deferred_foreign_key_commit_failure_rolls_back(caplog: pytest.LogCaptureFixture) -> None:
     with closing(sqlite3.connect(":memory:")) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
         conn.execute("CREATE TABLE child (parent_id REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)")
         enable_runtime_writes(conn)
-        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
-            with write_transaction(conn):
-                conn.execute("INSERT INTO child VALUES (42)")
+        with caplog.at_level(logging.WARNING, logger="mcp_telegram.sync_transactions"):
+            with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+                with write_transaction(conn):
+                    conn.execute("INSERT INTO child VALUES (42)")
+        record = next(record for record in caplog.records if record.name == "mcp_telegram.sync_transactions")
+        assert "stage=commit" in record.message
+        assert "sqlite_errorcode=787 sqlite_errorname=SQLITE_CONSTRAINT_FOREIGNKEY" in record.message
         assert not conn.in_transaction
         assert _query_only(conn)
         assert conn.execute("SELECT COUNT(*) FROM child").fetchone()[0] == 0
@@ -143,7 +150,142 @@ def test_competing_writer_entry_failure_restores_guard(tmp_path: Path) -> None:
             require_write_transaction(conn)
 
 
-def test_escaped_read_cursor_busy_snapshot_entry_restores_guard(tmp_path: Path) -> None:
+def test_fast_busy_entry_failure_is_debug_without_warning(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    path = tmp_path / "sync.db"
+    _create_db(path)
+    with (
+        closing(sqlite3.connect(path, timeout=0)) as conn,
+        closing(sqlite3.connect(path, timeout=0, isolation_level=None)) as competitor,
+    ):
+        enable_runtime_writes(conn)
+        competitor.execute("BEGIN IMMEDIATE")
+        with caplog.at_level(logging.DEBUG, logger="mcp_telegram.sync_transactions"):
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                with write_transaction(conn):
+                    pytest.fail("Cannot enter while another writer holds the lock")
+        records = [record for record in caplog.records if record.name == "mcp_telegram.sync_transactions"]
+        assert records
+        assert records[-1].levelno == logging.DEBUG
+        assert "stage=begin" in records[-1].message
+        assert "sqlite_errorcode=5" in records[-1].message
+        assert "sqlite_errorname=SQLITE_BUSY" in records[-1].message
+        competitor.rollback()
+
+
+def test_slow_write_logs_owner_and_timings(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    clock = iter((100.0, 100.0, 101.25, 101.25))
+    monkeypatch.setattr(sync_transactions, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    with closing(sqlite3.connect(":memory:")) as conn:
+        with caplog.at_level(logging.WARNING, logger="mcp_telegram.sync_transactions"):
+            with write_transaction(conn):
+                pass
+    records = [record for record in caplog.records if record.name == "mcp_telegram.sync_transactions"]
+    assert len(records) == 1
+    message = records[0].message
+    assert records[0].levelno == logging.WARNING
+    assert message.startswith("sqlite_write_slow stage=commit")
+    assert "caller_module=tests.test_sync_transactions" in message
+    assert "caller_function=test_slow_write_logs_owner_and_timings" in message
+    assert "wait_seconds=0.000 held_seconds=1.250" in message
+    assert "thread_name=MainThread" in message
+
+
+def test_slow_lock_wait_logs_after_transaction(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    clock = iter((200.0, 201.25, 201.25, 201.25))
+    monkeypatch.setattr(sync_transactions, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    with closing(sqlite3.connect(":memory:")) as conn:
+        with caplog.at_level(logging.WARNING, logger="mcp_telegram.sync_transactions"):
+            with write_transaction(conn):
+                pass
+    records = [record for record in caplog.records if record.name == "mcp_telegram.sync_transactions"]
+    assert len(records) == 1
+    assert records[0].message.startswith("sqlite_write_slow stage=begin")
+    assert "wait_seconds=1.250 held_seconds=0.000" in records[0].message
+
+
+def test_slow_wait_logs_when_body_fails(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    clock = iter((300.0, 301.25, 301.25, 301.25, 301.25))
+    monkeypatch.setattr(sync_transactions, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    with closing(sqlite3.connect(":memory:")) as conn:
+        with caplog.at_level(logging.WARNING, logger="mcp_telegram.sync_transactions"):
+            with pytest.raises(ValueError, match="body failure"):
+                with write_transaction(conn):
+                    raise ValueError("body failure")
+    record = next(record for record in caplog.records if record.name == "mcp_telegram.sync_transactions")
+    assert record.message.startswith("sqlite_write_slow stage=body")
+    assert "wait_seconds=1.250" in record.message
+    assert "error_type=ValueError" in record.message
+
+
+def test_busy_after_long_hold_is_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "sync.db"
+    _create_db(path)
+    clock = iter((400.0, 400.0, 401.25, 401.25, 401.25))
+    monkeypatch.setattr(sync_transactions, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    with (
+        closing(sqlite3.connect(path, timeout=0)) as conn,
+        closing(sqlite3.connect(path, timeout=0, isolation_level=None)) as competitor,
+    ):
+        enable_runtime_writes(conn)
+        with caplog.at_level(logging.WARNING, logger="mcp_telegram.sync_transactions"):
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                with write_transaction(conn):
+                    competitor.execute("BEGIN IMMEDIATE")
+        record = next(record for record in caplog.records if record.name == "mcp_telegram.sync_transactions")
+        assert record.levelno == logging.WARNING
+        assert "stage=body" in record.message
+        assert "sqlite_errorcode=5 sqlite_errorname=SQLITE_BUSY" in record.message
+        assert "held_seconds=1.250" in record.message
+
+
+def test_failing_logger_does_not_replace_primary_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = iter((500.0, 500.0, 501.25, 501.25, 501.25))
+    monkeypatch.setattr(sync_transactions, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    logger_transaction_states: list[bool] = []
+
+    class _FailingLogger:
+        def log(self, *_args: object, **_kwargs: object) -> None:
+            logger_transaction_states.append(conn.in_transaction)
+            raise RuntimeError("logger failure")
+
+    monkeypatch.setattr(sync_transactions, "logger", _FailingLogger())
+    with closing(sqlite3.connect(":memory:")) as conn:
+        failure = ValueError("primary failure")
+        with pytest.raises(ValueError) as caught:
+            with write_transaction(conn):
+                raise failure
+        assert caught.value is failure
+        assert _query_only(conn) is False
+        assert logger_transaction_states == [False]
+
+
+def test_sqlite_failure_logs_stage_classification_without_exception_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with closing(sqlite3.connect(":memory:")) as conn:
+        with caplog.at_level(logging.WARNING, logger="mcp_telegram.sync_transactions"):
+            with pytest.raises(sqlite3.OperationalError):
+                with write_transaction(conn):
+                    conn.execute("INSERT INTO private_table VALUES (1)")
+    records = [record for record in caplog.records if record.name == "mcp_telegram.sync_transactions"]
+    assert len(records) == 1
+    message = records[0].message
+    assert message.startswith("sqlite_write_failure stage=body")
+    assert "error_type=OperationalError" in message
+    assert "sqlite_errorcode=1 sqlite_errorname=SQLITE_ERROR" in message
+    assert "private_table" not in message
+    assert "no such table" not in message
+
+
+def test_escaped_read_cursor_busy_snapshot_entry_restores_guard(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     path = tmp_path / "sync.db"
     _create_db(path)
     with (
@@ -154,10 +296,14 @@ def test_escaped_read_cursor_busy_snapshot_entry_restores_guard(tmp_path: Path) 
         cursor = conn.execute("SELECT value FROM items")
         assert cursor.fetchone()[0] == 1
         competitor.execute("INSERT INTO items VALUES (4)")
-        with pytest.raises(sqlite3.OperationalError) as caught:
-            with write_transaction(conn):
-                pytest.fail("Stale retained cursor must fail at entry")
+        with caplog.at_level(logging.WARNING, logger="mcp_telegram.sync_transactions"):
+            with pytest.raises(sqlite3.OperationalError) as caught:
+                with write_transaction(conn):
+                    pytest.fail("Stale retained cursor must fail at entry")
         assert caught.value.sqlite_errorcode == sqlite3.SQLITE_BUSY_SNAPSHOT
+        record = next(record for record in caplog.records if record.name == "mcp_telegram.sync_transactions")
+        assert record.levelno == logging.WARNING
+        assert "sqlite_errorcode=517 sqlite_errorname=SQLITE_BUSY_SNAPSHOT" in record.message
         assert not conn.in_transaction
         assert _query_only(conn)
         cursor.close()
@@ -182,15 +328,19 @@ class _RollbackFailure(sqlite3.Connection):
         raise sqlite3.OperationalError("injected rollback failure")
 
 
-def test_rollback_failure_retires_connection_preserving_primary() -> None:
+def test_rollback_failure_retires_connection_preserving_primary(caplog: pytest.LogCaptureFixture) -> None:
     conn = sqlite3.connect(":memory:", factory=_RollbackFailure)
     enable_runtime_writes(conn)
     failure = KeyboardInterrupt("abort")
-    with pytest.raises(KeyboardInterrupt) as caught:
-        with write_transaction(conn):
-            raise failure
+    with caplog.at_level(logging.WARNING, logger="mcp_telegram.sync_transactions"):
+        with pytest.raises(KeyboardInterrupt) as caught:
+            with write_transaction(conn):
+                raise failure
     assert caught.value is failure
     assert "rollback failed" in failure.__notes__[0]
+    record = next(record for record in caplog.records if record.name == "mcp_telegram.sync_transactions")
+    assert "stage=rollback" in record.message
+    assert "error_type=OperationalError" in record.message
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
         conn.execute("SELECT 1")
 
@@ -202,19 +352,22 @@ def _deny_guard_restore(action: int, arg1: str | None, arg2: str | None, db: str
 
 
 @pytest.mark.parametrize("abort", [False, True])
-def test_restoration_failure_retires_connection(abort: bool) -> None:
+def test_restoration_failure_retires_connection(abort: bool, caplog: pytest.LogCaptureFixture) -> None:
     conn = sqlite3.connect(":memory:")
     enable_runtime_writes(conn)
     failure = KeyboardInterrupt("abort")
     expected = KeyboardInterrupt if abort else sqlite3.DatabaseError
-    with pytest.raises(expected) as caught:
-        with write_transaction(conn):
-            conn.set_authorizer(_deny_guard_restore)
-            if abort:
-                raise failure
+    with caplog.at_level(logging.WARNING, logger="mcp_telegram.sync_transactions"):
+        with pytest.raises(expected) as caught:
+            with write_transaction(conn):
+                conn.set_authorizer(_deny_guard_restore)
+                if abort:
+                    raise failure
     if abort:
         assert caught.value is failure
         assert "Restoring" in failure.__notes__[0]
+    record = next(record for record in caplog.records if record.name == "mcp_telegram.sync_transactions")
+    assert "stage=guard_restore" in record.message
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
         conn.execute("SELECT 1")
 

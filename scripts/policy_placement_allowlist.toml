@@ -197,6 +197,11 @@ rationale = "The HTTP server's existing environment inputs are outside the TTL p
 
 [[entry]]
 category = "policy_assignments"
+key = "src/mcp_telegram/runtime_observations.py:<module>:_PRUNE_BATCH_SIZE"
+rationale = "This fixed per-transaction deletion-work ceiling is an implementation safety invariant, not operator retention policy."
+
+[[entry]]
+category = "policy_assignments"
 key = "src/mcp_telegram/activity_cold_backfill.py:<module>:_BACKFILL_BATCH_LIMIT"
 rationale = "This inherited cold-backfill RPC batch cap is not introduced by the TTL migration."
 
