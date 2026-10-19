@@ -154,11 +154,22 @@ For retrospective windows, query `runtime_observations` first, then correlate an
 `journalctl -t mcp-telegram`. Use `docker logs` only for the current container after deploy;
 `conversation_history_events` is user history, not operational telemetry.
 
-## Вызов MCP tools (devtools-клиент)
+## Проверка MCP tools
 
-**Всегда используй `devtools/mcp_client/cli.py` для ad-hoc проверок и E2E-валидации — не `docker exec python3` и не самодельные скрипты.**
+**Штатные MCP smoke/E2E-проверки запускай через Justfile из корня репозитория.**
+Не дублируй команды готовых рецептов прямыми вызовами клиента или Docker Compose.
 
-Запускается из корня репозитория (`~/repos/j2h4u/mcp-telegram/`):
+```bash
+# Проверка уже работающего сервиса через HTTP
+just runtime-smoke
+
+# Полный цикл: сборка, перезапуск, ожидание Healthy и MCP smoke
+just runtime-verify
+```
+
+Прямой `devtools/mcp_client/cli.py` используй только для точечных диагностических
+запросов, которых нет в готовом рецепте. Не используй `docker exec python3`
+или самодельные MCP-клиенты.
 
 ```bash
 # Список доступных tools
@@ -168,13 +179,9 @@ uv run python -m devtools.mcp_client.cli list-tools
 uv run python -m devtools.mcp_client.cli call-tool \
   --name get_sync_status \
   --arguments '{"dialog_id": 228055330}'
-
-# Запуск smoke-теста из JSON-файла
-uv run python -m devtools.mcp_client.cli script \
-  --file devtools/mcp_client/smoke-integration.json
 ```
 
-Требует живого daemon (контейнер должен быть Healthy).
+Smoke и точечные запросы требуют живого daemon (контейнер должен быть Healthy).
 
 ## Runtime On This Machine
 
@@ -183,7 +190,7 @@ uv run python -m devtools.mcp_client.cli script \
 - Compose build uses the repo path as Docker build context
 - Rebuild after code changes:
   ```bash
-  docker compose -f /opt/docker/mcp-telegram/docker-compose.yml up -d --build mcp-telegram
+  just runtime-verify
   ```
 
 ## Ownership
