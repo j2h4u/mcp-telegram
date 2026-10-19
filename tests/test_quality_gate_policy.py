@@ -57,7 +57,12 @@ def test_fixed_metric_thresholds_and_coverage_informed_crap_gate() -> None:
     assert "run: python3 scripts/ci_pytest_runner.py run -- just crap-threshold" in workflow
     assert workflow.count("needs: changes") == 4
     assert workflow.count("if: needs.changes.outputs.run_heavy == 'true'") == 4
-    assert "needs: [changes, quality, unit, crap-threshold, docker-build]" in workflow
+    assert "needs: [changes, quality, export-stress, crap-threshold, docker-build]" in workflow
+    assert re.search(r"(?m)^  unit:\s*$", workflow) is None
+    assert re.search(r"(?m)^  export-stress:\s*$", workflow) is not None
+    assert "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'" in workflow
+    assert "run: python3 scripts/ci_pytest_runner.py run -- just export-stress" in workflow
+    assert "timeout-minutes: 30" in workflow
     assert re.search(r"(?m)^radon-threshold:\s*$", justfile) is not None
     assert re.search(r"(?m)^crap-threshold:\s*$", justfile) is not None
     assert "pytest-crap" not in pyproject_text
@@ -65,6 +70,9 @@ def test_fixed_metric_thresholds_and_coverage_informed_crap_gate() -> None:
     assert "--crap" not in justfile
     assert re.search(r"(?m)^coverage-data:\s*$", justfile) is not None
     assert "--cov-append --cov-report=" in justfile
+    assert justfile.count("-m 'not slow'") == 3
+    assert re.search(r"(?m)^export-stress:\s*$", justfile) is not None
+    assert "tests/test_chat_export_cli.py -m 'slow' --cov=src/mcp_telegram --cov-report=" in justfile
     assert justfile.count("just coverage-data;") == 1
     assert justfile.count('uv run coverage json -o "$coverage_file";') == 1
     assert "--cov-report=json:" not in justfile
@@ -73,6 +81,21 @@ def test_fixed_metric_thresholds_and_coverage_informed_crap_gate() -> None:
     assert "verify: check crap-threshold runtime-verify" in justfile
     assert "--baseline" not in justfile
     assert "tighten-baseline" not in justfile
+
+
+def test_export_stress_is_the_only_slow_ci_selection() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    justfile = (ROOT / "Justfile").read_text(encoding="utf-8")
+    export_test = (ROOT / "tests" / "test_chat_export_cli.py").read_text(encoding="utf-8")
+
+    assert export_test.count("@pytest.mark.slow") == 1
+    assert "-m 'not slow'" in justfile
+    assert "just export-stress" in workflow
+    assert "just unit" not in workflow
+    assert "unit:\n    uv run pytest -m 'not slow'" in justfile
+    assert "-m 'slow'" in justfile
+    stress_job = workflow.partition("  export-stress:\n")[2].partition("\n  crap-threshold:\n")[0]
+    assert "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'" in stress_job
 
 
 def test_import_linter_and_tach_are_both_required_static_gates() -> None:

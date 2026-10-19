@@ -110,9 +110,13 @@ test *args:
 test-parallel *args:
     uv run pytest -n 2 {{args}}
 
-# Unit tests.
+# Run the default local test suite without slow stress tests.
 unit:
-    uv run pytest
+    uv run pytest -m 'not slow'
+
+# Run only the million-message export stress test.
+export-stress:
+    uv run pytest tests/test_chat_export_cli.py -m 'slow' --cov=src/mcp_telegram --cov-report=
 
 # Dead-code sieve (advisory — vulture has false positives, read with judgment).
 deadcode:
@@ -125,8 +129,8 @@ deadcode:
 coverage-data:
     test_files=(tests/test_*.py); \
     split=$(((${#test_files[@]} + 1) / 2)); \
-    uv run pytest "${test_files[@]:0:split}" --cov=src/mcp_telegram --cov-report=; \
-    uv run pytest "${test_files[@]:split}" --cov=src/mcp_telegram --cov-append --cov-report=
+    uv run pytest "${test_files[@]:0:split}" -m 'not slow' --cov=src/mcp_telegram --cov-report=; \
+    uv run pytest "${test_files[@]:split}" -m 'not slow' --cov=src/mcp_telegram --cov-append --cov-report=
 
 # Enforce the repository-wide CRAP limit of 30 using per-function coverage.
 crap-threshold:

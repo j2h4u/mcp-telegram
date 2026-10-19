@@ -221,6 +221,7 @@ async def test_history_failure_removes_temporary(monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_million_messages_remain_bounded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """A million records stay paged; inspect output in chunks, never json.load."""
     million = 1_000_000
