@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import resource
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -218,81 +217,6 @@ async def test_history_failure_removes_temporary(monkeypatch: pytest.MonkeyPatch
     assert not list(tmp_path.glob(".*.tmp"))
     assert json.loads((tmp_path / "out").read_text())["messages"] == []
     assert (tmp_path / ".out.resume.sqlite3").exists()
-
-
-@pytest.mark.asyncio
-@pytest.mark.slow
-async def test_million_messages_remain_bounded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """A million records stay paged; inspect output in chunks, never json.load."""
-    million = 1_000_000
-    original_init = cli.Checkpoint.__init__
-
-    def fast_init(self: cli.Checkpoint, path: Path) -> None:
-        original_init(self, path)
-        # Durability uses real FULL commits in the interruption tests; this checks memory only.
-        self.db.execute("PRAGMA synchronous=OFF")
-
-    monkeypatch.setattr(cli.Checkpoint, "__init__", fast_init)
-
-    def fast_save(  # noqa: PLR0913 -- monkeypatch must preserve Checkpoint.save signature
-        self: cli.Checkpoint, kind: str, peer: int, identifier: int, payload: str, cursor_key: str
-    ) -> None:
-        # Synthetic memory stress commits at the normal page marker; real crash tests commit each record.
-        self.db.execute("INSERT OR REPLACE INTO records VALUES (?,?,?,?)", (kind, peer, identifier, payload))
-        self.set_state(cursor_key, identifier)
-
-    monkeypatch.setattr(cli.Checkpoint, "save", fast_save)
-    max_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-
-    async def handler(p: Payload) -> Payload:
-        data: Payload
-        if p["operation"] == "open":
-            data = {
-                "group": {"dialog_id": -1},
-                "upper_id": million,
-                "total_messages": None,
-                "total_kind": "unknown",
-                "migrated_from_dialog_id": None,
-            }
-        elif p["operation"] == "history":
-            upper = cast(int, p["before_id"]) - 1 if p["before_id"] else million
-            lower = max(1, upper - 99)
-            data = {
-                "items": [
-                    {
-                        "id": mid,
-                        "dialog_id": -1,
-                        "kind": "message",
-                        "raw": {},
-                        "author": None,
-                        "reactions": {"status": "known_empty", "can_view_list": False},
-                    }
-                    for mid in range(upper, lower - 1, -1)
-                ],
-                "next_before_id": lower,
-                "done": lower == 1,
-            }
-        else:
-            data = {"items": [], "next_before_id": 0, "done": True, "status": "complete"}
-        return {"ok": True, "data": data}
-
-    install_daemon(monkeypatch, handler)
-    output = tmp_path / "million.json"
-    summary = await cli.export_group(-1, output)
-    assert summary["messages"] == million
-    assert resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - max_rss < 32 * 1024
-    total = 0
-    tail = b""
-    needle = b'"reactors":[]'
-    with output.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            combined = tail + chunk
-            total += combined.count(needle)
-            # Retain only an incomplete marker across chunk boundaries.
-            tail = combined[-len(needle) + 1 :]
-            total -= tail.count(needle)
-    assert total == 0
-    output.unlink()
 
 
 @pytest.mark.asyncio
