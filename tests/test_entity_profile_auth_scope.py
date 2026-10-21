@@ -75,14 +75,14 @@ def test_profile_scope_changed_fences_only_stale_or_unavailable_pairs(
     conn.close()
 
 
-def test_scope_change_preserves_cached_detail_and_hides_private_scope(tmp_path: Path) -> None:
+async def test_scope_change_preserves_cached_detail_and_hides_private_scope(tmp_path: Path) -> None:
     conn, raw_service = _prepare(tmp_path / "scope-preserve.sqlite")
     service = cast(DaemonEntityInfoService, raw_service)
     service._deps = replace(service._deps, full_user_auth_scope=lambda: _scope())
     cached = SimpleNamespace(detail={"id": 42, "type": "user", "name": "Target"}, profile_observation_scope=None)
 
     assert service._profile_scope_changed(cached, 42, now=100) is True  # type: ignore[attr-defined]
-    result = cast(dict[str, object], service._progressive_result(42, cached.detail, {}, now=100))  # type: ignore[attr-defined]
+    result = cast(dict[str, object], await service._progressive_result(42, cached.detail, {}, now=100))  # type: ignore[attr-defined]
     data = cast(dict[str, object], result["data"])
 
     assert data["name"] == "Target"
@@ -239,7 +239,7 @@ async def test_ownership_invalid_cached_profile_admits_refresh_and_offers_demand
         conn.execute("DELETE FROM entity_profile_refresh_state WHERE entity_id=42")
     conn.commit()
 
-    result = service._progressive_cached_result(42, now=100)  # type: ignore[attr-defined]
+    result = await service._progressive_cached_result(42, now=100)  # type: ignore[attr-defined]
 
     assert result is not None and result["error"] == "entity_info_pending"
     assert coordinator.queue_depth == 1
@@ -281,7 +281,7 @@ async def test_ownership_invalid_cached_profile_preserves_failed_retry_state(tmp
         ).fetchone(),
     )
 
-    result = service._progressive_cached_result(42, now=100)  # type: ignore[attr-defined]
+    result = await service._progressive_cached_result(42, now=100)  # type: ignore[attr-defined]
 
     assert result is not None and result["error"] == "entity_info_pending"
     assert coordinator.queue_depth == 1
@@ -420,7 +420,7 @@ async def test_auth_scope_change_starts_new_generation_and_keeps_old_facts(tmp_p
             "UPDATE entity_profile_refresh_state SET status='complete', next_section='personal_channel' WHERE entity_id=42"
         )
     conn.commit()
-    service.auth_scope_changed()  # type: ignore[attr-defined]
+    await service.auth_scope_changed()  # type: ignore[attr-defined]
     assert conn.execute(
         "SELECT status, generation, pair_eligible FROM entity_profile_refresh_state WHERE entity_id=42"
     ).fetchone() == ("pending", generation + 1, 1)

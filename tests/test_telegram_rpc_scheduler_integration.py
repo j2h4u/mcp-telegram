@@ -174,6 +174,9 @@ def _make_gate(
     gate._connection_capability = None
     gate._connection_rpc_tasks = set()
     gate._pending_scalar_dispatches = {}
+    gate._cooldown_persistence = None
+    gate._cooldown_save_tasks = {}
+    gate._scalar_persistence_pending = set()
     gate._transport_state = _TransportBoundaryState.READY
     gate._log = {"telethon.client.users": logging.getLogger(__name__)}
     gate.flood_sleep_threshold = 0

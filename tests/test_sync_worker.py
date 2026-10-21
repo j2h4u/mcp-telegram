@@ -41,6 +41,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     current_rpc_scope,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.sqlite_writer_helpers import inline_writer
 
 
 class _SQLiteCursor(Protocol):
@@ -144,6 +145,7 @@ def make_worker(
         cast(sqlite3.Connection, sync_db),
         shutdown_event,
         total_messages_probe=TelethonHistoryAccessProbe(mock_client),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
 
 
@@ -166,6 +168,7 @@ async def test_automatic_group_history_uses_fresh_total_and_persists_decision(
         cast(sqlite3.Connection, sync_db),
         asyncio.Event(),
         automatic_group_history=AutomaticGroupHistoryConfig(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
     await worker._process_one_automatic_group()
     if total is None:
@@ -192,7 +195,11 @@ async def test_automatic_group_first_page_is_saved_once(sync_db: _SQLiteConnecti
     sync_db.commit()
     port = Port()
     worker = FullSyncWorker(
-        port, cast(sqlite3.Connection, sync_db), asyncio.Event(), automatic_group_history=AutomaticGroupHistoryConfig()
+        port,
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        automatic_group_history=AutomaticGroupHistoryConfig(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
     await worker._process_one_automatic_group()
     await worker._process_one_automatic_group()
@@ -219,6 +226,7 @@ async def test_automatic_group_rechecks_explicit_race(sync_db: _SQLiteConnection
         cast(sqlite3.Connection, sync_db),
         asyncio.Event(),
         automatic_group_history=AutomaticGroupHistoryConfig(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
     await worker._process_one_automatic_group()
     assert sync_db.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=503").fetchone() == ((1 if enabled else 0),)
@@ -246,6 +254,7 @@ async def test_full_sync_adapter_runs_one_automatic_first_page_under_budget(
         cast(sqlite3.Connection, sync_db),
         asyncio.Event(),
         automatic_group_history=AutomaticGroupHistoryConfig(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
     adapter = FullSyncDemandAdapter(worker)
 
@@ -283,6 +292,7 @@ async def test_automatic_group_storage_failure_rolls_back_receipt_and_enrollment
         cast(sqlite3.Connection, sync_db),
         asyncio.Event(),
         automatic_group_history=AutomaticGroupHistoryConfig(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
 
     with pytest.raises(sqlite3.IntegrityError, match="test storage failure"):
@@ -324,6 +334,7 @@ async def test_automatic_group_retry_skips_failed_candidate_and_reports_release(
         cast(sqlite3.Connection, sync_db),
         asyncio.Event(),
         automatic_group_history=policy,
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
     adapter = FullSyncDemandAdapter(worker)
 
@@ -361,6 +372,7 @@ async def test_automatic_group_ordinary_error_does_not_block_next_candidate(sync
         cast(sqlite3.Connection, sync_db),
         asyncio.Event(),
         automatic_group_history=AutomaticGroupHistoryConfig(probe_retry_seconds=60),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
     adapter = FullSyncDemandAdapter(worker)
     with patch("mcp_telegram.sync_worker.time.time", return_value=1_000):
@@ -398,6 +410,7 @@ async def test_ready_total_repair_runs_during_automatic_candidate_backoff(sync_d
         asyncio.Event(),
         total_messages_probe=probe,
         automatic_group_history=AutomaticGroupHistoryConfig(probe_retry_seconds=60),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
     adapter = FullSyncDemandAdapter(worker)
     with patch("mcp_telegram.sync_worker.time.time", return_value=1_000):
@@ -430,6 +443,7 @@ async def test_automatic_group_acceptance_resumes_partial_history_and_counts_top
         cast(sqlite3.Connection, sync_db),
         asyncio.Event(),
         automatic_group_history=AutomaticGroupHistoryConfig(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
 
     await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
@@ -470,7 +484,7 @@ async def test_dm_bootstrap_consumes_canonical_publication_without_dialog_traver
     client = MagicMock()
     worker = make_worker(client, sync_db, asyncio.Event())
 
-    assert worker.consume_canonical_dm_publication() == 2
+    assert worker.consume_canonical_dm_publication(cast(sqlite3.Connection, sync_db)) == 2
     assert sync_db.execute("SELECT dialog_id FROM synced_dialogs ORDER BY dialog_id").fetchall() == [(101,), (102,)]
     assert sync_db.execute("SELECT id FROM entities ORDER BY id").fetchall() == [(101,), (102,)]
 
@@ -480,8 +494,8 @@ async def test_dm_bootstrap_is_idempotent_for_consumed_publication(sync_db: _SQL
     publish_local_dialogs(sync_db, [(101, "user", "Alice", None, None)])
     worker = make_worker(MagicMock(), sync_db, asyncio.Event())
 
-    assert worker.consume_canonical_dm_publication() == 1
-    assert worker.consume_canonical_dm_publication() == 0
+    assert worker.consume_canonical_dm_publication(cast(sqlite3.Connection, sync_db)) == 1
+    assert worker.consume_canonical_dm_publication(cast(sqlite3.Connection, sync_db)) == 0
 
 
 @pytest.mark.asyncio
@@ -517,7 +531,7 @@ async def test_dm_bootstrap_excludes_hidden_rows_and_preserves_richer_entity_typ
     sync_db.commit()
     worker = make_worker(MagicMock(), sync_db, asyncio.Event())
 
-    assert worker.consume_canonical_dm_publication() == 1
+    assert worker.consume_canonical_dm_publication(cast(sqlite3.Connection, sync_db)) == 1
     assert sync_db.execute("SELECT dialog_id FROM synced_dialogs ORDER BY dialog_id").fetchall() == [(101,)]
     assert sync_db.execute("SELECT type FROM entities WHERE id=101").fetchone() == ("channel",)
 
@@ -569,7 +583,7 @@ def test_dm_enrollment_uses_canonical_type_after_partial_realtime_identity(sync_
     sync_db.commit()
 
     worker = make_worker(MagicMock(), sync_db, asyncio.Event())
-    assert worker.consume_canonical_dm_publication() == 1
+    assert worker.consume_canonical_dm_publication(cast(sqlite3.Connection, sync_db)) == 1
     assert sync_db.execute("SELECT dialog_id FROM synced_dialogs ORDER BY dialog_id").fetchall() == [(201,)]
 
 
@@ -582,7 +596,7 @@ async def test_hidden_previously_synced_dm_is_neither_reenrolled_nor_scheduled(s
     sync_db.commit()
     worker = make_worker(MagicMock(), sync_db, asyncio.Event())
 
-    assert worker.consume_canonical_dm_publication() == 0
+    assert worker.consume_canonical_dm_publication(cast(sqlite3.Connection, sync_db)) == 0
     assert worker._next_pending_dialog() is None
     assert sync_db.execute("SELECT status FROM synced_dialogs WHERE dialog_id=102").fetchone() == ("syncing",)
 
@@ -2728,7 +2742,7 @@ async def test_failed_history_peer_does_not_starve_ready_peer(
                 raise failure("retry")
             return FullHistoryPage(messages=(), next_before_message_id=None, total_messages=0)
 
-    worker = FullSyncWorker(Port(), sync_db, asyncio.Event())
+    worker = FullSyncWorker(Port(), sync_db, asyncio.Event(), writer=inline_writer(sync_db))
     await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
     await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
     assert calls == [1, 2]
@@ -2757,7 +2771,9 @@ async def test_failed_total_repair_peer_does_not_starve_ready_peer(
                 raise failure("retry")
             return 10
 
-    worker = FullSyncWorker(Port(), sync_db, asyncio.Event(), total_messages_probe=Probe())
+    worker = FullSyncWorker(
+        Port(), sync_db, asyncio.Event(), total_messages_probe=Probe(), writer=inline_writer(sync_db)
+    )
     await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
     await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
     assert calls == [1, 2]
@@ -2780,7 +2796,7 @@ async def test_cancelled_full_page_rotates_peer_and_resumes_checkpoint(sync_db: 
                 raise asyncio.CancelledError
             return FullHistoryPage(messages=(), next_before_message_id=None, total_messages=0)
 
-    worker = FullSyncWorker(Port(), sync_db, asyncio.Event())
+    worker = FullSyncWorker(Port(), sync_db, asyncio.Event(), writer=inline_writer(sync_db))
     with pytest.raises(asyncio.CancelledError):
         await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
     assert sync_db.execute("SELECT sync_progress FROM synced_dialogs WHERE dialog_id=1").fetchone() == (12,)

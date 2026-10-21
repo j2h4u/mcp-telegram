@@ -14,6 +14,7 @@ from telethon.tl.types import TypeInputPeer
 from .activity_substrate import ActivityClient
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .linked_chat_fact import LinkedChatFact, LinkedChatState, linked_chat_fact_owner
+from .sqlite_writer import SQLiteWriter
 from .sync_transactions import write_transaction
 from .telegram_demand import RpcAttemptBudgetExhaustedError
 from .telegram_rpc_scheduler import RpcAdmissionClosedError
@@ -48,6 +49,7 @@ async def resolve_linked_chat_id(
     channel_id: int,
     *,
     timeout_s: float | None = None,
+    writer: SQLiteWriter,
 ) -> LinkedChatFact:
     """Return the canonical fact and enqueue cold demand when it is unknown.
 
@@ -58,6 +60,10 @@ async def resolve_linked_chat_id(
     import time
 
     now = int(time.time())
+    return await writer.run(lambda db: _read_linked_chat_fact(db, channel_id, now))
+
+
+def _read_linked_chat_fact(conn: sqlite3.Connection, channel_id: int, now: int) -> LinkedChatFact:
     with write_transaction(conn):
         fact = linked_chat_fact_owner.read_fact(conn, channel_id)
         if fact.state is LinkedChatState.UNKNOWN:

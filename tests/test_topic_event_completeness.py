@@ -31,6 +31,7 @@ from mcp_telegram.event_handlers import EventHandlerManager
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.topics.contracts import TopicFact
 from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
+from sqlite_writer_helpers import event_manager, inline_writer
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
@@ -52,7 +53,7 @@ def _manager(client: MagicMock, db: sqlite3.Connection) -> EventHandlerManager:
     db.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (?, 'synced')", (dialog_id,))
     seed_full_history_enrollment(db, dialog_id, enabled=True)
     db.commit()
-    manager = EventHandlerManager(client, db, asyncio.Event())
+    manager = event_manager(client, db, asyncio.Event())
     manager.register()
     return manager
 
@@ -116,7 +117,7 @@ async def test_raw_service_create_and_edit_use_peer_id_and_prefer_top_target(
 async def test_raw_topic_events_ignore_nonservice_unknown_and_coverage_denied(
     client: MagicMock, db: sqlite3.Connection
 ) -> None:
-    manager = EventHandlerManager(client, db, asyncio.Event())
+    manager = event_manager(client, db, asyncio.Event())
     manager.register()
     peer = PeerChannel(123)
     regular = Message(id=1, peer_id=peer, message="hello", date=datetime.now(UTC), out=False)
@@ -128,7 +129,7 @@ async def test_raw_topic_events_ignore_nonservice_unknown_and_coverage_denied(
 
 
 def test_raw_topic_handler_registration_is_symmetric(client: MagicMock, db: sqlite3.Connection) -> None:
-    manager = EventHandlerManager(client, db, asyncio.Event())
+    manager = event_manager(client, db, asyncio.Event())
     manager.register()
     raw_calls = [
         call for call in client.add_event_handler.call_args_list if call.args[0].__name__ == "on_raw_topic_message"
@@ -237,7 +238,9 @@ async def test_topic_snapshot_captured_before_fetch_cannot_replace_realtime(
                     repository.apply_topic_pins(-1000000000123, (1,), observed_at=100)
             return (TopicFact(topic_id=1, title="stale snapshot", icon_emoji_id=5),)
 
-    await TopicRefresher(Gateway(), repository).refresh(-1000000000123, SimpleNamespace(forum=True))
+    await TopicRefresher(Gateway(), repository, writer=inline_writer(db)).refresh(
+        -1000000000123, SimpleNamespace(forum=True)
+    )
     row = _topic_rows(db)[1]
     assert row[1] == ("realtime" if mutation in {"create", "edit", "hide"} else "topic")
     if mutation in {"pin", "pins"}:

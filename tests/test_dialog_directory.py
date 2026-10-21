@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import Sequence
+import threading
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 from telethon.tl import functions, types  # type: ignore[import-untyped]
@@ -37,8 +39,56 @@ from mcp_telegram.dialog_directory_tl import (
 from mcp_telegram.dialog_identity import capture_identity_baseline, publish_dialog_identity
 from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
+
+
+class _DirectoryWriter:
+    """SQL-unit owner double; real ownership is covered by the file-backed smoke."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    async def run[T](self, operation: Callable[[sqlite3.Connection], T]) -> T:
+        conn = _open_sync_db(self.path)
+        try:
+            return operation(conn)
+        finally:
+            conn.close()
+
+
+def _writer(path: Path) -> SQLiteWriter:
+    return cast(SQLiteWriter, _DirectoryWriter(path))
+
+
+@pytest.mark.asyncio
+async def test_directory_owner_publishes_and_notifies_on_loop_thread(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    writer = await SQLiteWriter.open(db_path)
+    details: list[tuple[str, int]] = []
+    directory = CanonicalDialogDirectory(
+        _FakeClient([_pinned_response(), _pinned_response(), _response([_dialog(1, 8)])]),
+        db_path,
+        asyncio.Event(),
+        writer=writer,
+        startup_detail_setter=lambda detail: details.append((detail, threading.get_ident())),
+    )
+    try:
+        await directory.bind_account_id(100)
+        for _ in range(3):
+            await directory.run_slice()
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            assert conn.execute("SELECT status FROM dialog_directory_state").fetchone() == ("complete",)
+            assert conn.execute("SELECT name FROM dialogs WHERE dialog_id=1").fetchone() == ("User 1",)
+        finally:
+            conn.close()
+        assert details[-1][0] == "canonical dialog directory: complete"
+        assert {thread_id for _detail, thread_id in details} == {threading.get_ident()}
+    finally:
+        await writer.aclose()
 
 
 def _dialog(peer_id: int, message_id: int) -> types.Dialog:
@@ -236,7 +286,10 @@ async def test_imperfect_slice_advances_and_retains_every_identifiable_row(tmp_p
         users=[types.User(id=2, first_name="Two", access_hash=42)],
     )
     directory = CanonicalDialogDirectory(
-        _FakeClient([_pinned_response(), _pinned_response(), imperfect, _response([])]), db_path, asyncio.Event()
+        _FakeClient([_pinned_response(), _pinned_response(), imperfect, _response([])]),
+        db_path,
+        asyncio.Event(),
+        writer=_writer(db_path),
     )
 
     await directory.run_slice()
@@ -278,6 +331,7 @@ async def test_directory_traversal_never_mutates_current_drafts(tmp_path: Path) 
         _FakeClient([_pinned_response(), _pinned_response(), _response([_dialog(1, 8)]), _response([])]),
         db_path,
         asyncio.Event(),
+        writer=_writer(db_path),
     )
     await _run_slices(directory, 4)
     conn = _open_sync_db(db_path)
@@ -311,6 +365,7 @@ async def test_wholly_unpageable_slice_stages_then_retries_from_committed_cursor
         _FakeClient([_pinned_response(), _pinned_response(), unpageable, _response([])]),
         db_path,
         asyncio.Event(),
+        writer=_writer(db_path),
     )
 
     await directory.run_slice()
@@ -354,7 +409,7 @@ async def test_pinned_membership_keeps_source_order_when_entities_are_unknown(tm
         state=_state(),  # pyright: ignore[reportArgumentType] - Telethon's generated alias resolves to its module
     )
     directory = CanonicalDialogDirectory(
-        _FakeClient([pinned, _pinned_response(), _response([])]), db_path, asyncio.Event()
+        _FakeClient([pinned, _pinned_response(), _response([])]), db_path, asyncio.Event(), writer=_writer(db_path)
     )
 
     await directory.run_slice()
@@ -493,7 +548,9 @@ async def test_throttle_reaches_coordinator_policy(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     with pytest.raises(TelegramRpcThrottled):
-        await CanonicalDialogDirectory(_ThrottledClient([]), db_path, asyncio.Event()).run_slice()
+        await CanonicalDialogDirectory(
+            _ThrottledClient([]), db_path, asyncio.Event(), writer=_writer(db_path)
+        ).run_slice()
 
 
 @pytest.mark.asyncio
@@ -509,7 +566,7 @@ async def test_realtime_pins_win_over_an_overlapping_pending_pinned_rpc(
         folder_id=folder_id,
         dialog_id=realtime_id,
     )
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
 
     await _run_slices(directory, 3)
 
@@ -535,7 +592,7 @@ async def test_realtime_pin_delta_replays_onto_fresh_pinned_rpc_result(tmp_path:
         db_path,
         dialog_id=6,
     )
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
 
     await _run_slices(directory, 3)
 
@@ -555,8 +612,10 @@ async def test_existing_realtime_active_pins_are_replaced_by_unchanged_pinned_rp
 ) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    directory = CanonicalDialogDirectory(_FakeClient([_pinned_response([_dialog(1, 8)])]), db_path, asyncio.Event())
-    directory.bind_account_id(100)
+    directory = CanonicalDialogDirectory(
+        _FakeClient([_pinned_response([_dialog(1, 8)])]), db_path, asyncio.Event(), writer=_writer(db_path)
+    )
+    await directory.bind_account_id(100)
     conn = _open_sync_db(db_path)
     try:
         conn.commit()
@@ -631,7 +690,7 @@ async def test_first_ordinary_page_is_productive_when_every_dialog_was_pinned(tm
             _response([]),
         ]
     )
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
 
     await _run_slices(directory, 3)
 
@@ -671,7 +730,7 @@ async def test_directory_identity_loses_equal_time_race_but_presence_publishes(t
             _response([_dialog(1, 8)]),
         ]
     )
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
 
     await directory.run_slice()
     await directory.run_slice()
@@ -721,6 +780,7 @@ async def test_directory_does_not_publish_identity_over_realtime_created_members
         ),
         db_path,
         asyncio.Event(),
+        writer=_writer(db_path),
     )
     await _run_slices(directory, 3)
 
@@ -767,7 +827,7 @@ async def test_cursor_and_page_commit_together_and_absence_waits_for_eof(tmp_pat
             types.messages.Dialogs(dialogs=[], messages=[], chats=[], users=[]),
         ]
     )
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
 
     await directory.run_slice()
     await directory.run_slice()
@@ -814,6 +874,7 @@ async def test_directory_resume_keeps_pre_rpc_identity_baseline_and_presence_abs
         _FakeClient([_pinned_response(), _pinned_response(), _response([_dialog(1, 8)], terminal=False)]),
         db_path,
         asyncio.Event(),
+        writer=_writer(db_path),
     )
     await _run_slices(first, 3)
     conn = _open_sync_db(db_path)
@@ -836,6 +897,7 @@ async def test_directory_resume_keeps_pre_rpc_identity_baseline_and_presence_abs
         _FakeClient([types.messages.Dialogs(dialogs=[], messages=[], chats=[], users=[])]),
         db_path,
         asyncio.Event(),
+        writer=_writer(db_path),
     )
     await resumed.run_slice()
 
@@ -866,10 +928,10 @@ def _stage_min_user_directory_generation(db_path: Path) -> None:
     finally:
         conn.close()
 
-    directory = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event())
-    directory.bind_account_id(99)
+    directory = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event(), writer=_writer(db_path))
     conn = _open_sync_db(db_path)
     try:
+        directory._bind_account(conn, 99)
         conn.commit()
         with write_transaction(conn):
             directory._start_generation(conn, 1)
@@ -914,8 +976,12 @@ def _stage_repeated_peer_directory_facts(db_path: Path) -> None:
     finally:
         conn.close()
 
-    directory = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event())
-    directory.bind_account_id(99)
+    directory = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event(), writer=_writer(db_path))
+    conn = _open_sync_db(db_path)
+    try:
+        directory._bind_account(conn, 99)
+    finally:
+        conn.close()
     facts = (
         RawDialogFact(
             1,
@@ -976,6 +1042,7 @@ async def test_min_user_identity_mask_survives_directory_restart(tmp_path: Path)
         _FakeClient([types.messages.Dialogs(dialogs=[], messages=[], chats=[], users=[])]),
         db_path,
         asyncio.Event(),
+        writer=_writer(db_path),
     )
     await resumed.run_slice()
 
@@ -997,6 +1064,7 @@ async def test_repeated_peer_stage_merges_partial_and_complete_identity_fieldwis
         _FakeClient([types.messages.Dialogs(dialogs=[], messages=[], chats=[], users=[])]),
         db_path,
         asyncio.Event(),
+        writer=_writer(db_path),
     )
     await resumed.run_slice()
 
@@ -1033,7 +1101,7 @@ async def test_duplicate_page_cools_down_both_aliases_then_resumes_from_its_curs
             _response([]),
         ]
     )
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
     await _run_slices(directory, 4)
 
     conn = _open_sync_db(db_path)
@@ -1055,7 +1123,7 @@ async def test_duplicate_page_cools_down_both_aliases_then_resumes_from_its_curs
         conn.close()
 
     now = 1900
-    restarted = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    restarted = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
     await restarted.run_slice()
     conn = _open_sync_db(db_path)
     try:
@@ -1094,7 +1162,7 @@ async def test_terminal_duplicate_completes_without_pagination_cooldown(tmp_path
             _response([_dialog(1, 9)]),
         ]
     )
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
     await _run_slices(directory, 4)
 
     conn = _open_sync_db(db_path)
@@ -1127,7 +1195,7 @@ async def test_pagination_cooldown_does_not_change_the_prior_publication_age(
             _response([_dialog(1, 9)], terminal=False),
         ]
     )
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
     await _run_slices(directory, 3)
     now = 200
     await _run_slices(directory, 4)
@@ -1156,7 +1224,7 @@ async def test_duplicate_page_rollback_keeps_prior_cursor_and_staging(
             _response([_dialog(1, 9)], terminal=False),
         ]
     )
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
     await _run_slices(directory, 3)
 
     def fail_cursor(*_args: object) -> None:
@@ -1183,7 +1251,7 @@ async def test_many_productive_pages_never_cool_down_or_repeat_account_identity(
     ensure_sync_schema(db_path)
     pages = [_response([_dialog(index, index)], terminal=False) for index in range(1, 35)]
     client = _FakeClient([_pinned_response(), _pinned_response(), *pages, _response([])])
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
     await _run_slices(directory, 37)
 
     conn = _open_sync_db(db_path)
@@ -1208,7 +1276,7 @@ async def test_invalid_page_discards_only_that_page_and_retries_saved_cursor(tmp
             types.messages.Dialogs(dialogs=[], messages=[], chats=[], users=[]),
         ]
     )
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
     await directory.run_slice()
     await directory.run_slice()
     await directory.run_slice()
@@ -1240,7 +1308,7 @@ async def test_corrupt_persisted_cursor_latches_invalid_without_rpc(tmp_path: Pa
     finally:
         conn.close()
     client = _FakeClient([])
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
     await directory.run_slice()
     conn = _open_sync_db(db_path)
     try:
@@ -1267,7 +1335,7 @@ async def test_semantic_invalid_latches_without_rpc_or_automatic_recovery(tmp_pa
             _response([_dialog(1, 9), _dialog(1, 10)], terminal=False),
         ]
     )
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
     await _run_slices(directory, 4)
 
     conn = _open_sync_db(db_path)
@@ -1287,7 +1355,7 @@ async def test_semantic_invalid_latches_without_rpc_or_automatic_recovery(tmp_pa
         conn.close()
 
     await directory.run_slice()
-    restarted = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    restarted = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
     await restarted.run_slice()
     assert len(client.requests) == 4
     conn = _open_sync_db(db_path)
@@ -1315,7 +1383,9 @@ async def test_pinned_semantic_invalid_latches_its_source_and_logs_once(
 ) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    directory = CanonicalDialogDirectory(_FakeClient([_response([])]), db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(
+        _FakeClient([_response([])]), db_path, asyncio.Event(), writer=_writer(db_path)
+    )
     with caplog.at_level("WARNING", logger="mcp_telegram.dialog_directory"):
         await directory.run_slice()
         conn = _open_sync_db(db_path)
@@ -1350,7 +1420,7 @@ async def test_not_modified_without_cache_is_honest_incomplete_with_900_second_r
     ensure_sync_schema(db_path)
     monkeypatch.setattr("mcp_telegram.dialog_directory.time.time", lambda: 100)
     client = _FakeClient([_pinned_response(), _pinned_response(), types.messages.DialogsNotModified(count=1)])
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
     await _run_slices(directory, 3)
     conn = _open_sync_db(db_path)
     try:
@@ -1372,7 +1442,7 @@ async def test_account_fence_and_published_pin_receipt_survive_new_attempt(tmp_p
     ensure_sync_schema(db_path)
     pins = _pinned_response([_dialog(1, 8), _dialog(2, 9)])
     client = _FakeClient([pins, _pinned_response(), _response([])])
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
     await directory.run_slice()
     await directory.run_slice()
     await directory.run_slice()
@@ -1398,7 +1468,7 @@ async def test_account_fence_and_published_pin_receipt_survive_new_attempt(tmp_p
         conn.close()
 
     with pytest.raises(RuntimeError, match="account identity changed"):
-        directory.bind_account_id(101)
+        await directory.bind_account_id(101)
 
 
 @pytest.mark.asyncio
@@ -1422,7 +1492,7 @@ async def test_unread_observation_metadata_preserves_then_replaces_as_one_receip
             _response([]),
         ]
     )
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
 
     await _run_slices(directory, 3)
     first = _stored_unread_receipt(db_path)
@@ -1489,7 +1559,7 @@ async def test_cross_source_observations_replace_mutable_facts(tmp_path: Path) -
         users=[types.User(id=1, first_name="One", access_hash=42, bot=True)],
     )
     client = _FakeClient([pinned, _pinned_response(), ordinary])
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
     await directory.run_slice()
     await directory.run_slice()
     await directory.run_slice()
@@ -1513,7 +1583,9 @@ async def test_complete_detail_waits_for_receipt_commit(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     details: list[str] = []
     client = _FakeClient([_pinned_response(), _pinned_response(), _response([])])
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), startup_detail_setter=details.append)
+    directory = CanonicalDialogDirectory(
+        client, db_path, asyncio.Event(), startup_detail_setter=details.append, writer=_writer(db_path)
+    )
     await directory.run_slice()
     await directory.run_slice()
     conn = _open_sync_db(db_path)
@@ -1542,7 +1614,7 @@ async def test_page_failure_rolls_back_staging_and_cursor(tmp_path: Path, monkey
             _response([_dialog(1, 8)], terminal=False),
         ]
     )
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
     await directory.run_slice()
     await directory.run_slice()
 
@@ -1566,7 +1638,7 @@ def test_sqlite_row_composition_does_not_depend_on_tuple_factory(tmp_path: Path)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
-        directory = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event())
+        directory = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event(), writer=_writer(db_path))
         status = directory.status(0.0, conn)
         assert status is not None
         assert status.release_at == 0.0
@@ -1583,7 +1655,7 @@ def test_freshness_uses_acquisition_start_not_publication_time(tmp_path: Path) -
             "UPDATE dialog_directory_state SET status='complete',observation_started_at=100,observation_completed_at=999"
         )
         conn.commit()
-        directory = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event())
+        directory = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event(), writer=_writer(db_path))
         status = directory.status(999.0, conn)
         assert status is not None
         assert status.release_at == 1000.0
@@ -1604,7 +1676,10 @@ async def test_long_acquisition_and_restart_keep_the_original_freshness_age(
     now = 100
     monkeypatch.setattr("mcp_telegram.dialog_directory.time.time", lambda: now)
     directory = CanonicalDialogDirectory(
-        _FakeClient([_pinned_response(), _pinned_response(), _response([])]), db_path, asyncio.Event()
+        _FakeClient([_pinned_response(), _pinned_response(), _response([])]),
+        db_path,
+        asyncio.Event(),
+        writer=_writer(db_path),
     )
 
     await directory.run_slice()
@@ -1618,7 +1693,7 @@ async def test_long_acquisition_and_restart_keep_the_original_freshness_age(
         assert status is not None
         assert status.release_at == 1000.0
         assert status.overdue_seconds(float(now)) == 1.0
-        restarted = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event())
+        restarted = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event(), writer=_writer(db_path))
         restarted_status = restarted.status(float(now), conn)
         assert restarted_status == status
     finally:
@@ -1834,7 +1909,10 @@ async def test_directory_publication_merges_eligibility_for_unchanged_existing_d
         users=[types.User(id=1, first_name="One", access_hash=42, bot=True)],
     )
     directory = CanonicalDialogDirectory(
-        _FakeClient([_pinned_response(), _pinned_response(), response]), db_path, asyncio.Event()
+        _FakeClient([_pinned_response(), _pinned_response(), response]),
+        db_path,
+        asyncio.Event(),
+        writer=_writer(db_path),
     )
 
     await _run_slices(directory, 3)
@@ -1880,7 +1958,7 @@ async def test_reseen_hidden_dialog_regains_eligibility_facts_under_revision_fen
             response,
         ]
     )
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
 
     await _run_slices(directory, 9)
 
@@ -1899,7 +1977,7 @@ async def test_archive_only_pin_does_not_set_main_dialog_pinned_flag(tmp_path: P
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     client = _FakeClient([_pinned_response(), _pinned_response([_dialog(1, 8)]), _response([])])
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
 
     await _run_slices(directory, 3)
 
@@ -1935,7 +2013,10 @@ async def test_incomplete_directory_identity_keeps_known_username_and_oldest_bou
         users=[types.User(id=1, first_name="Partial", username="partial", min=True)],
     )
     directory = CanonicalDialogDirectory(
-        _FakeClient([_pinned_response(), _pinned_response(), response]), db_path, asyncio.Event()
+        _FakeClient([_pinned_response(), _pinned_response(), response]),
+        db_path,
+        asyncio.Event(),
+        writer=_writer(db_path),
     )
     await _run_slices(directory, 3)
     conn = _open_sync_db(db_path)
@@ -1964,6 +2045,7 @@ async def test_complete_directory_absence_hides_row_and_removes_current_eligibil
         ),
         db_path,
         asyncio.Event(),
+        writer=_writer(db_path),
     )
     await _run_slices(directory, 3)
     conn = _open_sync_db(db_path)
@@ -1979,7 +2061,10 @@ async def test_complete_directory_absence_hides_row_and_removes_current_eligibil
     finally:
         conn.close()
     directory = CanonicalDialogDirectory(
-        _FakeClient([_pinned_response(), _pinned_response(), _response([_dialog(1, 8)])]), db_path, asyncio.Event()
+        _FakeClient([_pinned_response(), _pinned_response(), _response([_dialog(1, 8)])]),
+        db_path,
+        asyncio.Event(),
+        writer=_writer(db_path),
     )
     await directory.run_slice()
     await directory.run_slice()

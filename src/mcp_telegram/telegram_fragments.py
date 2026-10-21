@@ -11,6 +11,7 @@ from .hydration_queue import HydrationPriority
 from .messages.sqlite_bundle import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
 from .observation_order import allocate_observation_order
+from .sqlite_writer import SQLiteWriter
 from .sync_transactions import write_transaction
 from .telegram_demand import AcquisitionKind
 from .telegram_gateway import CATCHABLE_GATEWAY_FAILURES, translate_gateway_failure
@@ -29,16 +30,13 @@ class _TelegramClientLike(Protocol):
 class FragmentContextService:
     """Persist one bounded context window around an anchor after a successful fetch."""
 
-    def __init__(self, conn: sqlite3.Connection, gateway: TelegramFragmentGateway) -> None:
+    def __init__(self, conn: sqlite3.Connection, gateway: TelegramFragmentGateway, *, writer: SQLiteWriter) -> None:
         self._conn = conn
+        self._writer = writer
         self._gateway = gateway
 
     async def fetch(self, dialog_id: int, anchor_message_id: int, context_size: int) -> FragmentFetchResult:
-        with write_transaction(self._conn):
-            self._conn.execute(
-                "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'fragment')", (dialog_id,)
-            )
-            observation_order = allocate_observation_order(self._conn)
+        observation_order = await self._writer.run(lambda conn: self._prepare_fetch(conn, dialog_id))
         with rpc_scope(
             TelegramRpcSource.MESSAGE_READ_FALLBACK,
             acquisition_kind=AcquisitionKind.MESSAGE_HISTORY_PAGE,
@@ -50,9 +48,21 @@ class FragmentContextService:
             result,
             messages=tuple(replace(message, observation_order=observation_order) for message in result.messages),
         )
-        with write_transaction(self._conn):
-            insert_messages_with_fts(self._conn, result.messages, priority=HydrationPriority.BACKFILL)
+        await self._writer.run(lambda conn: self._persist_messages(conn, result))
         return result
+
+    @staticmethod
+    def _prepare_fetch(conn: sqlite3.Connection, dialog_id: int) -> int:
+        with write_transaction(conn):
+            conn.execute(
+                "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'fragment')", (dialog_id,)
+            )
+            return allocate_observation_order(conn)
+
+    @staticmethod
+    def _persist_messages(conn: sqlite3.Connection, result: FragmentFetchResult) -> None:
+        with write_transaction(conn):
+            insert_messages_with_fts(conn, result.messages, priority=HydrationPriority.BACKFILL)
 
 
 class TelethonTelegramFragmentGateway:

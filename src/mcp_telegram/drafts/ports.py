@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Sequence
 from datetime import datetime
 from typing import Protocol
@@ -15,6 +16,8 @@ from mcp_telegram.drafts.contracts import (
 
 class DraftProjectionRepository(Protocol):
     """Single-writer projection contract supplied by the persistence worker."""
+
+    def for_connection(self, conn: sqlite3.Connection) -> DraftProjectionRepository: ...
 
     def bind_account(self, account_id: int) -> None: ...
 

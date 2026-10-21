@@ -16,7 +16,7 @@ import pytest
 from telethon.errors import ChannelPrivateError
 from telethon.tl.types import PeerUser
 
-from mcp_telegram.event_handlers import EventHandlerManager, _NewMessageEvent
+from mcp_telegram.event_handlers import _NewMessageEvent
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.linked_chat_fact import LinkedChatFact, LinkedChatState, linked_chat_fact_owner
 from mcp_telegram.own_only import OwnOnlyContext, query_own_only_candidates
@@ -44,6 +44,7 @@ from mcp_telegram.telegram_rpc_consumers import DemandKind, demand_contract
 from mcp_telegram.telegram_rpc_scheduler import (
     current_rpc_scope,
 )
+from tests.sqlite_writer_helpers import event_manager, inline_writer
 
 
 def _message(message_id: int, text: str = "draft", *, scheduled_at: int = 1_900_000_000) -> SimpleNamespace:
@@ -273,7 +274,11 @@ async def test_reconciliation_snapshot_marks_disappearance_nonvisible(conn: sqli
     conn.commit()
     client = _ScheduledSnapshotClient({42: []})
     worker = ScheduledMessageReconciler(
-        client, conn, asyncio.Event(), policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0)
+        client,
+        conn,
+        asyncio.Event(),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
+        writer=inline_writer(conn),
     )
 
     conn.commit()
@@ -297,7 +302,11 @@ async def test_reconciliation_floodwait_records_retry_and_stops_account_pass(con
     conn.commit()
     client = _ScheduledSnapshotClient(call_error=TelegramRpcThrottled(retry_after_seconds=30))
     worker = ScheduledMessageReconciler(
-        client, conn, asyncio.Event(), policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0)
+        client,
+        conn,
+        asyncio.Event(),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
+        writer=inline_writer(conn),
     )
 
     conn.commit()
@@ -322,7 +331,11 @@ async def test_reconciliation_without_own_only_context_does_not_sweep_all_synced
     conn.commit()
     client = _ScheduledSnapshotClient()
     worker = ScheduledMessageReconciler(
-        client, conn, asyncio.Event(), policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0)
+        client,
+        conn,
+        asyncio.Event(),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
+        writer=inline_writer(conn),
     )
 
     conn.commit()
@@ -366,9 +379,9 @@ async def test_reconciliation_classifies_and_enrolls_own_only_candidates(
     captured: dict[str, float | None] = {}
 
     async def fake_resolve_linked_chat_id(
-        client: object, conn: sqlite3.Connection, channel_id: int, *, timeout_s: float | None
+        client: object, conn: sqlite3.Connection, channel_id: int, *, timeout_s: float | None, writer: object
     ) -> LinkedChatFact:
-        del client, conn, channel_id
+        del client, conn, channel_id, writer
         captured["timeout_s"] = timeout_s
         return LinkedChatFact(LinkedChatState.KNOWN_LINK, discussion_id, 100, False, None, None)
 
@@ -379,6 +392,7 @@ async def test_reconciliation_classifies_and_enrolls_own_only_candidates(
         asyncio.Event(),
         OwnOnlyContext(account_id=42, personal_channel_id=9001),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=53.0),
+        writer=inline_writer(conn),
     )
     conn.executemany(
         "INSERT OR REPLACE INTO scheduled_reconciliation_state "
@@ -420,6 +434,7 @@ async def test_scheduled_context_retries_unknown_and_rereads_newer_link(
         asyncio.Event(),
         OwnOnlyContext(account_id=42, personal_channel_id=9001),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=1.0),
+        writer=inline_writer(conn),
     )
     current = LinkedChatFact(LinkedChatState.UNKNOWN, None, None, True, None, 200)
 
@@ -468,6 +483,7 @@ async def test_pending_linked_chat_gates_discovery_without_account_retry_and_all
         asyncio.Event(),
         OwnOnlyContext(account_id=42, personal_channel_id=personal_channel_id),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
+        writer=inline_writer(conn),
     )
 
     assert worker.discovery_retry_at(now) == retry_at
@@ -518,6 +534,7 @@ def test_known_linked_chat_facts_do_not_gate_discovery(conn: sqlite3.Connection,
         asyncio.Event(),
         OwnOnlyContext(account_id=42, personal_channel_id=personal_channel_id),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
+        writer=inline_writer(conn),
     )
 
     assert worker.discovery_retry_at(now) is None
@@ -553,6 +570,7 @@ async def test_suspended_pending_fact_suppresses_only_discovery_and_restore_rele
         asyncio.Event(),
         OwnOnlyContext(account_id=42, personal_channel_id=personal_channel_id),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
+        writer=inline_writer(conn),
     )
     discovery_adapter = ScheduledDiscoveryDemandAdapter(worker)
     repair_adapter = ScheduledRepairDemandAdapter(worker)
@@ -614,6 +632,7 @@ async def test_reconciliation_access_lost_candidate_log_has_dialog_context(
         asyncio.Event(),
         OwnOnlyContext(account_id=42, personal_channel_id=9001),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
+        writer=inline_writer(conn),
     )
     conn.execute(
         "INSERT OR REPLACE INTO scheduled_reconciliation_state "
@@ -650,7 +669,7 @@ async def test_reconciliation_access_lost_candidate_log_has_dialog_context(
 @pytest.mark.asyncio
 async def test_raw_scheduled_updates_ingest_without_messages_row(conn: sqlite3.Connection) -> None:
     client = MagicMock()
-    manager = EventHandlerManager(client, conn, asyncio.Event())
+    manager = event_manager(client, conn, asyncio.Event())
     offered: list[DemandKind] = []
     sink = MagicMock()
 
@@ -688,7 +707,7 @@ async def test_publication_reconciliation_runs_before_sync_enrollment(conn: sqli
     with write_transaction(conn):
         mark_scheduled_messages_removed(conn, 42, [21], [901], now=200)
     client = MagicMock()
-    manager = EventHandlerManager(client, conn, asyncio.Event())
+    manager = event_manager(client, conn, asyncio.Event())
     manager.bind_demand_sink(MagicMock())
     message = _message(901, "published")
     message.from_scheduled = True
@@ -704,7 +723,7 @@ async def test_publication_reconciliation_runs_before_sync_enrollment(conn: sqli
 @pytest.mark.asyncio
 async def test_publication_event_before_hint_is_retained_without_sync_enrollment(conn: sqlite3.Connection) -> None:
     client = MagicMock()
-    manager = EventHandlerManager(client, conn, asyncio.Event())
+    manager = event_manager(client, conn, asyncio.Event())
     manager.bind_demand_sink(MagicMock())
     message = _message(901, "published", scheduled_at=190)
     message.from_scheduled = True
@@ -805,6 +824,7 @@ async def test_reconciliation_processes_only_one_bounded_slice(conn: sqlite3.Con
         asyncio.Event(),
         OwnOnlyContext(account_id=999),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10, max_dialogs_per_slice=2),
+        writer=inline_writer(conn),
     )
 
     conn.commit()
@@ -836,6 +856,7 @@ async def test_concurrent_event_prevents_stale_snapshot_apply(conn: sqlite3.Conn
         conn,
         asyncio.Event(),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
+        writer=inline_writer(conn),
     )
     conn.commit()
     assert await worker.run_demand_slice(DemandKind.SCHEDULED_REPAIR) == 0
@@ -870,6 +891,7 @@ def test_scheduled_demand_status_reads_repair_and_discovery_due_state(conn: sqli
         conn,
         asyncio.Event(),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
+        writer=inline_writer(conn),
     )
 
     repair = ScheduledRepairDemandAdapter(reconciler).status(100)
@@ -896,7 +918,9 @@ def test_scheduled_discovery_status_wakes_for_unseeded_candidate_after_reopen(tm
     policy = ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10)
     try:
         adapter = ScheduledDiscoveryDemandAdapter(
-            ScheduledMessageReconciler(_ScheduledSnapshotClient(), conn, asyncio.Event(), policy=policy)
+            ScheduledMessageReconciler(
+                _ScheduledSnapshotClient(), conn, asyncio.Event(), policy=policy, writer=inline_writer(conn)
+            )
         )
         changes_before = conn.total_changes
         status = adapter.status(100.0)
@@ -908,7 +932,9 @@ def test_scheduled_discovery_status_wakes_for_unseeded_candidate_after_reopen(tm
     reopened = _open_sync_db(db_path)
     try:
         adapter = ScheduledDiscoveryDemandAdapter(
-            ScheduledMessageReconciler(_ScheduledSnapshotClient(), reopened, asyncio.Event(), policy=policy)
+            ScheduledMessageReconciler(
+                _ScheduledSnapshotClient(), reopened, asyncio.Event(), policy=policy, writer=inline_writer(reopened)
+            )
         )
         assert adapter.status(100.0) == DemandStatus(release_at=0.0)
         assert reopened.execute("SELECT COUNT(*) FROM scheduled_reconciliation_state").fetchone() == (0,)
@@ -939,6 +965,7 @@ def test_scheduled_demand_status_honors_future_account_retry(
         conn,
         asyncio.Event(),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
+        writer=inline_writer(conn),
     )
 
     status = adapter_type(reconciler).status(100)
@@ -972,6 +999,7 @@ def test_scheduled_demand_status_keeps_later_queue_release(
         conn,
         asyncio.Event(),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
+        writer=inline_writer(conn),
     )
 
     status = adapter_type(reconciler).status(100)
@@ -996,6 +1024,7 @@ async def test_scheduled_repair_adapter_runs_only_repair_rows_with_precise_scope
         conn,
         asyncio.Event(),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
+        writer=inline_writer(conn),
     )
     budget = RpcAttemptBudget(limit=16)
 
@@ -1028,6 +1057,7 @@ async def test_scheduled_discovery_adapter_runs_only_discovery_rows_with_precise
         asyncio.Event(),
         OwnOnlyContext(account_id=999),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
+        writer=inline_writer(conn),
     )
 
     conn.commit()
@@ -1056,6 +1086,7 @@ async def test_future_account_retry_does_not_appear_runnable(conn: sqlite3.Conne
         conn,
         asyncio.Event(),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10, state_scan_seconds=60),
+        writer=inline_writer(conn),
     )
 
     conn.commit()
@@ -1063,7 +1094,8 @@ async def test_future_account_retry_does_not_appear_runnable(conn: sqlite3.Conne
     assert client.requests == []
 
 
-def test_candidate_seed_is_not_repeated_for_an_immediate_slice(
+@pytest.mark.asyncio
+async def test_candidate_seed_is_not_repeated_for_an_immediate_slice(
     conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = 0
@@ -1079,10 +1111,11 @@ def test_candidate_seed_is_not_repeated_for_an_immediate_slice(
         conn,
         asyncio.Event(),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
+        writer=inline_writer(conn),
     )
 
-    worker._seed_candidates_if_due(100)
-    worker._seed_candidates_if_due(100)
+    await worker._seed_candidates_if_due(100)
+    await worker._seed_candidates_if_due(100)
 
     assert calls == 1
 
@@ -1099,6 +1132,7 @@ def test_due_selection_prioritizes_oldest_dirty_dialog(conn: sqlite3.Connection)
         conn,
         asyncio.Event(),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
+        writer=inline_writer(conn),
     )
 
     assert [row[0] for row in worker._due_rows(100)] == [42, 41, 43]
@@ -1127,6 +1161,7 @@ async def test_excluded_discovery_removes_only_scheduled_ownership_basis(conn: s
         asyncio.Event(),
         OwnOnlyContext(account_id=42),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
+        writer=inline_writer(conn),
     )
 
     conn.commit()

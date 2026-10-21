@@ -16,6 +16,7 @@ from mcp_telegram.folders.worker import FolderAttemptResult, FolderProjectionDem
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_transactions import enable_runtime_writes
 from mcp_telegram.telegram_demand import RpcAttemptBudget
+from tests.sqlite_writer_helpers import inline_writer
 
 
 class _Policy:
@@ -49,12 +50,22 @@ async def test_worker_does_not_observe_rules_before_exact_900_second_deadline(tm
         repository.project_observation(FolderRuleObservation((FolderRule(1, "One"),), "token", 100), completed_at=100)
         gateway = _Gateway()
         worker = FolderProjectionWorker(
-            FolderRefresher(gateway, repository), repository, asyncio.Event(), _Policy(), clock=lambda: 999
+            FolderRefresher(gateway, repository, writer=inline_writer(conn)),
+            repository,
+            asyncio.Event(),
+            _Policy(),
+            writer=inline_writer(conn),
+            clock=lambda: 999,
         )
         await FolderProjectionDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
         assert gateway.calls == 0
         worker = FolderProjectionWorker(
-            FolderRefresher(gateway, repository), repository, asyncio.Event(), _Policy(), clock=lambda: 1000
+            FolderRefresher(gateway, repository, writer=inline_writer(conn)),
+            repository,
+            asyncio.Event(),
+            _Policy(),
+            writer=inline_writer(conn),
+            clock=lambda: 1000,
         )
         await FolderProjectionDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
         assert gateway.calls == 1
@@ -84,7 +95,12 @@ async def test_unexpected_folder_failure_uses_bounded_retry_cadence(tmp_path: Pa
         repository = SQLiteFolderSnapshotRepository(conn)
         gateway = Gateway()
         worker = FolderProjectionWorker(
-            FolderRefresher(gateway, repository), repository, asyncio.Event(), _Policy(), clock=lambda: now[0]
+            FolderRefresher(gateway, repository, writer=inline_writer(conn)),
+            repository,
+            asyncio.Event(),
+            _Policy(),
+            writer=inline_writer(conn),
+            clock=lambda: now[0],
         )
         adapter = FolderProjectionDemandAdapter(worker)
         with pytest.raises(ValueError, match="transient normalization"):
@@ -113,7 +129,12 @@ async def test_latched_folder_failure_propagates_without_private_retry(tmp_path:
 
         repository = SQLiteFolderSnapshotRepository(conn)
         worker = FolderProjectionWorker(
-            FolderRefresher(Gateway(), repository), repository, asyncio.Event(), _Policy(), clock=lambda: 1000.0
+            FolderRefresher(Gateway(), repository, writer=inline_writer(conn)),
+            repository,
+            asyncio.Event(),
+            _Policy(),
+            writer=inline_writer(conn),
+            clock=lambda: 1000.0,
         )
         adapter = FolderProjectionDemandAdapter(worker)
         with pytest.raises(TelegramRpcThrottled, match="circuit open"):
@@ -139,7 +160,12 @@ def test_legacy_failure_without_retry_is_immediately_due(tmp_path: Path, outcome
         )
         adapter = FolderProjectionDemandAdapter(
             FolderProjectionWorker(
-                FolderRefresher(_Gateway(), repository), repository, asyncio.Event(), _Policy(), clock=lambda: 1000.0
+                FolderRefresher(_Gateway(), repository, writer=inline_writer(conn)),
+                repository,
+                asyncio.Event(),
+                _Policy(),
+                writer=inline_writer(conn),
+                clock=lambda: 1000.0,
             )
         )
         status = adapter.status(1000.0)

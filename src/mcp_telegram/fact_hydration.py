@@ -29,6 +29,7 @@ from .messages.sqlite_hydration_jobs import (
     repair_transcription_hydration_jobs,
 )
 from .observation_order import allocate_observation_order
+from .sqlite_writer import SQLiteWriter
 from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import (
@@ -282,6 +283,7 @@ class MessageFactHydrationWorker:
         conn: sqlite3.Connection,
         shutdown_event: asyncio.Event,
         *,
+        writer: SQLiteWriter,
         handlers: Sequence[HydrationHandler],
         interval_seconds: float,
         max_requests_per_cycle: int,
@@ -296,6 +298,7 @@ class MessageFactHydrationWorker:
         del circuit_retry_seconds
         self._client = client
         self._conn = conn
+        self._writer = writer
         self._shutdown_event = shutdown_event
         self._handlers: dict[str, HydrationHandler] = {}
         for handler in handlers:
@@ -331,7 +334,7 @@ class MessageFactHydrationWorker:
         clock_now = self._clock()
         effective_now = int(clock_now)
         if priority is HydrationPriority.BACKFILL:
-            self._run_due_repairs(clock_now, effective_now)
+            await self._run_due_repairs(clock_now, effective_now)
             effective_now = int(self._clock())
         if budget.exhausted:
             return
@@ -365,34 +368,40 @@ class MessageFactHydrationWorker:
             attempt_budget=budget,
         )
 
-    def _run_due_repairs(self, clock_now: float, effective_now: int) -> None:
+    async def _run_due_repairs(self, clock_now: float, effective_now: int) -> None:
         if clock_now < self.next_repair_at:
             return
-        if self._conn.in_transaction:
-            raise RuntimeError("fact hydration repair requires no open transaction")
-        # Own the writer before candidate reads; never retain a WAL read snapshot
-        # across producer writes or leave partial repairs for another caller to commit.
-        with write_transaction(self._conn):
-            has_more, cursors = self._run_repair_producers(effective_now)
+
+        def repair(
+            conn: sqlite3.Connection,
+        ) -> tuple[
+            bool, tuple[HydrationRepairCursor | None, HydrationRepairCursor | None, HydrationRepairCursor | None]
+        ]:
+            if conn.in_transaction:
+                raise RuntimeError("fact hydration repair requires no open transaction")
+            with write_transaction(conn):
+                return self._run_repair_producers(conn, effective_now)
+
+        has_more, cursors = await self._writer.run(repair)
         self._repair_cursors = cursors if has_more else (None, None, None)
         self.next_repair_at = clock_now if has_more else self._clock() + self._interval_seconds
 
     def _run_repair_producers(
-        self, effective_now: int
+        self, conn: sqlite3.Connection, effective_now: int
     ) -> tuple[bool, tuple[HydrationRepairCursor | None, HydrationRepairCursor | None, HydrationRepairCursor | None]]:
-        require_write_transaction(self._conn)
+        require_write_transaction(conn)
         has_more = False
         transcription_cursor, contact_other_cursor, video_cursor = self._repair_cursors
         if TRANSCRIPTION_HYDRATION_KIND in self._handlers:
             transcription = repair_transcription_hydration_jobs(
-                self._conn, due_at=effective_now, max_jobs=self._max_jobs_per_cycle, cursor=transcription_cursor
+                conn, due_at=effective_now, max_jobs=self._max_jobs_per_cycle, cursor=transcription_cursor
             )
             has_more = transcription.has_more
             transcription_cursor = transcription.next_cursor
         media_handler = self._handlers.get(MEDIA_METADATA_KIND)
         if media_handler is not None:
             media = repair_media_metadata_hydration_jobs(
-                self._conn,
+                conn,
                 due_at=effective_now,
                 max_jobs=min(media_handler.batch_size, self._max_jobs_per_cycle),
                 contact_other_cursor=contact_other_cursor,
@@ -411,12 +420,14 @@ class MessageFactHydrationWorker:
         *,
         attempt_budget: RpcAttemptBudget | None = None,
     ) -> _BatchOutcome:
-        started, preflight_observations = self._start_batch(handler, batch)
+        started, preflight_observations, observation_order = await self._writer.run(
+            lambda conn: self._start_batch(conn, handler, batch)
+        )
         if not started:
             self._log_drops(batch, preflight_observations)
             return _BatchOutcome(dropped=len(preflight_observations))
         attempts_before_request = None if attempt_budget is None else attempt_budget.attempts
-        observation_order = allocate_observation_order(self._conn)
+        assert observation_order is not None
         failure: Exception | None = None
         result: object = None
         try:
@@ -425,28 +436,40 @@ class MessageFactHydrationWorker:
             failure = exc
         finally:
             effective_now = int(self._clock())
-        with write_transaction(self._conn):
-            for job in started:
-                if not hydration_observation_current(self._conn, job.dialog_id, job.message_id, observation_order):
-                    self._queue.requeue_not_applied(job, effective_now + self._retry_delay_seconds)
+
+        def requeue_stale(conn: sqlite3.Connection) -> None:
+            with write_transaction(conn):
+                for job in started:
+                    if not hydration_observation_current(conn, job.dialog_id, job.message_id, observation_order):
+                        HydrationQueueRepository(conn).requeue_not_applied(
+                            job, effective_now + self._retry_delay_seconds
+                        )
+
+        await self._writer.run(requeue_stale)
         if failure is not None:
-            return self._handle_batch_error(
-                handler,
-                batch,
-                started,
-                preflight_observations,
-                failure,
-                effective_now,
-                observation_order=observation_order,
-                attempt_budget=attempt_budget,
-                attempts_before_request=attempts_before_request,
+            return await self._writer.run(
+                lambda conn: self._handle_batch_error(
+                    conn,
+                    handler,
+                    batch,
+                    started,
+                    preflight_observations,
+                    failure,
+                    effective_now,
+                    observation_order=observation_order,
+                    attempt_budget=attempt_budget,
+                    attempts_before_request=attempts_before_request,
+                )
             )
-        return self._apply_batch_result(
-            handler, batch, started, preflight_observations, result, effective_now, observation_order
+        return await self._writer.run(
+            lambda conn: self._apply_batch_result(
+                conn, handler, batch, started, preflight_observations, result, effective_now, observation_order
+            )
         )
 
     def _handle_batch_error(  # noqa: PLR0913, PLR0917 - dispatch preserves existing per-error recovery policies
         self,
+        conn: sqlite3.Connection,
         handler: HydrationHandler,
         batch: Sequence[HydrationJob],
         started: Sequence[HydrationJob],
@@ -460,6 +483,7 @@ class MessageFactHydrationWorker:
     ) -> _BatchOutcome:
         if isinstance(exc, (TelegramRpcAdmissionDeferred, RpcAdmissionSaturatedError, RpcAdmissionExpiredError)):
             return self._handle_admission_rejection(
+                conn,
                 handler,
                 batch,
                 started,
@@ -470,6 +494,7 @@ class MessageFactHydrationWorker:
             )
         if isinstance(exc, TelegramRpcThrottled):
             return self._handle_throttle(
+                conn,
                 handler,
                 batch,
                 started,
@@ -481,15 +506,17 @@ class MessageFactHydrationWorker:
                 observation_order=observation_order,
             )
         if isinstance(exc, RpcAdmissionClosedError):
-            with write_transaction(self._conn):
+            with write_transaction(conn):
                 self._release_undispatched(
-                    self._current_jobs(started, observation_order),
+                    conn,
+                    self._current_jobs(conn, started, observation_order),
                     effective_now,
                     error_code=type(exc).__name__,
                 )
             raise exc
         if isinstance(exc, ACCESS_LOST_ERRORS):
             return self._handle_access_lost(
+                conn,
                 handler,
                 batch,
                 started,
@@ -499,6 +526,7 @@ class MessageFactHydrationWorker:
                 observation_order=observation_order,
             )
         return self._handle_request_error(
+            conn,
             handler,
             batch,
             started,
@@ -510,6 +538,7 @@ class MessageFactHydrationWorker:
 
     def _apply_batch_result(  # noqa: PLR0913, PLR0917 - one transaction gates result and its queue effects
         self,
+        conn: sqlite3.Connection,
         handler: HydrationHandler,
         batch: Sequence[HydrationJob],
         started: Sequence[HydrationJob],
@@ -518,28 +547,34 @@ class MessageFactHydrationWorker:
         effective_now: int,
         observation_order: int,
     ) -> _BatchOutcome:
-        with write_transaction(self._conn):
-            current = self._current_jobs(started, observation_order)
+        with write_transaction(conn):
+            current = self._current_jobs(conn, started, observation_order)
             stale = [job for job in started if job not in current]
             preflight_observations = (*preflight_observations, *self._observations("not_applied", stale))
             if not current:
                 self._log_drops(batch, preflight_observations)
                 return _BatchOutcome(dropped=len(preflight_observations))
             applied = handler.apply(
-                self._conn, self._queue, current, result, now=effective_now, observation_order=observation_order
+                conn,
+                HydrationQueueRepository(conn),
+                current,
+                result,
+                now=effective_now,
+                observation_order=observation_order,
             )
-            return self._finish_applied(handler, batch, current, preflight_observations, applied, int(self._clock()))
+            return self._finish_applied(
+                conn, handler, batch, current, preflight_observations, applied, int(self._clock())
+            )
 
     def _current_jobs(
         self,
+        conn: sqlite3.Connection,
         jobs: Sequence[HydrationJob],
         observation_order: int | None,
     ) -> list[HydrationJob]:
-        require_write_transaction(self._conn)
+        require_write_transaction(conn)
         return [
-            job
-            for job in jobs
-            if hydration_observation_current(self._conn, job.dialog_id, job.message_id, observation_order)
+            job for job in jobs if hydration_observation_current(conn, job.dialog_id, job.message_id, observation_order)
         ]
 
     async def _request_batch(
@@ -581,6 +616,7 @@ class MessageFactHydrationWorker:
 
     def _handle_admission_rejection(  # noqa: PLR0913, PLR0917
         self,
+        conn: sqlite3.Connection,
         handler: HydrationHandler,
         batch: Sequence[HydrationJob],
         started: Sequence[HydrationJob],
@@ -590,9 +626,10 @@ class MessageFactHydrationWorker:
         *,
         observation_order: int | None = None,
     ) -> _BatchOutcome:
-        with write_transaction(self._conn):
+        with write_transaction(conn):
             retried = self._release_undispatched(
-                self._current_jobs(started, observation_order),
+                conn,
+                self._current_jobs(conn, started, observation_order),
                 effective_now + self._retry_delay_seconds,
                 error_code=type(exc).__name__,
             )
@@ -612,16 +649,20 @@ class MessageFactHydrationWorker:
 
     def _release_undispatched(
         self,
+        conn: sqlite3.Connection,
         jobs: Sequence[HydrationJob],
         due_at: int,
         *,
         error_code: str,
     ) -> int:
-        require_write_transaction(self._conn)
-        return sum(self._queue.requeue_undispatched(job, due_at, error_code=error_code) for job in jobs)
+        require_write_transaction(conn)
+        return sum(
+            HydrationQueueRepository(conn).requeue_undispatched(job, due_at, error_code=error_code) for job in jobs
+        )
 
     def _handle_flood_wait(  # noqa: PLR0913, PLR0917
         self,
+        conn: sqlite3.Connection,
         handler: HydrationHandler,
         batch: Sequence[HydrationJob],
         started: Sequence[HydrationJob],
@@ -635,10 +676,11 @@ class MessageFactHydrationWorker:
         if retry_delay is None:
             return self._handle_circuit_open(handler, batch, started, preflight_observations, effective_now)
         descriptor = describe_telegram_rpc_error(exc)
-        with write_transaction(self._conn):
+        with write_transaction(conn):
             retried, dropped, drop_observations = self._reschedule_or_drop(
+                conn,
                 handler,
-                self._current_jobs(started, observation_order),
+                self._current_jobs(conn, started, observation_order),
                 effective_now + retry_delay,
                 outcome=HydrationOutcome.RPC_PAUSED,
                 error_code=descriptor.symbol,
@@ -667,6 +709,7 @@ class MessageFactHydrationWorker:
 
     def _handle_throttle(  # noqa: PLR0913, PLR0917
         self,
+        conn: sqlite3.Connection,
         handler: HydrationHandler,
         batch: Sequence[HydrationJob],
         started: Sequence[HydrationJob],
@@ -682,6 +725,7 @@ class MessageFactHydrationWorker:
         if attempt_budget is not None:
             assert attempts_before_request is not None
             self._handle_coordinator_throttle(
+                conn,
                 handler,
                 batch,
                 started,
@@ -695,6 +739,7 @@ class MessageFactHydrationWorker:
         if exc.retry_after_seconds is None:
             return self._handle_circuit_open(handler, batch, started, preflight_observations, effective_now)
         return self._handle_flood_wait(
+            conn,
             handler,
             batch,
             started,
@@ -706,6 +751,7 @@ class MessageFactHydrationWorker:
 
     def _handle_coordinator_throttle(  # noqa: PLR0913, PLR0917
         self,
+        conn: sqlite3.Connection,
         handler: HydrationHandler,
         batch: Sequence[HydrationJob],
         started: Sequence[HydrationJob],
@@ -719,6 +765,7 @@ class MessageFactHydrationWorker:
         """Restore durable admission state before the coordinator owns throttling."""
         if request_dispatched and exc.retry_after_seconds is not None:
             self._handle_flood_wait(
+                conn,
                 handler,
                 batch,
                 started,
@@ -729,12 +776,12 @@ class MessageFactHydrationWorker:
             )
             return
 
-        with write_transaction(self._conn):
+        with write_transaction(conn):
             error_code = type(exc).__name__
-            current = self._current_jobs(started, observation_order)
+            current = self._current_jobs(conn, started, observation_order)
             if request_dispatched:
                 for job in current:
-                    self._queue.reschedule(
+                    HydrationQueueRepository(conn).reschedule(
                         job,
                         job.due_at,
                         outcome=HydrationOutcome.RPC_PAUSED,
@@ -742,7 +789,7 @@ class MessageFactHydrationWorker:
                     )
             else:
                 for job in current:
-                    self._queue.requeue_undispatched(
+                    HydrationQueueRepository(conn).requeue_undispatched(
                         job,
                         job.due_at,
                         outcome=HydrationOutcome.RPC_PAUSED,
@@ -780,6 +827,7 @@ class MessageFactHydrationWorker:
 
     def _handle_access_lost(  # noqa: PLR0913, PLR0917
         self,
+        conn: sqlite3.Connection,
         handler: HydrationHandler,
         batch: Sequence[HydrationJob],
         started: Sequence[HydrationJob],
@@ -791,13 +839,17 @@ class MessageFactHydrationWorker:
     ) -> _BatchOutcome:
         descriptor = describe_telegram_rpc_error(exc)
         self._log_drops(batch, preflight_observations)
-        with write_transaction(self._conn):
-            dialog_ids = tuple(dict.fromkeys(job.dialog_id for job in self._current_jobs(started, observation_order)))
+        with write_transaction(conn):
+            dialog_ids = tuple(
+                dict.fromkeys(job.dialog_id for job in self._current_jobs(conn, started, observation_order))
+            )
             summaries = tuple(
-                summary for dialog_id in dialog_ids for summary in self._queue.summarize_for_dialog(dialog_id)
+                summary
+                for dialog_id in dialog_ids
+                for summary in HydrationQueueRepository(conn).summarize_for_dialog(dialog_id)
             )
             for dialog_id in dialog_ids:
-                set_access_lost(self._conn, dialog_id, effective_now, reason=descriptor.error_type)
+                set_access_lost(conn, dialog_id, effective_now, reason=descriptor.error_type)
         self._log_summaries(summaries, descriptor)
         drop_counts: dict[str, int] = defaultdict(int)
         for summary in summaries:
@@ -813,6 +865,7 @@ class MessageFactHydrationWorker:
 
     def _handle_request_error(  # noqa: PLR0913, PLR0917
         self,
+        conn: sqlite3.Connection,
         handler: HydrationHandler,
         batch: Sequence[HydrationJob],
         started: Sequence[HydrationJob],
@@ -824,10 +877,10 @@ class MessageFactHydrationWorker:
     ) -> _BatchOutcome:
         descriptor = describe_telegram_rpc_error(exc)
         if handler.is_terminal_error(exc):
-            with write_transaction(self._conn):
-                current = self._current_jobs(started, observation_order)
+            with write_transaction(conn):
+                current = self._current_jobs(conn, started, observation_order)
                 for job in current:
-                    self._queue.mark_terminal(
+                    HydrationQueueRepository(conn).mark_terminal(
                         job, outcome=HydrationOutcome.TERMINAL_ERROR, error_code=descriptor.symbol
                     )
             self._log_drops(batch, preflight_observations)
@@ -835,10 +888,11 @@ class MessageFactHydrationWorker:
             stale = [job for job in started if job not in current]
             self._log_drops(stale, self._observations("not_applied", stale))
             return _BatchOutcome(dropped=len(preflight_observations) + len(started))
-        with write_transaction(self._conn):
+        with write_transaction(conn):
             retried, dropped, drop_observations = self._reschedule_or_drop(
+                conn,
                 handler,
-                self._current_jobs(started, observation_order),
+                self._current_jobs(conn, started, observation_order),
                 effective_now + self._retry_delay_seconds,
                 outcome=HydrationOutcome.TEMPORARY_FAILURE,
                 error_code=descriptor.symbol,
@@ -859,6 +913,7 @@ class MessageFactHydrationWorker:
 
     def _finish_applied(  # noqa: PLR0913, PLR0917
         self,
+        conn: sqlite3.Connection,
         handler: HydrationHandler,
         batch: Sequence[HydrationJob],
         started: Sequence[HydrationJob],
@@ -866,10 +921,11 @@ class MessageFactHydrationWorker:
         applied: AppliedFacts,
         effective_now: int,
     ) -> _BatchOutcome:
-        require_write_transaction(self._conn)
+        require_write_transaction(conn)
         pending = 0
         if applied.pending:
             pending, dropped, drop_observations = self._reschedule_or_drop(
+                conn,
                 handler,
                 started,
                 effective_now + handler.pending_delay_seconds,
@@ -891,23 +947,23 @@ class MessageFactHydrationWorker:
         )
 
     def _start_batch(
-        self, handler: HydrationHandler, jobs: Sequence[HydrationJob]
-    ) -> tuple[list[HydrationJob], tuple[HydrationDropObservation, ...]]:
-        with write_transaction(self._conn):
+        self, conn: sqlite3.Connection, handler: HydrationHandler, jobs: Sequence[HydrationJob]
+    ) -> tuple[list[HydrationJob], tuple[HydrationDropObservation, ...], int | None]:
+        with write_transaction(conn):
             started: list[HydrationJob] = []
             observations: list[HydrationDropObservation] = []
             for job in jobs:
-                if not handler.eligible(self._conn, job):
-                    self._queue.remove(job)
+                if not handler.eligible(conn, job):
+                    HydrationQueueRepository(conn).remove(job)
                     observations.append(
                         HydrationDropObservation("ineligible", job.message_id, job.kind, job.dialog_id, job.attempts)
                     )
                     continue
-                current = self._queue.start(job)
+                current = HydrationQueueRepository(conn).start(job)
                 if current is None:
                     continue
                 if current.attempts > self._max_attempts:
-                    self._queue.mark_terminal(current, outcome=HydrationOutcome.EXHAUSTED)
+                    HydrationQueueRepository(conn).mark_terminal(current, outcome=HydrationOutcome.EXHAUSTED)
                     observations.append(
                         HydrationDropObservation(
                             "attempt_limit", current.message_id, current.kind, current.dialog_id, current.attempts
@@ -915,10 +971,12 @@ class MessageFactHydrationWorker:
                     )
                     continue
                 started.append(current)
-        return started, tuple(observations)
+            observation_order = allocate_observation_order(conn) if started else None
+        return started, tuple(observations), observation_order
 
-    def _reschedule_or_drop(
+    def _reschedule_or_drop(  # noqa: PLR0913 - explicit writer connection accompanies queue policy
         self,
+        conn: sqlite3.Connection,
         handler: HydrationHandler,
         jobs: Sequence[HydrationJob],
         due_at: int,
@@ -926,17 +984,19 @@ class MessageFactHydrationWorker:
         outcome: HydrationOutcome,
         error_code: str | None = None,
     ) -> tuple[int, int, tuple[HydrationDropObservation, ...]]:
-        require_write_transaction(self._conn)
+        require_write_transaction(conn)
         rescheduled = dropped = 0
         observations: list[HydrationDropObservation] = []
         for job in jobs:
             if job.attempts >= self._max_attempts:
-                self._queue.mark_terminal(job, outcome=HydrationOutcome.EXHAUSTED, error_code=error_code)
+                HydrationQueueRepository(conn).mark_terminal(
+                    job, outcome=HydrationOutcome.EXHAUSTED, error_code=error_code
+                )
                 dropped += 1
                 observations.append(
                     HydrationDropObservation("attempt_limit", job.message_id, job.kind, job.dialog_id, job.attempts)
                 )
-            elif self._queue.reschedule(job, due_at, outcome=outcome, error_code=error_code):
+            elif HydrationQueueRepository(conn).reschedule(job, due_at, outcome=outcome, error_code=error_code):
                 rescheduled += 1
         return rescheduled, dropped, tuple(observations)
 

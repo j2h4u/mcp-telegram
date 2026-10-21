@@ -44,6 +44,7 @@ from mcp_telegram.messages.sqlite_hydration_jobs import (
 from mcp_telegram.reactions.contracts import ReactionAggregateSource
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
+from sqlite_writer_helpers import event_manager
 
 
 def _message(  # noqa: PLR0913
@@ -1193,7 +1194,7 @@ def test_known_peer_deletion_survives_restart_without_body_or_enrollment(tmp_pat
     from unittest.mock import MagicMock
 
     from mcp_telegram.activity_sync import _persist_own_message_rows
-    from mcp_telegram.event_handlers import EventHandlerManager, _DeletedMessagesEvent
+    from mcp_telegram.event_handlers import _DeletedMessagesEvent
 
     path = tmp_path / "known_peer.db"
     ensure_sync_schema(path)
@@ -1201,7 +1202,7 @@ def test_known_peer_deletion_survives_restart_without_body_or_enrollment(tmp_pat
     first = _open_sync_db(path)
     try:
         enable_runtime_writes(first)
-        manager = EventHandlerManager(MagicMock(), first, asyncio.Event())
+        manager = event_manager(MagicMock(), first, asyncio.Event())
         asyncio.run(
             manager.on_message_deleted(
                 cast(_DeletedMessagesEvent, SimpleNamespace(chat_id=channel_id, deleted_ids=[905]))

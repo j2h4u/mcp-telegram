@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
+from ..sqlite_writer import SQLiteWriter
 from ..telegram_demand import AcquisitionKind
 from ..telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
 from .contracts import FolderRuleObservation
@@ -20,9 +21,12 @@ class FolderRefreshResult:
 class FolderRefresher:
     """Observe rules once, then project entirely from the published catalog."""
 
-    def __init__(self, gateway: TelegramFolderGateway, repository: FolderSnapshotRepository) -> None:
+    def __init__(
+        self, gateway: TelegramFolderGateway, repository: FolderSnapshotRepository, *, writer: SQLiteWriter
+    ) -> None:
         self._gateway = gateway
         self._repository = repository
+        self._writer = writer
 
     async def acquire(self, *, started_at: int | None = None) -> FolderRuleObservation:
         observation_started_at = int(time.time()) if started_at is None else started_at
@@ -32,8 +36,12 @@ class FolderRefresher:
     async def refresh(self, *, completed_at: int | None = None) -> FolderRefreshResult:
         completion = int(time.time()) if completed_at is None else completed_at
         observation = await self.acquire(started_at=completion)
-        generation = self._repository.project_observation(observation, completed_at=completion)
+        generation = await self._writer.run(
+            lambda conn: self._repository.for_connection(conn).project_observation(observation, completed_at=completion)
+        )
         return FolderRefreshResult(0, generation)
 
-    def reproject_current_rules(self, *, now: int) -> int | None:
-        return self._repository.reproject_current_rules(now=now)
+    async def reproject_current_rules(self, *, now: int) -> int | None:
+        return await self._writer.run(
+            lambda conn: self._repository.for_connection(conn).reproject_current_rules(now=now)
+        )

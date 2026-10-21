@@ -41,6 +41,7 @@ from tests.helpers import (
     LoudUserProfilePort,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.sqlite_writer_helpers import inline_writer
 
 # ---------------------------------------------------------------------------
 # get_peer_id patch (daemon_api imports telethon_utils.get_peer_id; tests
@@ -248,6 +249,7 @@ def _make_server(conn: sqlite3.Connection, client: object) -> DaemonAPIServer:
         conn,
         cast(DaemonClientLike, client),
         asyncio.Event(),
+        writer=inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),

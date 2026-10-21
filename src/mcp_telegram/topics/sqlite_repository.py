@@ -40,6 +40,9 @@ class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataReposi
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
+    def for_connection(self, conn: sqlite3.Connection) -> SQLiteTopicSnapshotRepository:
+        return SQLiteTopicSnapshotRepository(conn)
+
     def begin_snapshot(self) -> int:
         with write_savepoint(self._conn):
             return allocate_observation_order(self._conn)

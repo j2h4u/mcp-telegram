@@ -42,6 +42,7 @@ from mcp_telegram.telegram_demand import (
     demand_context,
 )
 from mcp_telegram.telegram_rpc_consumers import DemandKind, TelegramRpcSource
+from sqlite_writer_helpers import event_manager
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 _SQLiteConnection = sqlite3.Connection
@@ -122,7 +123,7 @@ def make_manager(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> EventHandlerManager:
-    manager = EventHandlerManager(mock_client, sync_db, shutdown_event)
+    manager = event_manager(mock_client, sync_db, shutdown_event)
     manager.bind_demand_sink(MagicMock())
     return manager
 
@@ -146,7 +147,8 @@ class _RecordingDemandSink:
         return True
 
 
-def test_auto_enrollment_offers_full_sync_only_after_commit(
+@pytest.mark.asyncio
+async def test_auto_enrollment_offers_full_sync_only_after_commit(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
@@ -163,7 +165,7 @@ def test_auto_enrollment_offers_full_sync_only_after_commit(
     sink.offer.side_effect = offer
     manager.bind_demand_sink(sink)
 
-    assert manager._auto_enroll_dm(42)
+    assert await manager._auto_enroll_dm(42)
     assert offered == [DemandKind.FULL_SYNC_PAGE]
 
 
@@ -580,7 +582,8 @@ async def test_first_seen_outgoing_private_message_uses_chat_peer(
     get_sender.assert_not_awaited()
 
 
-def test_min_user_defaults_do_not_replace_known_canonical_bot_identity(
+@pytest.mark.asyncio
+async def test_min_user_defaults_do_not_replace_known_canonical_bot_identity(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
@@ -597,7 +600,7 @@ def test_min_user_defaults_do_not_replace_known_canonical_bot_identity(
     sync_db.commit()
     manager = make_manager(mock_client, sync_db, shutdown_event)
 
-    assert manager._auto_enroll_dm(
+    assert await manager._auto_enroll_dm(
         dialog_id,
         sender=types.User(id=dialog_id, min=True, access_hash=42),
         observed_at=20,
@@ -689,7 +692,7 @@ async def test_first_seen_private_event_preserves_existing_dialog_facts(
         ),
     )
     manager = make_manager(mock_client, sync_db, shutdown_event)
-    assert manager._auto_enroll_dm(dialog_id, sender=sender, message_date=msg.date, observed_at=100)
+    assert await manager._auto_enroll_dm(dialog_id, sender=sender, message_date=msg.date, observed_at=100)
 
     # Realtime presence intentionally exposes an absent-from-snapshot row; other
     # durable dialog facts must survive the thin first-event projection.
@@ -764,7 +767,8 @@ async def test_auto_enroll_writes_entity_when_sender_available(
     assert row[4] == "fixture person"
 
 
-def test_dm_entity_collectible_username_and_partial_sender_preserve_canonical_facts(
+@pytest.mark.asyncio
+async def test_dm_entity_collectible_username_and_partial_sender_preserve_canonical_facts(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
@@ -777,7 +781,7 @@ def test_dm_entity_collectible_username_and_partial_sender_preserve_canonical_fa
     sync_db.commit()
     manager = make_manager(mock_client, sync_db, shutdown_event)
 
-    assert manager._auto_enroll_dm(
+    assert await manager._auto_enroll_dm(
         dialog_id,
         sender=SimpleNamespace(usernames=[SimpleNamespace(username="@collectible", active=True)]),
         observed_at=100,
@@ -794,7 +798,7 @@ def test_dm_entity_collectible_username_and_partial_sender_preserve_canonical_fa
         (dialog_id, "service", "Known Service", "service_name", "known service", 1),
     )
     sync_db.commit()
-    assert manager._auto_enroll_dm(dialog_id, sender=SimpleNamespace(), observed_at=101)
+    assert await manager._auto_enroll_dm(dialog_id, sender=SimpleNamespace(), observed_at=101)
     assert sync_db.execute("SELECT name,username,type FROM entities WHERE id=?", (dialog_id,)).fetchone() == (
         "Known Service",
         "service_name",
@@ -814,7 +818,7 @@ def test_dm_entity_collectible_username_and_partial_sender_preserve_canonical_fa
         )
         assert identity is not None
         sync_db.commit()
-        manager._persist_dm_entity(unknown_id, identity, observed_at=102)
+        manager._persist_dm_entity(sync_db, unknown_id, identity, observed_at=102)
         assert sync_db.execute("SELECT type,username FROM entities WHERE id=?", (unknown_id,)).fetchone() == (
             "user",
             "observed",
@@ -860,7 +864,8 @@ async def test_auto_enroll_entity_write_fails_gracefully(
     assert dialog_id in manager._synced_dialog_ids
 
 
-def test_auto_enroll_rolls_back_enrollment_when_dialog_projection_fails(
+@pytest.mark.asyncio
+async def test_auto_enroll_rolls_back_enrollment_when_dialog_projection_fails(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
@@ -875,7 +880,7 @@ def test_auto_enroll_rolls_back_enrollment_when_dialog_projection_fails(
     sink = MagicMock()
     manager.bind_demand_sink(sink)
 
-    assert not manager._auto_enroll_dm(
+    assert not await manager._auto_enroll_dm(
         dialog_id,
         sender=SimpleNamespace(first_name="Atomic", last_name="Peer", username="atomic"),
         message_date=build_mock_message(id=22).date,
@@ -890,7 +895,8 @@ def test_auto_enroll_rolls_back_enrollment_when_dialog_projection_fails(
     sink.offer.assert_not_called()
 
 
-def test_auto_enroll_entity_failure_does_not_rollback_committed_dialog_projection(
+@pytest.mark.asyncio
+async def test_auto_enroll_entity_failure_does_not_rollback_committed_dialog_projection(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
@@ -905,7 +911,7 @@ def test_auto_enroll_entity_failure_does_not_rollback_committed_dialog_projectio
     sink = MagicMock()
     manager.bind_demand_sink(sink)
 
-    assert manager._auto_enroll_dm(
+    assert await manager._auto_enroll_dm(
         dialog_id,
         sender=types.User(id=dialog_id, first_name="Committed", last_name="Peer", username="committed"),
         message_date=build_mock_message(id=23).date,
@@ -1947,7 +1953,7 @@ async def test_linked_chat_retry_respects_owner_flood_wait_policy(
             raise TelegramRpcThrottled(retry_after_seconds=flood_wait_seconds)
 
     client = _FloodingClient()
-    manager = EventHandlerManager(client, sync_db, shutdown_event)  # type: ignore[arg-type]
+    manager = event_manager(client, sync_db, shutdown_event)  # type: ignore[arg-type]
     before = int(time.time())
     await manager.retry_one_pending_linked_chat_fact(RpcAttemptBudget(limit=1))
     after = int(time.time())
@@ -1981,7 +1987,7 @@ async def test_linked_chat_no_due_self_heal_commits_before_return(
         linked_chat_fact_owner.invalidate_from_update(sync_db, dialog_id, int(time.time()))
         sync_db.execute("UPDATE linked_chat_fact_state SET retry_at=NULL WHERE channel_id=?", (dialog_id,))
 
-    manager = EventHandlerManager(MagicMock(), sync_db, shutdown_event)  # type: ignore[arg-type]
+    manager = event_manager(MagicMock(), sync_db, shutdown_event)  # type: ignore[arg-type]
     assert await manager.retry_one_pending_linked_chat_fact(RpcAttemptBudget(limit=1)) is False
     assert sync_db.in_transaction is False
     repaired_retry = sync_db.execute(
@@ -2062,7 +2068,7 @@ async def test_accepted_linked_chat_publication_offers_scheduled_discovery_after
             )
             return True
 
-    manager = EventHandlerManager(_Client(), sync_db, shutdown_event)  # type: ignore[arg-type]
+    manager = event_manager(_Client(), sync_db, shutdown_event)  # type: ignore[arg-type]
     sink = _CommitObservingSink()
     manager.bind_demand_sink(sink)
 
@@ -2072,7 +2078,8 @@ async def test_accepted_linked_chat_publication_offers_scheduled_discovery_after
     assert sink.published_at_offer == [True] * len(expected_offers)
 
 
-def test_stale_linked_chat_publication_offers_no_followup_work(
+@pytest.mark.asyncio
+async def test_stale_linked_chat_publication_offers_no_followup_work(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
@@ -2103,11 +2110,11 @@ def test_stale_linked_chat_publication_offers_no_followup_work(
         full_chat=SimpleNamespace(id=channel_id, linked_chat_id=456),
         chats=[Channel(id=channel_id, access_hash=0, title="channel", photo=None, date=None)],
     )
-    manager = EventHandlerManager(MagicMock(), sync_db, shutdown_event)  # type: ignore[arg-type]
+    manager = event_manager(MagicMock(), sync_db, shutdown_event)  # type: ignore[arg-type]
     sink = _RecordingDemandSink()
     manager.bind_demand_sink(sink)
 
-    manager._publish_linked_chat_observation(work, work.generation, siblings_token, full_result, now)
+    await manager._publish_linked_chat_observation(work, work.generation, siblings_token, full_result, now)
 
     assert sink.offered == []
 

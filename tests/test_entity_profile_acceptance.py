@@ -25,6 +25,7 @@ from mcp_telegram.entity_profile.refresh import (
     RefreshLimits,
 )
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
+from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.telegram_demand import DemandStatus, RpcAttemptBudget
 from tests.test_entity_profile_full_user_pair import _pair_service, _PairClient, _prepare
 
@@ -175,27 +176,29 @@ async def test_actual_sink_loss_is_durable_and_does_not_change_pair_state(
     writer_started = threading.Event()
     writer_release = threading.Event()
 
-    def blocked_write_thread(*_args: object, **_kwargs: object) -> bool:
+    def blocked_write_thread(*_args: object, **_kwargs: object) -> None:
         writer_started.set()
         writer_release.wait(timeout=2.0)
-        return True
 
+    writer = await SQLiteWriter.open(path)
     sink = runtime_observations.RuntimeObservationSink(
         path,
+        writer=writer,
         retention_ttl_seconds=60,
         policy=replace(RuntimeObservationConfig(), queue_capacity=1),
     )
-    monkeypatch.setattr(sink, "_write_job", blocked_write_thread)
+    monkeypatch.setattr(sink, "_write_batch", blocked_write_thread)
     sink.record(kind="entity_profile.pair", outcome="head")
-    assert writer_started.wait(timeout=1.0)
+    assert await asyncio.to_thread(writer_started.wait, 1.0)
     for index in range(8):
         sink.record(kind="entity_profile.pair", outcome=f"overflow-{index}")
     assert sink.queue_full_drops > 0
     writer_release.set()
-    sink.close()
+    await sink.aclose()
 
-    ctx = cast(_SyncMainContext, SimpleNamespace(conn=conn, rpc_observation_sink=sink))
-    _persist_runtime_observation_loss(ctx)
+    ctx = cast(_SyncMainContext, SimpleNamespace(conn=conn, writer=writer, rpc_observation_sink=sink))
+    await _persist_runtime_observation_loss(ctx)
+    await writer.aclose()
     loss_row = cast(
         tuple[object, object] | None,
         conn.execute(

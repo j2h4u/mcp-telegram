@@ -84,6 +84,7 @@ from .flood import TelegramRpcThrottled, _raise_if_latched
 from .folders.read_model import dialog_placement
 from .linked_chat_fact import linked_chat_fact_owner
 from .models import DialogType
+from .sqlite_writer import SQLiteWriter
 from .sync_transactions import write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import (
@@ -324,6 +325,7 @@ class EntityInfoDeps:
     """Dependency container for entity-info orchestration."""
 
     conn: sqlite3.Connection
+    writer: SQLiteWriter
     client: _EntityInfoClient
     dm_peer_ids: Callable[[], set[int]]
     self_id: int | None
@@ -440,6 +442,11 @@ class DaemonEntityInfoService:
         """Attach post-commit wakeups to the process-wide coordinator."""
         self._demand_sink = sink
 
+    async def _write_profiles[T](self, operation: Callable[[EntityProfileRepository], T]) -> T:
+        return await self._deps.writer.run(
+            lambda conn: operation(EntityProfileRepository(conn, section_ttl_seconds=self._deps.detail_ttl_seconds))
+        )
+
     def bind_profile_observer(self, observer: ProfilePairObservationHook) -> None:
         """Attach the best-effort profile telemetry hook after composition."""
         self._deps = dataclass_replace(self._deps, profile_observer=observer)
@@ -458,27 +465,34 @@ class DaemonEntityInfoService:
         """Return the service-owned coordinator used by demand composition."""
         return self._refresh
 
-    def auth_scope_changed(self) -> None:
+    async def auth_scope_changed(self) -> None:
         """Queue completed User/Bot pairs under a new authorization generation."""
         if not self._deps.enable_full_user_pair:
             return
-        rows = cast(
-            list[tuple[int]],
-            self._deps.conn.execute(
-                "SELECT DISTINCT entity_id FROM entity_detail_sections "
-                "WHERE section IN ('full_profile', 'personal_channel') AND status='fresh' "
-                "GROUP BY entity_id HAVING COUNT(*)=2"
-            ).fetchall(),
-        )
         now = int(self._deps.now_provider())
-        for row in rows:
-            self._profiles.mark_pending(
-                int(row[0]),
-                now=now,
-                reason="auth_scope_changed",
-                pair_eligible_override=True,
-                pair_mode_override=self._current_pair_mode(),
+        pair_mode = self._current_pair_mode()
+
+        def queue_refreshes(conn: sqlite3.Connection) -> bool:
+            profiles = EntityProfileRepository(conn, section_ttl_seconds=self._deps.detail_ttl_seconds)
+            rows = cast(
+                list[tuple[int]],
+                conn.execute(
+                    "SELECT DISTINCT entity_id FROM entity_detail_sections "
+                    "WHERE section IN ('full_profile', 'personal_channel') AND status='fresh' "
+                    "GROUP BY entity_id HAVING COUNT(*)=2"
+                ).fetchall(),
             )
+            for row in rows:
+                profiles.mark_pending(
+                    int(row[0]),
+                    now=now,
+                    reason="auth_scope_changed",
+                    pair_eligible_override=True,
+                    pair_mode_override=pair_mode,
+                )
+            return bool(rows)
+
+        rows = await self._deps.writer.run(queue_refreshes)
         if rows and self._demand_sink is not None:
             offer_durable_demand(self._demand_sink, DemandKind.ENTITY_PROFILE_REFRESH)
 
@@ -507,7 +521,7 @@ class DaemonEntityInfoService:
 
         now = int(self._deps.now_provider())
         if self._progressive_enabled():
-            cached_result = self._progressive_cached_result(entity_id, now=now)
+            cached_result = await self._progressive_cached_result(entity_id, now=now)
             if cached_result is not None:
                 return await self._await_progressive_refresh(entity_id, cached_result)
         else:
@@ -516,7 +530,7 @@ class DaemonEntityInfoService:
                 return cached
 
         if self._deps.self_id == entity_id and self._deps.self_profile is not None:
-            return self._self_snapshot_result(entity_id, now=now, started_at=started_at)
+            return await self._self_snapshot_result(entity_id, now=now, started_at=started_at)
 
         if self._progressive_enabled():
             result = await self._progressive_miss(entity_id, now=now, started_at=started_at)
@@ -547,14 +561,14 @@ class DaemonEntityInfoService:
         )
         if not completed:
             return fallback
-        refreshed = self._progressive_cached_result(
+        refreshed = await self._progressive_cached_result(
             entity_id,
             now=int(self._deps.now_provider()),
             admit_refresh=False,
         )
         return fallback if refreshed is None else refreshed
 
-    def _progressive_cached_result(
+    async def _progressive_cached_result(
         self,
         entity_id: int,
         *,
@@ -569,19 +583,21 @@ class DaemonEntityInfoService:
         if cached is not None:
             if self._profile_ownership_unavailable(cached):
                 if admit_refresh:
-                    self._admit_cached_ownership_refresh(entity_id, now=now)
+                    await self._admit_cached_ownership_refresh(entity_id, now=now)
                 return self._pending_error(entity_id, "entity profile ownership is unavailable")
             if self._profile_scope_changed(cached, entity_id, now=now) and admit_refresh:
-                self._profiles.mark_pending(
-                    entity_id,
-                    now=now,
-                    reason="auth_scope_changed",
-                    pair_eligible_override=(True if self._deps.enable_full_user_pair else None),
-                    pair_mode_override=self._current_pair_mode(),
+                await self._write_profiles(
+                    lambda profiles: profiles.mark_pending(
+                        entity_id,
+                        now=now,
+                        reason="auth_scope_changed",
+                        pair_eligible_override=(True if self._deps.enable_full_user_pair else None),
+                        pair_mode_override=self._current_pair_mode(),
+                    )
                 )
                 cached = self._profiles.read(entity_id, now=now)
                 assert cached is not None
-            return self._progressive_result(
+            return await self._progressive_result(
                 entity_id,
                 cached.detail,
                 cached.sections,
@@ -603,40 +619,42 @@ class DaemonEntityInfoService:
             "Entity was not found. Action: retry with an exact entity id from ListDialogs.",
         )
 
-    def _admit_cached_ownership_refresh(self, entity_id: int, *, now: int) -> RefreshEnqueueResult:
+    async def _admit_cached_ownership_refresh(self, entity_id: int, *, now: int) -> RefreshEnqueueResult:
         """Admit ownership repair while retaining already durable refresh work."""
         assert self._refresh is not None
         enqueue_result = self._refresh.enqueue(entity_id)
-        existing_status = self._refresh_state_status(entity_id)
-        preserves_work = existing_status in {"pending", "failed"}
+        pair_mode = self._current_pair_mode()
+        pair_eligible = True if self._deps.enable_full_user_pair else None
+
+        def admit(conn: sqlite3.Connection) -> None:
+            profiles = EntityProfileRepository(conn, section_ttl_seconds=self._deps.detail_ttl_seconds)
+            try:
+                row = cast(
+                    tuple[str] | None,
+                    conn.execute(
+                        "SELECT status FROM entity_profile_refresh_state WHERE entity_id=?", (entity_id,)
+                    ).fetchone(),
+                )
+            except sqlite3.OperationalError:
+                row = None
+            if row is not None and row[0] in {"pending", "failed"}:
+                return
+            if enqueue_result is RefreshEnqueueResult.REJECTED:
+                profiles.mark_refresh_rejected(entity_id, now=now)
+            else:
+                profiles.mark_pending(
+                    entity_id,
+                    now=now,
+                    reason="profile_ownership_changed",
+                    pair_eligible_override=pair_eligible,
+                    pair_mode_override=pair_mode,
+                )
+
+        await self._deps.writer.run(admit)
         if enqueue_result is RefreshEnqueueResult.REJECTED:
-            if not preserves_work:
-                self._profiles.mark_refresh_rejected(entity_id, now=now)
             return enqueue_result
-        if not preserves_work:
-            self._profiles.mark_pending(
-                entity_id,
-                now=now,
-                reason="profile_ownership_changed",
-                pair_eligible_override=(True if self._deps.enable_full_user_pair else None),
-                pair_mode_override=self._current_pair_mode(),
-            )
         offer_durable_demand(self._require_demand_sink(), DemandKind.ENTITY_PROFILE_REFRESH)
         return enqueue_result
-
-    def _refresh_state_status(self, entity_id: int) -> str | None:
-        """Read the exact durable state needed to avoid rewriting active work."""
-        try:
-            row = cast(
-                tuple[object] | None,
-                self._deps.conn.execute(
-                    "SELECT status FROM entity_profile_refresh_state WHERE entity_id=?",
-                    (entity_id,),
-                ).fetchone(),
-            )
-        except sqlite3.OperationalError:
-            return None
-        return str(row[0]) if row is not None else None
 
     def _profile_ownership_unavailable(self, cached: object) -> bool:
         provider = self._deps.full_user_auth_scope
@@ -666,15 +684,15 @@ class DaemonEntityInfoService:
         identity = self._full_user_pair_identity(target_kind)
         return self._profiles.pair_receipts_require_new_scope(entity_id, identity, now=now)
 
-    def _self_snapshot_result(self, entity_id: int, *, now: int, started_at: float) -> dict[str, object]:
+    async def _self_snapshot_result(self, entity_id: int, *, now: int, started_at: float) -> dict[str, object]:
         self_detail = self._build_self_detail()
         if not self._progressive_enabled():
             self._log_stage(entity_id, "self_snapshot", started_at, detail_type=self_detail.get("type"))
             return {"ok": True, "data": self_detail}
-        self._profiles.save_core(self_detail, now=now)
+        await self._write_profiles(lambda profiles: profiles.save_core(self_detail, now=now))
         assert self._refresh is not None
         enqueue_result = self._refresh.enqueue(entity_id)
-        self._persist_refresh_admission(entity_id, enqueue_result, now=now)
+        await self._persist_refresh_admission(entity_id, enqueue_result, now=now)
         sections: dict[str, dict[str, object]] = {
             section: {
                 "status": "pending",
@@ -683,7 +701,7 @@ class DaemonEntityInfoService:
             }
             for section in PROFILE_SECTIONS
         }
-        return self._progressive_result(entity_id, self_detail, sections, now=now)
+        return await self._progressive_result(entity_id, self_detail, sections, now=now)
 
     async def _legacy_entity_info(
         self,
@@ -709,7 +727,7 @@ class DaemonEntityInfoService:
             return detail_error or self._error("telegram_api_error", "per-type helper returned no detail")
 
         stage_started_at = self._deps.now_provider()
-        self._writeback(
+        await self._writeback(
             entity_id,
             detail,
             now,
@@ -735,14 +753,14 @@ class DaemonEntityInfoService:
     def _record_section_failure(self, section: str, reason: str) -> None:
         self._section_failures.setdefault(section, reason)
 
-    def _queue_unknown_refresh(self, entity_id: int, *, now: int, message: str) -> dict[str, object]:
-        self._profiles.ensure_unknown_refresh_parent(entity_id, now=now)
+    async def _queue_unknown_refresh(self, entity_id: int, *, now: int, message: str) -> dict[str, object]:
+        await self._write_profiles(lambda profiles: profiles.ensure_unknown_refresh_parent(entity_id, now=now))
         assert self._refresh is not None
         enqueue_result = self._refresh.enqueue(entity_id)
         if enqueue_result is RefreshEnqueueResult.REJECTED:
-            self._profiles.mark_refresh_rejected(entity_id, now=now)
+            await self._write_profiles(lambda profiles: profiles.mark_refresh_rejected(entity_id, now=now))
             return self._pending_error(entity_id, "entity profile refresh queue is full")
-        self._persist_refresh_admission(entity_id, enqueue_result, now=now)
+        await self._persist_refresh_admission(entity_id, enqueue_result, now=now)
         return self._pending_error(entity_id, message)
 
     async def _progressive_miss(self, entity_id: int, *, now: int, started_at: float) -> dict[str, object]:
@@ -756,7 +774,7 @@ class DaemonEntityInfoService:
         except TimeoutError:
             self._log_stage(entity_id, "resolve_timeout", started_at)
             budget = self._deps.refresh_limits.foreground_resolve_seconds
-            return self._queue_unknown_refresh(
+            return await self._queue_unknown_refresh(
                 entity_id,
                 now=now,
                 message=f"entity resolution exceeded the {budget:g} second foreground budget",
@@ -765,20 +783,22 @@ class DaemonEntityInfoService:
             if resolve_error is not None and resolve_error.get("error") == "entity_not_found":
                 return resolve_error
             message = str((resolve_error or {}).get("message", "entity resolution is temporarily unavailable"))
-            return self._queue_unknown_refresh(entity_id, now=now, message=message)
+            return await self._queue_unknown_refresh(entity_id, now=now, message=message)
 
         core = self._core_from_entity(entity)
-        self._profiles.save_core(
-            core,
-            now=now,
-            dialog_identity_observation=observe_dialog_identity(
-                entity, dialog_id=entity_id, source="profile", observed_at=identity_started_at
-            ),
-            dialog_identity_baseline_revision=identity_baseline,
+        await self._write_profiles(
+            lambda profiles: profiles.save_core(
+                core,
+                now=now,
+                dialog_identity_observation=observe_dialog_identity(
+                    entity, dialog_id=entity_id, source="profile", observed_at=identity_started_at
+                ),
+                dialog_identity_baseline_revision=identity_baseline,
+            )
         )
         assert self._refresh is not None
         enqueue_result = self._refresh.enqueue(entity_id)
-        self._persist_refresh_admission(entity_id, enqueue_result, now=now)
+        await self._persist_refresh_admission(entity_id, enqueue_result, now=now)
         sections: dict[str, dict[str, object]] = {
             section: {
                 "status": "pending",
@@ -787,7 +807,7 @@ class DaemonEntityInfoService:
             }
             for section in PROFILE_SECTIONS
         }
-        result = self._progressive_result(entity_id, core, sections, now=now)
+        result = await self._progressive_result(entity_id, core, sections, now=now)
         self._log_stage(entity_id, "core_complete", started_at, detail_type=core.get("type"))
         return result
 
@@ -801,19 +821,22 @@ class DaemonEntityInfoService:
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
         now = int(self._deps.now_provider())
+        await self._write_profiles(lambda profiles: profiles.recover_pair_measurements(now=now))
         cursor = self._profiles.next_due_refresh(now=now)
         if cursor is None:
             return None
-        pair_mode = self._capture_refresh_pair_mode(cursor)
+        pair_mode = await self._capture_refresh_pair_mode(cursor)
         entity_type = self._stored_entity_type(cursor.entity_id, now=now)
         if entity_type is DialogType.UNKNOWN:
             return await self._run_unknown_entity_refresh(cursor, now=now)
         return await self._run_known_entity_refresh(cursor, entity_type, pair_mode=pair_mode, now=now)
 
-    def _capture_refresh_pair_mode(self, cursor: EntityRefreshCursor) -> str:
-        return self._profiles.capture_pair_mode(
-            cursor,
-            "enabled" if self._deps.enable_full_user_pair else "disabled",
+    async def _capture_refresh_pair_mode(self, cursor: EntityRefreshCursor) -> str:
+        return await self._write_profiles(
+            lambda profiles: profiles.capture_pair_mode(
+                cursor,
+                "enabled" if self._deps.enable_full_user_pair else "disabled",
+            )
         )
 
     async def _run_unknown_entity_refresh(
@@ -838,9 +861,9 @@ class DaemonEntityInfoService:
         if self._pair_enabled(cursor, entity_type, pair_mode=pair_mode):
             return await self._run_full_user_pair_refresh(cursor, entity_type, now=now)
         if self._is_paired_personal_channel_cursor(cursor, entity_type=entity_type, pair_mode=pair_mode):
-            return self._complete_paired_personal_channel(cursor, entity_type, now=now)
+            return await self._complete_paired_personal_channel(cursor, entity_type, now=now)
         if not self._section_applies(entity_type, cursor.next_section):
-            return self._complete_not_applicable_section(cursor, now=now)
+            return await self._complete_not_applicable_section(cursor, now=now)
         terminal = await self._acquire_and_commit_profile_section(cursor, entity_type, now=now)
         return DurableRefreshSliceResult(cursor.entity_id, terminal)
 
@@ -860,7 +883,7 @@ class DaemonEntityInfoService:
             raise
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
-            terminal = self._handle_profile_section_failure(
+            terminal = await self._handle_profile_section_failure(
                 _ProfileSectionFailure(
                     cursor=cursor,
                     entity_type=DialogType.GROUP,
@@ -882,7 +905,7 @@ class DaemonEntityInfoService:
             sqlite3.Error,
         ) as exc:
             raise_if_flood_wait_error(exc)
-            terminal = self._handle_profile_section_failure(
+            terminal = await self._handle_profile_section_failure(
                 _ProfileSectionFailure(
                     cursor=cursor,
                     entity_type=DialogType.GROUP,
@@ -899,21 +922,25 @@ class DaemonEntityInfoService:
             return DurableRefreshSliceResult(cursor.entity_id, terminal)
 
         if self._profile_scope_changed_during_acquisition(context.captured_scope):
-            self._profiles.mark_section_failure(
-                cursor,
-                now=now,
-                reason="auth_scope_changed",
-                retry_at=scope_changed_retry_at(now),
+            await self._write_profiles(
+                lambda profiles: profiles.mark_section_failure(
+                    cursor,
+                    now=now,
+                    reason="auth_scope_changed",
+                    retry_at=scope_changed_retry_at(now),
+                )
             )
             return DurableRefreshSliceResult(cursor.entity_id, DurableRefreshTerminal.FAILURE)
 
         full_profile = self._with_observation_metadata(full_profile, context.captured_scope)
         contact_overlap = self._with_observation_metadata(contact_overlap, context.captured_scope)
-        committed = self._profiles.commit_group_full_chat_pair(
-            cursor,
-            full_profile,
-            contact_overlap,
-            now=now,
+        committed = await self._write_profiles(
+            lambda profiles: profiles.commit_group_full_chat_pair(
+                cursor,
+                full_profile,
+                contact_overlap,
+                now=now,
+            )
         )
         self._observe_profile_section_commit(
             cursor,
@@ -935,7 +962,9 @@ class DaemonEntityInfoService:
         now: int,
     ) -> DurableRefreshSliceResult:
         identity = self._full_user_pair_identity(self._target_kind(entity_type))
-        if identity is not None and self._profiles.reuse_full_user_pair(cursor, identity, now=now):
+        if identity is not None and await self._write_profiles(
+            lambda profiles: profiles.reuse_full_user_pair(cursor, identity, now=now)
+        ):
             self._observe_profile_pair(
                 mode="enabled",
                 eligible_pair=True,
@@ -958,7 +987,7 @@ class DaemonEntityInfoService:
     def _target_kind(self, entity_type: DialogType) -> TargetKind:
         return TargetKind.BOT if entity_type in {DialogType.BOT, DialogType.SERVICE} else TargetKind.USER
 
-    def _complete_paired_personal_channel(
+    async def _complete_paired_personal_channel(
         self,
         cursor: EntityRefreshCursor,
         entity_type: DialogType,
@@ -968,13 +997,17 @@ class DaemonEntityInfoService:
         # The pair already captured the remote channel identity. Advancing this
         # ordered cursor is local work and must not repeat GetFullUser.
         identity = self._full_user_pair_identity(self._target_kind(entity_type))
-        committed = self._profiles.complete_same_generation_section(cursor, identity, now=now)
+        committed = await self._write_profiles(
+            lambda profiles: profiles.complete_same_generation_section(cursor, identity, now=now)
+        )
         if not committed:
-            failed = self._profiles.mark_section_failure(
-                cursor,
-                now=now,
-                reason="pair_receipt_invalid",
-                retry_at=failure_retry_at(now),
+            failed = await self._write_profiles(
+                lambda profiles: profiles.mark_section_failure(
+                    cursor,
+                    now=now,
+                    reason="pair_receipt_invalid",
+                    retry_at=failure_retry_at(now),
+                )
             )
             if not failed:
                 return DurableRefreshSliceResult(cursor.entity_id, None)
@@ -984,13 +1017,13 @@ class DaemonEntityInfoService:
             self._success_if_refresh_finished(cursor, committed=committed),
         )
 
-    def _complete_not_applicable_section(
+    async def _complete_not_applicable_section(
         self,
         cursor: EntityRefreshCursor,
         *,
         now: int,
     ) -> DurableRefreshSliceResult:
-        committed = self._commit_not_applicable_section(cursor, now=now)
+        committed = await self._commit_not_applicable_section(cursor, now=now)
         return DurableRefreshSliceResult(
             cursor.entity_id,
             self._success_if_refresh_finished(cursor, committed=committed),
@@ -1029,14 +1062,16 @@ class DaemonEntityInfoService:
         raw_type = stored.detail.get("type") if stored is not None else None
         return DialogType.parse(raw_type if isinstance(raw_type, str) else None)
 
-    def _commit_not_applicable_section(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
-        return self._profiles.commit_section(
-            cursor,
-            EntitySectionCommit(
-                self._not_applicable_section_patch(cursor.next_section),
-                status="not_applicable",
-            ),
-            now=now,
+    async def _commit_not_applicable_section(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
+        return await self._write_profiles(
+            lambda profiles: profiles.commit_section(
+                cursor,
+                EntitySectionCommit(
+                    self._not_applicable_section_patch(cursor.next_section),
+                    status="not_applicable",
+                ),
+                now=now,
+            )
         )
 
     async def _acquire_and_commit_profile_section(
@@ -1060,7 +1095,7 @@ class DaemonEntityInfoService:
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
             retry_at = throttled_retry_at(now, exc.retry_after_seconds)
-            return self._handle_profile_section_failure(
+            return await self._handle_profile_section_failure(
                 _ProfileSectionFailure(
                     cursor=cursor,
                     entity_type=entity_type,
@@ -1072,7 +1107,7 @@ class DaemonEntityInfoService:
             )
         except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
             raise_if_flood_wait_error(exc)
-            return self._handle_profile_section_failure(
+            return await self._handle_profile_section_failure(
                 _ProfileSectionFailure(
                     cursor=cursor,
                     entity_type=entity_type,
@@ -1083,17 +1118,19 @@ class DaemonEntityInfoService:
                 )
             )
         if self._profile_scope_changed_during_acquisition(context.captured_scope):
-            self._profiles.mark_section_failure(
-                cursor,
-                now=now,
-                reason="auth_scope_changed",
-                retry_at=scope_changed_retry_at(now),
+            await self._write_profiles(
+                lambda profiles: profiles.mark_section_failure(
+                    cursor,
+                    now=now,
+                    reason="auth_scope_changed",
+                    retry_at=scope_changed_retry_at(now),
+                )
             )
             return DurableRefreshTerminal.FAILURE
         if result.dialog_identity_observation is not None:
             result = dataclass_replace(result, dialog_identity_baseline_revision=identity_baseline)
         result = self._with_observation_metadata(result, context.captured_scope)
-        committed = self._commit_profile_section_result(cursor, entity_type, result, context, now=now)
+        committed = await self._commit_profile_section_result(cursor, entity_type, result, context, now=now)
         return self._success_if_refresh_finished(cursor, committed=committed)
 
     def _profile_section_context(
@@ -1109,19 +1146,23 @@ class DaemonEntityInfoService:
             eligible_pair=cursor.pair_eligible and entity_type in {DialogType.USER, DialogType.BOT},
         )
 
-    def _handle_profile_section_failure(self, failure: _ProfileSectionFailure) -> DurableRefreshTerminal | None:
-        failed = self._profiles.mark_section_failure(
-            failure.cursor,
-            now=failure.now,
-            reason=failure.reason,
-            retry_at=failure.retry_at,
+    async def _handle_profile_section_failure(self, failure: _ProfileSectionFailure) -> DurableRefreshTerminal | None:
+        failed = await self._write_profiles(
+            lambda profiles: profiles.mark_section_failure(
+                failure.cursor,
+                now=failure.now,
+                reason=failure.reason,
+                retry_at=failure.retry_at,
+            )
         )
         actual_attempts = self._rpc_attempt_count() - failure.context.attempt_start
         if failure.context.pair_section and failure.context.eligible_pair and failure.context.pair_mode == "disabled":
-            self._profiles.record_pair_attempt(
-                failure.cursor,
-                failure.cursor.next_section,
-                actual_attempts=actual_attempts,
+            await self._write_profiles(
+                lambda profiles: profiles.record_pair_attempt(
+                    failure.cursor,
+                    failure.cursor.next_section,
+                    actual_attempts=actual_attempts,
+                )
             )
         self._observe_profile_section_failure(failure.cursor, failure.entity_type, actual_attempts=actual_attempts)
         return DurableRefreshTerminal.FAILURE if failed else None
@@ -1129,7 +1170,7 @@ class DaemonEntityInfoService:
     def _profile_scope_changed_during_acquisition(self, captured_scope: TelegramAuthScope | None) -> bool:
         return self._deps.full_user_auth_scope is not None and captured_scope != self._capture_pair_scope()
 
-    def _commit_profile_section_result(
+    async def _commit_profile_section_result(
         self,
         cursor: EntityRefreshCursor,
         entity_type: DialogType,
@@ -1140,19 +1181,21 @@ class DaemonEntityInfoService:
     ) -> bool:
         actual_attempts = self._rpc_attempt_count() - context.attempt_start
         if context.pair_section and context.eligible_pair and context.pair_mode == "disabled":
-            committed, summary = self._profiles.commit_section_with_pair_measurement(
-                cursor,
-                result,
-                now=now,
-                outcome=self._section_commit_outcome(cursor.next_section, result),
-                actual_attempts=actual_attempts,
+            committed, summary = await self._write_profiles(
+                lambda profiles: profiles.commit_section_with_pair_measurement(
+                    cursor,
+                    result,
+                    now=now,
+                    outcome=self._section_commit_outcome(cursor.next_section, result),
+                    actual_attempts=actual_attempts,
+                )
             )
             if summary is not None:
                 self._emit_pair_summary(summary)
-            self._publish_profile_linked_chat_fact(cursor, entity_type, context, committed, now=now)
+            await self._publish_profile_linked_chat_fact(cursor, entity_type, context, committed, now=now)
             return committed
-        committed = self._profiles.commit_section(cursor, result, now=now)
-        self._publish_profile_linked_chat_fact(cursor, entity_type, context, committed, now=now)
+        committed = await self._write_profiles(lambda profiles: profiles.commit_section(cursor, result, now=now))
+        await self._publish_profile_linked_chat_fact(cursor, entity_type, context, committed, now=now)
         self._observe_profile_section_commit(
             cursor,
             entity_type,
@@ -1162,7 +1205,7 @@ class DaemonEntityInfoService:
         )
         return committed
 
-    def _publish_profile_linked_chat_fact(
+    async def _publish_profile_linked_chat_fact(
         self,
         cursor: EntityRefreshCursor,
         entity_type: DialogType,
@@ -1178,14 +1221,18 @@ class DaemonEntityInfoService:
             and context.linked_chat_fact_captured
             and context.linked_chat_observation_usable
         ):
-            with write_transaction(self._deps.conn):
-                published = linked_chat_fact_owner.publish(
-                    self._deps.conn,
-                    cursor.entity_id,
-                    cast(int, context.linked_chat_fact_generation),
-                    _raw_linked_chat_channel_id(context.linked_chat_id),
-                    now,
-                )
+
+            def write(conn: sqlite3.Connection) -> bool:
+                with write_transaction(conn):
+                    return linked_chat_fact_owner.publish(
+                        conn,
+                        cursor.entity_id,
+                        cast(int, context.linked_chat_fact_generation),
+                        _raw_linked_chat_channel_id(context.linked_chat_id),
+                        now,
+                    )
+
+            published = await self._deps.writer.run(write)
             self._offer_linked_chat_followups(published, context.linked_chat_id is not None)
 
     def _offer_linked_chat_followups(self, published: bool, has_link: bool) -> None:
@@ -1214,11 +1261,11 @@ class DaemonEntityInfoService:
             async with asyncio.timeout(self._deps.refresh_limits.per_rpc_seconds):
                 full_profile, personal_channel = await self._acquire_full_user_pair(cursor)
         except RpcAttemptBudgetExhaustedError:
-            self._record_full_user_pair_failure(cursor, pair_mode, attempt_start, reuse_rejection_reason)
+            await self._record_full_user_pair_failure(cursor, pair_mode, attempt_start, reuse_rejection_reason)
             raise
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
-            return self._handle_full_user_pair_failure(
+            return await self._handle_full_user_pair_failure(
                 _PairFailure(
                     cursor=cursor,
                     now=now,
@@ -1231,7 +1278,7 @@ class DaemonEntityInfoService:
             )
         except (TimeoutError, OSError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
             raise_if_flood_wait_error(exc)
-            return self._handle_full_user_pair_failure(
+            return await self._handle_full_user_pair_failure(
                 _PairFailure(
                     cursor=cursor,
                     now=now,
@@ -1243,7 +1290,7 @@ class DaemonEntityInfoService:
                 )
             )
         if self._pair_scope_mismatch(cursor, full_profile, now=now):
-            return self._handle_full_user_pair_failure(
+            return await self._handle_full_user_pair_failure(
                 _PairFailure(
                     cursor=cursor,
                     now=now,
@@ -1254,7 +1301,7 @@ class DaemonEntityInfoService:
                     reuse_rejection_reason="auth_scope_changed",
                 )
             )
-        committed = self._commit_full_user_pair_or_raise(
+        committed = await self._commit_full_user_pair_or_raise(
             _PairCommitRequest(
                 cursor=cursor,
                 full_profile=full_profile,
@@ -1266,7 +1313,7 @@ class DaemonEntityInfoService:
             )
         )
         actual_attempts = self._rpc_attempt_count() - attempt_start
-        summary = self._record_full_user_pair_commit(
+        summary = await self._record_full_user_pair_commit(
             _PairMeasurement(
                 cursor=cursor,
                 full_profile=full_profile,
@@ -1291,7 +1338,7 @@ class DaemonEntityInfoService:
             )
         return self._success_if_refresh_finished(cursor, committed=committed)
 
-    def _record_full_user_pair_failure(
+    async def _record_full_user_pair_failure(
         self,
         cursor: EntityRefreshCursor,
         pair_mode: str,
@@ -1299,7 +1346,9 @@ class DaemonEntityInfoService:
         reuse_rejection_reason: str | None,
     ) -> None:
         actual_attempts = self._rpc_attempt_count() - attempt_start
-        self._profiles.record_pair_attempt(cursor, "full_profile", actual_attempts=actual_attempts)
+        await self._write_profiles(
+            lambda profiles: profiles.record_pair_attempt(cursor, "full_profile", actual_attempts=actual_attempts)
+        )
         self._observe_profile_pair(
             mode=pair_mode,
             eligible_pair=cursor.pair_eligible,
@@ -1308,14 +1357,16 @@ class DaemonEntityInfoService:
             reuse_rejection_reason=reuse_rejection_reason,
         )
 
-    def _handle_full_user_pair_failure(self, failure: _PairFailure) -> DurableRefreshTerminal | None:
-        failed = self._profiles.mark_section_failure(
-            failure.cursor,
-            now=failure.now,
-            reason=failure.reason,
-            retry_at=failure.retry_at,
+    async def _handle_full_user_pair_failure(self, failure: _PairFailure) -> DurableRefreshTerminal | None:
+        failed = await self._write_profiles(
+            lambda profiles: profiles.mark_section_failure(
+                failure.cursor,
+                now=failure.now,
+                reason=failure.reason,
+                retry_at=failure.retry_at,
+            )
         )
-        self._record_full_user_pair_failure(
+        await self._record_full_user_pair_failure(
             failure.cursor,
             failure.pair_mode,
             failure.attempt_start,
@@ -1340,16 +1391,18 @@ class DaemonEntityInfoService:
         )
         return current_scope is None or expected_identity != expected_identity_for_scope
 
-    def _commit_full_user_pair_or_raise(self, request: _PairCommitRequest) -> bool:
+    async def _commit_full_user_pair_or_raise(self, request: _PairCommitRequest) -> bool:
         try:
-            return self._profiles.commit_full_user_pair(
-                request.cursor,
-                request.full_profile,
-                request.personal_channel,
-                now=request.now,
+            return await self._write_profiles(
+                lambda profiles: profiles.commit_full_user_pair(
+                    request.cursor,
+                    request.full_profile,
+                    request.personal_channel,
+                    now=request.now,
+                )
             )
         except Exception:
-            self._record_full_user_pair_failure(
+            await self._record_full_user_pair_failure(
                 request.cursor,
                 request.pair_mode,
                 request.attempt_start,
@@ -1357,26 +1410,31 @@ class DaemonEntityInfoService:
             )
             raise
 
-    def _record_full_user_pair_commit(self, measurement: _PairMeasurement) -> dict[str, object] | None:
+    async def _record_full_user_pair_commit(self, measurement: _PairMeasurement) -> dict[str, object] | None:
         if not measurement.committed:
             return None
         latency = pair_readiness_latency_ms(measurement.full_profile, measurement.personal_channel)
-        self._profiles.record_pair_section_outcome(
-            measurement.cursor,
-            "full_profile",
-            outcome=self._evidence_outcome(measurement.full_profile) or "unavailable",
-            actual_attempts=measurement.actual_attempts,
-            ready_at=measurement.now,
-            readiness_latency_ms=latency,
-        )
-        summary = self._profiles.record_pair_section_outcome(
-            measurement.cursor,
-            "personal_channel",
-            outcome=self._evidence_outcome(measurement.personal_channel) or "unavailable",
-            actual_attempts=0,
-            ready_at=measurement.now,
-            readiness_latency_ms=latency,
-        )
+
+        def record(profiles: EntityProfileRepository) -> dict[str, object] | None:
+            full_summary = profiles.record_pair_section_outcome(
+                measurement.cursor,
+                "full_profile",
+                outcome=self._evidence_outcome(measurement.full_profile) or "unavailable",
+                actual_attempts=measurement.actual_attempts,
+                ready_at=measurement.now,
+                readiness_latency_ms=latency,
+            )
+            personal_summary = profiles.record_pair_section_outcome(
+                measurement.cursor,
+                "personal_channel",
+                outcome=self._evidence_outcome(measurement.personal_channel) or "unavailable",
+                actual_attempts=0,
+                ready_at=measurement.now,
+                readiness_latency_ms=latency,
+            )
+            return personal_summary or full_summary
+
+        summary = await self._write_profiles(record)
         if summary is None and not self._profiles._refresh_has("pair_mode"):
             return self._historical_pair_summary(
                 measurement,
@@ -1886,43 +1944,50 @@ class DaemonEntityInfoService:
             raise
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
-            self._profiles.mark_refresh_failure(
-                cursor.entity_id,
-                now=now,
-                reason="flood_wait",
-                retry_at=throttled_retry_at(now, exc.retry_after_seconds),
+            retry_at = throttled_retry_at(now, exc.retry_after_seconds)
+            await self._write_profiles(
+                lambda profiles: profiles.mark_refresh_failure(
+                    cursor.entity_id,
+                    now=now,
+                    reason="flood_wait",
+                    retry_at=retry_at,
+                )
             )
             return self._persisted_failure(cursor.entity_id, now=now)
         if entity is None or error is not None:
             if error is not None and error.get("error") == "entity_not_found":
-                self._profiles.mark_refresh_not_found(cursor.entity_id, now=now)
+                await self._write_profiles(lambda profiles: profiles.mark_refresh_not_found(cursor.entity_id, now=now))
                 return DurableRefreshTerminal.FAILURE
             reason, retry_at = self._refresh_failure_details(error, now=now)
-            self._profiles.mark_refresh_failure(
-                cursor.entity_id,
-                now=now,
-                reason=reason,
-                retry_at=retry_at,
+            await self._write_profiles(
+                lambda profiles: profiles.mark_refresh_failure(
+                    cursor.entity_id,
+                    now=now,
+                    reason=reason,
+                    retry_at=retry_at,
+                )
             )
             return self._persisted_failure(cursor.entity_id, now=now)
         core = self._core_from_entity(entity)
         core["id"] = cursor.entity_id
-        committed = self._profiles.commit_core_acquisition(
-            cursor,
-            core,
-            next_acquisition_cursor=cursor.acquisition_cursor + 1,
-            now=now,
-            dialog_identity_observation=(
-                observe_dialog_identity(
-                    entity,
-                    dialog_id=cursor.entity_id,
-                    source="profile",
-                    observed_at=identity_started_at,
-                )
-                if self._deps.self_id != cursor.entity_id
-                else None
-            ),
-            dialog_identity_baseline_revision=identity_baseline,
+        committed = await self._write_profiles(
+            lambda profiles: profiles.commit_core_acquisition(
+                cursor,
+                core,
+                next_acquisition_cursor=cursor.acquisition_cursor + 1,
+                now=now,
+                dialog_identity_observation=(
+                    observe_dialog_identity(
+                        entity,
+                        dialog_id=cursor.entity_id,
+                        source="profile",
+                        observed_at=identity_started_at,
+                    )
+                    if self._deps.self_id != cursor.entity_id
+                    else None
+                ),
+                dialog_identity_baseline_revision=identity_baseline,
+            )
         )
         if not committed:
             return None
@@ -2061,7 +2126,7 @@ class DaemonEntityInfoService:
         if reference is None:
             return EntitySectionCommit({}, status="unavailable", reason="channel_reference_unavailable")
         is_broadcast_channel = entity_type is DialogType.CHANNEL
-        self._capture_linked_chat_fact_generation(entity_id, is_broadcast_channel, context)
+        await self._capture_linked_chat_fact_generation(entity_id, is_broadcast_channel, context)
         observation = await port.fetch_channel_profile(reference)
         unavailable = _channel_profile_unavailable_commit(reference, observation)
         if unavailable is not None:
@@ -2081,17 +2146,19 @@ class DaemonEntityInfoService:
             dialog_identity_observation=observation.dialog_identity_observation,
         )
 
-    def _capture_linked_chat_fact_generation(
+    async def _capture_linked_chat_fact_generation(
         self,
         entity_id: int,
         is_broadcast_channel: bool,
         context: _ProfileSectionContext | None,
     ) -> None:
         if is_broadcast_channel and context is not None:
-            with write_transaction(self._deps.conn):
-                context.linked_chat_fact_generation = linked_chat_fact_owner.capture_generation(
-                    self._deps.conn, entity_id
-                )
+
+            def write(conn: sqlite3.Connection) -> int:
+                with write_transaction(conn):
+                    return linked_chat_fact_owner.capture_generation(conn, entity_id)
+
+            context.linked_chat_fact_generation = await self._deps.writer.run(write)
             context.linked_chat_fact_captured = True
 
     @staticmethod
@@ -2486,7 +2553,7 @@ class DaemonEntityInfoService:
             ),
         }
 
-    def _progressive_result(
+    async def _progressive_result(
         self,
         entity_id: int,
         detail: Mapping[str, object],
@@ -2496,7 +2563,7 @@ class DaemonEntityInfoService:
         admit_refresh: bool = True,
     ) -> dict[str, object]:
         if admit_refresh:
-            self._enqueue_section_refresh(entity_id, sections)
+            await self._enqueue_section_refresh(entity_id, sections)
         result = dict(detail)
         result["id"] = entity_id
         current_photo = _current_photo_from_payload(self._profiles.read_section_payload(entity_id, "full_profile"))
@@ -2520,12 +2587,12 @@ class DaemonEntityInfoService:
         )
         return {"ok": True, "data": result}
 
-    def _enqueue_section_refresh(self, entity_id: int, sections: dict[str, dict[str, object]]) -> None:
+    async def _enqueue_section_refresh(self, entity_id: int, sections: dict[str, dict[str, object]]) -> None:
         if not self._has_refreshable_sections(sections):
             return
         assert self._refresh is not None
         enqueue_result = self._refresh.enqueue(entity_id)
-        self._record_section_admission(entity_id, sections, enqueue_result)
+        await self._record_section_admission(entity_id, sections, enqueue_result)
 
     @staticmethod
     def _has_refreshable_sections(sections: Mapping[str, Mapping[str, object]]) -> bool:
@@ -2535,14 +2602,16 @@ class DaemonEntityInfoService:
             for value in sections.values()
         )
 
-    def _record_section_admission(
+    async def _record_section_admission(
         self,
         entity_id: int,
         sections: dict[str, dict[str, object]],
         result: RefreshEnqueueResult,
     ) -> None:
         if result is RefreshEnqueueResult.REJECTED:
-            self._profiles.mark_refresh_rejected(entity_id, now=int(self._deps.now_provider()))
+            await self._write_profiles(
+                lambda profiles: profiles.mark_refresh_rejected(entity_id, now=int(self._deps.now_provider()))
+            )
             self._set_section_rejected(sections)
             return
         # A coalesced foreground request already has durable pending state
@@ -2550,7 +2619,9 @@ class DaemonEntityInfoService:
         # timestamp (and can mutate durable state while shutdown is winning
         # the local waiter race).
         if result is RefreshEnqueueResult.QUEUED:
-            self._profiles.mark_refresh_queued(entity_id, pair_mode_override=self._current_pair_mode())
+            await self._write_profiles(
+                lambda profiles: profiles.mark_refresh_queued(entity_id, pair_mode_override=self._current_pair_mode())
+            )
         self._set_section_queued(sections)
         offer_durable_demand(self._require_demand_sink(), DemandKind.ENTITY_PROFILE_REFRESH)
 
@@ -2570,11 +2641,13 @@ class DaemonEntityInfoService:
                 continue
             section.update(status="pending", reason="refresh_queued")
 
-    def _persist_refresh_admission(self, entity_id: int, result: RefreshEnqueueResult, *, now: int) -> None:
+    async def _persist_refresh_admission(self, entity_id: int, result: RefreshEnqueueResult, *, now: int) -> None:
         if result is RefreshEnqueueResult.REJECTED:
-            self._profiles.mark_refresh_rejected(entity_id, now=now)
+            await self._write_profiles(lambda profiles: profiles.mark_refresh_rejected(entity_id, now=now))
         else:
-            self._profiles.mark_pending(entity_id, now=now, pair_mode_override=self._current_pair_mode())
+            await self._write_profiles(
+                lambda profiles: profiles.mark_pending(entity_id, now=now, pair_mode_override=self._current_pair_mode())
+            )
             offer_durable_demand(self._require_demand_sink(), DemandKind.ENTITY_PROFILE_REFRESH)
 
     @staticmethod
@@ -2793,7 +2866,7 @@ class DaemonEntityInfoService:
             return await self._fetch_group_detail(entity), None
         return None, self._error("unsupported_entity_type", f"unknown entity kind: {dispatch_kind}")
 
-    def _writeback(
+    async def _writeback(
         self,
         entity_id: int,
         detail: dict[str, object],
@@ -2804,34 +2877,38 @@ class DaemonEntityInfoService:
     ) -> None:
         full_fetch_ok = detail.pop("_full_fetch_ok", True)
         try:
-            with write_transaction(self._deps.conn):
-                ensure_entity_stub(
-                    self._deps.conn,
-                    EntitySnapshot(
-                        entity_id=entity_id,
-                        entity_type=cast(str, detail.get("type", "unknown")),
-                        name=cast(str | None, detail.get("name")),
-                        username=cast(str | None, detail.get("username")),
-                        name_normalized=None,
-                        updated_at=now,
-                    ),
-                )
-                if full_fetch_ok:
-                    payload_with_schema = {
-                        "schema": _ENTITY_DETAIL_SCHEMA_VERSION,
-                        **{key: value for key, value in detail.items() if key != "linked_chat_id"},
-                    }
-                    self._deps.conn.execute(
-                        "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) VALUES (?, ?, ?)",
-                        (entity_id, json.dumps(payload_with_schema), now),
+
+            def write(conn: sqlite3.Connection) -> None:
+                with write_transaction(conn):
+                    ensure_entity_stub(
+                        conn,
+                        EntitySnapshot(
+                            entity_id=entity_id,
+                            entity_type=cast(str, detail.get("type", "unknown")),
+                            name=cast(str | None, detail.get("name")),
+                            username=cast(str | None, detail.get("username")),
+                            name_normalized=None,
+                            updated_at=now,
+                        ),
                     )
-                if dialog_identity_observation is not None:
-                    publish_dialog_identity(
-                        self._deps.conn,
-                        entity_id,
-                        dialog_identity_observation,
-                        dialog_identity_baseline_revision,
-                    )
+                    if full_fetch_ok:
+                        payload_with_schema = {
+                            "schema": _ENTITY_DETAIL_SCHEMA_VERSION,
+                            **{key: value for key, value in detail.items() if key != "linked_chat_id"},
+                        }
+                        conn.execute(
+                            "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) VALUES (?, ?, ?)",
+                            (entity_id, json.dumps(payload_with_schema), now),
+                        )
+                    if dialog_identity_observation is not None:
+                        publish_dialog_identity(
+                            conn,
+                            entity_id,
+                            dialog_identity_observation,
+                            dialog_identity_baseline_revision,
+                        )
+
+            await self._deps.writer.run(write)
         except sqlite3.OperationalError as exc:
             self._deps.logger.warning(
                 "entity_info db_writeback_failed entity_id=%r error=%s%s",
@@ -3384,17 +3461,21 @@ class DaemonEntityInfoService:
     async def _fetch_channel_detail(self, channel: object) -> dict[str, object]:
         channel_id = int(self._deps.get_peer_id(channel))
         reference = self._channel_reference_from_entity(channel)
-        fact_generation = self._capture_legacy_linked_chat_fact_generation(channel_id)
+        fact_generation = await self._capture_legacy_linked_chat_fact_generation(channel_id)
         profile = await self._fetch_channel_profile_observation(reference)
         if profile is not None and fact_generation is not _LINKED_CHAT_FACT_CAPTURE_UNAVAILABLE:
-            with write_transaction(self._deps.conn):
-                published = linked_chat_fact_owner.publish(
-                    self._deps.conn,
-                    channel_id,
-                    cast(int, fact_generation),
-                    _raw_linked_chat_channel_id(profile.linked_chat_id),
-                    int(profile.observation_completed_at),
-                )
+
+            def write(conn: sqlite3.Connection) -> bool:
+                with write_transaction(conn):
+                    return linked_chat_fact_owner.publish(
+                        conn,
+                        channel_id,
+                        cast(int, fact_generation),
+                        _raw_linked_chat_channel_id(profile.linked_chat_id),
+                        int(profile.observation_completed_at),
+                    )
+
+            published = await self._deps.writer.run(write)
             self._offer_linked_chat_followups(published, profile.linked_chat_id is not None)
         memberships = self._build_chat_membership(channel)
         contacts_subscribed, contacts_subscribed_partial, contacts_reason = await self._fetch_channel_contacts(
@@ -3429,20 +3510,24 @@ class DaemonEntityInfoService:
             "_full_fetch_ok": profile is not None,
         }
 
-    def _capture_legacy_linked_chat_fact_generation(
+    async def _capture_legacy_linked_chat_fact_generation(
         self, channel_id: int
     ) -> int | _LinkedChatFactCaptureUnavailable | None:
         try:
-            ledger_exists = cast(
-                tuple[int] | None,
-                self._deps.conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='linked_chat_fact_state'"
-                ).fetchone(),
-            )
-            if ledger_exists is None:
-                return _LINKED_CHAT_FACT_CAPTURE_UNAVAILABLE
-            with write_transaction(self._deps.conn):
-                return linked_chat_fact_owner.capture_generation(self._deps.conn, channel_id)
+
+            def write(conn: sqlite3.Connection) -> int | _LinkedChatFactCaptureUnavailable | None:
+                ledger_exists = cast(
+                    tuple[int] | None,
+                    conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='linked_chat_fact_state'"
+                    ).fetchone(),
+                )
+                if ledger_exists is None:
+                    return _LINKED_CHAT_FACT_CAPTURE_UNAVAILABLE
+                with write_transaction(conn):
+                    return linked_chat_fact_owner.capture_generation(conn, channel_id)
+
+            return await self._deps.writer.run(write)
         except sqlite3.Error as exc:
             self._deps.logger.warning(
                 "entity_info linked_chat_fact_capture_failed channel_id=%r error=%s%s",
@@ -3482,8 +3567,13 @@ class DaemonEntityInfoService:
             return None
         if observation.channel_id != channel_id:
             raise ValueError("channel profile observation target does not match")
-        with write_transaction(self._deps.conn):
-            self._profiles.persist_group_created(observation.channel_id, observation.created)
+
+        def write(conn: sqlite3.Connection) -> None:
+            profiles = EntityProfileRepository(conn, section_ttl_seconds=self._deps.detail_ttl_seconds)
+            with write_transaction(conn):
+                profiles.persist_group_created(observation.channel_id, observation.created)
+
+        await self._deps.writer.run(write)
         if observation.status is ProjectionStatus.UNAVAILABLE:
             reason = observation.reason or "channel_profile_unavailable"
             self._record_section_failure("full_profile", reason)
@@ -3632,8 +3722,13 @@ class DaemonEntityInfoService:
             observation = await self._deps.group_profile_port.fetch_group_profile(chat_id)
             if observation.group_id != chat_id:
                 raise ValueError("group profile observation target does not match")
-            with write_transaction(self._deps.conn):
-                self._profiles.persist_group_created(observation.group_id, observation.created)
+
+            def write(conn: sqlite3.Connection) -> None:
+                profiles = EntityProfileRepository(conn, section_ttl_seconds=self._deps.detail_ttl_seconds)
+                with write_transaction(conn):
+                    profiles.persist_group_created(observation.group_id, observation.created)
+
+            await self._deps.writer.run(write)
             return observation
         except TelegramRpcThrottled:
             raise

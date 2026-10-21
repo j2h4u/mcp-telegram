@@ -49,6 +49,9 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
+    def for_connection(self, conn: sqlite3.Connection) -> SQLiteFolderSnapshotRepository:
+        return SQLiteFolderSnapshotRepository(conn)
+
     def read_consecutive_failures(self) -> int:
         return _int_state(self._state("consecutive_failures")) or 0
 

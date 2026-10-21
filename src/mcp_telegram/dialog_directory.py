@@ -37,7 +37,8 @@ from .flood import TelegramRpcThrottled
 from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .models import DialogType
 from .read_state import apply_read_cursor
-from .sync_db import open_runtime_sync_db
+from .sqlite_writer import SQLiteWriter
+from .sync_db import open_sync_db_reader
 from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_demand import (
     AcquisitionKind,
@@ -245,12 +246,14 @@ class CanonicalDialogDirectory:
         db_path: Path,
         shutdown_event: asyncio.Event,
         *,
+        writer: SQLiteWriter,
         startup_detail_setter: Callable[[str], None] | None = None,
     ) -> None:
         self._client = cast(DialogDirectoryClient, client)
         self._db_path = db_path
         self._shutdown_event = shutdown_event
         self._startup_detail_setter = startup_detail_setter
+        self._writer = writer
 
     def status(self, now: float, conn: sqlite3.Connection) -> DemandStatus | None:
         """Expose the strictest current eventual freshness target (900 seconds)."""
@@ -273,21 +276,16 @@ class CanonicalDialogDirectory:
         """Run exactly one pinned or ordinary raw request, then commit its result."""
         if self._shutdown_event.is_set():
             return
-        conn = open_runtime_sync_db(self._db_path)
+        conn = open_sync_db_reader(self._db_path)
         try:
             initial_state = self._load_state(conn)
             if initial_state.cursor_error:
-                with write_transaction(conn):
-                    conn.execute(
-                        "UPDATE dialog_directory_state SET status='invalid',ordinary_status='invalid',"
-                        "reason='ordinary:invalid:corrupt_cursor',retry_at=NULL WHERE singleton=1 AND generation=?",
-                        (initial_state.generation,),
-                    )
+                await self._writer.run(lambda db: self._invalidate_cursor(db, initial_state.generation))
                 return
             if initial_state.status == "invalid":
                 return
             account_id = await self._bound_account_id(conn)
-            state = self._prepare_or_resume(conn)
+            state = await self._writer.run(self._prepare_or_resume)
             if state is None or self._shutdown_event.is_set():
                 return
             if state.pinned_main_status != "complete":
@@ -308,13 +306,18 @@ class CanonicalDialogDirectory:
         if self._startup_detail_setter is not None:
             self._startup_detail_setter(detail)
 
-    def bind_account_id(self, account_id: int) -> None:
+    @staticmethod
+    def _invalidate_cursor(conn: sqlite3.Connection, generation: int) -> None:
+        with write_transaction(conn):
+            conn.execute(
+                "UPDATE dialog_directory_state SET status='invalid',ordinary_status='invalid',"
+                "reason='ordinary:invalid:corrupt_cursor',retry_at=NULL WHERE singleton=1 AND generation=?",
+                (generation,),
+            )
+
+    async def bind_account_id(self, account_id: int) -> None:
         """Fence the directory to the authenticated account before readers start."""
-        conn = open_runtime_sync_db(self._db_path)
-        try:
-            self._bind_account(conn, account_id)
-        finally:
-            conn.close()
+        await self._writer.run(lambda db: self._bind_account(db, account_id))
 
     async def _authenticated_account_id(self) -> int:
         profile = await self._client.get_me()
@@ -324,7 +327,8 @@ class CanonicalDialogDirectory:
         """Use the durable account fence without an identity RPC on every page."""
         state = self._load_state(conn)
         if state.account_id is None:
-            self._bind_account(conn, await self._authenticated_account_id())
+            account_id = await self._authenticated_account_id()
+            await self._writer.run(lambda db: self._bind_account(db, account_id))
             state = self._load_state(conn)
         if state.account_id is None:
             raise RuntimeError("dialog directory account identity is missing")
@@ -419,16 +423,25 @@ class CanonicalDialogDirectory:
             response = await self._client(get_pinned_dialogs_request(folder_id))
         except Exception as exc:  # noqa: BLE001 - transport classes vary under Telethon
             self._propagate_policy_exception(exc)
-            self._mark_source_incomplete(
-                conn, state.generation, f"pinned_{folder_id}:{type(exc).__name__}", account_id, source_column=None
+            reason = f"pinned_{folder_id}:{type(exc).__name__}"
+            await self._writer.run(
+                lambda db: self._mark_source_incomplete(db, state.generation, reason, account_id, source_column=None)
             )
+            self._set_detail(f"canonical dialog directory: retry ({reason})")
             return
         page = normalize_pinned_dialogs_response(response)
+        detail = await self._writer.run(lambda db: self._commit_pinned_response(db, state, folder_id, account_id, page))
+        if detail is not None:
+            self._set_detail(detail)
+
+    def _commit_pinned_response(
+        self, conn: sqlite3.Connection, state: _DirectoryState, folder_id: int, account_id: int, page: RawDialogPage
+    ) -> str | None:
         if page.kind == "invalid":
             self._latch_semantic_invalid(
                 conn, state.generation, f"pinned_{folder_id}", page.reason or "invalid", account_id
             )
-            return
+            return f"canonical dialog directory: invalid pinned_{folder_id} ({page.reason or 'invalid'})"
         if page.kind == "not_modified":
             self._mark_not_modified_without_cache(
                 conn,
@@ -437,7 +450,7 @@ class CanonicalDialogDirectory:
                 account_id,
                 source_column="pinned_main_status" if folder_id == 0 else "pinned_archive_status",
             )
-            return
+            return f"canonical dialog directory: retry (pinned_{folder_id}:not_modified_without_cache)"
         if page.kind not in {"terminal", "page"}:
             raise RuntimeError(f"unexpected normalized pinned response: {page.kind}")
         with write_transaction(conn):
@@ -453,19 +466,33 @@ class CanonicalDialogDirectory:
                 f"UPDATE dialog_directory_state SET {column}='complete', retry_at=NULL WHERE singleton=1 AND account_id=? AND generation=?",
                 (account_id, state.generation),
             )
+        return None
 
     async def _acquire_ordinary(self, conn: sqlite3.Connection, state: _DirectoryState, account_id: int) -> None:
         try:
             response = await self._client(get_dialogs_request(state.cursor))
         except Exception as exc:  # noqa: BLE001 - transport classes vary under Telethon
             self._propagate_policy_exception(exc)
-            self._mark_source_incomplete(
-                conn, state.generation, f"ordinary:{type(exc).__name__}", account_id, source_column=None
+            reason = f"ordinary:{type(exc).__name__}"
+            await self._writer.run(
+                lambda db: self._mark_source_incomplete(db, state.generation, reason, account_id, source_column=None)
             )
+            self._set_detail(f"canonical dialog directory: retry ({reason})")
             return
         page = normalize_dialogs_response(response, state.cursor)
+        detail = await self._writer.run(lambda db: self._commit_ordinary_response(db, state, account_id, page))
+        if detail is not None:
+            self._set_detail(detail)
+
+    def _commit_ordinary_response(  # noqa: PLR0911 - preserves bounded page outcome branches
+        self, conn: sqlite3.Connection, state: _DirectoryState, account_id: int, page: RawDialogPage
+    ) -> str | None:
         if self._handle_ordinary_non_authoritative(conn, state, account_id, page):
-            return
+            if page.kind == "invalid":
+                return f"canonical dialog directory: invalid ordinary ({page.reason or 'invalid'})"
+            if page.kind == "not_modified":
+                return "canonical dialog directory: retry (ordinary:not_modified_without_cache)"
+            return None
         published = False
         with write_transaction(conn):
             new_ids = self._new_dialog_ids(conn, state.generation, page.facts)
@@ -485,13 +512,13 @@ class CanonicalDialogDirectory:
                             state.generation,
                         ),
                     )
-                    return
+                    return None
                 conn.execute(
                     "UPDATE dialog_directory_state SET observed_count=observed_count+?, reason=NULL, retry_at=NULL "
                     "WHERE singleton=1 AND account_id=? AND generation=?",
                     (len(page.facts), account_id, state.generation),
                 )
-                return
+                return None
             conn.execute(
                 "UPDATE dialog_directory_state SET ordinary_status='complete', observed_count=observed_count+?, reason=NULL "
                 "WHERE singleton=1 AND account_id=? AND generation=?",
@@ -499,7 +526,8 @@ class CanonicalDialogDirectory:
             )
             published = self._publish_if_complete(conn, state.generation, account_id)
         if published:
-            self._set_detail("canonical dialog directory: complete")
+            return "canonical dialog directory: complete"
+        return None
 
     def _handle_ordinary_non_authoritative(
         self, conn: sqlite3.Connection, state: _DirectoryState, account_id: int, page: RawDialogPage
@@ -546,7 +574,6 @@ class CanonicalDialogDirectory:
                 "WHERE singleton=1 AND account_id=? AND generation=?",
                 (reason, int(time.time()) + 60, account_id, generation),
             )
-        self._set_detail(f"canonical dialog directory: retry ({reason})")
 
     def _mark_not_modified_without_cache(
         self,
@@ -563,7 +590,6 @@ class CanonicalDialogDirectory:
                 "WHERE singleton=1 AND account_id=? AND generation=?",
                 (reason, int(time.time()) + 900, account_id, generation),
             )
-        self._set_detail(f"canonical dialog directory: retry ({reason})")
 
     def _latch_semantic_invalid(
         self, conn: sqlite3.Connection, generation: int, source: str, specific: str, account_id: int
@@ -590,7 +616,6 @@ class CanonicalDialogDirectory:
                 source,
                 specific,
             )
-        self._set_detail(f"canonical dialog directory: invalid {source} ({specific})")
 
     def _stage_facts(
         self,

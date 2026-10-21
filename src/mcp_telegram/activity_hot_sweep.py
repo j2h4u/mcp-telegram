@@ -16,7 +16,7 @@ import sqlite3
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, cast
 
 from .activity_peer_sweep import (
@@ -29,6 +29,7 @@ from .activity_peer_sweep import (
 )
 from .activity_substrate import ActivityClient
 from .hydration_queue import HydrationPriority
+from .sqlite_writer import SQLiteWriter
 from .sync_transactions import write_transaction
 from .telegram_demand import (
     AcquisitionKind,
@@ -187,6 +188,7 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
     shutdown_event: asyncio.Event
     policy: HotSweepPolicy
     timeout_s: float
+    writer: SQLiteWriter = field(kw_only=True)
     demand_kind = DemandKind.HOT_ACTIVITY_PAGE
 
     def status(self, now: float) -> DemandStatus | None:
@@ -226,32 +228,35 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
                                 min_id=state.committed_cursor,
                                 limit=_BACKFILL_BATCH_LIMIT,
                                 timeout_s=self.timeout_s,
+                                writer=self.writer,
                                 hydration_priority=HydrationPriority.FOREGROUND,
                             )
                         except RpcAttemptBudgetExhaustedError:
                             return None
 
-    def _persist_hot_page_result(self, state: _HotWindowState, result: SweepResult) -> None:
+    def _persist_hot_page_result(
+        self, conn: sqlite3.Connection, state: _HotWindowState, result: SweepResult, stopped: bool
+    ) -> None:
         """Persist the page outcome while keeping an incomplete window resumable."""
         max_seen = max(state.window_max_id, result.max_id or 0)
         had_new = state.had_new or result.genuinely_new > 0
         if result.flood_wait_seconds is not None:
             _save_hot_flood_state(
-                self.conn,
+                conn,
                 state.dialog_id,
                 next_retry_at=int(time.time()) + result.flood_wait_seconds,
             )
             return
         if result.skip_reason is SkipReason.ACCESS_SKIP:
             _save_hot_access_skip_state(
-                self.conn,
+                conn,
                 state.dialog_id,
                 retry_at=int(time.time()) + _ACCESS_SKIP_RETRY_S,
             )
             return
-        if _is_hot_page_drained(result) and not self.shutdown_event.is_set():
+        if _is_hot_page_drained(result) and not stopped:
             _save_hot_completed_state(
-                self.conn,
+                conn,
                 state.dialog_id,
                 hot_cursor=max_seen,
                 completion_at=int(time.time()),
@@ -260,10 +265,10 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
             )
             return
         if result.min_id is None:
-            _save_hot_min_id_gap_state(self.conn, state.dialog_id, now=int(time.time()))
+            _save_hot_min_id_gap_state(conn, state.dialog_id, now=int(time.time()))
             return
         _save_hot_window_progress(
-            self.conn,
+            conn,
             state.dialog_id,
             page_offset_id=result.min_id,
             window_max_id=max_seen,
@@ -284,6 +289,7 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
                     source=TelegramRpcSource.ACTIVITY_HOT_SWEEP,
                     cadence_s=self.policy.loop_interval_seconds,
                     timeout_s=self.timeout_s,
+                    writer=self.writer,
                 )
                 if enrollment.consumed:
                     # A due candidate, including a channel with no linked
@@ -292,13 +298,14 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
                     # terminal scan marker also occupies this slice.
                     return
 
-                state = _select_due_hot_window(self.conn, now=int(time.time()))
+                state = await self.writer.run(lambda db: _select_due_hot_window(db, now=int(time.time())))
                 if state is None or self.shutdown_event.is_set():
                     return
                 result = await self._fetch_hot_page(state, budget)
                 if result is None:
                     return
-                self._persist_hot_page_result(state, result)
+                stopped = self.shutdown_event.is_set()
+                await self.writer.run(lambda db: self._persist_hot_page_result(db, state, result, stopped))
 
 
 def _is_hot_page_drained(result: SweepResult) -> bool:

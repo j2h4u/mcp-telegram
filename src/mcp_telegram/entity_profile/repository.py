@@ -969,7 +969,6 @@ class EntityProfileRepository:
     def next_due_refresh(self, *, now: int) -> EntityRefreshCursor | None:
         """Read the oldest due entity cursor without claiming or changing it."""
         try:
-            self._recover_pair_measurements(now=now)
             columns = self._columns("entity_profile_refresh_state")
             selected = ["entity_id", "next_section", "acquisition_cursor", "retry_at"]
             selected.extend(
@@ -1007,7 +1006,7 @@ class EntityProfileRepository:
             pair_mode=(str(values["pair_mode"]) if values.get("pair_mode") in {"enabled", "disabled"} else None),
         )
 
-    def _recover_pair_measurements(self, *, now: int) -> None:
+    def recover_pair_measurements(self, *, now: int) -> None:
         """Complete measurement rows left behind by a committed pair receipt."""
         required = {
             "pair_full_profile_outcome",

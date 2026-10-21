@@ -13,7 +13,7 @@ Architecture:
 - Standalone module so daemon.py stays focused on process lifecycle.
 - EventHandlerManager is instantiated once per daemon run, registered BEFORE
   FullSyncWorker starts so no real-time events are missed during full sync.
-- All DB writes are synchronous sqlite3 (single-row ops, microsecond-fast).
+- Complete SQLite write units run through the shared dedicated writer thread.
 - In-memory _synced_dialog_ids set refreshed via refresh_synced_dialogs() from
   the daemon heartbeat loop.
 """
@@ -125,7 +125,7 @@ from .realtime_history_policy import (
     allows_new_message,
     realtime_history_coverage,
 )
-from .runtime_observations import record_runtime_observation
+from .runtime_observations import RuntimeObservationSink
 from .scheduled_messages import (
     mark_scheduled_messages_removed,
     scheduled_dialog_id,
@@ -133,6 +133,7 @@ from .scheduled_messages import (
     upsert_scheduled_message,
     verify_scheduled_publication,
 )
+from .sqlite_writer import SQLiteWriter
 from .sync_transactions import require_write_transaction, write_savepoint, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import (
@@ -309,15 +310,6 @@ class _OutboxReadEvent(Protocol):
     max_id: int | None
 
 
-def _record_runtime_observation_best_effort(conn: sqlite3.Connection, **event: object) -> None:
-    """Record diagnostics without changing event-handler outcomes."""
-    try:
-        with write_transaction(conn):
-            record_runtime_observation(conn, **event)  # type: ignore[arg-type]
-    except Exception:
-        logger.exception("runtime_event_record_failed kind=%s", event.get("kind"))
-
-
 def _inbox_read_update_identity(update: object) -> tuple[int, str] | None:
     if isinstance(update, UpdateReadHistoryInbox):
         return int(get_peer_id(update.peer)), "UpdateReadHistoryInbox"
@@ -346,7 +338,7 @@ def _apply_observed_inbox_read(  # noqa: PLR0913
     still_unread: int | None,
     operation_id: str,
     partial_reason: str | None,
-) -> tuple[int, int]:
+) -> tuple[tuple[int, int], dict[str, object]]:
     with write_transaction(conn):
         before_cursor, before_unread = _read_state(conn, dialog_id)
         rowcounts = _apply_inbox_read_fact(
@@ -358,21 +350,19 @@ def _apply_observed_inbox_read(  # noqa: PLR0913
         )
         after_cursor, after_unread = _read_state(conn, dialog_id)
     changed = before_cursor != after_cursor or before_unread != after_unread
-    _record_runtime_observation_best_effort(
-        conn,
-        kind="sync.inbox_read_finished",
-        dialog_id=dialog_id,
-        operation_id=operation_id,
-        outcome="partial" if partial_reason else ("applied" if changed else "unchanged"),
-        reason_code=partial_reason,
-        payload={
+    return rowcounts, {
+        "kind": "sync.inbox_read_finished",
+        "dialog_id": dialog_id,
+        "operation_id": operation_id,
+        "outcome": "partial" if partial_reason else ("applied" if changed else "unchanged"),
+        "reason_code": partial_reason,
+        "payload": {
             "cursor_before": before_cursor,
             "cursor_after": after_cursor,
             "unread_before": before_unread,
             "unread_after": after_unread,
         },
-    )
-    return rowcounts
+    }
 
 
 class _RawReactionUpdate(Protocol):
@@ -653,17 +643,30 @@ class EventHandlerManager:
         conn: sqlite3.Connection,
         shutdown_event: asyncio.Event,
         update_barrier: UpdateProcessingBarrier | None = None,
+        *,
+        writer: SQLiteWriter,
     ) -> None:
         self._client = client
         self._conn = conn
+        self._writer = writer
         self._shutdown_event = shutdown_event
         self._update_barrier = update_barrier
         self._shutdown_event.is_set()
         self._synced_dialog_ids: set[int] = set()
         self._realtime_history_status: _RealtimeHistoryStatusReader = _SQLiteRealtimeHistoryStatusReader(conn)
-        self._topic_metadata = SQLiteTopicMetadataRepository(conn)
         self._self_id: int | None = None
         self._demand_sink: DemandOfferSink | None = None
+        self._observation_sink: RuntimeObservationSink | None = None
+
+    def bind_observation_sink(self, sink: RuntimeObservationSink) -> None:
+        self._observation_sink = sink
+
+    def _record_observation(self, **event: object) -> None:
+        try:
+            if self._observation_sink is not None:
+                self._observation_sink.record(**event)  # type: ignore[arg-type]
+        except Exception:
+            logger.exception("runtime_event_record_failed kind=%s", event.get("kind"))
 
     def bind_demand_sink(self, sink: DemandOfferSink) -> None:
         """Attach post-commit durable wakeups after daemon composition."""
@@ -855,8 +858,9 @@ class EventHandlerManager:
             ),
         )
 
-    def _persist_dm_enrollment(
+    def _persist_dm_enrollment(  # noqa: PLR0913 - explicit worker connection
         self,
+        conn: sqlite3.Connection,
         dialog_id: int,
         identity: _DmIdentity | None,
         *,
@@ -864,19 +868,19 @@ class EventHandlerManager:
         observed_at: int,
         identity_baseline: _IdentityBaseline | None = None,
     ) -> EnrollmentOutcome:
-        with write_transaction(self._conn):
+        with write_transaction(conn):
             baseline_revision = (
                 identity_baseline.revision
                 if identity_baseline is not None
-                else capture_identity_baseline(self._conn, dialog_id)
+                else capture_identity_baseline(conn, dialog_id)
             )
-            outcome = ensure_automatic_dm_enrollment(self._conn, dialog_id, now=observed_at)
+            outcome = ensure_automatic_dm_enrollment(conn, dialog_id, now=observed_at)
             if not outcome.enabled:
                 return outcome
             row_existed_before_presence = (
-                self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
+                conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
             )
-            self._conn.execute(
+            conn.execute(
                 _UPSERT_REALTIME_DM_DIALOG_SQL,
                 (
                     dialog_id,
@@ -886,17 +890,19 @@ class EventHandlerManager:
             )
             if identity is not None:
                 self._publish_dm_identity(
+                    conn,
                     identity,
                     dialog_id,
                     baseline_revision,
                     observed_at,
                     row_existed_before_presence=row_existed_before_presence,
                 )
-            unhide_after_realtime_presence(self._conn, dialog_id)
+            unhide_after_realtime_presence(conn, dialog_id)
             return outcome
 
-    def _publish_dm_identity(
+    def _publish_dm_identity(  # noqa: PLR0913 - explicit worker connection
         self,
+        conn: sqlite3.Connection,
         identity: _DmIdentity,
         dialog_id: int,
         baseline_revision: int | None,
@@ -904,7 +910,7 @@ class EventHandlerManager:
         *,
         row_existed_before_presence: bool,
     ) -> None:
-        require_write_transaction(self._conn)
+        require_write_transaction(conn)
         observation = identity.dialog_identity_observation
         if observation is None:
             return
@@ -914,17 +920,19 @@ class EventHandlerManager:
         if expected_revision is None:
             return
         publish_dialog_identity(
-            self._conn,
+            conn,
             dialog_id,
             observation,
             expected_revision,
         )
 
-    def _persist_dm_entity(self, dialog_id: int, identity: _DmIdentity, observed_at: int) -> None:
+    def _persist_dm_entity(
+        self, conn: sqlite3.Connection, dialog_id: int, identity: _DmIdentity, observed_at: int
+    ) -> None:
         try:
-            with write_transaction(self._conn):
+            with write_transaction(conn):
                 apply_partial_entity_identity(
-                    self._conn,
+                    conn,
                     dialog_id,
                     PartialEntityIdentity(
                         observed_at=observed_at,
@@ -940,7 +948,7 @@ class EventHandlerManager:
             # has committed; the next refresh can fill a failed cache write.
             logger.exception("dm_auto_enroll_entity_failed dialog_id=%d", dialog_id)
 
-    def _auto_enroll_dm(
+    async def _auto_enroll_dm(
         self,
         dialog_id: int,
         sender: _SenderLike | None = None,
@@ -966,15 +974,18 @@ class EventHandlerManager:
         identity = self._dm_identity(sender, dialog_id=dialog_id, observed_at=now)
 
         try:
-            outcome = self._persist_dm_enrollment(
-                dialog_id,
-                identity,
-                message_timestamp=message_timestamp,
-                observed_at=now,
-                identity_baseline=identity_baseline,
+            outcome = await self._writer.run(
+                lambda conn: self._persist_dm_enrollment(
+                    conn,
+                    dialog_id,
+                    identity,
+                    message_timestamp=message_timestamp,
+                    observed_at=now,
+                    identity_baseline=identity_baseline,
+                )
             )
             if outcome.enabled and identity is not None:
-                self._persist_dm_entity(dialog_id, identity, now)
+                await self._writer.run(lambda conn: self._persist_dm_entity(conn, dialog_id, identity, now))
             if outcome.enabled and outcome.action in {"queue_full_history", "preserved_enabled_intent"}:
                 self._offer(DemandKind.FULL_SYNC_PAGE)
                 # status='syncing' is stable once inserted — FullSyncWorker only
@@ -1038,14 +1049,19 @@ class EventHandlerManager:
             return
         try:
             reaction_observed_at = int(time.time())
-            observation_order = allocate_observation_order(self._conn)
             msg = event.message
-            identity_baseline = _IdentityBaseline(capture_identity_baseline(self._conn, dialog_id))
+
+            def reserve_observation(conn: sqlite3.Connection) -> tuple[int, _IdentityBaseline]:
+                return allocate_observation_order(conn), _IdentityBaseline(capture_identity_baseline(conn, dialog_id))
+
+            observation_order, identity_baseline = await self._writer.run(reserve_observation)
             coverage = await self._new_message_coverage(dialog_id, event, identity_baseline=identity_baseline)
             if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
                 return
             if not allows_new_message(coverage, outgoing=bool(getattr(msg, "out", False))):
-                self._project_denied_new_message_metadata(dialog_id, msg, coverage, observation_order=observation_order)
+                await self._project_denied_new_message_metadata(
+                    dialog_id, msg, coverage, observation_order=observation_order
+                )
                 return
             entity_name_map = await _build_fwd_entity_map(msg, cast(_PeerNameClient, self._client))
             extracted = replace(
@@ -1056,32 +1072,40 @@ class EventHandlerManager:
             # while Telegram was queried, so gate the mutation again.
             coverage = self._realtime_coverage(dialog_id)
             if not allows_new_message(coverage, outgoing=bool(getattr(msg, "out", False))):
-                self._project_denied_new_message_metadata(dialog_id, msg, coverage, observation_order=observation_order)
+                await self._project_denied_new_message_metadata(
+                    dialog_id, msg, coverage, observation_order=observation_order
+                )
                 return
             now = int(time.time())
 
-            with write_transaction(self._conn):
-                if not allows_new_message(
-                    self._realtime_coverage(dialog_id), outgoing=bool(getattr(msg, "out", False))
-                ):
-                    return
-                insert_messages_with_fts(
-                    self._conn,
-                    [extracted],
-                    priority=HydrationPriority.FOREGROUND,
-                    reaction_source=ReactionAggregateSource.REALTIME_MESSAGE,
-                    reaction_observed_at=reaction_observed_at,
-                )
-                # A normal message carrying from_scheduled is the verification
-                # point for the untrusted sent_messages hint retained by the
-                # scheduled-queue delete update.
-                self._verify_scheduled_publication_if_needed(self._conn, dialog_id, msg, now=now)
-                # Phase 42 EVENTS-04: advance dialogs.last_message_at monotonically.
-                # MAX(COALESCE(..., 0), new_ts) ensures no regression on out-of-order
-                # events. UPDATE matches 0 rows when the dialog is not yet bootstrapped
-                # (no dialogs row) — silent no-op; bootstrap is the sole row creator.
-                self._project_new_message_metadata(dialog_id, msg, now, observation_order=observation_order)
-                self._record_body_event(dialog_id, now)
+            def _persist_event_0(conn: sqlite3.Connection) -> bool:
+                with write_transaction(conn):
+                    if not allows_new_message(
+                        realtime_history_coverage(*_SQLiteRealtimeHistoryStatusReader(conn).read_status(dialog_id)),
+                        outgoing=bool(getattr(msg, "out", False)),
+                    ):
+                        return False
+                    insert_messages_with_fts(
+                        conn,
+                        [extracted],
+                        priority=HydrationPriority.FOREGROUND,
+                        reaction_source=ReactionAggregateSource.REALTIME_MESSAGE,
+                        reaction_observed_at=reaction_observed_at,
+                    )
+                    # A normal message carrying from_scheduled is the verification
+                    # point for the untrusted sent_messages hint retained by the
+                    # scheduled-queue delete update.
+                    self._verify_scheduled_publication_if_needed(conn, dialog_id, msg, now=now)
+                    # Phase 42 EVENTS-04: advance dialogs.last_message_at monotonically.
+                    # MAX(COALESCE(..., 0), new_ts) ensures no regression on out-of-order
+                    # events. UPDATE matches 0 rows when the dialog is not yet bootstrapped
+                    # (no dialogs row) — silent no-op; bootstrap is the sole row creator.
+                    self._project_new_message_metadata(conn, dialog_id, msg, now, observation_order=observation_order)
+                    self._record_body_event(conn, dialog_id, now)
+                return True
+
+            if not await self._writer.run(_persist_event_0):
+                return
 
             self._offer_message_ingestion()
             if bool(getattr(msg, "from_scheduled", False)):
@@ -1107,7 +1131,9 @@ class EventHandlerManager:
         coverage = self._realtime_coverage(dialog_id)
         if coverage is not RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
             return coverage
-        self._verify_scheduled_publication_if_needed(self._conn, dialog_id, event.message)
+        await self._writer.run(
+            lambda conn: self._verify_scheduled_publication_if_needed(conn, dialog_id, event.message)
+        )
         if bool(getattr(event.message, "from_scheduled", False)):
             self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
         status, _ = self._realtime_history_status.read_status(dialog_id)
@@ -1123,7 +1149,7 @@ class EventHandlerManager:
                     peer = await cast(Callable[[], Awaitable[_SenderLike | None]], lookup)()
             except _DM_AUTO_ENROLL_SENDER_EXCEPTIONS:
                 logger.debug("dm_auto_enroll_peer_fetch_failed dialog_id=%d", dialog_id)
-            self._auto_enroll_dm(
+            await self._auto_enroll_dm(
                 dialog_id,
                 sender=peer,
                 message_date=event.message.date,
@@ -1133,7 +1159,7 @@ class EventHandlerManager:
             coverage = self._realtime_coverage(dialog_id)
         return coverage
 
-    def _project_denied_new_message_metadata(
+    async def _project_denied_new_message_metadata(
         self,
         dialog_id: int,
         msg: _MessageLike,
@@ -1144,27 +1170,39 @@ class EventHandlerManager:
         if not self._metadata_realtime_allowed(coverage):
             return
         now = int(time.time())
-        with write_transaction(self._conn):
-            self._project_new_message_metadata(dialog_id, msg, now, observation_order=observation_order)
 
-    def _update_last_message_timestamp(self, dialog_id: int, now: int, msg_date: datetime | None) -> None:
-        require_write_transaction(self._conn)
+        def _persist_event_0(conn: sqlite3.Connection) -> None:
+            with write_transaction(conn):
+                self._project_new_message_metadata(conn, dialog_id, msg, now, observation_order=observation_order)
+
+        await self._writer.run(_persist_event_0)
+
+    def _update_last_message_timestamp(
+        self, conn: sqlite3.Connection, dialog_id: int, now: int, msg_date: datetime | None
+    ) -> None:
+        require_write_transaction(conn)
         if msg_date is not None:
-            self._conn.execute(
+            conn.execute(
                 _UPDATE_DIALOG_LAST_MESSAGE_AT_SQL,
                 (int(msg_date.timestamp()), now, dialog_id),
             )
 
-    def _record_body_event(self, dialog_id: int, now: int) -> None:
-        require_write_transaction(self._conn)
-        self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+    def _record_body_event(self, conn: sqlite3.Connection, dialog_id: int, now: int) -> None:
+        require_write_transaction(conn)
+        conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 
     def _project_new_message_metadata(
-        self, dialog_id: int, msg: _MessageLike, now: int, *, observation_order: int | None = None
+        self,
+        conn: sqlite3.Connection,
+        dialog_id: int,
+        msg: _MessageLike,
+        now: int,
+        *,
+        observation_order: int | None = None,
     ) -> None:
         """Project dialog/topic metadata independently of message-body scope."""
-        self._update_last_message_timestamp(dialog_id, now, msg.date)
-        self._handle_topic_message_action(dialog_id, msg, now, observation_order=observation_order)
+        self._update_last_message_timestamp(conn, dialog_id, now, msg.date)
+        self._handle_topic_message_action(conn, dialog_id, msg, now, observation_order=observation_order)
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_topic_message(self, update: object) -> None:
@@ -1185,34 +1223,42 @@ class EventHandlerManager:
             if not self._metadata_realtime_allowed(self._realtime_coverage(dialog_id)):
                 return
             now = int(time.time())
-            with write_transaction(self._conn):
-                observation_order = allocate_observation_order(self._conn)
-                if not self._metadata_realtime_allowed(self._realtime_coverage(dialog_id)):
-                    return
-                self._handle_topic_message_action(
-                    dialog_id, cast(_MessageLike, msg), now, observation_order=observation_order
-                )
+
+            def _persist_event_0(conn: sqlite3.Connection) -> None:
+                with write_transaction(conn):
+                    observation_order = allocate_observation_order(conn)
+                    if not self._metadata_realtime_allowed(
+                        realtime_history_coverage(*_SQLiteRealtimeHistoryStatusReader(conn).read_status(dialog_id))
+                    ):
+                        return
+                    self._handle_topic_message_action(
+                        conn, dialog_id, cast(_MessageLike, msg), now, observation_order=observation_order
+                    )
+
+            await self._writer.run(_persist_event_0)
         except Exception:
             logger.exception("event_raw_topic_message_failed update=%r", type(update).__name__)
 
     def _handle_topic_message_action(
         self,
+        conn: sqlite3.Connection,
         dialog_id: int,
         msg: _MessageLike,
         now: int,
         *,
         observation_order: int | None = None,
     ) -> None:
-        require_write_transaction(self._conn)
+        require_write_transaction(conn)
         action = cast(object | None, getattr(msg, "action", None))
         if isinstance(action, MessageActionTopicCreate):
-            self._handle_topic_create_action(dialog_id, msg, now, action, observation_order=observation_order)
+            self._handle_topic_create_action(conn, dialog_id, msg, now, action, observation_order=observation_order)
             return
         if isinstance(action, MessageActionTopicEdit):
-            self._handle_topic_edit_action(dialog_id, msg, now, action, observation_order=observation_order)
+            self._handle_topic_edit_action(conn, dialog_id, msg, now, action, observation_order=observation_order)
 
-    def _handle_topic_create_action(
+    def _handle_topic_create_action(  # noqa: PLR0913 - explicit worker connection
         self,
+        conn: sqlite3.Connection,
         dialog_id: int,
         msg: _MessageLike,
         now: int,
@@ -1225,7 +1271,7 @@ class EventHandlerManager:
             return
         msg_date = msg.date
         topic_timestamp = int(msg_date.timestamp()) if msg_date is not None else now
-        self._topic_metadata.apply_topic_create(
+        SQLiteTopicMetadataRepository(conn).apply_topic_create(
             dialog_id,
             topic_id,
             title=action.title or "Topic",
@@ -1240,8 +1286,9 @@ class EventHandlerManager:
             topic_id,
         )
 
-    def _handle_topic_edit_action(
+    def _handle_topic_edit_action(  # noqa: PLR0913 - explicit worker connection
         self,
+        conn: sqlite3.Connection,
         dialog_id: int,
         msg: _MessageLike,
         now: int,
@@ -1270,7 +1317,7 @@ class EventHandlerManager:
             return
 
         topic_id = int(cast(int, topic_id_raw))
-        self._topic_metadata.apply_topic_edit(
+        SQLiteTopicMetadataRepository(conn).apply_topic_edit(
             dialog_id,
             topic_id,
             title=action.title,
@@ -1305,7 +1352,7 @@ class EventHandlerManager:
             return
 
         try:
-            observation_order = allocate_observation_order(self._conn)
+            observation_order = await self._writer.run(allocate_observation_order)
             msg = event.message
             message_id = int(msg.id)
             now = int(time.time())
@@ -1313,11 +1360,12 @@ class EventHandlerManager:
             if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
                 return
 
-            # Resolve async data BEFORE opening transaction — SQLite's synchronous
-            # driver cannot safely suspend inside a `with write_transaction(self._conn):` block while
-            # another coroutine may call into the same connection.
-            existing = read_message_text(self._conn, dialog_id, message_id)
-            existing_out = read_message_out(self._conn, dialog_id, message_id)
+            existing, existing_out = await self._writer.run(
+                lambda conn: (
+                    read_message_text(conn, dialog_id, message_id),
+                    read_message_out(conn, dialog_id, message_id),
+                )
+            )
 
             if not existing.found:
                 if await self._insert_missing_edited_message(dialog_id, msg, coverage, now, observation_order):
@@ -1370,19 +1418,27 @@ class EventHandlerManager:
         coverage = self._realtime_coverage(dialog_id)
         if not allows_missing_body_insert(coverage, RealtimeBodyEvent.EDIT, outgoing=outgoing):
             return False
-        with write_transaction(self._conn):
-            if not allows_missing_body_insert(
-                self._realtime_coverage(dialog_id), RealtimeBodyEvent.EDIT, outgoing=outgoing
-            ):
-                return False
-            insert_messages_with_fts(
-                self._conn,
-                [extracted],
-                priority=HydrationPriority.FOREGROUND,
-                reaction_source=ReactionAggregateSource.MESSAGE_EDIT,
-                reaction_observed_at=now,
-            )
-            self._record_body_event(dialog_id, now)
+
+        def _persist_event_0(conn: sqlite3.Connection) -> bool:
+            with write_transaction(conn):
+                if not allows_missing_body_insert(
+                    realtime_history_coverage(*_SQLiteRealtimeHistoryStatusReader(conn).read_status(dialog_id)),
+                    RealtimeBodyEvent.EDIT,
+                    outgoing=outgoing,
+                ):
+                    return False
+                insert_messages_with_fts(
+                    conn,
+                    [extracted],
+                    priority=HydrationPriority.FOREGROUND,
+                    reaction_source=ReactionAggregateSource.MESSAGE_EDIT,
+                    reaction_observed_at=now,
+                )
+                self._record_body_event(conn, dialog_id, now)
+            return True
+
+        if not await self._writer.run(_persist_event_0):
+            return False
         self._offer_message_ingestion()
         return True
 
@@ -1410,21 +1466,31 @@ class EventHandlerManager:
             # The incoming edit object may omit Telethon's ``out`` flag;
             # preserve the canonical outgoing classification of the row.
             extracted = replace(extracted, message=replace(extracted.message, out=1))
-        with write_transaction(self._conn):
-            outgoing = read_message_out(self._conn, dialog_id, int(msg.id)).outgoing
-            if not allows_existing_body_update(
-                self._realtime_coverage(dialog_id), RealtimeBodyEvent.EDIT, outgoing=outgoing
-            ):
-                return None
-            next_ver = persist_edited_message(
-                self._conn,
-                extracted,
-                old_text=old_text,
-                edit_date=edit_date_unix,
-                priority=HydrationPriority.FOREGROUND,
-            )
-            if old_text != extracted.message.text or msg.edit_date is not None or msg.reactions is not None:
-                self._record_body_event(dialog_id, now)
+
+        def _persist_event_0(conn: sqlite3.Connection) -> int | None:
+            with write_transaction(conn):
+                outgoing = read_message_out(conn, dialog_id, int(msg.id)).outgoing
+                current_text = read_message_text(conn, dialog_id, int(msg.id)).text
+                if not allows_existing_body_update(
+                    realtime_history_coverage(*_SQLiteRealtimeHistoryStatusReader(conn).read_status(dialog_id)),
+                    RealtimeBodyEvent.EDIT,
+                    outgoing=outgoing,
+                ):
+                    return None
+                next_ver = persist_edited_message(
+                    conn,
+                    extracted,
+                    old_text=current_text,
+                    edit_date=edit_date_unix,
+                    priority=HydrationPriority.FOREGROUND,
+                )
+                if current_text != extracted.message.text or msg.edit_date is not None or msg.reactions is not None:
+                    self._record_body_event(conn, dialog_id, now)
+            return next_ver
+
+        next_ver = await self._writer.run(_persist_event_0)
+        if next_ver is None:
+            return None
         self._offer_message_ingestion()
         if msg.reactions is not None and old_text == extracted.message.text:
             logger.debug(
@@ -1448,48 +1514,52 @@ class EventHandlerManager:
 
         if dialog_id is None:
             try:
-                self._handle_peerless_deletions(event.deleted_ids)
+                await self._writer.run(lambda conn: self._handle_peerless_deletions(conn, event.deleted_ids))
             except Exception:
                 logger.exception("event_delete_failed dialog_id=%s", dialog_id)
             return
 
         try:
             now = int(time.time())
-            with write_transaction(self._conn):
-                allowed_ids = record_message_deletions(self._conn, dialog_id, event.deleted_ids)
-                coverage = self._realtime_coverage(dialog_id)
-                if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
-                    return
-                if coverage is RealtimeHistoryCoverage.OWN_OUTGOING:
-                    allowed_ids = tuple(
-                        msg_id
-                        for msg_id in allowed_ids
-                        if read_message_out(self._conn, dialog_id, int(msg_id)).outgoing
-                    )
-                if not allowed_ids:
-                    return
 
-                for msg_id in allowed_ids:
-                    mark_message_deleted(self._conn, dialog_id, msg_id, now)
-                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+            def _persist_event_0(conn: sqlite3.Connection) -> None:
+                with write_transaction(conn):
+                    allowed_ids = record_message_deletions(conn, dialog_id, event.deleted_ids)
+                    coverage = realtime_history_coverage(
+                        *_SQLiteRealtimeHistoryStatusReader(conn).read_status(dialog_id)
+                    )
+                    if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
+                        return
+                    if coverage is RealtimeHistoryCoverage.OWN_OUTGOING:
+                        allowed_ids = tuple(
+                            msg_id for msg_id in allowed_ids if read_message_out(conn, dialog_id, int(msg_id)).outgoing
+                        )
+                    if not allowed_ids:
+                        return
+
+                    for msg_id in allowed_ids:
+                        mark_message_deleted(conn, dialog_id, msg_id, now)
+                    conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+
+            await self._writer.run(_persist_event_0)
 
             logger.info("event_delete dialog_id=%d count=%d", dialog_id, len(event.deleted_ids))
         except Exception:
             logger.exception("event_delete_failed dialog_id=%s", dialog_id)
 
-    def _handle_peerless_deletions(self, deleted_ids: Sequence[int]) -> None:
+    def _handle_peerless_deletions(self, conn: sqlite3.Connection, deleted_ids: Sequence[int]) -> None:
         now = int(time.time())
         resolved: list[tuple[int, int]] = []
-        with write_transaction(self._conn):
-            accepted_ids = record_nonchannel_deletions(self._conn, deleted_ids, now)
-            candidate_dialogs = find_unique_nonchannel_message_dialogs(self._conn, accepted_ids)
+        with write_transaction(conn):
+            accepted_ids = record_nonchannel_deletions(conn, deleted_ids, now)
+            candidate_dialogs = find_unique_nonchannel_message_dialogs(conn, accepted_ids)
             for raw_message_id in accepted_ids:
                 message_id = int(raw_message_id)
                 dialog_id = candidate_dialogs.get(message_id)
-                if dialog_id is not None and mark_message_deleted(self._conn, dialog_id, message_id, now):
+                if dialog_id is not None and mark_message_deleted(conn, dialog_id, message_id, now):
                     resolved.append((dialog_id, message_id))
             for dialog_id in {item[0] for item in resolved}:
-                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+                conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
         logger.info(
             "event_delete_peerless resolved=%d unresolved=%d",
             len(resolved),
@@ -1507,8 +1577,12 @@ class EventHandlerManager:
             logger.warning("scheduled_new_missing_peer message_id=%s", cast(object, getattr(message, "id", None)))
             return
         try:
-            with write_transaction(self._conn):
-                upsert_scheduled_message(self._conn, dialog_id, message)
+
+            def _persist_event_0(conn: sqlite3.Connection) -> None:
+                with write_transaction(conn):
+                    upsert_scheduled_message(conn, dialog_id, message)
+
+            await self._writer.run(_persist_event_0)
             self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
             message_id_attr = "id"
             logger.info(
@@ -1528,8 +1602,12 @@ class EventHandlerManager:
             return
         sent_message_ids = cast(Sequence[int] | None, getattr(update, "sent_messages", None))
         try:
-            with write_transaction(self._conn):
-                mark_scheduled_messages_removed(self._conn, dialog_id, message_ids, sent_message_ids)
+
+            def _persist_event_0(conn: sqlite3.Connection) -> None:
+                with write_transaction(conn):
+                    mark_scheduled_messages_removed(conn, dialog_id, message_ids, sent_message_ids)
+
+            await self._writer.run(_persist_event_0)
             self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
             logger.info("scheduled_removed dialog_id=%d count=%d", dialog_id, len(message_ids))
         except Exception:
@@ -1598,9 +1676,14 @@ class EventHandlerManager:
 
         try:
             now = int(time.time())
-            with write_transaction(self._conn):
-                rowcount = apply_read_cursor(self._conn, dialog_id, "outbox", max_id)
-                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+
+            def _persist_event_0(conn: sqlite3.Connection) -> int:
+                with write_transaction(conn):
+                    rowcount = apply_read_cursor(conn, dialog_id, "outbox", max_id)
+                    conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+                return rowcount
+
+            rowcount = await self._writer.run(_persist_event_0)
             if rowcount > 0:
                 logger.debug("event_outbox_read dialog_id=%d max_id=%d", dialog_id, max_id)
             else:
@@ -1647,38 +1730,33 @@ class EventHandlerManager:
             )
             return
 
-        existing_out = read_message_out(self._conn, dialog_id, int(msg_id))
-        if coverage is RealtimeHistoryCoverage.OWN_OUTGOING and not allows_existing_body_update(
-            coverage,
-            RealtimeBodyEvent.REACTION,
-            outgoing=existing_out.outgoing,
-        ):
-            return
-
         try:
             aggregates = project_reaction_aggregates(update.reactions)
-            previous_generation = self._reaction_generation(dialog_id, msg_id)
-            if not self._apply_reaction_event(
-                dialog_id, msg_id, aggregates, can_see_list=project_reaction_visibility(update.reactions)
-            ):
-                _record_runtime_observation_best_effort(
-                    self._conn,
+
+            def persist_reaction(conn: sqlite3.Connection) -> tuple[bool, bool]:
+                previous_generation = self._reaction_generation(conn, dialog_id, msg_id)
+                accepted = self._apply_reaction_event(
+                    conn, dialog_id, msg_id, aggregates, can_see_list=project_reaction_visibility(update.reactions)
+                )
+                return accepted, self._reaction_generation(conn, dialog_id, msg_id) != previous_generation
+
+            accepted, invalidated = await self._writer.run(persist_reaction)
+            if not accepted:
+                self._record_observation(
                     kind="reaction.aggregate",
                     outcome="rejected",
                     result_count=len(aggregates),
                     payload={"source": ReactionAggregateSource.RAW_UPDATE.value},
                 )
                 return
-            _record_runtime_observation_best_effort(
-                self._conn,
+            self._record_observation(
                 kind="reaction.aggregate",
                 outcome="accepted",
                 result_count=len(aggregates),
                 payload={"source": ReactionAggregateSource.RAW_UPDATE.value},
             )
-            if self._reaction_generation(dialog_id, msg_id) != previous_generation:
-                _record_runtime_observation_best_effort(
-                    self._conn,
+            if invalidated:
+                self._record_observation(
                     kind="reaction.invalidation",
                     outcome="detail_stale",
                     payload={"source": ReactionAggregateSource.RAW_UPDATE.value},
@@ -1696,10 +1774,10 @@ class EventHandlerManager:
                 msg_id,
             )
 
-    def _reaction_generation(self, dialog_id: int, msg_id: int) -> int | None:
+    def _reaction_generation(self, conn: sqlite3.Connection, dialog_id: int, msg_id: int) -> int | None:
         row = cast(
             tuple[object, ...] | None,
-            self._conn.execute(
+            conn.execute(
                 "SELECT generation FROM message_reaction_aggregate_state WHERE dialog_id=? AND message_id=?",
                 (dialog_id, msg_id),
             ).fetchone(),
@@ -1718,8 +1796,9 @@ class EventHandlerManager:
             logger.debug("raw_reaction_update_unparseable_peer peer=%r", peer)
             return None
 
-    def _apply_reaction_event(
+    def _apply_reaction_event(  # noqa: PLR0913 - explicit worker connection
         self,
+        conn: sqlite3.Connection,
         dialog_id: int,
         msg_id: int,
         aggregates: Sequence[ReactionAggregate],
@@ -1727,20 +1806,20 @@ class EventHandlerManager:
         *,
         can_see_list: bool | None = None,
     ) -> bool:
-        with write_transaction(self._conn):
-            if not hydration_observation_current(self._conn, dialog_id, msg_id, None):
+        with write_transaction(conn):
+            if not hydration_observation_current(conn, dialog_id, msg_id, None):
                 return False
-            coverage = self._realtime_coverage(dialog_id)
-            existing_out = read_message_out(self._conn, dialog_id, msg_id)
+            coverage = realtime_history_coverage(*_SQLiteRealtimeHistoryStatusReader(conn).read_status(dialog_id))
+            existing_out = read_message_out(conn, dialog_id, msg_id)
             if not allows_existing_body_update(coverage, RealtimeBodyEvent.REACTION, outgoing=existing_out.outgoing):
                 return False
             if coverage is not RealtimeHistoryCoverage.FULL_HISTORY and not existing_out.found:
                 return False
             now = int(time.time())
             if boundary is None:
-                boundary = allocate_observation_boundary(self._conn, ReactionAggregateSource.RAW_UPDATE)
+                boundary = allocate_observation_boundary(conn, ReactionAggregateSource.RAW_UPDATE)
             accepted = replace_reaction_aggregates(
-                self._conn,
+                conn,
                 dialog_id,
                 msg_id,
                 aggregates,
@@ -1751,7 +1830,7 @@ class EventHandlerManager:
             )
             if not accepted:
                 return False
-            self._record_body_event(dialog_id, now)
+            self._record_body_event(conn, dialog_id, now)
             return True
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
@@ -1780,18 +1859,15 @@ class EventHandlerManager:
 
         try:
             now = int(time.time())
-            row = read_message_text(self._conn, dialog_id, msg_id)
-            if row.found:
-                self._update_existing_transcription(
-                    event_fields,
-                    row.text,
-                    coverage,
-                    now,
-                )
-            elif coverage is RealtimeHistoryCoverage.FULL_HISTORY:
-                self._stage_missing_transcription(event_fields, now)
-            else:
-                return
+
+            def persist_transcription(conn: sqlite3.Connection) -> None:
+                row = read_message_text(conn, dialog_id, msg_id)
+                if row.found:
+                    self._update_existing_transcription(conn, event_fields, row.text, coverage, now)
+                elif coverage is RealtimeHistoryCoverage.FULL_HISTORY:
+                    self._stage_missing_transcription(conn, event_fields, now)
+
+            await self._writer.run(persist_transcription)
             logger.debug(
                 "event_raw_transcribed_audio dialog_id=%d message_id=%d",
                 dialog_id,
@@ -1806,17 +1882,21 @@ class EventHandlerManager:
 
     def _stage_missing_transcription(
         self,
+        conn: sqlite3.Connection,
         event: _TranscriptionEvent,
         now: int,
     ) -> None:
         """Store a FULL_HISTORY fact only while capture authorization remains."""
-        with write_transaction(self._conn):
-            if self._realtime_coverage(event.dialog_id) is not RealtimeHistoryCoverage.FULL_HISTORY:
+        with write_transaction(conn):
+            if (
+                realtime_history_coverage(*_SQLiteRealtimeHistoryStatusReader(conn).read_status(event.dialog_id))
+                is not RealtimeHistoryCoverage.FULL_HISTORY
+            ):
                 return
-            if read_message_text(self._conn, event.dialog_id, event.message_id).found:
+            if read_message_text(conn, event.dialog_id, event.message_id).found:
                 return
             if not stage_message_transcription(
-                self._conn,
+                conn,
                 event.dialog_id,
                 event.message_id,
                 transcribed_text=event.text,
@@ -1824,33 +1904,34 @@ class EventHandlerManager:
                 received_at=now,
             ):
                 return
-            self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, event.dialog_id))
+            conn.execute(_UPDATE_LAST_EVENT_SQL, (now, event.dialog_id))
 
     def _update_existing_transcription(
         self,
+        conn: sqlite3.Connection,
         event: _TranscriptionEvent,
         old_text: str | None,
         coverage: RealtimeHistoryCoverage,
         now: int,
     ) -> None:
         """Upsert a final fact and project changed text under current policy."""
-        with write_transaction(self._conn):
-            existing_out = read_message_out(self._conn, event.dialog_id, event.message_id)
+        with write_transaction(conn):
+            existing_out = read_message_out(conn, event.dialog_id, event.message_id)
             if not allows_existing_body_update(
                 coverage,
                 RealtimeBodyEvent.TRANSCRIPTION,
                 outgoing=existing_out.outgoing,
             ):
                 return
-            old_text = read_message_text(self._conn, event.dialog_id, event.message_id).text
+            old_text = read_message_text(conn, event.dialog_id, event.message_id).text
             if not allows_existing_body_update(
-                self._realtime_coverage(event.dialog_id),
+                realtime_history_coverage(*_SQLiteRealtimeHistoryStatusReader(conn).read_status(event.dialog_id)),
                 RealtimeBodyEvent.TRANSCRIPTION,
                 outgoing=existing_out.outgoing,
             ):
                 return
             if not apply_message_transcription(
-                self._conn,
+                conn,
                 event.dialog_id,
                 event.message_id,
                 transcribed_text=event.text,
@@ -1859,7 +1940,7 @@ class EventHandlerManager:
             ):
                 return
             if old_text != event.text:
-                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, event.dialog_id))
+                conn.execute(_UPDATE_LAST_EVENT_SQL, (now, event.dialog_id))
 
     @staticmethod
     def _transcription_event_fields(update: UpdateTranscribedAudio) -> _TranscriptionEvent | None:
@@ -1914,16 +1995,18 @@ class EventHandlerManager:
             return 1
         return None
 
-    def _apply_published_pin_mutation(self, folder_id: int | None, dialog_id: int, pinned: int) -> None:
+    def _apply_published_pin_mutation(
+        self, conn: sqlite3.Connection, folder_id: int | None, dialog_id: int, pinned: int
+    ) -> None:
         """Apply one published pin change within the caller's transaction."""
-        require_write_transaction(self._conn)
+        require_write_transaction(conn)
         if folder_id is None:
             return
         current = [
             int(cast(int, pin[0]))
             for pin in cast(
                 list[tuple[object, object]],
-                self._conn.execute(
+                conn.execute(
                     "SELECT dialog_id,position FROM dialog_directory_published_pins "
                     "WHERE folder_id=? ORDER BY position,dialog_id",
                     (folder_id,),
@@ -1934,20 +2017,21 @@ class EventHandlerManager:
             current = [dialog_id, *(existing for existing in current if existing != dialog_id)]
         else:
             current = [existing for existing in current if existing != dialog_id]
-        self._conn.execute("DELETE FROM dialog_directory_published_pins WHERE folder_id=?", (folder_id,))
-        self._conn.executemany(
+        conn.execute("DELETE FROM dialog_directory_published_pins WHERE folder_id=?", (folder_id,))
+        conn.executemany(
             "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (?,?,?)",
             [(folder_id, current_id, position) for position, current_id in enumerate(current)],
         )
-        apply_active_generation_pin_delta(self._conn, folder_id, dialog_id, bool(pinned))
+        apply_active_generation_pin_delta(conn, folder_id, dialog_id, bool(pinned))
         record_realtime_pin_fence(
-            self._conn,
+            conn,
             folder_id,
             {"kind": "delta", "dialog_id": dialog_id, "pinned": bool(pinned)},
         )
 
     def _project_pinned_eligibility(
         self,
+        conn: sqlite3.Connection,
         dialog_id: int,
         folder_id: object,
         *,
@@ -1958,32 +2042,30 @@ class EventHandlerManager:
         if not known_dialog or not isinstance(folder_id, int) or isinstance(folder_id, bool) or folder_id not in {0, 1}:
             return
         apply_realtime_eligibility(
-            self._conn,
+            conn,
             dialog_id,
             archived=int(folder_id == 1),
             observed_at=now,
         )
 
-    def _update_dialog_pinned(self, update: UpdateDialogPinned, now: int) -> None:
+    def _update_dialog_pinned(self, conn: sqlite3.Connection, update: UpdateDialogPinned, now: int) -> None:
         dialog_id = self._dialog_id_from_peer(update.peer)
         if dialog_id is None:
             return
         folder_id = getattr(update, "folder_id", None)
         published_folder = self._published_pin_folder(folder_id)
         pinned = 1 if update.pinned else 0
-        with write_transaction(self._conn):
-            known_dialog = (
-                self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
-            )
+        with write_transaction(conn):
+            known_dialog = conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
             # ``dialogs.pinned`` is the projection for the main list.  A pin
             # update scoped to another folder must not change that bit.
             if known_dialog and published_folder == 0:
-                self._conn.execute(_UPDATE_DIALOG_PINNED_SQL, (pinned, now, dialog_id))
-            self._apply_published_pin_mutation(published_folder, dialog_id, pinned)
-            self._project_pinned_eligibility(dialog_id, folder_id, known_dialog=known_dialog, now=now)
+                conn.execute(_UPDATE_DIALOG_PINNED_SQL, (pinned, now, dialog_id))
+            self._apply_published_pin_mutation(conn, published_folder, dialog_id, pinned)
+            self._project_pinned_eligibility(conn, dialog_id, folder_id, known_dialog=known_dialog, now=now)
         logger.info("event_dialog_pinned dialog_id=%d pinned=%d", dialog_id, pinned)
 
-    def _rewrite_pinned_dialogs(self, update: UpdatePinnedDialogs, now: int) -> None:
+    def _rewrite_pinned_dialogs(self, conn: sqlite3.Connection, update: UpdatePinnedDialogs, now: int) -> None:
         order = update.order
         if order is None:
             logger.debug("event_pinned_dialogs_order_none — skip")
@@ -1995,14 +2077,13 @@ class EventHandlerManager:
         published_folder = self._published_pin_folder(folder_id)
         is_main_folder = published_folder == 0
         pinned_ids = self._collect_pinned_dialog_ids(cast(Sequence[object], order))
-        with write_transaction(self._conn):
+        with write_transaction(conn):
             for dialog_id in pinned_ids:
                 if (
                     is_main_folder
-                    and self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()
-                    is not None
+                    and conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
                 ):
-                    self._conn.execute(_UPDATE_DIALOG_PINNED_SQL, (1, now, dialog_id))
+                    conn.execute(_UPDATE_DIALOG_PINNED_SQL, (1, now, dialog_id))
             if is_main_folder:
                 # Main list: rewrite the full pin set — the update is
                 # authoritative for all main-list pins.
@@ -2011,20 +2092,20 @@ class EventHandlerManager:
                     sql = _CLEAR_PINS_NOT_IN_SQL_TEMPLATE.format(
                         placeholders=placeholders,
                     )
-                    self._conn.execute(sql, (now, *pinned_ids))
+                    conn.execute(sql, (now, *pinned_ids))
                 else:
                     # Empty order list → all dialogs unpinned in main list.
                     # NOT IN () is invalid SQLite — use the dedicated SQL.
-                    self._conn.execute(_CLEAR_ALL_PINS_SQL, (now,))
+                    conn.execute(_CLEAR_ALL_PINS_SQL, (now,))
             if published_folder is not None:
-                self._conn.execute("DELETE FROM dialog_directory_published_pins WHERE folder_id=?", (published_folder,))
-                self._conn.executemany(
+                conn.execute("DELETE FROM dialog_directory_published_pins WHERE folder_id=?", (published_folder,))
+                conn.executemany(
                     "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (?,?,?)",
                     [(published_folder, dialog_id, position) for position, dialog_id in enumerate(pinned_ids)],
                 )
-                sync_active_generation_pins_from_publication(self._conn, published_folder)
+                sync_active_generation_pins_from_publication(conn, published_folder)
                 record_realtime_pin_fence(
-                    self._conn,
+                    conn,
                     published_folder,
                     {"kind": "rewrite", "dialog_ids": pinned_ids},
                 )
@@ -2037,25 +2118,30 @@ class EventHandlerManager:
             folder_id,
         )
 
-    def _update_dialog_unread_mark(self, update: UpdateDialogUnreadMark, now: int) -> None:
+    async def _update_dialog_unread_mark(self, update: UpdateDialogUnreadMark, now: int) -> None:
         dialog_id = self._dialog_id_from_peer(update.peer)
         if dialog_id is None:
             return
-        with write_transaction(self._conn):
-            rowcount = apply_unread_facts(
-                self._conn,
-                dialog_id,
-                unread_mark=getattr(update, "unread", None),
-                observed_at=now,
-                mark_needs_refresh=True,
-                create_missing=True,
-            )
-            apply_realtime_eligibility(
-                self._conn,
-                dialog_id,
-                unread=_current_unread_eligibility(self._conn, dialog_id),
-                observed_at=now,
-            )
+
+        def _persist_event_0(conn: sqlite3.Connection) -> int:
+            with write_transaction(conn):
+                rowcount = apply_unread_facts(
+                    conn,
+                    dialog_id,
+                    unread_mark=getattr(update, "unread", None),
+                    observed_at=now,
+                    mark_needs_refresh=True,
+                    create_missing=True,
+                )
+                apply_realtime_eligibility(
+                    conn,
+                    dialog_id,
+                    unread=_current_unread_eligibility(conn, dialog_id),
+                    observed_at=now,
+                )
+            return rowcount
+
+        rowcount = await self._writer.run(_persist_event_0)
         if rowcount:
             self._offer(DemandKind.DIALOG_LIGHT_RECONCILIATION)
         logger.info(
@@ -2078,14 +2164,14 @@ class EventHandlerManager:
         observed = observe_username(USERNAME_UNOBSERVED, update.usernames)
         return IDENTITY_OMITTED if observed is USERNAME_UNOBSERVED else cast(str | None, observed)
 
-    def _update_realtime_username(self, update: UpdateUserName, now: int) -> None:
-        with write_transaction(self._conn):
+    def _update_realtime_username(self, conn: sqlite3.Connection, update: UpdateUserName, now: int) -> None:
+        with write_transaction(conn):
             name = self._username_update_name(update)
             username = self._username_update_alias(update)
             dialog_id = int(update.user_id)
-            baseline_revision = capture_identity_baseline(self._conn, dialog_id)
+            baseline_revision = capture_identity_baseline(conn, dialog_id)
             publish_dialog_identity(
-                self._conn,
+                conn,
                 dialog_id,
                 DialogIdentityObservation(
                     dialog_id=dialog_id,
@@ -2098,7 +2184,7 @@ class EventHandlerManager:
             )
             if name is not IDENTITY_OMITTED or username is not IDENTITY_OMITTED:
                 apply_partial_entity_identity(
-                    self._conn,
+                    conn,
                     int(update.user_id),
                     PartialEntityIdentity(
                         observed_at=now,
@@ -2109,7 +2195,7 @@ class EventHandlerManager:
                     ),
                 )
 
-    def _update_realtime_notify(self, update: UpdateNotifySettings, now: int) -> None:
+    def _update_realtime_notify(self, conn: sqlite3.Connection, update: UpdateNotifySettings, now: int) -> None:
         peer = getattr(getattr(update, "peer", None), "peer", None)
         if not isinstance(peer, (PeerUser, PeerChat, PeerChannel)):
             return
@@ -2124,27 +2210,31 @@ class EventHandlerManager:
         if isinstance(mute_until, datetime):
             mute_until = int(mute_until.timestamp())
         if mute_until is None:
-            with write_transaction(self._conn):
-                if clear_realtime_mute(self._conn, dialog_id, observed_at=now):
-                    SQLiteFolderSnapshotRepository(self._conn).reproject_current_rules_in_transaction(now=now)
+            with write_transaction(conn):
+                if clear_realtime_mute(conn, dialog_id, observed_at=now):
+                    SQLiteFolderSnapshotRepository(conn).reproject_current_rules_in_transaction(now=now)
             return
         if not _is_valid_nonnegative_int(mute_until):
             return
-        with write_transaction(self._conn):
-            apply_realtime_eligibility(self._conn, dialog_id, mute_until=mute_until, observed_at=now)
-            SQLiteFolderSnapshotRepository(self._conn).reproject_current_rules_in_transaction(now=now)
+        with write_transaction(conn):
+            apply_realtime_eligibility(conn, dialog_id, mute_until=mute_until, observed_at=now)
+            SQLiteFolderSnapshotRepository(conn).reproject_current_rules_in_transaction(now=now)
 
-    def _update_realtime_identity_or_notify(self, update: UpdateUserName | UpdateNotifySettings, now: int) -> None:
+    def _update_realtime_identity_or_notify(
+        self, conn: sqlite3.Connection, update: UpdateUserName | UpdateNotifySettings, now: int
+    ) -> None:
         if isinstance(update, UpdateUserName):
-            self._update_realtime_username(update, now)
+            self._update_realtime_username(conn, update, now)
             return
-        self._update_realtime_notify(update, now)
+        self._update_realtime_notify(conn, update, now)
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_identity_or_notify(self, update: UpdateUserName | UpdateNotifySettings) -> None:
         """Persist complete name updates and exact notification mute deadlines."""
         try:
-            self._update_realtime_identity_or_notify(update, int(time.time()))
+            await self._writer.run(
+                lambda conn: self._update_realtime_identity_or_notify(conn, update, int(time.time()))
+            )
         except Exception:
             logger.exception("event_identity_or_notify_failed update=%r", type(update).__name__)
 
@@ -2165,11 +2255,11 @@ class EventHandlerManager:
         try:
             now = int(time.time())
             if isinstance(update, UpdateDialogPinned):
-                self._update_dialog_pinned(update, now)
+                await self._writer.run(lambda conn: self._update_dialog_pinned(conn, update, now))
             elif isinstance(update, UpdatePinnedDialogs):
-                self._rewrite_pinned_dialogs(update, now)
+                await self._writer.run(lambda conn: self._rewrite_pinned_dialogs(conn, update, now))
             elif isinstance(update, UpdateDialogUnreadMark):
-                self._update_dialog_unread_mark(update, now)
+                await self._update_dialog_unread_mark(update, now)
         except Exception:
             logger.exception(
                 "event_dialog_pinned_failed update=%r",
@@ -2207,13 +2297,17 @@ class EventHandlerManager:
                 return
             dialog_id = self._participant_dialog_id(update)
             occurred_at = int(update.date.timestamp()) if update.date is not None else int(time.time())
-            with write_transaction(self._conn):
-                changed = set_access_lost(
-                    self._conn,
-                    dialog_id,
-                    occurred_at,
-                    evidence=AccessLossEvidence("UpdateChannelParticipant", cause, update.actor_id),
-                )
+
+            def _persist_event_0(conn: sqlite3.Connection) -> bool:
+                with write_transaction(conn):
+                    return set_access_lost(
+                        conn,
+                        dialog_id,
+                        occurred_at,
+                        evidence=AccessLossEvidence("UpdateChannelParticipant", cause, update.actor_id),
+                    )
+
+            changed = await self._writer.run(_persist_event_0)
             if changed:
                 self._synced_dialog_ids.discard(dialog_id)
                 self._offer(DemandKind.DELTA_ACCESS_PROBE)
@@ -2239,10 +2333,13 @@ class EventHandlerManager:
             if dialog_id not in self._synced_dialog_ids:
                 return
             now = int(time.time())
-            changed, row = self._mark_channel_chat_update(
-                dialog_id,
-                now=now,
-                invalidate_linked_chat=isinstance(update, UpdateChannel),
+            changed, row = await self._writer.run(
+                lambda conn: self._mark_channel_chat_update(
+                    conn,
+                    dialog_id,
+                    now=now,
+                    invalidate_linked_chat=isinstance(update, UpdateChannel),
+                )
             )
             if changed:
                 self._offer(DemandKind.DIALOG_LIGHT_RECONCILIATION)
@@ -2262,22 +2359,23 @@ class EventHandlerManager:
 
     def _mark_channel_chat_update(
         self,
+        conn: sqlite3.Connection,
         dialog_id: int,
         *,
         now: int,
         invalidate_linked_chat: bool = False,
     ) -> tuple[int, tuple[str | None, int | None] | None]:
-        with write_transaction(self._conn):
-            changed = self._conn.execute(_UPDATE_DIALOG_NEEDS_REFRESH_SQL, (now, dialog_id)).rowcount
+        with write_transaction(conn):
+            changed = conn.execute(_UPDATE_DIALOG_NEEDS_REFRESH_SQL, (now, dialog_id)).rowcount
             row = cast(
                 tuple[str | None, int | None] | None,
-                self._conn.execute(
+                conn.execute(
                     "SELECT type, linked_chat_resolved_at FROM dialogs WHERE dialog_id = ?",
                     (dialog_id,),
                 ).fetchone(),
             )
             if invalidate_linked_chat and row is not None and row[0] == "channel" and row[1] is not None:
-                linked_chat_fact_owner.invalidate_from_update(self._conn, dialog_id, now)
+                linked_chat_fact_owner.invalidate_from_update(conn, dialog_id, now)
         return changed, row
 
     async def retry_one_pending_linked_chat_fact(self, budget: RpcAttemptBudget) -> bool:
@@ -2285,15 +2383,24 @@ class EventHandlerManager:
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
         now = int(time.time())
+
         # next_due performs a bounded self-heal UPDATE. End its write transaction
         # before peer resolution or the first asynchronous Telegram RPC.
-        with write_transaction(self._conn):
-            work = linked_chat_fact_owner.next_due(self._conn, now)
+        def _persist_event_0(conn: sqlite3.Connection) -> LinkedChatWork | None:
+            with write_transaction(conn):
+                return linked_chat_fact_owner.next_due(conn, now)
+
+        work = await self._writer.run(_persist_event_0)
         if work is None:
             return False
-        with write_transaction(self._conn):
-            generation = linked_chat_fact_owner.capture_generation(self._conn, work.channel_id)
-            siblings_token = capture_channel_full_siblings_token(self._conn, work.channel_id)
+
+        def _persist_event_1(conn: sqlite3.Connection) -> tuple[int, ChannelFullSiblingsToken]:
+            with write_transaction(conn):
+                generation = linked_chat_fact_owner.capture_generation(conn, work.channel_id)
+                siblings_token = capture_channel_full_siblings_token(conn, work.channel_id)
+            return (generation, siblings_token)
+
+        (generation, siblings_token) = await self._writer.run(_persist_event_1)
         return await self._acquire_linked_chat_work(work, generation, siblings_token, now)
 
     async def _acquire_linked_chat_work(
@@ -2307,14 +2414,14 @@ class EventHandlerManager:
         channel_id = work.channel_id
         input_channel = linked_chat_fact_owner.resolve_cached_input_peer(self._client, channel_id)
         if input_channel is None:
-            self._defer_linked_chat_work(work, now)
+            await self._writer.run(lambda conn: self._defer_linked_chat_work(conn, work, now))
             logger.debug("linked_chat_refresh_no_input_peer dialog_id=%d", channel_id)
             return True
 
         full_result = await self._request_linked_chat_full(work, input_channel, now)
         if full_result is None:
             return True
-        return self._publish_linked_chat_observation(work, generation, siblings_token, full_result, now)
+        return await self._publish_linked_chat_observation(work, generation, siblings_token, full_result, now)
 
     async def _request_linked_chat_full(
         self,
@@ -2332,22 +2439,25 @@ class EventHandlerManager:
                 channel_id,
                 exc.retry_after_seconds,
             )
-            self._defer_linked_chat_work(work, now, flood_wait_seconds=exc.retry_after_seconds)
+            retry_after_seconds = exc.retry_after_seconds
+            await self._writer.run(
+                lambda conn: self._defer_linked_chat_work(conn, work, now, flood_wait_seconds=retry_after_seconds)
+            )
             if exc.latched:
                 raise
             return None
         except RpcAdmissionClosedError:
-            self._defer_linked_chat_work(work, now)
+            await self._writer.run(lambda conn: self._defer_linked_chat_work(conn, work, now))
             raise
         except ACCESS_LOST_ERRORS as exc:
-            self._mark_linked_chat_access_lost(channel_id, now, exc)
+            await self._mark_linked_chat_access_lost(channel_id, now, exc)
             return None
         except Exception:
             logger.debug("linked_chat_refresh_failed dialog_id=%d", channel_id, exc_info=True)
-            self._defer_linked_chat_work(work, now)
+            await self._writer.run(lambda conn: self._defer_linked_chat_work(conn, work, now))
             return None
 
-    def _publish_linked_chat_observation(
+    async def _publish_linked_chat_observation(
         self,
         work: LinkedChatWork,
         generation: int,
@@ -2360,25 +2470,30 @@ class EventHandlerManager:
         try:
             validated_link = linked_chat_fact_owner.validate_observation(full_result, channel_id)
         except ValueError:
-            self._defer_linked_chat_work(work, now)
+            await self._writer.run(lambda conn: self._defer_linked_chat_work(conn, work, now))
             logger.debug("linked_chat_refresh_invalid_observation dialog_id=%d", channel_id)
             return True
-        with write_transaction(self._conn):
-            published = linked_chat_fact_owner.publish(
-                self._conn,
-                channel_id,
-                generation,
-                validated_link,
-                now,
-            )
-            if published:
-                write_channel_full_siblings(
-                    self._conn,
+
+        def _persist_event_0(conn: sqlite3.Connection) -> bool:
+            with write_transaction(conn):
+                published = linked_chat_fact_owner.publish(
+                    conn,
                     channel_id,
-                    full_result,
-                    siblings_token,
-                    observed_at=now,
+                    generation,
+                    validated_link,
+                    now,
                 )
+                if published:
+                    write_channel_full_siblings(
+                        conn,
+                        channel_id,
+                        full_result,
+                        siblings_token,
+                        observed_at=now,
+                    )
+            return published
+
+        published = await self._writer.run(_persist_event_0)
         if published:
             self._offer(DemandKind.SCHEDULED_DISCOVERY)
             if validated_link is not None and validated_link != 0:
@@ -2392,23 +2507,27 @@ class EventHandlerManager:
 
     def _defer_linked_chat_work(
         self,
+        conn: sqlite3.Connection,
         work: LinkedChatWork,
         now: int,
         *,
         flood_wait_seconds: int | None = None,
     ) -> None:
-        with write_transaction(self._conn):
+        with write_transaction(conn):
             retry_at = linked_chat_fact_owner.retry_at_for_failure(
-                self._conn,
+                conn,
                 work,
                 now,
                 flood_wait_seconds=flood_wait_seconds,
             )
-            linked_chat_fact_owner.defer(self._conn, work, retry_at)
+            linked_chat_fact_owner.defer(conn, work, retry_at)
 
-    def _mark_linked_chat_access_lost(self, channel_id: int, now: int, error: Exception) -> None:
-        with write_transaction(self._conn):
-            changed = set_access_lost(self._conn, channel_id, now, reason=type(error).__name__)
+    async def _mark_linked_chat_access_lost(self, channel_id: int, now: int, error: Exception) -> None:
+        def _persist_event_0(conn: sqlite3.Connection) -> bool:
+            with write_transaction(conn):
+                return set_access_lost(conn, channel_id, now, reason=type(error).__name__)
+
+        changed = await self._writer.run(_persist_event_0)
         if changed:
             self._synced_dialog_ids.discard(channel_id)
             self._offer(DemandKind.DELTA_ACCESS_PROBE)
@@ -2433,8 +2552,7 @@ class EventHandlerManager:
         try:
             max_id_raw = getattr(update, "max_id", None)
             still_unread_raw = getattr(update, "still_unread_count", None)
-            _record_runtime_observation_best_effort(
-                self._conn,
+            self._record_observation(
                 kind="telegram.inbox_read_received",
                 dialog_id=dialog_id,
                 operation_id=operation_id,
@@ -2462,8 +2580,7 @@ class EventHandlerManager:
                     dialog_id,
                     max_id_raw,
                 )
-                _record_runtime_observation_best_effort(
-                    self._conn,
+                self._record_observation(
                     kind="sync.inbox_read_finished",
                     dialog_id=dialog_id,
                     operation_id=operation_id,
@@ -2472,14 +2589,17 @@ class EventHandlerManager:
                 )
                 return
             max_id = cast(int, max_id_raw)
-            cursor_rowcount, unread_rowcount = _apply_observed_inbox_read(
-                self._conn,
-                dialog_id=dialog_id,
-                max_id=max_id,
-                still_unread=still_unread,
-                operation_id=operation_id,
-                partial_reason=partial_reason,
+            (cursor_rowcount, unread_rowcount), observation = await self._writer.run(
+                lambda conn: _apply_observed_inbox_read(
+                    conn,
+                    dialog_id=dialog_id,
+                    max_id=max_id,
+                    still_unread=still_unread,
+                    operation_id=operation_id,
+                    partial_reason=partial_reason,
+                )
             )
+            self._record_observation(**observation)
             logger.debug(
                 "event_raw_inbox_read dialog_id=%d max_id=%d still_unread_count=%s cursor_updated=%d unread_updated=%d",
                 dialog_id,
@@ -2489,8 +2609,7 @@ class EventHandlerManager:
                 unread_rowcount,
             )
         except Exception:
-            _record_runtime_observation_best_effort(
-                self._conn,
+            self._record_observation(
                 kind="sync.inbox_read_finished",
                 dialog_id=dialog_id,
                 operation_id=operation_id,
@@ -2530,15 +2649,19 @@ class EventHandlerManager:
                 return
             topic_id = int(topic_id_raw)
             now = int(time.time())
-            with write_transaction(self._conn):
-                observation_order = allocate_observation_order(self._conn)
-                self._topic_metadata.apply_topic_pin(
-                    dialog_id,
-                    topic_id,
-                    pinned=bool(singular_update.pinned),
-                    observed_at=now,
-                    observation_order=observation_order,
-                )
+
+            def _persist_event_0(conn: sqlite3.Connection) -> None:
+                with write_transaction(conn):
+                    observation_order = allocate_observation_order(conn)
+                    SQLiteTopicMetadataRepository(conn).apply_topic_pin(
+                        dialog_id,
+                        topic_id,
+                        pinned=bool(singular_update.pinned),
+                        observed_at=now,
+                        observation_order=observation_order,
+                    )
+
+            await self._writer.run(_persist_event_0)
             logger.info(
                 "event_forum_topic_pinned dialog_id=%d topic_id=%d pinned=%d",
                 dialog_id,
@@ -2567,14 +2690,18 @@ class EventHandlerManager:
             if not self._metadata_realtime_allowed(self._realtime_coverage(dialog_id)):
                 return
             now = int(time.time())
-            with write_transaction(self._conn):
-                observation_order = allocate_observation_order(self._conn)
-                self._topic_metadata.apply_topic_pins(
-                    dialog_id,
-                    order,
-                    observed_at=now,
-                    observation_order=observation_order,
-                )
+
+            def _persist_event_0(conn: sqlite3.Connection) -> None:
+                with write_transaction(conn):
+                    observation_order = allocate_observation_order(conn)
+                    SQLiteTopicMetadataRepository(conn).apply_topic_pins(
+                        dialog_id,
+                        order,
+                        observed_at=now,
+                        observation_order=observation_order,
+                    )
+
+            await self._writer.run(_persist_event_0)
             logger.info(
                 "event_forum_topics_pinned dialog_id=%d pinned_count=%d",
                 dialog_id,
@@ -2648,13 +2775,17 @@ class EventHandlerManager:
             "Sequence[_MessageLike | None]",
             await self._client.get_messages(dialog_id, ids=list(message_ids)),
         )
-        marked = 0
         now = int(time.time())
-        with write_transaction(self._conn):  # atomic per-dialog batch
-            for queried_id, returned_msg in zip(message_ids, results, strict=False):
-                if returned_msg is None and mark_message_deleted(self._conn, dialog_id, queried_id, now):
-                    marked += 1
-        return marked
+
+        def _persist_event_0(conn: sqlite3.Connection) -> int:
+            marked = 0
+            with write_transaction(conn):  # atomic per-dialog batch
+                for queried_id, returned_msg in zip(message_ids, results, strict=False):
+                    if returned_msg is None and mark_message_deleted(conn, dialog_id, queried_id, now):
+                        marked += 1
+            return marked
+
+        return await self._writer.run(_persist_event_0)
 
 
 _EXPORTED_SYMBOLS = (

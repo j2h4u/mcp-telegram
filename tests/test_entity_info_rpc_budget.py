@@ -32,6 +32,7 @@ from tests.helpers import (
     LoudUserAvatarHistoryPort,
     LoudUserProfilePort,
 )
+from tests.sqlite_writer_helpers import inline_writer
 
 _TEST_DBS: list[sqlite3.Connection] = []
 
@@ -231,6 +232,7 @@ def _make_server(
         conn,
         cast(DaemonClientLike, client),
         shutdown_event,
+        writer=inline_writer(conn),
         channel_profile_port=channel_profile_port,
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),

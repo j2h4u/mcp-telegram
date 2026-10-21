@@ -50,6 +50,7 @@ from .messages.sqlite_bundle import insert_messages_with_fts
 from .observation_order import allocate_observation_order
 from .read_state import apply_read_cursor
 from .resolver import latinize
+from .sqlite_writer import SQLiteWriter
 from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_demand import (
     AcquisitionKind,
@@ -220,18 +221,20 @@ class FullSyncWorker:
 
     Args:
         history_port: Transport-neutral backward history page port.
-        conn: Open SQLite writer connection to sync.db.
+        conn: Read-only SQLite connection to sync.db.
+        writer: Dedicated owner of all runtime writes.
         shutdown_event: asyncio.Event set when SIGTERM is received.
             Used to make FloodWait sleeps interruptible.
         total_messages_probe: Narrow access/total probe kept outside page ports.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         history_port: FullHistoryPagePort,
         conn: sqlite3.Connection,
         shutdown_event: asyncio.Event,
         *,
+        writer: SQLiteWriter,
         total_messages_probe: TotalMessagesProbe | None = None,
         automatic_group_history: AutomaticGroupHistoryPolicy | None = None,
     ) -> None:
@@ -239,21 +242,22 @@ class FullSyncWorker:
         self._total_messages_probe = total_messages_probe
         self._automatic_group_history = automatic_group_history
         self._conn = conn
+        self._writer = writer
         self._shutdown_event = shutdown_event
         self._last_page_error: BaseException | None = None
         self._last_total_repair_error: BaseException | None = None
 
-    def _published_dm_generation(self) -> int | None:
+    def _published_dm_generation(self, conn: sqlite3.Connection) -> int | None:
         row = cast(
             tuple[int] | None,
-            self._conn.execute(
+            conn.execute(
                 "SELECT generation FROM dialog_directory_publication WHERE singleton = 1 AND generation IS NOT NULL"
             ).fetchone(),
         )
         return None if row is None else int(row[0])
 
-    def _last_consumed_dm_generation(self) -> int:
-        value = _dm_enrollment_state(self._conn, _DM_ENROLLMENT_KEY_LAST_PUBLICATION_GENERATION)
+    def _last_consumed_dm_generation(self, conn: sqlite3.Connection) -> int:
+        value = _dm_enrollment_state(conn, _DM_ENROLLMENT_KEY_LAST_PUBLICATION_GENERATION)
         if value is None:
             return 0
         try:
@@ -264,14 +268,16 @@ class FullSyncWorker:
 
     def dm_enrollment_pending(self) -> bool:
         """Return whether a completed canonical publication needs local consumption."""
-        generation = self._published_dm_generation()
-        return generation is not None and generation > self._last_consumed_dm_generation()
+        generation = self._published_dm_generation(self._conn)
+        return generation is not None and generation > self._last_consumed_dm_generation(self._conn)
 
-    def _upsert_local_entity_stub(self, dialog_id: int, dialog_type: str, name: str | None, now: int) -> None:
+    def _upsert_local_entity_stub(
+        self, conn: sqlite3.Connection, dialog_id: int, dialog_type: str, name: str | None, now: int
+    ) -> None:
         """Create a local identity row while retaining richer existing fields."""
-        require_write_transaction(self._conn)
+        require_write_transaction(conn)
         upsert_entity_stub(
-            self._conn,
+            conn,
             EntitySnapshot(
                 entity_id=dialog_id,
                 entity_type=dialog_type,
@@ -282,38 +288,38 @@ class FullSyncWorker:
             ),
         )
 
-    def _consume_one_canonical_dm(self, row: tuple[object, ...], now: int) -> int:
-        require_write_transaction(self._conn)
+    def _consume_one_canonical_dm(self, conn: sqlite3.Connection, row: tuple[object, ...], now: int) -> int:
+        require_write_transaction(conn)
         dialog_id = int(cast(int, row[0]))
         dialog_type = str(row[1])
         name = cast(str | None, row[2])
         inbox = cast(int | None, row[3])
         outbox = cast(int | None, row[4])
-        outcome = ensure_automatic_dm_enrollment(self._conn, dialog_id, now=now)
-        self._upsert_local_entity_stub(dialog_id, dialog_type, name, now)
+        outcome = ensure_automatic_dm_enrollment(conn, dialog_id, now=now)
+        self._upsert_local_entity_stub(conn, dialog_id, dialog_type, name, now)
         if inbox is not None:
-            apply_read_cursor(self._conn, dialog_id, "inbox", inbox)
+            apply_read_cursor(conn, dialog_id, "inbox", inbox)
         if outbox is not None:
-            apply_read_cursor(self._conn, dialog_id, "outbox", outbox)
+            apply_read_cursor(conn, dialog_id, "outbox", outbox)
         return int(outcome.action == "queue_full_history")
 
-    def consume_canonical_dm_publication(self) -> int:
+    def consume_canonical_dm_publication(self, conn: sqlite3.Connection) -> int:
         """Consume one completed canonical dialog publication entirely locally."""
-        with write_transaction(self._conn):
-            generation = self._published_dm_generation()
-            if generation is None or generation <= self._last_consumed_dm_generation():
+        with write_transaction(conn):
+            generation = self._published_dm_generation(conn)
+            if generation is None or generation <= self._last_consumed_dm_generation(conn):
                 return 0
             rows = cast(
                 list[tuple[object, ...]],
-                self._conn.execute(
+                conn.execute(
                     "SELECT dialog_id,type,name,read_inbox_max_id,read_outbox_max_id FROM dialogs "
                     "WHERE type IN ('user','bot') AND hidden=0 ORDER BY dialog_id"
                 ).fetchall(),
             )
             now = int(time.time())
-            enrolled = sum(self._consume_one_canonical_dm(row, now) for row in rows)
+            enrolled = sum(self._consume_one_canonical_dm(conn, row, now) for row in rows)
             _set_dm_enrollment_state(
-                self._conn,
+                conn,
                 _DM_ENROLLMENT_KEY_LAST_PUBLICATION_GENERATION,
                 str(generation),
             )
@@ -337,26 +343,34 @@ class FullSyncWorker:
             return not await self._process_one_automatic_group()
 
         dialog_id, sync_progress = pending
-        with write_transaction(self._conn):
-            _set_dm_enrollment_state(self._conn, "full_sync_peer_cursor", str(dialog_id))
+
+        def persist_peer_cursor(conn: sqlite3.Connection) -> None:
+            with write_transaction(conn):
+                _set_dm_enrollment_state(conn, "full_sync_peer_cursor", str(dialog_id))
+
+        await self._writer.run(persist_peer_cursor)
         _, is_done = await self._fetch_batch(dialog_id, sync_progress)
-        with write_transaction(self._conn):
-            self._conn.execute(
-                "UPDATE synced_dialogs SET full_sync_retry_at=? WHERE dialog_id=?",
-                (
-                    int(time.time()) + 60
-                    if isinstance(self._last_page_error, (MessageHistoryUnavailableError, TimeoutError))
-                    else None,
-                    dialog_id,
-                ),
-            )
+
+        def persist_page_retry(conn: sqlite3.Connection) -> None:
+            with write_transaction(conn):
+                conn.execute(
+                    "UPDATE synced_dialogs SET full_sync_retry_at=? WHERE dialog_id=?",
+                    (
+                        int(time.time()) + 60
+                        if isinstance(self._last_page_error, (MessageHistoryUnavailableError, TimeoutError))
+                        else None,
+                        dialog_id,
+                    ),
+                )
+
+        await self._writer.run(persist_page_retry)
         if not is_done:
             return False  # more batches needed for this dialog
         # Dialog done — check if more pending dialogs remain
         return self._next_pending_dialog() is None
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_LOOKUP)
-    async def repair_one_total_messages(self) -> bool:  # noqa: PLR0911
+    async def repair_one_total_messages(self) -> bool:  # noqa: PLR0911, PLR0915
         """Repair one missing Telegram history total under a single RPC budget."""
         self._last_total_repair_error = None
         dialog_id = self._next_total_messages_repair_dialog()
@@ -366,8 +380,12 @@ class FullSyncWorker:
             error = RuntimeError("total-message repair requires an explicit access probe")
             self._last_total_repair_error = error
             return False
-        with write_transaction(self._conn):
-            _set_dm_enrollment_state(self._conn, "full_sync_total_peer_cursor", str(dialog_id))
+
+        def persist_total_peer_cursor(conn: sqlite3.Connection) -> None:
+            with write_transaction(conn):
+                _set_dm_enrollment_state(conn, "full_sync_total_peer_cursor", str(dialog_id))
+
+        await self._writer.run(persist_total_peer_cursor)
         try:
             total_messages = await self._total_messages_probe.probe_total_messages(dialog_id)
         except RpcAttemptBudgetExhaustedError:
@@ -380,7 +398,10 @@ class FullSyncWorker:
                 dialog_id,
                 type(exc).__name__,
             )
-            self._set_total_repair_retry(getattr(exc, "retry_after_seconds", None))
+            admission_error = exc
+            await self._writer.run(
+                lambda conn: self._set_total_repair_retry(conn, getattr(admission_error, "retry_after_seconds", None))
+            )
             self._last_total_repair_error = exc
             return False
         except TelegramRpcThrottled as exc:
@@ -390,49 +411,66 @@ class FullSyncWorker:
                 dialog_id,
                 exc.retry_after_seconds,
             )
-            self._set_total_repair_retry(exc.retry_after_seconds)
+            throttle_error = exc
+            await self._writer.run(lambda conn: self._set_total_repair_retry(conn, throttle_error.retry_after_seconds))
             self._last_total_repair_error = exc
             return False
         except MessageHistoryAccessLostError as exc:
-            with write_transaction(self._conn):
-                set_access_lost(self._conn, dialog_id, int(time.time()), reason=exc.reason_code)
+
+            def persist_access_loss(conn: sqlite3.Connection, error: MessageHistoryAccessLostError = exc) -> None:
+                with write_transaction(conn):
+                    set_access_lost(conn, dialog_id, int(time.time()), reason=error.reason_code)
+
+            await self._writer.run(persist_access_loss)
             return False
         except (MessageHistoryUnavailableError, TimeoutError) as exc:
             logger.warning("sync_total_repair_failed dialog_id=%d error=%s", dialog_id, exc)
-            with write_transaction(self._conn):
-                self._conn.execute(
-                    "UPDATE synced_dialogs SET full_sync_retry_at=? WHERE dialog_id=?",
-                    (int(time.time()) + 60, dialog_id),
-                )
+
+            def persist_total_retry(conn: sqlite3.Connection) -> None:
+                with write_transaction(conn):
+                    conn.execute(
+                        "UPDATE synced_dialogs SET full_sync_retry_at=? WHERE dialog_id=?",
+                        (int(time.time()) + 60, dialog_id),
+                    )
+
+            await self._writer.run(persist_total_retry)
             self._last_total_repair_error = exc
             return False
 
         if total_messages is None:
             logger.warning("sync_total_repair_missing_total dialog_id=%d", dialog_id)
-            with write_transaction(self._conn):
-                self._conn.execute(
-                    "UPDATE synced_dialogs SET full_sync_retry_at=? WHERE dialog_id=?",
-                    (int(time.time()) + 60, dialog_id),
-                )
+
+            def persist_missing_total_retry(conn: sqlite3.Connection) -> None:
+                with write_transaction(conn):
+                    conn.execute(
+                        "UPDATE synced_dialogs SET full_sync_retry_at=? WHERE dialog_id=?",
+                        (int(time.time()) + 60, dialog_id),
+                    )
+
+            await self._writer.run(persist_missing_total_retry)
             return False
-        with write_transaction(self._conn):
-            self._conn.execute(
-                _UPDATE_TOTAL_MESSAGES_SQL,
-                (total_messages, dialog_id, "access_lost", dialog_id),
-            )
-            _set_total_messages_repair_retry(self._conn, None)
-            self._conn.execute("UPDATE synced_dialogs SET full_sync_retry_at=NULL WHERE dialog_id=?", (dialog_id,))
+
+        def persist_total(conn: sqlite3.Connection) -> None:
+            with write_transaction(conn):
+                conn.execute(
+                    _UPDATE_TOTAL_MESSAGES_SQL,
+                    (total_messages, dialog_id, "access_lost", dialog_id),
+                )
+                _set_total_messages_repair_retry(conn, None)
+                conn.execute("UPDATE synced_dialogs SET full_sync_retry_at=NULL WHERE dialog_id=?", (dialog_id,))
+
+        await self._writer.run(persist_total)
         logger.info("sync_total_repair_complete dialog_id=%d total_messages=%d", dialog_id, total_messages)
         return self._next_total_messages_repair_dialog() is None
 
-    def _set_total_repair_retry(self, retry_after_seconds: object | None) -> None:
+    def _set_total_repair_retry(self, conn: sqlite3.Connection, retry_after_seconds: object | None) -> None:
         try:
             failure_delay = max(1, int(cast(float, retry_after_seconds))) if retry_after_seconds is not None else 0
         except TypeError, ValueError:
             failure_delay = 0
         release_at = int(time.time()) + max(_TOTAL_MESSAGES_REPAIR_FAILURE_DELAY_S, failure_delay)
-        with write_transaction(self._conn):
-            _set_total_messages_repair_retry(self._conn, release_at)
+        with write_transaction(conn):
+            _set_total_messages_repair_retry(conn, release_at)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -479,10 +517,10 @@ class FullSyncWorker:
         )
         return None if row is None or row[0] is None else float(row[0])
 
-    def _set_automatic_group_retry(self, dialog_id: int) -> None:
-        require_write_transaction(self._conn)
+    def _set_automatic_group_retry(self, conn: sqlite3.Connection, dialog_id: int) -> None:
+        require_write_transaction(conn)
         assert self._automatic_group_history is not None
-        self._conn.execute(
+        conn.execute(
             "INSERT OR REPLACE INTO daemon_state(key,value) VALUES (?,?)",
             (
                 f"automatic_group_history_retry:{dialog_id}",
@@ -510,12 +548,12 @@ class FullSyncWorker:
         )
         return None if row is None else int(row[0])
 
-    def _is_eligible_automatic_group(self, dialog_id: int, *, cutoff: int) -> bool:
+    def _is_eligible_automatic_group(self, conn: sqlite3.Connection, dialog_id: int, *, cutoff: int) -> bool:
         policy = self._automatic_group_history
         if policy is None:
             return False
         return (
-            self._conn.execute(
+            conn.execute(
                 "SELECT 1 FROM dialogs d LEFT JOIN full_history_enrollment fhe ON fhe.dialog_id=d.dialog_id "
                 "LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id "
                 "WHERE d.dialog_id=? AND fhe.dialog_id IS NULL AND d.hidden=0 "
@@ -535,37 +573,48 @@ class FullSyncWorker:
         try:
             page = await self._fetch_batch_page(dialog_id, 0)
         except Exception:
-            with write_transaction(self._conn):
-                self._set_automatic_group_retry(dialog_id)
+
+            def persist_probe_retry(conn: sqlite3.Connection) -> None:
+                with write_transaction(conn):
+                    self._set_automatic_group_retry(conn, dialog_id)
+
+            await self._writer.run(persist_probe_retry)
             raise
         if page.retry is not None:
-            with write_transaction(self._conn):
-                self._set_automatic_group_retry(dialog_id)
+
+            def persist_deferred_probe_retry(conn: sqlite3.Connection) -> None:
+                with write_transaction(conn):
+                    self._set_automatic_group_retry(conn, dialog_id)
+
+            await self._writer.run(persist_deferred_probe_retry)
             if isinstance(self._last_page_error, MessageHistoryUnavailableError):
                 self._last_page_error = None
             return True
         if page.total_messages is None:
-            with write_transaction(self._conn):
-                self._set_automatic_group_retry(dialog_id)
-            return True
-        return self._finalize_automatic_group_page(dialog_id, page)
 
-    def _finalize_automatic_group_page(self, dialog_id: int, page: _FetchedBatchPage) -> bool:
+            def persist_missing_probe_retry(conn: sqlite3.Connection) -> None:
+                with write_transaction(conn):
+                    self._set_automatic_group_retry(conn, dialog_id)
+
+            await self._writer.run(persist_missing_probe_retry)
+            return True
+        return await self._writer.run(lambda conn: self._finalize_automatic_group_page(conn, dialog_id, page))
+
+    def _finalize_automatic_group_page(self, conn: sqlite3.Connection, dialog_id: int, page: _FetchedBatchPage) -> bool:
         assert self._automatic_group_history is not None
-        with write_transaction(self._conn):
-            intent = read_intent(self._conn, dialog_id)
+        with write_transaction(conn):
+            intent = read_intent(conn, dialog_id)
             if intent.source is not None:
-                self._conn.execute(
-                    "DELETE FROM daemon_state WHERE key=?", (f"automatic_group_history_retry:{dialog_id}",)
-                )
+                conn.execute("DELETE FROM daemon_state WHERE key=?", (f"automatic_group_history_retry:{dialog_id}",))
                 if intent.enabled:
-                    self._conn.execute(
+                    conn.execute(
                         "UPDATE synced_dialogs SET status='syncing' WHERE dialog_id=? AND status IN ('own_only', 'fragment')",
                         (dialog_id,),
                     )
-                    self._store_batch_page_locked(dialog_id, 0, page)
+                    self._store_batch_page_locked(conn, dialog_id, 0, page)
                 return True
             if not self._is_eligible_automatic_group(
+                conn,
                 dialog_id,
                 cutoff=int(time.time()) - self._automatic_group_history.recent_days * 86_400,
             ):
@@ -574,15 +623,15 @@ class FullSyncWorker:
                 page.total_messages is not None and page.total_messages <= self._automatic_group_history.max_messages
             )
             intent = record_automatic_group_decision(
-                self._conn, dialog_id, enabled=accepted, total_messages=page.total_messages
+                conn, dialog_id, enabled=accepted, total_messages=page.total_messages
             )
-            self._conn.execute("DELETE FROM daemon_state WHERE key=?", (f"automatic_group_history_retry:{dialog_id}",))
+            conn.execute("DELETE FROM daemon_state WHERE key=?", (f"automatic_group_history_retry:{dialog_id}",))
             if accepted and intent.enabled:
-                self._conn.execute(
+                conn.execute(
                     "UPDATE synced_dialogs SET status='syncing' WHERE dialog_id=? AND status IN ('own_only', 'fragment')",
                     (dialog_id,),
                 )
-                self._store_batch_page_locked(dialog_id, 0, page)
+                self._store_batch_page_locked(conn, dialog_id, 0, page)
         return True
 
     def _next_total_messages_repair_dialog(self) -> int | None:
@@ -640,17 +689,25 @@ class FullSyncWorker:
             return _FetchedBatchPage(None, (), None, (sync_progress, False))
         if isinstance(exc, MessageHistoryAccessLostError):
             now = int(time.time())
-            with write_transaction(self._conn):
-                set_access_lost(self._conn, dialog_id, now, reason=exc.reason_code)
+
+            def persist_access_loss(conn: sqlite3.Connection, error: MessageHistoryAccessLostError = exc) -> None:
+                with write_transaction(conn):
+                    set_access_lost(conn, dialog_id, now, reason=error.reason_code)
+
+            await self._writer.run(persist_access_loss)
             return _FetchedBatchPage(None, (), None, (sync_progress, True))
         raise exc
 
     async def _fetch_batch_page(self, dialog_id: int, sync_progress: int) -> _FetchedBatchPage:
         self._last_page_error = None
-        with write_transaction(self._conn):
-            identity_revision = ensure_dialog_identity_baseline(self._conn, dialog_id)
+
+        def ensure_identity_baseline(conn: sqlite3.Connection) -> int:
+            with write_transaction(conn):
+                return ensure_dialog_identity_baseline(conn, dialog_id)
+
+        identity_revision = await self._writer.run(ensure_identity_baseline)
         reaction_observed_at = int(time.time())
-        observation_order = allocate_observation_order(self._conn)
+        observation_order = await self._writer.run(allocate_observation_order)
         try:
             page = await self._history_port.fetch_page(dialog_id, before_message_id=sync_progress)
         except MessageHistoryAccessLostError as exc:
@@ -666,8 +723,13 @@ class FullSyncWorker:
             self._last_page_error = exc
             return _FetchedBatchPage(None, (), None, (sync_progress, False))
         if page.identity is not None:
-            with write_transaction(self._conn):
-                publish_dialog_identity(self._conn, dialog_id, page.identity, identity_revision)
+
+            def persist_identity(conn: sqlite3.Connection) -> None:
+                with write_transaction(conn):
+                    assert page.identity is not None
+                    publish_dialog_identity(conn, dialog_id, page.identity, identity_revision)
+
+            await self._writer.run(persist_identity)
         total_messages = page.total_messages if sync_progress == 0 else None
         if (
             page.next_before_message_id is not None
@@ -720,32 +782,37 @@ class FullSyncWorker:
         page: _FetchedBatchPage,
     ) -> tuple[int, bool]:
         """Persist one fetched batch and update sync progress."""
-        with write_transaction(self._conn):
-            return self._store_batch_page_locked(dialog_id, sync_progress, page)
+
+        def persist_page(conn: sqlite3.Connection) -> tuple[int, bool]:
+            with write_transaction(conn):
+                return self._store_batch_page_locked(conn, dialog_id, sync_progress, page)
+
+        return await self._writer.run(persist_page)
 
     def _store_batch_page_locked(
         self,
+        conn: sqlite3.Connection,
         dialog_id: int,
         sync_progress: int,
         page: _FetchedBatchPage,
     ) -> tuple[int, bool]:
-        require_write_transaction(self._conn)
-        if sync_progress == 0 and full_history_enabled(self._conn, dialog_id):
-            self._conn.execute(
+        require_write_transaction(conn)
+        if sync_progress == 0 and full_history_enabled(conn, dialog_id):
+            conn.execute(
                 "UPDATE synced_dialogs SET delta_message_id=? WHERE dialog_id=? AND delta_message_id IS NULL",
                 (max((item.message.message_id for item in page.batch), default=0), dialog_id),
             )
         if page.next_before_message_id is None:
-            if not full_history_enabled(self._conn, dialog_id):
+            if not full_history_enabled(conn, dialog_id):
                 logger.info("sync_batch_discarded_disabled dialog_id=%d fetched=0", dialog_id)
                 return sync_progress, True
             now = int(time.time())
-            self._begin_topic_attribution_pass(dialog_id, sync_progress, now)
-            self._conn.execute(
+            self._begin_topic_attribution_pass(conn, dialog_id, sync_progress, now)
+            conn.execute(
                 _UPDATE_PROGRESS_DONE_SQL,
                 (sync_progress, "synced", page.total_messages, now, dialog_id, dialog_id),
             )
-            self._complete_topic_attribution_pass(dialog_id, now)
+            self._complete_topic_attribution_pass(conn, dialog_id, now)
             logger.info("sync_done dialog_id=%d status=synced (empty batch)", dialog_id)
             return sync_progress, True
 
@@ -753,19 +820,19 @@ class FullSyncWorker:
         new_progress = page.next_before_message_id
 
         # Single atomic transaction: messages + FTS + progress update
-        if not full_history_enabled(self._conn, dialog_id):
+        if not full_history_enabled(conn, dialog_id):
             logger.info("sync_batch_discarded_disabled dialog_id=%d fetched=%d", dialog_id, len(rows))
             return sync_progress, True
         now = int(time.time())
-        self._begin_topic_attribution_pass(dialog_id, sync_progress, now)
+        self._begin_topic_attribution_pass(conn, dialog_id, sync_progress, now)
         insert_messages_with_fts(
-            self._conn,
+            conn,
             rows,
             priority=HydrationPriority.BACKFILL,
             reaction_observed_at=page.reaction_observed_at,
         )
-        self._record_no_topic_attribution(dialog_id, rows)
-        self._conn.execute(
+        self._record_no_topic_attribution(conn, dialog_id, rows)
+        conn.execute(
             _UPDATE_PROGRESS_SQL,
             (new_progress, "syncing", page.total_messages, dialog_id, dialog_id),
         )
@@ -779,11 +846,13 @@ class FullSyncWorker:
         )
         return new_progress, False
 
-    def _begin_topic_attribution_pass(self, dialog_id: int, sync_progress: int, observed_at: int) -> None:
+    def _begin_topic_attribution_pass(
+        self, conn: sqlite3.Connection, dialog_id: int, sync_progress: int, observed_at: int
+    ) -> None:
         """Start or safely resume a current-extractor full-history receipt."""
-        require_write_transaction(self._conn)
+        require_write_transaction(conn)
         del sync_progress
-        self._conn.execute(
+        conn.execute(
             "UPDATE synced_dialogs SET topic_attribution_version=?, topic_attribution_state='partial', "
             "topic_attribution_observed_at=?, topic_attribution_completed_at=NULL, topic_attribution_no_topic_count=0 "
             "WHERE dialog_id=? AND status IN ('not_synced', 'syncing') "
@@ -791,21 +860,23 @@ class FullSyncWorker:
             (TOPIC_ATTRIBUTION_EXTRACTOR_VERSION, observed_at, dialog_id, TOPIC_ATTRIBUTION_EXTRACTOR_VERSION),
         )
 
-    def _record_no_topic_attribution(self, dialog_id: int, batch: Sequence[_ExtractedMessage]) -> None:
+    def _record_no_topic_attribution(
+        self, conn: sqlite3.Connection, dialog_id: int, batch: Sequence[_ExtractedMessage]
+    ) -> None:
         """Record legal extractor NULL outcomes from one current history page."""
-        require_write_transaction(self._conn)
+        require_write_transaction(conn)
         count = sum(message.message.forum_topic_id is None for message in batch)
         if count:
-            self._conn.execute(
+            conn.execute(
                 "UPDATE synced_dialogs SET topic_attribution_no_topic_count=topic_attribution_no_topic_count+? "
                 "WHERE dialog_id=? AND topic_attribution_version=? AND topic_attribution_state='partial'",
                 (count, dialog_id, TOPIC_ATTRIBUTION_EXTRACTOR_VERSION),
             )
 
-    def _complete_topic_attribution_pass(self, dialog_id: int, completed_at: int) -> None:
+    def _complete_topic_attribution_pass(self, conn: sqlite3.Connection, dialog_id: int, completed_at: int) -> None:
         """Publish a full current-extractor traversal, including legal NULL outcomes."""
-        require_write_transaction(self._conn)
-        self._conn.execute(
+        require_write_transaction(conn)
+        conn.execute(
             "UPDATE synced_dialogs SET topic_attribution_state='complete', topic_attribution_completed_at=? "
             "WHERE dialog_id=? AND topic_attribution_version=? AND topic_attribution_state='partial'",
             (completed_at, dialog_id, TOPIC_ATTRIBUTION_EXTRACTOR_VERSION),
@@ -883,7 +954,7 @@ class FullSyncDmEnrollmentDemandAdapter:
             return
         with demand_context(DemandKind.FULL_SYNC_DM_ENROLLMENT):
             with rpc_attempt_budget(budget):
-                self._worker.consume_canonical_dm_publication()
+                await self._worker._writer.run(lambda conn: self._worker.consume_canonical_dm_publication(conn))
 
 
 _EXPORTED_SYMBOLS = (

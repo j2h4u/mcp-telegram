@@ -31,6 +31,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     current_rpc_scope,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.sqlite_writer_helpers import inline_writer
 
 
 class _SQLiteCursor(Protocol):
@@ -117,7 +118,12 @@ async def test_zero_baseline_checks_empty_history(sync_db: _SQLiteConnection) ->
     dialog_id = 100
     _seed_dialog(sync_db, dialog_id, refresh_requested_at=1)
     port = _ForwardPort([ForwardGapPage((), complete=True)])
-    worker = DeltaSyncWorker(port, cast(sqlite3.Connection, sync_db), asyncio.Event())
+    worker = DeltaSyncWorker(
+        port,
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
+    )
 
     assert await worker.fetch_delta_slice_for_dialog(dialog_id) == 0
     assert port.calls == [(0, False)]
@@ -139,7 +145,12 @@ async def test_exact_page_continues_then_partial_page_completes(sync_db: _SQLite
     first = ForwardGapPage(tuple(_message(dialog_id, value) for value in range(101, 201)), complete=True)
     second = ForwardGapPage((_message(dialog_id, 201),), complete=True)
     port = _ForwardPort([first, second])
-    worker = DeltaSyncWorker(port, cast(sqlite3.Connection, sync_db), asyncio.Event())
+    worker = DeltaSyncWorker(
+        port,
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
+    )
 
     assert await worker.fetch_delta_slice_for_dialog(dialog_id) == 100
     first_checkpoint = sync_db.execute(
@@ -165,11 +176,21 @@ async def test_restart_uses_committed_forward_checkpoint(sync_db: _SQLiteConnect
     sync_db.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (?, ?, 1)", (dialog_id, 10))
     sync_db.commit()
     first_port = _ForwardPort([ForwardGapPage((_message(dialog_id, 11),), complete=False)])
-    first_worker = DeltaSyncWorker(first_port, cast(sqlite3.Connection, sync_db), asyncio.Event())
+    first_worker = DeltaSyncWorker(
+        first_port,
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
+    )
 
     assert await first_worker.fetch_delta_slice_for_dialog(dialog_id) == 1
     second_port = _ForwardPort([ForwardGapPage((), complete=True)])
-    second_worker = DeltaSyncWorker(second_port, cast(sqlite3.Connection, sync_db), asyncio.Event())
+    second_worker = DeltaSyncWorker(
+        second_port,
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
+    )
 
     assert await second_worker.fetch_delta_slice_for_dialog(dialog_id) == 0
     assert second_port.calls == [(11, False)]
@@ -182,7 +203,12 @@ async def test_interrupted_forward_page_publishes_rows_and_continuation(sync_db:
     sync_db.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (?, ?, 1)", (dialog_id, 10))
     sync_db.commit()
     port = _ForwardPort([ForwardGapPage((_message(dialog_id, 11),), complete=False)])
-    worker = DeltaSyncWorker(port, cast(sqlite3.Connection, sync_db), asyncio.Event())
+    worker = DeltaSyncWorker(
+        port,
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
+    )
 
     assert await worker.fetch_delta_slice_for_dialog(dialog_id) == 1
     assert sync_db.execute(
@@ -203,7 +229,12 @@ async def test_disable_after_fetch_discards_rows_and_checkpoint(sync_db: _SQLite
     sync_db.commit()
     port = _ForwardPort([ForwardGapPage((_message(dialog_id, 11),), complete=True)], sync_db)
     port.disable_after_fetch = True
-    worker = DeltaSyncWorker(port, cast(sqlite3.Connection, sync_db), asyncio.Event())
+    worker = DeltaSyncWorker(
+        port,
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
+    )
 
     assert await worker.fetch_delta_slice_for_dialog(dialog_id) == 0
     assert sync_db.execute(
@@ -222,7 +253,12 @@ async def test_access_loss_marks_dialog_without_publishing(sync_db: _SQLiteConne
     sync_db.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (?, ?, 1)", (dialog_id, 10))
     sync_db.commit()
     port = _ForwardPort([MessageHistoryAccessLostError("gone", reason_code="ChannelPrivateError")])
-    worker = DeltaSyncWorker(port, cast(sqlite3.Connection, sync_db), asyncio.Event())
+    worker = DeltaSyncWorker(
+        port,
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
+    )
 
     assert await worker.fetch_delta_slice_for_dialog(dialog_id) == 0
     access_row = sync_db.execute(
@@ -259,6 +295,7 @@ async def test_page_failures_preserve_checkpoint_and_reach_demand_coordinator(
         _ForwardPort([error_kind]),
         cast(sqlite3.Connection, sync_db),
         asyncio.Event(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
     observer = _DeltaObserver()
     adapter = DeltaGapFillDemandAdapter(worker, observer=observer)
@@ -381,7 +418,12 @@ async def test_forward_slice_observes_page_and_message_key_outcomes(
     sync_db.commit()
     page = ForwardGapPage(tuple(_message(dialog_id, message_id) for message_id in rows), complete=complete)
     observer = _DeltaObserver()
-    worker = DeltaSyncWorker(_ForwardPort([page]), cast(sqlite3.Connection, sync_db), asyncio.Event())
+    worker = DeltaSyncWorker(
+        _ForwardPort([page]),
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
+    )
     adapter = DeltaGapFillDemandAdapter(worker, observer=observer)
 
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
@@ -415,6 +457,7 @@ async def test_delta_sync_without_observer_skips_telemetry_lookup_and_still_comm
         _ForwardPort([ForwardGapPage((_message(dialog_id, 11),), complete=True)]),
         cast(sqlite3.Connection, sync_db),
         asyncio.Event(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
 
     await worker.fetch_delta_slice_for_dialog(dialog_id)
@@ -437,12 +480,18 @@ async def test_delta_cursor_ignores_realtime_rows_and_commits_duplicate_pages(sy
     sync_db.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (?, 201, 1)", (dialog_id,))
     sync_db.commit()
     port = _ForwardPort([ForwardGapPage((_message(dialog_id, 201),), complete=False)])
-    await DeltaSyncWorker(port, cast(sqlite3.Connection, sync_db), asyncio.Event()).fetch_delta_slice_for_dialog(
-        dialog_id
-    )
+    await DeltaSyncWorker(
+        port,
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
+    ).fetch_delta_slice_for_dialog(dialog_id)
     restarted_port = _ForwardPort([ForwardGapPage((_message(dialog_id, 202),), complete=True)])
     await DeltaSyncWorker(
-        restarted_port, cast(sqlite3.Connection, sync_db), asyncio.Event()
+        restarted_port,
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     ).fetch_delta_slice_for_dialog(dialog_id)
     assert port.calls == [(200, False)]
     assert restarted_port.calls == [(201, False)]
@@ -458,13 +507,19 @@ async def test_legacy_delta_cursor_rescans_and_resumes_despite_shared_max(sync_d
     sync_db.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (?, 999999, 1)", (dialog_id,))
     sync_db.commit()
     port = _ForwardPort([ForwardGapPage((_message(dialog_id, 1),), complete=False)])
-    await DeltaSyncWorker(port, cast(sqlite3.Connection, sync_db), asyncio.Event()).fetch_delta_slice_for_dialog(
-        dialog_id
-    )
+    await DeltaSyncWorker(
+        port,
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
+    ).fetch_delta_slice_for_dialog(dialog_id)
     restarted = _ForwardPort([ForwardGapPage((_message(dialog_id, 2),), complete=True)])
-    await DeltaSyncWorker(restarted, cast(sqlite3.Connection, sync_db), asyncio.Event()).fetch_delta_slice_for_dialog(
-        dialog_id
-    )
+    await DeltaSyncWorker(
+        restarted,
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
+    ).fetch_delta_slice_for_dialog(dialog_id)
     assert port.calls == [(0, False)]
     assert restarted.calls == [(1, False)]
 
@@ -477,9 +532,12 @@ async def test_empty_archive_accepts_new_history(sync_db: _SQLiteConnection) -> 
     sync_db.commit()
     port = _ForwardPort([ForwardGapPage((_message(dialog_id, 1),), complete=True)])
     assert (
-        await DeltaSyncWorker(port, cast(sqlite3.Connection, sync_db), asyncio.Event()).fetch_delta_slice_for_dialog(
-            dialog_id
-        )
+        await DeltaSyncWorker(
+            port,
+            cast(sqlite3.Connection, sync_db),
+            asyncio.Event(),
+            writer=inline_writer(cast(sqlite3.Connection, sync_db)),
+        ).fetch_delta_slice_for_dialog(dialog_id)
         == 1
     )
     assert port.calls == [(0, False)]
@@ -505,7 +563,7 @@ async def test_terminal_old_page_preserves_same_second_refresh(sync_db: sqlite3.
                 raise MessageHistoryAccessLostError("private", reason_code="private")
             return ForwardGapPage(messages=(), complete=True)
 
-    worker = DeltaSyncWorker(Port(), sync_db, asyncio.Event())
+    worker = DeltaSyncWorker(Port(), sync_db, asyncio.Event(), writer=inline_writer(sync_db))
     await worker.fetch_delta_slice_for_dialog(501)
     assert sync_db.execute(
         "SELECT delta_refresh_requested_at,delta_refresh_generation FROM synced_dialogs WHERE dialog_id=501"
@@ -530,7 +588,7 @@ async def test_failed_peer_does_not_starve_ready_peer_after_adapter_restart(
                 raise failure("retry")
             return ForwardGapPage(messages=(), complete=True)
 
-    worker = DeltaSyncWorker(Port(), sync_db, asyncio.Event())
+    worker = DeltaSyncWorker(Port(), sync_db, asyncio.Event(), writer=inline_writer(sync_db))
     await DeltaGapFillDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
     await DeltaGapFillDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
     assert calls == [1, 2]

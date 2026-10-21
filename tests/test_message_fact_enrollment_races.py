@@ -18,6 +18,7 @@ from mcp_telegram.message_fact_refresh import (
 from mcp_telegram.reactions.detail import ReactionDetailRefresher
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_reading import ReadDateFetchResult, TelegramReadReceiptGateway
+from tests.sqlite_writer_helpers import inline_writer
 
 _SQLiteConnection = sqlite3.Connection
 
@@ -95,6 +96,7 @@ async def test_read_at_disable_during_fetch_skips_read_fact_write(tmp_path: Path
                     handler_conn,
                     cast(ReactionDetailRefresher, object()),
                     cast(TelegramReadReceiptGateway, gateway),
+                    writer=inline_writer(handler_conn),
                 ),
                 _policy(),
                 now=2_000,
@@ -126,6 +128,7 @@ async def test_read_at_enabled_path_persists_read_fact(tmp_path: Path) -> None:
                 handler_conn,
                 cast(ReactionDetailRefresher, object()),
                 cast(TelegramReadReceiptGateway, gateway),
+                writer=inline_writer(handler_conn),
             ),
             _policy(),
             now=2_000,

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from telethon.tl.functions.messages import GetCustomEmojiDocumentsRequest, GetForumTopicsRequest
@@ -21,6 +23,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
 from mcp_telegram.topics.contracts import TopicFact, is_topic_capable
 from mcp_telegram.topics.refresh import TopicRefresher
 from mcp_telegram.topics.telegram_adapter import TelethonTelegramTopicGateway
+from tests.sqlite_writer_helpers import inline_writer
 
 
 @dataclass
@@ -44,6 +47,9 @@ class _Gateway:
 
 
 class _Repository:
+    def for_connection(self, _conn: sqlite3.Connection) -> _Repository:
+        return self
+
     def __init__(self) -> None:
         self.writes: list[tuple[int, tuple[TopicFact, ...]]] = []
 
@@ -69,7 +75,9 @@ async def test_refreshes_private_bot_topics_when_bot_forum_view_is_enabled() -> 
     repository = _Repository()
     bot = _Entity(bot=True, bot_forum_view=True)
 
-    count = await TopicRefresher(gateway, repository).refresh(8583106747, bot)
+    count = await TopicRefresher(gateway, repository, writer=inline_writer(cast(sqlite3.Connection, None))).refresh(
+        8583106747, bot
+    )
 
     assert count == 1
     assert gateway.entities == [bot]
@@ -81,7 +89,9 @@ async def test_does_not_fetch_topics_for_ordinary_private_bot() -> None:
     gateway = _Gateway()
     repository = _Repository()
 
-    count = await TopicRefresher(gateway, repository).refresh(42, _Entity(bot=True))
+    count = await TopicRefresher(gateway, repository, writer=inline_writer(cast(sqlite3.Connection, None))).refresh(
+        42, _Entity(bot=True)
+    )
 
     assert count == 0
     assert gateway.entities == []
@@ -94,7 +104,9 @@ async def test_topic_refresh_preserves_interactive_resolution_scope() -> None:
     repository = _Repository()
 
     with rpc_scope(TelegramRpcSource.TOPIC_RESOLUTION):
-        await TopicRefresher(gateway, repository).refresh(42, _Entity(forum=True))
+        await TopicRefresher(gateway, repository, writer=inline_writer(cast(sqlite3.Connection, None))).refresh(
+            42, _Entity(forum=True)
+        )
 
     assert gateway.scopes == [
         (
@@ -296,5 +308,7 @@ async def test_partial_topic_pages_never_publish_snapshot(failure: str) -> None:
         else TopicSourceUnavailableError
     )
     with pytest.raises(error):
-        await TopicRefresher(TelethonTelegramTopicGateway(Client()), repository).refresh(1, _Entity(forum=True))
+        await TopicRefresher(
+            TelethonTelegramTopicGateway(Client()), repository, writer=inline_writer(cast(sqlite3.Connection, None))
+        ).refresh(1, _Entity(forum=True))
     assert repository.writes == []

@@ -11,6 +11,7 @@ from enum import StrEnum
 from typing import Protocol
 
 from ..flood import TelegramRpcThrottled, _raise_if_latched
+from ..sqlite_writer import SQLiteWriter
 from ..telegram_demand import (
     DemandStatus,
     DurableDemandAdapter,
@@ -47,16 +48,18 @@ class FolderAttemptResult(StrEnum):
 
 
 class FolderProjectionWorker:
-    def __init__(
+    def __init__(  # noqa: PLR0913 - explicit lifecycle and writer dependencies
         self,
         refresher: FolderRefresher,
         repository: FolderSnapshotRepository,
         shutdown_event: asyncio.Event,
         policy: FolderProjectionScheduling,
         *,
+        writer: SQLiteWriter,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._refresher = refresher
+        self._writer = writer
         self._repository = repository
         self._shutdown_event = shutdown_event
         self._policy = policy
@@ -96,24 +99,24 @@ class FolderProjectionWorker:
         del reason
         async with self._attempt_lock:
             now = int(self._clock())
-            if self._attempt_preflight(now, budget):
+            if await self._attempt_preflight(now, budget):
                 return
             try:
                 await self._refresh_once(now, budget)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if self._handle_refresh_error(exc):
+                if await self._handle_refresh_error(exc):
                     return
                 raise
             else:
                 self._record_success()
 
-    def _attempt_preflight(self, now: int, budget: RpcAttemptBudget | None) -> bool:
+    async def _attempt_preflight(self, now: int, budget: RpcAttemptBudget | None) -> bool:
         """Run the no-RPC checks while the attempt lock is held."""
         expiry = self._repository.next_mute_expiry()
         if expiry is not None and now >= expiry:
-            self._repository.reproject_current_rules(now=now)
+            await self._writer.run(lambda conn: self._repository.for_connection(conn).reproject_current_rules(now=now))
         if self._repository.rules_are_fresh(now=now):
             self._next_due_at = self._due_at()
             return True
@@ -126,39 +129,41 @@ class FolderProjectionWorker:
         with rpc_attempt_budget(budget):
             await self._refresher.refresh(completed_at=now)
 
-    def _handle_refresh_error(self, exc: Exception) -> bool:
+    async def _handle_refresh_error(self, exc: Exception) -> bool:
         if isinstance(exc, (FolderSourceUnavailableError, TimeoutError, OSError)):
-            self._record_failure(FolderAttemptResult.SOURCE_UNAVAILABLE, None)
+            await self._record_failure(FolderAttemptResult.SOURCE_UNAVAILABLE, None)
             return True
         if isinstance(exc, TelegramRpcThrottled):
             # An account circuit is a coordinator-owned latch.  Let the
             # existing convention propagate it so this demand does not
             # create a private retry loop against a blocked account.
             _raise_if_latched(exc)
-            self._record_failure(
+            await self._record_failure(
                 FolderAttemptResult.CIRCUIT_OPEN if exc.retry_after_seconds is None else FolderAttemptResult.FLOOD_WAIT,
                 exc.retry_after_seconds,
             )
             return True
         if isinstance(exc, RpcAttemptBudgetExhaustedError):
             return True
-        self._record_failure(FolderAttemptResult.UNEXPECTED, None)
+        await self._record_failure(FolderAttemptResult.UNEXPECTED, None)
         return False
 
     def _record_success(self) -> None:
         self._failure_count = 0
         self._next_due_at = self._due_at()
 
-    def _record_failure(self, outcome: FolderAttemptResult, retry_after: int | None) -> None:
+    async def _record_failure(self, outcome: FolderAttemptResult, retry_after: int | None) -> None:
         self._failure_count += 1
         schedule = self._policy.retry_delays_seconds
         delay = schedule[min(self._failure_count - 1, len(schedule) - 1)]
         retry_at = math.ceil(self._clock() + max(delay, retry_after or 0))
-        self._repository.record_attempt(
-            attempted_at=int(self._clock()),
-            outcome=outcome,
-            next_retry_at=retry_at,
-            consecutive_failures=self._failure_count,
+        await self._writer.run(
+            lambda conn: self._repository.for_connection(conn).record_attempt(
+                attempted_at=int(self._clock()),
+                outcome=outcome,
+                next_retry_at=retry_at,
+                consecutive_failures=self._failure_count,
+            )
         )
         self._next_due_at = retry_at
 

@@ -17,6 +17,7 @@ from mcp_telegram.drafts.telethon_adapter import (
     normalize_update_draft,
 )
 from mcp_telegram.event_handlers import UpdateProcessingBarrier
+from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.telegram_demand import DemandStatus, RpcAttemptBudget, demand_context
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import rpc_attempt_budget
@@ -73,6 +74,7 @@ class DraftMessageOwner:
         shutdown_event: asyncio.Event,
         update_barrier: UpdateProcessingBarrier,
         *,
+        writer: SQLiteWriter,
         observe: RuntimeObserver | None = None,
         snapshot_gateway_factory: Callable[[object, int], DraftSnapshotGateway] = TelethonDraftSnapshotGateway,
         monotonic_clock: Callable[[], float] = time.monotonic,
@@ -81,6 +83,7 @@ class DraftMessageOwner:
         self._client = client
         self._event_client = cast(_DraftEventClient, client)
         self._repository = repository
+        self._writer = writer
         self._shutdown_event = shutdown_event
         self._update_barrier = update_barrier
         self._observe = observe
@@ -106,25 +109,30 @@ class DraftMessageOwner:
         self._event_client.remove_event_handler(self.on_raw_draft_update)
         self._registered = False
 
-    def bind_account(self, account_id: int) -> None:
+    async def bind_account(self, account_id: int) -> None:
         """Fence all subsequent observations to the authenticated account."""
         if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
             raise ValueError("account_id must be positive")
         if self._account_id is not None and self._account_id != account_id:
             raise RuntimeError("draft owner cannot change account within one daemon lifetime")
+        await self._writer.run(lambda conn: self._repository.for_connection(conn).bind_account(account_id))
         self._account_id = account_id
-        self._repository.bind_account(account_id)
         self._snapshot_gateway = self._snapshot_gateway_factory(self._client, account_id)
 
     def bind_demand_sink(self, sink: DemandOfferSink) -> None:
         """Attach the process-wide coordinator after durable composition exists."""
         self._demand_sink = sink
 
-    def request_recovery(self, reason: str) -> None:
+    async def request_recovery(self, reason: str) -> None:
         """Durably coalesce a startup, reconnect, or ambiguity recovery signal."""
         if self._account_id is None:
             return
-        self._repository.mark_recovery_needed(reason=reason, observed_at=datetime.now(UTC))
+        observed_at = datetime.now(UTC)
+        await self._writer.run(
+            lambda conn: self._repository.for_connection(conn).mark_recovery_needed(
+                reason=reason, observed_at=observed_at
+            )
+        )
         sink = self._demand_sink
         if sink is not None:
             offer_durable_demand(sink, self.demand_kind)
@@ -141,7 +149,7 @@ class DraftMessageOwner:
         await self._update_barrier.wait(self._shutdown_event)
         account_id = self._account_id
         if account_id is None:
-            self.request_recovery("account_unbound")
+            await self.request_recovery("account_unbound")
             return
         observation = normalize_update_draft(
             update,
@@ -150,16 +158,18 @@ class DraftMessageOwner:
             observed_at=datetime.now(UTC),
         )
         if observation is None:
-            self.request_recovery("normalization_incomplete")
+            await self.request_recovery("normalization_incomplete")
             return
         try:
-            result = self._repository.apply_realtime(observation)
+            result = await self._writer.run(
+                lambda conn: self._repository.for_connection(conn).apply_realtime(observation)
+            )
         except Exception:  # noqa: BLE001 - recovery preserves the next authoritative path
-            self.request_recovery("realtime_persistence_failed")
+            await self.request_recovery("realtime_persistence_failed")
             self._record("draft.observed", "deferred", "persistence_failed")
             return
         if observation.ambiguity or result.ambiguous:
-            self.request_recovery("ambiguous_realtime")
+            await self.request_recovery("ambiguous_realtime")
         duration_ms: float | None = None
         payload: Mapping[str, object] | None = None
         commit_utc_ms: int | None = None
@@ -193,7 +203,7 @@ class DraftMessageOwner:
         """Apply one account-wide snapshot without allowing a stale baseline to win."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
-        snapshot_run = self._prepare_snapshot_run(budget)
+        snapshot_run = await self._prepare_snapshot_run(budget)
         if snapshot_run is None:
             return
         gateway, claim_token = snapshot_run
@@ -202,15 +212,15 @@ class DraftMessageOwner:
                 with rpc_attempt_budget(budget):
                     coverage, observations = await gateway.fetch_all_drafts()
         except BaseException:
-            self._rearm_claimed_recovery("snapshot_fetch_failed", claim_token)
+            await self._rearm_claimed_recovery("snapshot_fetch_failed", claim_token)
             raise
         try:
-            self._publish_snapshot(coverage, observations, claim_token)
+            await self._publish_snapshot(coverage, observations, claim_token)
         except BaseException:
-            self._rearm_claimed_recovery("snapshot_publish_failed", claim_token)
+            await self._rearm_claimed_recovery("snapshot_publish_failed", claim_token)
             raise
 
-    def _prepare_snapshot_run(
+    async def _prepare_snapshot_run(
         self,
         budget: RpcAttemptBudget,
     ) -> tuple[DraftSnapshotGateway, int] | None:
@@ -222,12 +232,12 @@ class DraftMessageOwner:
         status = self.status(now)
         if status is None or not status.is_ready(now):
             return None
-        claim_token = self._repository.claim_recovery(now=now)
+        claim_token = await self._writer.run(lambda conn: self._repository.for_connection(conn).claim_recovery(now=now))
         if claim_token is None:
             return None
         return gateway, claim_token
 
-    def _publish_snapshot(
+    async def _publish_snapshot(
         self,
         coverage: SnapshotCoverage,
         observations: tuple[DraftObservation, ...],
@@ -235,17 +245,26 @@ class DraftMessageOwner:
     ) -> None:
         if not coverage.authoritative:
             reason = _snapshot_recovery_reason(coverage)
-            self._rearm_claimed_recovery(reason, claim_token)
+            await self._rearm_claimed_recovery(reason, claim_token)
             self._record("draft.recovery", "deferred", reason)
             return
-        result = self._repository.apply_snapshot(observations, coverage, claim_token=claim_token)
+        result = await self._writer.run(
+            lambda conn: self._repository.for_connection(conn).apply_snapshot(
+                observations, coverage, claim_token=claim_token
+            )
+        )
         if result.ambiguous or not result.accepted:
-            self._rearm_claimed_recovery(result.decision or "snapshot_failure", claim_token)
+            await self._rearm_claimed_recovery(result.decision or "snapshot_failure", claim_token)
         self._record("draft.recovery", "applied" if result.accepted else "ignored", result.decision)
 
-    def _rearm_claimed_recovery(self, reason: str, claim_token: int) -> None:
+    async def _rearm_claimed_recovery(self, reason: str, claim_token: int) -> None:
         """Return a claimed recovery to durable, bounded retry cadence."""
-        if not self._repository.rearm_recovery(reason=reason, now=time.time(), claim_token=claim_token):
+        now = time.time()
+        if not await self._writer.run(
+            lambda conn: self._repository.for_connection(conn).rearm_recovery(
+                reason=reason, now=now, claim_token=claim_token
+            )
+        ):
             return
         sink = self._demand_sink
         if sink is not None:

@@ -355,10 +355,10 @@ class TelegramRpcBudget:
 
 @dataclass(frozen=True, slots=True)
 class TelegramRpcCooldownPersistence:
-    """Synchronous persistence port for one account-wide UTC cooldown."""
+    """Read-only startup load and asynchronous durable cooldown save."""
 
     load_until_utc: Callable[[], float | None]
-    save_until_utc: Callable[[float], None]
+    save_until_utc: Callable[[float], Awaitable[None]]
 
     def __post_init__(self) -> None:
         if not callable(self.load_until_utc):
@@ -444,6 +444,8 @@ class TelegramRpcGate(TelegramClient):
         self._flood_event_observer: Callable[[FloodWaitObservation], None] | None = None
         self._rpc_request_observer = rpc_request_observer
         self._cooldown_persistence = cooldown_persistence
+        self._cooldown_save_tasks: dict[int, asyncio.Task[None]] = {}
+        self._scalar_persistence_pending: set[asyncio.Future[object]] = set()
         self._restore_account_cooldown()
         self._scheduler_policy = scheduler_policy
         self._limiter = (
@@ -484,7 +486,24 @@ class TelegramRpcGate(TelegramClient):
 
     async def close_rpc_scheduler(self) -> None:
         """Cancel queued admission work during final daemon shutdown."""
-        await self._admission_scheduler.close()
+        try:
+            await self._admission_scheduler.close()
+        finally:
+            await self._drain_cooldown_saves()
+
+    async def _drain_cooldown_saves(self) -> None:
+        """Keep durable FloodWait receipts owned until shutdown can close storage."""
+        cancelled = False
+        while self._cooldown_save_tasks:
+            receipts = asyncio.gather(*tuple(self._cooldown_save_tasks.values()))
+            while not receipts.done():
+                try:
+                    await asyncio.wait({receipts})
+                except asyncio.CancelledError:
+                    cancelled = True
+            receipts.result()
+        if cancelled:
+            raise asyncio.CancelledError
 
     def set_rpc_admission_observer(self, observer: AdmissionObserver | None) -> None:
         """Attach the daemon-owned operational telemetry sink."""
@@ -542,7 +561,7 @@ class TelegramRpcGate(TelegramClient):
         global _COOLDOWN_DEADLINE
         _COOLDOWN_DEADLINE = max(_COOLDOWN_DEADLINE, time.monotonic() + remaining)
 
-    def _persist_account_cooldown(self, *, monotonic_now: float) -> None:
+    async def _persist_account_cooldown(self, deadline_utc: float) -> None:
         """Persist the effective process deadline without changing FloodWait semantics."""
         persistence = cast(
             TelegramRpcCooldownPersistence | None,
@@ -550,9 +569,8 @@ class TelegramRpcGate(TelegramClient):
         )
         if persistence is None:
             return
-        deadline_utc = time.time() + max(0.0, _COOLDOWN_DEADLINE - monotonic_now)
         try:
-            persistence.save_until_utc(deadline_utc)
+            await persistence.save_until_utc(deadline_utc)
         except Exception:
             logger.exception("telegram_rpc_cooldown_persist_failed")
 
@@ -975,20 +993,14 @@ class TelegramRpcGate(TelegramClient):
     def _finalize_scalar_dispatch(self, raw_future: asyncio.Future[object]) -> None:
         """Record terminal actual-send outcomes and release their admission once."""
         pending = self._pending_scalar_dispatches.get(raw_future)
-        if pending is None:
+        if pending is None or raw_future in self._scalar_persistence_pending:
             return
         if raw_future.cancelled():
-            if self._transport_state is _TransportBoundaryState.DISCONNECTED:
-                self._release_scalar_dispatch(raw_future, pending)
-            elif self._transport_state is not _TransportBoundaryState.DISCONNECTING:
-                self._transport_state = _TransportBoundaryState.FAILED
+            self._settle_unconfirmed_scalar_dispatch(raw_future, pending)
             return
         exc = raw_future.exception()
         if exc is not None and not isinstance(exc, RPCError):
-            if self._transport_state is _TransportBoundaryState.DISCONNECTED:
-                self._release_scalar_dispatch(raw_future, pending)
-            elif self._transport_state is not _TransportBoundaryState.DISCONNECTING:
-                self._transport_state = _TransportBoundaryState.FAILED
+            self._settle_unconfirmed_scalar_dispatch(raw_future, pending)
             return
         if isinstance(exc, (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError)):
             _annotate_flood_attempt(
@@ -998,8 +1010,25 @@ class TelegramRpcGate(TelegramClient):
                 dispatch_at_monotonic=pending.dispatch_at_monotonic,
                 dispatch_kind="actual_send",
             )
-            self._record_flood(exc, scope=pending.scope)
+            _, receipt = self._record_flood(exc, scope=pending.scope)
+            if receipt is not None:
+                self._scalar_persistence_pending.add(raw_future)
+
+                def release(_receipt: asyncio.Task[None]) -> None:
+                    self._scalar_persistence_pending.discard(raw_future)
+                    self._release_scalar_dispatch(raw_future, pending)
+
+                receipt.add_done_callback(release, context=Context())
+                return
         self._release_scalar_dispatch(raw_future, pending)
+
+    def _settle_unconfirmed_scalar_dispatch(
+        self, raw_future: asyncio.Future[object], pending: _PendingScalarDispatch
+    ) -> None:
+        if self._transport_state is _TransportBoundaryState.DISCONNECTED:
+            self._release_scalar_dispatch(raw_future, pending)
+        elif self._transport_state is not _TransportBoundaryState.DISCONNECTING:
+            self._transport_state = _TransportBoundaryState.FAILED
 
     def _release_scalar_dispatch(
         self,
@@ -1037,6 +1066,7 @@ class TelegramRpcGate(TelegramClient):
             await asyncio.gather(*pending, return_exceptions=True)
         self._transport_state = _TransportBoundaryState.DISCONNECTED
         self._release_confirmed_teardown_dispatches()
+        await self._drain_cooldown_saves()
         return result
 
     def _release_confirmed_teardown_dispatches(self) -> None:
@@ -1045,7 +1075,7 @@ class TelegramRpcGate(TelegramClient):
             if raw_future.done() and not raw_future.cancelled():
                 self._finalize_scalar_dispatch(raw_future)
             remaining = self._pending_scalar_dispatches.get(raw_future)
-            if remaining is not None:
+            if remaining is not None and raw_future not in self._scalar_persistence_pending:
                 self._release_scalar_dispatch(raw_future, remaining)
 
     async def _handle_admission_deferral(
@@ -1245,27 +1275,36 @@ class TelegramRpcGate(TelegramClient):
                 raise RpcAdmissionExpiredError(scope, "Telegram RPC admission deadline elapsed")
 
     async def _observe_flood(self, exc: BaseException, *, scope: TelegramRpcScope | None = None) -> int:
-        """Compatibility wrapper for event-loop-atomic FloodWait recording."""
-        return self._record_flood(exc, scope=scope)
+        """Latch immediately, then await the gate-owned durable receipt."""
+        seconds, receipt = self._record_flood(exc, scope=scope)
+        if receipt is not None:
+            await asyncio.shield(receipt)
+        return seconds
 
-    def _record_flood(self, exc: BaseException, *, scope: TelegramRpcScope | None = None) -> int:
+    def _record_flood(
+        self, exc: BaseException, *, scope: TelegramRpcScope | None = None
+    ) -> tuple[int, asyncio.Task[None] | None]:
         """Extend cooldown and record one terminal FloodWait without caller ownership."""
         seconds = flood_seconds(exc, default=self._fallback_wait_seconds)
+        if self._flood_already_observed(exc):
+            return seconds, self._cooldown_save_tasks.get(id(exc))
         now = time.monotonic()
         global _COOLDOWN_DEADLINE
         _COOLDOWN_DEADLINE = max(_COOLDOWN_DEADLINE, now + seconds + self._cooldown_buffer_seconds)
-        observed = not self._flood_already_observed(exc)
         attempt = self._flood_attempt(exc)
-        if observed:
-            self._mark_flood_observed(exc)
-            try:
-                self._observe_flood_warning(attempt, seconds)
-            except Exception:
-                logger.exception("flood_wait_warning_observer_failed")
-        self._persist_account_cooldown(monotonic_now=now)
-        if observed:
-            self._observe_flood_event(scope, attempt, seconds)
-        return seconds
+        self._mark_flood_observed(exc)
+        try:
+            self._observe_flood_warning(attempt, seconds)
+        except Exception:
+            logger.exception("flood_wait_warning_observer_failed")
+        receipt = None
+        if self._cooldown_persistence is not None:
+            deadline_utc = time.time() + max(0.0, _COOLDOWN_DEADLINE - now)
+            receipt = asyncio.create_task(self._persist_account_cooldown(deadline_utc))
+            self._cooldown_save_tasks[id(exc)] = receipt
+            receipt.add_done_callback(lambda _task: self._cooldown_save_tasks.pop(id(exc), None), context=Context())
+        self._observe_flood_event(scope, attempt, seconds)
+        return seconds, receipt
 
     @staticmethod
     def _flood_already_observed(exc: BaseException) -> bool:

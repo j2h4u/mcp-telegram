@@ -33,6 +33,7 @@ from mcp_telegram.sync_db import _apply_migration_82, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_fact_queries import reaction_event_projection
 from mcp_telegram.telegram_message_projection import MessageLike, message_to_dict
+from sqlite_writer_helpers import inline_writer
 
 
 @pytest.fixture
@@ -150,7 +151,7 @@ async def test_detail_gate_and_inflight_visibility_fence(conn: sqlite3.Connectio
             return ReactionDetailFetchResult(page=ReactionDetailPage((ReactionEvent(7, "👍", 1),), None))
 
     gateway = Gateway()
-    refresher = ReactionDetailRefresher(conn, gateway)
+    refresher = ReactionDetailRefresher(conn, gateway, writer=inline_writer(conn))
     denied = await refresher.refresh_one(1, 2, 1, entity=1)
     assert denied.failure_kind == "visibility_unavailable"
     assert gateway.calls == 0

@@ -175,10 +175,18 @@ tool_by_name: dict[str, Tool] = dict(enumerate_available_tools())
 # Strong references keep fire-and-forget deliveries alive until they either
 # complete or the transport shutdown flush reaches its bounded deadline.
 _telemetry_tasks: set[asyncio.Task[None]] = set()
+_TELEMETRY_DELIVERY_CAPACITY = 32
+_telemetry_delivery_drops = 0
 
 
 def _schedule_telemetry(event: dict[str, object]) -> None:
     """Schedule one best-effort telemetry delivery without affecting the call."""
+    global _telemetry_delivery_drops
+    if len(_telemetry_tasks) >= _TELEMETRY_DELIVERY_CAPACITY:
+        _telemetry_delivery_drops += 1
+        if _telemetry_delivery_drops == 1 or _telemetry_delivery_drops % 100 == 0:
+            logger.warning("mcp_telemetry_delivery_dropped count=%d", _telemetry_delivery_drops)
+        return
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError as exc:

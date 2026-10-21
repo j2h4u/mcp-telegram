@@ -40,6 +40,7 @@ import os
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
+from contextlib import AsyncExitStack
 from contextvars import Context
 from dataclasses import dataclass, field
 from functools import partial
@@ -60,7 +61,13 @@ from .activity_cold_backfill import ColdBackfillPacing
 from .auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from .config import McpTelegramConfig, SchedulingConfig, load_config, resolve_scheduling_config
 from .daemon_api import DaemonApiPolicy, DaemonAPIServer, DaemonClientLike, DaemonHealthStatus
-from .delta_sync import AccessProbe, AccessProbePolicy, DeltaSyncWorker, DmGapScanPage
+from .delta_sync import (
+    AccessProbe,
+    AccessProbePolicy,
+    DeltaSyncWorker,
+    DmGapScanPage,
+    prepare_dm_deletion_reconciliation,
+)
 from .demand_composition import (
     DemandCompositionClient,
     DemandCompositionDependencies,
@@ -117,6 +124,8 @@ from .self_profile_maintenance import (
     SelfProfileMaintenanceDemandAdapter,
     SelfProfileMaintenanceDependencies,
 )
+from .sqlite_checkpoint import checkpoint_sqlite_connection
+from .sqlite_writer import SQLiteWriter
 from .startup_identity import (
     StartupIdentityResult,
     StartupIdentityState,
@@ -128,7 +137,6 @@ from .sync_db import (
     load_account_cooldown_until_utc,
     load_self_profile_last_success_at,
     migrate_legacy_databases,
-    open_runtime_sync_db,
     open_sync_db_reader,
     save_account_cooldown_until_utc,
     save_self_profile_last_success_at,
@@ -325,6 +333,7 @@ _SELECT_READ_POSITION_WORK_SQL = (
 class _SyncMainContext:
     db_path: Path
     conn: sqlite3.Connection
+    writer: SQLiteWriter
     feedback_conn: sqlite3.Connection
     shutdown_event: asyncio.Event
     client: _DaemonClient
@@ -378,6 +387,7 @@ class SQLiteSelfProfileCadence:
 
     conn: sqlite3.Connection
     interval_seconds: float
+    writer: SQLiteWriter
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.interval_seconds) or self.interval_seconds <= 0:
@@ -390,9 +400,9 @@ class SQLiteSelfProfileCadence:
         release_at = 0.0 if last_success_at is None else last_success_at + self.interval_seconds
         return DemandStatus(release_at=release_at)
 
-    def mark_refreshed(self, completed_at: float) -> None:
+    async def mark_refreshed(self, completed_at: float) -> None:
         """Commit a successful refresh timestamp atomically."""
-        save_self_profile_last_success_at(self.conn, completed_at)
+        await self.writer.run(lambda conn: save_self_profile_last_success_at(conn, completed_at))
 
 
 async def _initialize_read_positions(  # noqa: PLR0913
@@ -400,6 +410,7 @@ async def _initialize_read_positions(  # noqa: PLR0913
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
+    writer: SQLiteWriter,
     max_dialogs: int | None = None,
     failure_cooldown_seconds: float | None = None,
     batch_size: int | None = None,
@@ -459,6 +470,7 @@ async def _initialize_read_positions(  # noqa: PLR0913
             shutdown_event,
             batch_ids,
             failure_cooldown_seconds,
+            writer=writer,
             success_recheck_seconds=effective_success_recheck_seconds,
         )
         filled += batch_filled
@@ -494,6 +506,7 @@ async def _reconcile_read_position_batch(  # noqa: PLR0913
     batch_ids: list[int],
     failure_cooldown_seconds: float | None,
     *,
+    writer: SQLiteWriter,
     success_recheck_seconds: float,
 ) -> tuple[int, bool]:
     retry_ids: set[int] = set()
@@ -506,14 +519,16 @@ async def _reconcile_read_position_batch(  # noqa: PLR0913
             returned_ids: set[int] = set()
             success_due_at = int(time.time()) + max(1, math.ceil(success_recheck_seconds))
             retry_at = _read_position_retry_at(int(time.time()), failure_cooldown_seconds)
-            filled = _apply_read_positions_from_dialogs(
-                conn,
-                result,
-                retry_at=retry_at,
-                returned_ids=returned_ids,
-                failed_ids=retry_ids,
-                request_started_at=request_started_at,
-                success_due_at=success_due_at,
+            filled = await writer.run(
+                lambda owned: _apply_read_positions_from_dialogs(
+                    owned,
+                    result,
+                    retry_at=retry_at,
+                    returned_ids=returned_ids,
+                    failed_ids=retry_ids,
+                    request_started_at=request_started_at,
+                    success_due_at=success_due_at,
+                )
             )
             retry_ids.update(set(batch_ids) - returned_ids)
         else:
@@ -525,8 +540,7 @@ async def _reconcile_read_position_batch(  # noqa: PLR0913
         retry_ids.update(batch_ids)
         retry_at = _read_position_retry_at(int(time.time()), failure_cooldown_seconds)
         if retry_ids and retry_at is not None:
-            with write_transaction(conn):
-                _mark_read_position_retry(conn, retry_ids, retry_at)
+            await writer.run(lambda owned: _persist_read_position_retry(owned, retry_ids, retry_at))
         if exc.retry_after_seconds is not None:
             await sleep_through_flood(shutdown_event, exc.retry_after_seconds)
         return 0, True
@@ -536,9 +550,13 @@ async def _reconcile_read_position_batch(  # noqa: PLR0913
         filled = 0
     retry_at = _read_position_retry_at(int(time.time()), failure_cooldown_seconds)
     if retry_ids and retry_at is not None:
-        with write_transaction(conn):
-            _mark_read_position_retry(conn, retry_ids, retry_at)
+        await writer.run(lambda owned: _persist_read_position_retry(owned, retry_ids, retry_at))
     return filled, False
+
+
+def _persist_read_position_retry(conn: sqlite3.Connection, dialog_ids: set[int], retry_at: int | None) -> None:
+    with write_transaction(conn):
+        _mark_read_position_retry(conn, dialog_ids, retry_at)
 
 
 def _select_read_position_work_rows(
@@ -909,17 +927,7 @@ def _handle_tracked_task_completion(ctx: _SyncMainContext, task: asyncio.Task[ob
     exc = task.exception() if not task.cancelled() else None
     if exc is None:
         return
-    try:
-        with write_transaction(ctx.conn):
-            record_runtime_observation(
-                ctx.conn,
-                kind="runtime.task_failed",
-                outcome="failed",
-                reason_code=type(exc).__name__,
-                payload={"task_name": task.get_name()},
-            )
-    except Exception:
-        logger.exception("runtime_event_record_failed kind=runtime.task_failed")
+    _observe_runtime(ctx, "runtime.task_failed", "failed", type(exc).__name__, payload={"task_name": task.get_name()})
     if critical:
         ctx.api_server._ready = False
         ctx.api_server.startup_detail = f"critical background task failed: {task.get_name()}"
@@ -940,9 +948,9 @@ def _observe_runtime(  # noqa: PLR0913 - mirrors the bounded runtime-observation
     observed_at_ms: int | None = None,
 ) -> None:
     try:
-        with write_transaction(ctx.conn):
-            record_runtime_observation(
-                ctx.conn,
+        sink = ctx.rpc_observation_sink
+        if sink is not None:
+            sink.record(
                 kind=kind,
                 outcome=outcome,
                 reason_code=reason_code,
@@ -1048,14 +1056,17 @@ def _access_probe_policy_from_scheduling(scheduling: SchedulingConfig) -> Access
 
 def _create_telegram_client(
     config: McpTelegramConfig,
-    conn: sqlite3.Connection | None = None,
+    conn: sqlite3.Connection,
+    writer: SQLiteWriter,
 ) -> _DaemonClient:
     """Create the daemon-owned Telethon subclass with account-wide policy."""
-    if conn is None:
-        return cast(_DaemonClient, create_client(catch_up=True, config=config))
+
+    async def save_cooldown(deadline: float) -> None:
+        await writer.run(lambda owned: save_account_cooldown_until_utc(owned, deadline))
+
     cooldown_persistence = TelegramRpcCooldownPersistence(
         load_until_utc=partial(load_account_cooldown_until_utc, conn),
-        save_until_utc=partial(save_account_cooldown_until_utc, conn),
+        save_until_utc=save_cooldown,
     )
     return cast(
         _DaemonClient,
@@ -1067,32 +1078,60 @@ def _create_telegram_client(
     )
 
 
-async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0915 - composition root wires all daemon-owned services
+async def _build_sync_main_context() -> _SyncMainContext:
     config = load_config()
     scheduling = resolve_scheduling_config(config.scheduling)
     state_paths = StatePaths.from_state_dir(ensure_private_state_dir(config.state.dir))
     db_path = state_paths.sync_db_path
-    ensure_sync_schema(db_path)
+    await asyncio.to_thread(_bootstrap_sync_database, db_path, state_paths.state_dir, config)
+    async with AsyncExitStack() as cleanup:
+        writer = await SQLiteWriter.open(db_path)
+        cleanup.push_async_callback(writer.aclose)
+        conn = open_sync_db_reader(db_path)
+        cleanup.callback(conn.close)
+        ctx = await _compose_sync_main_context(config, scheduling, state_paths, writer, conn, cleanup=cleanup)
+        cleanup.pop_all()
+        return ctx
 
+
+def _bootstrap_sync_database(db_path: Path, state_dir: Path, config: McpTelegramConfig) -> None:
+    """Finish schema and legacy work before opening the runtime write owner."""
+    ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
-    migrate_legacy_databases(
-        conn,
-        state_paths.state_dir,
-        telemetry_retention_ttl_seconds=config.telemetry.retention_ttl_seconds,
-    )
-    enable_runtime_writes(conn)
-    startup_now_ms = int(time.time() * 1000)
-    while True:
-        prune_result = _prune_runtime_observations_batch(
+    try:
+        migrate_legacy_databases(
             conn,
-            ttl_seconds=config.telemetry.retention_ttl_seconds,
-            row_cap=config.telemetry.runtime_observations.row_cap,
-            now_ms=startup_now_ms,
+            state_dir,
+            telemetry_retention_ttl_seconds=config.telemetry.retention_ttl_seconds,
         )
-        if not prune_result.has_more:
-            break
-    with write_transaction(conn):
-        record_runtime_observation(conn, kind="runtime.started", outcome="observed")
+        enable_runtime_writes(conn)
+        startup_now_ms = int(time.time() * 1000)
+        while True:
+            result = _prune_runtime_observations_batch(
+                conn,
+                ttl_seconds=config.telemetry.retention_ttl_seconds,
+                row_cap=config.telemetry.runtime_observations.row_cap,
+                now_ms=startup_now_ms,
+            )
+            if not result.has_more:
+                break
+        with write_transaction(conn):
+            record_runtime_observation(conn, kind="runtime.started", outcome="observed")
+        prepare_dm_deletion_reconciliation(conn)
+    finally:
+        conn.close()
+
+
+async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - composition root wires daemon-owned services
+    config: McpTelegramConfig,
+    scheduling: SchedulingConfig,
+    state_paths: StatePaths,
+    writer: SQLiteWriter,
+    conn: sqlite3.Connection,
+    *,
+    cleanup: AsyncExitStack,
+) -> _SyncMainContext:
+    db_path = state_paths.sync_db_path
 
     # Open feedback.db before registering the shutdown handler so the SIGTERM
     # handler can checkpoint it.  feedback_conn is opened on the asyncio thread
@@ -1100,21 +1139,22 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
     # loop.add_signal_handler — so no cross-thread SQLite sharing occurs.
     feedback_db_path = state_paths.feedback_db_path
     feedback_conn = ensure_feedback_schema(feedback_db_path)
+    cleanup.callback(feedback_conn.close)
     feedback_service = FeedbackApplicationService(SQLiteFeedbackStore(feedback_conn))
     logger.info("feedback.db ready at %s", feedback_db_path)
 
     shutdown_event = daemon_shutdown.register_shutdown_handler(
-        conn,
         asyncio.get_running_loop(),
-        feedback_conn=feedback_conn,
     )
     flood_wait_kill_switch_event = asyncio.Event()
     _install_flood_wait_kill_switch(config, flood_wait_kill_switch_event)
 
-    client = _create_telegram_client(config, conn)
+    client = _create_telegram_client(config, conn, writer)
     rpc_scheduler_failure: dict[str, str | None] = {"detail": None}
 
     def health_status() -> DaemonHealthStatus:
+        if writer.failure is not None:
+            return _RpcSchedulerFailureStatus("SQLite write owner is unavailable")
         if rpc_scheduler_failure["detail"] is not None:
             return _RpcSchedulerFailureStatus(rpc_scheduler_failure["detail"])
         return flood_wait_kill_switch_status()
@@ -1122,11 +1162,13 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
     topic_refresher = TopicRefresher(
         TelethonTelegramTopicGateway(cast(TopicClient, client)),
         SQLiteTopicSnapshotRepository(conn),
+        writer=writer,
     )
     folder_repository = SQLiteFolderSnapshotRepository(conn)
     folder_refresher = FolderRefresher(
         TelethonTelegramFolderGateway(cast(FolderClient, client)),
         folder_repository,
+        writer=writer,
     )
     group_profile_port = TelethonGroupProfileGateway(client)
     user_profile_port = TelethonUserProfileGateway(client)
@@ -1140,6 +1182,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         shutdown_event,
         feedback_service,
         db_path,
+        writer=writer,
         hydration_requester=lambda hydration_conn, dialog_id, due_at: reconcile_fact_hydration_jobs_for_dialog(
             hydration_conn,
             dialog_id,
@@ -1147,7 +1190,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
             priority=HydrationPriority.BACKFILL,
         ),
         topic_refresher=topic_refresher,
-        folder_projection_reproject=lambda: folder_repository.ensure_mute_projection(now=int(time.time())),
+        folder_projection_reproject=lambda: _ensure_folder_projection(folder_repository, writer),
         group_profile_port=group_profile_port,
         user_profile_port=user_profile_port,
         channel_profile_port=channel_profile_port,
@@ -1176,6 +1219,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         ),
         health_status=health_status,
     )
+    cleanup.push_async_callback(api_server.shutdown)
     socket_path = state_paths.daemon_socket_path
     socket_path.unlink(missing_ok=True)
     old_umask = os.umask(0o177)
@@ -1188,12 +1232,17 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
     finally:
         os.umask(old_umask)
         socket_path.chmod(0o600)
+    cleanup.callback(socket_path.unlink, missing_ok=True)
+    cleanup.push_async_callback(unix_server.wait_closed)
+    cleanup.callback(unix_server.close)
     logger.info("daemon API listening on %s (not ready yet)", socket_path)
     rpc_observation_sink = RuntimeObservationSink(
         db_path,
+        writer=writer,
         retention_ttl_seconds=config.telemetry.retention_ttl_seconds,
         policy=config.telemetry.runtime_observations,
     )
+    cleanup.push_async_callback(rpc_observation_sink.aclose)
     rpc_admission_observer = RpcAdmissionObservationAggregator(
         rpc_observation_sink,
         policy=config.telemetry.runtime_observations,
@@ -1203,6 +1252,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
     ctx = _SyncMainContext(
         db_path=db_path,
         conn=conn,
+        writer=writer,
         feedback_conn=feedback_conn,
         shutdown_event=shutdown_event,
         client=client,
@@ -1215,11 +1265,13 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
             folder_repository,
             shutdown_event,
             config.scheduling.folder_projection,
+            writer=writer,
         ),
         fact_hydration_worker=MessageFactHydrationWorker(
             client,
             conn,
             shutdown_event,
+            writer=writer,
             handlers=(
                 MediaFactHydrationHandler(batch_size=scheduling.fact_hydration.batch_size),
                 TranscriptionHydrationHandler(
@@ -1239,6 +1291,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         self_profile_cadence=SQLiteSelfProfileCadence(
             conn,
             scheduling.self_profile_refresh_seconds,
+            writer,
         ),
         rpc_observation_sink=rpc_observation_sink,
         rpc_admission_observer=rpc_admission_observer,
@@ -1247,25 +1300,24 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         flood_wait_kill_switch_event=flood_wait_kill_switch_event,
     )
 
-    sink_error = rpc_observation_sink.writer_error
-    if sink_error is not None:
-        detail = f"Runtime observation sink failed during startup: {sink_error}"
-        rpc_scheduler_failure["detail"] = detail
-        api_server._ready = False
-        api_server.startup_detail = detail
-        shutdown_event.set()
-        logger.critical("runtime_observation_sink_startup_failed error=%s", sink_error)
-    else:
-        client.set_rpc_admission_observer(
-            partial(
-                _record_rpc_admission,
-                rpc_admission_observer,
-                fatal_callback=partial(_mark_rpc_scheduler_failed, ctx, rpc_scheduler_failure),
-            )
+    client.set_rpc_admission_observer(
+        partial(
+            _record_rpc_admission,
+            rpc_admission_observer,
+            fatal_callback=partial(_mark_rpc_scheduler_failed, ctx, rpc_scheduler_failure),
         )
-        client.set_rpc_request_observer(rpc_admission_observer.observe_request_attempt)
-        client.set_flood_event_observer(rpc_admission_observer.observe_flood_wait)
+    )
+    client.set_rpc_request_observer(rpc_admission_observer.observe_request_attempt)
+    client.set_flood_event_observer(rpc_admission_observer.observe_flood_wait)
     return ctx
+
+
+async def _ensure_folder_projection(repository: SQLiteFolderSnapshotRepository, writer: SQLiteWriter) -> int | None:
+    expiry = repository.next_mute_expiry()
+    now = int(time.time())
+    if expiry is None or now < expiry:
+        return None
+    return await writer.run(lambda conn: SQLiteFolderSnapshotRepository(conn).ensure_mute_projection(now=now))
 
 
 async def _run_fts_backfill(ctx: _SyncMainContext) -> None:
@@ -1276,16 +1328,7 @@ async def _run_fts_backfill(ctx: _SyncMainContext) -> None:
     ctx.api_server.startup_detail = "indexing messages for search"
     _ = ctx.api_server.startup_detail
     try:
-        # Open a dedicated connection for the thread — sqlite3 connections are
-        # not thread-safe and cannot be shared across threads.
-        def _backfill_in_thread() -> int:
-            thread_conn = open_runtime_sync_db(ctx.db_path)
-            try:
-                return backfill_fts_index(thread_conn)
-            finally:
-                thread_conn.close()
-
-        backfilled = await asyncio.to_thread(_backfill_in_thread)
+        backfilled = await ctx.writer.run(backfill_fts_index)
         if backfilled:
             logger.info("fts_backfill=%d messages indexed", backfilled)
     except Exception:
@@ -1322,9 +1365,9 @@ async def _acquire_startup_identity_before_updates(
     async def get_self_input_entity(account_id: int) -> object:
         return await ctx.client.get_input_entity(account_id)
 
-    def publish(profile: object, own_only_context: OwnOnlyContext) -> None:
-        directory.bind_account_id(own_only_context.account_id)
-        _publish_startup_identity(ctx, profile, own_only_context)
+    async def publish(profile: object, own_only_context: OwnOnlyContext) -> None:
+        await directory.bind_account_id(own_only_context.account_id)
+        await _publish_startup_identity(ctx, profile, own_only_context)
 
     adapter = SelfProfileMaintenanceDemandAdapter(
         SelfProfileMaintenanceDependencies(
@@ -1409,7 +1452,7 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     assert ctx.own_only_context == identity.own_only_context
     # The directory's account fence is durable and must settle before event
     # ownership and API readiness can expose the authenticated account.
-    ctx.demand_runtime.dialog_directory.bind_account_id(ctx.api_server.self_id)
+    await ctx.demand_runtime.dialog_directory.bind_account_id(ctx.api_server.self_id)
     assert ctx.handler_manager is not None
     ctx.handler_manager.set_self_id(ctx.api_server.self_id)
     logger.info("daemon self_id cached: %s", ctx.api_server.self_id)
@@ -1424,13 +1467,9 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     # values — so the NULL-sender shape is rare in practice. This daemon
     # step closes the gap once self_id is known. Idempotent via out=0.
     try:
-        with write_transaction(ctx.conn):
-            cur = ctx.conn.execute(
-                "UPDATE messages SET out = 1 WHERE out = 0 AND dialog_id > 0 AND sender_id = ?",
-                (ctx.api_server.self_id,),
-            )
-        if cur.rowcount > 0:
-            logger.info("backfilled out=1 on %d historical outgoing DM rows", cur.rowcount)
+        count = await ctx.writer.run(lambda conn: _backfill_outgoing_dm(conn, ctx.api_server.self_id))
+        if count > 0:
+            logger.info("backfilled out=1 on %d historical outgoing DM rows", count)
     except Exception:
         logger.warning("out=1 backfill skipped — non-fatal", exc_info=True)
 
@@ -1438,6 +1477,13 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     if ctx.api_server._ready:
         pass
     logger.info("daemon ready — serving requests on %s", ctx.socket_path)
+
+
+def _backfill_outgoing_dm(conn: sqlite3.Connection, self_id: int | None) -> int:
+    with write_transaction(conn):
+        return conn.execute(
+            "UPDATE messages SET out = 1 WHERE out = 0 AND dialog_id > 0 AND sender_id = ?", (self_id,)
+        ).rowcount
 
 
 def _offer_startup_demands(ctx: _SyncMainContext) -> None:
@@ -1480,7 +1526,7 @@ def capture_auth_scope(profile: object, client: object) -> TelegramAuthScope | N
         return None
 
 
-def _update_self_profile(api_server: DaemonAPIServer, me: _MeLike) -> None:
+async def _update_self_profile(api_server: DaemonAPIServer, me: _MeLike) -> None:
     """Atomically replace the account identity exposed to local readers."""
     self_id = int(me.id)
     api_server.self_id = self_id
@@ -1490,17 +1536,17 @@ def _update_self_profile(api_server: DaemonAPIServer, me: _MeLike) -> None:
         "last_name": getattr(me, "last_name", None),
         "username": getattr(me, "username", None),
     }
-    api_server._publish_auth_scope(capture_auth_scope(me, api_server._client))
+    await api_server._publish_auth_scope(capture_auth_scope(me, api_server._client))
 
 
-def _publish_startup_identity(ctx: _SyncMainContext, profile: object, own_only_context: OwnOnlyContext) -> None:
+async def _publish_startup_identity(ctx: _SyncMainContext, profile: object, own_only_context: OwnOnlyContext) -> None:
     """Publish all startup identity facts before waking the readiness waiter."""
-    _update_self_profile(ctx.api_server, cast(_MeLike, profile))
+    await _update_self_profile(ctx.api_server, cast(_MeLike, profile))
     ctx.own_only_context = own_only_context
 
 
 def _build_message_fact_refresh_dependencies(ctx: _SyncMainContext) -> MessageFactRefreshDeps:
-    conn = open_runtime_sync_db(ctx.db_path)
+    conn = open_sync_db_reader(ctx.db_path)
     read_at_callback: Callable[[Mapping[str, object]], None] | None = None
     reaction_callback: Callable[[str, str], None] | None = None
     sink = ctx.rpc_observation_sink
@@ -1527,6 +1573,7 @@ def _build_message_fact_refresh_dependencies(ctx: _SyncMainContext) -> MessageFa
         ReactionDetailRefresher(
             conn,
             TelethonTelegramReactionGateway(ctx.client),
+            writer=ctx.writer,
             policy=ReactionDetailPolicy(
                 unavailable_retry_seconds=ctx.scheduling.reaction_detail_unavailable_retry_seconds,
             ),
@@ -1534,6 +1581,7 @@ def _build_message_fact_refresh_dependencies(ctx: _SyncMainContext) -> MessageFa
         ),
         TelethonTelegramReadReceiptGateway(ctx.client),
         read_at_observer=read_at_callback,
+        writer=ctx.writer,
     )
 
 
@@ -1557,6 +1605,7 @@ def _build_demand_runtime(
         ctx.conn,
         ctx.shutdown_event,
         ctx.own_only_context,
+        writer=ctx.writer,
         policy=ScheduledReconciliationPolicy(
             activity_rpc_timeout_seconds=ctx.scheduling.activity_rpc_timeout_seconds,
             state_scan_seconds=ctx.scheduling.scheduled_reconciliation_seconds,
@@ -1567,6 +1616,7 @@ def _build_demand_runtime(
         ctx.conn,
         ctx.shutdown_event,
         ctx.topic_refresher,
+        writer=ctx.writer,
     )
 
     async def read_receipt_batch() -> object:
@@ -1574,6 +1624,7 @@ def _build_demand_runtime(
             ctx.client,
             ctx.conn,
             ctx.shutdown_event,
+            writer=ctx.writer,
             max_dialogs=ctx.scheduling.read_position_reconciliation_max_dialogs_per_pass,
             failure_cooldown_seconds=ctx.scheduling.read_position_reconciliation_failure_cooldown_seconds,
             batch_size=ctx.scheduling.read_position_reconciliation_batch_size,
@@ -1584,8 +1635,8 @@ def _build_demand_runtime(
     async def get_self_input_entity(account_id: int) -> object:
         return await ctx.client.get_input_entity(account_id)
 
-    def publish_startup_identity(profile: object, own_only_context: OwnOnlyContext) -> None:
-        _publish_startup_identity(ctx, profile, own_only_context)
+    async def publish_startup_identity(profile: object, own_only_context: OwnOnlyContext) -> None:
+        await _publish_startup_identity(ctx, profile, own_only_context)
         scheduled_reconciler._own_only_context = own_only_context
 
     draft_owner = ctx.draft_owner
@@ -1596,6 +1647,7 @@ def _build_demand_runtime(
         dependencies = DemandCompositionDependencies(
             client=cast(DemandCompositionClient, ctx.client),
             conn=ctx.conn,
+            writer=ctx.writer,
             db_path=ctx.db_path,
             shutdown_event=ctx.shutdown_event,
             full_sync_worker=history_runtime.full_sync_worker,
@@ -1681,10 +1733,14 @@ def _ensure_demand_runtime(
 async def _stop_daemon_api(ctx: _SyncMainContext) -> None:
     if ctx.unix_server is not None:
         ctx.unix_server.close()
-        await ctx.unix_server.wait_closed()
+    shutdown_clients = getattr(ctx.api_server, "shutdown_clients", None)
+    if shutdown_clients is not None:
+        await shutdown_clients()
     shutdown = getattr(ctx.api_server, "shutdown", None)
     if shutdown is not None:
         await shutdown()
+    if ctx.unix_server is not None:
+        await ctx.unix_server.wait_closed()
     ctx.socket_path.unlink(missing_ok=True)
 
 
@@ -1711,20 +1767,31 @@ async def _cancel_background_tasks(ctx: _SyncMainContext) -> None:
         demand_runtime.message_fact_refresh_deps.conn.close()
 
 
-def _close_runtime_connections(ctx: _SyncMainContext) -> None:
+async def _close_runtime_connections(ctx: _SyncMainContext) -> None:
+    try:
+        checkpoint_sqlite_connection(ctx.feedback_conn)
+    except Exception:
+        logger.debug("feedback_conn checkpoint error", exc_info=True)
     try:
         ctx.feedback_conn.close()
     except Exception:
         logger.debug("feedback_conn close error", exc_info=True)
     try:
-        with write_transaction(ctx.conn):
-            record_runtime_observation(ctx.conn, kind="runtime.stopped", outcome="observed")
+        await ctx.writer.run(lambda conn: _record_stopped(conn))
     except Exception:
         logger.exception("runtime_event_record_failed kind=runtime.stopped")
-    ctx.conn.close()
+    try:
+        await ctx.writer.aclose()
+    finally:
+        ctx.conn.close()
 
 
-def _persist_runtime_observation_loss(ctx: _SyncMainContext) -> None:
+def _record_stopped(conn: sqlite3.Connection) -> None:
+    with write_transaction(conn):
+        record_runtime_observation(conn, kind="runtime.stopped", outcome="observed")
+
+
+async def _persist_runtime_observation_loss(ctx: _SyncMainContext) -> None:
     """Persist a content-free boundary when the async telemetry sink lost rows."""
     sink = ctx.rpc_observation_sink
     if sink is None:
@@ -1732,11 +1799,15 @@ def _persist_runtime_observation_loss(ctx: _SyncMainContext) -> None:
     counts = _runtime_observation_loss_counts(sink)
     if not any(counts):
         return
+    await ctx.writer.run(lambda conn: _write_runtime_observation_loss(conn, counts))
+
+
+def _write_runtime_observation_loss(conn: sqlite3.Connection, counts: tuple[int, int, int, int, int]) -> None:
     queue_full_drops, _shutdown_drops, _startup_drops, _rejected_submissions, writer_failures = counts
-    with write_transaction(ctx.conn):
+    with write_transaction(conn):
         try:
             record_runtime_observation(
-                ctx.conn,
+                conn,
                 kind="runtime.telemetry_loss",
                 outcome="loss",
                 payload={
@@ -1749,7 +1820,7 @@ def _persist_runtime_observation_loss(ctx: _SyncMainContext) -> None:
             )
         except sqlite3.Error:
             logger.debug("runtime_observation_loss_event_failed")
-        ctx.conn.executemany(
+        conn.executemany(
             "INSERT OR REPLACE INTO daemon_state(key,value) VALUES (?,?)",
             (
                 ("runtime_observations_last_loss_ms", str(int(time.time() * 1000))),
@@ -1800,10 +1871,10 @@ async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
             try:
                 await ctx.rpc_observation_sink.aclose()
             finally:
-                _persist_runtime_observation_loss(ctx)
+                await _persist_runtime_observation_loss(ctx)
 
     async def close_runtime_connections() -> None:
-        _close_runtime_connections(ctx)
+        await _close_runtime_connections(ctx)
 
     stages: tuple[tuple[str, Callable[[], Awaitable[object]]], ...] = (
         ("daemon_api", lambda: _stop_daemon_api(ctx)),
@@ -1827,6 +1898,11 @@ async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
 # ---------------------------------------------------------------------------
 
 
+async def _monitor_sqlite_writer(ctx: _SyncMainContext) -> None:
+    failure = await ctx.writer.wait_failed()
+    raise RuntimeError("SQLite write owner failed") from failure
+
+
 async def sync_main() -> None:
     """Main entry point for the sync daemon process.
 
@@ -1835,8 +1911,7 @@ async def sync_main() -> None:
     """
     ctx = await _build_sync_main_context()
     try:
-        if ctx.rpc_observation_sink is not None and ctx.rpc_observation_sink.writer_error is not None:
-            return
+        _create_tracked_task(ctx, _monitor_sqlite_writer(ctx), name="sqlite_write_owner", critical=True)
         _create_tracked_task(
             ctx,
             _monitor_flood_wait_kill_switch(ctx),
@@ -1850,6 +1925,7 @@ async def sync_main() -> None:
             SQLiteDraftProjection(ctx.conn, ctx.scheduling.draft_recovery),
             ctx.shutdown_event,
             update_barrier,
+            writer=ctx.writer,
             observe=partial(_observe_runtime, ctx),
         )
         ctx.draft_owner.register()
@@ -1858,7 +1934,10 @@ async def sync_main() -> None:
             ctx.conn,
             ctx.shutdown_event,
             update_barrier=update_barrier,
+            writer=ctx.writer,
         )
+        if ctx.rpc_observation_sink is not None:
+            ctx.handler_manager.bind_observation_sink(ctx.rpc_observation_sink)
         ctx.handler_manager.register()
         logger.info("event handlers registered behind startup account barrier")
 
@@ -1869,12 +1948,13 @@ async def sync_main() -> None:
             ctx.client,
             ctx.db_path,
             ctx.shutdown_event,
+            writer=ctx.writer,
             startup_detail_setter=lambda detail: setattr(ctx.api_server, "startup_detail", detail),
         )
         startup_identity = await _acquire_startup_identity_before_updates(ctx, dialog_directory)
         assert ctx.api_server.self_id is not None
         ctx.handler_manager.set_self_id(ctx.api_server.self_id)
-        ctx.draft_owner.bind_account(ctx.api_server.self_id)
+        await ctx.draft_owner.bind_account(ctx.api_server.self_id)
         draft_owner = ctx.draft_owner
         assert draft_owner is not None
 
@@ -1884,13 +1964,14 @@ async def sync_main() -> None:
         )
         forward_gap_port = TelethonForwardGapPageAdapter(ctx.client)
         history_access_probe = TelethonHistoryAccessProbe(ctx.client)
-        delta_worker = DeltaSyncWorker(forward_gap_port, ctx.conn, ctx.shutdown_event)
+        delta_worker = DeltaSyncWorker(forward_gap_port, ctx.conn, ctx.shutdown_event, writer=ctx.writer)
         worker = FullSyncWorker(
             full_history_port,
             ctx.conn,
             ctx.shutdown_event,
             total_messages_probe=history_access_probe,
             automatic_group_history=ctx.scheduling.automatic_group_history,
+            writer=ctx.writer,
         )
         history_runtime = _HistorySyncRuntime(worker, delta_worker, history_access_probe)
         _ensure_demand_runtime(
@@ -1899,7 +1980,7 @@ async def sync_main() -> None:
             dialog_directory,
             startup_identity,
         )
-        draft_owner.request_recovery("startup")
+        await draft_owner.request_recovery("startup")
         update_barrier.open()
 
         # Keep the reconnect signal consumer live. Initial catch-up is already

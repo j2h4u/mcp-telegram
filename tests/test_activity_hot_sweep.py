@@ -22,6 +22,7 @@ from mcp_telegram.activity_peer_sweep import (
 from mcp_telegram.config import ActivityHotSweepConfig
 from mcp_telegram.sync_db import _apply_migrations
 from mcp_telegram.telegram_demand import RpcAttemptBudget
+from sqlite_writer_helpers import inline_writer
 
 _TEST_TIMEOUT_S = 120.0
 _POLICY = ActivityHotSweepConfig(jitter_max_seconds=0)
@@ -115,7 +116,9 @@ def test_hot_activity_adapter_reports_retry_gated_release() -> None:
         dialog_id = -100100000099
         _enroll(conn, dialog_id, hot_cursor=10)
         _save_dialog_state(conn, dialog_id, hot_next_retry_at=now + 90)
-        adapter = HotActivityDemandAdapter(_FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S)
+        adapter = HotActivityDemandAdapter(
+            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn)
+        )
 
         status = adapter.status(float(now))
 
@@ -135,7 +138,9 @@ async def test_hot_activity_adapter_resumes_page_window_before_advancing_cursor(
         call_log = _patch_sweep(
             monkeypatch, {dialog_id: [_make_sweep_result(first_page), _make_sweep_result(second_page)]}
         )
-        adapter = HotActivityDemandAdapter(_FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S)
+        adapter = HotActivityDemandAdapter(
+            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn)
+        )
 
         await adapter.run_slice(RpcAttemptBudget(limit=1))
 
@@ -150,7 +155,9 @@ async def test_hot_activity_adapter_resumes_page_window_before_advancing_cursor(
         assert state["hot_cursor"] == 10
         assert resume == (min(first_page), max(first_page))
 
-        restarted = HotActivityDemandAdapter(_FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S)
+        restarted = HotActivityDemandAdapter(
+            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn)
+        )
         await restarted.run_slice(RpcAttemptBudget(limit=1))
 
         state = _get_state(conn, dialog_id)
@@ -173,7 +180,9 @@ async def test_hot_activity_adapter_access_skip_preserves_cursor(monkeypatch: py
         prior_cursor = 999
         _enroll(conn, dialog_id, hot_cursor=prior_cursor)
         _patch_sweep(monkeypatch, {dialog_id: [_make_sweep_result([], skip_reason=SkipReason.ACCESS_SKIP)]})
-        adapter = HotActivityDemandAdapter(_FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S)
+        adapter = HotActivityDemandAdapter(
+            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn)
+        )
 
         await adapter.run_slice(RpcAttemptBudget(limit=1))
 
@@ -209,7 +218,9 @@ async def test_hot_activity_adapter_full_page_without_min_id_retries(monkeypatch
                 ]
             },
         )
-        adapter = HotActivityDemandAdapter(_FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S)
+        adapter = HotActivityDemandAdapter(
+            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn)
+        )
 
         await adapter.run_slice(RpcAttemptBudget(limit=1))
 
@@ -234,8 +245,8 @@ async def test_hot_sweep_includes_adjacent_id_with_exclusive_filter(monkeypatch:
     with _make_db() as conn:
         dialog_id = -100100000088
         _enroll(conn, dialog_id, hot_cursor=10)
-        await HotActivityDemandAdapter(_FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S).run_slice(
-            RpcAttemptBudget(1)
-        )
+        await HotActivityDemandAdapter(
+            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn)
+        ).run_slice(RpcAttemptBudget(1))
         assert fetched == [11]
         assert _get_state(conn, dialog_id)["hot_cursor"] == 11

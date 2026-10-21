@@ -58,7 +58,7 @@ def test_sqlite_import_owners_name_split_persistence_modules() -> None:
 
     assert {
         "account_trace_sqlite.py",
-        "daemon_shutdown.py",
+        "sqlite_writer.py",
         "sqlite_checkpoint.py",
         "messages/sqlite_bundle.py",
         "messages/sqlite_hydration.py",
@@ -67,6 +67,7 @@ def test_sqlite_import_owners_name_split_persistence_modules() -> None:
         "event_recovery.py",
         "dialog_identity.py",
     } <= gate.ALLOWED_IMPORTER_PATHS["sqlite3"]
+    assert "daemon_shutdown.py" not in gate.ALLOWED_IMPORTER_PATHS["sqlite3"]
     assert "messages/sqlite_repository.py" not in gate.ALLOWED_IMPORTER_PATHS["sqlite3"]
 
 

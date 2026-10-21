@@ -56,6 +56,9 @@ class SQLiteDraftProjection:
         self._conn = conn
         self._recovery_scheduling = recovery_scheduling
 
+    def for_connection(self, conn: sqlite3.Connection) -> SQLiteDraftProjection:
+        return SQLiteDraftProjection(conn, self._recovery_scheduling)
+
     def bind_account(self, account_id: int) -> None:
         """Bind this writer runtime to one authenticated Telegram account."""
         _validate_account_id(account_id)

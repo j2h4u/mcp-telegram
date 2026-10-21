@@ -38,12 +38,13 @@ from .dialog_identity import ensure_dialog_identity_baseline, publish_dialog_ide
 from .dialog_identity_contracts import DialogIdentityObservation
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
-from .linked_chat_fact import LinkedChatState
+from .linked_chat_fact import LinkedChatFact, LinkedChatState
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_bundle import insert_messages_with_fts, message_exists
 from .messages.telegram_adapter import extract_dialog_id, extract_message_row
 from .observation_order import allocate_observation_order
 from .own_only import enroll_own_only_sync_dialog
+from .sqlite_writer import SQLiteWriter
 from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import RpcAttemptBudgetExhaustedError
@@ -152,6 +153,7 @@ class PeerSweepRequest:
     min_id: int
     limit: int
     timeout_s: float
+    writer: SQLiteWriter = field(kw_only=True)
     hydration_priority: HydrationPriority = HydrationPriority.BACKFILL
 
 
@@ -200,7 +202,7 @@ async def _resolve_peer_for_sweep(request: PeerSweepRequest) -> TypeInputPeer | 
 
 
 def _extract_sweep_messages(
-    request: PeerSweepRequest, batch: Sequence[_SweepMessageLike]
+    conn: sqlite3.Connection, request: PeerSweepRequest, batch: Sequence[_SweepMessageLike]
 ) -> tuple[list[ExtractedMessage], frozenset[tuple[int, int]]]:
     extracted: list[ExtractedMessage] = []
     seen_keys: set[tuple[int, int]] = set()
@@ -219,11 +221,12 @@ def _extract_sweep_messages(
         seen_keys.add(key)
         extracted.append(extracted_message)
 
-    genuinely_new_keys = {key for key in seen_keys if not message_exists(request.conn, *key)}
+    genuinely_new_keys = {key for key in seen_keys if not message_exists(conn, *key)}
     return extracted, frozenset(genuinely_new_keys)
 
 
-def _extract_and_persist_sweep_messages(
+def _extract_and_persist_sweep_messages(  # noqa: PLR0913, PLR0917 - atomic page and observation context
+    conn: sqlite3.Connection,
     request: PeerSweepRequest,
     batch: Sequence[_SweepMessageLike],
     observation_order: int,
@@ -232,20 +235,20 @@ def _extract_and_persist_sweep_messages(
 ) -> tuple[list[ExtractedMessage], frozenset[tuple[int, int]]] | SweepResult:
     """Return page rows or an explicit non-completion processing error."""
     try:
-        with write_transaction(request.conn):
+        with write_transaction(conn):
             try:
-                extracted, genuinely_new_keys = _extract_sweep_messages(request, batch)
+                extracted, genuinely_new_keys = _extract_sweep_messages(conn, request, batch)
             except Exception:
                 logger.warning("sweep_peer_once_extraction_error dialog_id=%r", request.dialog_id, exc_info=True)
                 return _access_skip_result(rpc_calls=2, pages_fetched=1)
             if extracted:
                 insert_messages_with_fts(
-                    request.conn,
+                    conn,
                     [replace(row, observation_order=observation_order) for row in extracted],
                     priority=request.hydration_priority,
                 )
             if identity is not None:
-                publish_dialog_identity(request.conn, request.dialog_id, identity, identity_revision)
+                publish_dialog_identity(conn, request.dialog_id, identity, identity_revision)
     except Exception:
         logger.warning("sweep_peer_once_persistence_error dialog_id=%r", request.dialog_id, exc_info=True)
         return _access_skip_result(rpc_calls=2, pages_fetched=1)
@@ -272,6 +275,7 @@ def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequ
     min_id = cast(int, kwargs.pop("min_id"))
     limit = cast(int, kwargs.pop("limit"))
     timeout_s = cast(float, kwargs.pop("timeout_s"))
+    writer = cast(SQLiteWriter, kwargs.pop("writer"))
     hydration_priority = cast(
         HydrationPriority,
         kwargs.pop("hydration_priority", HydrationPriority.BACKFILL),
@@ -287,6 +291,7 @@ def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequ
         min_id=min_id,
         limit=limit,
         timeout_s=timeout_s,
+        writer=writer,
         hydration_priority=hydration_priority,
     )
 
@@ -372,8 +377,8 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, 
             early_result=_access_skip_result(rpc_calls=rpc_calls),
         )
     except ACCESS_LOST_ERRORS as exc:
-        with write_transaction(request.conn):
-            set_access_lost(request.conn, request.dialog_id, int(time.time()), reason=type(exc).__name__)
+        reason = type(exc).__name__
+        await request.writer.run(lambda db: _record_access_lost(db, request.dialog_id, reason))
         return _SearchOutcome(
             result=None,
             rpc_duration_s=_elapsed_s(search_started_at),
@@ -401,7 +406,7 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, 
 # ---------------------------------------------------------------------------
 
 
-async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
+async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:  # noqa: PLR0914 - bounded page state
     """Search for self-authored messages in a single peer and persist them.
 
     Direction-agnostic: takes explicit offset_id + min_id, reports both
@@ -431,9 +436,9 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
 
     # Step 2: issue per-peer self-search with concrete peer (not InputPeerEmpty)
     rpc_calls += 1  # SearchRequest is a governed Telegram call attempt.
-    with write_transaction(request.conn):
-        identity_revision = ensure_dialog_identity_baseline(request.conn, request.dialog_id)
-    observation_order = allocate_observation_order(request.conn)
+    identity_revision, observation_order = await request.writer.run(
+        lambda db: _prepare_sweep_observation(db, request.dialog_id)
+    )
     search = await _search_self_messages(request, peer, rpc_calls=rpc_calls)
     if search.early_result is not None:
         return search.early_result
@@ -441,14 +446,13 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
     rpc_duration_s = search.rpc_duration_s
     await _pace_successful_search_request()
     batch = list(cast(_SweepResultLike, search.result).messages or [])
-    page_rows = _extract_and_persist_sweep_messages(
-        request,
-        batch,
-        observation_order,
-        observe_response_dialog_identity(
-            search.result, request.dialog_id, source="profile", observed_at=int(time.time())
-        ),
-        identity_revision,
+    identity = observe_response_dialog_identity(
+        search.result, request.dialog_id, source="profile", observed_at=int(time.time())
+    )
+    page_rows = await request.writer.run(
+        lambda db: _extract_and_persist_sweep_messages(
+            db, request, batch, observation_order, identity, identity_revision
+        )
     )
     if isinstance(page_rows, SweepResult):
         return page_rows
@@ -508,6 +512,17 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
 # ---------------------------------------------------------------------------
 # Shared enrollment helper used by the bounded enrollment slice and API wiring.
 # ---------------------------------------------------------------------------
+
+
+def _prepare_sweep_observation(conn: sqlite3.Connection, dialog_id: int) -> tuple[int, int]:
+    with write_transaction(conn):
+        identity_revision = ensure_dialog_identity_baseline(conn, dialog_id)
+    return identity_revision, allocate_observation_order(conn)
+
+
+def _record_access_lost(conn: sqlite3.Connection, dialog_id: int, reason: str) -> None:
+    with write_transaction(conn):
+        set_access_lost(conn, dialog_id, int(time.time()), reason=reason)
 
 
 def enroll_activity_dialog(
@@ -829,6 +844,7 @@ class _ChannelEnrollmentRequest:
     timeout_s: float
     now: int
     cursor: int | None
+    writer: SQLiteWriter = field(kw_only=True)
 
 
 def _load_or_start_working_set_enrollment(conn: sqlite3.Connection) -> _WorkingSetEnrollmentPosition:
@@ -864,9 +880,9 @@ def _enroll_supergroup_slice(
 async def _enroll_channel_slice(
     request: _ChannelEnrollmentRequest,
 ) -> WorkingSetEnrollmentSliceResult:
-    row = _next_enrollment_dialog(request.conn, dialog_type="channel", cursor=request.cursor)
+    row = await request.writer.run(lambda db: _next_enrollment_dialog(db, dialog_type="channel", cursor=request.cursor))
     if row is None:
-        _finish_working_set_enrollment(request.conn, completed_at=request.now)
+        await request.writer.run(lambda db: _finish_working_set_enrollment(db, completed_at=request.now))
         return WorkingSetEnrollmentSliceResult(completed=True, consumed=True)
 
     channel_id, last_activity_at = row
@@ -875,12 +891,18 @@ async def _enroll_channel_slice(
         request.conn,
         channel_id,
         timeout_s=request.timeout_s,
+        writer=request.writer,
     )
+    return await request.writer.run(lambda db: _commit_channel_enrollment(db, channel_id, last_activity_at, resolution))
 
-    with write_transaction(request.conn):
+
+def _commit_channel_enrollment(
+    conn: sqlite3.Connection, channel_id: int, last_activity_at: int | None, resolution: LinkedChatFact
+) -> WorkingSetEnrollmentSliceResult:
+    with write_transaction(conn):
         if resolution.state is LinkedChatState.UNKNOWN:
             _write_working_set_enrollment_position(
-                request.conn,
+                conn,
                 phase=_ENROLLMENT_CHANNELS,
                 cursor=channel_id,
             )
@@ -888,19 +910,19 @@ async def _enroll_channel_slice(
         if resolution.state is LinkedChatState.KNOWN_LINK:
             assert resolution.linked_chat_id is not None
             _write_working_set_enrollment_position(
-                request.conn,
+                conn,
                 phase=_ENROLLMENT_CHANNELS,
                 cursor=channel_id,
             )
             _enroll_activity_dialog_in_transaction(
-                request.conn,
+                conn,
                 resolution.linked_chat_id,
                 "linked_chat",
                 last_activity_at=last_activity_at,
             )
         else:
             _write_working_set_enrollment_position(
-                request.conn,
+                conn,
                 phase=_ENROLLMENT_CHANNELS,
                 cursor=channel_id,
             )
@@ -914,10 +936,31 @@ async def run_working_set_enrollment_slice(  # noqa: PLR0913 - explicit bounded 
     source: TelegramRpcSource,
     cadence_s: float,
     timeout_s: float,
+    writer: SQLiteWriter,
     now: int | None = None,
 ) -> WorkingSetEnrollmentSliceResult:
     """Enroll one dialog candidate while durably retaining scan continuation."""
     at = int(time.time() if now is None else now)
+    preparation = await writer.run(lambda db: _prepare_working_set_enrollment(db, at=at, cadence_s=cadence_s))
+    if isinstance(preparation, WorkingSetEnrollmentSliceResult):
+        return preparation
+    position = preparation
+    return await _enroll_channel_slice(
+        _ChannelEnrollmentRequest(
+            client=client,
+            conn=conn,
+            source=source,
+            timeout_s=timeout_s,
+            now=at,
+            cursor=position.cursor,
+            writer=writer,
+        )
+    )
+
+
+def _prepare_working_set_enrollment(
+    conn: sqlite3.Connection, *, at: int, cadence_s: float
+) -> WorkingSetEnrollmentSliceResult | _WorkingSetEnrollmentPosition:
     release_at = working_set_enrollment_release_at(conn, now=float(at), cadence_s=cadence_s)
     if release_at is None or release_at > at:
         return WorkingSetEnrollmentSliceResult()
@@ -936,13 +979,4 @@ async def run_working_set_enrollment_slice(  # noqa: PLR0913 - explicit bounded 
         position = _WorkingSetEnrollmentPosition(_ENROLLMENT_CHANNELS, None)
     if position.phase != _ENROLLMENT_CHANNELS:
         raise RuntimeError(f"unknown working-set enrollment phase {position.phase!r}")
-    return await _enroll_channel_slice(
-        _ChannelEnrollmentRequest(
-            client=client,
-            conn=conn,
-            source=source,
-            timeout_s=timeout_s,
-            now=at,
-            cursor=position.cursor,
-        )
-    )
+    return position

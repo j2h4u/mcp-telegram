@@ -14,6 +14,7 @@ from mcp_telegram.config import FactHydrationConfig
 from mcp_telegram.fact_hydration import HydrationDropObservation, MessageFactHydrationWorker
 from mcp_telegram.hydration_queue import HydrationJob, HydrationPriority
 from mcp_telegram.telegram_rpc_error import describe_telegram_rpc_error
+from sqlite_writer_helpers import inline_writer
 
 
 def test_bad_request_uses_own_safe_message_and_mro_code() -> None:
@@ -88,6 +89,7 @@ def test_hydration_drop_log_aggregates_bounded_coordinates(caplog: pytest.LogCap
             conn,
             asyncio.Event(),
             handlers=(),
+            writer=inline_writer(conn),
             interval_seconds=1,
             max_requests_per_cycle=1,
             max_jobs_per_cycle=3,

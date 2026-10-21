@@ -40,6 +40,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcScope,
     TelegramRpcSource,
 )
+from sqlite_writer_helpers import inline_writer
 
 
 class _Clock:
@@ -487,6 +488,7 @@ def _suspended_discovery(
         asyncio.Event(),
         OwnOnlyContext(account_id=42, personal_channel_id=channel_id),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=1),
+        writer=inline_writer(conn),
     )
     return conn, client, ScheduledDiscoveryDemandAdapter(reconciler)
 
