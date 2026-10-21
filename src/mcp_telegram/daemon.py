@@ -8,8 +8,8 @@ Architecture:
 - sync-daemon is the sole owner of TelegramClient — connects once, holds it.
 - MCP server runs separately with disable_telegram_session() active and reads
   sync.db via open_sync_db_reader(); it never calls client.connect().
-- SIGTERM triggers shutdown_event (set by daemon_shutdown), which checkpoints
-  WAL before the daemon disconnects.
+- SIGTERM requests shutdown immediately; the write owner drains and checkpoints
+  after Telegram producers and durable RPC finalizers stop.
 
 Event handlers:
 - A startup barrier is attached before connect. Telethon's persisted catch-up
@@ -1133,10 +1133,7 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
 ) -> _SyncMainContext:
     db_path = state_paths.sync_db_path
 
-    # Open feedback.db before registering the shutdown handler so the SIGTERM
-    # handler can checkpoint it.  feedback_conn is opened on the asyncio thread
-    # (sync_main coroutine) — the same thread the SIGTERM handler runs on via
-    # loop.add_signal_handler — so no cross-thread SQLite sharing occurs.
+    # feedback.db remains a separate loop-owned store, closed during orderly shutdown.
     feedback_db_path = state_paths.feedback_db_path
     feedback_conn = ensure_feedback_schema(feedback_db_path)
     cleanup.callback(feedback_conn.close)
@@ -1321,7 +1318,7 @@ async def _ensure_folder_projection(repository: SQLiteFolderSnapshotRepository, 
 
 
 async def _run_fts_backfill(ctx: _SyncMainContext) -> None:
-    # FTS backfill runs in a thread pool (stemming is CPU-bound) so it doesn't
+    # FTS backfill runs on the write owner (stemming is CPU-bound) so it doesn't
     # block the event loop. Awaited here — before Telegram connect — so the
     # socket is already up and responding "not ready / indexing messages for
     # search" while we work. Total startup time = FTS time + Telegram time.
