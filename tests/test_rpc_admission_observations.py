@@ -14,6 +14,7 @@ from mcp_telegram.config import RuntimeObservationConfig
 from mcp_telegram.flood import FloodWaitObservation
 from mcp_telegram.rpc_admission_observations import DemandEvidenceOutcome, RpcAdmissionObservationAggregator
 from mcp_telegram.runtime_observations import MAX_PAYLOAD_BYTES, RuntimeObservationSink, encode_payload
+from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import AcquisitionKind
 from mcp_telegram.telegram_rpc_consumers import DemandKind
@@ -151,10 +152,12 @@ def test_flood_wait_records_content_free_sender_provenance_immediately() -> None
     }
 
 
-def test_flood_wait_observation_persists_through_runtime_sink(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_flood_wait_observation_persists_through_runtime_sink(tmp_path: Path) -> None:
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
-    sink = RuntimeObservationSink(path, retention_ttl_seconds=3600, policy=RuntimeObservationConfig())
+    writer = await SQLiteWriter.open(path)
+    sink = RuntimeObservationSink(path, writer=writer, retention_ttl_seconds=3600, policy=RuntimeObservationConfig())
     aggregator = RpcAdmissionObservationAggregator(sink, policy=RuntimeObservationConfig(), clock=lambda: 0.0)
 
     aggregator.observe_flood_wait(
@@ -174,7 +177,8 @@ def test_flood_wait_observation_persists_through_runtime_sink(tmp_path: Path) ->
             observed_at_ms=1_700_000_000_000,
         )
     )
-    sink.close()
+    await sink.aclose()
+    await writer.aclose()
 
     with closing(sqlite3.connect(path)) as conn:
         row = cast(

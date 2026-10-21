@@ -28,7 +28,7 @@ import sqlite3
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol, cast
 
@@ -41,6 +41,7 @@ from .activity_peer_sweep import (
 )
 from .activity_substrate import ActivityClient
 from .hydration_queue import HydrationPriority
+from .sqlite_writer import SQLiteWriter
 from .sync_read_model import SyncStatus
 from .sync_transactions import write_transaction
 from .telegram_demand import (
@@ -122,6 +123,7 @@ class ColdPeerPageDemandAdapter(DurableDemandAdapter):
     shutdown_event: asyncio.Event
     pacing: ColdBackfillPacing
     timeout_s: float
+    writer: SQLiteWriter = field(kw_only=True)
     demand_kind = DemandKind.COLD_PEER_PAGE
 
     def status(self, now: float) -> DemandStatus | None:
@@ -156,6 +158,7 @@ class ColdPeerPageDemandAdapter(DurableDemandAdapter):
                     source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
                     cadence_s=self.pacing.history.enroll_s,
                     timeout_s=self.timeout_s,
+                    writer=self.writer,
                 )
                 if enrollment.consumed:
                     # Keep the enrollment cursor at the candidate when the
@@ -168,6 +171,7 @@ class ColdPeerPageDemandAdapter(DurableDemandAdapter):
                     self.shutdown_event,
                     pacing=self.pacing,
                     timeout_s=self.timeout_s,
+                    writer=self.writer,
                 )
 
 
@@ -378,13 +382,14 @@ def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext, pacing: ColdBackfill
     return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0)
 
 
-async def run_cold_backfill_pass(
+async def run_cold_backfill_pass(  # noqa: PLR0913 - explicit worker dependencies
     client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
     pacing: ColdBackfillPacing,
     timeout_s: float,
+    writer: SQLiteWriter,
 ) -> ColdPassResult:
     """Run one cold peer-page operation under its precise durable root."""
     with _cold_demand_scope():
@@ -394,16 +399,18 @@ async def run_cold_backfill_pass(
             shutdown_event,
             pacing=pacing,
             timeout_s=timeout_s,
+            writer=writer,
         )
 
 
-async def _run_cold_backfill_pass(
+async def _run_cold_backfill_pass(  # noqa: PLR0913 - explicit worker dependencies
     client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
     pacing: ColdBackfillPacing,
     timeout_s: float,
+    writer: SQLiteWriter,
 ) -> ColdPassResult:
     """Run one Tier-B ColdBackfill pass.
 
@@ -425,7 +432,7 @@ async def _run_cold_backfill_pass(
     now = int(time.time())
 
     claim_until = now + max(1, math.ceil(timeout_s + pacing.history.batch_s))
-    row = _claim_cold_backfill_peer(conn, now=now, claim_until=claim_until)
+    row = await writer.run(lambda db: _claim_cold_backfill_peer(db, now=now, claim_until=claim_until))
 
     if row is None:
         logger.debug("activity_cold_backfill_pass_no_due_peer")
@@ -457,23 +464,26 @@ async def _run_cold_backfill_pass(
                 min_id=0,  # no time/id ceiling — full history walk
                 limit=_BACKFILL_BATCH_LIMIT,
                 timeout_s=timeout_s,
+                writer=writer,
                 hydration_priority=HydrationPriority.BACKFILL,
             )
     except RpcAttemptBudgetExhaustedError:
         # A slice bound is not an access failure. Release the short claim so
         # status() exposes immediate durable continuation on the next slice.
-        _release_cold_claim(conn, dialog_id=dialog_id, claim_until=claim_until)
+        await writer.run(lambda db: _release_cold_claim(db, dialog_id=dialog_id, claim_until=claim_until))
         return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0)
 
-    return _finish_cold_backfill_peer(
-        _ColdPeerFinishContext(
-            conn=conn,
-            dialog_id=dialog_id,
-            offset_id=offset_id,
-            started_at=started_at,
-            now=now,
-            claim_until=claim_until,
-            result=result,
-        ),
-        pacing,
+    return await writer.run(
+        lambda db: _finish_cold_backfill_peer(
+            _ColdPeerFinishContext(
+                conn=db,
+                dialog_id=dialog_id,
+                offset_id=offset_id,
+                started_at=started_at,
+                now=now,
+                claim_until=claim_until,
+                result=result,
+            ),
+            pacing,
+        )
     )

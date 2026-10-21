@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from typing import Protocol
 
 from .contracts import FolderRuleObservation
@@ -12,6 +13,8 @@ class TelegramFolderGateway(Protocol):
 
 
 class FolderSnapshotRepository(Protocol):
+    def for_connection(self, conn: sqlite3.Connection) -> FolderSnapshotRepository: ...
+
     def read_consecutive_failures(self) -> int: ...
     def read_last_outcome(self) -> str | None: ...
     def read_last_success_at(self) -> int | None: ...

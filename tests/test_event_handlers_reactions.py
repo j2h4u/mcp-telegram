@@ -38,6 +38,7 @@ from mcp_telegram.event_handlers import (
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import enable_runtime_writes
+from sqlite_writer_helpers import event_manager
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 _SQLiteConnection = sqlite3.Connection
@@ -153,7 +154,7 @@ def _count(conn: _SQLiteConnection, sql: str, parameters: tuple[object, ...] = (
 
 
 def _make_manager(client: MagicMock, conn: _SQLiteConnection, ev: asyncio.Event) -> EventHandlerManager:
-    m = EventHandlerManager(client, conn, ev)
+    m = event_manager(client, conn, ev)
     m.register()
     return m
 
@@ -437,7 +438,7 @@ def test_register_unregister_register_no_double_handler(
     shutdown_event: asyncio.Event,
 ) -> None:
     """AC-REG-IDEMPOTENT: register -> unregister -> register; raw handler net 1 active."""
-    mgr = EventHandlerManager(mock_client, sync_db, shutdown_event)
+    mgr = event_manager(mock_client, sync_db, shutdown_event)
 
     mgr.register()
     mgr.unregister()

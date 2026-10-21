@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -26,6 +26,7 @@ from mcp_telegram.delta_sync import (
     DeltaSyncWorker,
     DmDeletionReconciliationDemandAdapter,
     DmGapScanPage,
+    prepare_dm_deletion_reconciliation,
 )
 from mcp_telegram.demand_composition import (
     DemandCompositionClient,
@@ -66,8 +67,9 @@ from mcp_telegram.self_profile_maintenance import (
     SelfProfileCadenceState,
     SelfProfileMaintenanceDemandAdapter,
 )
+from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.startup_identity import StartupIdentityState
-from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.sync_db import ensure_sync_schema, open_sync_db_reader
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncDmEnrollmentDemandAdapter
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
@@ -82,6 +84,7 @@ from mcp_telegram.telegram_rpc_consumers import (
 )
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope, rpc_scope
 from tests.helpers import LoudUserProfilePort, build_mock_message
+from tests.sqlite_writer_helpers import inline_writer
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +98,9 @@ class _FolderPolicy:
 
 
 class _IdleFolderRepository(FolderSnapshotRepository):
+    def for_connection(self, conn: sqlite3.Connection) -> FolderSnapshotRepository:
+        return self
+
     def read_consecutive_failures(self) -> int:
         return 0
 
@@ -174,7 +180,9 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
     folder_repository = _IdleFolderRepository()
-    folder_worker = FolderProjectionWorker(MagicMock(), folder_repository, asyncio.Event(), _FolderPolicy())
+    folder_worker = FolderProjectionWorker(
+        MagicMock(), folder_repository, asyncio.Event(), _FolderPolicy(), writer=inline_writer(conn)
+    )
     message_fact_policy = MessageFactRefreshPolicy(
         read_at_ttl_seconds=60,
         reaction_max_messages_per_cycle=1,
@@ -190,11 +198,11 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
         "access_probe": MagicMock(),
         "dm_gap_scanner": _DmGapScanner(),
         "dialog": MagicMock(),
-        "directory": CanonicalDialogDirectory(MagicMock(), db_path, asyncio.Event()),
+        "directory": CanonicalDialogDirectory(MagicMock(), db_path, asyncio.Event(), writer=inline_writer(conn)),
         "entity": EntityRefreshCoordinator(),
         "hydration": MagicMock(),
         "folder": folder_worker,
-        "facts": MessageFactRefreshDeps(conn, MagicMock(), MagicMock()),
+        "facts": MessageFactRefreshDeps(conn, MagicMock(), MagicMock(), writer=inline_writer(conn)),
         "fact_policy": message_fact_policy,
         "scheduled": MagicMock(),
         "access_policy": MagicMock(),
@@ -202,9 +210,9 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
         "cold_pacing": ColdBackfillPacing(
             history=ColdBackfillHistoryPacing(batch_s=1.0, enroll_s=60.0, access_retry_s=60.0),
         ),
-        "cadence": SQLiteSelfProfileCadence(conn, 60.0),
+        "cadence": SQLiteSelfProfileCadence(conn, 60.0, writer=inline_writer(conn)),
         "draft_owner": DraftMessageOwner(
-            MagicMock(), MagicMock(), asyncio.Event(), UpdateProcessingBarrier(closed=True)
+            MagicMock(), MagicMock(), asyncio.Event(), UpdateProcessingBarrier(closed=True), writer=inline_writer(conn)
         ),
         "linked_chat_refresh": _LinkedChatRefresher(),
     }
@@ -215,11 +223,12 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
     async def get_self_input_entity(_account_id: int) -> object:
         return object()
 
-    update_profile: Callable[[object], None] = MagicMock()
-    publish_startup_identity: Callable[[object, OwnOnlyContext], None] = MagicMock()
+    update_profile: Callable[[object], Awaitable[None]] = AsyncMock()
+    publish_startup_identity: Callable[[object, OwnOnlyContext], Awaitable[None]] = AsyncMock()
     dependencies = DemandCompositionDependencies(
         client=cast(DemandCompositionClient, objects["client"]),
         conn=cast(sqlite3.Connection, objects["conn"]),
+        writer=inline_writer(conn),
         db_path=db_path,
         shutdown_event=cast(asyncio.Event, objects["shutdown"]),
         full_sync_worker=cast(object, objects["full"]),  # type: ignore[arg-type]
@@ -313,7 +322,7 @@ def test_adapter_map_is_exact_against_literal_21_kind_class_map(
     assert adapters[DemandKind.LIVE_HYDRATION_BATCH]._worker is objects["hydration"]  # type: ignore[attr-defined]
 
 
-def test_adapter_composition_quarantines_legacy_dm_generation_before_registration(
+def test_bootstrap_quarantines_legacy_dm_generation_before_registration(
     composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
 ) -> None:
     dependencies, objects = composition_dependencies
@@ -330,6 +339,7 @@ def test_adapter_composition_quarantines_legacy_dm_generation_before_registratio
         (json.dumps(legacy_state),),
     )
     dependencies.conn.commit()
+    prepare_dm_deletion_reconciliation(dependencies.conn)
 
     adapters = build_durable_adapter_map(dependencies)
 
@@ -396,13 +406,15 @@ async def test_invalid_dm_checkpoint_does_not_block_forward_delta_coordinator(
 
     class EmptyForwardPage:
         async def fetch_page(
-            self, _dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
+            self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
         ) -> ForwardGapPage:
             assert after_message_id == (delta_cursor or 0)
             assert not should_stop()
             return ForwardGapPage(messages=(), complete=True)
 
-    worker = DeltaSyncWorker(EmptyForwardPage(), dependencies.conn, dependencies.shutdown_event)  # type: ignore[arg-type]
+    worker = DeltaSyncWorker(
+        EmptyForwardPage(), dependencies.conn, dependencies.shutdown_event, writer=inline_writer(dependencies.conn)
+    )  # type: ignore[arg-type]
     coordinated_dependencies = replace(dependencies, delta_sync_worker=worker)
     coordinator = build_durable_coordinator(coordinated_dependencies)
 
@@ -539,6 +551,9 @@ def test_scheduled_repair_remains_due_during_day_long_local_link_wait(
         dependencies.shutdown_event,
         OwnOnlyContext(account_id=1, personal_channel_id=channel_id),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=30.0),
+        writer=inline_writer(  # type: ignore[arg-type]
+            dependencies.conn
+        ),
     )
     repair = ScheduledRepairDemandAdapter(reconciler).status(now)
     discovery = ScheduledDiscoveryDemandAdapter(reconciler).status(now)
@@ -593,7 +608,12 @@ async def test_linked_chat_adapter_real_gate_cannot_retry_physical_send(
             return await gate(request)
 
     client = _GateClient()
-    manager = EventHandlerManager(client, dependencies.conn, dependencies.shutdown_event)  # type: ignore[arg-type]
+    manager = EventHandlerManager(
+        client,  # type: ignore[arg-type]
+        dependencies.conn,
+        dependencies.shutdown_event,
+        writer=inline_writer(dependencies.conn),
+    )
     manager._synced_dialog_ids.add(dialog_id)
 
     class _RecordingSink:
@@ -665,7 +685,12 @@ async def test_malformed_dm_checkpoint_does_not_block_realtime_gate_acquisition(
         return {}
 
     monkeypatch.setattr("mcp_telegram.event_handlers._build_fwd_entity_map", acquire_forward_entity)
-    manager = EventHandlerManager(SimpleNamespace(), dependencies.conn, dependencies.shutdown_event)  # type: ignore[arg-type]
+    manager = EventHandlerManager(
+        SimpleNamespace(),  # type: ignore[arg-type]
+        dependencies.conn,
+        dependencies.shutdown_event,
+        writer=inline_writer(dependencies.conn),
+    )
 
     class _DemandSink:
         def offer(self, _kind: DemandKind) -> bool:
@@ -705,21 +730,47 @@ async def test_composition_builds_executable_coordinator(
     assert coordinator.state.value == "new"
 
 
-def test_self_profile_cadence_survives_database_restart(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_self_profile_cadence_survives_database_restart(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(str(db_path))
-    cadence = SQLiteSelfProfileCadence(conn, 60.0)
+    cadence = SQLiteSelfProfileCadence(conn, 60.0, writer=inline_writer(conn))
 
     assert cadence.status(100.0).release_at == 0.0
-    cadence.mark_refreshed(100.0)
+    await cadence.mark_refreshed(100.0)
     conn.close()
 
     restarted_conn = sqlite3.connect(str(db_path))
     try:
-        restarted_cadence = SQLiteSelfProfileCadence(restarted_conn, 60.0)
+        restarted_cadence = SQLiteSelfProfileCadence(restarted_conn, 60.0, writer=inline_writer(restarted_conn))
         assert restarted_cadence.status(110.0).release_at == 160.0
         assert not restarted_cadence.status(159.0).is_ready(159.0)
         assert restarted_cadence.status(160.0).is_ready(160.0)
     finally:
         restarted_conn.close()
+
+
+@pytest.mark.asyncio
+async def test_adapter_composition_is_readonly_and_shares_writer(
+    composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
+) -> None:
+    dependencies, _objects = composition_dependencies
+    writer = await SQLiteWriter.open(dependencies.db_path)
+    reader = open_sync_db_reader(dependencies.db_path)
+    try:
+        adapters = build_durable_adapter_map(replace(dependencies, conn=reader, writer=writer))
+        for kind in (
+            DemandKind.HOT_ACTIVITY_PAGE,
+            DemandKind.ARCHIVE_BACKFILL,
+            DemandKind.ARCHIVE_INCREMENTAL,
+            DemandKind.COLD_PEER_PAGE,
+        ):
+            assert cast(HotActivityDemandAdapter, adapters[kind]).writer is writer
+        assert (
+            cast(DmDeletionReconciliationDemandAdapter, adapters[DemandKind.DM_DELETION_RECONCILIATION])._writer
+            is writer
+        )
+    finally:
+        await writer.aclose()
+        reader.close()

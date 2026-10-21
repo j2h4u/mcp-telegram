@@ -38,6 +38,7 @@ from .own_only import (
     query_own_only_candidates,
     remove_own_only_basis,
 )
+from .sqlite_writer import SQLiteWriter
 from .sync_db import SCHEDULED_ACTIVE_REPAIR_SECONDS, SCHEDULED_QUIET_DISCOVERY_SECONDS
 from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
@@ -110,12 +111,14 @@ def _mark_scheduled_dialog_dirty(conn: sqlite3.Connection, dialog_id: int, now: 
     add_own_only_basis(conn, dialog_id, OwnOnlyBasis.SCHEDULED_EVENT, now=now)
 
 
-async def _load_candidate_entity(
+async def _load_candidate_entity(  # noqa: PLR0913 - classification and writer dependencies
     client: _ScheduledClient,
     conn: sqlite3.Connection,
     dialog_id: int,
     dialog_type: str,
     personal_channel_id: int | None,
+    *,
+    writer: SQLiteWriter,
 ) -> tuple[object | None, bool, bool]:
     """Fetch a channel entity; return (entity, stop, skip) for classification."""
     if dialog_type != "channel" or dialog_id == personal_channel_id:
@@ -129,10 +132,12 @@ async def _load_candidate_entity(
     except TelegramRpcThrottled as exc:
         _raise_if_latched(exc)
         assert exc.retry_after_seconds is not None
-        _record_retry(conn, int(time.time()) + exc.retry_after_seconds, "TelegramRpcThrottled")
+        retry_at = int(time.time()) + exc.retry_after_seconds
+        await writer.run(lambda worker_conn: _record_retry(worker_conn, retry_at, "TelegramRpcThrottled"))
         return None, True, False
     except RPCError as exc:
-        _log_own_only_entity_rpc_error(conn, dialog_id, exc)
+        error = exc
+        await writer.run(lambda worker_conn: _log_own_only_entity_rpc_error(worker_conn, dialog_id, error))
         return None, False, True
 
 
@@ -491,7 +496,7 @@ def _has_active_scheduled_messages(conn: sqlite3.Connection, dialog_id: int) -> 
 class ScheduledMessageReconciler:
     """Durable per-dialog scheduled-history reconciliation worker."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - explicit lifecycle and writer dependencies
         self,
         client: _ScheduledClient,
         conn: sqlite3.Connection,
@@ -499,42 +504,48 @@ class ScheduledMessageReconciler:
         own_only_context: OwnOnlyContext | None = None,
         *,
         policy: ScheduledReconciliationPolicy,
+        writer: SQLiteWriter,
     ) -> None:
         self._client = client
         self._conn = conn
+        self._writer = writer
         self._shutdown_event = shutdown_event
         self._own_only_context = own_only_context
         self._policy = policy
         self._next_candidate_seed_at = 0
 
-    def _seed_candidates(self, now: int) -> None:
-        """Enroll newly visible candidates without making them immediately due."""
+    async def _seed_candidates(self, now: int) -> None:
         candidate_ids = self._candidate_ids()
-        active_ids = {
-            _as_int(row[0])
-            for row in cast(
-                list[tuple[object]],
-                self._conn.execute(
-                    "SELECT DISTINCT dialog_id FROM scheduled_messages WHERE message_state='scheduled'"
-                ).fetchall(),
-            )
-        }
-        candidate_ids.update(active_ids)
-        with write_transaction(self._conn):
-            for dialog_id in candidate_ids:
-                self._conn.execute(
-                    """
-                    INSERT OR IGNORE INTO scheduled_reconciliation_state(
-                        dialog_id, repair_due_at, discovery_due_at, updated_at
-                    ) VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        dialog_id,
-                        now if dialog_id in active_ids else None,
-                        _stable_discovery_due_at(dialog_id, now, SCHEDULED_QUIET_DISCOVERY_SECONDS),
-                        now,
-                    ),
+
+        def persist(conn: sqlite3.Connection) -> None:
+            """Enroll newly visible candidates without making them immediately due."""
+            active_ids = {
+                _as_int(row[0])
+                for row in cast(
+                    list[tuple[object]],
+                    conn.execute(
+                        "SELECT DISTINCT dialog_id FROM scheduled_messages WHERE message_state='scheduled'"
+                    ).fetchall(),
                 )
+            }
+            candidate_ids.update(active_ids)
+            with write_transaction(conn):
+                for dialog_id in candidate_ids:
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO scheduled_reconciliation_state(
+                            dialog_id, repair_due_at, discovery_due_at, updated_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            dialog_id,
+                            now if dialog_id in active_ids else None,
+                            _stable_discovery_due_at(dialog_id, now, SCHEDULED_QUIET_DISCOVERY_SECONDS),
+                            now,
+                        ),
+                    )
+
+        await self._writer.run(persist)
         self._next_candidate_seed_at = now + max(1, int(self._policy.state_scan_seconds))
 
     def _candidate_ids(self) -> set[int]:
@@ -570,9 +581,9 @@ class ScheduledMessageReconciler:
         }
         return bool(candidate_ids - seeded_ids)
 
-    def _seed_candidates_if_due(self, now: int) -> None:
+    async def _seed_candidates_if_due(self, now: int) -> None:
         if now >= self._next_candidate_seed_at:
-            self._seed_candidates(now)
+            await self._seed_candidates(now)
 
     async def _context(self) -> OwnOnlyContext | ScheduledDiscoveryPending | None:
         context = self._own_only_context
@@ -583,6 +594,7 @@ class ScheduledMessageReconciler:
             self._conn,
             context.personal_channel_id,
             timeout_s=self._policy.activity_rpc_timeout_seconds,
+            writer=self._writer,
         )
         if resolution.state is LinkedChatState.UNKNOWN:
             now = int(time.time())
@@ -639,7 +651,7 @@ class ScheduledMessageReconciler:
             return known is not None
         dialog_type = str(row[0] or "unknown")
         entity, stop, skip = await _load_candidate_entity(
-            self._client, self._conn, dialog_id, dialog_type, context.personal_channel_id
+            self._client, self._conn, dialog_id, dialog_type, context.personal_channel_id, writer=self._writer
         )
         if stop:
             return None
@@ -656,8 +668,12 @@ class ScheduledMessageReconciler:
             context=context,
         )
         if classification.included:
-            with write_transaction(self._conn):
-                enroll_own_only_dialog(self._conn, dialog_id, classification)
+
+            def enroll(conn: sqlite3.Connection) -> None:
+                with write_transaction(conn):
+                    enroll_own_only_dialog(conn, dialog_id, classification)
+
+            await self._writer.run(enroll)
         return classification.included
 
     async def _fetch_scheduled_snapshot(self, dialog_id: int) -> list[object]:
@@ -702,15 +718,18 @@ class ScheduledMessageReconciler:
         )
         return [(_as_int(row[0]), _as_int(row[1]), bool(row[2])) for row in rows]
 
-    def _record_dialog_failure(self, dialog_id: int, kind: str, _code: str, now: int) -> None:
-        due_column = "discovery_due_at" if kind == "discovery" else "repair_due_at"
-        with write_transaction(self._conn):
-            self._conn.execute(
-                f"UPDATE scheduled_reconciliation_state SET {due_column}=?, updated_at=? WHERE dialog_id=?",
-                (now + self._policy.failure_retry_seconds, now, dialog_id),
-            )
+    async def _record_dialog_failure(self, dialog_id: int, kind: str, _code: str, now: int) -> None:
+        def persist(conn: sqlite3.Connection) -> None:
+            due_column = "discovery_due_at" if kind == "discovery" else "repair_due_at"
+            with write_transaction(conn):
+                conn.execute(
+                    f"UPDATE scheduled_reconciliation_state SET {due_column}=?, updated_at=? WHERE dialog_id=?",
+                    (now + self._policy.failure_retry_seconds, now, dialog_id),
+                )
 
-    def _apply_snapshot(
+        await self._writer.run(persist)
+
+    async def _apply_snapshot(
         self,
         dialog_id: int,
         generation: int,
@@ -719,63 +738,69 @@ class ScheduledMessageReconciler:
         discovery: bool,
         now: int,
     ) -> int | None:
-        # Acquire the write lock before checking the generation.  Otherwise a
-        # concurrent event can dirty the dialog after the check and be erased
-        # by this older snapshot.
-        with write_transaction(self._conn):
-            current = cast(
-                tuple[object] | None,
-                self._conn.execute(
-                    "SELECT dirty_generation FROM scheduled_reconciliation_state WHERE dialog_id=?", (dialog_id,)
-                ).fetchone(),
-            )
-            if current is None or _as_int(current[0]) != generation:
-                return None
-            snapshot_ids = _snapshot_message_ids(snapshot)
-            missing_ids = _missing_scheduled_ids(self._conn, dialog_id, snapshot_ids)
-            _upsert_snapshot_messages(self._conn, dialog_id, snapshot, now)
-            changed = mark_missing_from_snapshot(self._conn, dialog_id, missing_ids, now=now)
-            active = _has_active_scheduled_messages(self._conn, dialog_id)
-            self._conn.execute(
-                """
-                UPDATE scheduled_reconciliation_state
-                SET repair_due_at=?,
-                    discovery_due_at=CASE WHEN ? THEN ? ELSE discovery_due_at END,
-                    dirty_since=NULL,
-                    updated_at=?
-                WHERE dialog_id=? AND dirty_generation=?
-                """,
-                (
-                    now + SCHEDULED_ACTIVE_REPAIR_SECONDS if active else None,
-                    discovery,
-                    now + SCHEDULED_QUIET_DISCOVERY_SECONDS,
-                    now,
-                    dialog_id,
-                    generation,
-                ),
-            )
-            if not active:
-                remove_own_only_basis(self._conn, dialog_id, OwnOnlyBasis.SCHEDULED_EVENT, now=now)
-            return changed
+        def persist(conn: sqlite3.Connection) -> int | None:
+            # Acquire the write lock before checking the generation.  Otherwise a
+            # concurrent event can dirty the dialog after the check and be erased
+            # by this older snapshot.
+            with write_transaction(conn):
+                current = cast(
+                    tuple[object] | None,
+                    conn.execute(
+                        "SELECT dirty_generation FROM scheduled_reconciliation_state WHERE dialog_id=?", (dialog_id,)
+                    ).fetchone(),
+                )
+                if current is None or _as_int(current[0]) != generation:
+                    return None
+                snapshot_ids = _snapshot_message_ids(snapshot)
+                missing_ids = _missing_scheduled_ids(conn, dialog_id, snapshot_ids)
+                _upsert_snapshot_messages(conn, dialog_id, snapshot, now)
+                changed = mark_missing_from_snapshot(conn, dialog_id, missing_ids, now=now)
+                active = _has_active_scheduled_messages(conn, dialog_id)
+                conn.execute(
+                    """
+                    UPDATE scheduled_reconciliation_state
+                    SET repair_due_at=?,
+                        discovery_due_at=CASE WHEN ? THEN ? ELSE discovery_due_at END,
+                        dirty_since=NULL,
+                        updated_at=?
+                    WHERE dialog_id=? AND dirty_generation=?
+                    """,
+                    (
+                        now + SCHEDULED_ACTIVE_REPAIR_SECONDS if active else None,
+                        discovery,
+                        now + SCHEDULED_QUIET_DISCOVERY_SECONDS,
+                        now,
+                        dialog_id,
+                        generation,
+                    ),
+                )
+                if not active:
+                    remove_own_only_basis(conn, dialog_id, OwnOnlyBasis.SCHEDULED_EVENT, now=now)
+                return changed
 
-    def _finish_excluded_discovery(self, dialog_id: int, now: int) -> bool:
-        with write_transaction(self._conn):
-            active = cast(
-                tuple[object] | None,
-                self._conn.execute(
-                    "SELECT 1 FROM scheduled_messages WHERE dialog_id=? AND message_state='scheduled' LIMIT 1",
-                    (dialog_id,),
-                ).fetchone(),
-            )
-            if active is not None:
-                return False
-            remove_own_only_basis(self._conn, dialog_id, OwnOnlyBasis.SCHEDULED_EVENT, now=now)
-            self._conn.execute(
-                "UPDATE scheduled_reconciliation_state SET repair_due_at=NULL, discovery_due_at=?, "
-                "updated_at=? WHERE dialog_id=?",
-                (now + SCHEDULED_QUIET_DISCOVERY_SECONDS, now, dialog_id),
-            )
-            return True
+        return await self._writer.run(persist)
+
+    async def _finish_excluded_discovery(self, dialog_id: int, now: int) -> bool:
+        def persist(conn: sqlite3.Connection) -> bool:
+            with write_transaction(conn):
+                active = cast(
+                    tuple[object] | None,
+                    conn.execute(
+                        "SELECT 1 FROM scheduled_messages WHERE dialog_id=? AND message_state='scheduled' LIMIT 1",
+                        (dialog_id,),
+                    ).fetchone(),
+                )
+                if active is not None:
+                    return False
+                remove_own_only_basis(conn, dialog_id, OwnOnlyBasis.SCHEDULED_EVENT, now=now)
+                conn.execute(
+                    "UPDATE scheduled_reconciliation_state SET repair_due_at=NULL, discovery_due_at=?, "
+                    "updated_at=? WHERE dialog_id=?",
+                    (now + SCHEDULED_QUIET_DISCOVERY_SECONDS, now, dialog_id),
+                )
+                return True
+
+        return await self._writer.run(persist)
 
     async def _prepare_discovery(self, dialog_id: int, now: int) -> tuple[int, bool] | None:
         try:
@@ -783,14 +808,15 @@ class ScheduledMessageReconciler:
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
             assert exc.retry_after_seconds is not None
-            _record_retry(self._conn, int(time.time()) + exc.retry_after_seconds, "TelegramRpcThrottled")
+            retry_at = int(time.time()) + exc.retry_after_seconds
+            await self._writer.run(lambda conn: _record_retry(conn, retry_at, "TelegramRpcThrottled"))
             return 0, True
         if isinstance(eligible, ScheduledDiscoveryPending):
             return 0, True
         if eligible is None:
-            self._record_dialog_failure(dialog_id, "discovery", "classification_unavailable", now)
+            await self._record_dialog_failure(dialog_id, "discovery", "classification_unavailable", now)
             return 0, False
-        if not eligible and self._finish_excluded_discovery(dialog_id, now):
+        if not eligible and await self._finish_excluded_discovery(dialog_id, now):
             return 0, False
         return None
 
@@ -803,7 +829,7 @@ class ScheduledMessageReconciler:
             _raise_if_latched(exc)
             assert exc.retry_after_seconds is not None
             wake_at = int(time.time()) + exc.retry_after_seconds
-            _record_retry(self._conn, wake_at, "TelegramRpcThrottled")
+            await self._writer.run(lambda conn: _record_retry(conn, wake_at, "TelegramRpcThrottled"))
             logger.warning(
                 "scheduled_reconcile_flood_wait dialog_id=%d retry_at=%d — stopping account pass",
                 dialog_id,
@@ -812,7 +838,8 @@ class ScheduledMessageReconciler:
             return None, True
         except RPCError as exc:
             kind = "discovery" if discovery else "repair"
-            self._record_dialog_failure(dialog_id, kind, type(exc).__name__, now)
+            error_code = type(exc).__name__
+            await self._record_dialog_failure(dialog_id, kind, error_code, now)
             logger.warning("scheduled_reconcile_rpc_error dialog_id=%d error_type=%s", dialog_id, type(exc).__name__)
             return None, False
 
@@ -824,7 +851,7 @@ class ScheduledMessageReconciler:
         snapshot, stopped = await self._fetch_snapshot_or_stop(dialog_id, discovery, now)
         if snapshot is None:
             return 0, stopped
-        changed = self._apply_snapshot(dialog_id, generation, snapshot, discovery=discovery, now=now)
+        changed = await self._apply_snapshot(dialog_id, generation, snapshot, discovery=discovery, now=now)
         return (0 if changed is None else changed), False
 
     async def run_demand_slice(self, demand_kind: DemandKind) -> int:
@@ -869,12 +896,13 @@ class ScheduledMessageReconciler:
         retry_at = _retry_at(self._conn)
         if retry_at is not None and retry_at > now:
             return 0
-        self._seed_candidates_if_due(now)
+        await self._seed_candidates_if_due(now)
         due_rows = self._due_rows(now, demand_kind)
         total, flood_waited = await self._process_due_rows(due_rows, now, demand_kind)
 
         if due_rows and not self._shutdown_event.is_set() and not flood_waited:
-            _clear_retry(self._conn, int(time.time()))
+            completed_at = int(time.time())
+            await self._writer.run(lambda conn: _clear_retry(conn, completed_at))
         return total
 
 

@@ -13,10 +13,11 @@ import pytest
 from telethon.tl import types
 
 from helpers import build_mock_message
-from mcp_telegram.event_handlers import EventHandlerManager, _EditedMessageEvent
+from mcp_telegram.event_handlers import _EditedMessageEvent
 from mcp_telegram.fts import stem_text
 from mcp_telegram.message_composition import decode_formatting_entities
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from sqlite_writer_helpers import event_manager
 
 
 @pytest.mark.asyncio
@@ -41,7 +42,7 @@ async def test_formatting_only_edit_persists_without_lookup_or_history(tmp_path:
         conn.commit()
         message = build_mock_message(1, text="same", edit_date=datetime(2026, 1, 1, tzinfo=UTC))
         message.entities = [types.MessageEntityBold(offset=0, length=4)]
-        manager = EventHandlerManager(client, conn, asyncio.Event())
+        manager = event_manager(client, conn, asyncio.Event())
         await manager.on_message_edited(cast(_EditedMessageEvent, SimpleNamespace(chat_id=42, message=message)))
         facts = decode_formatting_entities(
             cast(tuple[str | None], conn.execute("SELECT formatting_entities FROM messages").fetchone())[0]

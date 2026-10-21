@@ -39,6 +39,7 @@ from mcp_telegram.telegram_reading import ReadDateFetchResult, ReadDateReason, T
 from mcp_telegram.telegram_rpc_consumers import TelegramRpcSource
 from mcp_telegram.telegram_rpc_scheduler import RpcAdmissionClosedError, rpc_scope
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.sqlite_writer_helpers import inline_writer
 
 
 def _make_db(path: str | Path = ":memory:") -> sqlite3.Connection:
@@ -228,6 +229,7 @@ async def test_reaction_pacing_caps_repeated_slices_and_opens_next_window() -> N
         conn,
         cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
         cast(TelegramReadReceiptGateway, object()),
+        writer=inline_writer(conn),
     )
     policy = MessageFactRefreshPolicy(
         reaction_max_messages_per_cycle=10,
@@ -267,6 +269,7 @@ async def test_reaction_pacing_claim_survives_cancellation_and_restart(tmp_path:
         conn,
         cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
         cast(TelegramReadReceiptGateway, object()),
+        writer=inline_writer(conn),
     )
     conn.commit()
     await refresh_message_facts_once(deps, policy, now=100, shutdown_event=event)
@@ -283,6 +286,7 @@ async def test_reaction_pacing_claim_survives_cancellation_and_restart(tmp_path:
         reopened,
         cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
         cast(TelegramReadReceiptGateway, object()),
+        writer=inline_writer(reopened),
     )
     await refresh_message_facts_once(reopened_deps, policy, now=100)
     assert calls == []
@@ -302,6 +306,7 @@ async def test_open_reaction_window_accepts_only_one_claim_batch() -> None:
         conn,
         cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
         cast(TelegramReadReceiptGateway, object()),
+        writer=inline_writer(conn),
     )
     policy = MessageFactRefreshPolicy(10, 0, 0, 600, 5, 600)
 
@@ -364,6 +369,7 @@ async def test_empty_reaction_scan_does_not_open_or_reset_window() -> None:
         conn,
         cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
         cast(TelegramReadReceiptGateway, object()),
+        writer=inline_writer(conn),
     )
     policy = MessageFactRefreshPolicy(10, 0, 0, 600, 5, 600)
 
@@ -385,6 +391,7 @@ async def test_set_shutdown_skips_reaction_claim() -> None:
         conn,
         cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
         cast(TelegramReadReceiptGateway, object()),
+        writer=inline_writer(conn),
     )
     shutdown_event = asyncio.Event()
     shutdown_event.set()
@@ -414,6 +421,7 @@ async def test_demand_adapter_passes_shutdown_to_message_fact_refresh() -> None:
             conn,
             cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
             cast(TelegramReadReceiptGateway, object()),
+            writer=inline_writer(conn),
         ),
         MessageFactRefreshPolicy(10, 0, 0, 600, 5, 600),
         shutdown_event=shutdown_event,
@@ -439,6 +447,7 @@ async def test_reaction_flood_wait_extends_durable_release() -> None:
         conn,
         cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls, result)),
         cast(TelegramReadReceiptGateway, object()),
+        writer=inline_writer(conn),
         clock=lambda: 350,
     )
     conn.commit()
@@ -483,6 +492,7 @@ async def test_read_date_runs_before_reaction_when_both_lanes_are_due() -> None:
             conn,
             cast(ReactionDetailRefresher, OrderedReactionRefresher([])),
             cast(TelegramReadReceiptGateway, OrderedReadGateway()),
+            writer=inline_writer(conn),
         ),
         MessageFactRefreshPolicy(10, 1, 0, 600, 5, 600),
         now=2_000,
@@ -509,6 +519,7 @@ def test_open_reaction_pacing_boundary_does_not_hide_due_read_dates() -> None:
         conn,
         cast(ReactionDetailRefresher, object()),
         cast(TelegramReadReceiptGateway, object()),
+        writer=inline_writer(conn),
     )
     policy = MessageFactRefreshPolicy(10, 1, 0, 600, 5, 600)
     status = MessageFactRefreshDemandAdapter(deps, policy).status(100)
@@ -535,6 +546,7 @@ async def test_cached_retry_boundary_restarts_empty_sweep_when_due() -> None:
             conn,
             cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
             cast(TelegramReadReceiptGateway, object()),
+            writer=inline_writer(conn),
             clock=lambda: clock[0],
         ),
         MessageFactRefreshPolicy(10, 0, 0, 600, 5, 600),
@@ -571,6 +583,7 @@ async def test_late_page_partial_candidate_outranks_earlier_missing_candidate() 
             conn,
             cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
             cast(TelegramReadReceiptGateway, object()),
+            writer=inline_writer(conn),
             clock=lambda: 100,
         ),
         MessageFactRefreshPolicy(1, 0, 0, 600, 1, 600),
@@ -623,6 +636,7 @@ def test_read_at_status_cache_keeps_release_without_requerying() -> None:
         conn,
         cast(ReactionDetailRefresher, object()),
         cast(TelegramReadReceiptGateway, object()),
+        writer=inline_writer(conn),
         clock=lambda: clock[0],
     )
     adapter = MessageFactRefreshDemandAdapter(deps, _policy(reaction_max=0))
@@ -658,6 +672,7 @@ async def test_empty_reaction_pages_have_bounded_vm_and_read_at_status_work() ->
             conn,
             cast(ReactionDetailRefresher, object()),
             cast(TelegramReadReceiptGateway, object()),
+            writer=inline_writer(conn),
             read_at_observer=observations.append,
             clock=lambda: clock[0],
         ),
@@ -709,6 +724,7 @@ async def test_frozen_reaction_upper_and_claim_revalidation() -> None:
             conn,
             cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
             cast(TelegramReadReceiptGateway, object()),
+            writer=inline_writer(conn),
             clock=lambda: clock[0],
         ),
         MessageFactRefreshPolicy(1, 0, 0, 600, 1, 600),
@@ -821,6 +837,7 @@ async def test_read_at_cycle_telemetry_is_aggregate_and_terminal_safe() -> None:
                 conn,
                 cast(ReactionDetailRefresher, object()),
                 cast(TelegramReadReceiptGateway, _ReadReceiptGateway()),
+                writer=inline_writer(conn),
                 read_at_observer=observations.append,
             ),
             _policy(reaction_max=0),
@@ -901,6 +918,7 @@ async def test_read_at_cycle_groups_interleaved_candidates_by_dialog() -> None:
                 conn,
                 cast(ReactionDetailRefresher, object()),
                 cast(TelegramReadReceiptGateway, Gateway()),
+                writer=inline_writer(conn),
             ),
             MessageFactRefreshPolicy(10, 4, 0, 600, 5, 600),
             now=1000,
@@ -932,6 +950,7 @@ async def test_read_at_attempt_telemetry_distinguishes_equal_message_ids_across_
                 conn,
                 cast(ReactionDetailRefresher, object()),
                 cast(TelegramReadReceiptGateway, _ReadReceiptGateway()),
+                writer=inline_writer(conn),
                 read_at_observer=observations.append,
             ),
             _policy(reaction_max=0),
@@ -964,6 +983,7 @@ async def test_canceled_read_at_cycle_publishes_no_incomplete_telemetry() -> Non
                 conn,
                 cast(ReactionDetailRefresher, object()),
                 cast(TelegramReadReceiptGateway, gateway),
+                writer=inline_writer(conn),
                 read_at_observer=observations.append,
             ),
             _policy(reaction_max=0),
@@ -1014,6 +1034,7 @@ async def test_message_too_old_cutoff_is_global_and_sent_at_based() -> None:
             conn,
             cast(ReactionDetailRefresher, object()),
             cast(TelegramReadReceiptGateway, Gateway()),
+            writer=inline_writer(conn),
             read_at_observer=observations.append,
         ),
         _policy(reaction_max=0, read_at_max=10),
@@ -1050,6 +1071,7 @@ async def test_message_too_old_cutoff_is_global_and_sent_at_based() -> None:
             conn,
             cast(ReactionDetailRefresher, object()),
             cast(TelegramReadReceiptGateway, Gateway()),
+            writer=inline_writer(conn),
             read_at_observer=observations.append,
         ),
         _policy(reaction_max=0, read_at_max=10),
@@ -1221,6 +1243,7 @@ async def test_fresh_recheck_skip_is_counted_separately(
         Gateway(),
         20,
         [ReadMessage(message_id=1, sent_at=1000, dialog_id=20, out=1)],
+        writer=inline_writer(conn),
         stale_before_utc=2000,
         checked_at=2000,
         read_at_ttl_seconds=600,
@@ -1314,6 +1337,7 @@ async def test_invalid_witness_is_quarantined_and_cycle_continues(invalid_sent_a
             conn,
             cast(ReactionDetailRefresher, object()),
             cast(TelegramReadReceiptGateway, Gateway()),
+            writer=inline_writer(conn),
             read_at_observer=observations.append,
         ),
         _policy(reaction_max=0, read_at_max=2),
@@ -1338,6 +1362,7 @@ async def test_invalid_witness_is_quarantined_and_cycle_continues(invalid_sent_a
             conn,
             cast(ReactionDetailRefresher, object()),
             cast(TelegramReadReceiptGateway, Gateway()),
+            writer=inline_writer(conn),
             read_at_observer=observations.append,
         ),
         _policy(reaction_max=0, read_at_max=2),
@@ -1382,7 +1407,10 @@ async def test_privacy_outcome_does_not_advance_read_date_cutoff() -> None:
     conn.commit()
     await refresh_message_facts_once(
         MessageFactRefreshDeps(
-            conn, cast(ReactionDetailRefresher, object()), cast(TelegramReadReceiptGateway, Gateway())
+            conn,
+            cast(ReactionDetailRefresher, object()),
+            cast(TelegramReadReceiptGateway, Gateway()),
+            writer=inline_writer(conn),
         ),
         _policy(reaction_max=0, read_at_max=1),
         now=2_000,
@@ -1423,6 +1451,7 @@ async def test_read_at_control_errors_leave_facts_and_telemetry_untouched(
                     conn,
                     cast(ReactionDetailRefresher, object()),
                     cast(TelegramReadReceiptGateway, _FailingReadReceiptGateway(error)),
+                    writer=inline_writer(conn),
                     read_at_observer=observations.append,
                 ),
                 _policy(reaction_max=0),
@@ -1449,7 +1478,10 @@ def test_read_at_cursor_null_has_no_candidate_or_release() -> None:
     assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL) is None
     adapter = MessageFactRefreshDemandAdapter(
         MessageFactRefreshDeps(
-            conn, cast(ReactionDetailRefresher, object()), cast(TelegramReadReceiptGateway, object())
+            conn,
+            cast(ReactionDetailRefresher, object()),
+            cast(TelegramReadReceiptGateway, object()),
+            writer=inline_writer(conn),
         ),
         _policy(reaction_max=0),
     )
@@ -1487,7 +1519,10 @@ def test_terminal_read_at_set_has_no_status_or_release() -> None:
     seed_full_history_enrollment(conn, 20, enabled=True)
     adapter = MessageFactRefreshDemandAdapter(
         MessageFactRefreshDeps(
-            conn, cast(ReactionDetailRefresher, object()), cast(TelegramReadReceiptGateway, object())
+            conn,
+            cast(ReactionDetailRefresher, object()),
+            cast(TelegramReadReceiptGateway, object()),
+            writer=inline_writer(conn),
         ),
         _policy(reaction_max=0),
     )
@@ -1544,6 +1579,7 @@ async def test_refresh_message_facts_once_respects_zero_budget() -> None:
                 conn,
                 cast(ReactionDetailRefresher, object()),
                 cast(TelegramReadReceiptGateway, read_receipts),
+                writer=inline_writer(conn),
             ),
             _policy(reaction_max=0, read_at_max=0),
             now=2_000,

@@ -19,6 +19,7 @@ from .access_lifecycle import set_access_lost
 from .dialog_identity import capture_identity_baseline, publish_dialog_identity
 from .flood import TelegramRpcThrottled, sleep_through_flood
 from .maintenance_logging import log_maintenance_cycle
+from .sqlite_writer import SQLiteWriter
 from .sync_transactions import write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import (
@@ -125,9 +126,12 @@ class DialogReconciliationWorker:
         conn: sqlite3.Connection,
         shutdown_event: asyncio.Event,
         topic_refresher: TopicRefresher | None = None,
+        *,
+        writer: SQLiteWriter,
     ) -> None:
         self._client = cast(_DialogSyncClient, client)
         self._conn = conn
+        self._writer = writer
         self._shutdown_event = shutdown_event
         self._topic_refresher = topic_refresher
 
@@ -138,24 +142,26 @@ class DialogReconciliationWorker:
         logger.warning("recon_light_flood_wait dialog_id=%d wait=%ds", dialog_id, wait_s)
         return await sleep_through_flood(self._shutdown_event, wait_s)
 
-    def _persist_light_dialog(self, dialog_id: int, entity: _EntityLike, identity_revision: int | None) -> None:
+    def _persist_light_dialog(
+        self, conn: sqlite3.Connection, dialog_id: int, entity: _EntityLike, identity_revision: int | None
+    ) -> None:
         fields = _extract_entity_fields(entity)
         snapshot_at = int(time.time())
         observation = observe_dialog_identity(entity, dialog_id=dialog_id, source="profile", observed_at=snapshot_at)
-        with write_transaction(self._conn):
-            self._conn.execute(
+        with write_transaction(conn):
+            conn.execute(
                 _UPDATE_DIALOG_ENTITY_SQL,
                 (fields["members"], fields["created"], snapshot_at, dialog_id),
             )
             if observation is not None:
-                publish_dialog_identity(self._conn, dialog_id, observation, identity_revision)
+                publish_dialog_identity(conn, dialog_id, observation, identity_revision)
 
     async def _refresh_light_dialog(self, dialog_id: int, *, refresh_topics: bool = True) -> bool | None:
         """Refresh one dirty dialog; None means shutdown interrupted a wait."""
-        identity_revision = capture_identity_baseline(self._conn, dialog_id)
+        identity_revision = await self._writer.run(lambda db: capture_identity_baseline(db, dialog_id))
         try:
             entity = await self._client.get_entity(dialog_id)
-            self._persist_light_dialog(dialog_id, entity, identity_revision)
+            await self._writer.run(lambda db: self._persist_light_dialog(db, dialog_id, entity, identity_revision))
             if refresh_topics and self._topic_refresher is not None and is_topic_capable(entity):
                 topic_count = await self._refresh_forum_topics(dialog_id, entity)
                 logger.debug(
@@ -174,8 +180,8 @@ class DialogReconciliationWorker:
                 type(exc).__name__,
             )
         except ACCESS_LOST_ERRORS as exc:
-            with write_transaction(self._conn):
-                set_access_lost(self._conn, dialog_id, int(time.time()), reason=type(exc).__name__)
+            reason = type(exc).__name__
+            await self._writer.run(lambda db: _record_access_lost(db, dialog_id, reason))
         except PeerIdInvalidError:
             logger.warning(
                 "recon_light_pass_peer_invalid dialog_id=%s (session cache miss; will retry next cycle)",
@@ -232,6 +238,11 @@ class DialogReconciliationWorker:
             return 0
         logger.debug("recon_topics_complete dialog_id=%d count=%d", dialog_id, count)
         return count
+
+
+def _record_access_lost(conn: sqlite3.Connection, dialog_id: int, reason: str) -> None:
+    with write_transaction(conn):
+        set_access_lost(conn, dialog_id, int(time.time()), reason=reason)
 
 
 class DialogLightReconciliationDemandAdapter:

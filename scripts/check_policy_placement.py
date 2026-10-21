@@ -61,6 +61,17 @@ NON_OPERATOR_POLICY_FINDINGS: frozenset[tuple[str, str]] = frozenset(
             "src/mcp_telegram/folders/contracts.py:<module>:FOLDER_DIALOG_PAGE_SIZE",
         ),
         ("policy_assignments", "src/mcp_telegram/delta_sync.py:<module>:_DELTA_SLICE_MESSAGE_LIMIT"),
+        # Finite owner-turn batching is a write-ownership invariant, not an operator TTL.
+        ("policy_assignments", "src/mcp_telegram/runtime_observations.py:<module>:_FLUSH_BATCH_SIZE"),
+        # Existing computed retry timestamps moved into synchronous owner callbacks.
+        ("policy_assignments", "src/mcp_telegram/scheduled_messages.py:_load_candidate_entity:retry_at"),
+        (
+            "policy_assignments",
+            "src/mcp_telegram/scheduled_messages.py:ScheduledMessageReconciler._prepare_discovery:retry_at",
+        ),
+        # Task ownership and a computed persistence timestamp are runtime state.
+        ("policy_assignments", "src/mcp_telegram/telegram_rpc.py:TelegramRpcGate.__init__:self._cooldown_save_tasks"),
+        ("policy_assignments", "src/mcp_telegram/telegram_rpc.py:TelegramRpcGate._record_flood:deadline_utc"),
         (
             "policy_assignments",
             "src/mcp_telegram/scheduled_messages.py:ScheduledReconciliationPolicy:failure_retry_seconds",

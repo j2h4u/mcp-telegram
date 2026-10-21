@@ -40,6 +40,7 @@ from tests.helpers import (
     LoudGroupProfilePort,
     LoudUserProfilePort,
 )
+from tests.sqlite_writer_helpers import inline_writer
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -119,6 +120,7 @@ def _make_server(
         conn,
         cast(DaemonClientLike, client),
         asyncio.Event(),
+        writer=inline_writer(conn),
         channel_profile_port=channel_profile_port,
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=user_profile_port if user_profile_port is not None else LoudUserProfilePort(),

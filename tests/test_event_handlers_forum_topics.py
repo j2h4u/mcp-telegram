@@ -44,6 +44,7 @@ from mcp_telegram.event_handlers import (
     _NewMessageEvent,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from sqlite_writer_helpers import event_manager
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 _SQLiteConnection = sqlite3.Connection
@@ -181,7 +182,7 @@ def _topic_count(conn: _SQLiteConnection) -> int:
 
 
 def _make_manager(client: MagicMock, conn: _SQLiteConnection, ev: asyncio.Event) -> EventHandlerManager:
-    m = EventHandlerManager(client, conn, ev)
+    m = event_manager(client, conn, ev)
     m.bind_demand_sink(MagicMock())
     m.register()
     return m
@@ -789,7 +790,7 @@ def test_register_attaches_forum_topic_pinned_handler(
     shutdown_event: asyncio.Event,
 ) -> None:
     """register() adds on_raw_forum_topic_pinned as an event handler."""
-    mgr = EventHandlerManager(mock_client, sync_db, shutdown_event)
+    mgr = event_manager(mock_client, sync_db, shutdown_event)
     mgr.register()
 
     add_calls = mock_client.add_event_handler.call_args_list
@@ -803,7 +804,7 @@ def test_unregister_detaches_forum_topic_pinned_handler(
     shutdown_event: asyncio.Event,
 ) -> None:
     """unregister() removes on_raw_forum_topic_pinned."""
-    mgr = EventHandlerManager(mock_client, sync_db, shutdown_event)
+    mgr = event_manager(mock_client, sync_db, shutdown_event)
     mgr.register()
     mgr.unregister()
 

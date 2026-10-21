@@ -5,12 +5,12 @@ import inspect
 import json
 import logging
 import sqlite3
-from collections.abc import Coroutine
+from collections.abc import AsyncIterator, Coroutine
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -44,6 +44,7 @@ from mcp_telegram.flood import FloodWaitKillSwitchStatus, TelegramRpcThrottled
 from mcp_telegram.own_only_contracts import OwnOnlyContext
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.runtime_observations import RuntimeObservationSink
+from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.startup_identity import (
     StartupIdentityResult,
     StartupIdentityState,
@@ -68,6 +69,18 @@ from tests.helpers import (
     LoudUserAvatarHistoryPort,
     LoudUserProfilePort,
 )
+from tests.sqlite_writer_helpers import inline_writer
+
+
+@pytest.fixture
+async def shared_writer(tmp_path: Path) -> AsyncIterator[SQLiteWriter]:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    writer = await SQLiteWriter.open(path)
+    try:
+        yield writer
+    finally:
+        await writer.aclose()
 
 
 def _ctx(**overrides: object) -> SimpleNamespace:
@@ -79,6 +92,7 @@ def _ctx(**overrides: object) -> SimpleNamespace:
         "handler_manager": _HandlerStub(),
         "api_server": _ApiStub(),
         "conn": MagicMock(),
+        "writer": SimpleNamespace(run=AsyncMock(return_value=0), aclose=AsyncMock()),
         "client": _ClientStub(),
         "user_profile_port": _UserProfilePort(),
         "folder_projection_worker": SimpleNamespace(),
@@ -149,7 +163,7 @@ class _ApiStub:
     async def shutdown(self) -> None:
         return
 
-    def _publish_auth_scope(self, _scope: object) -> None:
+    async def _publish_auth_scope(self, _scope: object) -> None:
         return
 
 
@@ -267,7 +281,7 @@ class _CadenceStub:
     def status(self, _now: float) -> None:
         return None
 
-    def mark_refreshed(self, _completed_at: float) -> None:
+    async def mark_refreshed(self, _completed_at: float) -> None:
         return
 
 
@@ -415,10 +429,10 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
         def register(self) -> None:
             events.append("owner:register")
 
-        def bind_account(self, account_id: int) -> None:
+        async def bind_account(self, account_id: int) -> None:
             events.append(f"owner:bind:{account_id}")
 
-        def request_recovery(self, reason: str) -> None:
+        async def request_recovery(self, reason: str) -> None:
             events.append(f"owner:recovery:{reason}")
 
     class _Handler:
@@ -437,6 +451,7 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
 
     ctx = SimpleNamespace(
         rpc_observation_sink=None,
+        writer=object(),
         client=object(),
         conn=object(),
         db_path=Path("/tmp/mcp-telegram-sync-main-test.db"),
@@ -457,6 +472,8 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
 
     def create_task(_ctx: object, coroutine: object, **kwargs: object) -> None:
         cast(Coroutine[object, object, object], coroutine).close()
+        if kwargs["name"] == "sqlite_write_owner":
+            assert kwargs.get("critical") is True
         events.append(f"task:{kwargs['name']}")
 
     async def connect(_ctx: object) -> bool:
@@ -508,6 +525,7 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
 
     assert events == [
         "context",
+        "task:sqlite_write_owner",
         "task:flood_wait_kill_switch_monitor",
         "fts",
         "barrier:True",
@@ -560,11 +578,15 @@ async def test_prime_runtime_waits_for_coordinator_profile_and_offers_folder() -
     startup_identity.advance_input_user(object())
     startup_identity.complete(StartupIdentityResult(SimpleNamespace(id=42), own_only_context))
     bound_account_ids: list[int] = []
+
+    async def bind_account_id(account_id: int) -> None:
+        bound_account_ids.append(account_id)
+
     ctx = _typed_ctx(
         coordinator=coordinator,
         demand_runtime=SimpleNamespace(
             startup_identity=startup_identity,
-            dialog_directory=SimpleNamespace(bind_account_id=bound_account_ids.append),
+            dialog_directory=SimpleNamespace(bind_account_id=bind_account_id),
         ),
         handler_manager=handler,
         api_server=api,
@@ -588,7 +610,9 @@ async def test_prime_runtime_waits_for_coordinator_profile_and_offers_folder() -
 
 
 @pytest.mark.asyncio
-async def test_classified_startup_identity_mismatch_preserves_directory_rows(tmp_path: Path) -> None:
+async def test_classified_startup_identity_mismatch_preserves_directory_rows(
+    tmp_path: Path, shared_writer: SQLiteWriter
+) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
@@ -608,7 +632,7 @@ async def test_classified_startup_identity_mismatch_preserves_directory_rows(tmp
         api_server=_ApiStub(),
         self_profile_cadence=_CadenceStub(),
     )
-    directory = CanonicalDialogDirectory(ctx.client, db_path, shutdown)
+    directory = CanonicalDialogDirectory(ctx.client, db_path, shutdown, writer=shared_writer)
 
     with pytest.raises(StartupIdentityUnavailableError, match="startup identity"):
         await _acquire_startup_identity_before_updates(ctx, directory)
@@ -622,7 +646,7 @@ async def test_classified_startup_identity_mismatch_preserves_directory_rows(tmp
 
 
 @pytest.mark.asyncio
-async def test_classified_startup_identity_binds_matching_account(tmp_path: Path) -> None:
+async def test_classified_startup_identity_binds_matching_account(tmp_path: Path, shared_writer: SQLiteWriter) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     shutdown = asyncio.Event()
@@ -633,7 +657,7 @@ async def test_classified_startup_identity_binds_matching_account(tmp_path: Path
         api_server=_ApiStub(),
         self_profile_cadence=_CadenceStub(),
     )
-    directory = CanonicalDialogDirectory(ctx.client, db_path, shutdown)
+    directory = CanonicalDialogDirectory(ctx.client, db_path, shutdown, writer=shared_writer)
 
     startup = await _acquire_startup_identity_before_updates(ctx, directory)
 
@@ -727,6 +751,7 @@ async def test_latched_coordinator_stop_keeps_local_daemon_socket_available(  # 
         cast(DaemonClientLike, client),
         shutdown,
         FeedbackApplicationService(SQLiteFeedbackStore(feedback_conn)),
+        writer=inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
@@ -839,6 +864,7 @@ async def test_protective_monitor_cancels_active_coordinator_without_closing_loc
         conn,
         cast(DaemonClientLike, client),
         shutdown,
+        writer=inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
@@ -931,11 +957,12 @@ async def test_protective_monitor_cancels_active_coordinator_without_closing_loc
 async def test_protective_stop_persists_pending_summary_while_daemon_remains_parked(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    shared_writer: SQLiteWriter,
 ) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     policy = RuntimeObservationConfig()
-    sink = RuntimeObservationSink(db_path, retention_ttl_seconds=3600, policy=policy)
+    sink = RuntimeObservationSink(db_path, writer=shared_writer, retention_ttl_seconds=3600, policy=policy)
     observer = RpcAdmissionObservationAggregator(sink, policy=policy)
     source = TelegramRpcSource.MCP_INTERACTIVE
     service_class = RPC_SOURCE_SERVICE_CLASS[source]
@@ -1024,11 +1051,12 @@ async def test_failed_protective_stop_flushes_without_disconnected_success_log(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    shared_writer: SQLiteWriter,
 ) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     policy = RuntimeObservationConfig()
-    sink = RuntimeObservationSink(db_path, retention_ttl_seconds=3600, policy=policy)
+    sink = RuntimeObservationSink(db_path, writer=shared_writer, retention_ttl_seconds=3600, policy=policy)
     observer = RpcAdmissionObservationAggregator(sink, policy=policy)
     source = TelegramRpcSource.MCP_INTERACTIVE
     service_class = RPC_SOURCE_SERVICE_CLASS[source]

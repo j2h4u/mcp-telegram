@@ -11,7 +11,7 @@ import pytest
 
 import mcp_telegram.request_timing as request_timing_module
 from mcp_telegram.correlation import correlation_context, current_operation_id
-from mcp_telegram.daemon_api import DaemonAPIServer, _insert_telemetry_row, _normalize_telemetry_event, _served_source
+from mcp_telegram.daemon_api import DaemonAPIServer, _normalize_telemetry_event, _served_source
 from mcp_telegram.daemon_client import DaemonConnection
 from mcp_telegram.operator_summary import _timing_contributor
 from mcp_telegram.request_timing import (
@@ -298,27 +298,31 @@ async def test_daemon_envelope_carries_active_operation_id() -> None:
     assert payload["operation_id"] == operation_id
 
 
-def test_mcp_telemetry_persists_operation_id_without_product_content() -> None:
+@pytest.mark.asyncio
+async def test_mcp_telemetry_persists_operation_id_without_product_content() -> None:
     conn = sqlite3.connect(":memory:")
     conn.executescript(_RUNTIME_OBSERVATIONS_V54_DDL.replace("runtime_observations_v54", "runtime_observations"))
     conn.execute("ALTER TABLE runtime_observations ADD COLUMN tool_capability TEXT")
     conn.execute("ALTER TABLE runtime_observations ADD COLUMN contract_version INTEGER")
-    _insert_telemetry_row(
-        conn,
+    result = await make_server(conn)._record_telemetry(
         {
-            "tool_name": "list_messages",
-            "operation_id": "b" * 32,
-            "timestamp": 1.0,
-            "duration_ms": 12.0,
-            "outcome": "success",
-            "arguments": "secret",
-            "message_text": "secret",
-        },
+            "event": {
+                "tool_name": "list_messages",
+                "operation_id": "b" * 32,
+                "timestamp": 1.0,
+                "duration_ms": 12.0,
+                "outcome": "success",
+                "arguments": "secret",
+                "message_text": "secret",
+            }
+        }
     )
+    assert result == {"ok": True}
     row = cast(
         tuple[str, str] | None, conn.execute("SELECT operation_id, payload_json FROM runtime_observations").fetchone()
     )
-    assert row == ("b" * 32, '{"timing_scope":"mcp_call"}')
+    assert row is not None
+    assert (row[0], row[1]) == ("b" * 32, '{"timing_scope":"mcp_call"}')
     conn.close()
 
 
@@ -690,21 +694,24 @@ async def test_timing_sink_failure_does_not_change_product_result() -> None:
     assert response["ok"] is True
 
 
-def test_mcp_phase_timing_is_retained_without_arbitrary_payload() -> None:
+@pytest.mark.asyncio
+async def test_mcp_phase_timing_is_retained_without_arbitrary_payload() -> None:
     conn = sqlite3.connect(":memory:")
     conn.executescript(_RUNTIME_OBSERVATIONS_V54_DDL.replace("runtime_observations_v54", "runtime_observations"))
     conn.execute("ALTER TABLE runtime_observations ADD COLUMN tool_capability TEXT")
     conn.execute("ALTER TABLE runtime_observations ADD COLUMN contract_version INTEGER")
-    _insert_telemetry_row(
-        conn,
+    result = await make_server(conn)._record_telemetry(
         {
-            "tool_name": "get_entity_info",
-            "timestamp": 1.0,
-            "primary_duration_ms": 89.0,
-            "account_protection_ms": 1000.0,
-            "payload": {"secret": "DO_NOT_RETAIN"},
-        },
+            "event": {
+                "tool_name": "get_entity_info",
+                "timestamp": 1.0,
+                "primary_duration_ms": 89.0,
+                "account_protection_ms": 1000.0,
+                "payload": {"secret": "DO_NOT_RETAIN"},
+            }
+        }
     )
+    assert result == {"ok": True}
     row = cast(tuple[str], conn.execute("SELECT payload_json FROM runtime_observations").fetchone())
     assert json.loads(row[0]) == {
         "timing_scope": "mcp_call",

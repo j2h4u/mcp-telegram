@@ -42,6 +42,7 @@ from tests.helpers import (
     LoudUserAvatarHistoryPort,
     LoudUserProfilePort,
 )
+from tests.sqlite_writer_helpers import inline_writer
 
 
 def _fenced_schema(conn: sqlite3.Connection) -> None:
@@ -159,6 +160,7 @@ def _pair_service(conn: sqlite3.Connection, client: _PairClient, *, enabled: boo
 
     service = DaemonEntityInfoService(
         EntityInfoDeps(
+            writer=inline_writer(conn),
             conn=conn,
             client=client,
             dm_peer_ids=lambda: set(),
@@ -290,6 +292,7 @@ async def test_protective_disconnect_serves_valid_partial_profile_from_local_cac
         conn,
         cast(DaemonClientLike, client),
         asyncio.Event(),
+        writer=inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
@@ -301,7 +304,7 @@ async def test_protective_disconnect_serves_valid_partial_profile_from_local_cac
     scope = TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99)
     api._ready = True
     api.bind_demand_sink(MagicMock(offer=MagicMock(return_value=True)))
-    api._publish_auth_scope(scope)
+    await api._publish_auth_scope(scope)
     api._health_status = lambda: FloodWaitKillSwitchStatus(
         open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
     )

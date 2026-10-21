@@ -11,6 +11,7 @@ from telethon.tl import functions, types  # type: ignore[import-untyped]
 
 from helpers import remove_v80_schema_for_historical_fixture
 from mcp_telegram.dialog_directory import CanonicalDialogDirectory
+from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import (
     _CURRENT_SCHEMA_VERSION,
     _DIALOG_DIRECTORY_STATE_DDL,
@@ -233,9 +234,13 @@ async def test_v77_incomplete_generation_restarts_from_fresh_full_crawl_and_publ
     _migrate_and_assert_fresh_directory_generation(db_path)
 
     client = _PublicationClient()
-    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
-    for _ in range(3):
-        await directory.run_slice()
+    writer = await SQLiteWriter.open(db_path)
+    try:
+        directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=writer)
+        for _ in range(3):
+            await directory.run_slice()
+    finally:
+        await writer.aclose()
     _assert_fresh_crawl_was_published(client, db_path)
 
 

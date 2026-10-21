@@ -21,6 +21,7 @@ from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.topics.refresh import TopicRefresher
 from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from mcp_telegram.topics.telegram_adapter import TelethonTelegramTopicGateway
+from sqlite_writer_helpers import inline_writer
 
 
 @pytest.fixture
@@ -70,7 +71,9 @@ async def test_recon_light_pass_resets_needs_refresh_without_owning_identity(
     _seed_dialog(sync_db, 100, needs_refresh=1)
     mock_client.get_entity.return_value = _user(100, "NewName")
 
-    count = await DialogReconciliationWorker(mock_client, sync_db, shutdown_event).run_light_pass()
+    count = await DialogReconciliationWorker(
+        mock_client, sync_db, shutdown_event, writer=inline_writer(sync_db)
+    ).run_light_pass()
 
     assert count == 1
     assert sync_db.execute("SELECT name, needs_refresh FROM dialogs WHERE dialog_id=100").fetchone() == ("Old", 0)
@@ -93,7 +96,12 @@ async def test_recon_light_pass_persists_chat_creation_date(
         version=1,
     )
 
-    assert await DialogReconciliationWorker(mock_client, sync_db, shutdown_event).run_light_pass() == 1
+    assert (
+        await DialogReconciliationWorker(
+            mock_client, sync_db, shutdown_event, writer=inline_writer(sync_db)
+        ).run_light_pass()
+        == 1
+    )
     assert sync_db.execute("SELECT created FROM dialogs WHERE dialog_id=100").fetchone() == (int(created.timestamp()),)
 
 
@@ -113,7 +121,12 @@ async def test_recon_light_pass_preserves_known_creation_date_when_entity_omits_
         version=1,
     )
 
-    assert await DialogReconciliationWorker(mock_client, sync_db, shutdown_event).run_light_pass() == 1
+    assert (
+        await DialogReconciliationWorker(
+            mock_client, sync_db, shutdown_event, writer=inline_writer(sync_db)
+        ).run_light_pass()
+        == 1
+    )
     assert sync_db.execute("SELECT created FROM dialogs WHERE dialog_id=100").fetchone() == (123456789,)
 
 
@@ -124,7 +137,12 @@ async def test_recon_light_pass_skips_hidden_and_clean_rows(
     _seed_dialog(sync_db, 100, needs_refresh=1, hidden=1)
     _seed_dialog(sync_db, 200, needs_refresh=0)
 
-    assert await DialogReconciliationWorker(mock_client, sync_db, shutdown_event).run_light_pass() == 0
+    assert (
+        await DialogReconciliationWorker(
+            mock_client, sync_db, shutdown_event, writer=inline_writer(sync_db)
+        ).run_light_pass()
+        == 0
+    )
     mock_client.get_entity.assert_not_called()
 
 
@@ -136,7 +154,9 @@ async def test_recon_light_pass_never_calls_iter_dialogs(
     mock_client.get_entity.return_value = _user(100)
     mock_client.iter_dialogs.side_effect = AssertionError("light pass must not enumerate dialogs")
 
-    await DialogReconciliationWorker(mock_client, sync_db, shutdown_event).run_light_pass()
+    await DialogReconciliationWorker(
+        mock_client, sync_db, shutdown_event, writer=inline_writer(sync_db)
+    ).run_light_pass()
 
     mock_client.iter_dialogs.assert_not_called()
 
@@ -149,7 +169,9 @@ async def test_recon_light_pass_flood_wait_advances_to_next_dialog(
     _seed_dialog(sync_db, 200, needs_refresh=1)
     mock_client.get_entity.side_effect = [TelegramRpcThrottled(retry_after_seconds=1), _user(200, "B")]
 
-    count = await DialogReconciliationWorker(mock_client, sync_db, shutdown_event).run_light_pass()
+    count = await DialogReconciliationWorker(
+        mock_client, sync_db, shutdown_event, writer=inline_writer(sync_db)
+    ).run_light_pass()
 
     assert count == 1
     assert mock_client.get_entity.call_count == 2
@@ -165,7 +187,12 @@ async def test_recon_light_pass_flood_wait_returns_on_shutdown(
     mock_client.get_entity.side_effect = TelegramRpcThrottled(retry_after_seconds=3600)
     shutdown_event.set()
 
-    assert await DialogReconciliationWorker(mock_client, sync_db, shutdown_event).run_light_pass() == 0
+    assert (
+        await DialogReconciliationWorker(
+            mock_client, sync_db, shutdown_event, writer=inline_writer(sync_db)
+        ).run_light_pass()
+        == 0
+    )
     assert sync_db.execute("SELECT needs_refresh FROM dialogs WHERE dialog_id=100").fetchone() == (1,)
 
 
@@ -178,7 +205,9 @@ async def test_recon_light_pass_access_lost_sets_hidden(
     sync_db.commit()
     mock_client.get_entity.side_effect = ChannelPrivateError(request=None)
 
-    await DialogReconciliationWorker(mock_client, sync_db, shutdown_event).run_light_pass()
+    await DialogReconciliationWorker(
+        mock_client, sync_db, shutdown_event, writer=inline_writer(sync_db)
+    ).run_light_pass()
 
     assert sync_db.execute("SELECT status FROM synced_dialogs WHERE dialog_id=100").fetchone() == ("access_lost",)
     assert sync_db.execute("SELECT hidden FROM dialogs WHERE dialog_id=100").fetchone() == (1,)
@@ -195,7 +224,12 @@ async def test_recon_light_pass_peer_invalid_leaves_dirty(
     mock_client.get_entity.side_effect = PeerIdInvalidError(request=None)
 
     with caplog.at_level(logging.WARNING):
-        assert await DialogReconciliationWorker(mock_client, sync_db, shutdown_event).run_light_pass() == 0
+        assert (
+            await DialogReconciliationWorker(
+                mock_client, sync_db, shutdown_event, writer=inline_writer(sync_db)
+            ).run_light_pass()
+            == 0
+        )
 
     assert sync_db.execute("SELECT needs_refresh, hidden FROM dialogs WHERE dialog_id=100").fetchone() == (1, 0)
     assert any("recon_light_pass_peer_invalid" in record.message for record in caplog.records)
@@ -212,7 +246,9 @@ async def test_recon_light_pass_emits_complete_log(
     mock_client.get_entity.return_value = _user(100)
 
     with caplog.at_level(logging.INFO):
-        await DialogReconciliationWorker(mock_client, sync_db, shutdown_event).run_light_pass()
+        await DialogReconciliationWorker(
+            mock_client, sync_db, shutdown_event, writer=inline_writer(sync_db)
+        ).run_light_pass()
 
     assert any("recon_light_pass_complete count=1" in record.message for record in caplog.records)
 
@@ -226,7 +262,12 @@ async def test_refresh_forum_topics_upserts(sync_db: sqlite3.Connection, shutdow
         topic_client,
         sync_db,
         shutdown_event,
-        TopicRefresher(TelethonTelegramTopicGateway(topic_client), SQLiteTopicSnapshotRepository(sync_db)),
+        TopicRefresher(
+            TelethonTelegramTopicGateway(topic_client),
+            SQLiteTopicSnapshotRepository(sync_db),
+            writer=inline_writer(sync_db),
+        ),
+        writer=inline_writer(sync_db),
     )
 
     assert await worker._refresh_forum_topics(999, entity) == 1
@@ -250,7 +291,12 @@ async def test_light_pass_refreshes_forum_topics(
         mock_client,
         sync_db,
         shutdown_event,
-        TopicRefresher(TelethonTelegramTopicGateway(topic_client), SQLiteTopicSnapshotRepository(sync_db)),
+        TopicRefresher(
+            TelethonTelegramTopicGateway(topic_client),
+            SQLiteTopicSnapshotRepository(sync_db),
+            writer=inline_writer(sync_db),
+        ),
+        writer=inline_writer(sync_db),
     )
     with patch.object(worker, "_refresh_forum_topics", wraps=worker._refresh_forum_topics) as refresh:
         await worker.run_light_pass()
@@ -293,7 +339,10 @@ async def test_light_reconciliation_publishes_identity_from_actual_fetched_entit
     mock_client.get_entity.return_value = entity
 
     assert (
-        await DialogReconciliationWorker(mock_client, sync_db, shutdown_event).run_light_pass(refresh_topics=False) == 1
+        await DialogReconciliationWorker(
+            mock_client, sync_db, shutdown_event, writer=inline_writer(sync_db)
+        ).run_light_pass(refresh_topics=False)
+        == 1
     )
     identity = read_dialog_identities(sync_db, [peer])[peer]
     assert identity.name is not None and identity.name.startswith("Fetched")
@@ -325,7 +374,12 @@ async def test_light_reconciliation_does_not_overwrite_identity_refreshed_during
         return types.User(id=peer, first_name="Older response", username="older")
 
     mock_client.get_entity.side_effect = fetch_entity
-    assert await DialogReconciliationWorker(mock_client, sync_db, shutdown_event).run_light_pass() == 1
+    assert (
+        await DialogReconciliationWorker(
+            mock_client, sync_db, shutdown_event, writer=inline_writer(sync_db)
+        ).run_light_pass()
+        == 1
+    )
     identity = read_dialog_identities(sync_db, [302])[302]
     assert (identity.name, identity.username, identity.source) == ("Directory name", "directory", "directory")
     assert sync_db.execute("SELECT needs_refresh FROM dialogs WHERE dialog_id=302").fetchone() == (0,)

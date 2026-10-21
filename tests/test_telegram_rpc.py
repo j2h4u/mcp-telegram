@@ -100,6 +100,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
 from mcp_telegram.topics.contracts import TopicFact
 from mcp_telegram.topics.refresh import TopicRefresher
 from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
+from sqlite_writer_helpers import event_manager, inline_writer
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     LoudChannelProfilePort,
@@ -328,6 +329,9 @@ def _gate(status: _CircuitStatus | None = None, *, retry_delays: tuple[float, ..
     gate._connection_capability = None
     gate._connection_rpc_tasks = set()
     gate._pending_scalar_dispatches = {}
+    gate._cooldown_persistence = None
+    gate._cooldown_save_tasks = {}
+    gate._scalar_persistence_pending = set()
     gate._transport_state = _TransportBoundaryState.READY
     gate._log = {"telethon.client.users": logging.getLogger(__name__)}
     gate.flood_sleep_threshold = 0
@@ -390,6 +394,10 @@ async def _close_bootstrap_gate(gate: TelegramRpcGate) -> None:
     )
     await gate._sender.disconnect()
     await gate.close_rpc_scheduler()
+
+
+async def _ignore_cooldown(_deadline: float) -> None:
+    pass
 
 
 async def _call(gate: TelegramRpcGate, request: object) -> object:
@@ -524,7 +532,7 @@ async def test_inherited_connect_waits_for_a_restored_cooldown_before_its_first_
     gate, sender = _bootstrap_gate()
     import mcp_telegram.telegram_rpc as rpc
 
-    gate._cooldown_persistence = TelegramRpcCooldownPersistence(lambda: rpc.time.time() + 30, lambda _until: None)
+    gate._cooldown_persistence = TelegramRpcCooldownPersistence(lambda: rpc.time.time() + 30, _ignore_cooldown)
     gate._restore_account_cooldown()
     waiting = asyncio.Event()
     release = asyncio.Event()
@@ -1273,7 +1281,7 @@ def test_factory_uses_supplied_snapshot_without_loading_config_again(
 
 
 def test_factory_forwards_optional_cooldown_persistence(tmp_path: Path) -> None:
-    persistence = TelegramRpcCooldownPersistence(lambda: None, lambda _deadline: None)
+    persistence = TelegramRpcCooldownPersistence(lambda: None, _ignore_cooldown)
     gate = create_client.__wrapped__(
         "1",
         "hash",
@@ -1374,7 +1382,10 @@ async def test_daemon_remote_topic_miss_projects_latched_gate_without_raw_send(t
         conn,
         cast(DaemonClientLike, GateClient()),
         asyncio.Event(),
-        topic_refresher=TopicRefresher(_TopicGateway(), SQLiteTopicSnapshotRepository(conn)),
+        topic_refresher=TopicRefresher(
+            _TopicGateway(), SQLiteTopicSnapshotRepository(conn), writer=inline_writer(conn)
+        ),
+        writer=inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
@@ -1779,6 +1790,9 @@ async def test_gate_restores_persisted_cooldown_and_blocks_transport_until_ready
         loaded += 1
         return load_account_cooldown_until_utc(reopened_conn)
 
+    async def save_until_utc(deadline: float) -> None:
+        save_account_cooldown_until_utc(reopened_conn, deadline)
+
     gate = TelegramRpcGate(
         StringSession(),
         1,
@@ -1791,7 +1805,7 @@ async def test_gate_restores_persisted_cooldown_and_blocks_transport_until_ready
         scheduler_policy=TelegramRpcSchedulerConfig(),
         cooldown_persistence=TelegramRpcCooldownPersistence(
             load_until_utc,
-            lambda deadline: save_account_cooldown_until_utc(reopened_conn, deadline),
+            save_until_utc,
         ),
     )
     waiting = asyncio.Event()
@@ -1839,7 +1853,11 @@ async def test_finite_flood_wait_persists_effective_max_utc_deadline(
     utc_now = [1_000.0]
     saved: list[float] = []
     gate = _gate()
-    gate._cooldown_persistence = TelegramRpcCooldownPersistence(lambda: None, saved.append)
+
+    async def save_until_utc(deadline: float) -> None:
+        saved.append(deadline)
+
+    gate._cooldown_persistence = TelegramRpcCooldownPersistence(lambda: None, save_until_utc)
     monkeypatch.setattr("mcp_telegram.telegram_rpc.time.monotonic", lambda: monotonic_now[0])
     monkeypatch.setattr("mcp_telegram.telegram_rpc.time.time", lambda: utc_now[0])
 
@@ -1859,7 +1877,11 @@ async def test_finite_flood_wait_persists_effective_max_utc_deadline(
 async def test_latched_circuit_never_persists_a_cooldown() -> None:
     saved: list[float] = []
     gate = _gate(_CircuitStatus(open=True))
-    gate._cooldown_persistence = TelegramRpcCooldownPersistence(lambda: None, saved.append)
+
+    async def save_until_utc(deadline: float) -> None:
+        saved.append(deadline)
+
+    gate._cooldown_persistence = TelegramRpcCooldownPersistence(lambda: None, save_until_utc)
     sender = _set_sender(gate, _request_value)
 
     with pytest.raises(TelegramRpcThrottled) as caught:
@@ -2519,7 +2541,7 @@ class _RecordingDmPageScanner:
 
 
 def _real_dm_page_scanner(gate: TelegramRpcGate, conn: sqlite3.Connection) -> _RecordingDmPageScanner:
-    manager = EventHandlerManager(_DmEventHandlerGateClient(gate), conn, asyncio.Event())
+    manager = event_manager(_DmEventHandlerGateClient(gate), conn, asyncio.Event())
     return _RecordingDmPageScanner(manager)
 
 
@@ -2535,7 +2557,7 @@ def _real_dm_page_adapter(
     )
     scanner = _real_dm_page_scanner(gate, conn)
     prepare_dm_deletion_reconciliation(conn, now=100)
-    return gate, sender, DmDeletionReconciliationDemandAdapter(conn, scanner), scanner
+    return gate, sender, DmDeletionReconciliationDemandAdapter(conn, scanner, writer=inline_writer(conn)), scanner
 
 
 async def _dispatch_forward_history_sibling(
@@ -2572,7 +2594,9 @@ async def _dispatch_forward_history_sibling(
             )
             return ForwardGapPage(messages=(), complete=True)
 
-    forward_adapter = DeltaGapFillDemandAdapter(DeltaSyncWorker(GateForwardPort(), conn, asyncio.Event()))
+    forward_adapter = DeltaGapFillDemandAdapter(
+        DeltaSyncWorker(GateForwardPort(), conn, asyncio.Event(), writer=inline_writer(conn))
+    )
     sibling = asyncio.create_task(forward_adapter.run_slice(RpcAttemptBudget(limit=1)))
     await _wait_for(lambda: sender.calls == 2)
     assert isinstance(sender.requests[1], functions.messages.GetHistoryRequest)
@@ -2648,7 +2672,7 @@ async def test_dm_page_cursor_commit_failure_preserves_tombstone_and_blocks_reco
         assert adapter.status(10_000_000) is None
 
         reconstructed_scanner = _real_dm_page_scanner(gate, conn)
-        reconstructed = DmDeletionReconciliationDemandAdapter(conn, reconstructed_scanner)
+        reconstructed = DmDeletionReconciliationDemandAdapter(conn, reconstructed_scanner, writer=inline_writer(conn))
         assert reconstructed.status(10_000_000) is None
         await reconstructed.run_slice(RpcAttemptBudget(limit=1))
         assert reconstructed_scanner.calls == 0
@@ -2741,7 +2765,7 @@ async def test_cancelled_dm_page_late_gate_flood_stays_claimed_across_restart() 
         assert observations[0].acquisition_kind == AcquisitionKind.MESSAGE_LOOKUP.value
         assert accumulator.kill_switch_status().events_in_window == 1
         restarted_scanner = _real_dm_page_scanner(gate, conn)
-        restarted = DmDeletionReconciliationDemandAdapter(conn, restarted_scanner)
+        restarted = DmDeletionReconciliationDemandAdapter(conn, restarted_scanner, writer=inline_writer(conn))
         assert restarted.status(10_000_000) is None
         prepare_dm_deletion_reconciliation(conn, now=200)
         assert _dm_reconciliation_state_for_rpc_test(conn)["status"] == "suspended"
@@ -2769,7 +2793,7 @@ async def test_dm_local_deferral_after_nested_dispatch_keeps_page_claimed() -> N
 
     conn = _dm_reconciliation_test_db()
     prepare_dm_deletion_reconciliation(conn, now=100)
-    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner())
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
     budget = RpcAttemptBudget(limit=1)
     with pytest.raises(TelegramRpcAdmissionDeferred):
         await adapter.run_slice(budget)
@@ -2892,6 +2916,56 @@ async def test_already_completed_actual_futures_finalize_once_for_success_and_fl
 
 
 @pytest.mark.asyncio
+async def test_cancelled_actual_flood_keeps_durable_receipt_and_lease_until_shutdown_drain() -> None:
+    gate = _gate()
+    sender = _RawFutureSender()
+    gate._main_sender = sender
+    saving = asyncio.Event()
+    commit = asyncio.Event()
+    saved: list[float] = []
+
+    async def save_until_utc(deadline: float) -> None:
+        saving.set()
+        await commit.wait()
+        saved.append(deadline)
+
+    gate._cooldown_persistence = TelegramRpcCooldownPersistence(lambda: None, save_until_utc)
+    caller = asyncio.create_task(_call(gate, _TestRequest("actual")))
+    await _wait_for(lambda: sender.calls == 1)
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    error = FloodWaitError(request=None, capture=20)
+    sender.futures[0].set_exception(error)
+    await saving.wait()
+    assert account_cooldown_deadline() > asyncio.get_running_loop().time()
+    assert gate._admission_scheduler.active_depths()[RpcServiceClass.INTERACTIVE] == 1
+
+    observer = asyncio.create_task(gate._observe_flood(error))
+    await asyncio.sleep(0)
+    assert not observer.done()
+    observer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await observer
+    closing = asyncio.create_task(gate.close_rpc_scheduler())
+    await asyncio.sleep(0)
+    assert not closing.done()
+    closing.cancel()
+    await asyncio.sleep(0)
+    closing.cancel()
+    await asyncio.sleep(0)
+    assert not closing.done()
+    assert saved == []
+    commit.set()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert len(saved) == 1
+    assert gate._pending_scalar_dispatches == {}
+    assert gate._cooldown_save_tasks == {}
+    assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
+
+
+@pytest.mark.asyncio
 async def test_actual_future_flood_protects_when_persistence_and_event_sinks_fail() -> None:
     gate = _gate()
     sender = _RawFutureSender()
@@ -2901,9 +2975,11 @@ async def test_actual_future_flood_protects_when_persistence_and_event_sinks_fai
     )
     gate._main_sender = sender
     gate._flood_observer = lambda **event: accumulator.observe(**event)
-    gate._cooldown_persistence = TelegramRpcCooldownPersistence(
-        lambda: None, lambda _deadline: (_ for _ in ()).throw(OSError())
-    )
+
+    async def fail_save(_deadline: float) -> None:
+        raise OSError
+
+    gate._cooldown_persistence = TelegramRpcCooldownPersistence(lambda: None, fail_save)
     gate.set_flood_event_observer(lambda _event: (_ for _ in ()).throw(OSError()))
     caller = asyncio.create_task(_call(gate, _TestRequest("actual")))
     await _wait_for(lambda: sender.calls == 1)

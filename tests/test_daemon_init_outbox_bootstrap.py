@@ -36,6 +36,7 @@ from telethon.errors.rpcerrorlist import RPCError
 
 from mcp_telegram.sync_transactions import write_transaction
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.sqlite_writer_helpers import inline_writer
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -130,7 +131,7 @@ async def test_bootstrap_populates_outbox_for_null_rows():
         client = _fake_client_with_dialogs([[fake_dialog]])
 
         with _patch_get_peer_id([1001]):
-            await _initialize_read_positions(client, conn, asyncio.Event())
+            await _initialize_read_positions(client, conn, asyncio.Event(), writer=inline_writer(conn))
 
         inbox, outbox = _read_cursors(conn, 1001)
         assert inbox == 100
@@ -153,7 +154,7 @@ async def test_bootstrap_populates_inbox_too():
         client = _fake_client_with_dialogs([[fake_dialog]])
 
         with _patch_get_peer_id([1001]):
-            await _initialize_read_positions(client, conn, asyncio.Event())
+            await _initialize_read_positions(client, conn, asyncio.Event(), writer=inline_writer(conn))
 
         inbox, outbox = _read_cursors(conn, 1001)
         assert inbox == 777
@@ -186,7 +187,7 @@ async def test_bootstrap_call_count_equals_ceil_n_over_15():
         # get_peer_id returns sequential dialog_ids in the same order as we seeded.
         dialog_ids_in_order = [1000 + i for i in range(N)]
         with _patch_get_peer_id(dialog_ids_in_order):
-            await _initialize_read_positions(client, conn, asyncio.Event())
+            await _initialize_read_positions(client, conn, asyncio.Event(), writer=inline_writer(conn))
 
         expected = math.ceil(N / 15)
         assert client._call_count.n == expected, (
@@ -203,7 +204,7 @@ async def test_bootstrap_skips_when_both_cursors_populated():
         _seed(conn, [(1001, 100, 200, "synced")])
 
         client = _fake_client_with_dialogs([])
-        filled = await _initialize_read_positions(client, conn, asyncio.Event())
+        filled = await _initialize_read_positions(client, conn, asyncio.Event(), writer=inline_writer(conn))
 
         assert filled == 0
         assert client._call_count.n == 0
@@ -221,7 +222,7 @@ async def test_bootstrap_runs_when_only_outbox_null():
         client = _fake_client_with_dialogs([[fake_dialog]])
 
         with _patch_get_peer_id([1001]):
-            await _initialize_read_positions(client, conn, asyncio.Event())
+            await _initialize_read_positions(client, conn, asyncio.Event(), writer=inline_writer(conn))
 
         inbox, outbox = _read_cursors(conn, 1001)
         # inbox: monotonic MAX(100, 150) = 150.
@@ -241,7 +242,7 @@ async def test_bootstrap_runs_when_only_inbox_null():
         client = _fake_client_with_dialogs([[fake_dialog]])
 
         with _patch_get_peer_id([1001]):
-            await _initialize_read_positions(client, conn, asyncio.Event())
+            await _initialize_read_positions(client, conn, asyncio.Event(), writer=inline_writer(conn))
 
         inbox, outbox = _read_cursors(conn, 1001)
         assert inbox == 100
@@ -271,7 +272,7 @@ async def test_bootstrap_telethon_returns_none_outbox_preserves_null():
         client = _fake_client_with_dialogs([[fake_dialog]])
 
         with _patch_get_peer_id([1001]):
-            await _initialize_read_positions(client, conn, asyncio.Event())
+            await _initialize_read_positions(client, conn, asyncio.Event(), writer=inline_writer(conn))
 
         inbox, outbox = _read_cursors(conn, 1001)
         assert inbox == 42
@@ -300,7 +301,7 @@ async def test_bootstrap_telethon_returns_zero_outbox_writes_zero():
         client = _fake_client_with_dialogs([[fake_dialog]])
 
         with _patch_get_peer_id([1001]):
-            await _initialize_read_positions(client, conn, asyncio.Event())
+            await _initialize_read_positions(client, conn, asyncio.Event(), writer=inline_writer(conn))
 
         inbox, outbox = _read_cursors(conn, 1001)
         assert outbox == 0, f"Expected outbox == 0 (legitimate zero), got {outbox!r}"
@@ -322,7 +323,7 @@ async def test_bootstrap_telethon_returns_none_inbox_preserves_null():
         client = _fake_client_with_dialogs([[fake_dialog]])
 
         with _patch_get_peer_id([1001]):
-            await _initialize_read_positions(client, conn, asyncio.Event())
+            await _initialize_read_positions(client, conn, asyncio.Event(), writer=inline_writer(conn))
 
         inbox, outbox = _read_cursors(conn, 1001)
         assert inbox is None, f"Expected inbox NULL (Telethon returned None), got {inbox!r} — must NOT fold None → 0"
@@ -364,7 +365,7 @@ async def test_bootstrap_v12_upgrade_scenario():
 
         dialog_ids_in_order = [1000 + i for i in range(N)]
         with _patch_get_peer_id(dialog_ids_in_order):
-            await _initialize_read_positions(client, conn, asyncio.Event())
+            await _initialize_read_positions(client, conn, asyncio.Event(), writer=inline_writer(conn))
 
         expected_calls = math.ceil(N / 15)
         assert client._call_count.n == expected_calls, (
@@ -422,7 +423,7 @@ async def test_bootstrap_live_event_race_newer_wins():
         client = _RaceClient()
 
         with _patch_get_peer_id([1001]):
-            await _initialize_read_positions(client, conn, asyncio.Event())
+            await _initialize_read_positions(client, conn, asyncio.Event(), writer=inline_writer(conn))
 
         inbox, outbox = _read_cursors(conn, 1001)
         assert outbox == 999, (
@@ -451,6 +452,7 @@ async def test_bootstrap_success_skips_empty_retry_transaction(failure_cooldown_
                 client,
                 conn,
                 asyncio.Event(),
+                writer=inline_writer(conn),
                 failure_cooldown_seconds=failure_cooldown_seconds,
                 batch_pause_seconds=0.001,
             )
@@ -477,6 +479,7 @@ async def test_bootstrap_failure_persists_retry_cooldown(failure_mode: str):
             client,
             conn,
             asyncio.Event(),
+            writer=inline_writer(conn),
             failure_cooldown_seconds=3600,
             batch_pause_seconds=0.001,
         )

@@ -12,7 +12,7 @@ import sqlite3
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Protocol, cast
 
@@ -29,6 +29,7 @@ from .messages.telegram_adapter import extract_dialog_id, extract_message_row
 from .models import DialogType
 from .observation_order import allocate_observation_order
 from .own_only import enroll_own_only_sync_dialog
+from .sqlite_writer import SQLiteWriter
 from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_demand import (
     AcquisitionKind,
@@ -80,6 +81,7 @@ class ArchiveBackfillDemandAdapter(DurableDemandAdapter):
     conn: sqlite3.Connection
     shutdown_event: asyncio.Event
     timeout_s: float
+    writer: SQLiteWriter = field(kw_only=True)
     demand_kind = DemandKind.ARCHIVE_BACKFILL
 
     def status(self, now: float) -> DemandStatus | None:
@@ -98,6 +100,7 @@ class ArchiveBackfillDemandAdapter(DurableDemandAdapter):
                     self.conn,
                     self.shutdown_event,
                     timeout_s=self.timeout_s,
+                    writer=self.writer,
                 )
 
 
@@ -110,6 +113,7 @@ class ArchiveIncrementalDemandAdapter(DurableDemandAdapter):
     shutdown_event: asyncio.Event
     interval_s: float
     timeout_s: float
+    writer: SQLiteWriter = field(kw_only=True)
     demand_kind = DemandKind.ARCHIVE_INCREMENTAL
 
     def status(self, now: float) -> DemandStatus | None:
@@ -138,6 +142,7 @@ class ArchiveIncrementalDemandAdapter(DurableDemandAdapter):
                     self.conn,
                     self.shutdown_event,
                     timeout_s=self.timeout_s,
+                    writer=self.writer,
                 )
 
 
@@ -564,12 +569,12 @@ def _log_incremental_batch(
 
 def _prepare_incremental_slice(
     conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
+    stopped: bool,
 ) -> tuple[int, int] | None:
     """Load and, for a new window, durably initialize incremental state."""
     with write_transaction(conn):
         state = _load_state(conn)
-        if shutdown_event.is_set() or state.get("backfill_complete") != "1":
+        if stopped or state.get("backfill_complete") != "1":
             return None
         last_sync_at = int(state.get("last_sync_at") or 0)
         if last_sync_at == 0:
@@ -636,12 +641,12 @@ def _commit_incremental_slice_result(
 
 def _prepare_backfill_slice(
     conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
+    stopped: bool,
 ) -> tuple[int, str] | None:
     """Load the checkpoint and retain the original backfill window start."""
     with write_transaction(conn):
         state = _load_state(conn)
-        if shutdown_event.is_set() or state.get("backfill_complete") == "1":
+        if stopped or state.get("backfill_complete") == "1":
             return None
         checkpoint = int(state.get("backfill_offset_id") or 0)
         conn.execute(
@@ -658,14 +663,16 @@ async def _run_backfill_slice(
     shutdown_event: asyncio.Event,
     *,
     timeout_s: float,
+    writer: SQLiteWriter,
 ) -> None:
     """Fetch one restart-safe archive-backfill page."""
-    window = _prepare_backfill_slice(conn, shutdown_event)
+    stopped = shutdown_event.is_set()
+    window = await writer.run(lambda db: _prepare_backfill_slice(db, stopped))
     if window is None:
         return
     checkpoint, started_at = window
     batch_started_at = time.monotonic()
-    observation_order = allocate_observation_order(conn)
+    observation_order = await writer.run(allocate_observation_order)
     result = await _search_backfill_batch(
         client,
         checkpoint,
@@ -677,23 +684,14 @@ async def _run_backfill_slice(
         return
     search_result = cast(_SearchResultLike, result)
     batch = list(search_result.messages or [])
-    if not batch:
-        with write_transaction(conn):
-            conn.execute("INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('backfill_complete', '1')")
-            conn.execute(
-                "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('last_sync_at', ?)",
-                (started_at,),
-            )
+    next_checkpoint = await writer.run(
+        lambda db: _commit_backfill_slice_result(db, search_result, batch, started_at, observation_order)
+    )
+    if next_checkpoint is None:
         return
-    with write_transaction(conn):
-        extracted = [replace(row, observation_order=observation_order) for row in _extract_own_message_rows(batch)]
-        _persist_own_message_rows(conn, extracted, priority=HydrationPriority.BACKFILL)
-        _upsert_entities_from_search(conn, search_result)
-        checkpoint = min(message.id for message in batch)
-        _set_state(conn, "backfill_offset_id", str(checkpoint))
     _log_backfill_batch(
         _BackfillState(
-            checkpoint=checkpoint,
+            checkpoint=next_checkpoint,
             total_fetched=len(batch),
             batch_num=1,
             loop_start=batch_started_at,
@@ -703,21 +701,43 @@ async def _run_backfill_slice(
     )
 
 
+def _commit_backfill_slice_result(
+    conn: sqlite3.Connection,
+    search_result: _SearchResultLike,
+    batch: Sequence[_SearchMessageLike],
+    started_at: str,
+    observation_order: int,
+) -> int | None:
+    with write_transaction(conn):
+        if not batch:
+            _set_state(conn, "backfill_complete", "1")
+            _set_state(conn, "last_sync_at", started_at)
+            return None
+        extracted = [replace(row, observation_order=observation_order) for row in _extract_own_message_rows(batch)]
+        _persist_own_message_rows(conn, extracted, priority=HydrationPriority.BACKFILL)
+        _upsert_entities_from_search(conn, search_result)
+        checkpoint = min(message.id for message in batch)
+        _set_state(conn, "backfill_offset_id", str(checkpoint))
+        return checkpoint
+
+
 async def _run_incremental_slice(
     client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
     timeout_s: float,
+    writer: SQLiteWriter,
 ) -> None:
     """Fetch one restart-safe page from the current incremental window."""
-    window = _prepare_incremental_slice(conn, shutdown_event)
+    stopped = shutdown_event.is_set()
+    window = await writer.run(lambda db: _prepare_incremental_slice(db, stopped))
     if window is None:
         return
     min_date, offset_id = window
 
     batch_started_at = time.monotonic()
-    observation_order = allocate_observation_order(conn)
+    observation_order = await writer.run(allocate_observation_order)
     result = await _search_incremental_batch(
         client,
         min_date,
@@ -728,6 +748,8 @@ async def _run_incremental_slice(
     )
     if result is _SEARCH_BATCH_RETRY or result is _SEARCH_BATCH_STOP:
         return
-    _commit_incremental_slice_result(
-        conn, cast(_SearchResultLike, result), min_date, batch_started_at, observation_order
+    await writer.run(
+        lambda db: _commit_incremental_slice_result(
+            db, cast(_SearchResultLike, result), min_date, batch_started_at, observation_order
+        )
     )

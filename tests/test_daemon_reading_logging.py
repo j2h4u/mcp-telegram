@@ -32,6 +32,7 @@ from mcp_telegram.telegram_reading import (
     TelegramHistoryGateway,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.sqlite_writer_helpers import inline_writer
 
 
 class _EntityMissingClient:
@@ -391,7 +392,9 @@ async def test_list_messages_telegram_entity_miss_logs_structured_warning_withou
             sync_db_path=None,
             self_id=1,
             resolve_dialog_id=lambda _selector: asyncio.sleep(0, result=0),
-            fragment_context=FragmentContextService(conn, TelethonTelegramFragmentGateway(_EntityMissingClient())),
+            fragment_context=FragmentContextService(
+                conn, TelethonTelegramFragmentGateway(_EntityMissingClient()), writer=inline_writer(conn)
+            ),
             history_gateway=TelethonTelegramHistoryGateway(_EntityMissingClient()),
             logger=logger,
             rid=lambda: " request_id=test-rid",

@@ -16,6 +16,7 @@ from mcp_telegram.dialog_identity import capture_identity_baseline, publish_dial
 from mcp_telegram.dialog_identity_contracts import DialogIdentityObservation
 from mcp_telegram.sync_db import _apply_migrations
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
+from sqlite_writer_helpers import inline_writer
 
 
 class _Client:
@@ -27,7 +28,7 @@ class _Client:
 
 
 def _request(conn: sqlite3.Connection, dialog_id: int = 111) -> PeerSweepRequest:
-    return PeerSweepRequest(_Client(), conn, dialog_id, 0, 0, 20, 1)
+    return PeerSweepRequest(_Client(), conn, dialog_id, 0, 0, 20, 1, writer=inline_writer(conn))
 
 
 @pytest.mark.parametrize("with_message", [False, True])

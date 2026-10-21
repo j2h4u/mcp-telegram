@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,8 +30,11 @@ TRANSACTION_EXCEPTIONS: dict[Path, frozenset[str]] = {
         }
     ),
     Path("sqlite_checkpoint.py"): frozenset({"checkpoint_sqlite_connection"}),
-    Path("reading/service.py"): frozenset({"_get_unread_summary_sync", "_list_unread_messages_from_reader"}),
-    Path("daemon_activity_stats.py"): frozenset({"_recent_activity_from_reader"}),
+    Path("reading/service.py"): frozenset(
+        {"ReadingService._get_unread_summary_sync", "ReadingService._list_unread_messages_from_reader"}
+    ),
+    Path("daemon_activity_stats.py"): frozenset({"DaemonActivityStatsService._recent_activity_from_reader"}),
+    Path("sqlite_writer.py"): frozenset({"SQLiteWriter._recover", "SQLiteWriter._check_idle"}),
 }
 
 _SYNC_DB_BOOTSTRAP_TRANSACTIONS = frozenset(
@@ -66,20 +69,20 @@ _SYNC_DB_BOOTSTRAP_TRANSACTIONS = frozenset(
 
 CONNECT_EXCEPTIONS: dict[Path, frozenset[str]] = {
     Path("sync_db.py"): frozenset({"_open_sync_db"}),
-    Path("runtime_observations.py"): frozenset({"_open_writer_connection"}),
     Path("event_recovery.py"): frozenset({"recover_events"}),
     Path("__init__.py"): frozenset({"feedback_list"}),
 }
 
 OPEN_SYNC_DB_CALLERS: dict[Path, frozenset[str]] = {
     Path("sync_db.py"): frozenset({"open_sync_db_reader", "open_runtime_sync_db", "ensure_sync_schema"}),
-    Path("daemon.py"): frozenset({"_build_sync_main_context"}),
+    Path("daemon.py"): frozenset({"_bootstrap_sync_database"}),
 }
+
+OPEN_RUNTIME_SYNC_DB_CALLERS = {Path("sqlite_writer.py"): frozenset({"SQLiteWriter._work"})}
 
 RUNTIME_FACTORY_FUNCTIONS: dict[Path, frozenset[str]] = {
     Path("sync_db.py"): frozenset({"open_runtime_sync_db"}),
-    Path("daemon.py"): frozenset({"_build_sync_main_context"}),
-    Path("runtime_observations.py"): frozenset({"_open_writer_connection"}),
+    Path("daemon.py"): frozenset({"_bootstrap_sync_database"}),
 }
 
 _TRANSACTION_SQL = re.compile(r"^(?:BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b", re.IGNORECASE)
@@ -87,6 +90,8 @@ _PRAGMA_TOGGLE = re.compile(r"^PRAGMA\s+query_only\b", re.IGNORECASE)
 _SQL_SPACE = re.compile(r"\s+")
 _CONNECTION_NAMES = {"conn", "_conn", "connection", "_connection", "db", "_db"}
 _HELPERS = {"write_transaction", "write_savepoint"}
+_FACTORIES = {"_open_sync_db", "open_runtime_sync_db", "enable_runtime_writes", "sqlite3.connect"}
+_TRACKED_SYMBOLS = _HELPERS | _FACTORIES
 
 
 def _qualified(node: ast.AST) -> str | None:
@@ -116,7 +121,7 @@ def _string(node: ast.AST, values: dict[str, str], seen: frozenset[str] = frozen
     return None
 
 
-def _function_nodes(body: list[ast.stmt], prefix: tuple[str, ...] = ()) -> Iterator[tuple[str, ast.AST]]:
+def _function_nodes(body: Iterable[ast.AST], prefix: tuple[str, ...] = ()) -> Iterator[tuple[str, ast.AST]]:
     for statement in body:
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
             name = ".".join((*prefix, statement.name))
@@ -124,6 +129,8 @@ def _function_nodes(body: list[ast.stmt], prefix: tuple[str, ...] = ()) -> Itera
             yield from _function_nodes(statement.body, (*prefix, statement.name))
         elif isinstance(statement, ast.ClassDef):
             yield from _function_nodes(statement.body, (*prefix, statement.name))
+        else:
+            yield from _function_nodes(ast.iter_child_nodes(statement), prefix)
 
 
 def _lexical_nodes(root: ast.AST) -> Iterator[ast.AST]:
@@ -154,23 +161,41 @@ def _target_names(target: ast.AST) -> set[str]:
     return set()
 
 
-def _helper_alias(value: ast.AST, aliases: dict[str, str]) -> str | None:
+def _symbol_alias(value: ast.AST, aliases: dict[str, str]) -> str | None:
     qualified = _qualified(value)
-    if qualified in _HELPERS or (qualified and qualified.rsplit(".", 1)[-1] in _HELPERS):
+    if qualified in aliases:
+        return aliases[qualified]
+    if qualified in _TRACKED_SYMBOLS:
+        return qualified
+    if qualified and qualified.rsplit(".", 1)[-1] in _TRACKED_SYMBOLS:
         return qualified.rsplit(".", 1)[-1]
-    return aliases.get(qualified or "") if isinstance(value, ast.Name) else None
+    if (
+        isinstance(value, ast.Attribute)
+        and value.attr == "connect"
+        and aliases.get(_qualified(value.value) or "") == "sqlite3"
+    ):
+        return "sqlite3.connect"
+    return None
 
 
 def _import_aliases(node: ast.Import | ast.ImportFrom) -> dict[str, str]:
     aliases: dict[str, str] = {}
-    if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("sync_transactions"):
-        aliases.update({alias.asname or alias.name: alias.name for alias in node.names if alias.name in _HELPERS})
+    if isinstance(node, ast.ImportFrom) and (node.module or "").rsplit(".", 1)[-1] in {"sync_transactions", "sync_db"}:
+        aliases.update(
+            {alias.asname or alias.name: alias.name for alias in node.names if alias.name in _TRACKED_SYMBOLS}
+        )
+    if isinstance(node, ast.ImportFrom) and node.module == "sqlite3":
+        aliases.update(
+            {alias.asname or alias.name: "sqlite3.connect" for alias in node.names if alias.name == "connect"}
+        )
     if isinstance(node, ast.Import):
         for item in node.names:
             if item.name.endswith("sync_transactions"):
                 module = item.asname or item.name.rsplit(".", 1)[-1]
                 aliases[module] = "sync_transactions"
                 aliases.update({f"{module}.{name}": name for name in _HELPERS})
+            elif item.name == "sqlite3":
+                aliases[item.asname or item.name] = "sqlite3"
     return aliases
 
 
@@ -178,7 +203,7 @@ def _assignment_aliases(node: ast.Assign | ast.AnnAssign, aliases: dict[str, str
     value = node.value
     if value is None:
         return {}
-    name = _helper_alias(value, aliases)
+    name = _symbol_alias(value, aliases)
     targets = node.targets if isinstance(node, ast.Assign) else [node.target]
     return {} if name is None else dict.fromkeys(set().union(*map(_target_names, targets)), name)
 
@@ -271,18 +296,16 @@ class _ScopeContext:
     allowed_tx: bool
     aliases: dict[str, str]
     conn_names: set[str]
+    is_async: bool
 
 
 def _context_helper_call(node: ast.AST, parent: dict[ast.AST, ast.AST], aliases: dict[str, str]) -> bool:
     if not isinstance(node, ast.Call):
         return False
-    func = _qualified(node.func)
-    helper = aliases.get(func or "")
-    if helper is None and func:
-        helper = aliases.get(func.rsplit(".", 1)[-1])
+    helper = _symbol_alias(node.func, aliases)
     item = parent.get(node)
     return (
-        helper is not None
+        helper in _HELPERS
         and isinstance(item, ast.withitem)
         and item.context_expr is node
         and isinstance(parent.get(item), ast.With)
@@ -312,12 +335,12 @@ def _check_call(
     called = _qualified(node.func) or ""
     tail = called.rsplit(".", 1)[-1]
     findings: list[str] = []
-    helper = aliases.get(called) or aliases.get(tail)
+    helper = _symbol_alias(node.func, aliases)
     if tail in {"commit", "rollback", "executescript"} and not allowed_tx:
         findings.append(f"{rel}:{line}: raw SQLite {tail} in {function}")
     if helper in _HELPERS and not _context_helper_call(node, scan.parents, aliases):
         findings.append(f"{rel}:{line}: {helper} must be a direct with-context in {function}")
-    findings.extend(_check_factory_call(scan, scope, node, tail, line))
+    findings.extend(_check_factory_call(scan, scope, node, _symbol_alias(node.func, aliases) or tail, line))
     if tail in {"execute", "executemany", "executescript"} and node.args and not allowed_tx:
         sql = _string(node.args[0], scan.values)
         if sql is not None and _is_transaction_sql(sql):
@@ -331,25 +354,20 @@ def _check_call(
 
 def _check_factory_call(scan: _ScanContext, scope: _ScopeContext, node: ast.Call, tail: str, line: int) -> list[str]:
     rel, function = scan.rel, scope.function
-    short_name = function.rsplit(".", 1)[-1]
     findings: list[str] = []
-    if (
-        tail == "_open_sync_db"
-        and short_name not in OPEN_SYNC_DB_CALLERS.get(rel, frozenset())
-        and not (
-            rel == Path("sync_db.py") and short_name in {"_open_sync_db", "open_sync_db_reader", "open_runtime_sync_db"}
-        )
-    ):
+    if tail == "_open_sync_db" and function not in OPEN_SYNC_DB_CALLERS.get(rel, frozenset()):
         findings.append(f"{rel}:{line}: legacy _open_sync_db call in {function}")
-    allowed_factory = short_name in RUNTIME_FACTORY_FUNCTIONS.get(rel, frozenset())
+    if tail == "open_runtime_sync_db" and function not in OPEN_RUNTIME_SYNC_DB_CALLERS.get(rel, frozenset()):
+        findings.append(f"{rel}:{line}: runtime writer connection outside owner in {function}")
+    allowed_factory = function in RUNTIME_FACTORY_FUNCTIONS.get(rel, frozenset())
     if (
         tail == "enable_runtime_writes"
         and not allowed_factory
         and not (rel == Path("sync_transactions.py") and function == "enable_runtime_writes")
     ):
         findings.append(f"{rel}:{line}: runtime write guard outside connection factory in {function}")
-    if _sqlite_connect_call(node, scan.sqlite_modules, scan.sqlite_connects):
-        if short_name not in CONNECT_EXCEPTIONS.get(rel, frozenset()):
+    if tail == "sqlite3.connect" or _sqlite_connect_call(node, scan.sqlite_modules, scan.sqlite_connects):
+        if function not in CONNECT_EXCEPTIONS.get(rel, frozenset()):
             findings.append(f"{rel}:{line}: SQLite connection outside approved factory in {function}")
         elif rel == Path("__init__.py"):
             text = _string(node.args[0], scan.values) if node.args else None
@@ -370,6 +388,8 @@ def _check_context(
     for item in node.items:
         context = item.context_expr
         if _context_helper_call(context, scan.parents, aliases):
+            if scope.is_async:
+                findings.append(f"{rel}:{line}: synchronous write context in async function {function}")
             if isinstance(node, ast.AsyncWith):
                 findings.append(f"{rel}:{line}: async context around synchronous write helper in {function}")
             elif not allowed_tx:
@@ -383,23 +403,25 @@ def _check_context(
     return findings
 
 
-def _check_helper_reference(
+def _check_owned_reference(
     scan: _ScanContext,
     function: str,
     node: ast.Name | ast.Attribute,
     aliases: dict[str, str],
 ) -> list[str]:
-    if isinstance(node, ast.Name):
-        helper = aliases.get(node.id)
-        if not isinstance(node.ctx, ast.Load) or helper not in _HELPERS:
-            return []
-    else:
-        if node.attr not in _HELPERS or aliases.get(_qualified(node.value) or "") != "sync_transactions":
-            return []
+    symbol = _symbol_alias(node, aliases)
+    if not isinstance(node.ctx, ast.Load) or symbol not in _TRACKED_SYMBOLS:
+        return []
     caller = scan.parents.get(node)
-    if isinstance(caller, ast.Call) and caller.func is node and _context_helper_call(caller, scan.parents, aliases):
+    if (
+        isinstance(caller, ast.Call)
+        and caller.func is node
+        and (symbol in _FACTORIES or _context_helper_call(caller, scan.parents, aliases))
+    ):
         return []
     line = int(getattr(node, "lineno", 0))
+    if symbol in _FACTORIES:
+        return [f"{scan.rel}:{line}: connection setup reference escapes direct call in {function}"]
     return [f"{scan.rel}:{line}: write helper reference escapes direct with-context in {function}"]
 
 
@@ -412,8 +434,8 @@ def _check_scope(
 ) -> list[str]:
     rel = scan.rel
     conn_names = _connections(root)
-    allowed_tx = _allowed_transaction(rel, function.rsplit(".", 1)[-1])
-    scope = _ScopeContext(function, allowed_tx, aliases, conn_names)
+    allowed_tx = _allowed_transaction(rel, function)
+    scope = _ScopeContext(function, allowed_tx, aliases, conn_names, isinstance(root, ast.AsyncFunctionDef))
     findings: list[str] = []
     for node in _lexical_nodes(root):
         if isinstance(node, ast.Call):
@@ -433,7 +455,7 @@ def _check_scope(
                 )
             )
         elif isinstance(node, (ast.Name, ast.Attribute)):
-            findings.extend(_check_helper_reference(scan, function, node, aliases))
+            findings.extend(_check_owned_reference(scan, function, node, aliases))
         if isinstance(node, (ast.Assign, ast.AnnAssign)) and not allowed_tx:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             if any(isinstance(target, ast.Attribute) and target.attr == "isolation_level" for target in targets):
@@ -475,8 +497,10 @@ def _file_violations(path: Path, source_root: Path) -> list[str]:
     scopes = [(name, node) for name, node in _function_nodes(tree.body)]
     scopes.append(("<module>", tree))
     findings: list[str] = []
+    scope_aliases = {"": module_aliases}
     for function, root in scopes:
-        aliases = _aliases(root, module_aliases)
+        aliases = _aliases(root, scope_aliases.get(function.rpartition(".")[0], module_aliases))
+        scope_aliases[function] = aliases
         findings.extend(_check_scope(scan, function, root, aliases=aliases))
     if rel == Path("event_recovery.py"):
         findings.extend(_recovery_source_violations(tree, rel, values, sqlite_modules, sqlite_connects))

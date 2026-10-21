@@ -43,6 +43,7 @@ from mcp_telegram.telegram_fact_queries import reaction_event_projection
 from mcp_telegram.telegram_reading import GatewayFailure, GatewayFailureKind, TelegramReadReceiptGateway
 from mcp_telegram.telegram_rpc_consumers import TelegramRpcSource
 from mcp_telegram.telegram_rpc_scheduler import RpcAdmissionClosedError, rpc_scope
+from tests.sqlite_writer_helpers import inline_writer
 
 
 def _db(tmp_path: Path) -> sqlite3.Connection:
@@ -104,7 +105,7 @@ def test_detail_partial_offset_survives_restart_and_publishes(tmp_path: Path) ->
             return ReactionDetailFetchResult(page=ReactionDetailPage(events, "next" if offset is None else None))
 
     gateway = Gateway()
-    refresher = ReactionDetailRefresher(conn, gateway, now=lambda: 20)
+    refresher = ReactionDetailRefresher(conn, gateway, writer=inline_writer(conn), now=lambda: 20)
     conn.commit()
     first = asyncio.run(refresher.refresh_one(1, 2, 1, entity=SimpleNamespace(), now=20))
     assert first.status == "partial"
@@ -140,7 +141,7 @@ def test_detail_persistence_requires_an_idle_dedicated_connection(tmp_path: Path
             return ReactionDetailFetchResult(page=ReactionDetailPage((ReactionEvent(7, "👍", None),), None))
 
     with pytest.raises(RuntimeError, match="idle connection"):
-        asyncio.run(ReactionDetailRefresher(conn, Gateway()).refresh_one(1, 2, 1, entity=1))
+        asyncio.run(ReactionDetailRefresher(conn, Gateway(), writer=inline_writer(conn)).refresh_one(1, 2, 1, entity=1))
     assert conn.execute("SELECT COUNT(*) FROM message_reaction_events").fetchone() == (0,)
     conn.rollback()
     conn.close()
@@ -306,7 +307,9 @@ def test_real_refresher_exposes_flood_wait_cycle_stop(tmp_path: Path) -> None:
             )
 
     conn.commit()
-    result = asyncio.run(ReactionDetailRefresher(conn, Gateway()).refresh_one(1, 2, 1, entity=1, now=10))
+    result = asyncio.run(
+        ReactionDetailRefresher(conn, Gateway(), writer=inline_writer(conn)).refresh_one(1, 2, 1, entity=1, now=10)
+    )
     assert result.status == "unavailable"
     assert result.failure_kind == GatewayFailureKind.FLOOD_WAIT.value
     assert result.retry_after == 17
@@ -427,7 +430,10 @@ def test_refresh_cycle_passes_generation_and_offset_and_limits_detail_pages(tmp_
     result = asyncio.run(
         refresh_message_facts_once(
             MessageFactRefreshDeps(
-                conn, cast(ReactionDetailRefresher, refresher), cast(TelegramReadReceiptGateway, object())
+                conn,
+                cast(ReactionDetailRefresher, refresher),
+                cast(TelegramReadReceiptGateway, object()),
+                writer=inline_writer(conn),
             ),
             MessageFactRefreshPolicy(
                 reaction_max_messages_per_cycle=10,
@@ -479,7 +485,10 @@ def test_refresh_cycle_stops_reaction_probes_after_flood_wait(tmp_path: Path) ->
     result = asyncio.run(
         refresh_message_facts_once(
             MessageFactRefreshDeps(
-                conn, cast(ReactionDetailRefresher, refresher), cast(TelegramReadReceiptGateway, object())
+                conn,
+                cast(ReactionDetailRefresher, refresher),
+                cast(TelegramReadReceiptGateway, object()),
+                writer=inline_writer(conn),
             ),
             MessageFactRefreshPolicy(
                 reaction_max_messages_per_cycle=10,
@@ -616,7 +625,11 @@ def test_detail_replaces_migrated_display_rows_on_first_complete_page(tmp_path: 
             return ReactionDetailFetchResult(page=ReactionDetailPage((ReactionEvent(9, "👍", None),), None))
 
     conn.commit()
-    result = asyncio.run(ReactionDetailRefresher(conn, Gateway(), now=lambda: 3).refresh_one(1, 2, 1, entity=1, now=3))
+    result = asyncio.run(
+        ReactionDetailRefresher(conn, Gateway(), writer=inline_writer(conn), now=lambda: 3).refresh_one(
+            1, 2, 1, entity=1, now=3
+        )
+    )
     assert result.status == "complete"
     assert conn.execute(
         "SELECT emoji, detail_generation, display_generation FROM message_reaction_events"
@@ -655,7 +668,7 @@ def test_detail_stale_writer_failure_and_non_advancing_offset_preserve_display(t
             )
 
     gateway = FailingGateway()
-    refresher = ReactionDetailRefresher(conn, gateway, now=lambda: 10)
+    refresher = ReactionDetailRefresher(conn, gateway, writer=inline_writer(conn), now=lambda: 10)
     conn.commit()
     assert asyncio.run(refresher.refresh_one(1, 2, 99, entity=1, now=10)).status == "stale_writer"
     assert gateway.calls == 0
@@ -685,7 +698,7 @@ def test_detail_stale_writer_failure_and_non_advancing_offset_preserve_display(t
 
     conn.commit()
     result = asyncio.run(
-        ReactionDetailRefresher(conn, RepeatingGateway(), now=lambda: 11).refresh_one(
+        ReactionDetailRefresher(conn, RepeatingGateway(), writer=inline_writer(conn), now=lambda: 11).refresh_one(
             1, 2, 2, entity=1, offset="same", now=11
         )
     )
@@ -725,7 +738,10 @@ def test_permanent_detail_failure_is_terminal_until_new_aggregate(
     conn.commit()
     result = asyncio.run(
         ReactionDetailRefresher(
-            conn, Gateway(), observation_sink=lambda kind, outcome: observations.append((kind, outcome))
+            conn,
+            Gateway(),
+            writer=inline_writer(conn),
+            observation_sink=lambda kind, outcome: observations.append((kind, outcome)),
         ).refresh_one(1, 2, 1, entity=1, now=10)
     )
     assert result.status == "unavailable"
@@ -775,7 +791,9 @@ def test_terminal_failure_clears_partial_staging_without_erasing_display(tmp_pat
 
     conn.commit()
     result = asyncio.run(
-        ReactionDetailRefresher(conn, Gateway()).refresh_one(1, 2, 1, entity=1, offset="resume", now=10)
+        ReactionDetailRefresher(conn, Gateway(), writer=inline_writer(conn)).refresh_one(
+            1, 2, 1, entity=1, offset="resume", now=10
+        )
     )
     assert result.status == "unavailable"
     assert result.next_offset is None
@@ -832,7 +850,11 @@ def test_detail_final_cas_discards_page_when_status_changes_before_update(tmp_pa
             return ReactionDetailFetchResult(page=ReactionDetailPage((ReactionEvent(4, "👍", None),), None))
 
     conn.commit()
-    result = asyncio.run(ReactionDetailRefresher(conn, Gateway(), now=lambda: 5).refresh_one(1, 2, 1, entity=1, now=5))
+    result = asyncio.run(
+        ReactionDetailRefresher(conn, Gateway(), writer=inline_writer(conn), now=lambda: 5).refresh_one(
+            1, 2, 1, entity=1, now=5
+        )
+    )
     assert result.status == "stale_writer"
     assert conn.execute("SELECT COUNT(*) FROM message_reaction_events").fetchone() == (0,)
     assert conn.execute("SELECT status, next_offset FROM message_reaction_event_status").fetchone() == (
@@ -863,7 +885,9 @@ def test_detail_rechecks_enrollment_after_gateway_returns(tmp_path: Path) -> Non
     async def run() -> ReactionDetailResult:
         gateway = BlockingGateway()
         task = asyncio.create_task(
-            ReactionDetailRefresher(conn, gateway, now=lambda: 4).refresh_one(1, 2, 1, entity=1, now=4)
+            ReactionDetailRefresher(conn, gateway, writer=inline_writer(conn), now=lambda: 4).refresh_one(
+                1, 2, 1, entity=1, now=4
+            )
         )
         await gateway.entered.wait()
         conn.execute("UPDATE full_history_enrollment SET enabled=0 WHERE dialog_id=1")
@@ -908,6 +932,7 @@ def test_empty_aggregate_is_not_a_detail_candidate_without_explicit_retry(tmp_pa
                 conn,
                 cast(ReactionDetailRefresher, TerminalRefresher()),
                 cast(TelegramReadReceiptGateway, object()),
+                writer=inline_writer(conn),
             ),
             MessageFactRefreshPolicy(
                 reaction_max_messages_per_cycle=1,

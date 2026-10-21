@@ -28,6 +28,7 @@ from tests.helpers import (
     LoudUserAvatarHistoryPort,
     LoudUserProfilePort,
 )
+from tests.sqlite_writer_helpers import inline_writer
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +44,7 @@ def _make_feedback_server(tmp_path: Path) -> Iterator[tuple[DaemonAPIServer, sql
         client,
         shutdown_event,
         FeedbackApplicationService(SQLiteFeedbackStore(feedback_conn)),
+        writer=inline_writer(sync_conn),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
@@ -322,6 +324,7 @@ async def test_submit_feedback_db_error_returns_internal(tmp_path: Path) -> None
             client,
             shutdown_event,
             FeedbackApplicationService(SQLiteFeedbackStore(mock_feedback_conn)),
+            writer=inline_writer(sync_conn),
             channel_profile_port=LoudChannelProfilePort(),
             group_profile_port=LoudGroupProfilePort(),
             user_profile_port=LoudUserProfilePort(),
@@ -353,6 +356,7 @@ async def test_feedback_without_wired_service_returns_not_initialised() -> None:
         sync_conn,
         client,
         asyncio.Event(),
+        writer=inline_writer(sync_conn),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),

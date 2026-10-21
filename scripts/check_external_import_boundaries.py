@@ -54,6 +54,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "delta_sync.py",
             "dialog_identity.py",
             "drafts/sqlite_projection.py",
+            "drafts/ports.py",  # Transaction-local projection binding to the shared SQLite owner.
             "dialog_sync.py",
             "dialog_directory.py",
             "dialog_directory_coverage.py",
@@ -62,6 +63,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "fact_hydration.py",
             "feedback_db.py",
             "folders/sqlite_repository.py",
+            "folders/ports.py",  # Transaction-local projection binding to the shared SQLite owner.
             "folders/read_repository.py",
             "fts.py",
             "history_enrollment.py",
@@ -84,12 +86,13 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "conversation_changes.py",
             "sync_worker.py",
             "sqlite_checkpoint.py",
+            "sqlite_writer.py",  # Sole runtime sync.db connection owner.
             "transcription_hydration.py",
             "telegram_fact_queries.py",
             "telegram_fragments.py",
             "topics/sqlite_repository.py",
+            "topics/ports.py",  # Transaction-local projection binding to the shared SQLite owner.
             "unread_state.py",
-            "daemon_shutdown.py",
             "entity_profile/repository.py",
         }
     ),

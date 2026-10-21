@@ -36,6 +36,7 @@ from tests.helpers import (
     LoudUserProfilePort,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.sqlite_writer_helpers import inline_writer
 
 # ---------------------------------------------------------------------------
 # Module-wide patch: telethon_utils.get_peer_id returns entity.id for mocks
@@ -314,6 +315,7 @@ def make_server(
         conn,
         cast(DaemonClientLike, client),
         shutdown_event,
+        writer=inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),

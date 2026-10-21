@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Protocol
 
 from .telegram_demand import (
@@ -90,7 +90,7 @@ async def run_reconnect_catch_up_loop(
     *,
     interval_seconds: float,
     observe: Callable[[str, str, str | None], None] | None = None,
-    on_reconnect: Callable[[], None] | None = None,
+    on_reconnect: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Recover missed updates once for each Telethon reconnect signal.
 
@@ -112,7 +112,7 @@ async def run_reconnect_catch_up_loop(
             if observe is not None:
                 observe("runtime.connection_observed", "reconnected", None)
             if on_reconnect is not None:
-                on_reconnect()
+                await on_reconnect()
 
         if await _request_catch_up(client, observe):
             recovery_needed = False

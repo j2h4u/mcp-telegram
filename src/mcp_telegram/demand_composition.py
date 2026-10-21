@@ -21,7 +21,6 @@ from mcp_telegram.delta_sync import (
     DeltaSyncWorker,
     DmDeletionReconciliationDemandAdapter,
     DmGapScanPage,
-    prepare_dm_deletion_reconciliation,
 )
 from mcp_telegram.dialog_directory import (
     CanonicalDialogDirectory,
@@ -55,6 +54,7 @@ from mcp_telegram.self_profile_maintenance import (
     SelfProfileMaintenanceDemandAdapter,
     SelfProfileMaintenanceDependencies,
 )
+from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.startup_identity import StartupIdentityState
 from mcp_telegram.sync_db import SyncDatabaseConnection
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncDmEnrollmentDemandAdapter, FullSyncWorker
@@ -91,6 +91,7 @@ class DemandCompositionDependencies:
 
     client: DemandCompositionClient
     conn: SyncDatabaseConnection
+    writer: SQLiteWriter
     db_path: Path
     shutdown_event: asyncio.Event
     full_sync_worker: FullSyncWorker
@@ -111,11 +112,11 @@ class DemandCompositionDependencies:
     activity_rpc_timeout_seconds: float
     read_receipt_batch: Callable[[], Awaitable[object]]
     self_profile_cadence: SelfProfileCadenceState
-    update_self_profile: Callable[[object], None]
+    update_self_profile: Callable[[object], Awaitable[None]]
     startup_identity: StartupIdentityState
     get_self_input_entity: Callable[[int], Awaitable[object]]
     user_profile_port: UserProfilePort
-    publish_startup_identity: Callable[[object, OwnOnlyContext], None]
+    publish_startup_identity: Callable[[object, OwnOnlyContext], Awaitable[None]]
     draft_owner: DraftMessageOwner
     linked_chat_fact_refresh_port: LinkedChatFactRefreshPort
     startup_detail_setter: Callable[[str], None] | None = None
@@ -151,12 +152,11 @@ def build_durable_adapter_map(
     observer: DeltaGapFillObservationHook | None = None,
 ) -> Mapping[DemandKind, DurableDemandAdapter]:
     """Build and validate the exhaustive durable adapter map."""
-    prepare_dm_deletion_reconciliation(dependencies.conn)
     adapters: dict[DemandKind, DurableDemandAdapter] = {
         DemandKind.ENTITY_PROFILE_REFRESH: EntityProfileDemandAdapter(dependencies.entity_refresh_coordinator),
         DemandKind.DELTA_GAP_FILL: DeltaGapFillDemandAdapter(dependencies.delta_sync_worker, observer=observer),
         DemandKind.DM_DELETION_RECONCILIATION: DmDeletionReconciliationDemandAdapter(
-            dependencies.conn, dependencies.dm_gap_scanner
+            dependencies.conn, dependencies.dm_gap_scanner, writer=dependencies.writer
         ),
         DemandKind.DELTA_ACCESS_PROBE: DeltaAccessProbeDemandAdapter(
             dependencies.delta_sync_worker,
@@ -170,6 +170,7 @@ def build_durable_adapter_map(
             dependencies.shutdown_event,
             dependencies.hot_sweep_policy,
             dependencies.activity_rpc_timeout_seconds,
+            writer=dependencies.writer,
         ),
         DemandKind.LIVE_HYDRATION_BATCH: FactHydrationDemandAdapter(
             dependencies.fact_hydration_worker,
@@ -189,6 +190,7 @@ def build_durable_adapter_map(
             dependencies.conn,
             dependencies.shutdown_event,
             dependencies.activity_rpc_timeout_seconds,
+            writer=dependencies.writer,
         ),
         DemandKind.ARCHIVE_INCREMENTAL: ArchiveIncrementalDemandAdapter(
             dependencies.client,
@@ -196,6 +198,7 @@ def build_durable_adapter_map(
             dependencies.shutdown_event,
             demand_freshness_seconds(DemandKind.ARCHIVE_INCREMENTAL),
             dependencies.activity_rpc_timeout_seconds,
+            writer=dependencies.writer,
         ),
         DemandKind.COLD_PEER_PAGE: ColdPeerPageDemandAdapter(
             dependencies.client,
@@ -203,6 +206,7 @@ def build_durable_adapter_map(
             dependencies.shutdown_event,
             dependencies.cold_backfill_pacing,
             dependencies.activity_rpc_timeout_seconds,
+            writer=dependencies.writer,
         ),
         DemandKind.BACKFILL_HYDRATION_BATCH: FactHydrationDemandAdapter(
             dependencies.fact_hydration_worker,

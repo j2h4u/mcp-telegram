@@ -18,6 +18,7 @@ from mcp_telegram.scheduled_messages import _record_retry, upsert_scheduled_mess
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
 from mcp_telegram.telegram_fact_queries import persist_read_at
+from tests.sqlite_writer_helpers import inline_writer
 from tests.test_scheduled_messages import _message
 
 Operation = Literal["access", "history", "claim", "read_date", "scheduled", "reaction"]
@@ -51,8 +52,8 @@ def _operation(conn: sqlite3.Connection, operation: Operation) -> None:
     elif operation == "scheduled":
         _record_retry(conn, 20, "transient")
     else:
-        ReactionDetailRefresher(conn, _Gateway(conn))._persist_failure(
-            1, 2, 1, expected_status="stale", expected_offset=None, staged_count=0, failure=None, when=10
+        ReactionDetailRefresher(conn, _Gateway(conn), writer=inline_writer(conn))._persist_failure(
+            conn, 1, 2, 1, expected_status="stale", expected_offset=None, staged_count=0, failure=None, when=10
         )
 
 
@@ -100,7 +101,9 @@ async def test_reaction_rpc_releases_writer_and_restores_guard(conn: sqlite3.Con
             conn, 1, 2, [ReactionAggregate("👍", 1)], source="history", observed_at=1, observation_sequence=1
         )
     gateway = _Gateway(conn)
-    result = await ReactionDetailRefresher(conn, gateway).refresh_one(1, 2, 1, entity=1, now=10)
+    result = await ReactionDetailRefresher(conn, gateway, writer=inline_writer(conn)).refresh_one(
+        1, 2, 1, entity=1, now=10
+    )
     assert result.status == "complete"
     assert gateway.calls == 1
     assert not conn.in_transaction

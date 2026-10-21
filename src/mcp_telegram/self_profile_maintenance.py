@@ -40,7 +40,7 @@ class SelfProfileCadenceState(Protocol):
     def status(self, now: float) -> DemandStatus | None:
         """Return the next due boundary without changing local state."""
 
-    def mark_refreshed(self, completed_at: float) -> None:
+    async def mark_refreshed(self, completed_at: float) -> None:
         """Commit the next cadence boundary after a successful refresh."""
 
 
@@ -54,11 +54,11 @@ class SelfProfileMaintenanceDependencies:
 
     cadence: SelfProfileCadenceState
     get_me: Callable[[], Awaitable[object]]
-    update_profile: Callable[[object], None]
+    update_profile: Callable[[object], Awaitable[None]]
     startup: StartupIdentityState | None = None
     get_input_entity: Callable[[int], Awaitable[object]] | None = None
     user_profile_port: UserProfilePort | None = None
-    publish_startup_identity: Callable[[object, OwnOnlyContext], None] | None = None
+    publish_startup_identity: Callable[[object, OwnOnlyContext], Awaitable[None]] | None = None
 
     def __post_init__(self) -> None:
         if self.startup is None:
@@ -162,8 +162,8 @@ class SelfProfileMaintenanceDemandAdapter(DurableDemandAdapter):
             account_id=int(cast(_MeLike, profile).id),
             personal_channel_id=personal_channel_id,
         )
-        publish_startup_identity(profile, own_only_context)
-        self._dependencies.cadence.mark_refreshed(self._clock())
+        await publish_startup_identity(profile, own_only_context)
+        await self._dependencies.cadence.mark_refreshed(self._clock())
         startup.complete(StartupIdentityResult(profile, own_only_context))
 
     @staticmethod
@@ -190,8 +190,8 @@ class SelfProfileMaintenanceDemandAdapter(DurableDemandAdapter):
                     except RpcAttemptBudgetExhaustedError:
                         return
 
-                    self._dependencies.update_profile(me)
-                    self._dependencies.cadence.mark_refreshed(self._clock())
+                    await self._dependencies.update_profile(me)
+                    await self._dependencies.cadence.mark_refreshed(self._clock())
 
 
 __all__ = [

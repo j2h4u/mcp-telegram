@@ -13,9 +13,11 @@ import dataclasses
 import sqlite3
 import time
 from collections.abc import Sequence
+from functools import partial
 from typing import cast
 
 from .models import DialogType, ReadMessage, ReadReactionEvent
+from .sqlite_writer import SQLiteWriter
 from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_demand import RpcAttemptBudgetExhaustedError
 from .telegram_gateway import CATCHABLE_GATEWAY_FAILURES
@@ -150,6 +152,7 @@ async def enrich_read_at(  # noqa: PLR0913
     dialog_id: int,
     messages: Sequence[ReadMessage],
     *,
+    writer: SQLiteWriter,
     dialog_type: str | DialogType | None,
     read_at_ttl_seconds: int,
     checked_at: int | None = None,
@@ -182,6 +185,7 @@ async def enrich_read_at(  # noqa: PLR0913
         read_at_ttl_seconds=read_at_ttl_seconds,
         cycle_reason_counts=cycle_reason_counts,
         cycle_metrics=cycle_metrics,
+        writer=writer,
     )
     if cycle_counts is not None:
         cycle_counts.extend(counts)
@@ -373,12 +377,13 @@ def _persist_message_too_old(
         return int(inserted or 0) + int(updated or 0)
 
 
-async def _refresh_stale_read_at_facts(  # noqa: PLR0913
+async def _refresh_stale_read_at_facts(  # noqa: PLR0913, PLR0914 - preserves per-result metrics after commit
     conn: sqlite3.Connection,
     gateway: TelegramReadReceiptGateway,
     dialog_id: int,
     messages: Sequence[ReadMessage],
     *,
+    writer: SQLiteWriter,
     stale_before_utc: int,
     checked_at: int,
     read_at_ttl_seconds: int,
@@ -391,30 +396,40 @@ async def _refresh_stale_read_at_facts(  # noqa: PLR0913
     candidate_ids = stale_read_at_ids(conn, dialog_id, tuple(message_by_id), stale_before_utc)
     for message_id in candidate_ids:
         message = message_by_id[message_id]
-        eligible, cutoff_skipped, fresh_skipped = _read_date_rpc_still_eligible(
-            conn,
-            dialog_id,
-            message_id,
-            sent_at=message.sent_at,
-            stale_before_utc=stale_before_utc,
+        eligible, cutoff_skipped, fresh_skipped = await writer.run(
+            partial(
+                _read_date_rpc_still_eligible,
+                dialog_id=dialog_id,
+                message_id=message_id,
+                sent_at=message.sent_at,
+                stale_before_utc=stale_before_utc,
+            )
         )
         if not eligible:
             _record_cutoff_skip(cycle_metrics, cutoff_skipped)
             _record_fresh_skip(cycle_metrics, fresh_skipped)
             continue
-        attempt_kind = _read_date_attempt_kind(conn, dialog_id, message_id)
+        attempt_kind = await writer.run(partial(_read_date_attempt_kind, dialog_id=dialog_id, message_id=message_id))
         result = await _fetch_read_date_result(gateway, dialog_id, message_id)
         _record_read_date_attempt(cycle_metrics, attempt_kind)
-        result_complete, result_missing, result_unavailable = _persist_fetched_read_date(
-            conn,
-            dialog_id,
-            message,
-            result,
-            checked_at=checked_at,
-            read_at_ttl_seconds=read_at_ttl_seconds,
-            cycle_reason_counts=cycle_reason_counts,
-            cycle_metrics=cycle_metrics,
+        persisted_reasons = None if cycle_reason_counts is None else dict(cycle_reason_counts)
+        persisted_metrics = None if cycle_metrics is None else dict(cycle_metrics)
+        result_complete, result_missing, result_unavailable = await writer.run(
+            partial(
+                _persist_fetched_read_date,
+                dialog_id=dialog_id,
+                message=message,
+                result=result,
+                checked_at=checked_at,
+                read_at_ttl_seconds=read_at_ttl_seconds,
+                cycle_reason_counts=persisted_reasons,
+                cycle_metrics=persisted_metrics,
+            )
         )
+        if cycle_reason_counts is not None and persisted_reasons is not None:
+            cycle_reason_counts.update(persisted_reasons)
+        if cycle_metrics is not None and persisted_metrics is not None:
+            cycle_metrics.update(persisted_metrics)
         complete += result_complete
         missing += result_missing
         unavailable += result_unavailable

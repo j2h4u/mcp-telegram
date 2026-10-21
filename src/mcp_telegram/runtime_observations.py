@@ -12,16 +12,19 @@ import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Protocol, cast
 
-from .sync_transactions import enable_runtime_writes, write_transaction
+from .sqlite_writer import SQLiteWriter
+from .sync_transactions import write_transaction
 
 RUNTIME_INSTANCE_ID = uuid.uuid4().hex
 MAX_PAYLOAD_BYTES = 1024
 DEFAULT_ROW_CAP = 100_000
 _PRUNE_BATCH_SIZE = 1_000
 _WRITER_POLL_SECONDS = 0.05
+_FLUSH_BATCH_SIZE = 32
 ALLOWED_KINDS = frozenset(
     {
         "mcp.call",
@@ -51,18 +54,6 @@ ALLOWED_KINDS = frozenset(
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _raise_if_writer_retired(conn: sqlite3.Connection, primary: BaseException) -> None:
-    """Dropping a job must never conceal a retired connection."""
-    try:
-        _ = conn.in_transaction
-    except sqlite3.ProgrammingError as probe_error:
-        raise primary from probe_error
-
-
-def _seconds_from_milliseconds(milliseconds: int) -> float:
-    return milliseconds / 1_000
 
 
 class RuntimeObservationPolicy(Protocol):
@@ -236,6 +227,7 @@ class RuntimeObservationSink:
         self,
         database: Path | str | sqlite3.Connection,
         *,
+        writer: SQLiteWriter,
         retention_ttl_seconds: int,
         policy: RuntimeObservationPolicy,
     ) -> None:
@@ -250,40 +242,25 @@ class RuntimeObservationSink:
         )
         if any(value <= 0 for value in positive_values):
             raise ValueError("runtime observation sink limits must be positive")
-        database_path = self._database_path(database)
-        self._database_path_value = database_path
+        self._database_path(database)
+        self._writer = writer
         self._retention_ttl_seconds = retention_ttl_seconds
         self._prune_every_writes = policy.prune_every_writes
-        self._busy_timeout_ms = policy.writer_busy_timeout_ms
-        self._writer_startup_wait_seconds = policy.writer_startup_wait_seconds
         self._shutdown_drain_grace_seconds = policy.shutdown_drain_grace_seconds
         self._row_cap = policy.row_cap
         self._jobs: queue.Queue[_ObservationJob] = queue.Queue(maxsize=policy.queue_capacity)
         self._close_requested = threading.Event()
-        self._abort_requested = threading.Event()
-        self._writer_ready = threading.Event()
         self._state_lock = threading.Lock()
-        self._connection_lock = threading.Lock()
         self._counter_lock = threading.Lock()
         self._log_lock = threading.Lock()
         self._last_log_at = 0.0
         self._last_logged_summary = self._summary_snapshot(RuntimeObservationCounters())
         self._accepting = True
         self._closed = False
-        self._writer_error: BaseException | None = None
-        self._writer_connection: sqlite3.Connection | None = None
         self._counters = RuntimeObservationCounters()
         self._prune_pending = False
         self._prune_now_ms: int | None = None
-        self._external_writes_since_prune = 0
-        self._maintenance_requested = threading.Event()
-        self._writer = threading.Thread(
-            target=self._writer_main,
-            name="runtime-observation-writer",
-            daemon=True,
-        )
-        self._writer.start()
-        self._writer_ready.wait(self._writer_startup_wait_seconds)
+        self._flush_task = asyncio.create_task(self._flush_loop(), name="runtime-observation-flush")
 
     @staticmethod
     def _database_path(database: Path | str | sqlite3.Connection) -> Path:
@@ -343,11 +320,9 @@ class RuntimeObservationSink:
             payload_json=encode_payload(payload),
         )
         with self._state_lock:
-            if self._writer_error is not None:
-                self._increment("rejected_submissions")
-                raise RuntimeError("runtime observation sink writer failed") from self._writer_error
             if self._closed or not self._accepting:
-                raise RuntimeError("runtime observation sink is closed")
+                self._increment("rejected_submissions")
+                return False
             try:
                 self._jobs.put_nowait(job)
             except queue.Full:
@@ -355,30 +330,38 @@ class RuntimeObservationSink:
                 return False
         return True
 
-    def note_external_write(self) -> None:
-        """Request maintenance after committed observations written elsewhere."""
-        with self._state_lock:
-            if self._closed or not self._accepting or self._writer_error is not None:
-                return
-            self._external_writes_since_prune += 1
-            if self._external_writes_since_prune >= self._prune_every_writes:
-                self._external_writes_since_prune = 0
-                self._maintenance_requested.set()
-
     def close(self) -> None:
-        """Synchronously close the sink for non-async callers."""
-        self._close_sync()
+        """Stop admission immediately; async callers must await aclose to drain."""
+        with self._state_lock:
+            self._accepting = False
+            self._close_requested.set()
 
     async def aclose(self) -> None:
-        """Stop accepting, then allow queued jobs a grace period to drain.
+        """Drain briefly, discard unsubmitted jobs, then settle accepted owner work.
 
-        The grace period does not bound method return: an arbitrary Python or
-        operating-system stall can keep the writer alive.  SQLite work is
-        interrupted after the grace period, and this method intentionally
-        waits for the writer thread to exit before returning.
-
+        The grace bounds buffered work, not an operation already accepted by
+        the shared owner: SQLite and OS stalls cannot safely be interrupted here.
         """
-        await asyncio.to_thread(self._close_sync)
+        self.close()
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            _, pending = await asyncio.wait({self._flush_task}, timeout=self._shutdown_drain_grace_seconds)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+            pending = {self._flush_task}
+        if pending:
+            self._drop_queued_jobs("shutdown_grace_drops")
+        while not self._flush_task.done():
+            try:
+                await asyncio.shield(self._flush_task)
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+                self._drop_queued_jobs("shutdown_grace_drops")
+        self._flush_task.result()
+        self._closed = True
+        self._maybe_log_summary()
+        if cancellation is not None:
+            raise cancellation
 
     @property
     def stats(self) -> RuntimeObservationCounters:
@@ -416,11 +399,6 @@ class RuntimeObservationSink:
     @property
     def startup_drops(self) -> int:
         return self.stats.startup_drops
-
-    @property
-    def writer_error(self) -> str | None:
-        with self._state_lock:
-            return None if self._writer_error is None else str(self._writer_error)
 
     def _increment(self, name: str, amount: int = 1) -> None:
         with self._counter_lock:
@@ -511,207 +489,96 @@ class RuntimeObservationSink:
         if dropped:
             self._increment(counter_name, dropped)
 
-    def _close_sync(self) -> None:
-        with self._state_lock:
-            if self._closed:
-                return
-            self._accepting = False
-            self._close_requested.set()
-        drain_until = time.monotonic() + self._shutdown_drain_grace_seconds
-        remaining = max(drain_until - time.monotonic(), 0)
-        self._writer.join(remaining)
-        if self._writer.is_alive():
-            self._abort_requested.set()
-            self._interrupt_writer()
-            self._drop_queued_jobs("shutdown_grace_drops")
-            self._writer.join()
-        with self._state_lock:
-            self._closed = True
-        self._maybe_log_summary()
-
-    def _writer_main(self) -> None:
-        conn: sqlite3.Connection | None = None
-        startup_complete = False
-        try:
-            conn = self._open_writer_connection()
-            with self._connection_lock:
-                self._writer_connection = conn
-            startup_complete = True
-            self._writer_ready.set()
-            self._run_writer_loop(conn)
-        except Exception as exc:  # noqa: BLE001 - writer must survive connection errors
-            self._handle_writer_failure(exc, startup_complete=startup_complete)
-        finally:
-            with self._connection_lock:
-                self._writer_connection = None
-            if conn is not None:
-                conn.close()
-
-    def _open_writer_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(
-            str(self._database_path_value),
-            timeout=_seconds_from_milliseconds(self._busy_timeout_ms),
-        )
-        conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
-        conn.execute("PRAGMA foreign_keys=ON")
-        enable_runtime_writes(conn)
-        conn.set_progress_handler(lambda: int(self._abort_requested.is_set()), 1_000)
-        return conn
-
-    def _interrupt_writer(self) -> None:
-        with self._connection_lock:
-            if self._writer_connection is not None:
-                try:
-                    self._writer_connection.interrupt()
-                except sqlite3.ProgrammingError:
-                    # The owner may retire its connection during shutdown.
-                    try:
-                        _ = self._writer_connection.in_transaction
-                    except sqlite3.ProgrammingError:
-                        return
-                    raise
-
-    def _run_writer_loop(self, conn: sqlite3.Connection) -> None:
+    async def _flush_loop(self) -> None:
         writes_since_prune = 0
-        while not self._abort_requested.is_set():
-            self._consume_external_write_request()
-            try:
-                job = self._jobs.get(True, _WRITER_POLL_SECONDS)
-            except queue.Empty:
-                if self._close_requested.is_set():
-                    return
-                if self._prune_pending:
-                    self._run_prune_batch(conn)
-                    self._maybe_log_summary()
-                continue
-            try:
-                writes_since_prune = self._process_job(conn, job, writes_since_prune)
-                self._maybe_log_summary()
-            finally:
-                self._jobs.task_done()
-
-    def _consume_external_write_request(self) -> None:
-        with self._state_lock:
-            if not self._maintenance_requested.is_set():
+        while True:
+            jobs: list[_ObservationJob] = []
+            while len(jobs) < _FLUSH_BATCH_SIZE:
+                try:
+                    jobs.append(self._jobs.get_nowait())
+                except queue.Empty:
+                    break
+            if jobs:
+                writes_since_prune = await self._flush_batch(jobs, writes_since_prune)
+            if self._close_requested.is_set() and self._jobs.empty():
                 return
-            self._maintenance_requested.clear()
-        self._prune_pending = True
-        if self._prune_now_ms is None:
-            self._prune_now_ms = int(time.time() * 1000)
+            if self._prune_pending and not self._close_requested.is_set():
+                await self._run_prune_batch()
+            self._maybe_log_summary()
+            # Yield between bounded batches so core submissions reach the owner.
+            await asyncio.sleep(0 if jobs else _WRITER_POLL_SECONDS)
 
-    def _process_job(self, conn: sqlite3.Connection, job: _ObservationJob, writes_since_prune: int) -> int:
-        result = self._write_job(conn, job)
-        if result is None:
-            self._increment("shutdown_grace_drops")
-        elif result:
-            writes_since_prune += 1
+    async def _flush_batch(self, jobs: list[_ObservationJob], writes_since_prune: int) -> int:
+        try:
+            await self._writer.run(partial(self._write_batch, jobs=jobs))
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never stop archive work
+            self._increment("permanent_failures", len(jobs))
+            logger.warning("runtime_observation_batch_failed error_type=%s", type(exc).__name__)
+        else:
+            self._increment("successful_writes", len(jobs))
+            writes_since_prune += len(jobs)
             if writes_since_prune >= self._prune_every_writes:
                 writes_since_prune = 0
                 self._prune_pending = True
-                if self._prune_now_ms is None:
-                    self._prune_now_ms = int(time.time() * 1000)
-            if self._prune_pending and not self._close_requested.is_set():
-                self._run_prune_batch(conn)
+        finally:
+            for _ in jobs:
+                self._jobs.task_done()
         return writes_since_prune
 
-    def _run_prune_batch(self, conn: sqlite3.Connection) -> None:
-        """Run one maintenance transaction; committed observations stay committed."""
-        if self._close_requested.is_set() or self._abort_requested.is_set():
-            return
+    async def _run_prune_batch(self) -> None:
+        effective_now = self._prune_now_ms or int(time.time() * 1000)
+        self._prune_now_ms = effective_now
         try:
-            effective_now = self._prune_now_ms if self._prune_now_ms is not None else int(time.time() * 1000)
-            result = _prune_runtime_observations_batch(
-                conn,
-                ttl_seconds=self._retention_ttl_seconds,
-                row_cap=self._row_cap,
-                now_ms=effective_now,
+            # Planning holds no writer reservation; deletion is a separate small transaction.
+            plan = await self._writer.run(
+                lambda conn: _plan_runtime_observations_batch(
+                    conn,
+                    ttl_seconds=self._retention_ttl_seconds,
+                    row_cap=self._row_cap,
+                    now_ms=effective_now,
+                )
             )
-        except Exception as exc:  # noqa: BLE001 - maintenance failure must not retire committed observations
-            self._handle_prune_failure(conn, exc)
-            return
-        self._prune_pending = result.has_more
-        if not result.has_more:
-            self._prune_now_ms = None
-
-    def _handle_prune_failure(self, conn: sqlite3.Connection, exc: Exception) -> None:
-        _raise_if_writer_retired(conn, exc)
-        if self._abort_requested.is_set():
+            if self._close_requested.is_set():
+                return
+            if plan.ids:
+                await self._writer.run(lambda conn: self._delete_prune_plan(conn, plan, effective_now))
+        except Exception as exc:  # noqa: BLE001 - committed observations remain committed
             self._prune_pending = False
             self._prune_now_ms = None
-            return
-        if isinstance(exc, sqlite3.OperationalError) and {"locked", "busy"}.intersection(str(exc).lower().split()):
-            self._increment("busy_retries")
-            return
-        self._prune_pending = False
-        self._prune_now_ms = None
-        logger.warning(
-            "runtime_observation_prune_failed error_type=%s sqlite_errorcode=%s",
-            type(exc).__name__,
-            getattr(exc, "sqlite_errorcode", None),
-        )
+            logger.warning("runtime_observation_prune_failed error_type=%s", type(exc).__name__)
+        else:
+            self._prune_pending = plan.has_more
+            if not plan.has_more:
+                self._prune_now_ms = None
 
-    def _handle_writer_failure(self, exc: BaseException, *, startup_complete: bool) -> None:
-        with self._state_lock:
-            self._writer_error = exc
-            self._accepting = False
-            self._close_requested.set()
-        self._writer_ready.set()
-        self._increment("permanent_failures")
-        if not startup_complete:
-            self._increment("startup_failures")
-        self._drop_queued_jobs()
-        logger.error(
-            "runtime_observation_writer_%s error=%s",
-            "failed" if startup_complete else "startup_failed",
-            exc,
-        )
-        self._maybe_log_summary()
+    @staticmethod
+    def _delete_prune_plan(conn: sqlite3.Connection, plan: _PrunePlan, now_ms: int) -> None:
+        with write_transaction(conn):
+            _apply_runtime_observations_plan(conn, plan, now_ms=now_ms)
 
-    def _write_job(self, conn: sqlite3.Connection, job: _ObservationJob) -> bool | None:
-        payload = cast(Mapping[str, object], json.loads(job.payload_json))
-        attempt = 0
-        while not self._abort_requested.is_set():
-            try:
-                with write_transaction(conn):
-                    record_runtime_observation(
-                        conn,
-                        kind=job.kind,
-                        dialog_id=job.dialog_id,
-                        operation_id=job.operation_id,
-                        outcome=job.outcome,
-                        reason_code=job.reason_code,
-                        duration_ms=job.duration_ms,
-                        tool_name=job.tool_name,
-                        tool_capability=job.tool_capability,
-                        contract_version=job.contract_version,
-                        result_count=job.result_count,
-                        has_cursor=job.has_cursor,
-                        page_depth=job.page_depth,
-                        has_filter=job.has_filter,
-                        error_type=job.error_type,
-                        payload=payload,
-                        observed_at_ms=job.observed_at_ms,
-                    )
-                self._increment("successful_writes")
-                return True
-            except sqlite3.OperationalError as exc:
-                _raise_if_writer_retired(conn, exc)
-                if self._abort_requested.is_set():
-                    return None
-                message = str(exc).lower()
-                if "locked" not in message and "busy" not in message:
-                    self._increment("permanent_failures")
-                    return False
-                self._increment("busy_retries")
-                time.sleep(min(0.01 * (attempt + 1), 0.05))
-                attempt += 1
-            except Exception as exc:  # noqa: BLE001 - one bad job must not stop FIFO draining
-                _raise_if_writer_retired(conn, exc)
-                if self._abort_requested.is_set():
-                    return None
-                self._increment("permanent_failures")
-                return False
-        return None
+    @staticmethod
+    def _write_batch(conn: sqlite3.Connection, jobs: list[_ObservationJob]) -> None:
+        with write_transaction(conn):
+            for job in jobs:
+                record_runtime_observation(
+                    conn,
+                    kind=job.kind,
+                    dialog_id=job.dialog_id,
+                    operation_id=job.operation_id,
+                    outcome=job.outcome,
+                    reason_code=job.reason_code,
+                    duration_ms=job.duration_ms,
+                    tool_name=job.tool_name,
+                    tool_capability=job.tool_capability,
+                    contract_version=job.contract_version,
+                    result_count=job.result_count,
+                    has_cursor=job.has_cursor,
+                    page_depth=job.page_depth,
+                    has_filter=job.has_filter,
+                    error_type=job.error_type,
+                    payload=cast(Mapping[str, object], json.loads(job.payload_json)),
+                    observed_at_ms=job.observed_at_ms,
+                )
 
 
 def _plan_runtime_observations_batch(

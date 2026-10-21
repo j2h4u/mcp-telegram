@@ -48,6 +48,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     rpc_scope,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.sqlite_writer_helpers import inline_writer
 
 
 class _RequestWithPeer(Protocol):
@@ -197,7 +198,9 @@ async def test_fragment_gateway_preserves_fixed_window_and_normalized_persistenc
         get_messages=AsyncMock(side_effect=get_messages),
     )
 
-    result = await FragmentContextService(conn, TelethonTelegramFragmentGateway(client)).fetch(42, 10, 6)
+    result = await FragmentContextService(
+        conn, TelethonTelegramFragmentGateway(client), writer=inline_writer(conn)
+    ).fetch(42, 10, 6)
 
     assert result.ok is True
     assert all(message.observation_order == 1 for message in result.messages)
@@ -247,7 +250,9 @@ async def test_fragment_late_result_keeps_message_observed_during_fetch(
     client = SimpleNamespace(
         get_input_entity=AsyncMock(return_value="entity"), get_messages=AsyncMock(side_effect=get_messages)
     )
-    result = await FragmentContextService(conn, TelethonTelegramFragmentGateway(client)).fetch(42, 10, 1)
+    result = await FragmentContextService(
+        conn, TelethonTelegramFragmentGateway(client), writer=inline_writer(conn)
+    ).fetch(42, 10, 1)
     assert result.messages[0].observation_order == 1
     assert conn.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=10").fetchone() == ("newer",)
 
@@ -263,7 +268,9 @@ async def test_fragment_gateway_translates_floodwait_without_partial_persistence
         get_messages=AsyncMock(),
     )
 
-    result = await FragmentContextService(conn, TelethonTelegramFragmentGateway(client)).fetch(42, 10, 6)
+    result = await FragmentContextService(
+        conn, TelethonTelegramFragmentGateway(client), writer=inline_writer(conn)
+    ).fetch(42, 10, 6)
 
     assert result.ok is False
     assert result.failure == GatewayFailure(
@@ -410,6 +417,7 @@ async def test_read_at_rejects_complete_result_without_date(
             Gateway(),
             42,
             [ReadMessage(message_id=1, sent_at=1_000, dialog_id=42, out=1)],
+            writer=inline_writer(conn),
             dialog_type="user",
             read_at_ttl_seconds=600,
             checked_at=3_000,
@@ -434,6 +442,7 @@ async def test_read_at_rejects_unknown_result_status(
             Gateway(),
             42,
             [ReadMessage(message_id=1, sent_at=1_000, dialog_id=42, out=1)],
+            writer=inline_writer(conn),
             dialog_type="user",
             read_at_ttl_seconds=600,
             checked_at=3_000,
@@ -475,6 +484,7 @@ async def test_read_at_telemetry_counts_local_admission_deferral_as_transient(
         Gateway(),
         42,
         [ReadMessage(message_id=1, sent_at=1_000, dialog_id=42, out=1)],
+        writer=inline_writer(conn),
         dialog_type="user",
         read_at_ttl_seconds=600,
         checked_at=3_000,
@@ -546,7 +556,14 @@ async def test_read_at_enrichment_only_probes_outgoing_user_dm_and_never_falls_b
         ReadMessage(message_id=3, sent_at=1_002, dialog_id=99, out=1),
     ]
     enriched = await enrich_read_at(
-        conn, Gateway(), 42, messages, dialog_type="user", read_at_ttl_seconds=600, checked_at=2_000
+        conn,
+        Gateway(),
+        42,
+        messages,
+        writer=inline_writer(conn),
+        dialog_type="user",
+        read_at_ttl_seconds=600,
+        checked_at=2_000,
     )
     assert [message.read_at for message in enriched] == [None, None, None]
     assert calls == [1]
@@ -557,7 +574,14 @@ async def test_read_at_enrichment_only_probes_outgoing_user_dm_and_never_falls_b
     # Group-shaped dialogs are outside the private User-DM contract and must
     # not trigger a Telegram RPC even when they contain an outgoing message.
     await enrich_read_at(
-        conn, Gateway(), 42, messages, dialog_type="supergroup", read_at_ttl_seconds=600, checked_at=2_001
+        conn,
+        Gateway(),
+        42,
+        messages,
+        writer=inline_writer(conn),
+        dialog_type="supergroup",
+        read_at_ttl_seconds=600,
+        checked_at=2_001,
     )
     assert calls == [1]
 
@@ -594,6 +618,7 @@ async def test_read_at_suppresses_terminal_duplicate_ids_in_source_order(
         Gateway(),
         42,
         messages,
+        writer=inline_writer(conn),
         dialog_type="user",
         read_at_ttl_seconds=600,
         checked_at=3_000,
@@ -617,6 +642,7 @@ async def test_read_at_rejects_boolean_ttl_before_shortcut(make_synced_db: Calla
             None,
             42,
             [],
+            writer=inline_writer(make_synced_db()),
             dialog_type="supergroup",
             read_at_ttl_seconds=True,
         )
@@ -795,7 +821,14 @@ async def test_read_at_projects_telegram_date_for_own_dm_only(
         ReadMessage(message_id=9, sent_at=1_001, dialog_id=42, out=0),
     ]
     enriched = await enrich_read_at(
-        conn, Gateway(), 42, messages, dialog_type="user", read_at_ttl_seconds=600, checked_at=3_100
+        conn,
+        Gateway(),
+        42,
+        messages,
+        writer=inline_writer(conn),
+        dialog_type="user",
+        read_at_ttl_seconds=600,
+        checked_at=3_100,
     )
 
     assert calls == [8]
@@ -821,7 +854,14 @@ async def test_read_at_unavailable_is_nullable_but_probe_status_is_persisted(
 
     messages = [ReadMessage(message_id=7, sent_at=1_000, dialog_id=42, out=1)]
     enriched = await enrich_read_at(
-        conn, Gateway(), 42, messages, dialog_type="user", read_at_ttl_seconds=600, checked_at=3_000
+        conn,
+        Gateway(),
+        42,
+        messages,
+        writer=inline_writer(conn),
+        dialog_type="user",
+        read_at_ttl_seconds=600,
+        checked_at=3_000,
     )
 
     assert calls == [7]
@@ -859,6 +899,7 @@ async def test_read_at_retry_deadline_uses_maximum_of_ttl_and_flood_wait(
         Gateway(),
         42,
         [ReadMessage(message_id=7, sent_at=1_000, dialog_id=42, out=1)],
+        writer=inline_writer(conn),
         dialog_type="user",
         read_at_ttl_seconds=600,
         checked_at=3_000,
@@ -920,7 +961,14 @@ async def test_read_at_propagates_persistence_operational_error_after_prior_comm
 
     with pytest.raises(sqlite3.OperationalError, match="persistence failed"):
         await enrich_read_at(
-            conn, Gateway(), 42, messages, dialog_type="user", read_at_ttl_seconds=600, checked_at=3_000
+            conn,
+            Gateway(),
+            42,
+            messages,
+            writer=inline_writer(conn),
+            dialog_type="user",
+            read_at_ttl_seconds=600,
+            checked_at=3_000,
         )
 
     assert calls == [1, 2]

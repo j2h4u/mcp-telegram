@@ -26,6 +26,7 @@ from mcp_telegram.realtime_history_policy import (
     realtime_history_coverage,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from sqlite_writer_helpers import event_manager
 
 
 @pytest.mark.parametrize(
@@ -70,7 +71,7 @@ def sync_db(tmp_path: Path) -> Iterator[sqlite3.Connection]:
 def _manager(conn: sqlite3.Connection, client: MagicMock) -> EventHandlerManager:
     conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (42, 'own_only')")
     conn.commit()
-    manager = EventHandlerManager(client, conn, asyncio.Event())
+    manager = event_manager(client, conn, asyncio.Event())
     manager.register()
     return manager
 
@@ -257,7 +258,7 @@ async def test_new_message_status_race_fails_closed_after_fetch(
         return {}
 
     monkeypatch.setattr("mcp_telegram.event_handlers._build_fwd_entity_map", fetch_forward)
-    manager = EventHandlerManager(client, sync_db, asyncio.Event())
+    manager = event_manager(client, sync_db, asyncio.Event())
     manager.register()
     await manager.on_new_message(SimpleNamespace(chat_id=42, is_private=False, message=build_mock_message(id=4)))
     assert sync_db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0

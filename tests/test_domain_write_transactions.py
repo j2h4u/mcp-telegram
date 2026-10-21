@@ -19,6 +19,7 @@ from mcp_telegram.sync_transactions import enable_runtime_writes, write_transact
 from mcp_telegram.telegram_fragments import FragmentContextService
 from mcp_telegram.telegram_reading import FragmentFetchResult
 from mcp_telegram.topics.sqlite_repository import SQLiteTopicMetadataRepository
+from tests.sqlite_writer_helpers import inline_writer
 
 
 @pytest.fixture
@@ -125,7 +126,7 @@ class _FragmentGateway:
 
 async def test_fragment_rpc_runs_after_write_owner_is_released(guarded_db: sqlite3.Connection) -> None:
     conn = guarded_db
-    result = await FragmentContextService(conn, _FragmentGateway(conn)).fetch(1, 2, 3)
+    result = await FragmentContextService(conn, _FragmentGateway(conn), writer=inline_writer(conn)).fetch(1, 2, 3)
     assert result.ok
     assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=1").fetchone() == ("fragment",)
 
@@ -134,7 +135,7 @@ def test_fragment_rejects_inherited_owner_before_rpc(guarded_db: sqlite3.Connect
     conn = guarded_db
     with write_transaction(conn):
         with pytest.raises(RuntimeError, match="idle connection"):
-            FragmentContextService(conn, _FragmentGateway(conn)).fetch(1, 2, 3).send(None)
+            FragmentContextService(conn, _FragmentGateway(conn), writer=inline_writer(conn)).fetch(1, 2, 3).send(None)
         assert conn.in_transaction
     assert conn.execute("SELECT COUNT(*) FROM synced_dialogs").fetchone() == (0,)
 

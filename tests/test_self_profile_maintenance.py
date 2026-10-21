@@ -81,8 +81,12 @@ class _StartupUserProfilePort:
         raise AssertionError(f"personal channel post fetch is not part of startup tests: {reference}/{message_id}")
 
 
-def _unused_update_profile(me: object) -> None:
+async def _unused_update_profile(me: object) -> None:
     del me
+
+
+async def _unused_publish_startup_identity(_profile: object, _context: OwnOnlyContext) -> None:
+    pass
 
 
 @dataclass
@@ -95,7 +99,7 @@ class _Cadence:
         self.statuses.append(now)
         return self.current
 
-    def mark_refreshed(self, completed_at: float) -> None:
+    async def mark_refreshed(self, completed_at: float) -> None:
         self.refreshed_at.append(completed_at)
 
 
@@ -156,7 +160,7 @@ async def test_run_slice_fetches_and_applies_one_profile_under_exact_demand() ->
         scope.attempt_budget.debit()
         return profile
 
-    def update_profile(me: object) -> None:
+    async def update_profile(me: object) -> None:
         seen["profile"] = me
 
     dependencies = SelfProfileMaintenanceDependencies(
@@ -186,10 +190,13 @@ async def test_run_slice_does_not_apply_profile_when_attempt_budget_is_exhausted
     async def get_me() -> object:
         raise RpcAttemptBudgetExhaustedError("budget exhausted before get_me")
 
+    async def update_profile(profile: object) -> None:
+        applied.append(profile)
+
     dependencies = SelfProfileMaintenanceDependencies(
         cadence=cadence,
         get_me=get_me,
-        update_profile=applied.append,
+        update_profile=update_profile,
     )
     adapter = SelfProfileMaintenanceDemandAdapter(dependencies, clock=lambda: 100.0)
 
@@ -228,15 +235,18 @@ async def test_startup_bypasses_persisted_cadence_and_resumes_after_budget_split
 
     user_profile_port = _StartupUserProfilePort(personal_channel_id=9001, observer=observe_scope)
 
-    def publish_startup_identity(applied_profile: object, context: OwnOnlyContext) -> None:
+    async def publish_startup_identity(applied_profile: object, context: OwnOnlyContext) -> None:
         applied_profiles.append(applied_profile)
         applied_contexts.append(context)
+
+    async def update_profile(profile: object) -> None:
+        applied_profiles.append(profile)
 
     adapter = SelfProfileMaintenanceDemandAdapter(
         SelfProfileMaintenanceDependencies(
             cadence=cadence,
             get_me=get_me,
-            update_profile=applied_profiles.append,
+            update_profile=update_profile,
             startup=startup,
             get_input_entity=get_input_entity,
             user_profile_port=user_profile_port,
@@ -289,7 +299,7 @@ async def test_startup_accepts_partial_personal_channel_id() -> None:
             startup=startup,
             get_input_entity=get_input_entity,
             user_profile_port=port,
-            publish_startup_identity=lambda _profile, _context: None,
+            publish_startup_identity=_unused_publish_startup_identity,
         ),
         clock=lambda: 100.0,
     )
@@ -315,7 +325,7 @@ async def test_permanent_startup_profile_failure_signals_terminal_state() -> Non
             startup=startup,
             get_input_entity=lambda _account_id: _unused_get_me(),
             user_profile_port=_StartupUserProfilePort(error=RuntimeError("permanent")),
-            publish_startup_identity=lambda _profile, _context: None,
+            publish_startup_identity=_unused_publish_startup_identity,
         ),
         clock=lambda: 100.0,
     )

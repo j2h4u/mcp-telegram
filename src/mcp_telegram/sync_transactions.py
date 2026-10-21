@@ -45,6 +45,8 @@ def _log_transaction_event(  # noqa: PLR0913
     *,
     error: BaseException | None = None,
     level: int = logging.WARNING,
+    body_seconds: float = 0.0,
+    commit_seconds: float = 0.0,
 ) -> None:
     """Emit content-free transaction diagnostics without changing write semantics."""
     try:
@@ -54,6 +56,7 @@ def _log_transaction_event(  # noqa: PLR0913
             (
                 "%s stage=%s caller_module=%s caller_function=%s caller_line=%d "
                 "thread_name=%s thread_native_id=%s wait_seconds=%.3f held_seconds=%.3f "
+                "body_seconds=%.3f commit_seconds=%.3f "
                 "error_type=%s sqlite_errorcode=%s sqlite_errorname=%s"
             ),
             event,
@@ -65,6 +68,8 @@ def _log_transaction_event(  # noqa: PLR0913
             threading.get_native_id(),
             wait_seconds,
             held_seconds,
+            body_seconds,
+            commit_seconds,
             None if error is None else type(error).__name__,
             getattr(error, "sqlite_errorcode", None),
             getattr(error, "sqlite_errorname", None),
@@ -96,11 +101,13 @@ def _read_query_only(conn: sqlite3.Connection, wait_started: float) -> bool:
         raise
 
 
-def _log_failure(
+def _log_failure(  # noqa: PLR0913, PLR0917
     stage: str,
     wait_seconds: float,
     held_seconds: float,
     error: BaseException,
+    body_seconds: float = 0.0,
+    commit_seconds: float = 0.0,
 ) -> None:
     if isinstance(error, sqlite3.Error):
         _log_transaction_event(
@@ -110,9 +117,54 @@ def _log_failure(
             held_seconds,
             error=error,
             level=logging.DEBUG if _is_fast_busy(error, wait_seconds, held_seconds) else logging.WARNING,
+            body_seconds=body_seconds,
+            commit_seconds=commit_seconds,
         )
-    elif wait_seconds >= _SLOW_WRITE_SECONDS or held_seconds >= _SLOW_WRITE_SECONDS:
-        _log_transaction_event("sqlite_write_slow", stage, wait_seconds, held_seconds, error=error)
+    elif (
+        wait_seconds >= _SLOW_WRITE_SECONDS
+        or held_seconds >= _SLOW_WRITE_SECONDS
+        or body_seconds >= _SLOW_WRITE_SECONDS
+        or commit_seconds >= _SLOW_WRITE_SECONDS
+    ):
+        _log_transaction_event(
+            "sqlite_write_slow",
+            stage,
+            wait_seconds,
+            held_seconds,
+            error=error,
+            body_seconds=body_seconds,
+            commit_seconds=commit_seconds,
+        )
+
+
+def _log_success_timings(wait_seconds: float, held_seconds: float, body_seconds: float, commit_seconds: float) -> None:
+    if wait_seconds >= _SLOW_WRITE_SECONDS:
+        _log_transaction_event(
+            "sqlite_write_slow",
+            "begin",
+            wait_seconds,
+            held_seconds,
+            body_seconds=body_seconds,
+            commit_seconds=commit_seconds,
+        )
+    if body_seconds >= _SLOW_WRITE_SECONDS:
+        _log_transaction_event(
+            "sqlite_write_slow",
+            "body",
+            wait_seconds,
+            held_seconds,
+            body_seconds=body_seconds,
+            commit_seconds=commit_seconds,
+        )
+    if commit_seconds >= _SLOW_WRITE_SECONDS:
+        _log_transaction_event(
+            "sqlite_write_slow",
+            "commit",
+            wait_seconds,
+            held_seconds,
+            body_seconds=body_seconds,
+            commit_seconds=commit_seconds,
+        )
 
 
 def _rollback_after_failure(
@@ -125,17 +177,19 @@ def _rollback_after_failure(
     return None
 
 
-def _restore_guard(
+def _restore_guard(  # noqa: PLR0913, PLR0917
     conn: sqlite3.Connection,
     query_only: bool,
     primary: BaseException | None,
     wait_seconds: float,
     held_seconds: float,
+    body_seconds: float,
+    commit_seconds: float,
 ) -> None:
     try:
         conn.execute(f"PRAGMA query_only = {int(query_only)}")
     except BaseException as restore_error:
-        _log_failure("guard_restore", wait_seconds, held_seconds, restore_error)
+        _log_failure("guard_restore", wait_seconds, held_seconds, restore_error, body_seconds, commit_seconds)
         if primary is not None:
             primary.add_note(f"Restoring SQLite query_only failed: {restore_error!r}")
         _retire_connection(conn, primary or restore_error)
@@ -166,7 +220,7 @@ def _retire_connection(conn: sqlite3.Connection, primary: BaseException) -> None
 
 
 @contextmanager
-def write_transaction(conn: sqlite3.Connection) -> Iterator[None]:
+def write_transaction(conn: sqlite3.Connection) -> Iterator[None]:  # noqa: PLR0915
     """Reserve the writer before reading; never await inside this write unit.
 
     Existing transactions belong to their caller and are rejected untouched.
@@ -178,6 +232,7 @@ def write_transaction(conn: sqlite3.Connection) -> Iterator[None]:
     query_only = _read_query_only(conn, wait_started)
     primary: BaseException | None = None
     retired, stage, held_started = False, "guard_disable", None
+    body_seconds = commit_seconds = 0.0
     try:
         conn.execute("PRAGMA query_only = OFF")
         stage = "begin"
@@ -187,17 +242,22 @@ def write_transaction(conn: sqlite3.Connection) -> Iterator[None]:
         wait_seconds = max(0.0, held_started - wait_started)
         stage = "body"
         yield
+        body_seconds = _elapsed(held_started)
         stage = "guard_check"
         require_write_transaction(conn)
         stage = "commit"
-        conn.commit()
-        held_seconds = _elapsed(held_started)
-        if wait_seconds >= _SLOW_WRITE_SECONDS:
-            _log_transaction_event("sqlite_write_slow", "begin", wait_seconds, held_seconds)
-        if held_seconds >= _SLOW_WRITE_SECONDS:
-            _log_transaction_event("sqlite_write_slow", "commit", max(0.0, held_started - wait_started), held_seconds)
+        commit_started = time.monotonic()
+        try:
+            conn.commit()
+        finally:
+            commit_finished = time.monotonic()
+            commit_seconds = max(0.0, commit_finished - commit_started)
+        held_seconds = max(0.0, commit_finished - cast(float, held_started))
+        _log_success_timings(wait_seconds, held_seconds, body_seconds, commit_seconds)
     except BaseException as error:
         primary = error
+        if stage == "body" and held_started is not None:
+            body_seconds = _elapsed(held_started)
         wait_seconds = _transaction_timings(wait_started, held_started)[0]
         rollback_error = _rollback_after_failure(conn)
         held_seconds = _elapsed(held_started)
@@ -206,15 +266,22 @@ def write_transaction(conn: sqlite3.Connection) -> Iterator[None]:
             error.add_note(f"SQLite rollback failed: {rollback_error!r}")
             _retire_connection(conn, error)
             held_seconds = _elapsed(held_started)
-            _log_failure(stage, wait_seconds, held_seconds, error)
-            _log_failure("rollback", wait_seconds, held_seconds, rollback_error)
+            _log_failure(stage, wait_seconds, held_seconds, error, body_seconds, commit_seconds)
+            _log_failure("rollback", wait_seconds, held_seconds, rollback_error, body_seconds, commit_seconds)
             raise error from rollback_error
-        _log_failure(stage, wait_seconds, held_seconds, error)
+        _log_failure(stage, wait_seconds, held_seconds, error, body_seconds, commit_seconds)
         raise
     finally:
         _owners.connections.discard(conn)
         if not retired:
-            _restore_guard(conn, query_only, primary, *_transaction_timings(wait_started, held_started))
+            _restore_guard(
+                conn,
+                query_only,
+                primary,
+                *_transaction_timings(wait_started, held_started),
+                body_seconds,
+                commit_seconds,
+            )
 
 
 @contextmanager

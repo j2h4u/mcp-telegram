@@ -73,6 +73,7 @@ from tests.helpers import (
     LoudGroupProfilePort,
     LoudUserAvatarHistoryPort,
 )
+from tests.sqlite_writer_helpers import inline_writer
 
 
 class _UserProfilePort:
@@ -296,7 +297,7 @@ async def test_rejected_refresh_is_not_reported_as_queued() -> None:
     assert service._refresh is not None
     assert service._refresh.enqueue(99) is RefreshEnqueueResult.QUEUED
 
-    result = service._progressive_result(
+    result = await service._progressive_result(
         42,
         {"id": 42, "type": "user", "name": "Queued"},
         {section: {"status": "pending", "reason": "refresh_queued"} for section in PROFILE_SECTIONS},
@@ -389,7 +390,7 @@ async def test_self_profile_rejection_persists_unavailable_sections() -> None:
     assert service._refresh is not None
     assert service._refresh.enqueue(99) is RefreshEnqueueResult.QUEUED
 
-    result = service._self_snapshot_result(42, now=100, started_at=100)
+    result = await service._self_snapshot_result(42, now=100, started_at=100)
     sections = cast(dict[str, dict[str, object]], cast(dict[str, object], result["data"])["sections"])
     assert all(
         section["status"] == "unavailable" and section["reason"] == "refresh_rejected" for section in sections.values()
@@ -525,6 +526,7 @@ def _test_service(conn: sqlite3.Connection, *, limits: RefreshLimits) -> DaemonE
     enable_runtime_writes(conn)
     service = DaemonEntityInfoService(
         EntityInfoDeps(
+            writer=inline_writer(conn),
             conn=conn,
             client=_UnusedClient(),
             dm_peer_ids=lambda: set(),
@@ -718,7 +720,7 @@ async def test_channel_profile_commit_publishes_linked_chat_fact_and_overlays_ca
                 "INSERT INTO dialogs(dialog_id, linked_chat_id, linked_chat_resolved_at) VALUES(-1004201, NULL, 99)"
             )
         committed = service._profiles.commit_section(cursor, commit, now=100)
-        service._publish_profile_linked_chat_fact(cursor, DialogType.CHANNEL, context, committed, now=100)
+        await service._publish_profile_linked_chat_fact(cursor, DialogType.CHANNEL, context, committed, now=100)
         assert committed
         assert offered == [DemandKind.SCHEDULED_DISCOVERY, DemandKind.COLD_PEER_PAGE]
         assert port.profile_calls == [-1000000010042]
@@ -731,7 +733,9 @@ async def test_channel_profile_commit_publishes_linked_chat_fact_and_overlays_ca
         assert "linked_chat_id" not in stored.detail
         data = cast(
             dict[str, object],
-            service._progressive_result(-10042, stored.detail, stored.sections, now=100, admit_refresh=False)["data"],
+            (await service._progressive_result(-10042, stored.detail, stored.sections, now=100, admit_refresh=False))[
+                "data"
+            ],
         )
         assert data["linked_chat_id"] == -1000000000777
         fact = linked_chat_fact_owner.read_fact(conn, -10042)
@@ -745,7 +749,7 @@ async def test_channel_profile_commit_publishes_linked_chat_fact_and_overlays_ca
                 raise AssertionError("linked-chat fact hit must stay local")
 
         no_rpc = NoRpcClient()
-        local_read = await resolve_linked_chat_id(no_rpc, conn, -10042)  # type: ignore[arg-type]
+        local_read = await resolve_linked_chat_id(no_rpc, conn, -10042, writer=inline_writer(conn))  # type: ignore[arg-type]
         assert local_read.state is LinkedChatState.KNOWN_LINK
         assert no_rpc.calls == 0
     finally:
@@ -759,7 +763,7 @@ async def test_channel_progressive_link_overlay_replaces_stale_and_unresolved_wi
     try:
         stale = {"id": -10043, "type": DialogType.CHANNEL.value, "linked_chat_id": -10088}
         sections: dict[str, dict[str, object]] = {section: {"status": "fresh"} for section in PROFILE_SECTIONS}
-        result = service._progressive_result(-10043, stale, sections, now=100, admit_refresh=False)
+        result = await service._progressive_result(-10043, stale, sections, now=100, admit_refresh=False)
         assert cast(dict[str, object], result["data"])["linked_chat_id"] is None
     finally:
         await service.shutdown()
@@ -793,7 +797,7 @@ async def test_channel_profile_fact_publish_is_fenced_by_newer_dialog_revision()
         with write_savepoint(conn):
             linked_chat_fact_owner.invalidate_from_update(conn, -10047, 100)
         assert service._profiles.commit_section(cursor, commit, now=100)
-        service._publish_profile_linked_chat_fact(cursor, DialogType.CHANNEL, context, True, now=100)
+        await service._publish_profile_linked_chat_fact(cursor, DialogType.CHANNEL, context, True, now=100)
         assert conn.execute("SELECT linked_chat_id FROM dialogs WHERE dialog_id=?", (-10047,)).fetchone() == (-10099,)
         assert linked_chat_fact_owner.read_fact(conn, -10047).refresh_pending
         assert offered == []
@@ -948,6 +952,7 @@ async def test_legacy_profile_publication_wakes_cold_adapter_for_local_link_enro
             conn,
             asyncio.Event(),
             ColdBackfillPacing(ColdBackfillHistoryPacing(batch_s=0.0, enroll_s=1.0, access_retry_s=1.0)),
+            writer=inline_writer(conn),
             timeout_s=1.0,
         )
         status = adapter.status(time())

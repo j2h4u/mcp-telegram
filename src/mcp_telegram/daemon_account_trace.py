@@ -52,6 +52,7 @@ from .messages.telegram_adapter import extract_message_row
 from .models import DialogType
 from .observation_order import allocate_observation_order
 from .resolver import Candidates, Resolved, _parse_tme_link, latinize, resolve
+from .sqlite_writer import SQLiteWriter
 from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import AcquisitionKind
@@ -111,6 +112,7 @@ class DaemonAccountTraceDeps:
     """Dependency container for account-trace orchestration."""
 
     conn: sqlite3.Connection
+    writer: SQLiteWriter
     client: _AccountTraceClientLike
     resolve_dialog_id: Callable[[DialogSelector], Awaitable[int | dict]]
     self_id: int | None
@@ -217,7 +219,7 @@ class _TraceEnrichPrecheckContext:
 @dataclasses.dataclass(frozen=True, slots=True)
 class _TraceCandidateMessagesContext:
     client: _AccountTraceClientLike
-    conn: sqlite3.Connection
+    writer: SQLiteWriter
     dialog_id: int
     iter_kwargs: dict[str, object]
     target_user_id: int
@@ -458,7 +460,7 @@ class DaemonAccountTraceService:
                 resolution_source="telegram_username_lookup_failed",
             )
 
-        return _persist_trace_username_result(self._deps, username, result)
+        return await self._deps.writer.run(lambda conn: _persist_trace_username_result(conn, username, result))
 
     @staticmethod
     def _build_trace_account_unresolved_payload(
@@ -691,16 +693,18 @@ class DaemonAccountTraceService:
         }
 
         now = int(time.time())
-        status = _trace_enrich_candidate_precheck(
-            _TraceEnrichPrecheckContext(
-                conn=self._deps.conn,
-                target_user_id=target_user_id,
-                dialog_id=dialog_id,
-                topic_id=topic_id,
-                strategy=strategy,
-                deadline_ms=deadline_ms,
-                deadline_at=deadline_at,
-                now=now,
+        status = await self._deps.writer.run(
+            lambda conn: _trace_enrich_candidate_precheck(
+                _TraceEnrichPrecheckContext(
+                    conn=conn,
+                    target_user_id=target_user_id,
+                    dialog_id=dialog_id,
+                    topic_id=topic_id,
+                    strategy=strategy,
+                    deadline_ms=deadline_ms,
+                    deadline_at=deadline_at,
+                    now=now,
+                )
             )
         )
         if status is not None:
@@ -718,7 +722,7 @@ class DaemonAccountTraceService:
         fetched, status = await _trace_enrich_candidate_messages(
             _TraceCandidateMessagesContext(
                 client=self._deps.client,
-                conn=self._deps.conn,
+                writer=self._deps.writer,
                 dialog_id=dialog_id,
                 iter_kwargs=iter_kwargs,
                 target_user_id=target_user_id,
@@ -733,35 +737,39 @@ class DaemonAccountTraceService:
         result["messages_seen"] = len(fetched)
         unique_messages, duplicate_count = _dedupe_trace_messages(fetched)
         result["duplicates_skipped"] += duplicate_count
-        with write_transaction(self._deps.conn):
-            changed, persisted_duplicate_count = _split_trace_duplicate_messages(
-                conn=self._deps.conn,
-                messages=unique_messages,
-            )
-            result["duplicates_skipped"] += persisted_duplicate_count
 
-            if changed:
-                result["messages_persisted"] = _persist_trace_messages(self._deps.conn, changed)
-
-            status = _trace_candidate_status_after_fetch(
-                fetched_count=len(fetched),
-                max_per_dialog=max_per_dialog,
-                deadline_ms=deadline_ms,
-                deadline_at=deadline_at,
-            )
-            _upsert_trace_coverage_fragment(
-                _TraceCoverageFragmentUpsertRequest(
-                    conn=self._deps.conn,
-                    target_user_id=target_user_id,
-                    dialog_id=dialog_id,
-                    topic_id=topic_id,
-                    status=status,
-                    fetched_at=now,
-                    last_error=f"BudgetExceeded:{deadline_ms}" if status == "budget_exceeded" else None,
-                    now=now,
+        def persist(conn: sqlite3.Connection) -> tuple[int, int, str]:
+            with write_transaction(conn):
+                changed, persisted_duplicate_count = _split_trace_duplicate_messages(
+                    conn=conn,
+                    messages=unique_messages,
                 )
-            )
-        result["status"] = status
+                persisted = _persist_trace_messages(conn, changed) if changed else 0
+
+                status = _trace_candidate_status_after_fetch(
+                    fetched_count=len(fetched),
+                    max_per_dialog=max_per_dialog,
+                    deadline_ms=deadline_ms,
+                    deadline_at=deadline_at,
+                )
+                _upsert_trace_coverage_fragment(
+                    _TraceCoverageFragmentUpsertRequest(
+                        conn=conn,
+                        target_user_id=target_user_id,
+                        dialog_id=dialog_id,
+                        topic_id=topic_id,
+                        status=status,
+                        fetched_at=now,
+                        last_error=f"BudgetExceeded:{deadline_ms}" if status == "budget_exceeded" else None,
+                        now=now,
+                    )
+                )
+                return persisted, persisted_duplicate_count, status
+
+        persisted, duplicates, persisted_status = await self._deps.writer.run(persist)
+        result["messages_persisted"] = persisted
+        result["duplicates_skipped"] += duplicates
+        result["status"] = persisted_status
         return result
 
     async def _trace_enrich_visible_dialogs(
@@ -783,33 +791,29 @@ class DaemonAccountTraceService:
         now = int(time.time())
         selected = candidate_dialogs[: request.max_dialogs]
         overflow = candidate_dialogs[request.max_dialogs :]
-        with write_transaction(self._deps.conn):
-            _mark_budget_exceeded_candidates(
-                self._deps.conn,
-                candidates=overflow,
-                request=_TraceVisibleBudgetContext(
-                    target_user_id=target_user_id,
-                    deadline_ms=request.deadline_ms,
-                    now=now,
-                    result=result,
-                ),
-            )
+
+        async def mark_budget_exceeded(candidates: list[dict[str, object]]) -> None:
+            def persist(conn: sqlite3.Connection) -> _TraceVisibleEnrichmentResult:
+                updated = dataclasses.replace(
+                    budget_context, result={**result, "fragment_status_counts": dict(result["fragment_status_counts"])}
+                )
+                with write_transaction(conn):
+                    _mark_budget_exceeded_candidates(conn, candidates=candidates, request=updated)
+                return updated.result
+
+            updated_result = await self._deps.writer.run(persist)
+            result.update(updated_result)
+
+        budget_context = _TraceVisibleBudgetContext(
+            target_user_id=target_user_id, deadline_ms=request.deadline_ms, now=now, result=result
+        )
+        await mark_budget_exceeded(overflow)
 
         if not selected:
             return result
 
         if request.deadline_ms <= 0:
-            with write_transaction(self._deps.conn):
-                _mark_budget_exceeded_candidates(
-                    self._deps.conn,
-                    candidates=selected,
-                    request=_TraceVisibleBudgetContext(
-                        target_user_id=target_user_id,
-                        deadline_ms=request.deadline_ms,
-                        now=now,
-                        result=result,
-                    ),
-                )
+            await mark_budget_exceeded(selected)
             return result
 
         deadline_at = time.monotonic() + (request.deadline_ms / 1000)
@@ -880,15 +884,17 @@ class DaemonAccountTraceService:
         selected_rows = query_result.selected_rows
         enrichment: _TraceVisibleEnrichmentResult | None = None
         if request.coverage_goal == "best_effort_visible":
-            candidates = _trace_candidate_dialogs(
-                _TraceCandidateBuildRequest(
-                    conn=self._deps.conn,
-                    target_user_id=target_user_id,
-                    observed_rows=selected_rows,
-                    exact_dialog_id=scope.exact_dialog_id,
-                    exact_topic_id=scope.exact_topic_id,
-                    linked_chat_map=scope.linked_chat_map,
-                    direct_chat_excluded=direct_chat_excluded,
+            candidates = await self._deps.writer.run(
+                lambda conn: _trace_candidate_dialogs(
+                    _TraceCandidateBuildRequest(
+                        conn=conn,
+                        target_user_id=target_user_id,
+                        observed_rows=selected_rows,
+                        exact_dialog_id=scope.exact_dialog_id,
+                        exact_topic_id=scope.exact_topic_id,
+                        linked_chat_map=scope.linked_chat_map,
+                        direct_chat_excluded=direct_chat_excluded,
+                    )
                 )
             )
             enrichment = await self._trace_enrich_visible_dialogs(
@@ -1379,7 +1385,7 @@ async def _resolve_trace_account_signature_scope(
     ):
         return None
 
-    resolution = await resolve_linked_chat_id(deps.client, deps.conn, exact_dialog_id)
+    resolution = await resolve_linked_chat_id(deps.client, deps.conn, exact_dialog_id, writer=deps.writer)
     if resolution.state is LinkedChatState.UNKNOWN:
         return {
             "ok": False,
@@ -1391,13 +1397,16 @@ async def _resolve_trace_account_signature_scope(
     if resolution.state is LinkedChatState.KNOWN_NONE:
         return None
     assert resolution.linked_chat_id is not None
+    linked_chat_id = resolution.linked_chat_id
 
     linked_chat_map: dict[int, int] = {exact_dialog_id: resolution.linked_chat_id}
     scope_dialog_ids = [exact_dialog_id, resolution.linked_chat_id]
-    enroll_activity_dialog(
-        deps.conn,
-        resolution.linked_chat_id,
-        source="linked_chat",
+    await deps.writer.run(
+        lambda conn: enroll_activity_dialog(
+            conn,
+            linked_chat_id,
+            source="linked_chat",
+        )
     )
     return scope_dialog_ids, linked_chat_map
 
@@ -1524,7 +1533,7 @@ async def _trace_enrich_candidate_messages(
     request: _TraceCandidateMessagesContext,
 ) -> tuple[list[ExtractedMessage], str | None]:
     fetched: list[ExtractedMessage] = []
-    observation_order = allocate_observation_order(request.conn)
+    observation_order = await request.writer.run(allocate_observation_order)
     try:
         async for msg in request.client.iter_messages(request.dialog_id, **request.iter_kwargs):
             if time.monotonic() >= request.deadline_at:
@@ -1540,10 +1549,10 @@ async def _trace_enrich_candidate_messages(
         seconds = exc.retry_after_seconds
         if seconds is None:
             return fetched, "flood_wait"
-        with write_transaction(request.conn):
-            _upsert_trace_coverage_fragment(
+        await request.writer.run(
+            lambda conn: _persist_trace_coverage_fragment(
                 _TraceCoverageFragmentUpsertRequest(
-                    conn=request.conn,
+                    conn=conn,
                     target_user_id=request.target_user_id,
                     dialog_id=request.dialog_id,
                     status="flood_wait",
@@ -1552,32 +1561,37 @@ async def _trace_enrich_candidate_messages(
                     now=request.now,
                 )
             )
+        )
         return fetched, "flood_wait"
     except ACCESS_LOST_ERRORS as exc:
-        with write_transaction(request.conn):
-            _upsert_trace_coverage_fragment(
+        error_type = type(exc).__name__
+        await request.writer.run(
+            lambda conn: _persist_trace_coverage_fragment(
                 _TraceCoverageFragmentUpsertRequest(
-                    conn=request.conn,
+                    conn=conn,
                     target_user_id=request.target_user_id,
                     dialog_id=request.dialog_id,
                     status="access_lost",
-                    last_error=type(exc).__name__,
+                    last_error=error_type,
                     now=request.now,
                 )
             )
+        )
         return fetched, "access_lost"
     except (RPCError, RuntimeError, TypeError, AttributeError, ValueError, sqlite3.Error) as exc:
-        with write_transaction(request.conn):
-            _upsert_trace_coverage_fragment(
+        error_type = type(exc).__name__
+        await request.writer.run(
+            lambda conn: _persist_trace_coverage_fragment(
                 _TraceCoverageFragmentUpsertRequest(
-                    conn=request.conn,
+                    conn=conn,
                     target_user_id=request.target_user_id,
                     dialog_id=request.dialog_id,
                     status="partial",
-                    last_error=type(exc).__name__,
+                    last_error=error_type,
                     now=request.now,
                 )
             )
+        )
         return fetched, "partial"
     return fetched, None
 
@@ -1781,7 +1795,7 @@ def _unresolved_trace_account(
 
 
 def _persist_trace_username_result(
-    deps: DaemonAccountTraceDeps,
+    conn: sqlite3.Connection,
     username: str,
     result: object,
 ) -> dict:
@@ -1797,9 +1811,9 @@ def _persist_trace_username_result(
     entity_type = classify_dialog_type(user).value
     display_name = _trace_username_display_name(user, username)
     resolved_username = _trace_username_value(user, username)
-    with write_transaction(deps.conn):
+    with write_transaction(conn):
         upsert_entity_snapshots(
-            deps.conn,
+            conn,
             (
                 EntitySnapshot(
                     entity_id=user_id,
@@ -1811,7 +1825,7 @@ def _persist_trace_username_result(
                 ),
             ),
         )
-    row = account_by_id(deps.conn, user_id)
+    row = account_by_id(conn, user_id)
     if row is None:
         return _unresolved_trace_account(
             query=f"@{username}",
@@ -1865,6 +1879,11 @@ def _sanitize_trace_last_error(last_error: str | None) -> str | None:
         return None
     compact = " ".join(last_error.split())
     return compact[:120]
+
+
+def _persist_trace_coverage_fragment(request: _TraceCoverageFragmentUpsertRequest) -> None:
+    with write_transaction(request.conn):
+        _upsert_trace_coverage_fragment(request)
 
 
 def _upsert_trace_coverage_fragment(

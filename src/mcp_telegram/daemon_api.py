@@ -85,7 +85,7 @@ from .entity_profile.refresh import RefreshLimits
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .folders.read_model import dialog_placement, folder_snapshot, folder_summaries, folders_by_dialog
-from .history_enrollment import disable_history, enable_history, read_intent
+from .history_enrollment import EnrollmentOutcome, disable_history, enable_history, read_intent
 from .models import ReadMessage
 from .reading import ReadingDeps, ReadingService
 from .request_timing import (
@@ -101,9 +101,9 @@ from .request_timing import (
 from .runtime_observations import (
     RuntimeObservationPolicy,
     RuntimeObservationSink,
-    record_runtime_observation,
     tool_telemetry_identity,
 )
+from .sqlite_writer import SQLiteWriter
 from .sync_read_model import (
     DM_DELETION_RECONCILIATION_STATE_KEY,
     InvalidDmDeletionCheckpointError,
@@ -344,38 +344,6 @@ def _mcp_timing_payload(event: Mapping[str, object]) -> dict[str, object]:
         if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= sys.float_info.max:
             payload[field] = value
     return payload
-
-
-def _insert_telemetry_row(
-    conn: sqlite3.Connection,
-    event: Mapping[str, object],
-) -> None:
-    record_runtime_observation(
-        conn,
-        kind="mcp.call",
-        observed_at_ms=int(float(cast(float, event.get("timestamp", time.time()))) * 1000),
-        operation_id=cast(str | None, event.get("operation_id")),
-        tool_name=str(event["tool_name"]),
-        tool_capability=cast(str | None, event.get("tool_capability")),
-        contract_version=cast(int | None, event.get("contract_version")),
-        duration_ms=float(cast(float, event.get("duration_ms", 0))),
-        result_count=int(cast(int, event.get("result_count", 0))),
-        has_cursor=bool(event.get("has_cursor")),
-        page_depth=int(cast(int, event.get("page_depth", 1))),
-        has_filter=bool(event.get("has_filter")),
-        outcome=str(event.get("outcome", "success")),
-        reason_code=cast(str | None, event.get("error_code")),
-        error_type=cast(str | None, event.get("error_type")),
-        payload=_mcp_timing_payload(event),
-    )
-
-
-def _write_telemetry(
-    conn: sqlite3.Connection,
-    event: Mapping[str, object],
-) -> None:
-    with write_transaction(conn):
-        _insert_telemetry_row(conn, event)
 
 
 class TelemetryPolicy(Protocol):
@@ -742,9 +710,10 @@ class DaemonAPIServer:
         feedback_service: FeedbackService | None = None,
         sync_db_path: Path | None = None,
         *,
+        writer: SQLiteWriter,
         hydration_requester: Callable[[sqlite3.Connection, int, int], None] | None = None,
         topic_refresher: TopicRefresher | None = None,
-        folder_projection_reproject: Callable[[], object] | None = None,
+        folder_projection_reproject: Callable[[], Awaitable[object]] | None = None,
         group_profile_port: GroupProfilePort,
         user_profile_port: UserProfilePort,
         channel_profile_port: ChannelProfilePort,
@@ -756,6 +725,7 @@ class DaemonAPIServer:
     ) -> None:
         conn.row_factory = sqlite3.Row
         self._conn = conn
+        self._writer = writer
         self._sync_db_path = _resolve_sync_db_path(conn, sync_db_path)
         self._feedback_service = feedback_service
         self._client = client
@@ -790,6 +760,8 @@ class DaemonAPIServer:
         self._profile_observer: ProfilePairObservationHook | None = None
         self._conversation_changes_token_codec = ConversationChangesTokenCodec()
         self._runtime_observation_sink: RuntimeObservationSink | None = None
+        self._closing_clients = False
+        self._client_handlers: dict[asyncio.Task[object], asyncio.StreamWriter] = {}
 
     def bind_runtime_observation_sink(self, sink: RuntimeObservationSink) -> None:
         """Attach the bounded asynchronous sink used for daemon timing evidence."""
@@ -807,12 +779,12 @@ class DaemonAPIServer:
         if self._entity_info_service is not None:
             self._entity_info_service.bind_profile_observer(observer)
 
-    def _publish_auth_scope(self, scope: TelegramAuthScope | None) -> None:
+    async def _publish_auth_scope(self, scope: TelegramAuthScope | None) -> None:
         """Publish private session identity to already-composed domain services."""
         changed = self._auth_scope != scope
         self._auth_scope = scope
         if changed and self._entity_info_service is not None:
-            self._entity_info_service.auth_scope_changed()
+            await self._entity_info_service.auth_scope_changed()
 
     def _require_demand_sink(self) -> DemandOfferSink:
         sink = self._demand_sink
@@ -820,9 +792,9 @@ class DaemonAPIServer:
             raise RuntimeError("durable demand sink is not bound")
         return sink
 
-    def _reproject_due_folder_memberships(self) -> None:
+    async def _reproject_due_folder_memberships(self) -> None:
         if self._folder_projection_reproject is not None:
-            self._folder_projection_reproject()
+            await self._folder_projection_reproject()
 
     def _get_reading_service(self) -> ReadingService:
         """Get memoized reading-service instance with explicit daemon dependencies."""
@@ -837,6 +809,7 @@ class DaemonAPIServer:
                     fragment_context=FragmentContextService(
                         self._conn,
                         TelethonTelegramFragmentGateway(self._client),
+                        writer=self._writer,
                     ),
                     history_gateway=TelethonTelegramHistoryGateway(self._client),
                     logger=cast(_LoggerLike, logger),
@@ -1207,6 +1180,13 @@ class DaemonAPIServer:
         async-with block, so the server keeps the stream open and returns one
         logical response per request line (large responses use bounded frames).
         """
+        if self._closing_clients:
+            writer.close()
+            await writer.wait_closed()
+            return
+        handler = asyncio.current_task()
+        assert handler is not None
+        self._client_handlers[handler] = writer
         method = ""
         request_id: str | None = None
         pending_read: asyncio.Task[bytes] | None = None
@@ -1246,16 +1226,27 @@ class DaemonAPIServer:
                 request_id,
             )
         finally:
-            tasks: list[asyncio.Task[object]] = [task for task in (pending_read, request_task) if task is not None]
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                logger.debug("wait_closed error method=%s", method, exc_info=True)
+            await self._finish_client_connection(handler, writer, method, (pending_read, request_task))
+
+    async def _finish_client_connection(
+        self,
+        handler: asyncio.Task[object],
+        writer: asyncio.StreamWriter,
+        method: str,
+        pending: tuple[asyncio.Task[object] | None, ...],
+    ) -> None:
+        tasks = [task for task in pending if task is not None]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            logger.debug("wait_closed error method=%s", method, exc_info=True)
+        finally:
+            self._client_handlers.pop(handler, None)
 
     # ------------------------------------------------------------------
     # Dispatcher
@@ -1568,6 +1559,7 @@ class DaemonAPIServer:
         return DaemonAccountTraceService(
             DaemonAccountTraceDeps(
                 conn=self._conn,
+                writer=self._writer,
                 client=cast(_AccountTraceClientLike, self._client),
                 resolve_dialog_id=self._resolve_dialog_id,
                 self_id=self.self_id,
@@ -1687,7 +1679,7 @@ class DaemonAPIServer:
 
     async def _list_dialogs(self, req: dict[str, object]) -> dict:
         """Delegate list_dialogs reads to the reading service."""
-        self._reproject_due_folder_memberships()
+        await self._reproject_due_folder_memberships()
         result = await self._get_reading_service().list_dialogs(cast(dict[str, object], req))
         if not result.get("ok"):
             return result
@@ -1771,7 +1763,7 @@ class DaemonAPIServer:
         return await self._get_reading_service().get_unread_summary(cast(dict[str, object], req))
 
     async def _list_folders(self, _req: dict[str, object]) -> dict:
-        self._reproject_due_folder_memberships()
+        await self._reproject_due_folder_memberships()
         return {
             "ok": True,
             "data": {
@@ -1934,12 +1926,15 @@ class DaemonAPIServer:
         dialog_id = _coerce_int(req.get("dialog_id", 0), 0)
         enable = bool(req.get("enable", True))
         now = int(time.time())
-        with write_transaction(self._conn):
-            outcome = (
-                enable_history(self._conn, dialog_id, now=now) if enable else disable_history(self._conn, dialog_id)
-            )
-            if enable and self._hydration_requester is not None:
-                self._hydration_requester(self._conn, dialog_id, now)
+
+        def persist(conn: sqlite3.Connection) -> EnrollmentOutcome:
+            with write_transaction(conn):
+                outcome = enable_history(conn, dialog_id, now=now) if enable else disable_history(conn, dialog_id)
+                if enable and self._hydration_requester is not None:
+                    self._hydration_requester(conn, dialog_id, now)
+                return outcome
+
+        outcome = await self._writer.run(persist)
         if enable:
             if outcome.action in {
                 "queue_full_history",
@@ -2043,10 +2038,14 @@ class DaemonAPIServer:
             data["archived_message_count"] = message_count
         return {"ok": True, "data": data}
 
-    def _recover_dialog_directory(self, req: dict[str, object]) -> dict[str, object]:
+    async def _recover_dialog_directory(self, req: dict[str, object]) -> dict[str, object]:
         """Start a new unpublished attempt only after a semantic-invalid latch."""
-        with write_transaction(self._conn):
-            result = recover_invalid_generation_in_transaction(self._conn)
+
+        def persist(conn: sqlite3.Connection) -> dict[str, object]:
+            with write_transaction(conn):
+                return recover_invalid_generation_in_transaction(conn)
+
+        result = await self._writer.run(persist)
         if result["ok"]:
             return {"ok": True, "data": result}
         return {"ok": False, "error": result["error"], "data": {"state": result["state"]}}
@@ -2068,6 +2067,7 @@ class DaemonAPIServer:
             self._entity_info_service = DaemonEntityInfoService(
                 EntityInfoDeps(
                     conn=self._conn,
+                    writer=self._writer,
                     client=cast(DaemonClientLike, self._client),
                     dm_peer_ids=self._dm_peer_ids,
                     self_id=self.self_id,
@@ -2099,7 +2099,7 @@ class DaemonAPIServer:
     async def _get_entity_info(self, req: dict[str, object]) -> dict:
         """Type-tagged entity inspector covering 5 Telegram entity kinds."""
         started_at = time.perf_counter()
-        self._reproject_due_folder_memberships()
+        await self._reproject_due_folder_memberships()
         projected_at = time.perf_counter()
         result = await self._get_entity_info_service().get_entity_info(req)
         fetched_at = time.perf_counter()
@@ -2118,6 +2118,15 @@ class DaemonAPIServer:
             _rid(),
         )
         return result
+
+    async def shutdown_clients(self) -> None:
+        """Close keepalive transports and settle requests before closing SQLite."""
+        self._closing_clients = True
+        handlers = tuple(self._client_handlers)
+        for handler in handlers:
+            self._client_handlers[handler].transport.abort()
+            handler.cancel()
+        await asyncio.gather(*handlers, return_exceptions=True)
 
     async def shutdown(self) -> None:
         """Stop profile refresh tasks before the daemon closes SQLite."""
@@ -2172,19 +2181,29 @@ class DaemonAPIServer:
             return outcome
         event["outcome"], event["error_code"] = outcome
         try:
-            _write_telemetry(self._conn, event)
+            sink = self._runtime_observation_sink
+            if sink is None:
+                return {"ok": False, "error": "internal", "message": "runtime observation sink is not bound"}
+            sink.record(
+                kind="mcp.call",
+                observed_at_ms=int(float(cast(float, event.get("timestamp", time.time()))) * 1000),
+                operation_id=cast(str | None, event.get("operation_id")),
+                tool_name=str(event["tool_name"]),
+                tool_capability=cast(str | None, event.get("tool_capability")),
+                contract_version=cast(int | None, event.get("contract_version")),
+                duration_ms=float(cast(float, event.get("duration_ms", 0))),
+                result_count=int(cast(int, event.get("result_count", 0))),
+                has_cursor=bool(event.get("has_cursor")),
+                page_depth=int(cast(int, event.get("page_depth", 1))),
+                has_filter=bool(event.get("has_filter")),
+                outcome=str(event.get("outcome", "success")),
+                reason_code=cast(str | None, event.get("error_code")),
+                error_type=cast(str | None, event.get("error_type")),
+                payload=_mcp_timing_payload(event),
+            )
         except Exception as exc:
             logger.exception("record_telemetry failed: %s", exc)
             return {"ok": False, "error": "internal", "message": "internal error"}
-        sink = self._runtime_observation_sink
-        if sink is not None:
-            try:
-                sink.note_external_write()
-            except Exception as exc:  # noqa: BLE001 - the insert already committed
-                logger.warning(
-                    "runtime_observation_maintenance_signal_failed error_type=%s",
-                    type(exc).__name__,
-                )
         return {"ok": True}
 
     # ------------------------------------------------------------------
@@ -2249,21 +2268,23 @@ class DaemonAPIServer:
         now = int(time.time())
         try:
             mapped_entities = [cast(Mapping[str, object], e) for e in entities]
-            with write_transaction(self._conn):
-                upsert_entity_snapshots(
-                    self._conn,
-                    [
-                        EntitySnapshot(
-                            entity_id=cast(int, e["id"]),
-                            entity_type=cast(str, e["type"]),
-                            name=cast(str | None, e.get("name") or None),
-                            username=cast(str | None, e.get("username")),
-                            name_normalized=latinize(str(e["name"])) if e.get("name") else None,
-                            updated_at=now,
-                        )
-                        for e in mapped_entities
-                    ],
+            snapshots = [
+                EntitySnapshot(
+                    entity_id=cast(int, e["id"]),
+                    entity_type=cast(str, e["type"]),
+                    name=cast(str | None, e.get("name") or None),
+                    username=cast(str | None, e.get("username")),
+                    name_normalized=latinize(str(e["name"])) if e.get("name") else None,
+                    updated_at=now,
                 )
+                for e in mapped_entities
+            ]
+
+            def persist(conn: sqlite3.Connection) -> None:
+                with write_transaction(conn):
+                    upsert_entity_snapshots(conn, snapshots)
+
+            await self._writer.run(persist)
             return {"ok": True, "upserted": len(entities)}
         except Exception as exc:
             logger.exception("upsert_entities failed: %s", exc)

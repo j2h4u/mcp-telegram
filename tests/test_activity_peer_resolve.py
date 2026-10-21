@@ -12,6 +12,7 @@ import pytest
 from mcp_telegram.activity_peer_resolve import linked_chat_retry_at, resolve_input_peer, resolve_linked_chat_id
 from mcp_telegram.linked_chat_fact import LinkedChatFact, LinkedChatState, linked_chat_fact_owner
 from mcp_telegram.sync_db import _apply_migrations
+from sqlite_writer_helpers import inline_writer
 
 
 @contextlib.contextmanager
@@ -51,7 +52,7 @@ async def test_resolve_input_peer_uses_client_session_lookup() -> None:
 async def test_unknown_fact_is_pending_and_cold_demand_is_idempotent() -> None:
     with _make_db() as conn:
         client = _Client()
-        fact = await resolve_linked_chat_id(client, conn, -10042)  # type: ignore[arg-type]
+        fact = await resolve_linked_chat_id(client, conn, -10042, writer=inline_writer(conn))  # type: ignore[arg-type]
         assert fact.state is LinkedChatState.UNKNOWN
         assert fact.refresh_pending
         generation = cast(
@@ -62,7 +63,7 @@ async def test_unknown_fact_is_pending_and_cold_demand_is_idempotent() -> None:
         )
         assert generation is not None and generation[0] == generation[1]
 
-        repeated = await resolve_linked_chat_id(client, conn, -10042)  # type: ignore[arg-type]
+        repeated = await resolve_linked_chat_id(client, conn, -10042, writer=inline_writer(conn))  # type: ignore[arg-type]
         assert repeated.state is LinkedChatState.UNKNOWN and repeated.refresh_pending
         assert (
             cast(
@@ -89,8 +90,8 @@ async def test_confirmed_no_link_and_stale_known_link_remain_distinct_from_unkno
             )
             conn.execute("UPDATE linked_chat_fact_state SET pending_generation=0,retry_at=200 WHERE channel_id=-10044")
 
-        no_link = await resolve_linked_chat_id(_Client(), conn, -10043)  # type: ignore[arg-type]
-        stale_link = await resolve_linked_chat_id(_Client(), conn, -10044)  # type: ignore[arg-type]
+        no_link = await resolve_linked_chat_id(_Client(), conn, -10043, writer=inline_writer(conn))  # type: ignore[arg-type]
+        stale_link = await resolve_linked_chat_id(_Client(), conn, -10044, writer=inline_writer(conn))  # type: ignore[arg-type]
         assert no_link.state is LinkedChatState.KNOWN_NONE and no_link.linked_chat_id is None
         assert stale_link.state is LinkedChatState.KNOWN_LINK and stale_link.linked_chat_id == -10099
         assert stale_link.refresh_pending and stale_link.retry_at == 200

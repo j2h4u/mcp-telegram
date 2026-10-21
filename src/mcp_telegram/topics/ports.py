@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from typing import Protocol
 
 from .contracts import TopicFact
@@ -12,6 +13,8 @@ class TelegramTopicGateway(Protocol):
 
 
 class TopicSnapshotRepository(Protocol):
+    def for_connection(self, conn: sqlite3.Connection) -> TopicSnapshotRepository: ...
+
     def begin_snapshot(self) -> int: ...
 
     def upsert_topics(

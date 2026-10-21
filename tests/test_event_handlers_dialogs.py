@@ -61,6 +61,7 @@ from mcp_telegram.event_handlers import (
     _ParticipantUpdateLike,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from sqlite_writer_helpers import event_manager
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 _SQLiteConnection = sqlite3.Connection
@@ -291,7 +292,7 @@ def _last_event_at(conn: _SQLiteConnection, dialog_id: int) -> int | None:
 
 
 def _make_manager(client: MagicMock, conn: _SQLiteConnection, ev: asyncio.Event) -> EventHandlerManager:
-    m = EventHandlerManager(client, conn, ev)
+    m = event_manager(client, conn, ev)
     m.register()
     return m
 
@@ -774,7 +775,7 @@ async def test_username_only_realtime_update_preserves_canonical_name_and_type(
     sync_db.commit()
     manager = _make_manager(mock_client, sync_db, shutdown_event)
     manager._update_realtime_username(
-        SimpleNamespace(user_id=dialog_id, usernames=[Username("new", active=True)]), now=100
+        sync_db, SimpleNamespace(user_id=dialog_id, usernames=[Username("new", active=True)]), now=100
     )
     assert sync_db.execute("SELECT name,username,type FROM entities WHERE id=?", (dialog_id,)).fetchone() == (
         "Known Name",
@@ -809,7 +810,7 @@ async def test_realtime_username_clear_is_authoritative_without_changing_presenc
     sync_db.commit()
 
     manager = _make_manager(mock_client, sync_db, shutdown_event)
-    manager._update_realtime_username(SimpleNamespace(user_id=dialog_id, usernames=[]), now=20)
+    manager._update_realtime_username(sync_db, SimpleNamespace(user_id=dialog_id, usernames=[]), now=20)
 
     assert sync_db.execute(
         "SELECT name,username,type,identity_complete,hidden FROM dialogs WHERE dialog_id=?", (dialog_id,)
@@ -839,7 +840,7 @@ async def test_realtime_identity_write_carries_profile_revision_past_old_cursor(
     manager = _make_manager(mock_client, sync_db, shutdown_event)
 
     manager._update_realtime_username(
-        SimpleNamespace(user_id=dialog_id, usernames=[Username("new", active=True)]), now=2
+        sync_db, SimpleNamespace(user_id=dialog_id, usernames=[Username("new", active=True)]), now=2
     )
 
     assert sync_db.execute(
@@ -874,7 +875,7 @@ async def test_dm_identity_write_carries_profile_revision_past_old_cursor(
     manager = _make_manager(mock_client, sync_db, shutdown_event)
     manager.bind_demand_sink(MagicMock())
 
-    assert manager._auto_enroll_dm(
+    assert await manager._auto_enroll_dm(
         dialog_id,
         sender=SimpleNamespace(first_name="Fresh", last_name="Person", username="fresh"),
         observed_at=2,
@@ -1335,7 +1336,7 @@ def test_register_attaches_three_new_handlers(
     shutdown_event: asyncio.Event,
 ) -> None:
     """Dialog, scheduled, and topic handlers bring the registration total to 14."""
-    mgr = EventHandlerManager(mock_client, sync_db, shutdown_event)
+    mgr = event_manager(mock_client, sync_db, shutdown_event)
     mgr.register()
     assert mock_client.add_event_handler.call_count == 15
 
@@ -1346,7 +1347,7 @@ def test_unregister_detaches_all_new_handlers(
     shutdown_event: asyncio.Event,
 ) -> None:
     """Every handler attached by register() is detached by unregister()."""
-    mgr = EventHandlerManager(mock_client, sync_db, shutdown_event)
+    mgr = event_manager(mock_client, sync_db, shutdown_event)
     mgr.register()
     mgr.unregister()
 

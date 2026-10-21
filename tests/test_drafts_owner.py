@@ -24,9 +24,13 @@ from mcp_telegram.runtime_observations import encode_payload, record_runtime_obs
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind
+from tests.sqlite_writer_helpers import inline_writer
 
 
 class _Repository:
+    def for_connection(self, _conn: sqlite3.Connection) -> _Repository:
+        return self
+
     def __init__(self) -> None:
         self.account_id: int | None = None
         self.realtime: list[DraftObservation] = []
@@ -145,7 +149,7 @@ class _Observer:
         )
 
 
-def _owner(
+async def _owner(
     repository: _Repository,
     gateway: _Gateway,
     *,
@@ -164,8 +168,9 @@ def _owner(
         snapshot_gateway_factory=lambda _client, _account: gateway,
         monotonic_clock=monotonic_clock,
         utc_now_ms=utc_now_ms,
+        writer=inline_writer(cast(sqlite3.Connection, None)),
     )
-    owner.bind_account(42)
+    await owner.bind_account(42)
     barrier.open()
     return owner, client
 
@@ -174,7 +179,7 @@ def _owner(
 async def test_raw_callback_registers_before_connect_and_never_enriches_peer() -> None:
     repository = _Repository()
     gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
-    owner, client = _owner(repository, gateway)
+    owner, client = await _owner(repository, gateway)
 
     owner.register()
     update = types.UpdateDraftMessage(types.PeerUser(91), types.DraftMessage("draft", datetime(2026, 1, 1, tzinfo=UTC)))
@@ -205,7 +210,7 @@ async def test_realtime_publication_telemetry_captures_receipt_before_commit_and
         assert monotonic_calls == [100.0]
 
     repository.before_realtime = assert_receipt_was_captured
-    owner, _client = _owner(
+    owner, _client = await _owner(
         repository,
         gateway,
         observe=observer,
@@ -278,7 +283,7 @@ async def test_realtime_duplicate_confirmation_is_marked_excludable_from_publica
     repository.realtime_result = DraftApplyResult(accepted=True, revision=17, publication_changed=False)
     gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
     observer = _Observer()
-    owner, _client = _owner(repository, gateway, observe=observer)
+    owner, _client = await _owner(repository, gateway, observe=observer)
 
     await owner.on_raw_draft_update(
         types.UpdateDraftMessage(types.PeerUser(91), types.DraftMessage("draft", datetime(2026, 1, 1, tzinfo=UTC)))
@@ -304,8 +309,9 @@ async def test_realtime_telemetry_marks_receipt_held_by_startup_barrier() -> Non
         barrier,
         observe=observer,
         snapshot_gateway_factory=lambda _client, _account: gateway,
+        writer=inline_writer(cast(sqlite3.Connection, None)),
     )
-    owner.bind_account(42)
+    await owner.bind_account(42)
 
     pending = asyncio.create_task(
         owner.on_raw_draft_update(
@@ -326,7 +332,7 @@ async def test_realtime_persistence_failure_does_not_claim_local_publication() -
     repository.realtime_error = RuntimeError("database failed")
     gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
     observer = _Observer()
-    owner, _client = _owner(repository, gateway, observe=observer)
+    owner, _client = await _owner(repository, gateway, observe=observer)
 
     await owner.on_raw_draft_update(
         types.UpdateDraftMessage(types.PeerUser(91), types.DraftMessage("draft", datetime(2026, 1, 1, tzinfo=UTC)))
@@ -347,7 +353,7 @@ async def test_realtime_persistence_failure_does_not_claim_local_publication() -
 async def test_undated_realtime_is_coalesced_for_snapshot_instead_of_arrival_ordering() -> None:
     repository = _Repository()
     gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
-    owner, _client = _owner(repository, gateway)
+    owner, _client = await _owner(repository, gateway)
     sink = _DemandSink()
     owner.bind_demand_sink(sink)
 
@@ -362,7 +368,7 @@ async def test_undated_realtime_is_coalesced_for_snapshot_instead_of_arrival_ord
 async def test_realtime_empty_update_persists_a_tombstone_without_requesting_recovery() -> None:
     repository = _Repository()
     gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
-    owner, _client = _owner(repository, gateway)
+    owner, _client = await _owner(repository, gateway)
 
     await owner.on_raw_draft_update(types.UpdateDraftMessage(types.PeerUser(91), types.DraftMessageEmpty()))
 
@@ -382,7 +388,7 @@ async def test_undated_empty_update_requests_bounded_recovery_without_rpc() -> N
     )
     gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
     sink = _DemandSink()
-    owner, _client = _owner(repository, gateway)
+    owner, _client = await _owner(repository, gateway)
     owner.bind_demand_sink(sink)
 
     await owner.on_raw_draft_update(types.UpdateDraftMessage(types.PeerUser(91), types.DraftMessageEmpty()))
@@ -396,7 +402,7 @@ async def test_undated_empty_update_requests_bounded_recovery_without_rpc() -> N
 async def test_snapshot_claim_applies_authoritative_coverage_without_baselines() -> None:
     repository = _Repository()
     gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
-    owner, _client = _owner(repository, gateway)
+    owner, _client = await _owner(repository, gateway)
     repository.due_at = 0.0
 
     await owner.run_slice(RpcAttemptBudget(1))
@@ -411,7 +417,7 @@ async def test_snapshot_recovery_does_not_emit_realtime_latency() -> None:
     repository = _Repository()
     gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
     observer = _Observer()
-    owner, _client = _owner(repository, gateway, observe=observer)
+    owner, _client = await _owner(repository, gateway, observe=observer)
     repository.due_at = 0.0
 
     await owner.run_slice(RpcAttemptBudget(1))
@@ -432,7 +438,7 @@ async def test_snapshot_recovery_does_not_emit_realtime_latency() -> None:
 async def test_incomplete_snapshot_never_calls_snapshot_apply_or_infers_absence() -> None:
     repository = _Repository()
     gateway = _Gateway(SnapshotCoverage(42, False, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
-    owner, _client = _owner(repository, gateway)
+    owner, _client = await _owner(repository, gateway)
     repository.due_at = 0.0
 
     await owner.run_slice(RpcAttemptBudget(1))
@@ -446,7 +452,7 @@ async def test_claimed_recovery_is_rearmed_when_snapshot_fetch_fails() -> None:
     repository = _Repository()
     gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
     gateway.failure = RuntimeError("transport failed")
-    owner, _client = _owner(repository, gateway)
+    owner, _client = await _owner(repository, gateway)
     repository.due_at = 0.0
 
     with pytest.raises(RuntimeError, match="transport failed"):
@@ -460,7 +466,7 @@ async def test_claimed_recovery_is_rearmed_when_snapshot_fetch_fails() -> None:
 async def test_claimed_recovery_does_not_use_snapshot_baselines() -> None:
     repository = _Repository()
     gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
-    owner, _client = _owner(repository, gateway)
+    owner, _client = await _owner(repository, gateway)
     repository.due_at = 0.0
 
     await owner.run_slice(RpcAttemptBudget(1))
@@ -474,7 +480,7 @@ async def test_claimed_recovery_is_rearmed_and_cancellation_propagates() -> None
     repository = _Repository()
     gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
     gateway.failure = asyncio.CancelledError()
-    owner, _client = _owner(repository, gateway)
+    owner, _client = await _owner(repository, gateway)
     repository.due_at = 0.0
 
     with pytest.raises(asyncio.CancelledError):
@@ -488,7 +494,7 @@ async def test_claimed_recovery_is_rearmed_when_snapshot_publish_fails() -> None
     repository = _Repository()
     repository.snapshot_error = RuntimeError("database failed")
     gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
-    owner, _client = _owner(repository, gateway)
+    owner, _client = await _owner(repository, gateway)
     repository.due_at = 0.0
 
     with pytest.raises(RuntimeError, match="database failed"):
@@ -502,7 +508,7 @@ async def test_realtime_persistence_error_requests_durable_recovery() -> None:
     repository = _Repository()
     repository.realtime_error = RuntimeError("database failed")
     gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
-    owner, _client = _owner(repository, gateway)
+    owner, _client = await _owner(repository, gateway)
 
     await owner.on_raw_draft_update(
         types.UpdateDraftMessage(types.PeerUser(91), types.DraftMessage("draft", datetime(2026, 1, 1, tzinfo=UTC)))

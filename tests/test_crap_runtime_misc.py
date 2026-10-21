@@ -30,6 +30,7 @@ from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_demand import demand_context
 from mcp_telegram.telegram_rpc_consumers import DemandKind, TelegramRpcSource
+from tests.sqlite_writer_helpers import inline_observation_sink, inline_writer
 
 
 @pytest.fixture()
@@ -43,9 +44,12 @@ def sync_conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
-def test_runtime_observation_loss_persists_only_nonzero_sink_counts(sync_conn: sqlite3.Connection) -> None:
-    ctx = cast(_SyncMainContext, SimpleNamespace(conn=sync_conn, rpc_observation_sink=None))
-    _persist_runtime_observation_loss(ctx)
+@pytest.mark.asyncio
+async def test_runtime_observation_loss_persists_only_nonzero_sink_counts(sync_conn: sqlite3.Connection) -> None:
+    ctx = cast(
+        _SyncMainContext, SimpleNamespace(conn=sync_conn, writer=inline_writer(sync_conn), rpc_observation_sink=None)
+    )
+    await _persist_runtime_observation_loss(ctx)
     assert sync_conn.execute(
         "SELECT COUNT(*) FROM daemon_state WHERE key LIKE 'runtime_observations_last_%'"
     ).fetchone() == (0,)
@@ -60,7 +64,7 @@ def test_runtime_observation_loss_persists_only_nonzero_sink_counts(sync_conn: s
             permanent_failures=3,
         ),
     )
-    _persist_runtime_observation_loss(ctx)
+    await _persist_runtime_observation_loss(ctx)
     rows = dict(sync_conn.execute("SELECT key, value FROM daemon_state WHERE key LIKE 'runtime_observations_last_%'"))
     assert rows["runtime_observations_last_queue_full_drops"] == "2"
     assert rows["runtime_observations_last_writer_failures"] == "3"
@@ -76,6 +80,8 @@ async def test_tracked_task_failure_records_noncritical_and_critical_outcomes(sy
         _SyncMainContext,
         SimpleNamespace(
             conn=sync_conn,
+            writer=inline_writer(sync_conn),
+            rpc_observation_sink=inline_observation_sink(sync_conn),
             background_tasks=set(),
             shutdown_event=asyncio.Event(),
             api_server=api,
@@ -170,6 +176,7 @@ async def test_working_set_enrollment_slice_preserves_phase_and_finishes(
         await run_working_set_enrollment_slice(
             cast(ActivityClient, _FakeClient()),
             sync_conn,
+            writer=inline_writer(sync_conn),
             source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
             cadence_s=10,
             timeout_s=1,
@@ -182,6 +189,7 @@ async def test_working_set_enrollment_slice_preserves_phase_and_finishes(
     first = await run_working_set_enrollment_slice(
         cast(ActivityClient, _FakeClient()),
         sync_conn,
+        writer=inline_writer(sync_conn),
         source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
         cadence_s=10,
         timeout_s=1,
@@ -199,6 +207,7 @@ async def test_working_set_enrollment_slice_preserves_phase_and_finishes(
         second = await run_working_set_enrollment_slice(
             cast(ActivityClient, _FakeClient()),
             sync_conn,
+            writer=inline_writer(sync_conn),
             source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
             cadence_s=10,
             timeout_s=1,
@@ -208,6 +217,7 @@ async def test_working_set_enrollment_slice_preserves_phase_and_finishes(
     final = await run_working_set_enrollment_slice(
         cast(ActivityClient, _FakeClient()),
         sync_conn,
+        writer=inline_writer(sync_conn),
         source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
         cadence_s=10,
         timeout_s=1,

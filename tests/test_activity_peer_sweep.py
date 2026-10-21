@@ -37,6 +37,7 @@ from mcp_telegram.message_contracts import ExtractedMessage
 from mcp_telegram.messages.telegram_adapter import extract_message_row
 from mcp_telegram.sync_db import _apply_migrations
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource
+from sqlite_writer_helpers import inline_writer
 
 _TEST_TIMEOUT_S = 120.0
 
@@ -89,7 +90,13 @@ async def test_channel_enrollment_holds_cursor_for_unknown_then_resumes_after_pu
 
         client = _FakeClient()
         first_result = await run_working_set_enrollment_slice(
-            client, conn, source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL, cadence_s=60, timeout_s=1, now=now
+            client,
+            conn,
+            source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
+            cadence_s=60,
+            timeout_s=1,
+            now=now,
+            writer=inline_writer(conn),
         )
         assert first_result.consumed
         assert conn.execute(
@@ -97,7 +104,13 @@ async def test_channel_enrollment_holds_cursor_for_unknown_then_resumes_after_pu
         ).fetchone() == (str(first),)
 
         pending_result = await run_working_set_enrollment_slice(
-            client, conn, source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL, cadence_s=60, timeout_s=1, now=now
+            client,
+            conn,
+            source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
+            cadence_s=60,
+            timeout_s=1,
+            now=now,
+            writer=inline_writer(conn),
         )
         assert pending_result.consumed
         state = dict(conn.execute("SELECT key,value FROM activity_sync_state"))
@@ -109,7 +122,13 @@ async def test_channel_enrollment_holds_cursor_for_unknown_then_resumes_after_pu
             generation = linked_chat_fact_owner.capture_generation(conn, pending)
             assert linked_chat_fact_owner.publish(conn, pending, generation, 300, now + 1)
         resumed = await run_working_set_enrollment_slice(
-            client, conn, source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL, cadence_s=60, timeout_s=1, now=now + 2
+            client,
+            conn,
+            source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
+            cadence_s=60,
+            timeout_s=1,
+            now=now + 2,
+            writer=inline_writer(conn),
         )
         assert resumed.consumed
         assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=-1000000000300").fetchone() is not None
@@ -130,7 +149,13 @@ async def test_projection_lag_enrolls_published_link_after_completed_scan(access
         conn.commit()
         client = _FakeClient()
         unresolved = await run_working_set_enrollment_slice(
-            client, conn, source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL, cadence_s=60, timeout_s=1, now=now
+            client,
+            conn,
+            source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
+            cadence_s=60,
+            timeout_s=1,
+            now=now,
+            writer=inline_writer(conn),
         )
         assert unresolved.consumed
         assert conn.execute(
@@ -145,18 +170,36 @@ async def test_projection_lag_enrolls_published_link_after_completed_scan(access
             generation_b = linked_chat_fact_owner.capture_generation(conn, channel_b)
             assert linked_chat_fact_owner.publish(conn, channel_b, generation_b, 300, now)
         linked_b = await run_working_set_enrollment_slice(
-            client, conn, source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL, cadence_s=60, timeout_s=1, now=now
+            client,
+            conn,
+            source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
+            cadence_s=60,
+            timeout_s=1,
+            now=now,
+            writer=inline_writer(conn),
         )
         assert linked_b.consumed
         assert conn.execute("SELECT source FROM activity_dialog_state WHERE dialog_id=-1000000000300").fetchone() == (
             "linked_chat",
         )
         scanned_b = await run_working_set_enrollment_slice(
-            client, conn, source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL, cadence_s=60, timeout_s=1, now=now
+            client,
+            conn,
+            source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
+            cadence_s=60,
+            timeout_s=1,
+            now=now,
+            writer=inline_writer(conn),
         )
         assert scanned_b.consumed
         completed = await run_working_set_enrollment_slice(
-            client, conn, source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL, cadence_s=60, timeout_s=1, now=now
+            client,
+            conn,
+            source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
+            cadence_s=60,
+            timeout_s=1,
+            now=now,
+            writer=inline_writer(conn),
         )
         assert completed.completed
         assert conn.execute(
@@ -170,14 +213,26 @@ async def test_projection_lag_enrolls_published_link_after_completed_scan(access
         assert working_set_enrollment_release_at(conn, now=now + 1, cadence_s=60) == 0
 
         linked_a = await run_working_set_enrollment_slice(
-            client, conn, source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL, cadence_s=60, timeout_s=1, now=now + 2
+            client,
+            conn,
+            source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
+            cadence_s=60,
+            timeout_s=1,
+            now=now + 2,
+            writer=inline_writer(conn),
         )
         assert linked_a.consumed
         assert conn.execute("SELECT source FROM activity_dialog_state WHERE dialog_id=-1000000000400").fetchone() == (
             "linked_chat",
         )
         await run_working_set_enrollment_slice(
-            client, conn, source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL, cadence_s=60, timeout_s=1, now=now + 3
+            client,
+            conn,
+            source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
+            cadence_s=60,
+            timeout_s=1,
+            now=now + 3,
+            writer=inline_writer(conn),
         )
         completed_at_row = cast(
             tuple[str] | None,
@@ -217,6 +272,7 @@ async def test_existing_activity_projection_prevents_linked_chat_lag_and_preserv
             cadence_s=60,
             timeout_s=1,
             now=now,
+            writer=inline_writer(conn),
         )
         assert not result.consumed
         assert conn.execute("SELECT source FROM activity_dialog_state WHERE dialog_id=?", (peer_id,)).fetchone() == (
@@ -256,6 +312,7 @@ def test_sweep_peer_once_resolve_none_returns_access_skip(monkeypatch: pytest.Mo
                     min_id=3,
                     limit=25,
                     timeout_s=_TEST_TIMEOUT_S,
+                    writer=inline_writer(conn),
                 )
             )
         )
@@ -281,7 +338,14 @@ def test_sweep_peer_once_resolution_error_reports_rpc_and_error(monkeypatch: pyt
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", failed_resolution)
         result = asyncio.run(
             sweep_peer_once(
-                client=_FakeClient(), conn=conn, dialog_id=123, offset_id=0, min_id=0, limit=10, timeout_s=1
+                client=_FakeClient(),
+                conn=conn,
+                dialog_id=123,
+                offset_id=0,
+                min_id=0,
+                limit=10,
+                timeout_s=1,
+                writer=inline_writer(conn),
             )
         )
         assert result.skip_reason is SkipReason.ACCESS_SKIP
@@ -305,7 +369,14 @@ def test_sweep_peer_once_search_error_reports_two_rpcs(monkeypatch: pytest.Monke
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", failed_search)
         result = asyncio.run(
             sweep_peer_once(
-                client=_FakeClient(), conn=conn, dialog_id=123, offset_id=0, min_id=0, limit=10, timeout_s=1
+                client=_FakeClient(),
+                conn=conn,
+                dialog_id=123,
+                offset_id=0,
+                min_id=0,
+                limit=10,
+                timeout_s=1,
+                writer=inline_writer(conn),
             )
         )
         assert result.rpc_calls == 2
@@ -333,7 +404,14 @@ def test_sweep_peer_once_extraction_error_reports_result_page(monkeypatch: pytes
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep._extract_sweep_messages", failed_extract)
         result = asyncio.run(
             sweep_peer_once(
-                client=_FakeClient(), conn=conn, dialog_id=123, offset_id=0, min_id=0, limit=10, timeout_s=1
+                client=_FakeClient(),
+                conn=conn,
+                dialog_id=123,
+                offset_id=0,
+                min_id=0,
+                limit=10,
+                timeout_s=1,
+                writer=inline_writer(conn),
             )
         )
         assert result.rpc_calls == 2
@@ -366,7 +444,14 @@ def test_sweep_peer_once_persistence_error_reports_result_page(monkeypatch: pyte
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.insert_messages_with_fts", failed_insert)
         result = asyncio.run(
             sweep_peer_once(
-                client=_FakeClient(), conn=conn, dialog_id=123, offset_id=0, min_id=0, limit=10, timeout_s=1
+                client=_FakeClient(),
+                conn=conn,
+                dialog_id=123,
+                offset_id=0,
+                min_id=0,
+                limit=10,
+                timeout_s=1,
+                writer=inline_writer(conn),
             )
         )
         assert result.rpc_calls == 2
@@ -405,6 +490,7 @@ def test_sweep_peer_once_floodwait_reports_seconds(monkeypatch: pytest.MonkeyPat
                 min_id=5,
                 limit=50,
                 timeout_s=_TEST_TIMEOUT_S,
+                writer=inline_writer(conn),
             )
         )
 
@@ -472,6 +558,7 @@ def test_sweep_peer_once_success_invokes_pacing_sleep(
                     min_id=6,
                     limit=30,
                     timeout_s=_TEST_TIMEOUT_S,
+                    writer=inline_writer(conn),
                 )
             )
 
@@ -523,6 +610,7 @@ def test_sweep_peer_once_floodwait_does_not_invoke_pacing_sleep(monkeypatch: pyt
                 min_id=5,
                 limit=50,
                 timeout_s=_TEST_TIMEOUT_S,
+                writer=inline_writer(conn),
             )
         )
 
@@ -569,6 +657,7 @@ def test_sweep_peer_once_latched_throttling_propagates_without_retry_state(
                     min_id=0,
                     limit=50,
                     timeout_s=_TEST_TIMEOUT_S,
+                    writer=inline_writer(conn),
                 )
             )
 
@@ -609,6 +698,7 @@ def test_sweep_peer_once_timeout_returns_access_skip(monkeypatch: pytest.MonkeyP
                 min_id=2,
                 limit=10,
                 timeout_s=_TEST_TIMEOUT_S,
+                writer=inline_writer(conn),
             )
         )
 
@@ -660,6 +750,7 @@ def test_sweep_peer_once_access_lost_marks_dialog_without_traceback(
                     min_id=2,
                     limit=10,
                     timeout_s=_TEST_TIMEOUT_S,
+                    writer=inline_writer(conn),
                 )
             )
 
@@ -717,6 +808,7 @@ def test_sweep_peer_once_empty_batch_is_history_floor(monkeypatch: pytest.Monkey
                 min_id=1,
                 limit=20,
                 timeout_s=_TEST_TIMEOUT_S,
+                writer=inline_writer(conn),
             )
         )
 
@@ -777,6 +869,7 @@ def test_sweep_peer_once_persists_only_extractable_messages(monkeypatch: pytest.
                 min_id=6,
                 limit=30,
                 timeout_s=_TEST_TIMEOUT_S,
+                writer=inline_writer(conn),
             )
         )
 
@@ -841,6 +934,7 @@ def test_sweep_peer_once_counts_unique_genuinely_new_keys_before_replacement(
                 min_id=6,
                 limit=30,
                 timeout_s=_TEST_TIMEOUT_S,
+                writer=inline_writer(conn),
             )
         )
 

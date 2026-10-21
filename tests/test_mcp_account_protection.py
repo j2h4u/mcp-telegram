@@ -33,6 +33,7 @@ from tests.helpers import (
     LoudUserAvatarHistoryPort,
     LoudUserProfilePort,
 )
+from tests.sqlite_writer_helpers import inline_writer
 from tests.test_entity_profile_full_user_pair import _prepare
 from tests.test_telegram_rpc import _CircuitStatus, _gate, _RawFutureSender, _TestRequest
 
@@ -115,6 +116,7 @@ def _local_daemon(
         cast(DaemonClientLike, client),
         asyncio.Event(),
         FeedbackApplicationService(SQLiteFeedbackStore(feedback_conn)),
+        writer=inline_writer(sync_conn),
         topic_refresher=topic_refresher,
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
@@ -344,7 +346,7 @@ async def test_registered_entity_info_keeps_owned_partial_cache_success_under_pr
         daemon._policy,
         entity_profile=replace(daemon._policy.entity_profile, foreground_refresh_wait_seconds=0.01),
     )
-    daemon._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
+    await daemon._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
     daemon._health_status = _active_status
     socket_path = tmp_path / "daemon.sock"
     _install_daemon_socket(monkeypatch, socket_path)

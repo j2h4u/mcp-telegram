@@ -41,12 +41,15 @@ async def test_reconnect_loop_catches_up_once_per_signal() -> None:
     recoveries: list[str] = []
     observations: list[tuple[str, str]] = []
 
+    async def recover() -> None:
+        recoveries.append("reconnect")
+
     await run_reconnect_catch_up_loop(
         client,
         shutdown,
         interval_seconds=0.001,
         observe=lambda kind, outcome, _reason: observations.append((kind, outcome)),
-        on_reconnect=lambda: recoveries.append("reconnect"),
+        on_reconnect=recover,
     )
 
     assert client.catch_up_calls == 2

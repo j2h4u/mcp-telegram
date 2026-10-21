@@ -35,6 +35,7 @@ import pytest
 
 from mcp_telegram.event_handlers import EventHandlerManager, _OutboxReadEvent
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from sqlite_writer_helpers import event_manager
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 _SQLiteConnection = sqlite3.Connection
@@ -107,7 +108,7 @@ def _make_event(chat_id: int | None, max_id: int) -> _OutboxReadEvent:
 
 
 def _make_manager(client: MagicMock, conn: _SQLiteConnection, ev: asyncio.Event) -> EventHandlerManager:
-    return EventHandlerManager(client, conn, ev)
+    return event_manager(client, conn, ev)
 
 
 # ---------------------------------------------------------------------------

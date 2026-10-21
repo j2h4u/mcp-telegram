@@ -18,11 +18,13 @@ from telethon.tl.types import PeerUser
 from mcp_telegram import activity_sync
 from mcp_telegram.activity_sync import ArchiveBackfillDemandAdapter, ArchiveIncrementalDemandAdapter
 from mcp_telegram.flood import TelegramRpcThrottled
-from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.sqlite_writer import SQLiteWriter
+from mcp_telegram.sync_db import ensure_sync_schema, open_sync_db_reader
 from mcp_telegram.telegram_demand import DemandStatus, DurableDemandAdapter, RpcAttemptBudget
 from mcp_telegram.telegram_demand_coordinator import CoordinatorState, TelegramDemandCoordinator
 from mcp_telegram.telegram_rpc_consumers import DURABLE_DEMAND_ORDER, DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred, TelegramRpcScope, current_rpc_scope
+from sqlite_writer_helpers import inline_writer
 
 _TEST_TIMEOUT_S = 0.05
 
@@ -192,7 +194,7 @@ def conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
 async def test_archive_backfill_adapter_commits_one_page_with_precise_scope(conn: sqlite3.Connection) -> None:
     client = _FakeClient([FakeSearchResult(messages=[_msg(100, 42, 1_700_000_100)]), FakeSearchResult(messages=[])])
     budget = RpcAttemptBudget(limit=1)
-    adapter = ArchiveBackfillDemandAdapter(client, conn, asyncio.Event(), _TEST_TIMEOUT_S)
+    adapter = ArchiveBackfillDemandAdapter(client, conn, asyncio.Event(), _TEST_TIMEOUT_S, writer=inline_writer(conn))
 
     assert adapter.status(1_700_000_000.0) is not None
     await adapter.run_slice(budget)
@@ -209,6 +211,28 @@ async def test_archive_backfill_adapter_commits_one_page_with_precise_scope(conn
 
 
 @pytest.mark.asyncio
+async def test_archive_commits_through_owner_with_readonly_loop_connection(conn: sqlite3.Connection) -> None:
+    path = Path(cast(str, conn.execute("PRAGMA database_list").fetchone()[2]))
+    writer = await SQLiteWriter.open(path)
+    reader = open_sync_db_reader(path)
+    try:
+        client = _FakeClient([FakeSearchResult(messages=[_msg(100, 42, 1_700_000_100)]), FakeSearchResult(messages=[])])
+        adapter = ArchiveBackfillDemandAdapter(client, reader, asyncio.Event(), _TEST_TIMEOUT_S, writer=writer)
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        assert reader.execute("SELECT value FROM activity_sync_state WHERE key='backfill_offset_id'").fetchone() == (
+            "100",
+        )
+        assert reader.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=42 AND message_id=100").fetchone() == (1,)
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        assert adapter.status(time.time()) is None
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            reader.execute("DELETE FROM activity_sync_state")
+    finally:
+        reader.close()
+        await writer.aclose()
+
+
+@pytest.mark.asyncio
 async def test_archive_incremental_adapter_resumes_from_key_value_state(conn: sqlite3.Connection) -> None:
     last_sync_at = int(time.time()) - 7_200
     with conn:
@@ -219,7 +243,9 @@ async def test_archive_incremental_adapter_resumes_from_key_value_state(conn: sq
         )
     client = _FakeClient([FakeSearchResult(messages=[_msg(12, 42, last_sync_at + 30)]), FakeSearchResult(messages=[])])
     first_budget = RpcAttemptBudget(limit=1)
-    adapter = ArchiveIncrementalDemandAdapter(client, conn, asyncio.Event(), 3_600.0, _TEST_TIMEOUT_S)
+    adapter = ArchiveIncrementalDemandAdapter(
+        client, conn, asyncio.Event(), 3_600.0, _TEST_TIMEOUT_S, writer=inline_writer(conn)
+    )
 
     initial = adapter.status(float(last_sync_at))
     assert initial is not None
@@ -246,10 +272,7 @@ async def test_archive_incremental_adapter_resumes_from_key_value_state(conn: sq
 async def test_archive_backfill_finite_throttle_is_owned_by_coordinator(conn: sqlite3.Connection) -> None:
     error = TelegramRpcThrottled(retry_after_seconds=17)
     adapter = ArchiveBackfillDemandAdapter(
-        _ThrottledClient(error, dispatch=True),
-        conn,
-        asyncio.Event(),
-        _TEST_TIMEOUT_S,
+        _ThrottledClient(error, dispatch=True), conn, asyncio.Event(), _TEST_TIMEOUT_S, writer=inline_writer(conn)
     )
     observer = _DemandObserver()
     coordinator = _coordinator(DemandKind.ARCHIVE_BACKFILL, adapter, observer=observer)
@@ -281,11 +304,7 @@ async def test_archive_incremental_latched_throttle_stops_coordinator_without_lo
     error = TelegramRpcThrottled(latched=True, detail="test circuit open")
     client = _ThrottledClient(error, dispatch=False)
     adapter = ArchiveIncrementalDemandAdapter(
-        client,
-        conn,
-        asyncio.Event(),
-        10.0,
-        _TEST_TIMEOUT_S,
+        client, conn, asyncio.Event(), 10.0, _TEST_TIMEOUT_S, writer=inline_writer(conn)
     )
     observer = _DemandObserver()
     shutdown_event = asyncio.Event()
@@ -320,7 +339,9 @@ async def test_archive_runtime_commits_page_and_leaves_rpc_connection_idle(conn:
 
     enable_runtime_writes(conn)
     client = IdleClient([FakeSearchResult(messages=[_msg(100, 42, 1_700_000_100)])])
-    adapter = ArchiveBackfillDemandAdapter(client, conn, asyncio.Event(), timeout_s=_TEST_TIMEOUT_S)
+    adapter = ArchiveBackfillDemandAdapter(
+        client, conn, asyncio.Event(), timeout_s=_TEST_TIMEOUT_S, writer=inline_writer(conn)
+    )
     await adapter.run_slice(RpcAttemptBudget(1))
 
     assert conn.execute("SELECT message_id FROM messages").fetchall() == [(100,)]
@@ -335,7 +356,9 @@ async def test_archive_page_failure_rolls_back_messages_and_checkpoint(conn: sql
 
     enable_runtime_writes(conn)
     client = _FakeClient([FakeSearchResult(messages=[_msg(100, 42, 1_700_000_100)])])
-    adapter = ArchiveBackfillDemandAdapter(client, conn, asyncio.Event(), timeout_s=_TEST_TIMEOUT_S)
+    adapter = ArchiveBackfillDemandAdapter(
+        client, conn, asyncio.Event(), timeout_s=_TEST_TIMEOUT_S, writer=inline_writer(conn)
+    )
     with patch.object(activity_sync, "_upsert_entities_from_search", side_effect=RuntimeError("identity write failed")):
         with pytest.raises(RuntimeError, match="identity write failed"):
             await adapter.run_slice(RpcAttemptBudget(1))
@@ -361,9 +384,9 @@ async def test_incremental_timeout_preserves_page_and_anchor(conn: sqlite3.Conne
         )
     before = activity_sync._load_state(conn)
     with patch.object(activity_sync, "call_with_timeout", new=AsyncMock(side_effect=TimeoutError)):
-        await ArchiveIncrementalDemandAdapter(_FakeClient([]), conn, asyncio.Event(), 10, _TEST_TIMEOUT_S).run_slice(
-            RpcAttemptBudget(1)
-        )
+        await ArchiveIncrementalDemandAdapter(
+            _FakeClient([]), conn, asyncio.Event(), 10, _TEST_TIMEOUT_S, writer=inline_writer(conn)
+        ).run_slice(RpcAttemptBudget(1))
     assert activity_sync._load_state(conn) == before
 
 
@@ -373,27 +396,31 @@ async def test_incremental_next_window_starts_before_scan_arrivals(conn: sqlite3
         conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
         conn.execute("INSERT OR REPLACE INTO activity_sync_state(key,value) VALUES ('last_sync_at','100')")
     client = _FakeClient([FakeSearchResult(messages=[_msg(12, 42, 190)]), FakeSearchResult(messages=[])])
-    adapter = ArchiveIncrementalDemandAdapter(client, conn, asyncio.Event(), 10, _TEST_TIMEOUT_S)
+    adapter = ArchiveIncrementalDemandAdapter(
+        client, conn, asyncio.Event(), 10, _TEST_TIMEOUT_S, writer=inline_writer(conn)
+    )
     with patch.object(activity_sync.time, "time", return_value=200):
         await adapter.run_slice(RpcAttemptBudget(1))
-    restarted = ArchiveIncrementalDemandAdapter(client, conn, asyncio.Event(), 10, _TEST_TIMEOUT_S)
+    restarted = ArchiveIncrementalDemandAdapter(
+        client, conn, asyncio.Event(), 10, _TEST_TIMEOUT_S, writer=inline_writer(conn)
+    )
     with patch.object(activity_sync.time, "time", return_value=1000):
         await restarted.run_slice(RpcAttemptBudget(1))
         assert activity_sync._load_state(conn)["last_sync_at"] == "200"
-        window = activity_sync._prepare_incremental_slice(conn, asyncio.Event())
+        window = activity_sync._prepare_incremental_slice(conn, False)
     assert window == (140, 0)
 
 
 @pytest.mark.asyncio
 async def test_backfill_completion_anchors_original_start(conn: sqlite3.Connection) -> None:
     client = _FakeClient([FakeSearchResult(messages=[_msg(12, 42, 190)]), FakeSearchResult(messages=[])])
-    adapter = ArchiveBackfillDemandAdapter(client, conn, asyncio.Event(), _TEST_TIMEOUT_S)
+    adapter = ArchiveBackfillDemandAdapter(client, conn, asyncio.Event(), _TEST_TIMEOUT_S, writer=inline_writer(conn))
     with patch.object(activity_sync.time, "time", return_value=200):
         await adapter.run_slice(RpcAttemptBudget(1))
     with patch.object(activity_sync.time, "time", return_value=1000):
-        await ArchiveBackfillDemandAdapter(client, conn, asyncio.Event(), _TEST_TIMEOUT_S).run_slice(
-            RpcAttemptBudget(1)
-        )
+        await ArchiveBackfillDemandAdapter(
+            client, conn, asyncio.Event(), _TEST_TIMEOUT_S, writer=inline_writer(conn)
+        ).run_slice(RpcAttemptBudget(1))
     assert activity_sync._load_state(conn)["last_sync_at"] == "200"
 
 
@@ -415,7 +442,7 @@ async def test_incremental_interruption_keeps_window(conn: sqlite3.Connection, e
     with patch.object(activity_sync, "call_with_timeout", new=AsyncMock(side_effect=error)):
         with pytest.raises(type(error)):
             await ArchiveIncrementalDemandAdapter(
-                _FakeClient([]), conn, asyncio.Event(), 10, _TEST_TIMEOUT_S
+                _FakeClient([]), conn, asyncio.Event(), 10, _TEST_TIMEOUT_S, writer=inline_writer(conn)
             ).run_slice(RpcAttemptBudget(1))
     assert activity_sync._load_state(conn) == before
 
@@ -436,7 +463,7 @@ async def test_incremental_shutdown_keeps_window(conn: sqlite3.Connection) -> No
     before = activity_sync._load_state(conn)
     shutdown = asyncio.Event()
     shutdown.set()
-    await ArchiveIncrementalDemandAdapter(_FakeClient([]), conn, shutdown, 10, _TEST_TIMEOUT_S).run_slice(
-        RpcAttemptBudget(1)
-    )
+    await ArchiveIncrementalDemandAdapter(
+        _FakeClient([]), conn, shutdown, 10, _TEST_TIMEOUT_S, writer=inline_writer(conn)
+    ).run_slice(RpcAttemptBudget(1))
     assert activity_sync._load_state(conn) == before

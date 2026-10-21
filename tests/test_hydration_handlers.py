@@ -41,6 +41,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     rpc_scope,
 )
 from mcp_telegram.transcription_hydration import TranscriptionHydrationHandler
+from tests.sqlite_writer_helpers import inline_writer
 
 
 @pytest.fixture
@@ -115,6 +116,7 @@ async def test_worker_reserves_before_request_and_rejects_late_fact_and_queue_ef
         object(),
         db,
         asyncio.Event(),
+        writer=inline_writer(db),
         handlers=(handler,),
         interval_seconds=1,
         max_requests_per_cycle=2,
@@ -213,6 +215,7 @@ async def test_old_request_error_refunds_original_and_preserves_replacement(  # 
         object(),
         db,
         asyncio.Event(),
+        writer=inline_writer(db),
         handlers=(handler,),
         interval_seconds=1,
         max_requests_per_cycle=2,
@@ -292,6 +295,7 @@ async def test_pending_attempts_remain_bounded_and_final_event_can_complete(db: 
         object(),
         db,
         asyncio.Event(),
+        writer=inline_writer(db),
         handlers=(handler,),
         interval_seconds=1,
         max_requests_per_cycle=2,
@@ -565,6 +569,7 @@ def test_access_loss_marks_dialogs_and_purges_all_active_hydration_jobs(
         object(),
         db,
         asyncio.Event(),
+        writer=inline_writer(db),
         handlers=(),
         interval_seconds=1,
         max_requests_per_cycle=0,
@@ -577,6 +582,7 @@ def test_access_loss_marks_dialogs_and_purges_all_active_hydration_jobs(
     )
 
     outcome = worker._handle_access_lost(
+        db,
         cast(HydrationHandler, SimpleNamespace(kind=MEDIA_METADATA_KIND)),
         [first, second, third],
         [first, second, third],

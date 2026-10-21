@@ -69,6 +69,7 @@ from tests.helpers import (
     LoudUserAvatarHistoryPort,
     LoudUserProfilePort,
 )
+from tests.sqlite_writer_helpers import inline_writer
 
 
 @pytest.fixture()
@@ -79,6 +80,7 @@ def trace_server(tmp_path: Path) -> Iterator[tuple[DaemonAPIServer, sqlite3.Conn
         conn,
         client,
         asyncio.Event(),
+        writer=inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
@@ -102,6 +104,7 @@ def trace_service(
     return DaemonAccountTraceService(
         DaemonAccountTraceDeps(
             conn=conn,
+            writer=server._writer,
             client=client,
             resolve_dialog_id=server._resolve_dialog_id,
             self_id=server.self_id,

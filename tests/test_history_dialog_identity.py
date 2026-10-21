@@ -32,6 +32,7 @@ from mcp_telegram.models import DialogType
 from mcp_telegram.reading import ReadingService
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.sync_worker import FullSyncWorker
+from sqlite_writer_helpers import inline_writer
 
 PEER = -1001234567890
 
@@ -119,10 +120,10 @@ async def test_history_workers_publish_orphan_identity_without_overwriting_refre
             return ForwardGapPage((), True, identity) if forward else FullHistoryPage((), 1, None, identity)
 
     if forward:
-        worker = DeltaSyncWorker(cast(ForwardGapPagePort, Port()), conn, asyncio.Event())
+        worker = DeltaSyncWorker(cast(ForwardGapPagePort, Port()), conn, asyncio.Event(), writer=inline_writer(conn))
         await worker.fetch_delta_slice_for_dialog(PEER)
     else:
-        worker = FullSyncWorker(cast(FullHistoryPagePort, Port()), conn, asyncio.Event())
+        worker = FullSyncWorker(cast(FullHistoryPagePort, Port()), conn, asyncio.Event(), writer=inline_writer(conn))
         await worker._fetch_batch(PEER, 0)
     identity = read_dialog_identities(conn, [PEER])[PEER]
     assert identity.name == ("Newer" if concurrent_refresh else "Canonical channel")

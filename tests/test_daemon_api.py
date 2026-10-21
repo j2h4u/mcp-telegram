@@ -29,7 +29,6 @@ from mcp_telegram.daemon_api import (
     DaemonClientLike,
     _normalize_telemetry_outcome,
     _ResolverEntityCache,
-    _write_telemetry,
 )
 from mcp_telegram.daemon_ipc import get_daemon_socket_path
 from mcp_telegram.daemon_message import _MessageLike, fetch_reaction_counts, message_to_dict
@@ -47,6 +46,7 @@ from mcp_telegram.reading.sqlite_projection import (
     _ListMessagesDbRequest,
 )
 from mcp_telegram.runtime_observations import RuntimeObservationSink, record_runtime_observation
+from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import _RUNTIME_OBSERVATIONS_V54_DDL, ensure_sync_schema
 from mcp_telegram.sync_read_model import compute_sync_coverage as _compute_sync_coverage
 from mcp_telegram.sync_transactions import enable_runtime_writes
@@ -74,6 +74,7 @@ from tests.helpers import (
     LoudUserProfilePort,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.sqlite_writer_helpers import inline_writer
 
 # Track sqlite connections created by module helpers and close them after each test.
 _TRACKED_SQLITE_CONN_CLEANUP: Final[list[sqlite3.Connection]] = []
@@ -342,12 +343,13 @@ def _activity_data(resp: dict[str, object]) -> dict[str, object]:
     return cast(dict[str, object], resp["data"])
 
 
-def make_server(
+def make_server(  # noqa: PLR0913
     conn: sqlite3.Connection | None = None,
     client: object | None = None,
     feedback_conn: sqlite3.Connection | None = None,
     topic_refresher: TopicRefresher | None = None,
     hydration_requester: Callable[[sqlite3.Connection, int, int], None] | None = None,
+    writer: SQLiteWriter | None = None,
 ) -> DaemonAPIServer:
     """Return a DaemonAPIServer wired to in-memory DB and mock client."""
     if conn is None:
@@ -368,6 +370,7 @@ def make_server(
         cast(DaemonClientLike, client),
         shutdown_event,
         FeedbackApplicationService(SQLiteFeedbackStore(feedback_conn)),
+        writer=writer if writer is not None else inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
         hydration_requester=hydration_requester,
         topic_refresher=topic_refresher,
@@ -379,6 +382,10 @@ def make_server(
         policy=make_daemon_api_policy(),
     )
     server._ready = True
+
+    sink = MagicMock()
+    sink.record.side_effect = lambda **fields: record_runtime_observation(conn, **fields)
+    server.bind_runtime_observation_sink(cast(RuntimeObservationSink, sink))
     return server
 
 
@@ -404,7 +411,7 @@ async def test_entity_profile_pending_projects_protection_only_when_active(
         server._policy,
         entity_profile=replace(server._policy.entity_profile, foreground_refresh_wait_seconds=0.01),
     )
-    server._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
+    await server._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
     server.bind_demand_sink(MagicMock(offer=MagicMock(return_value=True)))
     service = server._get_entity_info_service()
     service._profiles.save_core({"id": 42, "type": "user", "name": "Local stub"}, now=100)  # type: ignore[attr-defined]
@@ -523,6 +530,7 @@ def test_daemon_api_server_uses_explicit_sync_db_path(tmp_path: Path) -> None:
         cast(DaemonClientLike, client),
         asyncio.Event(),
         sync_db_path=sync_db_path,
+        writer=inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
@@ -2536,7 +2544,7 @@ async def test_list_topics_serves_cached_catalog_when_protection_blocks_optional
     server = make_server(
         conn,
         client,
-        topic_refresher=TopicRefresher(_Gateway(), SQLiteTopicSnapshotRepository(conn)),
+        topic_refresher=TopicRefresher(_Gateway(), SQLiteTopicSnapshotRepository(conn), writer=inline_writer(conn)),
     )
     server._health_status = lambda: FloodWaitKillSwitchStatus(
         open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
@@ -2603,7 +2611,7 @@ async def test_list_topics_keeps_cached_catalog_when_protection_opens_during_ico
     server = make_server(
         conn,
         client,
-        topic_refresher=TopicRefresher(_Gateway(), SQLiteTopicSnapshotRepository(conn)),
+        topic_refresher=TopicRefresher(_Gateway(), SQLiteTopicSnapshotRepository(conn), writer=inline_writer(conn)),
     )
     server._health_status = _health_status
 
@@ -2723,7 +2731,7 @@ async def test_list_topics_cached_selector_still_refreshes_topic_catalog() -> No
     conn.commit()
     client = _TestClient()
     client.get_entity = AsyncMock(return_value=SimpleNamespace(forum=True))
-    topic_refresher = TopicRefresher(_Gateway(), SQLiteTopicSnapshotRepository(conn))
+    topic_refresher = TopicRefresher(_Gateway(), SQLiteTopicSnapshotRepository(conn), writer=inline_writer(conn))
     server = make_server(conn, client, topic_refresher=topic_refresher)
 
     result = await server._list_topics({"dialog": "@forum_group"})
@@ -2751,7 +2759,7 @@ async def test_dispatch_list_topics_keeps_resolution_source_through_refresher() 
     client = _TestClient()
     client.get_entity = AsyncMock(return_value=SimpleNamespace(forum=True))
     gateway = _Gateway()
-    topic_refresher = TopicRefresher(gateway, SQLiteTopicSnapshotRepository(conn))
+    topic_refresher = TopicRefresher(gateway, SQLiteTopicSnapshotRepository(conn), writer=inline_writer(conn))
     server = make_server(conn, client, topic_refresher=topic_refresher)
 
     result = await server._dispatch({"method": "list_topics", "dialog_id": 323})
@@ -2778,7 +2786,7 @@ async def test_list_topics_refreshes_empty_private_bot_catalog() -> None:
     conn = _make_db_with_topics()
     client = _TestClient()
     client.get_entity = AsyncMock(return_value=SimpleNamespace(bot=True, bot_forum_view=True))
-    topic_refresher = TopicRefresher(_Gateway(), SQLiteTopicSnapshotRepository(conn))
+    topic_refresher = TopicRefresher(_Gateway(), SQLiteTopicSnapshotRepository(conn), writer=inline_writer(conn))
     server = make_server(conn, client, topic_refresher=topic_refresher)
 
     result = await server._list_topics({"dialog_id": 8583106747})
@@ -3557,7 +3565,7 @@ async def test_raw_inbox_read_updates_cursor_before_get_inbox_projection() -> No
     _seed_message(conn, dialog_id, message_id=11, text="new")
 
     client = _TestClient()
-    manager = EventHandlerManager(client, conn, asyncio.Event())
+    manager = EventHandlerManager(client, conn, asyncio.Event(), writer=inline_writer(conn))
     manager._synced_dialog_ids.add(dialog_id)
     await manager.on_raw_inbox_read(
         cast(
@@ -4364,8 +4372,10 @@ async def test_record_telemetry_signals_bound_sink_for_idle_retention(tmp_path: 
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
+    server_writer = await SQLiteWriter.open(db_path)
     sink = RuntimeObservationSink(
         db_path,
+        writer=server_writer,
         retention_ttl_seconds=3600,
         policy=replace(RuntimeObservationConfig(), prune_every_writes=1, row_cap=2),
     )
@@ -4394,8 +4404,8 @@ async def test_record_telemetry_signals_bound_sink_for_idle_retention(tmp_path: 
 
         deadline = time.monotonic() + 1.0
         while time.monotonic() < deadline:
-            remaining = conn.execute("SELECT COUNT(*) FROM runtime_observations").fetchone()
-            if remaining is not None and remaining[0] == 2:
+            rows = conn.execute("SELECT tool_name FROM runtime_observations ORDER BY id").fetchall()
+            if [row[0] for row in rows] == ["Older", "DirectMcpOnly"]:
                 break
             await asyncio.sleep(0.01)
         remaining = conn.execute("SELECT COUNT(*) FROM runtime_observations").fetchone()
@@ -4404,15 +4414,15 @@ async def test_record_telemetry_signals_bound_sink_for_idle_retention(tmp_path: 
         assert [row[0] for row in rows] == ["Older", "DirectMcpOnly"]
     finally:
         await sink.aclose()
+        await server_writer.aclose()
         conn.close()
 
 
 @pytest.mark.asyncio
-async def test_record_telemetry_keeps_committed_result_when_sink_signal_fails() -> None:
+async def test_record_telemetry_enqueues_without_writing_loop_connection() -> None:
     conn = _make_db_with_entities()
     server = make_server(conn)
     sink = MagicMock()
-    sink.note_external_write.side_effect = RuntimeError("signal failed")
     server.bind_runtime_observation_sink(cast(RuntimeObservationSink, sink))
 
     result = await server._record_telemetry(
@@ -4431,21 +4441,24 @@ async def test_record_telemetry_keeps_committed_result_when_sink_signal_fails() 
     )
 
     assert result == {"ok": True}
-    assert conn.execute("SELECT tool_name FROM runtime_observations").fetchall()[0][0] == "SignalFailure"
+    sink.record.assert_called_once()
+    assert sink.record.call_args.kwargs["kind"] == "mcp.call"
+    assert conn.execute("SELECT tool_name FROM runtime_observations").fetchall() == []
 
 
-def test_daemon_api_telemetry_insert_is_not_pruned_on_hot_path() -> None:
+@pytest.mark.asyncio
+async def test_daemon_api_telemetry_insert_is_not_pruned_on_hot_path() -> None:
     conn = _make_db_with_entities()
     for tool_name in ("Oldest", "Older", "Recent"):
         record_runtime_observation(conn, kind="mcp.call", tool_name=tool_name)
     conn.commit()
-    _write_telemetry(conn, {"tool_name": "Current"})
+    assert await make_server(conn)._record_telemetry({"event": {"tool_name": "Current"}}) == {"ok": True}
 
-    assert conn.execute("SELECT tool_name FROM runtime_observations ORDER BY id").fetchall() == [
-        ("Oldest",),
-        ("Older",),
-        ("Recent",),
-        ("Current",),
+    assert [row[0] for row in conn.execute("SELECT tool_name FROM runtime_observations ORDER BY id")] == [
+        "Oldest",
+        "Older",
+        "Recent",
+        "Current",
     ]
 
 
@@ -9261,25 +9274,34 @@ def test_trace_candidate_no_discussion_group_stays_signature_only() -> None:
     assert _LINKED_CHAT_ID not in dialog_ids, "linked group appeared in candidates despite no discussion group"
 
 
-def test_telemetry_rejects_foreign_transaction_without_committing() -> None:
+@pytest.mark.asyncio
+async def test_telemetry_enqueue_preserves_foreign_transaction_without_committing() -> None:
     conn = _make_db_with_entities()
     conn.execute("INSERT INTO daemon_state(key,value) VALUES ('foreign', 'pending')")
-    with pytest.raises(RuntimeError, match="idle connection"):
-        _write_telemetry(conn, {"tool_name": "Current"})
+    server = make_server(conn)
+    sink = MagicMock()
+    server.bind_runtime_observation_sink(cast(RuntimeObservationSink, sink))
+    assert await server._record_telemetry({"event": {"tool_name": "Current"}}) == {"ok": True}
+    sink.record.assert_called_once()
     assert conn.in_transaction
     assert conn.execute("SELECT COUNT(*) FROM runtime_observations").fetchone()[0] == 0
     conn.rollback()
     assert conn.execute("SELECT COUNT(*) FROM daemon_state WHERE key='foreign'").fetchone()[0] == 0
 
 
-def test_telemetry_writes_with_runtime_guard_and_restores_it() -> None:
+@pytest.mark.asyncio
+async def test_telemetry_enqueue_preserves_runtime_guard() -> None:
     conn = _make_db_with_entities()
     conn.commit()
     enable_runtime_writes(conn)
-    _write_telemetry(conn, {"tool_name": "Current"})
+    server = make_server(conn)
+    sink = MagicMock()
+    server.bind_runtime_observation_sink(cast(RuntimeObservationSink, sink))
+    assert await server._record_telemetry({"event": {"tool_name": "Current"}}) == {"ok": True}
+    sink.record.assert_called_once()
     assert not conn.in_transaction
     assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
-    assert conn.execute("SELECT tool_name FROM runtime_observations").fetchone()[0] == "Current"
+    assert conn.execute("SELECT COUNT(*) FROM runtime_observations").fetchone()[0] == 0
 
 
 @pytest.mark.asyncio

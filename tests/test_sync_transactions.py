@@ -115,6 +115,37 @@ def test_deferred_foreign_key_commit_failure_rolls_back(caplog: pytest.LogCaptur
             conn.execute("INSERT INTO child VALUES (42)")
 
 
+def test_failed_slow_commit_logs_commit_duration(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    class FakeClock:
+        now = 700.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+    clock = FakeClock()
+
+    class SlowCommitConnection(sqlite3.Connection):
+        def commit(self) -> None:
+            clock.now += 1.25
+            super().commit()
+
+    monkeypatch.setattr(sync_transactions, "time", clock)
+    with closing(sqlite3.connect(":memory:", factory=SlowCommitConnection)) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE child (parent_id REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)")
+        enable_runtime_writes(conn)
+        with caplog.at_level(logging.WARNING, logger="mcp_telegram.sync_transactions"):
+            with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+                with write_transaction(conn):
+                    conn.execute("INSERT INTO child VALUES (99)")
+    record = next(record for record in caplog.records if record.name == "mcp_telegram.sync_transactions")
+    assert record.message.startswith("sqlite_write_failure stage=commit")
+    assert "body_seconds=0.000 commit_seconds=1.250" in record.message
+
+
 def test_idle_guard_rejects_cached_dml_and_ddl() -> None:
     with closing(sqlite3.connect(":memory:")) as conn:
         conn.execute("CREATE TABLE items (value INTEGER)")
@@ -173,7 +204,7 @@ def test_fast_busy_entry_failure_is_debug_without_warning(tmp_path: Path, caplog
 
 
 def test_slow_write_logs_owner_and_timings(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
-    clock = iter((100.0, 100.0, 101.25, 101.25))
+    clock = iter((100.0, 100.0, 100.0, 100.0, 101.25, 101.25))
     monkeypatch.setattr(sync_transactions, "time", SimpleNamespace(monotonic=lambda: next(clock)))
     with closing(sqlite3.connect(":memory:")) as conn:
         with caplog.at_level(logging.WARNING, logger="mcp_telegram.sync_transactions"):
@@ -187,13 +218,30 @@ def test_slow_write_logs_owner_and_timings(monkeypatch: pytest.MonkeyPatch, capl
     assert "caller_module=tests.test_sync_transactions" in message
     assert "caller_function=test_slow_write_logs_owner_and_timings" in message
     assert "wait_seconds=0.000 held_seconds=1.250" in message
+    assert "body_seconds=0.000 commit_seconds=1.250" in message
     assert "thread_name=MainThread" in message
+
+
+def test_slow_body_is_attributed_separately_from_commit(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    clock = iter((600.0, 600.0, 601.25, 601.25, 601.25, 601.25))
+    monkeypatch.setattr(sync_transactions, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    with closing(sqlite3.connect(":memory:")) as conn:
+        with caplog.at_level(logging.WARNING, logger="mcp_telegram.sync_transactions"):
+            with write_transaction(conn):
+                pass
+    records = [record for record in caplog.records if record.name == "mcp_telegram.sync_transactions"]
+    assert len(records) == 1
+    assert records[0].message.startswith("sqlite_write_slow stage=body")
+    assert "body_seconds=1.250 commit_seconds=0.000" in records[0].message
+    assert "held_seconds=1.250" in records[0].message
 
 
 def test_slow_lock_wait_logs_after_transaction(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    clock = iter((200.0, 201.25, 201.25, 201.25))
+    clock = iter((200.0, 201.25, 201.25, 201.25, 201.25, 201.25))
     monkeypatch.setattr(sync_transactions, "time", SimpleNamespace(monotonic=lambda: next(clock)))
     with closing(sqlite3.connect(":memory:")) as conn:
         with caplog.at_level(logging.WARNING, logger="mcp_telegram.sync_transactions"):
@@ -203,10 +251,11 @@ def test_slow_lock_wait_logs_after_transaction(
     assert len(records) == 1
     assert records[0].message.startswith("sqlite_write_slow stage=begin")
     assert "wait_seconds=1.250 held_seconds=0.000" in records[0].message
+    assert "body_seconds=0.000 commit_seconds=0.000" in records[0].message
 
 
 def test_slow_wait_logs_when_body_fails(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
-    clock = iter((300.0, 301.25, 301.25, 301.25, 301.25))
+    clock = iter((300.0, 301.25, 302.5, 302.5, 302.5, 302.5))
     monkeypatch.setattr(sync_transactions, "time", SimpleNamespace(monotonic=lambda: next(clock)))
     with closing(sqlite3.connect(":memory:")) as conn:
         with caplog.at_level(logging.WARNING, logger="mcp_telegram.sync_transactions"):
@@ -216,6 +265,7 @@ def test_slow_wait_logs_when_body_fails(monkeypatch: pytest.MonkeyPatch, caplog:
     record = next(record for record in caplog.records if record.name == "mcp_telegram.sync_transactions")
     assert record.message.startswith("sqlite_write_slow stage=body")
     assert "wait_seconds=1.250" in record.message
+    assert "body_seconds=1.250 commit_seconds=0.000" in record.message
     assert "error_type=ValueError" in record.message
 
 
@@ -224,7 +274,7 @@ def test_busy_after_long_hold_is_warning(
 ) -> None:
     path = tmp_path / "sync.db"
     _create_db(path)
-    clock = iter((400.0, 400.0, 401.25, 401.25, 401.25))
+    clock = iter((400.0, 400.0, 401.25, 401.25, 401.25, 401.25))
     monkeypatch.setattr(sync_transactions, "time", SimpleNamespace(monotonic=lambda: next(clock)))
     with (
         closing(sqlite3.connect(path, timeout=0)) as conn,
@@ -240,12 +290,13 @@ def test_busy_after_long_hold_is_warning(
         assert "stage=body" in record.message
         assert "sqlite_errorcode=5 sqlite_errorname=SQLITE_BUSY" in record.message
         assert "held_seconds=1.250" in record.message
+        assert "body_seconds=1.250 commit_seconds=0.000" in record.message
 
 
 def test_failing_logger_does_not_replace_primary_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    clock = iter((500.0, 500.0, 501.25, 501.25, 501.25))
+    clock = iter((500.0, 500.0, 501.25, 501.25, 501.25, 501.25))
     monkeypatch.setattr(sync_transactions, "time", SimpleNamespace(monotonic=lambda: next(clock)))
     logger_transaction_states: list[bool] = []
 

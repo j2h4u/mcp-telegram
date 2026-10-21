@@ -11,11 +11,12 @@ import asyncio
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import cast
 
 from .models import ReadMessage
 from .reactions import ReactionDetailRefresher
+from .sqlite_writer import SQLiteWriter
 from .sync_transactions import write_transaction
 from .telegram_demand import (
     AcquisitionKind,
@@ -241,6 +242,7 @@ class MessageFactRefreshDeps:
     """Infrastructure dependencies for one optional fact refresh cycle."""
 
     conn: sqlite3.Connection
+    writer: SQLiteWriter = field(kw_only=True)
     reaction_detail_refresher: ReactionDetailRefresher
     read_receipt_gateway: TelegramReadReceiptGateway
     read_at_observer: Callable[[Mapping[str, object]], None] | None = None
@@ -938,6 +940,7 @@ async def _refresh_read_at_cycle(
             deps.read_receipt_gateway,
             grouped[0].dialog_id,
             grouped,
+            writer=deps.writer,
             dialog_type="user",
             read_at_ttl_seconds=policy.read_at_ttl_seconds,
             checked_at=checked_at,
@@ -984,7 +987,7 @@ async def _refresh_one_reaction_page(
     shutdown_event: asyncio.Event | None,
 ) -> tuple[int, bool]:
     dialog_id, message_id, generation, offset = row
-    if not _start_reaction_page(deps.conn):
+    if not await deps.writer.run(_start_reaction_page):
         return 0, True
     detail = await deps.reaction_detail_refresher.refresh_one(
         dialog_id,
@@ -995,8 +998,10 @@ async def _refresh_one_reaction_page(
         cancellation_event=shutdown_event,
         now=checked_at,
     )
-    if detail.retry_after is not None and detail.stop_cycle:
-        _extend_reaction_release(deps.conn, now=int(deps.clock()), retry_after=detail.retry_after)
+    retry_after = detail.retry_after
+    if retry_after is not None and detail.stop_cycle:
+        release_now = int(deps.clock())
+        await deps.writer.run(lambda conn: _extend_reaction_release(conn, now=release_now, retry_after=retry_after))
     return detail.fetched_pages, detail.stop_cycle or detail.status == "cancelled"
 
 
@@ -1011,13 +1016,15 @@ async def _refresh_reaction_pages(  # noqa: PLR0913 - keeps transaction and dema
 ) -> int:
     if shutdown_event is not None and shutdown_event.is_set():
         return 0
-    selected_reaction_rows = _claim_reaction_pages(
-        deps.conn,
-        now=claim_at,
-        max_pages=policy.reaction_detail_max_pages_per_cycle,
-        cycle_seconds=policy.reaction_detail_cycle_seconds,
-        candidate_limit=policy.reaction_max_messages_per_cycle,
-        candidates=candidates,
+    selected_reaction_rows = await deps.writer.run(
+        lambda conn: _claim_reaction_pages(
+            conn,
+            now=claim_at,
+            max_pages=policy.reaction_detail_max_pages_per_cycle,
+            cycle_seconds=policy.reaction_detail_cycle_seconds,
+            candidate_limit=policy.reaction_max_messages_per_cycle,
+            candidates=candidates,
+        )
     )
     reaction_refreshed = 0
     for index, row in enumerate(selected_reaction_rows):

@@ -56,6 +56,7 @@ from tests.helpers import (
     LoudUserAvatarHistoryPort,
     LoudUserProfilePort,
 )
+from tests.sqlite_writer_helpers import inline_writer
 
 
 def test_trace_content_projection_renders_persisted_hidden_link() -> None:
@@ -171,7 +172,7 @@ async def test_trace_acquisition_reserves_order_before_iterator_and_keeps_newer_
     fetched, status = await _trace_enrich_candidate_messages(
         _TraceCandidateMessagesContext(
             client=UpdatingClient(),
-            conn=conn,
+            writer=inline_writer(conn),
             dialog_id=222,
             iter_kwargs={"limit": 1},
             target_user_id=101,
@@ -224,6 +225,7 @@ def trace_enrichment_server(tmp_path: Path) -> Iterator[tuple[DaemonAPIServer, s
         conn,
         client,
         asyncio.Event(),
+        writer=inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
@@ -247,6 +249,7 @@ def trace_service(
     return DaemonAccountTraceService(
         DaemonAccountTraceDeps(
             conn=conn,
+            writer=server._writer,
             client=client,
             resolve_dialog_id=server._resolve_dialog_id,
             self_id=server.self_id,
@@ -597,7 +600,7 @@ async def test_trace_enrichment_propagates_latched_protection_without_retry_frag
         await _trace_enrich_candidate_messages(
             _TraceCandidateMessagesContext(
                 client=client,
-                conn=conn,
+                writer=inline_writer(conn),
                 dialog_id=222,
                 iter_kwargs={"limit": 1},
                 target_user_id=101,
@@ -670,7 +673,7 @@ async def test_trace_enrichment_partial_error_preserves_accumulated_messages(
     fetched, status = await _trace_enrich_candidate_messages(
         _TraceCandidateMessagesContext(
             client=PartialClient(),
-            conn=conn,
+            writer=inline_writer(conn),
             dialog_id=222,
             iter_kwargs={"limit": 100},
             target_user_id=101,

@@ -45,6 +45,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     current_rpc_scope,
     rpc_scope,
 )
+from tests.sqlite_writer_helpers import inline_writer
 
 
 def _hydration_db() -> sqlite3.Connection:
@@ -184,6 +185,7 @@ def _hydration_worker(
         object(),
         conn,
         asyncio.Event(),
+        writer=inline_writer(conn),
         handlers=(handler,),
         interval_seconds=60,
         max_requests_per_cycle=2,
@@ -268,6 +270,7 @@ def _repair_hydration_worker(
         object(),
         conn,
         asyncio.Event(),
+        writer=inline_writer(conn),
         handlers=(handler,),
         interval_seconds=interval_seconds,
         max_requests_per_cycle=2,
@@ -517,7 +520,7 @@ async def test_backfill_repair_failure_keeps_deadline_due() -> None:
     handler = _HydrationHandler()
     worker = _repair_hydration_worker(conn, handler)
 
-    def fail(_now: int) -> bool:
+    def fail(_conn: sqlite3.Connection, _now: int) -> bool:
         raise RuntimeError("producer failed")
 
     worker._run_repair_producers = fail  # type: ignore[method-assign]
@@ -535,7 +538,7 @@ async def test_slow_backfill_repair_cooldown_starts_after_completion(monkeypatch
     worker = _repair_hydration_worker(conn, _HydrationHandler(), clock=lambda: clock[0])
     calls = 0
 
-    def repair(_now: int) -> tuple[bool, tuple[None, None, None]]:
+    def repair(_conn: sqlite3.Connection, _now: int) -> tuple[bool, tuple[None, None, None]]:
         nonlocal calls
         calls += 1
         clock[0] += 300
@@ -565,6 +568,7 @@ def test_repair_cursor_advances_only_after_commit_and_resets_at_completed_sweep(
     )
 
     def fail_commit(
+        _conn: sqlite3.Connection,
         _now: int,
     ) -> tuple[bool, tuple[HydrationRepairCursor, HydrationRepairCursor, HydrationRepairCursor]]:
         conn.execute("INSERT INTO repair_child VALUES (1)")
@@ -573,17 +577,17 @@ def test_repair_cursor_advances_only_after_commit_and_resets_at_completed_sweep(
     try:
         monkeypatch.setattr(worker, "_run_repair_producers", fail_commit)
         with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
-            worker._run_due_repairs(100, 100)
+            asyncio.run(worker._run_due_repairs(100, 100))
         assert not conn.in_transaction
         assert conn.execute("SELECT COUNT(*) FROM repair_child").fetchone() == (0,)
         assert worker._repair_cursors == (None, None, None)
         assert worker.next_repair_at == 100
-        monkeypatch.setattr(worker, "_run_repair_producers", lambda _now: (True, next_cursors))
-        worker._run_due_repairs(100, 100)
+        monkeypatch.setattr(worker, "_run_repair_producers", lambda _conn, _now: (True, next_cursors))
+        asyncio.run(worker._run_due_repairs(100, 100))
         assert worker._repair_cursors == next_cursors
         assert worker.next_repair_at == 100
-        monkeypatch.setattr(worker, "_run_repair_producers", lambda _now: (False, next_cursors))
-        worker._run_due_repairs(100, 100)
+        monkeypatch.setattr(worker, "_run_repair_producers", lambda _conn, _now: (False, next_cursors))
+        asyncio.run(worker._run_due_repairs(100, 100))
         assert worker._repair_cursors == (None, None, None)
         assert worker.next_repair_at == 160
     finally:
@@ -601,7 +605,7 @@ def test_backfill_repair_rejects_foreign_transaction_without_rolling_it_back(
         worker = _repair_hydration_worker(conn, _HydrationHandler())
         conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
         with pytest.raises(RuntimeError, match="requires no open transaction"):
-            worker._run_due_repairs(100, 100)
+            asyncio.run(worker._run_due_repairs(100, 100))
         assert conn.in_transaction
         assert conn.execute("SELECT dialog_id FROM synced_dialogs").fetchall() == [(1,)]
         assert reader.execute("SELECT dialog_id FROM synced_dialogs").fetchall() == []
@@ -636,6 +640,7 @@ def test_backfill_repair_rolls_back_all_producers_and_retries_same_page(
             object(),
             conn,
             asyncio.Event(),
+            writer=inline_writer(conn),
             handlers=(handler, MediaFactHydrationHandler(batch_size=1)),
             interval_seconds=60,
             max_requests_per_cycle=2,
@@ -655,14 +660,14 @@ def test_backfill_repair_rolls_back_all_producers_and_retries_same_page(
 
         monkeypatch.setattr(fact_hydration, "repair_media_metadata_hydration_jobs", fail_second_producer)
         with pytest.raises(sqlite3.OperationalError, match="producer failed"):
-            worker._run_due_repairs(100, 100)
+            asyncio.run(worker._run_due_repairs(100, 100))
         assert not conn.in_transaction
         assert reader.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
         assert worker._repair_cursors == (None, None, None)
         assert worker.next_repair_at == 100
 
         monkeypatch.setattr(fact_hydration, "repair_media_metadata_hydration_jobs", media_repair)
-        worker._run_due_repairs(100, 100)
+        asyncio.run(worker._run_due_repairs(100, 100))
         assert not conn.in_transaction
         assert reader.execute("SELECT kind, message_id FROM hydration_jobs").fetchall() == [("transcription", 1)]
         assert worker.next_repair_at == 160
@@ -706,7 +711,7 @@ def test_backfill_repair_owns_wal_writer_before_candidate_reads(
             return rows
 
         monkeypatch.setattr(sqlite_hydration_jobs, "_repair_raw_page", attempt_competing_write)
-        worker._run_due_repairs(100, 100)
+        asyncio.run(worker._run_due_repairs(100, 100))
         assert interleaved
         assert not conn.in_transaction
         assert conn.execute("SELECT kind, message_id FROM hydration_jobs").fetchall() == [("media_metadata", 1)]

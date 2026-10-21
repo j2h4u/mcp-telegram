@@ -15,6 +15,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcScope,
     TelegramRpcSource,
 )
+from sqlite_writer_helpers import inline_writer
 
 
 def _closed_error(source: TelegramRpcSource) -> RpcAdmissionClosedError:
@@ -78,6 +79,7 @@ async def test_peer_sweep_resolution_propagates_scheduler_close() -> None:
             min_id=0,
             limit=10,
             timeout_s=1,
+            writer=inline_writer(conn),
         )
         with pytest.raises(RpcAdmissionClosedError, match="scheduler closed"):
             await _resolve_peer_for_sweep(request)
@@ -97,4 +99,6 @@ async def test_scheduled_entity_resolution_propagates_scheduler_close() -> None:
 
     with closing(sqlite3.connect(":memory:")) as conn:
         with pytest.raises(RpcAdmissionClosedError, match="scheduler closed"):
-            await _load_candidate_entity(_ClosedScheduledClient(closed), conn, 42, "channel", None)
+            await _load_candidate_entity(
+                _ClosedScheduledClient(closed), conn, 42, "channel", None, writer=inline_writer(conn)
+            )
