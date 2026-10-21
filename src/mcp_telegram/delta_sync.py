@@ -432,14 +432,10 @@ class DeltaSyncWorker:
             self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
         except MessageHistoryAccessLostError as exc:
-
-            def persist_access_loss(conn: sqlite3.Connection, error: MessageHistoryAccessLostError = exc) -> None:
-                with write_transaction(conn):
-                    set_access_lost(
-                        conn, dialog_id, int(time.time()), reason=error.reason_code, refresh_generation=generation
-                    )
-
-            await self._writer.run(persist_access_loss)
+            access_error = exc
+            await self._writer.run(
+                lambda conn: self._persist_access_loss(conn, dialog_id, access_error.reason_code, generation)
+            )
             self._last_delta_slice_access_lost = True
             return _DeltaFetchOutcome([], 0)
         except (MessageHistoryUnavailableError, TimeoutError) as exc:
@@ -467,6 +463,10 @@ class DeltaSyncWorker:
                 "uncommitted_unique_count": len(unique_keys),
             }
         return _DeltaFetchOutcome(rows, completed=page.complete, reaction_observed_at=reaction_observed_at)
+
+    def _persist_access_loss(self, conn: sqlite3.Connection, dialog_id: int, reason: str, generation: int) -> None:
+        with write_transaction(conn):
+            set_access_lost(conn, dialog_id, int(time.time()), reason=reason, refresh_generation=generation)
 
     async def _commit_delta_slice(self, dialog_id: int, outcome: _DeltaFetchOutcome, generation: int) -> int:
         continuation_required = not outcome.completed or len(outcome.rows) == _DELTA_SLICE_MESSAGE_LIMIT
@@ -714,24 +714,15 @@ class DeltaGapFillDemandAdapter:
                 try:
                     await self._run_forward_slice(budget, dialog_id)
                 except MessageHistoryUnavailableError, TimeoutError:
-
-                    def persist_retry(conn: sqlite3.Connection) -> None:
-                        with write_transaction(conn):
-                            conn.execute(
-                                "UPDATE synced_dialogs SET delta_retry_at=? WHERE dialog_id=?",
-                                (int(time.time()) + 60, dialog_id),
-                            )
-
-                    await self._worker._writer.run(persist_retry)
+                    await self._worker._writer.run(
+                        lambda conn: self._persist_retry(conn, dialog_id, int(time.time()) + 60)
+                    )
                 else:
+                    await self._worker._writer.run(lambda conn: self._persist_retry(conn, dialog_id, None))
 
-                    def clear_retry(conn: sqlite3.Connection) -> None:
-                        with write_transaction(conn):
-                            conn.execute(
-                                "UPDATE synced_dialogs SET delta_retry_at=NULL WHERE dialog_id=?", (dialog_id,)
-                            )
-
-                    await self._worker._writer.run(clear_retry)
+    def _persist_retry(self, conn: sqlite3.Connection, dialog_id: int, retry_at: int | None) -> None:
+        with write_transaction(conn):
+            conn.execute("UPDATE synced_dialogs SET delta_retry_at=? WHERE dialog_id=?", (retry_at, dialog_id))
 
 
 class DmDeletionReconciliationDemandAdapter:

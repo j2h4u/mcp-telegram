@@ -416,38 +416,20 @@ class FullSyncWorker:
             self._last_total_repair_error = exc
             return False
         except MessageHistoryAccessLostError as exc:
-
-            def persist_access_loss(conn: sqlite3.Connection, error: MessageHistoryAccessLostError = exc) -> None:
-                with write_transaction(conn):
-                    set_access_lost(conn, dialog_id, int(time.time()), reason=error.reason_code)
-
-            await self._writer.run(persist_access_loss)
+            access_error = exc
+            await self._writer.run(lambda conn: self._persist_access_loss(conn, dialog_id, access_error.reason_code))
             return False
         except (MessageHistoryUnavailableError, TimeoutError) as exc:
             logger.warning("sync_total_repair_failed dialog_id=%d error=%s", dialog_id, exc)
 
-            def persist_total_retry(conn: sqlite3.Connection) -> None:
-                with write_transaction(conn):
-                    conn.execute(
-                        "UPDATE synced_dialogs SET full_sync_retry_at=? WHERE dialog_id=?",
-                        (int(time.time()) + 60, dialog_id),
-                    )
-
-            await self._writer.run(persist_total_retry)
+            await self._writer.run(lambda conn: self._persist_total_retry(conn, dialog_id))
             self._last_total_repair_error = exc
             return False
 
         if total_messages is None:
             logger.warning("sync_total_repair_missing_total dialog_id=%d", dialog_id)
 
-            def persist_missing_total_retry(conn: sqlite3.Connection) -> None:
-                with write_transaction(conn):
-                    conn.execute(
-                        "UPDATE synced_dialogs SET full_sync_retry_at=? WHERE dialog_id=?",
-                        (int(time.time()) + 60, dialog_id),
-                    )
-
-            await self._writer.run(persist_missing_total_retry)
+            await self._writer.run(lambda conn: self._persist_total_retry(conn, dialog_id))
             return False
 
         def persist_total(conn: sqlite3.Connection) -> None:
@@ -462,6 +444,16 @@ class FullSyncWorker:
         await self._writer.run(persist_total)
         logger.info("sync_total_repair_complete dialog_id=%d total_messages=%d", dialog_id, total_messages)
         return self._next_total_messages_repair_dialog() is None
+
+    def _persist_access_loss(self, conn: sqlite3.Connection, dialog_id: int, reason: str) -> None:
+        with write_transaction(conn):
+            set_access_lost(conn, dialog_id, int(time.time()), reason=reason)
+
+    def _persist_total_retry(self, conn: sqlite3.Connection, dialog_id: int) -> None:
+        with write_transaction(conn):
+            conn.execute(
+                "UPDATE synced_dialogs SET full_sync_retry_at=? WHERE dialog_id=?", (int(time.time()) + 60, dialog_id)
+            )
 
     def _set_total_repair_retry(self, conn: sqlite3.Connection, retry_after_seconds: object | None) -> None:
         try:
@@ -570,33 +562,23 @@ class FullSyncWorker:
         dialog_id = self._next_automatic_group()
         if dialog_id is None:
             return False
+
+        def persist_probe_retry(conn: sqlite3.Connection) -> None:
+            with write_transaction(conn):
+                self._set_automatic_group_retry(conn, dialog_id)
+
         try:
             page = await self._fetch_batch_page(dialog_id, 0)
         except Exception:
-
-            def persist_probe_retry(conn: sqlite3.Connection) -> None:
-                with write_transaction(conn):
-                    self._set_automatic_group_retry(conn, dialog_id)
-
             await self._writer.run(persist_probe_retry)
             raise
         if page.retry is not None:
-
-            def persist_deferred_probe_retry(conn: sqlite3.Connection) -> None:
-                with write_transaction(conn):
-                    self._set_automatic_group_retry(conn, dialog_id)
-
-            await self._writer.run(persist_deferred_probe_retry)
+            await self._writer.run(persist_probe_retry)
             if isinstance(self._last_page_error, MessageHistoryUnavailableError):
                 self._last_page_error = None
             return True
         if page.total_messages is None:
-
-            def persist_missing_probe_retry(conn: sqlite3.Connection) -> None:
-                with write_transaction(conn):
-                    self._set_automatic_group_retry(conn, dialog_id)
-
-            await self._writer.run(persist_missing_probe_retry)
+            await self._writer.run(persist_probe_retry)
             return True
         return await self._writer.run(lambda conn: self._finalize_automatic_group_page(conn, dialog_id, page))
 
