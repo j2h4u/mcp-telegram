@@ -257,12 +257,9 @@ class RuntimeObservationSink:
         self._last_logged_summary = self._summary_snapshot(RuntimeObservationCounters())
         self._accepting = True
         self._closed = False
-        self._writer_error: BaseException | None = None
         self._counters = RuntimeObservationCounters()
         self._prune_pending = False
         self._prune_now_ms: int | None = None
-        self._external_writes_since_prune = 0
-        self._maintenance_requested = threading.Event()
         self._flush_task = asyncio.create_task(self._flush_loop(), name="runtime-observation-flush")
 
     @staticmethod
@@ -323,9 +320,6 @@ class RuntimeObservationSink:
             payload_json=encode_payload(payload),
         )
         with self._state_lock:
-            if self._writer_error is not None:
-                self._increment("rejected_submissions")
-                return False
             if self._closed or not self._accepting:
                 self._increment("rejected_submissions")
                 return False
@@ -335,16 +329,6 @@ class RuntimeObservationSink:
                 self._increment("queue_full_drops")
                 return False
         return True
-
-    def note_external_write(self) -> None:
-        """Request maintenance after committed observations written elsewhere."""
-        with self._state_lock:
-            if self._closed or not self._accepting or self._writer_error is not None:
-                return
-            self._external_writes_since_prune += 1
-            if self._external_writes_since_prune >= self._prune_every_writes:
-                self._external_writes_since_prune = 0
-                self._maintenance_requested.set()
 
     def close(self) -> None:
         """Stop admission immediately; async callers must await aclose to drain."""
@@ -415,11 +399,6 @@ class RuntimeObservationSink:
     @property
     def startup_drops(self) -> int:
         return self.stats.startup_drops
-
-    @property
-    def writer_error(self) -> str | None:
-        with self._state_lock:
-            return None if self._writer_error is None else str(self._writer_error)
 
     def _increment(self, name: str, amount: int = 1) -> None:
         with self._counter_lock:
@@ -513,7 +492,6 @@ class RuntimeObservationSink:
     async def _flush_loop(self) -> None:
         writes_since_prune = 0
         while True:
-            self._consume_external_write_request()
             jobs: list[_ObservationJob] = []
             while len(jobs) < _FLUSH_BATCH_SIZE:
                 try:
@@ -546,13 +524,6 @@ class RuntimeObservationSink:
             for _ in jobs:
                 self._jobs.task_done()
         return writes_since_prune
-
-    def _consume_external_write_request(self) -> None:
-        with self._state_lock:
-            if not self._maintenance_requested.is_set():
-                return
-            self._maintenance_requested.clear()
-        self._prune_pending = True
 
     async def _run_prune_batch(self) -> None:
         effective_now = self._prune_now_ms or int(time.time() * 1000)

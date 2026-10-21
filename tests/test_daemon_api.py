@@ -29,7 +29,6 @@ from mcp_telegram.daemon_api import (
     DaemonClientLike,
     _normalize_telemetry_outcome,
     _ResolverEntityCache,
-    _write_telemetry,
 )
 from mcp_telegram.daemon_ipc import get_daemon_socket_path
 from mcp_telegram.daemon_message import _MessageLike, fetch_reaction_counts, message_to_dict
@@ -4447,18 +4446,19 @@ async def test_record_telemetry_enqueues_without_writing_loop_connection() -> No
     assert conn.execute("SELECT tool_name FROM runtime_observations").fetchall() == []
 
 
-def test_daemon_api_telemetry_insert_is_not_pruned_on_hot_path() -> None:
+@pytest.mark.asyncio
+async def test_daemon_api_telemetry_insert_is_not_pruned_on_hot_path() -> None:
     conn = _make_db_with_entities()
     for tool_name in ("Oldest", "Older", "Recent"):
         record_runtime_observation(conn, kind="mcp.call", tool_name=tool_name)
     conn.commit()
-    _write_telemetry(conn, {"tool_name": "Current"})
+    assert await make_server(conn)._record_telemetry({"event": {"tool_name": "Current"}}) == {"ok": True}
 
-    assert conn.execute("SELECT tool_name FROM runtime_observations ORDER BY id").fetchall() == [
-        ("Oldest",),
-        ("Older",),
-        ("Recent",),
-        ("Current",),
+    assert [row[0] for row in conn.execute("SELECT tool_name FROM runtime_observations ORDER BY id")] == [
+        "Oldest",
+        "Older",
+        "Recent",
+        "Current",
     ]
 
 
@@ -9274,25 +9274,34 @@ def test_trace_candidate_no_discussion_group_stays_signature_only() -> None:
     assert _LINKED_CHAT_ID not in dialog_ids, "linked group appeared in candidates despite no discussion group"
 
 
-def test_telemetry_rejects_foreign_transaction_without_committing() -> None:
+@pytest.mark.asyncio
+async def test_telemetry_enqueue_preserves_foreign_transaction_without_committing() -> None:
     conn = _make_db_with_entities()
     conn.execute("INSERT INTO daemon_state(key,value) VALUES ('foreign', 'pending')")
-    with pytest.raises(RuntimeError, match="idle connection"):
-        _write_telemetry(conn, {"tool_name": "Current"})
+    server = make_server(conn)
+    sink = MagicMock()
+    server.bind_runtime_observation_sink(cast(RuntimeObservationSink, sink))
+    assert await server._record_telemetry({"event": {"tool_name": "Current"}}) == {"ok": True}
+    sink.record.assert_called_once()
     assert conn.in_transaction
     assert conn.execute("SELECT COUNT(*) FROM runtime_observations").fetchone()[0] == 0
     conn.rollback()
     assert conn.execute("SELECT COUNT(*) FROM daemon_state WHERE key='foreign'").fetchone()[0] == 0
 
 
-def test_telemetry_writes_with_runtime_guard_and_restores_it() -> None:
+@pytest.mark.asyncio
+async def test_telemetry_enqueue_preserves_runtime_guard() -> None:
     conn = _make_db_with_entities()
     conn.commit()
     enable_runtime_writes(conn)
-    _write_telemetry(conn, {"tool_name": "Current"})
+    server = make_server(conn)
+    sink = MagicMock()
+    server.bind_runtime_observation_sink(cast(RuntimeObservationSink, sink))
+    assert await server._record_telemetry({"event": {"tool_name": "Current"}}) == {"ok": True}
+    sink.record.assert_called_once()
     assert not conn.in_transaction
     assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
-    assert conn.execute("SELECT tool_name FROM runtime_observations").fetchone()[0] == "Current"
+    assert conn.execute("SELECT COUNT(*) FROM runtime_observations").fetchone()[0] == 0
 
 
 @pytest.mark.asyncio

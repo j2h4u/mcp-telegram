@@ -101,7 +101,6 @@ from .request_timing import (
 from .runtime_observations import (
     RuntimeObservationPolicy,
     RuntimeObservationSink,
-    record_runtime_observation,
     tool_telemetry_identity,
 )
 from .sqlite_writer import SQLiteWriter
@@ -345,38 +344,6 @@ def _mcp_timing_payload(event: Mapping[str, object]) -> dict[str, object]:
         if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= sys.float_info.max:
             payload[field] = value
     return payload
-
-
-def _insert_telemetry_row(
-    conn: sqlite3.Connection,
-    event: Mapping[str, object],
-) -> None:
-    record_runtime_observation(
-        conn,
-        kind="mcp.call",
-        observed_at_ms=int(float(cast(float, event.get("timestamp", time.time()))) * 1000),
-        operation_id=cast(str | None, event.get("operation_id")),
-        tool_name=str(event["tool_name"]),
-        tool_capability=cast(str | None, event.get("tool_capability")),
-        contract_version=cast(int | None, event.get("contract_version")),
-        duration_ms=float(cast(float, event.get("duration_ms", 0))),
-        result_count=int(cast(int, event.get("result_count", 0))),
-        has_cursor=bool(event.get("has_cursor")),
-        page_depth=int(cast(int, event.get("page_depth", 1))),
-        has_filter=bool(event.get("has_filter")),
-        outcome=str(event.get("outcome", "success")),
-        reason_code=cast(str | None, event.get("error_code")),
-        error_type=cast(str | None, event.get("error_type")),
-        payload=_mcp_timing_payload(event),
-    )
-
-
-def _write_telemetry(
-    conn: sqlite3.Connection,
-    event: Mapping[str, object],
-) -> None:
-    with write_transaction(conn):
-        _insert_telemetry_row(conn, event)
 
 
 class TelemetryPolicy(Protocol):
