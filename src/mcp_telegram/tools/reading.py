@@ -234,7 +234,9 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                 "last_delta_checked_at": {"type": ["integer", "null"]},
                 "sync_coverage_pct": {"type": ["integer", "null"]},
                 "archived_message_count": {"type": ["integer", "null"]},
-                "selection_state": {"type": "string", "enum": ["present", "unknown"]},
+                "selection_state": {"type": "string", "enum": ["present", "known_empty", "unknown"]},
+                "observation_horizon_at": {"type": ["integer", "null"]},
+                "sync_status": {"type": ["string", "null"]},
                 "topic_attribution": {
                     "type": "object",
                     "properties": {
@@ -506,20 +508,10 @@ def _list_messages_dialog_name(data: dict, rows: list[dict], fallback_dialog: st
 def _list_messages_coverage(data: dict) -> dict[str, object]:
     raw_coverage = data.get("coverage")
     dialog_access = data.get("dialog_access")
-    if raw_coverage in {"fragment", "local_only"}:
-        kind = "fragment"
-        if raw_coverage == "local_only":
-            kind = "local_only"
-    elif dialog_access == "archived":
-        kind = "archived"
-    elif dialog_access == "live":
-        kind = "live"
-    else:
-        kind = str(data.get("source") or "unknown")
     coverage: dict[str, object] = {
-        "kind": kind,
-        "state": kind,
-        "fragment_coverage": raw_coverage == "fragment",
+        "kind": "local_history",
+        "state": raw_coverage if raw_coverage in {"complete_as_of", "partial", "unknown"} else "unknown",
+        "fragment_coverage": data.get("sync_status") == "fragment",
         "dialog_access": dialog_access,
         "access_lost_at": data.get("access_lost_at"),
         "last_synced_at": data.get("last_synced_at"),
@@ -527,9 +519,11 @@ def _list_messages_coverage(data: dict) -> dict[str, object]:
         "last_delta_checked_at": data.get("last_delta_checked_at"),
         "sync_coverage_pct": data.get("sync_coverage_pct"),
         "archived_message_count": data.get("archived_message_count"),
+        "observation_horizon_at": data.get("observation_horizon_at"),
+        "sync_status": data.get("sync_status"),
     }
     selection_state = data.get("selection_state")
-    if selection_state in {"present", "unknown"}:
+    if selection_state in {"present", "known_empty", "unknown"}:
         coverage["selection_state"] = selection_state
     topic_attribution = data.get("topic_attribution")
     if isinstance(topic_attribution, dict):
@@ -549,16 +543,13 @@ def _list_messages_warnings(data: dict) -> list[StructuredWarning]:
                 action="Treat results as local archive content; sync cannot fetch current messages until access is restored.",
             )
         )
-    if data.get("coverage") == "local_only":
+    if data.get("coverage") in {"local_only", "partial", "unknown"}:
         warnings.append(
             structured_warning(
-                "local_history_unavailable",
+                "local_history_incomplete",
                 "This local read cannot establish complete published history; results contain only records available in this projection.",
                 severity="warning",
-                action=(
-                    "Mark the dialog for sync to make a complete local history available, or retry with "
-                    'message_state="sent" for an on-demand live page.'
-                ),
+                action=("Use mark_dialog_for_sync to request history acquisition; reads return retained local facts."),
             )
         )
     return warnings
@@ -1150,10 +1141,11 @@ class ListMessages(ToolArgs):
     topic resolution. Scheduled rows are author_only and unpublished.
 
     Use anchor_message_id with exact_dialog_id to read context around a search hit.
-    When local history is absent, the daemon may retain a bounded fragment around
-    that anchor; access-lost dialogs cannot be fetched. Supports sender, topic,
-    unread, and UTC time bounds. DM rows include read_state; inline read markers
-    show boundaries. Fragment coverage is a targeted snippet, not complete history.
+    Reads use retained local facts in every sync state and never fetch Telegram.
+    Missing anchors are reported as unavailable. Sender, topic and unread filters
+    cannot be combined with anchors; UTC bounds remain supported. Coverage and
+    its observation horizon describe what is known; local page exhaustion does
+    not establish current Telegram completeness. DM rows include read_state.
     """
 
     dialog: str | None = Field(
@@ -1161,7 +1153,7 @@ class ListMessages(ToolArgs):
         max_length=500,
         description=(
             f"{NATURAL_DIALOG_SELECTOR_DESCRIPTION} Mutually exclusive with exact_dialog_id. "
-            "For message_state=all or draft, names and @usernames resolve from the local dialog directory only; "
+            "Names and @usernames resolve from the local dialog directory only; "
             "use a previously returned exact_dialog_id when that directory lacks the selector."
         ),
     )
@@ -1210,10 +1202,9 @@ class ListMessages(ToolArgs):
         le=2_147_483_647,
         description=(
             "Optional message id to centre the response on. Returns context_size messages "
-            "including the anchor, split as evenly as possible before and after it. If local "
-            "history is unavailable, the daemon may fetch and retain that bounded fragment "
-            "from Telegram. Access-lost dialogs cannot be fetched. When set, navigation and "
-            "direction are ignored. "
+            "including the retained anchor, split as evenly as possible before and after it. "
+            "An unavailable local anchor returns a recoverable error. Sender, topic and unread "
+            "filters cannot be combined with an anchor. Navigation and direction are ignored. "
             'Obtain from msg_id: values in SearchMessages results. Requires message_state="sent".'
         ),
     )
@@ -1262,9 +1253,17 @@ def _validate_topic_selectors(args: ListMessages) -> None:
         raise ValueError("topic and exact_topic_id are mutually exclusive.")
 
 
-def _validate_message_state_selector(args: ListMessages) -> None:
+def _validate_context_selector(args: ListMessages) -> None:
+    if args.anchor_message_id is not None and (
+        args.sender is not None or args.topic is not None or args.exact_topic_id is not None or args.unread
+    ):
+        raise ValueError("anchor_message_id cannot be combined with sender, topic, exact_topic_id, or unread.")
     if args.message_state != "sent" and args.anchor_message_id is not None:
         raise ValueError('anchor_message_id requires message_state="sent"; retry with message_state="sent".')
+
+
+def _validate_message_state_selector(args: ListMessages) -> None:
+    _validate_context_selector(args)
     if args.unread and args.message_state in {"scheduled", "draft"}:
         raise ValueError('unread requires message_state="sent" or "all".')
     if args.message_state != "sent" and args.topic is not None:
@@ -1311,8 +1310,13 @@ def _project_resolved_topic(
     catalog = _validated_topic_catalog(response, requested_dialog_id)
     if isinstance(catalog, ToolResult):
         return catalog
-    dialog_id, topics = catalog
+    dialog_id, topics, data = catalog
+    evidence = _validated_topic_catalog_evidence(data)
+    if isinstance(evidence, ToolResult):
+        return evidence
     resolved_topic_id = _resolve_topic_matches(topics, topic_name)
+    if resolved_topic_id is None:
+        return _topic_not_found_result(dialog_id, evidence)
     if isinstance(resolved_topic_id, ToolResult):
         return resolved_topic_id
     return _ResolvedTopic(dialog_id=dialog_id, topic_id=resolved_topic_id)
@@ -1321,7 +1325,7 @@ def _project_resolved_topic(
 def _validated_topic_catalog(
     response: dict[str, object],
     requested_dialog_id: int | None,
-) -> tuple[int, list[dict[str, object]]] | ToolResult:
+) -> tuple[int, list[dict[str, object]], dict[str, object]] | ToolResult:
     if not response.get("ok"):
         return _topic_lookup_error(response)
     data = response.get("data")
@@ -1338,7 +1342,26 @@ def _validated_topic_catalog(
     topics = data.get("topics")
     if not isinstance(topics, list) or any(not _is_valid_topic_row(topic) for topic in topics):
         return _invalid_topic_lookup_response()
-    return canonical_dialog_id, cast(list[dict[str, object]], topics)
+    return canonical_dialog_id, cast(list[dict[str, object]], topics), data
+
+
+def _validated_topic_catalog_evidence(data: dict[str, object]) -> dict[str, object] | ToolResult:
+    if "catalog" not in data:
+        return {"coverage": "not_observed", "completed_at": None, "pending": False, "reason": None, "retry_at": None}
+    evidence = data["catalog"]
+    if not isinstance(evidence, dict):
+        return _invalid_topic_lookup_response()
+    if not evidence.keys() >= {"coverage", "completed_at", "pending", "reason", "retry_at"}:
+        return _invalid_topic_lookup_response()
+    if evidence["coverage"] not in ("not_observed", "partial", "complete", "not_applicable"):
+        return _invalid_topic_lookup_response()
+    if (
+        type(evidence["pending"]) is not bool
+        or type(evidence["reason"]) not in (str, type(None))
+        or any(type(evidence[field]) not in (int, type(None)) for field in ("completed_at", "retry_at"))
+    ):
+        return _invalid_topic_lookup_response()
+    return cast(dict[str, object], evidence)
 
 
 def _is_valid_topic_row(topic: object) -> bool:
@@ -1376,20 +1399,41 @@ def _topic_lookup_error(response: dict) -> ToolResult:
     )
 
 
-def _resolve_topic_matches(topics: list[dict], topic_name: str) -> int | ToolResult:
+def _resolve_topic_matches(topics: list[dict], topic_name: str) -> int | ToolResult | None:
     query = topic_name.lower()
     fuzzy_matches = [topic for topic in topics if query in (topic.get("title") or "").lower()]
     if len(fuzzy_matches) == 1:
         return fuzzy_matches[0]["id"]
     if not fuzzy_matches:
-        return _topic_not_found_result()
+        return None
     return _resolve_multiple_topic_matches(fuzzy_matches, query)
 
 
-def _topic_not_found_result() -> ToolResult:
+def _topic_not_found_result(dialog_id: int, catalog: dict[str, object]) -> ToolResult:
+    details: dict[str, object] = {"dialog_id": dialog_id, "catalog": catalog}
+    if catalog["coverage"] == "not_applicable":
+        return error_result(
+            "The observed dialog does not support topics.\nAction: Read without a topic filter or use a retained exact_topic_id.",
+            error_code="topic_not_applicable",
+            details=details,
+        )
+    if catalog["coverage"] == "complete":
+        return error_result(
+            "No matching topic in the completed local catalog; this describes the stored observation.\n"
+            "Action: Inspect retained list_topics or choose an already-known exact_topic_id; explicitly mark the dialog for sync if a background refresh is needed.",
+            error_code="topic_not_found",
+            details=details,
+        )
+    action = (
+        "Wait for the pending background catalog acquisition and check later, or use an already-known exact_topic_id."
+        if catalog["pending"]
+        else f"Use an already-known exact_topic_id, or call mark_dialog_for_sync(dialog_id={dialog_id}, enable=True) and wait for background catalog acquisition."
+    )
     return error_result(
-        "Topic was not found in this dialog.\n"
-        "Action: Call list_topics for this dialog, then retry list_messages with a numeric exact_topic_id."
+        "No matching topic is currently stored; the local topic catalog is incomplete, so absence is unknown.\n"
+        f"Action: {action}",
+        error_code="topic_catalog_incomplete",
+        details=details,
     )
 
 
@@ -1474,7 +1518,10 @@ def _list_messages_error_result(
         return ToolResult(
             content=_text_response(
                 ctx.rendered_text
-                or f"Error: {ctx.error}: {ctx.error_detail}\nAction: Retry list_messages with corrected arguments."
+                or (
+                    f"Error: {ctx.error}: {ctx.error_detail}\n"
+                    f"Action: {ctx.structured_content.get('required_action') or 'Retry list_messages with corrected arguments.'}"
+                )
             ),
             is_error=True,
             structured_content=ctx.structured_content,
@@ -1497,7 +1544,7 @@ def _list_messages_error_result(
 
 def _list_messages_structured_error_content(response: dict) -> dict[str, object] | None:
     error = response.get("error")
-    if error not in {"fragment_fetch_failed", "not_synced"}:
+    if error != "local_context_unavailable":
         return None
     return {
         "error": response.get("error", "unknown"),
@@ -1591,7 +1638,7 @@ def _list_messages_response_error(
         read_only_hint=True,
         destructive_hint=False,
         idempotent_hint=True,
-        open_world_hint=True,
+        open_world_hint=False,
     ),
     output_schema=LIST_MESSAGES_OUTPUT_SCHEMA,
 )
@@ -1736,7 +1783,7 @@ class SearchMessages(ToolArgs):
         read_only_hint=True,
         destructive_hint=False,
         idempotent_hint=True,
-        open_world_hint=True,
+        open_world_hint=False,
     ),
     output_schema=SEARCH_MESSAGES_OUTPUT_SCHEMA,
 )

@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Mapping
 from dataclasses import asdict, dataclass
-from datetime import datetime
 from enum import StrEnum
 from typing import Protocol
-
-from .message_contracts import ExtractedMessage
 
 
 class GatewayFailureKind(StrEnum):
@@ -82,22 +78,6 @@ class GatewayFailure:
 
 
 @dataclass(frozen=True, slots=True)
-class FragmentFetchResult:
-    messages: tuple[ExtractedMessage, ...] = ()
-    failure: GatewayFailure | None = None
-
-    @property
-    def ok(self) -> bool:
-        return self.failure is None
-
-
-@dataclass(frozen=True, slots=True)
-class HistoryMessage:
-    message: dict[str, object]
-    date: datetime | None
-
-
-@dataclass(frozen=True, slots=True)
 class ReadDateFetchResult:
     """One Telegram outbox read-date probe; ``read_at`` is never inferred."""
 
@@ -109,16 +89,6 @@ class ReadDateFetchResult:
     @property
     def ok(self) -> bool:
         return self.failure is None
-
-
-class TelegramFragmentGateway(Protocol):
-    async def fetch_context(self, dialog_id: int, anchor_message_id: int, window_size: int) -> FragmentFetchResult: ...
-
-
-class TelegramHistoryGateway(Protocol):
-    def stream_history(
-        self, dialog_id: int, kwargs: Mapping[str, object], self_id: int | None
-    ) -> AsyncGenerator[HistoryMessage | GatewayFailure]: ...
 
 
 class TelegramReadReceiptGateway(Protocol):

@@ -20,9 +20,12 @@ Profile reads use local observations; enabled personal-dialog synchronization
 also collects counterpart profiles in the background and applies delivered
 profile updates. Never-collected sections remain explicitly partial.
 
-Some existing history and topic paths still perform acquisition during
-reads. These are tracked departures from the product contract, not the desired
-runtime model. See [the architecture contract and current exceptions](docs/architecture-proposal.md#durable-facts-and-acquisition-evidence).
+History, bounded context and topic reads also project retained local facts,
+including partially synchronized or disabled dialogs. Missing data does not
+start acquisition. Enabled synchronization owns history and topic collection;
+`mark_dialog_for_sync` is the explicit ingestion command. Startup readiness and
+never-collected non-DM profiles remain separate limitations. See
+[the architecture contract and current exceptions](docs/architecture-proposal.md#durable-facts-and-acquisition-evidence).
 
 > [!IMPORTANT]
 > Review the [Telegram API Terms of Service](https://core.telegram.org/api/terms)
@@ -191,6 +194,21 @@ bot-DM topics:
 list_topics(exact_dialog_id=<dialog_id>)
 list_messages(exact_dialog_id=<dialog_id>, exact_topic_id=<topic_id>, message_state="sent")
 ```
+
+Topic catalogs report observation coverage separately from their retained rows.
+An unobserved catalog is not a known-empty catalog; a completed enumeration
+describes its observation interval, not a freshly verified Telegram snapshot.
+Missing optional icon decoration never delays a read. Enabled synchronization
+collects catalogs through the existing background demand executor, with durable
+page progress and event-aware ordering; disabling it retains collected topics.
+
+History selection is `present`, historically `known_empty`, or `unknown`.
+Only completed history evidence can establish empty selection, qualified by
+its observation horizon and supported attribution. Local pagination exhaustion
+does not establish complete Telegram history. Bounded context requires a
+retained readable anchor and returns its available local neighbors; it does
+not import missing cloud context. Use explicit sync enrollment to acquire more
+history. Context accepts UTC bounds, not sender, topic or unread filters.
 
 For a topic-filtered local result, `coverage.selection_state` is `present` or
 `unknown`. Empty remains `unknown`: topic roots and General-topic members may

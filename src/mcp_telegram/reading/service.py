@@ -1,4 +1,4 @@
-"""Application service for all local and Telegram-backed reading operations."""
+"""Application service for durable local reading operations."""
 
 import asyncio
 import dataclasses
@@ -37,16 +37,9 @@ from ..reactions.contracts import ReactionFreshness
 from ..request_timing import current_timing, timing_phase
 from ..resolver import latinize
 from ..sync_db import open_sync_db_reader
-from ..sync_read_model import SyncReadModelContractError, build_sync_read_model
-from ..telegram_fragments import FragmentContextService
-from ..telegram_reading import (
-    GatewayFailure,
-    TelegramHistoryGateway,
-)
+from ..sync_read_model import SyncReadModelContractError, build_sync_read_model, local_history_coverage
 from ..temporal import parse_utc_boundary
 from .draft_projection import draft_message_key, read_drafts
-from .history_scan import HistoryScanRequest as _ListMessagesTelegramRequest
-from .history_scan import scan_history
 from .query_records import read_message_from_row
 from .scheduled_projection import (
     build_scheduled_list_query,
@@ -78,6 +71,7 @@ from .sqlite_projection import (
     _read_state_for_dialog,
     count_dialog_rows,
     message_sent_at,
+    read_context_anchor,
     read_daemon_state_int,
     read_daemon_state_value,
 )
@@ -100,13 +94,6 @@ class LoggerLike(Protocol):
     def error(self, msg: str, *args: object, **kwargs: object) -> None: ...
 
     def exception(self, msg: str, *args: object, **kwargs: object) -> None: ...
-
-
-def _safe_exception_message(exc: BaseException) -> str:
-    message = str(exc).replace("\n", "\\n")
-    if not message:
-        return type(exc).__name__
-    return message
 
 
 def _set_timing_route(route: str, *, fallback: bool = False) -> None:
@@ -164,24 +151,6 @@ def _validate_time_bounds(since_utc: int | None, until_utc: int | None) -> None:
         raise ValueError("since_utc must be earlier than until_utc")
 
 
-def _log_recoverable_telegram_error(
-    logger: LoggerLike,
-    *,
-    event: str,
-    dialog_id: int,
-    exc: BaseException,
-    request_id: str,
-) -> None:
-    logger.warning(
-        "%s dialog_id=%d error_type=%s error_message=%s%s",
-        event,
-        dialog_id,
-        type(exc).__name__,
-        _safe_exception_message(exc),
-        request_id,
-    )
-
-
 @dataclass(frozen=True)
 class ReadingDeps:
     """External collaborators required by the reading application service."""
@@ -190,13 +159,10 @@ class ReadingDeps:
     sync_db_path: Path | None
     self_id: int | None
     resolve_dialog_id: Callable[[DialogSelector], Awaitable[int | dict]]
-    fragment_context: FragmentContextService
-    history_gateway: TelegramHistoryGateway
     logger: LoggerLike
     rid: Callable[[], str]
     deleted_message_visibility_seconds: int
     draft_response_budget_bytes: int
-    resolve_dialog_id_local: Callable[[DialogSelector], Awaitable[int | dict]] | None = None
 
 
 @dataclass(frozen=True)
@@ -216,6 +182,21 @@ class _ListMessagesRequest:
     message_state: str
     since_utc: int | None = None
     until_utc: int | None = None
+
+    def context_filter_error(self) -> dict[str, object] | None:
+        """Reject filters that cannot describe an anchored context window."""
+        if self.context_message_id is None:
+            return None
+        if self.unread or any(
+            value is not None for value in (self.sender_id, self.sender_name, self.topic_id, self.unread_after_id)
+        ):
+            return {
+                "ok": False,
+                "error": "invalid_context_filters",
+                "message": "Context anchors cannot be combined with sender, topic, or unread filters.",
+                "required_action": "Remove the filters or the context anchor.",
+            }
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -475,18 +456,6 @@ def _message_sent_at(item: object) -> int | None:
     if isinstance(item, ReadMessage):
         return item.sent_at
     return _object_to_int_or_none(_row_value(item, "sent_at"))
-
-
-def _context_uses_fragment_fallback(status: str | None) -> bool:
-    return status in (None, "not_synced", "fragment", "own_only")
-
-
-def _mark_fragment_coverage(result: dict) -> None:
-    data = result.get("data")
-    if isinstance(data, dict):
-        data["coverage"] = "fragment"
-    else:
-        result["coverage"] = "fragment"
 
 
 def _status_from_row(row: object | None) -> str | None:
@@ -776,8 +745,7 @@ class ReadingService:
     def _enrich_cached_facts(self, messages: Sequence[ReadMessage]) -> list[ReadMessage]:
         """Project cached facts onto a cross-dialog result without Telegram RPCs.
 
-        Global search spans multiple dialogs, so it cannot use the scoped
-        fresheners/read-receipt gateway.  Grouping by the row's dialog keeps
+        All reads project persisted facts. Grouping cross-dialog results keeps
         side-table lookups correctly keyed while preserving the result order.
         Missing fact tables/rows are intentionally represented by the helpers'
         nullable/unavailable defaults.
@@ -802,20 +770,6 @@ class ReadingService:
         dialog_id: int,
         request: _ListMessagesRequest,
     ) -> dict:
-        with timing_phase("local_projection"):
-            row = _fetchone_row(self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)))
-            current_status = _status_from_row(row)
-        if _context_uses_fragment_fallback(current_status):
-            return await self._list_fragment_context_result(dialog_id, request, current_status)
-        if current_status not in ("synced", "syncing"):
-            return {
-                "ok": False,
-                "error": "not_synced",
-                "message": "Context window is unavailable for this dialog state.",
-                "required_action": "Mark the dialog for sync to read broader history, or retry with an anchor_message_id for bounded fragment context.",
-                "context_availability": "context_window_unavailable",
-                "dialog_status": current_status or "not_synced",
-            }
         _set_timing_route("local_context")
         return await self._list_messages_context_window(
             dialog_id=dialog_id,
@@ -825,42 +779,7 @@ class ReadingService:
             until_utc=request.until_utc,
         )
 
-    async def _list_fragment_context_result(
-        self,
-        dialog_id: int,
-        request: _ListMessagesRequest,
-        current_status: str | None,
-    ) -> dict:
-        _set_timing_route("telegram_context_fallback", fallback=True)
-        with timing_phase("telegram_fallback"):
-            fragment_result = await self._deps.fragment_context.fetch(
-                dialog_id,
-                request.context_message_id or 0,
-                request.context_size,
-            )
-        if not fragment_result.ok:
-            failure = fragment_result.failure
-            detail = failure.as_dict() if failure is not None else None
-            return {
-                "ok": False,
-                "error": "fragment_fetch_failed",
-                "message": "Could not fetch bounded context from Telegram.",
-                "required_action": "Retry with a valid anchor_message_id, or mark the dialog for sync if broader history is needed.",
-                "context_availability": "fragment_unavailable",
-                "dialog_status": current_status or "not_synced",
-                "fragment_failure": detail,
-            }
-        result = await self._list_messages_context_window(
-            dialog_id=dialog_id,
-            anchor_message_id=request.context_message_id or 0,
-            context_size=request.context_size,
-            since_utc=request.since_utc,
-            until_utc=request.until_utc,
-        )
-        _mark_fragment_coverage(result)
-        return result
-
-    async def _list_messages_history_result(  # noqa: PLR0914
+    async def _list_messages_history_result(
         self,
         dialog_id: int,
         request: _ListMessagesRequest,
@@ -895,68 +814,52 @@ class ReadingService:
             dialog_type = identity.dialog_type.value
             read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
 
-        if status in ("synced", "syncing", "access_lost"):
-            _set_timing_route("local_history")
-            db_request = _ListMessagesDbRequest(
-                dialog_id=dialog_id,
-                limit=request.limit,
-                self_id=self._deps.self_id,
-                direction=direction,
-                direction_enum=HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST,
-                anchor_msg_id=anchor_msg_id,
-                anchor_sent_at=self._local_history_anchor_sent_at(dialog_id, anchor_msg_id, request.navigation),
-                sender_id=request.sender_id,
-                sender_name=request.sender_name,
-                topic_id=request.topic_id,
-                unread_after_id=request.unread_after_id,
-                unread=request.unread,
-                since_utc=request.since_utc,
-                until_utc=request.until_utc,
-            )
-            result = await self._list_messages_from_db(db_request)
-            with timing_phase("local_projection"):
-                access_metadata = _build_access_metadata(self._conn, dialog_id, status)
-            result["data"].update(access_metadata)
-            result["data"]["dialog_type"] = dialog_type
-            result["data"]["dialog_name"] = identity.display_name
-            result["data"]["dialog_name_source"] = identity.display_name_source
-            result["data"]["read_state"] = read_state
-            with timing_phase("local_projection"):
-                receipt = _topic_attribution_receipt(self._conn, dialog_id)
-                result["data"]["topic_attribution"] = receipt
-                selection_state = _topic_selection_state(
-                    topic_id=request.topic_id,
-                    messages=result["data"]["messages"],
-                    status=status,
-                    receipt=receipt,
-                )
-                if selection_state is not None:
-                    result["data"]["selection_state"] = selection_state
-            return result
-
-        _set_timing_route("telegram_fallback", fallback=True)
-        telegram_result = await self._list_messages_from_telegram(
-            _ListMessagesTelegramRequest(
-                dialog_id=dialog_id,
-                limit=request.limit,
-                direction=direction,
-                direction_enum=HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST,
-                anchor_msg_id=anchor_msg_id,
-                sender_id=request.sender_id,
-                topic_id=request.topic_id,
-                unread_after_id=request.unread_after_id,
-                unread=request.unread,
-                since_utc=request.since_utc,
-                until_utc=request.until_utc,
-            )
+        _set_timing_route("local_history")
+        db_request = _ListMessagesDbRequest(
+            dialog_id=dialog_id,
+            limit=request.limit,
+            self_id=self._deps.self_id,
+            direction=direction,
+            direction_enum=HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST,
+            anchor_msg_id=anchor_msg_id,
+            anchor_sent_at=self._local_history_anchor_sent_at(dialog_id, anchor_msg_id, request.navigation),
+            sender_id=request.sender_id,
+            sender_name=request.sender_name,
+            topic_id=request.topic_id,
+            unread_after_id=request.unread_after_id,
+            unread=request.unread,
+            since_utc=request.since_utc,
+            until_utc=request.until_utc,
         )
-        if telegram_result.get("ok"):
-            telegram_result["data"]["dialog_access"] = "live"
-            telegram_result["data"]["dialog_type"] = dialog_type
-            telegram_result["data"]["dialog_name"] = identity.display_name
-            telegram_result["data"]["dialog_name_source"] = identity.display_name_source
-            telegram_result["data"]["read_state"] = read_state
-        return telegram_result
+        result = await self._list_messages_from_db(db_request)
+        with timing_phase("local_projection"):
+            access_metadata = _build_access_metadata(self._conn, dialog_id, status)
+        result["data"].update(access_metadata)
+        result["data"]["selection_state"] = local_history_coverage(
+            status, access_metadata["last_synced_at"]
+        ).selection_state(
+            present=bool(result["data"]["messages"]),
+            attribution_complete=(
+                request.topic_id is None and request.sender_name is None and request.sender_id is None
+            ),
+            since_utc=request.since_utc,
+        )
+        result["data"]["dialog_type"] = dialog_type
+        result["data"]["dialog_name"] = identity.display_name
+        result["data"]["dialog_name_source"] = identity.display_name_source
+        result["data"]["read_state"] = read_state
+        with timing_phase("local_projection"):
+            receipt = _topic_attribution_receipt(self._conn, dialog_id)
+            result["data"]["topic_attribution"] = receipt
+            selection_state = _topic_selection_state(
+                topic_id=request.topic_id,
+                messages=result["data"]["messages"],
+                status=status,
+                receipt=receipt,
+            )
+            if selection_state is not None:
+                result["data"]["selection_state"] = selection_state
+        return result
 
     async def _search_messages_global_result(
         self,
@@ -1488,6 +1391,34 @@ class ReadingService:
                 return _UnreadPosition(_object_to_int(values[0]))
         return _ReadPositionPending()
 
+    def _local_context_anchor(
+        self,
+        dialog_id: int,
+        anchor_message_id: int,
+        since_utc: int | None,
+        until_utc: int | None,
+    ) -> int | dict[str, object]:
+        """Require a retained visible anchor and return its chronological position."""
+        with timing_phase("local_projection"):
+            anchor = read_context_anchor(self._conn, dialog_id, anchor_message_id)
+        unavailable = None
+        if anchor is None:
+            unavailable = "anchor_missing"
+        elif anchor[1]:
+            unavailable = "anchor_deleted"
+        elif (since_utc is not None and anchor[0] < since_utc) or (until_utc is not None and anchor[0] >= until_utc):
+            unavailable = "anchor_outside_time_range"
+        if unavailable is not None:
+            return {
+                "ok": False,
+                "error": "local_context_unavailable",
+                "message": "The requested anchor is unavailable in the retained local selection.",
+                "context_availability": unavailable,
+                "required_action": "Choose a retained, non-deleted anchor within the UTC bounds, or mark the dialog for sync to acquire history.",
+            }
+        assert anchor is not None
+        return anchor[0]
+
     async def _list_messages_context_window(
         self,
         dialog_id: int,
@@ -1497,17 +1428,21 @@ class ReadingService:
         until_utc: int | None = None,
     ) -> dict:
         """Return messages centred on anchor_message_id from sync.db."""
+        anchor_sent_at = self._local_context_anchor(dialog_id, anchor_message_id, since_utc, until_utc)
+        if isinstance(anchor_sent_at, dict):
+            return anchor_sent_at
         before_count = context_size // 2
         after_count = context_size - before_count - 1
         with timing_phase("local_projection"):
             before_rows = _fetchall_rows(
                 self._conn.execute(
                     _LIST_MESSAGES_BASE_SQL
-                    + " AND m.message_id <= :anchor AND (:since_utc IS NULL OR m.sent_at >= :since_utc) AND (:until_utc IS NULL OR m.sent_at < :until_utc) ORDER BY m.message_id DESC LIMIT :limit",
+                    + " AND (m.sent_at < :anchor_sent_at OR (m.sent_at = :anchor_sent_at AND m.message_id <= :anchor)) AND (:since_utc IS NULL OR m.sent_at >= :since_utc) AND (:until_utc IS NULL OR m.sent_at < :until_utc) ORDER BY m.sent_at DESC, m.message_id DESC LIMIT :limit",
                     {
                         "dialog_id": dialog_id,
                         "self_id": self._deps.self_id,
                         "anchor": anchor_message_id,
+                        "anchor_sent_at": anchor_sent_at,
                         "limit": context_size,
                         "since_utc": since_utc,
                         "until_utc": until_utc,
@@ -1518,11 +1453,12 @@ class ReadingService:
             after_rows = _fetchall_rows(
                 self._conn.execute(
                     _LIST_MESSAGES_BASE_SQL
-                    + " AND m.message_id > :anchor AND (:since_utc IS NULL OR m.sent_at >= :since_utc) AND (:until_utc IS NULL OR m.sent_at < :until_utc) ORDER BY m.message_id ASC LIMIT :limit",
+                    + " AND (m.sent_at > :anchor_sent_at OR (m.sent_at = :anchor_sent_at AND m.message_id > :anchor)) AND (:since_utc IS NULL OR m.sent_at >= :since_utc) AND (:until_utc IS NULL OR m.sent_at < :until_utc) ORDER BY m.sent_at ASC, m.message_id ASC LIMIT :limit",
                     {
                         "dialog_id": dialog_id,
                         "self_id": self._deps.self_id,
                         "anchor": anchor_message_id,
+                        "anchor_sent_at": anchor_sent_at,
                         "limit": context_size,
                         "since_utc": since_utc,
                         "until_utc": until_utc,
@@ -1552,6 +1488,13 @@ class ReadingService:
                     "messages": [dataclasses.asdict(m) for m in messages],
                     "source": "sync_db",
                     "anchor_message_id": anchor_message_id,
+                    "selection_state": "present",
+                    **_build_access_metadata(
+                        self._conn,
+                        dialog_id,
+                        _status_from_row(_fetchone_row(self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,))))
+                        or "not_synced",
+                    ),
                     "next_navigation": None,
                     "dialog_type": dialog_type,
                     "dialog_name": identity.display_name,
@@ -1560,76 +1503,6 @@ class ReadingService:
                     "reaction_freshness": freshness.as_dict(),
                 },
             }
-
-    async def _list_messages_from_telegram(
-        self,
-        req: _ListMessagesTelegramRequest,
-    ) -> dict:
-        """Fetch messages on-demand from Telegram API."""
-        self._logger.debug("list_messages_fallback_telegram dialog_id=%d%s", req.dialog_id, self._deps.rid())
-        with timing_phase("telegram_fallback"):
-            result = await scan_history(self._deps.history_gateway, req, self_id=self._deps.self_id)
-        self._logger.info(
-            "history_scan_complete stop=%s matched_count=%d%s",
-            result.stop,
-            len(result.messages),
-            self._deps.rid(),
-        )
-        if result.failure is not None:
-            return self._list_messages_telegram_error(req, result.failure)
-        with timing_phase("response_shape"):
-            messages = list(result.messages)
-            resume_after = result.resume_after
-            next_nav = None
-            if resume_after is not None and result.stop in {"output_limit", "candidate_limit", "window_edge"}:
-                message_id = _message_id_from_item(resume_after.message)
-                if message_id > 0:
-                    sent_at = int(resume_after.date.timestamp()) if resume_after.date is not None else None
-                    next_nav = encode_history_navigation(
-                        message_id,
-                        req.dialog_id,
-                        topic_id=req.topic_id,
-                        direction=req.direction_enum,
-                        sent_at=sent_at,
-                        message_state="sent",
-                        unread=req.unread,
-                        since_utc=req.since_utc,
-                        until_utc=req.until_utc,
-                    )
-            return {
-                "ok": True,
-                "data": {"messages": messages, "source": "telegram", "next_navigation": next_nav},
-            }
-
-    def _list_messages_telegram_error(self, req: _ListMessagesTelegramRequest, failure: GatewayFailure) -> dict:
-        if not failure.retryable or failure.kind.value in {"flood_wait", "access_lost", "transient"}:
-            _log_recoverable_telegram_error(
-                self._logger,
-                event="list_messages_telegram_error",
-                dialog_id=req.dialog_id,
-                exc=RuntimeError(failure.error_message),
-                request_id=self._deps.rid(),
-            )
-            detail: dict[str, object] = {
-                "error_type": failure.error_type,
-                "error_message": failure.error_message,
-                "retryable": failure.retryable,
-            }
-            if failure.retry_after is not None:
-                detail["retry_after"] = failure.retry_after
-            return {
-                "ok": False,
-                "error": "telegram_error",
-                "message": "failed to fetch messages",
-                "detail": detail,
-            }
-
-        self._logger.error(
-            "list_messages_telegram_unexpected dialog_id=%d%s",
-            req.dialog_id,
-            self._deps.rid(),
-        )
-        return {"ok": False, "error": "telegram_error", "message": "failed to fetch messages"}
 
     async def _list_messages_from_db(self, req: _ListMessagesDbRequest) -> dict:
         """Read messages from sync.db using the dynamic query builder."""
@@ -2003,7 +1876,7 @@ class ReadingService:
             anchor_msg_id=navigation.value if navigation is not None else None,
             anchor_sent_at=navigation.sent_at if navigation is not None else None,
         )
-        sent_rows = await self._all_sent_rows(all_request.status, sent_request)
+        sent_rows = await self._all_sent_rows(sent_request)
         # Telegram read cursors only describe published incoming history.
         # Scheduled and draft projections are author-only state and cannot be
         # truthfully classified as unread, so do not query or validate either
@@ -2042,9 +1915,7 @@ class ReadingService:
         )
         return self._all_local_response(state)
 
-    async def _all_sent_rows(self, status: str | None, db_request: _ListMessagesDbRequest) -> list[dict]:
-        if status not in {"synced", "syncing", "access_lost"}:
-            return []
+    async def _all_sent_rows(self, db_request: _ListMessagesDbRequest) -> list[dict]:
         sent_result = await self._list_messages_from_db(db_request)
         return [{**row, "message_state": "sent"} for row in sent_result["data"]["messages"]]
 
@@ -2058,17 +1929,6 @@ class ReadingService:
             access_metadata = _build_access_metadata(self._conn, dialog_id, status or "not_synced")
             access_metadata["dialog_name"] = identity.display_name
             access_metadata["dialog_name_source"] = identity.display_name_source
-            if status not in {"synced", "syncing", "access_lost"}:
-                access_metadata.update(
-                    {
-                        "dialog_access": "local_only",
-                        "coverage": "local_only",
-                        "required_action": (
-                            "Mark the dialog for sync to make a complete local history available, or retry with "
-                            'message_state="sent" for an on-demand live page.'
-                        ),
-                    }
-                )
         return dialog_type, read_state, access_metadata
 
     def _all_local_response(self, state: _AllLocalState) -> dict:
@@ -2083,6 +1943,15 @@ class ReadingService:
                 draft_result is not None and draft_result["data"]["next_navigation"] is not None
             )
             page = combined[: request.limit]
+            selection_state = local_history_coverage(
+                state.request.status, cast(int | None, access_metadata.get("last_synced_at"))
+            ).selection_state(
+                present=bool(page),
+                attribution_complete=(
+                    request.topic_id is None and request.sender_name is None and request.sender_id is None
+                ),
+                since_utc=request.since_utc,
+            )
             next_nav = self._all_next_navigation(
                 page,
                 has_more,
@@ -2115,6 +1984,7 @@ class ReadingService:
                     "source": "sync_db" if request.unread else "sync_db+scheduled_messages+draft_current",
                     "next_navigation": next_nav,
                     "message_state": "all",
+                    "selection_state": selection_state,
                     "dialog_type": dialog_type,
                     "read_state": read_state,
                     **projection_metadata,
@@ -2285,7 +2155,7 @@ class ReadingService:
         return await self._list_messages_history_result(dialog_id, request, direction)
 
     async def _list_messages(self, req: dict) -> dict:
-        """Return messages from sync.db (if synced) or Telegram (on-demand)."""
+        """Return retained messages from sync.db without acquiring Telegram facts."""
         try:
             selector = required_dialog_selector(
                 exact_id=req.get("dialog_id"),
@@ -2300,9 +2170,10 @@ class ReadingService:
         if direction not in ("newest", "oldest"):
             direction = "newest"
 
+        context_error = request.context_filter_error()
+        if context_error is not None:
+            return context_error
         resolver = self._deps.resolve_dialog_id
-        if request.message_state in {"draft", "all"} and self._deps.resolve_dialog_id_local is not None:
-            resolver = self._deps.resolve_dialog_id_local
         with timing_phase("resolution"):
             resolved = await resolver(selector)
         if isinstance(resolved, dict):
@@ -2811,9 +2682,6 @@ class ReadingService:
         return await self._list_messages_context_window(
             dialog_id=dialog_id, anchor_message_id=anchor_message_id, context_size=context_size
         )
-
-    async def list_messages_from_telegram(self, req: object) -> dict:
-        return await self._list_messages_from_telegram(cast(_ListMessagesTelegramRequest, req))
 
     async def list_messages_from_db(self, req: object) -> dict:
         return await self._list_messages_from_db(cast(_ListMessagesDbRequest, req))

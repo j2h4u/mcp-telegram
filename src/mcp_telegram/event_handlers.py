@@ -23,7 +23,7 @@ import logging
 import sqlite3
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import wraps
@@ -32,6 +32,7 @@ from typing import Protocol, cast, runtime_checkable
 from telethon import events  # type: ignore[import-untyped]
 from telethon.errors import RPCError  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
+    Channel,
     ChannelParticipantBanned,
     ChannelParticipantLeft,
     MessageActionTopicCreate,
@@ -62,6 +63,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     UpdateTranscribedAudio,
     UpdateUser,
     UpdateUserName,
+    User,
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
@@ -95,7 +97,7 @@ from .entity_profile.updates import (
 from .entity_store import PartialEntityIdentity, apply_partial_entity_identity
 from .flood import TelegramRpcThrottled
 from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
-from .history_enrollment import EnrollmentOutcome, ensure_automatic_dm_enrollment
+from .history_enrollment import EnrollmentOutcome, ensure_automatic_dm_enrollment, full_history_enabled
 from .hydration_queue import HydrationPriority
 from .identity_observation import USERNAME_UNOBSERVED, observe_username
 from .linked_chat_fact import LinkedChatWork, linked_chat_fact_owner
@@ -159,6 +161,8 @@ from .telegram_demand import (
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_scope
 from .telethon_dialog import classify_dialog_type, observe_dialog_identity
+from .topics.catalog import TopicCatalogRepository
+from .topics.contracts import is_topic_capable
 from .topics.sqlite_repository import SQLiteTopicMetadataRepository
 from .unread_state import apply_unread_facts
 
@@ -1273,6 +1277,8 @@ class EventHandlerManager:
     ) -> None:
         require_write_transaction(conn)
         action = cast(object | None, getattr(msg, "action", None))
+        if isinstance(action, (MessageActionTopicCreate, MessageActionTopicEdit)):
+            TopicCatalogRepository(conn).request(dialog_id, "topic_changed")
         if isinstance(action, MessageActionTopicCreate):
             self._handle_topic_create_action(conn, dialog_id, msg, now, action, observation_order=observation_order)
             return
@@ -2269,11 +2275,11 @@ class EventHandlerManager:
         return changed
 
     def _write_profile_pushes(
-        self, conn: sqlite3.Connection, update: object, users: Sequence[object]
-    ) -> tuple[bool, bool]:
+        self, conn: sqlite3.Connection, update: object, users: Sequence[object], topic_entities: Sequence[object]
+    ) -> tuple[bool, bool, bool]:
         owner = self._self_id
         if owner is None:
-            return False, False
+            return False, False, False
         profiles = EntityProfileRepository(conn, section_ttl_seconds=self._profile_detail_ttl_seconds)
         annotations: list[tuple[object, ProfileFieldObservation]] = []
         offered = False
@@ -2294,10 +2300,11 @@ class EventHandlerManager:
                     )
                 handled_name |= source is update and isinstance(update, UpdateUserName)
                 annotations.append((source, observation))
+            topics_changed = self._write_topic_capabilities(conn, topic_entities, annotations)
         # Object lifetime, not an evictable cache: a repeated bundle keeps its original order.
         for source, observation in annotations:
             mark_push_applied(source, self._profile_push_owner, observation)
-        return offered, handled_name
+        return offered, handled_name, topics_changed
 
     def _eligible_profile_push(self, profiles: EntityProfileRepository, push: ProfilePush | None) -> bool:
         return (
@@ -2325,11 +2332,16 @@ class EventHandlerManager:
 
     async def _persist_profile_pushes(self, *, update: object = None, sender: object = None) -> bool:
         users: Sequence[object] = (sender,) if sender is not None else bundled_profile_users(update)
-        if self._self_id is None or (not users and profile_update_id(update) is None):
+        topic_entities = self._topic_capability_entities(update, sender)
+        if self._self_id is None or (not users and not topic_entities and profile_update_id(update) is None):
             return False
-        offered, handled_name = await self._writer.run(lambda conn: self._write_profile_pushes(conn, update, users))
+        offered, handled_name, topics_changed = await self._writer.run(
+            lambda conn: self._write_profile_pushes(conn, update, users, topic_entities)
+        )
         if offered:
             self._offer(DemandKind.ENTITY_PROFILE_REFRESH)
+        if topics_changed:
+            self._offer(DemandKind.TOPIC_SNAPSHOT)
         return handled_name
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
@@ -2344,6 +2356,48 @@ class EventHandlerManager:
             )
         except Exception:
             logger.exception("event_identity_or_notify_failed update=%r", type(update).__name__)
+
+    def _topic_capability_entities(self, update: object, sender: object) -> tuple[object, ...]:
+        entities: object = getattr(update, "_entities", None)
+        if sender is not None and isinstance(sender, (User, Channel)):
+            entities = {get_peer_id(sender): sender}
+        if not isinstance(entities, Mapping):
+            return ()
+        return tuple(
+            entity
+            for key, entity in entities.items()
+            if isinstance(entity, (User, Channel))
+            and not bool(entity.min)
+            and key == get_peer_id(entity)
+            and full_history_enabled(self._conn, int(key))
+        )
+
+    def _write_topic_capabilities(
+        self,
+        conn: sqlite3.Connection,
+        entities: Sequence[object],
+        annotations: list[tuple[object, ProfileFieldObservation]],
+    ) -> bool:
+        require_write_transaction(conn)
+        changed = False
+        observations = {id(source): observation for source, observation in annotations}
+        repository = TopicCatalogRepository(conn)
+        for entity in entities:
+            dialog_id = int(get_peer_id(cast(TypePeer, entity)))
+            if not full_history_enabled(conn, dialog_id):
+                continue
+            observation = observations.get(id(entity)) or push_marker(entity, self._profile_push_owner)
+            if observation is None:
+                observation = ProfileFieldObservation(
+                    owner_account_id=cast(int, self._self_id),
+                    order=allocate_observation_order(conn),
+                    observed_at=int(time.time()),
+                    source="update",
+                )
+            changed |= repository.observe_capability(dialog_id, is_topic_capable(entity), observation.order)
+            if id(entity) not in observations:
+                annotations.append((entity, observation))
+        return changed
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_dialog_pinned(self, update: object) -> None:
@@ -2767,6 +2821,7 @@ class EventHandlerManager:
                         observed_at=now,
                         observation_order=observation_order,
                     )
+                    TopicCatalogRepository(conn).request(dialog_id, "topic_pin_changed")
 
             await self._writer.run(_persist_event_0)
             logger.info(
@@ -2807,6 +2862,7 @@ class EventHandlerManager:
                         observed_at=now,
                         observation_order=observation_order,
                     )
+                    TopicCatalogRepository(conn).request(dialog_id, "topic_pins_changed")
 
             await self._writer.run(_persist_event_0)
             logger.info(

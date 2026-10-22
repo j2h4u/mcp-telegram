@@ -89,7 +89,8 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "sqlite_writer.py",  # Sole runtime sync.db connection owner.
             "transcription_hydration.py",
             "telegram_fact_queries.py",
-            "telegram_fragments.py",
+            "topics/catalog.py",  # Durable topic catalog receipts and page progress in sync.db.
+            "topics/demand.py",  # Read projection bound to the shared writer for topic acquisition.
             "topics/sqlite_repository.py",
             "topics/ports.py",  # Transaction-local projection binding to the shared SQLite owner.
             "unread_state.py",

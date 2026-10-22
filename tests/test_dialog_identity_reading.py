@@ -10,8 +10,6 @@ from mcp_telegram.models import DialogType
 from mcp_telegram.reading import ReadingDeps, ReadingService
 from mcp_telegram.reading.query_records import read_message_from_row
 from mcp_telegram.reading.service import _SearchMessagesRequest
-from mcp_telegram.telegram_fragments import FragmentContextService
-from mcp_telegram.telegram_reading import TelegramHistoryGateway
 
 
 class _TestLogger:
@@ -165,8 +163,6 @@ def test_global_search_uses_canonical_dialog_label_and_source(
             sync_db_path=None,
             self_id=1,
             resolve_dialog_id=lambda _selector: asyncio.sleep(0, result=0),
-            fragment_context=cast(FragmentContextService, object()),
-            history_gateway=cast(TelegramHistoryGateway, object()),
             logger=_TestLogger(),
             rid=lambda: "",
             deleted_message_visibility_seconds=86_400,
@@ -211,9 +207,6 @@ async def test_empty_own_only_all_read_preserves_natural_name_resolution_id(
             sync_db_path=None,
             self_id=1,
             resolve_dialog_id=resolve_dialog,
-            resolve_dialog_id_local=resolve_dialog,
-            fragment_context=cast(FragmentContextService, object()),
-            history_gateway=cast(TelegramHistoryGateway, object()),
             logger=_TestLogger(),
             rid=lambda: "",
             deleted_message_visibility_seconds=86_400,
@@ -227,5 +220,6 @@ async def test_empty_own_only_all_read_preserves_natural_name_resolution_id(
     assert result["data"]["dialog_id"] == dialog_id
     assert result["data"]["dialog_name"] == "Canonical own-only peer"
     assert result["data"]["dialog_type"] == DialogType.SUPERGROUP.value
-    assert result["data"]["coverage"] == "local_only"
+    assert result["data"]["coverage"] == "partial"
+    assert result["data"]["selection_state"] == "unknown"
     assert result["data"]["messages"] == []

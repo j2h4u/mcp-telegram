@@ -116,9 +116,9 @@ def test_flood_wait_records_content_free_sender_provenance_immediately() -> None
 
     aggregator.observe_flood_wait(
         FloodWaitObservation(
-            source=TelegramRpcSource.MESSAGE_READ_FALLBACK,
-            service_class=RPC_SOURCE_SERVICE_CLASS[TelegramRpcSource.MESSAGE_READ_FALLBACK],
-            demand_kind=DemandKind.MESSAGE_READ_FALLBACK,
+            source=TelegramRpcSource.MCP_INTERACTIVE,
+            service_class=RPC_SOURCE_SERVICE_CLASS[TelegramRpcSource.MCP_INTERACTIVE],
+            demand_kind=DemandKind.MCP_REMOTE_ACQUISITION,
             acquisition_kind=AcquisitionKind.MESSAGE_HISTORY_PAGE,
             seconds=23,
             cooldown_until_utc_ms=1_700_000_023_000,
@@ -140,14 +140,14 @@ def test_flood_wait_records_content_free_sender_provenance_immediately() -> None
     assert row["duration_ms"] == 23_000
     assert row["observed_at_ms"] == 1_700_000_000_000
     assert row["payload"] == {
-        "source": "message_read_fallback",
+        "source": "mcp_interactive",
         "service_class": "interactive",
         "request_method": "GetHistoryRequest",
         "origin": "vendor_cache",
         "actual_dispatch": False,
         "cooldown_until_utc_ms": 1_700_000_023_000,
         "circuit_open": False,
-        "demand_kind": "message_read_fallback",
+        "demand_kind": "mcp_remote_acquisition",
         "acquisition_kind": "message_history_page",
     }
 
@@ -162,9 +162,9 @@ async def test_flood_wait_observation_persists_through_runtime_sink(tmp_path: Pa
 
     aggregator.observe_flood_wait(
         FloodWaitObservation(
-            source=TelegramRpcSource.MESSAGE_READ_FALLBACK,
-            service_class=RPC_SOURCE_SERVICE_CLASS[TelegramRpcSource.MESSAGE_READ_FALLBACK],
-            demand_kind=DemandKind.MESSAGE_READ_FALLBACK,
+            source=TelegramRpcSource.MCP_INTERACTIVE,
+            service_class=RPC_SOURCE_SERVICE_CLASS[TelegramRpcSource.MCP_INTERACTIVE],
+            demand_kind=DemandKind.MCP_REMOTE_ACQUISITION,
             acquisition_kind=AcquisitionKind.MESSAGE_HISTORY_PAGE,
             seconds=23,
             cooldown_until_utc_ms=1_700_000_023_000,
@@ -194,14 +194,14 @@ async def test_flood_wait_observation_persists_through_runtime_sink(tmp_path: Pa
     payload_json = row[5]
     assert isinstance(payload_json, str)
     assert json.loads(payload_json) == {
-        "source": "message_read_fallback",
+        "source": "mcp_interactive",
         "service_class": "interactive",
         "request_method": "GetHistoryRequest",
         "origin": "actual_send",
         "actual_dispatch": True,
         "cooldown_until_utc_ms": 1_700_000_023_000,
         "circuit_open": True,
-        "demand_kind": "message_read_fallback",
+        "demand_kind": "mcp_remote_acquisition",
         "acquisition_kind": "message_history_page",
         "admission_sequence": 17,
         "dispatch_at_monotonic": 42.5,

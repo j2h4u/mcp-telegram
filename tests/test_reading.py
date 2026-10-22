@@ -372,7 +372,9 @@ def test_search_messages_structured_payload_includes_dialog_anchor_read_state_wa
 
     assert payload["dialog_name"] == "Alice"
     assert payload["source"] == "sync_db"
-    assert coverage["kind"] == "archived"
+    assert coverage["kind"] == "local_history"
+    assert coverage["state"] == "unknown"
+    assert coverage["dialog_access"] == "archived"
     assert warnings[0]["kind"] == "archived_dialog"
     assert read_state_per_dialog["123"]["header_lines"] == ["[read-state: all caught up]"]
     assert navigation == {
@@ -424,7 +426,6 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
         _ListMessagesStructuredContentContext(
             args=ListMessages(
                 exact_dialog_id=123,
-                exact_topic_id=7,
                 limit=10,
                 navigation="start",
                 anchor_message_id=50,
@@ -434,7 +435,9 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
                 "messages": [],
                 "source": "sync_db",
                 "next_navigation": "history-token",
-                "coverage": "fragment",
+                "coverage": "partial",
+                "sync_status": "fragment",
+                "observation_horizon_at": None,
                 "dialog_access": "archived",
                 "last_synced_at": 1_699_990_000,
                 "last_event_at": 1_699_999_000,
@@ -459,7 +462,7 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
             dialog_id=123,
             sender_id=None,
             sender_name=None,
-            topic_id=7,
+            topic_id=None,
             direction="oldest",
             next_navigation="history-token",
         )
@@ -471,7 +474,9 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
     presentation = cast(dict[str, object], payload["presentation"])
     read_state = cast(dict[str, object], payload["read_state"])
     assert payload["dialog_id"] == 123
-    assert coverage["kind"] == "fragment"
+    assert coverage["kind"] == "local_history"
+    assert coverage["state"] == "partial"
+    assert coverage["observation_horizon_at"] is None
     assert coverage["fragment_coverage"] is True
     assert coverage["selection_state"] == "unknown"
     assert coverage["topic_attribution"] == {
@@ -555,10 +560,9 @@ def test_list_messages_preserves_empty_topic_warning_for_explicit_sent_reads() -
 def test_list_messages_warns_when_default_all_has_no_local_published_history() -> None:
     warnings = _list_messages_warnings({"coverage": "local_only"})
 
-    assert [warning["kind"] for warning in warnings] == ["local_history_unavailable"]
+    assert [warning["kind"] for warning in warnings] == ["local_history_incomplete"]
     assert warnings[0].get("action") == (
-        "Mark the dialog for sync to make a complete local history available, or retry with "
-        'message_state="sent" for an on-demand live page.'
+        "Use mark_dialog_for_sync to request history acquisition; reads return retained local facts."
     )
 
 
@@ -897,6 +901,14 @@ def test_list_messages_accepts_non_conflicting_selector_and_boundary_combination
     kwargs: dict[str, object],
 ) -> None:
     assert ListMessages.model_validate(kwargs)
+
+
+@pytest.mark.parametrize(
+    "filters", ({"sender": "Alice"}, {"topic": "General"}, {"exact_topic_id": 5}, {"unread": True})
+)
+def test_list_messages_rejects_context_filters_at_tool_boundary(filters: dict[str, object]) -> None:
+    with pytest.raises(ValidationError, match="anchor_message_id cannot be combined"):
+        ListMessages.model_validate({"exact_dialog_id": 42, "message_state": "sent", "anchor_message_id": 7, **filters})
 
 
 def test_search_messages_documents_sent_anchor_calls() -> None:

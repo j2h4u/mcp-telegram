@@ -23,7 +23,6 @@ class TelegramRpcSource(StrEnum):
 
     MCP_INTERACTIVE = "mcp_interactive"
     CHAT_EXPORT = "chat_export"
-    MESSAGE_READ_FALLBACK = "message_read_fallback"
     DIALOG_RESOLUTION = "dialog_resolution"
     TOPIC_RESOLUTION = "topic_resolution"
     ENTITY_INFO_FOREGROUND = "entity_info_foreground"
@@ -57,7 +56,6 @@ class DemandKind(StrEnum):
 
     MCP_REMOTE_ACQUISITION = "mcp_remote_acquisition"
     CHAT_EXPORT_OPERATION = "chat_export_operation"
-    MESSAGE_READ_FALLBACK = "message_read_fallback"
     ENTITY_LOOKUP = "entity_lookup"
     TOPIC_LOOKUP = "topic_lookup"
     FOREGROUND_ENTITY_FACTS = "foreground_entity_facts"
@@ -112,6 +110,7 @@ DURABLE_DEMAND_ORDER: tuple[DemandKind, ...] = (
     DemandKind.COLD_PEER_PAGE,
     DemandKind.BACKFILL_HYDRATION_BATCH,
     DemandKind.FOLDER_SNAPSHOT,
+    DemandKind.TOPIC_SNAPSHOT,
     DemandKind.MESSAGE_FACT_REFRESH,
     DemandKind.READ_RECEIPT_BATCH,
     DemandKind.SCHEDULED_REPAIR,
@@ -119,7 +118,7 @@ DURABLE_DEMAND_ORDER: tuple[DemandKind, ...] = (
     DemandKind.DRAFT_SNAPSHOT,
     DemandKind.LINKED_CHAT_REFRESH,
 )
-_EXPECTED_DURABLE_DEMAND_COUNT = 22
+_EXPECTED_DURABLE_DEMAND_COUNT = 23
 
 
 class ExecutionMode(StrEnum):
@@ -314,16 +313,6 @@ _REGISTRY: dict[TelegramRpcSource, TelegramRpcConsumerSpec] = {
         _D,
         AcquisitionTrigger.REQUEST,
         FanoutScope.DIALOG,
-        DemandPolicyOwner.CALLER,
-    ),
-    TelegramRpcSource.MESSAGE_READ_FALLBACK: _consumer(
-        "Message read fallback",
-        "Fetch one message absent from the local mirror",
-        _I,
-        TelegramFactDomain.MESSAGE_HISTORY,
-        _D,
-        AcquisitionTrigger.REQUEST,
-        FanoutScope.MESSAGE,
         DemandPolicyOwner.CALLER,
     ),
     TelegramRpcSource.DIALOG_RESOLUTION: _consumer(
@@ -669,9 +658,6 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
     DemandKind.CHAT_EXPORT_OPERATION: _contract(
         DemandKind.CHAT_EXPORT_OPERATION, TelegramRpcSource.CHAT_EXPORT, _INLINE
     ),
-    DemandKind.MESSAGE_READ_FALLBACK: _contract(
-        DemandKind.MESSAGE_READ_FALLBACK, TelegramRpcSource.MESSAGE_READ_FALLBACK, _INLINE
-    ),
     DemandKind.ENTITY_LOOKUP: _contract(DemandKind.ENTITY_LOOKUP, TelegramRpcSource.DIALOG_RESOLUTION, _INLINE),
     DemandKind.TOPIC_LOOKUP: _contract(DemandKind.TOPIC_LOOKUP, TelegramRpcSource.TOPIC_RESOLUTION, _INLINE),
     DemandKind.FOREGROUND_ENTITY_FACTS: _contract(
@@ -796,7 +782,8 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
     DemandKind.TOPIC_SNAPSHOT: _contract(
         DemandKind.TOPIC_SNAPSHOT,
         TelegramRpcSource.TOPIC_RECONCILIATION,
-        _INLINE,
+        _DURABLE,
+        max_rpc_attempts_per_slice=4,
     ),
     DemandKind.MESSAGE_FACT_REFRESH: _contract(
         DemandKind.MESSAGE_FACT_REFRESH,

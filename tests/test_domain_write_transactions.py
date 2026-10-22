@@ -16,10 +16,7 @@ from mcp_telegram.own_only import OwnOnlyBasis, OwnOnlyClassification, enroll_ow
 from mcp_telegram.read_state import apply_read_cursor
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
-from mcp_telegram.telegram_fragments import FragmentContextService
-from mcp_telegram.telegram_reading import FragmentFetchResult
 from mcp_telegram.topics.sqlite_repository import SQLiteTopicMetadataRepository
-from tests.sqlite_writer_helpers import inline_writer
 
 
 @pytest.fixture
@@ -112,32 +109,6 @@ def test_draft_writer_rejects_foreign_ambient_transaction(tmp_path: Path) -> Non
         assert conn.execute("PRAGMA query_only").fetchone() == (1,)
     finally:
         conn.close()
-
-
-class _FragmentGateway:
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self.conn = conn
-
-    async def fetch_context(self, dialog_id: int, anchor_message_id: int, window_size: int) -> FragmentFetchResult:
-        assert not self.conn.in_transaction
-        assert self.conn.execute("PRAGMA query_only").fetchone() == (1,)
-        return FragmentFetchResult(messages=())
-
-
-async def test_fragment_rpc_runs_after_write_owner_is_released(guarded_db: sqlite3.Connection) -> None:
-    conn = guarded_db
-    result = await FragmentContextService(conn, _FragmentGateway(conn), writer=inline_writer(conn)).fetch(1, 2, 3)
-    assert result.ok
-    assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=1").fetchone() == ("fragment",)
-
-
-def test_fragment_rejects_inherited_owner_before_rpc(guarded_db: sqlite3.Connection) -> None:
-    conn = guarded_db
-    with write_transaction(conn):
-        with pytest.raises(RuntimeError, match="idle connection"):
-            FragmentContextService(conn, _FragmentGateway(conn), writer=inline_writer(conn)).fetch(1, 2, 3).send(None)
-        assert conn.in_transaction
-    assert conn.execute("SELECT COUNT(*) FROM synced_dialogs").fetchone() == (0,)
 
 
 def test_native_runtime_ports_commit_one_coherent_domain_unit(guarded_db: sqlite3.Connection) -> None:

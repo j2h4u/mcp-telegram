@@ -821,8 +821,12 @@ def test_list_tools_exposes_snake_case_names_titles_and_annotations() -> None:
     assert search_annotations is not None
     assert dialog_stats_annotations is not None
     assert list_messages_annotations.read_only_hint is True
-    assert list_topics_annotations.open_world_hint is True
-    assert search_annotations.open_world_hint is True
+    assert list_topics_annotations.open_world_hint is False
+    assert search_annotations.open_world_hint is False
+    assert list_messages_annotations.open_world_hint is False
+    profile_annotations = server.tool_by_name["get_entity_info"].annotations
+    assert profile_annotations is not None
+    assert profile_annotations.open_world_hint is False
     assert dialog_stats_annotations.open_world_hint is True
     assert mark_annotations.read_only_hint is False
     assert mark_annotations.idempotent_hint is True
@@ -2460,6 +2464,10 @@ async def test_server_instructions_point_to_workflows_prompt(monkeypatch: pytest
     instructions = await server._build_server_instructions()
 
     assert "telegram_workflows" in instructions
+    assert "durable local Telegram mirror" in instructions
+    assert "without fetching Telegram data or scheduling acquisition" in instructions
+    assert "unknown is not absent" in instructions
+    assert "mark_dialog_for_sync" in instructions
     assert "Do NOT use WebFetch or web scraping" in instructions
     assert "trace_account_messages" not in instructions
     assert "best_effort_visible" not in instructions

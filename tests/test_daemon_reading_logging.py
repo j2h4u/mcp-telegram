@@ -1,53 +1,26 @@
-"""Logging regressions for daemon reading fallbacks."""
+"""Local reading projection, filtering and logging regressions."""
 
 from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
-from datetime import UTC, datetime
+from collections.abc import Sequence
 from pathlib import Path
-from typing import cast
 
 import pytest
 
 from mcp_telegram.models import ReadMessage
-from mcp_telegram.pagination import HistoryDirection, decode_navigation_token
+from mcp_telegram.pagination import decode_navigation_token
 from mcp_telegram.reactions.contracts import ReactionFreshness
 from mcp_telegram.reading import ReadingDeps, ReadingService
 from mcp_telegram.reading.service import (
-    _ListMessagesTelegramRequest,
     _object_to_int,
     _object_to_int_or_none,
     _row_sequence,
     _row_value,
     _SearchMessagesRequest,
 )
-from mcp_telegram.telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
-from mcp_telegram.telegram_history import TelethonTelegramHistoryGateway
-from mcp_telegram.telegram_reading import (
-    GatewayFailure,
-    GatewayFailureKind,
-    HistoryMessage,
-    TelegramHistoryGateway,
-)
 from tests.history_enrollment_helpers import seed_full_history_enrollment
-from tests.sqlite_writer_helpers import inline_writer
-
-
-class _EntityMissingClient:
-    async def get_messages(self, entity: object, ids: list[int]) -> object:
-        _ = (entity, ids)
-        return None
-
-    def iter_messages(self, dialog_id: int, **kwargs: object) -> AsyncIterator[object]:
-        _ = (dialog_id, kwargs)
-
-        async def _gen() -> AsyncIterator[object]:
-            raise ValueError("Could not find the input entity for PeerUser(user_id=123)")
-            yield object()
-
-        return _gen()
 
 
 class _TestLogger:
@@ -72,30 +45,6 @@ class _TestLogger:
 
     def exception(self, msg: str, *args: object, **kwargs: object) -> None:
         self.exception_calls.append((msg, args, kwargs))
-
-
-class _PagedHistoryGateway:
-    def __init__(
-        self,
-        pages: list[tuple[dict[str, object], ...]],
-        *,
-        failure: GatewayFailure | None = None,
-    ) -> None:
-        self.messages = [message for page in pages for message in page]
-        self.failure = failure
-        self.calls: list[dict[str, object]] = []
-
-    async def stream_history(
-        self, dialog_id: int, kwargs: Mapping[str, object], self_id: int | None
-    ) -> AsyncGenerator[HistoryMessage | GatewayFailure]:
-        _ = (dialog_id, self_id)
-        self.calls.append(dict(kwargs))
-        for message in self.messages:
-            sent_at = message.get("sent_at")
-            date = datetime.fromtimestamp(sent_at, tz=UTC) if isinstance(sent_at, int) else None
-            yield HistoryMessage(message=message, date=date)
-        if self.failure is not None:
-            yield self.failure
 
 
 @pytest.mark.parametrize(
@@ -177,8 +126,6 @@ def test_read_state_per_dialog_skips_non_dm_and_zero_dialogs() -> None:
             sync_db_path=None,
             self_id=1,
             resolve_dialog_id=lambda _selector: asyncio.sleep(0, result=0),
-            fragment_context=cast(FragmentContextService, object()),
-            history_gateway=cast(TelegramHistoryGateway, object()),
             logger=_TestLogger(),
             rid=lambda: "",
             deleted_message_visibility_seconds=86_400,
@@ -202,15 +149,13 @@ def test_read_state_per_dialog_skips_non_dm_and_zero_dialogs() -> None:
     assert states[7]["outbox_unread_count"] == 1
 
 
-def _telegram_service(gateway: _PagedHistoryGateway, conn: sqlite3.Connection | None = None) -> ReadingService:
+def _local_service(conn: sqlite3.Connection | None = None) -> ReadingService:
     return ReadingService(
         ReadingDeps(
             conn=conn or sqlite3.connect(":memory:"),
             sync_db_path=None,
             self_id=1,
             resolve_dialog_id=lambda _selector: asyncio.sleep(0, result=0),
-            fragment_context=cast(FragmentContextService, object()),
-            history_gateway=gateway,
             logger=_TestLogger(),
             rid=lambda: "",
             deleted_message_visibility_seconds=86_400,
@@ -224,7 +169,7 @@ def test_own_only_cache_missing_schema_fails_closed(tmp_path: Path, file_backed:
     database = tmp_path / "reading.db" if file_backed else ":memory:"
     conn = sqlite3.connect(database)
     conn.row_factory = sqlite3.Row
-    service = _telegram_service(_PagedHistoryGateway([]), conn)
+    service = _local_service(conn)
     try:
         with pytest.raises(sqlite3.OperationalError):
             service._own_only_basis_by_dialog()
@@ -233,7 +178,7 @@ def test_own_only_cache_missing_schema_fails_closed(tmp_path: Path, file_backed:
 
 
 def test_search_next_navigation_retains_scope_and_utc_bounds() -> None:
-    service = _telegram_service(_PagedHistoryGateway([]))
+    service = _local_service()
     request = _SearchMessagesRequest(
         dialog_id=123,
         dialog=None,
@@ -327,7 +272,7 @@ async def test_search_scoped_result_applies_time_bounds_and_keeps_cursor_context
         """
     )
     seed_full_history_enrollment(conn, 123, enabled=False)
-    service = _telegram_service(_PagedHistoryGateway([]), conn)
+    service = _local_service(conn)
 
     async def fake_build(
         dialog_id: int,
@@ -355,7 +300,9 @@ async def test_search_scoped_result_applies_time_bounds_and_keeps_cursor_context
             "outbox_cursor_state": "populated",
         }
     }
-    monkeypatch.setattr("mcp_telegram.reading.service._build_access_metadata", lambda *_args: {"dialog_access": "live"})
+    monkeypatch.setattr(
+        "mcp_telegram.reading.service._build_access_metadata", lambda *_args: {"dialog_access": "unknown"}
+    )
     request = _SearchMessagesRequest(
         dialog_id=123,
         dialog=None,
@@ -379,57 +326,7 @@ async def test_search_scoped_result_applies_time_bounds_and_keeps_cursor_context
     assert token.value == 1
     assert token.since_utc == 100
     assert token.until_utc == 200
-    assert result["data"]["dialog_access"] == "live"
-
-
-@pytest.mark.asyncio
-async def test_list_messages_telegram_entity_miss_logs_structured_warning_without_traceback() -> None:
-    logger = _TestLogger()
-    conn = sqlite3.connect(":memory:")
-    service = ReadingService(
-        ReadingDeps(
-            conn=conn,
-            sync_db_path=None,
-            self_id=1,
-            resolve_dialog_id=lambda _selector: asyncio.sleep(0, result=0),
-            fragment_context=FragmentContextService(
-                conn, TelethonTelegramFragmentGateway(_EntityMissingClient()), writer=inline_writer(conn)
-            ),
-            history_gateway=TelethonTelegramHistoryGateway(_EntityMissingClient()),
-            logger=logger,
-            rid=lambda: " request_id=test-rid",
-            deleted_message_visibility_seconds=86_400,
-            draft_response_budget_bytes=256 * 1024,
-        )
-    )
-
-    try:
-        result = await service._list_messages_from_telegram(
-            _ListMessagesTelegramRequest(
-                dialog_id=123,
-                limit=10,
-                direction="newest",
-                direction_enum=HistoryDirection.NEWEST,
-                anchor_msg_id=None,
-                sender_id=None,
-                topic_id=None,
-                unread_after_id=None,
-            )
-        )
-    finally:
-        conn.close()
-
-    assert result["ok"] is False
-    assert result["error"] == "telegram_error"
-    assert result["detail"] == {
-        "error_type": "ValueError",
-        "error_message": "Could not find the input entity for PeerUser(user_id=123)",
-        "retryable": False,
-    }
-    assert len(logger.warning_calls) == 1
-    _, _, kwargs = logger.warning_calls[0]
-    assert kwargs.get("exc_info") is None
-    assert logger.exception_calls == []
+    assert result["data"]["dialog_access"] == "unknown"
 
 
 @pytest.mark.asyncio
@@ -516,8 +413,6 @@ async def test_build_read_messages_projects_persisted_reaction_events() -> None:
             sync_db_path=None,
             self_id=1,
             resolve_dialog_id=lambda _selector: asyncio.sleep(0, result=0),
-            fragment_context=cast(FragmentContextService, object()),
-            history_gateway=cast(TelegramHistoryGateway, object()),
             logger=logger,
             rid=lambda: "",
             deleted_message_visibility_seconds=86_400,
@@ -539,146 +434,3 @@ async def test_build_read_messages_projects_persisted_reaction_events() -> None:
     ]
     assert messages[0].reaction_events_status == "partial"
     assert messages[0].reactions_display == "[👍×2]"
-
-
-@pytest.mark.asyncio
-async def test_list_messages_telegram_stream_filters_window_and_continues() -> None:
-    gateway = _PagedHistoryGateway(
-        [
-            ({"message_id": 1, "sent_at": 100}, {"message_id": 2, "sent_at": 101}),
-            ({"message_id": 3, "sent_at": 200}, {"message_id": 4, "sent_at": 201}),
-        ]
-    )
-    service = _telegram_service(gateway)
-    try:
-        result = await service._list_messages_from_telegram(
-            _ListMessagesTelegramRequest(
-                dialog_id=123,
-                limit=2,
-                direction="oldest",
-                direction_enum=HistoryDirection.OLDEST,
-                anchor_msg_id=None,
-                sender_id=None,
-                topic_id=None,
-                unread_after_id=None,
-                since_utc=200,
-                until_utc=300,
-            )
-        )
-    finally:
-        service._conn.close()
-
-    assert result["ok"] is True
-    assert [row["message_id"] for row in result["data"]["messages"]] == [3, 4]
-    assert result["data"]["next_navigation"] is not None
-    assert len(gateway.calls) == 1
-    assert gateway.calls[0]["reverse"] is True
-    assert "offset_date" not in gateway.calls[0]
-
-
-@pytest.mark.asyncio
-async def test_list_messages_telegram_until_is_exclusive() -> None:
-    gateway = _PagedHistoryGateway(
-        [
-            ({"message_id": 10, "sent_at": 300}, {"message_id": 9, "sent_at": 299}),
-            (),
-        ]
-    )
-    service = _telegram_service(gateway)
-    try:
-        result = await service._list_messages_from_telegram(
-            _ListMessagesTelegramRequest(
-                dialog_id=123,
-                limit=2,
-                direction="newest",
-                direction_enum=HistoryDirection.NEWEST,
-                anchor_msg_id=None,
-                sender_id=None,
-                topic_id=None,
-                unread_after_id=None,
-                since_utc=200,
-                until_utc=300,
-            )
-        )
-    finally:
-        service._conn.close()
-
-    assert result["ok"] is True
-    assert [row["message_id"] for row in result["data"]["messages"]] == [9]
-    assert result["data"]["next_navigation"] is None
-    assert len(gateway.calls) == 1
-    assert gateway.calls[0]["offset_date"] == datetime.fromtimestamp(300, tz=UTC)
-
-
-@pytest.mark.asyncio
-async def test_public_telegram_read_discards_successful_prefix_on_stream_failure() -> None:
-    failure = GatewayFailure(
-        kind=GatewayFailureKind.TRANSIENT,
-        error_type="OSError",
-        error_message="temporary failure",
-        retryable=True,
-    )
-    gateway = _PagedHistoryGateway(
-        [({"message_id": 5, "sent_at": 150},)],
-        failure=failure,
-    )
-    service = _telegram_service(gateway)
-    try:
-        result = await service.list_messages_from_telegram(
-            _ListMessagesTelegramRequest(
-                dialog_id=123,
-                limit=2,
-                direction="newest",
-                direction_enum=HistoryDirection.NEWEST,
-                anchor_msg_id=None,
-                sender_id=None,
-                topic_id=None,
-                unread_after_id=None,
-                since_utc=None,
-                until_utc=None,
-            )
-        )
-    finally:
-        service._conn.close()
-
-    assert result["ok"] is False
-    assert result["error"] == "telegram_error"
-    assert result["detail"]["error_type"] == "OSError"
-    assert len(gateway.calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_list_messages_telegram_boundary_cap_exposes_continuation() -> None:
-    pages: list[tuple[dict[str, object], ...]] = [
-        tuple({"message_id": page * 2 + offset, "sent_at": 100 + page * 2 + offset} for offset in (1, 2))
-        for page in range(16)
-    ]
-    gateway = _PagedHistoryGateway(pages)
-    service = _telegram_service(gateway)
-    try:
-        result = await service._list_messages_from_telegram(
-            _ListMessagesTelegramRequest(
-                dialog_id=123,
-                limit=2,
-                direction="oldest",
-                direction_enum=HistoryDirection.OLDEST,
-                anchor_msg_id=None,
-                sender_id=None,
-                topic_id=None,
-                unread_after_id=None,
-                since_utc=1000,
-                until_utc=2000,
-            )
-        )
-    finally:
-        service._conn.close()
-
-    assert result["ok"] is True
-    assert result["data"]["messages"] == []
-    continuation = result["data"]["next_navigation"]
-    assert continuation is not None
-    token = decode_navigation_token(continuation)
-    assert token.value == 32
-    assert token.since_utc == 1000
-    assert token.until_utc == 2000
-    assert len(gateway.calls) == 1

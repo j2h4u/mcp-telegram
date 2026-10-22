@@ -9,6 +9,7 @@ import sqlite3
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
 
@@ -25,10 +26,13 @@ from telethon.tl.types import (
     UpdateNewMessage,
     UpdatePinnedForumTopic,
     UpdatePinnedForumTopics,
+    User,
 )
 
 from mcp_telegram.event_handlers import EventHandlerManager
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.topics.catalog import TopicCatalogRepository
 from mcp_telegram.topics.contracts import TopicFact
 from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from sqlite_writer_helpers import event_manager, inline_writer
@@ -264,3 +268,42 @@ def test_reserved_topic_event_order_rejects_older_event(db: sqlite3.Connection) 
             -1000000000123, 1, title="older", icon_emoji_id=None, hidden=None, observed_at=100, observation_order=older
         )
     assert _topic_rows(db)[1][1] == "newer"
+
+
+@pytest.mark.asyncio
+async def test_supplied_bot_capability_change_reopens_catalog_without_rpc(db: sqlite3.Connection) -> None:
+    seed_full_history_enrollment(db, 42, enabled=True, source="automatic")
+    db.commit()
+    client = MagicMock()
+    manager = event_manager(client, db, asyncio.Event())
+    manager.set_self_id(1)
+    sink = MagicMock()
+    manager.bind_demand_sink(sink)
+    ordinary = SimpleNamespace(_entities={42: User(42, first_name="Bot", bot=True, bot_forum_view=False)})
+
+    await manager.on_raw_identity_or_notify(ordinary)
+    assert TopicCatalogRepository(db).coverage(42)["coverage"] == "not_applicable"
+    enabled = SimpleNamespace(_entities={42: User(42, first_name="Bot", bot=True, bot_forum_view=True)})
+    await manager.on_raw_identity_or_notify(enabled)
+
+    assert TopicCatalogRepository(db).coverage(42)["pending"] is True
+    assert any(call.args == (DemandKind.TOPIC_SNAPSHOT,) for call in sink.offer.call_args_list)
+    previous = list(sink.offer.call_args_list)
+    await manager.on_raw_identity_or_notify(enabled)
+    assert sink.offer.call_args_list == previous
+    client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_min_capability_bundle_does_not_turn_unknown_into_not_applicable(db: sqlite3.Connection) -> None:
+    seed_full_history_enrollment(db, 42, enabled=True)
+    db.commit()
+    client = MagicMock()
+    manager = event_manager(client, db, asyncio.Event())
+    manager.set_self_id(1)
+    manager.bind_demand_sink(MagicMock())
+
+    await manager.on_raw_identity_or_notify(SimpleNamespace(_entities={42: User(42, min=True, first_name="Partial")}))
+
+    assert TopicCatalogRepository(db).coverage(42)["coverage"] != "not_applicable"
+    client.assert_not_called()

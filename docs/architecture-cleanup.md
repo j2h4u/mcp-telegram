@@ -8,18 +8,13 @@ this table until removed.
 
 ## Current debt
 
-| ID | Deprecated edge(s) | Owner / target | Removal condition |
-|---|---|---|---|
-| `TG-001` | `telegram_fragments` → `messages.sqlite_bundle` | Telegram/messages | Inject a message-write port at the fragment ingestion seam. |
+There are no remaining deprecated edges. `TG-001` closed when ordinary reads
+became local-only: the obsolete fragment/history acquisition modules were
+removed instead of introducing a write port for a use case no longer exposed.
 
 Deprecated diagnostics are warnings so the gate stays green, but they are not
 approval to add more coupling. A new deprecated edge requires a table row in
 the same change with an owner and a concrete removal condition.
-
-## Next cleanup slices
-
-1. `TG-001`: introduce the message write boundary only once the fragment path
-   has a real interchangeable dependency.
 
 The SYNC-001 frontier is closed. Runtime entity writers use the canonical,
 transaction-neutral `entity_store` persistence boundary, and `event_handlers`

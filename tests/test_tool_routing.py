@@ -107,6 +107,10 @@ def _json_text(value: object) -> str:
     return value
 
 
+def _topic_catalog_fixture() -> dict[str, object]:
+    return {"coverage": "partial", "completed_at": None, "pending": True, "reason": None, "retry_at": None}
+
+
 def _assert_null_free(value: object, *, path: str = "$") -> None:
     assert value is not None, path
     if isinstance(value, dict):
@@ -424,6 +428,7 @@ STRUCTURED_TOOL_CASES = {
                     {"id": 1, "title": "General"},
                 ],
                 "dialog_id": 123,
+                "catalog": _topic_catalog_fixture(),
             },
         },
     ),
@@ -1191,6 +1196,7 @@ async def test_list_topics_via_daemon():
                     {"id": 2, "title": "Off-topic"},
                 ],
                 "dialog_id": 123,
+                "catalog": _topic_catalog_fixture(),
             },
         }
     )
@@ -1219,7 +1225,7 @@ async def test_list_topics_via_daemon():
 
 async def test_list_topics_passes_dialog_name():
     """ListTopics passes dialog name to daemon when not a numeric ID."""
-    conn = _make_daemon_conn({"ok": True, "data": {"topics": [], "dialog_id": 0}})
+    conn = _make_daemon_conn({"ok": True, "data": {"topics": [], "dialog_id": 0, "catalog": _topic_catalog_fixture()}})
     with _patch_daemon(conn):
         await list_topics(ListTopics(dialog="Some Group"))
 
@@ -1229,7 +1235,9 @@ async def test_list_topics_passes_dialog_name():
 
 async def test_list_topics_passes_exact_dialog_id():
     """ListTopics accepts the same exact dialog id selector style as ListMessages."""
-    conn = _make_daemon_conn({"ok": True, "data": {"topics": [], "dialog_id": 8583106747}})
+    conn = _make_daemon_conn(
+        {"ok": True, "data": {"topics": [], "dialog_id": 8583106747, "catalog": _topic_catalog_fixture()}}
+    )
     with _patch_daemon(conn):
         result = await list_topics(ListTopics(exact_dialog_id=8583106747))
 
@@ -1258,7 +1266,18 @@ def test_list_topics_schema_avoids_client_incompatible_selector_union() -> None:
 def test_list_topics_schema_explains_inconclusive_empty_catalog() -> None:
     empty_reason = LIST_TOPICS_OUTPUT_SCHEMA["properties"]["empty_reason"]
 
-    assert "could not confirm whether topics exist" in empty_reason["description"]
+    assert "requires a completed catalog enumeration" in empty_reason["description"]
+    assert "partial local evidence" in empty_reason["description"]
+
+
+def test_list_topics_advertises_local_only_read_boundary() -> None:
+    annotations = TOOL_REGISTRY["list_topics"].annotations
+
+    assert annotations is not None
+    assert annotations.read_only_hint is True
+    assert annotations.open_world_hint is False
+    description = ListTopics.__doc__ or ""
+    assert "local" in description.lower()
 
 
 @pytest.mark.parametrize("exact_dialog_id", [True, False])
@@ -1388,9 +1407,24 @@ async def test_all_dialog_scoped_tools_safely_project_ambiguity_and_suggestion_c
         )
 
 
-async def test_list_topics_empty_is_structured_non_error():
+@pytest.mark.parametrize(
+    ("coverage", "pending", "empty_reason"),
+    [
+        ("not_observed", False, "topic_catalog_not_observed"),
+        ("partial", True, "topic_catalog_partial"),
+        ("complete", False, "no_active_topics"),
+        ("not_applicable", False, "not_topic_capable"),
+    ],
+)
+async def test_list_topics_empty_is_structured_non_error(coverage: str, pending: bool, empty_reason: str):
     """ListTopics empty state is a structured successful response."""
-    conn = _make_daemon_conn({"ok": True, "data": {"topics": [], "dialog_id": 123}})
+    catalog = {"coverage": coverage, "completed_at": None, "pending": pending, "reason": None, "retry_at": None}
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {"topics": [], "dialog_id": 123, "catalog": catalog, "empty_reason": empty_reason},
+        }
+    )
     with _patch_daemon(conn):
         result = await list_topics(ListTopics(dialog="Some Group"))
 
@@ -1401,7 +1435,8 @@ async def test_list_topics_empty_is_structured_non_error():
         "dialog_id": 123,
         "topics": [],
         "count": 0,
-        "empty_reason": None,
+        "empty_reason": empty_reason,
+        "catalog": catalog,
     }
 
 
@@ -1422,6 +1457,7 @@ async def test_list_topics_structures_optional_topic_metadata():
                     },
                 ],
                 "dialog_id": -100,
+                "catalog": _topic_catalog_fixture(),
             },
         }
     )
@@ -1459,6 +1495,7 @@ async def test_list_topics_uses_fallback_color_when_custom_emoji_is_absent():
             "data": {
                 "topics": [{"id": 11, "title": "Default", "icon_color": 0x6FB9F0}],
                 "dialog_id": -100,
+                "catalog": _topic_catalog_fixture(),
             },
         }
     )
@@ -3679,7 +3716,8 @@ async def test_list_messages_topic_fuzzy_ambiguous_returns_error():
     assert candidates[0]["trust"] == {"source": "telegram", "is_untrusted": True}
 
 
-async def test_list_messages_topic_not_found_returns_error():
+@pytest.mark.parametrize(("complete", "pending"), [(False, False), (False, True), (True, False)])
+async def test_list_messages_topic_not_found_returns_error(complete: bool, pending: bool):
     """list_messages with topic= that doesn't match any topic returns error."""
     list_topics_response = {
         "ok": True,
@@ -3688,6 +3726,13 @@ async def test_list_messages_topic_not_found_returns_error():
                 {"id": 7, "title": "General"},
             ],
             "dialog_id": 1,
+            "catalog": {
+                "coverage": "complete" if complete else "partial",
+                "pending": pending,
+                "completed_at": 100 if complete else None,
+                "reason": None,
+                "retry_at": None,
+            },
         },
     }
     conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "source": "sync_db"}})
@@ -3696,7 +3741,15 @@ async def test_list_messages_topic_not_found_returns_error():
         result = await list_messages(ListMessages(exact_dialog_id=1, topic="nonexistent", message_state="sent"))
 
     text = _result_text(result)
-    assert "not found" in text.lower() or "nonexistent" in text.lower()
+    assert result.is_error
+    if complete:
+        assert "completed local catalog" in text.lower()
+    else:
+        assert "absence is unknown" in text.lower()
+        if pending:
+            assert "Wait for the pending background catalog acquisition" in text
+        else:
+            assert "mark_dialog_for_sync" in text
 
 
 async def test_list_messages_no_optional_params_not_sent():

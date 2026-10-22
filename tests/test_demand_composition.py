@@ -83,6 +83,7 @@ from mcp_telegram.telegram_rpc_consumers import (
     demand_freshness_seconds,
 )
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope, rpc_scope
+from mcp_telegram.topics.demand import TopicSnapshotDemandAdapter
 from tests.helpers import LoudUserProfilePort, build_mock_message
 from tests.sqlite_writer_helpers import inline_writer
 
@@ -273,7 +274,7 @@ def composition_dependencies(
         cast(sqlite3.Connection, objects["conn"]).close()
 
 
-def test_adapter_map_is_exact_against_literal_21_kind_class_map(
+def test_adapter_map_is_exact_against_literal_23_kind_class_map(
     composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
 ) -> None:
     dependencies, objects = composition_dependencies
@@ -296,6 +297,7 @@ def test_adapter_map_is_exact_against_literal_21_kind_class_map(
         DemandKind.COLD_PEER_PAGE: ColdPeerPageDemandAdapter,
         DemandKind.BACKFILL_HYDRATION_BATCH: FactHydrationDemandAdapter,
         DemandKind.FOLDER_SNAPSHOT: FolderProjectionDemandAdapter,
+        DemandKind.TOPIC_SNAPSHOT: TopicSnapshotDemandAdapter,
         DemandKind.MESSAGE_FACT_REFRESH: MessageFactRefreshDemandAdapter,
         DemandKind.READ_RECEIPT_BATCH: ReadReceiptDemandAdapter,
         DemandKind.SCHEDULED_REPAIR: ScheduledRepairDemandAdapter,
@@ -304,7 +306,7 @@ def test_adapter_map_is_exact_against_literal_21_kind_class_map(
         DemandKind.SELF_PROFILE_MAINTENANCE: SelfProfileMaintenanceDemandAdapter,
         DemandKind.LINKED_CHAT_REFRESH: LinkedChatFactDemandAdapter,
     }
-    assert len(expected) == 22
+    assert len(expected) == 23
     assert set(adapters) == set(expected)
     assert {kind: type(adapter) for kind, adapter in adapters.items()} == expected
     assert all(getattr(adapter, "demand_kind", None) is kind for kind, adapter in adapters.items())
@@ -773,6 +775,13 @@ async def test_adapter_composition_is_readonly_and_shares_writer(
             cast(DmDeletionReconciliationDemandAdapter, adapters[DemandKind.DM_DELETION_RECONCILIATION])._writer
             is writer
         )
+        topic_adapter = cast(TopicSnapshotDemandAdapter, adapters[DemandKind.TOPIC_SNAPSHOT])
+        assert topic_adapter._writer is writer
+        assert topic_adapter._conn is reader
+        changes_before = reader.total_changes
+        assert topic_adapter.status(0.0) is None
+        assert reader.total_changes == changes_before
+        assert reader.execute("SELECT COUNT(*) FROM topic_catalog_state").fetchone()[0] == 0
     finally:
         await writer.aclose()
         reader.close()

@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import ast
 import sqlite3
-from collections.abc import AsyncIterator, Callable
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Protocol, cast
-from unittest.mock import AsyncMock
 
 import pytest
 from telethon.errors import (
@@ -18,16 +17,11 @@ from telethon.errors import (
 from telethon.tl import types
 
 from mcp_telegram.flood import TelegramRpcThrottled
-from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
-from mcp_telegram.messages.telegram_adapter import extract_message_row
 from mcp_telegram.models import ReadMessage
-from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.reactions.projection import project_reaction_event
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
-from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudgetExhaustedError
+from mcp_telegram.telegram_demand import RpcAttemptBudgetExhaustedError
 from mcp_telegram.telegram_fact_queries import enrich_read_at, persist_read_at, stale_read_at_ids
-from mcp_telegram.telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
-from mcp_telegram.telegram_history import TelethonTelegramHistoryGateway
 from mcp_telegram.telegram_read_receipts import (
     TelethonTelegramReadReceiptGateway,
     classify_read_date_exception,
@@ -35,16 +29,13 @@ from mcp_telegram.telegram_read_receipts import (
 from mcp_telegram.telegram_reading import (
     GatewayFailure,
     GatewayFailureKind,
-    HistoryMessage,
     ReadDateFetchResult,
     ReadDateReason,
 )
-from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
     TelegramRpcAdmissionDeferred,
     TelegramRpcSource,
-    current_rpc_scope,
     rpc_scope,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
@@ -77,24 +68,6 @@ def _message(message_id: int, *, reaction: bool = True) -> SimpleNamespace:
     )
 
 
-class _HistoryClient:
-    def __init__(self, messages: list[object], *, error: Exception | None = None) -> None:
-        self.messages = messages
-        self.error = error
-        self.calls: list[tuple[int, dict[str, object]]] = []
-
-    def iter_messages(self, dialog_id: int, **kwargs: object) -> AsyncIterator[object]:
-        self.calls.append((dialog_id, kwargs))
-
-        async def stream() -> AsyncIterator[object]:
-            for message in self.messages:
-                yield message
-            if self.error is not None:
-                raise self.error
-
-        return stream()
-
-
 def _seed_synced(conn: sqlite3.Connection, dialog_id: int) -> None:
     conn.execute(
         "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', 0)",
@@ -108,50 +81,6 @@ def _seed_enrollment(conn: sqlite3.Connection, dialog_id: int, *, enabled: bool 
     """Seed the v34 durable authorization for direct fact-persistence tests."""
     seed_full_history_enrollment(conn, dialog_id, enabled=enabled)
     conn.commit()
-
-
-@pytest.mark.asyncio
-async def test_history_gateway_streams_ordered_messages_and_preserves_query_options() -> None:
-    client = _HistoryClient([_message(10), _message(12)])
-
-    streamed = [
-        item
-        async for item in TelethonTelegramHistoryGateway(client).stream_history(
-            42,
-            {"limit": 2, "reverse": True},
-            self_id=101,
-        )
-    ]
-
-    assert client.calls == [(42, {"limit": 2, "reverse": True})]
-    assert all(isinstance(item, HistoryMessage) for item in streamed)
-    messages = [item.message for item in streamed if isinstance(item, HistoryMessage)]
-    assert [message["message_id"] for message in messages] == [10, 12]
-    assert [message["dialog_id"] for message in messages] == [42, 42]
-    assert [message["effective_sender_id"] for message in messages] == [101, 101]
-
-
-@pytest.mark.asyncio
-async def test_history_gateway_streams_prefix_before_structured_failure() -> None:
-    client = _HistoryClient([_message(10)], error=ValueError("dialog not available"))
-
-    streamed = [
-        item
-        async for item in TelethonTelegramHistoryGateway(client).stream_history(
-            42,
-            {"limit": 2},
-            self_id=101,
-        )
-    ]
-
-    assert isinstance(streamed[0], HistoryMessage)
-    assert streamed[0].message["message_id"] == 10
-    assert streamed[1] == GatewayFailure(
-        kind=GatewayFailureKind.INVALID_TARGET,
-        error_type="ValueError",
-        error_message="dialog not available",
-        retryable=False,
-    )
 
 
 @pytest.mark.parametrize(
@@ -171,129 +100,6 @@ def test_reaction_gateway_peer_id_normalizes_telethon_and_narrow_doubles(peer: o
     assert project_reaction_event(SimpleNamespace(peer_id=peer, reaction=None, date=None)).reactor_id == expected
 
 
-@pytest.mark.asyncio
-async def test_fragment_gateway_preserves_fixed_window_and_normalized_persistence(
-    make_synced_db: Callable[[], sqlite3.Connection],
-) -> None:
-    conn = make_synced_db()
-    scopes: list[tuple[TelegramRpcSource, DemandKind, AcquisitionKind | None]] = []
-
-    async def get_input_entity(_dialog_id: int) -> str:
-        assert conn.execute("SELECT value FROM daemon_state WHERE key='canonical_observation_sequence'").fetchone() == (
-            "1",
-        )
-        scope = current_rpc_scope()
-        assert scope.demand_kind is not None
-        scopes.append((scope.source, scope.demand_kind, scope.acquisition_kind))
-        return "entity"
-
-    async def get_messages(_entity: object, *, ids: list[int]) -> list[object | None]:
-        scope = current_rpc_scope()
-        assert scope.demand_kind is not None
-        scopes.append((scope.source, scope.demand_kind, scope.acquisition_kind))
-        return [_message(10), None, _message(12)]
-
-    client = SimpleNamespace(
-        get_input_entity=AsyncMock(side_effect=get_input_entity),
-        get_messages=AsyncMock(side_effect=get_messages),
-    )
-
-    result = await FragmentContextService(
-        conn, TelethonTelegramFragmentGateway(client), writer=inline_writer(conn)
-    ).fetch(42, 10, 6)
-
-    assert result.ok is True
-    assert all(message.observation_order == 1 for message in result.messages)
-    cast(AsyncMock, client.get_messages).assert_awaited_once_with("entity", ids=[7, 8, 9, 10, 11, 12])
-    assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=42").fetchone() == ("fragment",)
-    assert conn.execute("SELECT message_id, text FROM messages ORDER BY message_id").fetchall() == [
-        (10, "message 10"),
-        (12, "message 12"),
-    ]
-    assert conn.execute("SELECT message_id, emoji, count FROM message_reactions ORDER BY message_id").fetchall() == [
-        (10, "👍", 2),
-        (12, "👍", 2),
-    ]
-    assert conn.execute("SELECT dialog_id, message_id FROM messages_fts ORDER BY message_id").fetchall() == [
-        (42, 10),
-        (42, 12),
-    ]
-    assert scopes == [
-        (
-            TelegramRpcSource.MESSAGE_READ_FALLBACK,
-            DemandKind.MESSAGE_READ_FALLBACK,
-            AcquisitionKind.ENTITY_LOOKUP,
-        ),
-        (
-            TelegramRpcSource.MESSAGE_READ_FALLBACK,
-            DemandKind.MESSAGE_READ_FALLBACK,
-            AcquisitionKind.MESSAGE_LOOKUP,
-        ),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_fragment_late_result_keeps_message_observed_during_fetch(
-    make_synced_db: Callable[[], sqlite3.Connection],
-) -> None:
-    conn = make_synced_db()
-
-    async def get_messages(_entity: object, *, ids: list[int]) -> list[object]:
-        newer = _message(10)
-        newer.message = "newer"
-        with write_transaction(conn):
-            extracted = extract_message_row(42, newer)
-            extracted.observation_order = allocate_observation_order(conn)
-            insert_messages_with_fts(conn, [extracted])
-        return [_message(10)]
-
-    client = SimpleNamespace(
-        get_input_entity=AsyncMock(return_value="entity"), get_messages=AsyncMock(side_effect=get_messages)
-    )
-    result = await FragmentContextService(
-        conn, TelethonTelegramFragmentGateway(client), writer=inline_writer(conn)
-    ).fetch(42, 10, 1)
-    assert result.messages[0].observation_order == 1
-    assert conn.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=10").fetchone() == ("newer",)
-
-
-@pytest.mark.asyncio
-async def test_fragment_gateway_translates_floodwait_without_partial_persistence(
-    make_synced_db: Callable[[], sqlite3.Connection],
-) -> None:
-    conn = make_synced_db()
-    flood = TelegramRpcThrottled(retry_after_seconds=17)
-    client = SimpleNamespace(
-        get_input_entity=AsyncMock(side_effect=flood),
-        get_messages=AsyncMock(),
-    )
-
-    result = await FragmentContextService(
-        conn, TelethonTelegramFragmentGateway(client), writer=inline_writer(conn)
-    ).fetch(42, 10, 6)
-
-    assert result.ok is False
-    assert result.failure == GatewayFailure(
-        kind=GatewayFailureKind.FLOOD_WAIT,
-        error_type="TelegramRpcThrottled",
-        error_message=str(flood),
-        retryable=True,
-        retry_after=17,
-    )
-    assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=42").fetchone() == ("fragment",)
-    assert conn.execute("SELECT COUNT(*) FROM messages").fetchone() == (0,)
-
-
-@pytest.mark.asyncio
-@pytest.mark.asyncio
-@pytest.mark.asyncio
-@pytest.mark.asyncio
-@pytest.mark.asyncio
-@pytest.mark.asyncio
-@pytest.mark.asyncio
-@pytest.mark.asyncio
-@pytest.mark.asyncio
-@pytest.mark.asyncio
 @pytest.mark.asyncio
 async def test_read_receipt_gateway_keeps_telegram_date_nullable() -> None:
     class Client:

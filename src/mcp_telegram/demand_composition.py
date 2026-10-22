@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Protocol
+from typing import Protocol, cast
 
 from mcp_telegram.activity_cold_backfill import ColdBackfillPacing, ColdPeerPageDemandAdapter
 from mcp_telegram.activity_hot_sweep import HotActivityDemandAdapter, HotSweepPolicy
@@ -71,6 +71,8 @@ from mcp_telegram.telegram_demand import (
 from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator, validate_durable_adapters
 from mcp_telegram.telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 from mcp_telegram.telegram_rpc_scheduler import rpc_attempt_budget
+from mcp_telegram.topics.demand import TopicSnapshotDemandAdapter
+from mcp_telegram.topics.telegram_adapter import TelethonTelegramTopicGateway, TopicClient
 
 
 class DemandCompositionClient(ActivityClient, Protocol):
@@ -153,6 +155,11 @@ def build_durable_adapter_map(
 ) -> Mapping[DemandKind, DurableDemandAdapter]:
     """Build and validate the exhaustive durable adapter map."""
     adapters: dict[DemandKind, DurableDemandAdapter] = {
+        DemandKind.TOPIC_SNAPSHOT: TopicSnapshotDemandAdapter(
+            TelethonTelegramTopicGateway(cast(TopicClient, dependencies.client)),
+            dependencies.conn,
+            writer=dependencies.writer,
+        ),
         DemandKind.ENTITY_PROFILE_REFRESH: EntityProfileDemandAdapter(dependencies.entity_refresh_coordinator),
         DemandKind.DELTA_GAP_FILL: DeltaGapFillDemandAdapter(dependencies.delta_sync_worker, observer=observer),
         DemandKind.DM_DELETION_RECONCILIATION: DmDeletionReconciliationDemandAdapter(

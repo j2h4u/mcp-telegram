@@ -97,9 +97,6 @@ from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcAdmissionScheduler,
     TelegramRpcScope,
 )
-from mcp_telegram.topics.contracts import TopicFact
-from mcp_telegram.topics.refresh import TopicRefresher
-from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from sqlite_writer_helpers import event_manager, inline_writer
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
@@ -1350,8 +1347,8 @@ async def test_latched_circuit_precedes_disconnected_transport_deferral() -> Non
 
 
 @pytest.mark.asyncio
-async def test_daemon_remote_topic_miss_projects_latched_gate_without_raw_send(tmp_path: Path) -> None:
-    """A daemon remote miss reaches the real Gate and stops before its raw sender."""
+async def test_daemon_unobserved_topic_catalog_does_not_cross_latched_gate(tmp_path: Path) -> None:
+    """Local catalog absence is readable without admission or a raw sender call."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
@@ -1373,18 +1370,10 @@ async def test_daemon_remote_topic_miss_projects_latched_gate_without_raw_send(t
         async def get_entity(self, dialog_id: int) -> object:
             return await gate(_TestRequest(dialog_id))
 
-    class _TopicGateway:
-        async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
-            del entity
-            raise AssertionError("latched gate must reject before topic refresh")
-
     server = DaemonAPIServer(
         conn,
         cast(DaemonClientLike, GateClient()),
         asyncio.Event(),
-        topic_refresher=TopicRefresher(
-            _TopicGateway(), SQLiteTopicSnapshotRepository(conn), writer=inline_writer(conn)
-        ),
         writer=inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
@@ -1401,14 +1390,11 @@ async def test_daemon_remote_topic_miss_projects_latched_gate_without_raw_send(t
         conn.close()
         await gate.close_rpc_scheduler()
 
-    assert response == {
-        "ok": False,
-        "error": "flood_wait_kill_switch_open",
-        "message": "Telegram acquisition is blocked by account protection.",
-        "required_action": "manual_operator_recovery",
-        "retryable": False,
-    }
-    assert check_calls > 0
+    assert response["ok"] is True
+    assert response["data"]["topics"] == []
+    assert response["data"]["catalog"]["coverage"] == "not_observed"
+    assert response["data"]["empty_reason"] == "topic_catalog_not_observed"
+    assert check_calls == 0
     assert sender.calls == 0
 
 

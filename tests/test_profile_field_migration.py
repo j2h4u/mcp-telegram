@@ -36,7 +36,7 @@ def test_fresh_schema_creates_empty_field_observation_table_idempotently(tmp_pat
         "source",
     ]
     assert "WITHOUT ROWID" in str(first_schema[0]).upper()
-    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (83,)
+    assert conn.execute("SELECT 1 FROM schema_version WHERE version=83").fetchone() == (1,)
 
     ensure_sync_schema(path)
     assert (
@@ -72,9 +72,14 @@ def test_field_observation_constraints_and_entity_cascade(tmp_path: Path) -> Non
     conn.close()
 
 
-def test_upgrade_from_v82_preserves_profile_facts_and_creates_no_field_rows(tmp_path: Path) -> None:
+def test_upgrade_from_v82_preserves_profile_facts_and_creates_no_field_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = tmp_path / "upgrade-v82.sqlite"
-    ensure_sync_schema(path)
+    with monkeypatch.context() as legacy:
+        legacy.setattr("mcp_telegram.sync_db._apply_migration_83", lambda _conn, current: current)
+        legacy.setattr("mcp_telegram.sync_db._apply_migration_84", lambda _conn, current: current)
+        ensure_sync_schema(path)
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("INSERT INTO entities(id, type, name, updated_at) VALUES (42, 'user', 'Target', 10)")
@@ -102,9 +107,7 @@ def test_upgrade_from_v82_preserves_profile_facts_and_creates_no_field_rows(tmp_
         for table in ("entity_details", "entity_detail_sections", "entity_profile_refresh_state")
     )
 
-    conn.execute("DROP TABLE entity_profile_field_observations")
-    conn.execute("DELETE FROM schema_version WHERE version=83")
-    conn.commit()
+    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (82,)
     conn.close()
 
     ensure_sync_schema(path)
@@ -115,5 +118,5 @@ def test_upgrade_from_v82_preserves_profile_facts_and_creates_no_field_rows(tmp_
     )
     assert after == before
     assert upgraded.execute("SELECT COUNT(*) FROM entity_profile_field_observations").fetchone() == (0,)
-    assert upgraded.execute("SELECT MAX(version) FROM schema_version").fetchone() == (83,)
+    assert upgraded.execute("SELECT 1 FROM schema_version WHERE version=83").fetchone() == (1,)
     upgraded.close()

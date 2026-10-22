@@ -62,6 +62,11 @@ class _Repository:
         self.writes.append((dialog_id, topics))
 
 
+class _NoEntityLookup:
+    async def get_entity(self, entity: object) -> object:
+        raise AssertionError("legacy complete fetch receives an already resolved entity")
+
+
 def test_topic_capability_includes_forum_supergroups_and_private_bot_views() -> None:
     assert is_topic_capable(_Entity(forum=True))
     assert is_topic_capable(_Entity(bot=True, bot_forum_view=True))
@@ -119,7 +124,7 @@ async def test_topic_refresh_preserves_interactive_resolution_scope() -> None:
 
 @pytest.mark.asyncio
 async def test_telethon_gateway_uses_input_peer_before_fetching_topics() -> None:
-    class Client:
+    class Client(_NoEntityLookup):
         def __init__(self) -> None:
             self.input_requests: list[object] = []
             self.requests: list[object] = []
@@ -146,7 +151,7 @@ async def test_telethon_gateway_uses_input_peer_before_fetching_topics() -> None
 
 @pytest.mark.asyncio
 async def test_telethon_gateway_resolves_custom_topic_icon_to_unicode_emoji() -> None:
-    class Client:
+    class Client(_NoEntityLookup):
         def __init__(self) -> None:
             self.requests: list[object] = []
 
@@ -195,7 +200,7 @@ async def test_telethon_gateway_resolves_custom_topic_icon_to_unicode_emoji() ->
 
 @pytest.mark.asyncio
 async def test_telethon_gateway_does_not_mask_flood_wait() -> None:
-    class Client:
+    class Client(_NoEntityLookup):
         async def get_input_entity(self, entity: object) -> object:
             return entity
 
@@ -229,7 +234,7 @@ def _page(topic_ids: list[int], *, count: int, create_order: bool = False) -> Si
 @pytest.mark.asyncio
 @pytest.mark.parametrize("create_order", [False, True])
 async def test_topic_pagination_preserves_demand_and_deduplicates(create_order: bool) -> None:
-    class Client:
+    class Client(_NoEntityLookup):
         def __init__(self) -> None:
             self.requests: list[GetForumTopicsRequest] = []
             self.scopes: list[object] = []
@@ -265,7 +270,7 @@ async def test_topic_pagination_preserves_demand_and_deduplicates(create_order: 
 
 @pytest.mark.asyncio
 async def test_topic_short_server_pages_continue_until_count() -> None:
-    class Client:
+    class Client(_NoEntityLookup):
         async def get_input_entity(self, entity: object) -> object:
             return entity
 
@@ -284,7 +289,7 @@ async def test_partial_topic_pages_never_publish_snapshot(failure: str) -> None:
     from mcp_telegram.telegram_demand import RpcAttemptBudgetExhaustedError
     from mcp_telegram.topics.contracts import TopicSourceUnavailableError
 
-    class Client:
+    class Client(_NoEntityLookup):
         async def get_input_entity(self, entity: object) -> object:
             return entity
 

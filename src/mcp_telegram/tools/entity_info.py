@@ -857,7 +857,7 @@ async def _get_entity_lookup(args: GetEntityInfo) -> ToolResult | _EntityLookup:
         read_only_hint=True,
         destructive_hint=False,
         idempotent_hint=True,
-        open_world_hint=True,
+        open_world_hint=False,
     ),
     output_schema=GET_ENTITY_INFO_OUTPUT_SCHEMA,
 )

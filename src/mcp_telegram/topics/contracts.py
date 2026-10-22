@@ -18,6 +18,23 @@ class TopicFact:
     icon_color: int | None = None
     date: int | None = None
     is_general: bool = False
+    hidden: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class TopicCursor:
+    offset_date: int | None = None
+    offset_id: int = 0
+    offset_topic: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class TopicPage:
+    topics: tuple[TopicFact, ...]
+    count: int
+    order_by_create_date: bool
+    next_cursor: TopicCursor | None
+    deleted_ids: tuple[int, ...] = ()
 
 
 def is_topic_capable(entity: object) -> bool:

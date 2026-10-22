@@ -7,13 +7,41 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
-from typing import cast
+from typing import Literal, cast
 
 from .realtime_history_policy import RealtimeHistoryCoverage, realtime_history_coverage
 
 
 class SyncReadModelContractError(ValueError):
     """Raised when canonical sync facts cannot be built or decoded safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class LocalHistoryCoverage:
+    """History evidence is independent of retained rows and current access."""
+
+    state: Literal["complete_as_of", "partial", "unknown"]
+    observation_horizon_at: int | None
+
+    def selection_state(
+        self, *, present: bool, attribution_complete: bool = True, since_utc: int | None = None
+    ) -> Literal["present", "known_empty", "unknown"]:
+        if present:
+            return "present"
+        if (
+            self.observation_horizon_at is not None
+            and attribution_complete
+            and (since_utc is None or since_utc <= self.observation_horizon_at)
+        ):
+            return "known_empty"
+        return "unknown"
+
+
+def local_history_coverage(status: str | None, last_synced_at: int | None) -> LocalHistoryCoverage:
+    """Only a completed full-history sync establishes an observation horizon."""
+    if status == "synced" and last_synced_at is not None:
+        return LocalHistoryCoverage("complete_as_of", last_synced_at)
+    return LocalHistoryCoverage("unknown" if status in {None, "not_synced"} else "partial", None)
 
 
 class InvalidDmDeletionCheckpointError(SyncReadModelContractError):
@@ -275,7 +303,7 @@ _STATUS_PROFILES: Mapping[SyncStatus, _StatusProfile] = MappingProxyType(
             HistoryScope.OWN_ONLY,
             HistoryDepthState.PARTIAL,
             HistorySyncState.OWN_MESSAGES_ONLY,
-            "Only own-message-related history is stored for this dialog.",
+            "Own-message acquisition does not establish full-history coverage; all retained rows remain readable.",
         ),
         SyncStatus.FRAGMENT: _StatusProfile(
             HistoryScope.FRAGMENT,
@@ -293,7 +321,7 @@ _STATUS_PROFILES: Mapping[SyncStatus, _StatusProfile] = MappingProxyType(
             HistoryScope.NONE,
             HistoryDepthState.NONE,
             HistorySyncState.NOT_SYNCED,
-            "This dialog is not enrolled for history sync.",
+            "No full-history completion is recorded; retained local rows remain readable regardless of enrollment.",
         ),
     }
 )
@@ -416,7 +444,7 @@ def _coverage_advisory(total_messages: int | None, saved_message_count: int) -> 
     if saved_message_count > total_messages:
         return "Local message_count exceeds Telegram total_messages, so coverage is not comparable."
     if total_messages == 0:
-        return "Empty dialogs are complete; non-empty local counts would be inconsistent."
+        return "A stored zero Telegram total does not establish an observed-empty history selection."
     return "Treat sync_coverage_pct as an approximate local-vs-Telegram ratio."
 
 

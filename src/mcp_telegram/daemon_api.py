@@ -5,7 +5,7 @@ DaemonAPIServer listens on a Unix domain socket and handles seventeen methods:
   - search_messages: FTS5 stemmed full-text search against messages_fts
   - trace_account_messages: observable authored-message evidence for one account
   - list_dialogs: canonical local dialog list enriched with sync_status
-  - list_topics: forum topic list via Telegram API
+  - list_topics: retained local topic facts and catalog coverage
   - get_me: current user info via Telegram API
   - mark_dialog_for_sync: add/remove dialog from sync scope
   - get_sync_status: sync status and message statistics for a dialog
@@ -83,7 +83,7 @@ from .entity_profile.ports import (
 )
 from .entity_profile.refresh import RefreshLimits
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
-from .flood import TelegramRpcThrottled, _raise_if_latched
+from .flood import TelegramRpcThrottled
 from .folders.read_model import dialog_placement, folder_snapshot, folder_summaries, folders_by_dialog
 from .history_enrollment import EnrollmentOutcome, disable_history, enable_history, read_intent
 from .models import ReadMessage
@@ -124,8 +124,7 @@ from .telegram_rpc_scheduler import (
     UnclassifiedTelegramRpcError,
     rpc_scope,
 )
-from .topics.contracts import TopicSourceUnavailableError
-from .topics.refresh import TopicRefresher
+from .topics.catalog import TopicCatalogRepository
 
 
 def _dm_deletion_reconciliation_is_blocked(conn: sqlite3.Connection) -> bool:
@@ -378,14 +377,7 @@ def _coerce_int(value: object, default: int) -> int:
         return default
 
 
-def _topic_icons_need_refresh(rows: list[tuple[object, object, object, object, object, object]]) -> bool:
-    """Whether a cached custom topic icon still lacks its Unicode fallback."""
-    return any(row[2] is not None and row[4] is None for row in rows)
-
-
 from .feedback_service import FeedbackService
-from .telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
-from .telegram_history import TelethonTelegramHistoryGateway
 
 
 class _LoggerLike(Protocol):
@@ -703,7 +695,6 @@ class DaemonAPIServer:
         *,
         writer: SQLiteWriter,
         hydration_requester: Callable[[sqlite3.Connection, int, int], None] | None = None,
-        topic_refresher: TopicRefresher | None = None,
         folder_projection_reproject: Callable[[], Awaitable[object]] | None = None,
         group_profile_port: GroupProfilePort,
         user_profile_port: UserProfilePort,
@@ -734,7 +725,6 @@ class DaemonAPIServer:
         self._ready: bool = False
         self.startup_detail: str = "connecting to Telegram"
         self._reading_service: ReadingService | None = None
-        self._topic_refresher = topic_refresher
         self._folder_projection_reproject = folder_projection_reproject
         self._group_profile_port = group_profile_port
         self._user_profile_port = user_profile_port
@@ -792,14 +782,7 @@ class DaemonAPIServer:
                     conn=self._conn,
                     sync_db_path=self._sync_db_path,
                     self_id=self.self_id,
-                    resolve_dialog_id=self._resolve_dialog_id,
-                    resolve_dialog_id_local=self._resolve_dialog_id_local,
-                    fragment_context=FragmentContextService(
-                        self._conn,
-                        TelethonTelegramFragmentGateway(self._client),
-                        writer=self._writer,
-                    ),
-                    history_gateway=TelethonTelegramHistoryGateway(self._client),
+                    resolve_dialog_id=self._resolve_dialog_id_local,
                     logger=cast(_LoggerLike, logger),
                     rid=_rid,
                     deleted_message_visibility_seconds=self._policy.deleted_message_visibility_seconds,
@@ -1513,12 +1496,7 @@ class DaemonAPIServer:
         self,
         selector: DialogSelector,
     ) -> int | dict:
-        """Resolve a draft-bearing read entirely from the local dialog directory.
-
-        The draft projection is local state.  A missing natural selector must
-        return the ordinary local resolution response, never trigger peer
-        lookup before the draft/all routing decision is known.
-        """
+        """Resolve a read from the local directory without Telegram acquisition."""
         if selector.exact_id is not None:
             return ResolvedDialogId(selector.exact_id, read_dialog_directory_coverage(self._conn))
         assert selector.query is not None
@@ -1576,10 +1554,6 @@ class DaemonAPIServer:
             anchor_message_id=anchor_message_id,
             context_size=context_size,
         )
-
-    async def _list_messages_from_telegram(self, req: object) -> dict:
-        """Delegate Telegram fallback reads to the reading service."""
-        return await self._get_reading_service().list_messages_from_telegram(req)
 
     # ------------------------------------------------------------------
     # list_messages — helpers
@@ -1768,18 +1742,7 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _list_topics(self, req: dict[str, object]) -> dict:
-        """Return topics for a dialog from the canonical topic_metadata snapshot table.
-
-        Normally this is a local read. If the catalog is empty and the daemon has
-        a topic refresher, the daemon may perform a one-shot refresh because the
-        daemon owns TelegramClient and persistence. MCP callers still go through
-        this daemon API boundary and never call Telegram directly.
-
-        Request: dialog_id (int) or dialog (str).
-        Response data: {"topics": [{"id", "title", "icon_emoji_id", "icon_emoji", "icon_color", "date"}],
-        "dialog_id": int}.
-        Errors: missing_dialog, dialog_not_found (from _resolve_dialog_id).
-        """
+        """Project retained topic facts and enumeration coverage without acquisition."""
         try:
             selector = required_dialog_selector(exact_id=req.get("dialog_id"), dialog=req.get("dialog"))
         except DialogSelectorError as exc:
@@ -1799,15 +1762,7 @@ class DaemonAPIServer:
             }
 
         rows = self._topic_rows(dialog_id)
-        empty_reason = None
-        if not rows:
-            if self._topic_refresher is None:
-                empty_reason = "topic_catalog_not_refreshed"
-            else:
-                empty_reason = await self._refresh_topic_catalog_for_list_topics(dialog_id)
-                rows = self._topic_rows(dialog_id)
-        else:
-            rows = await self._refresh_cached_topic_icons(dialog_id, rows)
+        catalog = TopicCatalogRepository(self._conn).coverage(dialog_id)
         topics = [
             {
                 "id": int(cast(int | str, row[0])),
@@ -1816,58 +1771,29 @@ class DaemonAPIServer:
                 "date": row[3],
                 "icon_emoji": row[4],
                 "icon_color": row[5],
+                "pinned": bool(row[6]),
+                "hidden": bool(row[7]),
+                "snapshot_at": row[8],
             }
             for row in rows
         ]
-        data = {"topics": topics, "dialog_id": dialog_id}
-        if not topics and empty_reason is not None:
-            data["empty_reason"] = empty_reason
+        empty_reason = None
+        if not topics:
+            empty_reason = {
+                "complete": "no_active_topics",
+                "not_applicable": "not_topic_capable",
+            }.get(
+                str(catalog["coverage"]),
+                "topic_catalog_not_observed" if catalog["coverage"] == "not_observed" else "topic_catalog_partial",
+            )
+        data = {"topics": topics, "dialog_id": dialog_id, "catalog": catalog, "empty_reason": empty_reason}
         return {"ok": True, "data": data}
 
-    def _topic_rows(self, dialog_id: int) -> list[tuple[object, object, object, object, object, object]]:
+    def _topic_rows(self, dialog_id: int) -> list[tuple[object, ...]]:
         return cast(
-            list[tuple[object, object, object, object, object, object]],
+            list[tuple[object, ...]],
             self._conn.execute(_LIST_TOPICS_SQL, (dialog_id,)).fetchall(),
         )
-
-    async def _refresh_cached_topic_icons(
-        self,
-        dialog_id: int,
-        rows: list[tuple[object, object, object, object, object, object]],
-    ) -> list[tuple[object, object, object, object, object, object]]:
-        """Refresh optional Unicode icon fallbacks without discarding cached topics."""
-        if not _topic_icons_need_refresh(rows) or self._health_status().open:
-            return rows
-        try:
-            await self._refresh_topic_catalog_for_list_topics(dialog_id)
-        except TelegramRpcThrottled as exc:
-            if exc.latched:
-                return rows
-            raise
-        return self._topic_rows(dialog_id)
-
-    async def _refresh_topic_catalog_for_list_topics(self, dialog_id: int) -> str:
-        if self._topic_refresher is None:
-            return "topic_catalog_not_refreshed"
-        with _preserve_or_rpc_scope(
-            TelegramRpcSource.TOPIC_RESOLUTION,
-            acquisition_kind=AcquisitionKind.TOPIC_LOOKUP,
-        ):
-            try:
-                entity = await self._client.get_entity(dialog_id)
-                refreshed = await self._topic_refresher.refresh(dialog_id, entity)
-            except TelegramRpcThrottled as exc:
-                _raise_if_latched(exc)
-                logger.info(
-                    "list_topics_refresh_deferred_flood_wait dialog_id=%d seconds=%s",
-                    dialog_id,
-                    exc.retry_after_seconds,
-                )
-                return "topic_catalog_deferred_flood_wait"
-            except TopicSourceUnavailableError as exc:
-                logger.info("list_topics_refresh_unavailable dialog_id=%d error=%s", dialog_id, exc)
-                return "topic_catalog_unavailable"
-        return "no_active_topics" if refreshed == 0 else "topic_catalog_refreshed"
 
     # ------------------------------------------------------------------
     # get_me
@@ -1920,6 +1846,8 @@ class DaemonAPIServer:
                 outcome = enable_history(conn, dialog_id, now=now) if enable else disable_history(conn, dialog_id)
                 if enable and self._hydration_requester is not None:
                     self._hydration_requester(conn, dialog_id, now)
+                if enable:
+                    TopicCatalogRepository(conn).request(dialog_id, "enrollment")
                 return outcome
 
         outcome = await self._writer.run(persist)
@@ -1936,6 +1864,7 @@ class DaemonAPIServer:
                 self._require_demand_sink(),
                 DemandKind.BACKFILL_HYDRATION_BATCH,
                 DemandKind.READ_RECEIPT_BATCH,
+                DemandKind.TOPIC_SNAPSHOT,
             )
         logger.info("mark_dialog_for_sync dialog_id=%d enable=%s", dialog_id, enable)
         return {

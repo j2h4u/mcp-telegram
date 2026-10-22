@@ -9,7 +9,6 @@ from unittest.mock import MagicMock
 
 import pytest
 from jsonschema import validate
-from mcp.types import TextContent
 
 from mcp_telegram import server as mcp_server
 from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
@@ -23,7 +22,6 @@ from mcp_telegram.flood import FloodWaitKillSwitchStatus
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc import TelegramRpcGate, _MainSender, _MainSenderAdapter
-from mcp_telegram.topics.refresh import TopicRefresher
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     LoudChannelProfilePort,
@@ -103,8 +101,6 @@ def _active_status() -> FloodWaitKillSwitchStatus:
 def _local_daemon(
     tmp_path: Path,
     client: object,
-    *,
-    topic_refresher: TopicRefresher | None = None,
 ) -> tuple[DaemonAPIServer, sqlite3.Connection, sqlite3.Connection, Path]:
     sync_path = tmp_path / "sync.db"
     ensure_sync_schema(sync_path)
@@ -117,7 +113,6 @@ def _local_daemon(
         asyncio.Event(),
         FeedbackApplicationService(SQLiteFeedbackStore(feedback_conn)),
         writer=inline_writer(sync_conn),
-        topic_refresher=topic_refresher,
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
@@ -206,7 +201,7 @@ async def test_registered_local_tool_uses_real_ipc_protection_snapshot(
 
 
 @pytest.mark.asyncio
-async def test_registered_remote_topic_miss_crosses_gate_ipc_client_and_server(
+async def test_registered_unobserved_topic_catalog_stays_local_under_protection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -234,7 +229,6 @@ async def test_registered_remote_topic_miss_crosses_gate_ipc_client_and_server(
     daemon, sync_conn, feedback_conn, _ = _local_daemon(
         tmp_path,
         GateClient(),
-        topic_refresher=cast(TopicRefresher, object()),
     )
     daemon._health_status = _active_status
     socket_path = tmp_path / "daemon.sock"
@@ -247,21 +241,14 @@ async def test_registered_remote_topic_miss_crosses_gate_ipc_client_and_server(
         feedback_conn.close()
         await gate.close_rpc_scheduler()
 
-    assert result.is_error is True
-    assert circuit_checks > 0
+    assert result.is_error is False
+    assert result.content == []
+    assert circuit_checks == 0
     assert sender.calls == 0
     payload = cast(dict[str, object], result.structured_content)
-    error = cast(dict[str, object], payload["error"])
-    details = cast(dict[str, object], error["details"])
-    assert error["code"] == "flood_wait_kill_switch_open"
-    assert error["message"] == "Telegram acquisition is blocked by account protection."
-    assert error["action"] == "Recovery requires operator action."
-    assert details["required_action"] == "manual_operator_recovery"
-    assert details["retryable"] is False
-    assert "retry_after" not in details
-    assert "retry" not in cast(str, error["action"]).lower()
-    assert isinstance(result.content[0], TextContent)
-    assert "Fix the arguments" not in result.content[0].text
+    assert payload["topics"] == []
+    assert payload["empty_reason"] == "topic_catalog_not_observed"
+    assert cast(dict[str, object], payload["catalog"])["coverage"] == "not_observed"
     assert cast(dict[str, object], payload["account_protection"]) == {
         "status": "active",
         "outbound_acquisition": "blocked",
@@ -516,7 +503,6 @@ async def test_registered_list_messages_pins_real_topic_lookup_identity_under_pr
     daemon, sync_conn, feedback_conn, _ = _local_daemon(
         tmp_path,
         client,
-        topic_refresher=cast(TopicRefresher, object()),
     )
     _seed_topic_dialog(sync_conn, 123, "Project", message="A content")
     _seed_topic_dialog(sync_conn, 456, "Archive", message="B content")
@@ -588,7 +574,7 @@ async def test_registered_list_messages_marks_empty_saved_messages_in_structured
 
 
 @pytest.mark.asyncio
-async def test_registered_list_messages_required_topic_miss_projects_protection_over_real_ipc(
+async def test_registered_list_messages_unobserved_topic_catalog_is_explicit_under_protection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -598,7 +584,6 @@ async def test_registered_list_messages_required_topic_miss_projects_protection_
     daemon, sync_conn, feedback_conn, _ = _local_daemon(
         tmp_path,
         client,
-        topic_refresher=cast(TopicRefresher, object()),
     )
     sync_conn.execute(
         "INSERT INTO dialogs "
@@ -633,12 +618,10 @@ async def test_registered_list_messages_required_topic_miss_projects_protection_
     payload = cast(dict[str, object], result.structured_content)
     error = cast(dict[str, object], payload["error"])
     details = cast(dict[str, object], error["details"])
-    assert error["code"] == "flood_wait_kill_switch_open"
-    assert error["action"] == "Recovery requires operator action."
-    assert details["required_action"] == "manual_operator_recovery"
-    assert details["retryable"] is False
-    assert "retry_after" not in details
-    assert "retry" not in cast(str, error["action"]).lower()
+    assert error["code"] == "topic_catalog_incomplete"
+    assert "mark_dialog_for_sync" in cast(str, error["action"])
+    assert details["dialog_id"] == 123
+    assert cast(dict[str, object], details["catalog"])["coverage"] == "not_observed"
     assert cast(dict[str, object], payload["account_protection"])["status"] == "active"
     assert sender.calls == 0
     assert message_requests == []
@@ -659,7 +642,6 @@ async def test_registered_list_messages_rejects_malformed_topic_ipc_identity_bef
     daemon, sync_conn, feedback_conn, _ = _local_daemon(
         tmp_path,
         object(),
-        topic_refresher=cast(TopicRefresher, object()),
     )
     _seed_topic_dialog(sync_conn, 123, "Project", message="must not be read")
     daemon._health_status = _active_status
