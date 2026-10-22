@@ -661,7 +661,8 @@ def test_tool_description_points_to_structured_read_state_fields() -> None:
 
     doc = ListMessages.__doc__ or ""
     assert "read_state" in doc
-    assert "inline read markers" in doc
+    assert "retained local facts" in doc
+    assert "never fetch Telegram" in doc
     assert "[I read up to here]" not in doc
     assert len(doc.split()) < 160
 

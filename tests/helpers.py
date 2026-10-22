@@ -368,7 +368,8 @@ class FakeUserProfilePort:
 
 
 def remove_v80_schema_for_historical_fixture(conn: sqlite3.Connection) -> None:
-    """Reconstruct pre-v80 physical ownership before rewinding its migration ledger."""
+    """Remove v80 and later physical additions before rewinding the migration ledger."""
+    conn.execute("DROP TRIGGER IF EXISTS topic_catalog_identity_changed")
     conn.execute("DROP TRIGGER IF EXISTS message_fts_key_insert")
     conn.execute("DROP INDEX IF EXISTS idx_messages_nonchannel_message_id")
     for table in (
@@ -376,6 +377,8 @@ def remove_v80_schema_for_historical_fixture(conn: sqlite3.Connection) -> None:
         "message_observations",
         "scheduled_publication_evidence",
         "nonchannel_message_deletions",
+        "entity_profile_field_observations",
+        "topic_catalog_state",
     ):
         conn.execute(f"DROP TABLE IF EXISTS {table}")
     for table, column in (
@@ -384,6 +387,8 @@ def remove_v80_schema_for_historical_fixture(conn: sqlite3.Connection) -> None:
         ("synced_dialogs", "delta_retry_at"),
         ("synced_dialogs", "delta_message_id"),
         ("topic_metadata", "observation_order"),
+        ("topic_metadata", "catalog_present"),
+        ("topic_metadata", "seen_generation"),
     ):
         rows = cast(
             list[tuple[int, str, str, int, str | None, int]], conn.execute(f"PRAGMA table_info({table})").fetchall()
