@@ -8,6 +8,18 @@ It is built for agents that need to triage unread chats, browse folders and
 topics, read recent context, search message history, audit your own activity,
 and understand how fresh or complete the local mirror is.
 
+The local database is the durable working source of truth for local search,
+analytics and MCP, not a disposable cache in front of Telegram. Ingestion,
+backfill and incoming updates maintain its facts. Ordinary reads should return
+the retained authorized information without contacting or waiting for Telegram.
+Observation age and incomplete coverage describe what is known; they do not
+make previously collected information disappear. Confirmed changes, deletions
+and account/privacy boundaries retain their normal meaning.
+
+Some existing profile, history and topic paths still perform acquisition during
+reads. These are tracked departures from the product contract, not the desired
+runtime model. See [the architecture contract and current exceptions](docs/architecture-proposal.md#durable-facts-and-acquisition-evidence).
+
 > [!IMPORTANT]
 > Review the [Telegram API Terms of Service](https://core.telegram.org/api/terms)
 > before use. Misuse may result in account suspension.

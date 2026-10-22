@@ -323,7 +323,8 @@ class EntityProfileRepository:
         *,
         now: int,
     ) -> bool:
-        """Detect a completed fresh pair whose authorization scope changed."""
+        """Detect authorization-scope changes independently of receipt age."""
+        del now
         rows = self._conn.execute(
             "SELECT section, status FROM entity_detail_sections "
             "WHERE entity_id=? AND section IN ('full_profile', 'personal_channel')",
@@ -334,14 +335,22 @@ class EntityProfileRepository:
             return False
         if identity is None:
             return True
+        supplied_scope = _auth_scope_fields(identity.get("auth_scope"))
+        if supplied_scope is None:
+            return True
+        try:
+            receipt_rows = self._conn.execute(
+                "SELECT section, acquisition_identity_json FROM entity_detail_sections "
+                "WHERE entity_id=? AND section IN ('full_profile', 'personal_channel')",
+                (entity_id,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return True
+        if {str(row[0]) for row in receipt_rows} != {"full_profile", "personal_channel"}:
+            return True
         return any(
-            not self._reusable_receipt_is_valid(
-                entity_id,
-                section,
-                identity=identity,
-                now=now,
-            )
-            for section in ("full_profile", "personal_channel")
+            (stored_scope := _receipt_auth_scope(row[1])) is None or stored_scope != supplied_scope
+            for row in receipt_rows
         )
 
     def complete_same_generation_section(
@@ -2372,6 +2381,22 @@ def _validated_receipt_fields(
 def _receipt_identity_matches(evidence: Mapping[str, object], identity: Mapping[str, object]) -> bool:
     stored_identity = evidence.get("identity")
     return isinstance(stored_identity, dict) and dict(identity) == stored_identity
+
+
+def _auth_scope_fields(value: object) -> tuple[int, int, int, int] | None:
+    if not isinstance(value, Mapping):
+        return None
+    fields = tuple(value.get(key) for key in ("version", "account_id", "dc_id", "auth_key_id"))
+    if any(not _is_nonnegative_int(field) or field == 0 for field in fields):
+        return None
+    return cast(tuple[int, int, int, int], fields)
+
+
+def _receipt_auth_scope(raw_identity: object) -> tuple[int, int, int, int] | None:
+    identity = _decode_mapping(raw_identity)
+    if identity is None:
+        return None
+    return _auth_scope_fields(identity.get("auth_scope"))
 
 
 def _receipt_observation(evidence: Mapping[str, object], *, now: int) -> tuple[int, int] | None:

@@ -3,6 +3,32 @@
 ## Canon
 
 - Trust source, tests, and live runtime over `.planning/*`.
+- Source describes current behavior; the product contract below defines required
+  behavior. A contradiction is tracked implementation debt, not permission to
+  reinterpret the product as a cloud proxy.
+
+## Product Contract: Durable Local Mirror
+
+`sync.db` is the durable working source of truth for local search, analytics and
+MCP, not a disposable acceleration cache. Telegram ingestion, backfill and
+delivered updates populate and update canonical local facts. Ordinary reads
+project persisted authorized data; they must not execute or wait for Telegram
+acquisition. Missing information is reported alongside useful retained data.
+
+Keep fact availability, coverage/completeness, observation age, field access,
+known sync gaps and acquisition progress separate. A reuse TTL does not remove
+knowledge or authorize read-time network access. Failed acquisition does not
+erase last-known facts. Actual clears/deletions, domain validity and account
+isolation still apply; age alone is neither deletion nor an account change.
+
+Apply supplied updates directly to canonical persistence shared by SQL analytics
+and MCP, not a response-only overlay. Obtain missing or invalidated evidence
+through the existing bounded ingestion owners and classified RPC gate. Do not
+add blanket polling, a competing gateway or invented observation timestamps.
+
+This is the required contract, not a claim that all paths already comply. See
+[the architecture contract and current exceptions](docs/architecture-proposal.md#durable-facts-and-acquisition-evidence).
+Track delivery in #382, the profile slice in #381 and other read paths in #383.
 
 ## Architecture
 
