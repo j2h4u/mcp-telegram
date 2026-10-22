@@ -28,7 +28,15 @@ add blanket polling, a competing gateway or invented observation timestamps.
 
 This is the required contract, not a claim that all paths already comply. See
 [the architecture contract and current exceptions](docs/architecture-proposal.md#durable-facts-and-acquisition-evidence).
-Track delivery in #382, the profile slice in #381 and other read paths in #383.
+Track remaining delivery and completed-slice evidence in WorkGraph `TG-91`.
+
+## Task Tracking
+
+Use WorkGraph (`wgr`), project `TG`, exclusively for task tracking and project
+management. Never create GitHub Issues for this repository. GitHub remains the
+code, pull-request and CI host, not a task tracker.
+Use `wgr list-tickets --project TG --state active` to find current work; do not
+infer that the project is absent when automatic Git-context detection is unbound.
 
 ## Architecture
 
