@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import json
 import pathlib
+import sqlite3
 from asyncio import StreamReader, StreamWriter
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from typing import cast
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from jsonschema import validate
@@ -63,6 +64,7 @@ from mcp_telegram.tools._base import (
 )
 from mcp_telegram.tools.discovery import LIST_TOPICS_OUTPUT_SCHEMA
 from mcp_telegram.tools.stats import GetDialogStats, GetUsageStats, get_dialog_stats, get_usage_stats
+from tests.test_daemon_api import _insert_message, _insert_synced_dialog, _make_db, _TestClient, make_server
 
 StructuredResult = ToolResult | CallToolResult
 
@@ -4130,68 +4132,91 @@ async def test_get_my_recent_activity_renders_reactions():
     ]
 
 
-async def test_list_messages_fragment_coverage_header():
-    """ListMessages prepends 'Coverage: fragment' header when daemon returns coverage='fragment'."""
-    conn = _make_daemon_conn(
-        {
-            "ok": True,
-            "data": {"messages": [], "coverage": "fragment"},
-        }
+@pytest.fixture
+async def retained_history_connection(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[sqlite3.Connection]:
+    database = _make_db()
+    client = _TestClient()
+    client.iter_messages = MagicMock(side_effect=AssertionError("history reads must not acquire Telegram"))
+    client.get_messages = AsyncMock(side_effect=AssertionError("context reads must not acquire Telegram"))
+    client.get_entity = AsyncMock(side_effect=AssertionError("exact-id reads must not resolve remotely"))
+    local_server = make_server(database, client)
+    offer = MagicMock(side_effect=AssertionError("reads must not enqueue acquisition"))
+    local_server.bind_demand_sink(MagicMock(offer=offer))
+
+    class Connection:
+        async def list_messages(self, **request: object) -> dict[str, object]:
+            before = database.total_changes
+            response = await local_server._list_messages(request)
+            assert database.total_changes == before
+            return response
+
+    @asynccontextmanager
+    async def connection() -> AsyncIterator[Connection]:
+        yield Connection()
+
+    monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", connection)
+    try:
+        yield database
+        client.iter_messages.assert_not_called()
+        client.get_messages.assert_not_called()
+        client.get_entity.assert_not_called()
+        offer.assert_not_called()
+    finally:
+        await local_server.shutdown()
+        database.close()
+
+
+async def test_list_messages_retained_fragment_has_partial_local_coverage(
+    retained_history_connection: sqlite3.Connection,
+) -> None:
+    """A retained fragment remains readable but cannot establish complete history."""
+    _insert_synced_dialog(retained_history_connection, 42, status="fragment")
+    _insert_message(retained_history_connection, 42, 100, text="retained anchor")
+    result = await list_messages(
+        ListMessages(exact_dialog_id=42, anchor_message_id=100, context_size=4, message_state="sent")
     )
-    with _patch_daemon(conn):
-        result = await list_messages(ListMessages(exact_dialog_id=42))
-    assert result.content == ()
-    assert _json_dict(_json_dict(result.structured_content)["coverage"])["fragment_coverage"] is True
+
+    payload = assert_structured_success_payload(result)
+    coverage = _json_dict(payload["coverage"])
+    assert coverage["kind"] == "local_history"
+    assert coverage["state"] == "partial"
+    assert coverage["fragment_coverage"] is True
+    assert coverage["selection_state"] == "present"
+    assert coverage["observation_horizon_at"] is None
+    assert coverage["dialog_access"] == "unknown"
+    assert _json_dict(_json_list(payload["messages"])[0])["msg_id"] == 100
 
 
-async def test_list_messages_no_fragment_no_header():
-    """ListMessages does NOT include 'Coverage: fragment' header when coverage field is absent."""
+async def test_list_messages_missing_coverage_does_not_imply_fragment_or_completeness() -> None:
+    """Missing legacy metadata remains unknown, not a positive coverage claim."""
     conn = _make_daemon_conn({"ok": True, "data": {"messages": []}})
     with _patch_daemon(conn):
         result = await list_messages(ListMessages(exact_dialog_id=42))
-    assert result.content == ()
-    assert _json_dict(_json_dict(result.structured_content)["coverage"])["fragment_coverage"] is False
+    payload = assert_structured_success_payload(result)
+    coverage = _json_dict(payload["coverage"])
+    assert coverage["fragment_coverage"] is False
+    assert coverage["state"] == "unknown"
 
 
-async def test_list_messages_fragment_fetch_failure_exposes_context_metadata():
-    """Fragment fetch failures should surface actionable structured metadata."""
-    conn = _make_daemon_conn(
-        {
-            "ok": False,
-            "error": "fragment_fetch_failed",
-            "message": "Could not fetch bounded context from Telegram.",
-            "required_action": "Retry with a valid anchor_message_id, or mark the dialog for sync if broader history is needed.",
-            "context_availability": "fragment_unavailable",
-            "dialog_status": "own_only",
-        }
+@pytest.mark.parametrize("status", ("own_only", "not_synced", "access_lost"))
+async def test_list_messages_missing_local_anchor_exposes_actionable_context_metadata(
+    retained_history_connection: sqlite3.Connection, status: str
+) -> None:
+    """The tool preserves the actual daemon's local-anchor failure across sync states."""
+    _insert_synced_dialog(retained_history_connection, 42, status=status)
+    _insert_message(retained_history_connection, 42, 99, text="a different retained message")
+
+    result = await list_messages(
+        ListMessages(exact_dialog_id=42, anchor_message_id=100, context_size=4, message_state="sent")
     )
-    with _patch_daemon(conn):
-        result = await list_messages(
-            ListMessages(exact_dialog_id=42, anchor_message_id=100, context_size=4, message_state="sent")
-        )
+
     assert result.content
     assert result.is_error is True
     payload = _json_dict(result.structured_content)
-    assert payload["error"] == "fragment_fetch_failed"
-    assert payload["context_availability"] == "fragment_unavailable"
-    assert payload["dialog_status"] == "own_only"
-
-
-async def test_list_messages_not_synced_failure_exposes_context_metadata():
-    """not_synced errors should preserve the same structured error envelope."""
-    conn = _make_daemon_conn(
-        {
-            "ok": False,
-            "error": "not_synced",
-            "message": "Dialog has not been synced yet.",
-            "required_action": "Mark the dialog for sync and retry.",
-            "context_availability": "unavailable",
-            "dialog_status": "not_synced",
-        }
+    assert payload["error"] == "local_context_unavailable"
+    assert payload["context_availability"] == "anchor_missing"
+    assert payload["required_action"] == (
+        "Choose a retained, non-deleted anchor within the UTC bounds, or mark the dialog for sync to acquire history."
     )
-    with _patch_daemon(conn):
-        result = await list_messages(ListMessages(exact_dialog_id=42))
-    assert result.content
-    payload = _json_dict(result.structured_content)
-    assert payload["error"] == "not_synced"
-    assert payload["required_action"] == "Mark the dialog for sync and retry."
+    assert "Action:" in _text_content(result)
+    assert "fragment_fetch_failed" not in _text_content(result)
