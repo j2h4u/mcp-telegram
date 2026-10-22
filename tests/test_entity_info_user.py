@@ -8,6 +8,7 @@ for user/bot), 3 (common envelope), 4 (User/Bot field surface fully preserved),
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import sqlite3
 from datetime import UTC, datetime
@@ -641,13 +642,18 @@ async def test_get_entity_info_access_lost_is_returned_without_duplicate_warning
     client = AsyncMock()
     client.get_entity = AsyncMock(side_effect=ChannelPrivateError(request=None))
     server = make_server(conn=conn, client=client)
+    caplog.clear()  # Exclude ensure_sync_schema INFO emitted while constructing the fixture.
 
     with caplog.at_level("WARNING", logger="mcp_telegram.daemon_api"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": entity_id})
 
     assert r["ok"] is True
     assert _dict(r["data"])["name"] == channel_name
-    assert not caplog.records
+    assert not [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.WARNING and record.name.startswith("mcp_telegram")
+    ]
     cast(AsyncMock, client.get_entity).assert_not_awaited()
 
 

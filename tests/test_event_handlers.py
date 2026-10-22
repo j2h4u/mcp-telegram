@@ -1531,6 +1531,7 @@ def test_register_adds_handlers(
     manager.register()
 
     expected = [
+        manager.on_raw_identity_or_notify,
         manager.on_new_message,
         manager.on_raw_topic_message,
         manager.on_message_edited,
@@ -1542,7 +1543,6 @@ def test_register_adds_handlers(
         manager.on_raw_delete_scheduled_messages,
         manager.on_raw_dialog_pinned,
         manager.on_raw_channel_chat_update,
-        manager.on_raw_identity_or_notify,
         manager.on_raw_participant,
         manager.on_raw_inbox_read,
         manager.on_raw_forum_topic_pinned,
