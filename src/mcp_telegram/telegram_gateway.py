@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import datetime
 from typing import Protocol, cast
@@ -38,14 +38,13 @@ from .entity_profile.contracts import (
     ChatAvatarHistoryObservation,
     ChatAvatarReference,
     ChatCurrentPhoto,
+    ChatEntityProfileFacts,
     CommonChatsObservation,
     CommonChatSummary,
     DialogIdentityObservation,
     GroupProfileObservation,
     GroupReference,
     ObservationBoundary,
-    PersonalChannelPost,
-    PersonalChannelReference,
     ProjectionStatus,
     TargetKind,
     UserAvatarHistoryObservation,
@@ -150,6 +149,7 @@ class TelethonChannelProfileGateway(ChannelProfilePort):
             dialog_identity_observation=_channel_dialog_identity_observation(
                 result, channel_id, observed_at=int(started_at)
             ),
+            chat_entity_fields=_channel_profile_entity_fields(result, channel_id),
         )
 
     async def fetch_channel_contact_overlap(self, reference: ChannelReference) -> ChannelContactOverlapObservation:
@@ -230,6 +230,8 @@ class TelethonGroupProfileGateway(GroupProfilePort):
             dialog_identity_observation=_group_dialog_identity_observation(
                 result, group_id, raw_group_id, observed_at=started_at
             ),
+            chat_entity_fields=_group_profile_entity_fields(result, raw_group_id),
+            participants_count=_group_profile_participants_count(result, raw_group_id),
         )
 
 
@@ -397,17 +399,8 @@ class TelethonUserProfileGateway(UserProfilePort):
             target_kind=normalized_kind,
             observation=ObservationBoundary(started_at=started_at, completed_at=completed_at),
         )
-        reference = _personal_channel_reference(result, observation.personal_channel.payload)
         current_photo = _normalize_user_current_photo(result, user_id)
-        return replace(observation, personal_channel_reference=reference, current_photo=current_photo)
-
-    async def fetch_personal_channel_post(
-        self, reference: PersonalChannelReference, message_id: int
-    ) -> PersonalChannelPost | None:
-        message_id = _validated_personal_channel_message_id(message_id)
-        peer = _personal_channel_peer(reference)
-        fetched = await self._client.get_messages(peer, ids=[message_id])
-        return _normalize_personal_channel_post(_first_message(fetched), message_id)
+        return replace(observation, current_photo=current_photo)
 
 
 def _is_canonical_channel_id(channel_id: object) -> bool:
@@ -491,6 +484,93 @@ def _channel_identity_patch(result: object, channel_id: int) -> dict[str, object
         return None
     chat = next((item for item in chats if _channel_target_matches(channel_id, getattr(item, "id", None))), None)
     return None if chat is None else _channel_identity_fields(chat)
+
+
+_CHAT_ADMIN_RIGHT_FIELDS = (
+    "change_info",
+    "post_messages",
+    "edit_messages",
+    "delete_messages",
+    "ban_users",
+    "invite_users",
+    "pin_messages",
+    "add_admins",
+    "anonymous",
+    "manage_call",
+    "other",
+    "manage_topics",
+    "post_stories",
+    "edit_stories",
+    "delete_stories",
+)
+
+
+def _chat_entity_membership(chat: types.Channel | types.Chat) -> dict[str, object]:
+    raw_rights = chat.admin_rights
+    rights = (
+        {name: bool(getattr(raw_rights, name, False)) for name in _CHAT_ADMIN_RIGHT_FIELDS}
+        if isinstance(raw_rights, types.ChatAdminRights)
+        else None
+    )
+    return {
+        "is_member": not bool(chat.left),
+        "is_admin": bool(chat.creator) or rights is not None,
+        "admin_rights": rights,
+    }
+
+
+def _chat_entity_restrictions(chat: types.Channel | types.Chat) -> list[dict[str, str | None]]:
+    if isinstance(chat, types.Chat):
+        return []
+    return [
+        {"platform": item.platform, "reason": item.reason, "text": item.text}
+        for item in chat.restriction_reason or ()
+        if isinstance(item, types.RestrictionReason)
+    ]
+
+
+def _channel_profile_entity_fields(result: object, channel_id: int) -> ChatEntityProfileFacts | None:
+    chats = getattr(result, "chats", None)
+    if not isinstance(chats, Sequence):
+        return None
+    chat = next(
+        (item for item in chats if isinstance(item, types.Channel) and _channel_target_matches(channel_id, item.id)),
+        None,
+    )
+    if chat is None or chat.min:
+        return None
+    return {
+        "my_membership": _chat_entity_membership(chat),
+        "restrictions": _chat_entity_restrictions(chat),
+        "has_topics": bool(chat.forum),
+    }
+
+
+def _group_profile_entity(result: object, raw_group_id: int) -> types.Chat | None:
+    chats = getattr(result, "chats", None)
+    if not isinstance(chats, Sequence):
+        return None
+    return next((item for item in chats if isinstance(item, types.Chat) and item.id == raw_group_id), None)
+
+
+def _group_profile_participants_count(result: object, raw_group_id: int) -> int | None:
+    chat = _group_profile_entity(result, raw_group_id)
+    return _nonnegative_int(chat.participants_count) if chat is not None else None
+
+
+def _group_profile_entity_fields(result: object, raw_group_id: int) -> ChatEntityProfileFacts | None:
+    chat = _group_profile_entity(result, raw_group_id)
+    if chat is None:
+        return None
+    migrated = chat.migrated_to
+    migrated_id = _positive_id(getattr(migrated, "channel_id", None))
+    fields: ChatEntityProfileFacts = {
+        "my_membership": _chat_entity_membership(chat),
+        "restrictions": _chat_entity_restrictions(chat),
+    }
+    if migrated is None or migrated_id is not None:
+        fields["migrated_to"] = -(CHANNEL_ID_MARKER + migrated_id) if migrated_id is not None else None
+    return fields
 
 
 def _channel_dialog_identity_observation(
@@ -930,63 +1010,6 @@ def _signed_64(value: object) -> int | None:
     if not isinstance(value, int) or isinstance(value, bool) or not -(2**63) <= value <= (2**63 - 1):
         return None
     return value
-
-
-def _first_message(value: object) -> object | None:
-    if value is None:
-        return None
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
-        return value[0] if value else None
-    return value
-
-
-def _validated_personal_channel_message_id(message_id: object) -> int:
-    if not isinstance(message_id, int) or isinstance(message_id, bool) or message_id <= 0:
-        raise ValueError("personal channel message id must be positive")
-    return message_id
-
-
-def _personal_channel_peer(reference: object) -> types.InputPeerChannel:
-    if not isinstance(reference, PersonalChannelReference):
-        raise TypeError("personal channel reference is invalid")
-    return types.InputPeerChannel(channel_id=reference.channel_id, access_hash=reference.access_hash)
-
-
-def _normalize_personal_channel_post(message: object | None, message_id: int) -> PersonalChannelPost | None:
-    if message is None:
-        return None
-    raw_message_id = getattr(message, "id", message_id)
-    if not isinstance(raw_message_id, int) or isinstance(raw_message_id, bool) or raw_message_id != message_id:
-        return None
-    raw_date = getattr(message, "date", None)
-    sent_at = int(raw_date.timestamp()) if isinstance(raw_date, datetime) else None
-    raw_text = getattr(message, "message", None)
-    return PersonalChannelPost(
-        message_id=message_id, sent_at=sent_at, text=raw_text if isinstance(raw_text, str) else None
-    )
-
-
-def _personal_channel_reference(
-    result: object, personal_channel: Mapping[str, object] | None
-) -> PersonalChannelReference | None:
-    if personal_channel is None:
-        return None
-    channel_id = _positive_id(personal_channel.get("personal_channel_id"))
-    if channel_id is None:
-        return None
-    chats = getattr(result, "chats", None)
-    if not isinstance(chats, Sequence) or isinstance(chats, str | bytes | bytearray):
-        return None
-    for chat in chats:
-        if not isinstance(chat, types.Channel) or bool(getattr(chat, "min", False)):
-            continue
-        if _positive_id(getattr(chat, "id", None)) != channel_id:
-            continue
-        access_hash = _signed_64(getattr(chat, "access_hash", None))
-        if access_hash is None:
-            return None
-        return PersonalChannelReference(channel_id=channel_id, access_hash=access_hash)
-    return None
 
 
 def _optional_string(value: object) -> str | None:

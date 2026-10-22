@@ -44,7 +44,7 @@ creating a placeholder service/repository layer.
 ## Minimal domain/use-case map
 
 The product model is a local Telegram mirror with two deliberately separate
-directions:
+directions. This is the required boundary; existing departures are listed below:
 
 - **Acquire Telegram facts** — daemon-owned use cases contact Telegram and
   materialize facts into SQLite.
@@ -61,6 +61,67 @@ This is the minimum DDD vocabulary for the current codebase:
 | Live events | `EventHandlerManager` | Telethon updates while daemon is online | New/edit/delete/read cursor rows; aggregate reaction updates |
 | Optional message facts | `message_fact_refresh` | Bounded per-message fact probes | Detailed reaction events/timestamps and exact outgoing-DM `read_at` facts |
 | Agent reading | `DaemonReadingService`, `DaemonAPIServer` read handlers | None | Structured MCP responses from local projections |
+
+## Durable facts and acquisition evidence
+
+SQLite is the durable working source of truth for local search, analytics and
+MCP. Telegram is the upstream source of observations, not a required query
+backend. Ordinary reads project canonical persisted facts and their limitations;
+they do not initiate or await remote acquisition. Ingestion, enabled sync
+subscriptions, initial/backfill work and repair of identified gaps own that work.
+All actual Telegram calls still pass through the existing classified RPC gate,
+priority admission, budgets and FloodWait handling. A call can use the gate
+correctly and still violate the product boundary by originating inside a read.
+
+Keep these meanings independent:
+
+| Concern | Meaning | Effect of elapsed time |
+| --- | --- | --- |
+| Durable fact | Latest accepted value or authoritative clearing, within its account namespace | Remains available until superseded or subject to an actual domain validity, retention or privacy rule |
+| Coverage | Which fields or selection were observed, including known absence | Does not become never-observed because an observation aged |
+| Observation age | When the evidence was acquired | Describes currency, not whether the fact exists |
+| Synchronization state | Known gaps, pending changes, retries and unavailable fields | Reports what maintenance remains without erasing last-known data |
+| Acquisition receipt | Exact observation, scope, field coverage and ordering evidence | May stop satisfying an explicit acquisition requirement without revoking materialized facts |
+| Transport cache | Disposable access hashes, request coalescing and acceleration state | May expire independently of durable domain data |
+
+A never-observed biography, an observed empty biography and a failed refresh
+are different results. A useful local profile can be old or limited without
+being absent. Time-bound facts such as an online-until timestamp can change
+their current interpretation locally; that is not permission to poll Telegram
+or invent a new observation. Same-account reconnection and expired receipt
+freshness are not account ownership changes. A real account mismatch remains a
+closed privacy boundary.
+
+Free facts delivered by Telegram updates must materialize in the canonical
+repository transaction used by both SQL analytics and MCP. Conflict metadata
+may protect a merge, but a service-only overlay must not create a second truth.
+Only fields actually observed may supersede older values; omitted, partial and
+explicitly cleared fields have different semantics. Preserve original evidence
+times and protect newer events from older in-flight acquisitions.
+
+Profile reads and entity-name resolution project retained local facts without
+network acquisition, refresh admission or foreground waiting. Enabled personal
+dialog synchronization owns bounded, durable counterpart-profile collection,
+including the existing archived and hidden cohort. Delivered profile fields
+materialize canonically, with per-field ordering against older in-flight RPCs.
+Acquisition receipts still retain their separate authorization/reuse rules.
+
+Current implementation debt is tracked explicitly:
+
+| Work | Known departure | Delivery |
+| --- | --- | --- |
+| Non-DM profiles | Reads expose retained facts or explicit partial coverage; automatic acquisition ownership for never-collected group/channel profiles is not supplied by the DM slice | [#382](https://github.com/j2h4u/mcp-telegram/issues/382), following [#381](https://github.com/j2h4u/mcp-telegram/issues/381) |
+| History and bounded context | Some incomplete-coverage reads acquire Telegram data inline | [#383](https://github.com/j2h4u/mcp-telegram/issues/383) |
+| Topics | Missing catalog or optional icon enrichment can acquire Telegram data during a read | [#383](https://github.com/j2h4u/mcp-telegram/issues/383) |
+| Startup and offline availability | Telegram/startup readiness currently limits local serving; no whole-process offline guarantee is made | [#374 audit](https://github.com/j2h4u/mcp-telegram/issues/374), lifecycle design tracked in [#382](https://github.com/j2h4u/mcp-telegram/issues/382) |
+
+The [delivery tracker](https://github.com/j2h4u/mcp-telegram/issues/382) separates
+these changes from COMMIT performance and broader replay reliability research.
+Do not report this contract as fully implemented after a documentation change
+or only the profile slice. Tests for ordinary reads must forbid network calls
+and acquisition waits, retain aged useful records and expose honest coverage.
+
+### Acquisition ownership
 
 The important distinction is not "one worker per entity"; it is whether a use
 case is acquiring Telegram facts or serving a deterministic local projection.

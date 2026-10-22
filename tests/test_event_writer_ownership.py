@@ -52,7 +52,7 @@ async def test_realtime_commits_with_readonly_loop_connection_and_postcommit_off
         def offer(self, kind: DemandKind) -> bool:
             return offer(kind)
 
-    manager = EventHandlerManager(MagicMock(), reader, asyncio.Event(), writer=writer)
+    manager = EventHandlerManager(MagicMock(), reader, asyncio.Event(), writer=writer, profile_detail_ttl_seconds=300)
     manager.bind_demand_sink(Sink())
     try:
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
@@ -83,7 +83,7 @@ async def test_realtime_lock_wait_keeps_loop_responsive_and_rollback_is_atomic(t
     lock = _seed(path)
     reader = open_sync_db_reader(path)
     writer = await SQLiteWriter.open(path)
-    manager = EventHandlerManager(MagicMock(), reader, asyncio.Event(), writer=writer)
+    manager = EventHandlerManager(MagicMock(), reader, asyncio.Event(), writer=writer, profile_detail_ttl_seconds=300)
     manager.bind_demand_sink(MagicMock())
     message = build_mock_message(1, text="pending")
     event = cast(_NewMessageEvent, SimpleNamespace(chat_id=42, is_private=True, message=message))

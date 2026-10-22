@@ -163,25 +163,6 @@ class EntityRefreshCoordinator:
             async with asyncio.timeout(self._limits.whole_refresh_seconds):
                 return await self._durable_slice_callback(budget)
 
-    async def wait_for_completion(self, entity_id: int, timeout_seconds: float) -> bool:
-        """Wait for an admitted refresh; true only when the wait ended normally."""
-        # Shutdown is terminal for this process-local coordinator.  Check it
-        # before the missing-event shortcut so a waiter created after close
-        # cannot report a successful refresh that never ran.
-        if self._closed:
-            return False
-        event = self._completion_events.get(entity_id)
-        if event is None:
-            return True
-        try:
-            async with asyncio.timeout(timeout_seconds):
-                await event.wait()
-        except TimeoutError:
-            return False
-        # An event may have been released by shutdown.  Re-check admission so
-        # shutdown wins a terminal-signal/waiter-resumption race.
-        return not self._closed
-
     def signal_terminal(self, result: DurableRefreshSliceResult) -> None:
         """Release coalesced waiters after durable success or persisted failure."""
         if result.terminal is None:

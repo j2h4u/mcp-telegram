@@ -1,8 +1,8 @@
 """SQLite repository for progressive entity profile data.
 
-``entity_details`` remains the compatibility blob. Section rows are additive
-metadata and payload storage; old databases and test fixtures without the
-table continue to work through the blob fallback.
+``entity_details`` stores canonical collected facts. Section rows record
+acquisition coverage and payloads; per-field observations order incremental
+updates. Older test fixtures retain a compatibility blob fallback.
 """
 
 # SQLite's dynamic row shape is guarded at runtime by the compatibility
@@ -17,8 +17,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import cast
 
-from ..dialog_identity import publish_dialog_identity
-from ..dialog_identity_contracts import DialogIdentityObservation
+from ..dialog_identity import capture_identity_baseline, publish_dialog_identity
+from ..dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation, ObservedText
 from ..entity_store import EntitySnapshot, ensure_entity_stub, upsert_entity_snapshots
 from ..models import DialogType
 from ..resolver import latinize
@@ -30,6 +30,7 @@ from .contracts import (
     PERSONAL_CHANNEL_OWNED_FIELDS,
     PROFILE_SECTIONS,
     ProfileAcquisitionEvidence,
+    ProfileFieldObservation,
 )
 
 _DETAIL_SCHEMA = 1
@@ -81,6 +82,7 @@ class EntitySectionCommit:
     dialog_created: int | None = None
     dialog_identity_observation: DialogIdentityObservation | None = None
     dialog_identity_baseline_revision: int | None = None
+    field_observation: ProfileFieldObservation | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +163,266 @@ class EntityProfileRepository:
             profile_owner_account_id=owner_account_id,
             profile_observation_scope=observation_scope,
         )
+
+    def read_identity(self, entity_id: int) -> dict[str, object]:
+        """Read only canonical directory identity, never private profile data."""
+        return self._read_entity_stub(entity_id)
+
+    def apply_profile_update(
+        self, entity_id: int, fields: Mapping[str, object], *, observation: ProfileFieldObservation
+    ) -> frozenset[str]:
+        """Persist supplied facts and their ordering without refreshing whole sections."""
+        if set(fields) - (set(FULL_PROFILE_OWNED_FIELDS) | {"current_photo"}):
+            raise ValueError("unsupported pushed profile field")
+        if not fields or not self._columns("entity_profile_field_observations"):
+            return frozenset()
+        with write_savepoint(self._conn):
+            base, reset_owner = self._observation_profile_base(entity_id, observation)
+            detail, accepted = self._merge_observed_fields(entity_id, base, fields, observation)
+            if not accepted:
+                return frozenset()
+            changed = frozenset(field for field in accepted if field not in base or detail[field] != base[field])
+            if reset_owner:
+                self._reset_unowned_sections(entity_id)
+            self._conn.execute(
+                "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_owner_account_id) VALUES (?,?,?,?) "
+                "ON CONFLICT(entity_id) DO UPDATE SET detail_json=excluded.detail_json,"
+                "profile_owner_account_id=excluded.profile_owner_account_id",
+                (
+                    entity_id,
+                    json.dumps({"schema": _DETAIL_SCHEMA, **detail}),
+                    observation.observed_at,
+                    observation.owner_account_id,
+                ),
+            )
+            self._store_field_observations(entity_id, accepted, observation)
+            self._publish_updated_identity(entity_id, detail, changed, observation.observed_at)
+            return changed
+
+    def _observation_profile_base(
+        self, entity_id: int, observation: ProfileFieldObservation
+    ) -> tuple[dict[str, object], bool]:
+        detail, _observed_at, owner, _scope = self._read_profile_blob(entity_id)
+        if owner is not None and owner != observation.owner_account_id:
+            raise ValueError("profile observation account does not match stored owner")
+        if owner is None:
+            return self._read_entity_stub(entity_id), True
+        return self._merge_canonical_identity(entity_id, detail), False
+
+    def _merge_observed_fields(
+        self,
+        entity_id: int,
+        base: Mapping[str, object],
+        fields: Mapping[str, object],
+        observation: ProfileFieldObservation,
+    ) -> tuple[dict[str, object], frozenset[str]]:
+        """Resolve field ordering before a canonical write; do not publish metadata yet."""
+        rows = self._conn.execute(
+            "SELECT field,owner_account_id,observation_order,source FROM entity_profile_field_observations WHERE entity_id=?",
+            (entity_id,),
+        ).fetchall()
+        previous = {str(row[0]): (row[1], row[2], row[3]) for row in rows}
+        accepted = {
+            field: value
+            for field, value in fields.items()
+            if _accept_field_observation(field, base, previous.get(field), observation)
+        }
+        detail = {**base, **accepted}
+        if "current_photo" in accepted:
+            detail["current_photo"] = _merge_current_photo(base.get("current_photo"), accepted["current_photo"])
+        if set(accepted) & {"contact", "mutual_contact", "close_friend", "blocked", "my_membership"}:
+            _recompose_profile_membership(detail)
+        return detail, frozenset(accepted)
+
+    def _store_field_observations(
+        self, entity_id: int, fields: frozenset[str], observation: ProfileFieldObservation
+    ) -> None:
+        self._conn.executemany(
+            "INSERT INTO entity_profile_field_observations(entity_id,field,owner_account_id,observation_order,observed_at,source) "
+            "VALUES (?,?,?,?,?,?) ON CONFLICT(entity_id,field) DO UPDATE SET "
+            "owner_account_id=excluded.owner_account_id,observation_order=excluded.observation_order,"
+            "observed_at=excluded.observed_at,source=excluded.source",
+            (
+                (
+                    entity_id,
+                    field,
+                    observation.owner_account_id,
+                    observation.order,
+                    observation.observed_at,
+                    observation.source,
+                )
+                for field in fields
+            ),
+        )
+
+    def _reset_unowned_sections(self, entity_id: int) -> None:
+        assignments = [
+            "status=CASE WHEN status='not_applicable' THEN status ELSE 'pending' END",
+            "observed_at=NULL",
+            "payload_json=NULL",
+            "reason='profile_owner_unverified'",
+            "retry_at=NULL",
+        ]
+        assignments.extend(
+            f"{column}=NULL"
+            for column in (
+                "acquisition_generation",
+                "acquisition_outcome",
+                "provenance_json",
+                "normalization_version",
+                "observation_started_at",
+                "observation_completed_at",
+                "acquisition_identity_json",
+            )
+            if self._section_has(column)
+        )
+        self._conn.execute(
+            "UPDATE entity_detail_sections SET " + ",".join(assignments) + " WHERE entity_id=?", (entity_id,)
+        )
+
+    def _publish_updated_identity(
+        self, entity_id: int, detail: Mapping[str, object], changed: frozenset[str], observed_at: int
+    ) -> None:
+        if not changed & {"name", "username"}:
+            return
+        baseline = capture_identity_baseline(self._conn, entity_id)
+        self._update_canonical_identity(entity_id, detail, now=observed_at)
+        self._bump_identity_fence(entity_id)
+        publish_dialog_identity(
+            self._conn,
+            entity_id,
+            DialogIdentityObservation(
+                entity_id,
+                name=cast(ObservedText, detail.get("name")) if "name" in changed else IDENTITY_OMITTED,
+                username=cast(ObservedText, detail.get("username")) if "username" in changed else IDENTITY_OMITTED,
+                source="realtime",
+                observed_at=observed_at,
+            ),
+            baseline,
+        )
+
+    def is_history_profile_managed(self, entity_id: int) -> bool:
+        """Check durable private-dialog enrollment without visibility filtering."""
+        if not self._columns("full_history_enrollment") or not self._columns("dialogs"):
+            return False
+        return (
+            self._conn.execute(
+                "SELECT 1 FROM full_history_enrollment e JOIN dialogs d ON d.dialog_id=e.dialog_id "
+                "WHERE e.dialog_id=? AND e.enabled=1 AND d.type IN ('user','bot','User','Bot')",
+                (entity_id,),
+            ).fetchone()
+            is not None
+        )
+
+    def reconcile_history_profiles(self, *, now: int, limit: int, pair_mode: str, self_id: int | None) -> int:
+        """Admit a bounded batch of missing DM facts, with no age-based polling."""
+        if isinstance(limit, bool) or limit < 1:
+            raise ValueError("profile reconciliation limit must be positive")
+        if self_id is None or not self._history_profile_schema_available():
+            return 0
+        with write_savepoint(self._conn):
+            rows = self._history_profiles_to_collect(self_id, min(limit, 32))
+            for entity_id, entity_type, name, repair_owner in rows:
+                ensure_entity_stub(
+                    self._conn,
+                    EntitySnapshot(entity_id, entity_type, name, None, latinize(name) if name else None, now),
+                )
+                sections = PROFILE_SECTIONS if repair_owner else self._missing_profile_sections(entity_id)
+                self.request_section_refresh(entity_id, sections, now=now, pair_mode=pair_mode)
+            return len(rows)
+
+    def _history_profile_schema_available(self) -> bool:
+        return all(
+            self._columns(table)
+            for table in ("full_history_enrollment", "dialogs", "entity_details", "entity_detail_sections")
+        ) and self._refresh_has("generation")
+
+    def _history_profiles_to_collect(self, self_id: int, limit: int) -> list[tuple[int, str, str | None, bool]]:
+        owner_mismatch = "p.profile_owner_account_id IS NOT ?" if self._detail_has("profile_owner_account_id") else "0"
+        owner_parameters: tuple[object, ...] = (self_id,) if self._detail_has("profile_owner_account_id") else ()
+        rows = self._conn.execute(
+            "WITH expected(section) AS (VALUES ('full_profile'),('common_chats'),('contact_overlap'),"
+            "('avatar_history'),('personal_channel')) "
+            f"SELECT d.dialog_id,d.type,d.name,({owner_mismatch}) FROM dialogs d "
+            "JOIN full_history_enrollment e ON e.dialog_id=d.dialog_id AND e.enabled=1 "
+            "LEFT JOIN entity_details p ON p.entity_id=d.dialog_id "
+            "LEFT JOIN entity_profile_refresh_state r ON r.entity_id=d.dialog_id "
+            "WHERE d.type IN ('user','bot','User','Bot') AND d.dialog_id<>? "
+            "AND (r.status IS NULL OR r.status='complete' "
+            "OR (r.status='rejected' AND r.reason='refresh_rejected')) "
+            f"AND (p.entity_id IS NULL OR ({owner_mismatch}) OR EXISTS ("
+            "SELECT 1 FROM expected x LEFT JOIN entity_detail_sections s "
+            "ON s.entity_id=d.dialog_id AND s.section=x.section "
+            "WHERE s.section IS NULL OR s.status IN ('pending','stale') "
+            "OR (s.status='fresh' AND s.observed_at IS NULL) "
+            "OR (s.status='unavailable' AND s.reason='refresh_rejected'))) "
+            "ORDER BY d.dialog_id LIMIT ?",
+            (*owner_parameters, self_id, *owner_parameters, limit),
+        ).fetchall()
+        return [(int(row[0]), str(row[1]), row[2], bool(row[3])) for row in rows]
+
+    def _missing_profile_sections(self, entity_id: int) -> tuple[str, ...]:
+        stored = self._read_stored_sections(entity_id)
+        missing = []
+        for section in PROFILE_SECTIONS:
+            row = stored.get(section)
+            if row is None or _profile_section_missing(row):
+                missing.append(section)
+        if not self._read_detail_blob(entity_id) and "full_profile" not in missing:
+            missing.insert(0, "full_profile")
+        return tuple(missing)
+
+    def request_section_refresh(self, entity_id: int, sections: tuple[str, ...], *, now: int, pair_mode: str) -> bool:
+        """Invalidate only requested sections and fence an older in-flight result."""
+        if any(section not in PROFILE_SECTIONS for section in sections):
+            raise ValueError("unknown profile section")
+        if pair_mode not in {"enabled", "disabled"}:
+            raise ValueError("invalid profile pair mode")
+        if not sections or not self._refresh_has("generation"):
+            return False
+        with write_savepoint(self._conn):
+            if not self.ensure_unknown_refresh_parent(entity_id, now=now):
+                return False
+            active = self._read_pending_refresh_state(entity_id)
+            previous = self._conn.execute(
+                "SELECT next_section FROM entity_profile_refresh_state WHERE entity_id=? AND status IN ('pending','failed')",
+                (entity_id,),
+            ).fetchone()
+            self._upsert_pending_refresh(entity_id, now=now, reason="profile_changed", pair_mode_override=pair_mode)
+            self._conn.executemany(
+                "INSERT INTO entity_detail_sections(entity_id,section,status,reason) VALUES (?,?,'pending','profile_changed') "
+                "ON CONFLICT(entity_id,section) DO UPDATE SET status='pending',reason='profile_changed'",
+                ((entity_id, section) for section in set(sections)),
+            )
+            first = min(sections, key=PROFILE_SECTIONS.index)
+            if previous is not None and previous[0] in PROFILE_SECTIONS:
+                first = min((first, str(previous[0])), key=PROFILE_SECTIONS.index)
+            self._conn.execute(
+                "UPDATE entity_profile_refresh_state SET generation=generation+?, started_at=?, "
+                "next_section=?,acquisition_cursor=0,follow_up_required=0,pair_eligible=? WHERE entity_id=?",
+                (
+                    int(_pending_refresh_is_active(active)),
+                    now,
+                    first,
+                    int(self._pair_is_eligible(entity_id, now=now)),
+                    entity_id,
+                ),
+            )
+            self._reset_pair_measurement(entity_id)
+            return True
+
+    def complete_unchanged_section(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
+        """Advance retained terminal knowledge without rewriting its observation."""
+        with write_savepoint(self._conn):
+            row = self._conn.execute(
+                "SELECT status,observed_at,reason,retry_at FROM entity_detail_sections WHERE entity_id=? AND section=?",
+                (cursor.entity_id, cursor.next_section),
+            ).fetchone()
+            if row is None or cursor.retry_at is not None or row[3] is not None or not self._cursor_matches(cursor):
+                return False
+            collected = row[0] == "fresh" and row[1] is not None
+            terminal = row[0] == "not_applicable" or (row[0] == "unavailable" and row[2] != "refresh_rejected")
+            return self._advance_completed_section(cursor, now=now) if collected or terminal else False
 
     def read_section_evidence(self, entity_id: int, section: str) -> dict[str, object] | None:
         """Return the bounded receipt projection, if a migration-created row has one."""
@@ -315,34 +577,6 @@ class EntityProfileRepository:
         if not self._receipt_materialization_is_exact(entity_id, section, evidence):
             return "materialization_mismatch"
         return None
-
-    def pair_receipts_require_new_scope(
-        self,
-        entity_id: int,
-        identity: Mapping[str, object] | None,
-        *,
-        now: int,
-    ) -> bool:
-        """Detect a completed fresh pair whose authorization scope changed."""
-        rows = self._conn.execute(
-            "SELECT section, status FROM entity_detail_sections "
-            "WHERE entity_id=? AND section IN ('full_profile', 'personal_channel')",
-            (entity_id,),
-        ).fetchall()
-        statuses = {str(row[0]): str(row[1]) for row in rows}
-        if statuses != {"full_profile": "fresh", "personal_channel": "fresh"}:
-            return False
-        if identity is None:
-            return True
-        return any(
-            not self._reusable_receipt_is_valid(
-                entity_id,
-                section,
-                identity=identity,
-                now=now,
-            )
-            for section in ("full_profile", "personal_channel")
-        )
 
     def complete_same_generation_section(
         self,
@@ -706,6 +940,11 @@ class EntityProfileRepository:
                         "THEN entity_detail_sections.reason ELSE excluded.reason END, retry_at=NULL",
                         ((entity_id, section, reason) for section in PROFILE_SECTIONS),
                     )
+                    if pair_eligible_override is None and self._refresh_has("pair_eligible"):
+                        self._conn.execute(
+                            "UPDATE entity_profile_refresh_state SET pair_eligible=? WHERE entity_id=?",
+                            (int(self._pair_is_eligible(entity_id, now=now)), entity_id),
+                        )
                 else:
                     # Active-generation re-admission must not rewrite evidence,
                     # timestamps, retry boundaries, or captured pair mode.
@@ -713,31 +952,6 @@ class EntityProfileRepository:
                         "INSERT OR IGNORE INTO entity_detail_sections(entity_id, section, status, observed_at, reason, payload_json, retry_at) "
                         "VALUES (?, ?, 'pending', NULL, ?, NULL, NULL)",
                         ((entity_id, section, reason) for section in PROFILE_SECTIONS),
-                    )
-        except sqlite3.OperationalError, sqlite3.IntegrityError:
-            return
-
-    def mark_refresh_queued(
-        self,
-        entity_id: int,
-        *,
-        reason: str = "refresh_queued",
-        pair_mode_override: str | None = None,
-    ) -> None:
-        """Clear rejection state and restore an honest queued reason."""
-        try:
-            with write_savepoint(self._conn):
-                new_generation = self._upsert_pending_refresh(
-                    entity_id,
-                    now=self._database_now(),
-                    reason=reason,
-                    pair_mode_override=pair_mode_override,
-                )
-                if new_generation:
-                    self._conn.execute(
-                        "UPDATE entity_detail_sections SET status='pending', reason=?, retry_at=NULL "
-                        "WHERE entity_id=? AND status IN ('pending', 'stale', 'unavailable')",
-                        (reason, entity_id),
                     )
         except sqlite3.OperationalError, sqlite3.IntegrityError:
             return
@@ -944,13 +1158,8 @@ class EntityProfileRepository:
     ) -> bool:
         if row is None:
             payload = _section_payload(detail, section)
-            return payload is None or observed_at is None or now - observed_at >= self._section_ttl_seconds
-        _section_name, raw_status, section_observed_at, _reason, _payload = row
-        return _section_due(raw_status, section_observed_at, now=now, ttl=self._section_ttl_seconds)
-
-    def _database_now(self) -> int:
-        row = cast(tuple[int] | None, self._conn.execute("SELECT unixepoch()").fetchone())
-        return row[0] if row is not None else 0
+            return self._legacy_section_status(detail, section, payload, observed_at, now=now) == "pending"
+        return _profile_section_missing(row)
 
     def next_refresh_release_at(self) -> float | None:
         """Return the earliest durable pending or retryable refresh release."""
@@ -1288,11 +1497,9 @@ class EntityProfileRepository:
         """Commit a section while an outer transaction is active."""
         if not self._cursor_matches(cursor):
             return False
-        detail = self._read_detail_blob(cursor.entity_id)
-        if not detail:
-            detail = self._read_entity_stub(cursor.entity_id)
-        detail = _strip_schema(detail)
-        detail.update(commit.detail_patch)
+        detail, accepted, reset_owner = self._prepare_observed_commit(
+            cursor.entity_id, commit.detail_patch, commit.field_observation
+        )
         if not self._write_detail(
             cursor.entity_id,
             detail,
@@ -1301,11 +1508,12 @@ class EntityProfileRepository:
             owner_account_id=commit.observation_owner_account_id,
             observation_scope=commit.observation_auth_scope,
             ownership_observed=commit.ownership_observed,
-            identity_patch=commit.identity_patch,
+            identity_patch=_accepted_identity_patch(commit, accepted),
             dialog_identity_observation=commit.dialog_identity_observation,
             dialog_identity_baseline_revision=commit.dialog_identity_baseline_revision,
         ):
             return False
+        self._finish_observed_commit(cursor.entity_id, accepted, reset_owner, commit.field_observation)
         section_payload = _section_payload(detail, cursor.next_section) if commit.payload is None else commit.payload
         self._write_section(
             cursor.entity_id,
@@ -1326,6 +1534,29 @@ class EntityProfileRepository:
             raise sqlite3.OperationalError("entity profile cursor advance was rejected")
         self.persist_group_created(cursor.entity_id, commit.dialog_created)
         return True
+
+    def _prepare_observed_commit(
+        self, entity_id: int, fields: Mapping[str, object], observation: ProfileFieldObservation | None
+    ) -> tuple[dict[str, object], frozenset[str], bool]:
+        if observation is None:
+            detail = self._read_detail_blob(entity_id) or self._read_entity_stub(entity_id)
+            return {**_strip_schema(detail), **fields}, frozenset(fields), False
+        base, reset_owner = self._observation_profile_base(entity_id, observation)
+        detail, accepted = self._merge_observed_fields(entity_id, base, fields, observation)
+        return detail, accepted, reset_owner
+
+    def _finish_observed_commit(
+        self,
+        entity_id: int,
+        accepted: frozenset[str],
+        reset_owner: bool,
+        observation: ProfileFieldObservation | None,
+    ) -> None:
+        if observation is None:
+            return
+        if reset_owner:
+            self._reset_unowned_sections(entity_id)
+        self._store_field_observations(entity_id, accepted, observation)
 
     def _advance_after_section_write(
         self,
@@ -1631,7 +1862,9 @@ class EntityProfileRepository:
                 return False
             self._write_group_pair_sections(cursor, detail, full_profile, contact_overlap, now=now)
             self.persist_group_created(cursor.entity_id, full_profile.dialog_created)
-            advanced = self._advance_group_full_chat_cursor(cursor, now=now)
+            advanced = self._advance_group_full_chat_cursor(
+                cursor, now=now, contact_overlap_pending=contact_overlap.status == "pending"
+            )
             if not advanced:
                 raise sqlite3.OperationalError("legacy group cursor advance was rejected")
             return True
@@ -1708,20 +1941,26 @@ class EntityProfileRepository:
         full_profile: EntitySectionCommit,
         contact_overlap: EntitySectionCommit,
     ) -> None:
+        if full_profile.status not in {"fresh", "unavailable"} or contact_overlap.status not in {
+            "fresh",
+            "unavailable",
+            "pending",
+        }:
+            raise ValueError("invalid legacy group section status")
         for commit in (full_profile, contact_overlap):
-            if commit.status not in {"fresh", "unavailable"}:
-                raise ValueError("invalid legacy group section status")
             if commit.evidence is not None and commit.evidence.generation != cursor.generation:
                 raise ValueError("legacy group evidence generation does not match refresh cursor")
 
-    def _advance_group_full_chat_cursor(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
+    def _advance_group_full_chat_cursor(
+        self, cursor: EntityRefreshCursor, *, now: int, contact_overlap_pending: bool
+    ) -> bool:
         require_write_transaction(self._conn)
         predicate, parameters = self._cursor_predicate(cursor)
         assignments = (
             "status='pending', retry_at=NULL, reason='refresh_queued', updated_at=?, "
             "next_section=?, acquisition_cursor=0"
         )
-        values: tuple[object, ...] = (now, PROFILE_SECTIONS[3])
+        values: tuple[object, ...] = (now, PROFILE_SECTIONS[2 if contact_overlap_pending else 3])
         if self._refresh_has("profile_revision") and self._detail_has("profile_revision"):
             assignments += ", profile_revision=?"
             values += (cursor.profile_revision + 1,)
@@ -1753,17 +1992,24 @@ class EntityProfileRepository:
         *,
         now: int,
     ) -> dict[str, object] | None:
-        detail = self._read_detail_blob(cursor.entity_id) or self._read_entity_stub(cursor.entity_id)
-        detail = _strip_schema(detail)
-        detail.update(full_profile.detail_patch)
-        detail.update(personal_channel.detail_patch)
-        if not self._write_pair_detail(cursor, detail, full_profile, personal_channel, now=now):
+        observation = full_profile.field_observation or personal_channel.field_observation
+        if (
+            full_profile.field_observation is not None
+            and personal_channel.field_observation is not None
+            and full_profile.field_observation != personal_channel.field_observation
+        ):
+            raise ValueError("paired profile field observations must match")
+        detail, accepted, reset_owner = self._prepare_observed_commit(
+            cursor.entity_id, {**full_profile.detail_patch, **personal_channel.detail_patch}, observation
+        )
+        if not self._write_pair_detail(cursor, detail, full_profile, personal_channel, now=now, accepted=accepted):
             return None
+        self._finish_observed_commit(cursor.entity_id, accepted, reset_owner, observation)
         self._write_pair_section(cursor.entity_id, "full_profile", full_profile, detail, now=now)
         self._write_pair_section(cursor.entity_id, "personal_channel", personal_channel, detail, now=now)
         return detail
 
-    def _write_pair_detail(
+    def _write_pair_detail(  # noqa: PLR0913
         self,
         cursor: EntityRefreshCursor,
         detail: Mapping[str, object],
@@ -1771,6 +2017,7 @@ class EntityProfileRepository:
         companion: EntitySectionCommit,
         *,
         now: int,
+        accepted: frozenset[str] | None = None,
     ) -> bool:
         owner_account_id, observation_scope, ownership_observed = _commit_metadata(full_profile, companion)
         return self._write_detail(
@@ -1781,7 +2028,9 @@ class EntityProfileRepository:
             owner_account_id=owner_account_id,
             observation_scope=observation_scope,
             ownership_observed=ownership_observed,
-            identity_patch=_combine_identity_patches(full_profile.identity_patch, companion.identity_patch),
+            identity_patch=_combine_identity_patches(
+                _accepted_identity_patch(full_profile, accepted), _accepted_identity_patch(companion, accepted)
+            ),
             dialog_identity_observation=full_profile.dialog_identity_observation,
             dialog_identity_baseline_revision=full_profile.dialog_identity_baseline_revision,
         )
@@ -2020,6 +2269,12 @@ class EntityProfileRepository:
         """Persist queue rejection without claiming that work was queued."""
         try:
             with write_savepoint(self._conn):
+                active = self._conn.execute(
+                    "SELECT 1 FROM entity_profile_refresh_state WHERE entity_id=? AND status IN ('pending','failed')",
+                    (entity_id,),
+                ).fetchone()
+                if reason == "refresh_rejected" and active is not None:
+                    return
                 self._conn.execute(
                     "INSERT INTO entity_profile_refresh_state(entity_id, status, retry_at, reason, updated_at) "
                     "VALUES (?, 'rejected', NULL, ?, ?) ON CONFLICT(entity_id) DO UPDATE SET status=excluded.status, "
@@ -2299,16 +2554,18 @@ class EntityProfileRepository:
         *,
         now: int,
     ) -> str:
+        del now
         if not _section_applicable(detail, section):
             return "not_applicable"
-        if payload is None or observed_at is None:
+        if section == "full_profile" or payload is None or observed_at is None:
             return "pending"
-        return "stale" if now - observed_at >= self._section_ttl_seconds else "fresh"
+        return "fresh"
 
     def _stored_section_status(self, raw_status: str, observed_at: int | None, *, now: int) -> str:
+        del now
         status = raw_status if raw_status in _SECTION_STATUSES else "pending"
-        if status == "fresh" and observed_at is not None and now - observed_at >= self._section_ttl_seconds:
-            return "stale"
+        if status == "fresh" and observed_at is None:
+            return "pending"
         return status
 
     def _read_detail_blob(self, entity_id: int) -> dict[str, object]:
@@ -2372,6 +2629,57 @@ def _validated_receipt_fields(
 def _receipt_identity_matches(evidence: Mapping[str, object], identity: Mapping[str, object]) -> bool:
     stored_identity = evidence.get("identity")
     return isinstance(stored_identity, dict) and dict(identity) == stored_identity
+
+
+def _accepted_identity_patch(
+    commit: EntitySectionCommit, accepted: frozenset[str] | None
+) -> Mapping[str, object] | None:
+    if commit.identity_patch is None or accepted is None or commit.field_observation is None:
+        return commit.identity_patch
+    return {field: value for field, value in commit.identity_patch.items() if field in accepted}
+
+
+def _profile_section_missing(row: tuple[object, ...]) -> bool:
+    return (
+        row[1] in {"pending", "stale"}
+        or (row[1] == "fresh" and row[2] is None)
+        or (row[1] == "unavailable" and row[3] == "refresh_rejected")
+    )
+
+
+def _merge_current_photo(previous: object, incoming: object) -> object:
+    if not isinstance(previous, Mapping) or not isinstance(incoming, Mapping):
+        return incoming
+    if previous.get("photo_id") == incoming.get("photo_id") and incoming.get("date") is None:
+        return {**incoming, "date": previous.get("date")}
+    return incoming
+
+
+def _accept_field_observation(
+    field: str,
+    current: Mapping[str, object],
+    previous: tuple[object, object, object] | None,
+    observation: ProfileFieldObservation,
+) -> bool:
+    if previous is not None:
+        owner, order, source = previous
+        if owner != observation.owner_account_id or not isinstance(order, int) or order >= observation.order:
+            return False
+        return observation.source != "min" or source == "min"
+    return observation.source != "min" or field not in current
+
+
+def _recompose_profile_membership(detail: dict[str, object]) -> None:
+    relationship = {
+        field: detail[field] for field in ("contact", "mutual_contact", "close_friend", "blocked") if field in detail
+    }
+    if relationship:
+        detail["my_membership"] = {
+            "is_member": bool(relationship.get("contact") or relationship.get("mutual_contact")),
+            "is_admin": False,
+            "admin_rights": None,
+            "relationship": relationship,
+        }
 
 
 def _receipt_observation(evidence: Mapping[str, object], *, now: int) -> tuple[int, int] | None:
@@ -2655,12 +2963,6 @@ def _decode_payload(value: str | None) -> object | None:
 def _decode_mapping(value: object) -> dict[str, object] | None:
     decoded = _decode_payload(value if isinstance(value, str) else None)
     return {str(key): item for key, item in decoded.items()} if isinstance(decoded, dict) else None
-
-
-def _section_due(status: str, observed_at: int | None, *, now: int, ttl: int) -> bool:
-    if status in {"pending", "stale", "unavailable"}:
-        return True
-    return status == "fresh" and (observed_at is None or now - observed_at >= ttl)
 
 
 def _encode_bounded_json(value: Mapping[str, object] | None) -> str | None:

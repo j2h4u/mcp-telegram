@@ -5,14 +5,13 @@ helpers for user/bot/channel/supergroup/group entity details.
 """
 
 import asyncio
-import json
 import logging
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from dataclasses import replace as dataclass_replace
-from typing import Protocol, cast, runtime_checkable
+from typing import Protocol, cast
 
 from telethon.errors import (  # type: ignore[import-untyped]
     ChatIdInvalidError,
@@ -25,8 +24,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
 
 from .auth_scope import TelegramAuthScope
 from .demand_wiring import DemandOfferSink, offer_durable_demand
-from .dialog_identity import capture_identity_baseline, publish_dialog_identity
-from .dialog_identity_contracts import DialogIdentityObservation
+from .dialog_identity import capture_identity_baseline
 from .entity_profile.contracts import (
     CHANNEL_ID_MARKER,
     FULL_PROFILE_OWNED_FIELDS,
@@ -36,15 +34,14 @@ from .entity_profile.contracts import (
     NORMALIZATION_VERSION,
     PERSONAL_CHANNEL_OWNED_FIELDS,
     PROFILE_SECTIONS,
-    ChannelContactOverlapObservation,
     ChannelProfileObservation,
     ChannelReference,
     ChatAvatarReference,
     ChatCurrentPhoto,
     GroupProfileObservation,
     GroupReference,
-    PersonalChannelReference,
     ProfileAcquisitionEvidence,
+    ProfileFieldObservation,
     ProjectionOutcome,
     ProjectionStatus,
     TargetKind,
@@ -67,7 +64,6 @@ from .entity_profile.refresh import (
     DurableRefreshSliceResult,
     DurableRefreshTerminal,
     EntityRefreshCoordinator,
-    RefreshEnqueueResult,
     RefreshLimits,
     failure_retry_at,
     scope_changed_retry_at,
@@ -79,16 +75,15 @@ from .entity_profile.repository import (
     EntitySectionCommit,
     pair_readiness_latency_ms,
 )
-from .entity_store import EntitySnapshot, ensure_entity_stub
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .folders.read_model import dialog_placement
 from .linked_chat_fact import linked_chat_fact_owner
 from .models import DialogType
+from .observation_order import allocate_observation_order
 from .sqlite_writer import SQLiteWriter
 from .sync_transactions import write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import (
-    AcquisitionKind,
     DemandStatus,
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
@@ -96,10 +91,8 @@ from .telegram_demand import (
 )
 from .telegram_rpc import raise_if_flood_wait_error
 from .telegram_rpc_consumers import DemandKind
-from .telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope, rpc_scope
+from .telegram_rpc_scheduler import current_rpc_scope
 from .telethon_dialog import classify_dialog_type, observe_dialog_identity
-
-_ENTITY_DETAIL_SCHEMA_VERSION = 1
 
 
 class _LinkedChatFactCaptureUnavailable:
@@ -145,34 +138,8 @@ class _AuthScopeUnavailableError(RuntimeError):
     """The live primary session identity cannot authorize a pair receipt."""
 
 
-_ADMIN_RIGHT_FIELDS = (
-    "change_info",
-    "post_messages",
-    "edit_messages",
-    "delete_messages",
-    "ban_users",
-    "invite_users",
-    "pin_messages",
-    "add_admins",
-    "anonymous",
-    "manage_call",
-    "other",
-    "manage_topics",
-    "post_stories",
-    "edit_stories",
-    "delete_stories",
-)
-
-
 class _EntityInfoClient(Protocol):
     def get_entity(self, entity_id: int) -> Awaitable[object]: ...
-
-    def get_messages(self, entity: object, ids: list[int]) -> Awaitable[object]: ...
-
-
-@runtime_checkable
-class _SupportsIsoformat(Protocol):
-    def isoformat(self) -> str: ...
 
 
 def _attr(obj: object, name: str, default: object | None = None) -> object | None:
@@ -180,11 +147,6 @@ def _attr(obj: object, name: str, default: object | None = None) -> object | Non
         return cast(object | None, object.__getattribute__(obj, name))
     except AttributeError:
         return default
-
-
-def _opt_int_attr(obj: object, name: str) -> int | None:
-    value = _attr(obj, name)
-    return value if isinstance(value, int) else None
 
 
 def _opt_str_attr(obj: object, name: str) -> str | None:
@@ -230,42 +192,8 @@ def _positive_personal_channel_id(payload: Mapping[str, object]) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
-def _bool_attr(obj: object, name: str) -> bool:
-    return bool(_attr(obj, name, False))
-
-
-def _value_or_none[T](value: object, expected_type: type[T]) -> T | None:
-    return value if isinstance(value, expected_type) else None
-
-
-def _isoformat_or_none(value: object | None) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, _SupportsIsoformat):
-        return cast(_SupportsIsoformat, value).isoformat()
-    return None
-
-
 def _compact_dict(items: Mapping[str, object | None]) -> dict[str, object]:
     return {key: value for key, value in items.items() if value is not None}
-
-
-def _row_sequence(row: object) -> Sequence[object]:
-    return cast(Sequence[object], row)
-
-
-def _row_mapping(row: object) -> Mapping[str, object]:
-    return cast(Mapping[str, object], row)
-
-
-def _row_int_or_none(row: Mapping[str, object], key: str) -> int | None:
-    value = row.get(key)
-    return value if isinstance(value, int) else None
-
-
-def _row_str_or_none(row: Mapping[str, object], key: str) -> str | None:
-    value = row.get(key)
-    return value if isinstance(value, str) else None
 
 
 def _current_photo_from_payload(payload: object) -> ChatCurrentPhoto | None:
@@ -335,7 +263,6 @@ class EntityInfoDeps:
     logger: logging.Logger
     now_provider: Callable[[], float]
     detail_ttl_seconds: int
-    slow_stage_seconds: float
     group_profile_port: GroupProfilePort
     user_profile_port: UserProfilePort
     channel_profile_port: ChannelProfilePort
@@ -432,7 +359,6 @@ class DaemonEntityInfoService:
     def __init__(self, deps: EntityInfoDeps, *, enable_refresh_coordinator: bool = True) -> None:
         self._deps = deps
         self._profiles = EntityProfileRepository(deps.conn, section_ttl_seconds=deps.detail_ttl_seconds)
-        self._section_failures: dict[str, str] = {}
         self._demand_sink: DemandOfferSink | None = None
         self._refresh = EntityRefreshCoordinator(limits=deps.refresh_limits) if enable_refresh_coordinator else None
         if self._refresh is not None:
@@ -441,6 +367,20 @@ class DaemonEntityInfoService:
     def bind_demand_sink(self, sink: DemandOfferSink) -> None:
         """Attach post-commit wakeups to the process-wide coordinator."""
         self._demand_sink = sink
+
+    async def reconcile_history_profiles(self) -> int:
+        """Recover one bounded batch of locally missing DM profile observations."""
+        count = await self._write_profiles(
+            lambda profiles: profiles.reconcile_history_profiles(
+                now=int(self._deps.now_provider()),
+                limit=32,
+                pair_mode=self._current_pair_mode(),
+                self_id=self._deps.self_id,
+            )
+        )
+        if count:
+            offer_durable_demand(self._require_demand_sink(), DemandKind.ENTITY_PROFILE_REFRESH)
+        return count
 
     async def _write_profiles[T](self, operation: Callable[[EntityProfileRepository], T]) -> T:
         return await self._deps.writer.run(
@@ -465,351 +405,90 @@ class DaemonEntityInfoService:
         """Return the service-owned coordinator used by demand composition."""
         return self._refresh
 
-    async def auth_scope_changed(self) -> None:
-        """Queue completed User/Bot pairs under a new authorization generation."""
-        if not self._deps.enable_full_user_pair:
-            return
-        now = int(self._deps.now_provider())
-        pair_mode = self._current_pair_mode()
-
-        def queue_refreshes(conn: sqlite3.Connection) -> bool:
-            profiles = EntityProfileRepository(conn, section_ttl_seconds=self._deps.detail_ttl_seconds)
-            rows = cast(
-                list[tuple[int]],
-                conn.execute(
-                    "SELECT DISTINCT entity_id FROM entity_detail_sections "
-                    "WHERE section IN ('full_profile', 'personal_channel') AND status='fresh' "
-                    "GROUP BY entity_id HAVING COUNT(*)=2"
-                ).fetchall(),
-            )
-            for row in rows:
-                profiles.mark_pending(
-                    int(row[0]),
-                    now=now,
-                    reason="auth_scope_changed",
-                    pair_eligible_override=True,
-                    pair_mode_override=pair_mode,
-                )
-            return bool(rows)
-
-        rows = await self._deps.writer.run(queue_refreshes)
-        if rows and self._demand_sink is not None:
-            offer_durable_demand(self._demand_sink, DemandKind.ENTITY_PROFILE_REFRESH)
-
     async def get_entity_info(self, req: Mapping[str, object]) -> dict[str, object]:
-        """Run one foreground entity-info use case under its RPC source."""
+        """Time a local-only projection of the durable entity profile."""
         started_at = time.perf_counter()
-        with rpc_scope(
-            TelegramRpcSource.ENTITY_INFO_FOREGROUND,
-            acquisition_kind=AcquisitionKind.ENTITY_LOOKUP,
-        ):
-            try:
-                return await self._get_entity_info(req)
-            finally:
-                self._deps.logger.info(
-                    "entity_profile.request duration_s=%.3f%s",
-                    time.perf_counter() - started_at,
-                    self._deps.rid(),
-                )
+        try:
+            return await self._get_entity_info(req)
+        finally:
+            self._deps.logger.info(
+                "entity_profile.request duration_s=%.3f%s",
+                time.perf_counter() - started_at,
+                self._deps.rid(),
+            )
 
     async def _get_entity_info(self, req: Mapping[str, object]) -> dict[str, object]:
-        """Type-tagged entity inspector covering 5 Telegram entity kinds."""
-        started_at = self._deps.now_provider()
+        """Project persisted observations without initiating Telegram acquisition."""
         entity_id = self._extract_entity_id(req)
         if isinstance(entity_id, dict):
             return entity_id
-
         now = int(self._deps.now_provider())
-        if self._progressive_enabled():
-            cached_result = await self._progressive_cached_result(entity_id, now=now)
-            if cached_result is not None:
-                return await self._await_progressive_refresh(entity_id, cached_result)
-        else:
-            cached = self._load_cached_detail(entity_id, now)
-            if cached is not None:
-                return cached
-
-        if self._deps.self_id == entity_id and self._deps.self_profile is not None:
-            return await self._self_snapshot_result(entity_id, now=now, started_at=started_at)
-
-        if self._progressive_enabled():
-            result = await self._progressive_miss(entity_id, now=now, started_at=started_at)
-            return await self._await_progressive_refresh(entity_id, result)
-
-        return await self._legacy_entity_info(entity_id, now=now, started_at=started_at)
-
-    async def _await_progressive_refresh(
-        self,
-        entity_id: int,
-        fallback: dict[str, object],
-    ) -> dict[str, object]:
-        """Return the refreshed projection when foreground wait headroom permits it."""
-        if fallback.get("error") == "entity_not_found":
-            return fallback
-        assert self._refresh is not None
-        started_at = time.perf_counter()
-        completed = await self._refresh.wait_for_completion(
-            entity_id,
-            self._deps.refresh_limits.foreground_refresh_wait_seconds,
-        )
-        self._deps.logger.info(
-            "entity_profile.refresh_wait completed=%s duration_s=%.3f budget_s=%.3f%s",
-            completed,
-            time.perf_counter() - started_at,
-            self._deps.refresh_limits.foreground_refresh_wait_seconds,
-            self._deps.rid(),
-        )
-        if not completed:
-            return fallback
-        refreshed = await self._progressive_cached_result(
-            entity_id,
-            now=int(self._deps.now_provider()),
-            admit_refresh=False,
-        )
-        return fallback if refreshed is None else refreshed
-
-    async def _progressive_cached_result(
-        self,
-        entity_id: int,
-        *,
-        now: int,
-        admit_refresh: bool = True,
-    ) -> dict[str, object] | None:
-        refresh_state = self._profiles.refresh_state(entity_id, now=now)
-        terminal_error = self._terminal_resolution_error(refresh_state)
-        if terminal_error is not None:
-            return terminal_error
-        cached = self._profiles.read(entity_id, now=now)
-        if cached is not None:
-            if self._profile_ownership_unavailable(cached):
-                if admit_refresh:
-                    await self._admit_cached_ownership_refresh(entity_id, now=now)
-                return self._pending_error(entity_id, "entity profile ownership is unavailable")
-            if self._profile_scope_changed(cached, entity_id, now=now) and admit_refresh:
-                await self._write_profiles(
-                    lambda profiles: profiles.mark_pending(
-                        entity_id,
-                        now=now,
-                        reason="auth_scope_changed",
-                        pair_eligible_override=(True if self._deps.enable_full_user_pair else None),
-                        pair_mode_override=self._current_pair_mode(),
-                    )
+        stored = self._profiles.read(entity_id, now=now)
+        if stored is not None and stored.profile_owner_account_id is not None:
+            if not self._profile_owner_matches(stored.profile_owner_account_id):
+                return self._error(
+                    "entity_profile_account_unavailable",
+                    "The stored profile is not bound to the current account. Action: verify the daemon account binding.",
                 )
-                cached = self._profiles.read(entity_id, now=now)
-                assert cached is not None
-            return await self._progressive_result(
-                entity_id,
-                cached.detail,
-                cached.sections,
-                now=now,
-                admit_refresh=admit_refresh,
+            return await self._progressive_result(entity_id, stored.detail, stored.sections, now=now)
+        identity = self._local_profile_identity(entity_id)
+        if not identity:
+            return self._error(
+                "entity_not_observed",
+                "No local observations exist for this entity. Action: use list_dialogs to select a known local entity.",
             )
-        if refresh_state is None:
-            return None
-        reason = str(refresh_state.get("reason", "entity refresh is temporarily unavailable"))
-        return self._pending_error(entity_id, reason)
+        sections = self._unobserved_sections(identity)
+        return await self._progressive_result(entity_id, identity, sections, now=now)
 
-    def _terminal_resolution_error(self, refresh_state: Mapping[str, object] | None) -> dict[str, object] | None:
-        if refresh_state is None:
-            return None
-        if refresh_state.get("status") != "rejected" or refresh_state.get("reason") != "entity_not_found":
-            return None
-        return self._error(
-            "entity_not_found",
-            "Entity was not found. Action: retry with an exact entity id from ListDialogs.",
-        )
-
-    async def _admit_cached_ownership_refresh(self, entity_id: int, *, now: int) -> RefreshEnqueueResult:
-        """Admit ownership repair while retaining already durable refresh work."""
-        assert self._refresh is not None
-        enqueue_result = self._refresh.enqueue(entity_id)
-        pair_mode = self._current_pair_mode()
-        pair_eligible = True if self._deps.enable_full_user_pair else None
-
-        def admit(conn: sqlite3.Connection) -> None:
-            profiles = EntityProfileRepository(conn, section_ttl_seconds=self._deps.detail_ttl_seconds)
-            try:
-                row = cast(
-                    tuple[str] | None,
-                    conn.execute(
-                        "SELECT status FROM entity_profile_refresh_state WHERE entity_id=?", (entity_id,)
-                    ).fetchone(),
-                )
-            except sqlite3.OperationalError:
-                row = None
-            if row is not None and row[0] in {"pending", "failed"}:
-                return
-            if enqueue_result is RefreshEnqueueResult.REJECTED:
-                profiles.mark_refresh_rejected(entity_id, now=now)
-            else:
-                profiles.mark_pending(
-                    entity_id,
-                    now=now,
-                    reason="profile_ownership_changed",
-                    pair_eligible_override=pair_eligible,
-                    pair_mode_override=pair_mode,
-                )
-
-        await self._deps.writer.run(admit)
-        if enqueue_result is RefreshEnqueueResult.REJECTED:
-            return enqueue_result
-        offer_durable_demand(self._require_demand_sink(), DemandKind.ENTITY_PROFILE_REFRESH)
-        return enqueue_result
-
-    def _profile_ownership_unavailable(self, cached: object) -> bool:
-        provider = self._deps.full_user_auth_scope
-        if provider is None:
-            return False
+    def _profile_owner_matches(self, owner_account_id: int) -> bool:
         scope = self._capture_pair_scope()
-        owner = getattr(cached, "profile_owner_account_id", None)
-        return scope is None or not isinstance(owner, int) or owner != scope.account_id
+        account_id = self._deps.self_id
+        if account_id is None and scope is not None:
+            account_id = scope.account_id
+        return (
+            account_id is not None
+            and owner_account_id == account_id
+            and (scope is None or scope.account_id == account_id)
+        )
 
-    def _profile_scope_changed(self, cached: object, entity_id: int, *, now: int) -> bool:
-        if self._deps.full_user_auth_scope is None:
-            return False
-        current_scope = self._capture_pair_scope()
-        if current_scope is None:
-            return True
-        stored_scope = getattr(cached, "profile_observation_scope", None)
-        if not isinstance(stored_scope, dict) or stored_scope != current_scope.as_private_mapping():
-            return True
-        detail = getattr(cached, "detail", {})
-        if not isinstance(detail, Mapping):
-            return False
-        raw_type = detail.get("type")
+    def _local_profile_identity(self, entity_id: int) -> dict[str, object]:
+        profile = self._deps.self_profile
+        if self._deps.self_id != entity_id or profile is None:
+            return self._observed_directory_identity(entity_id)
+        return {
+            "id": entity_id,
+            "type": DialogType.USER.value,
+            "name": " ".join(str(profile[key]) for key in ("first_name", "last_name") if profile.get(key)) or None,
+            "username": profile.get("username"),
+            "my_membership": {"role": "self"},
+        }
+
+    def _observed_directory_identity(self, entity_id: int) -> dict[str, object]:
+        identity = self._profiles.read_identity(entity_id)
+        if identity.get("type") != DialogType.UNKNOWN.value:
+            return identity
+        if any(isinstance(value, str) and value.strip() for value in (identity.get("name"), identity.get("username"))):
+            return identity
+        return {}
+
+    def _unobserved_sections(self, identity: Mapping[str, object]) -> dict[str, dict[str, object]]:
+        raw_type = identity.get("type")
         entity_type = DialogType.parse(raw_type if isinstance(raw_type, str) else None)
-        if not self._deps.enable_full_user_pair or entity_type not in {DialogType.USER, DialogType.BOT}:
-            return False
-        target_kind = TargetKind.BOT if entity_type is DialogType.BOT else TargetKind.USER
-        identity = self._full_user_pair_identity(target_kind)
-        return self._profiles.pair_receipts_require_new_scope(entity_id, identity, now=now)
-
-    async def _self_snapshot_result(self, entity_id: int, *, now: int, started_at: float) -> dict[str, object]:
-        self_detail = self._build_self_detail()
-        if not self._progressive_enabled():
-            self._log_stage(entity_id, "self_snapshot", started_at, detail_type=self_detail.get("type"))
-            return {"ok": True, "data": self_detail}
-        await self._write_profiles(lambda profiles: profiles.save_core(self_detail, now=now))
-        assert self._refresh is not None
-        enqueue_result = self._refresh.enqueue(entity_id)
-        await self._persist_refresh_admission(entity_id, enqueue_result, now=now)
-        sections: dict[str, dict[str, object]] = {
+        return {
             section: {
-                "status": "pending",
-                "observed_at": None,
-                "reason": self._refresh_reason(enqueue_result),
-            }
-            for section in PROFILE_SECTIONS
-        }
-        return await self._progressive_result(entity_id, self_detail, sections, now=now)
-
-    async def _legacy_entity_info(
-        self,
-        entity_id: int,
-        *,
-        now: int,
-        started_at: float,
-    ) -> dict[str, object]:
-        self._log_stage(entity_id, "cache_miss", started_at)
-        stage_started_at = self._deps.now_provider()
-        identity_started_at = int(stage_started_at)
-        identity_baseline = capture_identity_baseline(self._deps.conn, entity_id)
-        entity, resolve_error = await self._resolve_entity(entity_id)
-        self._log_stage(entity_id, "resolve_entity", stage_started_at)
-        if resolve_error is not None:
-            return resolve_error
-
-        stage_started_at = self._deps.now_provider()
-        detail, detail_error = await self._build_detail_by_type(entity)
-        detail_type = detail.get("type") if detail is not None else None
-        self._log_stage(entity_id, "build_detail", stage_started_at, detail_type=detail_type)
-        if detail_error is not None or detail is None:
-            return detail_error or self._error("telegram_api_error", "per-type helper returned no detail")
-
-        stage_started_at = self._deps.now_provider()
-        await self._writeback(
-            entity_id,
-            detail,
-            now,
-            dialog_identity_observation=observe_dialog_identity(
-                entity, dialog_id=entity_id, source="profile", observed_at=identity_started_at
-            ),
-            dialog_identity_baseline_revision=identity_baseline,
-        )
-        self._log_stage(entity_id, "writeback", stage_started_at, detail_type=detail.get("type"))
-        self._log_stage(entity_id, "complete", started_at, detail_type=detail.get("type"))
-        return {"ok": True, "data": detail}
-
-    def _progressive_enabled(self) -> bool:
-        """Enable the new contract only after its additive table exists."""
-        row = cast(
-            object,
-            self._deps.conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_detail_sections'"
-            ).fetchone(),
-        )
-        return row is not None
-
-    def _record_section_failure(self, section: str, reason: str) -> None:
-        self._section_failures.setdefault(section, reason)
-
-    async def _queue_unknown_refresh(self, entity_id: int, *, now: int, message: str) -> dict[str, object]:
-        await self._write_profiles(lambda profiles: profiles.ensure_unknown_refresh_parent(entity_id, now=now))
-        assert self._refresh is not None
-        enqueue_result = self._refresh.enqueue(entity_id)
-        if enqueue_result is RefreshEnqueueResult.REJECTED:
-            await self._write_profiles(lambda profiles: profiles.mark_refresh_rejected(entity_id, now=now))
-            return self._pending_error(entity_id, "entity profile refresh queue is full")
-        await self._persist_refresh_admission(entity_id, enqueue_result, now=now)
-        return self._pending_error(entity_id, message)
-
-    async def _progressive_miss(self, entity_id: int, *, now: int, started_at: float) -> dict[str, object]:
-        identity_baseline = capture_identity_baseline(self._deps.conn, entity_id)
-        identity_started_at = int(self._deps.now_provider())
-        try:
-            entity, resolve_error = await asyncio.wait_for(
-                self._resolve_entity(entity_id),
-                timeout=self._deps.refresh_limits.foreground_resolve_seconds,
-            )
-        except TimeoutError:
-            self._log_stage(entity_id, "resolve_timeout", started_at)
-            budget = self._deps.refresh_limits.foreground_resolve_seconds
-            return await self._queue_unknown_refresh(
-                entity_id,
-                now=now,
-                message=f"entity resolution exceeded the {budget:g} second foreground budget",
-            )
-        if resolve_error is not None or entity is None:
-            if resolve_error is not None and resolve_error.get("error") == "entity_not_found":
-                return resolve_error
-            message = str((resolve_error or {}).get("message", "entity resolution is temporarily unavailable"))
-            return await self._queue_unknown_refresh(entity_id, now=now, message=message)
-
-        core = self._core_from_entity(entity)
-        await self._write_profiles(
-            lambda profiles: profiles.save_core(
-                core,
-                now=now,
-                dialog_identity_observation=observe_dialog_identity(
-                    entity, dialog_id=entity_id, source="profile", observed_at=identity_started_at
+                "status": (
+                    "unavailable"
+                    if entity_type is DialogType.UNKNOWN or self._section_applies(entity_type, section)
+                    else "not_applicable"
                 ),
-                dialog_identity_baseline_revision=identity_baseline,
-            )
-        )
-        assert self._refresh is not None
-        enqueue_result = self._refresh.enqueue(entity_id)
-        await self._persist_refresh_admission(entity_id, enqueue_result, now=now)
-        sections: dict[str, dict[str, object]] = {
-            section: {
-                "status": "pending",
-                "observed_at": None,
-                "reason": self._refresh_reason(enqueue_result),
+                "reason": (
+                    "not_observed"
+                    if entity_type is DialogType.UNKNOWN or self._section_applies(entity_type, section)
+                    else "not_applicable"
+                ),
             }
             for section in PROFILE_SECTIONS
         }
-        result = await self._progressive_result(entity_id, core, sections, now=now)
-        self._log_stage(entity_id, "core_complete", started_at, detail_type=core.get("type"))
-        return result
 
     def _durable_refresh_status(self, now: float) -> DemandStatus | None:
         del now
@@ -856,6 +535,17 @@ class DaemonEntityInfoService:
         pair_mode: str,
         now: int,
     ) -> DurableRefreshSliceResult:
+        stored = self._profiles.read(cursor.entity_id, now=now)
+        scope = self._capture_pair_scope()
+        if (
+            stored is not None
+            and scope is not None
+            and stored.profile_owner_account_id == scope.account_id
+            and await self._write_profiles(lambda profiles: profiles.complete_unchanged_section(cursor, now=now))
+        ):
+            return DurableRefreshSliceResult(
+                cursor.entity_id, self._success_if_refresh_finished(cursor, committed=True)
+            )
         if entity_type is DialogType.GROUP and cursor.next_section == "full_profile":
             return await self._run_group_full_chat_pair(cursor, now=now)
         if self._pair_enabled(cursor, entity_type, pair_mode=pair_mode):
@@ -1084,6 +774,11 @@ class DaemonEntityInfoService:
         context = self._profile_section_context(cursor, entity_type)
         identity_baseline = capture_identity_baseline(self._deps.conn, cursor.entity_id)
         try:
+            field_observation = (
+                await self._reserve_profile_observation(context.captured_scope)
+                if entity_type in {DialogType.USER, DialogType.BOT, DialogType.SERVICE}
+                else None
+            )
             async with asyncio.timeout(self._deps.refresh_limits.per_rpc_seconds):
                 if entity_type is DialogType.CHANNEL and cursor.next_section == "full_profile":
                     result = await self._acquire_profile_section(cursor, entity_type, context=context)
@@ -1105,7 +800,7 @@ class DaemonEntityInfoService:
                     retry_at=retry_at,
                 )
             )
-        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
+        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError, sqlite3.Error) as exc:
             raise_if_flood_wait_error(exc)
             return await self._handle_profile_section_failure(
                 _ProfileSectionFailure(
@@ -1130,6 +825,7 @@ class DaemonEntityInfoService:
         if result.dialog_identity_observation is not None:
             result = dataclass_replace(result, dialog_identity_baseline_revision=identity_baseline)
         result = self._with_observation_metadata(result, context.captured_scope)
+        result = dataclass_replace(result, field_observation=field_observation)
         committed = await self._commit_profile_section_result(cursor, entity_type, result, context, now=now)
         return self._success_if_refresh_finished(cursor, committed=committed)
 
@@ -1467,24 +1163,38 @@ class DaemonEntityInfoService:
             if self._stored_entity_type(cursor.entity_id, now=int(now)) is DialogType.BOT
             else TargetKind.USER
         )
+        field_observation = await self._reserve_profile_observation(captured_scope)
         normalized = await self._deps.user_profile_port.fetch_user_profile(cursor.entity_id, target_kind)
         self._validate_full_user_acquisition(normalized, captured_scope)
         identity = self._full_user_pair_identity(target_kind, scope=captured_scope)
         full_profile = self._normalized_full_profile_commit(
             normalized.full_profile, cursor, identity, current_photo=normalized.current_photo
         )
+        folder_id = full_profile.detail_patch.get("folder_id")
+        folder_name = await self._resolve_folder_name(folder_id if isinstance(folder_id, int) else None)
         identity_observation = normalized.full_profile.dialog_identity_observation
         full_profile = dataclass_replace(
             full_profile,
+            detail_patch={**full_profile.detail_patch, "folder_name": folder_name},
             dialog_identity_observation=identity_observation,
             dialog_identity_baseline_revision=identity_baseline,
+            field_observation=field_observation,
         )
         personal_channel = self._normalized_personal_channel_commit(
             normalized.personal_channel,
             cursor,
             identity,
         )
+        personal_channel = dataclass_replace(personal_channel, field_observation=field_observation)
         return full_profile, personal_channel
+
+    async def _reserve_profile_observation(self, scope: TelegramAuthScope | None) -> ProfileFieldObservation | None:
+        if scope is None:
+            if self._deps.full_user_auth_scope is not None:
+                raise _AuthScopeUnavailableError("authenticated session scope is unavailable")
+            return None
+        order = await self._deps.writer.run(allocate_observation_order)
+        return ProfileFieldObservation(scope.account_id, order, int(self._deps.now_provider()), "rpc")
 
     def _validate_full_user_acquisition(
         self,
@@ -1753,6 +1463,7 @@ class DaemonEntityInfoService:
                 {"photo_id": current_photo.photo_id, "date": current_photo.date} if current_photo is not None else None
             )
         }
+        payload.update(private_payload)
         return EntitySectionCommit(
             payload,
             identity_patch=outcome.identity_patch,
@@ -2105,6 +1816,7 @@ class DaemonEntityInfoService:
                 else None
             )
         }
+        patch.update(private_payload)
         raw_identity_patch = dict(outcome.identity_patch or {})
         identity_patch = {**raw_identity_patch, "type": entity_type.value}
         return EntitySectionCommit(
@@ -2138,6 +1850,7 @@ class DaemonEntityInfoService:
             "slow_mode_seconds": observation.slow_mode_seconds,
         }
         patch.update(_channel_profile_kind_patch(entity_type, observation))
+        patch.update(observation.chat_entity_fields or {})
         return EntitySectionCommit(
             patch,
             payload=_channel_profile_payload(observation),
@@ -2198,7 +1911,7 @@ class DaemonEntityInfoService:
                 completed_at=completed_at,
                 identity=identity,
                 authoritative=True,
-                declared_fields=("about", "invite_link", "members_count"),
+                declared_fields=("about", "invite_link", "members_count", *(observation.chat_entity_fields or {})),
             ),
         )
         identity_observation = observation.dialog_identity_observation
@@ -2228,18 +1941,23 @@ class DaemonEntityInfoService:
                 ),
             )
         else:
-            contact_overlap = self._group_contact_overlap_commit(
-                observation,
-                evidence=self._group_full_chat_evidence(
-                    cursor,
-                    outcome="usable",
-                    started_at=started_at,
-                    completed_at=completed_at,
-                    identity=identity,
-                    authoritative=True,
-                    declared_fields=("contacts_subscribed", "contacts_subscribed_partial", "contacts_reason"),
-                ),
-            )
+            try:
+                contact_overlap = self._group_contact_overlap_commit(
+                    observation,
+                    evidence=self._group_full_chat_evidence(
+                        cursor,
+                        outcome="usable",
+                        started_at=started_at,
+                        completed_at=completed_at,
+                        identity=identity,
+                        authoritative=True,
+                        declared_fields=("contacts_subscribed", "contacts_subscribed_partial", "contacts_reason"),
+                    ),
+                )
+            except sqlite3.Error:
+                # The valid full profile remains useful; retry only the failed
+                # local overlap projection through its ordinary durable cursor.
+                contact_overlap = EntitySectionCommit({}, status="pending", reason="enumeration_failed")
         return full_profile, contact_overlap
 
     def _group_full_profile_commit(
@@ -2253,7 +1971,8 @@ class DaemonEntityInfoService:
             {
                 "about": observation.about,
                 "invite_link": observation.invite_link,
-                "members_count": len(participants) if participants is not None else None,
+                "members_count": len(participants) if participants is not None else observation.participants_count,
+                **(observation.chat_entity_fields or {}),
             },
             dialog_created=observation.created,
             payload={
@@ -2421,7 +2140,7 @@ class DaemonEntityInfoService:
             raise ValueError("user avatar observation target does not match")
         if observation.status is ProjectionStatus.UNAVAILABLE:
             return EntitySectionCommit({}, status="unavailable", reason=observation.reason, payload=None)
-        current = _current_photo_from_payload(self._profiles.read_section_payload(entity_id, "full_profile"))
+        current = self._current_profile_photo(entity_id)
         history, count = _reconcile_history_payload(observation.photos, current, observation.reported_count)
         return EntitySectionCommit({"avatar_history": history, "avatar_count": count}, payload=history)
 
@@ -2434,9 +2153,15 @@ class DaemonEntityInfoService:
             raise ValueError("chat avatar observation reference does not match")
         if observation.status is ProjectionStatus.UNAVAILABLE:
             return EntitySectionCommit({}, status="unavailable", reason=observation.reason, payload=None)
-        current = _current_photo_from_payload(self._profiles.read_section_payload(entity_id, "full_profile"))
+        current = self._current_profile_photo(entity_id)
         merged, count = _reconcile_history_payload(observation.photos, current, observation.reported_count)
         return EntitySectionCommit({"avatar_history": merged, "avatar_count": count}, payload=merged)
+
+    def _current_profile_photo(self, entity_id: int) -> ChatCurrentPhoto | None:
+        stored = self._profiles.read(entity_id, now=int(self._deps.now_provider()))
+        if stored is not None and "current_photo" in stored.detail:
+            return _current_photo_from_payload(stored.detail)
+        return _current_photo_from_payload(self._profiles.read_section_payload(entity_id, "full_profile"))
 
     def _user_reference(self, entity_id: int) -> UserReference | None:
         is_self = self._deps.self_id == entity_id
@@ -2560,13 +2285,11 @@ class DaemonEntityInfoService:
         sections: dict[str, dict[str, object]],
         *,
         now: int,
-        admit_refresh: bool = True,
     ) -> dict[str, object]:
-        if admit_refresh:
-            await self._enqueue_section_refresh(entity_id, sections)
         result = dict(detail)
         result["id"] = entity_id
-        current_photo = _current_photo_from_payload(self._profiles.read_section_payload(entity_id, "full_profile"))
+        photo_payload = result if "current_photo" in result else sections.get("full_profile", {}).get("data")
+        current_photo = _current_photo_from_payload(photo_payload)
         _project_current_photo(result, sections, current_photo)
         if result.get("type") == DialogType.CHANNEL.value:
             result["linked_chat_id"] = self._read_canonical_linked_chat_id(entity_id)
@@ -2587,73 +2310,6 @@ class DaemonEntityInfoService:
         )
         return {"ok": True, "data": result}
 
-    async def _enqueue_section_refresh(self, entity_id: int, sections: dict[str, dict[str, object]]) -> None:
-        if not self._has_refreshable_sections(sections):
-            return
-        assert self._refresh is not None
-        enqueue_result = self._refresh.enqueue(entity_id)
-        await self._record_section_admission(entity_id, sections, enqueue_result)
-
-    @staticmethod
-    def _has_refreshable_sections(sections: Mapping[str, Mapping[str, object]]) -> bool:
-        return any(
-            value.get("status") in {"pending", "stale"}
-            or (value.get("status") == "unavailable" and value.get("reason") == "refresh_rejected")
-            for value in sections.values()
-        )
-
-    async def _record_section_admission(
-        self,
-        entity_id: int,
-        sections: dict[str, dict[str, object]],
-        result: RefreshEnqueueResult,
-    ) -> None:
-        if result is RefreshEnqueueResult.REJECTED:
-            await self._write_profiles(
-                lambda profiles: profiles.mark_refresh_rejected(entity_id, now=int(self._deps.now_provider()))
-            )
-            self._set_section_rejected(sections)
-            return
-        # A coalesced foreground request already has durable pending state
-        # owned by the admitted request.  Rewriting it would renew its
-        # timestamp (and can mutate durable state while shutdown is winning
-        # the local waiter race).
-        if result is RefreshEnqueueResult.QUEUED:
-            await self._write_profiles(
-                lambda profiles: profiles.mark_refresh_queued(entity_id, pair_mode_override=self._current_pair_mode())
-            )
-        self._set_section_queued(sections)
-        offer_durable_demand(self._require_demand_sink(), DemandKind.ENTITY_PROFILE_REFRESH)
-
-    @staticmethod
-    def _set_section_rejected(sections: dict[str, dict[str, object]]) -> None:
-        for section in sections.values():
-            if section.get("status") == "not_applicable":
-                continue
-            section.update(status="unavailable", reason="refresh_rejected")
-
-    @staticmethod
-    def _set_section_queued(sections: dict[str, dict[str, object]]) -> None:
-        for section in sections.values():
-            if section.get("status") not in {"pending", "stale", "unavailable"}:
-                continue
-            if section.get("status") == "unavailable" and section.get("reason") != "refresh_rejected":
-                continue
-            section.update(status="pending", reason="refresh_queued")
-
-    async def _persist_refresh_admission(self, entity_id: int, result: RefreshEnqueueResult, *, now: int) -> None:
-        if result is RefreshEnqueueResult.REJECTED:
-            await self._write_profiles(lambda profiles: profiles.mark_refresh_rejected(entity_id, now=now))
-        else:
-            await self._write_profiles(
-                lambda profiles: profiles.mark_pending(entity_id, now=now, pair_mode_override=self._current_pair_mode())
-            )
-            offer_durable_demand(self._require_demand_sink(), DemandKind.ENTITY_PROFILE_REFRESH)
-
-    @staticmethod
-    def _refresh_reason(result: RefreshEnqueueResult) -> str:
-        return "refresh_rejected" if result is RefreshEnqueueResult.REJECTED else "refresh_queued"
-
     @staticmethod
     def _section_summaries(sections: Mapping[str, Mapping[str, object]]) -> dict[str, dict[str, object]]:
         return {
@@ -2670,135 +2326,22 @@ class DaemonEntityInfoService:
         statuses = {"fresh", "stale", "pending", "unavailable", "not_applicable"}
         return {status: sum(value.get("status") == status for value in sections.values()) for status in statuses}
 
-    @staticmethod
-    def _pending_error(entity_id: int, message: str) -> dict[str, object]:
-        return {
-            "ok": False,
-            "error": "entity_info_pending",
-            "message": message,
-            "retryable": True,
-            "data": {"id": entity_id, "completeness": "partial", "sections": {}},
-        }
-
     async def shutdown(self) -> None:
         if self._refresh is not None:
             await self._refresh.shutdown()
 
-    def _build_self_detail(self) -> dict[str, object]:
-        profile = self._deps.self_profile or {}
-        first_name = _value_or_none(profile.get("first_name"), str)
-        last_name = _value_or_none(profile.get("last_name"), str)
-        name = " ".join(part for part in (first_name, last_name) if part) or None
-        return {
-            "id": self._deps.self_id,
-            "type": DialogType.USER.value,
-            "name": name,
-            "username": _value_or_none(profile.get("username"), str),
-            "about": None,
-            "my_membership": {"role": "self"},
-            "avatar_history": [],
-            "avatar_count": 0,
-            "first_name": first_name,
-            "last_name": last_name,
-            "extra_usernames": [],
-            "emoji_status_id": None,
-            "status": None,
-            "phone": None,
-            "lang_code": None,
-            "contact": False,
-            "mutual_contact": False,
-            "close_friend": False,
-            "send_paid_messages_stars": None,
-            "personal_channel_id": None,
-            "personal_channel": None,
-            "personal_channel_unavailable_reason": None,
-            "birthday": None,
-            "verified": False,
-            "premium": False,
-            "bot": False,
-            "scam": False,
-            "fake": False,
-            "restricted": False,
-            "restriction_reason": [],
-            "blocked": False,
-            "ttl_period": None,
-            "private_forward_name": None,
-            "bot_info": None,
-            "business_location": None,
-            "business_intro": None,
-            "business_work_hours": None,
-            "note": None,
-            "folder_id": None,
-            "folder_name": None,
-            "common_chats": [],
-            "_full_fetch_ok": False,
-        }
-
-    def _log_stage(
-        self,
-        entity_id: int,
-        stage: str,
-        started_at: float,
-        *,
-        detail_type: object | None = None,
-    ) -> None:
-        duration_s = self._deps.now_provider() - started_at
-        if stage in {"cache_miss", "self_snapshot", "complete"} or duration_s >= self._deps.slow_stage_seconds:
-            self._deps.logger.info(
-                "entity_info_stage entity_id=%r stage=%s duration_s=%.3f detail_type=%s%s",
-                entity_id,
-                stage,
-                duration_s,
-                detail_type,
-                self._deps.rid(),
-            )
-
     def _extract_entity_id(self, req: Mapping[str, object]) -> int | dict[str, object]:
         entity_id = req.get("entity_id")
         if type(entity_id) is not int:
-            return self._error("telegram_api_error", "entity_id missing or not an integer")
+            return self._error(
+                "invalid_entity_id", "entity_id must be an integer. Action: use an exact entity id from ListDialogs."
+            )
         if not _is_valid_telethon_peer_id(entity_id):
             return self._error(
-                "entity_not_found",
+                "invalid_entity_id",
                 "Entity id is outside the valid Telegram peer-id range. Action: retry with an exact entity id from ListDialogs.",
             )
         return entity_id
-
-    def _load_cached_detail(self, entity_id: int, now: int) -> dict[str, object] | None:
-        try:
-            row = cast(
-                tuple[str, int] | None,
-                self._deps.conn.execute(
-                    "SELECT detail_json, fetched_at FROM entity_details WHERE entity_id = ?",
-                    (entity_id,),
-                ).fetchone(),
-            )
-        except sqlite3.OperationalError as exc:
-            self._deps.logger.warning(
-                "entity_info db_read_failed entity_id=%r error=%s%s",
-                entity_id,
-                exc,
-                self._deps.rid(),
-            )
-            return self._error("db_unavailable", str(exc))
-
-        if row is not None:
-            detail_json, fetched_at = row
-            if now - fetched_at < self._deps.detail_ttl_seconds:
-                try:
-                    detail = cast(dict[str, object], json.loads(detail_json))
-                except json.JSONDecodeError:
-                    self._deps.logger.warning(
-                        "entity_info detail_json_corrupt entity_id=%r%s — treating as cache miss",
-                        entity_id,
-                        self._deps.rid(),
-                    )
-                    return None
-                if detail.get("schema") == _ENTITY_DETAIL_SCHEMA_VERSION:
-                    if detail.get("type") == DialogType.CHANNEL.value:
-                        detail["linked_chat_id"] = self._read_canonical_linked_chat_id(entity_id)
-                    return {"ok": True, "data": self._strip_envelope_schema(detail)}
-        return None
 
     async def _resolve_entity(self, entity_id: int) -> tuple[object | None, dict[str, object] | None]:
         try:
@@ -2818,11 +2361,6 @@ class DaemonEntityInfoService:
         except TelegramRpcThrottled, RpcAttemptBudgetExhaustedError, UnclassifiedTelegramDemandError:
             raise
         except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError) as exc:
-            raise_if_flood_wait_error(exc)
-            raise_if_flood_wait_error(exc)
-            raise_if_flood_wait_error(exc)
-            raise_if_flood_wait_error(exc)
-            raise_if_flood_wait_error(exc)
             raise_if_flood_wait_error(exc)
             if isinstance(exc, ACCESS_LOST_ERRORS):
                 return None, self._error("telegram_api_error", str(exc))
@@ -2854,70 +2392,6 @@ class DaemonEntityInfoService:
             )
         return entity, None
 
-    async def _build_detail_by_type(self, entity: object) -> tuple[dict[str, object] | None, dict[str, object] | None]:
-        dispatch_kind = classify_dialog_type(entity)
-        if dispatch_kind in (DialogType.USER, DialogType.BOT, DialogType.SERVICE):
-            return await self._fetch_user_detail(entity), None
-        if dispatch_kind == DialogType.CHANNEL:
-            return await self._fetch_channel_detail(entity), None
-        if dispatch_kind in (DialogType.SUPERGROUP, DialogType.FORUM):
-            return await self._fetch_supergroup_detail(entity), None
-        if dispatch_kind == DialogType.GROUP:
-            return await self._fetch_group_detail(entity), None
-        return None, self._error("unsupported_entity_type", f"unknown entity kind: {dispatch_kind}")
-
-    async def _writeback(
-        self,
-        entity_id: int,
-        detail: dict[str, object],
-        now: int,
-        *,
-        dialog_identity_observation: DialogIdentityObservation | None = None,
-        dialog_identity_baseline_revision: int | None = None,
-    ) -> None:
-        full_fetch_ok = detail.pop("_full_fetch_ok", True)
-        try:
-
-            def write(conn: sqlite3.Connection) -> None:
-                with write_transaction(conn):
-                    ensure_entity_stub(
-                        conn,
-                        EntitySnapshot(
-                            entity_id=entity_id,
-                            entity_type=cast(str, detail.get("type", "unknown")),
-                            name=cast(str | None, detail.get("name")),
-                            username=cast(str | None, detail.get("username")),
-                            name_normalized=None,
-                            updated_at=now,
-                        ),
-                    )
-                    if full_fetch_ok:
-                        payload_with_schema = {
-                            "schema": _ENTITY_DETAIL_SCHEMA_VERSION,
-                            **{key: value for key, value in detail.items() if key != "linked_chat_id"},
-                        }
-                        conn.execute(
-                            "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) VALUES (?, ?, ?)",
-                            (entity_id, json.dumps(payload_with_schema), now),
-                        )
-                    if dialog_identity_observation is not None:
-                        publish_dialog_identity(
-                            conn,
-                            entity_id,
-                            dialog_identity_observation,
-                            dialog_identity_baseline_revision,
-                        )
-
-            await self._deps.writer.run(write)
-        except sqlite3.OperationalError as exc:
-            self._deps.logger.warning(
-                "entity_info db_writeback_failed entity_id=%r error=%s%s",
-                entity_id,
-                exc,
-                self._deps.rid(),
-                exc_info=True,
-            )
-
     @staticmethod
     def _error(message_key: str, message: str) -> dict[str, object]:
         return {
@@ -2926,239 +2400,6 @@ class DaemonEntityInfoService:
             "message": message,
             "data": None,
         }
-
-    @staticmethod
-    def _strip_envelope_schema(detail: Mapping[str, object]) -> dict[str, object]:
-        return {k: v for k, v in detail.items() if k != "schema"}
-
-    @staticmethod
-    def _format_user_status(status: object) -> dict[str, object] | None:
-        if status is None:
-            return None
-        status_type = type(status).__name__
-        static_statuses = {
-            "UserStatusRecently": "recently",
-            "UserStatusLastWeek": "last_week",
-            "UserStatusLastMonth": "last_month",
-        }
-        if status_type in static_statuses:
-            return {"type": static_statuses[status_type]}
-        timestamp_fields = {
-            "UserStatusOnline": ("online", "expires"),
-            "UserStatusOffline": ("offline", "was_online"),
-        }
-        status_value = timestamp_fields.get(status_type)
-        if status_value is None:
-            return None
-        status_name, timestamp_name = status_value
-        return {"type": status_name, timestamp_name: _isoformat_or_none(_attr(status, timestamp_name, None))}
-
-    async def _fetch_user_detail(self, user: object) -> dict[str, object]:
-        user_id = _opt_int_attr(user, "id")
-        if user_id is None:
-            raise ValueError("user id missing")
-
-        reference = self._user_reference(user_id)
-        common_chats = await self._collect_common_chats(user_id, reference=reference)
-        profile, current_photo = await self._collect_user_profile(user)
-        profile["folder_name"] = await self._resolve_folder_name(cast(int | None, profile["folder_id"]))
-        extra_usernames = self._collect_extra_usernames(user)
-        emoji_status_id = self._collect_emoji_status_id(user)
-        avatar_history, avatar_count = await self._collect_user_avatar_history(
-            user,
-            reference=reference,
-            current_photo=current_photo,
-        )
-        my_membership = self._build_user_membership(user, cast(bool, profile["blocked"]))
-
-        first_name = _opt_str_attr(user, "first_name")
-        last_name = _opt_str_attr(user, "last_name")
-        name = " ".join(part for part in (first_name, last_name) if part)
-        return {
-            "id": user_id,
-            "type": classify_dialog_type(user).value,
-            "name": name or None,
-            "username": _attr(user, "username", None),
-            "about": profile["about"],
-            "my_membership": my_membership,
-            "avatar_history": avatar_history,
-            "avatar_count": avatar_count,
-            "first_name": _attr(user, "first_name", None),
-            "last_name": _attr(user, "last_name", None),
-            "extra_usernames": extra_usernames,
-            "emoji_status_id": emoji_status_id,
-            "status": self._format_user_status(_attr(user, "status", None)),
-            "phone": _attr(user, "phone", None),
-            "lang_code": _attr(user, "lang_code", None),
-            "contact": bool(_attr(user, "contact", False)),
-            "mutual_contact": bool(_attr(user, "mutual_contact", False)),
-            "close_friend": bool(_attr(user, "close_friend", False)),
-            "send_paid_messages_stars": _attr(user, "send_paid_messages_stars", None),
-            "personal_channel_id": profile["personal_channel_id"],
-            "personal_channel": profile["personal_channel"],
-            "personal_channel_unavailable_reason": profile["personal_channel_unavailable_reason"],
-            "birthday": profile["birthday"],
-            "verified": bool(_attr(user, "verified", False)),
-            "premium": bool(_attr(user, "premium", False)),
-            "bot": bool(_attr(user, "bot", False)),
-            "scam": bool(_attr(user, "scam", False)),
-            "fake": bool(_attr(user, "fake", False)),
-            "restricted": bool(_attr(user, "restricted", False)),
-            "restriction_reason": self._collect_restrictions(user),
-            "blocked": profile["blocked"],
-            "ttl_period": profile["ttl_period"],
-            "private_forward_name": profile["private_forward_name"],
-            "bot_info": profile["bot_info"],
-            "business_location": profile["business_location"],
-            "business_intro": profile["business_intro"],
-            "business_work_hours": profile["business_work_hours"],
-            "note": profile["note"],
-            "folder_id": profile["folder_id"],
-            "folder_name": profile["folder_name"],
-            "common_chats": common_chats,
-            "_full_fetch_ok": profile["full_user_ok"],
-        }
-
-    async def _collect_common_chats(
-        self, user_id: int, *, reference: UserReference | None = None
-    ) -> list[dict[str, object]]:
-        reference = reference if reference is not None else self._user_reference(user_id)
-        if reference is None:
-            self._record_section_failure("common_chats", "user_reference_unavailable")
-            return []
-        try:
-            observation = await self._deps.common_chats_port.fetch_common_chats(reference)
-            if observation.status is ProjectionStatus.UNAVAILABLE:
-                self._record_section_failure("common_chats", observation.reason or "unavailable")
-                return []
-            return [{"id": item.chat_id, "name": item.name, "type": item.kind} for item in observation.chats]
-        except TelegramRpcThrottled:
-            raise
-        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
-            raise_if_flood_wait_error(exc)
-            self._record_section_failure("common_chats", type(exc).__name__.lower())
-            self._deps.logger.warning(
-                "entity_info user common_chats_failed user_id=%r error=%s%s",
-                user_id,
-                exc,
-                self._deps.rid(),
-                exc_info=not isinstance(exc, TimeoutError),
-            )
-        return []
-
-    async def _collect_user_profile(self, user: object) -> tuple[dict[str, object], ChatCurrentPhoto | None]:
-        user_id = _opt_int_attr(user, "id")
-        if user_id is None:
-            raise ValueError("user id missing")
-        profile: dict[str, object] = {
-            "about": None,
-            "personal_channel_id": None,
-            "blocked": False,
-            "ttl_period": None,
-            "private_forward_name": None,
-            "folder_id": None,
-            "folder_name": None,
-            "birthday": None,
-            "personal_channel": None,
-            "personal_channel_unavailable_reason": None,
-            "bot_info": None,
-            "business_location": None,
-            "business_intro": None,
-            "business_work_hours": None,
-            "note": None,
-            "full_user_ok": False,
-        }
-        current_photo: ChatCurrentPhoto | None = None
-        try:
-            target_kind = self._target_kind(classify_dialog_type(user))
-            observation = await self._deps.user_profile_port.fetch_user_profile(user_id, target_kind)
-            current_photo = observation.current_photo
-            full_outcome = observation.full_profile
-            if full_outcome.status is ProjectionStatus.UNAVAILABLE or full_outcome.payload is None:
-                raise ValueError(full_outcome.reason or "full user payload is unavailable")
-            profile.update(full_outcome.payload)
-            profile["full_user_ok"] = True
-            channel_payload = observation.personal_channel.payload or {}
-            channel_id = channel_payload.get("personal_channel_id")
-            if isinstance(channel_id, int) and channel_id > 0:
-                profile["personal_channel_id"] = channel_id
-            channel = await self._collect_personal_channel(
-                observation.personal_channel,
-                observation.personal_channel_reference,
-            )
-            profile["personal_channel"] = channel[0]
-            profile["personal_channel_unavailable_reason"] = channel[1]
-        except TelegramRpcThrottled:
-            raise
-        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError, KeyError) as exc:
-            raise_if_flood_wait_error(exc)
-            self._record_section_failure("full_profile", type(exc).__name__.lower())
-            self._deps.logger.warning(
-                "entity_info user full_user_failed user_id=%r error=%s%s",
-                user_id,
-                exc,
-                self._deps.rid(),
-                exc_info=not isinstance(exc, TimeoutError),
-            )
-        return profile, current_photo
-
-    async def _collect_personal_channel(
-        self,
-        outcome: ProjectionOutcome,
-        reference: PersonalChannelReference | None = None,
-    ) -> tuple[dict[str, object] | None, str | None]:
-        if outcome.status is ProjectionStatus.ABSENT:
-            return None, None
-        payload = dict(outcome.payload or {})
-        raw_channel_id = _positive_personal_channel_id(payload)
-        if raw_channel_id is None:
-            return None, outcome.reason or "personal_channel_unavailable"
-        if outcome.status is ProjectionStatus.PARTIAL:
-            return None, outcome.reason or "personal_channel_unavailable"
-        dialog_id = self._normalize_channel_dialog_id(raw_channel_id)
-        metadata, metadata_source = self._personal_channel_metadata(dialog_id=dialog_id, normalized=payload)
-        if metadata is None:
-            return None, outcome.reason or "channel_metadata_unavailable"
-        attached_message_id = payload.get("personal_channel_message")
-        attached_message_id = attached_message_id if isinstance(attached_message_id, int) else None
-        preview, preview_reason = await self._collect_personal_channel_post_preview(
-            reference, dialog_id=dialog_id, attached_message_id=attached_message_id
-        )
-        return self._personal_channel_card_result(
-            _PersonalChannelCard(
-                outcome=outcome,
-                channel_id=raw_channel_id,
-                dialog_id=dialog_id,
-                metadata=metadata,
-                metadata_source=metadata_source,
-                local_preview=preview,
-                local_reason=preview_reason,
-            ),
-            attached_message_id=attached_message_id,
-        )
-
-    def _personal_channel_card_result(
-        self,
-        card_context: _PersonalChannelCard,
-        *,
-        attached_message_id: int | None,
-    ) -> tuple[dict[str, object], str | None]:
-        card = _compact_dict(
-            {
-                "channel_id": card_context.channel_id,
-                "dialog_id": card_context.dialog_id,
-                "title": card_context.metadata.get("title"),
-                "username": card_context.metadata.get("username"),
-                "url": self._tme_url(cast(str | None, card_context.metadata.get("username"))),
-                "metadata_source": card_context.metadata_source,
-                "attached_message_id": attached_message_id,
-                "latest_or_attached_post": card_context.local_preview,
-                "post_preview_unavailable_reason": (
-                    card_context.local_reason if card_context.local_preview is None else None
-                ),
-            }
-        )
-        return card, None if card_context.outcome.status is ProjectionStatus.USABLE else card_context.outcome.reason
 
     @staticmethod
     def _normalized_personal_channel_metadata(normalized: Mapping[str, object] | None) -> dict[str, object]:
@@ -3205,61 +2446,6 @@ class DaemonEntityInfoService:
         if not metadata:
             return None, "local_entities"
         return metadata, "user_full_chats" if normalized_metadata else "local_entities"
-
-    async def _collect_personal_channel_post_preview(
-        self,
-        reference: PersonalChannelReference | None,
-        *,
-        dialog_id: int,
-        attached_message_id: int | None,
-    ) -> tuple[dict[str, object] | None, str | None]:
-        attached_failure: str | None = None
-        if reference is not None and attached_message_id is not None:
-            preview, attached_failure = await self._fetch_attached_personal_channel_post(
-                reference,
-                message_id=attached_message_id,
-            )
-            if preview is not None:
-                return preview, None
-
-        local_preview, local_failure = self._latest_local_personal_channel_post(dialog_id)
-        if local_preview is not None:
-            return local_preview, None
-        return None, attached_failure or local_failure
-
-    async def _fetch_attached_personal_channel_post(
-        self,
-        reference: PersonalChannelReference,
-        *,
-        message_id: int,
-    ) -> tuple[dict[str, object] | None, str]:
-        try:
-            post = await self._deps.user_profile_port.fetch_personal_channel_post(reference, message_id)
-        except TelegramRpcThrottled:
-            raise
-        except (TimeoutError, RPCError, TypeError, AttributeError, ValueError) as exc:
-            raise_if_flood_wait_error(exc)
-            self._record_section_failure("personal_channel", type(exc).__name__.lower())
-            self._deps.logger.warning(
-                "entity_info personal_channel_message_failed channel_id=%r message_id=%r error=%s%s",
-                reference.channel_id,
-                message_id,
-                exc,
-                self._deps.rid(),
-            )
-            return None, "attached_message_fetch_failed"
-
-        if post is None:
-            return None, "attached_message_not_found"
-        preview = self._post_preview_from_text(
-            source="personal_channel_message",
-            message_id=message_id,
-            sent_at=post.sent_at,
-            text=post.text,
-        )
-        if preview is None:
-            return None, "attached_message_has_no_text"
-        return preview, ""
 
     def _latest_local_personal_channel_post(self, dialog_id: int) -> tuple[dict[str, object] | None, str]:
         try:
@@ -3355,239 +2541,6 @@ class DaemonEntityInfoService:
             )
         return None
 
-    def _collect_extra_usernames(self, user: object) -> list[str]:
-        extra_usernames: list[str] = []
-        for uname in cast(Sequence[object], _attr(user, "usernames", None) or []):
-            raw = _opt_str_attr(uname, "username")
-            if raw and raw != _opt_str_attr(user, "username"):
-                extra_usernames.append(raw)
-        return extra_usernames
-
-    def _collect_emoji_status_id(self, user: object) -> int | None:
-        emoji_status = _attr(user, "emoji_status", None)
-        if emoji_status is None:
-            return None
-        return _opt_int_attr(emoji_status, "document_id")
-
-    async def _collect_user_avatar_history(
-        self,
-        user: object,
-        *,
-        reference: UserReference | None = None,
-        current_photo: ChatCurrentPhoto | None = None,
-    ) -> tuple[list[dict[str, object]], int]:
-        user_id = _opt_int_attr(user, "id")
-        if user_id is None:
-            return [], 0
-        reference = reference if reference is not None else self._user_reference(user_id)
-        if reference is None:
-            self._record_section_failure("avatar_history", "user_reference_unavailable")
-            return [], 0
-        try:
-            observation = await self._deps.user_avatar_history_port.fetch_user_avatar_history(reference)
-            if observation.status is ProjectionStatus.UNAVAILABLE:
-                self._record_section_failure("avatar_history", observation.reason or "unavailable")
-            return _reconcile_history_payload(observation.photos, current_photo, observation.reported_count)
-        except TelegramRpcThrottled:
-            raise
-        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
-            raise_if_flood_wait_error(exc)
-            self._record_section_failure("avatar_history", type(exc).__name__.lower())
-            self._deps.logger.warning(
-                "entity_info user photos_failed user_id=%r error=%s%s",
-                int(cast(int, self._deps.get_peer_id(user))),
-                exc,
-                self._deps.rid(),
-                exc_info=not isinstance(exc, TimeoutError),
-            )
-        return [], 0
-
-    def _build_user_membership(self, user: object, blocked: bool) -> dict[str, object]:
-        contact_flag = _bool_attr(user, "contact")
-        mutual_contact = _bool_attr(user, "mutual_contact")
-        close_friend = _bool_attr(user, "close_friend")
-        return {
-            "is_member": contact_flag or mutual_contact,
-            "is_admin": False,
-            "admin_rights": None,
-            "relationship": {
-                "contact": contact_flag,
-                "mutual_contact": mutual_contact,
-                "close_friend": close_friend,
-                "blocked": blocked,
-            },
-        }
-
-    def _collect_restrictions(self, entity: object) -> list[dict[str, object]]:
-        return [
-            {
-                "platform": _opt_str_attr(rr, "platform"),
-                "reason": _opt_str_attr(rr, "reason"),
-                "text": _opt_str_attr(rr, "text"),
-            }
-            for rr in cast(Sequence[object], _attr(entity, "restriction_reason", None) or [])
-        ]
-
-    async def _search_chat_photo_history(
-        self,
-        reference: ChatAvatarReference | None,
-        *,
-        current_photo: ChatCurrentPhoto | None = None,
-    ) -> tuple[list[dict[str, object]], int]:
-        """Avatar history via messages.Search(filter=ChatPhotos)."""
-        if reference is None:
-            return _reconcile_history_payload((), current_photo, 0)
-        try:
-            observation = await self._deps.chat_avatar_history_port.fetch_chat_avatar_history(reference)
-            if observation.reference != reference:
-                raise ValueError("chat avatar observation reference does not match")
-            if observation.status is ProjectionStatus.UNAVAILABLE:
-                self._record_section_failure("avatar_history", observation.reason or "unavailable")
-            history = tuple(observation.photos)
-            merged, count = reconcile_chat_avatar_history(history, current_photo, observation.reported_count)
-            return _reconcile_history_payload(merged, None, count)
-        except TelegramRpcThrottled:
-            raise
-        except (TimeoutError, RPCError, TypeError, AttributeError, ValueError) as exc:
-            raise_if_flood_wait_error(exc)
-            self._record_section_failure("avatar_history", type(exc).__name__.lower())
-            self._deps.logger.warning(
-                "entity_info avatar_search_failed error=%s%s",
-                exc,
-                self._deps.rid(),
-            )
-        return _reconcile_history_payload((), current_photo, 0)
-
-    async def _fetch_channel_detail(self, channel: object) -> dict[str, object]:
-        channel_id = int(self._deps.get_peer_id(channel))
-        reference = self._channel_reference_from_entity(channel)
-        fact_generation = await self._capture_legacy_linked_chat_fact_generation(channel_id)
-        profile = await self._fetch_channel_profile_observation(reference)
-        if profile is not None and fact_generation is not _LINKED_CHAT_FACT_CAPTURE_UNAVAILABLE:
-
-            def write(conn: sqlite3.Connection) -> bool:
-                with write_transaction(conn):
-                    return linked_chat_fact_owner.publish(
-                        conn,
-                        channel_id,
-                        cast(int, fact_generation),
-                        _raw_linked_chat_channel_id(profile.linked_chat_id),
-                        int(profile.observation_completed_at),
-                    )
-
-            published = await self._deps.writer.run(write)
-            self._offer_linked_chat_followups(published, profile.linked_chat_id is not None)
-        memberships = self._build_chat_membership(channel)
-        contacts_subscribed, contacts_subscribed_partial, contacts_reason = await self._fetch_channel_contacts(
-            reference,
-            is_admin=cast(bool, memberships["is_admin"]),
-        )
-        avatar_history, avatar_count = await self._search_chat_photo_history(
-            reference,
-            current_photo=profile.current_photo if profile is not None else None,
-        )
-
-        return {
-            "id": channel_id,
-            "type": DialogType.CHANNEL.value,
-            "name": _attr(channel, "title", None),
-            "username": _attr(channel, "username", None),
-            "about": profile.about if profile is not None else None,
-            "my_membership": memberships,
-            "avatar_history": avatar_history,
-            "avatar_count": avatar_count,
-            "subscribers_count": profile.participants_count if profile is not None else None,
-            "linked_chat_id": self._read_canonical_linked_chat_id(channel_id),
-            "pinned_msg_id": profile.pinned_msg_id if profile is not None else None,
-            "slow_mode_seconds": profile.slow_mode_seconds if profile is not None else None,
-            "available_reactions": dict(profile.available_reactions)
-            if profile is not None
-            else {"kind": "none", "emojis": []},
-            "restrictions": self._collect_restrictions(channel),
-            "contacts_subscribed": contacts_subscribed,
-            "contacts_subscribed_partial": contacts_subscribed_partial,
-            "contacts_reason": contacts_reason,
-            "_full_fetch_ok": profile is not None,
-        }
-
-    async def _capture_legacy_linked_chat_fact_generation(
-        self, channel_id: int
-    ) -> int | _LinkedChatFactCaptureUnavailable | None:
-        try:
-
-            def write(conn: sqlite3.Connection) -> int | _LinkedChatFactCaptureUnavailable | None:
-                ledger_exists = cast(
-                    tuple[int] | None,
-                    conn.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='linked_chat_fact_state'"
-                    ).fetchone(),
-                )
-                if ledger_exists is None:
-                    return _LINKED_CHAT_FACT_CAPTURE_UNAVAILABLE
-                with write_transaction(conn):
-                    return linked_chat_fact_owner.capture_generation(conn, channel_id)
-
-            return await self._deps.writer.run(write)
-        except sqlite3.Error as exc:
-            self._deps.logger.warning(
-                "entity_info linked_chat_fact_capture_failed channel_id=%r error=%s%s",
-                channel_id,
-                exc,
-                self._deps.rid(),
-            )
-            return _LINKED_CHAT_FACT_CAPTURE_UNAVAILABLE
-
-    def _channel_reference_from_entity(self, channel: object) -> ChannelReference | None:
-        channel_id = self._deps.get_peer_id(channel)
-        reference = self._deps.channel_reference_provider.get_channel_reference(channel_id)
-        return reference if isinstance(reference, ChannelReference) else None
-
-    async def _fetch_channel_profile_observation(
-        self, reference: ChannelReference | None
-    ) -> ChannelProfileObservation | None:
-        if reference is None:
-            self._record_section_failure("full_profile", "channel_reference_unavailable")
-            return None
-        channel_id = reference.channel_id
-        port = self._deps.channel_profile_port
-        try:
-            observation = await port.fetch_channel_profile(reference)
-        except TelegramRpcThrottled:
-            raise
-        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
-            raise_if_flood_wait_error(exc)
-            self._record_section_failure("full_profile", type(exc).__name__.lower())
-            self._deps.logger.warning(
-                "entity_info channel full_channel_failed channel_id=%r error=%s%s",
-                channel_id,
-                exc,
-                self._deps.rid(),
-                exc_info=not isinstance(exc, TimeoutError),
-            )
-            return None
-        if observation.channel_id != channel_id:
-            raise ValueError("channel profile observation target does not match")
-
-        def write(conn: sqlite3.Connection) -> None:
-            profiles = EntityProfileRepository(conn, section_ttl_seconds=self._deps.detail_ttl_seconds)
-            with write_transaction(conn):
-                profiles.persist_group_created(observation.channel_id, observation.created)
-
-        await self._deps.writer.run(write)
-        if observation.status is ProjectionStatus.UNAVAILABLE:
-            reason = observation.reason or "channel_profile_unavailable"
-            self._record_section_failure("full_profile", reason)
-            self._deps.logger.warning(
-                "entity_info channel full_channel_unavailable channel_id=%r reason=%s%s",
-                channel_id,
-                reason,
-                self._deps.rid(),
-            )
-            return None
-        if observation.status is not ProjectionStatus.USABLE:
-            raise ValueError(observation.reason or "channel profile is unavailable")
-        return observation
-
     def _read_canonical_linked_chat_id(self, channel_id: int) -> int | None:
         try:
             row = cast(
@@ -3602,68 +2555,6 @@ class DaemonEntityInfoService:
         if row is None or row[1] is None:
             return None
         return row[0] if isinstance(row[0], int) else None
-
-    def _build_chat_membership(self, entity: object) -> dict[str, object]:
-        is_creator = _bool_attr(entity, "creator")
-        admin_rights_obj = _attr(entity, "admin_rights", None)
-        admin_rights = self._extract_admin_rights(admin_rights_obj)
-        is_admin = is_creator or (admin_rights is not None)
-        return {
-            "is_member": not _bool_attr(entity, "left"),
-            "is_admin": is_admin,
-            "admin_rights": admin_rights,
-        }
-
-    def _extract_admin_rights(self, admin_rights_obj: object) -> dict[str, bool] | None:
-        if admin_rights_obj is None:
-            return None
-        return {field: bool(_attr(admin_rights_obj, field, False)) for field in _ADMIN_RIGHT_FIELDS}
-
-    async def _fetch_channel_contacts(
-        self,
-        reference: ChannelReference | None,
-        *,
-        is_admin: bool,
-        unavailable_reason: str = "not_an_admin",
-    ) -> tuple[list[dict[str, object]] | None, bool, str | None]:
-        if not is_admin:
-            return None, False, unavailable_reason
-        if reference is None:
-            return None, False, "channel_reference_unavailable"
-        channel_id = reference.channel_id
-        observation = await self._fetch_channel_contact_overlap_observation(reference)
-        if observation is None:
-            return None, False, "unavailable"
-        if observation.channel_id != channel_id:
-            raise ValueError("channel contact overlap observation target does not match")
-        if observation.status is ProjectionStatus.UNAVAILABLE or observation.contact_ids is None:
-            return None, False, self._channel_contact_unavailable_reason(observation.reason, unavailable_reason)
-        if observation.status is not ProjectionStatus.PARTIAL:
-            raise ValueError("channel contact overlap status is invalid")
-        contacts = self._enrich_contact_ids_with_names(set(observation.contact_ids) & self._deps.dm_peer_ids())
-        return contacts, True, observation.reason
-
-    async def _fetch_channel_contact_overlap_observation(
-        self, reference: ChannelReference
-    ) -> ChannelContactOverlapObservation | None:
-        try:
-            return await self._deps.channel_profile_port.fetch_channel_contact_overlap(reference)
-        except TelegramRpcThrottled:
-            raise
-        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
-            raise_if_flood_wait_error(exc)
-            self._record_section_failure("contact_overlap", type(exc).__name__.lower())
-            self._deps.logger.warning(
-                "entity_info channel contacts_fetch_failed channel_id=%r error=%s%s",
-                reference.channel_id,
-                exc,
-                self._deps.rid(),
-            )
-            return None
-
-    @staticmethod
-    def _channel_contact_unavailable_reason(reason: str | None, fallback: str) -> str | None:
-        return fallback if reason == "not_an_admin" and fallback != "not_an_admin" else reason
 
     def _enrich_contact_ids_with_names(self, ids: set[int]) -> list[dict[str, object]]:
         if not ids:
@@ -3681,123 +2572,6 @@ class DaemonEntityInfoService:
         out.extend({"id": missing_id, "name": None, "username": None} for missing_id in ids - seen)
         return sorted(out, key=lambda d: ((d["name"] or ""), d["id"]))
 
-    async def _fetch_supergroup_detail(self, channel: object) -> dict[str, object]:
-        channel_id = int(self._deps.get_peer_id(channel))
-        reference = self._channel_reference_from_entity(channel)
-        profile = await self._fetch_channel_profile_observation(reference)
-        memberships = self._build_chat_membership(channel)
-        hidden_members = bool(_attr(channel, "hidden_members", False)) and not memberships["is_admin"]
-        contacts_subscribed, contacts_subscribed_partial, contacts_reason = await self._fetch_channel_contacts(
-            reference,
-            is_admin=not hidden_members,
-            unavailable_reason="hidden_by_admin",
-        )
-        avatar_history, avatar_count = await self._search_chat_photo_history(
-            reference,
-            current_photo=profile.current_photo if profile is not None else None,
-        )
-
-        return {
-            "id": channel_id,
-            "type": DialogType.SUPERGROUP.value,
-            "name": _attr(channel, "title", None),
-            "username": _attr(channel, "username", None),
-            "about": profile.about if profile is not None else None,
-            "my_membership": memberships,
-            "avatar_history": avatar_history,
-            "avatar_count": avatar_count,
-            "members_count": profile.participants_count if profile is not None else None,
-            "linked_broadcast_id": profile.linked_chat_id if profile is not None else None,
-            "slow_mode_seconds": profile.slow_mode_seconds if profile is not None else None,
-            "has_topics": bool(_attr(channel, "forum", False)),
-            "restrictions": self._collect_restrictions(channel),
-            "contacts_subscribed": contacts_subscribed,
-            "contacts_subscribed_partial": contacts_subscribed_partial,
-            "contacts_reason": contacts_reason,
-            "_full_fetch_ok": profile is not None,
-        }
-
-    async def _fetch_group_profile_observation(self, chat_id: int) -> GroupProfileObservation | None:
-        try:
-            observation = await self._deps.group_profile_port.fetch_group_profile(chat_id)
-            if observation.group_id != chat_id:
-                raise ValueError("group profile observation target does not match")
-
-            def write(conn: sqlite3.Connection) -> None:
-                profiles = EntityProfileRepository(conn, section_ttl_seconds=self._deps.detail_ttl_seconds)
-                with write_transaction(conn):
-                    profiles.persist_group_created(observation.group_id, observation.created)
-
-            await self._deps.writer.run(write)
-            return observation
-        except TelegramRpcThrottled:
-            raise
-        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
-            raise_if_flood_wait_error(exc)
-            self._record_section_failure("full_profile", type(exc).__name__.lower())
-            self._deps.logger.warning(
-                "entity_info group full_profile_failed chat_id=%r error=%s%s",
-                chat_id,
-                exc,
-                self._deps.rid(),
-                exc_info=not isinstance(exc, TimeoutError),
-            )
-            return None
-
-    def _legacy_group_contacts(
-        self,
-        chat_id: int,
-        observation: GroupProfileObservation | None,
-    ) -> tuple[list[dict[str, object]] | None, str | None]:
-        if observation is None or observation.participant_ids is None:
-            return [], None
-        try:
-            intersect_ids = set(observation.participant_ids) & self._deps.dm_peer_ids()
-            return self._enrich_contact_ids_with_names(intersect_ids), None
-        except (TypeError, AttributeError, ValueError, sqlite3.Error) as exc:
-            self._record_section_failure("contact_overlap", type(exc).__name__.lower())
-            self._deps.logger.warning(
-                "entity_info group contacts_intersect_failed chat_id=%r error=%s%s",
-                chat_id,
-                exc,
-                self._deps.rid(),
-            )
-            return None, "enumeration_failed"
-
-    async def _fetch_group_detail(self, chat: object) -> dict[str, object]:
-        chat_id = int(self._deps.get_peer_id(chat))
-        migrated_to = self._resolve_group_migrated_to(chat)
-        observation = await self._fetch_group_profile_observation(chat_id)
-        my_membership = self._build_chat_membership(chat)
-        contacts_subscribed, contacts_reason = self._legacy_group_contacts(chat_id, observation)
-        participant_ids = observation.participant_ids if observation is not None else None
-        members_count = (
-            len(participant_ids) if participant_ids is not None else _opt_int_attr(chat, "participants_count")
-        )
-        avatar_history, avatar_count = await self._search_chat_photo_history(
-            self._chat_avatar_reference(chat_id),
-            current_photo=observation.current_photo if observation is not None else None,
-        )
-
-        return {
-            "id": chat_id,
-            "type": DialogType.GROUP.value,
-            "name": _attr(chat, "title", None),
-            "username": None,
-            "about": (observation.about or None) if observation is not None else None,
-            "my_membership": my_membership,
-            "avatar_history": avatar_history,
-            "avatar_count": avatar_count,
-            "members_count": members_count,
-            "migrated_to": migrated_to,
-            "invite_link": observation.invite_link if observation is not None else None,
-            "restrictions": self._collect_restrictions(chat),
-            "contacts_subscribed": contacts_subscribed,
-            "contacts_subscribed_partial": False,
-            "contacts_reason": contacts_reason,
-            "_full_fetch_ok": observation is not None,
-        }
-
     def _chat_avatar_reference(self, entity_id: int) -> ChatAvatarReference | None:
         if entity_id <= -CHANNEL_ID_MARKER - 1:
             channel_reference = self._deps.channel_reference_provider.get_channel_reference(entity_id)
@@ -3805,18 +2579,3 @@ class DaemonEntityInfoService:
                 return channel_reference
         reference = self._deps.chat_avatar_history_port.get_chat_avatar_reference(entity_id)
         return reference if isinstance(reference, (ChannelReference, GroupReference)) else None
-
-    def _resolve_group_migrated_to(self, chat: object) -> int | None:
-        migrated_to_obj = _attr(chat, "migrated_to", None)
-        if migrated_to_obj is None:
-            return None
-        try:
-            return int(self._deps.get_peer_id(migrated_to_obj))
-        except (TypeError, ValueError) as exc:
-            self._deps.logger.warning(
-                "entity_info group migrated_to_normalize_failed chat_id=%r error=%s%s",
-                int(self._deps.get_peer_id(chat)),
-                exc,
-                self._deps.rid(),
-            )
-            return None

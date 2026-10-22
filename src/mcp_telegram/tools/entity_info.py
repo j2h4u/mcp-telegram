@@ -1,8 +1,8 @@
 """MCP tool: GetEntityInfo — universal entity inspector (Phase 47).
 
 Universal replacement covering User / Bot / BroadcastChannel / Supergroup /
-LegacyChat. DB-first cache with the configured entity-detail TTL on the daemon side; tool itself
-maps daemon data into the structured MCP response.
+LegacyChat. Reads durable local observations without contacting Telegram; the
+tool maps daemon data into the structured MCP response.
 """
 
 import asyncio
@@ -722,7 +722,10 @@ async def _resolve_entity_lookup(entity: str) -> ToolResult | _EntityLookup:
     resolve_status = resolve_data.get("result", "not_found")
 
     if resolve_status == "not_found":
-        return error_result(entity_not_found_text(entity, retry_tool="GetEntityInfo"), error_code="entity_not_found")
+        return error_result(
+            "No local entity matches this query. Action: use list_dialogs to select a known local entity.",
+            error_code="entity_not_observed",
+        )
 
     if resolve_status == "candidates":
         matches = resolve_data.get("matches", [])
@@ -771,8 +774,10 @@ def _entity_info_fetch_error(args: GetEntityInfo, response: dict) -> ToolResult 
 
 
 class GetEntityInfo(ToolArgs):
-    """Look up a Telegram entity by name or exact numeric id (user, bot, service,
-    channel, supergroup, or legacy basic group). Returns a type-tagged profile:
+    """Read locally observed facts by name or exact numeric id (user, bot, service,
+    channel, supergroup, or legacy basic group), without contacting Telegram or
+    requesting acquisition. Missing sections are reported explicitly; observation
+    age does not erase stored facts. Returns a type-tagged profile:
 
       - user / bot:    id, name, usernames, bio, phone (with country),
                        language, online status, relationship

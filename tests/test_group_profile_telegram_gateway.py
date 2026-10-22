@@ -88,6 +88,54 @@ async def test_group_gateway_builds_request_and_normalizes_all_primitives() -> N
 
 
 @pytest.mark.asyncio
+async def test_group_entity_profile_facts_share_the_existing_full_chat_rpc() -> None:
+    response = _full_chat()
+    chat = cast(types.Chat, response.chats[0])
+    chat.creator = True
+    chat.migrated_to = types.InputChannel(channel_id=456, access_hash=99)
+    client = _Client(response)
+
+    observation = await TelethonGroupProfileGateway(client).fetch_group_profile(-123)
+
+    fields = observation.chat_entity_fields
+    assert fields is not None
+    assert "my_membership" in fields and "restrictions" in fields and "migrated_to" in fields
+    assert fields["my_membership"] == {"is_member": True, "is_admin": True, "admin_rights": None}
+    assert fields["restrictions"] == []
+    assert fields["migrated_to"] == -1000000000456
+    assert "has_topics" not in fields
+    assert len(client.requests) == 1
+    assert isinstance(client.requests[0], GetFullChatRequest)
+
+
+@pytest.mark.asyncio
+async def test_group_entity_profile_facts_preserve_explicit_nonmembership_and_absent_migration() -> None:
+    response = _full_chat()
+    chat = cast(types.Chat, response.chats[0])
+    chat.left = True
+
+    observation = await TelethonGroupProfileGateway(_Client(response)).fetch_group_profile(-123)
+
+    assert observation.chat_entity_fields == {
+        "my_membership": {"is_member": False, "is_admin": False, "admin_rights": None},
+        "restrictions": [],
+        "migrated_to": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_group_entity_preserves_count_when_participant_list_is_forbidden() -> None:
+    response = _full_chat(participants=types.ChatParticipantsForbidden(chat_id=123))
+    chat = cast(types.Chat, response.chats[0])
+    chat.participants_count = 13
+
+    observation = await TelethonGroupProfileGateway(_Client(response)).fetch_group_profile(-123)
+
+    assert observation.participant_ids is None
+    assert observation.participants_count == 13
+
+
+@pytest.mark.asyncio
 async def test_forbidden_group_gateway_observation_is_complete_identity() -> None:
     response = _full_chat()
     object.__setattr__(response, "chats", [types.ChatForbidden(id=123, title="Partial group")])
@@ -105,6 +153,7 @@ async def test_forbidden_group_gateway_observation_is_complete_identity() -> Non
         True,
         100,
     )
+    assert observation.chat_entity_fields is None
 
 
 @pytest.mark.asyncio

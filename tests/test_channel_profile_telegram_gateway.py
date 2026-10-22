@@ -182,6 +182,55 @@ async def test_profile_gateway_normalizes_one_full_channel_rpc() -> None:
 
 
 @pytest.mark.asyncio
+async def test_channel_entity_profile_facts_share_the_existing_full_channel_rpc() -> None:
+    response = _full_channel()
+    channel = cast(types.Channel, response.chats[0])
+    channel.creator = False
+    channel.left = True
+    channel.forum = True
+    channel.admin_rights = types.ChatAdminRights(delete_messages=True, manage_topics=True)
+    channel.restriction_reason = [types.RestrictionReason(platform="all", reason="other", text="Restricted")]
+    client = _Client(response)
+
+    observation = await TelethonChannelProfileGateway(client).fetch_channel_profile(_reference())
+
+    fields = observation.chat_entity_fields
+    assert fields is not None
+    assert "has_topics" in fields and "restrictions" in fields and "my_membership" in fields
+    assert fields["has_topics"] is True
+    assert fields["restrictions"] == [{"platform": "all", "reason": "other", "text": "Restricted"}]
+    membership = fields["my_membership"]
+    assert membership["is_member"] is False
+    assert membership["is_admin"] is True
+    rights = cast(dict[str, bool], membership["admin_rights"])
+    assert rights["delete_messages"] is True and rights["manage_topics"] is True
+    assert rights["add_admins"] is False
+    assert len(client.requests) == 1
+    assert isinstance(client.requests[0], GetFullChannelRequest)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ("missing", "min", "other_target", "forbidden"))
+async def test_channel_entity_profile_facts_do_not_invent_sparse_membership(case: str) -> None:
+    response = _full_channel()
+    channel = cast(types.Channel, response.chats[0])
+    if case == "missing":
+        response.chats = []
+    elif case == "min":
+        channel.min = True
+    elif case == "other_target":
+        channel.id = 456
+    else:
+        response.chats = cast(
+            list[types.TypeChat], [types.ChannelForbidden(id=123, access_hash=0, title="Unavailable")]
+        )
+
+    observation = await TelethonChannelProfileGateway(_Client(response)).fetch_channel_profile(_reference())
+
+    assert observation.chat_entity_fields is None
+
+
+@pytest.mark.asyncio
 async def test_min_forum_channel_gateway_preserves_kind_and_only_observes_positive_name() -> None:
     response = _full_channel()
     channel = response.chats[0]

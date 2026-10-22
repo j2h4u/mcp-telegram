@@ -10,8 +10,6 @@ from telethon.tl import types  # type: ignore[import-untyped]
 from telethon.tl.functions.users import GetFullUserRequest
 
 from mcp_telegram.entity_profile.contracts import (
-    PersonalChannelPost,
-    PersonalChannelReference,
     ProjectionStatus,
     TargetKind,
 )
@@ -138,27 +136,22 @@ def _channel(*, channel_id: int = 777, access_hash: object = -123, min: bool | N
 
 
 @pytest.mark.asyncio
-async def test_gateway_keeps_matching_negative_access_hash_as_private_capability() -> None:
+async def test_gateway_preserves_personal_channel_metadata_without_post_capability() -> None:
     response = _response()
     response.chats = [_channel(access_hash=-123)]  # type: ignore[attr-defined]
     client = _Client(response)
-    client.message = types.Message(
-        id=9,
-        peer_id=types.PeerChannel(777),
-        date=datetime(2026, 1, 2, tzinfo=UTC),
-        message="attached post",
-    )
     gateway = TelethonUserProfileGateway(client, now_provider=lambda: 100.0)
 
     observation = await gateway.fetch_user_profile(42, TargetKind.USER)
-    assert observation.personal_channel_reference == PersonalChannelReference(777, -123)
-
-    post = await gateway.fetch_personal_channel_post(observation.personal_channel_reference, 9)  # type: ignore[arg-type]
-    assert post == PersonalChannelPost(9, 1767312000, "attached post")
-    assert isinstance(client.message_entity, types.InputPeerChannel)
-    assert client.message_entity.channel_id == 777
-    assert client.message_entity.access_hash == -123
-    assert client.message_ids == [9]
+    assert observation.personal_channel.payload == {
+        "personal_channel_id": 777,
+        "personal_channel_message": 9,
+        "title": "Channel",
+        "username": "channel",
+    }
+    assert "access_hash" not in repr(observation)
+    assert not hasattr(observation, "personal_channel_reference")
+    assert client.message_ids == []
 
 
 @pytest.mark.asyncio
@@ -173,7 +166,7 @@ async def test_gateway_keeps_matching_negative_access_hash_as_private_capability
         _channel(min=True),
     ),
 )
-async def test_gateway_drops_absent_malformed_mismatched_or_min_channel_capability(
+async def test_gateway_never_exposes_channel_capability(
     chat: object | None,
 ) -> None:
     response = _response()
@@ -183,4 +176,5 @@ async def test_gateway_drops_absent_malformed_mismatched_or_min_channel_capabili
         42, TargetKind.USER
     )
 
-    assert observation.personal_channel_reference is None
+    assert "access_hash" not in repr(observation)
+    assert not hasattr(observation, "personal_channel_reference")

@@ -247,9 +247,6 @@ class _UserProfilePort:
         personal = ProjectionOutcome(ProjectionStatus.ABSENT, {"personal_channel_id": None}, None, None)
         return UserProfileObservation(user_id, target_kind, full, personal)
 
-    async def fetch_personal_channel_post(self, _reference: object, _message_id: int) -> None:
-        return None
-
 
 class _ConnectionStub:
     def __init__(self) -> None:
@@ -461,7 +458,10 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
             reconnect_catch_up_interval_seconds=5.0,
             automatic_group_history=AutomaticGroupHistoryConfig(),
         ),
-        api_server=SimpleNamespace(self_id=314),
+        api_server=SimpleNamespace(
+            self_id=314,
+            _policy=SimpleNamespace(full_user_pair_enabled=True, entity_detail_ttl_seconds=300),
+        ),
         draft_owner=None,
         handler_manager=None,
     )

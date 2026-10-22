@@ -21,8 +21,6 @@ from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from mcp_telegram.entity_profile.contracts import (
     ObservationBoundary,
-    PersonalChannelPost,
-    PersonalChannelReference,
     TargetKind,
     UserProfileObservation,
     UserReference,
@@ -78,6 +76,13 @@ def _fenced_schema(conn: sqlite3.Connection) -> None:
             started_at INTEGER, pair_eligible INTEGER NOT NULL DEFAULT 0,
             follow_up_required INTEGER NOT NULL DEFAULT 0, profile_revision INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE entity_profile_field_observations (
+            entity_id INTEGER NOT NULL, field TEXT NOT NULL, owner_account_id INTEGER NOT NULL,
+            observation_order INTEGER NOT NULL CHECK (observation_order > 0), observed_at INTEGER NOT NULL,
+            source TEXT NOT NULL CHECK (source IN ('rpc', 'update', 'min')),
+            PRIMARY KEY (entity_id, field)
+        ) WITHOUT ROWID;
         """
     )
 
@@ -130,11 +135,6 @@ class _PairClient:
             observation=ObservationBoundary(100.0, 100.0),
         )
 
-    async def fetch_personal_channel_post(
-        self, reference: PersonalChannelReference, message_id: int
-    ) -> PersonalChannelPost | None:
-        raise AssertionError(f"personal channel post fetch is not part of pair tests: {reference}/{message_id}")
-
     async def __call__(self, request: object) -> object:
         del request
         raise AssertionError("unexpected entity info request")
@@ -171,7 +171,6 @@ def _pair_service(conn: sqlite3.Connection, client: _PairClient, *, enabled: boo
             logger=logging.getLogger(__name__),
             now_provider=lambda: 100.0,
             detail_ttl_seconds=300,
-            slow_stage_seconds=1.0,
             group_profile_port=LoudGroupProfilePort(),
             channel_profile_port=LoudChannelProfilePort(),
             channel_reference_provider=LoudChannelProfilePort(),

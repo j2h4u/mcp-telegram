@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import re
 import sqlite3
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -23,6 +24,8 @@ from mcp_telegram.entity_profile.contracts import (
     ProjectionStatus,
 )
 from mcp_telegram.entity_profile.ports import ChannelProfilePort
+from mcp_telegram.sync_transactions import write_savepoint
+from mcp_telegram.telegram_gateway import _channel_profile_entity_fields
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     ClientChatAvatarHistoryPort,
@@ -31,6 +34,8 @@ from tests.helpers import (
     LoudGroupProfilePort,
     LoudUserAvatarHistoryPort,
     LoudUserProfilePort,
+    acquire_entity_profile,
+    in_memory_sync_db,
 )
 from tests.sqlite_writer_helpers import inline_writer
 
@@ -69,37 +74,7 @@ def _patch_get_peer_id():
 
 
 def _make_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:")
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.executescript(
-        """
-        CREATE TABLE synced_dialogs (
-            dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'not_synced',
-            last_synced_at INTEGER, last_event_at INTEGER,
-            sync_progress INTEGER DEFAULT 0, total_messages INTEGER,
-            access_lost_at INTEGER, read_inbox_max_id INTEGER, read_outbox_max_id INTEGER
-        );
-        CREATE TABLE full_history_enrollment (
-            dialog_id INTEGER PRIMARY KEY,
-            enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
-            source TEXT NOT NULL CHECK(source IN ('explicit', 'automatic', 'migration')),
-            updated_at INTEGER NOT NULL
-        ) WITHOUT ROWID;
-        CREATE TABLE dialogs (
-            dialog_id INTEGER PRIMARY KEY, name TEXT, type TEXT, archived INTEGER, hidden INTEGER,
-            identity_revision INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE entities (
-            id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT,
-            username TEXT, name_normalized TEXT, updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE entity_details (
-            entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL,
-            FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE
-        ) WITHOUT ROWID;
-        CREATE INDEX idx_entity_details_fetched_at ON entity_details(fetched_at);
-        """
-    )
+    conn = in_memory_sync_db()
     _TEST_DBS.append(conn)
     return conn
 
@@ -136,7 +111,7 @@ def _supergroup(id_: int = -1001, **kwargs: object) -> MagicMock:
     from telethon.tl.types import Channel as TelethonChannel  # type: ignore[import-untyped]
 
     c = MagicMock(spec=TelethonChannel)
-    c.id = id_
+    c.id = abs(id_)
     c.title = kwargs.get("title", "Test Supergroup")
     c.username = kwargs.get("username", "test_super")
     c.access_hash = 0
@@ -172,13 +147,20 @@ def _empty_search():
     return MagicMock(count=0, messages=[])
 
 
-def _channel_port(
+async def _acquire_local_profile(server: DaemonAPIServer, entity_id: int, name: str = "Test Supergroup") -> None:
+    await acquire_entity_profile(
+        server._get_entity_info_service(), entity_id, {"id": entity_id, "type": "supergroup", "name": name}
+    )
+
+
+def _channel_port(  # noqa: PLR0913 - fixture maps one normalized profile and overlap response
     channel_id: int,
     full: object,
     *,
     contact_ids: tuple[int, ...] = (),
     overlap_status: ProjectionStatus = ProjectionStatus.PARTIAL,
     overlap_reason: str = "bounded_contacts_page",
+    entity: object | None = None,
 ) -> FakeChannelProfilePort:
     full_chat = getattr(full, "full_chat", full)
     raw_link = getattr(full_chat, "linked_chat_id", None)
@@ -201,6 +183,9 @@ def _channel_port(
         current_photo=None,
         observation_started_at=100,
         observation_completed_at=100,
+        chat_entity_fields=(
+            _channel_profile_entity_fields(SimpleNamespace(chats=[entity]), channel_id) if entity is not None else None
+        ),
     )
     overlap = ChannelContactOverlapObservation(
         channel_id=channel_id,
@@ -222,7 +207,8 @@ async def test_get_entity_info_supergroup_type() -> None:
 
     full = _full_supergroup()
     client.side_effect = [_empty_search()]
-    server = make_server(client=client, channel_profile_port=_channel_port(-1001, full))
+    server = make_server(client=client, channel_profile_port=_channel_port(-1001, full, entity=sg))
+    await _acquire_local_profile(server, -1001)
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001})
     assert r["ok"] is True, r
     assert _dict(r["data"])["type"] == "supergroup"
@@ -237,7 +223,8 @@ async def test_get_entity_info_supergroup_field_surface() -> None:
 
     full = _full_supergroup(participants_count=42, slowmode_seconds=60, linked_chat_id=200500)
     client.side_effect = [_empty_search()]
-    server = make_server(client=client, channel_profile_port=_channel_port(-1002, full))
+    server = make_server(client=client, channel_profile_port=_channel_port(-1002, full, entity=sg))
+    await _acquire_local_profile(server, -1002)
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1002})
     d = _dict(r["data"])
     for key in (
@@ -264,7 +251,8 @@ async def test_get_entity_info_forum_supergroup_has_topics() -> None:
 
     full = _full_supergroup()
     client.side_effect = [_empty_search()]
-    server = make_server(client=client, channel_profile_port=_channel_port(-1003, full))
+    server = make_server(client=client, channel_profile_port=_channel_port(-1003, full, entity=sg))
+    await _acquire_local_profile(server, -1003)
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1003})
     assert r["ok"] is True
     assert _dict(r["data"])["type"] == "supergroup"
@@ -279,15 +267,14 @@ async def test_get_entity_info_supergroup_small_enumerates_dm_intersection() -> 
     Expected: contacts_subscribed = entries for ids 10 and 30, partial=False.
     """
     conn = _make_db()
-    # Seed DM-peer set
-    for did in (10, 30, 999):
-        conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (did,))
-    # Seed entities for name enrichment
-    conn.executemany(
-        "INSERT INTO entities (id, type, name, username, updated_at) VALUES (?, 'user', ?, ?, 1000)",
-        [(10, "Alice", "alice"), (30, "Charlie", "charlie")],
-    )
-    conn.commit()
+    # Seed DM-peer set and names through the SQLite test writer guard.
+    with write_savepoint(conn):
+        for did in (10, 30, 999):
+            conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (did,))
+        conn.executemany(
+            "INSERT INTO entities (id, type, name, username, updated_at) VALUES (?, 'user', ?, ?, 1000)",
+            [(10, "Alice", "alice"), (30, "Charlie", "charlie")],
+        )
 
     sg = _supergroup(id_=-1004, creator=True)  # creator → is_admin=True
 
@@ -296,8 +283,9 @@ async def test_get_entity_info_supergroup_small_enumerates_dm_intersection() -> 
     full = _full_supergroup(participants_count=3)
     client.side_effect = [_empty_search()]
     server = make_server(
-        conn=conn, client=client, channel_profile_port=_channel_port(-1004, full, contact_ids=(10, 20, 30))
+        conn=conn, client=client, channel_profile_port=_channel_port(-1004, full, contact_ids=(10, 20, 30), entity=sg)
     )
+    await _acquire_local_profile(server, -1004)
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1004})
     d = _dict(r["data"])
     assert d["contacts_subscribed_partial"] is True
@@ -314,13 +302,13 @@ async def test_get_entity_info_supergroup_small_enumerates_dm_intersection() -> 
 async def test_get_entity_info_supergroup_large_uses_contact_filter() -> None:
     """SPEC Req 9: members_count>1000 uses the same bounded contacts page; partial=True."""
     conn = _make_db()
-    for did in (50, 60, 70):
-        conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (did,))
-    conn.executemany(
-        "INSERT INTO entities (id, type, name, username, updated_at) VALUES (?, 'user', ?, ?, 1000)",
-        [(50, "U50", "u50"), (60, "U60", "u60")],
-    )
-    conn.commit()
+    with write_savepoint(conn):
+        for did in (50, 60, 70):
+            conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (did,))
+        conn.executemany(
+            "INSERT INTO entities (id, type, name, username, updated_at) VALUES (?, 'user', ?, ?, 1000)",
+            [(50, "U50", "u50"), (60, "U60", "u60")],
+        )
 
     sg = _supergroup(id_=-1005, creator=True)
     client = AsyncMock()
@@ -332,6 +320,7 @@ async def test_get_entity_info_supergroup_large_uses_contact_filter() -> None:
         client=client,
         channel_profile_port=_channel_port(-1005, full, contact_ids=(50, 60)),
     )
+    await _acquire_local_profile(server, -1005)
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1005})
     d = _dict(r["data"])
     assert d["contacts_subscribed_partial"] is True
@@ -350,7 +339,17 @@ async def test_get_entity_info_supergroup_hidden_members_null() -> None:
 
     full = _full_supergroup()
     client.side_effect = [_empty_search()]
-    server = make_server(client=client, channel_profile_port=_channel_port(-1006, full))
+    server = make_server(
+        client=client,
+        channel_profile_port=_channel_port(
+            -1006,
+            full,
+            overlap_status=ProjectionStatus.UNAVAILABLE,
+            overlap_reason="hidden_by_admin",
+            entity=sg,
+        ),
+    )
+    await _acquire_local_profile(server, -1006)
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1006})
     assert r["ok"]
     d = _dict(r["data"])
@@ -379,8 +378,10 @@ async def test_get_entity_info_supergroup_chat_admin_required_treated_as_hidden(
             full,
             overlap_status=ProjectionStatus.UNAVAILABLE,
             overlap_reason="not_an_admin",
+            entity=sg,
         ),
     )
+    await _acquire_local_profile(server, -1011)
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1011})
     assert r["ok"]
     d = _dict(r["data"])
@@ -397,7 +398,8 @@ async def test_get_entity_info_no_download_keys_supergroup() -> None:
 
     full = _full_supergroup()
     client.side_effect = [_empty_search()]
-    server = make_server(client=client, channel_profile_port=_channel_port(-1007, full))
+    server = make_server(client=client, channel_profile_port=_channel_port(-1007, full, entity=sg))
+    await _acquire_local_profile(server, -1007)
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1007})
 
     def _walk(o: object):

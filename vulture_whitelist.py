@@ -16,8 +16,8 @@
 # known false positives. The `# unused ... (path:line)` comments keep the list
 # regenerable — refresh with: `uv run vulture --make-whitelist`.
 #
-# Scope note: this whitelist covers ONLY the retained text layer and individually
-# confirmed framework false positives.
+# Scope note: this whitelist covers the retained text layer and individually
+# confirmed framework, serialized-contract, and test-support false positives.
 
 # --- errors.py: actionable error-message helpers (text layer) ---
 ambiguous_dialog_text  # unused function (src/mcp_telegram/errors.py:17)
@@ -123,6 +123,10 @@ fake
 restricted
 restriction_reason
 personal_channel_message
+emoji_status_id
+mutual_contact
+close_friend
+my_membership
 
 # Projection convenience properties are public contract accessors used by
 # callers/tests, though their reads are outside vulture's source graph.
@@ -134,6 +138,19 @@ authoritative_absence
 # entry point whose caller may live outside this source tree.
 section_is_reusable
 request_follow_up
+
+# Explicit entity-profile test-support write seams. Tests are outside the scan;
+# save_core exercises canonical identity/CAS fencing, and mark_pending seeds
+# complete bounded generations in writer, rollback, scope, and executor tests.
+# Production admission uses reconcile_history_profiles/request_section_refresh;
+# retaining these two helpers avoids duplicating transaction/fencing SQL in fixtures.
+save_core
+mark_pending
+
+# StoredProfile's private acquisition-audit metadata, round-tripped by the
+# ownership persistence test. Reading retained facts no longer depends on this
+# historical key/DC scope; current RPC receipt validation remains separate.
+profile_observation_scope
 
 # sqlite3 consumes this native connection setting; it is not a Python reader.
 isolation_level

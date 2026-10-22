@@ -8,8 +8,8 @@ AND entity_details rows; subsequent in-TTL call serves from DB).
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
+from dataclasses import replace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -23,14 +23,11 @@ from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.entity_profile.contracts import (
-    PersonalChannelPost,
-    PersonalChannelReference,
     ProjectionOutcome,
     ProjectionStatus,
     TargetKind,
     UserProfileObservation,
 )
-from mcp_telegram.flood import FloodWaitKillSwitchStatus
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     ClientChatAvatarHistoryPort,
@@ -39,6 +36,8 @@ from tests.helpers import (
     LoudChannelProfilePort,
     LoudGroupProfilePort,
     UserReference,
+    acquire_entity_profile,
+    in_memory_sync_db,
 )
 from tests.sqlite_writer_helpers import inline_writer
 
@@ -66,42 +65,17 @@ def _patch_get_peer_id():
 
 
 def _make_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:")
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.executescript(
-        """
-        CREATE TABLE synced_dialogs (
-            dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'not_synced',
-            last_synced_at INTEGER, last_event_at INTEGER,
-            sync_progress INTEGER DEFAULT 0, total_messages INTEGER,
-            access_lost_at INTEGER, read_inbox_max_id INTEGER, read_outbox_max_id INTEGER
-        );
-        CREATE TABLE full_history_enrollment (
-            dialog_id INTEGER PRIMARY KEY,
-            enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
-            source TEXT NOT NULL CHECK(source IN ('explicit', 'automatic', 'migration')),
-            updated_at INTEGER NOT NULL
-        ) WITHOUT ROWID;
-        CREATE TABLE dialogs (
-            dialog_id INTEGER PRIMARY KEY, name TEXT, type TEXT, archived INTEGER, hidden INTEGER,
-            identity_revision INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE entities (
-            id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT,
-            username TEXT, name_normalized TEXT, updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE entity_details (
-            entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL,
-            FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE
-        ) WITHOUT ROWID;
-        CREATE INDEX idx_entity_details_fetched_at ON entity_details(fetched_at);
-        """
-    )
+    conn = in_memory_sync_db()
     _TEST_DBS.append(conn)
     return conn
 
 
-def make_server(conn: sqlite3.Connection | None = None, client: DaemonClientLike | None = None) -> DaemonAPIServer:
+def make_server(
+    conn: sqlite3.Connection | None = None,
+    client: DaemonClientLike | None = None,
+    *,
+    about: str | None = None,
+) -> DaemonAPIServer:
     if conn is None:
         conn = _make_db()
     if client is None:
@@ -109,18 +83,16 @@ def make_server(conn: sqlite3.Connection | None = None, client: DaemonClientLike
     shutdown_event = asyncio.Event()
 
     class _GenericUserProfilePort:
+        def __init__(self) -> None:
+            self.about = about
+
         def get_user_reference(self, user_id: int, *, is_self: bool = False) -> UserReference:
             return UserReference(user_id, 0, is_self=is_self)
 
         async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
-            usable = ProjectionOutcome(ProjectionStatus.USABLE, {}, None, None)
+            usable = ProjectionOutcome(ProjectionStatus.USABLE, {"about": self.about}, None, None)
             absent = ProjectionOutcome(ProjectionStatus.ABSENT, {"personal_channel_id": None}, None, None)
             return UserProfileObservation(user_id, target_kind, usable, absent)
-
-        async def fetch_personal_channel_post(
-            self, reference: PersonalChannelReference, message_id: int
-        ) -> PersonalChannelPost | None:
-            raise AssertionError(f"personal channel post fetch is not part of TTL tests: {reference}/{message_id}")
 
     server = DaemonAPIServer(
         conn,
@@ -182,92 +154,61 @@ def _trio_results() -> tuple[MagicMock, MagicMock, MagicMock]:
 
 
 @pytest.mark.asyncio
-async def test_get_entity_info_serves_from_db_within_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
-    """SPEC Req 8: two consecutive calls within configured TTL → one MTProto round-trip."""
+async def test_get_entity_info_serves_old_profile_locally_without_refetch() -> None:
+    conn = _make_db()
     client = AsyncMock()
-    get_entity = AsyncMock(return_value=_user(42))
-    client.get_entity = get_entity
-    client.side_effect = _trio_results() + _trio_results()  # 6 items in case both calls fetch
-    server = make_server(client=client)
-
-    base = 1_000_000
-    monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base)
-    r1 = await server._dispatch({"method": "get_entity_info", "entity_id": 42})
-    assert r1["ok"]
-    first_call_count = get_entity.call_count
-    assert first_call_count == 1
-
-    # Within TTL window
-    monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base + 250)
-    server._health_status = lambda: FloodWaitKillSwitchStatus(
-        open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+    server = make_server(conn=conn, client=client, about="retained")
+    service = server._get_entity_info_service()
+    await acquire_entity_profile(
+        service, 42, {"id": 42, "type": "user", "name": "Cache", "username": "cache", "about": "retained"}
     )
-    r2, _, _ = await server._handle_client_line(
-        json.dumps({"method": "get_entity_info", "entity_id": 42}).encode(), "", None
-    )
-    assert r2["ok"]
-    assert get_entity.call_count == first_call_count, "must serve from DB; no new fetch"
+    service._deps = replace(service._deps, now_provider=lambda: 10_000_000)
+    before = conn.total_changes
+    calls_before_read = client.await_count
 
-    # After TTL → fresh fetch
-    monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base + 400)
-    r3 = await server._dispatch({"method": "get_entity_info", "entity_id": 42})
-    assert r3["ok"]
-    assert get_entity.call_count == first_call_count + 1
+    result = await server._dispatch({"method": "get_entity_info", "entity_id": 42})
+
+    assert result["ok"] is True
+    assert cast(dict[str, object], result["data"])["about"] == "retained"
+    assert conn.total_changes == before
+    assert client.await_count == calls_before_read
 
 
 @pytest.mark.asyncio
-async def test_get_entity_info_at_exact_ttl_age_refetches(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An entity detail exactly at the configured cutoff is stale, not fresh."""
+async def test_get_entity_info_exact_ttl_age_stays_local() -> None:
+    conn = _make_db()
     client = AsyncMock()
-    get_entity = AsyncMock(return_value=_user(43))
-    client.get_entity = get_entity
-    client.side_effect = _trio_results() + _trio_results()
-    server = make_server(client=client)
-    ttl_seconds = server._policy.entity_detail_ttl_seconds
-    base = 2_000_000
-    monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base)
-    assert (await server._dispatch({"method": "get_entity_info", "entity_id": 43}))["ok"]
+    server = make_server(conn=conn, client=client, about="at cutoff")
+    service = server._get_entity_info_service()
+    await acquire_entity_profile(service, 43, {"id": 43, "type": "user", "name": "Cache", "about": "at cutoff"})
+    service._deps = replace(service._deps, now_provider=lambda: 2_000_000)
+    before = conn.total_changes
+    calls_before_read = client.await_count
 
-    monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base + ttl_seconds)
-    assert (await server._dispatch({"method": "get_entity_info", "entity_id": 43}))["ok"]
+    result = await server._dispatch({"method": "get_entity_info", "entity_id": 43})
 
-    assert get_entity.call_count == 2
+    assert result["ok"] is True
+    assert cast(dict[str, object], result["data"])["about"] == "at cutoff"
+    assert conn.total_changes == before
+    assert client.await_count == calls_before_read
 
 
 @pytest.mark.asyncio
-async def test_get_entity_info_auto_resolve_writes_both_rows(monkeypatch: pytest.MonkeyPatch) -> None:
-    """SPEC Req 11: first call on unknown id writes entities AND entity_details rows."""
+async def test_get_entity_info_unknown_id_does_not_resolve_or_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Missing local identity stays missing without Telegram access or writeback."""
     conn = _make_db()
     # Pre-condition: no rows in either table for entity 100
     assert conn.execute("SELECT COUNT(*) FROM entities WHERE id=100").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM entity_details WHERE entity_id=100").fetchone()[0] == 0
 
     client = AsyncMock()
-    client.get_entity = AsyncMock(return_value=_user(100))
-    client.side_effect = _trio_results()
     server = make_server(conn=conn, client=client)
     monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: 5_000_000)
+    before = conn.total_changes
+    calls_before_read = client.await_count
     r = await server._dispatch({"method": "get_entity_info", "entity_id": 100})
 
-    assert r["ok"]
-    # Post-condition: BOTH rows now exist
-    # conn.row_factory is set to sqlite3.Row by DaemonAPIServer.__init__,
-    # so compare using tuple() to avoid Row vs tuple mismatch.
-    ent_row = cast(
-        tuple[int, str, str] | None, conn.execute("SELECT id, type, username FROM entities WHERE id=100").fetchone()
-    )
-    assert ent_row is not None
-    assert tuple(ent_row) == (100, "user", "cache")
-    det_row = cast(
-        tuple[str, int] | None,
-        conn.execute("SELECT detail_json, fetched_at FROM entity_details WHERE entity_id=100").fetchone(),
-    )
-    assert det_row is not None
-    assert det_row[1] == 5_000_000
-    # detail_json carries embedded schema discriminator
-    import json as _json
-
-    payload = cast(dict[str, object], _json.loads(det_row[0]))
-    assert payload["schema"] == 1
-    assert payload["type"] == "user"
-    assert payload["id"] == 100
+    assert r["ok"] is False
+    assert r["error"] == "entity_not_observed"
+    assert conn.total_changes == before
+    assert client.await_count == calls_before_read

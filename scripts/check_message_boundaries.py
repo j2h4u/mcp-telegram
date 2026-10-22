@@ -82,6 +82,10 @@ DIALOG_IDENTITY_ROLE_FUNCTIONS: Mapping[str, Mapping[str, frozenset[str]]] = {
         "_read_identity_aggregate": frozenset({"identity_complete", "identity_observed_at"})
     },
     "event_handlers.py": {"EventHandlerManager._mark_channel_chat_update": frozenset({"type"})},
+    "entity_profile/repository.py": {
+        "EntityProfileRepository.is_history_profile_managed": frozenset({"type"}),
+        "EntityProfileRepository._history_profiles_to_collect": frozenset({"type", "name"}),
+    },
     # Named SQL constants use canonical dialog kind only to decide whether a
     # peer is eligible for reaction scheduling.
     "message_fact_refresh.py": {

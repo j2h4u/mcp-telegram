@@ -31,6 +31,8 @@ from tests.helpers import (
     LoudGroupProfilePort,
     LoudUserAvatarHistoryPort,
     LoudUserProfilePort,
+    acquire_entity_profile,
+    in_memory_sync_db,
 )
 from tests.sqlite_writer_helpers import inline_writer
 
@@ -58,36 +60,7 @@ def _patch_get_peer_id():
 
 
 def _make_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:")
-    conn.executescript(
-        """
-        CREATE TABLE synced_dialogs (
-            dialog_id INTEGER PRIMARY KEY,
-            status TEXT NOT NULL DEFAULT 'not_synced',
-            last_synced_at INTEGER, last_event_at INTEGER,
-            sync_progress INTEGER DEFAULT 0, total_messages INTEGER,
-            access_lost_at INTEGER, read_inbox_max_id INTEGER, read_outbox_max_id INTEGER
-        );
-        CREATE TABLE full_history_enrollment (
-            dialog_id INTEGER PRIMARY KEY,
-            enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
-            source TEXT NOT NULL CHECK(source IN ('explicit', 'automatic', 'migration')),
-            updated_at INTEGER NOT NULL
-        ) WITHOUT ROWID;
-        CREATE TABLE dialogs (
-            dialog_id INTEGER PRIMARY KEY, name TEXT, type TEXT, archived INTEGER, hidden INTEGER,
-            identity_revision INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE entities (
-            id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT,
-            username TEXT, name_normalized TEXT, updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE entity_details (
-            entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL,
-            FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE
-        ) WITHOUT ROWID;
-        """
-    )
+    conn = in_memory_sync_db()
     _TEST_DBS.append(conn)
     return conn
 
@@ -267,11 +240,18 @@ async def test_get_entity_info_supergroup_small_rpc_count_le_9() -> None:
     channel_profile_port = _CountingChannelProfilePort(-1001000000001, 1000)
 
     server = _make_server(client=client, channel_profile_port=channel_profile_port)
+    await acquire_entity_profile(
+        server._get_entity_info_service(),
+        -1001000000001,
+        {"id": -1001000000001, "type": "supergroup", "name": "RPC budget test group"},
+    )
+    before_read = client.total_rpc_count + channel_profile_port.rpc_count
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001000000001})
 
     assert r["ok"] is True, f"expected ok=True, got {r!r}"
     total = client.total_rpc_count + channel_profile_port.rpc_count
-    assert total <= 4, f"bounded channel profile path made {total} RPCs"
+    assert total == before_read, "ordinary entity-info read must not acquire profile evidence"
+    assert total <= 4, f"bounded acquisition made {total} RPCs"
     assert channel_profile_port.rpc_count == 2
 
 
@@ -296,11 +276,18 @@ async def test_get_entity_info_supergroup_large_rpc_count_le_4() -> None:
     channel_profile_port = _CountingChannelProfilePort(-1001000000002, 50000)
 
     server = _make_server(client=client, channel_profile_port=channel_profile_port)
+    await acquire_entity_profile(
+        server._get_entity_info_service(),
+        -1001000000002,
+        {"id": -1001000000002, "type": "supergroup", "name": "RPC budget test group"},
+    )
+    before_read = client.total_rpc_count + channel_profile_port.rpc_count
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001000000002})
 
     assert r["ok"] is True, f"expected ok=True, got {r!r}"
     total = client.total_rpc_count + channel_profile_port.rpc_count
-    assert total <= 4, f"bounded channel profile path made {total} RPCs"
+    assert total == before_read, "ordinary entity-info read must not acquire profile evidence"
+    assert total <= 4, f"bounded acquisition made {total} RPCs"
     assert channel_profile_port.rpc_count == 2
 
 
@@ -326,9 +313,16 @@ async def test_get_entity_info_broadcast_channel_small_rpc_count_le_9() -> None:
     channel_profile_port = _CountingChannelProfilePort(-1009999999999, 1000)
 
     server = _make_server(client=client, channel_profile_port=channel_profile_port)
+    await acquire_entity_profile(
+        server._get_entity_info_service(),
+        -1009999999999,
+        {"id": -1009999999999, "type": "channel", "name": "RPC budget test channel"},
+    )
+    before_read = client.total_rpc_count + channel_profile_port.rpc_count
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1009999999999})
 
     assert r["ok"] is True, f"expected ok=True, got {r!r}"
     total = client.total_rpc_count + channel_profile_port.rpc_count
-    assert total <= 4, f"bounded channel profile path made {total} RPCs"
+    assert total == before_read, "ordinary entity-info read must not acquire profile evidence"
+    assert total <= 4, f"bounded acquisition made {total} RPCs"
     assert channel_profile_port.rpc_count == 2

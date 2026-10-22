@@ -751,7 +751,8 @@ def test_restart_keeps_original_observation_time_and_same_generation_channel_com
     assert reopened.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
         "complete",
     )
-    assert reopened_repo.read(42, now=110).sections["full_profile"]["status"] == "stale"  # type: ignore[union-attr]
+    # Collected coverage survives elapsed time without rewriting its observation.
+    assert reopened_repo.read(42, now=110).sections["full_profile"]["status"] == "fresh"  # type: ignore[union-attr]
     reopened.close()
 
 

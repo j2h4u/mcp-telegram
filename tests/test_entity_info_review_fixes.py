@@ -4,8 +4,7 @@ Covers:
 - WR-01: _format_relative_ymd future-date and today branches (fix(47-08))
 - CR-01: a channel profile failure does not suppress the independent bounded
          contact-overlap operation
-- WR-05: degraded full-fetch (user or channel profile request raises)
-         skips entity_details cache write (fix(47-09))
+- WR-05: failed background acquisitions do not publish fresh profile facts
 """
 
 from __future__ import annotations
@@ -18,8 +17,6 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from telethon.tl.types import Channel as TelethonChannel  # type: ignore[import-untyped]
-from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.entity_profile.contracts import (
@@ -29,6 +26,8 @@ from mcp_telegram.entity_profile.contracts import (
     ProjectionStatus,
 )
 from mcp_telegram.entity_profile.ports import ChannelProfilePort, UserProfilePort
+from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
+from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.tools.entity_info import _entity_input_label, _format_relative_ymd
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
@@ -39,6 +38,9 @@ from tests.helpers import (
     LoudChannelProfilePort,
     LoudGroupProfilePort,
     LoudUserProfilePort,
+    acquire_entity_profile,
+    bind_profile_test_account,
+    in_memory_sync_db,
 )
 from tests.sqlite_writer_helpers import inline_writer
 
@@ -70,37 +72,7 @@ def _patch_get_peer_id():
 
 
 def _make_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:")
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.executescript(
-        """
-        CREATE TABLE synced_dialogs (
-            dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'not_synced',
-            last_synced_at INTEGER, last_event_at INTEGER,
-            sync_progress INTEGER DEFAULT 0, total_messages INTEGER,
-            access_lost_at INTEGER, read_inbox_max_id INTEGER, read_outbox_max_id INTEGER
-        );
-        CREATE TABLE full_history_enrollment (
-            dialog_id INTEGER PRIMARY KEY,
-            enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
-            source TEXT NOT NULL CHECK(source IN ('explicit', 'automatic', 'migration')),
-            updated_at INTEGER NOT NULL
-        ) WITHOUT ROWID;
-        CREATE TABLE dialogs (
-            dialog_id INTEGER PRIMARY KEY, name TEXT, type TEXT, archived INTEGER, hidden INTEGER,
-            identity_revision INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE entities (
-            id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT,
-            username TEXT, name_normalized TEXT, updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE entity_details (
-            entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL,
-            FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE
-        ) WITHOUT ROWID;
-        CREATE INDEX idx_entity_details_fetched_at ON entity_details(fetched_at);
-        """
-    )
+    conn = in_memory_sync_db()
     _TEST_DBS.append(conn)
     return conn
 
@@ -131,42 +103,6 @@ def _make_server(
     )
     server._ready = True
     return server
-
-
-def _channel(id_: int = -1001, admin: bool = True, **kw: object) -> MagicMock:
-    c = MagicMock(spec=TelethonChannel)
-    c.id = id_
-    c.title = kw.get("title", "Chan")
-    c.username = kw.get("username", "chan")
-    c.access_hash = 0
-    c.min = False
-    c.megagroup = False
-    c.broadcast = True
-    c.forum = False
-    c.creator = admin
-    c.admin_rights = MagicMock() if admin else None
-    c.left = False
-    c.restriction_reason = []
-    return c
-
-
-def _supergroup(id_: int = -2001, admin: bool = True, **kw: object) -> MagicMock:
-    c = MagicMock(spec=TelethonChannel)
-    c.id = id_
-    c.title = kw.get("title", "SG")
-    c.username = kw.get("username", "sg")
-    c.access_hash = 0
-    c.min = False
-    c.megagroup = True
-    c.broadcast = False
-    c.forum = False
-    c.creator = admin
-    c.admin_rights = MagicMock() if admin else None
-    c.left = False
-    c.restriction_reason = []
-    c.noforwards = False
-    c.hidden_members = False
-    return c
 
 
 class _FailingChannelProfilePort:
@@ -204,22 +140,39 @@ class _FailingChannelProfilePort:
         return replace(self.overlap, channel_id=reference.channel_id)
 
 
-def _user_entity(id_: int = 99) -> MagicMock:
-    u = MagicMock(spec=User)
-    u.id = id_
-    u.first_name = "Test"
-    u.last_name = None
-    u.username = "testuser"
-    u.bot = False
-    u.contact = u.mutual_contact = u.close_friend = False
-    u.verified = u.premium = u.scam = u.fake = u.restricted = False
-    u.phone = u.lang_code = None
-    u.usernames = []
-    u.emoji_status = None
-    u.restriction_reason = []
-    u.send_paid_messages_stars = None
-    u.status = None
-    return u
+async def _acquire_overlap_then_fail_profile(server: DaemonAPIServer, entity_id: int, kind: str) -> None:
+    """Exercise independent durable sections, retaining overlap on profile failure."""
+    service = server._get_entity_info_service()
+    bind_profile_test_account(service)
+    service._deps = replace(service._deps, now_provider=lambda: 100.0, enable_full_user_pair=False)
+    service.bind_demand_sink(MagicMock())
+    await service._write_profiles(
+        lambda profiles: profiles.save_core({"id": entity_id, "type": kind, "name": "Known channel"}, now=100)
+    )
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    adapter = EntityProfileDemandAdapter(coordinator)
+    for section in ("contact_overlap", "full_profile"):
+        await service._write_profiles(
+            lambda profiles, section=section: profiles.request_section_refresh(
+                entity_id, (section,), now=100, pair_mode="disabled"
+            )
+        )
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+
+def _assert_failed_profile_is_retryable(conn: sqlite3.Connection, entity_id: int) -> None:
+    section = cast(
+        tuple[str, int | None, int] | None,
+        conn.execute(
+            "SELECT status, observed_at, retry_at FROM entity_detail_sections WHERE entity_id=? AND section='full_profile'",
+            (entity_id,),
+        ).fetchone(),
+    )
+    assert section is not None
+    assert section[0] == "unavailable"
+    assert section[1] is None
+    assert section[2] > 100
 
 
 # ---------------------------------------------------------------------------
@@ -287,17 +240,17 @@ def test_entity_input_label_prefers_entity_string() -> None:
 
 
 @pytest.mark.asyncio
-async def test_channel_profile_failure_still_runs_bounded_overlap() -> None:
+async def test_channel_profile_failure_preserves_acquired_bounded_overlap() -> None:
     """A profile failure leaves the successful bounded overlap available."""
-    chan = _channel(id_=-1001, admin=True)
     client = AsyncMock()
-    client.get_entity = AsyncMock(return_value=chan)
-    client.side_effect = [MagicMock(count=0, messages=[])]
     port = _FailingChannelProfilePort(-1001, RuntimeError("simulated profile failure"))
     server = _make_server(
         client=client,
         channel_profile_port=port,
     )
+    await _acquire_overlap_then_fail_profile(server, -1001, "channel")
+    _assert_failed_profile_is_retryable(server._conn, -1001)
+    changes = server._conn.total_changes
 
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001})
 
@@ -307,15 +260,14 @@ async def test_channel_profile_failure_still_runs_bounded_overlap() -> None:
     assert d["contacts_subscribed_partial"] is True
     assert d["contacts_reason"] == "bounded_contacts_page"
     assert port.profile_calls == port.overlap_calls == 1
+    assert server._conn.total_changes == changes
+    cast(AsyncMock, client.get_entity).assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_supergroup_profile_failure_preserves_overlap_adapter_reason() -> None:
     """A profile failure leaves an independent adapter-unavailable reason intact."""
-    sg = _supergroup(id_=-2001, admin=True)
     client = AsyncMock()
-    client.get_entity = AsyncMock(return_value=sg)
-    client.side_effect = [MagicMock(count=0, messages=[])]
     port = _FailingChannelProfilePort(
         -2001,
         RuntimeError("simulated profile failure"),
@@ -327,6 +279,9 @@ async def test_supergroup_profile_failure_preserves_overlap_adapter_reason() -> 
         client=client,
         channel_profile_port=port,
     )
+    await _acquire_overlap_then_fail_profile(server, -2001, "supergroup")
+    _assert_failed_profile_is_retryable(server._conn, -2001)
+    changes = server._conn.total_changes
 
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -2001})
 
@@ -334,61 +289,73 @@ async def test_supergroup_profile_failure_preserves_overlap_adapter_reason() -> 
     d = cast(dict[str, object], r["data"])
     assert d["contacts_subscribed"] is None
     assert d["contacts_reason"] == "access_lost"
-    assert d["members_count"] is None
+    assert d.get("members_count") is None
     assert port.profile_calls == port.overlap_calls == 1
+    assert server._conn.total_changes == changes
+    cast(AsyncMock, client.get_entity).assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
-# WR-05: degraded full fetch skips entity_details cache write
+# WR-05: failed durable acquisitions do not publish fresh profile facts
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_user_degraded_full_fetch_skips_entity_details_cache() -> None:
-    """WR-05: user profile request raises → full_user_ok=False →
-    entity_details row NOT written (prevents caching degraded response)."""
+async def test_user_failed_acquisition_keeps_identity_without_fresh_detail() -> None:
+    """A failed background request retains identity and retry, not fabricated detail."""
     conn = _make_db()
-    user = _user_entity(id_=77)
     client = AsyncMock()
-    client.get_entity = AsyncMock(return_value=user)
+    port = FakeUserProfilePort(error=RuntimeError("simulated profile failure"))
 
     server = _make_server(
         conn=conn,
         client=client,
-        user_profile_port=FakeUserProfilePort(error=RuntimeError("simulated FloodWait")),
+        user_profile_port=port,
         channel_profile_port=LoudChannelProfilePort(),
     )
+    await acquire_entity_profile(
+        server._get_entity_info_service(), 77, {"id": 77, "type": "user", "name": "Known user"}
+    )
+    _assert_failed_profile_is_retryable(conn, 77)
+    changes = conn.total_changes
+    calls = list(port.calls)
 
     r = await server._dispatch({"method": "get_entity_info", "entity_id": 77})
 
     assert r["ok"] is True, f"expected ok=True despite degraded fetch, got {r}"
 
-    # entities row written (auto-resolve still works)
+    # Identity existed before acquisition and remains locally readable.
     ent = cast(tuple[int] | None, conn.execute("SELECT id FROM entities WHERE id = 77").fetchone())
-    assert ent is not None, "entities row should be written even on degraded fetch"
+    assert ent is not None
 
     # entity_details row NOT written (degraded response must not be cached)
     detail = cast(
         tuple[int] | None, conn.execute("SELECT entity_id FROM entity_details WHERE entity_id = 77").fetchone()
     )
     assert detail is None, "entity_details must NOT be written when the user profile request fails"
+    assert conn.total_changes == changes
+    assert len(calls) == 1
+    assert port.calls == calls
+    cast(AsyncMock, client.get_entity).assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_channel_degraded_full_fetch_skips_entity_details_cache() -> None:
-    """WR-05: channel profile observation raises → full_channel_ok=False →
-    entity_details row NOT written."""
+async def test_channel_failed_acquisition_keeps_identity_without_fresh_detail() -> None:
+    """Failed channel acquisition does not cache invented full-profile fields."""
     conn = _make_db()
-    chan = _channel(id_=-3001, admin=False)
     client = AsyncMock()
-    client.get_entity = AsyncMock(return_value=chan)
-    client.side_effect = [MagicMock(count=0, messages=[])]
+    port = _FailingChannelProfilePort(-3001, RuntimeError("simulated profile failure"))
 
     server = _make_server(
         conn=conn,
         client=client,
-        channel_profile_port=_FailingChannelProfilePort(-3001, RuntimeError("simulated flood")),
+        channel_profile_port=port,
     )
+    await acquire_entity_profile(
+        server._get_entity_info_service(), -3001, {"id": -3001, "type": "channel", "name": "Known channel"}
+    )
+    _assert_failed_profile_is_retryable(conn, -3001)
+    changes = conn.total_changes
 
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -3001})
 
@@ -398,3 +365,7 @@ async def test_channel_degraded_full_fetch_skips_entity_details_cache() -> None:
         tuple[int] | None, conn.execute("SELECT entity_id FROM entity_details WHERE entity_id = -3001").fetchone()
     )
     assert detail is None, "entity_details must NOT be written when the channel profile observation fails"
+    assert conn.total_changes == changes
+    assert port.profile_calls == 1
+    assert port.overlap_calls == 0
+    cast(AsyncMock, client.get_entity).assert_not_awaited()

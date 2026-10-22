@@ -16,7 +16,8 @@ from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 82
+_CURRENT_SCHEMA_VERSION = 83
+_PROFILE_FIELD_OBSERVATIONS_MIGRATION = 83
 _REACTION_VISIBILITY_MIGRATION = 82
 _HISTORY_PEER_FAIRNESS_MIGRATION = 81
 _MESSAGE_OBSERVATION_MIGRATION = 80
@@ -4732,6 +4733,26 @@ def _apply_migration_82(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
+def _apply_migration_83(conn: sqlite3.Connection, current: int) -> int:
+    """Order profile field updates without duplicating canonical values."""
+    return _apply_migration(
+        conn,
+        current,
+        _PROFILE_FIELD_OBSERVATIONS_MIGRATION,
+        [
+            (
+                "CREATE TABLE IF NOT EXISTS entity_profile_field_observations ("
+                "entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE, "
+                "field TEXT NOT NULL, owner_account_id INTEGER NOT NULL, "
+                "observation_order INTEGER NOT NULL CHECK (observation_order > 0), "
+                "observed_at INTEGER NOT NULL, "
+                "source TEXT NOT NULL CHECK (source IN ('rpc', 'update', 'min')), "
+                "PRIMARY KEY (entity_id, field)) WITHOUT ROWID"
+            )
+        ],
+    )
+
+
 def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
     """Apply the conditional current-schema migration tail."""
     if _CURRENT_SCHEMA_VERSION >= _ENTITY_PROFILE_ACQUISITION_MIGRATION_61:
@@ -4743,6 +4764,11 @@ def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
     current = _apply_migrations_64_to_67(conn, current)
     current = _apply_migrations_68_to_71(conn, current)
     current = _apply_migrations_72_to_76(conn, current)
+    return _apply_migrations_77_to_83(conn, current)
+
+
+def _apply_migrations_77_to_83(conn: sqlite3.Connection, current: int) -> int:
+    """Apply durable observation and lifecycle metadata migrations."""
     if _CURRENT_SCHEMA_VERSION >= _LINKED_CHAT_FACT_DEMAND_MIGRATION:
         current = _apply_migration_77(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _DIALOG_IDENTITY_OWNER_MIGRATION:
@@ -4755,6 +4781,8 @@ def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
         current = _apply_migration_81(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _REACTION_VISIBILITY_MIGRATION:
         current = _apply_migration_82(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _PROFILE_FIELD_OBSERVATIONS_MIGRATION:
+        current = _apply_migration_83(conn, current)
     return current
 
 
