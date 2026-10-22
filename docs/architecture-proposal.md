@@ -134,10 +134,10 @@ Current implementation debt is tracked explicitly:
 
 | Work | Known departure | Delivery |
 | --- | --- | --- |
-| Non-DM profiles | Reads expose retained facts or explicit partial coverage; automatic acquisition ownership for never-collected group/channel profiles is not supplied by the DM slice | [#382](https://github.com/j2h4u/mcp-telegram/issues/382), following [#381](https://github.com/j2h4u/mcp-telegram/issues/381) |
-| Startup and offline availability | Telegram/startup readiness currently limits local serving; no whole-process offline guarantee is made | [#374 audit](https://github.com/j2h4u/mcp-telegram/issues/374), lifecycle design tracked in [#382](https://github.com/j2h4u/mcp-telegram/issues/382) |
+| Non-DM profiles | Reads expose retained facts or explicit partial coverage; automatic acquisition ownership for never-collected group/channel profiles is not supplied by the DM slice | WorkGraph `TG-91`, including completed DM-profile delivery evidence |
+| Startup and offline availability | Telegram/startup readiness currently limits local serving; no whole-process offline guarantee is made | Planned startup investigation `TG-90`; lifecycle design tracked in `TG-91` |
 
-The [delivery tracker](https://github.com/j2h4u/mcp-telegram/issues/382) separates
+The WorkGraph delivery tracker `TG-91` separates
 these changes from COMMIT performance and broader replay reliability research.
 Do not report this contract as fully implemented after a documentation change
 or only the profile slice. Tests for ordinary reads must forbid network calls
