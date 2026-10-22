@@ -34,8 +34,6 @@ from mcp_telegram.entity_profile.contracts import (
     CommonChatsObservation,
     GroupReference,
     ObservationBoundary,
-    PersonalChannelPost,
-    PersonalChannelReference,
     ProjectionStatus,
     TargetKind,
     UserAvatarHistoryObservation,
@@ -99,11 +97,6 @@ class _UserProfilePort:
             target_kind=target_kind,
             observation=ObservationBoundary(100.0, 100.0),
         )
-
-    async def fetch_personal_channel_post(
-        self, reference: PersonalChannelReference, message_id: int
-    ) -> PersonalChannelPost | None:
-        raise AssertionError(f"personal channel post fetch is not part of progressive tests: {reference}/{message_id}")
 
 
 class _UnusedClient:
@@ -183,38 +176,7 @@ def test_local_core_has_pending_sections_without_rpc() -> None:
 
 
 @pytest.mark.asyncio
-async def test_refresh_coordinator_coalesces_waiters_until_durable_terminal_signal() -> None:
-    coordinator = EntityRefreshCoordinator(limits=RefreshLimits(max_queued_refreshes=2))
-    assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
-    assert coordinator.enqueue(42) is RefreshEnqueueResult.COALESCED
-    assert coordinator.queue_depth == 1
-
-    waiter = asyncio.create_task(coordinator.wait_for_completion(42, 1.0))
-    await asyncio.sleep(0)
-    assert not waiter.done()
-
-    coordinator.signal_terminal(DurableRefreshSliceResult(42, DurableRefreshTerminal.SUCCESS))
-    assert await waiter is True
-    assert coordinator.queue_depth == 0
-    await coordinator.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_refresh_coordinator_waits_for_single_flight_completion() -> None:
-    coordinator = EntityRefreshCoordinator()
-    assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
-    waiter = asyncio.create_task(coordinator.wait_for_completion(42, 1.0))
-    await asyncio.sleep(0)
-    assert not waiter.done()
-
-    await coordinator.shutdown()
-    assert await waiter is False
-    assert coordinator.queue_depth == 0
-    assert coordinator.enqueue(43) is RefreshEnqueueResult.REJECTED
-
-
-@pytest.mark.asyncio
-async def test_get_entity_info_waits_for_fresh_profile_after_cache_miss() -> None:
+async def test_get_entity_info_returns_local_stub_without_waiting_or_acquiring() -> None:
     conn = sqlite3.connect(":memory:")
     with write_savepoint(conn):
         conn.execute(
@@ -228,40 +190,19 @@ async def test_get_entity_info_waits_for_fresh_profile_after_cache_miss() -> Non
     _sections_schema(conn)
     with write_savepoint(conn):
         conn.execute("INSERT INTO entities VALUES (42, 'User', 'Local User', 'local', NULL, 100)")
-    limits = RefreshLimits(foreground_refresh_wait_seconds=0.1)
-    service = _test_service(conn, limits=limits)
+    service = _test_service(conn, limits=RefreshLimits(foreground_refresh_wait_seconds=0.1))
     service._deps = replace(service._deps, get_dialog_placement=lambda _entity_id: {})
-
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    adapter = EntityProfileDemandAdapter(coordinator)
-
-    def status(_now: float) -> DemandStatus:
-        return DemandStatus(release_at=0.0)
-
-    async def run_slice(_budget: RpcAttemptBudget) -> DurableRefreshSliceResult:
-        service._profiles.save_core({"id": 42, "type": "user", "name": "Fresh User"}, now=100)
-        service._profiles.mark_pending(42, now=100)
-        while (cursor := service._profiles.next_due_refresh(now=100)) is not None:
-            status = "not_applicable" if cursor.next_section == "contact_overlap" else "fresh"
-            assert service._profiles.commit_section(
-                cursor,
-                EntitySectionCommit({"name": "Fresh User"}, status=status),
-                now=100,
-            )
-        return DurableRefreshSliceResult(42, DurableRefreshTerminal.SUCCESS)
-
-    coordinator.bind_durable_executor(status, run_slice)
-    request = asyncio.create_task(service.get_entity_info({"entity_id": 42}))
-    await asyncio.sleep(0)
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
-    result = await request
-
+    before = conn.total_changes
+    result = await service.get_entity_info({"entity_id": 42})
     data = cast(dict[str, object], result["data"])
     sections = cast(dict[str, dict[str, object]], data["sections"])
-    assert data["name"] == "Fresh User"
-    assert sections["full_profile"]["status"] == "fresh"
-    assert sections["common_chats"]["status"] == "fresh"
+    assert data["name"] == "Local User"
+    assert data["completeness"] == "partial"
+    assert sections["full_profile"]["reason"] == "not_observed"
+    assert coordinator.queue_depth == 0
+    assert conn.total_changes == before
     await service.shutdown()
     conn.close()
 
@@ -281,127 +222,50 @@ async def test_refresh_coordinator_reports_coalescing_and_queue_saturation() -> 
 
 
 @pytest.mark.asyncio
-async def test_rejected_refresh_is_not_reported_as_queued() -> None:
+async def test_local_projection_does_not_reject_persisted_work_when_waiter_queue_is_full() -> None:
     conn = sqlite3.connect(":memory:")
-    with write_savepoint(conn):
-        conn.execute(
-            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+    _apply_migrations(conn)
+    conn.commit()
+    service = _test_service(conn, limits=RefreshLimits(max_queued_refreshes=1))
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    coordinator.enqueue(99)
+    service._profiles.save_core({"id": 42, "type": "user", "name": "Known"}, now=100)
+    service._profiles.mark_pending(42, now=100)
+    before = conn.total_changes
+    try:
+        result = await service.get_entity_info({"entity_id": 42})
+        assert result["ok"] is True
+        assert conn.total_changes == before
+        assert coordinator.queue_depth == 1
+        assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
+            "pending",
         )
-    _sections_schema(conn)
-    service = _test_service(
-        conn,
-        limits=RefreshLimits(max_queued_refreshes=1),
-    )
-    service._deps = replace(service._deps, get_dialog_placement=lambda _entity_id: {})
-    assert service._refresh is not None
-    assert service._refresh.enqueue(99) is RefreshEnqueueResult.QUEUED
-
-    result = await service._progressive_result(
-        42,
-        {"id": 42, "type": "user", "name": "Queued"},
-        {section: {"status": "pending", "reason": "refresh_queued"} for section in PROFILE_SECTIONS},
-        now=100,
-    )
-
-    sections = cast(dict[str, dict[str, object]], cast(dict[str, object], result["data"])["sections"])
-    assert all(
-        section["status"] == "unavailable" and section["reason"] == "refresh_rejected" for section in sections.values()
-    )
-    assert service._profiles.refresh_state(42, now=100) == {
-        "status": "rejected",
-        "retry_at": None,
-        "reason": "refresh_rejected",
-    }
-    rows = cast(
-        list[tuple[str | None]],
-        conn.execute("SELECT reason FROM entity_detail_sections WHERE entity_id = 42").fetchall(),
-    )
-    assert {row[0] for row in rows} == {"refresh_rejected"}
-    status_rows = cast(
-        list[tuple[str | None]],
-        conn.execute("SELECT status FROM entity_detail_sections WHERE entity_id = 42").fetchall(),
-    )
-    assert {row[0] for row in status_rows} == {"unavailable"}
-    await service.shutdown()
-    conn.close()
+    finally:
+        await service.shutdown()
+        conn.close()
 
 
 @pytest.mark.asyncio
-async def test_progressive_miss_persists_rejected_admission() -> None:
+async def test_self_snapshot_remains_local_when_waiter_queue_is_full() -> None:
     conn = sqlite3.connect(":memory:")
-    with write_savepoint(conn):
-        conn.execute(
-            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-        )
-    _sections_schema(conn)
-    service = _test_service(
-        conn,
-        limits=RefreshLimits(max_queued_refreshes=1),
-    )
-    service._deps = replace(
-        service._deps,
-        get_peer_id=lambda value: int(value.id),
-        get_dialog_placement=lambda _entity_id: {},
-    )
-    entity = SimpleNamespace(id=42, first_name="Rejected", username="rejected")
-
-    async def resolve(_entity_id: int) -> tuple[object, None]:
-        return entity, None
-
-    service._resolve_entity = resolve  # type: ignore[method-assign]
-    assert service._refresh is not None
-    assert service._refresh.enqueue(99) is RefreshEnqueueResult.QUEUED
-
-    result = await service._progressive_miss(42, now=100, started_at=100)
-    sections = cast(dict[str, dict[str, object]], cast(dict[str, object], result["data"])["sections"])
-    assert all(
-        section["status"] == "unavailable" and section["reason"] == "refresh_rejected" for section in sections.values()
-    )
-    assert service._profiles.refresh_state(42, now=100) == {
-        "status": "rejected",
-        "retry_at": None,
-        "reason": "refresh_rejected",
-    }
-    await service.shutdown()
-    conn.close()
-
-
-@pytest.mark.asyncio
-async def test_self_profile_rejection_persists_unavailable_sections() -> None:
-    conn = sqlite3.connect(":memory:")
-    with write_savepoint(conn):
-        conn.execute(
-            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-        )
-    _sections_schema(conn)
-    service = _test_service(
-        conn,
-        limits=RefreshLimits(max_queued_refreshes=1),
-    )
-    service._deps = replace(
-        service._deps,
-        self_id=42,
-        self_profile={"first_name": "Self", "username": "self"},
-        get_dialog_placement=lambda _entity_id: {},
-    )
-    assert service._refresh is not None
-    assert service._refresh.enqueue(99) is RefreshEnqueueResult.QUEUED
-
-    result = await service._self_snapshot_result(42, now=100, started_at=100)
-    sections = cast(dict[str, dict[str, object]], cast(dict[str, object], result["data"])["sections"])
-    assert all(
-        section["status"] == "unavailable" and section["reason"] == "refresh_rejected" for section in sections.values()
-    )
-    rows = cast(
-        list[tuple[str | None, str | None]],
-        conn.execute("SELECT status, reason FROM entity_detail_sections WHERE entity_id = 42").fetchall(),
-    )
-    assert set(rows) == {("unavailable", "refresh_rejected")}
-    await service.shutdown()
-    conn.close()
+    _apply_migrations(conn)
+    conn.commit()
+    service = _test_service(conn, limits=RefreshLimits(max_queued_refreshes=1))
+    service._deps = replace(service._deps, self_id=42, self_profile={"first_name": "Self", "username": "self"})
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    coordinator.enqueue(99)
+    before = conn.total_changes
+    try:
+        result = await service.get_entity_info({"entity_id": 42})
+        assert result["ok"] is True
+        assert cast(dict[str, object], result["data"])["name"] == "Self"
+        assert conn.total_changes == before
+        assert conn.execute("SELECT entity_id FROM entity_detail_sections").fetchall() == []
+    finally:
+        await service.shutdown()
+        conn.close()
 
 
 def test_last_good_survives_refresh_failure() -> None:
@@ -413,14 +277,15 @@ def test_last_good_survives_refresh_failure() -> None:
         )
     with write_savepoint(conn):
         conn.execute(
-            "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+            "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL, "
+            "profile_owner_account_id INTEGER)"
         )
     _sections_schema(conn)
     with write_savepoint(conn):
         conn.execute("INSERT INTO entities VALUES (42, 'user', 'Good', 'good', NULL, 100)")
     with write_savepoint(conn):
         conn.execute(
-            "INSERT INTO entity_details VALUES (42, ?, 100)",
+            "INSERT INTO entity_details VALUES (42, ?, 100, 42)",
             (json.dumps({"schema": 1, "id": 42, "type": "user", "name": "Good", "common_chats": [{"id": 7}]}),),
         )
     repo = EntityProfileRepository(conn, section_ttl_seconds=300)
@@ -505,11 +370,8 @@ async def test_flood_wait_refresh_failure_signals_terminal_waiter_and_persists_r
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
-    waiter = asyncio.create_task(coordinator.wait_for_completion(42, 1.0))
-
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
 
-    assert await waiter is True
     retry_at = cast(
         tuple[int | None] | None,
         conn.execute("SELECT retry_at FROM entity_profile_refresh_state WHERE entity_id = 42").fetchone(),
@@ -537,7 +399,6 @@ def _test_service(conn: sqlite3.Connection, *, limits: RefreshLimits) -> DaemonE
             logger=logging.getLogger(__name__),
             now_provider=lambda: 100.0,
             detail_ttl_seconds=300,
-            slow_stage_seconds=1.0,
             user_profile_port=_UserProfilePort(_UnusedClient()),
             group_profile_port=LoudGroupProfilePort(),
             channel_profile_port=LoudChannelProfilePort(),
@@ -733,9 +594,7 @@ async def test_channel_profile_commit_publishes_linked_chat_fact_and_overlays_ca
         assert "linked_chat_id" not in stored.detail
         data = cast(
             dict[str, object],
-            (await service._progressive_result(-10042, stored.detail, stored.sections, now=100, admit_refresh=False))[
-                "data"
-            ],
+            (await service.get_entity_info({"entity_id": -10042}))["data"],
         )
         assert data["linked_chat_id"] == -1000000000777
         fact = linked_chat_fact_owner.read_fact(conn, -10042)
@@ -763,7 +622,7 @@ async def test_channel_progressive_link_overlay_replaces_stale_and_unresolved_wi
     try:
         stale = {"id": -10043, "type": DialogType.CHANNEL.value, "linked_chat_id": -10088}
         sections: dict[str, dict[str, object]] = {section: {"status": "fresh"} for section in PROFILE_SECTIONS}
-        result = await service._progressive_result(-10043, stale, sections, now=100, admit_refresh=False)
+        result = await service._progressive_result(-10043, stale, sections, now=100)
         assert cast(dict[str, object], result["data"])["linked_chat_id"] is None
     finally:
         await service.shutdown()
@@ -807,11 +666,8 @@ async def test_channel_profile_fact_publish_is_fenced_by_newer_dialog_revision()
 
 
 @pytest.mark.asyncio
-async def test_legacy_channel_detail_publishes_linked_chat_fact() -> None:
-    from types import SimpleNamespace
-
+async def test_durable_channel_adapter_publishes_linked_chat_fact_after_commit() -> None:
     service, conn, port = _channel_profile_service(channel_id=-10048, linked_chat_id=None)
-    service._deps = replace(service._deps, get_peer_id=lambda entity: cast(int, entity.id))
     offered: list[DemandKind] = []
 
     class RecordingSink:
@@ -821,7 +677,6 @@ async def test_legacy_channel_detail_publishes_linked_chat_fact() -> None:
             return True
 
     service.bind_demand_sink(RecordingSink())
-
     fetch_profile = port.fetch_channel_profile
 
     async def check_committed_capture(reference: ChannelReference) -> ChannelProfileObservation:
@@ -829,32 +684,30 @@ async def test_legacy_channel_detail_publishes_linked_chat_fact() -> None:
         return await fetch_profile(reference)
 
     port.fetch_channel_profile = check_committed_capture  # type: ignore[method-assign]
-
-    async def no_avatar_history(_reference: object, *, current_photo: object = None) -> tuple[list[object], int]:
-        del _reference, current_photo
-        return [], 0
-
-    service._search_chat_photo_history = no_avatar_history  # type: ignore[method-assign]
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
     try:
-        detail = await service._fetch_channel_detail(
-            SimpleNamespace(
-                id=-10048, title="Channel", username="channel", creator=False, admin_rights=None, left=False
-            )
-        )
-        assert detail["linked_chat_id"] == -1000000000777
+        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
         assert conn.execute(
-            "SELECT linked_chat_id, linked_chat_resolved_at FROM dialogs WHERE dialog_id=?", (-10048,)
+            "SELECT linked_chat_id, linked_chat_resolved_at FROM dialogs WHERE dialog_id=-10048"
         ).fetchone() == (-1000000000777, 100)
         assert offered == [DemandKind.SCHEDULED_DISCOVERY, DemandKind.COLD_PEER_PAGE]
+        assert port.profile_calls == [-1000000010048]
+        section = cast(
+            tuple[object, ...] | None,
+            conn.execute(
+                "SELECT status FROM entity_detail_sections WHERE entity_id=-10048 AND section='full_profile'"
+            ).fetchone(),
+        )
+        assert section == ("fresh",)
     finally:
         await service.shutdown()
         conn.close()
 
 
 @pytest.mark.asyncio
-async def test_legacy_profile_publication_wakes_cold_adapter_for_local_link_enrollment() -> None:
+async def test_durable_profile_publication_wakes_cold_adapter_for_local_link_enrollment() -> None:
     from time import time
-    from types import SimpleNamespace
 
     from mcp_telegram.activity_cold_backfill import (
         ColdBackfillHistoryPacing,
@@ -903,6 +756,8 @@ async def test_legacy_profile_publication_wakes_cold_adapter_for_local_link_enro
         channel_reference_provider=port,
         get_peer_id=lambda _entity: channel_id,
     )
+    service._profiles.save_core({"id": channel_id, "type": "channel", "name": "Channel"}, now=100)
+    service._profiles.mark_pending(channel_id, now=100)
     offered: list[DemandKind] = []
 
     class RecordingSink:
@@ -912,12 +767,6 @@ async def test_legacy_profile_publication_wakes_cold_adapter_for_local_link_enro
             return True
 
     service.bind_demand_sink(RecordingSink())
-
-    async def no_avatar_history(_reference: object, *, current_photo: object = None) -> tuple[list[object], int]:
-        del _reference, current_photo
-        return [], 0
-
-    service._search_chat_photo_history = no_avatar_history  # type: ignore[method-assign]
 
     class NoRpcClient:
         def __init__(self) -> None:
@@ -935,16 +784,9 @@ async def test_legacy_profile_publication_wakes_cold_adapter_for_local_link_enro
 
     client = NoRpcClient()
     try:
-        await service._fetch_channel_detail(
-            SimpleNamespace(
-                id=channel_id,
-                title="Channel",
-                username="channel",
-                creator=False,
-                admin_rights=None,
-                left=False,
-            )
-        )
+        coordinator = service.refresh_coordinator
+        assert coordinator is not None
+        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
         assert offered == [DemandKind.SCHEDULED_DISCOVERY, DemandKind.COLD_PEER_PAGE]
 
         adapter = ColdPeerPageDemandAdapter(
@@ -1297,41 +1139,34 @@ async def test_durable_profile_budget_exhaustion_leaves_core_cursor_ready() -> N
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
-    waiter = asyncio.create_task(coordinator.wait_for_completion(42, 1.0))
-
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
 
-    assert not waiter.done()
     assert conn.execute(
         "SELECT status, retry_at, next_section, acquisition_cursor FROM entity_profile_refresh_state WHERE entity_id=42"
     ).fetchone() == ("pending", None, "full_profile", 0)
     assert conn.execute("SELECT COUNT(*) FROM entities").fetchone() == (0,)
     await service.shutdown()
-    assert await waiter is False
     conn.close()
 
 
 @pytest.mark.asyncio
-async def test_entity_info_foreground_entrypoint_sets_rpc_source() -> None:
+async def test_entity_info_entrypoint_returns_local_facts_without_rpc_scope() -> None:
     conn = sqlite3.connect(":memory:")
+    _apply_migrations(conn)
+    conn.commit()
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities(id,type,name,updated_at) VALUES (42,'user','Known',100)")
     service = _test_service(conn, limits=RefreshLimits())
-    observed: list[tuple[TelegramRpcSource, DemandKind, AcquisitionKind | None]] = []
-
-    async def implementation(_req: object) -> dict[str, object]:
-        scope = current_rpc_scope()
-        assert scope.demand_kind is not None
-        observed.append((scope.source, scope.demand_kind, scope.acquisition_kind))
-        return {"ok": True}
-
-    service._get_entity_info = implementation  # type: ignore[method-assign]
-    assert await service.get_entity_info({"entity_id": 42}) == {"ok": True}
-    assert observed == [
-        (
-            TelegramRpcSource.ENTITY_INFO_FOREGROUND,
-            DemandKind.FOREGROUND_ENTITY_FACTS,
-            AcquisitionKind.ENTITY_LOOKUP,
-        )
-    ]
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    before = conn.total_changes
+    result = await service.get_entity_info({"entity_id": 42})
+    assert result["ok"] is True
+    data = cast(dict[str, object], result["data"])
+    assert data["name"] == "Known"
+    assert data["completeness"] == "partial"
+    assert coordinator.queue_depth == 0
+    assert conn.total_changes == before
     await service.shutdown()
     conn.close()
 
@@ -1456,24 +1291,32 @@ async def test_core_projection_uses_full_user_name_and_local_placement() -> None
 
 
 @pytest.mark.asyncio
-async def test_expected_enrichment_timeout_does_not_emit_traceback(caplog: pytest.LogCaptureFixture) -> None:
+async def test_durable_enrichment_timeout_persists_retry_without_traceback(caplog: pytest.LogCaptureFixture) -> None:
     class TimeoutClient:
         async def __call__(self, _request: object) -> object:
             raise TimeoutError
 
     conn = sqlite3.connect(":memory:")
+    _apply_migrations(conn)
+    conn.commit()
     service = _test_service(conn, limits=RefreshLimits())
-    service._deps = replace(
-        service._deps,
-        client=TimeoutClient(),
-        common_chats_port=ClientCommonChatsPort(TimeoutClient()),
-    )
-
-    with caplog.at_level(logging.WARNING):
-        assert await service._collect_common_chats(42) == []
-    assert caplog.records[-1].exc_info is False
-    await service.shutdown()
-    conn.close()
+    service._deps = replace(service._deps, common_chats_port=ClientCommonChatsPort(TimeoutClient()))
+    service._profiles.save_core({"id": 42, "type": "user", "name": "Known"}, now=100)
+    service._profiles.mark_pending(42, now=100)
+    with write_savepoint(conn):
+        conn.execute("UPDATE entity_profile_refresh_state SET next_section='common_chats' WHERE entity_id=42")
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    try:
+        with caplog.at_level(logging.WARNING):
+            await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        assert conn.execute(
+            "SELECT status, reason, retry_at FROM entity_detail_sections WHERE entity_id=42 AND section='common_chats'"
+        ).fetchone() == ("unavailable", "timeouterror", 160)
+        assert all(not record.exc_info for record in caplog.records)
+    finally:
+        await service.shutdown()
+        conn.close()
 
 
 @pytest.mark.asyncio
@@ -1746,7 +1589,8 @@ async def test_progressive_cached_avatar_projects_persisted_current_photo_withou
         )
     with write_savepoint(conn):
         conn.execute(
-            "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+            "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL, "
+            "profile_owner_account_id INTEGER)"
         )
     _sections_schema(conn)
     detail = {
@@ -1762,7 +1606,7 @@ async def test_progressive_cached_avatar_projects_persisted_current_photo_withou
             "INSERT INTO entities VALUES (?, ?, ?, NULL, NULL, 100)", (entity_id, entity_type, "Cached profile")
         )
     with write_savepoint(conn):
-        conn.execute("INSERT INTO entity_details VALUES (?, ?, 100)", (entity_id, json.dumps(detail)))
+        conn.execute("INSERT INTO entity_details VALUES (?, ?, 100, 42)", (entity_id, json.dumps(detail)))
     section_rows = {
         "full_profile": ("fresh", 100, None, {"current_photo": {"photo_id": 99, "date": None}}),
         "common_chats": ("fresh", 100, None, []),
@@ -1790,6 +1634,7 @@ async def test_progressive_cached_avatar_projects_persisted_current_photo_withou
         client=client,
         user_profile_port=_UserProfilePort(client),
         get_dialog_placement=lambda _entity_id: {},
+        self_id=42,
     )
     try:
         result = await service.get_entity_info({"entity_id": entity_id})
@@ -1807,67 +1652,63 @@ async def test_progressive_cached_avatar_projects_persisted_current_photo_withou
 
 
 @pytest.mark.asyncio
-async def test_unknown_core_timeout_enqueues_background_resolution() -> None:
+async def test_durable_unknown_core_timeout_retains_cursor_and_retry_resolves_identity() -> None:
+    class TimeoutThenResolve(_UnusedClient):
+        calls = 0
+
+        async def get_entity(self, entity_id: int) -> object:
+            self.calls += 1
+            if self.calls == 1:
+                await asyncio.sleep(1)
+            return User(id=entity_id, first_name="Known", username="known")
+
     conn = sqlite3.connect(":memory:")
-    with write_savepoint(conn):
-        conn.execute(
-            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-        )
-    _sections_schema(conn)
-    calls = 0
-    entity = SimpleNamespace(id=42, first_name="Known", username="known")
-
-    async def resolve(_entity_id: int) -> tuple[object, None]:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            await asyncio.sleep(1)
-        return entity, None
-
+    _apply_migrations(conn)
+    conn.commit()
+    client = TimeoutThenResolve()
     service = _test_service(conn, limits=RefreshLimits(0.01, 0.02, 0.05, 1))
-    service._deps = replace(service._deps, get_peer_id=lambda value: int(value.id))
-    service._resolve_entity = resolve  # type: ignore[method-assign]
-    pending = await service._progressive_miss(42, now=100, started_at=100)
-    assert pending["error"] == "entity_info_pending"
+    service._deps = replace(service._deps, client=client, get_peer_id=lambda value: int(value.id))
+    service._profiles.mark_pending(42, now=100)
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
-    await service.shutdown()
-    assert conn.execute("SELECT type, name FROM entities WHERE id=42").fetchone() == ("user", "Known")
-    conn.close()
+    adapter = EntityProfileDemandAdapter(coordinator)
+    try:
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        assert service._profiles.next_due_refresh(now=100) is None
+        due = service._profiles.next_due_refresh(now=160)
+        assert due is not None and due.acquisition_cursor == 0
+        service._deps = replace(service._deps, now_provider=lambda: 160.0)
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        assert conn.execute("SELECT type,name FROM entities WHERE id=42").fetchone() == ("user", "Known")
+        assert client.calls == 2
+    finally:
+        await service.shutdown()
+        conn.close()
 
 
 @pytest.mark.asyncio
-async def test_unknown_core_flood_wait_is_durable_without_fake_entity_row() -> None:
+async def test_durable_unknown_core_flood_wait_does_not_invent_identity() -> None:
+    class FloodResolve(_UnusedClient):
+        async def get_entity(self, entity_id: int) -> object:
+            raise TelegramRpcThrottled(retry_after_seconds=7)
+
     conn = sqlite3.connect(":memory:")
-    with write_savepoint(conn):
-        conn.execute(
-            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-        )
-    _sections_schema(conn)
-    service = _test_service(conn, limits=RefreshLimits(0.01, 0.02, 0.05, 1))
-    calls = 0
-
-    async def resolve(_entity_id: int) -> tuple[object, None]:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            await asyncio.sleep(1)
-        raise TelegramRpcThrottled(retry_after_seconds=7)
-
-    service._resolve_entity = resolve  # type: ignore[method-assign]
-    pending = await service._progressive_miss(42, now=100, started_at=100)
-    assert pending["error"] == "entity_info_pending"
+    _apply_migrations(conn)
+    conn.commit()
+    service = _test_service(conn, limits=RefreshLimits())
+    service._deps = replace(service._deps, client=FloodResolve())
+    service._profiles.mark_pending(42, now=100)
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
-    await service.shutdown()
-    assert conn.execute("SELECT COUNT(*) FROM entities").fetchone() == (0,)
-    state = service._profiles.refresh_state(42, now=100)
-    assert state == {"status": "failed", "retry_at": 107, "reason": "flood_wait"}
-    conn.close()
+    try:
+        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        assert conn.execute("SELECT type,name FROM entities WHERE id=42").fetchone() is None
+        assert conn.execute(
+            "SELECT status,retry_at,reason FROM entity_profile_refresh_state WHERE entity_id=42"
+        ).fetchone() == ("failed", 107, "flood_wait")
+    finally:
+        await service.shutdown()
+        conn.close()
 
 
 @pytest.mark.asyncio
@@ -1946,6 +1787,11 @@ async def test_entity_info_rejects_ids_outside_telethon_peer_domain_before_rpc(
     conn = sqlite3.connect(":memory:")
     with write_savepoint(conn):
         conn.execute(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+        )
+        conn.execute("INSERT INTO entities VALUES (42, 'user', 'Known', 'known', NULL, 100)")
+        conn.execute(
             "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
         )
     with write_savepoint(conn):
@@ -1957,83 +1803,74 @@ async def test_entity_info_rejects_ids_outside_telethon_peer_domain_before_rpc(
     demand_sink = MagicMock()
     service.bind_demand_sink(demand_sink)
     service._deps = replace(service._deps, client=client)
+    changes_before = conn.total_changes
 
     result = await service.get_entity_info({"entity_id": entity_id})
 
     assert result["ok"] is False
-    assert result["error"] == "entity_not_found"
-    assert client.entity_ids == ([entity_id] if should_reach_client else [])
+    assert result["error"] == ("entity_not_observed" if should_reach_client else "invalid_entity_id")
+    assert client.entity_ids == []
     assert demand_sink.call_count == 0
-    assert conn.total_changes == 0
+    assert conn.total_changes == changes_before
     await service.shutdown()
     conn.close()
 
 
 @pytest.mark.asyncio
-async def test_unknown_timeout_creates_fk_parent_before_refresh_rows(tmp_path: Path) -> None:
-    class TimeoutClient(_UnusedClient):
-        async def get_entity(self, entity_id: int) -> object:
-            del entity_id
-            await asyncio.sleep(1)
-            raise AssertionError("foreground timeout should cancel resolution")
-
+async def test_unknown_local_read_creates_no_fk_parent_or_refresh_rows(tmp_path: Path) -> None:
     path = tmp_path / "unknown-fk.sqlite"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA foreign_keys = ON")
-    service = _test_service(conn, limits=RefreshLimits(0.01, 0.02, 0.05, 1))
-    service._deps = replace(service._deps, client=TimeoutClient())
-
-    result = await service._progressive_miss(42, now=100, started_at=100)
-
-    assert result["error"] == "entity_info_pending"
-    assert conn.execute("SELECT type FROM entities WHERE id=42").fetchone() == ("unknown",)
-    assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == ("pending",)
-    assert conn.execute(
-        "SELECT COUNT(*) FROM entity_detail_sections WHERE entity_id=42 AND status='pending'"
-    ).fetchone() == (5,)
-    await service.shutdown()
-    conn.close()
+    service = _test_service(conn, limits=RefreshLimits())
+    before = conn.total_changes
+    try:
+        result = await service.get_entity_info({"entity_id": 42})
+        assert result["error"] == "entity_not_observed"
+        assert conn.total_changes == before
+        assert conn.execute("SELECT id FROM entities WHERE id=42").fetchone() is None
+        assert conn.execute("SELECT entity_id FROM entity_profile_refresh_state").fetchall() == []
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        await service.shutdown()
+        conn.close()
 
 
 @pytest.mark.asyncio
-async def test_unknown_timeout_then_terminal_not_found_stays_terminal_on_reread(tmp_path: Path) -> None:
-    class TimeoutThenNotFoundClient(_UnusedClient):
+async def test_durable_terminal_resolution_failure_does_not_make_local_read_retry(tmp_path: Path) -> None:
+    class NotFoundClient(_UnusedClient):
         calls = 0
 
         async def get_entity(self, entity_id: int) -> object:
-            del entity_id
             self.calls += 1
-            if self.calls == 1:
-                await asyncio.sleep(1)
             raise ValueError("entity no longer exists")
 
     path = tmp_path / "unknown-terminal.sqlite"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA foreign_keys = ON")
-    client = TimeoutThenNotFoundClient()
-    service = _test_service(conn, limits=RefreshLimits(0.01, 0.02, 0.05, 1))
+    client = NotFoundClient()
+    service = _test_service(conn, limits=RefreshLimits())
     service._deps = replace(service._deps, client=client)
+    assert service._profiles.ensure_unknown_refresh_parent(42, now=100)
+    service._profiles.mark_pending(42, now=100)
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-
-    pending = await service._progressive_miss(42, now=100, started_at=100)
-    assert pending["error"] == "entity_info_pending"
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
-    assert conn.execute("SELECT status, reason FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
-        "rejected",
-        "entity_not_found",
-    )
-
-    reread = await service.get_entity_info({"entity_id": 42})
-
-    assert reread["error"] == "entity_not_found"
-    assert "Action:" in str(reread["message"])
-    assert coordinator.queue_depth == 0
-    assert client.calls == 2
-    await service.shutdown()
-    conn.close()
+    try:
+        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        assert conn.execute("SELECT status,reason FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
+            "rejected",
+            "entity_not_found",
+        )
+        before = conn.total_changes
+        result = await service.get_entity_info({"entity_id": 42})
+        assert result["error"] == "entity_not_observed"
+        assert conn.total_changes == before
+        assert coordinator.queue_depth == 0
+        assert client.calls == 1
+    finally:
+        await service.shutdown()
+        conn.close()
 
 
 def test_refresh_rejection_is_fk_safe_without_unknown_parent(tmp_path: Path) -> None:
@@ -2197,33 +2034,23 @@ async def test_entity_acquisition_timeout_persists_retry_and_keeps_cursor(known:
 
 
 @pytest.mark.asyncio
-async def test_cancelled_entity_foreground_wait_keeps_persisted_refresh_enrollment() -> None:
+async def test_local_read_keeps_existing_durable_refresh_enrollment_unchanged() -> None:
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
     conn.commit()
     service = _test_service(conn, limits=RefreshLimits())
-    service._deps = replace(service._deps, get_dialog_placement=lambda _entity_id: {})
-    with write_savepoint(conn):
-        conn.execute("INSERT INTO entities(id,type,name,updated_at) VALUES (42,'user','Known',100)")
-    request = asyncio.create_task(service.get_entity_info({"entity_id": 42}))
-    coordinator = service.refresh_coordinator
-    assert coordinator is not None
-    async with asyncio.timeout(0.5):
-        while coordinator.queue_depth == 0:
-            await asyncio.sleep(0)
+    service._profiles.save_core({"id": 42, "type": "user", "name": "Known"}, now=100)
+    service._profiles.mark_pending(42, now=100)
     before = service._profiles.next_due_refresh(now=100)
     assert before is not None
-    request.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await request
-    after = service._profiles.next_due_refresh(now=100)
-    assert after is not None
-    assert (after.entity_id, after.generation, after.acquisition_cursor) == (
-        before.entity_id,
-        before.generation,
-        before.acquisition_cursor,
-    )
-    assert coordinator.queue_depth == 1
-    assert not coordinator.is_closed
-    await service.shutdown()
-    conn.close()
+    changes_before = conn.total_changes
+    try:
+        result = await service.get_entity_info({"entity_id": 42})
+        assert result["ok"] is True
+        assert service._profiles.next_due_refresh(now=100) == before
+        assert conn.total_changes == changes_before
+        coordinator = service.refresh_coordinator
+        assert coordinator is not None and coordinator.queue_depth == 0
+    finally:
+        await service.shutdown()
+        conn.close()

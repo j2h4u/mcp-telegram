@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -17,11 +15,9 @@ from mcp_telegram.daemon import capture_auth_scope
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
 from mcp_telegram.entity_profile.contracts import UserProfileObservation
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
-from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_transactions import write_savepoint
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind
-from tests.helpers import ClientCommonChatsPort
 from tests.test_entity_profile_full_user_pair import _pair_service, _PairClient, _prepare
 
 
@@ -46,53 +42,9 @@ def test_capture_scope_requires_positive_account_and_primary_key() -> None:
     assert capture_auth_scope(SimpleNamespace(id=42), SimpleNamespace(session=SimpleNamespace(dc_id=0))) is None
 
 
-@pytest.mark.parametrize(
-    "case",
-    [
-        (None, None, {"type": "user"}, False, False),
-        (lambda: _scope(), _scope().as_private_mapping(), {"type": "user"}, False, False),
-        (lambda: _scope(dc_id=3), _scope().as_private_mapping(), {"type": "user"}, False, True),
-        (lambda: _scope(account_id=7), _scope().as_private_mapping(), {"type": "user"}, False, True),
-        (lambda: None, _scope().as_private_mapping(), {"type": "user"}, False, True),
-        (lambda: _scope(), None, {"type": "user"}, False, True),
-        (lambda: _scope(), _scope().as_private_mapping(), [], False, False),
-        (lambda: _scope(), _scope().as_private_mapping(), {"type": "channel"}, False, False),
-        (lambda: _scope(), _scope().as_private_mapping(), {"type": "user"}, True, True),
-    ],
-)
-def test_profile_scope_changed_fences_only_stale_or_unavailable_pairs(
-    tmp_path: Path,
-    case: tuple[object, dict[str, object] | None, object, bool, bool],
-) -> None:
-    provider, stored_scope, detail, receipts_changed, expected = case
-    conn, raw_service = _prepare(tmp_path / f"scope-{expected}-{hash(str(detail))}.sqlite")
-    service = cast(DaemonEntityInfoService, raw_service)
-    service._deps = replace(service._deps, full_user_auth_scope=provider)  # type: ignore[arg-type]
-    service._profiles.pair_receipts_require_new_scope = MagicMock(return_value=receipts_changed)  # type: ignore[method-assign]
-    cached = SimpleNamespace(detail=detail, profile_observation_scope=stored_scope)
-
-    assert service._profile_scope_changed(cached, 42, now=100) is expected  # type: ignore[attr-defined]
-    conn.close()
-
-
-async def test_scope_change_preserves_cached_detail_and_hides_private_scope(tmp_path: Path) -> None:
-    conn, raw_service = _prepare(tmp_path / "scope-preserve.sqlite")
-    service = cast(DaemonEntityInfoService, raw_service)
-    service._deps = replace(service._deps, full_user_auth_scope=lambda: _scope())
-    cached = SimpleNamespace(detail={"id": 42, "type": "user", "name": "Target"}, profile_observation_scope=None)
-
-    assert service._profile_scope_changed(cached, 42, now=100) is True  # type: ignore[attr-defined]
-    result = cast(dict[str, object], await service._progressive_result(42, cached.detail, {}, now=100))  # type: ignore[attr-defined]
-    data = cast(dict[str, object], result["data"])
-
-    assert data["name"] == "Target"
-    assert "auth_scope" not in data
-    conn.close()
-
-
 @pytest.mark.asyncio
-async def test_scope_is_private_evidence_and_reuse_stops_at_ttl(tmp_path: Path) -> None:
-    conn, raw_service = _prepare(tmp_path / "scope.sqlite")
+async def test_scope_is_private_evidence_and_invalidated_pair_is_reacquired(tmp_path: Path) -> None:
+    conn, raw_service = _prepare(tmp_path / "scope.sqlite", migrated=True)
     service = cast(DaemonEntityInfoService, raw_service)
     scope = _scope()
     service._deps = replace(service._deps, full_user_auth_scope=lambda: scope)
@@ -124,23 +76,14 @@ async def test_scope_is_private_evidence_and_reuse_stops_at_ttl(tmp_path: Path) 
         )["full_profile"]
     )
 
-    with write_savepoint(conn):
-        conn.execute(
-            "UPDATE entity_profile_refresh_state SET status='pending', next_section='full_profile', acquisition_cursor=0 "
-            "WHERE entity_id=42"
-        )
-    conn.commit()
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
-    assert client.full_user_calls == 1
-
-    with write_savepoint(conn):
-        conn.execute("UPDATE entity_profile_refresh_state SET status='pending' WHERE entity_id=42")
-    with write_savepoint(conn):
-        conn.execute("UPDATE entity_profile_refresh_state SET next_section='full_profile' WHERE entity_id=42")
-    conn.commit()
-    service._deps = replace(service._deps, now_provider=lambda: 400.0)
+    service._profiles.request_section_refresh(42, ("full_profile", "personal_channel"), now=100, pair_mode="enabled")
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
     assert client.full_user_calls == 2
+
+    service._profiles.request_section_refresh(42, ("full_profile", "personal_channel"), now=400, pair_mode="enabled")
+    service._deps = replace(service._deps, now_provider=lambda: 400.0)
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    assert client.full_user_calls == 3
     await service.shutdown()
     conn.close()
 
@@ -235,19 +178,21 @@ async def test_ownership_invalid_cached_profile_admits_refresh_and_offers_demand
             "UPDATE entity_details SET profile_owner_account_id=NULL, profile_observation_scope_json=NULL "
             "WHERE entity_id=42"
         )
-    with write_savepoint(conn):
-        conn.execute("DELETE FROM entity_profile_refresh_state WHERE entity_id=42")
-    conn.commit()
+    before = cast(
+        tuple[object, ...] | None,
+        conn.execute("SELECT * FROM entity_profile_refresh_state WHERE entity_id=42").fetchone(),
+    )
 
-    result = await service._progressive_cached_result(42, now=100)  # type: ignore[attr-defined]
+    result = await service.get_entity_info({"entity_id": 42})
 
-    assert result is not None and result["error"] == "entity_info_pending"
-    assert coordinator.queue_depth == 1
-    assert sink.kinds == [DemandKind.ENTITY_PROFILE_REFRESH]
-    assert conn.execute(
-        "SELECT status, generation, next_section, acquisition_cursor FROM entity_profile_refresh_state "
-        "WHERE entity_id=42"
-    ).fetchone() == ("pending", 1, "full_profile", 0)
+    assert result["ok"] is True
+    data = cast(dict[str, object], result["data"])
+    assert data["name"] == "Target"
+    assert data["completeness"] == "partial"
+    assert "about" not in data and "phone" not in data
+    assert coordinator.queue_depth == 0
+    assert sink.kinds == []
+    assert conn.execute("SELECT * FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == before
 
     await service.shutdown()
     conn.close()
@@ -281,11 +226,15 @@ async def test_ownership_invalid_cached_profile_preserves_failed_retry_state(tmp
         ).fetchone(),
     )
 
-    result = await service._progressive_cached_result(42, now=100)  # type: ignore[attr-defined]
+    result = await service.get_entity_info({"entity_id": 42})
 
-    assert result is not None and result["error"] == "entity_info_pending"
-    assert coordinator.queue_depth == 1
-    assert sink.kinds == [DemandKind.ENTITY_PROFILE_REFRESH]
+    assert result["ok"] is True
+    data = cast(dict[str, object], result["data"])
+    assert data["name"] == "Target"
+    assert data["completeness"] == "partial"
+    assert "about" not in data and "phone" not in data
+    assert coordinator.queue_depth == 0
+    assert sink.kinds == []
     assert (
         conn.execute(
             "SELECT status, retry_at, reason, generation, started_at, next_section, acquisition_cursor "
@@ -299,7 +248,7 @@ async def test_ownership_invalid_cached_profile_preserves_failed_retry_state(tmp
 
 
 @pytest.mark.asyncio
-async def test_public_wait_reread_does_not_requeue_flooded_refresh(tmp_path: Path) -> None:
+async def test_public_local_read_does_not_requeue_failed_refresh(tmp_path: Path) -> None:
     conn, raw_service = _prepare(tmp_path / "ownership-reread.sqlite", migrated=True)
     service = cast(DaemonEntityInfoService, raw_service)
     coordinator = service.refresh_coordinator
@@ -307,62 +256,29 @@ async def test_public_wait_reread_does_not_requeue_flooded_refresh(tmp_path: Pat
 
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
     with write_savepoint(conn):
-        conn.execute(
-            "UPDATE entity_profile_refresh_state SET status='complete', next_section='personal_channel' WHERE entity_id=42"
-        )
-    with write_savepoint(conn):
-        conn.execute(
-            "UPDATE entity_detail_sections SET acquisition_generation=NULL, acquisition_outcome=NULL, "
-            "provenance_json=NULL, normalization_version=NULL, observation_started_at=NULL, "
-            "observation_completed_at=NULL, acquisition_identity_json=NULL, observed_at=0 "
-            "WHERE entity_id=42 AND section IN ('full_profile', 'personal_channel')"
-        )
-    service._profiles.mark_pending(42, now=100)  # type: ignore[attr-defined]
-    with write_savepoint(conn):
-        conn.execute(
-            "UPDATE entity_details SET profile_owner_account_id=NULL, profile_observation_scope_json=NULL "
-            "WHERE entity_id=42"
-        )
-    conn.commit()
-
-    class RecoveryClient(_PairClient):
-        async def __call__(self, request: object) -> object:
-            request_name = cast(tuple[str, object], request)[0]
-            if request_name == "common_chats":
-                raise TelegramRpcThrottled(retry_after_seconds=777)
-            return await super().__call__(request)
-
-    recovery_client = RecoveryClient()
-    service._deps = replace(
-        service._deps,
-        client=recovery_client,
-        common_chats_port=ClientCommonChatsPort(recovery_client),
-    )
-    request = asyncio.create_task(service.get_entity_info({"entity_id": 42}))
-    await asyncio.sleep(0)
-    assert coordinator.queue_depth == 1
-
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
-    assert coordinator.queue_depth == 1
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
-    failed_state = cast(
+        conn.execute("UPDATE entity_profile_refresh_state SET status='failed', retry_at=877, reason='flood_wait'")
+    before = cast(
         tuple[object, ...] | None,
         conn.execute(
             "SELECT status, retry_at, generation, next_section, acquisition_cursor "
             "FROM entity_profile_refresh_state WHERE entity_id=42"
         ).fetchone(),
     )
-    assert failed_state == ("failed", 877, 2, "common_chats", 0)
+    client = cast(_PairClient, service._deps.client)
+    calls_before = client.full_user_calls
 
-    result = await request
+    result = await service.get_entity_info({"entity_id": 42})
 
     assert result["ok"] is True
+    assert cast(dict[str, object], result["data"])["about"] == "about"
+    assert coordinator.queue_depth == 0
+    assert client.full_user_calls == calls_before
     assert (
         conn.execute(
             "SELECT status, retry_at, generation, next_section, acquisition_cursor "
             "FROM entity_profile_refresh_state WHERE entity_id=42"
         ).fetchone()
-        == failed_state
+        == before
     )
     await service.shutdown()
     conn.close()
@@ -370,7 +286,7 @@ async def test_public_wait_reread_does_not_requeue_flooded_refresh(tmp_path: Pat
 
 @pytest.mark.asyncio
 async def test_scope_change_during_rpc_rejects_receipt_and_progress(tmp_path: Path) -> None:
-    conn, raw_service = _prepare(tmp_path / "scope-change.sqlite")
+    conn, raw_service = _prepare(tmp_path / "scope-change.sqlite", migrated=True)
     service = cast(DaemonEntityInfoService, raw_service)
     first, second = _scope(), _scope(auth_key_id=100)
     current = [first]
@@ -402,28 +318,26 @@ async def test_scope_change_during_rpc_rejects_receipt_and_progress(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_auth_scope_change_starts_new_generation_and_keeps_old_facts(tmp_path: Path) -> None:
-    conn, raw_service = _prepare(tmp_path / "scope-generation.sqlite")
+async def test_same_account_scope_rotation_keeps_local_facts_without_mutation(tmp_path: Path) -> None:
+    conn, raw_service = _prepare(tmp_path / "scope-generation.sqlite", migrated=True)
     service = cast(DaemonEntityInfoService, raw_service)
-    scope = _scope()
-    service._deps = replace(service._deps, full_user_auth_scope=lambda: scope)
+    current_scope = [_scope()]
+    service._deps = replace(service._deps, full_user_auth_scope=lambda: current_scope[0])
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
-    generation_row = cast(
-        tuple[int],
-        conn.execute("SELECT generation FROM entity_profile_refresh_state WHERE entity_id=42").fetchone(),
-    )
-    generation = generation_row[0]
-    with write_savepoint(conn):
-        conn.execute(
-            "UPDATE entity_profile_refresh_state SET status='complete', next_section='personal_channel' WHERE entity_id=42"
-        )
-    conn.commit()
-    await service.auth_scope_changed()  # type: ignore[attr-defined]
-    assert conn.execute(
-        "SELECT status, generation, pair_eligible FROM entity_profile_refresh_state WHERE entity_id=42"
-    ).fetchone() == ("pending", generation + 1, 1)
-    assert "about" in cast(str, conn.execute("SELECT detail_json FROM entity_details WHERE entity_id=42").fetchone()[0])
+    before = {
+        table: conn.execute(f"SELECT * FROM {table} WHERE entity_id=42").fetchall()
+        for table in ("entity_details", "entity_detail_sections", "entity_profile_refresh_state")
+    }
+    current_scope[0] = _scope(auth_key_id=100)
+
+    result = await service.get_entity_info({"entity_id": 42})
+
+    assert result["ok"] is True
+    assert cast(dict[str, object], result["data"])["about"] == "about"
+    assert coordinator.queue_depth == 0
+    assert {table: conn.execute(f"SELECT * FROM {table} WHERE entity_id=42").fetchall() for table in before} == before
+    assert "auth_scope" not in str(result)
     await service.shutdown()
     conn.close()

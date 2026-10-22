@@ -275,7 +275,7 @@ async def test_registered_remote_topic_miss_crosses_gate_ipc_client_and_server(
 
 
 @pytest.mark.asyncio
-async def test_registered_entity_profile_pending_projects_manual_protection_error_over_ipc(
+async def test_registered_entity_profile_pending_keeps_partial_identity_under_protection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -302,17 +302,11 @@ async def test_registered_entity_profile_pending_projects_manual_protection_erro
         sync_conn.close()
         feedback_conn.close()
 
-    assert result.is_error is True
+    assert result.is_error is False
     payload = cast(dict[str, object], result.structured_content)
-    error = cast(dict[str, object], payload["error"])
-    details = cast(dict[str, object], error["details"])
-    assert error["code"] == "flood_wait_kill_switch_open"
-    assert error["message"] == "Telegram acquisition is blocked by account protection."
-    assert error["action"] == "Recovery requires operator action."
-    assert "retry" not in cast(str, error["action"]).lower()
-    assert details["required_action"] == "manual_operator_recovery"
-    assert details["retryable"] is False
-    assert "retry_after" not in details
+    assert payload["completeness"] == "partial"
+    assert payload["display_name"] == "Target"
+    assert cast(dict[str, object], payload["account_protection"])["status"] == "active"
     assert cast(dict[str, object], payload["account_protection"]) == {
         "status": "active",
         "outbound_acquisition": "blocked",
@@ -368,7 +362,7 @@ async def test_registered_entity_info_keeps_owned_partial_cache_success_under_pr
     assert payload["completeness"] == "partial"
     assert cast(dict[str, object], payload["sections"])["common_chats"] == {
         "status": "pending",
-        "reason": "refresh_queued",
+        "reason": "profile_owner_unverified",
     }
     assert cast(dict[str, object], payload["account_protection"])["status"] == "active"
     assert mcp_server.tool_by_name["get_entity_info"].output_schema is not None

@@ -144,18 +144,8 @@ def _dm_deletion_reconciliation_is_blocked(conn: sqlite3.Connection) -> bool:
 
 
 # Entity / telemetry SQL
-_ALL_ENTITY_NAMES_SQL = (
-    "SELECT id, name FROM entities "
-    "WHERE name IS NOT NULL "
-    "AND ((type IN ('User', 'Bot') AND updated_at > ?) "  # PascalCase per ListDialogs type vocabulary
-    "OR (type NOT IN ('User', 'Bot') AND updated_at > ?))"
-)
-_ALL_ENTITY_NAMES_NORMALIZED_SQL = (
-    "SELECT id, name_normalized FROM entities "
-    "WHERE name_normalized IS NOT NULL "
-    "AND ((type IN ('User', 'Bot') AND updated_at > ?) "  # PascalCase per ListDialogs type vocabulary
-    "OR (type NOT IN ('User', 'Bot') AND updated_at > ?))"
-)
+_ALL_ENTITY_NAMES_SQL = "SELECT id, name FROM entities WHERE name IS NOT NULL"
+_ALL_ENTITY_NAMES_NORMALIZED_SQL = "SELECT id, name_normalized FROM entities WHERE name_normalized IS NOT NULL"
 _ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, type FROM entities WHERE username = ? COLLATE NOCASE"
 _TELEMETRY_OUTCOMES = frozenset({"success", "tool_error", "validation_error", "exception", "cancelled"})
 _TELEMETRY_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -592,16 +582,17 @@ _current_request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class _ResolverEntityCache:
-    """SQLite-backed resolver cache used only with an explicit TTL policy."""
+    """SQLite-backed view of durable local entity identity facts."""
 
     conn: sqlite3.Connection
 
     def get(self, entity_id: int, ttl_seconds: int) -> Mapping[str, object] | None:
+        del ttl_seconds  # The resolver protocol's age limit cannot expire canonical identity.
         row = cast(
             tuple[str | None, str | None] | None,
             self.conn.execute(
-                "SELECT username, type FROM entities WHERE id = ? AND updated_at > ?",
-                (entity_id, int(time.time()) - ttl_seconds),
+                "SELECT username, type FROM entities WHERE id = ?",
+                (entity_id,),
             ).fetchone(),
         )
         if row is None:
@@ -781,10 +772,7 @@ class DaemonAPIServer:
 
     async def _publish_auth_scope(self, scope: TelegramAuthScope | None) -> None:
         """Publish private session identity to already-composed domain services."""
-        changed = self._auth_scope != scope
         self._auth_scope = scope
-        if changed and self._entity_info_service is not None:
-            await self._entity_info_service.auth_scope_changed()
 
     def _require_demand_sink(self) -> DemandOfferSink:
         sink = self._demand_sink
@@ -2077,7 +2065,6 @@ class DaemonAPIServer:
                     logger=cast(logging.Logger, logger),
                     now_provider=lambda: time.time(),
                     detail_ttl_seconds=self._policy.entity_detail_ttl_seconds,
-                    slow_stage_seconds=self._policy.slow_request_seconds,
                     group_profile_port=self._group_profile_port,
                     user_profile_port=self._user_profile_port,
                     channel_profile_port=self._channel_profile_port,
@@ -2099,8 +2086,6 @@ class DaemonAPIServer:
     async def _get_entity_info(self, req: dict[str, object]) -> dict:
         """Type-tagged entity inspector covering 5 Telegram entity kinds."""
         started_at = time.perf_counter()
-        await self._reproject_due_folder_memberships()
-        projected_at = time.perf_counter()
         result = await self._get_entity_info_service().get_entity_info(req)
         fetched_at = time.perf_counter()
         if result.get("error") == "entity_info_pending" and self._health_status().open:
@@ -2111,9 +2096,8 @@ class DaemonAPIServer:
             if isinstance(entity_id, int):
                 data["dialog_placement"] = dialog_placement(self._conn, entity_id)
         logger.info(
-            "entity_info_dispatch_timing folder_projection_s=%.3f service_s=%.3f dialog_placement_s=%.3f%s",
-            projected_at - started_at,
-            fetched_at - projected_at,
+            "entity_info_dispatch_timing service_s=%.3f dialog_placement_s=%.3f%s",
+            fetched_at - started_at,
             time.perf_counter() - fetched_at,
             _rid(),
         )
@@ -2331,23 +2315,16 @@ class DaemonAPIServer:
                 }
             return {"ok": True, "data": {"result": "not_found", "query": query}}
 
-        now = int(time.time())
         display_name_map = dict(
             cast(
                 list[tuple[int, str]],
-                self._conn.execute(
-                    _ALL_ENTITY_NAMES_SQL,
-                    (now - self._policy.user_directory_ttl_seconds, now - self._policy.group_directory_ttl_seconds),
-                ).fetchall(),
+                self._conn.execute(_ALL_ENTITY_NAMES_SQL).fetchall(),
             )
         )
         normalized = dict(
             cast(
                 list[tuple[int, str]],
-                self._conn.execute(
-                    _ALL_ENTITY_NAMES_NORMALIZED_SQL,
-                    (now - self._policy.user_directory_ttl_seconds, now - self._policy.group_directory_ttl_seconds),
-                ).fetchall(),
+                self._conn.execute(_ALL_ENTITY_NAMES_NORMALIZED_SQL).fetchall(),
             )
         )
 

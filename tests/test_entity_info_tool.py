@@ -502,8 +502,8 @@ async def test_get_entity_info_resolver_not_found() -> None:
     with patch("mcp_telegram.tools.entity_info.daemon_connection", fake_dc):
         result = await get_entity_info(GetEntityInfo(entity="Nobody"))
     text = cast(_TextContent, result.content[0]).text
-    assert "No entity matches 'Nobody'" in text
-    assert "GetEntityInfo" in text
+    assert "No local entity matches this query" in text
+    assert "list_dialogs" in text
 
 
 @pytest.mark.asyncio
@@ -811,7 +811,7 @@ async def test_resolve_entity_lookup_not_found_returns_error_result() -> None:
 
     assert isinstance(result, ToolResult)
     assert result.is_error is True
-    assert "No entity matches 'Nobody'" in cast(_TextContent, result.content[0]).text
+    assert "No local entity matches this query" in cast(_TextContent, result.content[0]).text
 
 
 @pytest.mark.asyncio
@@ -847,7 +847,16 @@ def test_entity_structured_content_uses_exact_input_for_numeric_lookup() -> None
 
 
 @pytest.mark.parametrize(
-    "code", ["entity_not_found", "entity_info_pending", "rpc_busy", "internal", "DO_NOT_LOG secret", None]
+    "code",
+    [
+        "entity_not_found",
+        "entity_not_observed",
+        "entity_info_pending",
+        "rpc_busy",
+        "internal",
+        "DO_NOT_LOG secret",
+        None,
+    ],
 )
 def test_entity_info_fetch_error_preserves_only_safe_reason_codes(code: object) -> None:
     from mcp_telegram.tools.entity_info import _entity_info_fetch_error
@@ -856,7 +865,9 @@ def test_entity_info_fetch_error_preserves_only_safe_reason_codes(code: object) 
     assert result is not None
     assert result.is_error
     assert result.error_code == (
-        code if code in {"entity_not_found", "entity_info_pending", "rpc_busy", "internal"} else "entity_info_failed"
+        code
+        if code in {"entity_not_found", "entity_not_observed", "entity_info_pending", "rpc_busy", "internal"}
+        else "entity_info_failed"
     )
 
 
@@ -881,7 +892,7 @@ async def test_entity_info_preserves_daemon_failure_kind(kind: str) -> None:
     [
         ({"ok": False, "error": "rpc_busy"}, "rpc_busy"),
         ({"ok": False, "error": "DO_NOT_LOG secret"}, "entity_resolution_failed"),
-        ({"ok": True, "data": {"result": "not_found"}}, "entity_not_found"),
+        ({"ok": True, "data": {"result": "not_found"}}, "entity_not_observed"),
     ],
 )
 async def test_entity_lookup_retains_reason_without_parsing_message(response: dict[str, object], code: str) -> None:

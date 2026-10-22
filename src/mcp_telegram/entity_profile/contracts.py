@@ -10,7 +10,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import cast
+from typing import Literal, TypedDict, cast
 
 from ..dialog_identity_contracts import DialogIdentityObservation
 
@@ -162,7 +162,6 @@ class UserProfileObservation:
     target_kind: TargetKind
     full_profile: ProjectionOutcome
     personal_channel: ProjectionOutcome
-    personal_channel_reference: PersonalChannelReference | None = None
     current_photo: ChatCurrentPhoto | None = None
 
     def __post_init__(self) -> None:
@@ -171,39 +170,6 @@ class UserProfileObservation:
             raise TypeError("target_kind must be a TargetKind")
         if self.current_photo is not None and not isinstance(self.current_photo, ChatCurrentPhoto):
             raise TypeError("current_photo must be ChatCurrentPhoto or None")
-
-
-@dataclass(frozen=True, slots=True)
-class PersonalChannelReference:
-    """Bounded capability for fetching one user's personal channel post."""
-
-    channel_id: int
-    access_hash: int
-
-    def __post_init__(self) -> None:
-        _validate_positive_id(self.channel_id, field_name="channel_id")
-        if (
-            not isinstance(self.access_hash, int)
-            or isinstance(self.access_hash, bool)
-            or not -(2**63) <= self.access_hash <= (2**63 - 1)
-        ):
-            raise ValueError("access_hash must be a signed 64-bit integer")
-
-
-@dataclass(frozen=True, slots=True)
-class PersonalChannelPost:
-    """Neutral bounded result for one personal-channel message fetch."""
-
-    message_id: int
-    sent_at: int | None
-    text: str | None
-
-    def __post_init__(self) -> None:
-        _validate_positive_id(self.message_id, field_name="message_id")
-        if self.sent_at is not None and (not isinstance(self.sent_at, int) or isinstance(self.sent_at, bool)):
-            raise TypeError("sent_at must be an integer or None")
-        if self.text is not None and not isinstance(self.text, str):
-            raise TypeError("text must be a string or None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,6 +286,15 @@ class ChatAvatarHistoryObservation:
         _validate_observation_boundary(self.observation_started_at, self.observation_completed_at)
 
 
+class ChatEntityProfileFacts(TypedDict, total=False):
+    """Account-visible fields supplied by one full Channel or Chat entity."""
+
+    my_membership: dict[str, object]
+    restrictions: list[dict[str, str | None]]
+    has_topics: bool
+    migrated_to: int | None
+
+
 @dataclass(frozen=True, slots=True)
 class ChannelProfileObservation:
     """Normalized result of one ``channels.GetFullChannel`` observation."""
@@ -341,6 +316,7 @@ class ChannelProfileObservation:
     normalization_version: str = CHANNEL_PROFILE_NORMALIZATION_VERSION
     identity_patch: Mapping[str, object] | None = None
     dialog_identity_observation: DialogIdentityObservation | None = None
+    chat_entity_fields: ChatEntityProfileFacts | None = None
 
     def __post_init__(self) -> None:
         _validate_nonzero_id(self.channel_id, field_name="channel_id")
@@ -396,11 +372,14 @@ class GroupProfileObservation:
     normalization_version: str = GROUP_PROFILE_NORMALIZATION_VERSION
     identity_patch: Mapping[str, object] | None = None
     dialog_identity_observation: DialogIdentityObservation | None = None
+    chat_entity_fields: ChatEntityProfileFacts | None = None
+    participants_count: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.group_id, int) or isinstance(self.group_id, bool):
             raise ValueError("group_id must be an integer")
         _validate_participant_observation(self.participant_ids, self.participants_unavailable_reason)
+        _validate_optional_nonnegative(self.participants_count, field_name="participants_count")
         _validate_observation_interval(self.observation_started_at, self.observation_completed_at)
         if self.identity_patch is not None and not isinstance(self.identity_patch, Mapping):
             raise TypeError("identity_patch must be a mapping or None")
@@ -581,6 +560,23 @@ PERSONAL_CHANNEL_OWNED_FIELDS: tuple[str, ...] = (
 
 
 @dataclass(frozen=True, slots=True)
+class ProfileFieldObservation:
+    """Private ordering and ownership of a bounded profile-field observation."""
+
+    owner_account_id: int
+    order: int
+    observed_at: int
+    source: Literal["rpc", "update", "min"]
+
+    def __post_init__(self) -> None:
+        for value, minimum in ((self.owner_account_id, 1), (self.order, 1), (self.observed_at, 0)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError("invalid profile field observation identity or time")
+        if self.source not in {"rpc", "update", "min"}:
+            raise ValueError("invalid profile field observation source")
+
+
+@dataclass(frozen=True, slots=True)
 class ProfileAcquisitionEvidence:
     """Bounded evidence attached to one section materialization.
 
@@ -620,7 +616,7 @@ class ProfileAcquisitionEvidence:
 
 
 def completeness(sections: dict[str, dict[str, object]]) -> str:
-    """Return ``complete`` only when every applicable section is fresh."""
+    """Report collected coverage; elapsed time does not erase an observation."""
     if not sections:
         return "partial"
     statuses = {str(value.get("status")) for value in sections.values()}

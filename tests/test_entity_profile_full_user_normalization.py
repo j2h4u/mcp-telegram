@@ -4,7 +4,7 @@ from datetime import UTC, date, datetime
 from types import SimpleNamespace
 
 import pytest
-from telethon.tl.types import User  # type: ignore[import-untyped]
+from telethon.tl.types import EmojiStatus, User  # type: ignore[import-untyped]
 
 from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED
 from mcp_telegram.entity_profile.contracts import (
@@ -86,6 +86,32 @@ def test_telethon_user_with_unspecified_bot_flag_is_a_user() -> None:
     assert result.full_profile.payload is not None
     assert result.full_profile.payload["bot"] is False
     assert result.full_profile.dialog_identity_observation is None
+
+
+def test_dynamic_user_fields_and_membership_are_real_normalized_facts() -> None:
+    user = User(
+        id=42,
+        first_name="Ada",
+        contact=True,
+        mutual_contact=True,
+        close_friend=True,
+        emoji_status=EmojiStatus(document_id=99),
+    )
+    response = SimpleNamespace(full_user=SimpleNamespace(blocked=True), users=[user], chats=[])
+
+    result = normalize_full_user_response(response, target_id=42, target_kind=TargetKind.USER)
+
+    facts = result.full_profile.payload
+    assert facts is not None
+    assert facts["emoji_status_id"] == 99
+    assert facts["mutual_contact"] is True
+    assert facts["close_friend"] is True
+    assert facts["my_membership"] == {
+        "is_member": True,
+        "is_admin": False,
+        "admin_rights": None,
+        "relationship": {"contact": True, "mutual_contact": True, "close_friend": True, "blocked": True},
+    }
 
 
 def test_min_telethon_user_emits_only_positive_partial_identity_on_fresh_boundary() -> None:

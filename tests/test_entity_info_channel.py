@@ -14,6 +14,7 @@ import re
 import sqlite3
 from collections.abc import Callable
 from datetime import UTC
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -35,6 +36,8 @@ from mcp_telegram.entity_profile.contracts import (
     ProjectionStatus,
 )
 from mcp_telegram.entity_profile.ports import ChannelProfilePort
+from mcp_telegram.sync_transactions import write_savepoint
+from mcp_telegram.telegram_gateway import _channel_identity_fields, _channel_profile_entity_fields
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     ClientChatAvatarHistoryPort,
@@ -43,6 +46,8 @@ from tests.helpers import (
     LoudGroupProfilePort,
     LoudUserAvatarHistoryPort,
     LoudUserProfilePort,
+    acquire_entity_profile,
+    in_memory_sync_db,
 )
 from tests.sqlite_writer_helpers import inline_writer
 
@@ -81,37 +86,7 @@ def _patch_get_peer_id():
 
 
 def _make_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:")
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.executescript(
-        """
-        CREATE TABLE synced_dialogs (
-            dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'not_synced',
-            last_synced_at INTEGER, last_event_at INTEGER,
-            sync_progress INTEGER DEFAULT 0, total_messages INTEGER,
-            access_lost_at INTEGER, read_inbox_max_id INTEGER, read_outbox_max_id INTEGER
-        );
-        CREATE TABLE full_history_enrollment (
-            dialog_id INTEGER PRIMARY KEY,
-            enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
-            source TEXT NOT NULL CHECK(source IN ('explicit', 'automatic', 'migration')),
-            updated_at INTEGER NOT NULL
-        ) WITHOUT ROWID;
-        CREATE TABLE dialogs (
-            dialog_id INTEGER PRIMARY KEY, name TEXT, type TEXT, archived INTEGER, hidden INTEGER,
-            identity_revision INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE entities (
-            id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT,
-            username TEXT, name_normalized TEXT, updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE entity_details (
-            entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL,
-            FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE
-        ) WITHOUT ROWID;
-        CREATE INDEX idx_entity_details_fetched_at ON entity_details(fetched_at);
-        """
-    )
+    conn = in_memory_sync_db()
     _TEST_DBS.append(conn)
     return conn
 
@@ -144,6 +119,12 @@ def make_server(
     return server
 
 
+async def _acquire_local_profile(server: DaemonAPIServer, entity_id: int, name: str = "Test Channel") -> None:
+    await acquire_entity_profile(
+        server._get_entity_info_service(), entity_id, {"id": entity_id, "type": "channel", "name": name}
+    )
+
+
 def _mock_client(*call_results: object) -> MagicMock:
     client = MagicMock()
     results = list(call_results)
@@ -168,6 +149,7 @@ def _channel_port(  # noqa: PLR0913
     contact_ids: tuple[int, ...] = (),
     overlap_status: ProjectionStatus = ProjectionStatus.PARTIAL,
     overlap_reason: str = "bounded_contacts_page",
+    entity: object | None = None,
 ) -> FakeChannelProfilePort:
     full_chat = getattr(full, "full_chat", full)
     raw_reactions: object = cast(object, getattr(full_chat, "available_reactions", None))
@@ -208,6 +190,10 @@ def _channel_port(  # noqa: PLR0913
         current_photo=current_photo,
         observation_started_at=100,
         observation_completed_at=100,
+        identity_patch=_channel_identity_fields(entity) if entity is not None else None,
+        chat_entity_fields=(
+            _channel_profile_entity_fields(SimpleNamespace(chats=[entity]), channel_id) if entity is not None else None
+        ),
     )
     overlap = ChannelContactOverlapObservation(
         channel_id=channel_id,
@@ -225,7 +211,7 @@ def _broadcast_channel(id_: int = -1001, **kwargs: object) -> MagicMock:
     # per HIGH-2 from 47-REVIEWS.md cycle 3 — Plan 03 Task 3 appends
     # broadcast-admin tests that reference this name in their bodies.
     c = MagicMock(spec=TelethonChannel)
-    c.id = id_
+    c.id = abs(id_)
     c.title = kwargs.get("title", "Test Channel")
     c.username = kwargs.get("username", "test_channel")
     c.access_hash = kwargs.get("access_hash", 0)
@@ -264,7 +250,10 @@ async def test_get_entity_info_channel_type() -> None:
     search = MagicMock(count=0, messages=[])
     client = _mock_client(search)
     client.get_entity = AsyncMock(return_value=chan)
-    server = make_server(client=client, channel_profile_port=_channel_port(-1001, full))
+    server = make_server(client=client, channel_profile_port=_channel_port(-1001, full, entity=chan))
+    await acquire_entity_profile(
+        server._get_entity_info_service(), -1001, {"id": -1001, "type": "channel", "name": "Test Channel"}
+    )
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001})
     assert r["ok"] is True, f"got {r}"
     assert _dict(r["data"])["type"] == "channel"
@@ -279,7 +268,8 @@ async def test_get_entity_info_channel_common_envelope() -> None:
     search = MagicMock(count=0, messages=[])
     client = _mock_client(search)
     client.get_entity = AsyncMock(return_value=chan)
-    server = make_server(client=client, channel_profile_port=_channel_port(-1002, full))
+    server = make_server(client=client, channel_profile_port=_channel_port(-1002, full, entity=chan))
+    await _acquire_local_profile(server, -1002, "News")
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1002})
     d = _dict(r["data"])
     for key in ("id", "type", "name", "username", "about", "my_membership", "avatar_history", "avatar_count"):
@@ -297,8 +287,9 @@ async def test_get_entity_info_channel_field_surface() -> None:
     search = MagicMock(count=0, messages=[])
     client = _mock_client(search)
     client.get_entity = AsyncMock(return_value=chan)
-    port = _channel_port(-1003, full, access_hash=17)
+    port = _channel_port(-1003, full, access_hash=17, entity=chan)
     server = make_server(client=client, channel_profile_port=port)
+    await _acquire_local_profile(server, -1003)
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1003})
     d = _dict(r["data"])
     for key in (
@@ -325,7 +316,17 @@ async def test_get_entity_info_channel_non_admin_contacts_null() -> None:
     search = MagicMock(count=0, messages=[])
     client = _mock_client(search)
     client.get_entity = AsyncMock(return_value=chan)
-    server = make_server(client=client, channel_profile_port=_channel_port(-1004, full))
+    server = make_server(
+        client=client,
+        channel_profile_port=_channel_port(
+            -1004,
+            full,
+            overlap_status=ProjectionStatus.UNAVAILABLE,
+            overlap_reason="not_an_admin",
+            entity=chan,
+        ),
+    )
+    await _acquire_local_profile(server, -1004)
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1004})
     d = _dict(r["data"])
     assert d["contacts_subscribed"] is None
@@ -345,7 +346,8 @@ async def test_get_entity_info_channel_available_reactions_some() -> None:
     search = MagicMock(count=0, messages=[])
     client = _mock_client(search)
     client.get_entity = AsyncMock(return_value=chan)
-    server = make_server(client=client, channel_profile_port=_channel_port(-1005, full))
+    server = make_server(client=client, channel_profile_port=_channel_port(-1005, full, entity=chan))
+    await _acquire_local_profile(server, -1005)
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1005})
     ar = _dict(r["data"])["available_reactions"]
     assert ar == {"kind": "some", "emojis": ["👍"]}
@@ -359,7 +361,8 @@ async def test_get_entity_info_no_download_keys_channel() -> None:
     search = MagicMock(count=0, messages=[])
     client = _mock_client(search)
     client.get_entity = AsyncMock(return_value=chan)
-    server = make_server(client=client, channel_profile_port=_channel_port(-1006, full))
+    server = make_server(client=client, channel_profile_port=_channel_port(-1006, full, entity=chan))
+    await _acquire_local_profile(server, -1006)
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1006})
 
     def _walk_keys(o: object):
@@ -403,7 +406,8 @@ async def test_get_entity_info_channel_avatar_search_fails_d20_fallback() -> Non
 
     client = _mock_client(search_exc)
     client.get_entity = AsyncMock(return_value=chan)
-    server = make_server(client=client, channel_profile_port=_channel_port(-1007, full))
+    server = make_server(client=client, channel_profile_port=_channel_port(-1007, full, entity=chan))
+    await _acquire_local_profile(server, -1007)
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1007})
 
     d = _dict(r["data"])
@@ -445,13 +449,14 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_small() -> N
     """
     # Resolve broadcast channel (megagroup=False, admin via creator=True)
     ch = MagicMock(spec=TelethonChannel)
-    ch.id = -1001234567890
+    ch.id = 1234567890
     ch.title = "Broadcast Admin"
     ch.username = "broadcast_admin"
     ch.access_hash = 0
     ch.min = False
     ch.megagroup = False
     ch.broadcast = True
+    ch.forum = False
     ch.creator = True  # is_admin=True via creator
     ch.admin_rights = None
     ch.left = False
@@ -463,24 +468,27 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_small() -> N
     client.get_entity = AsyncMock(return_value=ch)
 
     server = make_server(
-        client=client, channel_profile_port=_channel_port(-1001234567890, full, contact_ids=(111, 222, 333))
+        client=client,
+        channel_profile_port=_channel_port(-1001234567890, full, contact_ids=(111, 222, 333), entity=ch),
     )
     # Seed _dm_peer_ids: operator has DMed 111 and 333 (NOT 222).
-    server._conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (111,))
-    server._conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (333,))
-    # Names for the contact ids (entity rows for enrichment).
-    server._conn.execute(
-        "INSERT INTO entities (id, type, name, username, name_normalized, updated_at) "
-        "VALUES (?, 'User', 'Alice', 'alice', 'alice', 0)",
-        (111,),
-    )
-    server._conn.execute(
-        "INSERT INTO entities (id, type, name, username, name_normalized, updated_at) "
-        "VALUES (?, 'User', 'Carol', 'carol', 'carol', 0)",
-        (333,),
-    )
+    with write_savepoint(server._conn):
+        server._conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (111,))
+        server._conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (333,))
+        # Names for the contact ids (entity rows for enrichment).
+        server._conn.execute(
+            "INSERT INTO entities (id, type, name, username, name_normalized, updated_at) "
+            "VALUES (?, 'User', 'Alice', 'alice', 'alice', 0)",
+            (111,),
+        )
+        server._conn.execute(
+            "INSERT INTO entities (id, type, name, username, name_normalized, updated_at) "
+            "VALUES (?, 'User', 'Carol', 'carol', 'carol', 0)",
+            (333,),
+        )
 
     server._conn.commit()
+    await _acquire_local_profile(server, -1001234567890, "Broadcast Admin")
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001234567890})
     d = _dict(r["data"])
     assert d["type"] == "channel"
@@ -499,13 +507,14 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_large() -> N
     and returns contacts_subscribed_partial=True, reason='bounded_contacts_page'.
     """
     ch = MagicMock(spec=TelethonChannel)
-    ch.id = -1009876543210
+    ch.id = 9876543210
     ch.title = "Big Broadcast"
     ch.username = "big_broadcast"
     ch.access_hash = 0
     ch.min = False
     ch.megagroup = False
     ch.broadcast = True
+    ch.forum = False
     ch.creator = True
     ch.admin_rights = None
     ch.left = False
@@ -524,16 +533,19 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_large() -> N
     client.get_entity = AsyncMock(return_value=ch)
 
     server = make_server(
-        client=client, channel_profile_port=_channel_port(-1009876543210, full, contact_ids=(111, 222))
+        client=client,
+        channel_profile_port=_channel_port(-1009876543210, full, contact_ids=(111, 222), entity=ch),
     )
-    server._conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (111,))
-    server._conn.execute(
-        "INSERT INTO entities (id, type, name, username, name_normalized, updated_at) "
-        "VALUES (?, 'User', 'Alice', 'alice', 'alice', 0)",
-        (111,),
-    )
+    with write_savepoint(server._conn):
+        server._conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (111,))
+        server._conn.execute(
+            "INSERT INTO entities (id, type, name, username, name_normalized, updated_at) "
+            "VALUES (?, 'User', 'Alice', 'alice', 'alice', 0)",
+            (111,),
+        )
 
     server._conn.commit()
+    await _acquire_local_profile(server, -1009876543210, "Big Broadcast")
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1009876543210})
     d = _dict(r["data"])
     assert d["contacts_subscribed_partial"] is True
@@ -551,13 +563,14 @@ async def test_get_entity_info_channel_admin_chat_admin_required_falls_back_to_n
     than crashing or surfacing the exception.
     """
     ch = MagicMock(spec=TelethonChannel)
-    ch.id = -1001112223334
+    ch.id = 1112223334
     ch.title = "Revoked Admin"
     ch.username = None
     ch.access_hash = 0
     ch.min = False
     ch.megagroup = False
     ch.broadcast = True
+    ch.forum = False
     ch.creator = True
     ch.admin_rights = None
     ch.left = False
@@ -574,8 +587,10 @@ async def test_get_entity_info_channel_admin_chat_admin_required_falls_back_to_n
             full,
             overlap_status=ProjectionStatus.UNAVAILABLE,
             overlap_reason="not_an_admin",
+            entity=ch,
         ),
     )
+    await _acquire_local_profile(server, -1001112223334, "Revoked Admin")
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001112223334})
     d = _dict(r["data"])
     assert d["contacts_subscribed"] is None

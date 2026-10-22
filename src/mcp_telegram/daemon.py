@@ -875,10 +875,17 @@ def _log_heartbeat(
 async def _run_daemon_lifetime(ctx: _SyncMainContext) -> None:
     """Keep local refresh and heartbeat work alive beside the coordinator."""
     sync_start = time.monotonic()
+    if ctx.coordinator is not None:
+        while not ctx.shutdown_event.is_set():
+            if not await ctx.api_server._get_entity_info_service().reconcile_history_profiles():
+                break
+            await asyncio.sleep(0)
     while not ctx.shutdown_event.is_set():
         _log_heartbeat(ctx.conn, ctx.client, sync_start)
         if ctx.handler_manager is not None:
             ctx.handler_manager.refresh_synced_dialogs()
+        if ctx.coordinator is not None and not ctx.shutdown_event.is_set():
+            await ctx.api_server._get_entity_info_service().reconcile_history_profiles()
         shutdown_wait = asyncio.create_task(ctx.shutdown_event.wait())
         heartbeat_wait = asyncio.create_task(asyncio.sleep(HEARTBEAT_INTERVAL_S))
         try:
@@ -1932,6 +1939,8 @@ async def sync_main() -> None:
             ctx.shutdown_event,
             update_barrier=update_barrier,
             writer=ctx.writer,
+            profile_pair_mode="enabled" if ctx.api_server._policy.full_user_pair_enabled else "disabled",
+            profile_detail_ttl_seconds=ctx.api_server._policy.entity_detail_ttl_seconds,
         )
         if ctx.rpc_observation_sink is not None:
             ctx.handler_manager.bind_observation_sink(ctx.rpc_observation_sink)

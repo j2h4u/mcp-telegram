@@ -7,8 +7,6 @@ from types import SimpleNamespace
 import pytest
 
 from mcp_telegram.entity_profile.contracts import (
-    PersonalChannelPost,
-    PersonalChannelReference,
     ProjectionOutcome,
     ProjectionStatus,
     TargetKind,
@@ -74,11 +72,6 @@ class _StartupUserProfilePort:
             None,
         )
         return UserProfileObservation(user_id, target_kind, outcome, outcome)
-
-    async def fetch_personal_channel_post(
-        self, reference: PersonalChannelReference, message_id: int
-    ) -> PersonalChannelPost | None:
-        raise AssertionError(f"personal channel post fetch is not part of startup tests: {reference}/{message_id}")
 
 
 async def _unused_update_profile(me: object) -> None:

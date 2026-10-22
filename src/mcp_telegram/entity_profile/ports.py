@@ -12,8 +12,6 @@ from .contracts import (
     ChatAvatarReference,
     CommonChatsObservation,
     GroupProfileObservation,
-    PersonalChannelPost,
-    PersonalChannelReference,
     TargetKind,
     UserAvatarHistoryObservation,
     UserProfileObservation,
@@ -67,10 +65,6 @@ class UserProfilePort(Protocol):
     def get_user_reference(self, user_id: int, *, is_self: bool = False) -> UserReference | None: ...
 
     async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation: ...
-
-    async def fetch_personal_channel_post(
-        self, reference: PersonalChannelReference, message_id: int
-    ) -> PersonalChannelPost | None: ...
 
 
 class ProfilePairObservationHook(Protocol):

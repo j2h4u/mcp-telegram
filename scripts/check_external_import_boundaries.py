@@ -114,6 +114,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "drafts/telethon_adapter.py",
             "event_handlers.py",
             "folders/telegram_adapter.py",
+            "entity_profile/updates.py",  # Normalizes supplied Telegram updates; never acquires remotely.
             "messages/telegram_adapter.py",
             "reactions/telegram_adapter.py",
             "scheduled_messages.py",

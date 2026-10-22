@@ -22,7 +22,6 @@ from mcp_telegram.entity_profile.refresh import (
     EntityProfileDemandAdapter,
     EntityRefreshCoordinator,
     RefreshEnqueueResult,
-    RefreshLimits,
 )
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.sqlite_writer import SQLiteWriter
@@ -36,98 +35,6 @@ class _Recorder:
 
     def record(self, **values: object) -> None:
         self.rows.append(values)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ("cancelled", "timed_out"))
-async def test_one_waiter_lifetime_does_not_cancel_durable_pair_work(mode: str) -> None:
-    coordinator = EntityRefreshCoordinator(limits=RefreshLimits(max_queued_refreshes=1))
-    assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
-    started = asyncio.Event()
-    release = asyncio.Event()
-    calls = 0
-
-    async def run_slice(_budget: RpcAttemptBudget) -> DurableRefreshSliceResult:
-        nonlocal calls
-        calls += 1
-        started.set()
-        await release.wait()
-        return DurableRefreshSliceResult(42, DurableRefreshTerminal.SUCCESS)
-
-    coordinator.bind_durable_executor(lambda _now: DemandStatus(release_at=0.0), run_slice)
-    first_timeout = 0.01 if mode == "timed_out" else 1.0
-    first = asyncio.create_task(coordinator.wait_for_completion(42, first_timeout))
-    second = asyncio.create_task(coordinator.wait_for_completion(42, 1.0))
-    await asyncio.sleep(0)
-
-    durable = asyncio.create_task(EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1)))
-    assert await asyncio.wait_for(started.wait(), timeout=1.0) is True
-    if mode == "cancelled":
-        first.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await first
-    else:
-        assert await first is False
-    assert coordinator.queue_depth == 1
-
-    release.set()
-    await asyncio.wait_for(durable, timeout=1.0)
-    assert calls == 1
-    assert await asyncio.wait_for(second, timeout=1.0) is True
-    assert coordinator.queue_depth == 0
-    await coordinator.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_duplicate_waiters_under_queue_pressure_shutdown_without_extra_work() -> None:
-    coordinator = EntityRefreshCoordinator(limits=RefreshLimits(max_queued_refreshes=1))
-    assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
-    assert coordinator.enqueue(42) is RefreshEnqueueResult.COALESCED
-    assert coordinator.enqueue(43) is RefreshEnqueueResult.REJECTED
-    calls = 0
-
-    async def run_slice(_budget: RpcAttemptBudget) -> DurableRefreshSliceResult:
-        nonlocal calls
-        calls += 1
-        return DurableRefreshSliceResult(42, DurableRefreshTerminal.SUCCESS)
-
-    coordinator.bind_durable_executor(lambda _now: DemandStatus(release_at=0.0), run_slice)
-    waiters = [asyncio.create_task(coordinator.wait_for_completion(42, 1.0)) for _ in range(2)]
-    await asyncio.sleep(0)
-    await coordinator.shutdown()
-    assert await asyncio.gather(*waiters) == [False, False]
-    assert calls == 0
-    assert coordinator.queue_depth == 0
-
-
-@pytest.mark.asyncio
-async def test_shutdown_closes_waiters_before_start_and_is_idempotent() -> None:
-    coordinator = EntityRefreshCoordinator()
-    await coordinator.shutdown()
-    await coordinator.shutdown()
-
-    assert coordinator.enqueue(42) is RefreshEnqueueResult.REJECTED
-    assert await coordinator.wait_for_completion(42, 1.0) is False
-    assert coordinator.queue_depth == 0
-
-
-@pytest.mark.asyncio
-async def test_terminal_signal_wins_only_when_waiter_resumes_before_shutdown() -> None:
-    coordinator = EntityRefreshCoordinator()
-    assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
-    first = asyncio.create_task(coordinator.wait_for_completion(42, 1.0))
-    await asyncio.sleep(0)
-    coordinator.signal_terminal(DurableRefreshSliceResult(42, DurableRefreshTerminal.SUCCESS))
-    assert await first is True
-    await coordinator.shutdown()
-
-    coordinator = EntityRefreshCoordinator()
-    assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
-    second = asyncio.create_task(coordinator.wait_for_completion(42, 1.0))
-    await asyncio.sleep(0)
-    await coordinator.shutdown()
-    coordinator.signal_terminal(DurableRefreshSliceResult(42, DurableRefreshTerminal.FAILURE))
-    assert await second is False
 
 
 @pytest.mark.asyncio

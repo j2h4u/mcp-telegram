@@ -16,7 +16,11 @@ Observation age and incomplete coverage describe what is known; they do not
 make previously collected information disappear. Confirmed changes, deletions
 and account/privacy boundaries retain their normal meaning.
 
-Some existing profile, history and topic paths still perform acquisition during
+Profile reads use local observations; enabled personal-dialog synchronization
+also collects counterpart profiles in the background and applies delivered
+profile updates. Never-collected sections remain explicitly partial.
+
+Some existing history and topic paths still perform acquisition during
 reads. These are tracked departures from the product contract, not the desired
 runtime model. See [the architecture contract and current exceptions](docs/architecture-proposal.md#durable-facts-and-acquisition-evidence).
 

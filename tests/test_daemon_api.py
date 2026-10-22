@@ -391,14 +391,15 @@ def make_server(  # noqa: PLR0913
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("protected", "stored_owner"),
-    [(False, None), (True, None), (True, 7)],
+    ("protected", "stored_owner", "expected_error"),
+    [(False, None, None), (True, None, None), (True, 7, "entity_profile_account_unavailable")],
     ids=["inactive-missing-owner", "active-missing-owner", "active-wrong-owner"],
 )
 async def test_entity_profile_pending_projects_protection_only_when_active(
     tmp_path: Path,
     protected: bool,
     stored_owner: int | None,
+    expected_error: str | None,
 ) -> None:
     """Known local entity stubs retain domain ownership checks before API projection."""
     db_path = tmp_path / "sync.db"
@@ -418,8 +419,9 @@ async def test_entity_profile_pending_projects_protection_only_when_active(
     service._profiles.mark_pending(42, now=100)  # type: ignore[attr-defined]
     if stored_owner is not None:
         conn.execute(
-            "UPDATE entity_details SET profile_owner_account_id=?, profile_observation_scope_json='{}' WHERE entity_id=42",
-            (stored_owner,),
+            "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_owner_account_id,"
+            "profile_observation_scope_json) VALUES (42,?,100,?,'{}')",
+            ('{"schema":1,"about":"private"}', stored_owner),
         )
         conn.commit()
     server._health_status = lambda: FloodWaitKillSwitchStatus(
@@ -438,17 +440,12 @@ async def test_entity_profile_pending_projects_protection_only_when_active(
         conn.close()
 
     client.get_entity.assert_not_called()
-    if protected:
-        assert result == {
-            "ok": False,
-            "error": "flood_wait_kill_switch_open",
-            "message": "Telegram acquisition is blocked by account protection.",
-            "required_action": "manual_operator_recovery",
-            "retryable": False,
-        }
+    if expected_error is not None:
+        assert result["ok"] is False
+        assert result["error"] == expected_error
     else:
-        assert result["error"] == "entity_info_pending"
-        assert result["retryable"] is True
+        assert result["ok"] is True
+        assert result["data"]["completeness"] == "partial"
 
 
 @pytest.mark.asyncio
@@ -574,17 +571,20 @@ async def test_entity_info_dispatch_logs_separate_stage_durations(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     server = make_server()
-    clock = iter([10.0, 10.2, 10.5, 10.9])
+    clock = iter([10.0, 10.3, 10.7])
     monkeypatch.setattr("mcp_telegram.daemon_api.time.perf_counter", lambda: next(clock))
     service = MagicMock()
     service.get_entity_info = AsyncMock(return_value={"ok": True, "data": {"id": 42}})
     monkeypatch.setattr(server, "_get_entity_info_service", lambda: service)
+    monkeypatch.setattr(
+        server, "_reproject_due_folder_memberships", AsyncMock(side_effect=AssertionError("profile read wrote folders"))
+    )
     monkeypatch.setattr("mcp_telegram.daemon_api.dialog_placement", lambda _conn, _entity_id: {})
     with caplog.at_level("INFO", logger="mcp_telegram.daemon_api"):
         result = await server._get_entity_info({"entity_id": 42})
     assert result["ok"] is True
     message = next(record.message for record in caplog.records if "entity_info_dispatch_timing" in record.message)
-    assert "folder_projection_s=0.200 service_s=0.300 dialog_placement_s=0.400" in message
+    assert "service_s=0.300 dialog_placement_s=0.400" in message
 
 
 @pytest.mark.asyncio
@@ -3565,7 +3565,9 @@ async def test_raw_inbox_read_updates_cursor_before_get_inbox_projection() -> No
     _seed_message(conn, dialog_id, message_id=11, text="new")
 
     client = _TestClient()
-    manager = EventHandlerManager(client, conn, asyncio.Event(), writer=inline_writer(conn))
+    manager = EventHandlerManager(
+        client, conn, asyncio.Event(), writer=inline_writer(conn), profile_detail_ttl_seconds=300
+    )
     manager._synced_dialog_ids.add(dialog_id)
     await manager.on_raw_inbox_read(
         cast(
@@ -4647,8 +4649,8 @@ async def test_resolve_entity_exact_name() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolve_entity_directory_entry_at_exact_ttl_age_is_stale() -> None:
-    """Directory names at the exact configured TTL boundary are not candidates."""
+async def test_resolve_entity_directory_entry_remains_candidate_when_old() -> None:
+    """A stored user name remains a candidate regardless of observation age."""
     conn = _make_db_with_entities()
     now = 2_000_000_000
     ttl = make_daemon_api_policy().user_directory_ttl_seconds
@@ -4664,12 +4666,13 @@ async def test_resolve_entity_directory_entry_at_exact_ttl_age_is_stale() -> Non
     with patch("mcp_telegram.daemon_api.time.time", return_value=now):
         result = await make_server(conn)._dispatch({"method": "resolve_entity", "query": "Alice Smith"})
 
-    assert _response_data(result)["result"] == "not_found"
+    assert _response_data(result)["result"] == "resolved"
+    assert _response_data(result)["entity_id"] == 101
 
 
 @pytest.mark.asyncio
-async def test_resolve_group_directory_entry_at_exact_ttl_age_is_stale() -> None:
-    """Group names at the exact configured TTL boundary are not candidates."""
+async def test_resolve_group_directory_entry_remains_candidate_when_old() -> None:
+    """A stored group name remains a candidate regardless of observation age."""
     conn = _make_db_with_entities()
     now = 2_000_000_000
     ttl = make_daemon_api_policy().group_directory_ttl_seconds
@@ -4685,18 +4688,19 @@ async def test_resolve_group_directory_entry_at_exact_ttl_age_is_stale() -> None
     with patch("mcp_telegram.daemon_api.time.time", return_value=now):
         result = await make_server(conn)._dispatch({"method": "resolve_entity", "query": "Team Chat"})
 
-    assert _response_data(result)["result"] == "not_found"
+    assert _response_data(result)["result"] == "resolved"
+    assert _response_data(result)["entity_id"] == 102
 
 
-def test_resolver_enrichment_entry_at_exact_ttl_age_is_stale() -> None:
-    """Resolver enrichment does not reuse an entity at its exact TTL boundary."""
+def test_resolver_enrichment_entry_remains_available_when_old() -> None:
+    """Stored username and type remain available regardless of observation age."""
     conn = _make_db_with_entities()
     now = 2_000_000_000
     ttl = make_daemon_api_policy().resolver_enrichment_ttl_seconds
     _insert_entity(conn, 101, entity_type="User", username="alice", updated_at=now - ttl)
 
     with patch("mcp_telegram.daemon_api.time.time", return_value=now):
-        assert _ResolverEntityCache(conn).get(101, ttl) is None
+        assert _ResolverEntityCache(conn).get(101, ttl) == {"username": "alice", "type": "User"}
 
 
 @pytest.mark.asyncio

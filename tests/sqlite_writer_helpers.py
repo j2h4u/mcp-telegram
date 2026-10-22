@@ -46,6 +46,8 @@ def event_manager(
     update_barrier: UpdateProcessingBarrier | None = None,
 ) -> EventHandlerManager:
     """Build a SQL-unit manager; runtime ownership tests use the real writer."""
-    manager = EventHandlerManager(client, conn, shutdown_event, update_barrier, writer=inline_writer(conn))
+    manager = EventHandlerManager(
+        client, conn, shutdown_event, update_barrier, writer=inline_writer(conn), profile_detail_ttl_seconds=300
+    )
     manager.bind_observation_sink(inline_observation_sink(conn))
     return manager

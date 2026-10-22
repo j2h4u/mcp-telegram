@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import re
 import sqlite3
-from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import cast
@@ -30,12 +29,11 @@ from telethon.tl.types import Channel, User  # type: ignore[import-untyped]
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.entity_profile.contracts import (
     ObservationBoundary,
-    PersonalChannelPost,
-    PersonalChannelReference,
     TargetKind,
 )
 from mcp_telegram.entity_profile.full_user_normalization import normalize_full_user_response
 from mcp_telegram.entity_profile.ports import UserProfilePort
+from mcp_telegram.sync_transactions import write_transaction
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     ClientChatAvatarHistoryPort,
@@ -45,6 +43,8 @@ from tests.helpers import (
     LoudChannelProfilePort,
     LoudGroupProfilePort,
     LoudUserProfilePort,
+    acquire_entity_profile,
+    in_memory_sync_db,
 )
 from tests.sqlite_writer_helpers import inline_writer
 
@@ -83,39 +83,7 @@ def _patch_get_peer_id():
 
 
 def _make_db() -> sqlite3.Connection:
-    """Return an in-memory SQLite at v16 (entity_details present)."""
-    conn = sqlite3.connect(":memory:")
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.executescript(
-        """
-        CREATE TABLE synced_dialogs (
-            dialog_id INTEGER PRIMARY KEY,
-            status TEXT NOT NULL DEFAULT 'not_synced',
-            last_synced_at INTEGER, last_event_at INTEGER,
-            sync_progress INTEGER DEFAULT 0, total_messages INTEGER,
-            access_lost_at INTEGER, read_inbox_max_id INTEGER, read_outbox_max_id INTEGER
-        );
-        CREATE TABLE full_history_enrollment (
-            dialog_id INTEGER PRIMARY KEY,
-            enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
-            source TEXT NOT NULL CHECK(source IN ('explicit', 'automatic', 'migration')),
-            updated_at INTEGER NOT NULL
-        ) WITHOUT ROWID;
-        CREATE TABLE dialogs (
-            dialog_id INTEGER PRIMARY KEY, name TEXT, type TEXT, archived INTEGER, hidden INTEGER,
-            identity_revision INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE entities (
-            id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT,
-            username TEXT, name_normalized TEXT, updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE entity_details (
-            entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL,
-            FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE
-        ) WITHOUT ROWID;
-        CREATE INDEX idx_entity_details_fetched_at ON entity_details(fetched_at);
-        """
-    )
+    conn = in_memory_sync_db()
     _TEST_DBS.append(conn)
     return conn
 
@@ -145,6 +113,12 @@ def make_server(
     )
     server._ready = True
     return server
+
+
+async def _acquire_local_profile(server: DaemonAPIServer, entity_id: int, kind: str, name: str) -> None:
+    await acquire_entity_profile(
+        server._get_entity_info_service(), entity_id, {"id": entity_id, "type": kind, "name": name}
+    )
 
 
 def _make_user_mock(**kwargs: object) -> MagicMock:
@@ -190,10 +164,6 @@ def _make_channel_mock(**kwargs: object) -> MagicMock:
 def _user_profile_port(
     user: MagicMock,
     full: MagicMock,
-    *,
-    post: PersonalChannelPost | None = None,
-    reference: PersonalChannelReference | None = None,
-    post_error: BaseException | None = None,
 ) -> FakeUserProfilePort:
     full_user = cast(object, full.full_user)
     user_id = cast(int, user.id)
@@ -205,13 +175,7 @@ def _user_profile_port(
         target_kind=TargetKind.BOT if user_is_bot else TargetKind.USER,
         observation=ObservationBoundary(100.0, 100.0),
     )
-    if reference is not None:
-        observation = replace(observation, personal_channel_reference=reference)
-    return FakeUserProfilePort(
-        observation,
-        post=post,
-        post_error=post_error,
-    )
+    return FakeUserProfilePort(observation)
 
 
 @pytest.mark.asyncio
@@ -240,6 +204,7 @@ async def test_get_entity_info_user_type() -> None:
     photos.photos = []
     client.side_effect = [common, photos]
     server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
+    await _acquire_local_profile(server, 1, "user", "Alice Smith")
     with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 1})
     assert r["ok"] is True, f"got {r}"
@@ -273,6 +238,7 @@ async def test_get_entity_info_user_avatar_history_handles_photos_without_count(
     photos.photos = [photo]
     client.side_effect = [common, photos]
     server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
+    await _acquire_local_profile(server, 11, "user", "Alice Smith")
     with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 11})
     assert r["ok"] is True, f"got {r}"
@@ -307,6 +273,7 @@ async def test_get_entity_info_bot_type() -> None:
     photos.photos = []
     client.side_effect = [common, photos]
     server = make_server(client=client, user_profile_port=_user_profile_port(bot, full))
+    await _acquire_local_profile(server, 2, "bot", "MyBot")
     with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 2})
     assert r["ok"] is True
@@ -316,7 +283,7 @@ async def test_get_entity_info_bot_type() -> None:
 
 
 @pytest.mark.asyncio
-async def test_legacy_bot_profile_uses_resolved_kind_without_local_entity_row() -> None:
+async def test_bot_profile_acquisition_uses_bot_kind_and_get_does_not_repeat_it() -> None:
     bot = _make_user_mock(id=6, bot=True, first_name="ProfileBot")
     channel = _make_channel_mock(id=777, title="Bot Notes", username="bot_notes")
     client = AsyncMock()
@@ -338,12 +305,15 @@ async def test_legacy_bot_profile_uses_resolved_kind_without_local_entity_row() 
     client.side_effect = [common, photos]
     port = _user_profile_port(bot, full)
     server = make_server(client=client, user_profile_port=port)
+    await _acquire_local_profile(server, 6, "bot", "ProfileBot")
+    acquisition_calls = list(port.calls)
 
     with patch.object(server, "_ready", True):
         result = await server._dispatch({"method": "get_entity_info", "entity_id": 6})
 
     assert result["ok"] is True
-    assert port.calls == [(6, TargetKind.BOT)]
+    assert acquisition_calls == [(6, TargetKind.BOT), (6, TargetKind.BOT)]
+    assert port.calls == acquisition_calls
     personal_channel = _dict(_dict(result["data"])["personal_channel"])
     assert personal_channel["metadata_source"] == "user_full_chats"
     assert personal_channel["title"] == "Bot Notes"
@@ -376,6 +346,7 @@ async def test_get_entity_info_common_envelope_user() -> None:
     photos.photos = []
     client.side_effect = [common, photos]
     server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
+    await _acquire_local_profile(server, 3, "user", "Alice Smith")
     with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 3})
     assert r["ok"] is True
@@ -412,6 +383,7 @@ async def test_get_entity_info_user_field_surface_preserved() -> None:
     photos.photos = []
     client.side_effect = [common, photos]
     server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
+    await _acquire_local_profile(server, 4, "user", "Alice Smith")
     with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 4})
     d = _dict(r["data"])
@@ -490,15 +462,18 @@ async def test_get_entity_info_user_personal_channel_card_from_full_user_chats()
     photos.count = 0
     photos.photos = []
     client.side_effect = [common, photos]
+    conn = _make_db()
+    with write_transaction(conn):
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted, is_service) VALUES (?, ?, ?, ?, 0, 0)",
+            (-1000000000777, 55, int(attached_date.timestamp()), long_text),
+        )
     server = make_server(
+        conn=conn,
         client=client,
-        user_profile_port=_user_profile_port(
-            user,
-            full,
-            post=PersonalChannelPost(message_id=55, sent_at=int(attached_date.timestamp()), text=long_text),
-            reference=PersonalChannelReference(channel_id=777, access_hash=-123),
-        ),
+        user_profile_port=_user_profile_port(user, full),
     )
+    await _acquire_local_profile(server, 44, "user", "Alice Smith")
 
     with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 44})
@@ -514,7 +489,7 @@ async def test_get_entity_info_user_personal_channel_card_from_full_user_chats()
         "metadata_source": "user_full_chats",
         "attached_message_id": 55,
         "latest_or_attached_post": {
-            "source": "personal_channel_message",
+            "source": "local_latest_message",
             "message_id": 55,
             "sent_at": 1782216000,
             "text_preview": long_text[:100],
@@ -527,44 +502,21 @@ async def test_get_entity_info_user_personal_channel_card_from_full_user_chats()
 
 
 @pytest.mark.asyncio
-async def test_personal_channel_post_port_failure_returns_fallback_reason() -> None:
-    port = FakeUserProfilePort(post_error=TimeoutError("timed out"))
-    server = make_server(user_profile_port=port)
-
-    preview, reason = await server._get_entity_info_service()._fetch_attached_personal_channel_post(
-        PersonalChannelReference(channel_id=777, access_hash=-123), message_id=55
-    )
-
-    assert preview is None
-    assert reason == "attached_message_fetch_failed"
-
-
-@pytest.mark.asyncio
 async def test_get_entity_info_user_partial_personal_channel_skips_local_enrichment() -> None:
     conn = _make_db()
-    conn.execute(
-        """CREATE TABLE messages (
-            dialog_id INTEGER,
-            message_id INTEGER,
-            sent_at INTEGER,
-            text TEXT,
-            is_deleted INTEGER DEFAULT 0,
-            is_service INTEGER DEFAULT 0,
-            media_kind TEXT
-        )"""
-    )
-    conn.execute(
-        "INSERT INTO entities (id, type, name, username, updated_at) VALUES (?, 'channel', ?, ?, 1700000000)",
-        (-1000000000777, "Local Channel", "local_channel"),
-    )
-    conn.execute(
-        "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted, is_service) VALUES (?, 10, 100, ?, 0, 0)",
-        (-1000000000777, "older local post"),
-    )
-    conn.execute(
-        "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted, is_service) VALUES (?, 11, 200, ?, 0, 0)",
-        (-1000000000777, "latest local post"),
-    )
+    with write_transaction(conn):
+        conn.execute(
+            "INSERT INTO entities (id, type, name, username, updated_at) VALUES (?, 'channel', ?, ?, 1700000000)",
+            (-1000000000777, "Local Channel", "local_channel"),
+        )
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted, is_service) VALUES (?, 10, 100, ?, 0, 0)",
+            (-1000000000777, "older local post"),
+        )
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted, is_service) VALUES (?, 11, 200, ?, 0, 0)",
+            (-1000000000777, "latest local post"),
+        )
 
     user = _make_user_mock(id=45)
     client = AsyncMock()
@@ -593,6 +545,7 @@ async def test_get_entity_info_user_partial_personal_channel_skips_local_enrichm
     photos.photos = []
     client.side_effect = [common, photos]
     server = make_server(conn=conn, client=client, user_profile_port=_user_profile_port(user, full))
+    await _acquire_local_profile(server, 45, "user", "Alice Smith")
 
     with patch.object(server, "_ready", True):
         conn.commit()
@@ -635,6 +588,7 @@ async def test_get_entity_info_no_download_keys_user() -> None:
     photos.photos = [photo]
     client.side_effect = [common, photos]
     server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
+    await _acquire_local_profile(server, 5, "user", "Alice Smith")
     with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 5})
 
@@ -657,14 +611,15 @@ async def test_get_entity_info_no_download_keys_user() -> None:
 
 @pytest.mark.asyncio
 async def test_get_entity_info_entity_not_found() -> None:
-    """CONTEXT D-10: ValueError from get_entity → ok=false, error='entity_not_found'."""
+    """An unknown local identity stays unknown without a Telegram lookup."""
     client = AsyncMock()
     client.get_entity = AsyncMock(side_effect=ValueError("No entity 99999"))
     server = make_server(client=client)
     r = await server._dispatch({"method": "get_entity_info", "entity_id": 99999})
     assert r["ok"] is False
-    assert r["error"] == "entity_not_found"
+    assert r["error"] == "entity_not_observed"
     assert r["data"] is None
+    cast(AsyncMock, client.get_entity).assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -674,11 +629,15 @@ async def test_get_entity_info_access_lost_is_returned_without_duplicate_warning
     entity_id = -1000000009101
     channel_name = "Archived Fixture Channel"
     conn = _make_db()
-    conn.execute(
-        "INSERT INTO dialogs (dialog_id, name, type, archived, hidden) VALUES (?, ?, ?, ?, ?)",
-        (entity_id, channel_name, "channel", 1, 1),
-    )
-    conn.commit()
+    with write_transaction(conn):
+        conn.execute(
+            "INSERT INTO dialogs (dialog_id, name, type, archived, hidden) VALUES (?, ?, ?, ?, ?)",
+            (entity_id, channel_name, "channel", 1, 1),
+        )
+        conn.execute(
+            "INSERT INTO entities (id, type, name, username, updated_at) VALUES (?, 'channel', ?, NULL, 1)",
+            (entity_id, channel_name),
+        )
     client = AsyncMock()
     client.get_entity = AsyncMock(side_effect=ChannelPrivateError(request=None))
     server = make_server(conn=conn, client=client)
@@ -686,9 +645,10 @@ async def test_get_entity_info_access_lost_is_returned_without_duplicate_warning
     with caplog.at_level("WARNING", logger="mcp_telegram.daemon_api"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": entity_id})
 
-    assert r["ok"] is False
-    assert r["error"] == "telegram_api_error"
+    assert r["ok"] is True
+    assert _dict(r["data"])["name"] == channel_name
     assert not caplog.records
+    cast(AsyncMock, client.get_entity).assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -696,10 +656,12 @@ async def test_get_entity_info_dispatcher_route() -> None:
     """SPEC Req 1 (smoke): _dispatch routes 'get_entity_info' to _get_entity_info."""
     client = AsyncMock()
     client.get_entity = AsyncMock(side_effect=ValueError("smoke"))
-    server = make_server(client=client)
-    # The unknown_method fallback would return error='unknown_method', not entity_not_found.
+    server = make_server(client=client, user_profile_port=FakeUserProfilePort())
+    await _acquire_local_profile(server, 1, "user", "Route Test")
     r = await server._dispatch({"method": "get_entity_info", "entity_id": 1})
-    assert r["error"] == "entity_not_found", "must route, not fall to unknown_method"
+    assert r["ok"] is True, "must route to the durable local read"
+    assert _dict(r["data"])["id"] == 1
+    cast(AsyncMock, client.get_entity).assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -731,10 +693,10 @@ def test_dm_peer_ids_excludes_access_lost() -> None:
     """
     server = make_server()
     # Insert two DM peers: one synced, one access_lost.
-    server._conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (111,))
-    server._conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'access_lost')", (222,))
-    # Negative dialog_id (group/channel) must also stay excluded by the
-    # dialog_id > 0 clause regardless of status — sanity check.
-    server._conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (-1001,))
+    with write_transaction(server._conn):
+        server._conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (111,))
+        server._conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'access_lost')", (222,))
+        # Negative dialog_id (group/channel) must also stay excluded.
+        server._conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (-1001,))
     peers = server._dm_peer_ids()
     assert peers == {111}, f"expected only the synced DM peer, got {peers}"

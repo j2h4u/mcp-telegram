@@ -613,6 +613,7 @@ async def test_linked_chat_adapter_real_gate_cannot_retry_physical_send(
         dependencies.conn,
         dependencies.shutdown_event,
         writer=inline_writer(dependencies.conn),
+        profile_detail_ttl_seconds=300,
     )
     manager._synced_dialog_ids.add(dialog_id)
 
@@ -690,6 +691,7 @@ async def test_malformed_dm_checkpoint_does_not_block_realtime_gate_acquisition(
         dependencies.conn,
         dependencies.shutdown_event,
         writer=inline_writer(dependencies.conn),
+        profile_detail_ttl_seconds=300,
     )
 
     class _DemandSink:

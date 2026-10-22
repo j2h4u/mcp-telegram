@@ -99,11 +99,18 @@ Only fields actually observed may supersede older values; omitted, partial and
 explicitly cleared fields have different semantics. Preserve original evidence
 times and protect newer events from older in-flight acquisitions.
 
+Profile reads and entity-name resolution project retained local facts without
+network acquisition, refresh admission or foreground waiting. Enabled personal
+dialog synchronization owns bounded, durable counterpart-profile collection,
+including the existing archived and hidden cohort. Delivered profile fields
+materialize canonically, with per-field ordering against older in-flight RPCs.
+Acquisition receipts still retain their separate authorization/reuse rules.
+
 Current implementation debt is tracked explicitly:
 
 | Work | Known departure | Delivery |
 | --- | --- | --- |
-| Profiles and entity discovery | Read-time acquisition/waiting, age-dependent completeness and name filtering, missing automatic DM profile coverage | [#381](https://github.com/j2h4u/mcp-telegram/issues/381) |
+| Non-DM profiles | Reads expose retained facts or explicit partial coverage; automatic acquisition ownership for never-collected group/channel profiles is not supplied by the DM slice | [#382](https://github.com/j2h4u/mcp-telegram/issues/382), following [#381](https://github.com/j2h4u/mcp-telegram/issues/381) |
 | History and bounded context | Some incomplete-coverage reads acquire Telegram data inline | [#383](https://github.com/j2h4u/mcp-telegram/issues/383) |
 | Topics | Missing catalog or optional icon enrichment can acquire Telegram data during a read | [#383](https://github.com/j2h4u/mcp-telegram/issues/383) |
 | Startup and offline availability | Telegram/startup readiness currently limits local serving; no whole-process offline guarantee is made | [#374 audit](https://github.com/j2h4u/mcp-telegram/issues/374), lifecycle design tracked in [#382](https://github.com/j2h4u/mcp-telegram/issues/382) |

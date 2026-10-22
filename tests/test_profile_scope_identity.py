@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.entity_profile.repository import EntityProfileRepository
@@ -35,65 +37,14 @@ def _repo(path: Path, *, receipt_scope: object = SCOPE) -> tuple[sqlite3.Connect
     return conn, EntityProfileRepository(conn, section_ttl_seconds=10)
 
 
-def test_old_fresh_pair_with_same_auth_scope_does_not_request_new_scope(tmp_path: Path) -> None:
-    conn, repo = _repo(tmp_path / "same-scope.sqlite")
-    changed_identity = json.dumps(
-        {"auth_scope": SCOPE, "endpoint": "different", "normalization_version": "new", "declared_fields": ["other"]}
-    )
-    conn.execute(
-        "UPDATE entity_detail_sections SET acquisition_identity_json=?, acquisition_generation=999, observed_at=1",
-        (changed_identity,),
-    )
-    conn.commit()
-    assert repo.pair_receipts_require_new_scope(42, {"auth_scope": SCOPE, "endpoint": "changed"}, now=111) is False
-    conn.close()
-
-
-@pytest.mark.parametrize(
-    "changed",
-    [
-        {"version": 2, "account_id": 42, "dc_id": 2, "auth_key_id": 99},
-        {"version": 1, "account_id": 7, "dc_id": 2, "auth_key_id": 99},
-        {"version": 1, "account_id": 42, "dc_id": 3, "auth_key_id": 99},
-        {"version": 1, "account_id": 42, "dc_id": 2, "auth_key_id": 100},
-    ],
-)
-def test_actual_auth_scope_change_requests_new_scope(tmp_path: Path, changed: dict[str, int]) -> None:
-    conn, repo = _repo(tmp_path / f"changed-{changed['account_id']}-{changed['dc_id']}-{changed['auth_key_id']}.sqlite")
-    assert repo.pair_receipts_require_new_scope(42, {"auth_scope": changed}, now=101) is True
-    conn.close()
-
-
-@pytest.mark.parametrize("malformed", [None, {}, {"version": 1}, "not-a-scope"])
-def test_missing_or_malformed_scope_fails_closed(tmp_path: Path, malformed: object) -> None:
-    conn, repo = _repo(tmp_path / f"malformed-{malformed!s}.sqlite", receipt_scope=malformed)
-    assert repo.pair_receipts_require_new_scope(42, {"auth_scope": SCOPE}, now=101) is True
-    assert repo.pair_receipts_require_new_scope(42, {"auth_scope": None}, now=101) is True
-    conn.close()
-
-
-def test_pair_eligibility_guard_and_reuse_ttl_remain_separate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reusable_pair_receipt_stops_at_ttl(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     conn, repo = _repo(tmp_path / "eligibility.sqlite")
-    conn.execute("UPDATE entity_detail_sections SET status='stale' WHERE section='personal_channel'")
-    conn.commit()
-    assert repo.pair_receipts_require_new_scope(42, {"auth_scope": SCOPE}, now=111) is False
-
-    conn.execute("UPDATE entity_detail_sections SET status='fresh' WHERE section='personal_channel'")
-    conn.commit()
     monkeypatch.setattr(
         repo,
         "_parse_validated_receipt",
         lambda *args, **kwargs: SimpleNamespace(outcome="usable", observation_started_at=100),
     )
     assert repo._reusable_receipt_is_valid(42, "full_profile", identity={"auth_scope": SCOPE}, now=111) is False
-    conn.close()
-
-
-def test_eligible_pair_with_missing_identity_column_fails_closed(tmp_path: Path) -> None:
-    conn, repo = _repo(tmp_path / "missing-column.sqlite")
-    conn.execute("ALTER TABLE entity_detail_sections DROP COLUMN acquisition_identity_json")
-    conn.commit()
-    assert repo.pair_receipts_require_new_scope(42, {"auth_scope": SCOPE}, now=101) is True
     conn.close()
 
 
@@ -105,19 +56,28 @@ async def test_service_accepts_same_scope_at_ttl_boundary_without_db_changes(tmp
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
-    cached = service._profiles.read(42, now=100)
-    assert cached is not None
-
-    before = tuple(
-        tuple(conn.execute(f"SELECT * FROM {table} WHERE entity_id=42").fetchall())
-        for table in ("entity_details", "entity_detail_sections", "entity_profile_refresh_state")
-    )
-    assert service._profile_scope_changed(cached, 42, now=400) is False
-    after = tuple(
-        tuple(conn.execute(f"SELECT * FROM {table} WHERE entity_id=42").fetchall())
-        for table in ("entity_details", "entity_detail_sections", "entity_profile_refresh_state")
+    service._deps = replace(
+        service._deps,
+        now_provider=lambda: 400.0,
+        full_user_auth_scope=lambda: TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 100),
     )
 
-    assert after == before
-    await service.shutdown()
-    conn.close()
+    try:
+        before = tuple(
+            tuple(conn.execute(f"SELECT * FROM {table} WHERE entity_id=42").fetchall())
+            for table in ("entity_details", "entity_detail_sections", "entity_profile_refresh_state")
+        )
+        result = await service.get_entity_info({"entity_id": 42})
+        after = tuple(
+            tuple(conn.execute(f"SELECT * FROM {table} WHERE entity_id=42").fetchall())
+            for table in ("entity_details", "entity_detail_sections", "entity_profile_refresh_state")
+        )
+
+        assert result["ok"] is True
+        data = result["data"]
+        assert isinstance(data, dict)
+        assert data["id"] == 42
+        assert after == before
+    finally:
+        await service.shutdown()
+        conn.close()

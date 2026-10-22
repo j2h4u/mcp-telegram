@@ -5,13 +5,15 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import TypedDict, Unpack, cast
+from typing import TYPE_CHECKING, TypedDict, Unpack, cast
 
 from mcp_telegram.entity_profile.contracts import (
+    PROFILE_SECTIONS,
     ChannelContactOverlapObservation,
     ChannelProfileObservation,
     ChannelReference,
@@ -22,8 +24,6 @@ from mcp_telegram.entity_profile.contracts import (
     CommonChatSummary,
     GroupProfileObservation,
     GroupReference,
-    PersonalChannelPost,
-    PersonalChannelReference,
     ProjectionOutcome,
     ProjectionStatus,
     TargetKind,
@@ -31,6 +31,83 @@ from mcp_telegram.entity_profile.contracts import (
     UserProfileObservation,
     UserReference,
 )
+from mcp_telegram.sync_db import _apply_migrations
+from mcp_telegram.sync_transactions import enable_runtime_writes, write_savepoint
+
+if TYPE_CHECKING:
+    from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
+
+
+def in_memory_sync_db() -> sqlite3.Connection:
+    """Return a current-schema in-memory database with runtime writes guarded."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys = ON")
+    _apply_migrations(conn)
+    enable_runtime_writes(conn)
+    return conn
+
+
+def seed_entity_profile(
+    conn: sqlite3.Connection,
+    entity_id: int,
+    detail: dict[str, object],
+    *,
+    owner_account_id: int = 1,
+    observed_at: int = 100,
+) -> None:
+    """Seed a collected canonical profile for local projection tests."""
+    entity_type = str(detail["type"])
+    with write_savepoint(conn):
+        conn.execute(
+            "INSERT INTO entities(id,type,name,username,updated_at) VALUES (?,?,?,?,?)",
+            (entity_id, entity_type, detail.get("name"), detail.get("username"), observed_at),
+        )
+        conn.execute(
+            "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_owner_account_id) VALUES (?,?,?,?)",
+            (entity_id, json.dumps({"schema": 1, **detail}), observed_at, owner_account_id),
+        )
+        conn.executemany(
+            "INSERT INTO entity_detail_sections(entity_id,section,status,observed_at,payload_json) "
+            "VALUES (?,?,'fresh',?,'{}')",
+            ((entity_id, section, observed_at) for section in PROFILE_SECTIONS),
+        )
+
+
+async def acquire_entity_profile(service: DaemonEntityInfoService, entity_id: int, detail: dict[str, object]) -> None:
+    """Run the service's durable adapter for one fixture entity to completion."""
+    from unittest.mock import MagicMock
+
+    from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
+    from mcp_telegram.telegram_demand import RpcAttemptBudget
+
+    bind_profile_test_account(service)
+    service._deps = replace(service._deps, now_provider=lambda: 100.0, enable_full_user_pair=False)
+    service.bind_demand_sink(MagicMock())
+    await service._write_profiles(lambda profiles: profiles.save_core(detail, now=100))
+    await service._write_profiles(
+        lambda profiles: profiles.mark_pending(
+            entity_id, now=100, pair_eligible_override=False, pair_mode_override="disabled"
+        )
+    )
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    adapter = EntityProfileDemandAdapter(coordinator)
+    for _ in range(8):
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        if service._profiles.next_due_refresh(now=100) is None:
+            break
+
+
+def bind_profile_test_account(service: DaemonEntityInfoService) -> None:
+    """Bind fixture-owned private facts to a stable fake Telegram account."""
+    from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
+
+    scope = TelegramAuthScope(AUTH_SCOPE_VERSION, 1, 2, 99)
+    service._deps = replace(
+        service._deps,
+        self_id=1,
+        full_user_auth_scope=lambda: scope,
+    )
 
 
 class _BuildMockMessageKwargs(TypedDict, total=False):
@@ -264,11 +341,6 @@ class LoudUserProfilePort:
     async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
         raise AssertionError(f"unexpected user profile request for {user_id} ({target_kind})")
 
-    async def fetch_personal_channel_post(
-        self, reference: PersonalChannelReference, message_id: int
-    ) -> PersonalChannelPost | None:
-        raise AssertionError(f"unexpected personal channel post request for {reference.channel_id}/{message_id}")
-
 
 class FakeUserProfilePort:
     """Deterministic user profile port double with explicit call accounting."""
@@ -277,13 +349,9 @@ class FakeUserProfilePort:
         self,
         observation: UserProfileObservation | None = None,
         error: BaseException | None = None,
-        post: PersonalChannelPost | None = None,
-        post_error: BaseException | None = None,
     ) -> None:
         self.observation = observation
         self.error = error
-        self.post = post
-        self.post_error = post_error
         self.calls: list[tuple[int, TargetKind]] = []
 
     def get_user_reference(self, user_id: int, *, is_self: bool = False) -> UserReference:
@@ -297,15 +365,6 @@ class FakeUserProfilePort:
             unavailable = ProjectionOutcome(ProjectionStatus.UNAVAILABLE, None, "unset", None)
             return UserProfileObservation(user_id, target_kind, unavailable, unavailable)
         return self.observation
-
-    async def fetch_personal_channel_post(
-        self, reference: PersonalChannelReference, message_id: int
-    ) -> PersonalChannelPost | None:
-        if self.post_error is not None:
-            raise self.post_error
-        if self.post is not None and self.post.message_id != message_id:
-            return None
-        return self.post
 
 
 def remove_v80_schema_for_historical_fixture(conn: sqlite3.Connection) -> None:

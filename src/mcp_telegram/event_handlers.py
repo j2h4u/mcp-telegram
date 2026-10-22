@@ -60,6 +60,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     UpdateReadChannelInbox,
     UpdateReadHistoryInbox,
     UpdateTranscribedAudio,
+    UpdateUser,
     UpdateUserName,
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
@@ -80,6 +81,17 @@ from .dialog_directory import (
 )
 from .dialog_identity import capture_identity_baseline, publish_dialog_identity
 from .dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation, ObservedText
+from .entity_profile.contracts import ProfileFieldObservation
+from .entity_profile.repository import EntityProfileRepository
+from .entity_profile.updates import (
+    ProfilePush,
+    bundled_profile_users,
+    mark_push_applied,
+    profile_update_id,
+    project_profile_update,
+    project_user_profile,
+    push_marker,
+)
 from .entity_store import PartialEntityIdentity, apply_partial_entity_identity
 from .flood import TelegramRpcThrottled
 from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
@@ -637,7 +649,7 @@ class EventHandlerManager:
         shutdown_event: asyncio.Event set when SIGTERM is received.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - explicit daemon-owned writer and profile policy
         self,
         client: _EventHandlerClient,
         conn: sqlite3.Connection,
@@ -645,6 +657,8 @@ class EventHandlerManager:
         update_barrier: UpdateProcessingBarrier | None = None,
         *,
         writer: SQLiteWriter,
+        profile_detail_ttl_seconds: int,
+        profile_pair_mode: str = "enabled",
     ) -> None:
         self._client = client
         self._conn = conn
@@ -657,6 +671,9 @@ class EventHandlerManager:
         self._self_id: int | None = None
         self._demand_sink: DemandOfferSink | None = None
         self._observation_sink: RuntimeObservationSink | None = None
+        self._profile_pair_mode = profile_pair_mode
+        self._profile_detail_ttl_seconds = profile_detail_ttl_seconds
+        self._profile_push_owner = object()
 
     def bind_observation_sink(self, sink: RuntimeObservationSink) -> None:
         self._observation_sink = sink
@@ -705,6 +722,7 @@ class EventHandlerManager:
         handles overlap idempotently.
         """
         self._refresh_synced_dialogs()
+        self._client.add_event_handler(self.on_raw_identity_or_notify, events.Raw())
         self._client.add_event_handler(self.on_new_message, events.NewMessage)
         self._client.add_event_handler(
             self.on_raw_topic_message,
@@ -749,10 +767,6 @@ class EventHandlerManager:
         self._client.add_event_handler(
             self.on_raw_channel_chat_update,
             events.Raw(types=[UpdateChannel, UpdateChat]),
-        )
-        self._client.add_event_handler(
-            self.on_raw_identity_or_notify,
-            events.Raw(types=[UpdateUserName, UpdateNotifySettings]),
         )
         self._client.add_event_handler(
             self.on_raw_participant,
@@ -986,6 +1000,7 @@ class EventHandlerManager:
             )
             if outcome.enabled and identity is not None:
                 await self._writer.run(lambda conn: self._persist_dm_entity(conn, dialog_id, identity, now))
+                await self._persist_optional_dm_profile(sender, dialog_id)
             if outcome.enabled and outcome.action in {"queue_full_history", "preserved_enabled_intent"}:
                 self._offer(DemandKind.FULL_SYNC_PAGE)
                 # status='syncing' is stable once inserted — FullSyncWorker only
@@ -1002,6 +1017,14 @@ class EventHandlerManager:
         if identity is not None:
             logger.info("dm_auto_enroll_entity dialog_id=%d name=%r", dialog_id, identity.name)
         return True
+
+    async def _persist_optional_dm_profile(self, sender: object, dialog_id: int) -> None:
+        if self._self_id is None or project_user_profile(sender) is None:
+            return
+        try:
+            await self._persist_profile_pushes(sender=sender)
+        except Exception:
+            logger.exception("dm_auto_enroll_profile_failed dialog_id=%d", dialog_id)
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -2228,10 +2251,94 @@ class EventHandlerManager:
             return
         self._update_realtime_notify(conn, update, now)
 
+    def _apply_profile_push(
+        self,
+        profiles: EntityProfileRepository,
+        push: ProfilePush,
+        observation: ProfileFieldObservation,
+    ) -> frozenset[str]:
+        fields = dict(push.fields)
+        photo = fields.pop("current_photo", None) if push.authoritative_photo else None
+        changed = profiles.apply_profile_update(push.entity_id, fields, observation=observation)
+        if push.authoritative_photo and "current_photo" in push.fields:
+            changed |= profiles.apply_profile_update(
+                push.entity_id,
+                {"current_photo": photo},
+                observation=replace(observation, source="update"),
+            )
+        return changed
+
+    def _write_profile_pushes(
+        self, conn: sqlite3.Connection, update: object, users: Sequence[object]
+    ) -> tuple[bool, bool]:
+        owner = self._self_id
+        if owner is None:
+            return False, False
+        profiles = EntityProfileRepository(conn, section_ttl_seconds=self._profile_detail_ttl_seconds)
+        annotations: list[tuple[object, ProfileFieldObservation]] = []
+        offered = False
+        handled_name = False
+        pushes = [(user, project_user_profile(user)) for user in users]
+        pushes.append((update, project_profile_update(update)))
+        with write_transaction(conn):
+            for source, push in pushes:
+                if not self._eligible_profile_push(profiles, push):
+                    continue
+                assert push is not None
+                observation = self._profile_push_observation(conn, source, push)
+                changed = self._apply_profile_push(profiles, push, observation)
+                sections = self._profile_push_sections(source, changed)
+                if sections:
+                    offered |= profiles.request_section_refresh(
+                        push.entity_id, sections, now=observation.observed_at, pair_mode=self._profile_pair_mode
+                    )
+                handled_name |= source is update and isinstance(update, UpdateUserName)
+                annotations.append((source, observation))
+        # Object lifetime, not an evictable cache: a repeated bundle keeps its original order.
+        for source, observation in annotations:
+            mark_push_applied(source, self._profile_push_owner, observation)
+        return offered, handled_name
+
+    def _eligible_profile_push(self, profiles: EntityProfileRepository, push: ProfilePush | None) -> bool:
+        return (
+            push is not None and push.entity_id != self._self_id and profiles.is_history_profile_managed(push.entity_id)
+        )
+
+    def _profile_push_observation(
+        self, conn: sqlite3.Connection, source: object, push: ProfilePush
+    ) -> ProfileFieldObservation:
+        assert self._self_id is not None
+        return push_marker(source, self._profile_push_owner) or ProfileFieldObservation(
+            owner_account_id=self._self_id,
+            order=allocate_observation_order(conn),
+            observed_at=int(time.time()),
+            source="min" if push.minimal else "update",
+        )
+
+    def _profile_push_sections(self, source: object, changed: frozenset[str]) -> tuple[str, ...]:
+        sections: list[str] = []
+        if isinstance(source, UpdateUser) and push_marker(source, self._profile_push_owner) is None:
+            sections.extend(("full_profile", "personal_channel"))
+        if "current_photo" in changed:
+            sections.append("avatar_history")
+        return tuple(sections)
+
+    async def _persist_profile_pushes(self, *, update: object = None, sender: object = None) -> bool:
+        users: Sequence[object] = (sender,) if sender is not None else bundled_profile_users(update)
+        if self._self_id is None or (not users and profile_update_id(update) is None):
+            return False
+        offered, handled_name = await self._writer.run(lambda conn: self._write_profile_pushes(conn, update, users))
+        if offered:
+            self._offer(DemandKind.ENTITY_PROFILE_REFRESH)
+        return handled_name
+
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
-    async def on_raw_identity_or_notify(self, update: UpdateUserName | UpdateNotifySettings) -> None:
-        """Persist complete name updates and exact notification mute deadlines."""
+    async def on_raw_identity_or_notify(self, update: object) -> None:
+        """Materialize supplied profile facts and exact notification mute deadlines."""
         try:
+            handled_name = await self._persist_profile_pushes(update=update)
+            if not isinstance(update, (UpdateUserName, UpdateNotifySettings)) or handled_name:
+                return
             await self._writer.run(
                 lambda conn: self._update_realtime_identity_or_notify(conn, update, int(time.time()))
             )

@@ -121,28 +121,6 @@ class _CompletePairClient(_FailureClient):
         )
 
 
-def _requeue_new_generation(conn: sqlite3.Connection) -> None:
-    revision = cast(
-        tuple[int], conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone()
-    )[0]
-    conn.execute(
-        """
-        UPDATE entity_profile_refresh_state
-        SET status='pending', retry_at=NULL, reason='refresh_queued', next_section='full_profile',
-            acquisition_cursor=0, generation=generation+1, started_at=200, pair_eligible=1,
-            pair_mode='enabled', profile_revision=?, follow_up_required=0,
-            pair_full_profile_outcome=NULL, pair_personal_channel_outcome=NULL,
-            pair_ready_at=NULL, pair_readiness_latency_ms=NULL, pair_summary_watermark=NULL,
-            pair_attempts=0, pair_retries=0, pair_full_profile_attempts=0,
-            pair_personal_channel_attempts=0, pair_full_profile_retries=0,
-            pair_personal_channel_retries=0, pair_measurement_complete=0
-        WHERE entity_id=42
-        """,
-        (revision,),
-    )
-    conn.commit()
-
-
 async def _baseline_then_fail(path: Path, client: _FailureClient) -> tuple[sqlite3.Connection, DaemonEntityInfoService]:
     conn, raw_service = _prepare(path, migrated=True)
     service = cast(DaemonEntityInfoService, raw_service)
@@ -151,7 +129,9 @@ async def _baseline_then_fail(path: Path, client: _FailureClient) -> tuple[sqlit
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
     baseline = service._profiles.read(42, now=100)  # type: ignore[attr-defined]
     assert baseline is not None and baseline.detail["about"] == "about"
-    _requeue_new_generation(conn)
+    service._profiles.request_section_refresh(  # type: ignore[attr-defined]
+        42, ("full_profile", "personal_channel"), now=100, pair_mode="enabled"
+    )
     service._deps = replace(service._deps, client=client, user_profile_port=client)
     return conn, service
 
@@ -171,27 +151,29 @@ async def test_enabled_pair_failures_preserve_prior_data_and_account_attempts(
     conn, service = await _baseline_then_fail(tmp_path / f"{reason}.sqlite", _FailureClient(failure=failure))
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    try:
+        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
 
-    assert conn.execute(
-        "SELECT status, retry_at, reason, next_section, pair_attempts, pair_retries "
-        "FROM entity_profile_refresh_state WHERE entity_id=42"
-    ).fetchone() == ("failed", retry_at, reason, "full_profile", 1, 0)
-    assert conn.execute(
-        "SELECT status FROM entity_detail_sections WHERE entity_id=42 AND section='full_profile'"
-    ).fetchone() == ("stale",)
-    assert conn.execute(
-        "SELECT acquisition_generation, acquisition_outcome FROM entity_detail_sections "
-        "WHERE entity_id=42 AND section='full_profile'"
-    ).fetchone() == (1, "usable")
-    assert conn.execute(
-        "SELECT pair_full_profile_outcome, pair_personal_channel_outcome, pair_measurement_complete "
-        "FROM entity_profile_refresh_state WHERE entity_id=42"
-    ).fetchone() == (None, None, 0)
-    detail = service._profiles.read(42, now=200)  # type: ignore[attr-defined]
-    assert detail is not None and detail.detail["about"] == "about"
-    await service.shutdown()
-    conn.close()
+        assert conn.execute(
+            "SELECT status, retry_at, reason, next_section, pair_attempts, pair_retries "
+            "FROM entity_profile_refresh_state WHERE entity_id=42"
+        ).fetchone() == ("failed", retry_at, reason, "full_profile", 1, 0)
+        assert conn.execute(
+            "SELECT status FROM entity_detail_sections WHERE entity_id=42 AND section='full_profile'"
+        ).fetchone() == ("stale",)
+        assert conn.execute(
+            "SELECT acquisition_generation, acquisition_outcome FROM entity_detail_sections "
+            "WHERE entity_id=42 AND section='full_profile'"
+        ).fetchone() == (1, "usable")
+        assert conn.execute(
+            "SELECT pair_full_profile_outcome, pair_personal_channel_outcome, pair_measurement_complete "
+            "FROM entity_profile_refresh_state WHERE entity_id=42"
+        ).fetchone() == (None, None, 0)
+        detail = service._profiles.read(42, now=200)  # type: ignore[attr-defined]
+        assert detail is not None and detail.detail["about"] == "about"
+    finally:
+        await service.shutdown()
+        conn.close()
 
 
 @pytest.mark.asyncio
@@ -212,18 +194,20 @@ async def test_invalid_full_user_envelopes_do_not_create_positive_receipts(tmp_p
     )
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    try:
+        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
 
-    assert conn.execute(
-        "SELECT status, reason, next_section, pair_attempts FROM entity_profile_refresh_state WHERE entity_id=42"
-    ).fetchone() == ("failed", "valueerror", "full_profile", 1)
-    assert conn.execute(
-        "SELECT acquisition_generation, acquisition_outcome FROM entity_detail_sections "
-        "WHERE entity_id=42 AND section='full_profile'"
-    ).fetchone() == (1, "usable")
-    assert service._profiles.read(42, now=200).detail["about"] == "about"  # type: ignore[union-attr]
-    await service.shutdown()
-    conn.close()
+        assert conn.execute(
+            "SELECT status, reason, next_section, pair_attempts FROM entity_profile_refresh_state WHERE entity_id=42"
+        ).fetchone() == ("failed", "valueerror", "full_profile", 1)
+        assert conn.execute(
+            "SELECT acquisition_generation, acquisition_outcome FROM entity_detail_sections "
+            "WHERE entity_id=42 AND section='full_profile'"
+        ).fetchone() == (1, "usable")
+        assert service._profiles.read(42, now=200).detail["about"] == "about"  # type: ignore[union-attr]
+    finally:
+        await service.shutdown()
+        conn.close()
 
 
 def test_normalization_rejects_target_mismatch_and_pair_is_only_user_or_bot() -> None:
@@ -272,6 +256,9 @@ async def test_service_refresh_keeps_canonical_service_type_when_full_user_uses_
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
 
+    service._profiles.request_section_refresh(  # type: ignore[attr-defined]
+        42, ("full_profile", "personal_channel"), now=100, pair_mode="enabled"
+    )
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
 
     assert conn.execute("SELECT type FROM entities WHERE id=42").fetchone() == ("service",)
@@ -492,7 +479,9 @@ async def test_actual_entity_info_tool_renders_persisted_partial_on_target_kind_
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
-    _requeue_new_generation(conn)
+    service._profiles.request_section_refresh(  # type: ignore[attr-defined]
+        42, ("full_profile", "personal_channel"), now=100, pair_mode="enabled"
+    )
     mismatch_client = _PairClient(bot=False)
     service._deps = replace(service._deps, client=mismatch_client, user_profile_port=mismatch_client)  # type: ignore[attr-defined]
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
