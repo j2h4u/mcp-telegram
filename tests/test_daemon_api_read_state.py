@@ -84,6 +84,7 @@ def _make_db() -> Iterator[sqlite3.Connection]:
             sync_progress       INTEGER DEFAULT 0,
             total_messages      INTEGER,
             access_lost_at      INTEGER,
+            last_delta_checked_at INTEGER,
             read_inbox_max_id   INTEGER,
             read_outbox_max_id  INTEGER,
             topic_attribution_version INTEGER NOT NULL DEFAULT 0,

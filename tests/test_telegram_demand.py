@@ -55,7 +55,7 @@ def test_nested_acquisition_preserves_root_identity_and_restores_context() -> No
 
 
 def test_root_context_and_tokens_are_immutable() -> None:
-    with demand_context(DemandKind.MESSAGE_READ_FALLBACK) as token:
+    with demand_context(DemandKind.CHAT_EXPORT_OPERATION) as token:
         with pytest.raises(FrozenInstanceError):
             token.kind = DemandKind.MCP_REMOTE_ACQUISITION  # type: ignore[misc]
         with pytest.raises(RuntimeError, match="nested root demand"):

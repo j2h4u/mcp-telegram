@@ -47,10 +47,14 @@ from mcp_telegram.reading.sqlite_projection import (
 )
 from mcp_telegram.runtime_observations import RuntimeObservationSink, record_runtime_observation
 from mcp_telegram.sqlite_writer import SQLiteWriter
-from mcp_telegram.sync_db import _RUNTIME_OBSERVATIONS_V54_DDL, ensure_sync_schema
+from mcp_telegram.sync_db import (
+    _RUNTIME_OBSERVATIONS_V54_DDL,
+    _apply_migration_84,
+    _apply_migrations,
+    ensure_sync_schema,
+)
 from mcp_telegram.sync_read_model import compute_sync_coverage as _compute_sync_coverage
 from mcp_telegram.sync_transactions import enable_runtime_writes
-from mcp_telegram.telegram_demand import AcquisitionKind
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionSaturatedError,
@@ -60,9 +64,8 @@ from mcp_telegram.telegram_rpc_scheduler import (
     rpc_scope,
 )
 from mcp_telegram.telethon_dialog import classify_dialog_type
-from mcp_telegram.topics.contracts import TopicFact
-from mcp_telegram.topics.refresh import TopicRefresher
-from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
+from mcp_telegram.topics.catalog import TopicCatalogRepository
+from mcp_telegram.topics.contracts import TopicPage
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.dialog_directory_coverage_fixtures import install_dialog_directory_coverage_schema
 from tests.helpers import (
@@ -343,11 +346,10 @@ def _activity_data(resp: dict[str, object]) -> dict[str, object]:
     return cast(dict[str, object], resp["data"])
 
 
-def make_server(  # noqa: PLR0913
+def make_server(
     conn: sqlite3.Connection | None = None,
     client: object | None = None,
     feedback_conn: sqlite3.Connection | None = None,
-    topic_refresher: TopicRefresher | None = None,
     hydration_requester: Callable[[sqlite3.Connection, int, int], None] | None = None,
     writer: SQLiteWriter | None = None,
 ) -> DaemonAPIServer:
@@ -373,7 +375,6 @@ def make_server(  # noqa: PLR0913
         writer=writer if writer is not None else inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
         hydration_requester=hydration_requester,
-        topic_refresher=topic_refresher,
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
         common_chats_port=LoudCommonChatsPort(),
@@ -955,6 +956,8 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
         conn.execute(MESSAGES_FTS_DDL)
     install_dialog_directory_coverage_schema(conn)
     _install_message_observation_schema(conn)
+    conn.execute("CREATE TABLE schema_version(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)")
+    _apply_migration_84(conn, 83)
     conn.commit()
     return conn
 
@@ -1071,46 +1074,6 @@ def _make_db_with_activity() -> sqlite3.Connection:
     return conn
 
 
-def _make_db_for_fragment_context() -> sqlite3.Connection:
-    """Return test DB shape compatible with canonical message persistence."""
-    conn = _make_db(with_fts=True)
-    conn.execute(
-        """
-        CREATE TABLE message_entities (
-            dialog_id   INTEGER NOT NULL,
-            message_id  INTEGER NOT NULL,
-            offset      INTEGER NOT NULL,
-            length      INTEGER NOT NULL,
-            type        TEXT NOT NULL,
-            value       TEXT,
-            PRIMARY KEY (dialog_id, message_id, offset, length, type)
-        ) WITHOUT ROWID
-        """
-    )
-    conn.execute("ALTER TABLE messages ADD COLUMN grouped_id INTEGER")
-    conn.execute("ALTER TABLE messages ADD COLUMN reply_to_peer_id INTEGER")
-    conn.commit()
-    return conn
-
-
-def _fragment_message(message_id: int, text: str) -> SimpleNamespace:
-    return SimpleNamespace(
-        id=message_id,
-        date=datetime.fromtimestamp(1_700_000_000 + message_id, tz=UTC),
-        message=text,
-        sender_id=101,
-        sender=SimpleNamespace(first_name="Alice"),
-        media=None,
-        reply_to=None,
-        reactions=None,
-        edit_date=None,
-        grouped_id=None,
-        out=False,
-        fwd_from=None,
-        post_author=None,
-    )
-
-
 def _insert_synced_dialog(
     conn: sqlite3.Connection,
     dialog_id: int,
@@ -1187,7 +1150,7 @@ def _publish_test_dialog_directory(
     if completed_at is None:
         completed_at = started_at
     conn.execute(
-        "UPDATE dialogs SET identity_complete=1, identity_observed_at=?, identity_source='test'",
+        "UPDATE dialogs SET identity_complete=1, identity_observed_at=?, identity_source='directory'",
         (started_at,),
     )
     conn.execute(
@@ -1253,36 +1216,9 @@ def _insert_topic_metadata(
 
 
 def _make_db_with_topics() -> sqlite3.Connection:
-    """Return an in-memory DB with topic_metadata including v19 columns."""
-    conn = _make_db()
-    # _make_db() already creates topic_metadata with the v4 schema (no v19 cols).
-    # Drop and recreate with the full v19 schema so hidden/icon_emoji_id/etc. exist.
-    conn.executescript("DROP TABLE IF EXISTS topic_metadata;")
-    conn.execute(
-        """
-        CREATE TABLE topic_metadata (
-            observation_order INTEGER NOT NULL DEFAULT 0,
-            dialog_id      INTEGER NOT NULL,
-            topic_id       INTEGER NOT NULL,
-            title          TEXT NOT NULL,
-            top_message_id INTEGER,
-            is_general     INTEGER NOT NULL DEFAULT 0,
-            is_deleted     INTEGER NOT NULL DEFAULT 0,
-            inaccessible_error TEXT,
-            inaccessible_at    INTEGER,
-            updated_at     INTEGER NOT NULL DEFAULT 0,
-            icon_emoji_id  INTEGER,
-            icon_emoji     TEXT,
-            icon_color     INTEGER,
-            pinned         INTEGER NOT NULL DEFAULT 0,
-            hidden         INTEGER NOT NULL DEFAULT 0,
-            snapshot_at    INTEGER,
-            date           INTEGER,
-            PRIMARY KEY (dialog_id, topic_id)
-        )
-        """
-    )
-    conn.commit()
+    """Use the canonical topic receipt schema, without enabling fixture write guards."""
+    conn = _register_sqlite_connection(sqlite3.connect(":memory:"))
+    _apply_migrations(conn)
     return conn
 
 
@@ -1340,159 +1276,56 @@ async def test_list_messages_from_db() -> None:
 
 
 # ---------------------------------------------------------------------------
-# list_messages — on-demand fetch
+# list_messages — locally retained history without enrollment
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_list_messages_on_demand() -> None:
-    """list_messages with no synced_dialog row calls client.iter_messages on-demand."""
+async def test_list_messages_without_sync_row_reads_retained_messages() -> None:
+    """A missing sync row does not hide retained messages or authorize acquisition."""
     conn = _make_db()
-    # No synced_dialog row for dialog_id=2
-
-    # Mock message object
-    mock_msg = MagicMock()
-    mock_msg.id = 200
-    mock_msg.date = SimpleNamespace(timestamp=lambda: 1700000001.0)
-    mock_msg.message = "On-demand message"
-    mock_msg.sender_id = None
-    mock_msg.sender = SimpleNamespace(first_name="Bob")
-    mock_msg.media = None
-    mock_msg.reply_to = None
-    mock_msg.reactions = None
-    mock_msg.reply_to_msg_id = None
-    mock_msg.forum_topic_id = None
-
-    async def _fake_iter_messages(*args: object, **kwargs: object):  # type: ignore[misc]
-        yield mock_msg
-
+    _insert_message(conn, 2, 200, text="Retained message")
     client = _TestClient()
-    client.iter_messages = _fake_iter_messages
+    client.iter_messages = MagicMock(side_effect=AssertionError("local history must not fetch"))
     server = make_server(conn, client)
 
     result = await server._list_messages({"dialog_id": 2, "limit": 10, "message_state": "sent"})
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
-    assert result["data"]["source"] == "telegram"
+    assert result["data"]["source"] == "sync_db"
     messages = _response_messages(result)
     assert len(messages) == 1
     assert messages[0]["message_id"] == 200
+    client.iter_messages.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_dispatch_uncached_list_messages_binds_interactive_rpc_source() -> None:
+async def test_dispatch_uncached_list_messages_does_not_acquire() -> None:
     conn = _make_db()
-    seen_sources: list[TelegramRpcSource] = []
-    mock_msg = MagicMock()
-    mock_msg.id = 201
-    mock_msg.date = SimpleNamespace(timestamp=lambda: 1700000001.0)
-    mock_msg.message = "Interactive fallback"
-    mock_msg.sender_id = None
-    mock_msg.sender = None
-    mock_msg.media = None
-    mock_msg.reply_to = None
-    mock_msg.reactions = None
-    mock_msg.reply_to_msg_id = None
-    mock_msg.forum_topic_id = None
-
-    async def iter_messages(*_args: object, **_kwargs: object):
-        seen_sources.append(current_rpc_scope().source)
-        yield mock_msg
-
     client = _TestClient()
-    client.iter_messages = iter_messages
+    client.iter_messages = MagicMock(side_effect=AssertionError("local history must not fetch"))
     server = make_server(conn, client)
 
     result = await server._dispatch({"method": "list_messages", "dialog_id": 2, "limit": 10, "message_state": "sent"})
 
     assert result["ok"] is True
-    assert seen_sources == [TelegramRpcSource.MCP_INTERACTIVE]
+    assert _response_data(result)["source"] == "sync_db"
+    assert _response_data(result)["messages"] == []
+    client.iter_messages.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_reading_service_injects_fragment_context_caches_anchor_window() -> None:
-    """Fragment fetch inserts anchor+tail messages and marks dialog as fragment."""
-    conn = _make_db_for_fragment_context()
-    client = _TestClient()
-    entity = object()
-    client.get_input_entity = AsyncMock(return_value=entity)
-    client.get_messages = AsyncMock(
-        return_value=[
-            _fragment_message(10, "anchor"),
-            None,
-            _fragment_message(12, "tail"),
-        ]
-    )
-    server = make_server(conn, client)
-
-    ok = (await server._get_reading_service()._deps.fragment_context.fetch(42, 10, 6)).ok
-
-    assert ok is True
-    client.get_input_entity.assert_awaited_once_with(42)
-    client.get_messages.assert_awaited_once_with(entity, ids=[7, 8, 9, 10, 11, 12])
-    row = _fetchone_row(conn, "SELECT status FROM synced_dialogs WHERE dialog_id = 42")
-    assert row is not None
-    assert row[0] == "fragment"
-    assert [
-        (row[0], row[1]) for row in _fetchall_rows(conn, "SELECT message_id, text FROM messages ORDER BY message_id")
-    ] == [
-        (10, "anchor"),
-        (12, "tail"),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_reading_service_injects_empty_fragment_context() -> None:
-    """No returned messages is a valid fragment fetch with no cache insert."""
-    conn = _make_db_for_fragment_context()
-    client = _TestClient()
-    client.get_input_entity = AsyncMock(return_value=object())
-    client.get_messages = AsyncMock(return_value=[None])
-    server = make_server(conn, client)
-
-    ok = (await server._get_reading_service()._deps.fragment_context.fetch(43, 20, 6)).ok
-
-    assert ok is True
-    row = _fetchone_row(conn, "SELECT status FROM synced_dialogs WHERE dialog_id = 43")
-    assert row is not None
-    assert row[0] == "fragment"
-    assert _fetchone_int(conn, "SELECT COUNT(*) FROM messages") == 0
-
-
-@pytest.mark.asyncio
-async def test_reading_service_injects_fragment_failure() -> None:
-    """Telegram lookup failure leaves the fragment marker but reports failure."""
-    conn = _make_db_for_fragment_context()
-    client = _TestClient()
-    client.get_input_entity = AsyncMock(side_effect=RuntimeError("telegram unavailable"))
-    client.get_messages = AsyncMock()
-    server = make_server(conn, client)
-
-    ok = (await server._get_reading_service()._deps.fragment_context.fetch(44, 30, 6)).ok
-
-    assert ok is False
-    client.get_messages.assert_not_called()
-    row = _fetchone_row(conn, "SELECT status FROM synced_dialogs WHERE dialog_id = 44")
-    assert row is not None
-    assert row[0] == "fragment"
-
-
-@pytest.mark.asyncio
-async def test_list_messages_context_window_own_only_uses_fragment_fetch() -> None:
-    """own_only dialogs should only use bounded fragment fetch for anchor context."""
+async def test_list_messages_context_window_own_only_uses_retained_neighbors() -> None:
+    """Own-message coverage still permits a bounded local context window."""
     DIALOG_ID = 7005
 
-    conn = _make_db_for_fragment_context()
+    conn = _make_db()
     _insert_synced_dialog(conn, DIALOG_ID, status="own_only")
+    _insert_message(conn, DIALOG_ID, 10, text="anchor")
+    _insert_message(conn, DIALOG_ID, 11, text="tail")
     client = _TestClient()
-    entity = object()
-    client.get_input_entity = AsyncMock(return_value=entity)
-    client.get_messages = AsyncMock(
-        return_value=[
-            _fragment_message(10, "anchor"),
-            _fragment_message(11, "tail"),
-        ]
-    )
+    client.get_input_entity = AsyncMock(side_effect=AssertionError("context must remain local"))
+    client.get_messages = AsyncMock(side_effect=AssertionError("context must remain local"))
     server = make_server(conn, client)
 
     result = await server._list_messages(
@@ -1500,11 +1333,10 @@ async def test_list_messages_context_window_own_only_uses_fragment_fetch() -> No
     )
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    assert result["data"]["coverage"] == "fragment"
+    assert result["data"]["source"] == "sync_db"
     assert [m["message_id"] for m in _response_messages(result)] == [10, 11]
-    client.get_input_entity.assert_awaited_once_with(DIALOG_ID)
-    assert _call_count(client.get_messages) == 1
-    client.get_messages.assert_any_await(entity, ids=[8, 9, 10, 11])
+    client.get_input_entity.assert_not_called()
+    client.get_messages.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -2490,7 +2322,10 @@ async def test_list_dialogs_ignore_pinned_filters_via_sql() -> None:
 async def test_list_topics_through_daemon() -> None:
     """list_topics reads from topic_metadata snapshot — zero Telegram API calls."""
     conn = _make_db_with_topics()
-    conn.execute("INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at) VALUES (123, 1, 'General', 0)")
+    conn.execute(
+        "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at, is_general, is_deleted) "
+        "VALUES (123, 1, 'General', 0, 1, 0)"
+    )
     conn.commit()
 
     client = _TestClient()
@@ -2511,8 +2346,8 @@ async def test_list_topics_through_daemon() -> None:
 
 @pytest.mark.asyncio
 async def test_list_topics_rejects_saved_messages_without_refreshing_topics() -> None:
-    refresher = AsyncMock()
-    server = make_server(topic_refresher=cast(TopicRefresher, refresher))
+    client = _TestClient()
+    server = make_server(client=client)
     server.self_id = 12345
 
     result = await server._list_topics({"dialog_id": 12345})
@@ -2520,121 +2355,86 @@ async def test_list_topics_rejects_saved_messages_without_refreshing_topics() ->
     assert result["ok"] is False
     assert result["error"] == "saved_messages_not_supported"
     assert "ListMessages" in result["required_action"]
-    refresher.assert_not_awaited()
+    cast(MagicMock, client.get_entity).assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_list_topics_serves_cached_catalog_when_protection_blocks_optional_icon_enrichment() -> None:
-    """A cached catalog remains usable when only optional icon Unicode is missing."""
-
-    class _Gateway:
-        async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
-            del entity
-            raise AssertionError("active protection must skip optional topic icon enrichment")
+@pytest.mark.parametrize("protected", [False, True])
+async def test_list_topics_missing_icon_never_acquires_or_offers_refresh(protected: bool) -> None:
+    """Optional icon absence is not acquisition authority, regardless of protection."""
 
     conn = _make_db_with_topics()
     conn.execute(
         "INSERT INTO topic_metadata "
-        "(dialog_id, topic_id, title, icon_emoji_id, icon_emoji, icon_color, updated_at) "
-        "VALUES (123, 7, 'Cached topic', 42, NULL, 6, 100)"
+        "(dialog_id, topic_id, title, icon_emoji_id, icon_emoji, icon_color, updated_at, is_general, is_deleted) "
+        "VALUES (123, 7, 'Cached topic', 42, NULL, 6, 100, 0, 0)"
     )
     conn.commit()
     client = _TestClient()
     client.get_entity = AsyncMock(side_effect=AssertionError("cached catalog must not acquire Telegram"))
-    server = make_server(
-        conn,
-        client,
-        topic_refresher=TopicRefresher(_Gateway(), SQLiteTopicSnapshotRepository(conn), writer=inline_writer(conn)),
-    )
+    server = make_server(conn, client)
     server._health_status = lambda: FloodWaitKillSwitchStatus(
-        open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+        open=protected,
+        reason="test",
+        opened_at=1,
+        events_in_window=1,
+        wait_s_in_window=1,
+        window_seconds=1,
+        source="test",
     )
+    sink = MagicMock()
+    server.bind_demand_sink(sink)
+    before = conn.total_changes
 
     result, _, _ = await server._handle_client_line(b'{"method":"list_topics","dialog_id":123}', "", None)
 
-    assert result == {
-        "ok": True,
-        "data": {
-            "dialog_id": 123,
-            "topics": [
-                {
-                    "id": 7,
-                    "title": "Cached topic",
-                    "icon_emoji_id": 42,
-                    "icon_emoji": None,
-                    "icon_color": 6,
-                    "date": None,
-                }
-            ],
-        },
-    }
+    assert result["ok"] is True
+    assert result["data"]["dialog_id"] == 123
+    assert result["data"]["topics"] == [
+        {
+            "id": 7,
+            "title": "Cached topic",
+            "icon_emoji_id": 42,
+            "icon_emoji": None,
+            "icon_color": 6,
+            "date": None,
+            "pinned": False,
+            "hidden": False,
+            "snapshot_at": None,
+        }
+    ]
+    assert result["data"]["catalog"]["coverage"] == "partial"
+    assert conn.total_changes == before
+    assert sink.mock_calls == []
     cast(AsyncMock, client.get_entity).assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_list_topics_keeps_cached_catalog_when_protection_opens_during_icon_enrichment() -> None:
-    """A latched optional refresh preserves the catalog fetched before the race."""
-
-    protected = False
-
-    class _Gateway:
-        async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
-            del entity
-            raise TelegramRpcThrottled(latched=True)
-
-    async def _get_entity_after_protection_opens(dialog_id: int) -> object:
-        nonlocal protected
-        assert dialog_id == 123
-        protected = True
-        return SimpleNamespace(forum=True)
-
-    def _health_status() -> FloodWaitKillSwitchStatus:
-        return FloodWaitKillSwitchStatus(
-            open=protected,
-            reason="test" if protected else None,
-            opened_at=1 if protected else None,
-            events_in_window=1 if protected else 0,
-            wait_s_in_window=1 if protected else 0,
-            window_seconds=1,
-            source="test" if protected else None,
-        )
-
+async def test_list_topics_old_local_facts_are_not_expired() -> None:
+    """Observation age does not hide a topic or spend acquisition authority."""
     conn = _make_db_with_topics()
     conn.execute(
         "INSERT INTO topic_metadata "
-        "(dialog_id, topic_id, title, icon_emoji_id, icon_emoji, updated_at) "
-        "VALUES (123, 7, 'Cached topic', 42, NULL, 100)"
+        "(dialog_id, topic_id, title, icon_emoji_id, icon_emoji, updated_at, snapshot_at, is_general, is_deleted) "
+        "VALUES (123, 7, 'Retained topic', 42, '🧭', 1, 1, 0, 0)"
     )
     conn.commit()
     client = _TestClient()
-    client.get_entity = AsyncMock(side_effect=_get_entity_after_protection_opens)
-    server = make_server(
-        conn,
-        client,
-        topic_refresher=TopicRefresher(_Gateway(), SQLiteTopicSnapshotRepository(conn), writer=inline_writer(conn)),
-    )
-    server._health_status = _health_status
+    client.get_entity = AsyncMock(side_effect=AssertionError("old facts remain readable without Telegram"))
+    server = make_server(conn, client)
+    sink = MagicMock()
+    server.bind_demand_sink(sink)
+    before = conn.total_changes
 
     result, _, _ = await server._handle_client_line(b'{"method":"list_topics","dialog_id":123}', "", None)
 
-    assert protected is True
-    assert result == {
-        "ok": True,
-        "data": {
-            "dialog_id": 123,
-            "topics": [
-                {
-                    "id": 7,
-                    "title": "Cached topic",
-                    "icon_emoji_id": 42,
-                    "icon_emoji": None,
-                    "icon_color": None,
-                    "date": None,
-                }
-            ],
-        },
-    }
-    cast(AsyncMock, client.get_entity).assert_awaited_once_with(123)
+    assert result["ok"] is True
+    assert result["data"]["topics"][0]["title"] == "Retained topic"
+    assert result["data"]["topics"][0]["icon_emoji"] == "🧭"
+    assert result["data"]["catalog"]["coverage"] == "partial"
+    assert conn.total_changes == before
+    assert sink.mock_calls == []
+    cast(AsyncMock, client.get_entity).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2643,14 +2443,54 @@ async def test_list_topics_empty_snapshot() -> None:
     conn = _make_db_with_topics()
     client = _TestClient()
     server = make_server(conn, client)
+    sink = MagicMock()
+    server.bind_demand_sink(sink)
+    before = conn.total_changes
 
     result = await server._list_topics({"dialog_id": 456})
 
     assert result["ok"] is True
     assert result["data"]["topics"] == []
     assert result["data"]["dialog_id"] == 456
-    assert result["data"]["empty_reason"] == "topic_catalog_not_refreshed"
+    assert result["data"]["empty_reason"] == "topic_catalog_not_observed"
+    assert result["data"]["catalog"]["coverage"] == "not_observed"
+    assert conn.total_changes == before
+    assert sink.mock_calls == []
     cast(AsyncMock, client.get_entity).assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending", [False, True])
+async def test_list_topics_empty_receipt_distinguishes_complete_from_pending_without_acquisition(pending: bool) -> None:
+    conn = _make_db_with_topics()
+    seed_full_history_enrollment(conn, 42, enabled=True)
+    conn.commit()
+    repository = TopicCatalogRepository(conn)
+    repository.request(42, "enrollment")
+    scan = repository.begin_page(42)
+    assert scan is not None
+    assert repository.apply_page(scan, TopicPage((), 0, False, None))
+    if pending:
+        repository.request(42, "topic_changed")
+    expected_catalog = repository.coverage(42)
+    client = _TestClient()
+    client.get_entity = AsyncMock(side_effect=AssertionError("receipt read must not acquire"))
+    server = make_server(conn, client)
+    sink = MagicMock()
+    server.bind_demand_sink(sink)
+    before = conn.total_changes
+
+    result = await server._list_topics({"dialog_id": 42})
+
+    assert result["ok"] is True
+    assert result["data"]["topics"] == []
+    assert result["data"]["catalog"] == expected_catalog
+    assert result["data"]["empty_reason"] == ("topic_catalog_partial" if pending else "no_active_topics")
+    assert result["data"]["catalog"]["coverage"] == ("partial" if pending else "complete")
+    assert conn.total_changes == before
+    assert sink.mock_calls == []
+    client.assert_not_called()
+    cast(AsyncMock, client.get_entity).assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2683,10 +2523,11 @@ async def test_list_topics_cached_display_name_resolves_without_rpc(selector: st
 
     result = await server._list_topics({"dialog": selector})
 
-    assert result == {
-        "ok": True,
-        "data": {"topics": [], "dialog_id": 321, "empty_reason": "topic_catalog_not_refreshed"},
-    }
+    assert result["ok"] is True
+    assert result["data"]["topics"] == []
+    assert result["data"]["dialog_id"] == 321
+    assert result["data"]["empty_reason"] == "topic_catalog_not_observed"
+    assert result["data"]["catalog"]["coverage"] == "not_observed"
     cast(AsyncMock, client.get_entity).assert_not_called()
     cast(MagicMock, client.iter_dialogs).assert_not_called()
 
@@ -2707,22 +2548,18 @@ async def test_list_topics_cached_username_selectors_resolve_without_rpc(selecto
 
     result = await server._list_topics({"dialog": selector})
 
-    assert result == {
-        "ok": True,
-        "data": {"topics": [], "dialog_id": 322, "empty_reason": "topic_catalog_not_refreshed"},
-    }
+    assert result["ok"] is True
+    assert result["data"]["topics"] == []
+    assert result["data"]["dialog_id"] == 322
+    assert result["data"]["empty_reason"] == "topic_catalog_not_observed"
+    assert result["data"]["catalog"]["coverage"] == "not_observed"
     cast(AsyncMock, client.get_entity).assert_not_called()
     cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_list_topics_cached_selector_still_refreshes_topic_catalog() -> None:
-    """A locally resolved selector still permits the existing topic refresh."""
-
-    class _Gateway:
-        async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
-            assert getattr(entity, "forum", False) is True
-            return (TopicFact(topic_id=306001, title="Topic"),)
+async def test_list_topics_cached_selector_does_not_acquire_missing_catalog() -> None:
+    """Successful local resolution does not authorize a missing-catalog fetch."""
 
     conn = _make_db_with_topics()
     conn.execute("INSERT INTO dialogs (dialog_id, name, type) VALUES (323, 'Forum Group', 'supergroup')")
@@ -2731,86 +2568,54 @@ async def test_list_topics_cached_selector_still_refreshes_topic_catalog() -> No
     conn.commit()
     client = _TestClient()
     client.get_entity = AsyncMock(return_value=SimpleNamespace(forum=True))
-    topic_refresher = TopicRefresher(_Gateway(), SQLiteTopicSnapshotRepository(conn), writer=inline_writer(conn))
-    server = make_server(conn, client, topic_refresher=topic_refresher)
+    server = make_server(conn, client)
 
     result = await server._list_topics({"dialog": "@forum_group"})
 
     assert result["ok"] is True
     assert result["data"]["dialog_id"] == 323
-    assert result["data"]["topics"][0]["id"] == 306001
-    cast(AsyncMock, client.get_entity).assert_awaited_once_with(323)
+    assert result["data"]["topics"] == []
+    assert result["data"]["catalog"]["coverage"] == "not_observed"
+    assert result["data"]["empty_reason"] == "topic_catalog_not_observed"
+    cast(AsyncMock, client.get_entity).assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_dispatch_list_topics_keeps_resolution_source_through_refresher() -> None:
-    class _Gateway:
-        def __init__(self) -> None:
-            self.scopes: list[tuple[TelegramRpcSource, DemandKind, AcquisitionKind | None]] = []
-
-        async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
-            del entity
-            scope = current_rpc_scope()
-            assert scope.demand_kind is not None
-            self.scopes.append((scope.source, scope.demand_kind, scope.acquisition_kind))
-            return (TopicFact(topic_id=306001, title="Topic"),)
-
+async def test_dispatch_list_topics_never_enters_acquisition_scope() -> None:
     conn = _make_db_with_topics()
     client = _TestClient()
     client.get_entity = AsyncMock(return_value=SimpleNamespace(forum=True))
-    gateway = _Gateway()
-    topic_refresher = TopicRefresher(gateway, SQLiteTopicSnapshotRepository(conn), writer=inline_writer(conn))
-    server = make_server(conn, client, topic_refresher=topic_refresher)
+    server = make_server(conn, client)
+    sink = MagicMock()
+    server.bind_demand_sink(sink)
+    before = conn.total_changes
 
     result = await server._dispatch({"method": "list_topics", "dialog_id": 323})
 
     assert result["ok"] is True
-    assert gateway.scopes == [
-        (
-            TelegramRpcSource.MCP_INTERACTIVE,
-            DemandKind.MCP_REMOTE_ACQUISITION,
-            AcquisitionKind.TOPIC_SNAPSHOT,
-        )
-    ]
+    client.assert_not_called()
+    assert conn.total_changes == before
+    assert sink.mock_calls == []
+    cast(AsyncMock, client.get_entity).assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_list_topics_refreshes_empty_private_bot_catalog() -> None:
-    """Empty local topic catalog is refreshed inside daemon for topic-capable bot DMs."""
-
-    class _Gateway:
-        async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
-            assert getattr(entity, "bot_forum_view", False) is True
-            return (TopicFact(topic_id=306001, title="Topic"),)
+async def test_list_topics_missing_private_bot_catalog_is_not_known_empty() -> None:
+    """Bot-topic support does not turn an unknown local catalog into a remote read."""
 
     conn = _make_db_with_topics()
     client = _TestClient()
     client.get_entity = AsyncMock(return_value=SimpleNamespace(bot=True, bot_forum_view=True))
-    topic_refresher = TopicRefresher(_Gateway(), SQLiteTopicSnapshotRepository(conn), writer=inline_writer(conn))
-    server = make_server(conn, client, topic_refresher=topic_refresher)
+    server = make_server(conn, client)
 
     result = await server._list_topics({"dialog_id": 8583106747})
 
     assert result["ok"] is True
-    assert result["data"]["topics"] == [
-        {
-            "id": 306001,
-            "title": "Topic",
-            "icon_emoji_id": None,
-            "date": None,
-            "icon_emoji": None,
-            "icon_color": None,
-        }
-    ]
-    row = cast(
-        sqlite3.Row | None,
-        conn.execute(
-            "SELECT title FROM topic_metadata WHERE dialog_id = ? AND topic_id = ?",
-            (8583106747, 306001),
-        ).fetchone(),
-    )
-    assert row is not None
-    assert tuple(row) == ("Topic",)
+    assert result["data"]["topics"] == []
+    assert result["data"]["catalog"]["coverage"] == "not_observed"
+    assert result["data"]["empty_reason"] == "topic_catalog_not_observed"
+    assert conn.execute("SELECT COUNT(*) FROM topic_metadata").fetchone()[0] == 0
+    cast(AsyncMock, client.get_entity).assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2818,11 +2623,12 @@ async def test_list_topics_hidden_excluded() -> None:
     """_list_topics excludes rows with hidden=1."""
     conn = _make_db_with_topics()
     conn.execute(
-        "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at, hidden) VALUES (789, 1, 'Visible', 0, 0)"
+        "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at, hidden, is_general, is_deleted) "
+        "VALUES (789, 1, 'Visible', 0, 0, 0, 0)"
     )
     conn.execute(
-        "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at, hidden) "
-        "VALUES (789, 2, 'HiddenTopic', 0, 1)"
+        "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at, hidden, is_general, is_deleted) "
+        "VALUES (789, 2, 'HiddenTopic', 0, 1, 0, 0)"
     )
     conn.commit()
     client = _TestClient()
@@ -2841,12 +2647,12 @@ async def test_list_topics_deleted_excluded() -> None:
     """_list_topics excludes rows with is_deleted=1."""
     conn = _make_db_with_topics()
     conn.execute(
-        "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at, is_deleted) "
-        "VALUES (101, 1, 'Active', 0, 0)"
+        "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at, is_deleted, is_general) "
+        "VALUES (101, 1, 'Active', 0, 0, 0)"
     )
     conn.execute(
-        "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at, is_deleted) "
-        "VALUES (101, 2, 'Deleted', 0, 1)"
+        "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at, is_deleted, is_general) "
+        "VALUES (101, 2, 'Deleted', 0, 1, 0)"
     )
     conn.commit()
     client = _TestClient()
@@ -3101,7 +2907,9 @@ async def test_mark_dialog_for_sync_enable() -> None:
         DemandKind.FULL_SYNC_PAGE,
         DemandKind.BACKFILL_HYDRATION_BATCH,
         DemandKind.READ_RECEIPT_BATCH,
+        DemandKind.TOPIC_SNAPSHOT,
     ]
+    assert TopicCatalogRepository(conn).coverage(42)["pending"] is True
 
 
 @pytest.mark.asyncio
@@ -3142,7 +2950,9 @@ async def test_mark_dialog_for_sync_ignores_existing() -> None:
         DemandKind.DELTA_GAP_FILL,
         DemandKind.BACKFILL_HYDRATION_BATCH,
         DemandKind.READ_RECEIPT_BATCH,
+        DemandKind.TOPIC_SNAPSHOT,
     ]
+    assert TopicCatalogRepository(conn).coverage(42)["pending"] is True
 
 
 @pytest.mark.asyncio
@@ -5578,13 +5388,13 @@ async def test_list_messages_general_topic_title_fallback() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 35-01: list_messages — on-demand path: navigation token
+# list_messages — unenrolled local history: navigation token
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_list_messages_on_demand_navigation_offset_id() -> None:
-    """list_messages with on-demand dialog + navigation token passes offset_id to iter_messages."""
+async def test_list_messages_unenrolled_navigation_reads_local_anchor() -> None:
+    """Legacy navigation resolves an unenrolled dialog's retained local anchor."""
     from mcp_telegram.pagination import HistoryDirection, encode_history_navigation
 
     DIALOG_ID = 9070
@@ -5597,7 +5407,8 @@ async def test_list_messages_on_demand_navigation_offset_id() -> None:
         yield  # make it an async generator
 
     conn = _make_db()
-    # No synced_dialog row → on-demand path
+    _insert_message(conn, DIALOG_ID, 199, text="older", sent_at=100)
+    _insert_message(conn, DIALOG_ID, 200, text="anchor", sent_at=200)
     client = _TestClient()
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
@@ -5608,14 +5419,13 @@ async def test_list_messages_on_demand_navigation_offset_id() -> None:
     )
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    assert captured_kwargs.get("offset_id") == 200, (
-        f"Expected offset_id=200 in iter_messages kwargs, got: {captured_kwargs}"
-    )
+    assert captured_kwargs == {}
+    assert [m["message_id"] for m in _response_messages(result)] == [199]
 
 
 @pytest.mark.asyncio
-async def test_list_messages_on_demand_direction_oldest_reverse() -> None:
-    """list_messages with on-demand dialog + direction=oldest passes reverse=True to iter_messages."""
+async def test_list_messages_unenrolled_direction_oldest_is_local() -> None:
+    """Oldest ordering applies to retained history without enrollment."""
     DIALOG_ID = 9071
 
     captured_kwargs: dict = {}
@@ -5626,6 +5436,8 @@ async def test_list_messages_on_demand_direction_oldest_reverse() -> None:
         yield  # make it an async generator
 
     conn = _make_db()
+    _insert_message(conn, DIALOG_ID, 1, text="older", sent_at=100)
+    _insert_message(conn, DIALOG_ID, 2, text="newer", sent_at=200)
     client = _TestClient()
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
@@ -5635,19 +5447,18 @@ async def test_list_messages_on_demand_direction_oldest_reverse() -> None:
     )
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    assert captured_kwargs.get("reverse") is True, (
-        f"Expected reverse=True in iter_messages kwargs, got: {captured_kwargs}"
-    )
+    assert captured_kwargs == {}
+    assert [m["message_id"] for m in _response_messages(result)] == [1, 2]
 
 
 # ---------------------------------------------------------------------------
-# Phase 35-01: list_messages — on-demand path: sender/topic/unread filters
+# list_messages — unenrolled local history: sender/topic/unread filters
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_list_messages_on_demand_sender_id_from_user() -> None:
-    """list_messages with sender_id=42 on on-demand passes from_user=42 to iter_messages."""
+async def test_list_messages_unenrolled_sender_id_filters_local_rows() -> None:
+    """Exact sender filtering does not require history enrollment."""
     DIALOG_ID = 9080
 
     captured_kwargs: dict = {}
@@ -5658,6 +5469,8 @@ async def test_list_messages_on_demand_sender_id_from_user() -> None:
         yield
 
     conn = _make_db()
+    _insert_message(conn, DIALOG_ID, 1, text="selected", sender_id=42)
+    _insert_message(conn, DIALOG_ID, 2, text="excluded", sender_id=43)
     client = _TestClient()
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
@@ -5667,14 +5480,13 @@ async def test_list_messages_on_demand_sender_id_from_user() -> None:
     )
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    assert captured_kwargs.get("from_user") == 42, (
-        f"Expected from_user=42 in iter_messages kwargs, got: {captured_kwargs}"
-    )
+    assert captured_kwargs == {}
+    assert [m["message_id"] for m in _response_messages(result)] == [1]
 
 
 @pytest.mark.asyncio
-async def test_list_messages_on_demand_topic_id_reply_to() -> None:
-    """list_messages with topic_id=5 on on-demand passes reply_to=5 to iter_messages."""
+async def test_list_messages_unenrolled_topic_id_filters_local_rows() -> None:
+    """Exact topic filtering uses retained attribution without an RPC."""
     DIALOG_ID = 9081
 
     captured_kwargs: dict = {}
@@ -5685,6 +5497,8 @@ async def test_list_messages_on_demand_topic_id_reply_to() -> None:
         yield
 
     conn = _make_db()
+    _insert_message(conn, DIALOG_ID, 1, text="selected", forum_topic_id=5)
+    _insert_message(conn, DIALOG_ID, 2, text="excluded", forum_topic_id=6)
     client = _TestClient()
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
@@ -5692,12 +5506,13 @@ async def test_list_messages_on_demand_topic_id_reply_to() -> None:
     result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "topic_id": 5, "message_state": "sent"})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    assert captured_kwargs.get("reply_to") == 5, f"Expected reply_to=5 in iter_messages kwargs, got: {captured_kwargs}"
+    assert captured_kwargs == {}
+    assert [m["message_id"] for m in _response_messages(result)] == [1]
 
 
 @pytest.mark.asyncio
-async def test_list_messages_on_demand_unread_after_id_min_id() -> None:
-    """list_messages with unread_after_id=100 on on-demand passes min_id=100 to iter_messages."""
+async def test_list_messages_unenrolled_unread_boundary_filters_local_rows() -> None:
+    """An explicit read boundary filters retained history locally."""
     DIALOG_ID = 9082
 
     captured_kwargs: dict = {}
@@ -5708,6 +5523,8 @@ async def test_list_messages_on_demand_unread_after_id_min_id() -> None:
         yield
 
     conn = _make_db()
+    _insert_message(conn, DIALOG_ID, 100, text="boundary")
+    _insert_message(conn, DIALOG_ID, 101, text="unread")
     client = _TestClient()
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
@@ -5717,7 +5534,8 @@ async def test_list_messages_on_demand_unread_after_id_min_id() -> None:
     )
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    assert captured_kwargs.get("min_id") == 100, f"Expected min_id=100 in iter_messages kwargs, got: {captured_kwargs}"
+    assert captured_kwargs == {}
+    assert [m["message_id"] for m in _response_messages(result)] == [101]
 
 
 # ---------------------------------------------------------------------------
@@ -5772,17 +5590,12 @@ async def test_list_messages_context_window_near_start() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_messages_context_window_not_synced_error() -> None:
-    """context_message_id returns not_synced error for access_lost dialogs.
-
-    Phase 999.1 (D-07): absent/not_synced/fragment statuses now trigger the
-    fragment-fetch path instead of being rejected. Only 'access_lost' dialogs
-    (where we lost access and cannot fetch) are rejected with not_synced.
-    """
+async def test_list_messages_context_window_missing_archived_anchor() -> None:
+    """A missing archived anchor is a local availability error, not a sync demand."""
     DIALOG_ID = 7003
 
     conn = _make_db()
-    # access_lost: we had access but lost it — cannot perform fragment fetch
+    # Losing access preserves local history but cannot create a missing anchor.
     _insert_synced_dialog(conn, DIALOG_ID, status="access_lost")
     server = make_server(conn)
 
@@ -5791,7 +5604,8 @@ async def test_list_messages_context_window_not_synced_error() -> None:
     )
 
     assert result["ok"] is False
-    assert result["error"] == "not_synced"
+    assert result["error"] == "local_context_unavailable"
+    assert result["context_availability"] == "anchor_missing"
 
 
 @pytest.mark.asyncio
@@ -6360,8 +6174,8 @@ async def test_list_messages_access_lost_sync_coverage_pct() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_messages_synced_returns_live():
-    """list_messages on synced dialog returns dialog_access=live."""
+async def test_list_messages_synced_does_not_claim_current_access():
+    """Historical synchronization does not establish current Telegram access."""
     conn = _make_db()
     conn.execute(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
@@ -6378,7 +6192,7 @@ async def test_list_messages_synced_returns_live():
     server = make_server(conn)
     result = await server._list_messages({"dialog_id": 6002, "limit": 10})
     assert result["ok"] is True
-    assert result["data"]["dialog_access"] == "live"
+    assert result["data"]["dialog_access"] == "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -7542,10 +7356,10 @@ def test_list_messages_has_exactly_two_log_sites_in_method() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fallback_path_does_not_emit_counter(caplog: pytest.LogCaptureFixture) -> None:
-    """Non-sync.db path (dialog not in synced_dialogs → Telegram fallback) must NOT emit counter."""
+async def test_unenrolled_local_history_emits_counter(caplog: pytest.LogCaptureFixture) -> None:
+    """Unenrolled reads use the same local projection observability."""
     conn = _make_db()
-    # No synced_dialogs row — triggers live Telegram fallback
+    # No sync enrollment; no remote fallback is permitted.
     server = make_server(conn)
 
     # Mock telegram client to return empty list (avoid real API call)
@@ -7561,8 +7375,8 @@ async def test_fallback_path_does_not_emit_counter(caplog: pytest.LogCaptureFixt
     with caplog.at_level("INFO", logger="mcp_telegram.daemon_api"):
         await server._list_messages({"dialog_id": 999_999_999, "limit": 10, "message_state": "sent"})
     records = [r for r in caplog.records if r.message == "list_messages rendered"]
-    assert len(iter_calls) == 1
-    assert len(records) == 0, "Fallback/non-sync.db path must NOT emit the counter log"
+    assert iter_calls == []
+    assert len(records) == 1
 
 
 # ---------------------------------------------------------------------------

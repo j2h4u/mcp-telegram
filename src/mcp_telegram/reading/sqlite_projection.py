@@ -10,10 +10,11 @@ from typing import Literal, Protocol, cast
 
 from ..alert_policy import incoming_human_dm_sql
 from ..models import DialogType, ReadMessage, ReadState
-from ..sync_read_model import compute_sync_coverage
+from ..sync_read_model import compute_sync_coverage, local_history_coverage
 
 _SELECT_SYNC_STATUS_SQL = "SELECT status FROM synced_dialogs WHERE dialog_id = ?"
 _MESSAGE_SENT_AT_SQL = "SELECT sent_at FROM messages WHERE dialog_id = ? AND message_id = ?"
+_MESSAGE_CONTEXT_ANCHOR_SQL = "SELECT sent_at, is_deleted FROM messages WHERE dialog_id = ? AND message_id = ?"
 
 
 class _ListMessagesDbRequest(Protocol):
@@ -74,21 +75,46 @@ def message_sent_at(conn: sqlite3.Connection, dialog_id: int, message_id: int) -
     return None if row is None or row[0] is None else int(cast(int | str, row[0]))
 
 
+def read_context_anchor(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> tuple[int, int] | None:
+    """Read an anchor's timestamp and deletion flag without filtering either away."""
+    return cast(
+        tuple[int, int] | None,
+        conn.execute(_MESSAGE_CONTEXT_ANCHOR_SQL, (dialog_id, message_id)).fetchone(),
+    )
+
+
 def _build_access_metadata(
     conn: sqlite3.Connection,
     dialog_id: int,
-    status: str,
+    status: str | None,
 ) -> dict:
     """Build consistent access metadata for list_messages and search_messages."""
-    meta: dict = {"dialog_access": "archived" if status == "access_lost" else "live"}
+    row = cast(
+        tuple[int | None, int | None, int | None] | None,
+        conn.execute(
+            "SELECT last_synced_at, last_event_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id = ?",
+            (dialog_id,),
+        ).fetchone(),
+    )
+    last_synced_at, last_event_at, last_delta_checked_at = row if row is not None else (None, None, None)
+    coverage = local_history_coverage(status, last_synced_at)
+    meta: dict = {
+        "dialog_access": "archived" if status == "access_lost" else "unknown",
+        "sync_status": status or "not_synced",
+        "coverage": coverage.state,
+        "observation_horizon_at": coverage.observation_horizon_at,
+        "last_synced_at": last_synced_at,
+        "last_event_at": last_event_at,
+        "last_delta_checked_at": last_delta_checked_at,
+    }
 
     if status == "access_lost":
-        row = cast(
-            tuple[object, object, object, object, object] | None,
+        access_row = cast(
+            tuple[str | None, int | None, int | None, int | None, int | None] | None,
             conn.execute(_SELECT_DIALOG_ACCESS_META_SQL, (dialog_id,)).fetchone(),
         )
-        if row:
-            _, total_messages, access_lost_at, last_synced_at, last_event_at = row
+        if access_row:
+            _, total_messages, access_lost_at, last_synced_at, last_event_at = access_row
             total_messages_i = cast(int | None, total_messages)
             count_row = cast(tuple[object] | None, conn.execute(_COUNT_SYNCED_MESSAGES_SQL, (dialog_id,)).fetchone())
             local_count = int(cast(int | str, count_row[0])) if count_row else 0

@@ -21,13 +21,16 @@ VALUES
     (:dialog_id, :topic_id, :title, NULL,
      :is_general, 0, :updated_at,
      :icon_emoji_id, :icon_emoji, :icon_color,
-     0, 0, :snapshot_at, :date, :observation_order)
+     0, :hidden, :snapshot_at, :date, :observation_order)
 ON CONFLICT(dialog_id, topic_id) DO UPDATE SET
     title          = COALESCE(excluded.title, topic_metadata.title),
-    icon_emoji_id  = COALESCE(excluded.icon_emoji_id, topic_metadata.icon_emoji_id),
-    icon_emoji     = COALESCE(excluded.icon_emoji, topic_metadata.icon_emoji),
+    icon_emoji_id  = excluded.icon_emoji_id,
+    icon_emoji     = CASE WHEN excluded.icon_emoji_id IS topic_metadata.icon_emoji_id
+                    THEN COALESCE(excluded.icon_emoji, topic_metadata.icon_emoji) ELSE excluded.icon_emoji END,
     icon_color     = COALESCE(excluded.icon_color, topic_metadata.icon_color),
     is_general     = excluded.is_general,
+    hidden         = excluded.hidden,
+    is_deleted     = 0,
     updated_at     = excluded.updated_at,
     snapshot_at    = excluded.snapshot_at,
     date           = COALESCE(excluded.date, topic_metadata.date),
@@ -59,6 +62,7 @@ class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataReposi
                 "topic_id": topic.topic_id,
                 "title": topic.title,
                 "is_general": int(topic.is_general),
+                "hidden": int(topic.hidden),
                 "icon_emoji_id": topic.icon_emoji_id,
                 "icon_emoji": topic.icon_emoji,
                 "icon_color": topic.icon_color,
@@ -95,7 +99,10 @@ class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataReposi
             VALUES (?, ?, ?, NULL, 0, 0, ?, ?, 0, 0, ?, ?, ?)
             ON CONFLICT(dialog_id, topic_id) DO UPDATE SET
                 title = COALESCE(excluded.title, topic_metadata.title),
+                icon_emoji = CASE WHEN excluded.icon_emoji_id IS topic_metadata.icon_emoji_id
+                            THEN topic_metadata.icon_emoji ELSE NULL END,
                 icon_emoji_id = COALESCE(excluded.icon_emoji_id, topic_metadata.icon_emoji_id),
+                catalog_present = 1,
                 updated_at = excluded.updated_at,
                 snapshot_at = excluded.snapshot_at,
                 date = COALESCE(excluded.date, topic_metadata.date),
@@ -121,11 +128,15 @@ class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataReposi
             observation_order = allocate_observation_order(self._conn)
         self._conn.execute(
             "UPDATE topic_metadata SET title=COALESCE(?, title), "
+            "icon_emoji=CASE WHEN ? IS NULL OR ? IS icon_emoji_id THEN icon_emoji ELSE NULL END, "
             "icon_emoji_id=COALESCE(?, icon_emoji_id), hidden=COALESCE(?, hidden), "
+            "catalog_present=1, "
             "updated_at=?, snapshot_at=?, observation_order=? "
             "WHERE dialog_id=? AND topic_id=? AND observation_order < ?",
             (
                 title,
+                icon_emoji_id,
+                icon_emoji_id,
                 icon_emoji_id,
                 hidden,
                 observed_at,
@@ -150,7 +161,7 @@ class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataReposi
         if observation_order is None:
             observation_order = allocate_observation_order(self._conn)
         self._conn.execute(
-            "UPDATE topic_metadata SET pinned=?, snapshot_at=?, updated_at=?, observation_order=? "
+            "UPDATE topic_metadata SET pinned=?, catalog_present=1, snapshot_at=?, updated_at=?, observation_order=? "
             "WHERE dialog_id=? AND topic_id=? AND observation_order < ?",
             (int(pinned), observed_at, observed_at, observation_order, dialog_id, topic_id, observation_order),
         )
@@ -181,6 +192,10 @@ class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataReposi
                 ",".join("?" for _ in pinned_ids) or "NULL"
             ),
             (*sorted(pinned_ids), observed_at, observed_at, observation_order, dialog_id, observation_order),
+        )
+        self._conn.executemany(
+            "UPDATE topic_metadata SET catalog_present=1 WHERE dialog_id=? AND topic_id=? AND observation_order=?",
+            ((dialog_id, topic_id, observation_order) for topic_id in pinned_ids),
         )
 
 

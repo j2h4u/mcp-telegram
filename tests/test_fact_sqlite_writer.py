@@ -14,7 +14,6 @@ from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshPolicy,
     refresh_message_facts_once,
 )
-from mcp_telegram.messages.telegram_adapter import extract_message_row
 from mcp_telegram.models import ReadMessage
 from mcp_telegram.reactions.contracts import (
     ReactionAggregate,
@@ -29,10 +28,8 @@ from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_fact_queries import enrich_read_at
-from mcp_telegram.telegram_fragments import FragmentContextService
-from mcp_telegram.telegram_reading import FragmentFetchResult, ReadDateFetchResult
+from mcp_telegram.telegram_reading import ReadDateFetchResult
 from tests.test_fact_demand_adapters import _HydrationHandler
-from tests.test_telegram_reading import _message
 
 
 def _seed(conn: sqlite3.Connection) -> None:
@@ -68,10 +65,6 @@ async def test_fact_flows_use_owner_with_readonly_loop_connection(tmp_path: Path
             assert threading.get_ident() == loop_thread
             return ReadDateFetchResult(read_at=5, status="complete")
 
-        async def fetch_context(self, dialog_id: int, anchor_message_id: int, window_size: int) -> FragmentFetchResult:
-            assert threading.get_ident() == loop_thread
-            return FragmentFetchResult(messages=(extract_message_row(dialog_id, _message(3)),))
-
     def observe(kind: str, outcome: str) -> None:
         assert threading.get_ident() == loop_thread
         observations.append((kind, outcome))
@@ -100,10 +93,6 @@ async def test_fact_flows_use_owner_with_readonly_loop_connection(tmp_path: Path
             checked_at=100,
         )
         assert enriched[0].read_at == 5
-        fragment = await FragmentContextService(conn, gateway, writer=writer).fetch(1, 3, 1)
-        assert fragment.ok
-        assert conn.execute("SELECT message_id FROM messages WHERE message_id=3").fetchone() == (3,)
-
         worker = MessageFactHydrationWorker(
             object(),
             conn,

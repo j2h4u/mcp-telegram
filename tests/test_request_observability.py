@@ -464,8 +464,30 @@ async def test_unexpected_base_exception_is_not_recorded_as_cancellation() -> No
     assert events[0]["reason_code"] == "request_failed"
 
 
+def _assert_local_history_observation(selection: str, response: dict[str, object], payload: dict[str, object]) -> None:
+    if selection == "missing_anchor":
+        assert response["ok"] is False
+        assert response["error"] == "local_context_unavailable"
+        assert response["context_availability"] == "anchor_missing"
+        assert payload["route_attempted"] == "local_context"
+        assert payload["served_source"] == "error"
+        return
+    assert response["ok"] is True
+    data = cast(dict[str, object], response["data"])
+    assert data["source"] == "sync_db"
+    assert data["selection_state"] == ("present" if selection == "retained" else "unknown")
+    assert data["coverage"] == ("partial" if selection == "retained" else "unknown")
+    assert data["observation_horizon_at"] is None
+    if selection == "empty":
+        assert data["messages"] == []
+    assert payload["route_attempted"] == "local_history"
+    assert payload["served_source"] == "local"
+    assert payload["response_shape_ms"] is not None
+
+
 @pytest.mark.asyncio
-async def test_real_list_messages_seams_record_local_shape_and_fallback_attempt() -> None:  # noqa: PLR0914
+@pytest.mark.parametrize("selection", ("retained", "empty", "missing_anchor"))
+async def test_real_list_messages_seams_record_local_routes_without_fallback(selection: str) -> None:
     class Sink:
         def __init__(self) -> None:
             self.events: list[dict[str, object]] = []
@@ -474,77 +496,45 @@ async def test_real_list_messages_seams_record_local_shape_and_fallback_attempt(
             self.events.append(kwargs)
 
     conn = _make_db()
-    _insert_synced_dialog(conn, 1)
-    _insert_message(conn, 1, 100, text="local")
-    local_sink = Sink()
-    local_server = make_server(conn, _TestClient())
-    local_server._runtime_observation_sink = cast(RuntimeObservationSink, local_sink)
-    local_response, _, _ = await local_server._handle_client_line(
-        json.dumps(
-            {
-                "method": "list_messages",
-                "operation_id": "e" * 32,
-                "request_id": "abcdef12",
-                "dialog_id": 1,
-                "message_state": "sent",
-            }
-        ).encode(),
-        "",
-        None,
-    )
-    assert local_response["ok"] is True
-    local_payload = cast(dict[str, object], local_sink.events[0]["payload"])
-    assert local_sink.events[0]["operation_id"] == "e" * 32
-    assert local_payload["route_attempted"] == "local_history"
-    assert isinstance(local_payload["request_id"], str)
-    assert local_payload["request_id"] == "abcdef12"
-    assert local_payload["served_source"] == "local"
-    assert local_payload["response_shape_ms"] is not None
-
-    fallback_client = _TestClient()
-
-    async def empty_iter(*_args: object, **_kwargs: object):
-        if False:
-            yield None
-
-    fallback_client.iter_messages = empty_iter
-    fallback_sink = Sink()
-    fallback_server = make_server(_make_db(), fallback_client)
-    fallback_server._runtime_observation_sink = cast(RuntimeObservationSink, fallback_sink)
-    fallback_response, _, _ = await fallback_server._handle_client_line(
-        json.dumps(
-            {"method": "list_messages", "operation_id": "f" * 32, "dialog_id": 2, "message_state": "sent"}
-        ).encode(),
-        "",
-        None,
-    )
-    assert fallback_response["ok"] is True
-    fallback_payload = cast(dict[str, object], fallback_sink.events[0]["payload"])
-    assert fallback_payload["fallback_attempted"] is True
-    assert fallback_payload["route_attempted"] == "telegram_fallback"
-    assert fallback_payload["served_source"] == "telegram"
-
-    async def failed_iter(*_args: object, **_kwargs: object):
-        raise RuntimeError("telegram unavailable")
-        yield None
-
-    failed_client = _TestClient()
-    failed_client.iter_messages = failed_iter
-    failed_sink = Sink()
-    failed_server = make_server(_make_db(), failed_client)
-    failed_server._runtime_observation_sink = cast(RuntimeObservationSink, failed_sink)
-    failed_response, _, _ = await failed_server._handle_client_line(
-        json.dumps(
-            {"method": "list_messages", "operation_id": "1" * 32, "dialog_id": 2, "message_state": "sent"}
-        ).encode(),
-        "",
-        None,
-    )
-    assert failed_response["ok"] is False
-    failed_payload = cast(dict[str, object], failed_sink.events[0]["payload"])
-    assert failed_payload["fallback_attempted"] is True
-    assert failed_payload["route_attempted"] == "telegram_fallback"
-    assert failed_payload["served_source"] == "error"
+    if selection == "retained":
+        _insert_synced_dialog(conn, 1)
+        _insert_message(conn, 1, 100, text="local")
+    client = _TestClient()
+    client.iter_messages = MagicMock(side_effect=AssertionError("history reads must not acquire Telegram"))
+    client.get_messages = AsyncMock(side_effect=AssertionError("context reads must not acquire Telegram"))
+    client.get_entity = AsyncMock(side_effect=AssertionError("exact-id reads must not resolve remotely"))
+    offer = MagicMock(side_effect=AssertionError("reads must not enqueue acquisition"))
+    sink = Sink()
+    local_server = make_server(conn, client)
+    local_server.bind_demand_sink(MagicMock(offer=offer))
+    local_server._runtime_observation_sink = cast(RuntimeObservationSink, sink)
+    request: dict[str, object] = {
+        "method": "list_messages",
+        "operation_id": "e" * 32,
+        "request_id": "abcdef12",
+        "dialog_id": 1 if selection == "retained" else 2,
+        "message_state": "sent",
+    }
+    if selection == "missing_anchor":
+        request["context_message_id"] = 100
+    before = conn.total_changes
+    try:
+        response, _, _ = await local_server._handle_client_line(json.dumps(request).encode(), "", None)
+        assert conn.total_changes == before
+        assert len(sink.events) == 1
+        payload = cast(dict[str, object], sink.events[0]["payload"])
+        assert sink.events[0]["operation_id"] == "e" * 32
+        assert payload["request_id"] == "abcdef12"
+        assert payload["fallback_attempted"] is False
+        assert payload["rpc_attempts"] == 0
+        _assert_local_history_observation(selection, response, payload)
+        client.iter_messages.assert_not_called()
+        client.get_messages.assert_not_called()
+        client.get_entity.assert_not_called()
+        offer.assert_not_called()
+    finally:
+        await local_server.shutdown()
+        conn.close()
 
 
 @pytest.mark.asyncio

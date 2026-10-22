@@ -88,7 +88,6 @@ LEGACY_DEMAND_KIND_BY_SOURCE: Mapping[TelegramRpcSource, DemandKind] = MappingPr
     {
         TelegramRpcSource.MCP_INTERACTIVE: DemandKind.MCP_REMOTE_ACQUISITION,
         TelegramRpcSource.CHAT_EXPORT: DemandKind.CHAT_EXPORT_OPERATION,
-        TelegramRpcSource.MESSAGE_READ_FALLBACK: DemandKind.MESSAGE_READ_FALLBACK,
         TelegramRpcSource.DIALOG_RESOLUTION: DemandKind.ENTITY_LOOKUP,
         TelegramRpcSource.TOPIC_RESOLUTION: DemandKind.TOPIC_LOOKUP,
         TelegramRpcSource.ENTITY_INFO_FOREGROUND: DemandKind.FOREGROUND_ENTITY_FACTS,

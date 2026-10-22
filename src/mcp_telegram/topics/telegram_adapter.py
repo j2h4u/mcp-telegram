@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Protocol, cast
 
 from telethon.errors import RPCError  # type: ignore[import-untyped]
@@ -10,13 +10,23 @@ from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
     GetCustomEmojiDocumentsRequest,
     GetForumTopicsRequest,
 )
-from telethon.tl.types import DocumentAttributeCustomEmoji, TypeInputPeer  # type: ignore[import-untyped]
+from telethon.tl.types import (  # type: ignore[import-untyped]
+    Channel,
+    ChannelForbidden,
+    Chat,
+    ChatForbidden,
+    DocumentAttributeCustomEmoji,
+    ForumTopic,
+    ForumTopicDeleted,
+    TypeInputPeer,
+    User,
+)
 
 from ..flood import TelegramRpcThrottled
 from ..models import FORUM_TOPICS_PAGE_SIZE
 from ..telegram_demand import UnclassifiedTelegramDemandError
 from ..telegram_rpc_scheduler import current_rpc_scope
-from .contracts import TopicFact, TopicSourceUnavailableError
+from .contracts import TopicCursor, TopicFact, TopicPage, TopicSourceUnavailableError
 from .ports import TelegramTopicGateway
 
 
@@ -24,6 +34,8 @@ class TopicClient(Protocol):
     async def __call__(self, request: object) -> object: ...
 
     async def get_input_entity(self, entity: object) -> object: ...
+
+    async def get_entity(self, entity: object) -> object: ...
 
 
 class _TopicLike(Protocol):
@@ -55,6 +67,60 @@ class TelethonTelegramTopicGateway(TelegramTopicGateway):
     def __init__(self, client: TopicClient) -> None:
         self._client = client
         self._emoji_alt_by_id: dict[int, str] = {}
+
+    async def fetch_entity(self, dialog_id: int) -> object:
+        try:
+            entity = await self._client.get_entity(dialog_id)
+        except TelegramRpcThrottled:
+            raise
+        except (RPCError, TypeError, ValueError) as exc:
+            raise TopicSourceUnavailableError("source_unavailable") from exc
+        if isinstance(entity, (ChannelForbidden, ChatForbidden)):
+            raise TopicSourceUnavailableError("source_access_unavailable")
+        if not isinstance(entity, (Channel, Chat, User)) or bool(getattr(entity, "min", False)):
+            raise TopicSourceUnavailableError("capability_not_observed")
+        return entity
+
+    async def fetch_page(self, entity: object, cursor: TopicCursor) -> TopicPage:
+        """Fetch one bounded page; optional icon hydration is never on this path."""
+        try:
+            peer = cast(TypeInputPeer, await self._client.get_input_entity(entity))
+            result = cast(
+                _TopicsResultLike,
+                await self._client(
+                    GetForumTopicsRequest(
+                        peer=peer,
+                        offset_date=datetime.fromtimestamp(cursor.offset_date, UTC)
+                        if cursor.offset_date is not None
+                        else None,
+                        offset_id=cursor.offset_id,
+                        offset_topic=cursor.offset_topic,
+                        limit=FORUM_TOPICS_PAGE_SIZE,
+                    )
+                ),
+            )
+        except TelegramRpcThrottled:
+            raise
+        except (RPCError, TypeError, ValueError) as exc:
+            raise TopicSourceUnavailableError("topic_source_unavailable") from exc
+        return self._project_page(result, cursor)
+
+    def _project_page(self, result: _TopicsResultLike, cursor: TopicCursor) -> TopicPage:
+        count = _optional_int(getattr(result, "count", None))
+        if count is None or count < 0 or result.topics is None:
+            raise TopicSourceUnavailableError("topic_page_invalid")
+        page = result.topics
+        if any(not isinstance(topic, (ForumTopic, ForumTopicDeleted)) for topic in page):
+            raise TopicSourceUnavailableError("topic_constructor_unknown")
+        topics = tuple(_topic_fact(topic, self._emoji_alt_by_id) for topic in page if isinstance(topic, ForumTopic))
+        deleted = tuple(int(topic.id) for topic in page if isinstance(topic, ForumTopicDeleted))
+        return TopicPage(
+            topics,
+            count,
+            bool(getattr(result, "order_by_create_date", False)),
+            _page_cursor(result, cursor, count),
+            deleted,
+        )
 
     async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
         try:
@@ -111,6 +177,19 @@ class TelethonTelegramTopicGateway(TelegramTopicGateway):
         return {icon_id: self._emoji_alt_by_id[icon_id] for icon_id in icon_ids if icon_id in self._emoji_alt_by_id}
 
 
+def _page_cursor(result: _TopicsResultLike, cursor: TopicCursor, count: int) -> TopicCursor | None:
+    page = result.topics or []
+    if not page or (cursor.offset_topic == 0 and len(page) == count):
+        return None
+    if not isinstance(page[-1], ForumTopic):
+        return None
+    try:
+        date, offset_id, offset_topic = _topic_cursor(result, page[-1])
+    except TopicSourceUnavailableError:
+        return None  # The repository requires a cursor only for a nonterminal page.
+    return TopicCursor(_timestamp(date), offset_id, offset_topic)
+
+
 def _merge_topic_page(
     topics: dict[int, _TopicLike],
     page: tuple[_TopicLike, ...] | list[_TopicLike],
@@ -139,6 +218,7 @@ def _topic_fact(topic: _TopicLike, emoji_by_id: dict[int, str]) -> TopicFact:
         icon_color=_optional_int(getattr(topic, "icon_color", None)),
         date=_timestamp(topic.date),
         is_general=_is_general(topic),
+        hidden=bool(getattr(topic, "hidden", False)),
     )
 
 

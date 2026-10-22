@@ -122,10 +122,43 @@ def test_compute_sync_coverage(total: int | None, local: int, expected: int | No
     assert _compute_sync_coverage(total, local) == expected
 
 
-def test_build_access_metadata_live(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
+def test_build_access_metadata_status_without_evidence_does_not_claim_live_or_complete(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
     conn = make_synced_db()
     meta = _build_access_metadata(conn, dialog_id=100, status="synced")
-    assert meta == {"dialog_access": "live"}
+    assert meta == {
+        "dialog_access": "unknown",
+        "sync_status": "synced",
+        "coverage": "partial",
+        "observation_horizon_at": None,
+        "last_synced_at": None,
+        "last_event_at": None,
+        "last_delta_checked_at": None,
+    }
+
+
+def test_build_access_metadata_completed_observation_is_as_of_not_live(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
+    conn = make_synced_db()
+    conn.execute(
+        "INSERT INTO synced_dialogs(dialog_id,status,last_synced_at,last_event_at,last_delta_checked_at) "
+        "VALUES (100,'synced',1700000100,1700000200,1700000300)"
+    )
+    conn.commit()
+
+    meta = _build_access_metadata(conn, dialog_id=100, status="synced")
+
+    assert meta == {
+        "dialog_access": "unknown",
+        "sync_status": "synced",
+        "coverage": "complete_as_of",
+        "observation_horizon_at": 1700000100,
+        "last_synced_at": 1700000100,
+        "last_event_at": 1700000200,
+        "last_delta_checked_at": 1700000300,
+    }
 
 
 def test_build_access_metadata_archived(make_synced_db: Callable[[], sqlite3.Connection]) -> None:

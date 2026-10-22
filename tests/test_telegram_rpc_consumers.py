@@ -46,6 +46,7 @@ EXPECTED_DURABLE_DEMAND_ORDER = (
     DemandKind.COLD_PEER_PAGE,
     DemandKind.BACKFILL_HYDRATION_BATCH,
     DemandKind.FOLDER_SNAPSHOT,
+    DemandKind.TOPIC_SNAPSHOT,
     DemandKind.MESSAGE_FACT_REFRESH,
     DemandKind.READ_RECEIPT_BATCH,
     DemandKind.SCHEDULED_REPAIR,
@@ -75,7 +76,6 @@ def test_demand_registry_has_exact_operation_and_source_coverage() -> None:
     expected_by_source = {
         TelegramRpcSource.MCP_INTERACTIVE: {DemandKind.MCP_REMOTE_ACQUISITION},
         TelegramRpcSource.CHAT_EXPORT: {DemandKind.CHAT_EXPORT_OPERATION},
-        TelegramRpcSource.MESSAGE_READ_FALLBACK: {DemandKind.MESSAGE_READ_FALLBACK},
         TelegramRpcSource.DIALOG_RESOLUTION: {DemandKind.ENTITY_LOOKUP},
         TelegramRpcSource.TOPIC_RESOLUTION: {DemandKind.TOPIC_LOOKUP},
         TelegramRpcSource.ENTITY_INFO_FOREGROUND: {DemandKind.FOREGROUND_ENTITY_FACTS},
@@ -208,13 +208,14 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
     assert demand_contract(DemandKind.FOLDER_SNAPSHOT).max_rpc_attempts_per_slice == 2
     assert demand_contract(DemandKind.LIVE_HYDRATION_BATCH).max_rpc_attempts_per_slice == 2
     assert demand_contract(DemandKind.BACKFILL_HYDRATION_BATCH).max_rpc_attempts_per_slice == 2
-    assert demand_contract(DemandKind.TOPIC_SNAPSHOT).execution_mode is ExecutionMode.INLINE
+    assert demand_contract(DemandKind.TOPIC_SNAPSHOT).execution_mode is ExecutionMode.DURABLE
+    assert demand_contract(DemandKind.TOPIC_SNAPSHOT).max_rpc_attempts_per_slice == 4
     assert demand_contract(DemandKind.RECONNECT_DIFFERENCE).execution_mode is ExecutionMode.INLINE
 
 
 def test_durable_demand_order_is_a_literal_complete_contract() -> None:
     assert DURABLE_DEMAND_ORDER == EXPECTED_DURABLE_DEMAND_ORDER
-    assert len(DURABLE_DEMAND_ORDER) == 22
+    assert len(DURABLE_DEMAND_ORDER) == 23
     assert {
         kind for kind, contract in TELEGRAM_DEMAND_CONTRACTS.items() if contract.execution_mode is ExecutionMode.DURABLE
     } == set(EXPECTED_DURABLE_DEMAND_ORDER)

@@ -5,7 +5,7 @@ import inspect
 import json
 import logging
 import sqlite3
-from collections.abc import AsyncIterator, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
@@ -411,6 +411,29 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
     from mcp_telegram import daemon
 
     events: list[str] = []
+    writer_connection = object()
+    writer_active = False
+
+    class _Writer:
+        async def run(self, operation: Callable[[object], object]) -> object:
+            nonlocal writer_active
+            events.append("writer:run")
+            writer_active = True
+            try:
+                return operation(writer_connection)
+            finally:
+                writer_active = False
+                events.append("writer:done")
+
+    class _TopicCatalog:
+        def __init__(self, connection: object) -> None:
+            assert connection is writer_connection
+            assert writer_active
+            events.append("catalog:init")
+
+        def bootstrap(self) -> None:
+            assert writer_active
+            events.append("catalog:bootstrap")
 
     class _Barrier:
         def __init__(self, *, closed: bool) -> None:
@@ -448,9 +471,9 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
 
     ctx = SimpleNamespace(
         rpc_observation_sink=None,
-        writer=object(),
+        writer=_Writer(),
         client=object(),
-        conn=object(),
+        conn=writer_connection,
         db_path=Path("/tmp/mcp-telegram-sync-main-test.db"),
         shutdown_event=asyncio.Event(),
         scheduling=SimpleNamespace(
@@ -505,6 +528,7 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
     monkeypatch.setattr(daemon, "UpdateProcessingBarrier", _Barrier)
     monkeypatch.setattr(daemon, "DraftMessageOwner", _Owner)
     monkeypatch.setattr(daemon, "SQLiteDraftProjection", lambda *_args: object())
+    monkeypatch.setattr(daemon, "TopicCatalogRepository", _TopicCatalog)
     monkeypatch.setattr(daemon, "EventHandlerManager", _Handler)
     monkeypatch.setattr(daemon, "_connect_telegram", connect)
     monkeypatch.setattr(daemon, "CanonicalDialogDirectory", _Directory)
@@ -540,6 +564,10 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
         "owner:bind:314",
         "ensure",
         "owner:recovery:startup",
+        "writer:run",
+        "catalog:init",
+        "catalog:bootstrap",
+        "writer:done",
         "barrier:open",
         "task:reconnect_catch_up_loop",
         "prime",
@@ -561,6 +589,7 @@ def test_startup_demands_are_offered_to_coordinator() -> None:
         DemandKind.FULL_SYNC_PAGE,
         DemandKind.READ_RECEIPT_BATCH,
         DemandKind.DRAFT_SNAPSHOT,
+        DemandKind.TOPIC_SNAPSHOT,
     ]
 
 

@@ -662,7 +662,7 @@ async def test_default_all_empty_exact_topic_has_truthful_local_attribution() ->
 
 
 @pytest.mark.asyncio
-async def test_default_all_marks_not_synced_empty_history_as_local_only() -> None:
+async def test_default_all_marks_not_synced_empty_history_as_unknown() -> None:
     iter_messages = MagicMock(side_effect=AssertionError("all reads must not call Telegram"))
     client = MagicMock()
     client.iter_messages = iter_messages
@@ -673,12 +673,10 @@ async def test_default_all_marks_not_synced_empty_history_as_local_only() -> Non
 
     assert result["ok"] is True
     assert result["data"]["messages"] == []
-    assert result["data"]["coverage"] == "local_only"
-    assert result["data"]["dialog_access"] == "local_only"
-    assert result["data"]["required_action"] == (
-        "Mark the dialog for sync to make a complete local history available, or retry with "
-        'message_state="sent" for an on-demand live page.'
-    )
+    assert result["data"]["coverage"] == "unknown"
+    assert result["data"]["dialog_access"] == "unknown"
+    assert result["data"]["selection_state"] == "unknown"
+    assert result["data"]["observation_horizon_at"] is None
     iter_messages.assert_not_called()
 
 

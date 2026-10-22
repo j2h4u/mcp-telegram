@@ -3167,16 +3167,19 @@ def test_v79_upgrade_without_fts_cache_rebuilds_only_live_messages(db_path: Path
         assert backfill_fts_index(conn) == 0
 
 
-def test_v81_refresh_generation_preserves_legacy_request_and_cursor(tmp_path: Path) -> None:
+def test_v81_refresh_generation_preserves_legacy_request_and_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = tmp_path / "sync.db"
-    ensure_sync_schema(path)
+    with monkeypatch.context() as v80:
+        v80.setattr(sync_db_module, "_CURRENT_SCHEMA_VERSION", 80)
+        ensure_sync_schema(path)
     conn = _open_sync_db(path)
+    assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 80
+    assert "delta_refresh_generation" not in {row[1] for row in _table_info(conn, "synced_dialogs")}
     conn.execute(
         "INSERT INTO synced_dialogs(dialog_id,status,delta_refresh_requested_at,delta_message_id) VALUES (1,'synced',100,42),(2,'synced',NULL,7)"
     )
-    for column in ("delta_refresh_generation", "full_sync_retry_at", "delta_retry_at"):
-        conn.execute(f"ALTER TABLE synced_dialogs DROP COLUMN {column}")
-    conn.execute("DELETE FROM schema_version WHERE version>=81")
     conn.commit()
     conn.close()
     ensure_sync_schema(path)

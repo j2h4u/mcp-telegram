@@ -165,6 +165,7 @@ from .telegram_rpc_scheduler import (
     RpcAdmissionEventKind,
     TelegramRpcAdmissionDeferred,
 )
+from .topics.catalog import TopicCatalogRepository
 from .topics.refresh import TopicRefresher
 from .topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from .topics.telegram_adapter import TelethonTelegramTopicGateway, TopicClient
@@ -1193,7 +1194,6 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
             due_at=due_at,
             priority=HydrationPriority.BACKFILL,
         ),
-        topic_refresher=topic_refresher,
         folder_projection_reproject=lambda: _ensure_folder_projection(folder_repository, writer),
         group_profile_port=group_profile_port,
         user_profile_port=user_profile_port,
@@ -1500,6 +1500,7 @@ def _offer_startup_demands(ctx: _SyncMainContext) -> None:
         DemandKind.FULL_SYNC_PAGE,
         DemandKind.READ_RECEIPT_BATCH,
         DemandKind.DRAFT_SNAPSHOT,
+        DemandKind.TOPIC_SNAPSHOT,
     ):
         ctx.coordinator.offer(kind)
 
@@ -1987,7 +1988,14 @@ async def sync_main() -> None:
             startup_identity,
         )
         await draft_owner.request_recovery("startup")
+        await ctx.writer.run(lambda conn: TopicCatalogRepository(conn).bootstrap())
         update_barrier.open()
+
+        async def recover_projections() -> None:
+            await draft_owner.request_recovery("reconnect_observed")
+            await ctx.writer.run(lambda conn: TopicCatalogRepository(conn).request_recovery())
+            if ctx.coordinator is not None:
+                ctx.coordinator.offer(DemandKind.TOPIC_SNAPSHOT)
 
         # Keep the reconnect signal consumer live. Initial catch-up is already
         # retained by Telethon behind the startup barrier; an early signal
@@ -1999,7 +2007,7 @@ async def sync_main() -> None:
                 ctx.shutdown_event,
                 interval_seconds=ctx.scheduling.reconnect_catch_up_interval_seconds,
                 observe=lambda kind, outcome, reason: _observe_runtime(ctx, kind, outcome, reason),
-                on_reconnect=lambda: draft_owner.request_recovery("reconnect_observed"),
+                on_reconnect=recover_projections,
             ),
             name="reconnect_catch_up_loop",
         )

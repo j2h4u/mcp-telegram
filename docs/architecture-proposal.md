@@ -55,7 +55,8 @@ This is the minimum DDD vocabulary for the current codebase:
 
 | Domain concept | Use case | Telegram access | Local output |
 | --- | --- | --- | --- |
-| Dialog | Canonical dialog directory and `dialog_sync` light reconciliation | Dialog metadata, folders, topics | `dialogs`, folder/topic snapshots |
+| Dialog | Canonical dialog directory and `dialog_sync` light reconciliation | Dialog metadata and folders | `dialogs`, folder snapshots |
+| Topic catalog | Enabled enrollment and durable `TOPIC_SNAPSHOT` demand | Bounded topic pages | Topic metadata, catalog membership and enumeration receipts |
 | Message history | `FullSyncWorker` | Backward history batches | `messages`, FTS, aggregate reactions present on message objects |
 | Recent gaps | `DeltaSyncWorker` | Forward messages newer than local max id | New `messages`, FTS, aggregate reactions present on message objects |
 | Live events | `EventHandlerManager` | Telethon updates while daemon is online | New/edit/delete/read cursor rows; aggregate reaction updates |
@@ -106,13 +107,34 @@ including the existing archived and hidden cohort. Delivered profile fields
 materialize canonically, with per-field ordering against older in-flight RPCs.
 Acquisition receipts still retain their separate authorization/reuse rules.
 
+History and bounded context use local projections regardless of sync lifecycle
+or enabled enrollment. A retained context anchor is required; missing, deleted
+and time-excluded local anchors are distinct outcomes. Selection availability,
+historical coverage, observation horizon and current access are independent.
+Legacy fragment markers are not successful acquisition receipts. Neither local
+pagination exhaustion nor incomplete sender/topic attribution establishes
+remote absence. Explicit history acquisition remains sync enrollment, not a
+read-side fallback or a new cloud-context command.
+
+Topic reads never fetch catalogs or optional icons, offer demand, or write
+observations. Existing enabled enrollment authorizes durable topic collection,
+including automatic DM enrollment, without creating new subscriptions. Startup
+bootstraps missing work and resumes saved pages, rather than invalidating
+completed catalogs merely because the process restarted. Relevant delivered
+changes and identified recovery gaps invalidate existing authorized work.
+Page facts and cursor progress commit atomically in `sync.db`; completion is an
+enumeration observation interval, not an atomic cloud snapshot. Generation,
+request revision and observation fences preserve newer events. A completed
+omission changes catalog membership, never invents deletion or removes
+historical topic metadata. Partial attempts retain last-good facts and receipts
+while reporting current incompleteness. Missing icon decoration is independent
+of catalog completeness.
+
 Current implementation debt is tracked explicitly:
 
 | Work | Known departure | Delivery |
 | --- | --- | --- |
 | Non-DM profiles | Reads expose retained facts or explicit partial coverage; automatic acquisition ownership for never-collected group/channel profiles is not supplied by the DM slice | [#382](https://github.com/j2h4u/mcp-telegram/issues/382), following [#381](https://github.com/j2h4u/mcp-telegram/issues/381) |
-| History and bounded context | Some incomplete-coverage reads acquire Telegram data inline | [#383](https://github.com/j2h4u/mcp-telegram/issues/383) |
-| Topics | Missing catalog or optional icon enrichment can acquire Telegram data during a read | [#383](https://github.com/j2h4u/mcp-telegram/issues/383) |
 | Startup and offline availability | Telegram/startup readiness currently limits local serving; no whole-process offline guarantee is made | [#374 audit](https://github.com/j2h4u/mcp-telegram/issues/374), lifecycle design tracked in [#382](https://github.com/j2h4u/mcp-telegram/issues/382) |
 
 The [delivery tracker](https://github.com/j2h4u/mcp-telegram/issues/382) separates

@@ -89,12 +89,12 @@ Workflows:
 - FIND DIALOGS: Prefer a name, @username, or Telegram link when the caller has not already obtained an id from mcp-telegram. Use list_dialogs to discover exact ids before direct reads. Never treat identifiers from another API as mcp-telegram dialog ids.
 - TOPICS: Use list_topics for forum/topic-capable dialogs, then pass exact_topic_id to scoped reads when needed.
 - SYNC STATE: Use get_sync_status when a result looks stale, incomplete, or surprising. Full synced history means complete as of history_complete_at; ongoing freshness is local_knowledge_at.
-- ENROLL SYNC: Use mark_dialog_for_sync only when a dialog needs local sync coverage for search or anchor-based reading. This mutates local MCP sync scope, not Telegram.
+- ENROLL SYNC: Use mark_dialog_for_sync to request authorized background history/topic sync; enabled personal-dialog sync also maintains counterpart profiles. Reads never enroll or fetch. This mutates local MCP sync scope, not Telegram.
 - ACCOUNT TRACE: Use trace_account_messages when you need observable messages authored by one account. Treat best_effort_visible as bounded visible sampling, not completeness.
 - FEEDBACK: Use submit_feedback when a tool response is wrong, confusing, or missing a useful capability.
 
 Important limitations:
-- not_synced dialogs may be visible in list_dialogs but absent from search and folder message feeds.
+- not_synced dialogs can retain useful local records; no matching local records does not establish Telegram absence.
 - own_only dialogs are partial by design; do not present them as full chat history.
 - Read cursors and reaction aggregates may not include Telegram event timestamps. Do not infer unavailable times from sync or database timestamps.
 - Do not use WebFetch or web scraping for Telegram content available through these tools.
@@ -792,6 +792,10 @@ async def _build_server_instructions() -> str:
         "Telegram-read-only access to a Telegram account's message history: tools never send Telegram "
         "messages or mutate Telegram remotely. Some tools may change server-managed sync scope or submit "
         "feedback; use tool annotations and side_effects, when present, to distinguish those.\n\n"
+        "This server is a durable local Telegram mirror. Profile, history/context, search, and topic "
+        "reads return retained facts without fetching Telegram data or scheduling acquisition. "
+        "Age or incomplete coverage does not erase known facts; unknown is not absent. "
+        "For authorized background history/topic acquisition, explicitly use mark_dialog_for_sync.\n\n"
         "Response contract:\n"
         "- Successful tool calls are structured-only: read structuredContent for ids, "
         "counts, pagination, coverage, warnings, and other machine-readable facts.\n"

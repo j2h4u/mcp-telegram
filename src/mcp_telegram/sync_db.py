@@ -16,7 +16,8 @@ from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 83
+_CURRENT_SCHEMA_VERSION = 84
+_TOPIC_CATALOG_MIGRATION = 84
 _PROFILE_FIELD_OBSERVATIONS_MIGRATION = 83
 _REACTION_VISIBILITY_MIGRATION = 82
 _HISTORY_PEER_FAIRNESS_MIGRATION = 81
@@ -4753,6 +4754,45 @@ def _apply_migration_83(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_84(conn: sqlite3.Connection, current: int) -> int:
+    """Separate catalog membership and complete enumeration from topic facts."""
+    return _apply_migration(
+        conn,
+        current,
+        _TOPIC_CATALOG_MIGRATION,
+        [
+            "ALTER TABLE topic_metadata ADD COLUMN catalog_present INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE topic_metadata ADD COLUMN seen_generation INTEGER NOT NULL DEFAULT 0",
+            """CREATE TABLE topic_catalog_state (
+                dialog_id INTEGER PRIMARY KEY,
+                revision INTEGER NOT NULL DEFAULT 1,
+                scan_revision INTEGER,
+                generation INTEGER,
+                completed_at INTEGER,
+                pending INTEGER NOT NULL DEFAULT 1,
+                applicable INTEGER,
+                capability_observation_order INTEGER NOT NULL DEFAULT 0,
+                reason TEXT,
+                retry_at INTEGER,
+                offset_date INTEGER,
+                offset_id INTEGER NOT NULL DEFAULT 0,
+                offset_topic INTEGER NOT NULL DEFAULT 0,
+                expected_count INTEGER,
+                order_by_create_date INTEGER,
+                cursors TEXT NOT NULL DEFAULT '[]'
+            )""",
+            """CREATE TRIGGER topic_catalog_identity_changed AFTER UPDATE OF type ON dialogs
+            WHEN OLD.type IS NOT NEW.type AND EXISTS (
+                SELECT 1 FROM full_history_enrollment WHERE dialog_id=NEW.dialog_id AND enabled=1
+            ) BEGIN
+                INSERT INTO topic_catalog_state(dialog_id,reason) VALUES (NEW.dialog_id,'identity_changed')
+                ON CONFLICT(dialog_id) DO UPDATE SET revision=revision+1,pending=1,
+                reason=excluded.reason,retry_at=NULL;
+            END""",
+        ],
+    )
+
+
 def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
     """Apply the conditional current-schema migration tail."""
     if _CURRENT_SCHEMA_VERSION >= _ENTITY_PROFILE_ACQUISITION_MIGRATION_61:
@@ -4783,6 +4823,8 @@ def _apply_migrations_77_to_83(conn: sqlite3.Connection, current: int) -> int:
         current = _apply_migration_82(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _PROFILE_FIELD_OBSERVATIONS_MIGRATION:
         current = _apply_migration_83(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _TOPIC_CATALOG_MIGRATION:
+        current = _apply_migration_84(conn, current)
     return current
 
 

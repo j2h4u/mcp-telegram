@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import json
 import pathlib
+import sqlite3
 from asyncio import StreamReader, StreamWriter
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from typing import cast
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from jsonschema import validate
@@ -63,6 +64,7 @@ from mcp_telegram.tools._base import (
 )
 from mcp_telegram.tools.discovery import LIST_TOPICS_OUTPUT_SCHEMA
 from mcp_telegram.tools.stats import GetDialogStats, GetUsageStats, get_dialog_stats, get_usage_stats
+from tests.test_daemon_api import _insert_message, _insert_synced_dialog, _make_db, _TestClient, make_server
 
 StructuredResult = ToolResult | CallToolResult
 
@@ -105,6 +107,10 @@ def _json_list(value: object) -> list[object]:
 def _json_text(value: object) -> str:
     assert isinstance(value, str)
     return value
+
+
+def _topic_catalog_fixture() -> dict[str, object]:
+    return {"coverage": "partial", "completed_at": None, "pending": True, "reason": None, "retry_at": None}
 
 
 def _assert_null_free(value: object, *, path: str = "$") -> None:
@@ -424,6 +430,7 @@ STRUCTURED_TOOL_CASES = {
                     {"id": 1, "title": "General"},
                 ],
                 "dialog_id": 123,
+                "catalog": _topic_catalog_fixture(),
             },
         },
     ),
@@ -1191,6 +1198,7 @@ async def test_list_topics_via_daemon():
                     {"id": 2, "title": "Off-topic"},
                 ],
                 "dialog_id": 123,
+                "catalog": _topic_catalog_fixture(),
             },
         }
     )
@@ -1219,7 +1227,7 @@ async def test_list_topics_via_daemon():
 
 async def test_list_topics_passes_dialog_name():
     """ListTopics passes dialog name to daemon when not a numeric ID."""
-    conn = _make_daemon_conn({"ok": True, "data": {"topics": [], "dialog_id": 0}})
+    conn = _make_daemon_conn({"ok": True, "data": {"topics": [], "dialog_id": 0, "catalog": _topic_catalog_fixture()}})
     with _patch_daemon(conn):
         await list_topics(ListTopics(dialog="Some Group"))
 
@@ -1229,7 +1237,9 @@ async def test_list_topics_passes_dialog_name():
 
 async def test_list_topics_passes_exact_dialog_id():
     """ListTopics accepts the same exact dialog id selector style as ListMessages."""
-    conn = _make_daemon_conn({"ok": True, "data": {"topics": [], "dialog_id": 8583106747}})
+    conn = _make_daemon_conn(
+        {"ok": True, "data": {"topics": [], "dialog_id": 8583106747, "catalog": _topic_catalog_fixture()}}
+    )
     with _patch_daemon(conn):
         result = await list_topics(ListTopics(exact_dialog_id=8583106747))
 
@@ -1258,7 +1268,18 @@ def test_list_topics_schema_avoids_client_incompatible_selector_union() -> None:
 def test_list_topics_schema_explains_inconclusive_empty_catalog() -> None:
     empty_reason = LIST_TOPICS_OUTPUT_SCHEMA["properties"]["empty_reason"]
 
-    assert "could not confirm whether topics exist" in empty_reason["description"]
+    assert "requires a completed catalog enumeration" in empty_reason["description"]
+    assert "partial local evidence" in empty_reason["description"]
+
+
+def test_list_topics_advertises_local_only_read_boundary() -> None:
+    annotations = TOOL_REGISTRY["list_topics"].annotations
+
+    assert annotations is not None
+    assert annotations.read_only_hint is True
+    assert annotations.open_world_hint is False
+    description = ListTopics.__doc__ or ""
+    assert "local" in description.lower()
 
 
 @pytest.mark.parametrize("exact_dialog_id", [True, False])
@@ -1388,9 +1409,24 @@ async def test_all_dialog_scoped_tools_safely_project_ambiguity_and_suggestion_c
         )
 
 
-async def test_list_topics_empty_is_structured_non_error():
+@pytest.mark.parametrize(
+    ("coverage", "pending", "empty_reason"),
+    [
+        ("not_observed", False, "topic_catalog_not_observed"),
+        ("partial", True, "topic_catalog_partial"),
+        ("complete", False, "no_active_topics"),
+        ("not_applicable", False, "not_topic_capable"),
+    ],
+)
+async def test_list_topics_empty_is_structured_non_error(coverage: str, pending: bool, empty_reason: str):
     """ListTopics empty state is a structured successful response."""
-    conn = _make_daemon_conn({"ok": True, "data": {"topics": [], "dialog_id": 123}})
+    catalog = {"coverage": coverage, "completed_at": None, "pending": pending, "reason": None, "retry_at": None}
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {"topics": [], "dialog_id": 123, "catalog": catalog, "empty_reason": empty_reason},
+        }
+    )
     with _patch_daemon(conn):
         result = await list_topics(ListTopics(dialog="Some Group"))
 
@@ -1401,7 +1437,8 @@ async def test_list_topics_empty_is_structured_non_error():
         "dialog_id": 123,
         "topics": [],
         "count": 0,
-        "empty_reason": None,
+        "empty_reason": empty_reason,
+        "catalog": catalog,
     }
 
 
@@ -1422,6 +1459,7 @@ async def test_list_topics_structures_optional_topic_metadata():
                     },
                 ],
                 "dialog_id": -100,
+                "catalog": _topic_catalog_fixture(),
             },
         }
     )
@@ -1459,6 +1497,7 @@ async def test_list_topics_uses_fallback_color_when_custom_emoji_is_absent():
             "data": {
                 "topics": [{"id": 11, "title": "Default", "icon_color": 0x6FB9F0}],
                 "dialog_id": -100,
+                "catalog": _topic_catalog_fixture(),
             },
         }
     )
@@ -3679,7 +3718,8 @@ async def test_list_messages_topic_fuzzy_ambiguous_returns_error():
     assert candidates[0]["trust"] == {"source": "telegram", "is_untrusted": True}
 
 
-async def test_list_messages_topic_not_found_returns_error():
+@pytest.mark.parametrize(("complete", "pending"), [(False, False), (False, True), (True, False)])
+async def test_list_messages_topic_not_found_returns_error(complete: bool, pending: bool):
     """list_messages with topic= that doesn't match any topic returns error."""
     list_topics_response = {
         "ok": True,
@@ -3688,6 +3728,13 @@ async def test_list_messages_topic_not_found_returns_error():
                 {"id": 7, "title": "General"},
             ],
             "dialog_id": 1,
+            "catalog": {
+                "coverage": "complete" if complete else "partial",
+                "pending": pending,
+                "completed_at": 100 if complete else None,
+                "reason": None,
+                "retry_at": None,
+            },
         },
     }
     conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "source": "sync_db"}})
@@ -3696,7 +3743,15 @@ async def test_list_messages_topic_not_found_returns_error():
         result = await list_messages(ListMessages(exact_dialog_id=1, topic="nonexistent", message_state="sent"))
 
     text = _result_text(result)
-    assert "not found" in text.lower() or "nonexistent" in text.lower()
+    assert result.is_error
+    if complete:
+        assert "completed local catalog" in text.lower()
+    else:
+        assert "absence is unknown" in text.lower()
+        if pending:
+            assert "Wait for the pending background catalog acquisition" in text
+        else:
+            assert "mark_dialog_for_sync" in text
 
 
 async def test_list_messages_no_optional_params_not_sent():
@@ -4077,68 +4132,91 @@ async def test_get_my_recent_activity_renders_reactions():
     ]
 
 
-async def test_list_messages_fragment_coverage_header():
-    """ListMessages prepends 'Coverage: fragment' header when daemon returns coverage='fragment'."""
-    conn = _make_daemon_conn(
-        {
-            "ok": True,
-            "data": {"messages": [], "coverage": "fragment"},
-        }
+@pytest.fixture
+async def retained_history_connection(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[sqlite3.Connection]:
+    database = _make_db()
+    client = _TestClient()
+    client.iter_messages = MagicMock(side_effect=AssertionError("history reads must not acquire Telegram"))
+    client.get_messages = AsyncMock(side_effect=AssertionError("context reads must not acquire Telegram"))
+    client.get_entity = AsyncMock(side_effect=AssertionError("exact-id reads must not resolve remotely"))
+    local_server = make_server(database, client)
+    offer = MagicMock(side_effect=AssertionError("reads must not enqueue acquisition"))
+    local_server.bind_demand_sink(MagicMock(offer=offer))
+
+    class Connection:
+        async def list_messages(self, **request: object) -> dict[str, object]:
+            before = database.total_changes
+            response = await local_server._list_messages(request)
+            assert database.total_changes == before
+            return response
+
+    @asynccontextmanager
+    async def connection() -> AsyncIterator[Connection]:
+        yield Connection()
+
+    monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", connection)
+    try:
+        yield database
+        client.iter_messages.assert_not_called()
+        client.get_messages.assert_not_called()
+        client.get_entity.assert_not_called()
+        offer.assert_not_called()
+    finally:
+        await local_server.shutdown()
+        database.close()
+
+
+async def test_list_messages_retained_fragment_has_partial_local_coverage(
+    retained_history_connection: sqlite3.Connection,
+) -> None:
+    """A retained fragment remains readable but cannot establish complete history."""
+    _insert_synced_dialog(retained_history_connection, 42, status="fragment")
+    _insert_message(retained_history_connection, 42, 100, text="retained anchor")
+    result = await list_messages(
+        ListMessages(exact_dialog_id=42, anchor_message_id=100, context_size=4, message_state="sent")
     )
-    with _patch_daemon(conn):
-        result = await list_messages(ListMessages(exact_dialog_id=42))
-    assert result.content == ()
-    assert _json_dict(_json_dict(result.structured_content)["coverage"])["fragment_coverage"] is True
+
+    payload = assert_structured_success_payload(result)
+    coverage = _json_dict(payload["coverage"])
+    assert coverage["kind"] == "local_history"
+    assert coverage["state"] == "partial"
+    assert coverage["fragment_coverage"] is True
+    assert coverage["selection_state"] == "present"
+    assert coverage["observation_horizon_at"] is None
+    assert coverage["dialog_access"] == "unknown"
+    assert _json_dict(_json_list(payload["messages"])[0])["msg_id"] == 100
 
 
-async def test_list_messages_no_fragment_no_header():
-    """ListMessages does NOT include 'Coverage: fragment' header when coverage field is absent."""
+async def test_list_messages_missing_coverage_does_not_imply_fragment_or_completeness() -> None:
+    """Missing legacy metadata remains unknown, not a positive coverage claim."""
     conn = _make_daemon_conn({"ok": True, "data": {"messages": []}})
     with _patch_daemon(conn):
         result = await list_messages(ListMessages(exact_dialog_id=42))
-    assert result.content == ()
-    assert _json_dict(_json_dict(result.structured_content)["coverage"])["fragment_coverage"] is False
+    payload = assert_structured_success_payload(result)
+    coverage = _json_dict(payload["coverage"])
+    assert coverage["fragment_coverage"] is False
+    assert coverage["state"] == "unknown"
 
 
-async def test_list_messages_fragment_fetch_failure_exposes_context_metadata():
-    """Fragment fetch failures should surface actionable structured metadata."""
-    conn = _make_daemon_conn(
-        {
-            "ok": False,
-            "error": "fragment_fetch_failed",
-            "message": "Could not fetch bounded context from Telegram.",
-            "required_action": "Retry with a valid anchor_message_id, or mark the dialog for sync if broader history is needed.",
-            "context_availability": "fragment_unavailable",
-            "dialog_status": "own_only",
-        }
+@pytest.mark.parametrize("status", ("own_only", "not_synced", "access_lost"))
+async def test_list_messages_missing_local_anchor_exposes_actionable_context_metadata(
+    retained_history_connection: sqlite3.Connection, status: str
+) -> None:
+    """The tool preserves the actual daemon's local-anchor failure across sync states."""
+    _insert_synced_dialog(retained_history_connection, 42, status=status)
+    _insert_message(retained_history_connection, 42, 99, text="a different retained message")
+
+    result = await list_messages(
+        ListMessages(exact_dialog_id=42, anchor_message_id=100, context_size=4, message_state="sent")
     )
-    with _patch_daemon(conn):
-        result = await list_messages(
-            ListMessages(exact_dialog_id=42, anchor_message_id=100, context_size=4, message_state="sent")
-        )
+
     assert result.content
     assert result.is_error is True
     payload = _json_dict(result.structured_content)
-    assert payload["error"] == "fragment_fetch_failed"
-    assert payload["context_availability"] == "fragment_unavailable"
-    assert payload["dialog_status"] == "own_only"
-
-
-async def test_list_messages_not_synced_failure_exposes_context_metadata():
-    """not_synced errors should preserve the same structured error envelope."""
-    conn = _make_daemon_conn(
-        {
-            "ok": False,
-            "error": "not_synced",
-            "message": "Dialog has not been synced yet.",
-            "required_action": "Mark the dialog for sync and retry.",
-            "context_availability": "unavailable",
-            "dialog_status": "not_synced",
-        }
+    assert payload["error"] == "local_context_unavailable"
+    assert payload["context_availability"] == "anchor_missing"
+    assert payload["required_action"] == (
+        "Choose a retained, non-deleted anchor within the UTC bounds, or mark the dialog for sync to acquire history."
     )
-    with _patch_daemon(conn):
-        result = await list_messages(ListMessages(exact_dialog_id=42))
-    assert result.content
-    payload = _json_dict(result.structured_content)
-    assert payload["error"] == "not_synced"
-    assert payload["required_action"] == "Mark the dialog for sync and retry."
+    assert "Action:" in _text_content(result)
+    assert "fragment_fetch_failed" not in _text_content(result)

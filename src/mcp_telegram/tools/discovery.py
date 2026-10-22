@@ -601,6 +601,18 @@ LIST_TOPICS_OUTPUT_SCHEMA = {
     "properties": {
         "dialog": {"type": "string"},
         "dialog_id": {"type": ["integer", "null"]},
+        "catalog": {
+            "type": "object",
+            "properties": {
+                "coverage": {"enum": ["not_observed", "partial", "complete", "not_applicable"]},
+                "completed_at": {"type": ["integer", "null"]},
+                "pending": {"type": "boolean"},
+                "reason": {"type": ["string", "null"]},
+                "retry_at": {"type": ["integer", "null"]},
+            },
+            "required": ["coverage", "completed_at", "pending", "reason", "retry_at"],
+            "additionalProperties": False,
+        },
         "topics": {
             "type": "array",
             "items": {
@@ -630,13 +642,12 @@ LIST_TOPICS_OUTPUT_SCHEMA = {
         "empty_reason": {
             "type": ["string", "null"],
             "description": (
-                "Why topics is empty. no_active_topics confirms an empty refreshed catalog; "
-                "topic_catalog_deferred_flood_wait and topic_catalog_unavailable mean that "
-                "the daemon could not confirm whether topics exist."
+                "no_active_topics requires a completed catalog enumeration. Other reasons "
+                "describe unavailable or partial local evidence, or a dialog without topic support."
             ),
         },
     },
-    "required": ["dialog", "dialog_id", "topics", "count", "empty_reason"],
+    "required": ["dialog", "dialog_id", "topics", "count", "empty_reason", "catalog"],
     "additionalProperties": False,
 }
 
@@ -890,9 +901,9 @@ class ListTopics(ToolArgs):
 
     Use this before topic= when working with forum supergroups or bot DM topics so you
     can choose an exact topic name or numeric topic_id instead of guessing via fuzzy match.
-    The daemon may refresh missing topic metadata from Telegram. An empty response is
-    conclusive only when empty_reason is no_active_topics; deferred or unavailable catalog
-    reasons mean that topic existence could not be confirmed.
+    Reads only retained local topics; authorized background acquisition maintains the catalog.
+    An empty response is conclusive only when empty_reason is no_active_topics. Catalog
+    coverage reports incomplete or unavailable evidence separately from retained topic facts.
     """
 
     dialog: str | None = Field(default=None, max_length=500, description=NATURAL_DIALOG_SELECTOR_DESCRIPTION)
@@ -1004,6 +1015,7 @@ def _list_topics_payload(args: ListTopics, data: dict[str, object]) -> dict[str,
         "topics": topics,
         "count": len(topics),
         "empty_reason": None if topics else data.get("empty_reason"),
+        "catalog": data.get("catalog"),
     }
 
 
@@ -1015,7 +1027,7 @@ def _list_topics_payload(args: ListTopics, data: dict[str, object]) -> dict[str,
         read_only_hint=True,
         destructive_hint=False,
         idempotent_hint=True,
-        open_world_hint=True,
+        open_world_hint=False,
     ),
     output_schema=LIST_TOPICS_OUTPUT_SCHEMA,
 )
