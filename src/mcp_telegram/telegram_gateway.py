@@ -1107,7 +1107,20 @@ async def fetch_scheduled_history_snapshot(
     """
     input_entity = cast(TypeInputPeer, await client.get_input_entity(dialog_id))
     result = await client(GetScheduledHistoryRequest(peer=input_entity, hash=0))
-    messages = list(cast(Sequence[object], getattr(result, "messages", ()) or ()))
+    accepted = (types.messages.Messages, types.messages.MessagesSlice, types.messages.ChannelMessages)
+    if not isinstance(result, accepted):
+        raise ValueError("scheduled history response is not authoritative")
+    raw_messages = cast(object, getattr(result, "messages", None))
+    if not isinstance(raw_messages, list):
+        raise ValueError("scheduled history messages are invalid")
+    messages = list(cast(list[object], raw_messages))
+    if not isinstance(result, types.messages.Messages):
+        completeness = (
+            bool(cast(object, getattr(result, "inexact", False))),
+            cast(object, getattr(result, "count", None)),
+        )
+        if completeness != (False, len(messages)):
+            raise ValueError("scheduled history response is incomplete")
     entities = {
         get_peer_id(entity): entity
         for entity in [

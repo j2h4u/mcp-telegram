@@ -7,6 +7,7 @@ from typing import cast
 
 from ..hydration_queue import TRANSCRIPTION_HYDRATION_KIND, HydrationJob, HydrationPriority, HydrationQueueRepository
 from ..media_fact import decode_media_fact, is_transcribable_telegram_media
+from ..observation_order import delivered_observation_order
 from .sqlite_bundle import has_nonchannel_deletion, persist_transcribed_text, read_message_text
 from .sqlite_hydration_jobs import (
     _FACT_HYDRATION_ELIGIBILITY_SQL,
@@ -44,15 +45,22 @@ def upsert_message_transcription(  # noqa: PLR0913
     transcribed_text: str,
     transcription_id: int,
     received_at: int,
-) -> None:
+    observation_order: int | None = None,
+) -> bool:
     """Upsert the latest final Telegram transcription fact."""
     text = transcribed_text.strip()
     if not text:
-        return
-    conn.execute(
-        "INSERT INTO message_transcriptions(dialog_id, message_id, text, transcription_id, received_at) VALUES (?, ?, ?, ?, ?) "
-        "ON CONFLICT(dialog_id,message_id) DO UPDATE SET text=excluded.text, transcription_id=excluded.transcription_id, received_at=excluded.received_at",
-        (dialog_id, message_id, text, transcription_id, received_at),
+        return False
+    order = delivered_observation_order(conn) if observation_order is None else observation_order
+    return (
+        conn.execute(
+            "INSERT INTO message_transcriptions(dialog_id, message_id, text, transcription_id, received_at, observation_order) "
+            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(dialog_id,message_id) DO UPDATE SET text=excluded.text, "
+            "transcription_id=excluded.transcription_id, received_at=excluded.received_at, observation_order=excluded.observation_order "
+            "WHERE COALESCE(message_transcriptions.observation_order,0) < excluded.observation_order",
+            (dialog_id, message_id, text, transcription_id, received_at, order),
+        ).rowcount
+        > 0
     )
 
 
@@ -77,9 +85,10 @@ def apply_message_transcription(  # noqa: PLR0913
     if row is None or not _is_transcribable_media_pair(*row):
         return False
     message = read_message_text(conn, dialog_id, message_id)
-    upsert_message_transcription(
+    if not upsert_message_transcription(
         conn, dialog_id, message_id, transcribed_text=text, transcription_id=transcription_id, received_at=received_at
-    )
+    ):
+        return False
     if message.found and message.text != text:
         persist_transcribed_text(conn, dialog_id, message_id, old_text=message.text, transcribed_text=text)
     _remove_transcription_hydration_job(conn, dialog_id, message_id)
@@ -101,9 +110,10 @@ def stage_message_transcription(  # noqa: PLR0913
     text = transcribed_text.strip()
     if not text or read_message_text(conn, dialog_id, message_id).found:
         return False
-    upsert_message_transcription(
+    if not upsert_message_transcription(
         conn, dialog_id, message_id, transcribed_text=text, transcription_id=transcription_id, received_at=received_at
-    )
+    ):
+        return False
     _remove_transcription_hydration_job(conn, dialog_id, message_id)
     return True
 
@@ -145,9 +155,16 @@ def apply_message_transcription_if_absent(  # noqa: PLR0913
             ).fetchone(),
         )
         return "already_applied" if fact is not None else "not_applied"
-    upsert_message_transcription(
-        conn, dialog_id, message_id, transcribed_text=text, transcription_id=transcription_id, received_at=received_at
-    )
+    if not upsert_message_transcription(
+        conn,
+        dialog_id,
+        message_id,
+        transcribed_text=text,
+        transcription_id=transcription_id,
+        received_at=received_at,
+        observation_order=observation_order,
+    ):
+        return "not_applied"
     old_text = read_message_text(conn, dialog_id, message_id).text
     if old_text != text:
         persist_transcribed_text(conn, dialog_id, message_id, old_text=old_text, transcribed_text=text)

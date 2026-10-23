@@ -29,6 +29,7 @@ from .fts import stem_text
 from .linked_chat_fact import LinkedChatState, linked_chat_fact_owner
 from .message_contracts import ExtractedMessage
 from .messages.telegram_adapter import extract_message_row
+from .observation_order import allocate_observation_order, delivered_observation_order
 from .own_only import (
     OwnOnlyBasis,
     OwnOnlyContext,
@@ -262,13 +263,30 @@ WHERE scheduled_messages.message_state != 'published'
 """
 
 
-def upsert_scheduled_message(
+def _scheduled_observation_current(
+    conn: sqlite3.Connection, dialog_id: int, message_id: int, observation_order: int
+) -> bool:
+    row = cast(
+        tuple[int, int, str | None],
+        conn.execute(
+            "SELECT COALESCE((SELECT observation_order FROM scheduled_messages "
+            "WHERE dialog_id=? AND message_id=?),0), "
+            "COALESCE((SELECT snapshot_observation_order FROM scheduled_reconciliation_state WHERE dialog_id=?),0), "
+            "(SELECT message_state FROM scheduled_messages WHERE dialog_id=? AND message_id=?)",
+            (dialog_id, message_id, dialog_id, dialog_id, message_id),
+        ).fetchone(),
+    )
+    return row[2] != "published" and observation_order > max(row[0], row[1])
+
+
+def upsert_scheduled_message(  # noqa: PLR0913 - shared queue projection with retained acquisition order
     conn: sqlite3.Connection,
     dialog_id: int,
     message: object,
     *,
     now: int | None = None,
     mark_dirty: bool = True,
+    observation_order: int | None = None,
 ) -> None:
     """Insert or replace one scheduled snapshot without touching sent history."""
     extracted = extract_message_row(dialog_id, message)
@@ -277,9 +295,16 @@ def upsert_scheduled_message(
     scheduled_at = _unix_timestamp(getattr(extracted, "scheduled_at", None)) or extracted.message.sent_at
     if scheduled_at is None or scheduled_at <= timestamp:
         return
+    order = delivered_observation_order(conn) if observation_order is None else observation_order
+    if not _scheduled_observation_current(conn, dialog_id, extracted.message.message_id, order):
+        return
     cursor = conn.execute(_UPSERT_SCHEDULED_SQL, _scheduled_params(dialog_id, extracted, message, timestamp))
     if not cursor.rowcount:
         return
+    conn.execute(
+        "UPDATE scheduled_messages SET observation_order=? WHERE dialog_id=? AND message_id=?",
+        (order, dialog_id, extracted.message.message_id),
+    )
     conn.execute(_DELETE_SCHEDULED_FTS_SQL, (dialog_id, extracted.message.message_id))
     conn.execute(
         _INSERT_SCHEDULED_FTS_SQL,
@@ -297,13 +322,14 @@ INSERT OR IGNORE INTO scheduled_messages (
 """
 
 
-def mark_scheduled_messages_removed(
+def mark_scheduled_messages_removed(  # noqa: PLR0913 - removal hints share the supplied update order
     conn: sqlite3.Connection,
     dialog_id: int,
     message_ids: Sequence[int],
     sent_message_ids: Sequence[int] | None = None,
     *,
     now: int | None = None,
+    observation_order: int | None = None,
 ) -> None:
     """Retain queue-removal evidence and store publication hints as unverified.
 
@@ -314,8 +340,26 @@ def mark_scheduled_messages_removed(
     timestamp = int(time.time()) if now is None else int(now)
     hints = list(sent_message_ids or ())
     require_write_transaction(conn)
+    order = delivered_observation_order(conn) if observation_order is None else observation_order
+    if _apply_scheduled_removals(conn, dialog_id, message_ids, hints, timestamp=timestamp, order=order):
+        _mark_scheduled_dialog_dirty(conn, dialog_id, timestamp)
+
+
+def _apply_scheduled_removals(  # noqa: PLR0913 - one update shares timestamp and order across queue IDs
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_ids: Sequence[int],
+    hints: Sequence[int],
+    *,
+    timestamp: int,
+    order: int,
+) -> bool:
+    changed = False
     for index, raw_message_id in enumerate(message_ids):
         message_id = int(raw_message_id)
+        if not _scheduled_observation_current(conn, dialog_id, message_id, order):
+            continue
+        changed = True
         hint = int(hints[index]) if index < len(hints) else None
         state = "unknown_missing" if hint is not None else "cancelled"
         conn.execute(
@@ -337,8 +381,12 @@ def mark_scheduled_messages_removed(
                 (hint, timestamp, dialog_id, message_id),
             )
             _reconcile_scheduled_publication(conn, dialog_id, hint, timestamp)
+        conn.execute(
+            "UPDATE scheduled_messages SET observation_order=? WHERE dialog_id=? AND message_id=?",
+            (order, dialog_id, message_id),
+        )
         conn.execute(_DELETE_SCHEDULED_FTS_SQL, (dialog_id, message_id))
-    _mark_scheduled_dialog_dirty(conn, dialog_id, timestamp)
+    return changed
 
 
 def verify_scheduled_publication(
@@ -402,22 +450,27 @@ def mark_missing_from_snapshot(
     message_ids: Sequence[int],
     *,
     now: int | None = None,
+    observation_order: int | None = None,
 ) -> int:
-    """Mark active rows absent from an authoritative snapshot as non-visible."""
+    """Mark older active rows absent from an authoritative snapshot as non-visible."""
     require_write_transaction(conn)
     timestamp = int(time.time()) if now is None else int(now)
-    if not message_ids:
+    order = delivered_observation_order(conn) if observation_order is None else observation_order
+    accepted = [
+        message_id for message_id in message_ids if _scheduled_observation_current(conn, dialog_id, message_id, order)
+    ]
+    if not accepted:
         return 0
-    placeholders = ",".join("?" for _ in message_ids)
-    params: tuple[object, ...] = (timestamp, dialog_id, *[int(item) for item in message_ids])
+    placeholders = ",".join("?" for _ in accepted)
+    params: tuple[object, ...] = (timestamp, order, dialog_id, *[int(item) for item in accepted])
     cursor = conn.execute(
         "UPDATE scheduled_messages SET message_state='unknown_missing', unpublished=1, unseen=1, "
-        "updated_at=? WHERE dialog_id=? AND message_state='scheduled' "
+        "updated_at=?, observation_order=? WHERE dialog_id=? AND message_state='scheduled' "
         f"AND message_id IN ({placeholders})",
         params,
     )
     if cursor.rowcount:
-        conn.executemany(_DELETE_SCHEDULED_FTS_SQL, ((dialog_id, int(item)) for item in message_ids))
+        conn.executemany(_DELETE_SCHEDULED_FTS_SQL, ((dialog_id, int(item)) for item in accepted))
     return cursor.rowcount
 
 
@@ -476,10 +529,14 @@ def _missing_scheduled_ids(conn: sqlite3.Connection, dialog_id: int, snapshot_id
     return [_as_int(row[0]) for row in active_rows if _as_int(row[0]) not in snapshot_ids]
 
 
-def _upsert_snapshot_messages(conn: sqlite3.Connection, dialog_id: int, snapshot: Sequence[object], now: int) -> None:
+def _upsert_snapshot_messages(
+    conn: sqlite3.Connection, dialog_id: int, snapshot: Sequence[object], now: int, observation_order: int
+) -> None:
     for message in snapshot:
         if getattr(message, "id", None):
-            upsert_scheduled_message(conn, dialog_id, message, now=now, mark_dirty=False)
+            upsert_scheduled_message(
+                conn, dialog_id, message, now=now, mark_dirty=False, observation_order=observation_order
+            )
 
 
 def _has_active_scheduled_messages(conn: sqlite3.Connection, dialog_id: int) -> bool:
@@ -729,7 +786,7 @@ class ScheduledMessageReconciler:
 
         await self._writer.run(persist)
 
-    async def _apply_snapshot(
+    async def _apply_snapshot(  # noqa: PLR0913 - one authoritative RPC boundary fences the full set
         self,
         dialog_id: int,
         generation: int,
@@ -737,6 +794,7 @@ class ScheduledMessageReconciler:
         *,
         discovery: bool,
         now: int,
+        observation_order: int,
     ) -> int | None:
         def persist(conn: sqlite3.Connection) -> int | None:
             # Acquire the write lock before checking the generation.  Otherwise a
@@ -744,17 +802,21 @@ class ScheduledMessageReconciler:
             # by this older snapshot.
             with write_transaction(conn):
                 current = cast(
-                    tuple[object] | None,
+                    tuple[int, int] | None,
                     conn.execute(
-                        "SELECT dirty_generation FROM scheduled_reconciliation_state WHERE dialog_id=?", (dialog_id,)
+                        "SELECT dirty_generation,COALESCE(snapshot_observation_order,0) "
+                        "FROM scheduled_reconciliation_state WHERE dialog_id=?",
+                        (dialog_id,),
                     ).fetchone(),
                 )
-                if current is None or _as_int(current[0]) != generation:
+                if current is None or _as_int(current[0]) != generation or observation_order <= current[1]:
                     return None
                 snapshot_ids = _snapshot_message_ids(snapshot)
                 missing_ids = _missing_scheduled_ids(conn, dialog_id, snapshot_ids)
-                _upsert_snapshot_messages(conn, dialog_id, snapshot, now)
-                changed = mark_missing_from_snapshot(conn, dialog_id, missing_ids, now=now)
+                _upsert_snapshot_messages(conn, dialog_id, snapshot, now, observation_order)
+                changed = mark_missing_from_snapshot(
+                    conn, dialog_id, missing_ids, now=now, observation_order=observation_order
+                )
                 active = _has_active_scheduled_messages(conn, dialog_id)
                 conn.execute(
                     """
@@ -762,7 +824,8 @@ class ScheduledMessageReconciler:
                     SET repair_due_at=?,
                         discovery_due_at=CASE WHEN ? THEN ? ELSE discovery_due_at END,
                         dirty_since=NULL,
-                        updated_at=?
+                        updated_at=?,
+                        snapshot_observation_order=?
                     WHERE dialog_id=? AND dirty_generation=?
                     """,
                     (
@@ -770,6 +833,7 @@ class ScheduledMessageReconciler:
                         discovery,
                         now + SCHEDULED_QUIET_DISCOVERY_SECONDS,
                         now,
+                        observation_order,
                         dialog_id,
                         generation,
                     ),
@@ -848,10 +912,13 @@ class ScheduledMessageReconciler:
             outcome = await self._prepare_discovery(dialog_id, now)
             if outcome is not None:
                 return outcome
+        observation_order = await self._writer.run(allocate_observation_order)
         snapshot, stopped = await self._fetch_snapshot_or_stop(dialog_id, discovery, now)
         if snapshot is None:
             return 0, stopped
-        changed = await self._apply_snapshot(dialog_id, generation, snapshot, discovery=discovery, now=now)
+        changed = await self._apply_snapshot(
+            dialog_id, generation, snapshot, discovery=discovery, now=now, observation_order=observation_order
+        )
         return (0 if changed is None else changed), False
 
     async def run_demand_slice(self, demand_kind: DemandKind) -> int:
