@@ -510,9 +510,6 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
     async def run_reconnect(*_args: object, **_kwargs: object) -> None:
         return None
 
-    async def run_fts(_ctx: object) -> None:
-        events.append("fts")
-
     async def prime(_ctx: object) -> None:
         events.append("prime")
 
@@ -524,7 +521,6 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
 
     monkeypatch.setattr(daemon, "_build_sync_main_context", build_context)
     monkeypatch.setattr(daemon, "_create_tracked_task", create_task)
-    monkeypatch.setattr(daemon, "_run_fts_backfill", run_fts)
     monkeypatch.setattr(daemon, "UpdateProcessingBarrier", _Barrier)
     monkeypatch.setattr(daemon, "DraftMessageOwner", _Owner)
     monkeypatch.setattr(daemon, "SQLiteDraftProjection", lambda *_args: object())
@@ -551,7 +547,6 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
         "context",
         "task:sqlite_write_owner",
         "task:flood_wait_kill_switch_monitor",
-        "fts",
         "barrier:True",
         "owner:init",
         "owner:register",

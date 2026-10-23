@@ -84,6 +84,10 @@ _TRACE_FUZZY_MIN_LEN = 4
 _TRACE_FUZZY_SCORE_MIN = 75
 
 
+class _LocalSearchIndexUnavailableError(Exception):
+    """A local sent-message FTS query could not be executed."""
+
+
 class LoggerLike(Protocol):
     def debug(self, msg: str, *args: object, **kwargs: object) -> None: ...
 
@@ -861,24 +865,28 @@ class ReadingService:
                 result["data"]["selection_state"] = selection_state
         return result
 
+    def _fetch_search_rows(self, sql: str, parameters: dict[str, object]) -> list[object]:
+        try:
+            return _fetchall_rows(self._conn.execute(sql, parameters))
+        except sqlite3.Error as exc:
+            raise _LocalSearchIndexUnavailableError from exc
+
     async def _search_messages_global_result(
         self,
         request: _SearchMessagesRequest,
         stemmed: str,
     ) -> dict:
         with timing_phase("local_projection"):
-            rows = _fetchall_rows(
-                self._conn.execute(
-                    _SELECT_FTS_ALL_CHRONOLOGICAL_SQL if request.message_state == "all" else _SELECT_FTS_ALL_SQL,
-                    {
-                        "query": stemmed,
-                        "limit": request.limit,
-                        "offset": request.offset,
-                        "self_id": self._deps.self_id,
-                        "since_utc": request.since_utc,
-                        "until_utc": request.until_utc,
-                    },
-                )
+            rows = self._fetch_search_rows(
+                _SELECT_FTS_ALL_CHRONOLOGICAL_SQL if request.message_state == "all" else _SELECT_FTS_ALL_SQL,
+                {
+                    "query": stemmed,
+                    "limit": request.limit,
+                    "offset": request.offset,
+                    "self_id": self._deps.self_id,
+                    "since_utc": request.since_utc,
+                    "until_utc": request.until_utc,
+                },
             )
             identities = read_dialog_identities(
                 self._conn, {_object_to_int(_row_value(row, "dialog_id")) for row in rows}
@@ -910,19 +918,17 @@ class ReadingService:
         stemmed: str,
     ) -> dict:
         with timing_phase("local_projection"):
-            rows = _fetchall_rows(
-                self._conn.execute(
-                    _SELECT_FTS_CHRONOLOGICAL_SQL if request.message_state == "all" else _SELECT_FTS_SQL,
-                    {
-                        "query": stemmed,
-                        "dialog_id": request.dialog_id,
-                        "limit": request.limit,
-                        "offset": request.offset,
-                        "self_id": self._deps.self_id,
-                        "since_utc": request.since_utc,
-                        "until_utc": request.until_utc,
-                    },
-                )
+            rows = self._fetch_search_rows(
+                _SELECT_FTS_CHRONOLOGICAL_SQL if request.message_state == "all" else _SELECT_FTS_SQL,
+                {
+                    "query": stemmed,
+                    "dialog_id": request.dialog_id,
+                    "limit": request.limit,
+                    "offset": request.offset,
+                    "self_id": self._deps.self_id,
+                    "since_utc": request.since_utc,
+                    "until_utc": request.until_utc,
+                },
             )
         messages, freshness = await self._build_read_messages_from_rows(request.dialog_id, rows, log_rendered=False)
         messages = self._restore_search_plain_text(rows, messages)
@@ -2347,7 +2353,15 @@ class ReadingService:
                     "Action: pass a searchable query, or use list_messages."
                 ),
             }
-        result = await self._search_messages_for_state(request, stemmed, selector)
+        try:
+            result = await self._search_messages_for_state(request, stemmed, selector)
+        except _LocalSearchIndexUnavailableError:
+            return {
+                "ok": False,
+                "error": "local_search_index_unavailable",
+                "message": "The local message search index could not be queried.",
+                "required_action": "Use list_messages to read retained local messages.",
+            }
         if selector is None:
             result = self._attach_directory_coverage(result, read_dialog_directory_coverage(self._conn))
         return result

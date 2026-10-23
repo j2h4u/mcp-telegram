@@ -77,8 +77,7 @@ def test_upgrade_from_v82_preserves_profile_facts_and_creates_no_field_rows(
 ) -> None:
     path = tmp_path / "upgrade-v82.sqlite"
     with monkeypatch.context() as legacy:
-        legacy.setattr("mcp_telegram.sync_db._apply_migration_83", lambda _conn, current: current)
-        legacy.setattr("mcp_telegram.sync_db._apply_migration_84", lambda _conn, current: current)
+        legacy.setattr("mcp_telegram.sync_db._CURRENT_SCHEMA_VERSION", 82)
         ensure_sync_schema(path)
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA foreign_keys=ON")

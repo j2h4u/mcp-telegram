@@ -578,11 +578,24 @@ class DaemonActivityStatsService:
     async def get_usage_stats(self, req: Mapping[str, object]) -> dict[str, object]:
         since = _coerce_int(req.get("since", int(time.time()) - 30 * 86400), int(time.time()) - 30 * 86400)
         try:
-            stats = _query_usage_stats(self._deps.conn.cursor(), since)
+            db_path = self._deps.sync_db_path
+            if db_path is not None:
+                stats = await asyncio.to_thread(self._usage_stats_from_reader, db_path, since)
+            else:
+                stats = _query_usage_stats(self._deps.conn.cursor(), since)
             return {"ok": True, "data": stats}
         except Exception as exc:
             self._deps.logger.exception("get_usage_stats failed: %s", exc)
             return {"ok": False, "error": "internal", "message": "internal error"}
+
+    @staticmethod
+    def _usage_stats_from_reader(db_path: Path, since: int) -> dict[str, object]:
+        conn = open_sync_db_reader(db_path)
+        try:
+            conn.execute("BEGIN")
+            return _query_usage_stats(conn.cursor(), since)
+        finally:
+            conn.close()
 
     async def get_dialog_stats(self, req: Mapping[str, object]) -> dict[str, object]:
         try:
