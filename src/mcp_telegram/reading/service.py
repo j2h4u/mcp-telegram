@@ -167,7 +167,6 @@ class ReadingDeps:
     rid: Callable[[], str]
     deleted_message_visibility_seconds: int
     draft_response_budget_bytes: int
-    message_search_index_verified: bool = True
 
 
 @dataclass(frozen=True)
@@ -2363,8 +2362,6 @@ class ReadingService:
                 "message": "The local message search index could not be queried.",
                 "required_action": "Use list_messages to read retained local messages.",
             }
-        if result.get("ok") and request.message_state != "scheduled" and not self._deps.message_search_index_verified:
-            result["data"]["search_index_state"] = "repair_unverified"
         if selector is None:
             result = self._attach_directory_coverage(result, read_dialog_directory_coverage(self._conn))
         return result

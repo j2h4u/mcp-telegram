@@ -8,6 +8,7 @@ from typing import cast
 
 import pytest
 
+from mcp_telegram.fts import MESSAGES_FTS_DDL
 from mcp_telegram.sync_db import (
     _CURRENT_SCHEMA_VERSION,
     _apply_migration_47,
@@ -1071,9 +1072,7 @@ def _seed_v6_reaction_backfill_db(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (dialog_id, message_id)
         ) WITHOUT ROWID"""
     )
-    conn.execute(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(dialog_id UNINDEXED, message_id UNINDEXED, text)"
-    )
+    conn.execute(MESSAGES_FTS_DDL)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS synced_dialogs (
             dialog_id      INTEGER PRIMARY KEY,

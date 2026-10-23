@@ -1,11 +1,10 @@
-"""Retained local search stays useful when startup FTS repair is unverified."""
+"""Retained local search reports real SQL failures independently of scheduled search."""
 
 import sqlite3
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from dataclasses import replace
 from types import SimpleNamespace
-from typing import Literal, cast
+from typing import Literal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -15,7 +14,6 @@ from mcp.types import TextContent
 from mcp_telegram.reading import ReadingDeps, ReadingService
 from mcp_telegram.tools import omit_none_mapping_values, reading
 from mcp_telegram.tools._base import TOOL_REGISTRY
-from mcp_telegram.tools.structured import StructuredWarning
 
 
 @pytest.fixture
@@ -39,7 +37,6 @@ def local_reading(make_synced_db: Callable[[], sqlite3.Connection]) -> ReadingSe
             rid=lambda: "",
             deleted_message_visibility_seconds=86_400,
             draft_response_budget_bytes=1024,
-            message_search_index_verified=False,
         )
     )
 
@@ -58,7 +55,7 @@ def _connect_tool(monkeypatch: pytest.MonkeyPatch, service: ReadingService) -> N
 @pytest.mark.parametrize("scoped", [False, True])
 @pytest.mark.parametrize("message_state", ["sent", "all"])
 @pytest.mark.parametrize("query", ["needle", "absent"])
-async def test_unverified_search_preserves_hits_and_separate_warning(
+async def test_local_search_preserves_hits_and_coverage(
     local_reading: ReadingService,
     monkeypatch: pytest.MonkeyPatch,
     scoped: bool,
@@ -73,20 +70,9 @@ async def test_unverified_search_preserves_hits_and_separate_warning(
     assert not result.content
     assert payload is not None
     assert payload["count"] == (1 if query == "needle" else 0)
-    assert payload["search_index_state"] == "repair_unverified"
-    warnings = cast(list[StructuredWarning], payload["warnings"])
-    warning = next(warning for warning in warnings if warning["kind"] == "local_search_index_unverified")
-    assert "may omit retained messages" in warning["message"]
-    assert "empty result does not establish" in warning["message"]
-    assert warning.get("action") == "Use list_messages to read retained local messages."
     output_schema = TOOL_REGISTRY["search_messages"].output_schema
     assert output_schema is not None
     validate(omit_none_mapping_values(payload), output_schema)
-    local_reading._deps = replace(local_reading._deps, message_search_index_verified=True)
-    verified = await reading.search_messages(args)
-    assert verified.structured_content is not None
-    assert verified.structured_content["coverage"] == payload["coverage"]
-    assert "search_index_state" not in verified.structured_content
 
 
 @pytest.mark.parametrize("scoped", [False, True])
@@ -101,8 +87,6 @@ async def test_scheduled_search_does_not_depend_on_sent_index(
     assert not result.is_error
     assert result.structured_content is not None
     assert "search_index_state" not in result.structured_content
-    warnings = cast(list[StructuredWarning], result.structured_content["warnings"])
-    assert not any(w["kind"] == "local_search_index_unverified" for w in warnings)
 
 
 @pytest.mark.parametrize("scoped", [False, True])

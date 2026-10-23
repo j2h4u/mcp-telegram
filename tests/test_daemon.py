@@ -157,7 +157,6 @@ class _ApiStub:
         self.self_id = 1
         self.self_profile: dict[str, object] | None = None
         self.startup_detail = ""
-        self.message_search_index_verified = True
         self._ready = False
         self._client = object()
 
@@ -511,9 +510,6 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
     async def run_reconnect(*_args: object, **_kwargs: object) -> None:
         return None
 
-    async def run_fts(_ctx: object) -> None:
-        events.append("fts")
-
     async def prime(_ctx: object) -> None:
         events.append("prime")
 
@@ -525,7 +521,6 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
 
     monkeypatch.setattr(daemon, "_build_sync_main_context", build_context)
     monkeypatch.setattr(daemon, "_create_tracked_task", create_task)
-    monkeypatch.setattr(daemon, "_run_fts_backfill", run_fts)
     monkeypatch.setattr(daemon, "UpdateProcessingBarrier", _Barrier)
     monkeypatch.setattr(daemon, "DraftMessageOwner", _Owner)
     monkeypatch.setattr(daemon, "SQLiteDraftProjection", lambda *_args: object())
@@ -552,7 +547,6 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
         "context",
         "task:sqlite_write_owner",
         "task:flood_wait_kill_switch_monitor",
-        "fts",
         "barrier:True",
         "owner:init",
         "owner:register",
@@ -1242,41 +1236,3 @@ async def test_shutdown_cancels_disconnects_and_detaches_before_flushing_telemet
 
 async def _append_async(stages: list[str], stage: str) -> None:
     stages.append(stage)
-
-
-@pytest.mark.parametrize("status", ["completed", "skipped"])
-async def test_startup_fts_verification_sets_flag_after_writer_success(status: str) -> None:
-    api_server = _ApiStub()
-
-    async def run(callback: object) -> object:
-        assert api_server.message_search_index_verified is False
-        assert callback is daemon.ensure_fts_index
-        return SimpleNamespace(status=status)
-
-    writer_run = AsyncMock(side_effect=run)
-    writer = SimpleNamespace(run=writer_run)
-    ctx = cast(_SyncMainContext, SimpleNamespace(api_server=api_server, writer=writer))
-    await daemon._run_fts_backfill(ctx)
-    assert api_server.message_search_index_verified is True
-    writer_run.assert_awaited_once_with(daemon.ensure_fts_index)
-
-
-async def test_startup_fts_verification_failure_is_visible_and_startup_continues(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    api_server = _ApiStub()
-    writer = SimpleNamespace(run=AsyncMock(side_effect=RuntimeError("sensitive exception text")))
-    ctx = cast(_SyncMainContext, SimpleNamespace(api_server=api_server, writer=writer))
-    await daemon._run_fts_backfill(ctx)
-    assert api_server.message_search_index_verified is False
-    assert "fts_startup_verification_failed exception_type=RuntimeError" in caplog.text
-    assert "sensitive exception text" not in caplog.text
-
-
-async def test_startup_fts_verification_cancellation_propagates() -> None:
-    api_server = _ApiStub()
-    writer = SimpleNamespace(run=AsyncMock(side_effect=asyncio.CancelledError))
-    ctx = cast(_SyncMainContext, SimpleNamespace(api_server=api_server, writer=writer))
-    with pytest.raises(asyncio.CancelledError):
-        await daemon._run_fts_backfill(ctx)
-    assert api_server.message_search_index_verified is False
