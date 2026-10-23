@@ -940,8 +940,19 @@ class EventHandlerManager:
         expected_revision = (
             baseline_revision if baseline_revision is not None else (0 if not row_existed_before_presence else None)
         )
-        if expected_revision is None:
+        if expected_revision is None or capture_identity_baseline(conn, dialog_id) != expected_revision:
             return
+        order = delivered_observation_order(conn)
+        name_accepted = observation.name is IDENTITY_OMITTED or claim_dialog_fact(conn, dialog_id, "name", order)
+        username_accepted = observation.username is IDENTITY_OMITTED or claim_dialog_fact(
+            conn, dialog_id, "username", order
+        )
+        observation = replace(
+            observation,
+            name=observation.name if name_accepted else IDENTITY_OMITTED,
+            username=observation.username if username_accepted else IDENTITY_OMITTED,
+            complete=all((observation.complete, name_accepted, username_accepted)),
+        )
         publish_dialog_identity(
             conn,
             dialog_id,

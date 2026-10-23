@@ -2286,3 +2286,48 @@ async def test_new_enrichment_failure_keeps_original_delivery_pending(
         await manager.on_new_message(event)
     assert delivered.failed
     assert sync_db.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=42").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_retained_dm_enrollment_preserves_newer_identity_and_materializes_message(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 101
+    sync_db.execute(
+        "INSERT INTO dialogs(dialog_id,name,username,type,identity_revision,identity_complete,identity_source,identity_observed_at) "
+        "VALUES (?,'New','new','user',1,1,'directory',200)",
+        (dialog_id,),
+    )
+    sync_db.executemany(
+        "INSERT INTO dialog_fact_observations(dialog_id,field,observation_order) VALUES (?,?,3)",
+        [(dialog_id, "name"), (dialog_id, "username")],
+    )
+    sync_db.commit()
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(
+            chat_id=dialog_id,
+            message=build_mock_message(id=1001, text="retained message"),
+            is_private=True,
+            get_sender=AsyncMock(return_value=types.User(id=dialog_id, first_name="Old", username="old")),
+        ),
+    )
+    with delivered_update_context(DeliveredUpdate(2, 100, 2)):
+        await manager.on_new_message(event)
+    assert sync_db.execute("SELECT name,username FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        "New",
+        "new",
+    )
+    assert sync_db.execute(
+        "SELECT field,observation_order FROM dialog_fact_observations WHERE dialog_id=? ORDER BY field",
+        (dialog_id,),
+    ).fetchall() == [("name", 3), ("username", 3)]
+    assert sync_db.execute("SELECT dialog_id FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        dialog_id,
+    )
+    assert sync_db.execute(
+        "SELECT text FROM messages WHERE dialog_id=? AND message_id=1001", (dialog_id,)
+    ).fetchone() == ("retained message",)
