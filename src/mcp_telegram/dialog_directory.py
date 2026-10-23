@@ -120,6 +120,11 @@ class _StagedFact:
 type _StagedIdentityRow = tuple[int, str | None, str | None, str | None, int, int, int | None, int]
 
 
+type _StagedScalarRow = tuple[
+    int, int, int, int | None, int | None, int | None, int | None, int | None, int | None, int | None
+]
+
+
 @dataclass(frozen=True, slots=True)
 class _StagedEntityProjection:
     name: str | None
@@ -1112,11 +1117,14 @@ def _staged_identity_observation(row: _StagedIdentityRow, mask: int) -> DialogId
 
 
 def _ordered_identity_mask(conn: sqlite3.Connection, generation: int, dialog_id: int, mask: int) -> int:
-    row = conn.execute(
-        "SELECT name_observation_order,username_observation_order FROM dialog_directory_staging "
-        "WHERE generation=? AND dialog_id=?",
-        (generation, dialog_id),
-    ).fetchone()
+    row = cast(
+        tuple[int | None, int | None] | None,
+        conn.execute(
+            "SELECT name_observation_order,username_observation_order FROM dialog_directory_staging "
+            "WHERE generation=? AND dialog_id=?",
+            (generation, dialog_id),
+        ).fetchone(),
+    )
     assert row is not None
     for field, bit, order in (("name", 1, row[0]), ("username", 2, row[1])):
         if mask & bit and order is not None and not claim_dialog_fact(conn, dialog_id, field, order):
@@ -1125,15 +1133,18 @@ def _ordered_identity_mask(conn: sqlite3.Connection, generation: int, dialog_id:
 
 
 def _publish_ordered_scalar_facts(conn: sqlite3.Connection, generation: int) -> None:
-    rows = conn.execute(
-        "SELECT staged.dialog_id,staged.snapshot_at,staged.archived,"
-        "staged.unread_count,staged.unread_mark,staged.eligibility_mute_until,"
-        "staged.archived_observation_order,staged.unread_count_observation_order,"
-        "staged.unread_mark_observation_order,staged.mute_until_observation_order "
-        "FROM dialog_directory_staging staged JOIN dialogs d ON d.dialog_id=staged.dialog_id "
-        "WHERE staged.generation=? AND staged.observation_order IS NOT NULL",
-        (generation,),
-    ).fetchall()
+    rows = cast(
+        list[_StagedScalarRow],
+        conn.execute(
+            "SELECT staged.dialog_id,staged.snapshot_at,staged.archived,"
+            "staged.unread_count,staged.unread_mark,staged.eligibility_mute_until,"
+            "staged.archived_observation_order,staged.unread_count_observation_order,"
+            "staged.unread_mark_observation_order,staged.mute_until_observation_order "
+            "FROM dialog_directory_staging staged JOIN dialogs d ON d.dialog_id=staged.dialog_id "
+            "WHERE staged.generation=? AND staged.observation_order IS NOT NULL",
+            (generation,),
+        ).fetchall(),
+    )
     for (
         dialog_id,
         observed_at,
@@ -1455,13 +1466,14 @@ def _commit_pinned_generation(
     if observation_order is not None:
         current = claim_pin_snapshot(conn, folder_id, observation_order, rpc_ids)
         if current is None:
-            current = [
-                row[0]
-                for row in conn.execute(
+            rows = cast(
+                list[tuple[int]],
+                conn.execute(
                     "SELECT dialog_id FROM dialog_directory_published_pins WHERE folder_id=? ORDER BY position",
                     (folder_id,),
-                )
-            ]
+                ).fetchall(),
+            )
+            current = [dialog_id for (dialog_id,) in rows]
         for event in read_realtime_pin_fence(conn, generation, folder_id):
             if "observation_order" not in event:
                 current = _apply_realtime_pin_fence_event(current, event)

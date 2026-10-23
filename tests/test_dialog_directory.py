@@ -2154,7 +2154,7 @@ async def test_partial_later_source_keeps_each_supplied_staging_field_order(tmp_
     pinned.unread_mark = True
     pinned.notify_settings = types.PeerNotifySettings(mute_until=datetime(2027, 1, 1, tzinfo=UTC))
     ordinary = _dialog(9801, 9)
-    ordinary.unread_count = None
+    ordinary.unread_count = None  # pyright: ignore[reportAttributeAccessIssue] - synthetic partial dialog
     ordinary.unread_mark = None
     directory = CanonicalDialogDirectory(
         _FakeClient(
@@ -2171,20 +2171,24 @@ async def test_partial_later_source_keeps_each_supplied_staging_field_order(tmp_
     await directory.run_slice()
     conn = _open_sync_db(db_path)
     try:
-        original_order = conn.execute(
-            "SELECT observation_order FROM dialog_directory_staging WHERE dialog_id=9801"
-        ).fetchone()[0]
+        original_order = cast(
+            tuple[int],
+            conn.execute("SELECT observation_order FROM dialog_directory_staging WHERE dialog_id=9801").fetchone(),
+        )[0]
     finally:
         conn.close()
     await directory.run_slice()
     await directory.run_slice()
     conn = _open_sync_db(db_path)
     try:
-        row = conn.execute(
-            "SELECT name_observation_order,username_observation_order,unread_count_observation_order,"
-            "unread_mark_observation_order,mute_until_observation_order,observation_order,"
-            "unread_count,unread_mark,eligibility_mute_until FROM dialog_directory_staging WHERE dialog_id=9801"
-        ).fetchone()
+        row = cast(
+            tuple[int, int, int, int, int, int, int, int, int],
+            conn.execute(
+                "SELECT name_observation_order,username_observation_order,unread_count_observation_order,"
+                "unread_mark_observation_order,mute_until_observation_order,observation_order,"
+                "unread_count,unread_mark,eligibility_mute_until FROM dialog_directory_staging WHERE dialog_id=9801"
+            ).fetchone(),
+        )
         assert row[0] == row[2] == row[3] == row[4] == original_order
         assert row[1] == row[5] and row[1] > original_order
         assert row[6:] == (7, 1, 1798761600)
@@ -2223,16 +2227,22 @@ async def test_rejected_original_identity_baseline_does_not_advance_field_orders
         manager = event_manager(MagicMock(), conn, asyncio.Event())
         manager._update_realtime_username(
             conn,
-            SimpleNamespace(
-                user_id=10001,
-                usernames=[types.Username("newer_alias", active=True)],
+            cast(
+                types.UpdateUserName,
+                SimpleNamespace(
+                    user_id=10001,
+                    usernames=[types.Username("newer_alias", active=True)],
+                ),
             ),
             100,
         )
-        expected_identity = conn.execute(
-            "SELECT name,username,type,identity_complete,identity_source,identity_observed_at,identity_revision "
-            "FROM dialogs WHERE dialog_id=10001"
-        ).fetchone()
+        expected_identity = cast(
+            tuple[str | None, str | None, str | None, int, str | None, int | None, int] | None,
+            conn.execute(
+                "SELECT name,username,type,identity_complete,identity_source,identity_observed_at,identity_revision "
+                "FROM dialogs WHERE dialog_id=10001"
+            ).fetchone(),
+        )
         expected_orders = conn.execute(
             "SELECT field,observation_order FROM dialog_fact_observations WHERE dialog_id=10001 "
             "AND field IN ('name','username') ORDER BY field"
