@@ -299,6 +299,7 @@ async def test_replacement_loop_rejects_failed_cancelled_admission_before_waitin
     entered, release = ThreadEvent(), ThreadEvent()
     vendor_entered = asyncio.Event()
     blocker: asyncio.Task[None] | None = None
+    admission: asyncio.Task[list[object]] | None = None
 
     def hold(_conn: sqlite3.Connection) -> None:
         entered.set()
@@ -324,8 +325,7 @@ async def test_replacement_loop_rejects_failed_cancelled_admission_before_waitin
             assert client._active_delivery is not None and not client._active_delivery.done.is_set()
         else:
             # The blocked real writer keeps admit queued before cancellation.
-            while writer._queue.qsize() == 0:
-                await asyncio.sleep(0)
+            await _wait_for_queued_admission(writer, admission, blocker)
         admission.cancel()
         release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -336,9 +336,46 @@ async def test_replacement_loop_rejects_failed_cancelled_admission_before_waitin
         assert _pending(path) is not None
         assert client._delivery_failure.is_set() and _saved(client)[0][0] == 10
     finally:
-        release.set()
+        await _close_cancelled_admission(client, writer, admission, blocker, release)
+
+
+async def _wait_for_queued_admission(
+    writer: SQLiteWriter,
+    admission: asyncio.Task[list[object]],
+    blocker: asyncio.Task[None] | None,
+) -> None:
+    assert blocker is not None
+
+    async def queued() -> None:
+        while True:
+            if blocker.done():
+                await blocker
+                raise AssertionError("writer blocker ended before queued cancellation")
+            if admission.done():
+                await admission
+                raise AssertionError("admission ended before queued cancellation")
+            if writer._queue.qsize():
+                return
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(queued(), 2)
+
+
+async def _close_cancelled_admission(
+    client: TelegramRpcGate,
+    writer: SQLiteWriter,
+    admission: asyncio.Task[list[object]] | None,
+    blocker: asyncio.Task[None] | None,
+    release: ThreadEvent,
+) -> None:
+    release.set()
+    try:
+        if admission is not None:
+            admission.cancel()
+            await asyncio.gather(admission, return_exceptions=True)
         if blocker is not None:
             await blocker
+    finally:
         cast(SQLiteSession, client.session).close()
         await writer.aclose()
 

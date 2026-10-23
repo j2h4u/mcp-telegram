@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -380,6 +380,7 @@ async def test_admission_wait_and_rpc_execution_are_separate_boundaries() -> Non
         _admission_scheduler=scheduler,
         _register_scalar_dispatch_completion=register_completion,
     )
+    gate._reject_exhausted_attempt_budget = MethodType(TelegramRpcGate._reject_exhausted_attempt_budget, gate)
     scope = TelegramRpcScope(
         source=TelegramRpcSource.MCP_INTERACTIVE,
         service_class=RpcServiceClass.INTERACTIVE,
@@ -396,12 +397,23 @@ async def test_admission_wait_and_rpc_execution_are_separate_boundaries() -> Non
         task = asyncio.create_task(
             _AdmissionAwareSender(cast(TelegramRpcGate, gate), send_attempt, scope).send("request")
         )
-        await admission_started.wait()
-        assert timing is not None
-        assert timing.phases == {}
-        release_admission.set()
-        assert await task == "ok"
-        payload = timing.payload()
+        admitted = asyncio.create_task(admission_started.wait())
+        try:
+            done, _ = await asyncio.wait({admitted, task}, timeout=2, return_when=asyncio.FIRST_COMPLETED)
+            if task in done:
+                await task
+                raise AssertionError("RPC completed before admission was released")
+            assert admitted in done, "RPC did not reach admission"
+            assert timing is not None
+            assert timing.phases == {}
+            release_admission.set()
+            assert await asyncio.wait_for(task, 2) == "ok"
+            payload = timing.payload()
+        finally:
+            release_admission.set()
+            admitted.cancel()
+            task.cancel()
+            await asyncio.gather(admitted, task, return_exceptions=True)
 
     assert payload["rpc_admission_ms"] is not None
     assert payload["rpc_execution_ms"] is not None
