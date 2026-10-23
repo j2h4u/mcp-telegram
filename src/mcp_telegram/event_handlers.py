@@ -1181,29 +1181,37 @@ class EventHandlerManager:
             self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
         status, _ = self._realtime_history_status.read_status(dialog_id)
         if event.is_private and status is None:
-            outgoing = bool(getattr(event.message, "out", False))
-            cached_peer = getattr(event, "chat" if outgoing else "sender", None)
-            peer = cached_peer
-            try:
-                lookup = getattr(event, "get_chat" if outgoing else "get_sender", None)
-                if callable(lookup) and (peer is None or bool(getattr(peer, "min", False))):
-                    peer = await cast(Callable[[], Awaitable[_SenderLike | None]], lookup)()
-            except _DM_AUTO_ENROLL_SENDER_EXCEPTIONS:
-                logger.debug("dm_auto_enroll_peer_fetch_failed dialog_id=%d", dialog_id)
-            # An acquired replacement is new evidence; bundled identities keep admission time.
-            acquired_peer = peer is not None and peer is not cached_peer
-            with delivered_update_context(None) if acquired_peer else nullcontext():
-                enrolled = await self._auto_enroll_dm(
-                    dialog_id,
-                    sender=peer,
-                    message_date=event.message.date,
-                    observed_at=delivered_observed_at(),
-                    identity_baseline=identity_baseline,
-                )
-            if not enrolled:
-                fail_delivered_update()
+            await self._enroll_new_private_message(dialog_id, event, identity_baseline)
             coverage = self._realtime_coverage(dialog_id)
         return coverage
+
+    async def _enroll_new_private_message(
+        self,
+        dialog_id: int,
+        event: _NewMessageEvent,
+        identity_baseline: _IdentityBaseline | None,
+    ) -> None:
+        peer_field = "chat" if bool(getattr(event.message, "out", False)) else "sender"
+        cached_peer = cast(_SenderLike | None, getattr(event, peer_field, None))
+        peer: _SenderLike | None = cached_peer
+        try:
+            lookup = getattr(event, f"get_{peer_field}", None)
+            if callable(lookup) and (peer is None or bool(cast(object, getattr(peer, "min", False)))):
+                peer = await cast(Callable[[], Awaitable[_SenderLike | None]], lookup)()
+        except _DM_AUTO_ENROLL_SENDER_EXCEPTIONS:
+            logger.debug("dm_auto_enroll_peer_fetch_failed dialog_id=%d", dialog_id)
+        # An acquired replacement is new evidence; bundled identities keep admission time.
+        acquired_peer = peer is not None and peer is not cached_peer
+        with delivered_update_context(None) if acquired_peer else nullcontext():
+            enrolled = await self._auto_enroll_dm(
+                dialog_id,
+                sender=peer,
+                message_date=event.message.date,
+                observed_at=delivered_observed_at(),
+                identity_baseline=identity_baseline,
+            )
+        if not enrolled:
+            fail_delivered_update()
 
     async def _project_denied_new_message_metadata(
         self,
