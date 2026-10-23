@@ -834,7 +834,6 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
             "additionalProperties": False,
         },
         "source": {"type": "string"},
-        "search_index_state": {"type": "string", "enum": ["repair_unverified"]},
         "coverage": {"type": "object"},
         "directory_coverage": {"type": "object"},
         "warnings": {"type": "array", "items": {"type": "object"}},
@@ -1041,19 +1040,7 @@ def _search_structured_content(ctx: _SearchStructuredContentContext) -> dict[str
     source = data.get("source", "sync_db")
     data_with_source = {**data, "source": source}
     warnings = _list_messages_warnings(data)
-    search_index_unverified = data.get("search_index_state") == "repair_unverified"
-    if search_index_unverified:
-        warnings.append(
-            structured_warning(
-                "local_search_index_unverified",
-                "Local search index repair was not verified. Results may omit retained messages; "
-                "an empty result does not establish their absence.",
-                severity="warning",
-                action="Use list_messages to read retained local messages.",
-            )
-        )
     return {
-        **({"search_index_state": "repair_unverified"} if search_index_unverified else {}),
         "query": ctx.args.query,
         "dialog_name": _search_dialog_name(ctx.rows, ctx.global_mode, ctx.dialog_label, data.get("dialog_name")),
         "dialog_name_source": _search_dialog_name_source(ctx.rows, ctx.global_mode, data.get("dialog_name_source")),

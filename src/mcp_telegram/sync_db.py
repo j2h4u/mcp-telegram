@@ -16,7 +16,8 @@ from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 84
+_CURRENT_SCHEMA_VERSION = 85
+_HISTORICAL_FTS_BACKFILL_MIGRATION = 85
 _TOPIC_CATALOG_MIGRATION = 84
 _PROFILE_FIELD_OBSERVATIONS_MIGRATION = 83
 _REACTION_VISIBILITY_MIGRATION = 82
@@ -1912,16 +1913,8 @@ def _apply_migrations_11_to_15(conn: sqlite3.Connection, current: int) -> int:
     # the message_cache zombie (dropped in v7 but DDL constant survived until
     # this migration removed it).
     #
-    # FTS COVERAGE NOTE (review finding from Codex + OpenCode, 2026-04-24):
-    # This migration does NOT insert rows into messages_fts. The FTS gap is
-    # closed at the next daemon startup by `backfill_fts_index()` in fts.py,
-    # which sweeps the entire messages table and re-populates messages_fts
-    # for any (dialog_id, message_id) missing from it. In practice this means
-    # migrated own-only messages become searchable via SearchMessages ~one
-    # daemon restart after upgrade (the same restart that runs the v15
-    # migration, because daemon.py runs ensure_sync_schema → backfill_fts_index
-    # on boot). Plan 03 Task 4 verifies this end-to-end via a live MCP
-    # SearchMessages call against a migrated message.
+    # This import leaves FTS filling to migration 85, after stable message keys
+    # exist. Bootstrap completes that bounded backfill before serving reads.
     #
     # SPARSE COLUMNS NOTE (review finding, 2026-04-24):
     # activity_comments stored only 7 semantically useful columns
@@ -4918,8 +4911,26 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     current = _apply_migration_59(conn, current)
     current = _apply_migration_60(conn, current)
     current = _apply_late_migrations(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _HISTORICAL_FTS_BACKFILL_MIGRATION:
+        current = _apply_migration_85(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
+
+
+def _apply_migration_85(conn: sqlite3.Connection, current: int) -> int:
+    """Finish historical FTS coverage once, preserving committed batch progress."""
+    if current >= _HISTORICAL_FTS_BACKFILL_MIGRATION:
+        return current
+    from .fts import backfill_fts_index
+
+    logger.info("sync_db v85: historical FTS backfill started")
+    # Backfill owns bounded transactions; publish the ledger only after both passes.
+    inserted = backfill_fts_index(conn)
+    with write_transaction(conn):
+        conn.execute("INSERT INTO schema_version VALUES (85, strftime('%s', 'now'))")
+        conn.execute("DELETE FROM daemon_state WHERE key='fts_repair_receipt'")
+    logger.info("sync_db v85: historical FTS backfill completed inserted=%d", inserted)
+    return _HISTORICAL_FTS_BACKFILL_MIGRATION
 
 
 def _ensure_scheduled_messages_fts(conn: sqlite3.Connection) -> None:
