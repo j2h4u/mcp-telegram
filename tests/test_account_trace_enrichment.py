@@ -255,8 +255,6 @@ def trace_service(
             self_id=server.self_id,
             logger=cast(_LoggerLike, logging.getLogger("test")),
             rid=lambda: "",
-            user_directory_ttl_seconds=server._policy.user_directory_ttl_seconds,
-            group_directory_ttl_seconds=server._policy.group_directory_ttl_seconds,
         )
     )
 

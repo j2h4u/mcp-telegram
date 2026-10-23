@@ -1531,8 +1531,6 @@ class DaemonAPIServer:
                 self_id=self.self_id,
                 logger=cast(AccountTraceLoggerLike, logger),
                 rid=_rid,
-                user_directory_ttl_seconds=self._policy.user_directory_ttl_seconds,
-                group_directory_ttl_seconds=self._policy.group_directory_ttl_seconds,
             )
         )
 

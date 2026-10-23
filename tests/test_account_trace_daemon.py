@@ -12,6 +12,7 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from jsonschema import validate
 from telethon.tl.functions.channels import GetFullChannelRequest  # type: ignore[import-untyped]
 
 from account_trace_fixtures import (
@@ -60,6 +61,8 @@ from mcp_telegram.telegram_demand import AcquisitionKind
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope
 from mcp_telegram.tools import TOOL_REGISTRY
+from mcp_telegram.tools._base import omit_none_mapping_values, structured_result
+from mcp_telegram.tools.account_trace import TraceAccountMessages, _trace_structured_content
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     LoudChannelProfilePort,
@@ -110,14 +113,124 @@ def trace_service(
             self_id=server.self_id,
             logger=cast(_LoggerLike, logging.getLogger("test")),
             rid=lambda: "",
-            user_directory_ttl_seconds=server._policy.user_directory_ttl_seconds,
-            group_directory_ttl_seconds=server._policy.group_directory_ttl_seconds,
         ),
     )
 
 
 def _dict(value: object) -> dict[str, object]:
     return cast(dict[str, object], value)
+
+
+def _forbid_trace_acquisition(client: AsyncMock) -> None:
+    client.side_effect = AssertionError("Observed trace must not acquire Telegram facts")
+    client.get_entity.side_effect = AssertionError("Observed trace must not resolve peers")
+    client.iter_messages.side_effect = AssertionError("Observed trace must not fetch messages")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("goal", [None, "observed"])
+@pytest.mark.parametrize("account", ["@missing", "https://t.me/missing"])
+async def test_observed_unknown_username_is_local_unknown(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+    goal: str | None,
+    account: str,
+) -> None:
+    _server, conn, client = trace_server
+    _forbid_trace_acquisition(client)
+    before = list(conn.iterdump())
+    req: dict[str, object] = {"account": account}
+    if goal is not None:
+        req["coverage_goal"] = goal
+    result = await trace_service._trace_account_messages(req)
+    assert result["ok"] is True
+    data = _dict(result["data"])
+    assert _dict(data["resolved_account"])["resolution_source"] == "username_not_in_local_archive"
+    assert _dict(data["coverage"])["state"] == "unknown"
+    assert "does not establish Telegram absence" in str(cast(list[dict], data["gaps"])[0]["detail"])
+    assert list(conn.iterdump()) == before
+    assert client.mock_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("goal", [None, "observed"])
+@pytest.mark.parametrize("link_state", ["unknown", "known_none", "known_link"])
+async def test_observed_channel_scope_reads_retained_facts_without_writes(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+    goal: str | None,
+    link_state: str,
+) -> None:
+    _server, conn, client = trace_server
+    _forbid_trace_acquisition(client)
+    seed_entity(conn, entity_id=101, name="Alice Example", username="alice")
+    seed_dialog(conn, dialog_id=-100123, name="Channel", dialog_type="Channel")
+    seed_dialog(conn, dialog_id=-100456, name="Discussion", dialog_type="Supergroup")
+    seed_synced_dialog(conn, dialog_id=-100123)
+    seed_synced_dialog(conn, dialog_id=-100456)
+    if link_state != "unknown":
+        conn.execute(
+            "UPDATE dialogs SET linked_chat_id=?, linked_chat_resolved_at=1 WHERE dialog_id=-100123",
+            (-100456 if link_state == "known_link" else None,),
+        )
+    for message_id in (1, 2):
+        seed_channel_signature_message(
+            conn, dialog_id=-100123, message_id=message_id, sent_at=message_id, signature="Alice Example"
+        )
+    seed_message(conn, dialog_id=-100456, message_id=3, sent_at=3, sender_id=101)
+    conn.commit()
+    req: dict[str, object] = {"exact_account_id": 101, "exact_dialog_id": -100123, "view": "messages", "limit": 1}
+    if goal is not None:
+        req["coverage_goal"] = goal
+    before = list(conn.iterdump())
+    first = await trace_service._trace_account_messages(req)
+    data = _dict(first["data"])
+    evidence = cast(list[dict], cast(list[dict], data["groups"])[0]["evidence"])
+    assert evidence[0]["dialog_id"] == (-100456 if link_state == "known_link" else -100123)
+    gaps = cast(list[dict], data["gaps"])
+    assert any(gap["kind"] == "linked_chat_unknown" for gap in gaps) == (link_state == "unknown")
+    assert _dict(data["provenance"])["local_cache_writes"] == 0
+    assert list(conn.iterdump()) == before
+    projected = _trace_structured_content(dict(data), TraceAccountMessages(exact_account_id=101, view="messages"))
+    projected = cast(dict[str, object], omit_none_mapping_values(structured_result(projected).structured_content))
+    validate(projected, TOOL_REGISTRY["trace_account_messages"].output_schema)
+    assert any(warning["kind"] == "linked_chat_unknown" for warning in cast(list[dict], projected["warnings"])) == (
+        link_state == "unknown"
+    )
+    navigation = data["next_navigation"]
+    assert isinstance(navigation, str)
+    # New linkage between pages must not widen or replace the captured scope.
+    conn.execute("UPDATE dialogs SET linked_chat_id=-100999, linked_chat_resolved_at=2 WHERE dialog_id=-100123")
+    conn.commit()
+    before = list(conn.iterdump())
+    req["navigation"] = navigation
+    second = _dict((await trace_service._trace_account_messages(req))["data"])
+    second_evidence = cast(list[dict], cast(list[dict], second["groups"])[0]["evidence"])
+    assert second_evidence[0]["dialog_id"] == -100123
+    assert second_evidence[0]["message_id"] == (2 if link_state == "known_link" else 1)
+    assert any(gap["kind"] == "linked_chat_unknown" for gap in cast(list[dict], second["gaps"])) == (
+        link_state == "unknown"
+    )
+    assert list(conn.iterdump()) == before
+    assert client.mock_calls == []
+
+
+@pytest.mark.asyncio
+async def test_retained_account_names_survive_ttl_but_actual_clears_do_not(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
+    _server, conn, client = trace_server
+    _forbid_trace_acquisition(client)
+    seed_entity(conn, entity_id=123, name="Alice Example", updated_at=1)
+    conn.commit()
+    result = await trace_service._resolve_trace_account({"account": "Alice Example"})
+    assert result["account_id"] == 123
+    conn.execute("UPDATE entities SET name=NULL, name_normalized=NULL, username=NULL WHERE id=123")
+    conn.commit()
+    result = await trace_service._resolve_trace_account({"account": "Alice Example"})
+    assert result["confidence"] == "unresolved"
+    assert client.mock_calls == []
 
 
 @pytest.mark.asyncio
@@ -701,7 +814,11 @@ async def test_resolve_trace_username_lookup_upserts_user(
         ]
     )
 
-    result = await trace_service._resolve_trace_account({"account": "@alice"})
+    response = await trace_service._trace_account_messages(
+        {"account": "@alice", "coverage_goal": "best_effort_visible"}
+    )
+    assert response["ok"] is True
+    result = _dict(_dict(response["data"])["resolved_account"])
 
     assert result["confidence"] == "resolved"
     assert result["account_id"] == 123
@@ -722,7 +839,9 @@ async def test_resolve_trace_username_lookup_failure_is_structured(
     server, _conn, client = trace_server
     client.side_effect = RuntimeError("not visible")
 
-    result = await trace_service._resolve_trace_account({"account": "https://t.me/alice"})
+    result = await trace_service._resolve_trace_account(
+        {"account": "https://t.me/alice"}, coverage_goal="best_effort_visible"
+    )
 
     assert result["confidence"] == "unresolved"
     assert result["resolution_source"] == "telegram_username_lookup_failed"
@@ -1171,7 +1290,7 @@ async def test_trace_zero_hit_resolved_account_returns_observed_zero_gap(
 
 
 @pytest.mark.asyncio
-async def test_trace_defers_unknown_channel_scope_before_pagination(
+async def test_explicit_trace_defers_unknown_channel_scope_before_pagination(
     trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
     trace_service: DaemonAccountTraceService,
 ) -> None:
@@ -1182,7 +1301,9 @@ async def test_trace_defers_unknown_channel_scope_before_pagination(
     conn.commit()
 
     result = _dict(
-        await trace_service._trace_account_messages({"exact_account_id": 101, "exact_dialog_id": -100123, "limit": 10})
+        await trace_service._trace_account_messages(
+            {"exact_account_id": 101, "exact_dialog_id": -100123, "limit": 10, "coverage_goal": "best_effort_visible"}
+        )
     )
     assert result["error"] == "linked_chat_pending"
     assert result["retry_at"] is not None

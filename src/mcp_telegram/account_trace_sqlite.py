@@ -16,17 +16,9 @@ from .dialog_identity import read_dialog_identities
 
 _ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, name_normalized FROM entities WHERE username = ? COLLATE NOCASE"
 _TRACE_ACCOUNT_BY_ID_SQL = "SELECT id, name, username, name_normalized FROM entities WHERE id = ?"
-_TRACE_ACCOUNT_NAMES_SQL = (
-    "SELECT id, name FROM entities "
-    "WHERE id > 0 AND name IS NOT NULL "
-    "AND ((type IN ('User', 'Bot', 'user', 'bot') AND updated_at > ?) "
-    "OR (type NOT IN ('User', 'Bot', 'user', 'bot') AND updated_at > ?))"
-)
+_TRACE_ACCOUNT_NAMES_SQL = "SELECT id, name FROM entities WHERE id > 0 AND name IS NOT NULL"
 _TRACE_ACCOUNT_NAMES_NORMALIZED_SQL = (
-    "SELECT id, name_normalized FROM entities "
-    "WHERE id > 0 AND name_normalized IS NOT NULL "
-    "AND ((type IN ('User', 'Bot', 'user', 'bot') AND updated_at > ?) "
-    "OR (type NOT IN ('User', 'Bot', 'user', 'bot') AND updated_at > ?))"
+    "SELECT id, name_normalized FROM entities WHERE id > 0 AND name_normalized IS NOT NULL"
 )
 
 _EFFECTIVE_SENDER_ID_EXPR = (
@@ -275,12 +267,10 @@ def account_by_username(conn: sqlite3.Connection, username: str) -> Mapping[str,
 
 
 def account_directory_names(
-    conn: sqlite3.Connection, *, user_after: int, group_after: int
+    conn: sqlite3.Connection,
 ) -> tuple[list[tuple[object, object]], list[tuple[object, object]]]:
-    names = [_pair(row) for row in _rows(conn.execute(_TRACE_ACCOUNT_NAMES_SQL, (user_after, group_after)))]
-    normalized = [
-        _pair(row) for row in _rows(conn.execute(_TRACE_ACCOUNT_NAMES_NORMALIZED_SQL, (user_after, group_after)))
-    ]
+    names = [_pair(row) for row in _rows(conn.execute(_TRACE_ACCOUNT_NAMES_SQL))]
+    normalized = [_pair(row) for row in _rows(conn.execute(_TRACE_ACCOUNT_NAMES_NORMALIZED_SQL))]
     return names, normalized
 
 

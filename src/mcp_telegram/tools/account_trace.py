@@ -258,7 +258,9 @@ class TraceAccountMessages(ToolArgs):
     content-free dialog summaries. Use view="messages" only when message text or a detailed
     timeline is needed. Scope with dialog/exact_dialog_id, and use
     exact_topic_id only together with a dialog scope. coverage_goal="observed" reports the
-    current archive view; coverage_goal="best_effort_visible" permits bounded visible sampling
+    retained local archive without contacting Telegram or starting background collection. Unknown
+    discussion links leave channel evidence available with a coverage gap;
+    coverage_goal="best_effort_visible" permits bounded visible sampling
     with daemon-enforced dialog, message, and time limits. An unscoped trace omits the direct
     conversation with the target account because list_messages already covers that dialog. Gaps
     describe visibility or sync limits, not proof that no authored message exists.
@@ -320,7 +322,8 @@ class TraceAccountMessages(ToolArgs):
     coverage_goal: Literal["observed", "best_effort_visible"] = Field(
         default="observed",
         description=(
-            "observed returns the current archive view; best_effort_visible permits bounded "
+            "observed reads retained local facts without contacting Telegram or starting background collection; "
+            "best_effort_visible permits bounded "
             "visible sampling without claiming completeness."
         ),
     )
