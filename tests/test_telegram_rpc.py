@@ -2510,6 +2510,9 @@ class _DmEventHandlerGateClient:
     async def get_me(self) -> object:
         return await self._gate.get_me()
 
+    async def get_entity(self, _dialog_id: object) -> object:
+        return await self._gate.get_entity(cast(types.TypePeer, _dialog_id))
+
     def __call__(self, _request: object) -> Coroutine[object, object, object]:
         async def call_gate() -> object:
             return await self._gate(_request)
