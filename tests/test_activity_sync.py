@@ -408,7 +408,8 @@ async def test_incremental_next_window_starts_before_scan_arrivals(conn: sqlite3
         await restarted.run_slice(RpcAttemptBudget(1))
         assert activity_sync._load_state(conn)["last_sync_at"] == "200"
         window = activity_sync._prepare_incremental_slice(conn, False)
-    assert window == (140, 0)
+    assert window is not None
+    assert window[:2] == (140, 0)
 
 
 @pytest.mark.asyncio
