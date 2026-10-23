@@ -570,7 +570,7 @@ def _log_incremental_batch(
 def _prepare_incremental_slice(
     conn: sqlite3.Connection,
     stopped: bool,
-) -> tuple[int, int] | None:
+) -> tuple[int, int, int] | None:
     """Load and, for a new window, durably initialize incremental state."""
     with write_transaction(conn):
         state = _load_state(conn)
@@ -593,7 +593,7 @@ def _prepare_incremental_slice(
                 "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, '0')",
                 (_INCREMENTAL_OFFSET_ID_KEY,),
             )
-        return min_date, offset_id
+        return min_date, offset_id, allocate_observation_order(conn)
 
 
 def _commit_incremental_slice_result(
@@ -642,7 +642,7 @@ def _commit_incremental_slice_result(
 def _prepare_backfill_slice(
     conn: sqlite3.Connection,
     stopped: bool,
-) -> tuple[int, str] | None:
+) -> tuple[int, str, int] | None:
     """Load the checkpoint and retain the original backfill window start."""
     with write_transaction(conn):
         state = _load_state(conn)
@@ -654,7 +654,7 @@ def _prepare_backfill_slice(
             (str(int(time.time())),),
         )
         state = _load_state(conn)
-    return checkpoint, state["backfill_started_at"] or "0"
+        return checkpoint, state["backfill_started_at"] or "0", allocate_observation_order(conn)
 
 
 async def _run_backfill_slice(
@@ -670,9 +670,8 @@ async def _run_backfill_slice(
     window = await writer.run(lambda db: _prepare_backfill_slice(db, stopped))
     if window is None:
         return
-    checkpoint, started_at = window
+    checkpoint, started_at, observation_order = window
     batch_started_at = time.monotonic()
-    observation_order = await writer.run(allocate_observation_order)
     result = await _search_backfill_batch(
         client,
         checkpoint,
@@ -734,10 +733,9 @@ async def _run_incremental_slice(
     window = await writer.run(lambda db: _prepare_incremental_slice(db, stopped))
     if window is None:
         return
-    min_date, offset_id = window
+    min_date, offset_id, observation_order = window
 
     batch_started_at = time.monotonic()
-    observation_order = await writer.run(allocate_observation_order)
     result = await _search_incremental_batch(
         client,
         min_date,

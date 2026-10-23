@@ -40,6 +40,7 @@ from mcp_telegram.observation_order import delivered_observation_order
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
+from mcp_telegram.telegram_delivery import ProtocolSnapshot, load_protocol_snapshot
 from mcp_telegram.telegram_demand import AcquisitionKind, acquisition_context
 from mcp_telegram.telegram_rpc import (
     TelegramRpcBudget,
@@ -115,26 +116,35 @@ def _pending(path: Path) -> bytes | None:
         return cast(bytes | None, conn.execute("SELECT pending FROM update_delivery").fetchone()[0])
 
 
+def _safe(path: Path) -> ProtocolSnapshot:
+    with closing(sqlite3.connect(path)) as conn:
+        return load_protocol_snapshot(conn.execute("SELECT safe_snapshot FROM update_delivery").fetchone()[0])
+
+
 def _database(tmp_path: Path) -> Path:
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     return path
 
 
-async def _mixed(client: TelegramRpcGate) -> list[object]:
+async def _mixed(
+    client: TelegramRpcGate, *, users: list[types.TypeUser] | None = None, chats: list[types.TypeChat] | None = None
+) -> list[object]:
     client._message_box.try_begin_get_diff(ENTRY_ACCOUNT, "offline fixture")
     difference = types.updates.Difference(
         new_messages=[_message(11), _message(12)],
         new_encrypted_messages=[],
         other_updates=[types.UpdateNewChannelMessage(_message(13, channel=True), 21, 1)],
-        chats=[],
-        users=[],
+        chats=chats or [],
+        users=users or [],
         state=types.updates.State(12, 4, DATE + timedelta(seconds=10), 1, 0),  # pyright: ignore[reportArgumentType] - vendor State annotation names its module
     )
     result = client._message_box.apply_difference(difference, client._mb_entity_cache)
     assert result is not None
-    updates, users, chats = result
-    return await client._preprocess_updates(list[object](updates), list[object](users), list[object](chats))
+    processed, processed_users, processed_chats = result
+    return await client._preprocess_updates(
+        list[object](processed), list[object](processed_users), list[object](processed_chats)
+    )
 
 
 class _ObservedDeliveryDone(asyncio.Event):
@@ -282,8 +292,10 @@ async def test_callback_migration_replacement_vendor_loop_restores_latest_whole_
             "channels": {123: 21},
         }
         assert client._delivery_safe is not None and client._delivery_safe.pts == 12
-        assert _saved(client)[0][:3] == (12, 4, 1)
-        assert _saved(client)[123][0] == 21
+        safe = _safe(path)
+        assert (safe.pts, safe.qts, safe.seq, safe.channels) == (12, 4, 1, {123: 21})
+        assert _saved(client)[0][:3] == (10, 3, 0)
+        assert _saved(client)[123][0] == 20
         assert _pending(path) is None and not client._delivery_failure.is_set()
     finally:
         await _close_migration_delivery(client, writer, dispatches, probe)
@@ -418,6 +430,10 @@ async def test_whole_snapshot_waits_for_all_callbacks_and_survives_other_session
         release.set()
         await asyncio.gather(*tasks)
         assert (_pending(path) is not None) is failure
+        assert _safe(path).pts == (10 if failure else 12)
+        assert _saved(client) == baseline
+        await client._save_states_and_entities()
+        cast(SQLiteSession, client.session).save()
         assert _saved(client) == (
             baseline
             if failure
@@ -509,28 +525,45 @@ async def test_pending_restart_keeps_original_tokens_time_and_first_channel_enti
         await writer.aclose()
 
 
-async def test_completion_before_session_mirror_restores_without_fresh_replay(
+@pytest.mark.parametrize("lost_receipt", [False, True])
+async def test_completion_skips_session_mirror_and_restart_restores_without_fresh_replay(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    lost_receipt: bool,
 ) -> None:
     path = _database(tmp_path)
     writer = await SQLiteWriter.open(path)
     client = _client(tmp_path / "session", writer)
+    reopened: TelegramRpcGate | None = None
     try:
         await client.start_update_delivery(99)
         updates = await _mixed(client)
 
-        async def mirror_failure() -> None:
-            raise OSError("offline crash before checkpoint mirror")
+        async def forbidden_batch_mirror() -> None:
+            raise AssertionError("completion must not mirror the checkpoint")
 
-        monkeypatch.setattr(client, "_save_states_and_entities", mirror_failure)
+        monkeypatch.setattr(client, "_save_states_and_entities", forbidden_batch_mirror)
+        repository = client._delivery_repository
+        assert repository is not None
+        complete = repository.complete
+
+        async def lose_completion_receipt(snapshot: str) -> None:
+            await complete(snapshot)
+            raise OSError("fixture canonical completion receipt lost")
+
+        if lost_receipt:
+            monkeypatch.setattr(repository, "complete", lose_completion_receipt)
         for update in updates[:-1]:
             await client._dispatch_update(update)
-        with pytest.raises(OSError, match="offline crash"):
+        if lost_receipt:
+            with pytest.raises(OSError, match="receipt lost"):
+                await client._dispatch_update(updates[-1])
+        else:
             await client._dispatch_update(updates[-1])
         assert _pending(path) is None
+        assert _safe(path).pts == 12
         assert _saved(client)[0][0] == 10
-        cast(SQLiteSession, client.session).close()
+        # Reopen before closing the writer Session, whose close would commit.
         reopened = _client(tmp_path / "session", writer)
         calls: list[object] = []
 
@@ -542,8 +575,10 @@ async def test_completion_before_session_mirror_restores_without_fresh_replay(
         assert calls == []
         assert _saved(reopened)[0][:3] == (12, 4, 1)
         assert reopened._message_box.session_state()[0]["pts"] == 12
-        cast(SQLiteSession, reopened.session).close()
     finally:
+        if reopened is not None:
+            cast(SQLiteSession, reopened.session).close()
+        cast(SQLiteSession, client.session).close()
         await writer.aclose()
 
 
@@ -692,7 +727,8 @@ asyncio.run(main())
 
 
 async def test_channel_difference_admission_uses_captured_consumed_snapshot(tmp_path: Path) -> None:
-    writer = await SQLiteWriter.open(_database(tmp_path))
+    path = _database(tmp_path)
+    writer = await SQLiteWriter.open(path)
     client = _client(tmp_path / "session", writer)
     try:
         await client.start_update_delivery(99)
@@ -715,6 +751,10 @@ async def test_channel_difference_admission_uses_captured_consumed_snapshot(tmp_
         # A later mutable directory initialization must not alter this envelope's snapshot.
         client._message_box.try_set_channel_state(123, 999)
         await asyncio.gather(*(client._dispatch_update(update) for update in admitted))
+        assert _safe(path).channels[123] == 21
+        assert _saved(client)[123][0] == 20
+        await client._save_states_and_entities()
+        cast(SQLiteSession, client.session).save()
         assert _saved(client)[123][0] == 21
     finally:
         cast(SQLiteSession, client.session).close()
@@ -760,6 +800,10 @@ async def test_one_pending_batch_and_waiting_snapshot_captured_before_prior_sett
         await asyncio.gather(*dispatches)
         second = await waiting
         await client._dispatch_update(second[0])
+        assert set(_safe(path).channels) == {123, 456}
+        assert set(_saved(client)) == {0, 123}
+        await client._save_states_and_entities()
+        cast(SQLiteSession, client.session).save()
         assert set(_saved(client)) == {0, 123, 456}
         assert _pending(path) is None
         with closing(sqlite3.connect(path)) as conn:

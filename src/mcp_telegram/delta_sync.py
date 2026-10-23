@@ -408,13 +408,13 @@ class DeltaSyncWorker:
         return row_first_int(row)
 
     async def _collect_delta_slice(self, dialog_id: int, max_known_id: int, generation: int) -> _DeltaFetchOutcome:
-        def ensure_identity_baseline(conn: sqlite3.Connection) -> int:
+        def prepare_observation(conn: sqlite3.Connection) -> tuple[int, int, int]:
             with write_transaction(conn):
-                return ensure_dialog_identity_baseline(conn, dialog_id)
+                identity_revision = ensure_dialog_identity_baseline(conn, dialog_id)
+                reaction_observed_at = int(time.time())
+                return identity_revision, reaction_observed_at, allocate_observation_order(conn)
 
-        identity_revision = await self._writer.run(ensure_identity_baseline)
-        reaction_observed_at = int(time.time())
-        observation_order = await self._writer.run(allocate_observation_order)
+        identity_revision, reaction_observed_at, observation_order = await self._writer.run(prepare_observation)
         try:
             page = await self._history_port.fetch_page(
                 dialog_id,

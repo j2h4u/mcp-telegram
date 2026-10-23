@@ -517,7 +517,7 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:  # no
 def _prepare_sweep_observation(conn: sqlite3.Connection, dialog_id: int) -> tuple[int, int]:
     with write_transaction(conn):
         identity_revision = ensure_dialog_identity_baseline(conn, dialog_id)
-    return identity_revision, allocate_observation_order(conn)
+        return identity_revision, allocate_observation_order(conn)
 
 
 def _record_access_lost(conn: sqlite3.Connection, dialog_id: int, reason: str) -> None:
