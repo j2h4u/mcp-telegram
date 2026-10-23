@@ -11,17 +11,19 @@ import sqlite3
 import subprocess
 import sys
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event as ThreadEvent
 from types import SimpleNamespace
-from typing import cast
+from typing import Literal, cast
 
 import pytest
 import telethon
-from telethon import TelegramClient, events, types
+from telethon import TelegramClient, events, functions, types
 from telethon._updates import ChannelState, SessionState
 from telethon._updates.messagebox import ENTRY_ACCOUNT
+from telethon.errors import UserMigrateError
 from telethon.sessions import SQLiteSession
 from telethon.tl.functions.users import GetUsersRequest
 
@@ -38,8 +40,18 @@ from mcp_telegram.observation_order import delivered_observation_order
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
-from mcp_telegram.telegram_rpc import TelegramRpcBudget, TelegramRpcGate
+from mcp_telegram.telegram_demand import AcquisitionKind, acquisition_context
+from mcp_telegram.telegram_rpc import (
+    TelegramRpcBudget,
+    TelegramRpcGate,
+    TelegramRpcSource,
+    _MainSender,
+    _MainSenderAdapter,
+    _TransportBoundaryState,
+    rpc_scope,
+)
 from mcp_telegram.update_delivery import UpdateDeliveryRepository
+from test_telegram_rpc import _BootstrapSender, _idle_bootstrap_task
 
 DATE = datetime(2026, 10, 1, tzinfo=UTC)
 
@@ -123,6 +135,249 @@ async def _mixed(client: TelegramRpcGate) -> list[object]:
     assert result is not None
     updates, users, chats = result
     return await client._preprocess_updates(list[object](updates), list[object](users), list[object](chats))
+
+
+class _ObservedDeliveryDone(asyncio.Event):
+    def __init__(self) -> None:
+        super().__init__()
+        self.waiters = 0
+        self.first_waiting = asyncio.Event()
+        self.replacement_waiting = asyncio.Event()
+
+    async def wait(self) -> Literal[True]:
+        self.waiters += 1
+        (self.first_waiting if self.waiters == 1 else self.replacement_waiting).set()
+        return await super().wait()
+
+
+def _prepare_migration_transport(client: TelegramRpcGate, monkeypatch: pytest.MonkeyPatch) -> _BootstrapSender:
+    sender = _BootstrapSender()
+    sender._connected = True
+    client._main_sender, client._sender = cast(_MainSender, sender), _MainSenderAdapter(client)
+    client._transport_state = _TransportBoundaryState.READY
+    client._transient_retry_delays = (0.0,)
+    monkeypatch.setattr(client, "_connection", lambda *_args, **_kwargs: object())
+    client._catch_up = True
+    client._keepalive_loop = _idle_bootstrap_task
+    monkeypatch.setattr(
+        TelegramRpcGate,
+        "_config",
+        SimpleNamespace(dc_options=[SimpleNamespace(id=3, ip_address="127.0.0.3", port=443, ipv6=False, cdn=False)]),
+    )
+    return sender
+
+
+@dataclass
+class _MigrationLoopProbe:
+    release: asyncio.Event = field(default_factory=asyncio.Event)
+    migrated: asyncio.Event = field(default_factory=asyncio.Event)
+    status_done: asyncio.Event = field(default_factory=asyncio.Event)
+    captures: list[dict[str, object]] = field(default_factory=list)
+    futures: list[asyncio.Future[object]] = field(default_factory=list)
+
+
+def _observe_migration_delivery(client: TelegramRpcGate, sender: _BootstrapSender) -> _MigrationLoopProbe:
+    probe = _MigrationLoopProbe()
+    original_preprocess = client._preprocess_updates
+    first_rpc = True
+
+    async def tracked(updates: list[object], users: list[object], chats: list[object]) -> list[object]:
+        if any(isinstance(update, types.UpdateUserStatus) for update in updates):
+            probe.captures.append(client._capture_delivery_snapshot([]).model_dump())
+        return await original_preprocess(updates, users, chats)
+
+    async def handler(update: object) -> None:
+        if isinstance(update, types.UpdateUserStatus):
+            probe.status_done.set()
+        elif isinstance(update, types.UpdateNewMessage) and update.message.id == 11:
+            with acquisition_context(AcquisitionKind.ENTITY_LOOKUP), rpc_scope(TelegramRpcSource.REALTIME_EVENT):
+                await client(GetUsersRequest([types.InputUserSelf()]))
+            probe.migrated.set()
+            await probe.release.wait()
+
+    def response(request: object) -> object:
+        nonlocal first_rpc
+        if isinstance(request, GetUsersRequest):
+            if first_rpc:
+                first_rpc = False
+                return UserMigrateError(request, capture=3)
+            return [types.User(99, access_hash=999, first_name="fixture")]
+        if isinstance(request, (functions.updates.GetDifferenceRequest, functions.updates.GetChannelDifferenceRequest)):
+            pending = asyncio.get_running_loop().create_future()
+            probe.futures.append(pending)
+            return pending
+        return object()
+
+    sender.response = response
+    client._preprocess_updates = tracked
+    client.add_event_handler(handler, events.Raw())
+    return probe
+
+
+async def _close_migration_delivery(
+    client: TelegramRpcGate,
+    writer: SQLiteWriter,
+    dispatches: list[asyncio.Task[None]],
+    probe: _MigrationLoopProbe,
+) -> None:
+    probe.release.set()
+    for task in (client._updates_handle, client._keepalive_handle):
+        if task is not None:
+            task.cancel()
+    await asyncio.gather(
+        *(task for task in (client._updates_handle, client._keepalive_handle) if task is not None),
+        return_exceptions=True,
+    )
+    for future in probe.futures:
+        future.cancel()
+    await asyncio.gather(*dispatches, *list(client._event_handler_tasks), return_exceptions=True)
+    await client._disconnect_main_sender()
+    cast(SQLiteSession, client.session).close()
+    await writer.aclose()
+    await client.close_rpc_scheduler()
+
+
+async def test_callback_migration_replacement_vendor_loop_restores_latest_whole_safe_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _database(tmp_path)
+    writer = await SQLiteWriter.open(path)
+    client = _client(tmp_path / "session", writer)
+    probe = _observe_migration_delivery(client, _prepare_migration_transport(client, monkeypatch))
+    dispatches: list[asyncio.Task[None]] = []
+    try:
+        await client.start_update_delivery(99)
+        updates = await _mixed(client)
+        active = client._active_delivery
+        assert active is not None
+        done = _ObservedDeliveryDone()
+        active.done = done
+        old_loop = asyncio.create_task(client._update_loop())
+        client._updates_handle = old_loop
+        client._keepalive_handle = asyncio.create_task(_idle_bootstrap_task())
+        await asyncio.wait_for(done.first_waiting.wait(), 2)
+        await client._updates_queue.put(
+            types.UpdateShort(types.UpdateUserStatus(55, types.UserStatusOnline(DATE)), DATE + timedelta(seconds=20))
+        )
+        dispatches = [asyncio.create_task(client._dispatch_update(update)) for update in updates]
+        client._event_handler_tasks.update(dispatches)
+        for dispatch in dispatches:
+            dispatch.add_done_callback(client._event_handler_tasks.discard)
+        await asyncio.wait_for(probe.migrated.wait(), 2)
+        await asyncio.wait_for(done.replacement_waiting.wait(), 2)
+        assert old_loop.cancelled()
+        assert not probe.status_done.is_set() and probe.captures == []
+        assert _pending(path) is not None and _saved(client)[0][0] == 10
+        probe.release.set()
+        await asyncio.gather(*dispatches)
+        await asyncio.wait_for(probe.status_done.wait(), 2)
+        active = client._active_delivery
+        if active is not None:
+            await asyncio.wait_for(active.done.wait(), 2)
+        assert len(probe.captures) == 1
+        assert {key: probe.captures[0][key] for key in ("pts", "qts", "seq", "channels")} == {
+            "pts": 12,
+            "qts": 4,
+            "seq": 1,
+            "channels": {123: 21},
+        }
+        assert client._delivery_safe is not None and client._delivery_safe.pts == 12
+        assert _saved(client)[0][:3] == (12, 4, 1)
+        assert _saved(client)[123][0] == 21
+        assert _pending(path) is None and not client._delivery_failure.is_set()
+    finally:
+        await _close_migration_delivery(client, writer, dispatches, probe)
+
+
+@pytest.mark.parametrize("stage", ["queued", "committed"])
+async def test_replacement_loop_rejects_failed_cancelled_admission_before_waiting_on_undispatched_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    path = _database(tmp_path)
+    writer = await SQLiteWriter.open(path)
+    client = _client(tmp_path / "session", writer)
+    entered, release = ThreadEvent(), ThreadEvent()
+    vendor_entered = asyncio.Event()
+    blocker: asyncio.Task[None] | None = None
+    admission: asyncio.Task[list[object]] | None = None
+
+    def hold(_conn: sqlite3.Connection) -> None:
+        entered.set()
+        assert release.wait(5)
+
+    async def hold_preprocess(_client: TelegramClient, *_args: object) -> list[object]:
+        vendor_entered.set()
+        return await asyncio.Future[list[object]]()
+
+    async def forbidden_vendor(_client: TelegramClient) -> None:
+        raise AssertionError("failed delivery must not open vendor intake")
+
+    try:
+        await client.start_update_delivery(99)
+        if stage == "queued":
+            blocker = asyncio.create_task(writer.run(hold))
+            assert await asyncio.to_thread(entered.wait, 2)
+        else:
+            monkeypatch.setattr(TelegramClient, "_preprocess_updates", hold_preprocess)
+        admission = asyncio.create_task(_mixed(client))
+        if stage == "committed":
+            await asyncio.wait_for(vendor_entered.wait(), 2)
+            assert client._active_delivery is not None and not client._active_delivery.done.is_set()
+        else:
+            # The blocked real writer keeps admit queued before cancellation.
+            await _wait_for_queued_admission(writer, admission, blocker)
+        admission.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await admission
+        monkeypatch.setattr(TelegramClient, "_update_loop", forbidden_vendor)
+        with pytest.raises(RuntimeError, match="admission is closed"):
+            await asyncio.wait_for(client._update_loop(), 2)
+        assert _pending(path) is not None
+        assert client._delivery_failure.is_set() and _saved(client)[0][0] == 10
+    finally:
+        await _close_cancelled_admission(client, writer, admission, blocker, release)
+
+
+async def _wait_for_queued_admission(
+    writer: SQLiteWriter,
+    admission: asyncio.Task[list[object]],
+    blocker: asyncio.Task[None] | None,
+) -> None:
+    assert blocker is not None
+
+    async def queued() -> None:
+        while True:
+            if blocker.done():
+                await blocker
+                raise AssertionError("writer blocker ended before queued cancellation")
+            if admission.done():
+                await admission
+                raise AssertionError("admission ended before queued cancellation")
+            if writer._queue.qsize():
+                return
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(queued(), 2)
+
+
+async def _close_cancelled_admission(
+    client: TelegramRpcGate,
+    writer: SQLiteWriter,
+    admission: asyncio.Task[list[object]] | None,
+    blocker: asyncio.Task[None] | None,
+    release: ThreadEvent,
+) -> None:
+    release.set()
+    try:
+        if admission is not None:
+            admission.cancel()
+            await asyncio.gather(admission, return_exceptions=True)
+        if blocker is not None:
+            await blocker
+    finally:
+        cast(SQLiteSession, client.session).close()
+        await writer.aclose()
 
 
 @pytest.mark.parametrize("failure", [False, True])
