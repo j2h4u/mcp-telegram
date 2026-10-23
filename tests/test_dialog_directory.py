@@ -2268,3 +2268,139 @@ async def test_rejected_original_identity_baseline_does_not_advance_field_orders
         )
     finally:
         conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_pin", [False, True])
+async def test_staged_empty_pin_snapshot_does_not_fence_retained_changes_before_publication(
+    tmp_path: Path,
+    old_pin: bool,
+) -> None:
+    from unittest.mock import MagicMock
+
+    from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
+    from mcp_telegram.observation_order import allocate_observation_order
+    from sqlite_writer_helpers import event_manager
+
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        old_order = allocate_observation_order(conn)
+        conn.execute("INSERT INTO dialogs(dialog_id,pinned) VALUES (101,?)", (int(not old_pin),))
+        if not old_pin:
+            conn.execute("INSERT INTO dialog_directory_published_pins VALUES (0,101,0)")
+        conn.commit()
+    finally:
+        conn.close()
+    directory = CanonicalDialogDirectory(
+        _FakeClient([_pinned_response(), _pinned_response(), _response([_dialog(101, 8)])]),
+        db_path,
+        asyncio.Event(),
+        writer=_writer(db_path),
+    )
+    await directory.run_slice()
+    conn = _open_sync_db(db_path)
+    try:
+        snapshot_order = cast(
+            tuple[int],
+            conn.execute("SELECT observation_order FROM dialog_directory_pin_snapshots WHERE folder_id=0").fetchone(),
+        )[0]
+        assert snapshot_order > old_order
+        assert (
+            conn.execute("SELECT observation_order FROM dialog_pin_snapshot_observations WHERE folder_id=0").fetchone()
+            is None
+        )
+        manager = event_manager(MagicMock(), conn, asyncio.Event())
+        update = types.UpdateDialogPinned(
+            peer=types.DialogPeer(peer=types.PeerUser(101)), pinned=old_pin, folder_id=None
+        )
+        with delivered_update_context(DeliveredUpdate(old_order, 100, old_order)):
+            manager._update_dialog_pinned(conn, update, 100)
+        assert conn.execute("SELECT pinned FROM dialogs WHERE dialog_id=101").fetchone() == (int(old_pin),)
+        assert conn.execute("SELECT COUNT(*) FROM dialog_directory_published_pins WHERE folder_id=0").fetchone() == (
+            int(old_pin),
+        )
+        assert conn.execute("SELECT COUNT(*) FROM dialog_directory_pins WHERE folder_id=0").fetchone() == (0,)
+    finally:
+        conn.close()
+    await _run_slices(directory, 2)
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT observation_order FROM dialog_pin_snapshot_observations WHERE folder_id=0"
+        ).fetchone() == (snapshot_order,)
+        assert conn.execute("SELECT pinned FROM dialogs WHERE dialog_id=101").fetchone() == (0,)
+        assert conn.execute("SELECT COUNT(*) FROM dialog_directory_pin_snapshots").fetchone() == (0,)
+        with delivered_update_context(DeliveredUpdate(old_order, 100, old_order)):
+            event_manager(MagicMock(), conn, asyncio.Event())._update_dialog_pinned(conn, update, 100)
+        assert conn.execute("SELECT pinned FROM dialogs WHERE dialog_id=101").fetchone() == (0,)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rewrite", [False, True])
+async def test_complete_pin_publication_preserves_newer_raw_collection_changes(tmp_path: Path, rewrite: bool) -> None:
+    from unittest.mock import MagicMock
+
+    from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
+    from mcp_telegram.observation_order import allocate_observation_order
+    from sqlite_writer_helpers import event_manager
+
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.executemany("INSERT INTO dialogs(dialog_id,pinned) VALUES (?,?)", [(101, 1), (202, 0)])
+        conn.execute("INSERT INTO dialog_directory_published_pins VALUES (0,101,0)")
+        conn.commit()
+    finally:
+        conn.close()
+    directory = CanonicalDialogDirectory(
+        _FakeClient(
+            [_pinned_response([_dialog(101, 8)]), _pinned_response(), _response([_dialog(101, 8), _dialog(202, 9)])]
+        ),
+        db_path,
+        asyncio.Event(),
+        writer=_writer(db_path),
+    )
+    await directory.run_slice()
+    conn = _open_sync_db(db_path)
+    try:
+        order = allocate_observation_order(conn)
+        manager = event_manager(MagicMock(), conn, asyncio.Event())
+        with delivered_update_context(DeliveredUpdate(order, 100, order)):
+            if rewrite:
+                manager._rewrite_pinned_dialogs(
+                    conn,
+                    types.UpdatePinnedDialogs(
+                        order=[types.DialogPeer(peer=types.PeerUser(202))],
+                        folder_id=None,
+                    ),
+                    100,
+                )
+            else:
+                manager._update_dialog_pinned(
+                    conn,
+                    types.UpdateDialogPinned(
+                        peer=types.DialogPeer(peer=types.PeerUser(202)),
+                        pinned=True,
+                        folder_id=None,
+                    ),
+                    100,
+                )
+    finally:
+        conn.close()
+    await _run_slices(directory, 2)
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT dialog_id FROM dialog_directory_published_pins WHERE folder_id=0 ORDER BY position"
+        ).fetchall() == ([(202,)] if rewrite else [(202,), (101,)])
+        assert conn.execute("SELECT dialog_id,pinned FROM dialogs ORDER BY dialog_id").fetchall() == [
+            (101, int(not rewrite)),
+            (202, 1),
+        ]
+    finally:
+        conn.close()

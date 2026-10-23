@@ -395,6 +395,7 @@ class CanonicalDialogDirectory:
         conn.execute("DELETE FROM dialog_directory_staging")
         conn.execute("DELETE FROM dialog_directory_baseline")
         conn.execute("DELETE FROM dialog_directory_pins")
+        conn.execute("DELETE FROM dialog_directory_pin_snapshots")
         conn.execute("DELETE FROM daemon_state WHERE key LIKE 'dialog_directory_pin_fence:%'")
         # Realtime pin deltas received before a source RPC completes must
         # build on the active generation's coherent prior publication.  The
@@ -816,6 +817,7 @@ class CanonicalDialogDirectory:
         state = self._load_state(conn)
         if not _publication_ready(state, generation, account_id):
             return False
+        _publish_generation_pin_snapshots(conn, generation)
         # Eligibility facts must merge before the dialogs UPDATE below. That
         # UPDATE fires the revision trigger, so doing this afterwards would
         # make the pre-acquisition revision fence reject every existing row.
@@ -975,6 +977,7 @@ class CanonicalDialogDirectory:
         conn.execute("DELETE FROM dialog_directory_staging WHERE generation=?", (generation,))
         conn.execute("DELETE FROM dialog_directory_baseline WHERE generation=?", (generation,))
         conn.execute("DELETE FROM dialog_directory_pins WHERE generation=?", (generation,))
+        conn.execute("DELETE FROM dialog_directory_pin_snapshots WHERE generation=?", (generation,))
         return True
 
     def _save_cursor(self, conn: sqlite3.Connection, cursor: DialogCursor, generation: int, account_id: int) -> None:
@@ -1301,6 +1304,16 @@ def sync_active_generation_pins_from_publication(conn: sqlite3.Connection, folde
     if row is None or row[1] != "in_progress":
         return
     generation = int(cast(int, row[0]))
+    if (
+        conn.execute(
+            "SELECT 1 FROM dialog_directory_pin_snapshots staged JOIN dialog_pin_snapshot_observations published "
+            "ON published.folder_id=staged.folder_id WHERE staged.generation=? AND staged.folder_id=? "
+            "AND published.observation_order<=staged.observation_order",
+            (generation, folder_id),
+        ).fetchone()
+        is not None
+    ):
+        return
     conn.execute("DELETE FROM dialog_directory_pins WHERE generation=? AND folder_id=?", (generation, folder_id))
     conn.execute(
         "INSERT INTO dialog_directory_pins(generation,folder_id,dialog_id,position) "
@@ -1324,22 +1337,22 @@ def apply_active_generation_pin_delta(conn: sqlite3.Connection, folder_id: int, 
     if row is None or row[1] != "in_progress":
         return
     generation = int(cast(int, row[0]))
-    current = [
-        int(cast(int, pin[0]))
-        for pin in cast(
-            list[tuple[object, object]],
-            conn.execute(
-                "SELECT dialog_id,position FROM dialog_directory_pins "
-                "WHERE generation=? AND folder_id=? ORDER BY position,dialog_id",
-                (generation, folder_id),
-            ).fetchall(),
-        )
-    ]
+    if (
+        conn.execute(
+            "SELECT 1 FROM dialog_directory_pin_snapshots staged JOIN dialog_pin_observations delta "
+            "ON delta.folder_id=staged.folder_id WHERE staged.generation=? AND staged.folder_id=? "
+            "AND delta.dialog_id=? AND delta.observation_order<=staged.observation_order",
+            (generation, folder_id, dialog_id),
+        ).fetchone()
+        is not None
+    ):
+        return
+    current = _generation_pin_ids(conn, generation, folder_id)
     if pinned:
         current = [dialog_id, *(existing for existing in current if existing != dialog_id)]
     else:
         current = [existing for existing in current if existing != dialog_id]
-    current = ordered_pin_overlay(conn, folder_id, current)
+    current = ordered_pin_overlay(conn, folder_id, current, _staged_pin_snapshot_order(conn, generation, folder_id))
     conn.execute(
         "DELETE FROM dialog_directory_pins WHERE generation=? AND folder_id=?",
         (generation, folder_id),
@@ -1464,16 +1477,12 @@ def _commit_pinned_generation(
     observation_order: int | None = None,
 ) -> None:
     if observation_order is not None:
-        current = claim_pin_snapshot(conn, folder_id, observation_order, rpc_ids)
-        if current is None:
-            rows = cast(
-                list[tuple[int]],
-                conn.execute(
-                    "SELECT dialog_id FROM dialog_directory_published_pins WHERE folder_id=? ORDER BY position",
-                    (folder_id,),
-                ).fetchall(),
-            )
-            current = [dialog_id for (dialog_id,) in rows]
+        conn.execute(
+            "INSERT INTO dialog_directory_pin_snapshots(generation,folder_id,observation_order) VALUES (?,?,?) "
+            "ON CONFLICT(generation,folder_id) DO UPDATE SET observation_order=excluded.observation_order",
+            (generation, folder_id, observation_order),
+        )
+        current = ordered_pin_overlay(conn, folder_id, rpc_ids, observation_order)
         for event in read_realtime_pin_fence(conn, generation, folder_id):
             if "observation_order" not in event:
                 current = _apply_realtime_pin_fence_event(current, event)
@@ -1486,6 +1495,49 @@ def _commit_pinned_generation(
         # No realtime writer published this source during the request, so this
         # RPC is the authoritative, replaceable source order.
         replace_active_generation_pins(conn, generation, folder_id, rpc_ids)
+
+
+def _generation_pin_ids(conn: sqlite3.Connection, generation: int, folder_id: int) -> list[int]:
+    rows = cast(
+        list[tuple[int]],
+        conn.execute(
+            "SELECT dialog_id FROM dialog_directory_pins WHERE generation=? AND folder_id=? ORDER BY position,dialog_id",
+            (generation, folder_id),
+        ).fetchall(),
+    )
+    return [dialog_id for (dialog_id,) in rows]
+
+
+def _staged_pin_snapshot_order(conn: sqlite3.Connection, generation: int, folder_id: int) -> int | None:
+    row = cast(
+        tuple[int] | None,
+        conn.execute(
+            "SELECT observation_order FROM dialog_directory_pin_snapshots WHERE generation=? AND folder_id=?",
+            (generation, folder_id),
+        ).fetchone(),
+    )
+    return None if row is None else row[0]
+
+
+def _publish_generation_pin_snapshots(conn: sqlite3.Connection, generation: int) -> None:
+    snapshots = cast(
+        list[tuple[int, int]],
+        conn.execute(
+            "SELECT folder_id,observation_order FROM dialog_directory_pin_snapshots WHERE generation=?", (generation,)
+        ).fetchall(),
+    )
+    for folder_id, order in snapshots:
+        current = claim_pin_snapshot(conn, folder_id, order, _generation_pin_ids(conn, generation, folder_id))
+        if current is None:
+            rows = cast(
+                list[tuple[int]],
+                conn.execute(
+                    "SELECT dialog_id FROM dialog_directory_published_pins WHERE folder_id=? ORDER BY position",
+                    (folder_id,),
+                ).fetchall(),
+            )
+            current = [dialog_id for (dialog_id,) in rows]
+        replace_active_generation_pins(conn, generation, folder_id, current)
 
 
 def _insert_realtime_eligibility(
