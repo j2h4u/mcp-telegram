@@ -142,18 +142,20 @@ projection atomically. Actual search SQL failures report index unavailability
 with `list_messages` as the retained-data fallback; scheduled-only search remains
 independent. Reads never start repair or Telegram acquisition.
 
-Current implementation debt is tracked explicitly:
+Accepted scope limits and delivery evidence:
 
-| Work | Known departure | Delivery |
+| Scope | Current boundary | Evidence |
 | --- | --- | --- |
-| Non-DM profiles | Reads expose retained facts or explicit partial coverage; automatic acquisition ownership for never-collected group/channel profiles is not supplied by the DM slice | WorkGraph `TG-91`, including completed DM-profile delivery evidence |
-| Startup and offline availability | Telegram/startup readiness currently limits local serving; no whole-process offline guarantee is made | Completed audit `TG-90`; historical FTS migration `TG-96` replaces `TG-95` startup receipts; lifecycle design tracked in `TG-91` |
+| Non-DM profiles | Reads expose retained facts or explicit partial coverage; blanket automatic acquisition of never-collected group/channel profiles is outside the accepted DM slice | Accepted scope review `TG-97` |
+| Startup and offline availability | Telegram/startup readiness limits local serving; no whole-process offline guarantee is made | Accepted audit `TG-90`; historical FTS migration `TG-96` replaces `TG-95` startup receipts, not the startup lifecycle |
 
-The WorkGraph delivery tracker `TG-91` separates
-these changes from COMMIT performance and broader replay reliability research.
-Do not report this contract as fully implemented after a documentation change
-or only the profile slice. Tests for ordinary reads must forbid network calls
-and acquisition waits, retain aged useful records and expose honest coverage.
+WorkGraph `TG-91` records source, test and live-runtime evidence for update replay
+after durable local admission (`TG-101`, `TG-16`), observed-mode account tracing
+(`TG-102`), retained statistics (`TG-103`), operational documentation (`TG-106`),
+and persistence consolidation (`TG-94`, including `TG-107` and `TG-104`).
+Storage/WAL flush latency remains outside this delivery’s guarantees.
+Tests for ordinary reads must forbid network calls and acquisition waits,
+retain aged useful records and expose honest coverage.
 
 ### Acquisition ownership
 
