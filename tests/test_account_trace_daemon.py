@@ -123,8 +123,8 @@ def _dict(value: object) -> dict[str, object]:
 
 def _forbid_trace_acquisition(client: AsyncMock) -> None:
     client.side_effect = AssertionError("Observed trace must not acquire Telegram facts")
-    client.get_entity.side_effect = AssertionError("Observed trace must not resolve peers")
-    client.iter_messages.side_effect = AssertionError("Observed trace must not fetch messages")
+    cast(AsyncMock, client.get_entity).side_effect = AssertionError("Observed trace must not resolve peers")
+    cast(AsyncMock, client.iter_messages).side_effect = AssertionError("Observed trace must not fetch messages")
 
 
 @pytest.mark.asyncio
@@ -193,7 +193,7 @@ async def test_observed_channel_scope_reads_retained_facts_without_writes(
     assert list(conn.iterdump()) == before
     projected = _trace_structured_content(dict(data), TraceAccountMessages(exact_account_id=101, view="messages"))
     projected = cast(dict[str, object], omit_none_mapping_values(structured_result(projected).structured_content))
-    validate(projected, TOOL_REGISTRY["trace_account_messages"].output_schema)
+    validate(projected, cast(dict[str, object], TOOL_REGISTRY["trace_account_messages"].output_schema))
     assert any(warning["kind"] == "linked_chat_unknown" for warning in cast(list[dict], projected["warnings"])) == (
         link_state == "unknown"
     )
