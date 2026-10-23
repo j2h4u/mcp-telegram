@@ -18,43 +18,71 @@ This directory is the live deployment workspace, not the source checkout.
 
 - dotMD integration is archived and stopped; this deployment has no active
   dotMD downstream consumer. The source-export snapshot is reference-only in
-  the repository archive and is not part of the runtime contract.
+  the repository archive and is not part of the runtime contract. Generic
+  Unix-socket and HTTP MCP serving remain active.
 
 ## Operations
 
-### SQLite backup retention
+### SQLite backup, restore and retention
 
-Take a SQLite backup in the operator-owned `backups/` directory before a
-schema-changing deployment; code-only rebuilds do not need one. After the
-service is healthy, the expected migration version is confirmed, and the
-official MCP smoke succeeds, remove only the backup and verification sidecars
-created for that rollout. Keep a copy needed for a failed deployment or
-rollback until the issue is resolved. Never use a blanket glob that could
-remove historical backups or exports.
+Before changing the schema or an incompatible persisted format, stop the
+writer daemon and create a consistent matching backup pair of `sync.db` and
+`mcp_telegram_session.session` in the operator-owned `backups/` directory.
+Use SQLite-aware backups of both databases while the writer daemon is stopped, or
+copy their complete stopped database families, including required WAL/SHM
+sidecars. Copying only live database files is insufficient. Protect Session
+backups as credentials and retain the matching release/configuration reference.
+
+Restore only a matching pair with the writer daemon stopped; first preserve the
+current pair. Restoring an older backup loses facts ingested after its capture
+and is not a lossless rollback. The Session checkpoint may lag the authoritative
+`sync.db` checkpoint, while Session also holds required authentication and peer
+facts; neither database replaces the other.
+
+Binary rollback requires compatibility with the current schema, pending-delivery
+format and authoritative/safe checkpoint semantics. Healthy startup or a schema
+number alone does not establish that compatibility. Do not run an older binary
+that ignores pending deliveries or the safe checkpoint, delete pending rows, or
+manually rewind offsets.
+
+After the service is healthy, the expected migration version is confirmed, and
+the official MCP smoke succeeds, remove only the matching backup pair and
+verification sidecars created for that rollout. Keep copies needed for a failed
+deployment or rollback until the issue is resolved. Never use a blanket glob
+that could remove historical backups or exports. Code-only rebuilds without
+schema or incompatible-format changes do not need a new backup.
 
 ### Entity Profile rollout and rollback
 
-The profile pair switch is safe to roll back at the configuration level. Keep
-the sequence migration-aware: deploy the v62 binary with the switch disabled,
-let startup complete the additive v62 migration, then enable the switch; to
-roll back, disable it, restart, and re-enable it only after the same current
-binary has restarted successfully. The generation records its captured mode,
-so a disabled generation stays disabled across restart and a configuration
-flip. Existing receipts and progressive sections remain readable in every
-step.
+Roll back the profile pair switch by disabling it and restarting the same
+current compatible binary; re-enable it only after that binary restarts
+successfully. This configuration rollback does not authorize a binary downgrade:
+the schema, pending-delivery and checkpoint compatibility rules above still
+apply. Each generation keeps its captured mode, so a disabled generation stays
+disabled across restart and a configuration flip. Existing receipts and
+progressive sections remain readable.
 
-Arbitrary older binaries are unsupported after this migration. Roll back the
-configuration before reverting the binary, and use a binary that understands
-the v62 schema and pair-mode records.
+### Runtime checks
 
-- Rebuild and restart after source changes:
+Run the standard runtime checks from the repository root
+(`/home/j2h4u/repos/j2h4u/mcp-telegram`):
+
+- Rebuild, restart, wait for Healthy, and run the MCP smoke:
   ```bash
-  docker compose -f /opt/docker/mcp-telegram/docker-compose.yml up -d --build mcp-telegram
+  just runtime-verify
   ```
-- Check health:
+- Check the already running HTTP service:
   ```bash
-  docker compose -f /opt/docker/mcp-telegram/docker-compose.yml ps mcp-telegram
+  just runtime-smoke
   ```
+- Check container status:
+  ```bash
+  just runtime-status
+  ```
+
+Use the official `devtools.mcp_client.cli` only for point diagnostics absent
+from the existing recipes; it does not replace the standard MCP smoke.
+
 - Query logs across container recreation:
   ```bash
   journalctl CONTAINER_NAME=mcp-telegram --since '3 days ago' -o short-iso
@@ -62,10 +90,6 @@ the v62 schema and pair-mode records.
   Docker Compose logs cover only the current container. Journald retention is
   controlled by the host; this service does not configure a separate log
   retention policy.
-- Validate MCP over HTTP from the source checkout:
-  ```bash
-  uv run python -m devtools.mcp_client.cli list-tools
-  ```
 
 ## Auth
 
