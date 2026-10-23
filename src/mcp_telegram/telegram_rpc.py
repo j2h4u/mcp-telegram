@@ -680,6 +680,12 @@ class TelegramRpcGate(TelegramClient):
                 return
             snapshot = active.envelope.checkpoint_after
             for channel_id, access_hash in snapshot.channel_hashes.items():
+                try:
+                    peer = self.session.get_input_entity(types.PeerChannel(channel_id))
+                except ValueError:
+                    peer = None
+                if getattr(peer, "access_hash", None) == access_hash:
+                    continue
                 self.session.process_entities(
                     types.contacts.ResolvedPeer(
                         types.PeerChannel(channel_id), [types.ChannelForbidden(channel_id, access_hash, "")], []
@@ -691,8 +697,6 @@ class TelegramRpcGate(TelegramClient):
             self.session.save()
             await repository.complete(snapshot.model_dump_json())
             self._delivery_safe = snapshot
-            await self._save_states_and_entities()
-            self.session.save()
             self._active_delivery = None
         except BaseException:
             self._delivery_failure.set()
