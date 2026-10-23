@@ -19,6 +19,7 @@ from typing import Never, Protocol, cast
 from aiolimiter import AsyncLimiter
 from telethon import (  # type: ignore[import-untyped]
     TelegramClient,  # type: ignore[import-untyped]
+    helpers,
     types,
 )
 from telethon._updates import ChannelState, SessionState  # type: ignore[import-untyped]
@@ -425,6 +426,9 @@ class TelegramRpcGate(TelegramClient):
     observed: this gate makes no stronger claim about cancellation of work.
     """
 
+    _catch_up: bool
+    _updates_handle: asyncio.Task[object] | None
+
     def __init__(  # noqa: PLR0913 - Telethon constructor plus explicit account policy
         self,
         *args: object,
@@ -482,6 +486,7 @@ class TelegramRpcGate(TelegramClient):
         self._connection_capability: _ConnectionCapability | None = None
         self._connection_retry_delays: Iterator[float] | None = None
         self._connection_mutation_started = False
+        self._connection_update_loop: asyncio.Task[object] | None = None
         self._connection_rpc_tasks: set[asyncio.Task[object]] = set()
         self._pending_scalar_dispatches: dict[asyncio.Future[object], _PendingScalarDispatch] = {}
         self._transport_state = _TransportBoundaryState.DISCONNECTED
@@ -878,7 +883,7 @@ class TelegramRpcGate(TelegramClient):
         current_task = asyncio.current_task()
         if self._connect_owner is not None:
             if self._connect_owner is current_task:
-                await super().connect()  # type: ignore[misc]
+                await self._reconnect_connection_owner()
                 return
             raise self._connection_owner_deferred()
         self.check_circuit()
@@ -904,6 +909,7 @@ class TelegramRpcGate(TelegramClient):
         self._connection_capability = capability
         self._connection_retry_delays = iter(self._transient_retry_delays) if retry_delays is None else retry_delays
         self._connection_mutation_started = False
+        self._connection_update_loop = self._capture_connection_update_loop(initial_dc)
         reservation = object()
         self._connect_owner = reservation
         owner: asyncio.Task[object] | None = None
@@ -928,7 +934,33 @@ class TelegramRpcGate(TelegramClient):
                 self._connect_owner = None
                 self._connection_capability = None
                 self._connection_retry_delays = None
+                self._connection_update_loop = None
                 self._connection_rpc_tasks.clear()
+
+    def _capture_connection_update_loop(self, initial_dc: int | None) -> asyncio.Task[object] | None:
+        current_task = asyncio.current_task()
+        if initial_dc is not None and current_task is self._updates_handle:
+            return current_task
+        return None
+
+    async def _reconnect_connection_owner(self) -> None:
+        retained_loop = self._connection_update_loop
+        if retained_loop is None:
+            await super().connect()  # type: ignore[misc]
+            return
+        catch_up = self._catch_up
+        self._catch_up = False
+        try:
+            await super().connect()  # type: ignore[misc]
+        finally:
+            self._catch_up = catch_up
+            replacement = self._updates_handle
+            if replacement is not None and replacement is not retained_loop:
+                # Telethon creates this task at its non-yielding connect tail.
+                replacement.cancel()
+            self._updates_handle = retained_loop
+            if replacement is not None and replacement is not retained_loop:
+                await asyncio.gather(replacement, return_exceptions=True)
 
     def _start_connection_owner(
         self, scope: TelegramRpcScope, *, initial_dc: int | None = None, initial_delay: float = 0.0
@@ -1053,7 +1085,20 @@ class TelegramRpcGate(TelegramClient):
             await asyncio.gather(*tasks, return_exceptions=True)
         self._connection_rpc_tasks.clear()
         if disconnect_transport:
+            await self._disconnect_connection_owner()
+
+    async def _disconnect_connection_owner(self) -> None:
+        if self._connection_update_loop is None:
             await super()._disconnect()  # type: ignore[misc]
+            return
+        await self._sender.disconnect()
+        await helpers._cancel(logger, keepalive_handle=self._keepalive_handle)
+
+    async def _disconnect(self) -> None:
+        if self._connection_update_loop is not None and asyncio.current_task() is self._connect_owner:
+            await self._disconnect_connection_owner()
+            return
+        await super()._disconnect()  # type: ignore[misc]
 
     async def _complete_failed_connection_cleanup(
         self, *, disconnect_transport: bool = True
