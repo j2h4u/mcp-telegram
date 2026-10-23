@@ -8117,25 +8117,12 @@ async def test_get_my_recent_activity_filters_incoming_messages() -> None:
 
 
 def test_search_messages_finds_migrated_own_message() -> None:
-    """D-5 proof: migrated own messages become FTS-searchable.
-
-    Cross-AI review (2026-04-24) HIGH finding: neither Codex nor
-    OpenCode could find a test that proves the headline phase goal
-    — own messages become findable via SearchMessages after migration.
-    This test simulates the migration-then-FTS-backfill path at unit
-    level: seed an out=1 row directly in messages (no FTS entry yet,
-    as would happen immediately after the v15 migration INSERT);
-    invoke backfill_fts_index() to close the gap (the same function
-    daemon.py runs at startup after ensure_sync_schema); then
-    execute a raw `messages_fts MATCH` query and assert the row is
-    findable. A live MCP-level SearchMessages call is additionally
-    performed by Task 4 against the running container.
-    """
-    from mcp_telegram.fts import backfill_fts_index
+    """Historical own messages become searchable when migration 85 completes."""
+    from mcp_telegram.sync_db import _apply_migration_85
 
     conn = _make_db_with_activity()
     # _make_db() creates messages_fts only with with_fts=True (default False).
-    # Create the FTS table here to simulate the daemon startup environment.
+    # Recreate the missing historical index before the final migration.
     from mcp_telegram.fts import MESSAGES_FTS_DDL
 
     conn.execute(MESSAGES_FTS_DDL)
@@ -8149,9 +8136,9 @@ def test_search_messages_finds_migrated_own_message() -> None:
     )
     conn.commit()
 
-    # Close the FTS gap — this is what daemon.py does on startup after
-    # ensure_sync_schema applies the v15 migration.
-    backfill_fts_index(conn)
+    conn.execute("DELETE FROM schema_version WHERE version=85")
+    conn.commit()
+    assert _apply_migration_85(conn, 84) == 85
 
     # Now the row must be findable via FTS MATCH.
     # messages_fts stores dialog_id and message_id as UNINDEXED columns;
@@ -8168,9 +8155,7 @@ def test_search_messages_finds_migrated_own_message() -> None:
         "WHERE fts.stemmed_text MATCH ? AND m.out = 1",
         (stemmed,),
     ).fetchall()
-    assert len(hits) == 1, (
-        f"D-5 violated: migrated own message must be FTS-searchable after backfill_fts_index(). Hits: {hits}"
-    )
+    assert len(hits) == 1, f"D-5 violated: migrated own message must be FTS-searchable after migration 85. Hits: {hits}"
     assert hits[0] == (42, 7, "unique-search-needle alpha")
 
 

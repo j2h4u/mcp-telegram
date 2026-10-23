@@ -95,7 +95,6 @@ from .folders.refresh import FolderRefresher
 from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .folders.telegram_adapter import FolderClient, TelethonTelegramFolderGateway
 from .folders.worker import FolderProjectionWorker
-from .fts import backfill_fts_index
 from .hydration_queue import HydrationPriority
 from .media_hydration import MediaFactHydrationHandler
 from .message_fact_refresh import (
@@ -1324,21 +1323,6 @@ async def _ensure_folder_projection(repository: SQLiteFolderSnapshotRepository, 
     return await writer.run(lambda conn: SQLiteFolderSnapshotRepository(conn).ensure_mute_projection(now=now))
 
 
-async def _run_fts_backfill(ctx: _SyncMainContext) -> None:
-    # FTS backfill runs on the write owner (stemming is CPU-bound) so it doesn't
-    # block the event loop. Awaited here — before Telegram connect — so the
-    # socket is already up and responding "not ready / indexing messages for
-    # search" while we work. Total startup time = FTS time + Telegram time.
-    ctx.api_server.startup_detail = "indexing messages for search"
-    _ = ctx.api_server.startup_detail
-    try:
-        backfilled = await ctx.writer.run(backfill_fts_index)
-        if backfilled:
-            logger.info("fts_backfill=%d messages indexed", backfilled)
-    except Exception:
-        logger.warning("fts_backfill failed — FTS search may be incomplete until next restart", exc_info=True)
-
-
 async def _connect_telegram(ctx: _SyncMainContext) -> bool:
     try:
         ctx.api_server.startup_detail = "connecting to Telegram"
@@ -1922,7 +1906,6 @@ async def sync_main() -> None:
             _monitor_flood_wait_kill_switch(ctx),
             name="flood_wait_kill_switch_monitor",
         )
-        await _run_fts_backfill(ctx)
 
         update_barrier = UpdateProcessingBarrier(closed=True)
         ctx.draft_owner = DraftMessageOwner(

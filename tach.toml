@@ -92,7 +92,7 @@ depends_on = [
     "mcp_telegram.event_handlers", "mcp_telegram.feedback_db", "mcp_telegram.feedback_service", "mcp_telegram.flood",
     "mcp_telegram.fact_hydration", "mcp_telegram.hydration_queue",
     "mcp_telegram.folders.refresh", "mcp_telegram.folders.sqlite_repository", "mcp_telegram.folders.telegram_adapter", "mcp_telegram.folders.worker",
-    "mcp_telegram.fts", "mcp_telegram.media_hydration", "mcp_telegram.message_fact_refresh", "mcp_telegram.message_history.telegram_adapter", "mcp_telegram.messages.sqlite_hydration_jobs",
+    "mcp_telegram.media_hydration", "mcp_telegram.message_fact_refresh", "mcp_telegram.message_history.telegram_adapter", "mcp_telegram.messages.sqlite_hydration_jobs",
     "mcp_telegram.own_only_contracts", "mcp_telegram.read_state", "mcp_telegram.reconnect", "mcp_telegram.reactions.telegram_adapter", "mcp_telegram.rpc_admission_observations", "mcp_telegram.scheduled_messages",
     "mcp_telegram.runtime_observations", "mcp_telegram.self_profile_maintenance", "mcp_telegram.startup_identity", "mcp_telegram.state", "mcp_telegram.sync_db", "mcp_telegram.sync_worker", "mcp_telegram.telegram", "mcp_telegram.daemon_shutdown",
     "mcp_telegram.telegram_read_receipts", "mcp_telegram.topics.refresh", "mcp_telegram.transcription_hydration",

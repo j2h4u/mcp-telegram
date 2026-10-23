@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
+from unittest.mock import Mock
 
 import pytest
 
+import mcp_telegram.fts as fts
 import mcp_telegram.sync_db as sync_db_module
 from helpers import remove_v80_schema_for_historical_fixture
 from mcp_telegram.sync_db import (
@@ -3162,9 +3166,178 @@ def test_v79_upgrade_without_fts_cache_rebuilds_only_live_messages(db_path: Path
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM message_fts_keys").fetchone() == (2,)
-        assert backfill_fts_index(conn) == 1
         assert conn.execute("SELECT dialog_id,message_id FROM messages_fts").fetchall() == [(42, 1)]
         assert backfill_fts_index(conn) == 0
+
+
+@pytest.fixture()
+def v84_db(db_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    with monkeypatch.context() as version:
+        version.setattr(sync_db_module, "_CURRENT_SCHEMA_VERSION", 84)
+        ensure_sync_schema(db_path)
+    return db_path
+
+
+@pytest.mark.parametrize("receipt", ["absent", "malformed", "matching"])
+def test_v85_repairs_every_earlier_database_and_removes_receipt(
+    v84_db: Path, monkeypatch: pytest.MonkeyPatch, receipt: str
+) -> None:
+    with _sqlite_connection(v84_db) as conn:
+        conn.execute("UPDATE dialog_directory_state SET account_id=100")
+        conn.execute(
+            "INSERT INTO messages(dialog_id,message_id,sent_at,text,is_deleted) "
+            "VALUES (1,1,1,'needle',0),(1,2,2,'retained',0),(1,3,3,'deleted',1)"
+        )
+        conn.execute(fts.INSERT_FTS_SQL, (1, 2, "retained"))
+        conn.execute(fts.INSERT_FTS_SQL, (1, 3, "deleted"))
+        conn.execute(
+            "INSERT INTO messages_fts(rowid,dialog_id,message_id,stemmed_text) "
+            "VALUES (9998,1,1,'duplicate'),(9999,9,9,'orphan')"
+        )
+        if receipt != "absent":
+            value = (
+                "{"
+                if receipt == "malformed"
+                else json.dumps(
+                    {
+                        "algorithm_version": 1,
+                        "schema_version": 84,
+                        "schema_cookie": _fetchone_int(conn, "PRAGMA schema_version"),
+                        "account_id": 100,
+                    }
+                )
+            )
+            conn.execute("INSERT INTO daemon_state(key,value) VALUES ('fts_repair_receipt',?)", (value,))
+        conn.commit()
+    repair = Mock(wraps=fts.backfill_fts_index)
+    monkeypatch.setattr(fts, "backfill_fts_index", repair)
+    ensure_sync_schema(v84_db)
+    repair.assert_called_once()
+    with _sqlite_connection(v84_db) as conn:
+        assert _fetchall_rows(conn, "SELECT dialog_id,message_id FROM messages_fts ORDER BY message_id") == [
+            (1, 1),
+            (1, 2),
+        ]
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM messages") == 3
+        assert _fetchone_row(conn, "SELECT value FROM daemon_state WHERE key='fts_repair_receipt'") is None
+        assert _fetchall_rows(conn, "SELECT DISTINCT version FROM schema_version ORDER BY version") == [
+            (v,) for v in range(1, 86)
+        ]
+
+
+def test_v85_fills_v15_import_before_bootstrap_completes(v84_db: Path) -> None:
+    with _sqlite_connection(v84_db) as conn:
+        conn.execute(
+            "CREATE TABLE activity_comments(dialog_id INTEGER,message_id INTEGER,sent_at INTEGER,text TEXT,"
+            "reactions TEXT,reply_count INTEGER DEFAULT 0,last_synced_at INTEGER,PRIMARY KEY(dialog_id,message_id))"
+        )
+        conn.execute(
+            "INSERT INTO activity_comments(dialog_id,message_id,sent_at,text) VALUES (42,7,1,'написал сообщение')"
+        )
+        conn.commit()
+        sync_db_module._apply_migrations_11_to_15(conn, 14)
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM messages_fts") == 0
+    ensure_sync_schema(v84_db)
+    with _sqlite_connection(v84_db) as conn:
+        assert _fetchall_rows(
+            conn,
+            "SELECT dialog_id,message_id FROM messages_fts WHERE messages_fts MATCH ?",
+            (fts.stem_query("написали"),),
+        ) == [(42, 7)]
+        assert _fetchone_row(conn, "SELECT out,text FROM messages WHERE dialog_id=42 AND message_id=7") == (
+            1,
+            "написал сообщение",
+        )
+
+
+def test_v85_fresh_database_and_restarts_never_repeat_backfill(db_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repair = Mock(wraps=fts.backfill_fts_index)
+    monkeypatch.setattr(fts, "backfill_fts_index", repair)
+    ensure_sync_schema(db_path)
+    repair.assert_called_once()
+    with _sqlite_connection(db_path) as conn:
+        assert _fetchall_rows(conn, "SELECT DISTINCT version FROM schema_version ORDER BY version") == [
+            (v,) for v in range(1, 86)
+        ]
+        conn.execute("CREATE INDEX unrelated_fts_lifecycle_test ON daemon_state(value)")
+        conn.execute("UPDATE dialog_directory_state SET account_id=101,generation=generation+1")
+        conn.commit()
+    ensure_sync_schema(db_path)
+    ensure_sync_schema(db_path)
+    repair.assert_called_once()
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+def test_v85_partial_batches_survive_failure_without_advancing_ledger(
+    v84_db: Path, monkeypatch: pytest.MonkeyPatch, failure: type[BaseException]
+) -> None:
+    with _sqlite_connection(v84_db) as conn:
+        conn.executemany(
+            "INSERT INTO messages(dialog_id,message_id,sent_at,text) VALUES (1,?,1,?)",
+            ((message_id, "fail" if message_id == 501 else "needle") for message_id in range(1, 502)),
+        )
+        conn.execute("INSERT INTO messages_fts(rowid,dialog_id,message_id,stemmed_text) VALUES (9999,9,9,'orphan')")
+        conn.commit()
+    original_stem = fts.stem_text
+
+    def fail_after_first_batch(text: str | None) -> str:
+        if text == "fail":
+            raise failure("interrupted second batch")
+        return original_stem(text)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(fts, "stem_text", fail_after_first_batch)
+        with pytest.raises(failure, match="interrupted second batch"):
+            ensure_sync_schema(v84_db)
+    with _sqlite_connection(v84_db) as conn:
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 84
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM messages") == 501
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM messages_fts") == 500
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM messages_fts WHERE dialog_id=9") == 0
+    ensure_sync_schema(v84_db)
+    with _sqlite_connection(v84_db) as conn:
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 85
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM messages") == 501
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM messages_fts") == 501
+
+
+def test_v85_final_commit_failure_keeps_old_ledger_and_receipt_then_retries(
+    v84_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _sqlite_connection(v84_db) as conn:
+        conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at,text) VALUES (1,1,1,'needle')")
+        conn.execute("INSERT INTO daemon_state(key,value) VALUES ('fts_repair_receipt','old')")
+        conn.commit()
+    open_connection = sync_db_module._open_sync_db
+
+    def open_with_failing_commit(path: Path) -> sqlite3.Connection:
+        conn = open_connection(path)
+
+        def authorize(action: int, arg1: str | None, _arg2: str | None, _db: str | None, _source: str | None) -> int:
+            if (
+                action == sqlite3.SQLITE_TRANSACTION
+                and arg1 == "COMMIT"
+                and _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=85") is not None
+            ):
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(authorize)
+        return conn
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sync_db_module, "_open_sync_db", open_with_failing_commit)
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            ensure_sync_schema(v84_db)
+    with _sqlite_connection(v84_db) as conn:
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 84
+        assert _fetchone_row(conn, "SELECT value FROM daemon_state WHERE key='fts_repair_receipt'") == ("old",)
+        assert _fetchone_row(conn, "SELECT text FROM messages") == ("needle",)
+        assert _fetchone_row(conn, "SELECT dialog_id,message_id FROM messages_fts") == (1, 1)
+    ensure_sync_schema(v84_db)
+    with _sqlite_connection(v84_db) as conn:
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM schema_version WHERE version=85") == 1
+        assert _fetchone_row(conn, "SELECT value FROM daemon_state WHERE key='fts_repair_receipt'") is None
 
 
 def test_v81_refresh_generation_preserves_legacy_request_and_cursor(

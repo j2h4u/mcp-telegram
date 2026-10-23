@@ -21,6 +21,25 @@ def test_current_source_has_no_transaction_boundary_violations() -> None:
     assert gate.boundary_violations() == []
 
 
+def test_usage_reader_snapshot_exception_stays_function_scoped(tmp_path: Path) -> None:
+    root = _source_tree(
+        tmp_path,
+        {
+            "daemon_activity_stats.py": """
+class DaemonActivityStatsService:
+    def _usage_stats_from_reader(self, conn):
+        conn.execute('BEGIN')
+
+    def unreviewed_reader(self, conn):
+        conn.execute('BEGIN')
+"""
+        },
+    )
+    violations = gate.boundary_violations(root)
+    assert len(violations) == 1
+    assert "raw transaction SQL in DaemonActivityStatsService.unreviewed_reader" in violations[0]
+
+
 def test_gate_rejects_raw_transactions_and_context_managers(tmp_path: Path) -> None:
     root = _source_tree(
         tmp_path,

@@ -13,8 +13,9 @@ Design:
 - Module-level stemmer is created once (thread-safe for reads).
 - _WORD_RE extracts Cyrillic, Latin, and digit tokens; punctuation is
   silently dropped (matches FTS5 unicode61 tokenizer behaviour).
-- backfill_fts_index() runs on every daemon startup and indexes only
-  messages missing from the FTS table (idempotent, no duplicates).
+- Migration 85 completes historical FTS repair once before serving reads.
+- backfill_fts_index() repairs missing stable-key rows and removes invalid rows;
+  it does not compare stored text or create missing stable keys.
 """
 
 import re
