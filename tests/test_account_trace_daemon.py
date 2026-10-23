@@ -5,11 +5,12 @@ import dataclasses
 import logging
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from jsonschema import validate
@@ -62,7 +63,7 @@ from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope
 from mcp_telegram.tools import TOOL_REGISTRY
 from mcp_telegram.tools._base import omit_none_mapping_values, structured_result
-from mcp_telegram.tools.account_trace import TraceAccountMessages, _trace_structured_content
+from mcp_telegram.tools.account_trace import TraceAccountMessages, _trace_structured_content, trace_account_messages
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     LoudChannelProfilePort,
@@ -125,6 +126,109 @@ def _forbid_trace_acquisition(client: AsyncMock) -> None:
     client.side_effect = AssertionError("Observed trace must not acquire Telegram facts")
     cast(AsyncMock, client.get_entity).side_effect = AssertionError("Observed trace must not resolve peers")
     cast(AsyncMock, client.iter_messages).side_effect = AssertionError("Observed trace must not fetch messages")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("navigation", ["", 0, False, [], {}])
+@pytest.mark.parametrize("goal", ["observed", "best_effort_visible"])
+async def test_trace_rejects_invalid_navigation_before_resolution(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+    navigation: object,
+    goal: str,
+) -> None:
+    _server, conn, client = trace_server
+    _forbid_trace_acquisition(client)
+    before = list(conn.iterdump())
+    result = await trace_service._trace_account_messages(
+        {"account": "@missing", "navigation": navigation, "coverage_goal": goal}
+    )
+    assert result["error"] == "invalid_navigation"
+    assert result["ok"] is False
+    assert list(conn.iterdump()) == before
+    assert client.mock_calls == []
+
+
+@pytest.mark.asyncio
+async def test_mcp_trace_rejects_empty_navigation_on_unknown_channel(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
+    _server, conn, client = trace_server
+    _forbid_trace_acquisition(client)
+    seed_entity(conn, entity_id=101, name="Alice Example")
+    seed_dialog(conn, dialog_id=-100123, name="Channel", dialog_type="Channel")
+    seed_synced_dialog(conn, dialog_id=-100123)
+    seed_channel_signature_message(conn, dialog_id=-100123, message_id=1, sent_at=1, signature="Alice Example")
+    conn.commit()
+
+    async def forward(**kwargs: object) -> dict[str, object]:
+        return await trace_service._trace_account_messages(kwargs)
+
+    @asynccontextmanager
+    async def connection() -> AsyncIterator[SimpleNamespace]:
+        yield SimpleNamespace(trace_account_messages=forward)
+
+    before = list(conn.iterdump())
+    with patch("mcp_telegram.tools.account_trace.daemon_connection", new=connection):
+        result = await trace_account_messages(
+            TraceAccountMessages(exact_account_id=101, exact_dialog_id=-100123, navigation="")
+        )
+    assert result.is_error is True
+    assert "invalid_navigation" in str(result.content)
+    assert list(conn.iterdump()) == before
+    assert client.mock_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_evidence", [False, True])
+@pytest.mark.parametrize("goal", [None, "observed"])
+async def test_known_link_scope_counts_missing_discussion_and_keeps_coverage_on_continuation(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+    has_evidence: bool,
+    goal: str | None,
+) -> None:
+    _server, conn, client = trace_server
+    _forbid_trace_acquisition(client)
+    seed_entity(conn, entity_id=101, name="Alice Example")
+    seed_dialog(conn, dialog_id=-100123, name="Channel", dialog_type="Channel")
+    seed_synced_dialog(conn, dialog_id=-100123)
+    conn.execute("UPDATE dialogs SET linked_chat_id=-100456, linked_chat_resolved_at=1 WHERE dialog_id=-100123")
+    if has_evidence:
+        for message_id in (1, 2):
+            seed_channel_signature_message(
+                conn, dialog_id=-100123, message_id=message_id, sent_at=message_id, signature="Alice Example"
+            )
+    conn.commit()
+    req: dict[str, object] = {"exact_account_id": 101, "exact_dialog_id": -100123, "limit": 1}
+    if goal is not None:
+        req["coverage_goal"] = goal
+    before = list(conn.iterdump())
+    first = _dict((await trace_service._trace_account_messages(req))["data"])
+    coverage = _dict(first["coverage"])
+    assert coverage["dialogs_considered"] == 2
+    assert coverage["dialogs_with_gaps"] == 1
+    assert coverage["state"] == ("partial" if has_evidence else "unknown")
+    assert {gap["dialog_id"] for gap in cast(list[dict], first["gaps"]) if gap["kind"] == "dialog_not_synced"} == {
+        -100456
+    }
+    assert bool(first["groups"]) == has_evidence
+    assert list(conn.iterdump()) == before
+    if has_evidence:
+        req["navigation"] = first["next_navigation"]
+        assert isinstance(req["navigation"], str)
+        conn.execute("UPDATE dialogs SET linked_chat_id=-100999, linked_chat_resolved_at=2 WHERE dialog_id=-100123")
+        conn.commit()
+        before = list(conn.iterdump())
+        second = _dict((await trace_service._trace_account_messages(req))["data"])
+        assert _dict(second["coverage"])["dialogs_considered"] == 2
+        assert _dict(second["coverage"])["state"] == "partial"
+        assert {gap["dialog_id"] for gap in cast(list[dict], second["gaps"]) if gap["kind"] == "dialog_not_synced"} == {
+            -100456
+        }
+        assert list(conn.iterdump()) == before
+    assert client.mock_calls == []
 
 
 @pytest.mark.asyncio

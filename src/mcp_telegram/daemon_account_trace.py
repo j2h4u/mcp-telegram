@@ -846,6 +846,9 @@ class DaemonAccountTraceService:
         exact_account_error = _validate_exact_account_id(req.get("exact_account_id"))
         if exact_account_error is not None:
             return exact_account_error
+        request_error = _validate_trace_account_navigation(req.get("navigation"))
+        if request_error is not None:
+            return request_error
         request, request_error = _parse_trace_account_messages_request(req)
         if request_error is not None:
             return request_error
@@ -925,6 +928,7 @@ class DaemonAccountTraceService:
                 exact_topic_id=scope.exact_topic_id,
                 coverage_goal=request.coverage_goal,
                 direct_chat_excluded=direct_chat_excluded,
+                scope_dialog_ids=scope.scope_dialog_ids,
             )
         )
         coverage["observed_message_count"] = query_result.observed_message_count
@@ -938,6 +942,7 @@ class DaemonAccountTraceService:
                 exact_topic_id=scope.exact_topic_id,
                 coverage_goal=request.coverage_goal,
                 direct_chat_excluded=direct_chat_excluded,
+                scope_dialog_ids=scope.scope_dialog_ids,
             )
         )
         _apply_trace_unknown_link_coverage(scope, coverage=coverage, gaps=gaps)
@@ -1188,6 +1193,12 @@ def _resolve_trace_account_by_fuzzy(
         )
 
     return _unresolved_trace_account(query=query, resolution_source="entities_fuzzy_not_found")
+
+
+def _validate_trace_account_navigation(navigation: object) -> dict[str, object] | None:
+    if navigation is not None and (not isinstance(navigation, str) or not navigation):
+        return {"ok": False, "error": "invalid_navigation", "message": "navigation must be a nonempty token string"}
+    return None
 
 
 def _invalid_trace_enum(view: object, group_by: object) -> tuple[str, str] | None:
@@ -1732,6 +1743,7 @@ class _TraceGapBuildRequest:
     exact_topic_id: int | None = None
     coverage_goal: str = "observed"
     direct_chat_excluded: bool = False
+    scope_dialog_ids: list[int] | None = None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1743,6 +1755,7 @@ class _TraceCoverageBuildRequest:
     exact_topic_id: int | None = None
     coverage_goal: str = "observed"
     direct_chat_excluded: bool = False
+    scope_dialog_ids: list[int] | None = None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1995,7 +2008,7 @@ def _trace_coverage_dialogs(
     fragment_dialogs: set[int],
 ) -> tuple[set[int], str]:
     if request.exact_dialog_id is not None:
-        return {request.exact_dialog_id}, "exact_dialog_scope"
+        return set(request.scope_dialog_ids or [request.exact_dialog_id]), "exact_dialog_scope"
     if request.coverage_goal == "best_effort_visible":
         access_lost_dialogs = access_lost_dialog_ids(request.conn)
         if request.direct_chat_excluded:
@@ -2034,6 +2047,8 @@ def _build_trace_coverage(request: _TraceCoverageBuildRequest) -> dict:
     )
     gap_dialogs = _trace_coverage_gap_dialogs(request.conn, considered_dialogs, fragments)
     state = "unknown" if not considered_dialogs else "partial" if gap_dialogs else "complete"
+    if request.scope_dialog_ids and gap_dialogs and not observed_dialogs:
+        state = "unknown"
     return {
         "state": state,
         "observed_message_count": len(request.rows),
@@ -2182,6 +2197,7 @@ def _collect_trace_gap_dialogs(
 ) -> set[int]:
     dialog_ids = {_row_int(item, "dialog_id") for item in request.evidence}
     dialog_ids.update(_row_int(row, "dialog_id") for row in fragment_rows)
+    dialog_ids.update(request.scope_dialog_ids or ())
     if request.exact_dialog_id is not None:
         dialog_ids.add(request.exact_dialog_id)
     elif request.coverage_goal == "best_effort_visible" and request.coverage.get("dialogs_considered", 0):
