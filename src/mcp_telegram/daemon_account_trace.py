@@ -45,6 +45,7 @@ from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
 from .linked_chat_fact import LinkedChatState
+from .linked_chat_fact import read_fact as read_linked_chat_fact
 from .message_content import MessageSnapshot, project_message_content
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_bundle import insert_messages_with_fts
@@ -118,8 +119,6 @@ class DaemonAccountTraceDeps:
     self_id: int | None
     logger: _LoggerLike
     rid: Callable[[], str]
-    user_directory_ttl_seconds: int
-    group_directory_ttl_seconds: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,7 +402,7 @@ class DaemonAccountTraceService:
     def __init__(self, deps: DaemonAccountTraceDeps) -> None:
         self._deps = deps
 
-    async def _resolve_trace_account(self, req: dict) -> dict:
+    async def _resolve_trace_account(self, req: dict, *, coverage_goal: str = "observed") -> dict:
         """Resolve an Account Trace target without probing arbitrary numeric ids."""
         lookup = _extract_trace_account_lookup(req)
         if lookup.mode == "exact_id":
@@ -428,15 +427,17 @@ class DaemonAccountTraceService:
         if lookup.mode == "username":
             username = str(lookup.query)
             row = _resolve_trace_account_by_username(self._deps.conn, username)
-            if row is not None:
-                return row
-            return await self._resolve_trace_username(username)
+            if row is None and coverage_goal == "best_effort_visible":
+                return await self._resolve_trace_username(username)
+            return (
+                row
+                if row is not None
+                else _unresolved_trace_account(query=username, resolution_source="username_not_in_local_archive")
+            )
 
         return _resolve_trace_account_by_fuzzy(
             self._deps.conn,
             str(lookup.query),
-            user_directory_ttl_seconds=self._deps.user_directory_ttl_seconds,
-            group_directory_ttl_seconds=self._deps.group_directory_ttl_seconds,
         )
 
     async def _resolve_trace_username(self, username: str) -> dict:
@@ -628,7 +629,7 @@ class DaemonAccountTraceService:
         return {
             "kind": "account_unresolved",
             "severity": "action_required",
-            "detail": "No visible account matched this reference.",
+            "detail": "No retained local account matched this reference; this does not establish Telegram absence.",
         }
 
     @staticmethod
@@ -845,12 +846,15 @@ class DaemonAccountTraceService:
         exact_account_error = _validate_exact_account_id(req.get("exact_account_id"))
         if exact_account_error is not None:
             return exact_account_error
+        request_error = _validate_trace_account_navigation(req.get("navigation"))
+        if request_error is not None:
+            return request_error
         request, request_error = _parse_trace_account_messages_request(req)
         if request_error is not None:
             return request_error
         assert request is not None
 
-        resolved_account = await self._resolve_trace_account(req)
+        resolved_account = await self._resolve_trace_account(req, coverage_goal=request.coverage_goal)
         if resolved_account.get("confidence") != "resolved" or resolved_account.get("account_id") is None:
             return self._build_trace_account_unresolved_payload(resolved_account, request)
 
@@ -924,6 +928,7 @@ class DaemonAccountTraceService:
                 exact_topic_id=scope.exact_topic_id,
                 coverage_goal=request.coverage_goal,
                 direct_chat_excluded=direct_chat_excluded,
+                scope_dialog_ids=scope.scope_dialog_ids,
             )
         )
         coverage["observed_message_count"] = query_result.observed_message_count
@@ -937,8 +942,10 @@ class DaemonAccountTraceService:
                 exact_topic_id=scope.exact_topic_id,
                 coverage_goal=request.coverage_goal,
                 direct_chat_excluded=direct_chat_excluded,
+                scope_dialog_ids=scope.scope_dialog_ids,
             )
         )
+        _apply_trace_unknown_link_coverage(scope, coverage=coverage, gaps=gaps)
         return self._build_trace_account_success_payload(
             _TraceAccountPayloadContext(
                 resolved_account=resolved_account,
@@ -952,6 +959,29 @@ class DaemonAccountTraceService:
                 directory_coverage=scope.directory_coverage,
             )
         )
+
+
+def _apply_trace_unknown_link_coverage(
+    scope: _TraceAccountMessagesScope,
+    *,
+    coverage: dict,
+    gaps: list[dict[str, object]],
+) -> None:
+    if scope.scope_dialog_ids != [scope.exact_dialog_id]:
+        return
+    gaps.append(
+        _trace_gap(
+            _TraceGapCandidate(
+                kind="linked_chat_unknown",
+                severity="warning",
+                detail="Discussion linkage was unknown when this page sequence began. "
+                "This page and its continuations cover retained channel messages only.",
+                dialog_id=scope.exact_dialog_id,
+            )
+        )
+    )
+    coverage["state"] = "partial" if coverage["observed_message_count"] else "unknown"
+    coverage["dialogs_with_gaps"] = max(1, int(coverage["dialogs_with_gaps"]))
 
 
 def _project_trace_content_rows(
@@ -1124,17 +1154,9 @@ def _resolve_trace_account_by_username(conn: sqlite3.Connection, username: str) 
 def _resolve_trace_account_by_fuzzy(
     conn: sqlite3.Connection,
     query: str,
-    *,
-    user_directory_ttl_seconds: int,
-    group_directory_ttl_seconds: int,
 ) -> dict:
-    now = int(time.time())
     display_name_map: dict[int, str] = {}
-    names, normalized_rows = account_directory_names(
-        conn,
-        user_after=now - user_directory_ttl_seconds,
-        group_after=now - group_directory_ttl_seconds,
-    )
+    names, normalized_rows = account_directory_names(conn)
     for values in names:
         display_name_map[_row_int(cast(Mapping[str, object], {"entity_id": values[0]}), "entity_id")] = str(values[1])
     normalized: dict[int, str] = {}
@@ -1171,6 +1193,12 @@ def _resolve_trace_account_by_fuzzy(
         )
 
     return _unresolved_trace_account(query=query, resolution_source="entities_fuzzy_not_found")
+
+
+def _validate_trace_account_navigation(navigation: object) -> dict[str, object] | None:
+    if navigation is not None and (not isinstance(navigation, str) or not navigation):
+        return {"ok": False, "error": "invalid_navigation", "message": "navigation must be a nonempty token string"}
+    return None
 
 
 def _invalid_trace_enum(view: object, group_by: object) -> tuple[str, str] | None:
@@ -1275,7 +1303,9 @@ async def _resolve_trace_account_scope(
     # not recompute channel linkage and silently change that pagination scope.
     signature_scope = None
     if request.req.get("navigation") is None:
-        signature_scope = await _resolve_trace_account_signature_scope(request.deps, exact_dialog_id)
+        signature_scope = await _resolve_trace_account_signature_scope(
+            request.deps, exact_dialog_id, coverage_goal=request.request.coverage_goal
+        )
     if isinstance(signature_scope, dict):
         return None, signature_scope
     if signature_scope is not None:
@@ -1374,6 +1404,8 @@ def _validate_trace_account_scope_exact_topic(
 async def _resolve_trace_account_signature_scope(
     deps: DaemonAccountTraceDeps,
     exact_dialog_id: int | None,
+    *,
+    coverage_goal: str,
 ) -> tuple[list[int] | None, dict[int, int]] | dict[str, object] | None:
     if exact_dialog_id is None:
         return None
@@ -1385,8 +1417,16 @@ async def _resolve_trace_account_signature_scope(
     ):
         return None
 
-    resolution = await resolve_linked_chat_id(deps.client, deps.conn, exact_dialog_id, writer=deps.writer)
+    resolution = (
+        read_linked_chat_fact(deps.conn, exact_dialog_id)
+        if coverage_goal == "observed"
+        else await resolve_linked_chat_id(deps.client, deps.conn, exact_dialog_id, writer=deps.writer)
+    )
     if resolution.state is LinkedChatState.UNKNOWN:
+        if coverage_goal == "observed":
+            # A singleton scope also retains the unknown-link coverage boundary
+            # in continuation tokens without rereading a changing link fact.
+            return [exact_dialog_id], {}
         return {
             "ok": False,
             "error": "linked_chat_pending",
@@ -1401,13 +1441,14 @@ async def _resolve_trace_account_signature_scope(
 
     linked_chat_map: dict[int, int] = {exact_dialog_id: resolution.linked_chat_id}
     scope_dialog_ids = [exact_dialog_id, resolution.linked_chat_id]
-    await deps.writer.run(
-        lambda conn: enroll_activity_dialog(
-            conn,
-            linked_chat_id,
-            source="linked_chat",
+    if coverage_goal == "best_effort_visible":
+        await deps.writer.run(
+            lambda conn: enroll_activity_dialog(
+                conn,
+                linked_chat_id,
+                source="linked_chat",
+            )
         )
-    )
     return scope_dialog_ids, linked_chat_map
 
 
@@ -1702,6 +1743,7 @@ class _TraceGapBuildRequest:
     exact_topic_id: int | None = None
     coverage_goal: str = "observed"
     direct_chat_excluded: bool = False
+    scope_dialog_ids: list[int] | None = None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1713,6 +1755,7 @@ class _TraceCoverageBuildRequest:
     exact_topic_id: int | None = None
     coverage_goal: str = "observed"
     direct_chat_excluded: bool = False
+    scope_dialog_ids: list[int] | None = None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1965,7 +2008,7 @@ def _trace_coverage_dialogs(
     fragment_dialogs: set[int],
 ) -> tuple[set[int], str]:
     if request.exact_dialog_id is not None:
-        return {request.exact_dialog_id}, "exact_dialog_scope"
+        return set(request.scope_dialog_ids or [request.exact_dialog_id]), "exact_dialog_scope"
     if request.coverage_goal == "best_effort_visible":
         access_lost_dialogs = access_lost_dialog_ids(request.conn)
         if request.direct_chat_excluded:
@@ -2004,6 +2047,8 @@ def _build_trace_coverage(request: _TraceCoverageBuildRequest) -> dict:
     )
     gap_dialogs = _trace_coverage_gap_dialogs(request.conn, considered_dialogs, fragments)
     state = "unknown" if not considered_dialogs else "partial" if gap_dialogs else "complete"
+    if request.scope_dialog_ids and gap_dialogs and not observed_dialogs:
+        state = "unknown"
     return {
         "state": state,
         "observed_message_count": len(request.rows),
@@ -2152,6 +2197,7 @@ def _collect_trace_gap_dialogs(
 ) -> set[int]:
     dialog_ids = {_row_int(item, "dialog_id") for item in request.evidence}
     dialog_ids.update(_row_int(row, "dialog_id") for row in fragment_rows)
+    dialog_ids.update(request.scope_dialog_ids or ())
     if request.exact_dialog_id is not None:
         dialog_ids.add(request.exact_dialog_id)
     elif request.coverage_goal == "best_effort_visible" and request.coverage.get("dialogs_considered", 0):

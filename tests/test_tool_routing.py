@@ -2189,11 +2189,10 @@ def test_trace_account_messages_schema_and_docstring_contract() -> None:
     assert "exact_topic_id" in schema["properties"]
     assert "authored-message" in doc or "authored message" in doc
     assert "bounded visible sampling" in doc
-    assert " local " not in f" {doc.lower()} "
+    assert "without contacting Telegram or starting background collection" in doc
     assert " live " not in f" {doc.lower()} "
     assert " cache " not in f" {doc.lower()} "
     assert " sql " not in f" {doc.lower()} "
-    assert " telegram " not in f" {doc.lower()} "
 
 
 # ---------------------------------------------------------------------------
