@@ -22,6 +22,7 @@ from telethon.errors import (
     FloodTestPhoneWaitError,
     FloodWaitError,
     NetworkMigrateError,
+    PhoneMigrateError,
     ServerError,
     SlowModeWaitError,
     UserMigrateError,
@@ -64,6 +65,7 @@ from mcp_telegram.telegram import create_client
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
     RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
     current_demand_token,
     demand_context,
     demand_contract,
@@ -394,6 +396,348 @@ async def _close_bootstrap_gate(gate: TelegramRpcGate) -> None:
     )
     await gate._sender.disconnect()
     await gate.close_rpc_scheduler()
+
+
+async def _normal_migration_gate(
+    monkeypatch: pytest.MonkeyPatch, delays: tuple[float, ...]
+) -> tuple[TelegramRpcGate, _BootstrapSender]:
+    gate, sender = _bootstrap_gate()
+    await gate.connect()
+    gate._transient_retry_delays = delays
+    gate._authorized = True
+    monkeypatch.setattr(
+        TelegramRpcGate,
+        "_config",
+        SimpleNamespace(
+            dc_options=[
+                SimpleNamespace(id=dc, ip_address=f"127.0.0.{dc}", port=443, ipv6=False, cdn=False) for dc in (2, 3, 4)
+            ]
+        ),
+    )
+    sender.sent.clear()
+    sender.scopes.clear()
+    sender.connect_calls = sender.disconnect_calls = 0
+    return gate, sender
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("delays", "outcomes", "bootstrap", "expected_dc", "expected_sends", "exhausted"),
+    [
+        ((0.0,), [3, "ok"], [], 3, 3, False),
+        ((0.0,), [2, "ok"], [], 2, 3, False),
+        ((), [3], [], 2, 1, True),
+        ((0.0,), ["transient", 3], [], 2, 2, True),
+        ((0.0, 0.0), ["transient", 3, "ok"], [], 3, 4, False),
+        ((0.0, 0.0), [3, "ok"], [4], 4, 4, False),
+        ((0.0,), [3], [4], 3, 2, True),
+        ((0.0,), [3], [3], 3, 2, True),
+        ((0.0, 0.0), [3, "ok"], ["transient"], 3, 4, False),
+        ((0.0, 0.0), [3], ["transient", 4], 3, 3, True),
+    ],
+)
+async def test_normal_vendor_migration_uses_only_the_original_retry_remainder(  # noqa: PLR0913
+    monkeypatch: pytest.MonkeyPatch,
+    delays: tuple[float, ...],
+    outcomes: list[int | str],
+    bootstrap: list[int | str],
+    expected_dc: int,
+    expected_sends: int,
+    exhausted: bool,
+) -> None:
+    gate, sender = await _normal_migration_gate(monkeypatch, delays)
+    normal_results, bootstrap_results = iter(outcomes), iter(bootstrap)
+    budget = RpcAttemptBudget(12)
+    deadline = asyncio.get_running_loop().time() + 10
+
+    def respond(request: object) -> object:
+        outcome = next(normal_results) if isinstance(request, _TestRequest) else next(bootstrap_results, "ok")
+        if isinstance(outcome, int):
+            return UserMigrateError(request, capture=outcome)
+        if outcome == "transient":
+            return ServerError(request, "fixture")
+        return "ok"
+
+    sender.response = respond
+    try:
+        with demand_context(DemandKind.MCP_REMOTE_ACQUISITION, deadline=deadline) as token:
+            with rpc_attempt_budget(budget), rpc_scope(TelegramRpcSource.MCP_INTERACTIVE, deadline=deadline):
+                if exhausted:
+                    with pytest.raises(TelegramRpcAdmissionDeferred, match="redirect exhausted"):
+                        await gate(_TestRequest("normal"))
+                else:
+                    assert await gate(_TestRequest("normal")) == "ok"
+        assert gate.session.dc_id == expected_dc
+        assert len(sender.sent) == expected_sends
+        assert budget.attempts == token.attempt_evidence.actual_attempts == expected_sends
+        assert all(scope.attempt_budget is budget and scope.deadline == deadline for scope in sender.scopes)
+        assert all(scope.source is TelegramRpcSource.MCP_INTERACTIVE for scope in sender.scopes)
+        if expected_dc == 2 and exhausted:
+            assert sender.connect_calls == sender.disconnect_calls == 0
+            assert sender.auth_key.key == b"test"
+        assert gate._connect_owner is None
+    finally:
+        await _close_bootstrap_gate(gate)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [1, 2])
+async def test_normal_migration_budget_exhaustion_before_or_during_dc_lookup_preserves_transport(
+    monkeypatch: pytest.MonkeyPatch, limit: int
+) -> None:
+    gate, sender = await _normal_migration_gate(monkeypatch, (0.0,))
+    config = gate._config
+    monkeypatch.setattr(TelegramRpcGate, "_config", None)
+    sender.response = lambda request: (
+        UserMigrateError(request, capture=3) if isinstance(request, _TestRequest) else config
+    )
+    budget = RpcAttemptBudget(limit)
+    try:
+        with rpc_attempt_budget(budget), rpc_scope(TelegramRpcSource.MCP_INTERACTIVE):
+            with pytest.raises(RpcAttemptBudgetExhaustedError):
+                await gate(_TestRequest("normal"))
+        assert [type(request).__name__ for request in sender.sent] == ["_TestRequest", "GetConfigRequest"][:limit]
+        assert gate.session.dc_id == 2
+        assert sender.auth_key.key == b"test"
+        assert sender.connect_calls == sender.disconnect_calls == 0
+        assert gate._transport_state is _TransportBoundaryState.READY
+        assert gate._connect_owner is None
+    finally:
+        await _close_bootstrap_gate(gate)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [PhoneMigrateError, NetworkMigrateError])
+async def test_normal_authorized_terminal_migration_does_not_switch(
+    monkeypatch: pytest.MonkeyPatch, error: type[PhoneMigrateError] | type[NetworkMigrateError]
+) -> None:
+    gate, sender = await _normal_migration_gate(monkeypatch, (0.0, 0.0))
+    sender.response = lambda request: error(request, capture=3)
+    try:
+        with pytest.raises(error):
+            await _call(gate, _TestRequest("normal"))
+        assert len(sender.sent) == 1
+        assert gate.session.dc_id == 2
+        assert sender.connect_calls == sender.disconnect_calls == 0
+    finally:
+        await _close_bootstrap_gate(gate)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_normal_migration_lookup_failure_preserves_old_transport_and_reservation_blocks_foreign_switch(
+    monkeypatch: pytest.MonkeyPatch, cancel: bool
+) -> None:
+    gate, sender = await _normal_migration_gate(monkeypatch, (0.0,))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def lookup(_client: TelegramClient, _dc: int, *, cdn: bool = False) -> object:
+        del cdn
+        entered.set()
+        await release.wait()
+        raise ValueError("lookup failed")
+
+    monkeypatch.setattr(TelegramClient, "_get_dc", lookup)
+    sender.response = lambda request: UserMigrateError(request, capture=3)
+    caller = asyncio.create_task(_call(gate, _TestRequest("normal")))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        with pytest.raises(TelegramRpcAdmissionDeferred, match="already running"):
+            await _call(gate, _TestRequest("foreign migration"))
+        if cancel:
+            caller.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError if cancel else ValueError):
+            await caller
+        assert sender.connect_calls == sender.disconnect_calls == 0
+        assert len(sender.sent) == 2
+        assert gate.session.dc_id == 2 and sender.auth_key.key == b"test"
+        assert gate._transport_state is _TransportBoundaryState.READY
+        assert gate._connect_owner is None
+    finally:
+        release.set()
+        await asyncio.gather(caller, return_exceptions=True)
+        await _close_bootstrap_gate(gate)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uncertain_cleanup", [False, True])
+@pytest.mark.parametrize("mutation", ["set_dc", "save"])
+async def test_normal_migration_postlookup_mutation_failure_uses_existing_cleanup(
+    monkeypatch: pytest.MonkeyPatch, uncertain_cleanup: bool, mutation: str
+) -> None:
+    gate, sender = await _normal_migration_gate(monkeypatch, (0.0,))
+    sender.response = lambda request: UserMigrateError(request, capture=3)
+    original_set_dc = gate.session.set_dc
+
+    def mutate_then_fail(dc: int, address: str, port: int) -> None:
+        original_set_dc(dc, address, port)
+        raise ValueError("session mutation failed")
+
+    def fail_save() -> None:
+        raise ValueError("session save failed")
+
+    if mutation == "set_dc":
+        gate.session.set_dc = mutate_then_fail
+    else:
+        gate.session.save = fail_save
+    if uncertain_cleanup:
+        sender.disconnect_error = OSError("unconfirmed cleanup")
+    try:
+        with pytest.raises(TelegramRpcAdmissionDeferred if uncertain_cleanup else ValueError):
+            await _call(gate, _TestRequest("normal"))
+        assert gate.session.dc_id == 3
+        assert gate._connection_mutation_started
+        assert sender.disconnect_calls == 1
+        assert len(sender.sent) == 1
+        assert (gate._connect_owner is not None) == uncertain_cleanup
+        assert gate._transport_state is (
+            _TransportBoundaryState.FAILED if uncertain_cleanup else _TransportBoundaryState.DISCONNECTED
+        )
+    finally:
+        sender.disconnect_error = None
+        if uncertain_cleanup:
+            with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
+                await _close_bootstrap_gate(gate)
+            await sender.disconnect()
+            await gate.close_rpc_scheduler()
+        else:
+            await _close_bootstrap_gate(gate)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["retry_delay", "cooldown"])
+async def test_normal_migration_reserves_before_delay_or_cooldown_and_cancels_without_mutation(
+    monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    import mcp_telegram.telegram_rpc as rpc
+
+    gate, sender = await _normal_migration_gate(monkeypatch, (1.0 if phase == "retry_delay" else 0.0,))
+    waiting = asyncio.Event()
+
+    async def wait(_delay: float) -> None:
+        waiting.set()
+        await asyncio.Future()
+
+    def respond(request: object) -> object:
+        if phase == "cooldown":
+            rpc._COOLDOWN_DEADLINE = rpc.time.monotonic() + 30
+        return UserMigrateError(request, capture=3)
+
+    sender.response = respond
+    monkeypatch.setattr(rpc.asyncio, "sleep", wait)
+    caller = asyncio.create_task(_call(gate, _TestRequest("normal")))
+    try:
+        await asyncio.wait_for(waiting.wait(), 2)
+        assert gate._connect_owner is not None
+        with pytest.raises(TelegramRpcAdmissionDeferred, match="already running"):
+            await gate._switch_dc(4)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        assert gate.session.dc_id == 2
+        assert sender.connect_calls == sender.disconnect_calls == 0
+        assert len(sender.sent) == 1
+        assert gate._connect_owner is None
+    finally:
+        rpc.reset_account_cooldown()
+        caller.cancel()
+        await asyncio.gather(caller, return_exceptions=True)
+        await _close_bootstrap_gate(gate)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked", ["deadline", "circuit", "cancel"])
+async def test_normal_migration_rechecks_admission_after_lookup(monkeypatch: pytest.MonkeyPatch, blocked: str) -> None:
+    gate, sender = await _normal_migration_gate(monkeypatch, (0.0,))
+    original_lookup = TelegramClient._get_dc
+    entered, release = asyncio.Event(), asyncio.Event()
+    deadline = asyncio.get_running_loop().time() + 0.25
+
+    async def lookup(client: TelegramClient, dc: int, *, cdn: bool = False) -> object:
+        result = await original_lookup(client, dc, cdn=cdn)
+        entered.set()
+        await release.wait()
+        if blocked == "circuit":
+            gate._rpc_circuit_status = lambda: _CircuitStatus(open=True)
+        elif blocked == "cancel":
+            cast(asyncio.Task[object], asyncio.current_task()).cancel()
+        return result
+
+    async def call() -> object:
+        with demand_context(DemandKind.MCP_REMOTE_ACQUISITION, deadline=deadline):
+            with rpc_scope(TelegramRpcSource.MCP_INTERACTIVE, deadline=deadline):
+                return await gate(_TestRequest("normal"))
+
+    monkeypatch.setattr(TelegramClient, "_get_dc", lookup)
+    sender.response = lambda request: UserMigrateError(request, capture=3)
+    caller = asyncio.create_task(call())
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        if blocked == "deadline":
+            await asyncio.sleep(max(0.0, deadline - asyncio.get_running_loop().time()) + 0.001)
+        release.set()
+        expected = {
+            "deadline": RpcAdmissionExpiredError,
+            "circuit": TelegramRpcThrottled,
+            "cancel": asyncio.CancelledError,
+        }[blocked]
+        with pytest.raises(expected):
+            await caller
+        assert gate.session.dc_id == 2
+        assert sender.connect_calls == sender.disconnect_calls == 0
+        assert gate._connect_owner is None
+        assert not gate._connection_mutation_started
+    finally:
+        release.set()
+        await asyncio.gather(caller, return_exceptions=True)
+        await _close_bootstrap_gate(gate)
+
+
+@pytest.mark.asyncio
+async def test_normal_migration_rechecks_mutable_budget_after_postlookup_cooldown_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mcp_telegram.telegram_rpc as rpc
+
+    gate, sender = await _normal_migration_gate(monkeypatch, (0.0,))
+    original_lookup = TelegramClient._get_dc
+    waiting, release = asyncio.Event(), asyncio.Event()
+    budget = RpcAttemptBudget(2)
+
+    async def lookup(client: TelegramClient, dc: int, *, cdn: bool = False) -> object:
+        result = await original_lookup(client, dc, cdn=cdn)
+        rpc._COOLDOWN_DEADLINE = rpc.time.monotonic() + 30
+        return result
+
+    async def wait(_delay: float) -> None:
+        waiting.set()
+        await release.wait()
+
+    async def call() -> object:
+        with rpc_attempt_budget(budget), rpc_scope(TelegramRpcSource.MCP_INTERACTIVE):
+            return await gate(_TestRequest("normal"))
+
+    monkeypatch.setattr(TelegramClient, "_get_dc", lookup)
+    monkeypatch.setattr(rpc.asyncio, "sleep", wait)
+    sender.response = lambda request: UserMigrateError(request, capture=3)
+    caller = asyncio.create_task(call())
+    try:
+        await asyncio.wait_for(waiting.wait(), 2)
+        budget.debit()
+        rpc.reset_account_cooldown()
+        release.set()
+        with pytest.raises(RpcAttemptBudgetExhaustedError):
+            await caller
+        assert len(sender.sent) == 1
+        assert gate.session.dc_id == 2 and not gate._connection_mutation_started
+        assert sender.connect_calls == sender.disconnect_calls == 0
+        assert gate._connect_owner is None
+    finally:
+        rpc.reset_account_cooldown()
+        release.set()
+        await asyncio.gather(caller, return_exceptions=True)
+        await _close_bootstrap_gate(gate)
 
 
 async def _ignore_cooldown(_deadline: float) -> None:
