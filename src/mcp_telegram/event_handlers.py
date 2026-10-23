@@ -88,8 +88,10 @@ from .dialog_directory import (
     record_realtime_pin_fence,
     sync_active_generation_pins_from_publication,
 )
+from .dialog_fact_observations import claim_dialog_fact
 from .dialog_identity import capture_identity_baseline, publish_dialog_identity
 from .dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation, ObservedText
+from .dialog_pin_observations import claim_pin_delta, claim_pin_snapshot, ordered_pin_overlay
 from .entity_profile.contracts import ProfileFieldObservation
 from .entity_profile.repository import EntityProfileRepository
 from .entity_profile.updates import (
@@ -641,11 +643,6 @@ ON CONFLICT(dialog_id) DO UPDATE SET
     END,
     needs_refresh = 1
 """
-
-# IN-list rewrite — placeholder count substituted at call site:
-_CLEAR_PINS_NOT_IN_SQL_TEMPLATE = (
-    "UPDATE dialogs SET pinned=0, snapshot_at=? WHERE pinned=1 AND dialog_id NOT IN ({placeholders})"
-)
 
 # Empty-list fast path (NOT IN () is invalid SQLite — see review):
 _CLEAR_ALL_PINS_SQL = "UPDATE dialogs SET pinned=0, snapshot_at=? WHERE pinned=1"
@@ -2090,10 +2087,7 @@ class EventHandlerManager:
                 ).fetchall(),
             )
         ]
-        if pinned:
-            current = [dialog_id, *(existing for existing in current if existing != dialog_id)]
-        else:
-            current = [existing for existing in current if existing != dialog_id]
+        current = ordered_pin_overlay(conn, folder_id, current)
         conn.execute("DELETE FROM dialog_directory_published_pins WHERE folder_id=?", (folder_id,))
         conn.executemany(
             "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (?,?,?)",
@@ -2103,7 +2097,12 @@ class EventHandlerManager:
         record_realtime_pin_fence(
             conn,
             folder_id,
-            {"kind": "delta", "dialog_id": dialog_id, "pinned": bool(pinned)},
+            {
+                "kind": "delta",
+                "dialog_id": dialog_id,
+                "pinned": bool(pinned),
+                "observation_order": delivered_observation_order(conn),
+            },
         )
 
     def _project_pinned_eligibility(
@@ -2133,12 +2132,17 @@ class EventHandlerManager:
         published_folder = self._published_pin_folder(folder_id)
         pinned = 1 if update.pinned else 0
         with write_transaction(conn):
+            observation_order = delivered_observation_order(conn)
+            pin_accepted = published_folder is None or claim_pin_delta(
+                conn, published_folder, dialog_id, bool(pinned), observation_order
+            )
             known_dialog = conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
             # ``dialogs.pinned`` is the projection for the main list.  A pin
             # update scoped to another folder must not change that bit.
-            if known_dialog and published_folder == 0:
-                conn.execute(_UPDATE_DIALOG_PINNED_SQL, (pinned, now, dialog_id))
-            self._apply_published_pin_mutation(conn, published_folder, dialog_id, pinned)
+            if pin_accepted:
+                if known_dialog and published_folder == 0:
+                    conn.execute(_UPDATE_DIALOG_PINNED_SQL, (pinned, now, dialog_id))
+                self._apply_published_pin_mutation(conn, published_folder, dialog_id, pinned)
             self._project_pinned_eligibility(conn, dialog_id, folder_id, known_dialog=known_dialog, now=now)
         logger.info("event_dialog_pinned dialog_id=%d pinned=%d", dialog_id, pinned)
 
@@ -2155,25 +2159,15 @@ class EventHandlerManager:
         is_main_folder = published_folder == 0
         pinned_ids = self._collect_pinned_dialog_ids(cast(Sequence[object], order))
         with write_transaction(conn):
-            for dialog_id in pinned_ids:
-                if (
-                    is_main_folder
-                    and conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
-                ):
-                    conn.execute(_UPDATE_DIALOG_PINNED_SQL, (1, now, dialog_id))
+            if published_folder is not None:
+                merged = claim_pin_snapshot(conn, published_folder, delivered_observation_order(conn), pinned_ids)
+                if merged is None:
+                    return
+                pinned_ids = merged
             if is_main_folder:
-                # Main list: rewrite the full pin set — the update is
-                # authoritative for all main-list pins.
-                if pinned_ids:
-                    placeholders = ",".join("?" * len(pinned_ids))
-                    sql = _CLEAR_PINS_NOT_IN_SQL_TEMPLATE.format(
-                        placeholders=placeholders,
-                    )
-                    conn.execute(sql, (now, *pinned_ids))
-                else:
-                    # Empty order list → all dialogs unpinned in main list.
-                    # NOT IN () is invalid SQLite — use the dedicated SQL.
-                    conn.execute(_CLEAR_ALL_PINS_SQL, (now,))
+                conn.execute(_CLEAR_ALL_PINS_SQL, (now,))
+                for dialog_id in pinned_ids:
+                    conn.execute(_UPDATE_DIALOG_PINNED_SQL, (1, now, dialog_id))
             if published_folder is not None:
                 conn.execute("DELETE FROM dialog_directory_published_pins WHERE folder_id=?", (published_folder,))
                 conn.executemany(
@@ -2184,7 +2178,11 @@ class EventHandlerManager:
                 record_realtime_pin_fence(
                     conn,
                     published_folder,
-                    {"kind": "rewrite", "dialog_ids": pinned_ids},
+                    {
+                        "kind": "rewrite",
+                        "dialog_ids": pinned_ids,
+                        "observation_order": delivered_observation_order(conn),
+                    },
                 )
             # For folder-scoped updates (folder_id != None) we only set the
             # pinned=1 rows above; we do not clear other dialogs because the
@@ -2246,6 +2244,13 @@ class EventHandlerManager:
             name = self._username_update_name(update)
             username = self._username_update_alias(update)
             dialog_id = int(update.user_id)
+            observation_order = delivered_observation_order(conn)
+            if name is not IDENTITY_OMITTED and not claim_dialog_fact(conn, dialog_id, "name", observation_order):
+                name = IDENTITY_OMITTED
+            if username is not IDENTITY_OMITTED and not claim_dialog_fact(
+                conn, dialog_id, "username", observation_order
+            ):
+                username = IDENTITY_OMITTED
             baseline_revision = capture_identity_baseline(conn, dialog_id)
             publish_dialog_identity(
                 conn,
