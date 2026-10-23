@@ -821,8 +821,24 @@ CREATE TABLE IF NOT EXISTS dialog_directory_staging (
     eligibility_unread   INTEGER CHECK(eligibility_unread IN (0, 1) OR eligibility_unread IS NULL),
     eligibility_mute_until INTEGER,
     eligibility_observed_at INTEGER,
+    observation_order INTEGER,
+    name_observation_order INTEGER,
+    username_observation_order INTEGER,
+    archived_observation_order INTEGER,
+    unread_count_observation_order INTEGER,
+    unread_mark_observation_order INTEGER,
+    mute_until_observation_order INTEGER,
     PRIMARY KEY(generation, dialog_id)
 ) WITHOUT ROWID
+"""
+
+_DIALOG_FACT_OBSERVATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS dialog_fact_observations (
+    dialog_id INTEGER NOT NULL,
+    field TEXT NOT NULL,
+    observation_order INTEGER NOT NULL,
+    PRIMARY KEY(dialog_id,field)
+)
 """
 
 # v74: account-owned current draft projection.  Zero is reserved exclusively
@@ -4944,10 +4960,7 @@ def _apply_migration_86(conn: sqlite3.Connection, current: int) -> int:
             "ALTER TABLE dialog_directory_staging ADD COLUMN unread_count_observation_order INTEGER",
             "ALTER TABLE dialog_directory_staging ADD COLUMN unread_mark_observation_order INTEGER",
             "ALTER TABLE dialog_directory_staging ADD COLUMN mute_until_observation_order INTEGER",
-            (
-                "CREATE TABLE IF NOT EXISTS dialog_fact_observations (dialog_id INTEGER NOT NULL, "
-                "field TEXT NOT NULL, observation_order INTEGER NOT NULL, PRIMARY KEY(dialog_id,field))"
-            ),
+            _DIALOG_FACT_OBSERVATIONS_DDL,
             (
                 "CREATE TABLE IF NOT EXISTS dialog_pin_observations (folder_id INTEGER NOT NULL, "
                 "dialog_id INTEGER NOT NULL, observation_order INTEGER NOT NULL, pinned INTEGER NOT NULL, "
