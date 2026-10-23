@@ -5,14 +5,17 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Literal, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from jsonschema import validate
+from mcp.types import TextContent
 
 from mcp_telegram.reading import ReadingDeps, ReadingService
 from mcp_telegram.tools import omit_none_mapping_values, reading
 from mcp_telegram.tools._base import TOOL_REGISTRY
+from mcp_telegram.tools.structured import StructuredWarning
 
 
 @pytest.fixture
@@ -59,7 +62,7 @@ async def test_unverified_search_preserves_hits_and_separate_warning(
     local_reading: ReadingService,
     monkeypatch: pytest.MonkeyPatch,
     scoped: bool,
-    message_state: str,
+    message_state: Literal["sent", "all"],
     query: str,
 ) -> None:
     _connect_tool(monkeypatch, local_reading)
@@ -71,13 +74,17 @@ async def test_unverified_search_preserves_hits_and_separate_warning(
     assert payload is not None
     assert payload["count"] == (1 if query == "needle" else 0)
     assert payload["search_index_state"] == "repair_unverified"
-    warning = next(warning for warning in payload["warnings"] if warning["kind"] == "local_search_index_unverified")
+    warnings = cast(list[StructuredWarning], payload["warnings"])
+    warning = next(warning for warning in warnings if warning["kind"] == "local_search_index_unverified")
     assert "may omit retained messages" in warning["message"]
     assert "empty result does not establish" in warning["message"]
-    assert warning["action"] == "Use list_messages to read retained local messages."
-    validate(omit_none_mapping_values(payload), TOOL_REGISTRY["search_messages"].output_schema)
+    assert warning.get("action") == "Use list_messages to read retained local messages."
+    output_schema = TOOL_REGISTRY["search_messages"].output_schema
+    assert output_schema is not None
+    validate(omit_none_mapping_values(payload), output_schema)
     local_reading._deps = replace(local_reading._deps, message_search_index_verified=True)
     verified = await reading.search_messages(args)
+    assert verified.structured_content is not None
     assert verified.structured_content["coverage"] == payload["coverage"]
     assert "search_index_state" not in verified.structured_content
 
@@ -94,13 +101,14 @@ async def test_scheduled_search_does_not_depend_on_sent_index(
     assert not result.is_error
     assert result.structured_content is not None
     assert "search_index_state" not in result.structured_content
-    assert not any(w["kind"] == "local_search_index_unverified" for w in result.structured_content["warnings"])
+    warnings = cast(list[StructuredWarning], result.structured_content["warnings"])
+    assert not any(w["kind"] == "local_search_index_unverified" for w in warnings)
 
 
 @pytest.mark.parametrize("scoped", [False, True])
 @pytest.mark.parametrize("message_state", ["sent", "all"])
 async def test_actual_fts_query_failure_returns_specific_error_and_preserves_list_reads(
-    local_reading: ReadingService, monkeypatch: pytest.MonkeyPatch, scoped: bool, message_state: str
+    local_reading: ReadingService, monkeypatch: pytest.MonkeyPatch, scoped: bool, message_state: Literal["sent", "all"]
 ) -> None:
     local_reading._conn.execute("DROP TABLE messages_fts")
     _connect_tool(monkeypatch, local_reading)
@@ -109,8 +117,10 @@ async def test_actual_fts_query_failure_returns_specific_error_and_preserves_lis
     )
     assert result.is_error
     assert result.error_code == "local_search_index_unavailable"
-    assert "list_messages" in result.content[0].text
-    assert "list_dialogs" not in result.content[0].text
+    error_content = result.content[0]
+    assert isinstance(error_content, TextContent)
+    assert "list_messages" in error_content.text
+    assert "list_dialogs" not in error_content.text
     listed = await local_reading.list_messages({"dialog_id": 1, "message_state": "sent"})
     assert listed["ok"]
     assert listed["data"]["messages"][0]["message_id"] == 7

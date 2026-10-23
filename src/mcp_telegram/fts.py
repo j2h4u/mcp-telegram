@@ -81,19 +81,27 @@ def _fts_repair_scope(conn: sqlite3.Connection) -> dict[str, int | None]:
     }
 
 
+def _parse_fts_repair_receipt(value: object) -> object:
+    if not isinstance(value, str):
+        return None
+    try:
+        return cast(object, json.loads(value))
+    except ValueError, TypeError:
+        return None
+
+
 def _fts_repair_reason(conn: sqlite3.Connection, scope: dict[str, int | None]) -> str:
-    row = conn.execute("SELECT value FROM daemon_state WHERE key=?", (_FTS_REPAIR_RECEIPT_KEY,)).fetchone()
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute("SELECT value FROM daemon_state WHERE key=?", (_FTS_REPAIR_RECEIPT_KEY,)).fetchone(),
+    )
     if row is None:
         return "receipt_missing"
-    try:
-        receipt = json.loads(row[0])
-    except ValueError, TypeError:
+    receipt = _parse_fts_repair_receipt(row[0])
+    if not isinstance(receipt, dict):
         return "receipt_malformed"
-    if (
-        not isinstance(receipt, dict)
-        or receipt.keys() != scope.keys()
-        or any(type(value) not in (int, type(None)) for value in receipt.values())
-    ):
+    receipt = cast(dict[object, object], receipt)
+    if receipt.keys() != scope.keys() or any(type(value) not in (int, type(None)) for value in receipt.values()):
         return "receipt_malformed"
     if scope["account_id"] is None:
         return "account_unknown"

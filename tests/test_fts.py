@@ -419,9 +419,12 @@ def test_receipt_commit_failure_rolls_back_and_retries(receipt_conn: sqlite3.Con
         action: int, arg1: str | None, _arg2: str | None, _db: str | None, _source: str | None
     ) -> int:
         if action == sqlite3.SQLITE_TRANSACTION and arg1 == "COMMIT":
-            row = receipt_conn.execute(
-                "SELECT value FROM daemon_state WHERE key=?", (fts._FTS_REPAIR_RECEIPT_KEY,)
-            ).fetchone()
+            row = cast(
+                tuple[object, ...] | None,
+                receipt_conn.execute(
+                    "SELECT value FROM daemon_state WHERE key=?", (fts._FTS_REPAIR_RECEIPT_KEY,)
+                ).fetchone(),
+            )
             if row is not None:
                 return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
