@@ -130,12 +130,22 @@ historical topic metadata. Partial attempts retain last-good facts and receipts
 while reporting current incompleteness. Missing icon decoration is independent
 of catalog completeness.
 
+Startup FTS repair stores a versioned completion receipt in `sync.db` only
+after both repair passes and the receipt transaction commit. Matching receipts
+skip later sweeps; absent or incompatible receipts require repair. The receipt
+checks keyed live-row coverage and invalid-row cleanup, not every stored text
+or Telegram-history completeness. A failed repair preserves local reads and
+searchable retained matches, with separate `repair_unverified` index state and
+an explicit search warning, including empty results. Scheduled-only search is
+independent. Normal message writes maintain the message/key/FTS projection
+atomically; reads never start repair or Telegram acquisition.
+
 Current implementation debt is tracked explicitly:
 
 | Work | Known departure | Delivery |
 | --- | --- | --- |
 | Non-DM profiles | Reads expose retained facts or explicit partial coverage; automatic acquisition ownership for never-collected group/channel profiles is not supplied by the DM slice | WorkGraph `TG-91`, including completed DM-profile delivery evidence |
-| Startup and offline availability | Telegram/startup readiness currently limits local serving; no whole-process offline guarantee is made | Planned startup investigation `TG-90`; lifecycle design tracked in `TG-91` |
+| Startup and offline availability | Telegram/startup readiness currently limits local serving; no whole-process offline guarantee is made | Completed audit `TG-90`, repeated FTS repair optimization `TG-95`; lifecycle design tracked in `TG-91` |
 
 The WorkGraph delivery tracker `TG-91` separates
 these changes from COMMIT performance and broader replay reliability research.

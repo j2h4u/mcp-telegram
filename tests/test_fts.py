@@ -5,16 +5,21 @@ Tests are ordered: unit tests first, then integration tests.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
+from contextlib import closing
 from pathlib import Path
 from typing import cast
+from unittest.mock import Mock
 
 import pytest
 
+import mcp_telegram.fts as fts
 from mcp_telegram.fts import (
     MESSAGES_FTS_DDL,
     backfill_fts_index,
+    ensure_fts_index,
     stem_query,
     stem_text,
 )
@@ -297,3 +302,143 @@ def test_backfill_fts_index_empty_messages(tmp_sync_db_path: Path) -> None:
         assert count == 0
     finally:
         conn.close()
+
+
+@pytest.fixture()
+def receipt_conn(tmp_sync_db_path: Path) -> Iterator[sqlite3.Connection]:
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    conn.execute("UPDATE dialog_directory_state SET account_id=100 WHERE singleton=1")
+    conn.commit()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def test_fts_receipt_skips_repair_and_survives_connection_reopen(
+    receipt_conn: sqlite3.Connection, tmp_sync_db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert ensure_fts_index(receipt_conn).status == "completed"
+    repair = Mock(side_effect=AssertionError("repair must not run for matching receipt"))
+    monkeypatch.setattr(fts, "backfill_fts_index", repair)
+    receipt_conn.execute("UPDATE dialog_directory_state SET generation=generation+1")
+    receipt_conn.commit()
+    ensure_sync_schema(tmp_sync_db_path)
+    with closing(sqlite3.connect(tmp_sync_db_path)) as reopened:
+        assert ensure_fts_index(reopened).status == "skipped"
+    repair.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        ("missing", "receipt_missing"),
+        ("malformed", "receipt_malformed"),
+        ("list", "receipt_malformed"),
+        ("boolean", "receipt_malformed"),
+        ("version", "algorithm_version_changed"),
+        ("schema", "schema_version_changed"),
+        ("cookie", "schema_cookie_changed"),
+        ("missing_index", "schema_cookie_changed"),
+        ("account", "account_id_changed"),
+        ("unknown", "account_unknown"),
+    ],
+)
+def test_fts_receipt_invalidated(
+    receipt_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, change: str, reason: str
+) -> None:
+    ensure_fts_index(receipt_conn)
+    if change == "missing":
+        receipt_conn.execute("DELETE FROM daemon_state WHERE key=?", (fts._FTS_REPAIR_RECEIPT_KEY,))
+    elif change in {"malformed", "list", "boolean", "version"}:
+        receipt = fts._fts_repair_scope(receipt_conn)
+        value = "{" if change == "malformed" else "[]"
+        if change in {"boolean", "version"}:
+            receipt["algorithm_version"] = True if change == "boolean" else 0
+            value = json.dumps(receipt)
+        receipt_conn.execute("UPDATE daemon_state SET value=? WHERE key=?", (value, fts._FTS_REPAIR_RECEIPT_KEY))
+    elif change == "schema":
+        receipt_conn.execute("UPDATE schema_version SET version=version+10000")
+    elif change in {"cookie", "missing_index"}:
+        receipt_conn.execute("DROP TABLE messages_fts")
+        if change == "cookie":
+            receipt_conn.execute(MESSAGES_FTS_DDL)
+    else:
+        receipt_conn.execute("UPDATE dialog_directory_state SET account_id=?", (None if change == "unknown" else 101,))
+    receipt_conn.commit()
+    repair = Mock(wraps=backfill_fts_index)
+    monkeypatch.setattr(fts, "backfill_fts_index", repair)
+    result = ensure_fts_index(receipt_conn)
+    assert result.status == "completed"
+    assert result.reason == reason
+    repair.assert_called_once_with(receipt_conn)
+    if change != "unknown":
+        assert ensure_fts_index(receipt_conn).status == "skipped"
+        repair.assert_called_once_with(receipt_conn)
+
+
+def test_unknown_account_never_skips_and_binding_repairs_once(receipt_conn: sqlite3.Connection) -> None:
+    receipt_conn.execute("UPDATE dialog_directory_state SET account_id=NULL")
+    receipt_conn.commit()
+    assert ensure_fts_index(receipt_conn).status == "completed"
+    assert ensure_fts_index(receipt_conn).status == "completed"
+    receipt_conn.execute("UPDATE dialog_directory_state SET account_id=100")
+    receipt_conn.commit()
+    assert ensure_fts_index(receipt_conn).status == "completed"
+    assert ensure_fts_index(receipt_conn).status == "skipped"
+
+
+def test_failed_partial_repair_leaves_no_receipt_and_retries(
+    receipt_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ensure_fts_index(receipt_conn)
+    receipt_conn.execute("UPDATE dialog_directory_state SET account_id=101")
+    receipt_conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at,text) VALUES (1,1,1,'hello')")
+    receipt_conn.commit()
+
+    def partial_repair(conn: sqlite3.Connection) -> int:
+        assert backfill_fts_index(conn) == 1
+        raise RuntimeError("failure after committed batch")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(fts, "backfill_fts_index", partial_repair)
+        with pytest.raises(RuntimeError, match="committed batch"):
+            ensure_fts_index(receipt_conn)
+    assert receipt_conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0] == 1
+    assert (
+        receipt_conn.execute("SELECT value FROM daemon_state WHERE key=?", (fts._FTS_REPAIR_RECEIPT_KEY,)).fetchone()
+        is None
+    )
+    assert ensure_fts_index(receipt_conn).status == "completed"
+    assert ensure_fts_index(receipt_conn).status == "skipped"
+
+
+def test_receipt_commit_failure_rolls_back_and_retries(receipt_conn: sqlite3.Connection) -> None:
+    def deny_receipt_commit(
+        action: int, arg1: str | None, _arg2: str | None, _db: str | None, _source: str | None
+    ) -> int:
+        if action == sqlite3.SQLITE_TRANSACTION and arg1 == "COMMIT":
+            row = cast(
+                tuple[object, ...] | None,
+                receipt_conn.execute(
+                    "SELECT value FROM daemon_state WHERE key=?", (fts._FTS_REPAIR_RECEIPT_KEY,)
+                ).fetchone(),
+            )
+            if row is not None:
+                return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    receipt_conn.set_authorizer(deny_receipt_commit)
+    try:
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            ensure_fts_index(receipt_conn)
+    finally:
+        receipt_conn.set_authorizer(None)
+    assert not receipt_conn.in_transaction
+    assert (
+        receipt_conn.execute("SELECT value FROM daemon_state WHERE key=?", (fts._FTS_REPAIR_RECEIPT_KEY,)).fetchone()
+        is None
+    )
+    assert ensure_fts_index(receipt_conn).status == "completed"
+    assert ensure_fts_index(receipt_conn).status == "skipped"
