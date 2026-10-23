@@ -24,6 +24,7 @@ import pytest
 from telethon.tl import types  # type: ignore[import-untyped]
 
 from helpers import build_mock_message
+from mcp_telegram.delivered_update import DeliveredUpdate, current_delivered_update, delivered_update_context
 from mcp_telegram.dialog_identity import capture_identity_baseline, publish_dialog_identity
 from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
 from mcp_telegram.event_handlers import (
@@ -2217,3 +2218,71 @@ async def test_known_channel_unknown_deletion_blocks_delayed_own_archive_in_all_
         sync_db.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (channel_id,)).fetchone()
         == before
     )
+
+
+@pytest.mark.asyncio
+async def test_delivered_message_reuses_admitted_order_and_time(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    insert_synced_dialog(sync_db, 42)
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    event = make_new_message_event(42, build_mock_message(id=502, text="retained"))
+    delivered = DeliveredUpdate(observation_order=991, captured_at=1_700_000_000.75, reaction_sequence=81)
+    for _ in range(2):
+        with delivered_update_context(delivered):
+            await manager.on_new_message(event)
+    assert not delivered.failed
+    assert (
+        sync_db.execute(
+            "SELECT observation_order FROM message_observations WHERE dialog_id=42 AND message_id=502"
+        ).fetchone()[0]
+        == 991
+    )
+    assert sync_db.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=42").fetchone()[0] == 1_700_000_000
+
+
+@pytest.mark.asyncio
+async def test_swallowed_required_callback_failure_marks_delivery(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    monkeypatch.setattr(manager._writer, "run", AsyncMock(side_effect=sqlite3.OperationalError("write failed")))
+    delivered = DeliveredUpdate(observation_order=991, captured_at=1_700_000_000.75, reaction_sequence=81)
+    with delivered_update_context(delivered):
+        await manager.on_message_deleted(make_message_deleted_event(42, [502]))
+    assert delivered.failed
+
+
+@pytest.mark.asyncio
+async def test_new_enrichment_failure_keeps_original_delivery_pending(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(
+            chat_id=42,
+            message=build_mock_message(id=502, text="retained"),
+            is_private=True,
+            get_sender=AsyncMock(return_value=types.User(id=42, first_name="Fresh")),
+        ),
+    )
+
+    def fail_enrollment(*_args: object, **_kwargs: object) -> None:
+        assert current_delivered_update() is None
+        raise sqlite3.OperationalError("enrollment failed")
+
+    monkeypatch.setattr(manager, "_persist_dm_enrollment", fail_enrollment)
+    delivered = DeliveredUpdate(observation_order=991, captured_at=1_700_000_000.75, reaction_sequence=81)
+    with delivered_update_context(delivered):
+        await manager.on_new_message(event)
+    assert delivered.failed
+    assert sync_db.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=42").fetchone()[0] == 0
