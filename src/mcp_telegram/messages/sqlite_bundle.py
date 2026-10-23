@@ -8,6 +8,8 @@ from collections.abc import Sequence
 from dataclasses import asdict, dataclass, fields, replace
 from typing import cast
 
+from mcp_telegram.delivered_update import current_delivered_update
+
 from .. import message_contracts as _message_contracts
 from ..alert_policy import incoming_human_dm_sql
 from ..fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
@@ -388,13 +390,19 @@ def _replace_reaction_projections(
     for item in extracted:
         if not item.reactions_observed:
             continue
+        retained = (
+            current_delivered_update()
+            if source in {ReactionAggregateSource.REALTIME_MESSAGE, ReactionAggregateSource.MESSAGE_EDIT}
+            else None
+        )
         replace_reaction_aggregates(
             conn,
             item.message.dialog_id,
             item.message.message_id,
             tuple(ReactionAggregate(emoji=row.emoji, count=row.count) for row in item.reactions),
             source=source,
-            observed_at=observed_at,
+            observed_at=observed_at if retained is None else int(retained.captured_at),
+            observation_sequence=None if retained is None else retained.reaction_sequence,
             can_see_list=item.reaction_can_see_list,
         )
 

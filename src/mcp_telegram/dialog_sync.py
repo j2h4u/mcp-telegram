@@ -8,6 +8,7 @@ import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime
 from functools import wraps
 from typing import Protocol, cast
@@ -16,9 +17,12 @@ from telethon.errors import PeerIdInvalidError, RPCError  # type: ignore[import-
 from telethon.tl import types  # type: ignore[import-untyped]
 
 from .access_lifecycle import set_access_lost
+from .dialog_fact_observations import claim_dialog_fact
 from .dialog_identity import capture_identity_baseline, publish_dialog_identity
+from .dialog_identity_contracts import IDENTITY_OMITTED
 from .flood import TelegramRpcThrottled, sleep_through_flood
 from .maintenance_logging import log_maintenance_cycle
+from .observation_order import allocate_observation_order
 from .sqlite_writer import SQLiteWriter
 from .sync_transactions import write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
@@ -143,7 +147,12 @@ class DialogReconciliationWorker:
         return await sleep_through_flood(self._shutdown_event, wait_s)
 
     def _persist_light_dialog(
-        self, conn: sqlite3.Connection, dialog_id: int, entity: _EntityLike, identity_revision: int | None
+        self,
+        conn: sqlite3.Connection,
+        dialog_id: int,
+        entity: _EntityLike,
+        identity_revision: int | None,
+        observation_order: int | None = None,
     ) -> None:
         fields = _extract_entity_fields(entity)
         snapshot_at = int(time.time())
@@ -153,15 +162,37 @@ class DialogReconciliationWorker:
                 _UPDATE_DIALOG_ENTITY_SQL,
                 (fields["members"], fields["created"], snapshot_at, dialog_id),
             )
-            if observation is not None:
+            if observation is not None and capture_identity_baseline(conn, dialog_id) == identity_revision:
+                if observation_order is not None:
+                    name = observation.name
+                    username = observation.username
+                    if name is not IDENTITY_OMITTED and not claim_dialog_fact(
+                        conn, dialog_id, "name", observation_order
+                    ):
+                        name = IDENTITY_OMITTED
+                    if username is not IDENTITY_OMITTED and not claim_dialog_fact(
+                        conn, dialog_id, "username", observation_order
+                    ):
+                        username = IDENTITY_OMITTED
+                    observation = replace(
+                        observation,
+                        name=name,
+                        username=username,
+                        complete=observation.complete
+                        and name is not IDENTITY_OMITTED
+                        and username is not IDENTITY_OMITTED,
+                    )
                 publish_dialog_identity(conn, dialog_id, observation, identity_revision)
 
     async def _refresh_light_dialog(self, dialog_id: int, *, refresh_topics: bool = True) -> bool | None:
         """Refresh one dirty dialog; None means shutdown interrupted a wait."""
         identity_revision = await self._writer.run(lambda db: capture_identity_baseline(db, dialog_id))
+        observation_order = await self._writer.run(allocate_observation_order)
         try:
             entity = await self._client.get_entity(dialog_id)
-            await self._writer.run(lambda db: self._persist_light_dialog(db, dialog_id, entity, identity_revision))
+            await self._writer.run(
+                lambda db: self._persist_light_dialog(db, dialog_id, entity, identity_revision, observation_order)
+            )
             if refresh_topics and self._topic_refresher is not None and is_topic_capable(entity):
                 topic_count = await self._refresh_forum_topics(dialog_id, entity)
                 logger.debug(

@@ -12,6 +12,7 @@ from typing import cast
 import pytest
 from telethon.tl import types  # type: ignore[import-untyped]
 
+from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
 from mcp_telegram.drafts.contracts import (
     DraftApplyResult,
     DraftObservation,
@@ -514,4 +515,21 @@ async def test_realtime_persistence_error_requests_durable_recovery() -> None:
         types.UpdateDraftMessage(types.PeerUser(91), types.DraftMessage("draft", datetime(2026, 1, 1, tzinfo=UTC)))
     )
 
+    assert repository.reasons == ["realtime_persistence_failed"]
+
+
+@pytest.mark.asyncio
+async def test_delivered_draft_keeps_capture_time_and_failed_raw_payload() -> None:
+    repository = _Repository()
+    gateway = _Gateway(SnapshotCoverage(42, True, 0), ())
+    owner, _client = await _owner(repository, gateway)
+    update = types.UpdateDraftMessage(types.PeerUser(91), types.DraftMessage("draft", datetime(2026, 1, 1, tzinfo=UTC)))
+    delivered = DeliveredUpdate(observation_order=991, captured_at=1_700_000_000.75, reaction_sequence=81)
+    with delivered_update_context(delivered):
+        await owner.on_raw_draft_update(update)
+    assert repository.realtime[0].observed_at == datetime.fromtimestamp(delivered.captured_at, UTC)
+    repository.realtime_error = RuntimeError("write failed")
+    with delivered_update_context(delivered):
+        await owner.on_raw_draft_update(update)
+    assert delivered.failed
     assert repository.reasons == ["realtime_persistence_failed"]

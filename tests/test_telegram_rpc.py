@@ -322,6 +322,9 @@ def _gate(status: _CircuitStatus | None = None, *, retry_delays: tuple[float, ..
     gate._flood_waited_requests = {}
     gate._no_updates = False
     gate._reconnect_event = asyncio.Event()
+    gate._delivery_repository = None
+    gate._delivery_callbacks = {}
+    gate._active_delivery = None
     gate._connect_owner = None
     gate._connection_capability = None
     gate._connection_rpc_tasks = set()
@@ -2506,6 +2509,9 @@ class _DmEventHandlerGateClient:
 
     async def get_me(self) -> object:
         return await self._gate.get_me()
+
+    async def get_entity(self, _dialog_id: object) -> object:
+        return await self._gate.get_entity(cast(types.TypePeer, _dialog_id))
 
     def __call__(self, _request: object) -> Coroutine[object, object, object]:
         async def call_gate() -> object:

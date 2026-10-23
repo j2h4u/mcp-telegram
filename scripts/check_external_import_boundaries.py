@@ -86,7 +86,10 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "conversation_changes.py",
             "sync_worker.py",
             "sqlite_checkpoint.py",
-            "sqlite_writer.py",  # Sole runtime sync.db connection owner.
+            "sqlite_writer.py",
+            "update_delivery.py",  # Bounded pending envelope through the existing writer.
+            "dialog_fact_observations.py",  # Per-field canonical replay ordering.
+            "dialog_pin_observations.py",  # Pin collection replay ordering.  # Sole runtime sync.db connection owner.
             "transcription_hydration.py",
             "telegram_fact_queries.py",
             "topics/catalog.py",  # Durable topic catalog receipts and page progress in sync.db.
@@ -124,6 +127,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "telegram_access.py",
             "telegram_gateway.py",
             "telegram_rpc.py",
+            "telegram_delivery.py",  # Versioned local TL recovery serialization, no acquisition.
             "telegram_rpc_error.py",
             "telegram_read_receipts.py",
             "transcription_hydration.py",

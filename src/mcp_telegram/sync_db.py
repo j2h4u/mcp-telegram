@@ -16,7 +16,8 @@ from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 85
+_CURRENT_SCHEMA_VERSION = 86
+_UPDATE_DELIVERY_MIGRATION = 86
 _HISTORICAL_FTS_BACKFILL_MIGRATION = 85
 _TOPIC_CATALOG_MIGRATION = 84
 _PROFILE_FIELD_OBSERVATIONS_MIGRATION = 83
@@ -820,8 +821,24 @@ CREATE TABLE IF NOT EXISTS dialog_directory_staging (
     eligibility_unread   INTEGER CHECK(eligibility_unread IN (0, 1) OR eligibility_unread IS NULL),
     eligibility_mute_until INTEGER,
     eligibility_observed_at INTEGER,
+    observation_order INTEGER,
+    name_observation_order INTEGER,
+    username_observation_order INTEGER,
+    archived_observation_order INTEGER,
+    unread_count_observation_order INTEGER,
+    unread_mark_observation_order INTEGER,
+    mute_until_observation_order INTEGER,
     PRIMARY KEY(generation, dialog_id)
 ) WITHOUT ROWID
+"""
+
+_DIALOG_FACT_OBSERVATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS dialog_fact_observations (
+    dialog_id INTEGER NOT NULL,
+    field TEXT NOT NULL,
+    observation_order INTEGER NOT NULL,
+    PRIMARY KEY(dialog_id,field)
+)
 """
 
 # v74: account-owned current draft projection.  Zero is reserved exclusively
@@ -4913,8 +4930,53 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     current = _apply_late_migrations(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _HISTORICAL_FTS_BACKFILL_MIGRATION:
         current = _apply_migration_85(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _UPDATE_DELIVERY_MIGRATION:
+        current = _apply_migration_86(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
+
+
+def _apply_migration_86(conn: sqlite3.Connection, current: int) -> int:
+    return _apply_migration(
+        conn,
+        current,
+        _UPDATE_DELIVERY_MIGRATION,
+        [
+            (
+                "CREATE TABLE IF NOT EXISTS update_delivery (singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
+                "account_id INTEGER NOT NULL, format INTEGER NOT NULL, safe_snapshot TEXT NOT NULL, pending BLOB)"
+            ),
+            (
+                "CREATE TABLE IF NOT EXISTS update_delivery_tokens (position INTEGER PRIMARY KEY, "
+                "observation_order INTEGER NOT NULL, reaction_sequence INTEGER NOT NULL)"
+            ),
+            "ALTER TABLE scheduled_messages ADD COLUMN observation_order INTEGER",
+            "ALTER TABLE scheduled_reconciliation_state ADD COLUMN snapshot_observation_order INTEGER",
+            "ALTER TABLE message_transcriptions ADD COLUMN observation_order INTEGER",
+            "ALTER TABLE dialog_directory_staging ADD COLUMN observation_order INTEGER",
+            "ALTER TABLE dialog_directory_staging ADD COLUMN name_observation_order INTEGER",
+            "ALTER TABLE dialog_directory_staging ADD COLUMN username_observation_order INTEGER",
+            "ALTER TABLE dialog_directory_staging ADD COLUMN archived_observation_order INTEGER",
+            "ALTER TABLE dialog_directory_staging ADD COLUMN unread_count_observation_order INTEGER",
+            "ALTER TABLE dialog_directory_staging ADD COLUMN unread_mark_observation_order INTEGER",
+            "ALTER TABLE dialog_directory_staging ADD COLUMN mute_until_observation_order INTEGER",
+            _DIALOG_FACT_OBSERVATIONS_DDL,
+            (
+                "CREATE TABLE IF NOT EXISTS dialog_directory_pin_snapshots (generation INTEGER NOT NULL, "
+                "folder_id INTEGER NOT NULL, observation_order INTEGER NOT NULL, PRIMARY KEY(generation,folder_id))"
+            ),
+            (
+                "CREATE TABLE IF NOT EXISTS dialog_pin_observations (folder_id INTEGER NOT NULL, "
+                "dialog_id INTEGER NOT NULL, observation_order INTEGER NOT NULL, pinned INTEGER NOT NULL, "
+                "PRIMARY KEY(folder_id,dialog_id))"
+            ),
+            (
+                "CREATE TABLE IF NOT EXISTS dialog_pin_snapshot_observations (folder_id INTEGER PRIMARY KEY, "
+                "observation_order INTEGER NOT NULL)"
+            ),
+        ],
+        ignore_duplicate_column=True,
+    )
 
 
 def _apply_migration_85(conn: sqlite3.Connection, current: int) -> int:

@@ -9,6 +9,7 @@ from typing import cast
 
 import pytest
 
+from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
 from mcp_telegram.fts import stem_text
 from mcp_telegram.hydration_queue import HydrationOutcome, HydrationPriority, HydrationQueueRepository
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
@@ -24,6 +25,7 @@ from mcp_telegram.messages.sqlite_bundle import (
 )
 from mcp_telegram.messages.sqlite_hydration import (
     apply_message_transcription,
+    apply_message_transcription_if_absent,
     stage_message_transcription,
     upsert_message_transcription,
 )
@@ -41,6 +43,7 @@ from mcp_telegram.messages.sqlite_hydration_jobs import (
     repair_transcription_hydration_jobs,
     transcription_hydration_eligible,
 )
+from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.reactions.contracts import ReactionAggregateSource
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
@@ -1225,3 +1228,64 @@ def test_known_peer_deletion_survives_restart_without_body_or_enrollment(tmp_pat
         assert second.execute("SELECT COUNT(*) FROM messages_fts").fetchone() == (0,)
     finally:
         second.close()
+
+
+@pytest.mark.asyncio
+async def test_retained_transcription_replay_rejects_fact_and_all_dependent_effects(conn: sqlite3.Connection) -> None:
+    with write_transaction(conn):
+        insert_messages_with_fts(conn, [_message(904, text=None, media_kind="voice", media_payload="{}")])
+    original = DeliveredUpdate(allocate_observation_order(conn), 100.0, 1)
+    with delivered_update_context(original), write_transaction(conn):
+        assert apply_message_transcription(
+            conn, 42, 904, transcribed_text="old speech", transcription_id=1, received_at=100
+        )
+    with write_transaction(conn):
+        assert apply_message_transcription(
+            conn, 42, 904, transcribed_text="new speech", transcription_id=2, received_at=100
+        )
+        conn.execute("INSERT INTO hydration_jobs(kind,dialog_id,message_id,due_at) VALUES('transcription',42,904,100)")
+    before = conn.execute("SELECT * FROM message_transcriptions").fetchall()
+    with delivered_update_context(original), write_transaction(conn):
+        assert not apply_message_transcription(
+            conn, 42, 904, transcribed_text="old speech", transcription_id=1, received_at=100
+        )
+    assert conn.execute("SELECT * FROM message_transcriptions").fetchall() == before
+    assert conn.execute("SELECT text FROM messages WHERE message_id=904").fetchone() == ("new speech",)
+    assert conn.execute("SELECT stemmed_text FROM messages_fts WHERE message_id=904").fetchone() == (
+        stem_text("new speech"),
+    )
+    assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (1,)
+    assert conn.execute("SELECT COUNT(*) FROM message_versions").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_newer_background_transcription_uses_acquisition_order_against_retained_raw_update(
+    conn: sqlite3.Connection,
+) -> None:
+    _make_hydration_eligible(conn)
+    with write_transaction(conn):
+        insert_messages_with_fts(conn, [_message(905, text=None, media_kind="voice", media_payload="{}")])
+    original = DeliveredUpdate(allocate_observation_order(conn), 100.0, 1)
+    acquired_order = allocate_observation_order(conn)
+    with write_transaction(conn):
+        assert (
+            apply_message_transcription_if_absent(
+                conn,
+                42,
+                905,
+                transcribed_text="background speech",
+                transcription_id=2,
+                received_at=100,
+                observation_order=acquired_order,
+            )
+            == "applied"
+        )
+    with delivered_update_context(original), write_transaction(conn):
+        assert not apply_message_transcription(
+            conn, 42, 905, transcribed_text="old speech", transcription_id=1, received_at=100
+        )
+    assert conn.execute("SELECT text,observation_order FROM message_transcriptions").fetchone() == (
+        "background speech",
+        acquired_order,
+    )
+    assert conn.execute("SELECT text FROM messages WHERE message_id=905").fetchone() == ("background speech",)

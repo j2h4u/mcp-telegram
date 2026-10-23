@@ -802,7 +802,7 @@ requires-dist = [
     { name = "rapidfuzz", specifier = ">=3.14.6" },
     { name = "snowballstemmer", specifier = ">=3.1.1" },
     { name = "starlette", specifier = ">=1.7.0" },
-    { name = "telethon", specifier = ">=1.45.0" },
+    { name = "telethon", specifier = "==1.45.0" },
     { name = "typer", specifier = ">=0.27.3" },
     { name = "uvicorn", specifier = ">=0.54.0" },
     { name = "xdg-base-dirs", specifier = ">=6.0.3" },

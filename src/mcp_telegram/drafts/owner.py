@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Protocol, cast
 
+from mcp_telegram.delivered_update import delivered_observed_datetime, fail_delivered_update
 from mcp_telegram.demand_wiring import DemandOfferSink, offer_durable_demand
 from mcp_telegram.drafts.contracts import DraftObservation, DraftObservationSource, SnapshotCoverage
 from mcp_telegram.drafts.ports import DraftProjectionRepository, DraftSnapshotGateway
@@ -139,6 +140,14 @@ class DraftMessageOwner:
         self._record("draft.recovery", "requested", reason)
 
     async def on_raw_draft_update(self, update: object) -> None:
+        """Report required callback failures before Telethon can swallow them."""
+        try:
+            await self._apply_raw_draft_update(update)
+        except BaseException:
+            fail_delivered_update()
+            raise
+
+    async def _apply_raw_draft_update(self, update: object) -> None:
         """Persist one raw update after the startup account barrier opens.
 
         This callback deliberately performs no Telegram RPC and no peer lookup.
@@ -149,13 +158,14 @@ class DraftMessageOwner:
         await self._update_barrier.wait(self._shutdown_event)
         account_id = self._account_id
         if account_id is None:
+            fail_delivered_update()
             await self.request_recovery("account_unbound")
             return
         observation = normalize_update_draft(
             update,
             account_id=account_id,
             source=DraftObservationSource.REALTIME,
-            observed_at=datetime.now(UTC),
+            observed_at=delivered_observed_datetime(),
         )
         if observation is None:
             await self.request_recovery("normalization_incomplete")
@@ -165,6 +175,7 @@ class DraftMessageOwner:
                 lambda conn: self._repository.for_connection(conn).apply_realtime(observation)
             )
         except Exception:  # noqa: BLE001 - recovery preserves the next authoritative path
+            fail_delivered_update()
             await self.request_recovery("realtime_persistence_failed")
             self._record("draft.observed", "deferred", "persistence_failed")
             return

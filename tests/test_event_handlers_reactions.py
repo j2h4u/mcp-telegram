@@ -31,6 +31,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 
 from helpers import build_mock_message, build_mock_reactions
+from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
 from mcp_telegram.event_handlers import (
     EventHandlerManager,
     _EditedMessageEvent,
@@ -599,3 +600,28 @@ async def test_on_raw_transcribed_audio_missing_row_stages_final_fact(
         "SELECT text, transcription_id FROM message_transcriptions WHERE dialog_id=? AND message_id=?",
         (dialog_id, message_id),
     ).fetchone() == ("speech to text", 3)
+
+
+@pytest.mark.asyncio
+async def test_retained_raw_reaction_replay_reuses_existing_boundary(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    _enroll(sync_db, 42)
+    _insert_msg(sync_db, 42, 500, text="hi")
+    update = cast(
+        _RawReactionUpdate,
+        SimpleNamespace(peer=PeerUser(user_id=42), msg_id=500, reactions=build_mock_reactions({"🔥": 4})),
+    )
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+    enable_runtime_writes(sync_db)
+    delivered = DeliveredUpdate(observation_order=991, captured_at=1_700_000_000.75, reaction_sequence=81)
+    with delivered_update_context(delivered):
+        await manager.on_raw_reaction_update(update)
+    before = sync_db.execute("SELECT * FROM message_reaction_aggregate_state").fetchall()
+    with delivered_update_context(delivered):
+        await manager.on_raw_reaction_update(update)
+    assert not delivered.failed
+    assert sync_db.execute("SELECT * FROM message_reaction_aggregate_state").fetchall() == before
+    assert _last_event_at(sync_db, 42) == 1_700_000_000

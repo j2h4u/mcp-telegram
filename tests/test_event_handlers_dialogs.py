@@ -1428,3 +1428,228 @@ async def test_non_unread_handlers_do_not_insert_into_dialogs_table(
         await mgr.on_new_message(event)
 
     assert _dialogs_count(sync_db) == 1  # raw metadata may create a thin row
+
+
+@pytest.mark.asyncio
+async def test_retained_pin_deltas_preserve_other_peers_and_order(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
+
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+    for dialog_id in (9101, 9102):
+        _insert_dialog(sync_db, dialog_id, pinned=0, snapshot_at=1)
+    publications: list[list[tuple[int]]] = []
+    for order, dialog_id, pinned in ((20, 9102, True), (10, 9101, True), (30, 9101, False), (10, 9101, True)):
+        with delivered_update_context(DeliveredUpdate(order, 100, order)):
+            manager._update_dialog_pinned(
+                sync_db,
+                UpdateDialogPinned(
+                    peer=DialogPeer(peer=PeerUser(user_id=dialog_id)),
+                    pinned=pinned,
+                    folder_id=None,
+                ),
+                100,
+            )
+        publications.append(
+            sync_db.execute("SELECT dialog_id FROM dialog_directory_published_pins ORDER BY position").fetchall()
+        )
+    assert publications == [[(9102,)], [(9102,), (9101,)], [(9102,)], [(9102,)]]
+    assert sync_db.execute("SELECT dialog_id,pinned FROM dialogs ORDER BY dialog_id").fetchall() == [
+        (9101, 0),
+        (9102, 1),
+    ]
+    assert sync_db.execute("SELECT dialog_id FROM dialog_directory_published_pins").fetchall() == [(9102,)]
+
+
+@pytest.mark.asyncio
+async def test_retained_pin_fullset_preserves_newer_delta_and_fences_unknown_old_peer(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
+
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+    for dialog_id in (9201, 9202, 9203):
+        _insert_dialog(sync_db, dialog_id, pinned=0, snapshot_at=1)
+    with delivered_update_context(DeliveredUpdate(30, 100, 30)):
+        manager._update_dialog_pinned(
+            sync_db,
+            UpdateDialogPinned(
+                peer=DialogPeer(peer=PeerUser(user_id=9202)),
+                pinned=True,
+                folder_id=None,
+            ),
+            100,
+        )
+    with delivered_update_context(DeliveredUpdate(20, 100, 20)):
+        manager._rewrite_pinned_dialogs(
+            sync_db,
+            UpdatePinnedDialogs(
+                order=[DialogPeer(peer=PeerUser(user_id=9201))],
+                folder_id=None,
+            ),
+            100,
+        )
+    with delivered_update_context(DeliveredUpdate(10, 100, 10)):
+        manager._update_dialog_pinned(
+            sync_db,
+            UpdateDialogPinned(
+                peer=DialogPeer(peer=PeerUser(user_id=9203)),
+                pinned=True,
+                folder_id=None,
+            ),
+            100,
+        )
+    assert sync_db.execute("SELECT dialog_id FROM dialog_directory_published_pins ORDER BY position").fetchall() == [
+        (9202,),
+        (9201,),
+    ]
+    assert sync_db.execute("SELECT dialog_id,pinned FROM dialogs ORDER BY dialog_id").fetchall() == [
+        (9201, 1),
+        (9202, 1),
+        (9203, 0),
+    ]
+
+
+def test_unread_field_orders_are_independent_and_reject_same_second_replay(sync_db: _SQLiteConnection) -> None:
+    from mcp_telegram.sync_transactions import write_transaction
+    from mcp_telegram.unread_state import apply_unread_facts
+
+    _insert_dialog(sync_db, 9301, snapshot_at=1)
+    with write_transaction(sync_db):
+        apply_unread_facts(sync_db, 9301, observed_at=100, unread_count=5, observation_order=20)
+        apply_unread_facts(sync_db, 9301, observed_at=100, unread_mark=True, observation_order=10)
+        apply_unread_facts(sync_db, 9301, observed_at=100, unread_count=1, observation_order=10)
+    assert sync_db.execute("SELECT unread_count,unread_mark FROM dialogs WHERE dialog_id=9301").fetchone() == (5, 1)
+
+
+@pytest.mark.asyncio
+async def test_retained_archive_fact_survives_rejected_pin_delta(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
+
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+    _insert_dialog(sync_db, 9401, pinned=0, snapshot_at=1)
+    with delivered_update_context(DeliveredUpdate(20, 100, 20)):
+        manager._rewrite_pinned_dialogs(sync_db, UpdatePinnedDialogs(order=[], folder_id=1), 100)
+    with delivered_update_context(DeliveredUpdate(10, 100, 10)):
+        manager._update_dialog_pinned(
+            sync_db,
+            UpdateDialogPinned(
+                peer=DialogPeer(peer=PeerUser(user_id=9401)),
+                pinned=True,
+                folder_id=1,
+            ),
+            100,
+        )
+    assert sync_db.execute("SELECT COUNT(*) FROM dialog_directory_published_pins WHERE folder_id=1").fetchone() == (0,)
+    assert sync_db.execute("SELECT archived FROM dialog_directory_facts WHERE dialog_id=9401").fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+async def test_retained_identity_fields_are_independent_with_matching_second(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
+
+    dialog_id = 9601
+    _insert_dialog(sync_db, dialog_id, snapshot_at=1)
+    sync_db.execute(
+        "INSERT INTO entities(id,type,name,username,name_normalized,updated_at) VALUES (?,?,?,?,?,?)",
+        (dialog_id, "user", "Original", "original", "original", 1),
+    )
+    sync_db.commit()
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+    with delivered_update_context(DeliveredUpdate(20, 100, 20)):
+        manager._update_realtime_username(
+            sync_db,
+            SimpleNamespace(
+                user_id=dialog_id,
+                usernames=[Username("new_alias", active=True)],
+            ),
+            100,
+        )
+    with delivered_update_context(DeliveredUpdate(10, 100, 10)):
+        manager._update_realtime_username(
+            sync_db,
+            SimpleNamespace(
+                user_id=dialog_id,
+                first_name="Retained",
+                last_name="Name",
+                usernames=[Username("old_alias", active=True)],
+            ),
+            100,
+        )
+    assert sync_db.execute("SELECT name,username FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        "Retained Name",
+        "new_alias",
+    )
+    assert sync_db.execute("SELECT name,username FROM entities WHERE id=?", (dialog_id,)).fetchone() == (
+        "Retained Name",
+        "new_alias",
+    )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_retained_pin_does_not_append_active_generation_fence(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
+    from mcp_telegram.dialog_directory import read_realtime_pin_fence
+
+    _insert_dialog(sync_db, 9701, pinned=0, snapshot_at=1)
+    sync_db.execute("UPDATE dialog_directory_state SET status='in_progress',generation=1 WHERE singleton=1")
+    sync_db.commit()
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+    update = UpdateDialogPinned(peer=DialogPeer(peer=PeerUser(user_id=9701)), pinned=True, folder_id=None)
+    for _ in range(2):
+        with delivered_update_context(DeliveredUpdate(20, 100, 20)):
+            manager._update_dialog_pinned(sync_db, update, 100)
+    assert len(read_realtime_pin_fence(sync_db, 1, 0)) == 1
+    assert sync_db.execute(
+        "SELECT dialog_id,position FROM dialog_directory_pins WHERE generation=1 AND folder_id=0"
+    ).fetchall() == [(9701, 0)]
+
+
+@pytest.mark.asyncio
+async def test_retained_pin_order_survives_pending_authoritative_snapshot(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
+    from mcp_telegram.dialog_directory import _commit_pinned_generation
+    from mcp_telegram.sync_transactions import write_transaction
+
+    for dialog_id in (9901, 9902, 9903):
+        _insert_dialog(sync_db, dialog_id, pinned=0, snapshot_at=1)
+    sync_db.execute("UPDATE dialog_directory_state SET status='in_progress',generation=1 WHERE singleton=1")
+    sync_db.commit()
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+    for order, dialog_id in ((20, 9902), (10, 9901)):
+        with delivered_update_context(DeliveredUpdate(order, 100, order)):
+            manager._update_dialog_pinned(
+                sync_db,
+                UpdateDialogPinned(
+                    peer=DialogPeer(peer=PeerUser(user_id=dialog_id)),
+                    pinned=True,
+                    folder_id=None,
+                ),
+                100,
+            )
+    with write_transaction(sync_db):
+        _commit_pinned_generation(sync_db, 1, 0, [9903], observation_order=5)
+    assert sync_db.execute(
+        "SELECT dialog_id FROM dialog_directory_pins WHERE generation=1 AND folder_id=0 ORDER BY position"
+    ).fetchall() == [(9902,), (9901,), (9903,)]

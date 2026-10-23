@@ -13,6 +13,7 @@ from concurrent.futures import Future
 from pathlib import Path
 from typing import cast
 
+from .delivered_update import isolate_delivered_update
 from .sync_db import open_runtime_sync_db
 
 _STOP = None
@@ -78,7 +79,9 @@ class SQLiteWriter:
                 self._slots.release()
                 raise RuntimeError("SQLite writer is unavailable") from self._fatal_error
             result: Future[object] = Future()
-            self._queue.put((callback, result, contextvars.copy_context(), time.monotonic()))
+            context = contextvars.copy_context()
+            isolate_delivered_update(context)
+            self._queue.put((callback, result, context, time.monotonic()))
         wrapped = asyncio.wrap_future(result)
         try:
             await asyncio.wait({wrapped})

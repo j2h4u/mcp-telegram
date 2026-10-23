@@ -13,12 +13,15 @@ from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
+from telethon import types
 from telethon.errors import ChannelPrivateError
 from telethon.tl.types import PeerUser
 
+from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
 from mcp_telegram.event_handlers import _NewMessageEvent
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.linked_chat_fact import LinkedChatFact, LinkedChatState, linked_chat_fact_owner
+from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.own_only import OwnOnlyContext, query_own_only_candidates
 from mcp_telegram.scheduled_messages import (
     ScheduledDiscoveryDemandAdapter,
@@ -99,7 +102,9 @@ class _ScheduledSnapshotClient:
         if self.call_error is not None:
             raise self.call_error
         dialog_id = int(cast(int, cast(SimpleNamespace, _request).peer))
-        return SimpleNamespace(messages=self.snapshots.get(dialog_id, []), users=[], chats=[])
+        return types.messages.Messages(
+            messages=cast(list[types.TypeMessage], self.snapshots.get(dialog_id, [])), topics=[], users=[], chats=[]
+        )
 
 
 @pytest.fixture()
@@ -849,7 +854,7 @@ async def test_concurrent_event_prevents_stale_snapshot_apply(conn: sqlite3.Conn
             with write_transaction(conn):
                 upsert_scheduled_message(conn, 42, _message(12), now=200)
             conn.commit()
-            return SimpleNamespace(messages=[])
+            return types.messages.Messages(messages=[], topics=[], users=[], chats=[])
 
     worker = ScheduledMessageReconciler(
         _ConcurrentClient(),
@@ -1169,3 +1174,92 @@ async def test_excluded_discovery_removes_only_scheduled_ownership_basis(conn: s
     assert conn.execute("SELECT inclusion_basis FROM own_only_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
         '["owned_channel"]',
     )
+
+
+@pytest.mark.asyncio
+async def test_retained_scheduled_updates_cannot_overwrite_newer_queue_effects(conn: sqlite3.Connection) -> None:
+    original = DeliveredUpdate(allocate_observation_order(conn), 100.0, 1)
+    with delivered_update_context(original), write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(11, "old"), now=100)
+    with write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(11, "new"), now=100)
+    before = conn.execute("SELECT dirty_generation FROM scheduled_reconciliation_state").fetchone()
+    with delivered_update_context(original), write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(11, "old"), now=100)
+        mark_scheduled_messages_removed(conn, 42, [11], now=100)
+    assert conn.execute("SELECT text,message_state FROM scheduled_messages").fetchone() == ("new", "scheduled")
+    assert conn.execute("SELECT dirty_generation FROM scheduled_reconciliation_state").fetchone() == before
+    with write_transaction(conn):
+        mark_scheduled_messages_removed(conn, 42, [11], now=100)
+    before = conn.execute("SELECT * FROM scheduled_messages").fetchall()
+    with delivered_update_context(original), write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(11, "old"), now=100)
+    assert conn.execute("SELECT * FROM scheduled_messages").fetchall() == before
+    assert conn.execute("SELECT COUNT(*) FROM scheduled_messages_fts").fetchone() == (0,)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.asyncio
+async def test_authoritative_snapshot_fences_retained_create_including_unknown_absent_id(
+    conn: sqlite3.Connection, empty: bool
+) -> None:
+    original = DeliveredUpdate(allocate_observation_order(conn), 100.0, 1)
+    conn.execute(
+        "INSERT INTO scheduled_reconciliation_state(dialog_id,repair_due_at,discovery_due_at,updated_at) "
+        "VALUES(42,0,0,0)"
+    )
+    conn.commit()
+    client = _ScheduledSnapshotClient({42: [] if empty else [_message(11, "snapshot")]})
+    worker = ScheduledMessageReconciler(
+        client,
+        conn,
+        asyncio.Event(),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
+        writer=inline_writer(conn),
+    )
+    await worker.run_demand_slice(DemandKind.SCHEDULED_REPAIR)
+    assert len(client.requests) == 1
+    assert conn.execute("SELECT snapshot_observation_order FROM scheduled_reconciliation_state").fetchone() == (2,)
+    with delivered_update_context(original), write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(11, "old"), now=100)
+        upsert_scheduled_message(conn, 42, _message(12, "absent"), now=100)
+        mark_scheduled_messages_removed(conn, 42, [11, 12], now=100)
+    assert conn.execute("SELECT message_id,text,message_state FROM scheduled_messages").fetchall() == (
+        [] if empty else [(11, "snapshot", "scheduled")]
+    )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        types.messages.MessagesNotModified(count=0),
+        SimpleNamespace(messages=[]),
+        types.messages.Messages(messages=cast(list[types.TypeMessage], None), topics=[], chats=[], users=[]),
+        types.messages.MessagesSlice(count=1, messages=[], topics=[], chats=[], users=[]),
+        types.messages.MessagesSlice(count=0, messages=[], topics=[], chats=[], users=[], inexact=True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_incomplete_scheduled_response_never_advances_authoritative_absence_floor(
+    conn: sqlite3.Connection, response: object
+) -> None:
+    conn.execute(
+        "INSERT INTO scheduled_reconciliation_state(dialog_id,repair_due_at,discovery_due_at,updated_at) "
+        "VALUES(42,0,0,0)"
+    )
+    conn.commit()
+
+    class Client(_ScheduledSnapshotClient):
+        async def __call__(self, _request: object, **_kwargs: object) -> object:
+            return response
+
+    worker = ScheduledMessageReconciler(
+        Client(),
+        conn,
+        asyncio.Event(),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
+        writer=inline_writer(conn),
+    )
+    with pytest.raises(ValueError, match="scheduled history"):
+        await worker.run_demand_slice(DemandKind.SCHEDULED_REPAIR)
+    assert conn.execute("SELECT snapshot_observation_order FROM scheduled_reconciliation_state").fetchone() == (None,)

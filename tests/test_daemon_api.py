@@ -12,6 +12,7 @@ import json
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,6 +33,7 @@ from mcp_telegram.daemon_api import (
 )
 from mcp_telegram.daemon_ipc import get_daemon_socket_path
 from mcp_telegram.daemon_message import _MessageLike, fetch_reaction_counts, message_to_dict
+from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
 from mcp_telegram.dialog_directory_coverage import read_dialog_directory_coverage
 from mcp_telegram.dialog_selector import required_dialog_selector
 from mcp_telegram.event_handlers import EventHandlerManager, _InboxReadUpdateLike
@@ -48,6 +50,7 @@ from mcp_telegram.reading.sqlite_projection import (
 from mcp_telegram.runtime_observations import RuntimeObservationSink, record_runtime_observation
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import (
+    _DIALOG_FACT_OBSERVATIONS_DDL,
     _RUNTIME_OBSERVATIONS_V54_DDL,
     _apply_migration_84,
     _apply_migrations,
@@ -965,6 +968,7 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
 def _make_db_with_dialogs(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.Connection:
     """_make_db() + dialogs table + 4 indexes (Phase 40 schema v17)."""
     conn = _make_db(with_fts=with_fts, with_entities=with_entities)
+    conn.execute(_DIALOG_FACT_OBSERVATIONS_DDL)
     conn.execute("DROP TABLE IF EXISTS dialogs")
     conn.execute(
         """
@@ -3366,7 +3370,8 @@ async def test_list_unread_messages_basic() -> None:
 
 
 @pytest.mark.asyncio
-async def test_raw_inbox_read_updates_cursor_before_get_inbox_projection() -> None:
+@pytest.mark.parametrize("retained", [False, True])
+async def test_raw_inbox_read_updates_cursor_before_get_inbox_projection(retained: bool) -> None:
     """Raw read updates make the corresponding message disappear from GetInbox."""
     conn = _make_db_with_dialogs()
     dialog_id = 1001
@@ -3379,23 +3384,27 @@ async def test_raw_inbox_read_updates_cursor_before_get_inbox_projection() -> No
         client, conn, asyncio.Event(), writer=inline_writer(conn), profile_detail_ttl_seconds=300
     )
     manager._synced_dialog_ids.add(dialog_id)
-    await manager.on_raw_inbox_read(
-        cast(
-            _InboxReadUpdateLike,
-            UpdateReadHistoryInbox(
-                peer=PeerUser(user_id=dialog_id),
-                max_id=11,
-                still_unread_count=0,
-                pts=1,
-                pts_count=1,
-                folder_id=None,
-            ),
+    with delivered_update_context(DeliveredUpdate(900, 100, 900)) if retained else nullcontext():
+        await manager.on_raw_inbox_read(
+            cast(
+                _InboxReadUpdateLike,
+                UpdateReadHistoryInbox(
+                    peer=PeerUser(user_id=dialog_id),
+                    max_id=11,
+                    still_unread_count=0,
+                    pts=1,
+                    pts_count=1,
+                    folder_id=None,
+                ),
+            )
         )
-    )
 
     assert conn.execute("SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
         11,
     )
+    assert conn.execute("SELECT unread_count FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (0,)
+    if retained:
+        assert conn.execute("SELECT observation_order FROM dialog_fact_observations").fetchone() == (900,)
     result = await make_server(conn, client)._dispatch(
         {"method": "get_inbox", "limit": 100, "group_size_threshold": 100}
     )

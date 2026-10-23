@@ -10,6 +10,9 @@ from __future__ import annotations
 import sqlite3
 from typing import Final, cast
 
+from .delivered_update import current_delivered_update
+from .dialog_fact_observations import claim_dialog_fact
+
 _UNSET: Final = object()
 
 
@@ -22,6 +25,7 @@ def apply_unread_facts(  # noqa: PLR0913
     unread_mark: bool | object | None = _UNSET,
     mark_needs_refresh: bool = False,
     create_missing: bool = False,
+    observation_order: int | None = None,
 ) -> int:
     """Write one or both exact Telegram unread facts.
 
@@ -34,31 +38,32 @@ def apply_unread_facts(  # noqa: PLR0913
 
     Returns the number of existing snapshot rows updated (0 or 1).
     """
+    ordered = observation_order is not None or current_delivered_update() is not None
     assignments: list[str] = []
     values: list[object] = []
-    if unread_count is not _UNSET and unread_count is not None:
+    if unread_count not in (_UNSET, None) and claim_dialog_fact(conn, dialog_id, "unread_count", observation_order):
         assignments.extend(
             (
                 (
-                    "unread_count = CASE WHEN unread_count_observed_at IS NULL "
+                    f"unread_count = CASE WHEN {int(ordered)} OR unread_count_observed_at IS NULL "
                     "OR unread_count_observed_at <= ? THEN ? ELSE unread_count END"
                 ),
                 (
-                    "unread_count_observed_at = CASE WHEN unread_count_observed_at IS NULL "
+                    f"unread_count_observed_at = CASE WHEN {int(ordered)} OR unread_count_observed_at IS NULL "
                     "OR unread_count_observed_at <= ? THEN ? ELSE unread_count_observed_at END"
                 ),
             )
         )
         values.extend((observed_at, int(cast(int, unread_count)), observed_at, observed_at))
-    if unread_mark is not _UNSET and unread_mark is not None:
+    if unread_mark not in (_UNSET, None) and claim_dialog_fact(conn, dialog_id, "unread_mark", observation_order):
         assignments.extend(
             (
                 (
-                    "unread_mark = CASE WHEN unread_mark_observed_at IS NULL "
+                    f"unread_mark = CASE WHEN {int(ordered)} OR unread_mark_observed_at IS NULL "
                     "OR unread_mark_observed_at <= ? THEN ? ELSE unread_mark END"
                 ),
                 (
-                    "unread_mark_observed_at = CASE WHEN unread_mark_observed_at IS NULL "
+                    f"unread_mark_observed_at = CASE WHEN {int(ordered)} OR unread_mark_observed_at IS NULL "
                     "OR unread_mark_observed_at <= ? THEN ? ELSE unread_mark_observed_at END"
                 ),
             )

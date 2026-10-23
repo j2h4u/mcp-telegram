@@ -125,6 +125,15 @@ def test_fresh_schema_has_separate_identity_fence_and_complete_presence_trigger(
     )
     assert "baseline_identity_revision" in {row[1] for row in baseline_columns}
     assert "identity_fields_observed" in {row[1] for row in staging_columns}
+    assert {
+        "observation_order",
+        "name_observation_order",
+        "username_observation_order",
+        "archived_observation_order",
+        "unread_count_observation_order",
+        "unread_mark_observation_order",
+        "mute_until_observation_order",
+    } <= {row[1] for row in staging_columns}
 
 
 def test_v77_upgrade_seeds_only_legacy_dialog_facts_and_restarts_incomplete_generation(

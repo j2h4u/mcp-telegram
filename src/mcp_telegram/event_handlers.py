@@ -24,6 +24,7 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import wraps
@@ -73,6 +74,12 @@ from .channel_full_siblings import (
     capture_channel_full_siblings_token,
     write_channel_full_siblings,
 )
+from .delivered_update import (
+    current_delivered_update,
+    delivered_observed_at,
+    delivered_update_context,
+    fail_delivered_update,
+)
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_directory import (
     apply_active_generation_pin_delta,
@@ -81,8 +88,10 @@ from .dialog_directory import (
     record_realtime_pin_fence,
     sync_active_generation_pins_from_publication,
 )
+from .dialog_fact_observations import claim_dialog_fact
 from .dialog_identity import capture_identity_baseline, publish_dialog_identity
 from .dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation, ObservedText
+from .dialog_pin_observations import claim_pin_delta, claim_pin_snapshot, ordered_pin_overlay
 from .entity_profile.contracts import ProfileFieldObservation
 from .entity_profile.repository import EntityProfileRepository
 from .entity_profile.updates import (
@@ -126,7 +135,7 @@ from .messages.telegram_adapter import (
 from .messages.telegram_adapter import (
     extract_message_row,
 )
-from .observation_order import allocate_observation_order
+from .observation_order import delivered_observation_order
 from .reactions.contracts import ReactionAggregate, ReactionAggregateSource, ReactionObservationBoundary
 from .reactions.persistence import allocate_observation_boundary, replace_reaction_aggregates
 from .reactions.projection import project_reaction_aggregates, project_reaction_visibility
@@ -194,13 +203,17 @@ def _demand_root[**P, R](
         @wraps(func)
         async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
             manager = cast(EventHandlerManager, args[0])
-            await manager._wait_for_update_barrier()
             try:
-                current_demand_token()
-            except UnclassifiedTelegramDemandError:
-                with demand_context(kind):
-                    return await func(*args, **kwargs)
-            return await func(*args, **kwargs)
+                await manager._wait_for_update_barrier()
+                try:
+                    current_demand_token()
+                except UnclassifiedTelegramDemandError:
+                    with demand_context(kind):
+                        return await func(*args, **kwargs)
+                return await func(*args, **kwargs)
+            except BaseException:
+                fail_delivered_update()
+                raise
 
         return wrapped
 
@@ -305,10 +318,6 @@ class _NewMessageEvent(Protocol):
     is_private: bool
     message: _MessageLike
 
-    async def get_sender(self) -> _SenderLike | None: ...
-
-    async def get_chat(self) -> _SenderLike | None: ...
-
 
 class _EditedMessageEvent(Protocol):
     chat_id: int | None
@@ -362,7 +371,7 @@ def _apply_observed_inbox_read(  # noqa: PLR0913
             dialog_id,
             max_id=max_id,
             unread_count=still_unread,
-            observed_at=int(time.time()),
+            observed_at=delivered_observed_at(),
         )
         after_cursor, after_unread = _read_state(conn, dialog_id)
     changed = before_cursor != after_cursor or before_unread != after_unread
@@ -534,6 +543,8 @@ class _EventHandlerClient(Protocol):
 
     async def get_me(self) -> object: ...
 
+    async def get_entity(self, _dialog_id: object) -> object: ...
+
     def __call__(self, _request: object) -> Coroutine[object, object, object]: ...
 
 
@@ -576,6 +587,18 @@ def _first_non_empty_str(*values: object) -> str | None:
         if isinstance(value, str) and value != "":
             return value
     return None
+
+
+def _newer_dialog_identity_fields(conn: sqlite3.Connection, dialog_id: int, order: int) -> frozenset[str]:
+    rows = cast(
+        list[tuple[str]],
+        conn.execute(
+            "SELECT field FROM dialog_fact_observations WHERE dialog_id=? AND observation_order>? "
+            "AND field IN ('name','username')",
+            (dialog_id, order),
+        ).fetchall(),
+    )
+    return frozenset(field for (field,) in rows)
 
 
 # ---------------------------------------------------------------------------
@@ -630,11 +653,6 @@ ON CONFLICT(dialog_id) DO UPDATE SET
     END,
     needs_refresh = 1
 """
-
-# IN-list rewrite — placeholder count substituted at call site:
-_CLEAR_PINS_NOT_IN_SQL_TEMPLATE = (
-    "UPDATE dialogs SET pinned=0, snapshot_at=? WHERE pinned=1 AND dialog_id NOT IN ({placeholders})"
-)
 
 # Empty-list fast path (NOT IN () is invalid SQLite — see review):
 _CLEAR_ALL_PINS_SQL = "UPDATE dialogs SET pinned=0, snapshot_at=? WHERE pinned=1"
@@ -829,6 +847,7 @@ class EventHandlerManager:
         except RpcAdmissionClosedError:
             raise
         except Exception:
+            fail_delivered_update()
             logger.exception("participant_update_self_id_unavailable")
         return self._self_id
 
@@ -935,8 +954,19 @@ class EventHandlerManager:
         expected_revision = (
             baseline_revision if baseline_revision is not None else (0 if not row_existed_before_presence else None)
         )
-        if expected_revision is None:
+        if expected_revision is None or capture_identity_baseline(conn, dialog_id) != expected_revision:
             return
+        order = delivered_observation_order(conn)
+        name_accepted = observation.name is IDENTITY_OMITTED or claim_dialog_fact(conn, dialog_id, "name", order)
+        username_accepted = observation.username is IDENTITY_OMITTED or claim_dialog_fact(
+            conn, dialog_id, "username", order
+        )
+        observation = replace(
+            observation,
+            name=observation.name if name_accepted else IDENTITY_OMITTED,
+            username=observation.username if username_accepted else IDENTITY_OMITTED,
+            complete=all((observation.complete, name_accepted, username_accepted)),
+        )
         publish_dialog_identity(
             conn,
             dialog_id,
@@ -949,15 +979,21 @@ class EventHandlerManager:
     ) -> None:
         try:
             with write_transaction(conn):
+                retained = current_delivered_update()
+                newer_fields = (
+                    frozenset()
+                    if retained is None
+                    else _newer_dialog_identity_fields(conn, dialog_id, retained.observation_order)
+                )
                 apply_partial_entity_identity(
                     conn,
                     dialog_id,
                     PartialEntityIdentity(
                         observed_at=observed_at,
                         observed_type=identity.entity_type,
-                        name_observed=identity.name_observed,
+                        name_observed=identity.name_observed and "name" not in newer_fields,
                         name=identity.name,
-                        username_observed=identity.username_observed,
+                        username_observed=identity.username_observed and "username" not in newer_fields,
                         username=identity.username,
                     ),
                 )
@@ -987,7 +1023,7 @@ class EventHandlerManager:
         so the resolver can find this contact immediately.  Identity lookup is
         best-effort: a missing peer still receives a visible thin dialog row.
         """
-        now = int(time.time()) if observed_at is None else observed_at
+        now = delivered_observed_at() if observed_at is None else observed_at
         message_timestamp = int(message_date.timestamp()) if message_date is not None else None
         identity = self._dm_identity(sender, dialog_id=dialog_id, observed_at=now)
 
@@ -1016,6 +1052,7 @@ class EventHandlerManager:
                 self._synced_dialog_ids.add(dialog_id)
                 logger.info("dm_auto_enroll dialog_id=%d", dialog_id)
         except Exception:
+            fail_delivered_update()
             logger.exception("dm_auto_enroll_failed dialog_id=%d", dialog_id)
             return False
         if identity is not None:
@@ -1075,11 +1112,11 @@ class EventHandlerManager:
         if dialog_id is None:
             return
         try:
-            reaction_observed_at = int(time.time())
+            reaction_observed_at = delivered_observed_at()
             msg = event.message
 
             def reserve_observation(conn: sqlite3.Connection) -> tuple[int, _IdentityBaseline]:
-                return allocate_observation_order(conn), _IdentityBaseline(capture_identity_baseline(conn, dialog_id))
+                return delivered_observation_order(conn), _IdentityBaseline(capture_identity_baseline(conn, dialog_id))
 
             observation_order, identity_baseline = await self._writer.run(reserve_observation)
             coverage = await self._new_message_coverage(dialog_id, event, identity_baseline=identity_baseline)
@@ -1103,7 +1140,7 @@ class EventHandlerManager:
                     dialog_id, msg, coverage, observation_order=observation_order
                 )
                 return
-            now = int(time.time())
+            now = delivered_observed_at()
 
             def _persist_event_0(conn: sqlite3.Connection) -> bool:
                 with write_transaction(conn):
@@ -1141,6 +1178,7 @@ class EventHandlerManager:
         except RpcAdmissionClosedError:
             raise
         except Exception as exc:
+            fail_delivered_update()
             logger.exception(
                 "event_new_failed dialog_id=%s sqlite_errorcode=%s sqlite_errorname=%s",
                 dialog_id,
@@ -1159,32 +1197,45 @@ class EventHandlerManager:
         if coverage is not RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
             return coverage
         await self._writer.run(
-            lambda conn: self._verify_scheduled_publication_if_needed(conn, dialog_id, event.message)
+            lambda conn: self._verify_scheduled_publication_if_needed(
+                conn, dialog_id, event.message, now=delivered_observed_at()
+            )
         )
         if bool(getattr(event.message, "from_scheduled", False)):
             self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
         status, _ = self._realtime_history_status.read_status(dialog_id)
         if event.is_private and status is None:
-            peer = None
-            try:
-                lookup = (
-                    getattr(event, "get_chat", None)
-                    if bool(getattr(event.message, "out", False))
-                    else getattr(event, "get_sender", None)
-                )
-                if callable(lookup):
-                    peer = await cast(Callable[[], Awaitable[_SenderLike | None]], lookup)()
-            except _DM_AUTO_ENROLL_SENDER_EXCEPTIONS:
-                logger.debug("dm_auto_enroll_peer_fetch_failed dialog_id=%d", dialog_id)
-            await self._auto_enroll_dm(
+            await self._enroll_new_private_message(dialog_id, event, identity_baseline)
+            coverage = self._realtime_coverage(dialog_id)
+        return coverage
+
+    async def _enroll_new_private_message(
+        self,
+        dialog_id: int,
+        event: _NewMessageEvent,
+        identity_baseline: _IdentityBaseline | None,
+    ) -> None:
+        peer_field = "chat" if bool(getattr(event.message, "out", False)) else "sender"
+        cached_peer = cast(_SenderLike | None, getattr(event, peer_field, None))
+        peer: _SenderLike | None = cached_peer
+        acquired_peer = False
+        try:
+            if peer is None or bool(cast(object, getattr(peer, "min", False))):
+                # The pinned get_entity(PeerUser) path returns a GetUsers RPC response, not a cached getter result.
+                peer = cast(_SenderLike | None, await self._client.get_entity(PeerUser(dialog_id)))
+                acquired_peer = peer is not None
+        except _DM_AUTO_ENROLL_SENDER_EXCEPTIONS:
+            logger.debug("dm_auto_enroll_peer_fetch_failed dialog_id=%d", dialog_id)
+        with delivered_update_context(None) if acquired_peer else nullcontext():
+            enrolled = await self._auto_enroll_dm(
                 dialog_id,
                 sender=peer,
                 message_date=event.message.date,
-                observed_at=int(time.time()),
+                observed_at=delivered_observed_at(),
                 identity_baseline=identity_baseline,
             )
-            coverage = self._realtime_coverage(dialog_id)
-        return coverage
+        if not enrolled:
+            fail_delivered_update()
 
     async def _project_denied_new_message_metadata(
         self,
@@ -1196,7 +1247,7 @@ class EventHandlerManager:
     ) -> None:
         if not self._metadata_realtime_allowed(coverage):
             return
-        now = int(time.time())
+        now = delivered_observed_at()
 
         def _persist_event_0(conn: sqlite3.Connection) -> None:
             with write_transaction(conn):
@@ -1249,11 +1300,11 @@ class EventHandlerManager:
             dialog_id = int(get_peer_id(cast(TypePeer, peer)))
             if not self._metadata_realtime_allowed(self._realtime_coverage(dialog_id)):
                 return
-            now = int(time.time())
+            now = delivered_observed_at()
 
             def _persist_event_0(conn: sqlite3.Connection) -> None:
                 with write_transaction(conn):
-                    observation_order = allocate_observation_order(conn)
+                    observation_order = delivered_observation_order(conn)
                     if not self._metadata_realtime_allowed(
                         realtime_history_coverage(*_SQLiteRealtimeHistoryStatusReader(conn).read_status(dialog_id))
                     ):
@@ -1264,6 +1315,7 @@ class EventHandlerManager:
 
             await self._writer.run(_persist_event_0)
         except Exception:
+            fail_delivered_update()
             logger.exception("event_raw_topic_message_failed update=%r", type(update).__name__)
 
     def _handle_topic_message_action(
@@ -1381,10 +1433,10 @@ class EventHandlerManager:
             return
 
         try:
-            observation_order = await self._writer.run(allocate_observation_order)
+            observation_order = await self._writer.run(delivered_observation_order)
             msg = event.message
             message_id = int(msg.id)
-            now = int(time.time())
+            now = delivered_observed_at()
             coverage = self._realtime_coverage(dialog_id)
             if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
                 return
@@ -1427,6 +1479,7 @@ class EventHandlerManager:
         except RpcAdmissionClosedError:
             raise
         except Exception:
+            fail_delivered_update()
             logger.exception("event_edit_failed dialog_id=%s", dialog_id)
 
     async def _insert_missing_edited_message(
@@ -1545,11 +1598,12 @@ class EventHandlerManager:
             try:
                 await self._writer.run(lambda conn: self._handle_peerless_deletions(conn, event.deleted_ids))
             except Exception:
+                fail_delivered_update()
                 logger.exception("event_delete_failed dialog_id=%s", dialog_id)
             return
 
         try:
-            now = int(time.time())
+            now = delivered_observed_at()
 
             def _persist_event_0(conn: sqlite3.Connection) -> None:
                 with write_transaction(conn):
@@ -1574,10 +1628,11 @@ class EventHandlerManager:
 
             logger.info("event_delete dialog_id=%d count=%d", dialog_id, len(event.deleted_ids))
         except Exception:
+            fail_delivered_update()
             logger.exception("event_delete_failed dialog_id=%s", dialog_id)
 
     def _handle_peerless_deletions(self, conn: sqlite3.Connection, deleted_ids: Sequence[int]) -> None:
-        now = int(time.time())
+        now = delivered_observed_at()
         resolved: list[tuple[int, int]] = []
         with write_transaction(conn):
             accepted_ids = record_nonchannel_deletions(conn, deleted_ids, now)
@@ -1609,7 +1664,7 @@ class EventHandlerManager:
 
             def _persist_event_0(conn: sqlite3.Connection) -> None:
                 with write_transaction(conn):
-                    upsert_scheduled_message(conn, dialog_id, message)
+                    upsert_scheduled_message(conn, dialog_id, message, now=delivered_observed_at())
 
             await self._writer.run(_persist_event_0)
             self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
@@ -1620,6 +1675,7 @@ class EventHandlerManager:
                 int(cast(int, getattr(message, message_id_attr))),
             )
         except Exception:
+            fail_delivered_update()
             logger.exception("scheduled_new_failed dialog_id=%s", dialog_id)
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
@@ -1634,12 +1690,15 @@ class EventHandlerManager:
 
             def _persist_event_0(conn: sqlite3.Connection) -> None:
                 with write_transaction(conn):
-                    mark_scheduled_messages_removed(conn, dialog_id, message_ids, sent_message_ids)
+                    mark_scheduled_messages_removed(
+                        conn, dialog_id, message_ids, sent_message_ids, now=delivered_observed_at()
+                    )
 
             await self._writer.run(_persist_event_0)
             self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
             logger.info("scheduled_removed dialog_id=%d count=%d", dialog_id, len(message_ids))
         except Exception:
+            fail_delivered_update()
             logger.exception("scheduled_removed_failed dialog_id=%s", dialog_id)
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
@@ -1704,7 +1763,7 @@ class EventHandlerManager:
             return
 
         try:
-            now = int(time.time())
+            now = delivered_observed_at()
 
             def _persist_event_0(conn: sqlite3.Connection) -> int:
                 with write_transaction(conn):
@@ -1724,6 +1783,7 @@ class EventHandlerManager:
         except asyncio.CancelledError:
             raise
         except (RuntimeError, sqlite3.DatabaseError) as exc:
+            fail_delivered_update()
             logger.error(
                 "event_outbox_read_failed dialog_id=%s max_id=%s error=%r",
                 dialog_id,
@@ -1797,6 +1857,7 @@ class EventHandlerManager:
                 len(aggregates),
             )
         except Exception:
+            fail_delivered_update()
             logger.exception(
                 "event_raw_reaction_apply_failed dialog_id=%d message_id=%d",
                 dialog_id,
@@ -1844,9 +1905,19 @@ class EventHandlerManager:
                 return False
             if coverage is not RealtimeHistoryCoverage.FULL_HISTORY and not existing_out.found:
                 return False
-            now = int(time.time())
+            now = delivered_observed_at()
             if boundary is None:
-                boundary = allocate_observation_boundary(conn, ReactionAggregateSource.RAW_UPDATE)
+                delivered = current_delivered_update()
+                boundary = (
+                    allocate_observation_boundary(conn, ReactionAggregateSource.RAW_UPDATE)
+                    if delivered is None
+                    else ReactionObservationBoundary(
+                        observed_at=int(delivered.captured_at),
+                        source_rank=ReactionAggregateSource.RAW_UPDATE.rank,
+                        sequence=delivered.reaction_sequence,
+                        source=ReactionAggregateSource.RAW_UPDATE.value,
+                    )
+                )
             accepted = replace_reaction_aggregates(
                 conn,
                 dialog_id,
@@ -1887,7 +1958,7 @@ class EventHandlerManager:
             return
 
         try:
-            now = int(time.time())
+            now = delivered_observed_at()
 
             def persist_transcription(conn: sqlite3.Connection) -> None:
                 row = read_message_text(conn, dialog_id, msg_id)
@@ -1903,6 +1974,7 @@ class EventHandlerManager:
                 msg_id,
             )
         except Exception:
+            fail_delivered_update()
             logger.exception(
                 "event_raw_transcribed_audio_failed dialog_id=%d message_id=%d",
                 dialog_id,
@@ -2042,10 +2114,7 @@ class EventHandlerManager:
                 ).fetchall(),
             )
         ]
-        if pinned:
-            current = [dialog_id, *(existing for existing in current if existing != dialog_id)]
-        else:
-            current = [existing for existing in current if existing != dialog_id]
+        current = ordered_pin_overlay(conn, folder_id, current)
         conn.execute("DELETE FROM dialog_directory_published_pins WHERE folder_id=?", (folder_id,))
         conn.executemany(
             "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (?,?,?)",
@@ -2055,7 +2124,12 @@ class EventHandlerManager:
         record_realtime_pin_fence(
             conn,
             folder_id,
-            {"kind": "delta", "dialog_id": dialog_id, "pinned": bool(pinned)},
+            {
+                "kind": "delta",
+                "dialog_id": dialog_id,
+                "pinned": bool(pinned),
+                "observation_order": delivered_observation_order(conn),
+            },
         )
 
     def _project_pinned_eligibility(
@@ -2085,12 +2159,17 @@ class EventHandlerManager:
         published_folder = self._published_pin_folder(folder_id)
         pinned = 1 if update.pinned else 0
         with write_transaction(conn):
+            observation_order = delivered_observation_order(conn)
+            pin_accepted = published_folder is None or claim_pin_delta(
+                conn, published_folder, dialog_id, bool(pinned), observation_order
+            )
             known_dialog = conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
             # ``dialogs.pinned`` is the projection for the main list.  A pin
             # update scoped to another folder must not change that bit.
-            if known_dialog and published_folder == 0:
-                conn.execute(_UPDATE_DIALOG_PINNED_SQL, (pinned, now, dialog_id))
-            self._apply_published_pin_mutation(conn, published_folder, dialog_id, pinned)
+            if pin_accepted:
+                if known_dialog and published_folder == 0:
+                    conn.execute(_UPDATE_DIALOG_PINNED_SQL, (pinned, now, dialog_id))
+                self._apply_published_pin_mutation(conn, published_folder, dialog_id, pinned)
             self._project_pinned_eligibility(conn, dialog_id, folder_id, known_dialog=known_dialog, now=now)
         logger.info("event_dialog_pinned dialog_id=%d pinned=%d", dialog_id, pinned)
 
@@ -2107,25 +2186,15 @@ class EventHandlerManager:
         is_main_folder = published_folder == 0
         pinned_ids = self._collect_pinned_dialog_ids(cast(Sequence[object], order))
         with write_transaction(conn):
-            for dialog_id in pinned_ids:
-                if (
-                    is_main_folder
-                    and conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
-                ):
-                    conn.execute(_UPDATE_DIALOG_PINNED_SQL, (1, now, dialog_id))
+            if published_folder is not None:
+                merged = claim_pin_snapshot(conn, published_folder, delivered_observation_order(conn), pinned_ids)
+                if merged is None:
+                    return
+                pinned_ids = merged
             if is_main_folder:
-                # Main list: rewrite the full pin set — the update is
-                # authoritative for all main-list pins.
-                if pinned_ids:
-                    placeholders = ",".join("?" * len(pinned_ids))
-                    sql = _CLEAR_PINS_NOT_IN_SQL_TEMPLATE.format(
-                        placeholders=placeholders,
-                    )
-                    conn.execute(sql, (now, *pinned_ids))
-                else:
-                    # Empty order list → all dialogs unpinned in main list.
-                    # NOT IN () is invalid SQLite — use the dedicated SQL.
-                    conn.execute(_CLEAR_ALL_PINS_SQL, (now,))
+                conn.execute(_CLEAR_ALL_PINS_SQL, (now,))
+                for dialog_id in pinned_ids:
+                    conn.execute(_UPDATE_DIALOG_PINNED_SQL, (1, now, dialog_id))
             if published_folder is not None:
                 conn.execute("DELETE FROM dialog_directory_published_pins WHERE folder_id=?", (published_folder,))
                 conn.executemany(
@@ -2136,7 +2205,11 @@ class EventHandlerManager:
                 record_realtime_pin_fence(
                     conn,
                     published_folder,
-                    {"kind": "rewrite", "dialog_ids": pinned_ids},
+                    {
+                        "kind": "rewrite",
+                        "dialog_ids": pinned_ids,
+                        "observation_order": delivered_observation_order(conn),
+                    },
                 )
             # For folder-scoped updates (folder_id != None) we only set the
             # pinned=1 rows above; we do not clear other dialogs because the
@@ -2198,6 +2271,13 @@ class EventHandlerManager:
             name = self._username_update_name(update)
             username = self._username_update_alias(update)
             dialog_id = int(update.user_id)
+            observation_order = delivered_observation_order(conn)
+            if name is not IDENTITY_OMITTED and not claim_dialog_fact(conn, dialog_id, "name", observation_order):
+                name = IDENTITY_OMITTED
+            if username is not IDENTITY_OMITTED and not claim_dialog_fact(
+                conn, dialog_id, "username", observation_order
+            ):
+                username = IDENTITY_OMITTED
             baseline_revision = capture_identity_baseline(conn, dialog_id)
             publish_dialog_identity(
                 conn,
@@ -2292,6 +2372,7 @@ class EventHandlerManager:
                     continue
                 assert push is not None
                 observation = self._profile_push_observation(conn, source, push)
+                push = self._filter_retained_profile_identity(conn, push, observation)
                 changed = self._apply_profile_push(profiles, push, observation)
                 sections = self._profile_push_sections(source, changed)
                 if sections:
@@ -2306,6 +2387,22 @@ class EventHandlerManager:
             mark_push_applied(source, self._profile_push_owner, observation)
         return offered, handled_name, topics_changed
 
+    @staticmethod
+    def _filter_retained_profile_identity(
+        conn: sqlite3.Connection,
+        push: ProfilePush,
+        observation: ProfileFieldObservation,
+    ) -> ProfilePush:
+        if current_delivered_update() is None:
+            return push
+        newer = _newer_dialog_identity_fields(conn, push.entity_id, observation.order)
+        excluded: set[str] = set()
+        if "name" in newer:
+            excluded.update(("name", "first_name", "last_name"))
+        if "username" in newer:
+            excluded.update(("username", "extra_usernames"))
+        return replace(push, fields={field: value for field, value in push.fields.items() if field not in excluded})
+
     def _eligible_profile_push(self, profiles: EntityProfileRepository, push: ProfilePush | None) -> bool:
         return (
             push is not None and push.entity_id != self._self_id and profiles.is_history_profile_managed(push.entity_id)
@@ -2317,8 +2414,8 @@ class EventHandlerManager:
         assert self._self_id is not None
         return push_marker(source, self._profile_push_owner) or ProfileFieldObservation(
             owner_account_id=self._self_id,
-            order=allocate_observation_order(conn),
-            observed_at=int(time.time()),
+            order=delivered_observation_order(conn),
+            observed_at=delivered_observed_at(),
             source="min" if push.minimal else "update",
         )
 
@@ -2352,9 +2449,10 @@ class EventHandlerManager:
             if not isinstance(update, (UpdateUserName, UpdateNotifySettings)) or handled_name:
                 return
             await self._writer.run(
-                lambda conn: self._update_realtime_identity_or_notify(conn, update, int(time.time()))
+                lambda conn: self._update_realtime_identity_or_notify(conn, update, delivered_observed_at())
             )
         except Exception:
+            fail_delivered_update()
             logger.exception("event_identity_or_notify_failed update=%r", type(update).__name__)
 
     def _topic_capability_entities(self, update: object, sender: object) -> tuple[object, ...]:
@@ -2390,8 +2488,8 @@ class EventHandlerManager:
             if observation is None:
                 observation = ProfileFieldObservation(
                     owner_account_id=cast(int, self._self_id),
-                    order=allocate_observation_order(conn),
-                    observed_at=int(time.time()),
+                    order=delivered_observation_order(conn),
+                    observed_at=delivered_observed_at(),
                     source="update",
                 )
             changed |= repository.observe_capability(dialog_id, is_topic_capable(entity), observation.order)
@@ -2414,7 +2512,7 @@ class EventHandlerManager:
             including False, and retain the existing needs_refresh signal.
         """
         try:
-            now = int(time.time())
+            now = delivered_observed_at()
             if isinstance(update, UpdateDialogPinned):
                 await self._writer.run(lambda conn: self._update_dialog_pinned(conn, update, now))
             elif isinstance(update, UpdatePinnedDialogs):
@@ -2422,6 +2520,7 @@ class EventHandlerManager:
             elif isinstance(update, UpdateDialogUnreadMark):
                 await self._update_dialog_unread_mark(update, now)
         except Exception:
+            fail_delivered_update()
             logger.exception(
                 "event_dialog_pinned_failed update=%r",
                 type(update).__name__,
@@ -2457,7 +2556,7 @@ class EventHandlerManager:
             if cause is None:
                 return
             dialog_id = self._participant_dialog_id(update)
-            occurred_at = int(update.date.timestamp()) if update.date is not None else int(time.time())
+            occurred_at = int(update.date.timestamp()) if update.date is not None else delivered_observed_at()
 
             def _persist_event_0(conn: sqlite3.Connection) -> bool:
                 with write_transaction(conn):
@@ -2475,6 +2574,7 @@ class EventHandlerManager:
         except RpcAdmissionClosedError:
             raise
         except Exception:
+            fail_delivered_update()
             logger.exception("event_channel_participant_failed")
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
@@ -2493,7 +2593,7 @@ class EventHandlerManager:
                 return
             if dialog_id not in self._synced_dialog_ids:
                 return
-            now = int(time.time())
+            now = delivered_observed_at()
             changed, row = await self._writer.run(
                 lambda conn: self._mark_channel_chat_update(
                     conn,
@@ -2508,6 +2608,7 @@ class EventHandlerManager:
         except RpcAdmissionClosedError:
             raise
         except Exception:
+            fail_delivered_update()
             logger.exception(
                 "event_channel_chat_update_failed update=%r",
                 type(update).__name__,
@@ -2770,6 +2871,7 @@ class EventHandlerManager:
                 unread_rowcount,
             )
         except Exception:
+            fail_delivered_update()
             self._record_observation(
                 kind="sync.inbox_read_finished",
                 dialog_id=dialog_id,
@@ -2809,11 +2911,11 @@ class EventHandlerManager:
             if not _is_valid_nonnegative_int(topic_id_raw) or singular_update.pinned is None:
                 return
             topic_id = int(topic_id_raw)
-            now = int(time.time())
+            now = delivered_observed_at()
 
             def _persist_event_0(conn: sqlite3.Connection) -> None:
                 with write_transaction(conn):
-                    observation_order = allocate_observation_order(conn)
+                    observation_order = delivered_observation_order(conn)
                     SQLiteTopicMetadataRepository(conn).apply_topic_pin(
                         dialog_id,
                         topic_id,
@@ -2831,6 +2933,7 @@ class EventHandlerManager:
                 int(bool(singular_update.pinned)),
             )
         except Exception:
+            fail_delivered_update()
             logger.exception(
                 "event_forum_topic_pinned_failed update=%r",
                 type(update).__name__,
@@ -2851,11 +2954,11 @@ class EventHandlerManager:
                 return
             if not self._metadata_realtime_allowed(self._realtime_coverage(dialog_id)):
                 return
-            now = int(time.time())
+            now = delivered_observed_at()
 
             def _persist_event_0(conn: sqlite3.Connection) -> None:
                 with write_transaction(conn):
-                    observation_order = allocate_observation_order(conn)
+                    observation_order = delivered_observation_order(conn)
                     SQLiteTopicMetadataRepository(conn).apply_topic_pins(
                         dialog_id,
                         order,
@@ -2871,6 +2974,7 @@ class EventHandlerManager:
                 len(order),
             )
         except Exception:
+            fail_delivered_update()
             logger.exception(
                 "event_forum_topics_pinned_failed update=%r",
                 type(update).__name__,

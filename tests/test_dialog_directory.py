@@ -2087,3 +2087,320 @@ async def test_complete_directory_absence_hides_row_and_removes_current_eligibil
         )
     finally:
         conn.close()
+
+
+@pytest.mark.asyncio
+async def test_authoritative_directory_snapshot_fences_retained_scalar_and_pin_replay(tmp_path: Path) -> None:
+    from unittest.mock import MagicMock
+
+    from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
+    from mcp_telegram.observation_order import allocate_observation_order
+    from mcp_telegram.unread_state import apply_unread_facts
+    from sqlite_writer_helpers import event_manager
+
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    old_order = allocate_observation_order(conn)
+    conn.close()
+    dialog = _dialog(9501, 8)
+    dialog.unread_count = 8
+    dialog.unread_mark = True
+    dialog.notify_settings = types.PeerNotifySettings(mute_until=datetime(2027, 1, 1, tzinfo=UTC))
+    directory = CanonicalDialogDirectory(
+        _FakeClient([_pinned_response([dialog]), _pinned_response(), _response([dialog])]),
+        db_path,
+        asyncio.Event(),
+        writer=_writer(db_path),
+    )
+    await _run_slices(directory, 3)
+    conn = _open_sync_db(db_path)
+    try:
+        manager = event_manager(MagicMock(), conn, asyncio.Event())
+        with delivered_update_context(DeliveredUpdate(old_order, 100, old_order)):
+            with write_transaction(conn):
+                apply_unread_facts(conn, 9501, observed_at=100, unread_count=0, unread_mark=False)
+                clear_realtime_mute(conn, 9501, observed_at=100)
+            manager._update_dialog_pinned(
+                conn,
+                types.UpdateDialogPinned(
+                    peer=types.DialogPeer(peer=types.PeerUser(9501)),
+                    pinned=False,
+                    folder_id=None,
+                ),
+                100,
+            )
+        assert conn.execute("SELECT unread_count,unread_mark,pinned FROM dialogs WHERE dialog_id=9501").fetchone() == (
+            8,
+            1,
+            1,
+        )
+        assert conn.execute("SELECT mute_until FROM dialog_directory_facts WHERE dialog_id=9501").fetchone() == (
+            1798761600,
+        )
+        assert conn.execute("SELECT dialog_id FROM dialog_directory_published_pins WHERE folder_id=0").fetchall() == [
+            (9501,)
+        ]
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_partial_later_source_keeps_each_supplied_staging_field_order(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    pinned = _dialog(9801, 8)
+    pinned.unread_count = 7
+    pinned.unread_mark = True
+    pinned.notify_settings = types.PeerNotifySettings(mute_until=datetime(2027, 1, 1, tzinfo=UTC))
+    ordinary = _dialog(9801, 9)
+    ordinary.unread_count = None  # pyright: ignore[reportAttributeAccessIssue] - synthetic partial dialog
+    ordinary.unread_mark = None
+    directory = CanonicalDialogDirectory(
+        _FakeClient(
+            [
+                _pinned_response([pinned]),
+                _pinned_response(),
+                _response([ordinary], terminal=False, users=[types.User(id=9801, min=True, username="later")]),
+            ]
+        ),
+        db_path,
+        asyncio.Event(),
+        writer=_writer(db_path),
+    )
+    await directory.run_slice()
+    conn = _open_sync_db(db_path)
+    try:
+        original_order = cast(
+            tuple[int],
+            conn.execute("SELECT observation_order FROM dialog_directory_staging WHERE dialog_id=9801").fetchone(),
+        )[0]
+    finally:
+        conn.close()
+    await directory.run_slice()
+    await directory.run_slice()
+    conn = _open_sync_db(db_path)
+    try:
+        row = cast(
+            tuple[int, int, int, int, int, int, int, int, int],
+            conn.execute(
+                "SELECT name_observation_order,username_observation_order,unread_count_observation_order,"
+                "unread_mark_observation_order,mute_until_observation_order,observation_order,"
+                "unread_count,unread_mark,eligibility_mute_until FROM dialog_directory_staging WHERE dialog_id=9801"
+            ).fetchone(),
+        )
+        assert row[0] == row[2] == row[3] == row[4] == original_order
+        assert row[1] == row[5] and row[1] > original_order
+        assert row[6:] == (7, 1, 1798761600)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_original_identity_baseline_does_not_advance_field_orders(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from sqlite_writer_helpers import event_manager
+
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO dialogs(dialog_id,name,username,type,identity_complete,identity_source,identity_observed_at) "
+            "VALUES (10001,'Original','original','user',1,'directory',10)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    directory = CanonicalDialogDirectory(
+        _FakeClient([_pinned_response(), _pinned_response(), _response([_dialog(10001, 8)])]),
+        db_path,
+        asyncio.Event(),
+        writer=_writer(db_path),
+    )
+    await directory.run_slice()
+    await directory.run_slice()
+    conn = _open_sync_db(db_path)
+    try:
+        manager = event_manager(MagicMock(), conn, asyncio.Event())
+        manager._update_realtime_username(
+            conn,
+            cast(
+                types.UpdateUserName,
+                SimpleNamespace(
+                    user_id=10001,
+                    usernames=[types.Username("newer_alias", active=True)],
+                ),
+            ),
+            100,
+        )
+        expected_identity = cast(
+            tuple[str | None, str | None, str | None, int, str | None, int | None, int] | None,
+            conn.execute(
+                "SELECT name,username,type,identity_complete,identity_source,identity_observed_at,identity_revision "
+                "FROM dialogs WHERE dialog_id=10001"
+            ).fetchone(),
+        )
+        expected_orders = conn.execute(
+            "SELECT field,observation_order FROM dialog_fact_observations WHERE dialog_id=10001 "
+            "AND field IN ('name','username') ORDER BY field"
+        ).fetchall()
+    finally:
+        conn.close()
+    await directory.run_slice()
+    conn = _open_sync_db(db_path)
+    try:
+        assert (
+            conn.execute(
+                "SELECT name,username,type,identity_complete,identity_source,identity_observed_at,identity_revision "
+                "FROM dialogs WHERE dialog_id=10001"
+            ).fetchone()
+            == expected_identity
+        )
+        assert (
+            conn.execute(
+                "SELECT field,observation_order FROM dialog_fact_observations WHERE dialog_id=10001 "
+                "AND field IN ('name','username') ORDER BY field"
+            ).fetchall()
+            == expected_orders
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_pin", [False, True])
+async def test_staged_empty_pin_snapshot_does_not_fence_retained_changes_before_publication(
+    tmp_path: Path,
+    old_pin: bool,
+) -> None:
+    from unittest.mock import MagicMock
+
+    from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
+    from mcp_telegram.observation_order import allocate_observation_order
+    from sqlite_writer_helpers import event_manager
+
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        old_order = allocate_observation_order(conn)
+        conn.execute("INSERT INTO dialogs(dialog_id,pinned) VALUES (101,?)", (int(not old_pin),))
+        if not old_pin:
+            conn.execute("INSERT INTO dialog_directory_published_pins VALUES (0,101,0)")
+        conn.commit()
+    finally:
+        conn.close()
+    directory = CanonicalDialogDirectory(
+        _FakeClient([_pinned_response(), _pinned_response(), _response([_dialog(101, 8)])]),
+        db_path,
+        asyncio.Event(),
+        writer=_writer(db_path),
+    )
+    await directory.run_slice()
+    conn = _open_sync_db(db_path)
+    try:
+        snapshot_order = cast(
+            tuple[int],
+            conn.execute("SELECT observation_order FROM dialog_directory_pin_snapshots WHERE folder_id=0").fetchone(),
+        )[0]
+        assert snapshot_order > old_order
+        assert (
+            conn.execute("SELECT observation_order FROM dialog_pin_snapshot_observations WHERE folder_id=0").fetchone()
+            is None
+        )
+        manager = event_manager(MagicMock(), conn, asyncio.Event())
+        update = types.UpdateDialogPinned(
+            peer=types.DialogPeer(peer=types.PeerUser(101)), pinned=old_pin, folder_id=None
+        )
+        with delivered_update_context(DeliveredUpdate(old_order, 100, old_order)):
+            manager._update_dialog_pinned(conn, update, 100)
+        assert conn.execute("SELECT pinned FROM dialogs WHERE dialog_id=101").fetchone() == (int(old_pin),)
+        assert conn.execute("SELECT COUNT(*) FROM dialog_directory_published_pins WHERE folder_id=0").fetchone() == (
+            int(old_pin),
+        )
+        assert conn.execute("SELECT COUNT(*) FROM dialog_directory_pins WHERE folder_id=0").fetchone() == (0,)
+    finally:
+        conn.close()
+    await _run_slices(directory, 2)
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT observation_order FROM dialog_pin_snapshot_observations WHERE folder_id=0"
+        ).fetchone() == (snapshot_order,)
+        assert conn.execute("SELECT pinned FROM dialogs WHERE dialog_id=101").fetchone() == (0,)
+        assert conn.execute("SELECT COUNT(*) FROM dialog_directory_pin_snapshots").fetchone() == (0,)
+        with delivered_update_context(DeliveredUpdate(old_order, 100, old_order)):
+            event_manager(MagicMock(), conn, asyncio.Event())._update_dialog_pinned(conn, update, 100)
+        assert conn.execute("SELECT pinned FROM dialogs WHERE dialog_id=101").fetchone() == (0,)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rewrite", [False, True])
+async def test_complete_pin_publication_preserves_newer_raw_collection_changes(tmp_path: Path, rewrite: bool) -> None:
+    from unittest.mock import MagicMock
+
+    from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
+    from mcp_telegram.observation_order import allocate_observation_order
+    from sqlite_writer_helpers import event_manager
+
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.executemany("INSERT INTO dialogs(dialog_id,pinned) VALUES (?,?)", [(101, 1), (202, 0)])
+        conn.execute("INSERT INTO dialog_directory_published_pins VALUES (0,101,0)")
+        conn.commit()
+    finally:
+        conn.close()
+    directory = CanonicalDialogDirectory(
+        _FakeClient(
+            [_pinned_response([_dialog(101, 8)]), _pinned_response(), _response([_dialog(101, 8), _dialog(202, 9)])]
+        ),
+        db_path,
+        asyncio.Event(),
+        writer=_writer(db_path),
+    )
+    await directory.run_slice()
+    conn = _open_sync_db(db_path)
+    try:
+        order = allocate_observation_order(conn)
+        manager = event_manager(MagicMock(), conn, asyncio.Event())
+        with delivered_update_context(DeliveredUpdate(order, 100, order)):
+            if rewrite:
+                manager._rewrite_pinned_dialogs(
+                    conn,
+                    types.UpdatePinnedDialogs(
+                        order=[types.DialogPeer(peer=types.PeerUser(202))],
+                        folder_id=None,
+                    ),
+                    100,
+                )
+            else:
+                manager._update_dialog_pinned(
+                    conn,
+                    types.UpdateDialogPinned(
+                        peer=types.DialogPeer(peer=types.PeerUser(202)),
+                        pinned=True,
+                        folder_id=None,
+                    ),
+                    100,
+                )
+    finally:
+        conn.close()
+    await _run_slices(directory, 2)
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT dialog_id FROM dialog_directory_published_pins WHERE folder_id=0 ORDER BY position"
+        ).fetchall() == ([(202,)] if rewrite else [(202,), (101,)])
+        assert conn.execute("SELECT dialog_id,pinned FROM dialogs ORDER BY dialog_id").fetchall() == [
+            (101, int(not rewrite)),
+            (202, 1),
+        ]
+    finally:
+        conn.close()
