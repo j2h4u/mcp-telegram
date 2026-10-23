@@ -33,7 +33,12 @@ TRANSACTION_EXCEPTIONS: dict[Path, frozenset[str]] = {
     Path("reading/service.py"): frozenset(
         {"ReadingService._get_unread_summary_sync", "ReadingService._list_unread_messages_from_reader"}
     ),
-    Path("daemon_activity_stats.py"): frozenset({"DaemonActivityStatsService._recent_activity_from_reader"}),
+    Path("daemon_activity_stats.py"): frozenset(
+        {
+            "DaemonActivityStatsService._recent_activity_from_reader",
+            "DaemonActivityStatsService._usage_stats_from_reader",
+        }
+    ),
     Path("sqlite_writer.py"): frozenset({"SQLiteWriter._recover", "SQLiteWriter._check_idle"}),
 }
 
