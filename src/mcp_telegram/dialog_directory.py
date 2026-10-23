@@ -754,26 +754,7 @@ class CanonicalDialogDirectory:
                     row.snapshot_at,
                 ),
             )
-            order_assignments = ["observation_order=?"]
-            order_values: list[int | None] = [observation_order]
-            supplied_fields = (
-                ("name", bool(row.identity_fields_observed & 1)),
-                ("username", bool(row.identity_fields_observed & 2)),
-                ("archived", True),
-                ("unread_count", row.unread_count is not None),
-                ("unread_mark", row.unread_mark is not None),
-                ("mute_until", row.eligibility_mute_until is not None),
-            )
-            for field, supplied in supplied_fields:
-                if supplied:
-                    order_assignments.append(f"{field}_observation_order=?")
-                    order_values.append(observation_order)
-            conn.execute(
-                "UPDATE dialog_directory_staging SET "
-                + ",".join(order_assignments)
-                + " WHERE generation=? AND dialog_id=?",
-                (*order_values, generation, row.dialog_id),
-            )
+            _stage_fact_orders(conn, generation, row, observation_order)
             conn.execute(
                 "UPDATE dialog_directory_baseline SET seen=1 WHERE generation=? AND dialog_id=?",
                 (generation, row.dialog_id),
@@ -1069,6 +1050,29 @@ class CanonicalDialogDirectoryDemandAdapter:
                         await self._directory.run_slice()
 
 
+def _stage_fact_orders(
+    conn: sqlite3.Connection, generation: int, row: _StagedFact, observation_order: int | None
+) -> None:
+    order_assignments = ["observation_order=?"]
+    order_values: list[int | None] = [observation_order]
+    supplied_fields = (
+        ("name", bool(row.identity_fields_observed & 1)),
+        ("username", bool(row.identity_fields_observed & 2)),
+        ("archived", True),
+        ("unread_count", row.unread_count is not None),
+        ("unread_mark", row.unread_mark is not None),
+        ("mute_until", row.eligibility_mute_until is not None),
+    )
+    for field, supplied in supplied_fields:
+        if supplied:
+            order_assignments.append(f"{field}_observation_order=?")
+            order_values.append(observation_order)
+    conn.execute(
+        "UPDATE dialog_directory_staging SET " + ",".join(order_assignments) + " WHERE generation=? AND dialog_id=?",
+        (*order_values, generation, row.dialog_id),
+    )
+
+
 def _publish_staged_identities(conn: sqlite3.Connection, generation: int, inserted_ids: set[int]) -> None:
     rows = cast(
         list[_StagedIdentityRow],
@@ -1078,7 +1082,8 @@ def _publish_staged_identities(conn: sqlite3.Connection, generation: int, insert
             (generation,),
         ).fetchall(),
     )
-    for dialog_id, name, username, raw_type, complete, observed_at, baseline_revision, mask in rows:
+    for row in rows:
+        dialog_id, _, _, _, _, _, baseline_revision, mask = row
         expected_revision = (
             baseline_revision if baseline_revision is not None else (0 if dialog_id in inserted_ids else None)
         )
@@ -1088,17 +1093,22 @@ def _publish_staged_identities(conn: sqlite3.Connection, generation: int, insert
         publish_dialog_identity(
             conn,
             dialog_id,
-            DialogIdentityObservation(
-                dialog_id=dialog_id,
-                name=name if mask & 1 else IDENTITY_OMITTED,
-                username=username if mask & 2 else IDENTITY_OMITTED,
-                dialog_type=raw_type if mask & 4 else IDENTITY_OMITTED,
-                complete=bool(complete) and (mask & 1 != 0) and (mask & 2 != 0) and (mask & 4 != 0),
-                source="directory",
-                observed_at=observed_at,
-            ),
+            _staged_identity_observation(row, mask),
             expected_revision,
         )
+
+
+def _staged_identity_observation(row: _StagedIdentityRow, mask: int) -> DialogIdentityObservation:
+    dialog_id, name, username, raw_type, complete, observed_at, _, _ = row
+    return DialogIdentityObservation(
+        dialog_id=dialog_id,
+        name=name if mask & 1 else IDENTITY_OMITTED,
+        username=username if mask & 2 else IDENTITY_OMITTED,
+        dialog_type=raw_type if mask & 4 else IDENTITY_OMITTED,
+        complete=bool(complete) and (mask & 1 != 0) and (mask & 2 != 0) and (mask & 4 != 0),
+        source="directory",
+        observed_at=observed_at,
+    )
 
 
 def _ordered_identity_mask(conn: sqlite3.Connection, generation: int, dialog_id: int, mask: int) -> int:
