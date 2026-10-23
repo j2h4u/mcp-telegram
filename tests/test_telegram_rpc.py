@@ -800,6 +800,7 @@ async def _prepare_self_origin_difference(
 ) -> tuple[_SelfOriginDifference, asyncio.Task[object]]:
     gate, sender = await _normal_migration_gate(patch, (0.0,))
     idle = gate._updates_handle
+    assert idle is not None
     idle.cancel()
     await asyncio.gather(idle, return_exceptions=True)
     box = MessageBox(logging.getLogger(__name__))
