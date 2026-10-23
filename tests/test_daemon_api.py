@@ -6918,10 +6918,27 @@ def _make_db_for_dialog_stats() -> sqlite3.Connection:
 
 
 @pytest.mark.asyncio
-async def test_get_dialog_stats_synced_returns_aggregated() -> None:
-    """_get_dialog_stats with synced dialog returns aggregated reactions/mentions/hashtags/forwards."""
+@pytest.mark.parametrize("limit", [1, 5])
+@pytest.mark.parametrize(
+    ("status", "coverage", "horizon"),
+    [
+        (None, "unknown", None),
+        ("not_synced", "unknown", None),
+        ("own_only", "partial", None),
+        ("pending", "partial", None),
+        ("failed", "partial", None),
+        ("syncing", "partial", None),
+        ("synced", "complete_as_of", 1),
+        ("access_lost", "partial", None),
+    ],
+)
+async def test_get_dialog_stats_retained_aggregates_ignore_enrollment(
+    status: str | None, coverage: str, horizon: int | None, limit: int
+) -> None:
+    """The same retained facts survive every sync state and an old observation horizon."""
     conn = _make_db_for_dialog_stats()
-    _insert_synced_dialog(conn, 1, status="synced")
+    if status is not None:
+        _insert_synced_dialog(conn, 1, status=status, last_synced_at=1)
     _insert_message(conn, 1, 1)
     _insert_message(conn, 1, 2)
     _insert_message(conn, 1, 3)
@@ -6975,47 +6992,57 @@ async def test_get_dialog_stats_synced_returns_aggregated() -> None:
     )
     conn.commit()
 
-    server = make_server(conn)
-    result = await server._get_dialog_stats({"dialog_id": 1, "limit": 5})
+    client = _TestClient()
+    client.get_entity = AsyncMock(side_effect=AssertionError("stats must stay local"))
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("stats must stay local"))
+    server = make_server(conn, client)
+    conn.execute("PRAGMA query_only=ON")
+    result = await server._get_dialog_stats({"dialog_id": 1, "limit": limit})
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
     data = result["data"]
     assert data["dialog_id"] == 1
 
-    # Reactions sorted by total DESC: 👍 total=4, ❤️ total=2
-    reactions = data["top_reactions"]
-    assert len(reactions) == 2
-    assert reactions[0]["emoji"] == "👍"
-    assert reactions[0]["count"] == 4
-    assert reactions[1]["emoji"] == "❤️"
-
-    # Mentions: @alice count=1
-    mentions = data["top_mentions"]
-    assert len(mentions) == 1
-    assert mentions[0]["value"] == "@alice"
-    assert mentions[0]["count"] == 1
-
-    # Hashtags: #python first (count=2)
-    hashtags = data["top_hashtags"]
-    assert hashtags[0]["value"] == "#python"
-    assert hashtags[0]["count"] == 2
-
-    # Forwards: Channel A first (count=2)
-    forwards = data["top_forwards"]
-    assert forwards[0]["peer_id"] == 100
-    assert forwards[0]["name"] == "Channel A"
-    assert forwards[0]["count"] == 2
+    assert data["top_reactions"] == [{"emoji": "👍", "count": 4}, {"emoji": "❤️", "count": 2}][:limit]
+    assert data["top_mentions"] == [{"value": "@alice", "count": 1}]
+    assert data["top_hashtags"] == [{"value": "#python", "count": 2}, {"value": "#rust", "count": 1}][:limit]
+    assert (
+        data["top_forwards"]
+        == [
+            {"peer_id": 100, "name": "Channel A", "count": 2},
+            {"peer_id": 200, "name": "Channel B", "count": 1},
+        ][:limit]
+    )
+    assert data["sync_status"] == (status or "not_synced")
+    assert data["coverage"] == coverage
+    assert data["observation_horizon_at"] == horizon
+    cast(AsyncMock, client.get_entity).assert_not_awaited()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
+    client.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_get_dialog_stats_not_synced_returns_error() -> None:
-    """_get_dialog_stats with no synced row returns not_synced error referencing MarkDialogForSync."""
-    server = make_server()
+async def test_get_dialog_stats_unknown_exact_id_returns_empty_unknown() -> None:
+    """A valid exact id needs neither a local directory entry nor sync enrollment."""
+    conn = _make_db_for_dialog_stats()
+    server = make_server(conn)
+    conn.execute("PRAGMA query_only=ON")
     result = await server._get_dialog_stats({"dialog_id": 999})
 
-    assert result["ok"] is False
-    assert result["error"] == "not_synced"
-    assert "MarkDialogForSync" in result["message"]
+    assert result == {
+        "ok": True,
+        "data": {
+            "dialog_id": 999,
+            "sync_status": "not_synced",
+            "coverage": "unknown",
+            "observation_horizon_at": None,
+            "directory_coverage": read_dialog_directory_coverage(conn).to_wire(),
+            "top_reactions": [],
+            "top_mentions": [],
+            "top_hashtags": [],
+            "top_forwards": [],
+        },
+    }
 
 
 @pytest.mark.asyncio
@@ -7033,6 +7060,8 @@ async def test_get_dialog_stats_empty_synced() -> None:
     assert data["top_mentions"] == []
     assert data["top_hashtags"] == []
     assert data["top_forwards"] == []
+    assert data["coverage"] == "partial"
+    assert data["observation_horizon_at"] is None
 
 
 @pytest.mark.asyncio
@@ -7070,6 +7099,7 @@ async def test_get_dialog_stats_resolves_fuzzy_dialog_name() -> None:
 
     assert result["ok"] is True
     assert result["data"]["dialog_id"] == 1
+    assert result["data"]["directory_coverage"] == read_dialog_directory_coverage(conn).to_wire()
     cast(AsyncMock, client.get_entity).assert_not_awaited()
     cast(MagicMock, client.iter_dialogs).assert_not_called()
 

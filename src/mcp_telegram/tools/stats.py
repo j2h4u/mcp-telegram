@@ -81,6 +81,13 @@ GET_DIALOG_STATS_OUTPUT_SCHEMA = {
         "dialog": {"type": "string"},
         "dialog_id": {"type": ["integer", "null"]},
         "directory_coverage": {"type": "object"},
+        "sync_status": {"type": "string"},
+        "coverage": {
+            "type": "string",
+            "enum": ["unknown", "partial", "complete_as_of"],
+            "description": "Message history coverage only; does not establish completeness of reactions or other fields.",
+        },
+        "observation_horizon_at": {"type": ["integer", "null"]},
         "top_n": {"type": "integer"},
         "top_reactions": {
             "type": "array",
@@ -149,6 +156,9 @@ GET_DIALOG_STATS_OUTPUT_SCHEMA = {
         "dialog",
         "dialog_id",
         "directory_coverage",
+        "sync_status",
+        "coverage",
+        "observation_horizon_at",
         "top_n",
         "top_reactions",
         "top_mentions",
@@ -299,10 +309,11 @@ async def get_usage_stats(args: GetUsageStats) -> ToolResult:
 
 
 class GetDialogStats(ToolArgs):
-    """Return aggregate analytics for one synced dialog: top reactions (emoji+count),
+    """Return retained local analytics for one dialog: top reactions (emoji+count),
     top @mentions, top #hashtags, and top forward sources. Pass a dialog name, @username,
-    or numeric dialog_id. Requires the dialog to be synced (use MarkDialogForSync first);
-    non-synced dialogs return an actionable error.
+    or numeric dialog_id. Sync enrollment is not required. Empty aggregates mean no
+    retained observations, not that Telegram has none. Coverage describes message history
+    only; it does not establish completeness of reactions or other fields.
 
     top_n controls how many entries are returned in each category independently —
     e.g. top_n=5 returns up to 5 reactions, 5 mentions, 5 hashtags, and 5 forward sources."""
@@ -362,11 +373,6 @@ async def get_dialog_stats(args: GetDialogStats) -> ToolResult:
                 is_error=True,
                 structured_content=projection.structured_content,
             )
-        if error == "not_synced":
-            return error_result(
-                f"Error: dialog is not synced. {msg}\n"
-                "Action: Call MarkDialogForSync for this dialog, wait for sync completion, then retry GetDialogStats."
-            )
         if error == "dialog_not_found":
             from ..errors import dialog_not_found_text
 
@@ -387,6 +393,9 @@ async def get_dialog_stats(args: GetDialogStats) -> ToolResult:
         "dialog": args.dialog,
         "dialog_id": data.get("dialog_id", dialog_id),
         "directory_coverage": data.get("directory_coverage") or dict(_DEFAULT_DIRECTORY_COVERAGE),
+        "sync_status": data.get("sync_status", "not_synced"),
+        "coverage": data.get("coverage", "unknown"),
+        "observation_horizon_at": data.get("observation_horizon_at"),
         "top_n": args.top_n,
         "top_reactions": reactions,
         "top_mentions": mentions,
