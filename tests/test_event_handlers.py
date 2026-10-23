@@ -10,6 +10,7 @@ DAEMON-09 (channel/supergroup MessageDeleted), and DAEMON-10
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 from collections.abc import Iterator
@@ -466,7 +467,7 @@ async def test_first_seen_private_message_projects_visible_dialog_and_entity(
             chat_id=dialog_id,
             message=msg,
             is_private=True,
-            get_sender=AsyncMock(return_value=sender),
+            sender=sender,
         ),
     )
 
@@ -508,15 +509,17 @@ async def test_dm_enrollment_does_not_overwrite_identity_published_during_sender
     lookup_started = asyncio.Event()
     lookup_release = asyncio.Event()
 
-    async def delayed_sender() -> types.User:
+    async def delayed_sender(peer: object) -> types.User:
+        assert peer == types.PeerUser(dialog_id)
         lookup_started.set()
         await lookup_release.wait()
         return types.User(id=dialog_id, first_name="Stale", last_name="Sender", username="old_handle")
 
+    mock_client.get_entity = AsyncMock(side_effect=delayed_sender)
     msg = build_mock_message(id=19, text="hello")
     event = cast(
         _NewMessageEvent,
-        SimpleNamespace(chat_id=dialog_id, message=msg, is_private=True, get_sender=delayed_sender),
+        SimpleNamespace(chat_id=dialog_id, message=msg, is_private=True),
     )
     manager = make_manager(mock_client, sync_db, shutdown_event)
     handling = asyncio.create_task(manager.on_new_message(event))
@@ -560,7 +563,8 @@ async def test_first_seen_outgoing_private_message_uses_chat_peer(
     msg = build_mock_message(id=18, text="outgoing")
     msg.out = True
     get_sender = AsyncMock(side_effect=AssertionError("operator sender must not be used"))
-    get_chat = AsyncMock(return_value=peer)
+    get_chat = AsyncMock(side_effect=AssertionError("event cache lookup must not be used as fresh evidence"))
+    mock_client.get_entity = AsyncMock(return_value=peer)
     event = cast(
         _NewMessageEvent,
         SimpleNamespace(
@@ -579,7 +583,8 @@ async def test_first_seen_outgoing_private_message_uses_chat_peer(
         "Target Bot",
         "bot",
     )
-    get_chat.assert_awaited_once_with()
+    mock_client.get_entity.assert_awaited_once_with(types.PeerUser(dialog_id))
+    get_chat.assert_not_awaited()
     get_sender.assert_not_awaited()
 
 
@@ -619,6 +624,7 @@ async def test_first_seen_outgoing_private_lookup_failure_keeps_message_discover
     shutdown_event: asyncio.Event,
 ) -> None:
     dialog_id = 7018
+    mock_client.get_entity = AsyncMock(side_effect=RuntimeError("unavailable"))
     msg = build_mock_message(id=19, text="lookup failed")
     msg.out = True
     event = cast(
@@ -627,7 +633,6 @@ async def test_first_seen_outgoing_private_lookup_failure_keeps_message_discover
             chat_id=dialog_id,
             message=msg,
             is_private=True,
-            get_chat=AsyncMock(side_effect=RuntimeError("unavailable")),
         ),
     )
 
@@ -656,7 +661,7 @@ async def test_first_seen_private_event_respects_explicit_disable_tombstone(
             chat_id=dialog_id,
             message=build_mock_message(id=21, text="ignored"),
             is_private=True,
-            get_sender=AsyncMock(return_value=sender),
+            sender=sender,
         ),
     )
 
@@ -689,7 +694,7 @@ async def test_first_seen_private_event_preserves_existing_dialog_facts(
             chat_id=dialog_id,
             message=msg,
             is_private=True,
-            get_sender=AsyncMock(return_value=sender),
+            sender=sender,
         ),
     )
     manager = make_manager(mock_client, sync_db, shutdown_event)
@@ -738,7 +743,7 @@ async def test_auto_enroll_writes_entity_when_sender_available(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """Auto-enroll writes an entities row when get_sender() returns a User."""
+    """Auto-enroll writes an entities row from a supplied sender."""
     dialog_id = 7010
     sender = SimpleNamespace(first_name="Fixture", last_name="Person", username="fixture_person")
 
@@ -749,7 +754,7 @@ async def test_auto_enroll_writes_entity_when_sender_available(
             chat_id=dialog_id,
             message=msg,
             is_private=True,
-            get_sender=AsyncMock(return_value=sender),
+            sender=sender,
         ),
     )
 
@@ -843,7 +848,7 @@ async def test_auto_enroll_entity_write_fails_gracefully(
             chat_id=dialog_id,
             message=msg,
             is_private=True,
-            get_sender=AsyncMock(return_value=sender),
+            sender=sender,
         ),
     )
 
@@ -934,8 +939,9 @@ async def test_auto_enroll_no_entity_when_sender_unavailable(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """When get_sender() fails, dialog is enrolled but no entity row is written."""
+    """When explicit entity acquisition fails, enrollment still creates a thin dialog."""
     dialog_id = 7012
+    mock_client.get_entity = AsyncMock(side_effect=Exception("Telegram unreachable"))
 
     msg = build_mock_message(id=1, text="hello")
     event = cast(
@@ -944,7 +950,6 @@ async def test_auto_enroll_no_entity_when_sender_unavailable(
             chat_id=dialog_id,
             message=msg,
             is_private=True,
-            get_sender=AsyncMock(side_effect=Exception("Telegram unreachable")),
         ),
     )
 
@@ -982,7 +987,7 @@ async def test_auto_enroll_writes_tombstone_for_nameless_sender(
             chat_id=dialog_id,
             message=msg,
             is_private=True,
-            get_sender=AsyncMock(return_value=sender),
+            sender=sender,
         ),
     )
 
@@ -1013,7 +1018,7 @@ async def test_auto_enroll_handles_sender_without_name_attrs(
             chat_id=dialog_id,
             message=msg,
             is_private=True,
-            get_sender=AsyncMock(return_value=sender),
+            sender=sender,
         ),
     )
 
@@ -1047,7 +1052,7 @@ async def test_auto_enroll_handles_non_string_sender_name_fields(
             chat_id=dialog_id,
             message=msg,
             is_private=True,
-            get_sender=AsyncMock(return_value=sender),
+            sender=sender,
         ),
     )
 
@@ -2266,13 +2271,13 @@ async def test_new_enrichment_failure_keeps_original_delivery_pending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = make_manager(mock_client, sync_db, shutdown_event)
+    mock_client.get_entity = AsyncMock(return_value=types.User(id=42, first_name="Fresh"))
     event = cast(
         _NewMessageEvent,
         SimpleNamespace(
             chat_id=42,
             message=build_mock_message(id=502, text="retained"),
             is_private=True,
-            get_sender=AsyncMock(return_value=types.User(id=42, first_name="Fresh")),
         ),
     )
 
@@ -2285,6 +2290,7 @@ async def test_new_enrichment_failure_keeps_original_delivery_pending(
     with delivered_update_context(delivered):
         await manager.on_new_message(event)
     assert delivered.failed
+    mock_client.get_entity.assert_awaited_once_with(types.PeerUser(42))
     assert sync_db.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=42").fetchone()[0] == 0
 
 
@@ -2304,15 +2310,22 @@ async def test_retained_dm_enrollment_preserves_newer_identity_and_materializes_
         "INSERT INTO dialog_fact_observations(dialog_id,field,observation_order) VALUES (?,?,3)",
         [(dialog_id, "name"), (dialog_id, "username")],
     )
+    sync_db.execute(
+        "INSERT INTO entities(id,type,name,username,updated_at) VALUES (?,'user','New','new',200)", (dialog_id,)
+    )
     sync_db.commit()
     manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.set_self_id(99)
+    cached_sender = types.User(id=dialog_id, first_name="Old", username="old", premium=True)
+    get_sender = AsyncMock(return_value=cached_sender)
     event = cast(
         _NewMessageEvent,
         SimpleNamespace(
             chat_id=dialog_id,
             message=build_mock_message(id=1001, text="retained message"),
             is_private=True,
-            get_sender=AsyncMock(return_value=types.User(id=dialog_id, first_name="Old", username="old")),
+            sender=cached_sender,
+            get_sender=get_sender,
         ),
     )
     with delivered_update_context(DeliveredUpdate(2, 100, 2)):
@@ -2331,3 +2344,15 @@ async def test_retained_dm_enrollment_preserves_newer_identity_and_materializes_
     assert sync_db.execute(
         "SELECT text FROM messages WHERE dialog_id=? AND message_id=1001", (dialog_id,)
     ).fetchone() == ("retained message",)
+
+    assert sync_db.execute("SELECT name,username FROM entities WHERE id=?", (dialog_id,)).fetchone() == ("New", "new")
+    details = sync_db.execute("SELECT detail_json FROM entity_details WHERE entity_id=?", (dialog_id,)).fetchone()
+    assert details is not None
+    assert cast(dict[str, object], json.loads(details[0]))["premium"] is True
+    assert sync_db.execute(
+        "SELECT owner_account_id,observation_order FROM entity_profile_field_observations "
+        "WHERE entity_id=? AND field='premium'",
+        (dialog_id,),
+    ).fetchone() == (99, 2)
+    get_sender.assert_not_called()
+    mock_client.get_entity.assert_not_called()
