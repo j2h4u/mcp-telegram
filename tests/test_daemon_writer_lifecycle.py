@@ -41,6 +41,9 @@ async def test_shutdown_preserves_finalizer_commit_loss_boundary_and_final_marke
             conn.execute("INSERT INTO daemon_state(key,value) VALUES ('finalizer','committed')")
 
     class Client:
+        def close_update_delivery(self) -> None:
+            pass
+
         async def disconnect(self) -> None:
             stages.append("disconnect")
 

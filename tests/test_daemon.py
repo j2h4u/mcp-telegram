@@ -168,6 +168,9 @@ class _ApiStub:
 
 
 class _ClientStub:
+    def close_update_delivery(self) -> None:
+        pass
+
     def __init__(self) -> None:
         self.disconnect_calls = 0
         self.close_scheduler_calls = 0

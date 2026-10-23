@@ -486,6 +486,7 @@ class TelegramRpcGate(TelegramClient):
         self._pending_scalar_dispatches: dict[asyncio.Future[object], _PendingScalarDispatch] = {}
         self._transport_state = _TransportBoundaryState.DISCONNECTED
         self._delivery_repository: UpdateDeliveryRepository | None = None
+        self._delivery_closed = False
         self._delivery_ready = asyncio.Event()
         self._delivery_failure = asyncio.Event()
         self._delivery_safe: ProtocolSnapshot | None = None
@@ -497,6 +498,20 @@ class TelegramRpcGate(TelegramClient):
         if self._delivery_repository is not None or self.is_connected():
             raise RuntimeError("update delivery must be configured once before connect")
         self._delivery_repository = repository
+
+    def close_update_delivery(self) -> None:
+        """Fence shutdown before callbacks detach; admitted SQLite writes still settle."""
+        self._delivery_closed = True
+        self._delivery_ready.clear()
+        active = self._active_delivery
+        if active is not None:
+            for context in active.contexts.values():
+                context.failed = True
+            active.done.set()
+
+    def _require_delivery_open(self) -> None:
+        if self._delivery_closed:
+            raise asyncio.CancelledError
 
     async def wait_update_delivery_failure(self) -> None:
         await self._delivery_failure.wait()
@@ -546,6 +561,7 @@ class TelegramRpcGate(TelegramClient):
 
     async def start_update_delivery(self, account_id: int) -> None:
         """Replay local obligations after domain owners/account validation, then release intake."""
+        self._require_delivery_open()
         repository = self._delivery_repository
         if repository is None:
             raise RuntimeError("update delivery repository is not configured")
@@ -564,6 +580,7 @@ class TelegramRpcGate(TelegramClient):
                 await self._complete_update_delivery()
             if self._delivery_failure.is_set():
                 raise RuntimeError("retained Telegram update replay failed")
+        self._require_delivery_open()
         assert self._delivery_safe is not None
         self._restore_delivery_message_box(account_id)
         await self._save_states_and_entities()
@@ -624,11 +641,13 @@ class TelegramRpcGate(TelegramClient):
         repository = self._delivery_repository
         if repository is None:
             return cast(list[object], await super()._preprocess_updates(updates, users, chats))
+        self._require_delivery_open()
         # Capture before either await: the vendor head can change while the prior callbacks finish.
         envelope = DeliveryEnvelope.capture(self._capture_delivery_snapshot(chats), time.time(), updates, users, chats)
         prior = self._active_delivery
         if prior is not None:
             await prior.done.wait()
+        self._require_delivery_open()
         if self._delivery_failure.is_set() or not self._delivery_ready.is_set():
             raise RuntimeError("Telegram update admission is closed")
         try:
@@ -647,6 +666,8 @@ class TelegramRpcGate(TelegramClient):
         repository = self._delivery_repository
         assert active is not None and repository is not None and self.session is not None
         try:
+            if self._delivery_closed:
+                return
             if any(context.failed for context in active.contexts.values()):
                 self._delivery_failure.set()
                 return
@@ -1399,6 +1420,7 @@ class TelegramRpcGate(TelegramClient):
         """Let each difference RPC and dispatched update establish its own root."""
         if self._delivery_repository is not None:
             await self._delivery_ready.wait()
+            self._require_delivery_open()
         await super()._update_loop()  # type: ignore[misc]
 
     async def _handle_auto_reconnect(self) -> None:
@@ -1429,6 +1451,8 @@ class TelegramRpcGate(TelegramClient):
         if self._delivery_repository is None:
             with demand_context(DemandKind.REALTIME_EVENT_ACQUISITION):
                 await super()._dispatch_update(update)  # type: ignore[misc]
+            return
+        if self._delivery_closed:
             return
         if active is None or id(update) not in active.remaining:
             self._delivery_failure.set()

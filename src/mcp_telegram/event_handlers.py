@@ -543,6 +543,8 @@ class _EventHandlerClient(Protocol):
 
     async def get_me(self) -> object: ...
 
+    async def get_entity(self, _dialog_id: object) -> object: ...
+
     def __call__(self, _request: object) -> Coroutine[object, object, object]: ...
 
 
@@ -585,6 +587,18 @@ def _first_non_empty_str(*values: object) -> str | None:
         if isinstance(value, str) and value != "":
             return value
     return None
+
+
+def _newer_dialog_identity_fields(conn: sqlite3.Connection, dialog_id: int, order: int) -> frozenset[str]:
+    rows = cast(
+        list[tuple[str]],
+        conn.execute(
+            "SELECT field FROM dialog_fact_observations WHERE dialog_id=? AND observation_order>? "
+            "AND field IN ('name','username')",
+            (dialog_id, order),
+        ).fetchall(),
+    )
+    return frozenset(field for (field,) in rows)
 
 
 # ---------------------------------------------------------------------------
@@ -965,15 +979,21 @@ class EventHandlerManager:
     ) -> None:
         try:
             with write_transaction(conn):
+                retained = current_delivered_update()
+                newer_fields = (
+                    frozenset()
+                    if retained is None
+                    else _newer_dialog_identity_fields(conn, dialog_id, retained.observation_order)
+                )
                 apply_partial_entity_identity(
                     conn,
                     dialog_id,
                     PartialEntityIdentity(
                         observed_at=observed_at,
                         observed_type=identity.entity_type,
-                        name_observed=identity.name_observed,
+                        name_observed=identity.name_observed and "name" not in newer_fields,
                         name=identity.name,
-                        username_observed=identity.username_observed,
+                        username_observed=identity.username_observed and "username" not in newer_fields,
                         username=identity.username,
                     ),
                 )
@@ -1198,14 +1218,14 @@ class EventHandlerManager:
         peer_field = "chat" if bool(getattr(event.message, "out", False)) else "sender"
         cached_peer = cast(_SenderLike | None, getattr(event, peer_field, None))
         peer: _SenderLike | None = cached_peer
+        acquired_peer = False
         try:
-            lookup = getattr(event, f"get_{peer_field}", None)
-            if callable(lookup) and (peer is None or bool(cast(object, getattr(peer, "min", False)))):
-                peer = await cast(Callable[[], Awaitable[_SenderLike | None]], lookup)()
+            if peer is None or bool(cast(object, getattr(peer, "min", False))):
+                # The pinned get_entity(PeerUser) path returns a GetUsers RPC response, not a cached getter result.
+                peer = cast(_SenderLike | None, await self._client.get_entity(PeerUser(dialog_id)))
+                acquired_peer = peer is not None
         except _DM_AUTO_ENROLL_SENDER_EXCEPTIONS:
             logger.debug("dm_auto_enroll_peer_fetch_failed dialog_id=%d", dialog_id)
-        # An acquired replacement is new evidence; bundled identities keep admission time.
-        acquired_peer = peer is not None and peer is not cached_peer
         with delivered_update_context(None) if acquired_peer else nullcontext():
             enrolled = await self._auto_enroll_dm(
                 dialog_id,
@@ -2352,6 +2372,7 @@ class EventHandlerManager:
                     continue
                 assert push is not None
                 observation = self._profile_push_observation(conn, source, push)
+                push = self._filter_retained_profile_identity(conn, push, observation)
                 changed = self._apply_profile_push(profiles, push, observation)
                 sections = self._profile_push_sections(source, changed)
                 if sections:
@@ -2365,6 +2386,22 @@ class EventHandlerManager:
         for source, observation in annotations:
             mark_push_applied(source, self._profile_push_owner, observation)
         return offered, handled_name, topics_changed
+
+    @staticmethod
+    def _filter_retained_profile_identity(
+        conn: sqlite3.Connection,
+        push: ProfilePush,
+        observation: ProfileFieldObservation,
+    ) -> ProfilePush:
+        if current_delivered_update() is None:
+            return push
+        newer = _newer_dialog_identity_fields(conn, push.entity_id, observation.order)
+        excluded: set[str] = set()
+        if "name" in newer:
+            excluded.update(("name", "first_name", "last_name"))
+        if "username" in newer:
+            excluded.update(("username", "extra_usernames"))
+        return replace(push, fields={field: value for field, value in push.fields.items() if field not in excluded})
 
     def _eligible_profile_push(self, profiles: EntityProfileRepository, push: ProfilePush | None) -> bool:
         return (

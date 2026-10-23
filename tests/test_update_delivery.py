@@ -14,6 +14,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -22,7 +23,9 @@ from telethon import TelegramClient, events, types
 from telethon._updates import ChannelState, SessionState
 from telethon._updates.messagebox import ENTRY_ACCOUNT
 from telethon.sessions import SQLiteSession
+from telethon.tl.functions.users import GetUsersRequest
 
+from mcp_telegram import daemon
 from mcp_telegram.config import TelegramRpcSchedulerConfig
 from mcp_telegram.delivered_update import (
     DeliveredUpdate,
@@ -558,6 +561,174 @@ async def test_missing_channel_entities_fails_closed_and_min_hash_never_replaces
         await client._save_states_and_entities()
         cast(SQLiteSession, client.session).save()
         assert _saved(client) == baseline
+    finally:
+        cast(SQLiteSession, client.session).close()
+        await writer.aclose()
+
+
+async def test_daemon_shutdown_closes_delivery_before_unregister_and_background_await(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _database(tmp_path)
+    writer = await SQLiteWriter.open(path)
+    client = _client(tmp_path / "session", writer)
+    calls: list[int] = []
+
+    async def callback(update: types.UpdateNewMessage) -> None:
+        calls.append(update.message.id)
+
+    client.add_event_handler(callback, events.Raw())
+    try:
+        await client.start_update_delivery(99)
+        baseline = _saved(client)
+        updates = await _mixed(client)
+
+        async def background() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                # The vendor can dispatch admitted work after unregister, while shutdown awaits cancellation.
+                await asyncio.gather(*(client._dispatch_update(update) for update in updates))
+
+        async def unrelated_stage(_ctx: object) -> None:
+            assert client._delivery_closed
+
+        task = asyncio.create_task(background())
+        await asyncio.sleep(0)
+        context = SimpleNamespace(
+            client=client,
+            shutdown_event=asyncio.Event(),
+            draft_owner=None,
+            coordinator=None,
+            handler_manager=SimpleNamespace(unregister=lambda: client.remove_event_handler(callback)),
+            background_tasks={task},
+            demand_runtime=None,
+            rpc_admission_observer=None,
+            rpc_observation_sink=None,
+        )
+        monkeypatch.setattr(daemon, "_stop_daemon_api", unrelated_stage)
+        monkeypatch.setattr(daemon, "_close_runtime_connections", unrelated_stage)
+        await daemon._shutdown_sync_main_context(cast(daemon._SyncMainContext, context))
+        assert calls == []
+        assert _pending(path) is not None
+        assert _saved(client) == baseline
+        reopened = _client(tmp_path / "session", writer)
+        reopened.add_event_handler(callback, events.Raw())
+        try:
+            await reopened.start_update_delivery(99)
+            assert set(calls) == {11, 12, 13}
+            assert _pending(path) is None
+        finally:
+            cast(SQLiteSession, reopened.session).close()
+    finally:
+        cast(SQLiteSession, client.session).close()
+        await writer.aclose()
+
+
+async def test_shutdown_after_empty_envelope_commit_keeps_pending_obligation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _database(tmp_path)
+    writer = await SQLiteWriter.open(path)
+    client = _client(tmp_path / "session", writer)
+    try:
+        await client.start_update_delivery(99)
+        baseline = _saved(client)
+        repository = client._delivery_repository
+        assert repository is not None
+        original_admit = repository.admit
+
+        async def close_after_commit(payload: bytes, count: int) -> tuple[tuple[int, int], ...]:
+            tokens = await original_admit(payload, count)
+            client.close_update_delivery()
+            return tokens
+
+        monkeypatch.setattr(repository, "admit", close_after_commit)
+        await client._preprocess_updates([], [], [])
+        assert _pending(path) is not None
+        assert _saved(client) == baseline
+        assert not client._delivery_ready.is_set()
+        with pytest.raises(asyncio.CancelledError):
+            await client.start_update_delivery(99)
+        with pytest.raises(asyncio.CancelledError):
+            await client._preprocess_updates([], [], [])
+    finally:
+        cast(SQLiteSession, client.session).close()
+        await writer.aclose()
+
+
+async def test_callback_write_settles_after_close_without_acknowledging_removed_required_handler(
+    tmp_path: Path,
+) -> None:
+    path = _database(tmp_path)
+    writer = await SQLiteWriter.open(path)
+    client = _client(tmp_path / "session", writer)
+    entered, release = asyncio.Event(), asyncio.Event()
+    required_calls: list[object] = []
+
+    def persist(conn: sqlite3.Connection) -> None:
+        with write_transaction(conn):
+            conn.execute("INSERT OR REPLACE INTO daemon_state(key,value) VALUES('shutdown_write','settled')")
+
+    async def first(_update: object) -> None:
+        entered.set()
+        await release.wait()
+        await writer.run(persist)
+
+    async def required(update: object) -> None:
+        required_calls.append(update)
+
+    client.add_event_handler(first, events.Raw())
+    client.add_event_handler(required, events.Raw())
+    try:
+        await client.start_update_delivery(99)
+        baseline = _saved(client)
+        updates = await _mixed(client)
+        tasks = [asyncio.create_task(client._dispatch_update(update)) for update in updates]
+        await entered.wait()
+        client.close_update_delivery()
+        client.remove_event_handler(required)
+        release.set()
+        await asyncio.gather(*tasks)
+        assert required_calls == []
+        assert (
+            await writer.run(
+                lambda conn: conn.execute("SELECT value FROM daemon_state WHERE key='shutdown_write'").fetchone()[0]
+            )
+            == "settled"
+        )
+        assert _pending(path) is not None
+        await client._save_states_and_entities()
+        cast(SQLiteSession, client.session).save()
+        assert _saved(client) == baseline
+    finally:
+        cast(SQLiteSession, client.session).close()
+        await writer.aclose()
+
+
+async def test_pinned_peer_user_entity_lookup_always_uses_rpc_response_even_with_cached_user(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = await SQLiteWriter.open(_database(tmp_path))
+    client = _client(tmp_path / "session", writer)
+    cached = types.User(55, access_hash=555, first_name="Cached")
+    fresh = types.User(55, access_hash=555, first_name="Fresh")
+    client._mb_entity_cache.extend([cached], [])
+    requests: list[object] = []
+
+    async def get_users(_client: TelegramRpcGate, request: object) -> list[types.User]:
+        requests.append(request)
+        return [fresh]
+
+    monkeypatch.setattr(TelegramRpcGate, "__call__", get_users)
+    try:
+        result = await client.get_entity(types.PeerUser(55))
+        assert result is fresh
+        assert len(requests) == 1
+        assert isinstance(requests[0], GetUsersRequest)
     finally:
         cast(SQLiteSession, client.session).close()
         await writer.aclose()

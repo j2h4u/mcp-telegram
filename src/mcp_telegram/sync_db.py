@@ -4962,6 +4962,10 @@ def _apply_migration_86(conn: sqlite3.Connection, current: int) -> int:
             "ALTER TABLE dialog_directory_staging ADD COLUMN mute_until_observation_order INTEGER",
             _DIALOG_FACT_OBSERVATIONS_DDL,
             (
+                "CREATE TABLE IF NOT EXISTS dialog_directory_pin_snapshots (generation INTEGER NOT NULL, "
+                "folder_id INTEGER NOT NULL, observation_order INTEGER NOT NULL, PRIMARY KEY(generation,folder_id))"
+            ),
+            (
                 "CREATE TABLE IF NOT EXISTS dialog_pin_observations (folder_id INTEGER NOT NULL, "
                 "dialog_id INTEGER NOT NULL, observation_order INTEGER NOT NULL, pinned INTEGER NOT NULL, "
                 "PRIMARY KEY(folder_id,dialog_id))"

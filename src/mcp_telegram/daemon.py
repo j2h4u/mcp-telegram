@@ -241,6 +241,8 @@ def read_operator_summary_snapshot(
 
 
 class _DaemonClient(Protocol):
+    def close_update_delivery(self) -> None: ...
+
     def configure_update_delivery(self, repository: UpdateDeliveryRepository) -> None: ...
 
     async def start_update_delivery(self, account_id: int) -> None: ...
@@ -274,7 +276,7 @@ class _DaemonClient(Protocol):
 
     async def get_input_entity(self, dialog_id: int, /) -> object: ...
 
-    async def get_entity(self, _dialog_id: int) -> object: ...
+    async def get_entity(self, _dialog_id: object) -> object: ...
 
     async def get_messages(self, *_args: object, **_kwargs: object) -> object: ...
 
@@ -1850,6 +1852,7 @@ async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
     shutdown_event = cast(asyncio.Event | None, getattr(ctx, "shutdown_event", None))
     if shutdown_event is not None:
         shutdown_event.set()
+    ctx.client.close_update_delivery()
 
     async def detach_observer() -> None:
         ctx.client.set_rpc_admission_observer(None)
