@@ -724,6 +724,8 @@ class DaemonAPIServer:
         # While False, handle_client returns daemon_not_ready with startup_detail.
         self._ready: bool = False
         self.startup_detail: str = "connecting to Telegram"
+        # Startup settles repair before the memoized reading service is composed.
+        self.message_search_index_verified: bool = True
         self._reading_service: ReadingService | None = None
         self._folder_projection_reproject = folder_projection_reproject
         self._group_profile_port = group_profile_port
@@ -787,6 +789,7 @@ class DaemonAPIServer:
                     rid=_rid,
                     deleted_message_visibility_seconds=self._policy.deleted_message_visibility_seconds,
                     draft_response_budget_bytes=self._policy.draft_response_budget_bytes,
+                    message_search_index_verified=self.message_search_index_verified,
                 )
             )
         return self._reading_service

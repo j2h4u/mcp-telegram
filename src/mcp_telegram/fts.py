@@ -13,18 +13,27 @@ Design:
 - Module-level stemmer is created once (thread-safe for reads).
 - _WORD_RE extracts Cyrillic, Latin, and digit tokens; punctuation is
   silently dropped (matches FTS5 unicode61 tokenizer behaviour).
-- backfill_fts_index() runs on every daemon startup and indexes only
-  messages missing from the FTS table (idempotent, no duplicates).
+- ensure_fts_index() skips startup repair after a matching durable receipt.
+- backfill_fts_index() repairs missing stable-key rows and removes invalid rows;
+  it does not compare stored text or create missing stable keys.
 """
 
+import json
+import logging
 import re
 import sqlite3
-from typing import cast
+import time
+from dataclasses import dataclass
+from typing import Literal, cast
 
 import snowballstemmer  # type: ignore[import-untyped]
 
 from .search_contracts import SEARCHABLE_QUERY_TOKEN_PATTERN
 from .sync_transactions import write_transaction
+
+logger = logging.getLogger(__name__)
+_FTS_REPAIR_RECEIPT_KEY = "fts_repair_receipt"
+_FTS_REPAIR_VERSION = 1
 
 # Module-level stemmer — Russian language model.
 # snowballstemmer is stateless for stemWords(), safe for concurrent reads.
@@ -54,6 +63,81 @@ DELETE_FTS_SQL = (
 # ---------------------------------------------------------------------------
 # Public helpers
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FTSRepairResult:
+    status: Literal["skipped", "completed"]
+    reason: str
+    inserted: int
+
+
+def _fts_repair_scope(conn: sqlite3.Connection) -> dict[str, int | None]:
+    return {
+        "algorithm_version": _FTS_REPAIR_VERSION,
+        "schema_version": conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0],
+        "schema_cookie": conn.execute("PRAGMA schema_version").fetchone()[0],
+        "account_id": conn.execute("SELECT account_id FROM dialog_directory_state WHERE singleton=1").fetchone()[0],
+    }
+
+
+def _fts_repair_reason(conn: sqlite3.Connection, scope: dict[str, int | None]) -> str:
+    row = conn.execute("SELECT value FROM daemon_state WHERE key=?", (_FTS_REPAIR_RECEIPT_KEY,)).fetchone()
+    if row is None:
+        return "receipt_missing"
+    try:
+        receipt = json.loads(row[0])
+    except ValueError, TypeError:
+        return "receipt_malformed"
+    if (
+        not isinstance(receipt, dict)
+        or receipt.keys() != scope.keys()
+        or any(type(value) not in (int, type(None)) for value in receipt.values())
+    ):
+        return "receipt_malformed"
+    if scope["account_id"] is None:
+        return "account_unknown"
+    for key, value in scope.items():
+        if receipt[key] != value:
+            return f"{key}_changed"
+    return "receipt_matches"
+
+
+def ensure_fts_index(conn: sqlite3.Connection) -> FTSRepairResult:
+    """Repair once per persisted schema/account scope; publish only after COMMIT."""
+    started = time.monotonic()
+    reason = "receipt_check"
+    inserted: int | None = None
+    try:
+        reason = _fts_repair_reason(conn, _fts_repair_scope(conn))
+        if reason == "receipt_matches":
+            logger.info(
+                "fts_repair_skipped reason=%s duration_seconds=%.3f inserted=0", reason, time.monotonic() - started
+            )
+            return FTSRepairResult("skipped", reason, 0)
+        logger.info("fts_repair_started reason=%s duration_seconds=0 inserted=0", reason)
+        # A committed partial repair must never leave a reusable completion receipt.
+        with write_transaction(conn):
+            conn.execute("DELETE FROM daemon_state WHERE key=?", (_FTS_REPAIR_RECEIPT_KEY,))
+        inserted = backfill_fts_index(conn)
+        with write_transaction(conn):
+            conn.execute(
+                "INSERT INTO daemon_state(key,value) VALUES (?,?)",
+                (_FTS_REPAIR_RECEIPT_KEY, json.dumps(_fts_repair_scope(conn), sort_keys=True)),
+            )
+    except Exception as exc:
+        logger.warning(
+            "fts_repair_failed reason=%s duration_seconds=%.3f inserted=%s exception_type=%s",
+            reason,
+            time.monotonic() - started,
+            "unknown" if inserted is None else inserted,
+            type(exc).__name__,
+        )
+        raise
+    logger.info(
+        "fts_repair_completed reason=%s duration_seconds=%.3f inserted=%d", reason, time.monotonic() - started, inserted
+    )
+    return FTSRepairResult("completed", reason, inserted)
 
 
 def stem_text(text: str | None) -> str:

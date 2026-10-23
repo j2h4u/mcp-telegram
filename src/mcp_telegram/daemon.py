@@ -95,7 +95,7 @@ from .folders.refresh import FolderRefresher
 from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .folders.telegram_adapter import FolderClient, TelethonTelegramFolderGateway
 from .folders.worker import FolderProjectionWorker
-from .fts import backfill_fts_index
+from .fts import ensure_fts_index
 from .hydration_queue import HydrationPriority
 from .media_hydration import MediaFactHydrationHandler
 from .message_fact_refresh import (
@@ -1331,12 +1331,13 @@ async def _run_fts_backfill(ctx: _SyncMainContext) -> None:
     # search" while we work. Total startup time = FTS time + Telegram time.
     ctx.api_server.startup_detail = "indexing messages for search"
     _ = ctx.api_server.startup_detail
+    ctx.api_server.message_search_index_verified = False
     try:
-        backfilled = await ctx.writer.run(backfill_fts_index)
-        if backfilled:
-            logger.info("fts_backfill=%d messages indexed", backfilled)
-    except Exception:
-        logger.warning("fts_backfill failed — FTS search may be incomplete until next restart", exc_info=True)
+        await ctx.writer.run(ensure_fts_index)
+    except Exception as exc:  # noqa: BLE001 - retained reads remain available after repair failure
+        logger.warning("fts_startup_verification_failed exception_type=%s", type(exc).__name__)
+        return
+    ctx.api_server.message_search_index_verified = True
 
 
 async def _connect_telegram(ctx: _SyncMainContext) -> bool:

@@ -834,6 +834,7 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
             "additionalProperties": False,
         },
         "source": {"type": "string"},
+        "search_index_state": {"type": "string", "enum": ["repair_unverified"]},
         "coverage": {"type": "object"},
         "directory_coverage": {"type": "object"},
         "warnings": {"type": "array", "items": {"type": "object"}},
@@ -997,6 +998,14 @@ def _search_messages_error_result(
     dialog_label: str | None,
     has_cursor: bool,
 ) -> ToolResult:
+    if error == "local_search_index_unavailable":
+        return error_result(
+            "Error: local_search_index_unavailable: The local message search index could not be queried.\n"
+            "Action: Use list_messages to read retained local messages.",
+            error_code=error,
+            has_filter=True,
+            has_cursor=has_cursor,
+        )
     projection = project_dialog_resolution_error(
         response,
         fallback_action="Retry SearchMessages with an exact dialog id.",
@@ -1031,7 +1040,20 @@ def _search_structured_content(ctx: _SearchStructuredContentContext) -> dict[str
     data = ctx.data
     source = data.get("source", "sync_db")
     data_with_source = {**data, "source": source}
+    warnings = _list_messages_warnings(data)
+    search_index_unverified = data.get("search_index_state") == "repair_unverified"
+    if search_index_unverified:
+        warnings.append(
+            structured_warning(
+                "local_search_index_unverified",
+                "Local search index repair was not verified. Results may omit retained messages; "
+                "an empty result does not establish their absence.",
+                severity="warning",
+                action="Use list_messages to read retained local messages.",
+            )
+        )
     return {
+        **({"search_index_state": "repair_unverified"} if search_index_unverified else {}),
         "query": ctx.args.query,
         "dialog_name": _search_dialog_name(ctx.rows, ctx.global_mode, ctx.dialog_label, data.get("dialog_name")),
         "dialog_name_source": _search_dialog_name_source(ctx.rows, ctx.global_mode, data.get("dialog_name_source")),
@@ -1039,7 +1061,7 @@ def _search_structured_content(ctx: _SearchStructuredContentContext) -> dict[str
         "source": source,
         "coverage": _list_messages_coverage(data_with_source),
         "directory_coverage": data.get("directory_coverage") or dict(_DEFAULT_DIRECTORY_COVERAGE),
-        "warnings": _list_messages_warnings(data),
+        "warnings": warnings,
         "read_state_per_dialog": _search_read_state_per_dialog(data),
         "navigation": {
             "next_navigation": ctx.next_navigation,

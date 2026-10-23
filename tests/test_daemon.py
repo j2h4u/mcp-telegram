@@ -1241,3 +1241,40 @@ async def test_shutdown_cancels_disconnects_and_detaches_before_flushing_telemet
 
 async def _append_async(stages: list[str], stage: str) -> None:
     stages.append(stage)
+
+
+@pytest.mark.parametrize("status", ["completed", "skipped"])
+async def test_startup_fts_verification_sets_flag_after_writer_success(status: str) -> None:
+    api_server = SimpleNamespace(message_search_index_verified=True, startup_detail="")
+
+    async def run(callback: object) -> object:
+        assert api_server.message_search_index_verified is False
+        assert callback is daemon.ensure_fts_index
+        return SimpleNamespace(status=status)
+
+    writer = SimpleNamespace(run=AsyncMock(side_effect=run))
+    ctx = cast(_SyncMainContext, SimpleNamespace(api_server=api_server, writer=writer))
+    await daemon._run_fts_backfill(ctx)
+    assert api_server.message_search_index_verified is True
+    writer.run.assert_awaited_once_with(daemon.ensure_fts_index)
+
+
+async def test_startup_fts_verification_failure_is_visible_and_startup_continues(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    api_server = SimpleNamespace(message_search_index_verified=True, startup_detail="")
+    writer = SimpleNamespace(run=AsyncMock(side_effect=RuntimeError("sensitive exception text")))
+    ctx = cast(_SyncMainContext, SimpleNamespace(api_server=api_server, writer=writer))
+    await daemon._run_fts_backfill(ctx)
+    assert api_server.message_search_index_verified is False
+    assert "fts_startup_verification_failed exception_type=RuntimeError" in caplog.text
+    assert "sensitive exception text" not in caplog.text
+
+
+async def test_startup_fts_verification_cancellation_propagates() -> None:
+    api_server = SimpleNamespace(message_search_index_verified=True, startup_detail="")
+    writer = SimpleNamespace(run=AsyncMock(side_effect=asyncio.CancelledError))
+    ctx = cast(_SyncMainContext, SimpleNamespace(api_server=api_server, writer=writer))
+    with pytest.raises(asyncio.CancelledError):
+        await daemon._run_fts_backfill(ctx)
+    assert api_server.message_search_index_verified is False
