@@ -4,10 +4,17 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
 
+from .delivered_update import current_delivered_update
 from .sync_transactions import write_savepoint
 
 if TYPE_CHECKING:
     from .sync_db import SyncDatabaseConnection
+
+
+def delivered_observation_order(conn: SyncDatabaseConnection) -> int:
+    """Reuse admission order only for the currently delivered raw update."""
+    current = current_delivered_update()
+    return allocate_observation_order(conn) if current is None else current.observation_order
 
 
 def allocate_observation_order(conn: SyncDatabaseConnection) -> int:

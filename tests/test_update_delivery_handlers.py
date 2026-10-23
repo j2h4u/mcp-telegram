@@ -1,5 +1,7 @@
 """TG-98 regressions through durable admission and real canonical callbacks."""
 
+# pyright: reportAny=false
+
 from __future__ import annotations
 
 import asyncio
@@ -8,14 +10,16 @@ import threading
 from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
 from telethon import events, types
+from telethon.sessions import SQLiteSession
 
 from mcp_telegram.delivered_update import DeliveredUpdate, current_delivered_update, delivered_update_context
 from mcp_telegram.delta_sync import _SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL, DeltaSyncWorker
-from mcp_telegram.event_handlers import EventHandlerManager, UpdateProcessingBarrier
+from mcp_telegram.event_handlers import EventHandlerManager, UpdateProcessingBarrier, _EventHandlerClient
 from mcp_telegram.message_history.contracts import ForwardGapPage
 from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
 from mcp_telegram.messages.telegram_adapter import extract_message_row
@@ -52,7 +56,12 @@ def _manager(
     barrier: UpdateProcessingBarrier | None = None,
 ) -> EventHandlerManager:
     manager = EventHandlerManager(
-        client, reader, asyncio.Event(), barrier, writer=writer, profile_detail_ttl_seconds=300
+        cast(_EventHandlerClient, client),
+        reader,
+        asyncio.Event(),
+        barrier,
+        writer=writer,
+        profile_detail_ttl_seconds=300,
     )
     manager.set_self_id(99)
     manager.bind_demand_sink(MagicMock())
@@ -73,7 +82,9 @@ def _body(mid: int, text: str, *, group: bool = False) -> types.Message:
 async def _admit(client: TelegramRpcGate, updates: list[object]) -> list[object]:
     processed: list[object] = []
     for update in updates:
-        client._message_box.process_updates(types.UpdateShort(update, DATE), client._mb_entity_cache, processed)
+        client._message_box.process_updates(
+            types.UpdateShort(cast(types.TypeUpdate, update), DATE), client._mb_entity_cache, processed
+        )
     assert len(processed) == len(updates)
     return await client._preprocess_updates(
         processed, [types.User(55, access_hash=555, first_name="Fixture")], [types.ChatForbidden(7, "Fixture")]
@@ -127,6 +138,7 @@ async def test_required_canonical_write_failure_replays_tg98_cases_1_to_4(  # no
         candidates = [row[0] for row in reader.execute(_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL)]
         assert (-7 in candidates) is (scenario != "hidden_new")
 
+        port = None
         if scenario == "visible_new":
 
             class Port:
@@ -149,12 +161,13 @@ async def test_required_canonical_write_failure_replays_tg98_cases_1_to_4(  # no
 
         await _write(writer, "DROP TRIGGER tg101_fault")
         if scenario == "visible_new":
+            assert port is not None
             await DeltaSyncWorker(port, reader, asyncio.Event(), writer=writer).fetch_delta_slice_for_dialog(-7)
             assert port.calls == [10, 10]
             assert reader.execute("SELECT delta_message_id FROM synced_dialogs").fetchone() == (11,)
             assert reader.execute("SELECT text FROM messages WHERE message_id=11").fetchone() == ("new",)
             assert _pending(path) is not None  # Delta success cannot acknowledge the retained update.
-        client.session.close()
+        cast(SQLiteSession, client.session).close()
         reader.close()
         await writer.aclose()
         writer = await SQLiteWriter.open(path)
@@ -178,7 +191,7 @@ async def test_required_canonical_write_failure_replays_tg98_cases_1_to_4(  # no
             11 if scenario == "visible_new" else 10,
         )
     finally:
-        client.session.close()
+        cast(SQLiteSession, client.session).close()
         reader.close()
         await writer.aclose()
 
@@ -197,7 +210,11 @@ async def test_same_second_concurrent_edit_history_replay_and_legitimate_return_
     if a_committed:
 
         async def lose_ack(update: object) -> None:
-            if isinstance(update, types.UpdateEditMessage) and update.message.message == "A":
+            if (
+                isinstance(update, types.UpdateEditMessage)
+                and isinstance(update.message, types.Message)
+                and update.message.message == "A"
+            ):
                 raise RuntimeError("required acknowledgement lost after canonical commit")
 
         client.add_event_handler(lose_ack, events.Raw())
@@ -228,7 +245,7 @@ async def test_same_second_concurrent_edit_history_replay_and_legitimate_return_
         assert _pending(path) is not None
         if not a_committed:
             await _write(writer, "DROP TRIGGER tg101_fault")
-        client.session.close()
+        cast(SQLiteSession, client.session).close()
         reader.close()
         await writer.aclose()
         writer = await SQLiteWriter.open(path)
@@ -248,7 +265,7 @@ async def test_same_second_concurrent_edit_history_replay_and_legitimate_return_
         ]
         assert _pending(path) is None
     finally:
-        client.session.close()
+        cast(SQLiteSession, client.session).close()
         reader.close()
         await writer.aclose()
 
@@ -311,13 +328,13 @@ async def test_closed_handler_barrier_cancellation_retains_raw_update_for_restar
         assert _pending(path) is not None
         assert _saved(client) == baseline
         assert reader.execute("SELECT COUNT(*) FROM messages WHERE message_id=11").fetchone() == (0,)
-        client.session.close()
+        cast(SQLiteSession, client.session).close()
         client = _client(tmp_path / "session", writer, channel=False)
         _manager(client, reader, writer)
         await client.start_update_delivery(99)
         assert _pending(path) is None
         assert reader.execute("SELECT text FROM messages WHERE message_id=11").fetchone() == ("new",)
     finally:
-        client.session.close()
+        cast(SQLiteSession, client.session).close()
         reader.close()
         await writer.aclose()

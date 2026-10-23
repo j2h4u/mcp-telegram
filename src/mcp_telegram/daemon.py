@@ -169,6 +169,7 @@ from .topics.refresh import TopicRefresher
 from .topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from .topics.telegram_adapter import TelethonTelegramTopicGateway, TopicClient
 from .transcription_hydration import TranscriptionHydrationHandler
+from .update_delivery import UpdateDeliveryRepository
 
 logger = logging.getLogger(__name__)
 
@@ -240,6 +241,12 @@ def read_operator_summary_snapshot(
 
 
 class _DaemonClient(Protocol):
+    def configure_update_delivery(self, repository: UpdateDeliveryRepository) -> None: ...
+
+    async def start_update_delivery(self, account_id: int) -> None: ...
+
+    async def wait_update_delivery_failure(self) -> None: ...
+
     def add_event_handler(self, _callback: object, _event: object) -> None: ...
 
     def remove_event_handler(self, _callback: object) -> None: ...
@@ -1075,7 +1082,7 @@ def _create_telegram_client(
         load_until_utc=partial(load_account_cooldown_until_utc, conn),
         save_until_utc=save_cooldown,
     )
-    return cast(
+    client = cast(
         _DaemonClient,
         create_client(
             catch_up=True,
@@ -1083,6 +1090,8 @@ def _create_telegram_client(
             cooldown_persistence=cooldown_persistence,
         ),
     )
+    client.configure_update_delivery(UpdateDeliveryRepository(writer))
+    return client
 
 
 async def _build_sync_main_context() -> _SyncMainContext:
@@ -1710,12 +1719,6 @@ def _ensure_demand_runtime(
         bind = getattr(producer, "bind_demand_sink", None)
         if callable(bind):
             bind(demand_runtime.coordinator)
-    _create_tracked_task(
-        ctx,
-        demand_runtime.coordinator.run(),
-        name="telegram_demand_coordinator",
-        critical=True,
-    )
     return demand_runtime
 
 
@@ -1892,6 +1895,20 @@ async def _monitor_sqlite_writer(ctx: _SyncMainContext) -> None:
     raise RuntimeError("SQLite write owner failed") from failure
 
 
+async def _release_updates_after_replay(ctx: _SyncMainContext, barrier: UpdateProcessingBarrier) -> None:
+    """Bind owners before replay, and start background acquisitions only after restoration."""
+    barrier.open()
+    assert ctx.api_server.self_id is not None
+    await ctx.client.start_update_delivery(ctx.api_server.self_id)
+    assert ctx.coordinator is not None
+    _create_tracked_task(
+        ctx,
+        ctx.coordinator.run(),
+        name="telegram_demand_coordinator",
+        critical=True,
+    )
+
+
 async def sync_main() -> None:
     """Main entry point for the sync daemon process.
 
@@ -1901,6 +1918,7 @@ async def sync_main() -> None:
     ctx = await _build_sync_main_context()
     try:
         _create_tracked_task(ctx, _monitor_sqlite_writer(ctx), name="sqlite_write_owner", critical=True)
+        _create_tracked_task(ctx, ctx.client.wait_update_delivery_failure(), name="update_delivery", critical=True)
         _create_tracked_task(
             ctx,
             _monitor_flood_wait_kill_switch(ctx),
@@ -1972,7 +1990,7 @@ async def sync_main() -> None:
         )
         await draft_owner.request_recovery("startup")
         await ctx.writer.run(lambda conn: TopicCatalogRepository(conn).bootstrap())
-        update_barrier.open()
+        await _release_updates_after_replay(ctx, update_barrier)
 
         async def recover_projections() -> None:
             await draft_owner.request_recovery("reconnect_observed")

@@ -10,11 +10,17 @@ from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import AbstractContextManager
 from contextvars import Context
 from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import StrEnum
+from functools import wraps
 from typing import Never, Protocol, cast
 
 from aiolimiter import AsyncLimiter
-from telethon import TelegramClient  # type: ignore[import-untyped]
+from telethon import (  # type: ignore[import-untyped]
+    TelegramClient,  # type: ignore[import-untyped]
+    types,
+)
+from telethon._updates import ChannelState, SessionState  # type: ignore[import-untyped]
 from telethon.errors import (  # type: ignore[import-untyped]
     FloodPremiumWaitError,
     FloodTestPhoneWaitError,
@@ -27,6 +33,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
     ServerError,
     TimedOutError,
 )
+from telethon.events.common import EventBuilder  # type: ignore[import-untyped]
 from telethon.tl.functions.channels import GetFullChannelRequest  # type: ignore[import-untyped]
 from telethon.tl.functions.updates import (  # type: ignore[import-untyped]
     GetChannelDifferenceRequest,
@@ -34,8 +41,10 @@ from telethon.tl.functions.updates import (  # type: ignore[import-untyped]
 )
 from telethon.utils import is_list_like  # type: ignore[import-untyped]
 
+from .delivered_update import DeliveredUpdate, delivered_update_context, fail_delivered_update
 from .flood import FloodWaitObservation, TelegramRpcThrottled, flood_seconds
 from .request_timing import current_timing, timing_phase
+from .telegram_delivery import DeliveryEnvelope, ProtocolSnapshot, load_delivery_envelope, load_protocol_snapshot
 from .telegram_demand import (
     AcquisitionKind,
     DemandToken,
@@ -67,6 +76,7 @@ from .telegram_rpc_scheduler import (
     rpc_attempt_budget,
     rpc_scope,
 )
+from .update_delivery import UpdateDeliveryRepository
 
 logger = logging.getLogger(__name__)
 
@@ -399,6 +409,14 @@ def _cooldown_until_utc_ms() -> int:
     return int((time.time() + max(0.0, _COOLDOWN_DEADLINE - time.monotonic())) * 1_000)
 
 
+@dataclass(slots=True)
+class _ActiveDelivery:
+    envelope: DeliveryEnvelope
+    contexts: dict[int, DeliveredUpdate]
+    remaining: set[int]
+    done: asyncio.Event
+
+
 class TelegramRpcGate(TelegramClient):
     """A Telethon client with account-global admission and transient retry.
 
@@ -467,6 +485,213 @@ class TelegramRpcGate(TelegramClient):
         self._connection_rpc_tasks: set[asyncio.Task[object]] = set()
         self._pending_scalar_dispatches: dict[asyncio.Future[object], _PendingScalarDispatch] = {}
         self._transport_state = _TransportBoundaryState.DISCONNECTED
+        self._delivery_repository: UpdateDeliveryRepository | None = None
+        self._delivery_ready = asyncio.Event()
+        self._delivery_failure = asyncio.Event()
+        self._delivery_safe: ProtocolSnapshot | None = None
+        self._active_delivery: _ActiveDelivery | None = None
+        self._delivery_callbacks: dict[object, object] = {}
+
+    def configure_update_delivery(self, repository: UpdateDeliveryRepository) -> None:
+        """Hold the vendor loop before connect; auth RPC remains available."""
+        if self._delivery_repository is not None or self.is_connected():
+            raise RuntimeError("update delivery must be configured once before connect")
+        self._delivery_repository = repository
+
+    async def wait_update_delivery_failure(self) -> None:
+        await self._delivery_failure.wait()
+        raise RuntimeError("required Telegram update delivery failed; retained package needs recovery")
+
+    def add_event_handler(self, callback: Callable[..., Awaitable[object]], event: object = None) -> None:
+        @wraps(callback)
+        async def retained_callback(*args: object) -> object:
+            try:
+                return await callback(*args)
+            except BaseException:
+                fail_delivered_update()
+                raise
+
+        self._delivery_callbacks[callback] = retained_callback
+        super().add_event_handler(retained_callback, cast(EventBuilder, event))
+
+    def remove_event_handler(self, callback: object, event: object = None) -> int:
+        return cast(
+            int,
+            super().remove_event_handler(
+                cast(Callable[..., Awaitable[object]], self._delivery_callbacks.pop(callback, callback)),
+                cast(EventBuilder, event),
+            ),
+        )
+
+    def _capture_delivery_snapshot(self, chats: list[object]) -> ProtocolSnapshot:
+        account, channels = self._message_box.session_state()
+        hashes = {}
+        supplied = {getattr(chat, "id", None): chat for chat in chats}
+        for channel_id in channels:
+            entity = self._mb_entity_cache.get(channel_id)
+            chat = supplied.get(channel_id)
+            access_hash = None if getattr(chat, "min", False) else getattr(chat, "access_hash", None)
+            if access_hash is None:
+                access_hash = getattr(entity, "hash", None)
+            if access_hash is not None:
+                hashes[channel_id] = access_hash
+        return ProtocolSnapshot(
+            pts=cast(int, account["pts"]),
+            qts=cast(int, account["qts"]),
+            date=cast(datetime, account["date"]),
+            seq=cast(int, account["seq"]),
+            channels=channels,
+            channel_hashes=hashes,
+        )
+
+    async def start_update_delivery(self, account_id: int) -> None:
+        """Replay local obligations after domain owners/account validation, then release intake."""
+        repository = self._delivery_repository
+        if repository is None:
+            raise RuntimeError("update delivery repository is not configured")
+        state = await repository.bind(account_id, self._capture_delivery_snapshot([]).model_dump_json())
+        self._delivery_safe = load_protocol_snapshot(state.safe_snapshot)
+        if state.pending is not None:
+            envelope = load_delivery_envelope(state.pending)
+            updates, users, chats = envelope.unpack()
+            if len(updates) != len(state.orders) or len(state.orders) != len(state.reaction_sequences):
+                raise RuntimeError("retained Telegram update tokens are incomplete")
+            self._install_delivery(envelope, updates, tuple(zip(state.orders, state.reaction_sequences, strict=True)))
+            await super()._preprocess_updates(updates, users, chats)  # type: ignore[misc]
+            if updates:
+                await asyncio.gather(*(self._dispatch_update(update) for update in updates))
+            else:
+                await self._complete_update_delivery()
+            if self._delivery_failure.is_set():
+                raise RuntimeError("retained Telegram update replay failed")
+        assert self._delivery_safe is not None
+        self._restore_delivery_message_box(account_id)
+        await self._save_states_and_entities()
+        assert self.session is not None
+        self.session.save()
+        self._delivery_ready.set()
+
+    def _restore_delivery_message_box(self, account_id: int) -> None:
+        snapshot = self._delivery_safe
+        assert snapshot is not None and self.session is not None
+        for channel_id, access_hash in snapshot.channel_hashes.items():
+            self.session.process_entities(
+                types.contacts.ResolvedPeer(
+                    types.PeerChannel(channel_id), [types.ChannelForbidden(channel_id, access_hash, "")], []
+                )
+            )
+        self._message_box.load(
+            SessionState(
+                account_id,
+                self.session.dc_id,
+                bool(self._mb_entity_cache.self_bot),
+                snapshot.pts,
+                snapshot.qts,
+                int(snapshot.date.timestamp()),
+                snapshot.seq,
+                None,
+            ),
+            [ChannelState(channel_id, pts) for channel_id, pts in snapshot.channels.items()],
+        )
+        for channel_id in snapshot.channels:
+            peer = self.session.get_input_entity(types.PeerChannel(channel_id))
+            # MessageBox needs the access hash in its own cache before channel difference.
+            self._mb_entity_cache.extend(
+                [],
+                [
+                    types.Channel(
+                        id=channel_id,
+                        title="",
+                        photo=types.ChatPhotoEmpty(),
+                        date=None,
+                        access_hash=peer.access_hash,
+                    )
+                ],
+            )
+
+    def _install_delivery(
+        self, envelope: DeliveryEnvelope, updates: list[object], tokens: tuple[tuple[int, int], ...]
+    ) -> None:
+        contexts = {
+            id(update): DeliveredUpdate(order, envelope.captured_at, sequence)
+            for update, (order, sequence) in zip(updates, tokens, strict=True)
+        }
+        self._active_delivery = _ActiveDelivery(envelope, contexts, set(contexts), asyncio.Event())
+
+    async def _preprocess_updates(
+        self, updates: list[object], users: list[object], chats: list[object]
+    ) -> list[object]:
+        repository = self._delivery_repository
+        if repository is None:
+            return cast(list[object], await super()._preprocess_updates(updates, users, chats))
+        # Capture before either await: the vendor head can change while the prior callbacks finish.
+        envelope = DeliveryEnvelope.capture(self._capture_delivery_snapshot(chats), time.time(), updates, users, chats)
+        prior = self._active_delivery
+        if prior is not None:
+            await prior.done.wait()
+        if self._delivery_failure.is_set() or not self._delivery_ready.is_set():
+            raise RuntimeError("Telegram update admission is closed")
+        try:
+            tokens = await repository.admit(envelope.model_dump_json().encode("utf-8"), len(updates))
+            self._install_delivery(envelope, updates, tokens)
+            result = await super()._preprocess_updates(updates, users, chats)  # type: ignore[misc]
+            if not updates:
+                await self._complete_update_delivery()
+            return cast(list[object], result)
+        except BaseException:
+            self._delivery_failure.set()
+            raise
+
+    async def _complete_update_delivery(self) -> None:
+        active = self._active_delivery
+        repository = self._delivery_repository
+        assert active is not None and repository is not None and self.session is not None
+        try:
+            if any(context.failed for context in active.contexts.values()):
+                self._delivery_failure.set()
+                return
+            snapshot = active.envelope.checkpoint_after
+            for channel_id, access_hash in snapshot.channel_hashes.items():
+                self.session.process_entities(
+                    types.contacts.ResolvedPeer(
+                        types.PeerChannel(channel_id), [types.ChannelForbidden(channel_id, access_hash, "")], []
+                    )
+                )
+            for channel_id in snapshot.channels:
+                self.session.get_input_entity(types.PeerChannel(channel_id))
+            # Entity/access-hash durability precedes authoritative completion across the two databases.
+            self.session.save()
+            await repository.complete(snapshot.model_dump_json())
+            self._delivery_safe = snapshot
+            await self._save_states_and_entities()
+            self.session.save()
+            self._active_delivery = None
+        except BaseException:
+            self._delivery_failure.set()
+            raise
+        finally:
+            active.done.set()
+
+    async def _save_states_and_entities(self) -> None:
+        if self.session is None:
+            return
+        if self._delivery_repository is None:
+            await super()._save_states_and_entities()  # type: ignore[misc]
+            return
+        if self._mb_entity_cache.self_id:
+            self.session.process_entities(
+                types.contacts.ResolvedPeer(
+                    types.PeerUser(0), [], [types.User(0, access_hash=self._mb_entity_cache.self_id)]
+                )
+            )
+        snapshot = self._delivery_safe
+        if snapshot is None:
+            return
+        self.session.set_update_state(
+            0, types.updates.State(snapshot.pts, snapshot.qts, snapshot.date, snapshot.seq, 0)
+        )
+        for channel_id, pts in snapshot.channels.items():
+            self.session.set_update_state(channel_id, types.updates.State(pts, 0, snapshot.date, 0, 0))
 
     @staticmethod
     def rpc_scope(
@@ -1172,6 +1397,8 @@ class TelegramRpcGate(TelegramClient):
 
     async def _update_loop(self) -> None:
         """Let each difference RPC and dispatched update establish its own root."""
+        if self._delivery_repository is not None:
+            await self._delivery_ready.wait()
         await super()._update_loop()  # type: ignore[misc]
 
     async def _handle_auto_reconnect(self) -> None:
@@ -1198,8 +1425,26 @@ class TelegramRpcGate(TelegramClient):
 
     async def _dispatch_update(self, update: object) -> None:
         """Give one ordinary or replayed update its event-owned demand root."""
-        with demand_context(DemandKind.REALTIME_EVENT_ACQUISITION):
-            await super()._dispatch_update(update)  # type: ignore[misc]
+        active = self._active_delivery
+        if self._delivery_repository is None:
+            with demand_context(DemandKind.REALTIME_EVENT_ACQUISITION):
+                await super()._dispatch_update(update)  # type: ignore[misc]
+            return
+        if active is None or id(update) not in active.remaining:
+            self._delivery_failure.set()
+            raise RuntimeError("Telegram update has no durable admission")
+        context = active.contexts[id(update)]
+        try:
+            with delivered_update_context(context), demand_context(DemandKind.REALTIME_EVENT_ACQUISITION):
+                await super()._dispatch_update(update)  # type: ignore[misc]
+        except BaseException:
+            context.failed = True
+            self._delivery_failure.set()
+            raise
+        finally:
+            active.remaining.discard(id(update))
+            if not active.remaining:
+                await self._complete_update_delivery()
 
     def _scheduler_transport_ready(self) -> bool:
         return (

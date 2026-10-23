@@ -318,10 +318,6 @@ class _NewMessageEvent(Protocol):
     is_private: bool
     message: _MessageLike
 
-    async def get_sender(self) -> _SenderLike | None: ...
-
-    async def get_chat(self) -> _SenderLike | None: ...
-
 
 class _EditedMessageEvent(Protocol):
     chat_id: int | None

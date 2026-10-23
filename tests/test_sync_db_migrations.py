@@ -3221,7 +3221,7 @@ def test_v85_repairs_every_earlier_database_and_removes_receipt(
         assert _fetchone_int(conn, "SELECT COUNT(*) FROM messages") == 3
         assert _fetchone_row(conn, "SELECT value FROM daemon_state WHERE key='fts_repair_receipt'") is None
         assert _fetchall_rows(conn, "SELECT DISTINCT version FROM schema_version ORDER BY version") == [
-            (v,) for v in range(1, 86)
+            (v,) for v in range(1, _CURRENT_SCHEMA_VERSION + 1)
         ]
 
 
@@ -3257,7 +3257,7 @@ def test_v85_fresh_database_and_restarts_never_repeat_backfill(db_path: Path, mo
     repair.assert_called_once()
     with _sqlite_connection(db_path) as conn:
         assert _fetchall_rows(conn, "SELECT DISTINCT version FROM schema_version ORDER BY version") == [
-            (v,) for v in range(1, 86)
+            (v,) for v in range(1, _CURRENT_SCHEMA_VERSION + 1)
         ]
         conn.execute("CREATE INDEX unrelated_fts_lifecycle_test ON daemon_state(value)")
         conn.execute("UPDATE dialog_directory_state SET account_id=101,generation=generation+1")
@@ -3296,7 +3296,7 @@ def test_v85_partial_batches_survive_failure_without_advancing_ledger(
         assert _fetchone_int(conn, "SELECT COUNT(*) FROM messages_fts WHERE dialog_id=9") == 0
     ensure_sync_schema(v84_db)
     with _sqlite_connection(v84_db) as conn:
-        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 85
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
         assert _fetchone_int(conn, "SELECT COUNT(*) FROM messages") == 501
         assert _fetchone_int(conn, "SELECT COUNT(*) FROM messages_fts") == 501
 

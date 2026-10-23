@@ -287,7 +287,9 @@ def test_sync_main_has_one_coordinator_task_and_no_retired_launcher() -> None:
 
     source = inspect.getsource(daemon.sync_main)
     composition = inspect.getsource(_ensure_demand_runtime)
-    assert composition.count('name="telegram_demand_coordinator"') == 1
+    release = inspect.getsource(daemon._release_updates_after_replay)
+    assert release.count('name="telegram_demand_coordinator"') == 1
+    assert composition.count('name="telegram_demand_coordinator"') == 0
     for retired in (
         "_run_sync_loop",
         "run_activity_sync_loop",
@@ -379,7 +381,7 @@ def test_ensure_demand_runtime_wires_all_demand_sinks_once(monkeypatch: pytest.M
         "fact:coordinator",
         "folder:coordinator",
     ]
-    assert created_tasks == [{"name": "telegram_demand_coordinator", "critical": True}]
+    assert created_tasks == []
 
 
 def test_ensure_demand_runtime_reuses_existing_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -413,6 +415,16 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
     events: list[str] = []
     writer_connection = object()
     writer_active = False
+
+    class _Client:
+        async def wait_update_delivery_failure(self) -> None:
+            await asyncio.Event().wait()
+
+        async def start_update_delivery(self, account_id: int) -> None:
+            assert "barrier:open" in events
+            assert "catalog:bootstrap" in events
+            assert f"owner:bind:{account_id}" in events
+            events.append("delivery:replayed")
 
     class _Writer:
         async def run(self, operation: Callable[[object], object]) -> object:
@@ -470,9 +482,10 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
             events.append("directory:init")
 
     ctx = SimpleNamespace(
+        coordinator=SimpleNamespace(run=lambda: asyncio.sleep(0)),
         rpc_observation_sink=None,
         writer=_Writer(),
-        client=object(),
+        client=_Client(),
         conn=writer_connection,
         db_path=Path("/tmp/mcp-telegram-sync-main-test.db"),
         shutdown_event=asyncio.Event(),
@@ -546,6 +559,7 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
     assert events == [
         "context",
         "task:sqlite_write_owner",
+        "task:update_delivery",
         "task:flood_wait_kill_switch_monitor",
         "barrier:True",
         "owner:init",
@@ -564,6 +578,8 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
         "catalog:bootstrap",
         "writer:done",
         "barrier:open",
+        "delivery:replayed",
+        "task:telegram_demand_coordinator",
         "task:reconnect_catch_up_loop",
         "prime",
         "offers",
