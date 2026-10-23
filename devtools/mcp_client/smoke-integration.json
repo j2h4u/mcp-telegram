@@ -163,7 +163,7 @@
       }
     },
     {
-      "_comment": "get_dialog_stats — placeholder dialog id validates the actionable error path",
+      "_comment": "get_dialog_stats — valid unknown exact id returns retained empty aggregates with unknown history coverage",
       "action": "call_tool",
       "name": "get_dialog_stats",
       "arguments": {
@@ -171,20 +171,17 @@
         "top_n": 3
       },
       "expect": {
-        "one_of": [
-          {
-            "is_error": true,
-            "content_text_contains": [
-              "synced"
-            ]
-          },
-          {
-            "is_error": true,
-            "content_text_contains": [
-              "dialog"
-            ]
-          }
-        ]
+        "is_error": false,
+        "path_equals": {
+          "content": [],
+          "structuredContent.top_reactions": [],
+          "structuredContent.top_mentions": [],
+          "structuredContent.top_hashtags": [],
+          "structuredContent.top_forwards": [],
+          "structuredContent.coverage": "unknown"
+        },
+        "path_exists": ["structuredContent.coverage"],
+        "path_not_exists": ["structuredContent.observation_horizon_at"]
       }
     },
     {

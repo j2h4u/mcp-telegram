@@ -19,6 +19,7 @@ from .dialog_selector import DialogSelector, DialogSelectorError, required_dialo
 from .message_content import MessageSnapshot, project_message_content
 from .models import DialogType
 from .sync_db import open_sync_db_reader
+from .sync_read_model import local_history_coverage
 
 
 class _LoggerLike(Protocol):
@@ -33,7 +34,7 @@ class _LoggerLike(Protocol):
     def exception(self, msg: str, *_args: object, **_kwargs: object) -> None: ...
 
 
-_SELECT_SYNC_STATUS_SQL = "SELECT status FROM synced_dialogs WHERE dialog_id = ?"
+_SELECT_SYNC_COVERAGE_SQL = "SELECT status, last_synced_at FROM synced_dialogs WHERE dialog_id = ?"
 _GET_DIALOG_TOP_REACTIONS_SQL = (
     "SELECT emoji, SUM(count) AS cnt "
     "FROM message_reactions WHERE dialog_id = ? "
@@ -609,13 +610,12 @@ class DaemonActivityStatsService:
             return resolved
         dialog_id = resolved
         directory_coverage = cast(DialogDirectoryCoverage | None, getattr(resolved, "coverage", None))
-        row = cast(tuple[object] | None, self._deps.conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone())
-        if row is None or row[0] not in ("synced", "syncing", "access_lost"):
-            return {
-                "ok": False,
-                "error": "not_synced",
-                "message": "GetDialogStats requires a synced dialog. Use MarkDialogForSync first.",
-            }
+        row = cast(
+            tuple[str, int | None] | None,
+            self._deps.conn.execute(_SELECT_SYNC_COVERAGE_SQL, (dialog_id,)).fetchone(),
+        )
+        status, last_synced_at = row if row is not None else (None, None)
+        coverage = local_history_coverage(status, last_synced_at)
 
         reactions = [
             {"emoji": r[0], "count": int(cast(int | str, r[1]))}
@@ -647,6 +647,9 @@ class DaemonActivityStatsService:
         ]
         data: dict[str, object] = {
             "dialog_id": dialog_id,
+            "sync_status": status or "not_synced",
+            "coverage": coverage.state,
+            "observation_horizon_at": coverage.observation_horizon_at,
             "top_reactions": reactions,
             "top_mentions": mentions,
             "top_hashtags": hashtags,
