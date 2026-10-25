@@ -14,24 +14,52 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import cast
 
+from ..dialog_fact_observations import claim_dialog_fact
 from ..dialog_identity import capture_identity_baseline, publish_dialog_identity
 from ..dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation, ObservedText
 from ..entity_store import EntitySnapshot, ensure_entity_stub, upsert_entity_snapshots
 from ..models import DialogType
 from ..resolver import latinize
 from ..sync_transactions import require_write_transaction, write_savepoint
+from .collection_repository import (
+    EffectiveProfileMerge,
+    collection_progress,
+    encode,
+    patch_embedded_story,
+    reconcile_embedded_stories,
+    store_collection_page,
+    store_semantic_patch,
+    store_semantic_snapshot,
+    store_story_update,
+)
 from .contracts import (
     FULL_PROFILE_OWNED_FIELDS,
     FULL_USER_ENDPOINT,
     NORMALIZATION_VERSION,
     PERSONAL_CHANNEL_OWNED_FIELDS,
+    PROFILE_COLLECTION_SECTIONS,
     PROFILE_SECTIONS,
+    ObservationBoundary,
     ProfileAcquisitionEvidence,
+    ProfileCollectionItem,
+    ProfileCollectionPage,
     ProfileFieldObservation,
+    ProfileSemanticSnapshot,
+    SuppliedProfileUser,
 )
+from .profile_history import (
+    CollectionHistoryMerge,
+    HistoryObservation,
+    append_collection_history,
+    append_explicit_collection_clear,
+    collection_history_watermark,
+    effective_collection_membership,
+)
+from .profile_history_store import append_effective_history
+from .supplied_profile import authorized_legacy_user_fields, summary_fingerprint, supplied_current_stories
 
 _DETAIL_SCHEMA = 1
 _EVIDENCE_MAX_JSON_BYTES = 4096
@@ -66,6 +94,7 @@ class EntityRefreshCursor:
     pair_eligible: bool = False
     profile_revision: int = 0
     pair_mode: str | None = None
+    page_cursor_json: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +112,8 @@ class EntitySectionCommit:
     dialog_identity_observation: DialogIdentityObservation | None = None
     dialog_identity_baseline_revision: int | None = None
     field_observation: ProfileFieldObservation | None = None
+    semantic_snapshot: ProfileSemanticSnapshot | None = None
+    collection_page: ProfileCollectionPage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +169,15 @@ class EntityProfileRepository:
                 columns = set()
             self._column_cache[table] = columns
         return columns
+
+    def _profile_sections(self, entity_id: int) -> tuple[str, ...]:
+        kind = str(self._read_entity_stub(entity_id).get("type", "")).lower()
+        return PROFILE_SECTIONS if kind in {"user", "bot"} else PROFILE_SECTIONS[:5]
+
+    def _next_section(self, cursor: EntityRefreshCursor) -> str | None:
+        sections = self._profile_sections(cursor.entity_id)
+        index = sections.index(cursor.next_section) + 1
+        return sections[index] if index < len(sections) else None
 
     def _refresh_has(self, column: str) -> bool:
         return column in self._columns("entity_profile_refresh_state")
@@ -198,6 +238,118 @@ class EntityProfileRepository:
             self._store_field_observations(entity_id, accepted, observation)
             self._publish_updated_identity(entity_id, detail, changed, observation.observed_at)
             return changed
+
+    def apply_supplied_user(
+        self,
+        user: SuppliedProfileUser,
+        *,
+        observation: ProfileFieldObservation,
+        boundary: ObservationBoundary | None = None,
+    ) -> frozenset[str]:
+        """One authority path for delivered Users and finite collection sidecars."""
+        with write_savepoint(self._conn):
+            supplied = replace(observation, source="min") if user.minimal else observation
+            ordinary = user
+            if user.authoritative_photo:
+                ordinary = replace(
+                    user,
+                    fields={key: value for key, value in user.fields.items() if key != "user.photo"},
+                    legacy_fields={key: value for key, value in user.legacy_fields.items() if key != "current_photo"},
+                )
+            changed = self._apply_supplied_part(ordinary, supplied, boundary)
+            if user.authoritative_photo:
+                photo = replace(
+                    user,
+                    fields={"user.photo": user.fields.get("user.photo")},
+                    legacy_fields={"current_photo": user.legacy_fields.get("current_photo")},
+                    minimal=False,
+                )
+                changed |= self._apply_supplied_part(
+                    photo,
+                    replace(observation, source="update") if observation.source == "min" else observation,
+                    boundary,
+                )
+            return changed
+
+    def _apply_supplied_part(
+        self, user: SuppliedProfileUser, observation: ProfileFieldObservation, boundary: ObservationBoundary | None
+    ) -> frozenset[str]:
+        base, legacy_evidence = self._owned_history_base(user.entity_id, observation)
+        changed = self.apply_profile_update(
+            user.entity_id, authorized_legacy_user_fields(user), observation=observation
+        )
+        if user.fields:
+            self._observation_profile_base(user.entity_id, observation)
+            incoming = ProfileSemanticSnapshot(
+                user.entity_id,
+                observation.owner_account_id,
+                user.fields,
+                user.coverage,
+                boundary or ObservationBoundary(),
+                endpoint="supplied.User",
+            )
+            merged = store_semantic_patch(self._conn, incoming, observation)
+            append_effective_history(self._conn, merged, observation, base, legacy_evidence)
+            if observation.source != "min":
+                changed |= self._changed_semantic_roots(merged)
+        return changed
+
+    @staticmethod
+    def _changed_semantic_roots(merged: EffectiveProfileMerge) -> frozenset[str]:
+        return frozenset(
+            root.split(".", 1)[-1]
+            for root in merged.after
+            if summary_fingerprint(root, merged.before.get(root)) != summary_fingerprint(root, merged.after[root])
+            and any(path == root or path.startswith((root + ".", root + "[")) for path in merged.accepted_paths)
+        )
+
+    def apply_story_update(
+        self, entity_id: int, item: ProfileCollectionItem, *, observation: ProfileFieldObservation
+    ) -> frozenset[str]:
+        self._observation_profile_base(entity_id, observation)
+        prior = self._conn.execute(
+            "SELECT MAX(observation_order) FROM entity_profile_collection_facts WHERE owner_account_id=? AND entity_id=? AND item_key=?",
+            (observation.owner_account_id, entity_id, item.key),
+        ).fetchone()
+        if prior is not None and prior[0] is not None and prior[0] >= observation.order:
+            return frozenset()
+        store_story_update(self._conn, entity_id, item, observation)
+        patch_embedded_story(self._conn, entity_id, item, observation)
+        if item.fields.get("constructor") != "StoryItemDeleted":
+            return frozenset({"current_stories", "pinned_stories"})
+        for section in ("current_stories", "pinned_stories"):
+            self._journal_story_deletion(entity_id, section, item.key, observation)
+        return frozenset({"current_stories", "pinned_stories"})
+
+    def _published_membership(self, entity_id: int, section: str, published: Mapping[str, object]) -> frozenset[str]:
+        return frozenset(
+            str(row[0])
+            for row in self._conn.execute(
+                "SELECT item_key FROM entity_profile_collection_membership WHERE owner_account_id=? "
+                "AND entity_id=? AND section=? AND generation=? AND scan=? AND identity_kind='remote'",
+                (published["owner_account_id"], entity_id, section, published["generation"], published["scan"]),
+            )
+        )
+
+    def _journal_story_deletion(
+        self, entity_id: int, section: str, key: str, observation: ProfileFieldObservation
+    ) -> None:
+        payload = self.read_section_payload(entity_id, section)
+        published = payload.get("published") if isinstance(payload, dict) else None
+        if (
+            not isinstance(published, dict)
+            or not published.get("identifiable")
+            or published.get("owner_account_id") != observation.owner_account_id
+        ):
+            return
+        context = HistoryObservation(entity_id, observation, ObservationBoundary())
+        members = effective_collection_membership(
+            self._conn, context, section, published, self._published_membership(entity_id, section, published)
+        )
+        if members is not None and key in members:
+            append_explicit_collection_clear(
+                self._conn, HistoryObservation(entity_id, observation, ObservationBoundary()), section, key, published
+            )
 
     def _observation_profile_base(
         self, entity_id: int, observation: ProfileFieldObservation
@@ -301,35 +453,13 @@ class EntityProfileRepository:
             baseline,
         )
 
-    def is_history_profile_managed(self, entity_id: int) -> bool:
-        """Check durable private-dialog enrollment without visibility filtering."""
-        if not self._columns("full_history_enrollment") or not self._columns("dialogs"):
-            return False
-        return (
-            self._conn.execute(
-                "SELECT 1 FROM full_history_enrollment e JOIN dialogs d ON d.dialog_id=e.dialog_id "
-                "WHERE e.dialog_id=? AND e.enabled=1 AND d.type IN ('user','bot','User','Bot')",
-                (entity_id,),
-            ).fetchone()
-            is not None
-        )
-
     def reconcile_history_profiles(self, *, now: int, limit: int, pair_mode: str, self_id: int | None) -> int:
-        """Admit a bounded batch of missing DM facts, with no age-based polling."""
+        """Advance the finite personal-peer admission checkpoint."""
         if isinstance(limit, bool) or limit < 1:
             raise ValueError("profile reconciliation limit must be positive")
         if self_id is None or not self._history_profile_schema_available():
             return 0
-        with write_savepoint(self._conn):
-            rows = self._history_profiles_to_collect(self_id, min(limit, 32))
-            for entity_id, entity_type, name, repair_owner in rows:
-                ensure_entity_stub(
-                    self._conn,
-                    EntitySnapshot(entity_id, entity_type, name, None, latinize(name) if name else None, now),
-                )
-                sections = PROFILE_SECTIONS if repair_owner else self._missing_profile_sections(entity_id)
-                self.request_section_refresh(entity_id, sections, now=now, pair_mode=pair_mode)
-            return len(rows)
+        return _reconcile_profile_admission(self._conn, self_id, now=now, limit=limit, pair_mode=pair_mode)
 
     def _history_profile_schema_available(self) -> bool:
         return all(
@@ -337,34 +467,10 @@ class EntityProfileRepository:
             for table in ("full_history_enrollment", "dialogs", "entity_details", "entity_detail_sections")
         ) and self._refresh_has("generation")
 
-    def _history_profiles_to_collect(self, self_id: int, limit: int) -> list[tuple[int, str, str | None, bool]]:
-        owner_mismatch = "p.profile_owner_account_id IS NOT ?" if self._detail_has("profile_owner_account_id") else "0"
-        owner_parameters: tuple[object, ...] = (self_id,) if self._detail_has("profile_owner_account_id") else ()
-        rows = self._conn.execute(
-            "WITH expected(section) AS (VALUES ('full_profile'),('common_chats'),('contact_overlap'),"
-            "('avatar_history'),('personal_channel')) "
-            f"SELECT d.dialog_id,d.type,d.name,({owner_mismatch}) FROM dialogs d "
-            "JOIN full_history_enrollment e ON e.dialog_id=d.dialog_id AND e.enabled=1 "
-            "LEFT JOIN entity_details p ON p.entity_id=d.dialog_id "
-            "LEFT JOIN entity_profile_refresh_state r ON r.entity_id=d.dialog_id "
-            "WHERE d.type IN ('user','bot','User','Bot') AND d.dialog_id<>? "
-            "AND (r.status IS NULL OR r.status='complete' "
-            "OR (r.status='rejected' AND r.reason='refresh_rejected')) "
-            f"AND (p.entity_id IS NULL OR ({owner_mismatch}) OR EXISTS ("
-            "SELECT 1 FROM expected x LEFT JOIN entity_detail_sections s "
-            "ON s.entity_id=d.dialog_id AND s.section=x.section "
-            "WHERE s.section IS NULL OR s.status IN ('pending','stale') "
-            "OR (s.status='fresh' AND s.observed_at IS NULL) "
-            "OR (s.status='unavailable' AND s.reason='refresh_rejected'))) "
-            "ORDER BY d.dialog_id LIMIT ?",
-            (*owner_parameters, self_id, *owner_parameters, limit),
-        ).fetchall()
-        return [(int(row[0]), str(row[1]), row[2], bool(row[3])) for row in rows]
-
     def _missing_profile_sections(self, entity_id: int) -> tuple[str, ...]:
         stored = self._read_stored_sections(entity_id)
         missing = []
-        for section in PROFILE_SECTIONS:
+        for section in self._profile_sections(entity_id):
             row = stored.get(section)
             if row is None or _profile_section_missing(row):
                 missing.append(section)
@@ -374,13 +480,14 @@ class EntityProfileRepository:
 
     def request_section_refresh(self, entity_id: int, sections: tuple[str, ...], *, now: int, pair_mode: str) -> bool:
         """Invalidate only requested sections and fence an older in-flight result."""
-        if any(section not in PROFILE_SECTIONS for section in sections):
+        if any(section not in self._profile_sections(entity_id) for section in sections):
             raise ValueError("unknown profile section")
         if pair_mode not in {"enabled", "disabled"}:
             raise ValueError("invalid profile pair mode")
         if not sections or not self._refresh_has("generation"):
             return False
         with write_savepoint(self._conn):
+            self._capture_legacy_section_evidence(entity_id, sections)
             if not self.ensure_unknown_refresh_parent(entity_id, now=now):
                 return False
             active = self._read_pending_refresh_state(entity_id)
@@ -394,12 +501,12 @@ class EntityProfileRepository:
                 "ON CONFLICT(entity_id,section) DO UPDATE SET status='pending',reason='profile_changed'",
                 ((entity_id, section) for section in set(sections)),
             )
-            first = min(sections, key=PROFILE_SECTIONS.index)
-            if previous is not None and previous[0] in PROFILE_SECTIONS:
-                first = min((first, str(previous[0])), key=PROFILE_SECTIONS.index)
+            first = _first_dirty_section(sections, previous)
             self._conn.execute(
                 "UPDATE entity_profile_refresh_state SET generation=generation+?, started_at=?, "
-                "next_section=?,acquisition_cursor=0,follow_up_required=0,pair_eligible=? WHERE entity_id=?",
+                "next_section=?,acquisition_cursor=0,follow_up_required=0,pair_eligible=? "
+                + (",page_cursor_json=NULL " if self._refresh_has("page_cursor_json") else "")
+                + "WHERE entity_id=?",
                 (
                     int(_pending_refresh_is_active(active)),
                     now,
@@ -411,6 +518,75 @@ class EntityProfileRepository:
             self._reset_pair_measurement(entity_id)
             return True
 
+    def invalidate_profile_sections(
+        self,
+        entity_id: int,
+        sections: tuple[str, ...],
+        *,
+        observation: ProfileFieldObservation,
+        reason: str,
+        pair_mode: str,
+    ) -> bool:
+        """Persist the original invalidation order so replay cannot revive finished work."""
+        require_write_transaction(self._conn)
+        if reason != "user" and reason != "supplied:" + ",".join(sorted(set(sections))):
+            raise ValueError("invalid profile invalidation kind")
+        self._observation_profile_base(entity_id, observation)
+        previous = self._conn.execute(
+            "SELECT observation_order FROM entity_profile_field_observations "
+            "WHERE owner_account_id=? AND entity_id=? AND field=?",
+            (observation.owner_account_id, entity_id, "__invalidation__:" + reason),
+        ).fetchone()
+        if previous is not None and previous[0] >= observation.order:
+            return False
+        if not self.request_section_refresh(entity_id, sections, now=observation.observed_at, pair_mode=pair_mode):
+            return False
+        self._conn.execute(
+            "INSERT INTO entity_profile_field_observations(entity_id,field,owner_account_id,observation_order,observed_at,source) VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(entity_id,field) DO UPDATE SET owner_account_id=excluded.owner_account_id,"
+            "observation_order=excluded.observation_order,observed_at=excluded.observed_at,source=excluded.source",
+            (
+                entity_id,
+                "__invalidation__:" + reason,
+                observation.owner_account_id,
+                observation.order,
+                observation.observed_at,
+                observation.source,
+            ),
+        )
+        return True
+
+    def _capture_legacy_section_evidence(self, entity_id: int, sections: tuple[str, ...]) -> None:
+        """Keep the original legacy section age before invalidation or v2 overwrite."""
+        detail, _observed, owner, _scope = self._read_profile_blob(entity_id)
+        if owner is None:
+            return
+        for section in set(sections) & {"avatar_history", "common_chats"}:
+            if not isinstance(detail.get(section), list):
+                continue
+            row = self._conn.execute(
+                "SELECT status,observed_at,reason,payload_json FROM entity_detail_sections WHERE entity_id=? AND section=?",
+                (entity_id, section),
+            ).fetchone()
+            if row is None:
+                continue
+            previous = json.loads(row[3]) if row[3] else None
+            if not isinstance(previous, list):
+                continue
+            receipt = {
+                "owner_account_id": owner,
+                "section": section,
+                "observed_at": row[1],
+                "stored_status": row[0],
+                "stored_reason": row[2],
+                "traversal_coverage": "unknown",
+                "original_status": row[0] if row[0] not in {"pending", "stale"} else None,
+            }
+            self._conn.execute(
+                "UPDATE entity_detail_sections SET payload_json=? WHERE entity_id=? AND section=?",
+                (encode({"legacy_evidence": receipt}), entity_id, section),
+            )
+
     def complete_unchanged_section(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
         """Advance retained terminal knowledge without rewriting its observation."""
         with write_savepoint(self._conn):
@@ -420,9 +596,31 @@ class EntityProfileRepository:
             ).fetchone()
             if row is None or cursor.retry_at is not None or row[3] is not None or not self._cursor_matches(cursor):
                 return False
-            collected = row[0] == "fresh" and row[1] is not None
-            terminal = row[0] == "not_applicable" or (row[0] == "unavailable" and row[2] != "refresh_rejected")
-            return self._advance_completed_section(cursor, now=now) if collected or terminal else False
+            return self._advance_completed_section(cursor, now=now) if self._section_collected(cursor, row) else False
+
+    def _section_collected(self, cursor: EntityRefreshCursor, row: tuple[object, ...]) -> bool:
+        if row[0] in {"not_applicable", "unavailable"}:
+            return row[0] == "not_applicable" or row[2] != "refresh_rejected"
+        if row[0] != "fresh" or row[1] is None:
+            return False
+        if str(self._read_entity_stub(cursor.entity_id).get("type", "")).lower() not in {"user", "bot"}:
+            return True
+        if cursor.next_section == "full_profile":
+            return self._has_semantic_snapshot(cursor.entity_id)
+        if cursor.next_section in PROFILE_COLLECTION_SECTIONS:
+            payload = self.read_section_payload(cursor.entity_id, cursor.next_section)
+            return isinstance(payload, dict) and payload.get("complete") is True
+        return True
+
+    def _has_semantic_snapshot(self, entity_id: int) -> bool:
+        row = self._conn.execute(
+            "SELECT source,fields_json FROM entity_profile_semantic_snapshots s JOIN entity_details p "
+            "ON p.entity_id=s.entity_id AND p.profile_owner_account_id=s.owner_account_id "
+            "WHERE s.entity_id=? AND s.normalization_version=? AND s.source='rpc' "
+            "AND s.observation_order>0 AND s.observation_started_at IS NOT NULL AND s.observation_completed_at IS NOT NULL",
+            (entity_id, NORMALIZATION_VERSION),
+        ).fetchone()
+        return row is not None and row[0] != "legacy" and row[1] != "{}"
 
     def read_section_evidence(self, entity_id: int, section: str) -> dict[str, object] | None:
         """Return the bounded receipt projection, if a migration-created row has one."""
@@ -873,6 +1071,19 @@ class EntityProfileRepository:
         except sqlite3.OperationalError, ValueError:
             return False
 
+    def refresh_is_complete(self, cursor: EntityRefreshCursor) -> bool:
+        """Read completion for the committed generation without exposing resolved state."""
+        generation = self._refresh_has("generation")
+        row = self._conn.execute(
+            "SELECT status"
+            + (", generation" if generation else "")
+            + " FROM entity_profile_refresh_state WHERE entity_id=?",
+            (cursor.entity_id,),
+        ).fetchone()
+        if row is None:
+            return not generation and self._next_section(cursor) is None
+        return row[0] == "complete" and (not generation or row[1] == cursor.generation)
+
     def refresh_state(self, entity_id: int, *, now: int) -> dict[str, object] | None:
         """Return a durable unresolved-refresh state while it is relevant."""
         try:
@@ -887,6 +1098,7 @@ class EntityProfileRepository:
                     "follow_up_required",
                     "profile_revision",
                     "pair_mode",
+                    "page_cursor_json",
                 )
                 if column in columns
             )
@@ -938,7 +1150,7 @@ class EntityProfileRepository:
                         "THEN entity_detail_sections.status ELSE 'pending' END, "
                         "reason=CASE WHEN entity_detail_sections.status='not_applicable' "
                         "THEN entity_detail_sections.reason ELSE excluded.reason END, retry_at=NULL",
-                        ((entity_id, section, reason) for section in PROFILE_SECTIONS),
+                        ((entity_id, section, reason) for section in self._profile_sections(entity_id)),
                     )
                     if pair_eligible_override is None and self._refresh_has("pair_eligible"):
                         self._conn.execute(
@@ -951,7 +1163,7 @@ class EntityProfileRepository:
                     self._conn.executemany(
                         "INSERT OR IGNORE INTO entity_detail_sections(entity_id, section, status, observed_at, reason, payload_json, retry_at) "
                         "VALUES (?, ?, 'pending', NULL, ?, NULL, NULL)",
-                        ((entity_id, section, reason) for section in PROFILE_SECTIONS),
+                        ((entity_id, section, reason) for section in self._profile_sections(entity_id)),
                     )
         except sqlite3.OperationalError, sqlite3.IntegrityError:
             return
@@ -1065,6 +1277,7 @@ class EntityProfileRepository:
             "follow_up_required": 0,
             "profile_revision": self._profile_revision(entity_id),
             "pair_mode": pair_mode_override,
+            "page_cursor_json": None,
         }
 
     def _upsert_legacy_pending_refresh(self, entity_id: int, *, now: int, reason: str) -> None:
@@ -1189,6 +1402,7 @@ class EntityProfileRepository:
                     "follow_up_required",
                     "profile_revision",
                     "pair_mode",
+                    "page_cursor_json",
                 )
                 if column in columns
             )
@@ -1213,6 +1427,7 @@ class EntityProfileRepository:
             pair_eligible=bool(values.get("pair_eligible", 0)),
             profile_revision=int(values.get("profile_revision") or 0),
             pair_mode=(str(values["pair_mode"]) if values.get("pair_mode") in {"enabled", "disabled"} else None),
+            page_cursor_json=cast(str | None, values.get("page_cursor_json")),
         )
 
     def recover_pair_measurements(self, *, now: int) -> None:
@@ -1497,6 +1712,9 @@ class EntityProfileRepository:
         """Commit a section while an outer transaction is active."""
         if not self._cursor_matches(cursor):
             return False
+        if commit.collection_page is not None:
+            return self._commit_collection(cursor, commit, now=now)
+        history_base, history_evidence = self._owned_history_base(cursor.entity_id, commit.field_observation)
         detail, accepted, reset_owner = self._prepare_observed_commit(
             cursor.entity_id, commit.detail_patch, commit.field_observation
         )
@@ -1514,6 +1732,7 @@ class EntityProfileRepository:
         ):
             return False
         self._finish_observed_commit(cursor.entity_id, accepted, reset_owner, commit.field_observation)
+        self._store_semantic_commit(commit, history_base, history_evidence)
         section_payload = _section_payload(detail, cursor.next_section) if commit.payload is None else commit.payload
         self._write_section(
             cursor.entity_id,
@@ -1534,6 +1753,271 @@ class EntityProfileRepository:
             raise sqlite3.OperationalError("entity profile cursor advance was rejected")
         self.persist_group_created(cursor.entity_id, commit.dialog_created)
         return True
+
+    def _owned_history_base(
+        self, entity_id: int, observation: ProfileFieldObservation | None
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        detail, _at, owner, _scope = self._read_profile_blob(entity_id)
+        if observation is None or owner != observation.owner_account_id:
+            return {}, {}
+        rows = self._conn.execute(
+            "SELECT field,observation_order,observed_at,source FROM entity_profile_field_observations "
+            "WHERE entity_id=? AND owner_account_id=? AND field IN ('name','username','current_photo')",
+            (entity_id, owner),
+        ).fetchall()
+        partial = {str(row[0]) for row in rows if row[3] == "min"}
+        values = {key: value for key, value in detail.items() if key not in partial}
+        evidence: dict[str, object] = {
+            "legacy." + str(row[0]): {"order": row[1], "observed_at": row[2], "source": row[3]}
+            for row in rows
+            if row[0] in values
+        }
+        return values, evidence
+
+    def _store_semantic_commit(
+        self, commit: EntitySectionCommit, legacy_before: Mapping[str, object], legacy_evidence: Mapping[str, object]
+    ) -> EffectiveProfileMerge | None:
+        snapshot = commit.semantic_snapshot
+        observation = commit.field_observation
+        if snapshot is not None:
+            if snapshot.owner_account_id is None:
+                return None
+            if observation is None:
+                raise ValueError("semantic commit requires account observation")
+            snapshot.require_account(observation.owner_account_id)
+            merged = store_semantic_snapshot(self._conn, snapshot, observation.order)
+            if merged is not None:
+                self._dirty_summary_sections(merged)
+                if commit.evidence is not None:
+                    merged = self._store_supplied_stories(merged, commit.evidence.generation, observation)
+                append_effective_history(self._conn, merged, observation, legacy_before, legacy_evidence)
+            return merged
+        return None
+
+    def _commit_collection(self, cursor: EntityRefreshCursor, commit: EntitySectionCommit, *, now: int) -> bool:
+        page = commit.collection_page
+        observation = commit.field_observation
+        if page is None or observation is None:
+            raise ValueError("collection commit requires captured account observation")
+        if page.entity_id != cursor.entity_id or page.section != cursor.next_section:
+            raise ValueError("collection page identity mismatch")
+        owner = self._conn.execute(
+            "SELECT profile_owner_account_id FROM entity_details WHERE entity_id=?", (cursor.entity_id,)
+        ).fetchone()
+        if owner is not None and owner[0] is not None and owner[0] != observation.owner_account_id:
+            return False
+        self._apply_collection_sidecars(page, observation)
+        # Accepted sidecars can advance this page's own identity revision.
+        cursor = replace(cursor, profile_revision=self._profile_revision(cursor.entity_id))
+        state = json.loads(cursor.page_cursor_json) if cursor.page_cursor_json else {}
+        summary = store_collection_page(
+            self._conn,
+            page,
+            owner=observation.owner_account_id,
+            generation=cursor.generation,
+            cursor=state,
+            order=observation.order,
+        )
+        reconcile_embedded_stories(self._conn, page, observation)
+        summary["history_order"] = observation.order
+        if not self._advance_collection(cursor, page, state, summary, now=now):
+            raise sqlite3.OperationalError("entity profile collection cursor advance was rejected")
+        return True
+
+    def _apply_collection_sidecars(self, page: ProfileCollectionPage, observation: ProfileFieldObservation) -> None:
+        if page.supplied_user is not None:
+            if page.supplied_user.entity_id != page.entity_id:
+                raise ValueError("supplied user target mismatch")
+            self.apply_supplied_user(page.supplied_user, observation=observation, boundary=page.observation)
+        for identity in page.sidecar_identities:
+            if identity.dialog_id != page.entity_id:
+                self._publish_supplied_identity(identity, observation)
+
+    def _advance_collection(
+        self,
+        cursor: EntityRefreshCursor,
+        page: ProfileCollectionPage,
+        state: dict[str, object],
+        summary: dict[str, object],
+        *,
+        now: int,
+    ) -> bool:
+        self._capture_legacy_section_evidence(cursor.entity_id, (cursor.next_section,))
+        previous = self.read_section_payload(cursor.entity_id, cursor.next_section)
+        if isinstance(previous, dict) and isinstance(previous.get("legacy_evidence"), dict):
+            state = {**state, "legacy_evidence": previous["legacy_evidence"]}
+        progress = collection_progress(page, state, summary, previous)
+        self._journal_collection(cursor, page, progress.payload)
+        self._write_section(
+            cursor.entity_id,
+            cursor.next_section,
+            progress.status,
+            progress.reason,
+            progress.payload,
+            now=now,
+            evidence=ProfileAcquisitionEvidence(
+                generation=cursor.generation,
+                outcome="usable" if progress.status == "fresh" else "partial",
+                observation_started_at=int(cast(float, page.observation.started_at)),
+                observation_completed_at=int(cast(float, page.observation.completed_at)),
+            ),
+        )
+        if progress.cursor is None:
+            return self._advance_after_section_write(cursor, now=now, detail_revision=None) == 1
+        predicate, parameters = self._cursor_predicate(cursor)
+        return (
+            self._conn.execute(
+                "UPDATE entity_profile_refresh_state SET page_cursor_json=?,status=?,retry_at=?,reason=?,updated_at=? WHERE "
+                + predicate,
+                (
+                    encode(progress.cursor),
+                    "failed" if progress.retry else "pending",
+                    now + 60 if progress.retry else None,
+                    progress.reason or "collection_page",
+                    now,
+                    *parameters,
+                ),
+            ).rowcount
+            == 1
+        )
+
+    def _store_supplied_stories(
+        self, merge: EffectiveProfileMerge, generation: int, observation: ProfileFieldObservation
+    ) -> EffectiveProfileMerge:
+        page = supplied_current_stories(merge)
+        if page is None:
+            return merge
+        previous = self.read_section_payload(page.entity_id, page.section)
+        # Use a distinct scan when supplied contents supersede a publication in this generation.
+        scan = (
+            1 + int(previous.get("scan", -1))
+            if isinstance(previous, dict) and previous.get("generation") == generation
+            else 0
+        )
+        state: dict[str, object] = {"scan": scan}
+        summary = store_collection_page(
+            self._conn,
+            page,
+            owner=observation.owner_account_id,
+            generation=generation,
+            cursor=state,
+            order=observation.order,
+        )
+        reconciled = reconcile_embedded_stories(self._conn, page, observation, merge)
+        assert reconciled is not None
+        summary["history_order"] = observation.order
+        progress = collection_progress(page, state, summary, previous)
+        payload = {**progress.payload, "supplied_cursor": progress.cursor, "supplied_generation": generation}
+        self._journal_collection(
+            EntityRefreshCursor(page.entity_id, page.section, 0, None, generation=generation), page, payload
+        )
+        self._write_section(
+            page.entity_id,
+            page.section,
+            progress.status,
+            progress.reason,
+            payload,
+            now=observation.observed_at,
+            evidence=ProfileAcquisitionEvidence(
+                generation,
+                "usable" if progress.status == "fresh" else "partial",
+                observation_started_at=int(cast(float, page.observation.started_at)),
+                observation_completed_at=int(cast(float, page.observation.completed_at)),
+            ),
+        )
+        return reconciled
+
+    def _publish_supplied_identity(
+        self, identity: DialogIdentityObservation, observation: ProfileFieldObservation
+    ) -> None:
+        if not identity.complete or not self._read_entity_stub(identity.dialog_id):
+            return
+        name = identity.name
+        username = identity.username
+        if name is not IDENTITY_OMITTED and not claim_dialog_fact(
+            self._conn, identity.dialog_id, "name", observation.order
+        ):
+            name = IDENTITY_OMITTED
+        if username is not IDENTITY_OMITTED and not claim_dialog_fact(
+            self._conn, identity.dialog_id, "username", observation.order
+        ):
+            username = IDENTITY_OMITTED
+        identity = replace(
+            identity,
+            name=name,
+            username=username,
+            complete=name is not IDENTITY_OMITTED and username is not IDENTITY_OMITTED,
+        )
+        baseline = capture_identity_baseline(self._conn, identity.dialog_id)
+        patch = {
+            name: value
+            for name, value in (("name", identity.name), ("username", identity.username))
+            if value is not IDENTITY_OMITTED
+        }
+        self._update_canonical_identity(identity.dialog_id, patch, now=observation.observed_at)
+        self._publish_dialog_identity(identity, baseline)
+
+    def _dirty_summary_sections(self, merge: EffectiveProfileMerge) -> None:
+        dependencies = {
+            "full_user.saved_music": ("saved_music",),
+            "full_user.stargifts_count": ("saved_gifts",),
+            "full_user.common_chats_count": ("common_chats",),
+            "full_user.stories": ("current_stories", "pinned_stories"),
+            "full_user.stories_pinned_available": ("pinned_stories",),
+            "full_user.personal_channel_id": ("personal_channel",),
+            "user.photo": ("avatar_history",),
+            "full_user.profile_photo": ("avatar_history",),
+            "full_user.personal_photo": ("avatar_history",),
+            "full_user.fallback_photo": ("avatar_history",),
+        }
+        sections = {
+            section
+            for root, targets in dependencies.items()
+            if root in merge.after
+            and (
+                root not in merge.before
+                or summary_fingerprint(root, merge.before[root]) != summary_fingerprint(root, merge.after[root])
+            )
+            and any(path == root or path.startswith(root + ".") for path in merge.accepted_paths)
+            for section in targets
+        }
+        self._conn.executemany(
+            "INSERT INTO entity_detail_sections(entity_id,section,status,reason) VALUES (?,?,'pending','profile_summary_changed') "
+            "ON CONFLICT(entity_id,section) DO UPDATE SET status='pending',reason='profile_summary_changed'",
+            ((merge.snapshot.target_id, section) for section in sections),
+        )
+
+    def _journal_collection(
+        self, cursor: EntityRefreshCursor, page: ProfileCollectionPage, payload: Mapping[str, object]
+    ) -> None:
+        published = payload.get("published")
+        if payload.get("complete") is not True or not isinstance(published, dict):
+            return
+        observation = ProfileFieldObservation(
+            int(cast(int, published["owner_account_id"])),
+            int(cast(int, payload["history_order"])),
+            int(cast(float, page.observation.started_at)),
+            "rpc",
+        )
+        context = HistoryObservation(cursor.entity_id, observation, page.observation)
+        old = payload.get("previous_published")
+        if payload.get("comparable_membership") is True and isinstance(old, dict):
+            before = effective_collection_membership(
+                self._conn, context, page.section, old, self._published_membership(cursor.entity_id, page.section, old)
+            )
+            if before is not None:
+                append_collection_history(
+                    self._conn,
+                    CollectionHistoryMerge(
+                        context,
+                        page.section,
+                        before,
+                        self._published_membership(cursor.entity_id, page.section, published),
+                        True,
+                        old,
+                    ),
+                )
+        published["history_event_id"] = collection_history_watermark(self._conn, context)
 
     def _prepare_observed_commit(
         self, entity_id: int, fields: Mapping[str, object], observation: ProfileFieldObservation | None
@@ -1565,7 +2049,7 @@ class EntityProfileRepository:
         now: int,
         detail_revision: int | None,
     ) -> int:
-        next_section = _next_profile_section(cursor.next_section)
+        next_section = self._next_section(cursor)
         if next_section is None:
             return self._finish_section_generation(cursor, now=now, detail_revision=detail_revision)
         return self._queue_next_section(cursor, next_section=next_section, now=now, detail_revision=detail_revision)
@@ -1606,10 +2090,22 @@ class EntityProfileRepository:
         predicate, parameters = self._cursor_predicate(cursor)
         revision_assignment = ", profile_revision=?" if detail_revision is not None else ""
         revision_value = (detail_revision,) if detail_revision is not None else ()
+        payload = self.read_section_payload(cursor.entity_id, next_section)
+        supplied = (
+            payload.get("supplied_cursor")
+            if isinstance(payload, dict) and payload.get("supplied_generation") == cursor.generation
+            else None
+        )
+        page_assignment = ", page_cursor_json=?" if self._refresh_has("page_cursor_json") else ""
+        page_value = (encode(supplied) if supplied is not None else None,) if page_assignment else ()
         return self._conn.execute(
             "UPDATE entity_profile_refresh_state SET status='pending', retry_at=NULL, reason='refresh_queued', "
-            "updated_at=?, next_section=?, acquisition_cursor=0" + revision_assignment + " WHERE " + predicate,
-            (now, next_section, *revision_value, *parameters),
+            "updated_at=?, next_section=?, acquisition_cursor=0"
+            + page_assignment
+            + revision_assignment
+            + " WHERE "
+            + predicate,
+            (now, next_section, *page_value, *revision_value, *parameters),
         ).rowcount
 
     def _write_detail(  # noqa: PLR0913
@@ -1999,12 +2495,14 @@ class EntityProfileRepository:
             and full_profile.field_observation != personal_channel.field_observation
         ):
             raise ValueError("paired profile field observations must match")
+        history_base, history_evidence = self._owned_history_base(cursor.entity_id, observation)
         detail, accepted, reset_owner = self._prepare_observed_commit(
             cursor.entity_id, {**full_profile.detail_patch, **personal_channel.detail_patch}, observation
         )
         if not self._write_pair_detail(cursor, detail, full_profile, personal_channel, now=now, accepted=accepted):
             return None
         self._finish_observed_commit(cursor.entity_id, accepted, reset_owner, observation)
+        self._store_semantic_commit(full_profile, history_base, history_evidence)
         self._write_pair_section(cursor.entity_id, "full_profile", full_profile, detail, now=now)
         self._write_pair_section(cursor.entity_id, "personal_channel", personal_channel, detail, now=now)
         return detail
@@ -2171,7 +2669,10 @@ class EntityProfileRepository:
         changed = self._conn.execute(
             "UPDATE entity_profile_refresh_state SET status='pending', retry_at=NULL, "
             "reason='refresh_follow_up', updated_at=?, generation=generation+1, started_at=?, "
-            "pair_eligible=?, follow_up_required=0, next_section=?, acquisition_cursor=0" + revision_assignment + " "
+            "pair_eligible=?, follow_up_required=0, next_section=?, acquisition_cursor=0"
+            + (",page_cursor_json=NULL" if self._refresh_has("page_cursor_json") else "")
+            + revision_assignment
+            + " "
             "WHERE " + predicate,
             (
                 now,
@@ -2222,7 +2723,7 @@ class EntityProfileRepository:
 
     def _advance_completed_section(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
         require_write_transaction(self._conn)
-        next_section = _next_profile_section(cursor.next_section)
+        next_section = self._next_section(cursor)
         if next_section is None and self._refresh_has("generation") and self._refresh_follow_up_required(cursor):
             return self._start_follow_up_generation(cursor, now=now) == 1
         predicate, parameters = self._cursor_predicate(cursor)
@@ -2263,6 +2764,9 @@ class EntityProfileRepository:
         if self._refresh_has("profile_revision"):
             clauses.append("profile_revision=?")
             parameters.append(cursor.profile_revision)
+        if self._refresh_has("page_cursor_json"):
+            clauses.append("page_cursor_json IS ?")
+            parameters.append(cursor.page_cursor_json)
         return " AND ".join(clauses), tuple(parameters)
 
     def mark_refresh_rejected(self, entity_id: int, *, now: int, reason: str = "refresh_rejected") -> None:
@@ -2284,7 +2788,7 @@ class EntityProfileRepository:
                 self._conn.executemany(
                     "INSERT OR IGNORE INTO entity_detail_sections(entity_id, section, status, observed_at, reason, payload_json, retry_at) "
                     "VALUES (?, ?, 'unavailable', NULL, ?, NULL, NULL)",
-                    ((entity_id, section, reason) for section in PROFILE_SECTIONS),
+                    ((entity_id, section, reason) for section in self._profile_sections(entity_id)),
                 )
                 self._conn.execute(
                     "UPDATE entity_detail_sections SET status='unavailable', reason=?, retry_at=NULL "
@@ -2368,7 +2872,7 @@ class EntityProfileRepository:
     ) -> dict[str, dict[str, object]]:
         by_name = self._read_stored_sections(entity_id)
         output: dict[str, dict[str, object]] = {}
-        for section in PROFILE_SECTIONS:
+        for section in self._profile_sections(entity_id):
             section_name, value = self._read_section(
                 entity_id, section, by_name, detail, now=now, observed_at=observed_at
             )
@@ -2897,15 +3401,6 @@ def _combine_identity_patches(
     return combined
 
 
-def _next_profile_section(section: str) -> str | None:
-    try:
-        index = PROFILE_SECTIONS.index(section)
-    except ValueError:
-        return PROFILE_SECTIONS[0]
-    next_index = index + 1
-    return PROFILE_SECTIONS[next_index] if next_index < len(PROFILE_SECTIONS) else None
-
-
 def _optional_text(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
@@ -2995,3 +3490,188 @@ def pair_readiness_latency_ms(
     if not starts or any(value is None for value in starts + completes):
         return None
     return float((max(cast(list[int], completes)) - min(cast(list[int], starts))) * 1000)
+
+
+def _first_dirty_section(sections: tuple[str, ...], previous: tuple[object, ...] | None) -> str:
+    first = min(sections, key=PROFILE_SECTIONS.index)
+    if previous is not None and previous[0] in PROFILE_SECTIONS:
+        first = min((first, str(previous[0])), key=PROFILE_SECTIONS.index)
+    return first
+
+
+_PROFILE_ADMISSION_STATE = "profile_admission_v2"
+_PROFILE_ADMISSION_TYPES = ("user", "bot", "User", "Bot")
+_PROFILE_EXCLUDED_PEERS = frozenset({777000, 1271266957})
+
+
+def _read_profile_admission_state(conn: sqlite3.Connection, owner: int) -> dict[str, object]:
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute("SELECT value FROM daemon_state WHERE key=?", (_PROFILE_ADMISSION_STATE,)).fetchone(),
+    )
+    state = cast(dict[str, object], json.loads(cast(str, row[0]))) if row else {}
+    if state.get("account") != owner or state.get("version") != NORMALIZATION_VERSION:
+        return {
+            "account": owner,
+            "version": NORMALIZATION_VERSION,
+            "phase": 0,
+            "last_peer": 0,
+            "completed": False,
+            "directory_generation": 0,
+            "pending_directory_generation": 0,
+        }
+    return state
+
+
+def _save_profile_admission_state(conn: sqlite3.Connection, state: dict[str, object]) -> None:
+    conn.execute(
+        "INSERT INTO daemon_state(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (_PROFILE_ADMISSION_STATE, json.dumps(state, separators=(",", ":"))),
+    )
+
+
+def _profile_peer_key(owner: int, peer: int) -> str:
+    return f"profile_admission:{owner}:{NORMALIZATION_VERSION}:{peer}"
+
+
+def profile_peer_managed(conn: sqlite3.Connection, owner: int, peer: int) -> bool:
+    return (
+        conn.execute("SELECT 1 FROM daemon_state WHERE key=?", (_profile_peer_key(owner, peer),)).fetchone() is not None
+    )
+
+
+def personal_profile_peer(conn: sqlite3.Connection, owner: int, peer: int) -> bool:
+    if peer <= 0 or peer == owner or peer in _PROFILE_EXCLUDED_PEERS:
+        return False
+    dialog = cast(tuple[str] | None, conn.execute("SELECT type FROM dialogs WHERE dialog_id=?", (peer,)).fetchone())
+    entity = cast(tuple[str] | None, conn.execute("SELECT type FROM entities WHERE id=?", (peer,)).fetchone())
+    kinds = {str(value[0]).lower() for value in (dialog, entity) if value is not None}
+    if kinds & {"service", "replies"}:
+        return False
+    return (
+        (dialog is not None and dialog[0].lower() in {"user", "bot"})
+        or profile_peer_managed(conn, owner, peer)
+        or conn.execute("SELECT 1 FROM messages WHERE dialog_id=? LIMIT 1", (peer,)).fetchone() is not None
+    )
+
+
+def admit_profile_peer(
+    conn: sqlite3.Connection, owner: int, peer: int, *, now: int, pair_mode: str = "enabled"
+) -> bool:
+    """Admit a locally evidenced private peer once per normalization version."""
+    require_write_transaction(conn)
+    if peer <= 0 or peer == owner or peer in _PROFILE_EXCLUDED_PEERS or profile_peer_managed(conn, owner, peer):
+        return False
+    if not _ensure_profile_private_identity(conn, peer, now):
+        return False
+    # Queue-only adapter: this path never evaluates receipt reuse or TTL.
+    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
+    sections = repo._missing_profile_sections(peer)
+    semantic = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT source,normalization_version FROM entity_profile_semantic_snapshots "
+            "WHERE owner_account_id=? AND entity_id=?",
+            (owner, peer),
+        ).fetchone(),
+    )
+    if semantic is None or semantic[0] == "legacy" or semantic[1] != NORMALIZATION_VERSION:
+        sections = repo._profile_sections(peer)
+    queued = (
+        False
+        if _profile_retains_acquisition(conn, owner, peer)
+        else repo.request_section_refresh(peer, sections, now=now, pair_mode=pair_mode)
+    )
+    conn.execute("INSERT INTO daemon_state(key,value) VALUES (?,?)", (_profile_peer_key(owner, peer), str(now)))
+    return queued
+
+
+def _profile_retains_acquisition(conn: sqlite3.Connection, owner: int, peer: int) -> bool:
+    row = cast(
+        tuple[str, str | None, int | None] | None,
+        conn.execute(
+            "SELECT r.status,r.reason,d.profile_owner_account_id FROM entity_profile_refresh_state r "
+            "LEFT JOIN entity_details d ON d.entity_id=r.entity_id WHERE r.entity_id=?",
+            (peer,),
+        ).fetchone(),
+    )
+    if row is None or (row[2] if row[2] is not None else bound_profile_account(conn)) != owner:
+        return False
+    return row[0] in {"pending", "failed"} or (row[0] == "rejected" and row[1] != "refresh_rejected")
+
+
+def _ensure_profile_private_identity(conn: sqlite3.Connection, peer: int, now: int) -> bool:
+    row = cast(
+        tuple[object, ...] | None, conn.execute("SELECT type,name FROM dialogs WHERE dialog_id=?", (peer,)).fetchone()
+    )
+    kind, name = (str(row[0]), cast(str | None, row[1])) if row else ("unknown", None)
+    existing = cast(tuple[object, ...] | None, conn.execute("SELECT type FROM entities WHERE id=?", (peer,)).fetchone())
+    if (existing and str(existing[0]).lower() in {"service", "replies"}) or kind.lower() in {"service", "replies"}:
+        return False
+    if existing is None:
+        ensure_entity_stub(conn, EntitySnapshot(peer, kind, name, None, None, now))
+    return True
+
+
+def request_profile_directory_pass(conn: sqlite3.Connection, owner: int, generation: int) -> None:
+    require_write_transaction(conn)
+    state = _read_profile_admission_state(conn, owner)
+    state["pending_directory_generation"] = max(int(cast(int, state["pending_directory_generation"])), generation)
+    _save_profile_admission_state(conn, state)
+
+
+def _reconcile_profile_admission(conn: sqlite3.Connection, owner: int, *, now: int, limit: int, pair_mode: str) -> int:
+    """Checkpoint at most 32 examined peers, including already admitted peers."""
+    with write_savepoint(conn):
+        state = _read_profile_admission_state(conn, owner)
+        if state["completed"]:
+            if state["pending_directory_generation"] == state["directory_generation"]:
+                return 0
+            state.update(phase=0, last_peer=0, completed=False)
+        if state["phase"] == 0 and state["last_peer"] == 0:
+            state["directory_generation"] = state["pending_directory_generation"]
+        examined = 0
+        while examined < min(limit, 32) and int(cast(int, state["phase"])) < len(_PROFILE_ADMISSION_TYPES) + 1:
+            phase, last = int(cast(int, state["phase"])), int(cast(int, state["last_peer"]))
+            peers = _profile_admission_candidates(conn, phase, last, min(limit, 32) - examined)
+            if not peers:
+                state.update(phase=phase + 1, last_peer=0)
+                continue
+            for peer in peers:
+                admit_profile_peer(conn, owner, peer, now=now, pair_mode=pair_mode)
+                state["last_peer"] = peer
+                examined += 1
+        state["completed"] = state["phase"] == len(_PROFILE_ADMISSION_TYPES) + 1
+        _save_profile_admission_state(conn, state)
+        return examined
+
+
+def _profile_admission_candidates(conn: sqlite3.Connection, phase: int, last: int, limit: int) -> list[int]:
+    if phase < len(_PROFILE_ADMISSION_TYPES):
+        return [
+            int(cast(int, row[0]))
+            for row in cast(
+                list[tuple[int]],
+                conn.execute(
+                    "SELECT dialog_id FROM dialogs WHERE type=? AND dialog_id>? ORDER BY dialog_id LIMIT ?",
+                    (_PROFILE_ADMISSION_TYPES[phase], last, limit),
+                ).fetchall(),
+            )
+        ]
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT dialog_id FROM messages WHERE dialog_id>? AND dialog_id>0 ORDER BY dialog_id LIMIT 1", (last,)
+        ).fetchone(),
+    )
+    return [int(cast(int, row[0]))] if row else []
+
+
+def bound_profile_account(conn: sqlite3.Connection) -> int | None:
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='dialog_directory_state'").fetchone() is None:
+        return None
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute("SELECT account_id FROM dialog_directory_state WHERE singleton=1").fetchone(),
+    )
+    return int(cast(int, row[0])) if row and row[0] is not None else None

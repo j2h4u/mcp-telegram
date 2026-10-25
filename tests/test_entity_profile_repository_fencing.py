@@ -16,6 +16,7 @@ from mcp_telegram.entity_profile.refresh import failure_retry_at, scope_changed_
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_transactions import write_savepoint
+from tests.helpers import finish_empty_profile_collections
 
 
 def _repository(path: Path) -> tuple[sqlite3.Connection, EntityProfileRepository]:
@@ -778,7 +779,7 @@ def test_same_generation_channel_completion_ignores_ttl(tmp_path: Path) -> None:
             "materialized_fields": ["personal_channel_id"],
             "authoritative": True,
         },
-        normalization_version="entity-profile-full-user-v1",
+        normalization_version="entity-profile-full-user-v2",
         observation_started_at=100,
         observation_completed_at=101,
         identity=identity,
@@ -803,6 +804,7 @@ def test_same_generation_channel_completion_ignores_ttl(tmp_path: Path) -> None:
     assert channel_cursor is not None
     assert not repo.complete_same_generation_section(channel_cursor, None, now=10_000)
     assert repo.complete_same_generation_section(channel_cursor, identity, now=10_000)
+    finish_empty_profile_collections(repo, 42, now=10_000)
     assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
         "complete",
     )
@@ -834,7 +836,7 @@ def test_same_generation_channel_completion_rejects_changed_generation_or_scope(
             "materialized_fields": ["personal_channel_id"],
             "authoritative": True,
         },
-        normalization_version="entity-profile-full-user-v1",
+        normalization_version="entity-profile-full-user-v2",
         observation_started_at=100,
         observation_completed_at=101,
         identity=stored_identity,
@@ -881,7 +883,7 @@ def test_same_generation_completion_rejects_corrupt_provenance_or_payload(tmp_pa
             "materialized_fields": ["personal_channel_id"],
             "authoritative": True,
         },
-        normalization_version="entity-profile-full-user-v1",
+        normalization_version="entity-profile-full-user-v2",
         observation_started_at=100,
         observation_completed_at=101,
         identity=identity,
@@ -931,7 +933,7 @@ def test_receipts_with_invalid_observation_bounds_are_rejected(
             "materialized_fields": ["about"],
             "authoritative": True,
         },
-        normalization_version="entity-profile-full-user-v1",
+        normalization_version="entity-profile-full-user-v2",
         observation_started_at=100,
         observation_completed_at=101,
         identity=identity,

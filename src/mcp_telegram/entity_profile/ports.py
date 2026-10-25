@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Protocol
 
 from .contracts import (
@@ -12,6 +13,7 @@ from .contracts import (
     ChatAvatarReference,
     CommonChatsObservation,
     GroupProfileObservation,
+    ProfileCollectionPage,
     TargetKind,
     UserAvatarHistoryObservation,
     UserProfileObservation,
@@ -64,7 +66,17 @@ class UserProfilePort(Protocol):
 
     def get_user_reference(self, user_id: int, *, is_self: bool = False) -> UserReference | None: ...
 
-    async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation: ...
+    async def fetch_user_profile(
+        self, user_id: int, target_kind: TargetKind, *, owner_account_id: int | None = None
+    ) -> UserProfileObservation: ...
+
+
+class ProfileCollectionPort(Protocol):
+    """One classified collection request; the daemon owns continuation."""
+
+    async def fetch_profile_collection_page(
+        self, reference: UserReference, section: str, cursor: Mapping[str, object]
+    ) -> ProfileCollectionPage: ...
 
 
 class ProfilePairObservationHook(Protocol):

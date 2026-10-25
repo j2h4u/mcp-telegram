@@ -12,6 +12,7 @@ import logging
 import sys
 import time
 import typing as t
+from copy import deepcopy
 from dataclasses import dataclass
 from functools import cache
 
@@ -511,6 +512,7 @@ def _project_tool_result(name: str, tool_result: object, telemetry: _CallTelemet
         if tool_result.structured_content is not None
         else None
     )
+    _restore_profile_nulls(name, tool_result, structured_content)
     if tool_result.is_error:
         structured_content = _canonical_tool_error(tool_result.error_code, tool_result.content, structured_content)
     return CallToolResult(
@@ -518,6 +520,16 @@ def _project_tool_result(name: str, tool_result: object, telemetry: _CallTelemet
         structured_content=structured_content,
         is_error=tool_result.is_error,
     )
+
+
+def _restore_profile_nulls(
+    name: str, tool_result: tools.ToolResult, structured_content: dict[str, object] | None
+) -> None:
+    if name == "get_entity_info" and not tool_result.is_error and structured_content is not None:
+        original = tool_result.structured_content or {}
+        for key in ("semantic", "page"):
+            if key in original:
+                structured_content[key] = deepcopy(original[key])
 
 
 def _log_tool_result(

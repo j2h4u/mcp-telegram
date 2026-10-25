@@ -115,7 +115,8 @@ def test_upgrade_from_v82_preserves_profile_facts_and_creates_no_field_rows(
         upgraded.execute(f"SELECT * FROM {table} WHERE entity_id=42").fetchall()
         for table in ("entity_details", "entity_detail_sections", "entity_profile_refresh_state")
     )
-    assert after == before
+    assert after[:2] == before[:2]
+    assert [row[:-1] for row in cast(list[tuple[object, ...]], after[2])] == before[2]
     assert upgraded.execute("SELECT COUNT(*) FROM entity_profile_field_observations").fetchone() == (0,)
     assert upgraded.execute("SELECT 1 FROM schema_version WHERE version=83").fetchone() == (1,)
     upgraded.close()

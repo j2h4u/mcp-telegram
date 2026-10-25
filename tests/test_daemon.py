@@ -244,7 +244,9 @@ class _UserProfilePort:
     def __init__(self) -> None:
         self.calls: list[tuple[int, TargetKind]] = []
 
-    async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
+    async def fetch_user_profile(
+        self, user_id: int, target_kind: TargetKind, *, owner_account_id: int | None = None
+    ) -> UserProfileObservation:
         self.calls.append((user_id, target_kind))
         full = ProjectionOutcome(ProjectionStatus.USABLE, {}, None, None)
         personal = ProjectionOutcome(ProjectionStatus.ABSENT, {"personal_channel_id": None}, None, None)

@@ -35,6 +35,7 @@ from .dialog_fact_observations import claim_dialog_fact
 from .dialog_identity import capture_identity_baseline, publish_dialog_identity
 from .dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
 from .dialog_pin_observations import claim_pin_snapshot, ordered_pin_overlay
+from .entity_profile.repository import request_profile_directory_pass
 from .flood import TelegramRpcThrottled
 from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .models import DialogType
@@ -978,6 +979,7 @@ class CanonicalDialogDirectory:
         conn.execute("DELETE FROM dialog_directory_baseline WHERE generation=?", (generation,))
         conn.execute("DELETE FROM dialog_directory_pins WHERE generation=?", (generation,))
         conn.execute("DELETE FROM dialog_directory_pin_snapshots WHERE generation=?", (generation,))
+        request_profile_directory_pass(conn, account_id, generation)
         return True
 
     def _save_cursor(self, conn: sqlite3.Connection, cursor: DialogCursor, generation: int, account_id: int) -> None:

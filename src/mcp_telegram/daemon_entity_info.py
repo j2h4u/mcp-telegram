@@ -5,6 +5,7 @@ helpers for user/bot/channel/supergroup/group entity details.
 """
 
 import asyncio
+import json
 import logging
 import sqlite3
 import time
@@ -33,6 +34,7 @@ from .entity_profile.contracts import (
     GROUP_PROFILE_NORMALIZATION_VERSION,
     NORMALIZATION_VERSION,
     PERSONAL_CHANNEL_OWNED_FIELDS,
+    PROFILE_COLLECTION_SECTIONS,
     PROFILE_SECTIONS,
     ChannelProfileObservation,
     ChannelReference,
@@ -42,6 +44,8 @@ from .entity_profile.contracts import (
     GroupReference,
     ProfileAcquisitionEvidence,
     ProfileFieldObservation,
+    ProfileFieldState,
+    ProfileSemanticSnapshot,
     ProjectionOutcome,
     ProjectionStatus,
     TargetKind,
@@ -56,6 +60,7 @@ from .entity_profile.ports import (
     ChatAvatarHistoryPort,
     CommonChatsPort,
     GroupProfilePort,
+    ProfileCollectionPort,
     ProfilePairObservationHook,
     UserAvatarHistoryPort,
     UserProfilePort,
@@ -209,6 +214,18 @@ def _current_photo_from_payload(payload: object) -> ChatCurrentPhoto | None:
     if date is not None and not isinstance(date, str):
         return None
     return ChatCurrentPhoto(photo_id, date)
+
+
+def _profile_photo_patch(photo: ChatCurrentPhoto | None, snapshot: ProfileSemanticSnapshot | None) -> dict[str, object]:
+    if photo is not None:
+        evidence = snapshot.coverage.get("user.photo.photo_id") if snapshot else None
+        if snapshot is None or (evidence is not None and evidence.authoritative):
+            return {"current_photo": {"photo_id": photo.photo_id, "date": photo.date}}
+    elif snapshot is not None:
+        evidence = snapshot.coverage.get("user.photo")
+        if evidence is not None and evidence.state is ProfileFieldState.CLEARED and evidence.authoritative:
+            return {"current_photo": None}
+    return {}
 
 
 def _reconcile_history_payload(
@@ -430,7 +447,7 @@ class DaemonEntityInfoService:
                     "entity_profile_account_unavailable",
                     "The stored profile is not bound to the current account. Action: verify the daemon account binding.",
                 )
-            return await self._progressive_result(entity_id, stored.detail, stored.sections, now=now)
+            return await self._local_profile_result(entity_id, stored.detail, stored.sections, now=now, req=req)
         identity = self._local_profile_identity(entity_id)
         if not identity:
             return self._error(
@@ -438,7 +455,44 @@ class DaemonEntityInfoService:
                 "No local observations exist for this entity. Action: use list_dialogs to select a known local entity.",
             )
         sections = self._unobserved_sections(identity)
-        return await self._progressive_result(entity_id, identity, sections, now=now)
+        return await self._local_profile_result(entity_id, identity, sections, now=now, req=req)
+
+    async def _local_profile_result(
+        self,
+        entity_id: int,
+        detail: Mapping[str, object],
+        sections: dict[str, dict[str, object]],
+        *,
+        now: int,
+        req: Mapping[str, object],
+    ) -> dict[str, object]:
+        from .entity_profile.reader import read_profile
+
+        result = await self._progressive_result(entity_id, detail, sections, now=now)
+        scope = self._capture_pair_scope()
+        owner = self._deps.self_id or (scope.account_id if scope is not None else None)
+        modern = cast(
+            tuple[object, ...] | None,
+            self._deps.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='entity_profile_semantic_snapshots'"
+            ).fetchone(),
+        )
+        if owner is None or modern is None or entity_id <= 0:
+            if req.get("cursor") is not None or req.get("section") is not None:
+                return self._error(
+                    "profile_selection_unavailable", "Account-bound local profile paging is unavailable."
+                )
+            return result
+        try:
+            projection = read_profile(self._deps.conn, owner, entity_id, now, req)
+        except (ValueError, TypeError) as exc:
+            return self._error(
+                "invalid_profile_navigation", str(exc) + ". Action: restart the local selection without a cursor."
+            )
+        data = result.get("data")
+        if isinstance(data, dict):
+            data.update(projection)
+        return result
 
     def _profile_owner_matches(self, owner_account_id: int) -> bool:
         scope = self._capture_pair_scope()
@@ -487,7 +541,9 @@ class DaemonEntityInfoService:
                     else "not_applicable"
                 ),
             }
-            for section in PROFILE_SECTIONS
+            for section in (
+                PROFILE_SECTIONS if entity_type in {DialogType.USER, DialogType.BOT} else PROFILE_SECTIONS[:5]
+            )
         }
 
     def _durable_refresh_status(self, now: float) -> DemandStatus | None:
@@ -783,7 +839,7 @@ class DaemonEntityInfoService:
                 if entity_type is DialogType.CHANNEL and cursor.next_section == "full_profile":
                     result = await self._acquire_profile_section(cursor, entity_type, context=context)
                 else:
-                    result = await self._acquire_profile_section(cursor, entity_type)
+                    result = await self._acquire_profile_section(cursor, entity_type, context=context)
         except RpcAttemptBudgetExhaustedError:
             self._observe_profile_section_failure(cursor, entity_type, actual_attempts=0)
             raise
@@ -1164,11 +1220,17 @@ class DaemonEntityInfoService:
             else TargetKind.USER
         )
         field_observation = await self._reserve_profile_observation(captured_scope)
-        normalized = await self._deps.user_profile_port.fetch_user_profile(cursor.entity_id, target_kind)
+        normalized = await self._deps.user_profile_port.fetch_user_profile(
+            cursor.entity_id, target_kind, owner_account_id=captured_scope.account_id if captured_scope else None
+        )
         self._validate_full_user_acquisition(normalized, captured_scope)
         identity = self._full_user_pair_identity(target_kind, scope=captured_scope)
         full_profile = self._normalized_full_profile_commit(
-            normalized.full_profile, cursor, identity, current_photo=normalized.current_photo
+            normalized.full_profile,
+            cursor,
+            identity,
+            current_photo=normalized.current_photo,
+            semantic_snapshot=normalized.semantic_snapshot,
         )
         folder_id = full_profile.detail_patch.get("folder_id")
         folder_name = await self._resolve_folder_name(folder_id if isinstance(folder_id, int) else None)
@@ -1179,6 +1241,7 @@ class DaemonEntityInfoService:
             dialog_identity_observation=identity_observation,
             dialog_identity_baseline_revision=identity_baseline,
             field_observation=field_observation,
+            semantic_snapshot=normalized.semantic_snapshot,
         )
         personal_channel = self._normalized_personal_channel_commit(
             normalized.personal_channel,
@@ -1456,13 +1519,10 @@ class DaemonEntityInfoService:
         identity: Mapping[str, object] | None,
         *,
         current_photo: ChatCurrentPhoto | None = None,
+        semantic_snapshot: ProfileSemanticSnapshot | None = None,
     ) -> EntitySectionCommit:
         payload = dict(outcome.payload or {})
-        private_payload = {
-            "current_photo": (
-                {"photo_id": current_photo.photo_id, "date": current_photo.date} if current_photo is not None else None
-            )
-        }
+        private_payload = _profile_photo_patch(current_photo, semantic_snapshot)
         payload.update(private_payload)
         return EntitySectionCommit(
             payload,
@@ -1711,13 +1771,13 @@ class DaemonEntityInfoService:
             return "flood_wait", throttled_retry_at(now, retry_after)
         return "entity_unavailable", failure_retry_at(now)
 
-    @staticmethod
     def _success_if_refresh_finished(
+        self,
         cursor: EntityRefreshCursor,
         *,
         committed: bool,
     ) -> DurableRefreshTerminal | None:
-        if committed and cursor.next_section == PROFILE_SECTIONS[-1]:
+        if committed and self._profiles.refresh_is_complete(cursor):
             return DurableRefreshTerminal.SUCCESS
         return None
 
@@ -1733,9 +1793,16 @@ class DaemonEntityInfoService:
         context: _ProfileSectionContext | None = None,
     ) -> EntitySectionCommit:
         section = cursor.next_section
+        if section in PROFILE_COLLECTION_SECTIONS and entity_type in {DialogType.USER, DialogType.BOT}:
+            reference = self._user_reference(cursor.entity_id)
+            if reference is None:
+                raise ValueError("collection user reference unavailable")
+            state = json.loads(cursor.page_cursor_json) if cursor.page_cursor_json else {}
+            page = await cast(ProfileCollectionPort, self._deps.user_profile_port).fetch_profile_collection_page(
+                reference, section, state.get("request", {})
+            )
+            return EntitySectionCommit({}, collection_page=page)
         if section == "full_profile":
-            if context is None:
-                return await self._acquire_full_profile(cursor.entity_id, entity_type)
             return await self._acquire_full_profile(cursor.entity_id, entity_type, context=context)
         if section == "common_chats":
             return await self._acquire_common_chats(cursor.entity_id)
@@ -1749,6 +1816,8 @@ class DaemonEntityInfoService:
 
     @staticmethod
     def _section_applies(entity_type: DialogType, section: str) -> bool:
+        if section in {"saved_music", "saved_gifts", "current_stories", "pinned_stories"}:
+            return entity_type in {DialogType.USER, DialogType.BOT}
         if section in {"full_profile", "avatar_history"}:
             return entity_type is not DialogType.UNKNOWN
         if section == "common_chats":
@@ -1792,16 +1861,22 @@ class DaemonEntityInfoService:
         context: _ProfileSectionContext | None = None,
     ) -> EntitySectionCommit:
         if entity_type in {DialogType.USER, DialogType.BOT, DialogType.SERVICE}:
-            return await self._acquire_user_full_profile(entity_id, entity_type)
+            return await self._acquire_user_full_profile(
+                entity_id, entity_type, scope=context.captured_scope if context else None
+            )
 
         if entity_type in {DialogType.CHANNEL, DialogType.SUPERGROUP, DialogType.FORUM}:
             return await self._acquire_channel_full_profile(entity_id, entity_type, context=context)
 
         return EntitySectionCommit({}, status="unavailable", reason="unsupported_entity_type")
 
-    async def _acquire_user_full_profile(self, entity_id: int, entity_type: DialogType) -> EntitySectionCommit:
+    async def _acquire_user_full_profile(
+        self, entity_id: int, entity_type: DialogType, *, scope: TelegramAuthScope | None = None
+    ) -> EntitySectionCommit:
         target_kind = self._target_kind(entity_type)
-        observation = await self._deps.user_profile_port.fetch_user_profile(entity_id, target_kind)
+        observation = await self._deps.user_profile_port.fetch_user_profile(
+            entity_id, target_kind, owner_account_id=scope.account_id if scope else None
+        )
         outcome = observation.full_profile
         if outcome.status is ProjectionStatus.UNAVAILABLE or outcome.payload is None:
             raise ValueError(outcome.reason or "full user payload is unavailable")
@@ -1809,13 +1884,7 @@ class DaemonEntityInfoService:
         folder_id = patch.get("folder_id")
         patch["folder_name"] = await self._resolve_folder_name(folder_id if isinstance(folder_id, int) else None)
         current_photo = observation.current_photo
-        private_payload = {
-            "current_photo": (
-                {"photo_id": current_photo.photo_id, "date": current_photo.date}
-                if isinstance(current_photo, ChatCurrentPhoto)
-                else None
-            )
-        }
+        private_payload = _profile_photo_patch(current_photo, observation.semantic_snapshot)
         patch.update(private_payload)
         raw_identity_patch = dict(outcome.identity_patch or {})
         identity_patch = {**raw_identity_patch, "type": entity_type.value}
@@ -1824,6 +1893,7 @@ class DaemonEntityInfoService:
             payload=private_payload,
             identity_patch=identity_patch,
             dialog_identity_observation=outcome.dialog_identity_observation,
+            semantic_snapshot=observation.semantic_snapshot,
         )
 
     async def _acquire_channel_full_profile(

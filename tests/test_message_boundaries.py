@@ -789,3 +789,46 @@ def test_inbox_delivery_facade_cannot_mutate_canonical_fields(field: str) -> Non
     )
     findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
     assert any(f"canonical field {field!r} must be owned" in finding.message for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "function,sql",
+    [
+        ("personal_profile_peer", "SELECT 1 FROM messages WHERE dialog_id=? LIMIT 1"),
+        (
+            "_profile_admission_candidates",
+            "SELECT dialog_id FROM messages WHERE dialog_id>? AND dialog_id>0 ORDER BY dialog_id LIMIT 1",
+        ),
+    ],
+)
+def test_profile_identity_only_seeks_are_exact_reviewed_owners(function: str, sql: str) -> None:
+    gate = _gate()
+    source = f"def {function}(conn):\n    conn.execute({sql!r})\n"
+    assert not gate.violations_for(gate.SOURCE_ROOT / "entity_profile/repository.py", source)
+    assert gate.violations_for(gate.SOURCE_ROOT / "rogue.py", source)
+
+
+@pytest.mark.parametrize(
+    "function,sql",
+    [
+        ("personal_profile_peer", "SELECT text FROM messages WHERE dialog_id=? LIMIT 1"),
+        ("personal_profile_peer", "SELECT * FROM messages WHERE dialog_id=? LIMIT 1"),
+        ("personal_profile_peer", "SELECT 1 FROM messages WHERE dialog_id=?"),
+        ("personal_profile_peer", "DELETE FROM messages WHERE dialog_id=?"),
+        ("personal_profile_peer", "SELECT 1,text FROM messages WHERE dialog_id=? LIMIT 1"),
+        ("personal_profile_peer", "SELECT 1 FROM messages JOIN dialogs USING(dialog_id) WHERE dialog_id=? LIMIT 1"),
+        (
+            "_profile_admission_candidates",
+            "SELECT dialog_id,text FROM messages WHERE dialog_id>? AND dialog_id>0 ORDER BY dialog_id LIMIT 1",
+        ),
+        (
+            "_profile_admission_candidates",
+            "SELECT dialog_id FROM messages WHERE dialog_id>? AND dialog_id>0 ORDER BY dialog_id",
+        ),
+        ("unreviewed_function", "SELECT 1 FROM messages WHERE dialog_id=? LIMIT 1"),
+    ],
+)
+def test_profile_seek_permission_does_not_allow_message_reads_or_mutation(function: str, sql: str) -> None:
+    gate = _gate()
+    source = f"def {function}(conn):\n    conn.execute({sql!r})\n"
+    assert gate.violations_for(gate.SOURCE_ROOT / "entity_profile/repository.py", source)

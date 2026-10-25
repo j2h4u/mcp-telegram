@@ -10,6 +10,7 @@ from typing import cast
 
 import pytest
 
+from helpers import remove_v87_schema_for_historical_fixture
 from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
@@ -375,7 +376,8 @@ def test_topic_catalog_migration_preserves_legacy_rows_without_receipts(tmp_path
     with closing(sqlite3.connect(path)) as conn, conn:
         _seed(conn, 7, "Legacy title")
         conn.execute("UPDATE topic_metadata SET pinned=1,hidden=1,icon_emoji_id=77,icon_emoji='🧭'")
-        # Undo only the new schema on this test-owned database to reproduce v83.
+        # Remove later physical additions before reproducing the historical v83 ledger.
+        remove_v87_schema_for_historical_fixture(conn)
         conn.execute("DROP TRIGGER topic_catalog_identity_changed")
         conn.execute("DROP TABLE topic_catalog_state")
         conn.execute("ALTER TABLE topic_metadata DROP COLUMN catalog_present")

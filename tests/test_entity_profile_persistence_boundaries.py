@@ -21,6 +21,7 @@ from mcp_telegram.entity_profile.contracts import (
 )
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
 from mcp_telegram.sync_db import _CURRENT_SCHEMA_VERSION, ensure_sync_schema
+from tests.helpers import finish_empty_profile_collections
 
 
 def _seed_pending_pair(path: Path, *, mode: str = "enabled") -> None:
@@ -170,13 +171,14 @@ os._exit(74)
     assert conn.execute(
         "SELECT pair_mode, pair_measurement_complete, pair_summary_watermark FROM entity_profile_refresh_state WHERE entity_id=42"
     ).fetchone() == ("enabled", 1, 101)
-    for section in PROFILE_SECTIONS[1:-1]:
+    for section in PROFILE_SECTIONS[1:4]:
         cursor = repo.next_due_refresh(now=101)
         assert cursor is not None and cursor.next_section == section
         assert repo.commit_section(cursor, EntitySectionCommit({}, status="not_applicable"), now=101)
     cursor = repo.next_due_refresh(now=101)
     assert cursor is not None and cursor.next_section == "personal_channel"
     assert repo.complete_same_generation_section(cursor, {"account_generation": 7, "entity_type": "user"}, now=101)
+    finish_empty_profile_collections(repo, 42, now=101)
     assert repo.next_due_refresh(now=105) is None
     assert repo.read_section_evidence(42, "full_profile") is not None
     assert repo.read(42, now=105) is not None
@@ -257,7 +259,7 @@ def test_migrated_profile_pair_mode_sequence_preserves_receipts_and_progress(tmp
     )
     repo.record_pair_section_outcome(cursor, "full_profile", outcome="usable", actual_attempts=1, ready_at=101)
     repo.record_pair_section_outcome(cursor, "personal_channel", outcome="absent", actual_attempts=0, ready_at=101)
-    for section in PROFILE_SECTIONS[1:-1]:
+    for section in PROFILE_SECTIONS[1:4]:
         cursor = repo.next_due_refresh(now=101)
         assert cursor is not None and cursor.next_section == section
         assert repo.commit_section(cursor, EntitySectionCommit({}, status="not_applicable"), now=101)
@@ -265,6 +267,7 @@ def test_migrated_profile_pair_mode_sequence_preserves_receipts_and_progress(tmp
     assert cursor is not None and cursor.next_section == "personal_channel"
     assert repo.complete_same_generation_section(cursor, identity, now=101)
 
+    finish_empty_profile_collections(repo, 42, now=101)
     repo.mark_pending(42, now=200, pair_mode_override="disabled")
     cursor = repo.next_due_refresh(now=200)
     assert cursor is not None and cursor.pair_mode == "disabled"
@@ -275,7 +278,7 @@ def test_migrated_profile_pair_mode_sequence_preserves_receipts_and_progress(tmp
         outcome="usable",
         actual_attempts=2,
     )[0]
-    for section in PROFILE_SECTIONS[1:-1]:
+    for section in PROFILE_SECTIONS[1:4]:
         cursor = repo.next_due_refresh(now=201)
         assert cursor is not None and cursor.next_section == section
         assert repo.commit_section_with_pair_measurement(
@@ -304,6 +307,7 @@ def test_migrated_profile_pair_mode_sequence_preserves_receipts_and_progress(tmp
     )
     assert disabled[1:] == ("disabled", "usable", "absent", 4, 1)
 
+    finish_empty_profile_collections(repo, 42, now=202)
     repo.mark_pending(42, now=300, pair_mode_override="enabled")
     cursor = repo.next_due_refresh(now=300)
     assert cursor is not None and cursor.pair_mode == "enabled"

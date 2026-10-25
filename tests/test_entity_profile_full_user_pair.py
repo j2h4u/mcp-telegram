@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +13,7 @@ from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
+from telethon.tl import types
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
 import mcp_telegram.daemon as daemon
@@ -21,11 +22,13 @@ from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from mcp_telegram.entity_profile.contracts import (
     ObservationBoundary,
+    ProfileCollectionPage,
     TargetKind,
     UserProfileObservation,
     UserReference,
 )
 from mcp_telegram.entity_profile.full_user_normalization import normalize_full_user_response
+from mcp_telegram.entity_profile.ports import ProfileCollectionPort
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, RefreshLimits
 from mcp_telegram.flood import FloodWaitKillSwitchStatus
 from mcp_telegram.sync_db import ensure_sync_schema
@@ -43,7 +46,7 @@ from tests.helpers import (
 from tests.sqlite_writer_helpers import inline_writer
 
 
-def _fenced_schema(conn: sqlite3.Connection) -> None:
+def _fenced_schema(conn: sqlite3.Connection, *, semantic: bool = True) -> None:
     conn.executescript(
         """
         CREATE TABLE entities (
@@ -85,6 +88,15 @@ def _fenced_schema(conn: sqlite3.Connection) -> None:
         ) WITHOUT ROWID;
         """
     )
+    if not semantic:
+        return
+    from mcp_telegram.sync_db import _apply_migration_87, _apply_migration_88
+
+    conn.execute("ALTER TABLE entity_details ADD COLUMN profile_owner_account_id INTEGER")
+    conn.execute("ALTER TABLE entity_details ADD COLUMN profile_observation_scope_json TEXT")
+    conn.execute("CREATE TABLE schema_version(version INTEGER PRIMARY KEY, applied_at INTEGER)")
+    _apply_migration_87(conn, 86)
+    _apply_migration_88(conn, 87)
 
 
 class _PairClient:
@@ -103,11 +115,24 @@ class _PairClient:
         self.username = username
         self.min_user = min_user
         self.full_user_calls = 0
+        self.collection_port: ProfileCollectionPort | None = None
+
+    async def fetch_profile_collection_page(
+        self, reference: UserReference, section: str, cursor: Mapping[str, object]
+    ) -> ProfileCollectionPage:
+        if self.collection_port is not None:
+            return await self.collection_port.fetch_profile_collection_page(reference, section, cursor)
+        budget = current_rpc_scope().attempt_budget
+        assert budget is not None
+        budget.debit()
+        return ProfileCollectionPage(reference.user_id, section, (), ObservationBoundary(100, 100), 0, terminal=True)
 
     def get_user_reference(self, user_id: int, *, is_self: bool = False) -> UserReference:
         return UserReference(user_id, 0, is_self=is_self)
 
-    async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
+    async def fetch_user_profile(
+        self, user_id: int, target_kind: TargetKind, *, owner_account_id: int | None = None
+    ) -> UserProfileObservation:
         scope = current_rpc_scope()
         assert scope.attempt_budget is not None
         scope.attempt_budget.debit()
@@ -122,7 +147,15 @@ class _PairClient:
         full_user_data = {"about": "about", "personal_channel_message": 9}
         if not self.omit_channel_id:
             full_user_data["personal_channel_id"] = self.channel_id
-        full_user = SimpleNamespace(**full_user_data)
+        full_user = types.UserFull(
+            id=42,
+            settings=types.PeerSettings(),
+            notify_settings=types.PeerNotifySettings(),
+            common_chats_count=0,
+            **full_user_data,
+        )
+        if self.omit_channel_id:
+            del full_user.personal_channel_id
         response = SimpleNamespace(
             full_user=full_user,
             users=[user],
@@ -132,6 +165,7 @@ class _PairClient:
             response,
             target_id=user_id,
             target_kind=target_kind,
+            owner_account_id=owner_account_id,
             observation=ObservationBoundary(100.0, 100.0),
         )
 
@@ -343,7 +377,7 @@ async def test_protective_disconnect_serves_valid_partial_profile_from_local_cac
 
 
 @pytest.mark.asyncio
-async def test_min_full_user_pair_publishes_only_positive_identity_fields(tmp_path: Path) -> None:
+async def test_min_full_user_pair_preserves_complete_identity(tmp_path: Path) -> None:
     conn, service = _prepare(tmp_path / "min-pair.sqlite", min_user=True)
     conn.execute("INSERT INTO dialogs(dialog_id,name,type,username) VALUES (42,'Old name','user','old_username')")
     conn.commit()
@@ -355,7 +389,7 @@ async def test_min_full_user_pair_publishes_only_positive_identity_fields(tmp_pa
 
     assert conn.execute(
         "SELECT name,username,type,identity_revision,revision FROM dialogs WHERE dialog_id=42"
-    ).fetchone() == ("Partial", "old_username", "user", 1, 0)
+    ).fetchone() == ("Old name", "old_username", "user", 0, 0)
     await service.shutdown()  # type: ignore[attr-defined]
     conn.close()
 
@@ -397,8 +431,9 @@ async def test_pair_personal_channel_completion_is_local_and_does_not_repeat_ful
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
 
     assert client.full_user_calls == 1
-    assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
-        "complete",
+    assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == ("pending",)
+    assert conn.execute("SELECT next_section FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
+        "saved_music",
     )
     assert conn.execute(
         "SELECT generation, profile_revision FROM entity_profile_refresh_state WHERE entity_id=42"
@@ -424,6 +459,7 @@ async def test_personal_channel_pair_guard_requires_pair_eligibility(
         "UPDATE entity_profile_refresh_state SET next_section='personal_channel', acquisition_cursor=0, "
         "pair_eligible=0 WHERE entity_id=42"
     )
+    conn.execute("UPDATE entity_detail_sections SET status='pending' WHERE section='personal_channel'")
     conn.commit()
 
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))

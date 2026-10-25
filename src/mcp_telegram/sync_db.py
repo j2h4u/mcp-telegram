@@ -16,7 +16,10 @@ from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 86
+_CURRENT_SCHEMA_VERSION = 89
+_PROFILE_COLLECTION_MIGRATION = 88
+_PROFILE_HISTORY_MIGRATION = 89
+_SEMANTIC_PROFILE_MIGRATION = 87
 _UPDATE_DELIVERY_MIGRATION = 86
 _HISTORICAL_FTS_BACKFILL_MIGRATION = 85
 _TOPIC_CATALOG_MIGRATION = 84
@@ -4932,8 +4935,132 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_85(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _UPDATE_DELIVERY_MIGRATION:
         current = _apply_migration_86(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _SEMANTIC_PROFILE_MIGRATION:
+        current = _apply_migration_87(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _PROFILE_COLLECTION_MIGRATION:
+        current = _apply_migration_88(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _PROFILE_HISTORY_MIGRATION:
+        current = _apply_migration_89(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
+
+
+def _apply_migration_89(conn: sqlite3.Connection, current: int) -> int:
+    return _apply_migration(
+        conn,
+        current,
+        _PROFILE_HISTORY_MIGRATION,
+        [
+            """CREATE TABLE entity_profile_change_events (
+            event_id INTEGER PRIMARY KEY,
+            owner_account_id INTEGER NOT NULL CHECK(owner_account_id>0),
+            entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+            observation_order INTEGER NOT NULL CHECK(observation_order>0),
+            change_key TEXT NOT NULL, category TEXT NOT NULL,
+            before_json TEXT NOT NULL, after_json TEXT NOT NULL, previous_provenance_json TEXT NOT NULL,
+            observation_started_at REAL, observation_completed_at REAL,
+            observed_at INTEGER NOT NULL, source TEXT NOT NULL, server_time REAL,
+            UNIQUE(owner_account_id,entity_id,observation_order,change_key)
+        )""",
+            "CREATE INDEX entity_profile_change_events_owner ON entity_profile_change_events(owner_account_id,entity_id,event_id)",
+            """UPDATE entity_detail_sections SET payload_json=json_set(payload_json,'$.published.history_event_id',0)
+            WHERE json_valid(payload_json) AND json_type(payload_json,'$.published')='object'""",
+            """UPDATE entity_profile_refresh_state SET page_cursor_json=json_set(page_cursor_json,'$.baseline.history_event_id',0)
+            WHERE json_valid(page_cursor_json) AND json_type(page_cursor_json,'$.baseline')='object'""",
+        ],
+    )
+
+
+def _apply_migration_88(conn: sqlite3.Connection, current: int) -> int:
+    if current >= _PROFILE_COLLECTION_MIGRATION:
+        return current
+    statements: list[str] = []
+    for table in ("entity_detail_sections", "entity_profile_refresh_state"):
+        indexes = [
+            row[0]
+            for row in cast(
+                list[tuple[str]],
+                conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL", (table,)
+                ).fetchall(),
+            )
+        ]
+        sql = cast(
+            tuple[str], conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+        )[0]
+        # Preserve every historical column while extending only the section CHECK.
+        sql = sql.replace(table, f"{table}_v88", 1).replace(
+            "'personal_channel'", "'personal_channel','saved_music','saved_gifts','current_stories','pinned_stories'"
+        )
+        if table == "entity_profile_refresh_state":
+            position = sql.rfind(")")
+            sql = sql[:position] + ", page_cursor_json TEXT" + sql[position:]
+        columns = ",".join(
+            str(row[1])
+            for row in cast(list[tuple[object, ...]], conn.execute(f"PRAGMA table_info({table})").fetchall())
+        )
+        statements.extend(
+            [
+                sql,
+                f"INSERT INTO {table}_v88({columns}) SELECT {columns} FROM {table}",
+                f"DROP TABLE {table}",
+                f"ALTER TABLE {table}_v88 RENAME TO {table}",
+            ]
+        )
+        statements.extend(indexes)
+    statements.extend(
+        [
+            """CREATE TABLE entity_profile_collection_facts (
+            owner_account_id INTEGER NOT NULL CHECK(owner_account_id>0),
+            entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+            section TEXT NOT NULL, item_key TEXT NOT NULL,
+            fields_json TEXT NOT NULL, coverage_json TEXT NOT NULL, provenance_json TEXT NOT NULL DEFAULT '{}',
+            observation_order INTEGER NOT NULL CHECK(observation_order>0), observed_at INTEGER NOT NULL,
+            PRIMARY KEY(owner_account_id,entity_id,section,item_key)
+        ) WITHOUT ROWID""",
+            """CREATE TABLE entity_profile_collection_membership (
+            owner_account_id INTEGER NOT NULL, entity_id INTEGER NOT NULL, section TEXT NOT NULL,
+            generation INTEGER NOT NULL, scan INTEGER NOT NULL DEFAULT 0, item_key TEXT NOT NULL,
+            identity_kind TEXT NOT NULL CHECK(identity_kind IN ('remote','observation')),
+            page_key TEXT NOT NULL, ordinal INTEGER NOT NULL,
+            detail_complete INTEGER NOT NULL CHECK(detail_complete IN (0,1)),
+            PRIMARY KEY(owner_account_id,entity_id,section,generation,scan,item_key),
+            FOREIGN KEY(owner_account_id,entity_id,section,item_key)
+              REFERENCES entity_profile_collection_facts(owner_account_id,entity_id,section,item_key) ON DELETE CASCADE
+        ) WITHOUT ROWID""",
+        ]
+    )
+    return _apply_migration(conn, current, _PROFILE_COLLECTION_MIGRATION, statements)
+
+
+def _apply_migration_87(conn: sqlite3.Connection, current: int) -> int:
+    """Retain legacy facts while requiring explicit v2 field coverage per account."""
+    return _apply_migration(
+        conn,
+        current,
+        _SEMANTIC_PROFILE_MIGRATION,
+        [
+            """CREATE TABLE entity_profile_semantic_snapshots (
+                owner_account_id INTEGER NOT NULL CHECK(typeof(owner_account_id)='integer' AND owner_account_id>0),
+                entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE CHECK(entity_id>0),
+                normalization_version TEXT NOT NULL,
+                fields_json TEXT NOT NULL DEFAULT '{}',
+                coverage_json TEXT NOT NULL DEFAULT '{}',
+                provenance_json TEXT NOT NULL DEFAULT '{}',
+                complete INTEGER NOT NULL DEFAULT 0 CHECK(complete IN (0,1)),
+                observation_order INTEGER NOT NULL DEFAULT 0 CHECK(observation_order>=0),
+                observation_started_at INTEGER,
+                observation_completed_at INTEGER,
+                source TEXT NOT NULL CHECK(source IN ('rpc','update','min','legacy')),
+                PRIMARY KEY(owner_account_id,entity_id)
+            ) WITHOUT ROWID""",
+            """INSERT INTO entity_profile_semantic_snapshots (
+                owner_account_id,entity_id,normalization_version,coverage_json,source
+            ) SELECT profile_owner_account_id,entity_id,'entity-profile-full-user-v2',
+                '{"reason":"legacy_normalization_incomplete"}','legacy'
+            FROM entity_details WHERE profile_owner_account_id>0 AND entity_id>0""",
+        ],
+    )
 
 
 def _apply_migration_86(conn: sqlite3.Connection, current: int) -> int:

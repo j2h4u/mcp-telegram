@@ -257,7 +257,7 @@ def test_request_factories_and_chat_photo_types_have_one_production_owner() -> N
         assert "InputMessagesFilterChatPhotos" not in source
         assert "MessageActionChatEditPhoto" not in source
     owners = (root / "telegram_gateway.py").read_text()
-    assert owners.count("GetCommonChatsRequest") == 2
-    assert owners.count("GetUserPhotosRequest") == 2
+    assert owners.count("GetCommonChatsRequest") == 3
+    assert owners.count("GetUserPhotosRequest") == 3
     assert owners.count("InputMessagesFilterChatPhotos") == 1
     assert owners.count("MessageActionChatEditPhoto") == 1

@@ -3,6 +3,7 @@
 # SQLite row shapes are asserted below.
 # pyright: reportAny=false
 
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -11,7 +12,10 @@ import pytest
 
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
 from mcp_telegram.entity_profile.contracts import (
+    PROFILE_SECTIONS,
     CommonChatsObservation,
+    ObservationBoundary,
+    ProfileCollectionPage,
     ProjectionStatus,
     UserAvatarHistoryObservation,
     UserReference,
@@ -44,6 +48,12 @@ class _RetryingFacts:
         self._attempt()
         return UserAvatarHistoryObservation(reference.user_id, (), 0, ProjectionStatus.USABLE, None, 1000, 1000)
 
+    async def fetch_profile_collection_page(
+        self, reference: UserReference, section: str, cursor: Mapping[str, object]
+    ) -> ProfileCollectionPage:
+        self._attempt()
+        return ProfileCollectionPage(reference.user_id, section, (), ObservationBoundary(1000, 1000), 0, terminal=True)
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("section", ("common_chats", "avatar_history"))
@@ -56,6 +66,7 @@ async def test_executor_retries_first_timeout_of_missing_section(tmp_path: Path,
     client = _PairClient(channel_id=None)
     service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=True))
     facts = _RetryingFacts()
+    client.collection_port = facts
     clock = [1000.0]
     service._deps = replace(
         service._deps,
@@ -80,7 +91,7 @@ async def test_executor_retries_first_timeout_of_missing_section(tmp_path: Path,
         assert conn.execute(
             "SELECT status,retry_at FROM entity_detail_sections WHERE section=?", (section,)
         ).fetchone() == ("fresh", None)
-        for _ in range(5):
+        for _ in range(len(PROFILE_SECTIONS)):
             await adapter.run_slice(RpcAttemptBudget(limit=1))
         assert repo.next_due_refresh(now=int(clock[0])) is None
         assert facts.calls == 2
@@ -105,7 +116,7 @@ async def test_executor_acquires_only_missing_personal_channel_without_pair_loop
     adapter = EntityProfileDemandAdapter(coordinator)
     repo.request_section_refresh(42, ("personal_channel",), now=100_000, pair_mode="enabled")
     try:
-        for _ in range(5):
+        for _ in range(len(PROFILE_SECTIONS)):
             await adapter.run_slice(RpcAttemptBudget(limit=1))
         assert client.full_user_calls == 1
         assert repo.next_due_refresh(now=100_000) is None

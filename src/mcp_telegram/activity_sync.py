@@ -20,6 +20,7 @@ from telethon.tl.functions.messages import SearchRequest
 from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty, InputPeerSelf
 
 from .activity_substrate import ActivityClient, call_with_timeout
+from .entity_profile.repository import admit_profile_peer, bound_profile_account
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled, sleep_through_flood
 from .hydration_queue import HydrationPriority
@@ -380,8 +381,11 @@ def _persist_own_message_rows(
     require_write_transaction(conn)
     insert_messages_with_fts(conn, extracted, priority=priority)
     dialog_ids = {em.message.dialog_id for em in extracted}
+    account = bound_profile_account(conn)
     for dialog_id in dialog_ids:
         enroll_own_only_sync_dialog(conn, dialog_id)
+        if account is not None:
+            admit_profile_peer(conn, account, dialog_id, now=int(time.time()))
 
 
 async def _search_backfill_batch(

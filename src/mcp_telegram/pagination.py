@@ -618,3 +618,42 @@ def decode_account_trace_navigation(
         sent_before=sent_before,
         scope_dialog_ids=scope_dialog_ids,
     )
+
+
+@dataclass(frozen=True)
+class ProfileNavigationToken:
+    """Account-bound local profile selection, separate from Telegram RPC cursors."""
+
+    account: int
+    entity: int
+    section: str
+    source_kind: str
+    generation: int = 0
+    scan: int = 0
+    fingerprint: str = ""
+    last_key: str = ""
+    watermark: int = 0
+    version: int = 1
+
+
+def encode_profile_navigation(token: ProfileNavigationToken) -> str:
+    from dataclasses import asdict
+
+    return _encode_payload({"kind": "profile", **asdict(token)})
+
+
+def decode_profile_navigation(value: str, *, account: int, entity: int, section: str) -> ProfileNavigationToken:
+    payload = _decode_payload(value)
+    if payload.pop("kind", None) != "profile" or payload.get("version") != 1:
+        raise ValueError("Unsupported profile navigation")
+    integers = ("account", "entity", "generation", "scan", "watermark", "version")
+    strings = ("section", "source_kind", "fingerprint", "last_key")
+    if set(payload) != set(integers + strings):
+        raise ValueError("Invalid profile navigation fields")
+    if any(type(payload[key]) is not int or cast(int, payload[key]) < 0 for key in integers):
+        raise ValueError("Invalid profile navigation number")
+    if any(not isinstance(payload[key], str) for key in strings):
+        raise ValueError("Invalid profile navigation text")
+    if (payload["account"], payload["entity"], payload["section"]) != (account, entity, section):
+        raise ValueError("Profile navigation belongs to another account, entity, or section")
+    return ProfileNavigationToken(**cast(dict, payload))

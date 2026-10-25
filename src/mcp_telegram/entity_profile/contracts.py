@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Literal, TypedDict, cast
 
@@ -20,12 +20,20 @@ PROFILE_SECTIONS: tuple[str, ...] = (
     "contact_overlap",
     "avatar_history",
     "personal_channel",
+    "saved_music",
+    "saved_gifts",
+    "current_stories",
+    "pinned_stories",
+)
+
+PROFILE_COLLECTION_SECTIONS = frozenset(
+    {"avatar_history", "common_chats", "saved_music", "saved_gifts", "current_stories", "pinned_stories"}
 )
 
 PROFILE_ACQUISITION_OUTCOMES: frozenset[str] = frozenset({"usable", "partial", "absent", "unavailable"})
 PROFILE_NORMALIZATION_VERSION = "entity-profile-v1"
 FULL_USER_ENDPOINT = "users.GetFullUser"
-NORMALIZATION_VERSION = "entity-profile-full-user-v1"
+NORMALIZATION_VERSION = "entity-profile-full-user-v2"
 GROUP_PROFILE_ENDPOINT = "messages.GetFullChat"
 GROUP_PROFILE_NORMALIZATION_VERSION = "entity-profile-group-full-chat-v1"
 CHANNEL_PROFILE_ENDPOINT = "channels.GetFullChannel"
@@ -49,6 +57,118 @@ class ProjectionStatus(StrEnum):
     PARTIAL = "partial"
     ABSENT = "absent"
     UNAVAILABLE = "unavailable"
+
+
+class ProfileFieldClass(StrEnum):
+    """Classify account-visible facts separately from excluded protocol state."""
+
+    PROFILE = "profile"
+    PRIVATE_FACT = "private_fact"
+    CAPABILITY = "capability"
+    INAPPLICABLE = "inapplicable"
+
+
+class ProfileFieldState(StrEnum):
+    PRESENT = "present"
+    CLEARED = "cleared"
+    API_NOT_RETURNED = "api_not_returned"
+    UNKNOWN = "unknown"
+    INAPPLICABLE = "inapplicable"
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileFieldCoverage:
+    """Only authoritative paths may replace or clear a retained value."""
+
+    classification: ProfileFieldClass
+    state: ProfileFieldState
+    authoritative: bool = False
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileSemanticSnapshot:
+    """Current facts and per-path evidence; API non-return never deletes knowledge."""
+
+    target_id: int
+    owner_account_id: int | None
+    fields: Mapping[str, object]
+    coverage: Mapping[str, ProfileFieldCoverage]
+    observation: ObservationBoundary
+    diagnostics: tuple[str, ...] = ()
+    normalization_version: str = NORMALIZATION_VERSION
+    schema_layer: int = 229
+    endpoint: str = FULL_USER_ENDPOINT
+
+    def __post_init__(self) -> None:
+        _validate_positive_id(self.target_id, field_name="target_id")
+        if self.owner_account_id is not None:
+            _validate_positive_id(self.owner_account_id, field_name="owner_account_id")
+
+    @property
+    def complete(self) -> bool:
+        """Complete response coverage includes explicitly unavailable fields, not their values."""
+        return (
+            self.owner_account_id is not None
+            and self.observation.valid
+            and bool(self.coverage)
+            and not self.diagnostics
+            and all(field.state is not ProfileFieldState.UNKNOWN for field in self.coverage.values())
+        )
+
+    def require_account(self, owner_account_id: int) -> None:
+        """Call before persisting or projecting account-private facts."""
+        _validate_positive_id(owner_account_id, field_name="owner_account_id")
+        if self.owner_account_id != owner_account_id:
+            raise ValueError("semantic profile account does not match requested owner")
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCollectionItem:
+    key: str
+    fields: Mapping[str, object]
+    coverage: Mapping[str, ProfileFieldCoverage]
+    identity_kind: str = "remote"
+    detail_complete: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.key or self.identity_kind not in {"remote", "observation"}:
+            raise ValueError("invalid collection item identity")
+
+
+@dataclass(frozen=True, slots=True)
+class SuppliedProfileUser:
+    entity_id: int
+    fields: Mapping[str, object]
+    coverage: Mapping[str, ProfileFieldCoverage]
+    legacy_fields: Mapping[str, object]
+    minimal: bool
+    authoritative_photo: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCollectionPage:
+    entity_id: int
+    section: str
+    items: tuple[ProfileCollectionItem, ...]
+    observation: ObservationBoundary
+    reported_count: int | None = None
+    next_cursor: Mapping[str, object] | None = None
+    terminal: bool = False
+    diagnostics: tuple[str, ...] = ()
+    reason: str | None = None
+    metadata: Mapping[str, object] = field(default_factory=dict)
+    supplied_user: SuppliedProfileUser | None = None
+    sidecar_identities: tuple[DialogIdentityObservation, ...] = ()
+
+    def __post_init__(self) -> None:
+        _validate_positive_id(self.entity_id, field_name="entity_id")
+        if self.section not in PROFILE_COLLECTION_SECTIONS or not self.observation.valid:
+            raise ValueError("invalid collection page boundary")
+        if self.reported_count is not None:
+            _validate_count(self.reported_count)
+        if self.terminal and self.next_cursor is not None:
+            raise ValueError("terminal page cannot have continuation")
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +283,7 @@ class UserProfileObservation:
     full_profile: ProjectionOutcome
     personal_channel: ProjectionOutcome
     current_photo: ChatCurrentPhoto | None = None
+    semantic_snapshot: ProfileSemanticSnapshot | None = None
 
     def __post_init__(self) -> None:
         _validate_positive_id(self.target_id, field_name="target_id")
@@ -170,6 +291,8 @@ class UserProfileObservation:
             raise TypeError("target_kind must be a TargetKind")
         if self.current_photo is not None and not isinstance(self.current_photo, ChatCurrentPhoto):
             raise TypeError("current_photo must be ChatCurrentPhoto or None")
+        if self.semantic_snapshot is not None and self.semantic_snapshot.target_id != self.target_id:
+            raise ValueError("semantic snapshot target does not match profile observation")
 
 
 @dataclass(frozen=True, slots=True)

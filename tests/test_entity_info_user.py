@@ -11,6 +11,8 @@ import asyncio
 import logging
 import re
 import sqlite3
+from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import cast
@@ -25,15 +27,19 @@ from telethon.errors import ChannelPrivateError
 # MagicMock() never satisfies the isinstance check and the User branch is
 # silently not exercised. Module-level import keeps the spec= reference
 # cheap (no per-test imports).
-from telethon.tl.types import Channel, User  # type: ignore[import-untyped]
+from telethon.tl.types import Channel, PeerNotifySettings, PeerSettings, Photo, User, UserFull  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.entity_profile.contracts import (
     ObservationBoundary,
+    ProfileCollectionPage,
     TargetKind,
+    UserProfileObservation,
+    UserReference,
 )
 from mcp_telegram.entity_profile.full_user_normalization import normalize_full_user_response
 from mcp_telegram.entity_profile.ports import UserProfilePort
+from mcp_telegram.entity_profile.semantic_normalization import normalize_collection_item
 from mcp_telegram.sync_transactions import write_transaction
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
@@ -45,6 +51,7 @@ from tests.helpers import (
     LoudGroupProfilePort,
     LoudUserProfilePort,
     acquire_entity_profile,
+    client_profile_collection_page,
     in_memory_sync_db,
 )
 from tests.sqlite_writer_helpers import inline_writer
@@ -162,9 +169,39 @@ def _make_channel_mock(**kwargs: object) -> MagicMock:
     return channel
 
 
+class _UserProfileFixturePort(FakeUserProfilePort):
+    def __init__(self, observation: UserProfileObservation, client: object) -> None:
+        super().__init__(observation)
+        self.client = client
+
+    async def fetch_profile_collection_page(
+        self, reference: UserReference, section: str, cursor: Mapping[str, object]
+    ) -> ProfileCollectionPage:
+        del cursor
+        page = await client_profile_collection_page(self.client, reference, section)
+        if section != "avatar_history":
+            return page
+        items = []
+        for item in page.items:
+            date = item.fields.get("date")
+            photo = Photo(
+                cast(int, item.fields["id"]),
+                987654321,
+                b"private-ref",
+                datetime.fromisoformat(date) if isinstance(date, str) else None,
+                [],
+                4,
+            )
+            fields, coverage, diagnostics = normalize_collection_item(photo)
+            assert not diagnostics
+            items.append(replace(item, fields=fields, coverage=coverage))
+        return replace(page, items=tuple(items))
+
+
 def _user_profile_port(
     user: MagicMock,
     full: MagicMock,
+    client: object,
 ) -> FakeUserProfilePort:
     full_user = cast(object, full.full_user)
     user_id = cast(int, user.id)
@@ -175,8 +212,9 @@ def _user_profile_port(
         target_id=user_id,
         target_kind=TargetKind.BOT if user_is_bot else TargetKind.USER,
         observation=ObservationBoundary(100.0, 100.0),
+        owner_account_id=1,
     )
-    return FakeUserProfilePort(observation)
+    return _UserProfileFixturePort(observation, client)
 
 
 @pytest.mark.asyncio
@@ -187,7 +225,11 @@ async def test_get_entity_info_user_type() -> None:
     client.get_entity = AsyncMock(return_value=user)
     common, full, photos = MagicMock(), MagicMock(), MagicMock()
     common.chats = []
-    full.full_user = MagicMock(
+    full.full_user = UserFull(
+        id=cast(int, user.id),
+        settings=PeerSettings(),
+        notify_settings=PeerNotifySettings(),
+        common_chats_count=0,
         about=None,
         personal_channel_id=None,
         birthday=None,
@@ -204,7 +246,7 @@ async def test_get_entity_info_user_type() -> None:
     photos.count = 0
     photos.photos = []
     client.side_effect = [common, photos]
-    server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
+    server = make_server(client=client, user_profile_port=_user_profile_port(user, full, client))
     await _acquire_local_profile(server, 1, "user", "Alice Smith")
     with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 1})
@@ -220,7 +262,11 @@ async def test_get_entity_info_user_avatar_history_handles_photos_without_count(
     client.get_entity = AsyncMock(return_value=user)
     common, full, photos = MagicMock(), MagicMock(), MagicMock()
     common.chats = []
-    full.full_user = MagicMock(
+    full.full_user = UserFull(
+        id=cast(int, user.id),
+        settings=PeerSettings(),
+        notify_settings=PeerNotifySettings(),
+        common_chats_count=0,
         about=None,
         personal_channel_id=None,
         birthday=None,
@@ -238,14 +284,19 @@ async def test_get_entity_info_user_avatar_history_handles_photos_without_count(
     del photos.count
     photos.photos = [photo]
     client.side_effect = [common, photos]
-    server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
+    server = make_server(client=client, user_profile_port=_user_profile_port(user, full, client))
     await _acquire_local_profile(server, 11, "user", "Alice Smith")
     with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 11})
     assert r["ok"] is True, f"got {r}"
     d = _dict(r["data"])
-    assert d["avatar_count"] == 1
-    assert d["avatar_history"] == [{"photo_id": 77, "date": "2026-06-23T12:00:00+00:00"}]
+    page = await server._dispatch({"method": "get_entity_info", "entity_id": 11, "section": "avatar_history"})
+    selected = _dict_at(page, "data", "page")
+    assert _dict_at(d, "collections", "avatar_history")["reported_count"] == 1
+    items = cast(list[dict[str, object]], selected["items"])
+    assert len(items) == 1 and items[0]["state"] == "retained"
+    assert _dict(items[0]["value"])["id"] == 77
+    assert _dict(items[0]["value"])["date"] == "2026-06-23T12:00:00+00:00"
 
 
 @pytest.mark.asyncio
@@ -256,7 +307,11 @@ async def test_get_entity_info_bot_type() -> None:
     client.get_entity = AsyncMock(return_value=bot)
     common, full, photos = MagicMock(), MagicMock(), MagicMock()
     common.chats = []
-    full.full_user = MagicMock(
+    full.full_user = UserFull(
+        id=cast(int, bot.id),
+        settings=PeerSettings(),
+        notify_settings=PeerNotifySettings(),
+        common_chats_count=0,
         about=None,
         personal_channel_id=None,
         birthday=None,
@@ -273,7 +328,7 @@ async def test_get_entity_info_bot_type() -> None:
     photos.count = 0
     photos.photos = []
     client.side_effect = [common, photos]
-    server = make_server(client=client, user_profile_port=_user_profile_port(bot, full))
+    server = make_server(client=client, user_profile_port=_user_profile_port(bot, full, client))
     await _acquire_local_profile(server, 2, "bot", "MyBot")
     with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 2})
@@ -291,7 +346,11 @@ async def test_bot_profile_acquisition_uses_bot_kind_and_get_does_not_repeat_it(
     client.get_entity = AsyncMock(return_value=bot)
     common, full, photos = MagicMock(), MagicMock(), MagicMock()
     common.chats = []
-    full.full_user = MagicMock(
+    full.full_user = UserFull(
+        id=cast(int, bot.id),
+        settings=PeerSettings(),
+        notify_settings=PeerNotifySettings(),
+        common_chats_count=0,
         about="bot bio",
         personal_channel_id=777,
         personal_channel_message=None,
@@ -304,7 +363,7 @@ async def test_bot_profile_acquisition_uses_bot_kind_and_get_does_not_repeat_it(
     photos.count = 0
     photos.photos = []
     client.side_effect = [common, photos]
-    port = _user_profile_port(bot, full)
+    port = _user_profile_port(bot, full, client)
     server = make_server(client=client, user_profile_port=port)
     await _acquire_local_profile(server, 6, "bot", "ProfileBot")
     acquisition_calls = list(port.calls)
@@ -329,7 +388,11 @@ async def test_get_entity_info_common_envelope_user() -> None:
     client.get_entity = AsyncMock(return_value=user)
     common, full, photos = MagicMock(), MagicMock(), MagicMock()
     common.chats = []
-    full.full_user = MagicMock(
+    full.full_user = UserFull(
+        id=cast(int, user.id),
+        settings=PeerSettings(),
+        notify_settings=PeerNotifySettings(),
+        common_chats_count=0,
         about="bio text",
         personal_channel_id=None,
         birthday=None,
@@ -346,16 +409,17 @@ async def test_get_entity_info_common_envelope_user() -> None:
     photos.count = 0
     photos.photos = []
     client.side_effect = [common, photos]
-    server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
+    server = make_server(client=client, user_profile_port=_user_profile_port(user, full, client))
     await _acquire_local_profile(server, 3, "user", "Alice Smith")
     with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 3})
     assert r["ok"] is True
     d = _dict(r["data"])
-    for key in ("id", "type", "name", "username", "about", "my_membership", "avatar_history", "avatar_count"):
+    for key in ("id", "type", "name", "username", "about", "my_membership", "collections"):
         assert key in d, f"missing common envelope key: {key}"
     assert d["about"] == "bio text"
     assert isinstance(d["my_membership"], dict)
+    assert _dict_at(d, "collections", "avatar_history")["reported_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -366,7 +430,11 @@ async def test_get_entity_info_user_field_surface_preserved() -> None:
     client.get_entity = AsyncMock(return_value=user)
     common, full, photos = MagicMock(), MagicMock(), MagicMock()
     common.chats = []
-    full.full_user = MagicMock(
+    full.full_user = UserFull(
+        id=cast(int, user.id),
+        settings=PeerSettings(),
+        notify_settings=PeerNotifySettings(),
+        common_chats_count=0,
         about=None,
         personal_channel_id=999,
         birthday=None,
@@ -383,7 +451,7 @@ async def test_get_entity_info_user_field_surface_preserved() -> None:
     photos.count = 0
     photos.photos = []
     client.side_effect = [common, photos]
-    server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
+    server = make_server(client=client, user_profile_port=_user_profile_port(user, full, client))
     await _acquire_local_profile(server, 4, "user", "Alice Smith")
     with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 4})
@@ -402,7 +470,6 @@ async def test_get_entity_info_user_field_surface_preserved() -> None:
         "close_friend",
         "send_paid_messages_stars",
         "personal_channel_id",
-        "birthday",
         "verified",
         "premium",
         "bot",
@@ -412,21 +479,33 @@ async def test_get_entity_info_user_field_surface_preserved() -> None:
         "restriction_reason",
         "blocked",
         "ttl_period",
-        "private_forward_name",
-        "bot_info",
-        "business_location",
-        "business_intro",
-        "business_work_hours",
         "note",
-        "folder_id",
         "folder_name",
-        "common_chats",
     ):
         assert key in d, f"User field surface regression: missing {key}"
     assert d["phone"] == "+12025551234"
     assert d["lang_code"] == "en"
     assert d["personal_channel_id"] == 999
     assert d["ttl_period"] == 86400
+    acquisition = _dict_at(d, "semantic", "acquisition")
+    field_coverage = {row["path"]: row for row in cast(list[dict[str, object]], acquisition["field_coverage"])}
+    for field in (
+        "birthday",
+        "private_forward_name",
+        "bot_info",
+        "business_location",
+        "business_intro",
+        "business_work_hours",
+        "folder_id",
+    ):
+        assert field not in d
+        fact = field_coverage["full_user." + field]
+        assert fact["state"] == "api_not_returned" and fact["authoritative"] is False
+        assert fact["reason"] == "endpoint_did_not_return_value"
+    assert _dict_at(d, "semantic", "fields")["full_user.about"] is None
+    about = field_coverage["full_user.about"]
+    assert about["state"] == "cleared" and about["authoritative"] is True
+    assert _dict_at(d, "collections", "common_chats")["reported_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -444,7 +523,11 @@ async def test_get_entity_info_user_personal_channel_card_from_full_user_chats()
     client.get_messages = get_messages
     common, full, photos = MagicMock(), MagicMock(), MagicMock()
     common.chats = []
-    full.full_user = MagicMock(
+    full.full_user = UserFull(
+        id=cast(int, user.id),
+        settings=PeerSettings(),
+        notify_settings=PeerNotifySettings(),
+        common_chats_count=0,
         about=None,
         personal_channel_id=777,
         personal_channel_message=55,
@@ -472,7 +555,7 @@ async def test_get_entity_info_user_personal_channel_card_from_full_user_chats()
     server = make_server(
         conn=conn,
         client=client,
-        user_profile_port=_user_profile_port(user, full),
+        user_profile_port=_user_profile_port(user, full, client),
     )
     await _acquire_local_profile(server, 44, "user", "Alice Smith")
 
@@ -526,7 +609,11 @@ async def test_get_entity_info_user_partial_personal_channel_skips_local_enrichm
     client.get_messages = get_messages
     common, full, photos = MagicMock(), MagicMock(), MagicMock()
     common.chats = []
-    full.full_user = MagicMock(
+    full.full_user = UserFull(
+        id=cast(int, user.id),
+        settings=PeerSettings(),
+        notify_settings=PeerNotifySettings(),
+        common_chats_count=0,
         about=None,
         personal_channel_id=777,
         personal_channel_message=None,
@@ -545,7 +632,7 @@ async def test_get_entity_info_user_partial_personal_channel_skips_local_enrichm
     photos.count = 0
     photos.photos = []
     client.side_effect = [common, photos]
-    server = make_server(conn=conn, client=client, user_profile_port=_user_profile_port(user, full))
+    server = make_server(conn=conn, client=client, user_profile_port=_user_profile_port(user, full, client))
     await _acquire_local_profile(server, 45, "user", "Alice Smith")
 
     with patch.object(server, "_ready", True):
@@ -567,7 +654,11 @@ async def test_get_entity_info_no_download_keys_user() -> None:
     client.get_entity = AsyncMock(return_value=user)
     common, full, photos = MagicMock(), MagicMock(), MagicMock()
     common.chats = []
-    full.full_user = MagicMock(
+    full.full_user = UserFull(
+        id=cast(int, user.id),
+        settings=PeerSettings(),
+        notify_settings=PeerNotifySettings(),
+        common_chats_count=0,
         about=None,
         personal_channel_id=None,
         birthday=None,
@@ -588,7 +679,7 @@ async def test_get_entity_info_no_download_keys_user() -> None:
     photos.count = 1
     photos.photos = [photo]
     client.side_effect = [common, photos]
-    server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
+    server = make_server(client=client, user_profile_port=_user_profile_port(user, full, client))
     await _acquire_local_profile(server, 5, "user", "Alice Smith")
     with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 5})
@@ -605,9 +696,15 @@ async def test_get_entity_info_no_download_keys_user() -> None:
     forbidden = re.compile(r"^(file_id|file_reference|download_)")
     bad = [k for k in _walk_keys(_dict(r["data"])) if forbidden.match(str(k))]
     assert not bad, f"forbidden download-related keys present: {bad}"
-    d = _dict(r["data"])
-    assert d["avatar_history"] == [{"photo_id": 10001, "date": "2024-01-01T00:00:00"}]
-    assert d["avatar_count"] == 1
+    selected = await server._dispatch({"method": "get_entity_info", "entity_id": 5, "section": "avatar_history"})
+    assert not [key for key in _walk_keys(_dict(selected["data"])) if forbidden.match(str(key))]
+    data = _dict(selected["data"])
+    assert _dict_at(data, "collections", "avatar_history")["reported_count"] == 1
+    items = cast(list[dict[str, object]], _dict_at(data, "page")["items"])
+    assert len(items) == 1 and items[0]["state"] == "retained"
+    assert _dict(items[0]["value"])["id"] == 10001
+    assert _dict(items[0]["value"])["date"] == "2024-01-01T00:00:00"
+    assert "987654321" not in repr(data) and "private-ref" not in repr(data)
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,7 @@ from .daemon_ipc import REQUEST_LIMIT, get_daemon_socket_path, read_response
 
 logger = logging.getLogger(__name__)
 DEFAULT_DAEMON_TIMEOUT_SECONDS = ENTITY_PROFILE_DAEMON_TIMEOUT_SECONDS
+DEFAULT_ENTITY_PROFILE_PAGE_LIMIT = 50
 ENTITY_PROFILE_ENDPOINT_TIMEOUT_CAP_SECONDS = _config.ENTITY_PROFILE_ENDPOINT_TIMEOUT_CAP_SECONDS
 type DaemonFailureKind = Literal[
     "not_running",
@@ -517,16 +518,28 @@ class DaemonConnection:
             payload["navigation"] = navigation
         return await self.request(payload)
 
-    async def get_entity_info(self, *, entity_id: int) -> dict:
-        """Return type-tagged entity profile (user/bot/channel/supergroup/group).
+    async def get_entity_info(
+        self,
+        *,
+        entity_id: int,
+        section: str | None = None,
+        cursor: str | None = None,
+        limit: int = DEFAULT_ENTITY_PROFILE_PAGE_LIMIT,
+    ) -> dict:
+        """Read retained local entity facts with coverage and acquisition progress.
 
-        DB-first; daemon falls back to Telegram on cache miss/stale according to
-        the configured entity-detail TTL (per CONTEXT D-01 / SPEC Req 8).
-        Response carries one of five 'type'
-        discriminators in data['type']: 'user' | 'bot' | 'channel' |
-        'supergroup' | 'group'.
+        This read makes no Telegram request, waits for no acquisition and does
+        not enroll the entity. Useful retained data remains available alongside
+        its coverage and progress evidence.
         """
-        return await self.request({"method": "get_entity_info", "entity_id": entity_id})
+        payload: dict[str, object] = {"method": "get_entity_info", "entity_id": entity_id}
+        if section is not None:
+            payload["section"] = section
+        if cursor is not None:
+            payload["cursor"] = cursor
+        if limit != DEFAULT_ENTITY_PROFILE_PAGE_LIMIT:
+            payload["limit"] = limit
+        return await self.request(payload)
 
     async def get_inbox(  # noqa: PLR0913
         self,

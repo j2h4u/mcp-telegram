@@ -92,8 +92,8 @@ from .dialog_fact_observations import claim_dialog_fact
 from .dialog_identity import capture_identity_baseline, publish_dialog_identity
 from .dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation, ObservedText
 from .dialog_pin_observations import claim_pin_delta, claim_pin_snapshot, ordered_pin_overlay
-from .entity_profile.contracts import ProfileFieldObservation
-from .entity_profile.repository import EntityProfileRepository
+from .entity_profile.contracts import ProfileFieldObservation, SuppliedProfileUser
+from .entity_profile.repository import EntityProfileRepository, admit_profile_peer, personal_profile_peer
 from .entity_profile.updates import (
     ProfilePush,
     bundled_profile_users,
@@ -662,6 +662,26 @@ _CLEAR_ALL_PINS_SQL = "UPDATE dialogs SET pinned=0, snapshot_at=? WHERE pinned=1
 # ---------------------------------------------------------------------------
 
 
+def _identity_path_excluded(path: str, roots: set[str]) -> bool:
+    return any(path == root or path.startswith((root + ".", root + "[")) for root in roots)
+
+
+def _mask_profile_identity_fields(push: ProfilePush, excluded: set[str]) -> ProfilePush:
+    semantic_roots = {"user." + field for field in excluded if field in {"first_name", "last_name", "username"}}
+    if "extra_usernames" in excluded:
+        semantic_roots.add("user.usernames")
+    return replace(
+        push,
+        fields={field: value for field, value in push.fields.items() if field not in excluded},
+        semantic_fields={path: value for path, value in push.semantic_fields.items() if path not in semantic_roots},
+        semantic_coverage={
+            path: value
+            for path, value in push.semantic_coverage.items()
+            if not _identity_path_excluded(path, semantic_roots)
+        },
+    )
+
+
 class EventHandlerManager:
     """Registers and dispatches real-time Telethon events to sync.db.
 
@@ -1098,6 +1118,37 @@ class EventHandlerManager:
                     published_at=int(message.date.timestamp()) if isinstance(message.date, datetime) else None,
                 )
 
+    async def _prepare_new_message_profile(
+        self, event: _NewMessageEvent, dialog_id: int, observed_at: int
+    ) -> tuple[int, _IdentityBaseline]:
+        """Admit supplied private-peer evidence before message-history policy."""
+
+        def reserve_observation(conn: sqlite3.Connection) -> tuple[int, _IdentityBaseline, bool]:
+            with write_savepoint(conn):
+                admitted = bool(
+                    self._self_id is not None
+                    and event.is_private
+                    and admit_profile_peer(
+                        conn,
+                        self._self_id,
+                        dialog_id,
+                        now=observed_at,
+                        pair_mode=self._profile_pair_mode,
+                    )
+                )
+                return (
+                    delivered_observation_order(conn),
+                    _IdentityBaseline(capture_identity_baseline(conn, dialog_id)),
+                    admitted,
+                )
+
+        observation_order, identity_baseline, admitted = await self._writer.run(reserve_observation)
+        if admitted:
+            self._offer(DemandKind.ENTITY_PROFILE_REFRESH)
+        if event.is_private and self._self_id is not None:
+            await self._persist_optional_dm_profile(getattr(event.message, "sender", None), dialog_id)
+        return observation_order, identity_baseline
+
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     @_acquisition(AcquisitionKind.ENTITY_LOOKUP)
     async def on_new_message(self, event: _NewMessageEvent) -> None:
@@ -1115,10 +1166,9 @@ class EventHandlerManager:
             reaction_observed_at = delivered_observed_at()
             msg = event.message
 
-            def reserve_observation(conn: sqlite3.Connection) -> tuple[int, _IdentityBaseline]:
-                return delivered_observation_order(conn), _IdentityBaseline(capture_identity_baseline(conn, dialog_id))
-
-            observation_order, identity_baseline = await self._writer.run(reserve_observation)
+            observation_order, identity_baseline = await self._prepare_new_message_profile(
+                event, dialog_id, reaction_observed_at
+            )
             coverage = await self._new_message_coverage(dialog_id, event, identity_baseline=identity_baseline)
             if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
                 return
@@ -2343,15 +2393,19 @@ class EventHandlerManager:
         push: ProfilePush,
         observation: ProfileFieldObservation,
     ) -> frozenset[str]:
-        fields = dict(push.fields)
-        photo = fields.pop("current_photo", None) if push.authoritative_photo else None
-        changed = profiles.apply_profile_update(push.entity_id, fields, observation=observation)
-        if push.authoritative_photo and "current_photo" in push.fields:
-            changed |= profiles.apply_profile_update(
+        changed = profiles.apply_supplied_user(
+            SuppliedProfileUser(
                 push.entity_id,
-                {"current_photo": photo},
-                observation=replace(observation, source="update"),
-            )
+                push.semantic_fields,
+                push.semantic_coverage,
+                push.fields,
+                push.minimal,
+                push.authoritative_photo,
+            ),
+            observation=observation,
+        )
+        if push.story is not None:
+            changed |= profiles.apply_story_update(push.entity_id, push.story, observation=observation)
         return changed
 
     def _write_profile_pushes(
@@ -2362,13 +2416,13 @@ class EventHandlerManager:
             return False, False, False
         profiles = EntityProfileRepository(conn, section_ttl_seconds=self._profile_detail_ttl_seconds)
         annotations: list[tuple[object, ProfileFieldObservation]] = []
-        offered = False
         handled_name = False
+        invalidations: dict[int, tuple[set[str], ProfileFieldObservation, bool]] = {}
         pushes = [(user, project_user_profile(user)) for user in users]
         pushes.append((update, project_profile_update(update)))
         with write_transaction(conn):
             for source, push in pushes:
-                if not self._eligible_profile_push(profiles, push):
+                if not self._eligible_profile_push(conn, push):
                     continue
                 assert push is not None
                 observation = self._profile_push_observation(conn, source, push)
@@ -2376,16 +2430,50 @@ class EventHandlerManager:
                 changed = self._apply_profile_push(profiles, push, observation)
                 sections = self._profile_push_sections(source, changed)
                 if sections:
-                    offered |= profiles.request_section_refresh(
-                        push.entity_id, sections, now=observation.observed_at, pair_mode=self._profile_pair_mode
+                    self._coalesce_profile_invalidation(
+                        invalidations, push.entity_id, sections, observation, isinstance(source, UpdateUser)
                     )
                 handled_name |= source is update and isinstance(update, UpdateUserName)
                 annotations.append((source, observation))
+            offered = self._flush_profile_invalidations(profiles, invalidations)
             topics_changed = self._write_topic_capabilities(conn, topic_entities, annotations)
         # Object lifetime, not an evictable cache: a repeated bundle keeps its original order.
         for source, observation in annotations:
             mark_push_applied(source, self._profile_push_owner, observation)
         return offered, handled_name, topics_changed
+
+    def _flush_profile_invalidations(
+        self,
+        profiles: EntityProfileRepository,
+        invalidations: dict[int, tuple[set[str], ProfileFieldObservation, bool]],
+    ) -> bool:
+        offered = False
+        for entity_id, (sections, observation, whole_peer) in invalidations.items():
+            offered |= profiles.invalidate_profile_sections(
+                entity_id,
+                tuple(sorted(sections)),
+                observation=observation,
+                reason="user" if whole_peer else "supplied:" + ",".join(sorted(sections)),
+                pair_mode=self._profile_pair_mode,
+            )
+        return offered
+
+    @staticmethod
+    def _coalesce_profile_invalidation(
+        pending: dict[int, tuple[set[str], ProfileFieldObservation, bool]],
+        entity_id: int,
+        sections: tuple[str, ...],
+        observation: ProfileFieldObservation,
+        whole_peer: bool,
+    ) -> None:
+        previous = pending.get(entity_id)
+        combined = set(sections)
+        if previous is not None:
+            combined.update(previous[0])
+            whole_peer |= previous[2]
+            if previous[1].order > observation.order:
+                observation = previous[1]
+        pending[entity_id] = combined, observation, whole_peer
 
     @staticmethod
     def _filter_retained_profile_identity(
@@ -2401,11 +2489,13 @@ class EventHandlerManager:
             excluded.update(("name", "first_name", "last_name"))
         if "username" in newer:
             excluded.update(("username", "extra_usernames"))
-        return replace(push, fields={field: value for field, value in push.fields.items() if field not in excluded})
+        return _mask_profile_identity_fields(push, excluded)
 
-    def _eligible_profile_push(self, profiles: EntityProfileRepository, push: ProfilePush | None) -> bool:
+    def _eligible_profile_push(self, conn: sqlite3.Connection, push: ProfilePush | None) -> bool:
         return (
-            push is not None and push.entity_id != self._self_id and profiles.is_history_profile_managed(push.entity_id)
+            push is not None
+            and self._self_id is not None
+            and personal_profile_peer(conn, self._self_id, push.entity_id)
         )
 
     def _profile_push_observation(
@@ -2420,12 +2510,27 @@ class EventHandlerManager:
         )
 
     def _profile_push_sections(self, source: object, changed: frozenset[str]) -> tuple[str, ...]:
-        sections: list[str] = []
-        if isinstance(source, UpdateUser) and push_marker(source, self._profile_push_owner) is None:
-            sections.extend(("full_profile", "personal_channel"))
-        if "current_photo" in changed:
-            sections.append("avatar_history")
-        return tuple(sections)
+        if isinstance(source, UpdateUser):
+            return (
+                "full_profile",
+                "personal_channel",
+                "avatar_history",
+                "common_chats",
+                "saved_music",
+                "saved_gifts",
+                "current_stories",
+                "pinned_stories",
+            )
+        if type(source).__name__ == "UpdateStory":
+            return tuple(sorted(changed & {"current_stories", "pinned_stories"}))
+        sections: set[str] = set()
+        if "current_photo" in changed or "photo" in changed:
+            sections.update(("avatar_history", "full_profile"))
+        if "bot_info_version" in changed:
+            sections.add("full_profile")
+        if changed & {"stories_max_id", "stories_unavailable"}:
+            sections.add("current_stories")
+        return tuple(sorted(sections))
 
     async def _persist_profile_pushes(self, *, update: object = None, sender: object = None) -> bool:
         users: Sequence[object] = (sender,) if sender is not None else bundled_profile_users(update)

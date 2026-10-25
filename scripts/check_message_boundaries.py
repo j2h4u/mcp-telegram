@@ -83,8 +83,9 @@ DIALOG_IDENTITY_ROLE_FUNCTIONS: Mapping[str, Mapping[str, frozenset[str]]] = {
     },
     "event_handlers.py": {"EventHandlerManager._mark_channel_chat_update": frozenset({"type"})},
     "entity_profile/repository.py": {
-        "EntityProfileRepository.is_history_profile_managed": frozenset({"type"}),
-        "EntityProfileRepository._history_profiles_to_collect": frozenset({"type", "name"}),
+        "personal_profile_peer": frozenset({"type"}),
+        "_ensure_profile_private_identity": frozenset({"type", "name"}),
+        "_profile_admission_candidates": frozenset({"type"}),
     },
     # Named SQL constants use canonical dialog kind only to decide whether a
     # peer is eligible for reaction scheduling.
@@ -1383,6 +1384,22 @@ def _search_hit_violations(path: str, tree: ast.AST) -> list[Finding]:
     return findings
 
 
+_PROFILE_PEER_SQL_SHAPES = {
+    "personal_profile_peer": "SELECT 1 FROM messages WHERE dialog_id=? LIMIT 1",
+    "_profile_admission_candidates": "SELECT dialog_id FROM messages WHERE dialog_id>? AND dialog_id>0 ORDER BY dialog_id LIMIT 1",
+}
+
+
+def _authorized_profile_peer_sql(relative: str, snippet: _SqlSnippet) -> bool:
+    """Permit only the two reviewed identity-only, indexed private-peer seeks."""
+    if relative != "entity_profile/repository.py":
+        return False
+    expected = _PROFILE_PEER_SQL_SHAPES.get(snippet.function or "")
+    return expected is not None and [token.casefold() for token in _sql_tokens(snippet.text)] == [
+        token.casefold() for token in _sql_tokens(expected)
+    ]
+
+
 def violations_for(path: Path, source: str) -> list[Finding]:
     relative = _relative(path)
     tree = ast.parse(source, filename=str(path))
@@ -1409,6 +1426,7 @@ def violations_for(path: Path, source: str) -> list[Finding]:
                 "direct FROM/JOIN messages or UPDATE/INSERT/DELETE messages/message_versions SQL is outside a reviewed owner",
             )
             for snippet in sql_hits
+            if not _authorized_profile_peer_sql(relative, snippet)
         )
     entity_dml_hits = [snippet for snippet in _sql_snippets(tree, constants) if _has_entity_table_dml(snippet.text)]
     if entity_dml_hits and relative not in ENTITY_DML_OWNER_PATHS and relative not in ENTITY_DML_SCHEMA_OWNER_PATHS:

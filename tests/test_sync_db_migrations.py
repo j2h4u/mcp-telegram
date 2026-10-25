@@ -39,6 +39,7 @@ from mcp_telegram.sync_db import (
     _open_sync_db,
     ensure_sync_schema,
 )
+from tests.helpers import remove_v87_schema_for_historical_fixture
 
 Row = tuple[object, ...]
 TableInfoRow = tuple[int, str, str, int, object, int]
@@ -2270,6 +2271,7 @@ def _downgrade_event_tables_to_v50(conn: sqlite3.Connection) -> None:
                dialog_id INTEGER NOT NULL, message_id INTEGER, version INTEGER, daemon_event_id INTEGER);"""
     )
     remove_v80_schema_for_historical_fixture(conn)
+    remove_v87_schema_for_historical_fixture(conn)
     conn.execute("DELETE FROM schema_version WHERE version >= 51")
 
 
@@ -2303,6 +2305,7 @@ def _downgrade_event_tables_to_v53(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE runtime_observations RENAME TO runtime_events")
     conn.execute("ALTER TABLE conversation_history_events RENAME TO sync_alert_events")
     remove_v80_schema_for_historical_fixture(conn)
+    remove_v87_schema_for_historical_fixture(conn)
     conn.execute("DELETE FROM schema_version WHERE version >= 54")
 
 

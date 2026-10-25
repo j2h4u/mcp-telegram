@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import sqlite3
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +19,7 @@ from telethon.errors import PeerIdInvalidError  # type: ignore[import-untyped]
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from helpers import remove_v80_schema_for_historical_fixture
+from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.daemon_entity_info import (
     _SQLITE_INT64_MAX,
     _SQLITE_INT64_MIN,
@@ -34,10 +35,12 @@ from mcp_telegram.entity_profile.contracts import (
     CommonChatsObservation,
     GroupReference,
     ObservationBoundary,
+    ProfileCollectionPage,
     ProjectionStatus,
     TargetKind,
     UserAvatarHistoryObservation,
     UserProfileObservation,
+    UserReference,
 )
 from mcp_telegram.entity_profile.full_user_normalization import normalize_full_user_response
 from mcp_telegram.entity_profile.refresh import (
@@ -83,7 +86,16 @@ class _UserProfilePort:
 
         return UserReference(user_id, 0, is_self=is_self)
 
-    async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
+    async def fetch_profile_collection_page(
+        self, reference: UserReference, section: str, cursor: Mapping[str, object]
+    ) -> ProfileCollectionPage:
+        from tests.helpers import client_profile_collection_page
+
+        return await client_profile_collection_page(self.client, reference, section)
+
+    async def fetch_user_profile(
+        self, user_id: int, target_kind: TargetKind, *, owner_account_id: int | None = None
+    ) -> UserProfileObservation:
         response = await self.client(("full_user", {"id": user_id}))  # type: ignore[operator]
         if not hasattr(response, "users") or not response.users:
             response = SimpleNamespace(
@@ -95,6 +107,7 @@ class _UserProfilePort:
             response,
             target_id=user_id,
             target_kind=target_kind,
+            owner_account_id=owner_account_id,
             observation=ObservationBoundary(100.0, 100.0),
         )
 
@@ -384,7 +397,13 @@ async def test_flood_wait_refresh_failure_signals_terminal_waiter_and_persists_r
     conn.close()
 
 
-def _test_service(conn: sqlite3.Connection, *, limits: RefreshLimits) -> DaemonEntityInfoService:
+def _test_service(
+    conn: sqlite3.Connection, *, limits: RefreshLimits, account_id: int | None = None
+) -> DaemonEntityInfoService:
+    if account_id is not None:
+        from tests.helpers import enable_profile_page_fixture
+
+        enable_profile_page_fixture(conn)
     enable_runtime_writes(conn)
     service = DaemonEntityInfoService(
         EntityInfoDeps(
@@ -407,6 +426,9 @@ def _test_service(conn: sqlite3.Connection, *, limits: RefreshLimits) -> DaemonE
             user_avatar_history_port=LoudUserAvatarHistoryPort(),
             chat_avatar_history_port=LoudChatAvatarHistoryPort(),
             refresh_limits=limits,
+            full_user_auth_scope=(lambda: TelegramAuthScope(AUTH_SCOPE_VERSION, account_id, 2, 99))
+            if account_id is not None
+            else None,
         )
     )
     service.bind_demand_sink(MagicMock())
@@ -955,7 +977,7 @@ async def test_durable_channel_reference_miss_commits_unavailable_without_rpc_at
 
 
 @pytest.mark.asyncio
-async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt() -> None:
+async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt(request: pytest.FixtureRequest) -> None:
     class BudgetedClient:
         def __init__(self) -> None:
             self.calls: list[str] = []
@@ -988,6 +1010,7 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt() 
             raise AssertionError("dialog traversal is not part of a profile section")
 
     conn = sqlite3.connect(":memory:")
+    request.addfinalizer(conn.close)
     with write_savepoint(conn):
         conn.execute(
             "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
@@ -1004,7 +1027,7 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt() 
     repository.mark_pending(42, now=100)
     client = BudgetedClient()
 
-    service = _test_service(conn, limits=RefreshLimits())
+    service = _test_service(conn, limits=RefreshLimits(), account_id=42)
     service._deps = replace(
         service._deps,
         client=cast(object, client),
@@ -1029,7 +1052,7 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt() 
     ).fetchone() == ("fresh",)
     await service.shutdown()
 
-    restarted = _test_service(conn, limits=RefreshLimits())
+    restarted = _test_service(conn, limits=RefreshLimits(), account_id=42)
     restarted._deps = replace(
         restarted._deps,
         client=cast(object, client),
@@ -1088,7 +1111,7 @@ async def test_durable_profile_adapter_checkpoints_core_resolution_before_sectio
             "entity_id,status,retry_at,reason,updated_at,next_section,acquisition_cursor) "
             "VALUES (42,'pending',NULL,'refresh_queued',100,'full_profile',0)"
         )
-    service = _test_service(conn, limits=RefreshLimits())
+    service = _test_service(conn, limits=RefreshLimits(), account_id=42)
     service._deps = replace(
         service._deps,
         client=ResolvingClient(),
@@ -1299,8 +1322,8 @@ async def test_durable_enrichment_timeout_persists_retry_without_traceback(caplo
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
     conn.commit()
-    service = _test_service(conn, limits=RefreshLimits())
-    service._deps = replace(service._deps, common_chats_port=ClientCommonChatsPort(TimeoutClient()))
+    service = _test_service(conn, limits=RefreshLimits(), account_id=42)
+    service._deps = replace(service._deps, user_profile_port=_UserProfilePort(TimeoutClient()))
     service._profiles.save_core({"id": 42, "type": "user", "name": "Known"}, now=100)
     service._profiles.mark_pending(42, now=100)
     with write_savepoint(conn):
@@ -1365,14 +1388,16 @@ async def test_partial_detail_uses_canonical_identity_and_skips_core_resolution(
     cursor = repo.next_due_refresh(now=100)
     assert cursor is not None
     _advance_fixture_cursor(repo, 42, 7, 100)
-    service = _test_service(conn, limits=RefreshLimits())
+    service = _test_service(conn, limits=RefreshLimits(), account_id=42)
     resolved_calls: list[int] = []
 
     async def resolve_entity(entity_id: int) -> tuple[object | None, dict[str, object] | None]:
         resolved_calls.append(entity_id)
         raise AssertionError("known canonical entities must not resolve their core again")
 
-    async def acquire_section(_cursor: object, _entity_type: DialogType) -> EntitySectionCommit:
+    async def acquire_section(
+        _cursor: object, _entity_type: DialogType, *, context: object = None
+    ) -> EntitySectionCommit:
         return EntitySectionCommit({"about": "fresh"}, payload={"about": "fresh"})
 
     service._resolve_entity = resolve_entity  # type: ignore[method-assign]
@@ -1493,7 +1518,7 @@ async def test_production_schema_core_write_syncs_revision_before_next_section_a
             (json.dumps({"schema": 1, "about": "legacy"}),),
         )
     conn.commit()
-    service = _test_service(conn, limits=RefreshLimits())
+    service = _test_service(conn, limits=RefreshLimits(), account_id=42)
     service._profiles.mark_pending(42, now=100)
     core_calls = 0
 
@@ -1505,7 +1530,9 @@ async def test_production_schema_core_write_syncs_revision_before_next_section_a
         scope.attempt_budget.debit()
         return SimpleNamespace(id=42), None
 
-    async def acquire_section(_cursor: object, _entity_type: DialogType) -> EntitySectionCommit:
+    async def acquire_section(
+        _cursor: object, _entity_type: DialogType, *, context: object = None
+    ) -> EntitySectionCommit:
         return EntitySectionCommit({"about": "fresh"}, payload={"about": "fresh"})
 
     service._resolve_entity = resolve_entity  # type: ignore[method-assign]
