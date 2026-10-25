@@ -49,8 +49,10 @@ Default Docker runtime is one container with two worker processes:
 - **Daemon-only mode** (`mcp-telegram sync`) — useful for split-mode debugging, but it is not the
   default Docker command.
 
-State location is explicit in `config.toml`. In Docker it is `/srv/mcp-telegram/database`,
-mounted at the same path inside the container. The daemon is the only writer;
+State location is explicit in `config.toml`. On this machine, the configured state
+is `/var/lib/mcp-telegram/database` on ext4, mounted at the same path inside the container.
+The deploy templates retain `/srv/mcp-telegram/database` as their default.
+The path change preserves the same durable local facts. The daemon is the only writer;
 MCP serving code uses daemon APIs and read-only DB access for lightweight queries.
 
 ### Archived integrations
