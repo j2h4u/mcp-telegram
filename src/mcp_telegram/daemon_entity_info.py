@@ -986,7 +986,9 @@ class DaemonEntityInfoService:
                 self._emit_pair_summary(summary)
             await self._publish_profile_linked_chat_fact(cursor, entity_type, context, committed, now=now)
             return committed
-        committed = await self._write_profiles(lambda profiles: profiles.commit_section(cursor, result, now=now))
+        committed = await self._write_profiles(
+            lambda profiles: self._commit_profile_section_in_scope(profiles, cursor, result, context, now=now)
+        )
         await self._publish_profile_linked_chat_fact(cursor, entity_type, context, committed, now=now)
         self._observe_profile_section_commit(
             cursor,
@@ -996,6 +998,26 @@ class DaemonEntityInfoService:
             actual_attempts=actual_attempts,
         )
         return committed
+
+    def _commit_profile_section_in_scope(
+        self,
+        profiles: EntityProfileRepository,
+        cursor: EntityRefreshCursor,
+        result: EntitySectionCommit,
+        context: _ProfileSectionContext,
+        *,
+        now: int,
+    ) -> bool:
+        if (
+            cursor.next_section in {"current_stories", "pinned_stories"}
+            and result.collection_page is not None
+            and self._profile_scope_changed_during_acquisition(context.captured_scope)
+        ):
+            profiles.mark_section_failure(
+                cursor, now=now, reason="auth_scope_changed", retry_at=scope_changed_retry_at(now)
+            )
+            return False
+        return profiles.commit_section(cursor, result, now=now)
 
     def _commit_unsupported_contact_overlap(
         self,

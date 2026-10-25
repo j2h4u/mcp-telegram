@@ -717,8 +717,12 @@ def _story_detail_page(
     if not isinstance(values, list):
         raise StoryProfileValidationError("vector_missing")
     returned = [getattr(value, "id", None) for value in values]
+    identity_diagnostics: tuple[str, ...] = ()
     if set(returned) != set(requested[:100]):
-        raise _story_identity_mismatch(requested[:100], returned)
+        mismatch = _story_identity_mismatch(requested[:100], returned)
+        if mismatch.category != "ids_missing":
+            raise mismatch
+        identity_diagnostics = (mismatch.reason,)
     items, _missing, diagnostics = _collection_items(section, values, details=True)
     after = cursor.get("after")
     next_cursor = cast(Mapping[str, object] | None, after)
@@ -733,7 +737,7 @@ def _story_detail_page(
         cast(int | None, cursor.get("reported_count")),
         next_cursor,
         terminal,
-        diagnostics,
+        diagnostics + identity_diagnostics,
     )
 
 
