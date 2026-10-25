@@ -1409,7 +1409,7 @@ class EntityProfileRepository:
             row = self._conn.execute(
                 f"SELECT {', '.join(selected)} FROM entity_profile_refresh_state "
                 "WHERE status IN ('pending', 'failed') AND (retry_at IS NULL OR retry_at <= ?) "
-                "ORDER BY COALESCE(retry_at, 0), updated_at, entity_id LIMIT 1",
+                "ORDER BY updated_at, entity_id LIMIT 1",
                 (now,),
             ).fetchone()
         except sqlite3.OperationalError:
