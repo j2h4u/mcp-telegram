@@ -29,6 +29,10 @@ class _ReadScope:
 
 def _object(encoded: object) -> dict[str, object]:
     value: object = json.loads(encoded) if isinstance(encoded, str) else encoded
+    return _mapping(value)
+
+
+def _mapping(value: object) -> dict[str, object]:
     return cast(dict[str, object], value) if isinstance(value, dict) else {}
 
 
@@ -79,10 +83,11 @@ def _field_evidence(
     return [
         {
             "path": path,
-            "value": _value_evidence(path, _object(coverage.get(path)), _object(paths.get(path)), values, now),
+            "value": _value_evidence(path, _mapping(coverage.get(path)), _mapping(paths.get(path)), values, now),
         }
         for path in sorted(set(coverage) | set(paths))
-        if _public_evidence(path, _object(coverage.get(path)))
+        if isinstance(coverage.get(path), dict) or isinstance(paths.get(path), dict)
+        if _public_evidence(path, _mapping(coverage.get(path)))
     ]
 
 
@@ -252,15 +257,15 @@ def section_summary(conn: sqlite3.Connection, owner: int, entity: int, section: 
 
 def _summary_metadata(payload: dict[str, object]) -> dict[str, object]:
     names = ("pinned_to_top", "max_read_id", "chat_notifications_enabled")
-    metadata = _object(payload.get("metadata"))
-    provenance = _object(payload.get("metadata_provenance"))
+    metadata = _mapping(payload.get("metadata"))
+    provenance = _mapping(payload.get("metadata_provenance"))
     return {
         "metadata": {key: metadata[key] for key in names if key in metadata},
         "metadata_evidence": [
             {
                 "name": key,
-                "observation_started_at": _object(provenance.get(key)).get("started_at"),
-                "observation_completed_at": _object(provenance.get(key)).get("completed_at"),
+                "observation_started_at": _mapping(provenance.get(key)).get("started_at"),
+                "observation_completed_at": _mapping(provenance.get(key)).get("completed_at"),
             }
             for key in names
             if key in metadata
