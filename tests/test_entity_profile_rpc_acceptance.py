@@ -436,10 +436,12 @@ async def test_actual_entity_info_tool_renders_persisted_user_and_bot_profile(
     tmp_path: Path,
     entity_type: str,
     bot: bool,
+    request: pytest.FixtureRequest,
 ) -> None:
     conn, raw_service = _prepare(
         tmp_path / f"tool-{entity_type}.sqlite", migrated=True, entity_type=entity_type, bot=bot
     )
+    request.addfinalizer(conn.close)
     service = cast(DaemonEntityInfoService, raw_service)
     service._deps = replace(  # type: ignore[attr-defined]
         service._deps,
@@ -468,15 +470,28 @@ async def test_actual_entity_info_tool_renders_persisted_user_and_bot_profile(
     assert payload["type"] == entity_type
     assert payload["completeness"] == "partial"
     encoded = json.dumps(payload, sort_keys=True)
-    for internal in ("evidence", "auth_scope", "normalization_version", "acquisition_generation"):
+    for internal in ("auth_scope", "acquisition_generation", "access_hash", "file_reference", "file_id", "download_"):
         assert internal not in encoded
+    legacy = json.dumps(
+        {
+            key: value
+            for key, value in payload.items()
+            if key not in {"semantic", "page", "collections", "history_coverage"}
+        },
+        sort_keys=True,
+    )
+    for internal in ("evidence", "normalization_version"):
+        assert internal not in legacy
     await service.shutdown()
     conn.close()
 
 
 @pytest.mark.asyncio
-async def test_actual_entity_info_tool_renders_persisted_partial_on_target_kind_mismatch(tmp_path: Path) -> None:
+async def test_actual_entity_info_tool_renders_persisted_partial_on_target_kind_mismatch(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
     conn, raw_service = _prepare(tmp_path / "tool-mismatch.sqlite", migrated=True, entity_type="bot", bot=True)
+    request.addfinalizer(conn.close)
     service = cast(DaemonEntityInfoService, raw_service)
     service._deps = replace(  # type: ignore[attr-defined]
         service._deps,
@@ -513,7 +528,17 @@ async def test_actual_entity_info_tool_renders_persisted_partial_on_target_kind_
     assert payload["type"] == "bot"
     assert payload["completeness"] == "partial"
     encoded = json.dumps(payload, sort_keys=True)
-    for internal in ("evidence", "auth_scope", "normalization_version", "acquisition_generation"):
+    for internal in ("auth_scope", "acquisition_generation", "access_hash", "file_reference", "file_id", "download_"):
         assert internal not in encoded
+    legacy = json.dumps(
+        {
+            key: value
+            for key, value in payload.items()
+            if key not in {"semantic", "page", "collections", "history_coverage"}
+        },
+        sort_keys=True,
+    )
+    for internal in ("evidence", "normalization_version"):
+        assert internal not in legacy
     await service.shutdown()
     conn.close()
