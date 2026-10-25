@@ -1,7 +1,8 @@
 """Actual normalized personal-profile facts match a finite, closed wire schema."""
 
 import json
-from collections.abc import Mapping
+import sqlite3
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,10 +13,13 @@ from jsonschema import Draft202012Validator, ValidationError
 from telethon.tl import types
 
 from mcp_telegram.entity_profile import output_schema, semantic_normalization
-from mcp_telegram.entity_profile.contracts import ObservationBoundary, ProfileSemanticSnapshot
+from mcp_telegram.entity_profile.collection_repository import store_semantic_snapshot
+from mcp_telegram.entity_profile.contracts import ObservationBoundary, ProfileFieldObservation, ProfileSemanticSnapshot
 from mcp_telegram.entity_profile.field_manifest import PROFILE_FIELD_MANIFEST
 from mcp_telegram.entity_profile.output_schema import build_profile_fields_output_schema, project_profile_fields
+from mcp_telegram.entity_profile.repository import EntityProfileRepository
 from mcp_telegram.entity_profile.semantic_normalization import normalize_semantic_profile
+from mcp_telegram.sync_transactions import write_savepoint
 
 _DATE = datetime(2025, 1, 2, tzinfo=UTC)
 
@@ -118,7 +122,7 @@ def test_schema_is_closed_finite_and_imports_the_isolated_source(schema: dict[st
     Draft202012Validator.check_schema(schema)
     definitions = _mapping(schema["$defs"])
     assert 300 < len(definitions) <= len(PROFILE_FIELD_MANIFEST) + 2
-    assert len(json.dumps(schema, separators=(",", ":"))) < 200_000
+    assert len(json.dumps(schema, separators=(",", ":"))) < 230_000
     assert schema["additionalProperties"] is False
     for name, value in definitions.items():
         definition = _mapping(value)
@@ -217,3 +221,42 @@ def test_projector_rejects_unexpected_or_protocol_only_constructors() -> None:
         project_profile_fields({"full_user.note": {"constructor": "Photo"}})
     with pytest.raises(ValueError, match="Protocol-only profile constructor"):
         project_profile_fields({"user.emoji_status": {"constructor": "InputEmojiStatusCollectible"}})
+
+
+def test_newer_canonical_clear_survives_stale_snapshot_and_validates(
+    make_synced_db: Callable[[], sqlite3.Connection],
+    validator: Draft202012Validator,
+) -> None:
+    conn = make_synced_db()
+    snapshot = _normalize(_full(), types.User(id=42, phone="123"))
+    repository = EntityProfileRepository(conn, section_ttl_seconds=300)
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities(id,type,updated_at) VALUES(42,'user',1)")
+        assert store_semantic_snapshot(conn, snapshot, 1) is not None
+        assert repository.apply_profile_update(
+            42,
+            {"phone": None},
+            observation=ProfileFieldObservation(77, 3, 150, "update"),
+        ) == frozenset({"phone"})
+        merged = store_semantic_snapshot(conn, snapshot, 2)
+    assert merged is not None
+    assert merged.after["user.phone"] is None
+    before = deepcopy(dict(merged.after))
+    wire = project_profile_fields(merged.after)
+    assert wire["user.phone"] is None
+    assert merged.after == before
+    validator.validate(wire)
+    persisted = cast(
+        tuple[str, str, str] | None,
+        conn.execute(
+            "SELECT fields_json,coverage_json,provenance_json FROM entity_profile_semantic_snapshots "
+            "WHERE owner_account_id=77 AND entity_id=42"
+        ).fetchone(),
+    )
+    assert persisted is not None
+    fields = _mapping(cast(object, json.loads(persisted[0])))
+    coverage = _mapping(cast(object, json.loads(persisted[1])))
+    provenance = _mapping(cast(object, json.loads(persisted[2])))
+    assert fields["user.phone"] is None
+    assert _mapping(coverage["user.phone"])["state"] == "unknown"
+    assert _mapping(_mapping(provenance["fields"])["user.phone"])["order"] == 3

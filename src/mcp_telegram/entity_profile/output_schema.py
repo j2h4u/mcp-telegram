@@ -42,12 +42,13 @@ def _union(choices: list[dict[str, object]]) -> dict[str, object]:
 
 def _field_schema(rule: ProfileFieldRule) -> dict[str, object] | None:
     choices = [schema for name in rule.value_types if (schema := _atom_schema(name)) is not None]
+    if not choices and not rule.vector:
+        return None
     if rule.vector:
         # Unknown vector elements retain their positions as null placeholders.
         choices = [{"type": "array", "items": _union([*choices, {"type": "null"}])}]
-    if rule.clear_on_none:
-        choices.append({"type": "null"})
-    return _union(choices) if choices else None
+    # Acquisition omission rules do not revoke accepted canonical clears.
+    return _union([*choices, {"type": "null"}])
 
 
 def _properties(rules: Mapping[str, ProfileFieldRule]) -> dict[str, object]:
