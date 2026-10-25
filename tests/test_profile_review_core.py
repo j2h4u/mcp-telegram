@@ -130,6 +130,7 @@ def test_tombstone_survives_real_reaction_and_late_full_and_embedded_unknown_is_
 ) -> None:
     persist_full(db, full(10, stories=[story(8, "old8", "before8"), story(9, "old9", "before9")]), 10)
     supplied(db, types.UpdateStory(types.PeerUser(42), types.StoryItemDeleted(8)), 30)
+    _assert_tombstone_metadata(db, "full_user.stories.stories[0]")
     supplied(db, types.UpdateSentStoryReaction(types.PeerUser(42), 8, types.ReactionEmoji("late")), 40)
     supplied(db, types.UpdateSentStoryReaction(types.PeerUser(42), 99, types.ReactionEmoji("unknown")), 50)
     for (encoded,) in cast(
@@ -154,6 +155,20 @@ def test_tombstone_survives_real_reaction_and_late_full_and_embedded_unknown_is_
     paths = cast(dict[str, dict[str, object]], evidence["fields"])
     assert paths["full_user.stories.stories[1]"]["order"] == 30
     assert paths["full_user.stories.stories[1]"]["source"] == "update"
+    _assert_tombstone_metadata(db, "full_user.stories.stories[1]")
+
+
+def _assert_tombstone_metadata(db: sqlite3.Connection, prefix: str) -> None:
+    coverage, provenance = one(db, "SELECT coverage_json,provenance_json FROM entity_profile_semantic_snapshots")
+    maps = (
+        cast(dict[str, object], json.loads(cast(str, coverage))),
+        cast(dict[str, dict[str, object]], json.loads(cast(str, provenance)))["fields"],
+    )
+    for evidence in maps:
+        assert {path for path in evidence if path == prefix or path.startswith(prefix + ".")} == {
+            prefix,
+            prefix + ".id",
+        }
 
 
 def test_known_empty_emoji_forms_are_equivalent_but_real_clear_is_recorded_once(db: sqlite3.Connection) -> None:
@@ -271,3 +286,59 @@ def test_min_legacy_evidence_does_not_fabricate_a_known_previous_observation(db:
             observation=ProfileFieldObservation(7, 10, 200, "update"),
         )
     assert not [row for row in events(db) if row[0] in {"legacy.name", "photo.current"}]
+
+
+def test_late_fulluser_confirmed_member_keeps_newer_canonical_reaction_and_exact_evidence(
+    db: sqlite3.Connection,
+) -> None:
+    repository = EntityProfileRepository(db, section_ttl_seconds=300)
+    with write_transaction(db):
+        repository.request_section_refresh(42, ("full_profile",), now=10, pair_mode="disabled")
+        initial = repository.next_due_refresh(now=10)
+        assert initial is not None
+        assert repository.commit_section(
+            initial,
+            EntitySectionCommit(
+                {},
+                semantic_snapshot=full(10, stories=[]),
+                field_observation=ProfileFieldObservation(7, 10, 10, "rpc"),
+                evidence=ProfileAcquisitionEvidence(initial.generation, "usable"),
+            ),
+            now=11,
+        )
+        repository.request_section_refresh(42, ("full_profile",), now=20, pair_mode="disabled")
+        reserved = repository.next_due_refresh(now=20)
+        assert reserved is not None
+    supplied(db, types.UpdateSentStoryReaction(types.PeerUser(42), 8, types.ReactionEmoji("new")), 30)
+    before, _ = semantic(db)
+    assert cast(dict[str, object], before["full_user.stories"])["stories"] == []
+    with write_transaction(db):
+        assert repository.commit_section(
+            reserved,
+            EntitySectionCommit(
+                {},
+                semantic_snapshot=full(20, stories=[story(8, "new caption", "old")]),
+                field_observation=ProfileFieldObservation(7, 20, 20, "rpc"),
+                evidence=ProfileAcquisitionEvidence(reserved.generation, "usable"),
+            ),
+            now=21,
+        )
+    fields, provenance = semantic(db)
+    embedded = cast(list[dict[str, object]], cast(dict[str, object], fields["full_user.stories"])["stories"])
+    assert [item["id"] for item in embedded] == [8]
+    assert embedded[0]["caption"] == "new caption"
+    assert cast(dict[str, object], embedded[0]["sent_reaction"])["emoticon"] == "new"
+    current, canonical_provenance = one(
+        db,
+        "SELECT fields_json,provenance_json FROM entity_profile_collection_facts WHERE section='current_stories' AND item_key='8'",
+    )
+    assert embedded[0] == json.loads(cast(str, current))
+    paths = cast(dict[str, dict[str, object]], provenance["fields"])
+    canonical = cast(dict[str, dict[str, object]], json.loads(cast(str, canonical_provenance)))
+    assert paths["full_user.stories.stories[0].sent_reaction"] == canonical["item.sent_reaction"]
+    assert paths["full_user.stories.stories[0].sent_reaction"]["order"] == 30
+    assert paths["full_user.stories.stories[0].caption"]["order"] == 20
+    assert one(
+        db,
+        "SELECT observation_started_at,observation_completed_at,observation_order FROM entity_profile_semantic_snapshots",
+    ) == (20, 21, 20)

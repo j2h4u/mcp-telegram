@@ -29,6 +29,7 @@ from .collection_repository import (
     collection_progress,
     encode,
     patch_embedded_story,
+    reconcile_embedded_stories,
     store_collection_page,
     store_semantic_patch,
     store_semantic_snapshot,
@@ -1800,10 +1801,10 @@ class EntityProfileRepository:
             snapshot.require_account(observation.owner_account_id)
             merged = store_semantic_snapshot(self._conn, snapshot, observation.order)
             if merged is not None:
-                append_effective_history(self._conn, merged, observation, legacy_before, legacy_evidence)
                 self._dirty_summary_sections(merged)
                 if commit.evidence is not None:
-                    self._store_supplied_stories(merged, commit.evidence.generation, observation)
+                    merged = self._store_supplied_stories(merged, commit.evidence.generation, observation)
+                append_effective_history(self._conn, merged, observation, legacy_before, legacy_evidence)
             return merged
         return None
 
@@ -1831,6 +1832,7 @@ class EntityProfileRepository:
             cursor=state,
             order=observation.order,
         )
+        reconcile_embedded_stories(self._conn, page, observation)
         summary["history_order"] = observation.order
         if not self._advance_collection(cursor, page, state, summary, now=now):
             raise sqlite3.OperationalError("entity profile collection cursor advance was rejected")
@@ -1893,10 +1895,10 @@ class EntityProfileRepository:
 
     def _store_supplied_stories(
         self, merge: EffectiveProfileMerge, generation: int, observation: ProfileFieldObservation
-    ) -> None:
+    ) -> EffectiveProfileMerge:
         page = supplied_current_stories(merge)
         if page is None:
-            return
+            return merge
         previous = self.read_section_payload(page.entity_id, page.section)
         # Use a distinct scan when supplied contents supersede a publication in this generation.
         scan = (
@@ -1913,6 +1915,8 @@ class EntityProfileRepository:
             cursor=state,
             order=observation.order,
         )
+        reconciled = reconcile_embedded_stories(self._conn, page, observation, merge)
+        assert reconciled is not None
         summary["history_order"] = observation.order
         progress = collection_progress(page, state, summary, previous)
         payload = {**progress.payload, "supplied_cursor": progress.cursor, "supplied_generation": generation}
@@ -1933,6 +1937,7 @@ class EntityProfileRepository:
                 observation_completed_at=int(cast(float, page.observation.completed_at)),
             ),
         )
+        return reconciled
 
     def _publish_supplied_identity(
         self, identity: DialogIdentityObservation, observation: ProfileFieldObservation

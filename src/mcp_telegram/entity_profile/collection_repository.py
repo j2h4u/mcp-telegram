@@ -249,6 +249,8 @@ def store_semantic_patch(
         conn, incoming, (previous, paths, old_coverage), observation.order
     )
     effective_coverage = dict(old_coverage)
+    for root in snapshot.fields:
+        _retain_path_provenance(effective_coverage, previous.get(root), fields.get(root), root)
     for path in accepted:
         effective_paths[path] = {
             "order": observation.order,
@@ -338,9 +340,17 @@ def _retain_path_provenance(paths: dict[str, object], old: object, new: object, 
         for key, value in new.items():
             _retain_path_provenance(paths, old.get(key), value, f"{root}.{key}")
     elif isinstance(new, list) and isinstance(old, list):
-        _reindex_vector_provenance(paths, old, new, root)
+        _reconcile_vector_provenance(paths, old, new, root)
     elif old != new:
         _drop_path_provenance(paths, root)
+
+
+def _reconcile_vector_provenance(paths: dict[str, object], old: list[object], new: list[object], root: str) -> None:
+    """Post-merge structural cleanup, after pre-merge identity/order association."""
+    _reindex_vector_provenance(paths, old, new, root)
+    previous = {_identity(item): item for item in old if _identity(item) is not None}
+    for index, item in enumerate(new):
+        _retain_path_provenance(paths, previous.get(_identity(item)), item, f"{root}[{index}]")
 
 
 def _drop_path_provenance(paths: dict[str, object], root: str) -> None:
@@ -389,6 +399,119 @@ def store_collection_page(  # noqa: PLR0913 - one captured page transaction
                 (owner, page.entity_id, page.section, generation, scan, key),
             )
     return _collection_summary(conn, page, owner, generation, scan)
+
+
+def reconcile_embedded_stories(
+    conn: sqlite3.Connection,
+    page: ProfileCollectionPage,
+    observation: ProfileFieldObservation,
+    merge: EffectiveProfileMerge | None = None,
+) -> EffectiveProfileMerge | None:
+    """Fan out effective facts only for confirmed IDs already in the embedded list."""
+    require_write_transaction(conn)
+    if page.section != "current_stories":
+        return merge
+    row = conn.execute(
+        "SELECT fields_json,coverage_json,provenance_json FROM entity_profile_semantic_snapshots "
+        "WHERE owner_account_id=? AND entity_id=?",
+        (observation.owner_account_id, page.entity_id),
+    ).fetchone()
+    if row is None:
+        return merge
+    fields, coverage, provenance = (json.loads(value) for value in row)
+    peer = fields.get("full_user.stories")
+    stories = peer.get("stories") if isinstance(peer, dict) else None
+    if not isinstance(stories, list):
+        return merge
+    paths = dict(provenance.get("fields", {}))
+    confirmed = {item.key for item in page.items if item.identity_kind == "remote"}
+    patched = _reconcile_story_nodes(
+        conn, (observation.owner_account_id, page.entity_id), stories, confirmed, coverage=coverage, paths=paths
+    )
+    fields["full_user.stories"] = {**cast(dict[str, object], peer), "stories": patched}
+    provenance["fields"] = paths
+    conn.execute(
+        "UPDATE entity_profile_semantic_snapshots SET fields_json=?,coverage_json=?,provenance_json=?,"
+        "complete=CASE WHEN ? THEN complete ELSE 0 END WHERE owner_account_id=? AND entity_id=?",
+        (
+            encode(fields),
+            encode(coverage),
+            encode(provenance),
+            int(all(_known_coverage(value) for value in coverage.values())),
+            observation.owner_account_id,
+            page.entity_id,
+        ),
+    )
+    return _reconciled_merge(merge, fields, provenance, paths)
+
+
+def _reconciled_merge(
+    merge: EffectiveProfileMerge | None,
+    fields: Mapping[str, object],
+    provenance: Mapping[str, object],
+    paths: Mapping[str, object],
+) -> EffectiveProfileMerge | None:
+    if merge is None:
+        return None
+    accepted = frozenset(
+        path
+        for path in merge.accepted_paths
+        if isinstance((evidence := paths.get(path)), dict) and evidence.get("order", 0) <= merge.order
+    )
+    return replace(merge, after=fields, provenance=provenance, accepted_paths=accepted)
+
+
+def _reconcile_story_nodes(  # noqa: PLR0913 - one account-scoped embedded-list fanout
+    conn: sqlite3.Connection,
+    owner_entity: tuple[int, int],
+    stories: list[object],
+    confirmed: set[str],
+    *,
+    coverage: dict[str, object],
+    paths: dict[str, object],
+) -> list[object]:
+    patched = list(stories)
+    for index, story in enumerate(stories):
+        if not isinstance(story, dict) or str(story.get("id")) not in confirmed:
+            continue
+        key = str(story["id"])
+        prefix = f"full_user.stories.stories[{index}]"
+        effective = _copy_story_fact(conn, (*owner_entity, key), prefix, coverage, paths)
+        if effective is not None:
+            patched[index] = effective
+    return patched
+
+
+def _copy_story_fact(
+    conn: sqlite3.Connection,
+    identity: tuple[int, int, str],
+    prefix: str,
+    coverage: dict[str, object],
+    paths: dict[str, object],
+) -> dict[str, object] | None:
+    row = conn.execute(
+        "SELECT fields_json,coverage_json,provenance_json FROM entity_profile_collection_facts "
+        "WHERE owner_account_id=? AND entity_id=? AND item_key=? AND section='current_stories'",
+        identity,
+    ).fetchone()
+    if row is None:
+        return None
+    fields, item_coverage, observations = (json.loads(value) for value in row)
+    if str(fields.get("id")) != identity[2] or fields.get("constructor") not in {
+        "StoryItem",
+        "StoryItemSkipped",
+        "StoryItemDeleted",
+    }:
+        return None
+    _drop_path_provenance(coverage, prefix)
+    _drop_path_provenance(paths, prefix)
+    coverage.update(
+        {prefix + path[len("item") :]: value for path, value in item_coverage.items() if _path_under(path, "item")}
+    )
+    paths.update(
+        {prefix + path[len("item") :]: value for path, value in observations.items() if _path_under(path, "item")}
+    )
+    return fields
 
 
 def patch_embedded_story(
