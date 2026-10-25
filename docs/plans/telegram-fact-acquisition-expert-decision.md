@@ -1,5 +1,9 @@
 # Telegram Fact Acquisition: Expert Panel Decision
 
+Status: historical acquisition-design and acceptance record. Current ordinary-read
+behavior is governed by the [durable local mirror contract](../architecture-proposal.md#durable-facts-and-acquisition-evidence);
+reads do not initiate or await Telegram acquisition.
+
 ## Decision
 
 Develop the existing modular monolith around typed, domain-owned fact
@@ -292,6 +296,10 @@ not `PASS`. Evidence becomes stale when relevant implementation, schema,
 configuration, or dependencies change afterward.
 
 ### Mandatory ship gate
+
+Historical acceptance: the table below preserves the original gate. Its live
+`get_entity_info` RPC requirement is superseded by the durable local mirror
+contract linked above; it is not a current read-path instruction.
 
 The slice is `SHIPPED_VERIFIED` only when an independent final verifier confirms
 all of the following:

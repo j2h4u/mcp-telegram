@@ -376,9 +376,12 @@ If PR 1 becomes too large, the only allowed three-PR split is:
 
 The work must not settle into a permanent mixture of old and new producers.
 
-## Current dirty worktree
+## Historical pre-cutover worktree review
 
-The current scheduled work is input, not protected sunk cost.
+The following records the scheduled worktree review at the time of the proposal,
+not the current checkout state or a new implementation instruction.
+
+The scheduled work was input, not protected sunk cost.
 
 Preserve after verification: active repair versus quiet discovery, narrow
 working set, per-dialog due state, event coalescing, oldest dirty age,

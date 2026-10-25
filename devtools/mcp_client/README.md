@@ -2,6 +2,7 @@
 
 Small Streamable HTTP MCP client for local regression testing. It connects to
 `http://127.0.0.1:3100/mcp` by default; use `--url` to select another endpoint.
+Use direct CLI calls only for point diagnostics not covered by a Justfile recipe.
 
 ```bash
 uv run python -m devtools.mcp_client.cli list-tools
@@ -14,11 +15,10 @@ uv run python -m devtools.mcp_client.cli call-tool \
 
 ## Smoke Tests
 
-Run the integration smoke against the live HTTP service:
+From the repository root, run the standard smoke against the live HTTP service:
 
 ```bash
-uv run python -m devtools.mcp_client.cli script \
-  --file devtools/mcp_client/smoke-integration.json
+just runtime-smoke
 ```
 
 ## Script Format

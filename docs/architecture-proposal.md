@@ -159,6 +159,9 @@ retain aged useful records and expose honest coverage.
 
 ### Acquisition ownership
 
+See the [fact acquisition telemetry reference](telegram-fact-acquisition-telemetry.md)
+for the active paired Entity Profile observation contract.
+
 The important distinction is not "one worker per entity"; it is whether a use
 case is acquiring Telegram facts or serving a deterministic local projection.
 For example, `DeltaSyncWorker` stores reactions that arrive on newly fetched
