@@ -28,6 +28,7 @@ from .collection_repository import (
     EffectiveProfileMerge,
     collection_progress,
     encode,
+    patch_embedded_story,
     store_collection_page,
     store_semantic_patch,
     store_semantic_snapshot,
@@ -262,13 +263,17 @@ class EntityProfileRepository:
                     legacy_fields={"current_photo": user.legacy_fields.get("current_photo")},
                     minimal=False,
                 )
-                changed |= self._apply_supplied_part(photo, replace(observation, source="update"), boundary)
+                changed |= self._apply_supplied_part(
+                    photo,
+                    replace(observation, source="update") if observation.source == "min" else observation,
+                    boundary,
+                )
             return changed
 
     def _apply_supplied_part(
         self, user: SuppliedProfileUser, observation: ProfileFieldObservation, boundary: ObservationBoundary | None
     ) -> frozenset[str]:
-        base = self._owned_history_base(user.entity_id, observation)
+        base, legacy_evidence = self._owned_history_base(user.entity_id, observation)
         changed = self.apply_profile_update(
             user.entity_id, authorized_legacy_user_fields(user), observation=observation
         )
@@ -283,7 +288,7 @@ class EntityProfileRepository:
                 endpoint="supplied.User",
             )
             merged = store_semantic_patch(self._conn, incoming, observation)
-            append_effective_history(self._conn, merged, observation, base)
+            append_effective_history(self._conn, merged, observation, base, legacy_evidence)
             if observation.source != "min":
                 changed |= self._changed_semantic_roots(merged)
         return changed
@@ -308,6 +313,7 @@ class EntityProfileRepository:
         if prior is not None and prior[0] is not None and prior[0] >= observation.order:
             return frozenset()
         store_story_update(self._conn, entity_id, item, observation)
+        patch_embedded_story(self._conn, entity_id, item, observation)
         if item.fields.get("constructor") != "StoryItemDeleted":
             return frozenset({"current_stories", "pinned_stories"})
         for section in ("current_stories", "pinned_stories"):
@@ -1721,7 +1727,7 @@ class EntityProfileRepository:
             return False
         if commit.collection_page is not None:
             return self._commit_collection(cursor, commit, now=now)
-        history_base = self._owned_history_base(cursor.entity_id, commit.field_observation)
+        history_base, history_evidence = self._owned_history_base(cursor.entity_id, commit.field_observation)
         detail, accepted, reset_owner = self._prepare_observed_commit(
             cursor.entity_id, commit.detail_patch, commit.field_observation
         )
@@ -1739,7 +1745,7 @@ class EntityProfileRepository:
         ):
             return False
         self._finish_observed_commit(cursor.entity_id, accepted, reset_owner, commit.field_observation)
-        self._store_semantic_commit(commit, history_base)
+        self._store_semantic_commit(commit, history_base, history_evidence)
         section_payload = _section_payload(detail, cursor.next_section) if commit.payload is None else commit.payload
         self._write_section(
             cursor.entity_id,
@@ -1761,21 +1767,28 @@ class EntityProfileRepository:
         self.persist_group_created(cursor.entity_id, commit.dialog_created)
         return True
 
-    def _owned_history_base(self, entity_id: int, observation: ProfileFieldObservation | None) -> dict[str, object]:
+    def _owned_history_base(
+        self, entity_id: int, observation: ProfileFieldObservation | None
+    ) -> tuple[dict[str, object], dict[str, object]]:
         detail, _at, owner, _scope = self._read_profile_blob(entity_id)
         if observation is None or owner != observation.owner_account_id:
-            return {}
-        partial = {
-            str(row[0])
-            for row in self._conn.execute(
-                "SELECT field FROM entity_profile_field_observations WHERE entity_id=? AND owner_account_id=? AND source='min'",
-                (entity_id, owner),
-            )
+            return {}, {}
+        rows = self._conn.execute(
+            "SELECT field,observation_order,observed_at,source FROM entity_profile_field_observations "
+            "WHERE entity_id=? AND owner_account_id=? AND field IN ('name','username','current_photo')",
+            (entity_id, owner),
+        ).fetchall()
+        partial = {str(row[0]) for row in rows if row[3] == "min"}
+        values = {key: value for key, value in detail.items() if key not in partial}
+        evidence: dict[str, object] = {
+            "legacy." + str(row[0]): {"order": row[1], "observed_at": row[2], "source": row[3]}
+            for row in rows
+            if row[0] in values
         }
-        return {key: value for key, value in detail.items() if key not in partial}
+        return values, evidence
 
     def _store_semantic_commit(
-        self, commit: EntitySectionCommit, legacy_before: Mapping[str, object]
+        self, commit: EntitySectionCommit, legacy_before: Mapping[str, object], legacy_evidence: Mapping[str, object]
     ) -> EffectiveProfileMerge | None:
         snapshot = commit.semantic_snapshot
         observation = commit.field_observation
@@ -1787,7 +1800,7 @@ class EntityProfileRepository:
             snapshot.require_account(observation.owner_account_id)
             merged = store_semantic_snapshot(self._conn, snapshot, observation.order)
             if merged is not None:
-                append_effective_history(self._conn, merged, observation, legacy_before)
+                append_effective_history(self._conn, merged, observation, legacy_before, legacy_evidence)
                 self._dirty_summary_sections(merged)
                 if commit.evidence is not None:
                     self._store_supplied_stories(merged, commit.evidence.generation, observation)
@@ -2489,14 +2502,14 @@ class EntityProfileRepository:
             and full_profile.field_observation != personal_channel.field_observation
         ):
             raise ValueError("paired profile field observations must match")
-        history_base = self._owned_history_base(cursor.entity_id, observation)
+        history_base, history_evidence = self._owned_history_base(cursor.entity_id, observation)
         detail, accepted, reset_owner = self._prepare_observed_commit(
             cursor.entity_id, {**full_profile.detail_patch, **personal_channel.detail_patch}, observation
         )
         if not self._write_pair_detail(cursor, detail, full_profile, personal_channel, now=now, accepted=accepted):
             return None
         self._finish_observed_commit(cursor.entity_id, accepted, reset_owner, observation)
-        self._store_semantic_commit(full_profile, history_base)
+        self._store_semantic_commit(full_profile, history_base, history_evidence)
         self._write_pair_section(cursor.entity_id, "full_profile", full_profile, detail, now=now)
         self._write_pair_section(cursor.entity_id, "personal_channel", personal_channel, detail, now=now)
         return detail

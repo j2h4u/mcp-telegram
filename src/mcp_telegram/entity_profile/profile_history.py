@@ -158,15 +158,32 @@ def _photo_change(merge: ProfileHistoryMerge, root: str) -> tuple[str, str, obje
     if roles is not None:
         before, after = {"photo_id": before, "personal": roles[0]}, {"photo_id": after, "personal": roles[1]}
     category = "private_owner" if _personal_photo(root, merge.before[root], merge.after[root]) else "profile"
-    return (f"photo.{_PHOTO_ROOTS[root]}", category, before, after) if before != after else None
+    return (f"photo.{_PHOTO_ROOTS[root]}", category, merge.before[root], merge.after[root]) if before != after else None
 
 
 def _different_values(merge: ProfileHistoryMerge, root: str, before: object, after: object) -> bool:
     comparison = None if root in _PHOTO_ROOTS else merge.comparison_values.get(root)
+    if _known_clear_form(root, before, root in merge.previous_cleared_paths) or _known_clear_form(
+        root, after, root in merge.cleared_paths
+    ):
+        comparison = (
+            None if _known_clear_form(root, before, root in merge.previous_cleared_paths) else before,
+            None if _known_clear_form(root, after, root in merge.cleared_paths) else after,
+        )
     if root in {"legacy.name", "legacy.username"} and comparison is None:
         return False
     old_comparison, new_comparison = comparison if comparison is not None else (before, after)
     return old_comparison != new_comparison
+
+
+def _known_clear_form(root: str, value: object, cleared: bool) -> bool:
+    if root == "user.emoji_status":
+        return cleared
+    if root == "user.last_name":
+        return cleared or value == ""
+    if root == "user.usernames":
+        return cleared or (isinstance(value, list) and not value)
+    return False
 
 
 def _current_photo_roles(root: str, before: object, after: object) -> tuple[bool, bool] | None:

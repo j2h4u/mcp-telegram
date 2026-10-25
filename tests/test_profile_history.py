@@ -159,7 +159,10 @@ def test_photo_roles_transition_clear_and_reappearance_without_upload_dates(
         assert append_profile_history(db, replace(returned, observation=observation(3))) == 1
     result = rows(db)
     assert [(row[3], row[4]) for row in result] == [(f"photo.{role}", category)] * 2
-    assert [(json.loads(cast(str, row[5])), json.loads(cast(str, row[6]))) for row in result] == [(8, None), (None, 8)]
+    assert [(json.loads(cast(str, row[5])), json.loads(cast(str, row[6]))) for row in result] == [
+        ({"id": 8, "date": 1}, None),
+        (None, {"id": 8, "date": 1}),
+    ]
 
 
 def test_nested_accepted_paths_group_once_and_ignore_unaccepted_roots(db: sqlite3.Connection) -> None:
@@ -341,8 +344,8 @@ def test_photo_empty_placeholder_requires_explicit_clear_authority(db: sqlite3.C
             == 1
         )
     assert [(json.loads(cast(str, row[5])), json.loads(cast(str, row[6]))) for row in rows(db)] == [
-        (8, None),
-        (None, 9),
+        ({"constructor": "Photo", "id": 8}, {"constructor": "PhotoEmpty", "id": 8}),
+        ({"constructor": "PhotoEmpty", "id": 8}, {"id": 9}),
     ]
 
 
@@ -481,3 +484,34 @@ def test_same_photo_id_known_current_role_transition_is_meaningful_but_unknown_r
     assert row[3:5] == ("photo.current", "private_owner")
     assert json.loads(cast(str, row[5])) == {"photo_id": 8, "personal": False}
     assert json.loads(cast(str, row[6])) == {"photo_id": 8, "personal": True}
+
+
+def test_personal_photo_event_retains_exact_metadata_and_explicit_empty_clear_payload(db: sqlite3.Connection) -> None:
+    before = {
+        "constructor": "Photo",
+        "id": 80,
+        "date": "2026-01-01T00:00:00+00:00",
+        "sizes": [{"constructor": "PhotoSize", "type": "x", "w": 640, "h": 480, "size": 2000}],
+        "video_sizes": [{"constructor": "VideoSize", "type": "v", "w": 640, "h": 480, "size": 4000}],
+    }
+    after = {**before, "id": 81}
+    value = merge("full_user.personal_photo", before, after)
+    empty = {"constructor": "PhotoEmpty", "id": 81}
+    with write_transaction(db):
+        assert (
+            append_profile_history(db, replace(value, after={"full_user.personal_photo": {**before, "sizes": []}})) == 0
+        )
+        assert append_profile_history(db, value) == 1
+        cleared = replace(
+            value,
+            before={"full_user.personal_photo": after},
+            after={"full_user.personal_photo": empty},
+            observation=observation(3),
+            cleared_paths=frozenset({"full_user.personal_photo"}),
+        )
+        assert append_profile_history(db, cleared) == 1
+    result = rows(db)
+    assert json.loads(cast(str, result[0][5])) == before
+    assert json.loads(cast(str, result[0][6])) == after
+    assert json.loads(cast(str, result[1][5])) == after
+    assert json.loads(cast(str, result[1][6])) == empty

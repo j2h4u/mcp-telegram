@@ -662,6 +662,26 @@ _CLEAR_ALL_PINS_SQL = "UPDATE dialogs SET pinned=0, snapshot_at=? WHERE pinned=1
 # ---------------------------------------------------------------------------
 
 
+def _identity_path_excluded(path: str, roots: set[str]) -> bool:
+    return any(path == root or path.startswith((root + ".", root + "[")) for root in roots)
+
+
+def _mask_profile_identity_fields(push: ProfilePush, excluded: set[str]) -> ProfilePush:
+    semantic_roots = {"user." + field for field in excluded if field in {"first_name", "last_name", "username"}}
+    if "extra_usernames" in excluded:
+        semantic_roots.add("user.usernames")
+    return replace(
+        push,
+        fields={field: value for field, value in push.fields.items() if field not in excluded},
+        semantic_fields={path: value for path, value in push.semantic_fields.items() if path not in semantic_roots},
+        semantic_coverage={
+            path: value
+            for path, value in push.semantic_coverage.items()
+            if not _identity_path_excluded(path, semantic_roots)
+        },
+    )
+
+
 class EventHandlerManager:
     """Registers and dispatches real-time Telethon events to sync.db.
 
@@ -2439,7 +2459,7 @@ class EventHandlerManager:
             excluded.update(("name", "first_name", "last_name"))
         if "username" in newer:
             excluded.update(("username", "extra_usernames"))
-        return replace(push, fields={field: value for field, value in push.fields.items() if field not in excluded})
+        return _mask_profile_identity_fields(push, excluded)
 
     def _eligible_profile_push(self, profiles: EntityProfileRepository, push: ProfilePush | None) -> bool:
         return (

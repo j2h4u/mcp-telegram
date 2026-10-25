@@ -123,7 +123,7 @@ async def test_known_legacy_name_and_photo_changes_before_backfill_are_not_lost(
     selected = [row for row in events(db) if row[0] in {"legacy.name", "photo.current"}]
     assert [(row[0], json.loads(cast(str, row[1]))) for row in selected] == [
         ("legacy.name", "Before"),
-        ("photo.current", 8),
+        ("photo.current", {"photo_id": 8, "date": 1}),
     ]
     assert all(row[3] == "update" for row in selected)
     client.assert_not_called()

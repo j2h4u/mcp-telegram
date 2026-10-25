@@ -13,6 +13,7 @@ def append_effective_history(
     merge: EffectiveProfileMerge,
     observation: ProfileFieldObservation,
     legacy_before: Mapping[str, object],
+    legacy_evidence: Mapping[str, object] | None = None,
 ) -> int:
     previous_paths = merge.previous_provenance.get("fields", {})
     previous_paths = previous_paths if isinstance(previous_paths, dict) else {}
@@ -32,7 +33,7 @@ def append_effective_history(
         ),
         previous_cleared_paths=_previous_clears(merge.previous_coverage),
     )
-    return append_profile_history(conn, change) + _legacy_history(conn, change, legacy_before)
+    return append_profile_history(conn, change) + _legacy_history(conn, change, legacy_before, legacy_evidence or {})
 
 
 _MISSING = object()
@@ -137,7 +138,9 @@ def _name_representations(parts: list[object]) -> tuple[str, str]:
     return " ".join(part for part in text if part), " ".join(part.strip() for part in text if part.strip())
 
 
-def _legacy_history(conn: sqlite3.Connection, change: ProfileHistoryMerge, legacy: Mapping[str, object]) -> int:
+def _legacy_history(
+    conn: sqlite3.Connection, change: ProfileHistoryMerge, legacy: Mapping[str, object], evidence: Mapping[str, object]
+) -> int:
     before: dict[str, object] = {}
     after: dict[str, object] = {}
     comparisons: dict[str, tuple[object, object]] = {}
@@ -155,7 +158,7 @@ def _legacy_history(conn: sqlite3.Connection, change: ProfileHistoryMerge, legac
             after,
             frozenset(after),
             frozenset(before),
-            {},
+            {key: evidence[key] for key in before if key in evidence},
             comparisons,
             cleared_paths=frozenset({"legacy.current_photo"}) if "user.photo" in change.cleared_paths else frozenset(),
         ),

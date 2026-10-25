@@ -244,8 +244,9 @@ def _specific_values(update: object) -> dict[str, object]:
         return {"user.status": update.status}
     if isinstance(update, types.UpdateUserEmojiStatus):
         return {"user.emoji_status": update.emoji_status}
-    if isinstance(update, types.UpdatePeerBlocked) and not update.blocked_my_stories_from:
-        return {"full_user.blocked": bool(update.blocked)}
+    if isinstance(update, types.UpdatePeerBlocked):
+        path = "full_user.blocked_my_stories_from" if update.blocked_my_stories_from else "full_user.blocked"
+        return {path: bool(update.blocked)}
     return _specific_settings(update)
 
 
@@ -280,6 +281,7 @@ def _specific_semantics(update: object) -> tuple[dict[str, object], dict[str, Pr
             "full_user.settings",
             "full_user.notify_settings",
             "full_user.blocked",
+            "full_user.blocked_my_stories_from",
             "full_user.ttl_period",
             "full_user.wallpaper_overridden",
         }:
@@ -305,6 +307,8 @@ def _semantic_push_value(path: str, value: object) -> tuple[object, dict[str, Pr
     if isinstance(value, TLObject):
         fields, evidence, diagnostics = normalize_collection_item(value)
         coverage = {path + key[len("item") :]: item for key, item in evidence.items()}
+        if path == "user.emoji_status" and isinstance(value, types.EmojiStatusEmpty):
+            coverage[path] = ProfileFieldCoverage(ProfileFieldClass.PROFILE, ProfileFieldState.CLEARED, True)
         coverage.setdefault(
             path,
             ProfileFieldCoverage(

@@ -43,6 +43,9 @@ class EffectiveProfileMerge:
 class _MergeAuthority:
     previous: Mapping[str, object]
     rejected: set[str] = field(default_factory=set)
+    observations: Mapping[str, object] = field(default_factory=dict)
+    order: int | None = None
+    retained: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +132,9 @@ def _identity(value: object) -> tuple[object, object] | None:
     if isinstance(value, dict):
         identifier = value.get("id", value.get("photo_id"))
         if identifier is not None:
-            return value.get("constructor"), identifier
+            constructor = value.get("constructor")
+            family = "story" if constructor in {"StoryItem", "StoryItemSkipped", "StoryItemDeleted"} else constructor
+            return family, identifier
     return None
 
 
@@ -142,18 +147,25 @@ def merge_semantic_fields(
 ) -> object:
     """Omissions retain facts; a changed constructor/ID never inherits old children."""
     evidence = coverage.get(path)
-    if authority is not None and _reject_untrusted_value(old, new, coverage, path, authority.previous):
+    if authority is not None and (
+        _reject_stale_value(old, new, path, authority)
+        or _reject_untrusted_value(old, new, coverage, path, authority.previous)
+    ):
         authority.rejected.add(path)
         return old
     if _retains_previous_value(evidence):
         return old if old is not None else new
-    if evidence is not None and evidence.state is ProfileFieldState.CLEARED and not evidence.authoritative:
+    if _unauthorized_clear(evidence):
         return old
     if isinstance(new, dict):
         return _merge_semantic_node(old, new, coverage, path, authority)
     if isinstance(new, list):
         return _merge_semantic_vector(old, new, coverage, path, authority)
     return new
+
+
+def _unauthorized_clear(evidence: ProfileFieldCoverage | None) -> bool:
+    return evidence is not None and evidence.state is ProfileFieldState.CLEARED and not evidence.authoritative
 
 
 def _retains_previous_value(evidence: ProfileFieldCoverage | None) -> bool:
@@ -179,7 +191,7 @@ def store_semantic_snapshot(
     previous_provenance = json.loads(row[2]) if row else {}
     previous_paths = previous_provenance.get("fields", {})
     previous_coverage = json.loads(row[3]) if row else {}
-    fields, accepted, paths, rejected = _merge_snapshot(
+    fields, accepted, paths, authority = _merge_snapshot(
         conn, snapshot, (previous, previous_paths, previous_coverage), order
     )
     provenance = {
@@ -189,7 +201,7 @@ def store_semantic_snapshot(
         "diagnostics": snapshot.diagnostics,
         "acquisition_coverage": {key: asdict(value) for key, value in snapshot.coverage.items()},
     }
-    effective_coverage = _snapshot_coverage(snapshot, paths, order, previous_coverage, (previous, fields, rejected))
+    effective_coverage = _snapshot_coverage(snapshot, paths, order, previous_coverage, (previous, fields, authority))
     complete = _effective_complete(snapshot, effective_coverage, bool(row and row[4]))
     conn.execute(
         "INSERT INTO entity_profile_semantic_snapshots(owner_account_id,entity_id,normalization_version,"
@@ -231,9 +243,9 @@ def store_semantic_patch(
     ).fetchone()
     previous, provenance, old_coverage = (json.loads(value) for value in row) if row else ({}, {}, {})
     paths = provenance.get("fields", {})
-    coverage = _ordered_item_coverage(snapshot.coverage, paths, observation.order)
-    incoming = replace(snapshot, coverage=coverage)
-    fields, accepted, effective_paths, _rejected = _merge_snapshot(
+    coverage = snapshot.coverage
+    incoming = snapshot
+    fields, accepted, effective_paths, _authority = _merge_snapshot(
         conn, incoming, (previous, paths, old_coverage), observation.order
     )
     effective_coverage = dict(old_coverage)
@@ -289,9 +301,9 @@ def _merge_snapshot(
     snapshot: ProfileSemanticSnapshot,
     prior: tuple[dict[str, object], dict[str, object], dict[str, object]],
     order: int,
-) -> tuple[dict[str, object], frozenset[str], dict[str, object], set[str]]:
+) -> tuple[dict[str, object], frozenset[str], dict[str, object], _MergeAuthority]:
     previous, previous_paths, previous_coverage = prior
-    authority = _MergeAuthority(previous_coverage)
+    authority = _MergeAuthority(previous_coverage, observations=previous_paths, order=order)
     fences = {
         row[0]: row[1:]
         for row in conn.execute(
@@ -317,7 +329,8 @@ def _merge_snapshot(
             _retain_path_provenance(retained_paths, previous.get(root), fields[root], root)
             accepted.update(_record_path_observation(snapshot.coverage, root, paths, snapshot.observation, order))
     _restore_rejected_observations(paths, retained_paths, accepted, authority.rejected)
-    return fields, frozenset(accepted), paths, authority.rejected
+    _restore_parent_observations(paths, retained_paths, accepted, authority.retained)
+    return fields, frozenset(accepted), paths, authority
 
 
 def _retain_path_provenance(paths: dict[str, object], old: object, new: object, root: str) -> None:
@@ -378,6 +391,56 @@ def store_collection_page(  # noqa: PLR0913 - one captured page transaction
     return _collection_summary(conn, page, owner, generation, scan)
 
 
+def patch_embedded_story(
+    conn: sqlite3.Connection,
+    entity_id: int,
+    item: ProfileCollectionItem,
+    observation: ProfileFieldObservation,
+) -> EffectiveProfileMerge | None:
+    """Patch only matching retained story identities, never synthetic membership."""
+    require_write_transaction(conn)
+    row = conn.execute(
+        "SELECT fields_json FROM entity_profile_semantic_snapshots WHERE owner_account_id=? AND entity_id=?",
+        (observation.owner_account_id, entity_id),
+    ).fetchone()
+    fields = json.loads(row[0]) if row else {}
+    root = "full_user.stories"
+    peer_stories = fields.get(root)
+    stories = peer_stories.get("stories") if isinstance(peer_stories, dict) else None
+    if not isinstance(stories, list):
+        return None
+    patched, coverage = _embedded_story_patch(stories, item, root)
+    if not coverage:
+        return None
+    snapshot = ProfileSemanticSnapshot(
+        entity_id,
+        observation.owner_account_id,
+        {root: {**cast(dict[str, object], peer_stories), "stories": patched}},
+        coverage,
+        ObservationBoundary(),
+        endpoint="delivered.Story",
+    )
+    return store_semantic_patch(conn, snapshot, observation)
+
+
+def _embedded_story_patch(
+    stories: list[object], item: ProfileCollectionItem, root: str
+) -> tuple[list[object], dict[str, ProfileFieldCoverage]]:
+    patched = list(stories)
+    coverage: dict[str, ProfileFieldCoverage] = {}
+    for index, old in enumerate(stories):
+        if not isinstance(old, dict) or str(old.get("id")) != item.key:
+            continue
+        if old.get("constructor") not in {"StoryItem", "StoryItemSkipped", "StoryItemDeleted"}:
+            continue
+        prefix = f"{root}.stories[{index}]"
+        patched[index] = (
+            dict(item.fields) if item.fields.get("constructor") == "StoryItemDeleted" else {**old, **item.fields}
+        )
+        coverage.update({prefix + path[len("item") :]: value for path, value in item.coverage.items()})
+    return patched, coverage
+
+
 def store_story_update(
     conn: sqlite3.Connection, entity_id: int, item: ProfileCollectionItem, observation: ProfileFieldObservation
 ) -> None:
@@ -419,10 +482,9 @@ def _store_item(  # noqa: PLR0913 - persisted composite identity
     prior_paths = json.loads(old[2]) if old else {}
     if old and old[1] >= order and not _has_later_delivered_leaf(prior_paths, order):
         return
-    coverage = _ordered_item_coverage(coverage, prior_paths, order)
     previous_fields = json.loads(old[0]) if old else {}
     previous_coverage = json.loads(old[3]) if old else {}
-    authority = _MergeAuthority(previous_coverage)
+    authority = _MergeAuthority(previous_coverage, observations=prior_paths, order=order)
     merged = merge_semantic_fields(previous_fields, dict(fields), coverage, "item", authority)
     provenance = dict(prior_paths)
     _retain_path_provenance(provenance, previous_fields, merged, "item")
@@ -433,7 +495,10 @@ def _store_item(  # noqa: PLR0913 - persisted composite identity
             {path: {"order": order, "observed_at": page.observation.started_at, "source": source} for path in accepted}
         )
     _restore_rejected_observations(provenance, retained_provenance, accepted, authority.rejected)
-    effective_coverage = _item_coverage(coverage, previous_coverage, (previous_fields, merged), authority.rejected)
+    _restore_parent_observations(provenance, retained_provenance, accepted, authority.retained)
+    effective_coverage = _item_coverage(
+        coverage, previous_coverage, (previous_fields, merged), authority.rejected, authority.retained
+    )
     conn.execute(
         "INSERT INTO entity_profile_collection_facts(owner_account_id,entity_id,section,item_key,fields_json,"
         "coverage_json,provenance_json,observation_order,observed_at) VALUES(?,?,?,?,?,?,?,?,?) "
@@ -455,18 +520,6 @@ def _has_later_delivered_leaf(paths: Mapping[str, object], order: int) -> bool:
         isinstance(value, dict) and value.get("source") == "update" and value.get("order", 0) > order
         for value in paths.values()
     )
-
-
-def _ordered_item_coverage(
-    coverage: Mapping[str, ProfileFieldCoverage], previous: Mapping[str, object], order: int
-) -> dict[str, ProfileFieldCoverage]:
-    blocked = {path for path, old in previous.items() if isinstance(old, dict) and old.get("order", 0) >= order}
-    return {
-        path: ProfileFieldCoverage(value.classification, ProfileFieldState.UNKNOWN)
-        if any(_path_under(path, old) for old in blocked)
-        else value
-        for path, value in coverage.items()
-    }
 
 
 def _collection_summary(
@@ -508,7 +561,9 @@ def _merge_semantic_node(
     if not previous and authority is not None:
         previous_coverage = dict(authority.previous)
         _drop_path_provenance(previous_coverage, path)
-        authority = _MergeAuthority(previous_coverage, authority.rejected)
+        previous_observations = dict(authority.observations)
+        _drop_path_provenance(previous_observations, path)
+        authority = replace(authority, previous=previous_coverage, observations=previous_observations)
     result = dict(previous)
     for key, value in new.items():
         child_path = f"{path}.{key}" if path else key
@@ -529,7 +584,9 @@ def _merge_semantic_vector(
     if authority is not None:
         previous_coverage = dict(authority.previous)
         _reindex_vector_provenance(previous_coverage, previous, new, path)
-        authority = _MergeAuthority(previous_coverage, authority.rejected)
+        previous_observations = dict(authority.observations)
+        _reindex_vector_provenance(previous_observations, previous, new, path)
+        authority = replace(authority, previous=previous_coverage, observations=previous_observations)
     return [
         merge_semantic_fields(by_identity.get(_identity(item)), item, coverage, f"{path}[{index}]", authority)
         for index, item in enumerate(new)
@@ -701,7 +758,7 @@ def _snapshot_coverage(
     paths: Mapping[str, object],
     order: int,
     previous: Mapping[str, object],
-    values: tuple[Mapping[str, object], Mapping[str, object], set[str]],
+    values: tuple[Mapping[str, object], Mapping[str, object], _MergeAuthority],
 ) -> dict[str, object]:
     coverage: dict[str, object] = {
         key: value for key, value in previous.items() if isinstance(value, dict) and "state" in value
@@ -710,13 +767,12 @@ def _snapshot_coverage(
         _retain_path_provenance(coverage, values[0].get(root), values[1].get(root), root)
     retained_coverage = dict(coverage)
     coverage.update({key: asdict(value) for key, value in snapshot.coverage.items()})
-    _restore_rejected_coverage(coverage, retained_coverage, values[2])
+    _restore_rejected_coverage(coverage, retained_coverage, values[2].rejected)
     for root in snapshot.fields:
         evidence = paths.get(root)
-        if isinstance(evidence, dict) and (
-            evidence.get("order", 0) > order or evidence.get("reason") == "legacy_alias_bridge"
-        ):
+        if isinstance(evidence, dict) and (evidence.get("reason") == "legacy_alias_bridge"):
             _restore_newer_coverage(coverage, root, evidence, previous)
+    _restore_parent_coverage(coverage, retained_coverage, values[2].retained)
     return coverage
 
 
@@ -762,13 +818,42 @@ def _item_coverage(
     previous: Mapping[str, object],
     values: tuple[object, object],
     rejected: set[str],
+    retained: set[str],
 ) -> dict[str, object]:
     result = dict(previous)
     _retain_path_provenance(result, values[0], values[1], "item")
     retained_coverage = dict(result)
     result.update({key: asdict(value) for key, value in incoming.items()})
     _restore_rejected_coverage(result, retained_coverage, rejected)
+    _restore_parent_coverage(result, retained_coverage, retained)
     return result
+
+
+def _reject_stale_value(old: object, new: object, path: str, authority: _MergeAuthority) -> bool:
+    previous = authority.observations.get(path)
+    if authority.order is None or not isinstance(previous, dict) or previous.get("order", 0) < authority.order:
+        return False
+    same_container = isinstance(old, dict) and isinstance(new, dict) and _same_node(old, new)
+    if same_container or (isinstance(old, list) and isinstance(new, list)):
+        authority.retained.add(path)
+        return False
+    authority.rejected.add(path)
+    return True
+
+
+def _restore_parent_observations(
+    paths: dict[str, object], previous: Mapping[str, object], accepted: set[str], retained: set[str]
+) -> None:
+    for path in retained:
+        if path in previous:
+            paths[path] = previous[path]
+        accepted.discard(path)
+
+
+def _restore_parent_coverage(coverage: dict[str, object], previous: Mapping[str, object], retained: set[str]) -> None:
+    for path in retained:
+        if path in previous:
+            coverage[path] = previous[path]
 
 
 def _reject_untrusted_value(
@@ -779,8 +864,10 @@ def _reject_untrusted_value(
     previous: Mapping[str, object],
 ) -> bool:
     evidence = incoming.get(path)
-    if evidence is None or not _known_authority(previous.get(path)):
+    if not _known_authority(previous.get(path)):
         return False
+    if evidence is None:
+        return _reject_container_value(old, new, incoming, path)
     if evidence.state in {ProfileFieldState.UNKNOWN, ProfileFieldState.API_NOT_RETURNED}:
         return True
     if evidence.authoritative:
