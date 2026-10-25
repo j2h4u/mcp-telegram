@@ -253,8 +253,8 @@ current workflow guide and important interpretation rules.
    cd mcp-telegram
    ```
 
-2. Create a deploy directory and copy the compose template plus deployment-local
-   files.
+2. Create a deploy directory and copy the compose template plus [deployment-local
+   notes](deploy/AGENTS.md) and configuration files.
 
    ```bash
    mkdir -p /opt/docker/mcp-telegram
@@ -457,7 +457,8 @@ waits for it to become healthy, and runs the redacted MCP smoke test through
 Pull requests that change documentation only retain the required `ci` status
 but skip Python tests, CRAP analysis, CodeQL, dependency review, and Docker builds.
 
-Use the devtools MCP client for local MCP validation:
+Use the [devtools MCP client](devtools/mcp_client/README.md) for point diagnostics
+not covered by the Justfile recipes:
 
 ```bash
 uv run python -m devtools.mcp_client.cli list-tools
