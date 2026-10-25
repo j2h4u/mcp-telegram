@@ -188,3 +188,32 @@ def test_group_only_user_identity_is_not_a_personal_correspondent(
     with write_savepoint(conn):
         conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES(42,1,1)")
     assert personal_profile_peer(conn, 77, 42)
+
+
+@pytest.mark.parametrize("existing_owner,requested_owner,preserved", [(7, 7, True), (8, 7, False)])
+def test_pre_details_not_found_keeps_bound_negative_state(
+    make_synced_db: Callable[[], sqlite3.Connection], existing_owner: int, requested_owner: int, preserved: bool
+) -> None:
+    from mcp_telegram.entity_profile.repository import EntityProfileRepository
+
+    conn = make_synced_db()
+    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
+    with write_savepoint(conn):
+        conn.execute("UPDATE dialog_directory_state SET account_id=? WHERE singleton=1", (existing_owner,))
+        conn.execute("INSERT INTO entities(id,type,updated_at) VALUES(42,'unknown',1)")
+        repo.mark_pending(42, now=100)
+        repo.mark_refresh_not_found(42, now=101)
+    before = cast(
+        tuple[object, ...] | None,
+        conn.execute("SELECT * FROM entity_profile_refresh_state WHERE entity_id=42").fetchone(),
+    )
+    assert conn.execute("SELECT COUNT(*) FROM entity_details").fetchone() == (0,)
+    with write_savepoint(conn):
+        queued = admit_profile_peer(conn, requested_owner, 42, now=200)
+    after = cast(
+        tuple[object, ...] | None,
+        conn.execute("SELECT * FROM entity_profile_refresh_state WHERE entity_id=42").fetchone(),
+    )
+    assert queued is not preserved
+    assert (after == before) is preserved
+    assert conn.execute("SELECT COUNT(*) FROM entity_details").fetchone() == (0,)

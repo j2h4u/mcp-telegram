@@ -17,17 +17,40 @@ def closed(properties: dict, required: tuple[str, ...] = ()) -> dict:
 _TIMESTAMP = {"type": ["string", "null"]}
 _TEXT = {"type": ["string", "null"]}
 _NUMBER = {"type": ["integer", "null"]}
-_EVIDENCE = closed(
+_VALUE_EVIDENCE = closed(
     {
-        "path": {"type": "string"},
-        "availability": {"type": "string"},
-        "authoritative": {"type": "boolean"},
-        "reason": _TEXT,
+        "availability": {"enum": ["retained", "not_observed"]},
+        "state": {"enum": ["present", "cleared", "unknown"]},
+        "authoritative": {"type": ["boolean", "null"]},
         "source": _TEXT,
         "observed_at": _TIMESTAMP,
         "observation_started_at": _TIMESTAMP,
         "observation_completed_at": _TIMESTAMP,
         "age_seconds": _NUMBER,
+    }
+)
+_EVIDENCE = closed({"path": {"type": "string"}, "value": _VALUE_EVIDENCE})
+_ACQUISITION = closed(
+    {
+        "availability": {"enum": ["observed", "not_observed"]},
+        "source": {"const": "rpc"},
+        "endpoint": _TEXT,
+        "layer": _NUMBER,
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "observation_started_at": _TIMESTAMP,
+        "observation_completed_at": _TIMESTAMP,
+        "age_seconds": _NUMBER,
+        "field_coverage": {
+            "type": "array",
+            "items": closed(
+                {
+                    "path": {"type": "string"},
+                    "state": {"type": "string"},
+                    "authoritative": {"type": "boolean"},
+                    "reason": _TEXT,
+                }
+            ),
+        },
     }
 )
 _HISTORY_COVERAGE = closed(
@@ -97,6 +120,8 @@ _LEGACY_EVIDENCE = closed(
         "stored_reason": _TEXT,
         "original_status": _TEXT,
         "traversal_coverage": {"const": "unknown"},
+        "observation_scope": {"const": "legacy_section"},
+        "age_seconds": _NUMBER,
     }
 )
 _SOURCES = {
@@ -137,6 +162,7 @@ def _collection_page(section: str) -> dict:
             "observed_at": _TIMESTAMP,
             "age_seconds": _NUMBER,
             "field_evidence": {"type": "array", "items": _EVIDENCE},
+            "acquisition": closed({"availability": {"const": "unknown"}}),
         }
     )
     return closed({**_PAGE_COMMON, "section": {"const": section}, "items": {"type": "array", "items": item}})
@@ -212,10 +238,7 @@ def profile_read_schemas() -> tuple[dict, dict]:
             "availability": {"enum": ["retained", "not_observed"]},
             "complete": {"type": "boolean"},
             "normalization_version": {"type": "string"},
-            "source": {"type": "string"},
-            "acquisition": closed(
-                {"observation_started_at": _TIMESTAMP, "observation_completed_at": _TIMESTAMP, "age_seconds": _NUMBER}
-            ),
+            "acquisition": _ACQUISITION,
         }
     )
     history = closed(

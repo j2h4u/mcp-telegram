@@ -3610,16 +3610,16 @@ def admit_profile_peer(
 
 def _profile_retains_acquisition(conn: sqlite3.Connection, owner: int, peer: int) -> bool:
     row = cast(
-        tuple[str, str | None] | None,
+        tuple[str, str | None, int | None] | None,
         conn.execute(
-            "SELECT r.status,r.reason FROM entity_profile_refresh_state r JOIN entity_details d ON d.entity_id=r.entity_id "
-            "WHERE r.entity_id=? AND d.profile_owner_account_id=?",
-            (peer, owner),
+            "SELECT r.status,r.reason,d.profile_owner_account_id FROM entity_profile_refresh_state r "
+            "LEFT JOIN entity_details d ON d.entity_id=r.entity_id WHERE r.entity_id=?",
+            (peer,),
         ).fetchone(),
     )
-    return row is not None and (
-        row[0] in {"pending", "failed"} or (row[0] == "rejected" and row[1] != "refresh_rejected")
-    )
+    if row is None or (row[2] if row[2] is not None else bound_profile_account(conn)) != owner:
+        return False
+    return row[0] in {"pending", "failed"} or (row[0] == "rejected" and row[1] != "refresh_rejected")
 
 
 def _ensure_profile_private_identity(conn: sqlite3.Connection, peer: int, now: int) -> bool:

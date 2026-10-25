@@ -900,7 +900,7 @@ def _snapshot_coverage(
     for root in snapshot.fields:
         _retain_path_provenance(coverage, values[0].get(root), values[1].get(root), root)
     retained_coverage = dict(coverage)
-    coverage.update({key: asdict(value) for key, value in snapshot.coverage.items()})
+    _accept_value_coverage(coverage, snapshot.coverage)
     _restore_rejected_coverage(coverage, retained_coverage, values[2].rejected)
     for root in snapshot.fields:
         evidence = paths.get(root)
@@ -908,6 +908,14 @@ def _snapshot_coverage(
             _restore_newer_coverage(coverage, root, evidence, previous)
     _restore_parent_coverage(coverage, retained_coverage, values[2].retained)
     return coverage
+
+
+def _accept_value_coverage(retained: dict[str, object], incoming: Mapping[str, ProfileFieldCoverage]) -> None:
+    """Non-return retains the accepted evidence alongside its retained value."""
+    for path, evidence in incoming.items():
+        if evidence.state in {ProfileFieldState.UNKNOWN, ProfileFieldState.API_NOT_RETURNED} and path in retained:
+            continue
+        retained[path] = asdict(evidence)
 
 
 def _restore_rejected_coverage(coverage: dict[str, object], retained: Mapping[str, object], rejected: set[str]) -> None:
@@ -957,7 +965,7 @@ def _item_coverage(
     result = dict(previous)
     _retain_path_provenance(result, values[0], values[1], "item")
     retained_coverage = dict(result)
-    result.update({key: asdict(value) for key, value in incoming.items()})
+    _accept_value_coverage(result, incoming)
     _restore_rejected_coverage(result, retained_coverage, rejected)
     _restore_parent_coverage(result, retained_coverage, retained)
     return result

@@ -22,7 +22,7 @@ from mcp_telegram.entity_profile.repository import EntityProfileRepository
 from mcp_telegram.entity_profile.semantic_normalization import normalize_collection_item, normalize_semantic_profile
 from mcp_telegram.sync_transactions import write_savepoint
 from mcp_telegram.tools import entity_info
-from mcp_telegram.tools._base import TOOL_REGISTRY, ToolResult
+from mcp_telegram.tools._base import TOOL_REGISTRY, ToolResult, structured_result
 from tests.test_entity_profile_progressive import _test_service
 
 
@@ -193,6 +193,9 @@ async def test_registered_default_and_collection_outputs_are_closed_and_lossless
             dict, server._project_tool_result("get_entity_info", tool, server._CallTelemetry()).structured_content
         )
         assert result["semantic"]["fields"]["user.phone"] is None
+        phone_value = next(row["value"] for row in result["semantic"]["field_evidence"] if row["path"] == "user.phone")
+        assert phone_value["availability"] == "retained"
+        assert phone_value["state"] == "unknown" and phone_value["authoritative"] is None
         assert result["semantic"]["fields"]["full_user.about"] is None
         assert result["semantic"]["fields"]["full_user.note"]["entities"][0] is None
         assert result["semantic"]["fields"]["full_user.note"]["entities"][1]["offset"] == 1
@@ -339,9 +342,13 @@ def test_real_legacy_receipt_survives_partial_page_failure_and_retry(conn: sqlit
     legacy_source = next(source for source in result["available_sources"] if source["source"] == "legacy")
     assert "generation" not in legacy_source and "scan" not in legacy_source
     assert len(result["items"]) == 3
-    assert all(item["observed_at"] == 100 and item["age_seconds"] == 100 for item in result["items"])
+    assert all(item["observed_at"] is None and item["age_seconds"] is None for item in result["items"])
+    assert result["legacy_evidence"]["observed_at"] == 100
+    assert result["legacy_evidence"]["age_seconds"] == 100
+    assert result["legacy_evidence"]["observation_scope"] == "legacy_section"
     assert result["legacy_evidence"]["stored_status"] == "fresh"
     assert result["legacy_evidence"]["traversal_coverage"] == "unknown"
+    _assert_legacy_wire(result)
     active = next(source["cursor"] for source in result["available_sources"] if source["source"] == "active")
     current = cast(dict, read_profile(conn, 77, 42, 200, {"section": section, "cursor": active})["page"])
     assert current["source"] == "active" and current["returned_count"] == 1
@@ -350,7 +357,22 @@ def test_real_legacy_receipt_survives_partial_page_failure_and_retry(conn: sqlit
     with write_savepoint(conn):
         assert reopened.request_section_refresh(42, (section,), now=201, pair_mode="enabled")
     retained = cast(dict, read_profile(conn, 77, 42, 210, {"section": section})["page"])
-    assert retained["legacy_evidence"] == result["legacy_evidence"]
+    assert retained["legacy_evidence"] == {**result["legacy_evidence"], "age_seconds": 110}
+
+
+def _assert_legacy_wire(result: dict) -> None:
+    # Validate the real projection/omission boundary against the registered page schema.
+    schema = TOOL_REGISTRY["get_entity_info"].output_schema
+    assert schema is not None
+    page_schema = {**cast(dict, schema["properties"])["page"], "$defs": schema["$defs"]}
+    wire = cast(
+        dict,
+        server._project_tool_result(
+            "get_entity_info", structured_result({"page": result}), server._CallTelemetry()
+        ).structured_content,
+    )
+    Draft202012Validator(page_schema).validate(wire["page"])
+    assert all(item["observed_at"] is None for item in wire["page"]["items"])
 
 
 async def test_history_uses_insertion_watermark_and_real_registered_wire(
@@ -422,3 +444,123 @@ def test_profile_cursor_process_restart_and_account_fencing(
     monkeypatch.setattr(pagination, "_TOKEN_SECRET", b"replacement-process-key")
     with pytest.raises(ValueError):
         read_profile(conn, 77, 42, 200, {"section": "saved_music", "cursor": page["next_cursor"]})
+
+
+@pytest.mark.parametrize("phone", ["123", None])
+def test_retained_value_and_latest_full_user_nonreturn_have_separate_evidence(
+    make_synced_db: Callable[[], sqlite3.Connection], phone: str | None
+) -> None:
+    conn = make_synced_db()
+    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
+    full = types.UserFull(42, types.PeerSettings(), types.PeerNotifySettings(), 0)
+    from mcp_telegram.entity_profile.contracts import SuppliedProfileUser
+    from mcp_telegram.entity_profile.updates import project_profile_update, project_user_profile
+
+    push = project_profile_update(types.UpdateUserPhone(42, phone or ""))
+    assert push is not None
+    with write_savepoint(conn):
+        conn.execute("INSERT INTO entities(id,type,updated_at) VALUES(42,'user',1)")
+        repo.apply_supplied_user(
+            SuppliedProfileUser(42, push.semantic_fields, push.semantic_coverage, push.fields, False, False),
+            observation=ProfileFieldObservation(77, 1, 10, "update"),
+        )
+    patch = cast(dict, read_profile(conn, 77, 42, 200, {})["semantic"])
+    assert patch["acquisition"] == {"availability": "not_observed"}
+    snapshot = normalize_semantic_profile(
+        types.User(42), full, target_id=42, owner_account_id=77, observation=ObservationBoundary(100, 101)
+    )
+    with write_savepoint(conn):
+        assert store_semantic_snapshot(conn, snapshot, 2) is not None
+    semantic = cast(dict, read_profile(conn, 77, 42, 200, {})["semantic"])
+    value = next(row["value"] for row in semantic["field_evidence"] if row["path"] == "user.phone")
+    assert semantic["fields"]["user.phone"] == (
+        None if phone is None else {"text": "123", "is_telegram_content": True, "content_kind": "snippet"}
+    )
+    assert value["availability"] == "retained"
+    assert value["state"] == ("cleared" if phone is None else "present")
+    assert (value["observed_at"], value["source"], value["age_seconds"], value["authoritative"]) == (
+        10,
+        "update",
+        190,
+        True,
+    )
+    acquisition = semantic["acquisition"]
+    assert (
+        acquisition["observation_started_at"],
+        acquisition["observation_completed_at"],
+        acquisition["age_seconds"],
+        acquisition["source"],
+    ) == (100, 101, 99, "rpc")
+    fact = next(row for row in acquisition["field_coverage"] if row["path"] == "user.phone")
+    assert fact["state"] == "api_not_returned"
+    # A later minimal supplied observation retains accepted evidence and the actual RPC clock.
+    minimal = project_user_profile(types.User(42, min=True))
+    assert minimal is not None
+    with write_savepoint(conn):
+        repo.apply_supplied_user(
+            SuppliedProfileUser(
+                42,
+                minimal.semantic_fields,
+                minimal.semantic_coverage,
+                minimal.fields,
+                True,
+                minimal.authoritative_photo,
+            ),
+            observation=ProfileFieldObservation(77, 3, 120, "update"),
+        )
+    later = cast(dict, read_profile(conn, 77, 42, 200, {})["semantic"])
+    assert next(row["value"] for row in later["field_evidence"] if row["path"] == "user.phone") == value
+    assert later["acquisition"] == acquisition
+
+
+def test_real_collection_page_exposes_flat_provenance_and_retains_unknown_coverage(conn: sqlite3.Connection) -> None:
+    from mcp_telegram.entity_profile.collection_repository import store_collection_page
+    from mcp_telegram.entity_profile.contracts import (
+        ProfileCollectionItem,
+        ProfileCollectionPage,
+    )
+    from mcp_telegram.pagination import ProfileNavigationToken, encode_profile_navigation
+
+    date = datetime(2025, 1, 1, tzinfo=UTC)
+    first, coverage, _ = normalize_collection_item(types.Photo(9, 123, b"private-ref", date, [], 4))
+    page = ProfileCollectionPage(
+        42,
+        "avatar_history",
+        (ProfileCollectionItem("9", first, coverage),),
+        ObservationBoundary(10, 11),
+        1,
+        terminal=True,
+    )
+    with write_savepoint(conn):
+        store_collection_page(conn, page, owner=77, order=1, generation=1, cursor={"scan": 0})
+        partial_fields, partial_coverage, _ = normalize_collection_item(
+            types.Photo(9, 123, b"private-ref", None, [], 4)
+        )
+        partial = ProfileCollectionPage(
+            42,
+            "avatar_history",
+            (
+                ProfileCollectionItem(
+                    "9",
+                    partial_fields,
+                    partial_coverage,
+                ),
+            ),
+            ObservationBoundary(100, 101),
+            1,
+            terminal=True,
+        )
+        store_collection_page(conn, partial, owner=77, order=2, generation=1, cursor={"scan": 0})
+    token = encode_profile_navigation(ProfileNavigationToken(77, 42, "avatar_history", "published", 1, 0))
+    page_result = cast(dict, read_profile(conn, 77, 42, 200, {"section": "avatar_history", "cursor": token})["page"])
+    value = next(row["value"] for row in page_result["items"][0]["field_evidence"] if row["path"] == "item.date")
+    assert page_result["items"][0]["value"]["date"] == date.isoformat()
+    assert (
+        value["observed_at"],
+        value["observation_started_at"],
+        value["observation_completed_at"],
+        value["source"],
+        value["age_seconds"],
+    ) == (10, 10, 11, "rpc", 190)
+    assert value["state"] == "present" and value["authoritative"] is True
+    assert page_result["items"][0]["acquisition"] == {"availability": "unknown"}

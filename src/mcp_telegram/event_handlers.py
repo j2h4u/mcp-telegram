@@ -2422,7 +2422,7 @@ class EventHandlerManager:
         pushes.append((update, project_profile_update(update)))
         with write_transaction(conn):
             for source, push in pushes:
-                if not self._eligible_profile_push(push):
+                if not self._eligible_profile_push(conn, push):
                     continue
                 assert push is not None
                 observation = self._profile_push_observation(conn, source, push)
@@ -2491,11 +2491,11 @@ class EventHandlerManager:
             excluded.update(("username", "extra_usernames"))
         return _mask_profile_identity_fields(push, excluded)
 
-    def _eligible_profile_push(self, push: ProfilePush | None) -> bool:
+    def _eligible_profile_push(self, conn: sqlite3.Connection, push: ProfilePush | None) -> bool:
         return (
             push is not None
             and self._self_id is not None
-            and personal_profile_peer(self._conn, self._self_id, push.entity_id)
+            and personal_profile_peer(conn, self._self_id, push.entity_id)
         )
 
     def _profile_push_observation(

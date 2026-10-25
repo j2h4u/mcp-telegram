@@ -296,6 +296,7 @@ def _specific_semantics(update: object) -> tuple[dict[str, object], dict[str, Pr
 
 
 def _semantic_push_value(path: str, value: object) -> tuple[object, dict[str, ProfileFieldCoverage]]:
+    evidence: Mapping[str, ProfileFieldCoverage]
     if isinstance(value, (list, tuple)):
         values: list[object] = []
         coverage = {path: ProfileFieldCoverage(ProfileFieldClass.PROFILE, ProfileFieldState.PRESENT, True)}

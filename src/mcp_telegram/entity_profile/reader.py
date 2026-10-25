@@ -45,57 +45,116 @@ def semantic_profile(conn: sqlite3.Connection, owner: int, entity: int, now: int
         tuple[object, ...] | None,
         conn.execute(
             "SELECT fields_json,coverage_json,provenance_json,normalization_version,complete,"
-            "observation_started_at,observation_completed_at,source FROM entity_profile_semantic_snapshots "
+            "observation_started_at,observation_completed_at FROM entity_profile_semantic_snapshots "
             "WHERE owner_account_id=? AND entity_id=?",
             (owner, entity),
         ).fetchone(),
     )
     if row is None:
-        return {"fields": {}, "field_evidence": [], "availability": "not_observed", "complete": False}
+        return {
+            "fields": {},
+            "field_evidence": [],
+            "availability": "not_observed",
+            "complete": False,
+            "acquisition": {"availability": "not_observed"},
+        }
     provenance = _object(row[2])
     paths = provenance.get("fields", {})
     paths = cast(dict[str, object], paths) if isinstance(paths, dict) else {}
     coverage = _object(row[1])
-    evidence = _field_evidence(coverage, paths, now)
+    evidence = _field_evidence(coverage, paths, now, _profile_values(_object(row[0])))
     return {
         "fields": project_profile_fields(_object(row[0])),
         "field_evidence": evidence,
         "availability": "retained" if _object(row[0]) else "not_observed",
         "complete": bool(row[4]),
         "normalization_version": row[3],
-        "source": row[7],
-        "acquisition": {
-            "observation_started_at": row[5],
-            "observation_completed_at": row[6],
-            "age_seconds": _age(now, row[6]),
-        },
+        "acquisition": _acquisition_evidence(provenance, row[5:7], now),
     }
 
 
-def _field_evidence(coverage: dict[str, object], paths: dict[str, object], now: int) -> list[dict[str, object]]:
-    evidence = []
-    for path in sorted(set(coverage) | set(paths)):
-        if "__invalidation__:" in path:
-            continue
-        field, observed = coverage.get(path), paths.get(path)
-        field = cast(dict[str, object], field) if isinstance(field, dict) else {}
-        observed = cast(dict[str, object], observed) if isinstance(observed, dict) else {}
-        if field.get("classification") in {"capability", "inapplicable"}:
-            continue
-        evidence.append(
+def _field_evidence(
+    coverage: dict[str, object], paths: dict[str, object], now: int, values: dict[str, object]
+) -> list[dict[str, object]]:
+    return [
+        {
+            "path": path,
+            "value": _value_evidence(path, _object(coverage.get(path)), _object(paths.get(path)), values, now),
+        }
+        for path in sorted(set(coverage) | set(paths))
+        if _public_evidence(path, _object(coverage.get(path)))
+    ]
+
+
+def _public_evidence(path: str, field: dict[str, object]) -> bool:
+    return not path.startswith("__invalidation__:") and field.get("classification") not in {
+        "capability",
+        "inapplicable",
+    }
+
+
+def _value_evidence(
+    path: str, field: dict[str, object], observed: dict[str, object], values: dict[str, object], now: int
+) -> dict[str, object]:
+    known = field.get("state") in {"present", "cleared"}
+    state = "present" if path in values and values[path] is not None else "unknown"
+    if path in values and field.get("state") == "cleared" and field.get("authoritative"):
+        state = "cleared"
+    return {
+        "availability": "retained" if path in values else "not_observed",
+        "state": state,
+        "authoritative": field.get("authoritative") if known else None,
+        "observed_at": observed.get("observed_at"),
+        "observation_started_at": observed.get(
+            "observation_started_at", observed.get("observed_at") if observed.get("source") == "rpc" else None
+        ),
+        "observation_completed_at": observed.get("observation_completed_at"),
+        "source": observed.get("source"),
+        "age_seconds": _age(now, observed.get("observed_at", observed.get("observation_completed_at"))),
+    }
+
+
+def _profile_values(fields: dict[str, object]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for path, value in fields.items():
+        _collect_values(result, path, value)
+    return result
+
+
+def _collect_values(result: dict[str, object], path: str, value: object) -> None:
+    result[path] = value
+    if isinstance(value, dict):
+        for key, child in cast(dict[str, object], value).items():
+            _collect_values(result, path + "." + key, child)
+    elif isinstance(value, list):
+        for index, child in enumerate(cast(list[object], value)):
+            _collect_values(result, f"{path}[{index}]", child)
+
+
+def _acquisition_evidence(provenance: dict[str, object], bounds: tuple[object, ...], now: int) -> dict[str, object]:
+    coverage = provenance.get("acquisition_coverage")
+    if not isinstance(coverage, dict) or any(value is None for value in bounds):
+        return {"availability": "not_observed"}
+    return {
+        "availability": "observed",
+        "source": "rpc",
+        "endpoint": provenance.get("endpoint"),
+        "layer": provenance.get("layer"),
+        "diagnostics": provenance.get("diagnostics", []),
+        "observation_started_at": bounds[0],
+        "observation_completed_at": bounds[1],
+        "age_seconds": _age(now, bounds[1]),
+        "field_coverage": [
             {
                 "path": path,
-                "availability": field.get("state", "unknown"),
+                "state": field.get("state", "unknown"),
                 "authoritative": field.get("authoritative", False),
                 "reason": field.get("reason"),
-                "observed_at": observed.get("observed_at"),
-                "observation_started_at": observed.get("observation_started_at"),
-                "observation_completed_at": observed.get("observation_completed_at"),
-                "source": observed.get("source"),
-                "age_seconds": _age(now, observed.get("observed_at", observed.get("observation_completed_at"))),
             }
-        )
-    return evidence
+            for path, field in cast(dict[str, dict[str, object]], coverage).items()
+            if _public_evidence(path, field)
+        ],
+    }
 
 
 def history_coverage(conn: sqlite3.Connection, owner: int, entity: int) -> dict[str, object]:
@@ -365,7 +424,8 @@ def _collection_item(section: str, row: tuple[object, ...], now: int) -> dict[st
         "value": value,
         "observed_at": row[5],
         "age_seconds": _age(now, row[5]),
-        "field_evidence": _field_evidence(_object(row[3]), _object(_object(row[4]).get("fields", {})), now),
+        "field_evidence": _field_evidence(_object(row[3]), _object(row[4]), now, _profile_values({"item": fields})),
+        "acquisition": {"availability": "unknown"},
     }
 
 
@@ -397,10 +457,11 @@ def _legacy_page(
             {
                 "item_key": None,
                 "identity_kind": "legacy",
+                "acquisition": {"availability": "unknown"},
                 "state": state,
                 "value": projected,
-                "observed_at": receipt.get("observed_at"),
-                "age_seconds": _age(now, receipt.get("observed_at")),
+                "observed_at": None,
+                "age_seconds": None,
             }
         )
     has_more = offset + limit < len(values)
@@ -411,7 +472,11 @@ def _legacy_page(
         "value_semantics": "retained_legacy_values",
         "membership_semantics": "fingerprinted_legacy",
         "items": items,
-        "legacy_evidence": receipt,
+        "legacy_evidence": {
+            **receipt,
+            "observation_scope": "legacy_section",
+            "age_seconds": _age(now, receipt.get("observed_at")),
+        },
         "next_cursor": encode_profile_navigation(replace(token, last_key=str(offset + limit))) if has_more else None,
         "has_more": has_more,
         "returned_count": len(items),

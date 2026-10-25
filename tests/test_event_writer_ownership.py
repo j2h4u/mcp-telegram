@@ -120,3 +120,37 @@ async def test_realtime_lock_wait_keeps_loop_responsive_and_rollback_is_atomic(t
         await writer.aclose()
         reader.close()
         lock.close()
+
+
+@pytest.mark.asyncio
+async def test_supplied_profile_eligibility_uses_real_callback_connection(tmp_path: Path) -> None:
+    from telethon.tl.types import User
+
+    path = tmp_path / "profile-owner.db"
+    seed = _seed(path)
+    seed.close()
+    reader = open_sync_db_reader(path)
+    writer = await SQLiteWriter.open(path)
+    client = MagicMock()
+    manager = EventHandlerManager(client, reader, asyncio.Event(), writer=writer, profile_detail_ttl_seconds=300)
+    manager._self_id = 77
+    manager.bind_demand_sink(MagicMock())
+    try:
+        # Keep both real protections: the loop reader is read-only and thread-bound.
+        with pytest.raises(sqlite3.ProgrammingError, match="thread"):
+            await writer.run(lambda _conn: cast(tuple[object, ...] | None, reader.execute("SELECT 1").fetchone()))
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            reader.execute("UPDATE dialogs SET name='forbidden' WHERE dialog_id=42")
+        reader.rollback()
+        await manager._persist_profile_pushes(sender=User(42, first_name="Retained supplied name", phone="123"))
+        assert reader.execute("SELECT name FROM entities WHERE id=42").fetchone() == ("Retained supplied name",)
+        assert reader.execute("SELECT profile_owner_account_id FROM entity_details WHERE entity_id=42").fetchone() == (
+            77,
+        )
+        assert reader.execute(
+            "SELECT COUNT(*) FROM entity_profile_semantic_snapshots WHERE owner_account_id=77 AND entity_id=42"
+        ).fetchone() == (1,)
+        assert client.mock_calls == []
+    finally:
+        await writer.aclose()
+        reader.close()
