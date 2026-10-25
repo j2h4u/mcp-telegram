@@ -118,13 +118,6 @@ def _history_root(path: str) -> str | None:
     return next((root for root in _PROFILE_ROOTS | _OWNER_ROOTS | _PHOTO_ROOTS.keys() if _under(path, root)), None)
 
 
-def _history_value(root: str, value: object) -> object:
-    # Expiry is volatile only at this concrete status path; nested dates may be content.
-    if root == "user.emoji_status" and isinstance(value, Mapping):
-        return {str(key): item for key, item in value.items() if key != "until"}
-    return value
-
-
 def _photo_id(value: object, *, cleared: bool) -> object:
     if cleared or value is None:
         return None
@@ -157,7 +150,6 @@ def _profile_change(merge: ProfileHistoryMerge, root: str) -> tuple[str, str, ob
         category = "private_owner" if _personal_photo(root, merge.before[root], merge.after[root]) else "profile"
         key = f"photo.{_PHOTO_ROOTS[root]}"
     else:
-        before, after = _history_value(root, before), _history_value(root, after)
         category = "private_owner" if root in _OWNER_ROOTS else "profile"
         key = root
     return (key, category, before, after) if _different_values(merge, root, before, after) else None

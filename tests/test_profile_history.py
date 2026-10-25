@@ -113,12 +113,22 @@ def test_volatile_unknown_and_internal_paths_are_current_only(db: sqlite3.Connec
     assert not rows(db)
 
 
-def test_emoji_expiry_is_current_only_but_substantive_price_is_an_edit(db: sqlite3.Connection) -> None:
-    value = merge("user.emoji_status", {"document_id": 9, "until": 10}, {"document_id": 9, "until": 20})
+def test_emoji_selected_deadline_is_exact_observed_configuration_not_presence(db: sqlite3.Connection) -> None:
+    before = {"constructor": "EmojiStatus", "document_id": 9, "until": 10}
+    after = {"constructor": "EmojiStatus", "document_id": 9, "until": 20}
+    value = replace(merge("user.emoji_status", before, after), accepted_paths=frozenset({"user.emoji_status.until"}))
     with write_transaction(db):
-        assert append_profile_history(db, replace(value, accepted_paths=frozenset({"user.emoji_status.until"}))) == 0
+        assert append_profile_history(db, value) == 1
+        assert append_profile_history(db, value) == 0
+        unchanged = replace(value, before=value.after, observation=observation(3))
+        assert append_profile_history(db, unchanged) == 0
         assert append_profile_history(db, merge("user.send_paid_messages_stars", 10, 20)) == 1
-    assert [row[3] for row in rows(db)] == ["user.send_paid_messages_stars"]
+    result = rows(db)
+    assert [row[3] for row in result] == ["user.emoji_status", "user.send_paid_messages_stars"]
+    assert json.loads(cast(str, result[0][5])) == before
+    assert json.loads(cast(str, result[0][6])) == after
+    # Deadline is content; it is neither an observation timestamp nor a server event time.
+    assert result[0][8:13] == (20, 25, 30, "rpc", None)
 
 
 @pytest.mark.parametrize(
