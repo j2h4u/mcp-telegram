@@ -38,6 +38,7 @@ from mcp_telegram.dialog_directory_tl import (
 )
 from mcp_telegram.dialog_identity import capture_identity_baseline, publish_dialog_identity
 from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
+from mcp_telegram.entity_profile.repository import _read_profile_admission_state
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
@@ -83,6 +84,9 @@ async def test_directory_owner_publishes_and_notifies_on_loop_thread(tmp_path: P
         try:
             assert conn.execute("SELECT status FROM dialog_directory_state").fetchone() == ("complete",)
             assert conn.execute("SELECT name FROM dialogs WHERE dialog_id=1").fetchone() == ("User 1",)
+            admission = _read_profile_admission_state(conn, 100)
+            assert admission["pending_directory_generation"] == 1
+            assert admission["completed"] is False
         finally:
             conn.close()
         assert details[-1][0] == "canonical dialog directory: complete"

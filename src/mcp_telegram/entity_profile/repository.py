@@ -467,51 +467,18 @@ class EntityProfileRepository:
         )
 
     def reconcile_history_profiles(self, *, now: int, limit: int, pair_mode: str, self_id: int | None) -> int:
-        """Admit a bounded batch of missing DM facts, with no age-based polling."""
+        """Advance the finite personal-peer admission checkpoint."""
         if isinstance(limit, bool) or limit < 1:
             raise ValueError("profile reconciliation limit must be positive")
         if self_id is None or not self._history_profile_schema_available():
             return 0
-        with write_savepoint(self._conn):
-            rows = self._history_profiles_to_collect(self_id, min(limit, 32))
-            for entity_id, entity_type, name, repair_owner in rows:
-                ensure_entity_stub(
-                    self._conn,
-                    EntitySnapshot(entity_id, entity_type, name, None, latinize(name) if name else None, now),
-                )
-                sections = PROFILE_SECTIONS if repair_owner else self._missing_profile_sections(entity_id)
-                self.request_section_refresh(entity_id, sections, now=now, pair_mode=pair_mode)
-            return len(rows)
+        return _reconcile_profile_admission(self._conn, self_id, now=now, limit=limit, pair_mode=pair_mode)
 
     def _history_profile_schema_available(self) -> bool:
         return all(
             self._columns(table)
             for table in ("full_history_enrollment", "dialogs", "entity_details", "entity_detail_sections")
         ) and self._refresh_has("generation")
-
-    def _history_profiles_to_collect(self, self_id: int, limit: int) -> list[tuple[int, str, str | None, bool]]:
-        owner_mismatch = "p.profile_owner_account_id IS NOT ?" if self._detail_has("profile_owner_account_id") else "0"
-        owner_parameters: tuple[object, ...] = (self_id,) if self._detail_has("profile_owner_account_id") else ()
-        rows = self._conn.execute(
-            "WITH expected(section) AS (VALUES ('full_profile'),('common_chats'),('contact_overlap'),"
-            "('avatar_history'),('personal_channel')) "
-            f"SELECT d.dialog_id,d.type,d.name,({owner_mismatch}) FROM dialogs d "
-            "JOIN full_history_enrollment e ON e.dialog_id=d.dialog_id AND e.enabled=1 "
-            "LEFT JOIN entity_details p ON p.entity_id=d.dialog_id "
-            "LEFT JOIN entity_profile_refresh_state r ON r.entity_id=d.dialog_id "
-            "WHERE d.type IN ('user','bot','User','Bot') AND d.dialog_id<>? "
-            "AND (r.status IS NULL OR r.status='complete' "
-            "OR (r.status='rejected' AND r.reason='refresh_rejected')) "
-            f"AND (p.entity_id IS NULL OR ({owner_mismatch}) OR EXISTS ("
-            "SELECT 1 FROM expected x LEFT JOIN entity_detail_sections s "
-            "ON s.entity_id=d.dialog_id AND s.section=x.section "
-            "WHERE s.section IS NULL OR s.status IN ('pending','stale') "
-            "OR (s.status='fresh' AND s.observed_at IS NULL) "
-            "OR (s.status='unavailable' AND s.reason='refresh_rejected'))) "
-            "ORDER BY d.dialog_id LIMIT ?",
-            (*owner_parameters, self_id, *owner_parameters, limit),
-        ).fetchall()
-        return [(int(row[0]), str(row[1]), row[2], bool(row[3])) for row in rows]
 
     def _missing_profile_sections(self, entity_id: int) -> tuple[str, ...]:
         stored = self._read_stored_sections(entity_id)
@@ -533,6 +500,7 @@ class EntityProfileRepository:
         if not sections or not self._refresh_has("generation"):
             return False
         with write_savepoint(self._conn):
+            self._capture_legacy_section_evidence(entity_id, sections)
             if not self.ensure_unknown_refresh_parent(entity_id, now=now):
                 return False
             active = self._read_pending_refresh_state(entity_id)
@@ -600,6 +568,37 @@ class EntityProfileRepository:
             ),
         )
         return True
+
+    def _capture_legacy_section_evidence(self, entity_id: int, sections: tuple[str, ...]) -> None:
+        """Keep the original legacy section age before invalidation or v2 overwrite."""
+        detail, _observed, owner, _scope = self._read_profile_blob(entity_id)
+        if owner is None:
+            return
+        for section in set(sections) & {"avatar_history", "common_chats"}:
+            if not isinstance(detail.get(section), list):
+                continue
+            row = self._conn.execute(
+                "SELECT status,observed_at,reason,payload_json FROM entity_detail_sections WHERE entity_id=? AND section=?",
+                (entity_id, section),
+            ).fetchone()
+            if row is None:
+                continue
+            previous = json.loads(row[3]) if row[3] else None
+            if not isinstance(previous, list):
+                continue
+            receipt = {
+                "owner_account_id": owner,
+                "section": section,
+                "observed_at": row[1],
+                "stored_status": row[0],
+                "stored_reason": row[2],
+                "traversal_coverage": "unknown",
+                "original_status": row[0] if row[0] not in {"pending", "stale"} else None,
+            }
+            self._conn.execute(
+                "UPDATE entity_detail_sections SET payload_json=? WHERE entity_id=? AND section=?",
+                (encode({"legacy_evidence": receipt}), entity_id, section),
+            )
 
     def complete_unchanged_section(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
         """Advance retained terminal knowledge without rewriting its observation."""
@@ -1856,9 +1855,11 @@ class EntityProfileRepository:
         *,
         now: int,
     ) -> bool:
-        progress = collection_progress(
-            page, state, summary, self.read_section_payload(cursor.entity_id, cursor.next_section)
-        )
+        self._capture_legacy_section_evidence(cursor.entity_id, (cursor.next_section,))
+        previous = self.read_section_payload(cursor.entity_id, cursor.next_section)
+        if isinstance(previous, dict) and isinstance(previous.get("legacy_evidence"), dict):
+            state = {**state, "legacy_evidence": previous["legacy_evidence"]}
+        progress = collection_progress(page, state, summary, previous)
         self._journal_collection(cursor, page, progress.payload)
         self._write_section(
             cursor.entity_id,
@@ -3518,3 +3519,181 @@ def _first_dirty_section(sections: tuple[str, ...], previous: tuple[object, ...]
     if previous is not None and previous[0] in PROFILE_SECTIONS:
         first = min((first, str(previous[0])), key=PROFILE_SECTIONS.index)
     return first
+
+
+_PROFILE_ADMISSION_STATE = "profile_admission_v2"
+_PROFILE_ADMISSION_TYPES = ("user", "bot", "User", "Bot")
+_PROFILE_EXCLUDED_PEERS = frozenset({777000, 1271266957})
+
+
+def _read_profile_admission_state(conn: sqlite3.Connection, owner: int) -> dict[str, object]:
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute("SELECT value FROM daemon_state WHERE key=?", (_PROFILE_ADMISSION_STATE,)).fetchone(),
+    )
+    state = cast(dict[str, object], json.loads(cast(str, row[0]))) if row else {}
+    if state.get("account") != owner or state.get("version") != NORMALIZATION_VERSION:
+        return {
+            "account": owner,
+            "version": NORMALIZATION_VERSION,
+            "phase": 0,
+            "last_peer": 0,
+            "completed": False,
+            "directory_generation": 0,
+            "pending_directory_generation": 0,
+        }
+    return state
+
+
+def _save_profile_admission_state(conn: sqlite3.Connection, state: dict[str, object]) -> None:
+    conn.execute(
+        "INSERT INTO daemon_state(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (_PROFILE_ADMISSION_STATE, json.dumps(state, separators=(",", ":"))),
+    )
+
+
+def _profile_peer_key(owner: int, peer: int) -> str:
+    return f"profile_admission:{owner}:{NORMALIZATION_VERSION}:{peer}"
+
+
+def profile_peer_managed(conn: sqlite3.Connection, owner: int, peer: int) -> bool:
+    return (
+        conn.execute("SELECT 1 FROM daemon_state WHERE key=?", (_profile_peer_key(owner, peer),)).fetchone() is not None
+    )
+
+
+def personal_profile_peer(conn: sqlite3.Connection, owner: int, peer: int) -> bool:
+    if peer <= 0 or peer == owner or peer in _PROFILE_EXCLUDED_PEERS:
+        return False
+    dialog = cast(tuple[str] | None, conn.execute("SELECT type FROM dialogs WHERE dialog_id=?", (peer,)).fetchone())
+    entity = cast(tuple[str] | None, conn.execute("SELECT type FROM entities WHERE id=?", (peer,)).fetchone())
+    kinds = {str(value[0]).lower() for value in (dialog, entity) if value is not None}
+    if kinds & {"service", "replies"}:
+        return False
+    return (
+        (dialog is not None and dialog[0].lower() in {"user", "bot"})
+        or profile_peer_managed(conn, owner, peer)
+        or conn.execute("SELECT 1 FROM messages WHERE dialog_id=? LIMIT 1", (peer,)).fetchone() is not None
+    )
+
+
+def admit_profile_peer(
+    conn: sqlite3.Connection, owner: int, peer: int, *, now: int, pair_mode: str = "enabled"
+) -> bool:
+    """Admit a locally evidenced private peer once per normalization version."""
+    require_write_transaction(conn)
+    if peer <= 0 or peer == owner or peer in _PROFILE_EXCLUDED_PEERS or profile_peer_managed(conn, owner, peer):
+        return False
+    if not _ensure_profile_private_identity(conn, peer, now):
+        return False
+    # Queue-only adapter: this path never evaluates receipt reuse or TTL.
+    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
+    sections = repo._missing_profile_sections(peer)
+    semantic = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT source,normalization_version FROM entity_profile_semantic_snapshots "
+            "WHERE owner_account_id=? AND entity_id=?",
+            (owner, peer),
+        ).fetchone(),
+    )
+    if semantic is None or semantic[0] == "legacy" or semantic[1] != NORMALIZATION_VERSION:
+        sections = repo._profile_sections(peer)
+    queued = (
+        False
+        if _profile_retains_acquisition(conn, owner, peer)
+        else repo.request_section_refresh(peer, sections, now=now, pair_mode=pair_mode)
+    )
+    conn.execute("INSERT INTO daemon_state(key,value) VALUES (?,?)", (_profile_peer_key(owner, peer), str(now)))
+    return queued
+
+
+def _profile_retains_acquisition(conn: sqlite3.Connection, owner: int, peer: int) -> bool:
+    row = cast(
+        tuple[str, str | None] | None,
+        conn.execute(
+            "SELECT r.status,r.reason FROM entity_profile_refresh_state r JOIN entity_details d ON d.entity_id=r.entity_id "
+            "WHERE r.entity_id=? AND d.profile_owner_account_id=?",
+            (peer, owner),
+        ).fetchone(),
+    )
+    return row is not None and (
+        row[0] in {"pending", "failed"} or (row[0] == "rejected" and row[1] != "refresh_rejected")
+    )
+
+
+def _ensure_profile_private_identity(conn: sqlite3.Connection, peer: int, now: int) -> bool:
+    row = cast(
+        tuple[object, ...] | None, conn.execute("SELECT type,name FROM dialogs WHERE dialog_id=?", (peer,)).fetchone()
+    )
+    kind, name = (str(row[0]), cast(str | None, row[1])) if row else ("unknown", None)
+    existing = cast(tuple[object, ...] | None, conn.execute("SELECT type FROM entities WHERE id=?", (peer,)).fetchone())
+    if (existing and str(existing[0]).lower() in {"service", "replies"}) or kind.lower() in {"service", "replies"}:
+        return False
+    if existing is None:
+        ensure_entity_stub(conn, EntitySnapshot(peer, kind, name, None, None, now))
+    return True
+
+
+def request_profile_directory_pass(conn: sqlite3.Connection, owner: int, generation: int) -> None:
+    require_write_transaction(conn)
+    state = _read_profile_admission_state(conn, owner)
+    state["pending_directory_generation"] = max(int(cast(int, state["pending_directory_generation"])), generation)
+    _save_profile_admission_state(conn, state)
+
+
+def _reconcile_profile_admission(conn: sqlite3.Connection, owner: int, *, now: int, limit: int, pair_mode: str) -> int:
+    """Checkpoint at most 32 examined peers, including already admitted peers."""
+    with write_savepoint(conn):
+        state = _read_profile_admission_state(conn, owner)
+        if state["completed"]:
+            if state["pending_directory_generation"] == state["directory_generation"]:
+                return 0
+            state.update(phase=0, last_peer=0, completed=False)
+        if state["phase"] == 0 and state["last_peer"] == 0:
+            state["directory_generation"] = state["pending_directory_generation"]
+        examined = 0
+        while examined < min(limit, 32) and int(cast(int, state["phase"])) < len(_PROFILE_ADMISSION_TYPES) + 1:
+            phase, last = int(cast(int, state["phase"])), int(cast(int, state["last_peer"]))
+            peers = _profile_admission_candidates(conn, phase, last, min(limit, 32) - examined)
+            if not peers:
+                state.update(phase=phase + 1, last_peer=0)
+                continue
+            for peer in peers:
+                admit_profile_peer(conn, owner, peer, now=now, pair_mode=pair_mode)
+                state["last_peer"] = peer
+                examined += 1
+        state["completed"] = state["phase"] == len(_PROFILE_ADMISSION_TYPES) + 1
+        _save_profile_admission_state(conn, state)
+        return examined
+
+
+def _profile_admission_candidates(conn: sqlite3.Connection, phase: int, last: int, limit: int) -> list[int]:
+    if phase < len(_PROFILE_ADMISSION_TYPES):
+        return [
+            int(cast(int, row[0]))
+            for row in cast(
+                list[tuple[int]],
+                conn.execute(
+                    "SELECT dialog_id FROM dialogs WHERE type=? AND dialog_id>? ORDER BY dialog_id LIMIT ?",
+                    (_PROFILE_ADMISSION_TYPES[phase], last, limit),
+                ).fetchall(),
+            )
+        ]
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT dialog_id FROM messages WHERE dialog_id>? AND dialog_id>0 ORDER BY dialog_id LIMIT 1", (last,)
+        ).fetchone(),
+    )
+    return [int(cast(int, row[0]))] if row else []
+
+
+def bound_profile_account(conn: sqlite3.Connection) -> int | None:
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='dialog_directory_state'").fetchone() is None:
+        return None
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute("SELECT account_id FROM dialog_directory_state WHERE singleton=1").fetchone(),
+    )
+    return int(cast(int, row[0])) if row and row[0] is not None else None

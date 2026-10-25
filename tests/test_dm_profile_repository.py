@@ -142,12 +142,12 @@ def test_reconcile_backfills_large_cohort_without_waiters_and_survives_restart(t
     while count := repo.reconcile_history_profiles(now=200, limit=32, pair_mode="enabled", self_id=7):
         assert count <= 32
         admitted += count
-    assert admitted == 141
+    assert admitted == 143  # 142 correspondents plus the examined self candidate.
     assert repo.is_history_profile_managed(240)
-    assert not repo.is_history_profile_managed(300)
+    assert conn.execute("SELECT 1 FROM entity_profile_refresh_state WHERE entity_id=300").fetchone() == (1,)
     assert not repo.is_history_profile_managed(301)
     assert conn.execute("SELECT COUNT(*) FROM entity_details").fetchone() == (0,)
-    assert conn.execute("SELECT COUNT(*) FROM entity_profile_refresh_state WHERE status='pending'").fetchone() == (141,)
+    assert conn.execute("SELECT COUNT(*) FROM entity_profile_refresh_state WHERE status='pending'").fetchone() == (142,)
     conn.close()
     reopened = sqlite3.connect(path)
     restarted = EntityProfileRepository(reopened, section_ttl_seconds=10)
@@ -179,7 +179,7 @@ def test_reconcile_preserves_completed_unavailable_failed_and_not_found(tmp_path
             "UPDATE entity_detail_sections SET status='unavailable',reason='refresh_rejected' WHERE entity_id=43"
         )
     failed = conn.execute("SELECT * FROM entity_profile_refresh_state WHERE entity_id=41").fetchone()
-    assert repo.reconcile_history_profiles(now=100_000, limit=32, pair_mode="enabled", self_id=7) == 1
+    assert repo.reconcile_history_profiles(now=100_000, limit=32, pair_mode="enabled", self_id=7) == 5
     assert conn.execute("SELECT * FROM entity_profile_refresh_state WHERE entity_id=41").fetchone() == failed
     assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=43").fetchone() == ("pending",)
     assert repo.reconcile_history_profiles(now=200_000, limit=32, pair_mode="enabled", self_id=7) == 0

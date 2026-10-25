@@ -447,7 +447,7 @@ class DaemonEntityInfoService:
                     "entity_profile_account_unavailable",
                     "The stored profile is not bound to the current account. Action: verify the daemon account binding.",
                 )
-            return await self._progressive_result(entity_id, stored.detail, stored.sections, now=now)
+            return await self._local_profile_result(entity_id, stored.detail, stored.sections, now=now, req=req)
         identity = self._local_profile_identity(entity_id)
         if not identity:
             return self._error(
@@ -455,7 +455,44 @@ class DaemonEntityInfoService:
                 "No local observations exist for this entity. Action: use list_dialogs to select a known local entity.",
             )
         sections = self._unobserved_sections(identity)
-        return await self._progressive_result(entity_id, identity, sections, now=now)
+        return await self._local_profile_result(entity_id, identity, sections, now=now, req=req)
+
+    async def _local_profile_result(
+        self,
+        entity_id: int,
+        detail: Mapping[str, object],
+        sections: dict[str, dict[str, object]],
+        *,
+        now: int,
+        req: Mapping[str, object],
+    ) -> dict[str, object]:
+        from .entity_profile.reader import read_profile
+
+        result = await self._progressive_result(entity_id, detail, sections, now=now)
+        scope = self._capture_pair_scope()
+        owner = self._deps.self_id or (scope.account_id if scope is not None else None)
+        modern = cast(
+            tuple[object, ...] | None,
+            self._deps.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='entity_profile_semantic_snapshots'"
+            ).fetchone(),
+        )
+        if owner is None or modern is None or entity_id <= 0:
+            if req.get("cursor") is not None or req.get("section") is not None:
+                return self._error(
+                    "profile_selection_unavailable", "Account-bound local profile paging is unavailable."
+                )
+            return result
+        try:
+            projection = read_profile(self._deps.conn, owner, entity_id, now, req)
+        except (ValueError, TypeError) as exc:
+            return self._error(
+                "invalid_profile_navigation", str(exc) + ". Action: restart the local selection without a cursor."
+            )
+        data = result.get("data")
+        if isinstance(data, dict):
+            data.update(projection)
+        return result
 
     def _profile_owner_matches(self, owner_account_id: int) -> bool:
         scope = self._capture_pair_scope()

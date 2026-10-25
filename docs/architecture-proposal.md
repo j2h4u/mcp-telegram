@@ -101,10 +101,13 @@ explicitly cleared fields have different semantics. Preserve original evidence
 times and protect newer events from older in-flight acquisitions.
 
 Profile reads and entity-name resolution project retained local facts without
-network acquisition, refresh admission or foreground waiting. Enabled personal
-dialog synchronization owns bounded, durable counterpart-profile collection,
-including the existing archived and hidden cohort. Delivered profile fields
-materialize canonically, with per-field ordering against older in-flight RPCs.
+network acquisition, refresh admission or foreground waiting. Bounded, durable
+counterpart-profile collection covers all local personal user/bot dialogs,
+including archived, hidden and history-disabled dialogs, plus peers known from
+retained private-message history; the authenticated account itself is excluded.
+Profile admission never changes message-history enrollment. Supported fields
+supplied by updates materialize canonically, with per-field ordering against
+older in-flight RPCs.
 Acquisition receipts still retain their separate authorization/reuse rules.
 
 History and bounded context use local projections regardless of sync lifecycle

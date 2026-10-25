@@ -60,6 +60,8 @@ class CollectionProgress:
 def collection_progress(
     page: ProfileCollectionPage, state: dict[str, object], summary: dict[str, object], previous: object
 ) -> CollectionProgress:
+    legacy = _retained_legacy_evidence(state)
+    summary.update(legacy)
     first_count = state.get("first_count", page.reported_count)
     summary["changed_during_scan"] = bool(state.get("changed_count")) or first_count != page.reported_count
     summary["diagnostics"] = tuple(cast(list[str], state.get("diagnostics", []))) + page.diagnostics
@@ -76,7 +78,11 @@ def collection_progress(
             summary,
             "pending",
             _retry_reason(stalled, bool(summary["changed_during_scan"])),
-            {"scan": int(cast(int, state.get("scan", 0))) + 1, "baseline": baseline},
+            {
+                "scan": int(cast(int, state.get("scan", 0))) + 1,
+                "baseline": baseline,
+                **legacy,
+            },
             True,
         )
     next_state = {
@@ -91,8 +97,13 @@ def collection_progress(
         "baseline": baseline,
         "metadata": summary["metadata"],
         "metadata_provenance": summary["metadata_provenance"],
+        **legacy,
     }
     return CollectionProgress(summary, "pending", None, next_state)
+
+
+def _retained_legacy_evidence(state: Mapping[str, object]) -> dict[str, object]:
+    return {"legacy_evidence": state["legacy_evidence"]} if "legacy_evidence" in state else {}
 
 
 def _collection_complete(page: ProfileCollectionPage, summary: Mapping[str, object], stalled: bool) -> bool:

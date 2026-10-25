@@ -223,17 +223,17 @@ async def test_rollback_does_not_annotate_bundle_or_lose_retry(database: sqlite3
 
 
 @pytest.mark.asyncio
-async def test_non_enrolled_user_and_other_owner_are_not_materialized(database: sqlite3.Connection) -> None:
+async def test_history_disabled_peer_is_materialized_but_other_owner_is_fenced(database: sqlite3.Connection) -> None:
     manager, client = _manager(database)
     with write_transaction(database):
         database.execute("UPDATE full_history_enrollment SET enabled=0 WHERE dialog_id=42")
-    await manager.on_raw_identity_or_notify(types.UpdateUserPhone(42, "ignored"))
-    assert "phone" not in _detail(database)
+    await manager.on_raw_identity_or_notify(types.UpdateUserPhone(42, "retained"))
+    assert _detail(database)["phone"] == "retained"
     with write_transaction(database):
         database.execute("UPDATE full_history_enrollment SET enabled=1 WHERE dialog_id=42")
         database.execute("UPDATE entity_details SET profile_owner_account_id=8 WHERE entity_id=42")
     await manager.on_raw_identity_or_notify(types.UpdateUserPhone(42, "ignored"))
-    assert "phone" not in _detail(database)
+    assert _detail(database)["phone"] == "retained"
     assert client.mock_calls == []
 
 

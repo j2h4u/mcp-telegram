@@ -68,7 +68,7 @@ def _constructor_schema(name: str) -> dict[str, object]:
 
 
 def _reachable_constructors() -> list[str]:
-    pending = ["User", "UserFull"]
+    pending = ["User", "UserFull", "SavedStarGift", "Chat", "ChatForbidden", "ChatEmpty", "Channel", "ChannelForbidden"]
     visited: set[str] = set()
     while pending:
         name = pending.pop()
@@ -162,3 +162,95 @@ def project_profile_fields(fields: Mapping[str, object]) -> dict[str, object]:
         for name, rule in _root_rules().items()
         if name in fields
     }
+
+
+COLLECTION_CONSTRUCTORS: dict[str, tuple[str, ...]] = {
+    "common_chats": ("Chat", "ChatForbidden", "ChatEmpty", "Channel", "ChannelForbidden"),
+    "avatar_history": ("Photo", "PhotoEmpty"),
+    "saved_music": ("Document", "DocumentEmpty"),
+    "saved_gifts": ("SavedStarGift",),
+    "current_stories": ("StoryItem", "StoryItemSkipped", "StoryItemDeleted"),
+    "pinned_stories": ("StoryItem", "StoryItemSkipped", "StoryItemDeleted"),
+}
+
+
+def collection_item_schema(section: str) -> dict[str, object]:
+    canonical = cast(dict[str, object], _field_schema(ProfileFieldRule(COLLECTION_CONSTRUCTORS[section])))
+    legacy = {"avatar_history": _LEGACY_PHOTO_SCHEMA, "common_chats": _LEGACY_CHAT_SCHEMA}.get(section)
+    return {"anyOf": [canonical, legacy]} if legacy is not None else canonical
+
+
+def project_collection_item(section: str, fields: Mapping[str, object]) -> object:
+    return _project_atom(dict(fields), ProfileFieldRule(COLLECTION_CONSTRUCTORS[section]), "snippet")
+
+
+def history_value_schema(change_key: str) -> dict[str, object]:
+    rule = _root_rules().get(change_key)
+    if rule is not None:
+        return cast(dict[str, object], _field_schema(rule))
+    if change_key in {"legacy.name", "legacy.username", "owner.saved_contact_name"}:
+        return cast(dict[str, object], _field_schema(ProfileFieldRule(("str",))))
+    if change_key.startswith("photo.") and change_key[6:] in {"current", "public", "personal", "fallback"}:
+        return {"anyOf": [cast(dict[str, object], _field_schema(_PHOTO_RULE)), _LEGACY_PHOTO_SCHEMA]}
+    if change_key.startswith("collection.") and change_key.split(".", 2)[1] in COLLECTION_CONSTRUCTORS:
+        return {"type": ["string", "null"]}
+    raise ValueError("Unsupported retained history key")
+
+
+_PHOTO_RULE = ProfileFieldRule(("UserProfilePhoto", "UserProfilePhotoEmpty", "Photo", "PhotoEmpty"))
+_LEGACY_PHOTO_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "photo_id": {"type": "integer"},
+        "date": {"type": ["string", "null"]},
+        "personal": {"type": "boolean"},
+    },
+    "required": ["photo_id"],
+    "additionalProperties": False,
+}
+
+
+_LEGACY_CHAT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "integer"},
+        "name": {"anyOf": [{"$ref": "#/$defs/telegram_content"}, {"type": "null"}]},
+        "username": {"anyOf": [{"$ref": "#/$defs/telegram_content"}, {"type": "null"}]},
+        "type": {"type": ["string", "null"]},
+    },
+    "required": ["id"],
+    "additionalProperties": False,
+}
+
+
+def project_legacy_collection_item(section: str, value: object) -> object:
+    if not isinstance(value, dict):
+        raise ValueError("Unsupported legacy collection value")
+    if section == "avatar_history" and type(value.get("photo_id")) is int:
+        return {key: value[key] for key in ("photo_id", "date") if key in value}
+    if section == "common_chats" and type(value.get("id")) is int:
+        return _project_legacy_chat(value)
+    raise ValueError("Unsupported legacy collection value")
+
+
+def _project_legacy_chat(value: dict[str, object]) -> dict[str, object]:
+    result: dict[str, object] = {key: value[key] for key in ("id", "type") if key in value}
+    for key in ("name", "username"):
+        if key in value:
+            text = value[key]
+            result[key] = telegram_content(text, "snippet") if isinstance(text, str) else None
+    return result
+
+
+def project_history_value(change_key: str, value: object) -> object:
+    history_value_schema(change_key)
+    if change_key.startswith("collection."):
+        return value
+    if change_key.startswith("photo."):
+        if isinstance(value, dict) and "constructor" not in value:
+            if set(value) - {"photo_id", "date", "personal"}:
+                raise ValueError("Unsupported legacy photo evidence")
+            return dict(value)
+        return _project_atom(value, _PHOTO_RULE, "snippet")
+    rule = _root_rules().get(change_key, ProfileFieldRule(("str",)))
+    return _project_field(value, rule, _CONTENT_KINDS.get(change_key, "snippet"))

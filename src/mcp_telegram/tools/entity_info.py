@@ -9,11 +9,13 @@ import asyncio
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Literal, TypedDict, cast
 
 import phonenumbers
 from pydantic import ConfigDict, Field, StrictInt, model_validator
 
 from ..daemon_client import ENTITY_PROFILE_ENDPOINT_TIMEOUT_CAP_SECONDS
+from ..entity_profile.read_schema import profile_read_schemas
 from ..errors import (
     entity_not_found_text,
     fetch_entity_info_error_text,
@@ -120,6 +122,12 @@ GET_ENTITY_INFO_OUTPUT_SCHEMA = {
     ],
     "additionalProperties": True,
 }
+
+
+_PROFILE_PROPERTIES, _PROFILE_DEFINITIONS = profile_read_schemas()
+cast(dict[str, object], GET_ENTITY_INFO_OUTPUT_SCHEMA["properties"]).update(_PROFILE_PROPERTIES)
+GET_ENTITY_INFO_OUTPUT_SCHEMA["$defs"] = _PROFILE_DEFINITIONS
+GET_ENTITY_INFO_OUTPUT_SCHEMA["additionalProperties"] = False
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +237,7 @@ def _common_structured(data: dict, *, entity_id: int) -> dict[str, object]:
         "username": data.get("username"),
         "about": _content_field("common.about", about, "about") if about else None,
         "my_membership": data.get("my_membership") or {},
-        "avatar_count": data.get("avatar_count") or len(data.get("avatar_history") or []),
+        "avatar_count": data.get("avatar_count"),
     }
 
 
@@ -649,6 +657,7 @@ def _entity_structured_content(
         "warnings": _entity_warnings(data),
         "content_fields": _content_fields(data),
         "dialog_placement": _dialog_placement_structured(data.get("dialog_placement")),
+        **{key: data[key] for key in ("semantic", "collections", "history_coverage", "page") if key in data},
     }
 
 
@@ -795,8 +804,11 @@ class GetEntityInfo(ToolArgs):
                         it migrated to, if any), invite_link,
                         contacts_subscribed.
 
-    Avatar history (`avatar_history`) returns photo_id + date metadata only —
-    no download capability. The `type` field tells you which kind was
+    Optional section/cursor/limit selects bounded retained collection or observed
+    history pages. No section returns scalar facts and collection progress.
+    Field observation age is separate from acquisition age and coverage.
+    Photo dates describe uploads; change bounds describe local observations,
+    not action dates or actors. Avatar history contains metadata only; no download capability. The `type` field tells you which kind was
     resolved; non-applicable per-type fields are simply absent.
     Resolves the name via fuzzy match — returns candidates if ambiguous.
     Provide either `entity` for fuzzy/name lookup or `exact_entity_id` for a
@@ -816,6 +828,21 @@ class GetEntityInfo(ToolArgs):
         max_length=500,
         description="Natural name or handle for fuzzy resolution. Mutually exclusive with exact_entity_id.",
     )
+    section: (
+        Literal[
+            "common_chats",
+            "avatar_history",
+            "saved_music",
+            "saved_gifts",
+            "current_stories",
+            "pinned_stories",
+            "history",
+        ]
+        | None
+    ) = None
+    cursor: str | None = Field(default=None, max_length=4000)
+    limit: int = Field(default=50, ge=1, le=100)
+
     exact_entity_id: StrictInt | None = Field(
         default=None,
         description="Exact numeric Telegram entity id for direct lookup. Mutually exclusive with entity.",
@@ -823,6 +850,8 @@ class GetEntityInfo(ToolArgs):
 
     @model_validator(mode="after")
     def _validate_entity_selector(self) -> GetEntityInfo:
+        if self.cursor is not None and self.section is None:
+            raise ValueError("A cursor requires a selected section.")
         if self.entity is None and self.exact_entity_id is None:
             raise ValueError("Provide either entity or exact_entity_id.")
         if self.entity is not None and self.exact_entity_id is not None:
@@ -873,6 +902,15 @@ async def get_entity_info(args: GetEntityInfo) -> ToolResult:
         )
 
 
+_DEFAULT_PROFILE_LIMIT = 50
+
+
+class _ProfileRequest(TypedDict, total=False):
+    section: str
+    cursor: str
+    limit: int
+
+
 async def _get_entity_info_within_budget(args: GetEntityInfo) -> ToolResult:
     resolved = await _get_entity_lookup(args)
     if isinstance(resolved, ToolResult):
@@ -881,7 +919,14 @@ async def _get_entity_info_within_budget(args: GetEntityInfo) -> ToolResult:
 
     try:
         async with _bounded_daemon_connection() as conn:
-            response = await conn.get_entity_info(entity_id=lookup.entity_id)
+            request: _ProfileRequest = {}
+            if args.section is not None:
+                request["section"] = args.section
+            if args.cursor is not None:
+                request["cursor"] = args.cursor
+            if args.limit != _DEFAULT_PROFILE_LIMIT:
+                request["limit"] = args.limit
+            response = await conn.get_entity_info(entity_id=lookup.entity_id, **request)
     except DaemonNotRunningError as exc:
         return error_result(_daemon_not_running_text(exc), error_code=f"daemon_{exc.kind}")
 

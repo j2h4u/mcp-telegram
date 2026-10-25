@@ -226,6 +226,20 @@ def normalize_output_schema(schema: dict[str, object] | None) -> dict[str, objec
     return normalized
 
 
+def _registered_output_schema(name: str, schema: dict[str, object] | None) -> dict[str, object] | None:
+    temporal = normalize_temporal_output_schema(schema)
+    normalized = normalize_output_schema(temporal)
+    if name == "get_entity_info" and normalized is not None and temporal is not None:
+        properties = t.cast(dict[str, object], normalized["properties"])
+        original = t.cast(dict[str, object], temporal["properties"])
+        for key in ("semantic", "page"):
+            if key in original:
+                properties[key] = deepcopy(original[key])
+        if "$defs" in temporal:
+            normalized["$defs"] = deepcopy(temporal["$defs"])
+    return _protection_output_schema(normalized)
+
+
 def _protection_output_schema(schema: dict[str, object] | None) -> dict[str, object] | None:
     if schema is None:
         return None
@@ -569,9 +583,7 @@ def mcp_tool(
             annotations=annotations,
             exported_name=exported_name,
             title=exported_title or cls.__name__,
-            output_schema=_protection_output_schema(
-                normalize_output_schema(normalize_temporal_output_schema(output_schema))
-            ),
+            output_schema=_registered_output_schema(exported_name, output_schema),
         )
         return wrapped
 

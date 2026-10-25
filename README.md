@@ -16,9 +16,12 @@ Observation age and incomplete coverage describe what is known; they do not
 make previously collected information disappear. Confirmed changes, deletions
 and account/privacy boundaries retain their normal meaning.
 
-Profile reads use local observations; enabled personal-dialog synchronization
-also collects counterpart profiles in the background and applies delivered
-profile updates. Never-collected sections remain explicitly partial.
+Profile reads use local observations. Background profile collection covers all
+local personal user/bot dialogs, including archived and history-disabled dialogs,
+plus peers known from retained private-message history, excluding the account
+itself. Profile admission never changes message-history enrollment. Supported
+fields supplied by updates persist locally; unfinished sections remain explicitly
+partial.
 
 History, bounded context and topic reads also project retained local facts,
 including partially synchronized or disabled dialogs. Missing data does not
@@ -118,6 +121,16 @@ and Telegram-originated content.
 | `get_usage_stats` | Summarize local MCP tool telemetry for the last 30 days. |
 | `get_dialog_stats` | Show dialog-level reaction, mention, hashtag, and forward statistics. |
 | `submit_feedback` | Write agent feedback into the local operator queue. |
+
+`get_entity_info` projects retained supported User/UserFull nested facts, exact
+notes, metadata and observed profile changes. Its `section`, `cursor` and `limit`
+arguments page local `avatar_history`, `common_chats`, `saved_music`, `saved_gifts`,
+`current_stories`, `pinned_stories` or `history` rows (`limit` defaults to 50,
+maximum 100), without contacting or waiting for Telegram or changing history
+enrollment. Facts, coverage, observation age and acquisition progress remain
+separate, so pending or unavailable sections do not erase known values. Past
+unobserved names and change times remain unknown; `Photo.date` is upload/creation
+time, not when a photo became an avatar.
 
 ## Common Agent Workflows
 
@@ -496,14 +509,16 @@ See [the architecture proposal](docs/architecture-proposal.md) and the
   file on this machine. `deploy/docker-compose.yml` is the repository template;
   the deployed file can have local-only values such as the absolute repository
   path and extra Docker networks.
-- Runtime state location is explicit in `config.toml`: `/srv/mcp-telegram/database`.
-  The Docker container mounts the same host directory at the same path.
-- The live Telegram mirror is `/srv/mcp-telegram/database/sync.db` on the
+- Runtime state location is explicit in `config.toml`: on this machine it is
+  `/var/lib/mcp-telegram/database`. The Docker container mounts the same host
+  directory at the same path. Deploy templates default to
+  `/srv/mcp-telegram/database`.
+- The live Telegram mirror is `/var/lib/mcp-telegram/database/sync.db` on the
   host and inside the container. Its
   `sync.db-wal` and `sync.db-shm` siblings are normal SQLite WAL-mode sidecar
   files, not separate databases.
 - `feedback.db` in the same directory stores agent-submitted feedback.
-- `/srv/mcp-telegram/database/mcp_telegram_session.session` is the active
+- `/var/lib/mcp-telegram/database/mcp_telegram_session.session` is the active
   Telegram session file and must be treated like an account credential.
 - Files under `/opt/docker/mcp-telegram/backups/` are point-in-time operator
   backups. They are not mounted into the running container and may be smaller or

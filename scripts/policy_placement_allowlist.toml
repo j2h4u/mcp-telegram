@@ -491,3 +491,38 @@ rationale = "Reviewed export Unix-socket response contract: 420 seconds covers t
 category = "policy_assignments"
 key = "src/mcp_telegram/message_fact_refresh.py:<module>:_REACTION_DISCOVERY_PAGE_SIZE"
 rationale = "Reviewed SQLite discovery work bound: at most 256 raw aggregate rows are examined before yielding; this is an adapter resource contract, not a scheduling interval."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon_client.py:<module>:DEFAULT_ENTITY_PROFILE_PAGE_LIMIT"
+rationale = "The default 50 is the bounded local get_entity_info response-page request contract, not operator scheduling policy."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/daemon_client.py:DaemonConnection.get_entity_info:limit"
+rationale = "The default 50 preserves the local profile-page request contract; explicit per-call limits remain bounded by the API."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/entity_profile/reader.py:<module>:_MAX_PAGE_SIZE"
+rationale = "The maximum 100 bounds local profile response pages; it does not configure acquisition cadence or receipt reuse."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/tools/entity_info.py:<module>:_DEFAULT_PROFILE_LIMIT"
+rationale = "The default 50 is the public local profile-page request contract, shared with the daemon client."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/entity_profile/collection_repository.py:CollectionProgress:retry"
+rationale = "False initializes result/control state describing whether this collection outcome needs retry; it is not retry scheduling policy."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/telegram_gateway.py:<module>:_PROFILE_PAGE_LIMIT"
+rationale = "This is the code-owned finite single-slice Telegram request and detail-ID bound, not a universal Telegram API maximum or polling policy."
+
+[[entry]]
+category = "policy_call_keywords"
+key = "src/mcp_telegram/entity_profile/repository.py:admit_profile_peer:section_ttl_seconds"
+rationale = "This queue-only repository adapter checks stored presence/status and enqueues sections; this path never evaluates receipt reuse or TTL. The constructor requires this otherwise inert argument."

@@ -93,7 +93,7 @@ from .dialog_identity import capture_identity_baseline, publish_dialog_identity
 from .dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation, ObservedText
 from .dialog_pin_observations import claim_pin_delta, claim_pin_snapshot, ordered_pin_overlay
 from .entity_profile.contracts import ProfileFieldObservation, SuppliedProfileUser
-from .entity_profile.repository import EntityProfileRepository
+from .entity_profile.repository import EntityProfileRepository, admit_profile_peer, personal_profile_peer
 from .entity_profile.updates import (
     ProfilePush,
     bundled_profile_users,
@@ -1118,6 +1118,37 @@ class EventHandlerManager:
                     published_at=int(message.date.timestamp()) if isinstance(message.date, datetime) else None,
                 )
 
+    async def _prepare_new_message_profile(
+        self, event: _NewMessageEvent, dialog_id: int, observed_at: int
+    ) -> tuple[int, _IdentityBaseline]:
+        """Admit supplied private-peer evidence before message-history policy."""
+
+        def reserve_observation(conn: sqlite3.Connection) -> tuple[int, _IdentityBaseline, bool]:
+            with write_savepoint(conn):
+                admitted = bool(
+                    self._self_id is not None
+                    and event.is_private
+                    and admit_profile_peer(
+                        conn,
+                        self._self_id,
+                        dialog_id,
+                        now=observed_at,
+                        pair_mode=self._profile_pair_mode,
+                    )
+                )
+                return (
+                    delivered_observation_order(conn),
+                    _IdentityBaseline(capture_identity_baseline(conn, dialog_id)),
+                    admitted,
+                )
+
+        observation_order, identity_baseline, admitted = await self._writer.run(reserve_observation)
+        if admitted:
+            self._offer(DemandKind.ENTITY_PROFILE_REFRESH)
+        if event.is_private and self._self_id is not None:
+            await self._persist_optional_dm_profile(getattr(event.message, "sender", None), dialog_id)
+        return observation_order, identity_baseline
+
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     @_acquisition(AcquisitionKind.ENTITY_LOOKUP)
     async def on_new_message(self, event: _NewMessageEvent) -> None:
@@ -1135,10 +1166,9 @@ class EventHandlerManager:
             reaction_observed_at = delivered_observed_at()
             msg = event.message
 
-            def reserve_observation(conn: sqlite3.Connection) -> tuple[int, _IdentityBaseline]:
-                return delivered_observation_order(conn), _IdentityBaseline(capture_identity_baseline(conn, dialog_id))
-
-            observation_order, identity_baseline = await self._writer.run(reserve_observation)
+            observation_order, identity_baseline = await self._prepare_new_message_profile(
+                event, dialog_id, reaction_observed_at
+            )
             coverage = await self._new_message_coverage(dialog_id, event, identity_baseline=identity_baseline)
             if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
                 return
@@ -2392,7 +2422,7 @@ class EventHandlerManager:
         pushes.append((update, project_profile_update(update)))
         with write_transaction(conn):
             for source, push in pushes:
-                if not self._eligible_profile_push(profiles, push):
+                if not self._eligible_profile_push(push):
                     continue
                 assert push is not None
                 observation = self._profile_push_observation(conn, source, push)
@@ -2461,9 +2491,11 @@ class EventHandlerManager:
             excluded.update(("username", "extra_usernames"))
         return _mask_profile_identity_fields(push, excluded)
 
-    def _eligible_profile_push(self, profiles: EntityProfileRepository, push: ProfilePush | None) -> bool:
+    def _eligible_profile_push(self, push: ProfilePush | None) -> bool:
         return (
-            push is not None and push.entity_id != self._self_id and profiles.is_history_profile_managed(push.entity_id)
+            push is not None
+            and self._self_id is not None
+            and personal_profile_peer(self._conn, self._self_id, push.entity_id)
         )
 
     def _profile_push_observation(
