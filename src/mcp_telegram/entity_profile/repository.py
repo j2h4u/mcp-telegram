@@ -36,6 +36,7 @@ from .collection_repository import (
     store_story_update,
 )
 from .contracts import (
+    CHANNEL_CONTACT_UNSUPPORTED_REASON,
     FULL_PROFILE_OWNED_FIELDS,
     FULL_USER_ENDPOINT,
     NORMALIZATION_VERSION,
@@ -1664,6 +1665,52 @@ class EntityProfileRepository:
             raise ValueError("invalid terminal section status")
         with write_savepoint(self._conn):
             return self._commit_section_in_transaction(cursor, commit, now=now)
+
+    def commit_unsupported_contact_overlap(
+        self, cursor: EntityRefreshCursor, commit: EntitySectionCommit, *, now: int
+    ) -> bool:
+        """Publish only a negative receipt; retained contact facts keep their age."""
+        evidence = commit.evidence
+        if (
+            (cursor.next_section, commit.status, commit.reason)
+            != ("contact_overlap", "unavailable", CHANNEL_CONTACT_UNSUPPORTED_REASON)
+            or evidence is None
+            or evidence.generation != cursor.generation
+            or evidence.outcome != "unavailable"
+        ):
+            return False
+        with write_savepoint(self._conn):
+            _detail, _observed, owner, _scope = self._read_primary_detail(cursor.entity_id)
+            if owner is None or owner != commit.observation_owner_account_id or not self._cursor_matches(cursor):
+                return False
+            self._write_unsupported_contact_receipt(cursor, evidence)
+            if self._advance_after_section_write(cursor, now=now, detail_revision=None) != 1:
+                raise sqlite3.OperationalError("unsupported contact cursor advance was rejected")
+            return True
+
+    def _write_unsupported_contact_receipt(
+        self, cursor: EntityRefreshCursor, evidence: ProfileAcquisitionEvidence
+    ) -> None:
+        require_write_transaction(self._conn)
+        columns = ["entity_id", "section", "status", "reason", "retry_at"]
+        values: list[object] = [
+            cursor.entity_id,
+            "contact_overlap",
+            "unavailable",
+            CHANNEL_CONTACT_UNSUPPORTED_REASON,
+            None,
+        ]
+        evidence_columns, evidence_values = self._section_evidence_values(evidence)
+        columns.extend(evidence_columns)
+        values.extend(evidence_values)
+        updates = ", ".join(
+            f"{column}=excluded.{column}" for column in columns if column not in {"entity_id", "section"}
+        )
+        self._conn.execute(
+            f"INSERT INTO entity_detail_sections({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)}) "
+            f"ON CONFLICT(entity_id, section) DO UPDATE SET {updates}",
+            values,
+        )
 
     def commit_section_with_pair_measurement(
         self,

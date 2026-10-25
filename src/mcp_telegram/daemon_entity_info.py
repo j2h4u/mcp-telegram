@@ -27,6 +27,8 @@ from .auth_scope import TelegramAuthScope
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_identity import capture_identity_baseline
 from .entity_profile.contracts import (
+    CHANNEL_CONTACT_UNSUPPORTED_REASON,
+    CHANNEL_CONTACT_UNSUPPORTED_RPC_CODE,
     CHANNEL_ID_MARKER,
     FULL_PROFILE_OWNED_FIELDS,
     FULL_USER_ENDPOINT,
@@ -36,6 +38,7 @@ from .entity_profile.contracts import (
     PERSONAL_CHANNEL_OWNED_FIELDS,
     PROFILE_COLLECTION_SECTIONS,
     PROFILE_SECTIONS,
+    ChannelContactOverlapObservation,
     ChannelProfileObservation,
     ChannelReference,
     ChatAvatarReference,
@@ -955,6 +958,10 @@ class DaemonEntityInfoService:
         *,
         now: int,
     ) -> bool:
+        if cursor.next_section == "contact_overlap" and result.reason == CHANNEL_CONTACT_UNSUPPORTED_REASON:
+            return await self._write_profiles(
+                lambda profiles: self._commit_unsupported_contact_overlap(profiles, cursor, result, context, now=now)
+            )
         actual_attempts = self._rpc_attempt_count() - context.attempt_start
         if context.pair_section and context.eligible_pair and context.pair_mode == "disabled":
             committed, summary = await self._write_profiles(
@@ -980,6 +987,22 @@ class DaemonEntityInfoService:
             actual_attempts=actual_attempts,
         )
         return committed
+
+    def _commit_unsupported_contact_overlap(
+        self,
+        profiles: EntityProfileRepository,
+        cursor: EntityRefreshCursor,
+        result: EntitySectionCommit,
+        context: _ProfileSectionContext,
+        *,
+        now: int,
+    ) -> bool:
+        if self._profile_scope_changed_during_acquisition(context.captured_scope):
+            profiles.mark_section_failure(
+                cursor, now=now, reason="auth_scope_changed", retry_at=scope_changed_retry_at(now)
+            )
+            return False
+        return profiles.commit_unsupported_contact_overlap(cursor, result, now=now)
 
     async def _publish_profile_linked_chat_fact(
         self,
@@ -1831,7 +1854,7 @@ class DaemonEntityInfoService:
         if section == "common_chats":
             return await self._acquire_common_chats(cursor.entity_id)
         if section == "contact_overlap":
-            return await self._acquire_contact_overlap(cursor.entity_id, entity_type)
+            return await self._acquire_contact_overlap(cursor, entity_type)
         if section == "avatar_history":
             return await self._acquire_avatar_history(cursor.entity_id, entity_type)
         if section == "personal_channel":
@@ -2130,13 +2153,13 @@ class DaemonEntityInfoService:
 
     async def _acquire_contact_overlap(
         self,
-        entity_id: int,
+        cursor: EntityRefreshCursor,
         entity_type: DialogType,
     ) -> EntitySectionCommit:
         if entity_type is DialogType.GROUP:
-            return await self._acquire_group_contact_overlap(entity_id)
+            return await self._acquire_group_contact_overlap(cursor.entity_id)
 
-        return await self._acquire_channel_contact_overlap(entity_id, entity_type)
+        return await self._acquire_channel_contact_overlap(cursor.entity_id, entity_type, generation=cursor.generation)
 
     async def _acquire_group_contact_overlap(self, entity_id: int) -> EntitySectionCommit:
         observation = await self._deps.group_profile_port.fetch_group_profile(entity_id)
@@ -2176,6 +2199,8 @@ class DaemonEntityInfoService:
         self,
         entity_id: int,
         entity_type: DialogType,
+        *,
+        generation: int,
     ) -> EntitySectionCommit:
         port = self._deps.channel_profile_port
         reference = self._deps.channel_reference_provider.get_channel_reference(entity_id)
@@ -2192,6 +2217,11 @@ class DaemonEntityInfoService:
         observation = await port.fetch_channel_contact_overlap(reference)
         if observation.channel_id != reference.channel_id:
             raise ValueError("channel contact overlap observation target does not match")
+        if (
+            observation.status is ProjectionStatus.UNAVAILABLE
+            and observation.reason == CHANNEL_CONTACT_UNSUPPORTED_REASON
+        ):
+            return self._unsupported_contact_overlap_commit(observation, generation=generation)
         reason = observation.reason
         if reason == "not_an_admin" and entity_type in {DialogType.SUPERGROUP, DialogType.FORUM}:
             reason = "hidden_by_admin"
@@ -2213,6 +2243,30 @@ class DaemonEntityInfoService:
                 "contacts_reason": reason,
             },
             payload=contacts,
+        )
+
+    @staticmethod
+    def _unsupported_contact_overlap_commit(
+        observation: ChannelContactOverlapObservation, *, generation: int
+    ) -> EntitySectionCommit:
+        if observation.observation_started_at is None or observation.observation_completed_at is None:
+            raise ValueError("unsupported contact outcome requires its actual observation bounds")
+        return EntitySectionCommit(
+            {},
+            status="unavailable",
+            reason=CHANNEL_CONTACT_UNSUPPORTED_REASON,
+            evidence=ProfileAcquisitionEvidence(
+                generation=generation,
+                outcome="unavailable",
+                provenance={
+                    "endpoint": observation.endpoint,
+                    "rpc_code": CHANNEL_CONTACT_UNSUPPORTED_RPC_CODE,
+                    "rpc_symbol": observation.reason,
+                },
+                normalization_version=observation.normalization_version,
+                observation_started_at=int(observation.observation_started_at),
+                observation_completed_at=int(observation.observation_completed_at),
+            ),
         )
 
     async def _acquire_avatar_history(
