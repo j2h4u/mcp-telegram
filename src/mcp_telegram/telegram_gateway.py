@@ -599,7 +599,6 @@ def _collection_page(
         next_cursor,
         terminal,
         diagnostics,
-        detail_ids=missing,
         metadata=_collection_metadata(section, result),
     )
 

@@ -65,7 +65,6 @@ def supplied_current_stories(merge: EffectiveProfileMerge) -> ProfileCollectionP
         merge.snapshot.observation,
         next_cursor=continuation,
         terminal=not missing,
-        detail_ids=tuple(missing),
         metadata={key: value[key] for key in ("max_read_id", "chat_notifications_enabled") if key in value},
     )
 

@@ -143,9 +143,9 @@ def test_reconcile_backfills_large_cohort_without_waiters_and_survives_restart(t
         assert count <= 32
         admitted += count
     assert admitted == 143  # 142 correspondents plus the examined self candidate.
-    assert repo.is_history_profile_managed(240)
+    assert conn.execute("SELECT 1 FROM entity_profile_refresh_state WHERE entity_id=240").fetchone() == (1,)
     assert conn.execute("SELECT 1 FROM entity_profile_refresh_state WHERE entity_id=300").fetchone() == (1,)
-    assert not repo.is_history_profile_managed(301)
+    assert conn.execute("SELECT 1 FROM entity_profile_refresh_state WHERE entity_id=301").fetchone() is None
     assert conn.execute("SELECT COUNT(*) FROM entity_details").fetchone() == (0,)
     assert conn.execute("SELECT COUNT(*) FROM entity_profile_refresh_state WHERE status='pending'").fetchone() == (142,)
     conn.close()
@@ -249,7 +249,6 @@ def test_unchanged_section_advances_without_renewing_observation(tmp_path: Path)
 def test_minimal_fixture_has_no_automatic_enrollment(tmp_path: Path) -> None:
     conn = sqlite3.connect(tmp_path / "minimal.sqlite")
     repo = EntityProfileRepository(conn, section_ttl_seconds=10)
-    assert not repo.is_history_profile_managed(42)
     assert repo.reconcile_history_profiles(now=100, limit=32, pair_mode="enabled", self_id=7) == 0
     conn.close()
 

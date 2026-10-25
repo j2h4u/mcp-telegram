@@ -83,7 +83,6 @@ DIALOG_IDENTITY_ROLE_FUNCTIONS: Mapping[str, Mapping[str, frozenset[str]]] = {
     },
     "event_handlers.py": {"EventHandlerManager._mark_channel_chat_update": frozenset({"type"})},
     "entity_profile/repository.py": {
-        "EntityProfileRepository.is_history_profile_managed": frozenset({"type"}),
         "personal_profile_peer": frozenset({"type"}),
         "_ensure_profile_private_identity": frozenset({"type", "name"}),
         "_profile_admission_candidates": frozenset({"type"}),

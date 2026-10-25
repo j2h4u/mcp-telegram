@@ -12,7 +12,6 @@ from dataclasses import dataclass
 
 from .contracts import ProfileFieldClass
 
-TL_PROFILE_LAYER = 229
 PARTIAL_PROFILE_CONSTRUCTORS = frozenset({"User", "StoryItem", "Channel", "Community", "PollResults"})
 
 

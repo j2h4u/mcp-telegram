@@ -453,19 +453,6 @@ class EntityProfileRepository:
             baseline,
         )
 
-    def is_history_profile_managed(self, entity_id: int) -> bool:
-        """Check durable private-dialog enrollment without visibility filtering."""
-        if not self._columns("full_history_enrollment") or not self._columns("dialogs"):
-            return False
-        return (
-            self._conn.execute(
-                "SELECT 1 FROM full_history_enrollment e JOIN dialogs d ON d.dialog_id=e.dialog_id "
-                "WHERE e.dialog_id=? AND e.enabled=1 AND d.type IN ('user','bot','User','Bot')",
-                (entity_id,),
-            ).fetchone()
-            is not None
-        )
-
     def reconcile_history_profiles(self, *, now: int, limit: int, pair_mode: str, self_id: int | None) -> int:
         """Advance the finite personal-peer admission checkpoint."""
         if isinstance(limit, bool) or limit < 1:
@@ -3412,15 +3399,6 @@ def _combine_identity_patches(
     if second:
         combined.update(second)
     return combined
-
-
-def _next_profile_section(section: str) -> str | None:
-    try:
-        index = PROFILE_SECTIONS.index(section)
-    except ValueError:
-        return PROFILE_SECTIONS[0]
-    next_index = index + 1
-    return PROFILE_SECTIONS[next_index] if next_index < len(PROFILE_SECTIONS) else None
 
 
 def _optional_text(value: object) -> str | None:

@@ -26,28 +26,6 @@ PROFILE_SECTIONS: tuple[str, ...] = (
     "pinned_stories",
 )
 
-PROFILE_SECTION_MAINTENANCE: Mapping[str, tuple[str, ...]] = {
-    "full_profile": ("supplied_fields", "explicit_user_invalidation", "bot_version_or_photo_invalidation"),
-    "personal_channel": ("full_user_summary", "explicit_user_invalidation"),
-    "avatar_history": ("current_photo_invalidation", "explicit_user_invalidation", "last_collected_snapshot"),
-    "common_chats": ("full_user_summary_invalidation", "explicit_user_invalidation", "last_collected_snapshot"),
-    "contact_overlap": ("last_collected_snapshot",),
-    "saved_music": ("full_user_summary_invalidation", "explicit_user_invalidation", "last_collected_snapshot"),
-    "saved_gifts": ("full_user_summary_invalidation", "explicit_user_invalidation", "last_collected_snapshot"),
-    "current_stories": (
-        "supplied_peer_stories",
-        "supplied_story_facts",
-        "story_invalidation",
-        "explicit_user_invalidation",
-    ),
-    "pinned_stories": (
-        "supplied_story_facts",
-        "story_invalidation",
-        "explicit_user_invalidation",
-        "last_collected_snapshot",
-    ),
-}
-
 PROFILE_COLLECTION_SECTIONS = frozenset(
     {"avatar_history", "common_chats", "saved_music", "saved_gifts", "current_stories", "pinned_stories"}
 )
@@ -179,7 +157,6 @@ class ProfileCollectionPage:
     terminal: bool = False
     diagnostics: tuple[str, ...] = ()
     reason: str | None = None
-    detail_ids: tuple[int, ...] = ()
     metadata: Mapping[str, object] = field(default_factory=dict)
     supplied_user: SuppliedProfileUser | None = None
     sidecar_identities: tuple[DialogIdentityObservation, ...] = ()

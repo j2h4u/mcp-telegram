@@ -24,7 +24,7 @@ from mcp_telegram.entity_profile.contracts import (
     ProfileFieldState,
     ProfileSemanticSnapshot,
 )
-from mcp_telegram.entity_profile.field_manifest import PROFILE_FIELD_MANIFEST, TL_PROFILE_LAYER
+from mcp_telegram.entity_profile.field_manifest import PROFILE_FIELD_MANIFEST
 from mcp_telegram.entity_profile.full_user_normalization import normalize_full_user_response
 from mcp_telegram.entity_profile.repository import _apply_identity_patch
 from mcp_telegram.entity_profile.semantic_normalization import normalize_semantic_profile
@@ -79,7 +79,7 @@ def _schema_value_types(annotation: object) -> set[str]:
 
 
 def test_manifest_exhaustively_matches_installed_recursive_schema() -> None:
-    assert alltlobjects.LAYER == TL_PROFILE_LAYER == 229
+    assert alltlobjects.LAYER == 229
     queue = deque([types.User, types.UserFull, types.UserEmpty, types.SavedStarGift])
     actual: dict[str, set[str]] = {}
     while queue:
