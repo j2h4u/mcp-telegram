@@ -884,7 +884,7 @@ async def test_progressive_contact_permission_reason_depends_on_entity_type(
         ),
     )
     try:
-        commit = await service._acquire_channel_contact_overlap(-10046, entity_type)
+        commit = await service._acquire_channel_contact_overlap(-10046, entity_type, generation=1)
         assert commit.status == "unavailable"
         assert commit.reason == expected_reason
         assert commit.detail_patch["contacts_reason"] == expected_reason

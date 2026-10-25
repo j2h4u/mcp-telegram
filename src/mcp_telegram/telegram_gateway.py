@@ -9,7 +9,7 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Protocol, cast
 
-from telethon.errors import ChatAdminRequiredError  # type: ignore[import-untyped]
+from telethon.errors import ChatAdminRequiredError, RPCError  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
 from telethon.tl.functions.channels import (  # type: ignore[import-untyped]
     GetFullChannelRequest,
@@ -40,6 +40,8 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .entity_profile.contracts import (
+    CHANNEL_CONTACT_UNSUPPORTED_REASON,
+    CHANNEL_CONTACT_UNSUPPORTED_RPC_CODE,
     CHANNEL_ID_MARKER,
     ChannelContactOverlapObservation,
     ChannelProfileObservation,
@@ -78,7 +80,7 @@ from .flood import TelegramRpcThrottled, _raise_if_latched
 from .identity_observation import USERNAME_UNOBSERVED, observe_username
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_reading import GatewayFailure, GatewayFailureKind
-from .telegram_rpc_error import is_reaction_detail_terminal_rpc_error
+from .telegram_rpc_error import describe_telegram_rpc_error, is_reaction_detail_terminal_rpc_error
 from .telegram_rpc_scheduler import RpcAdmissionClosedError, RpcAdmissionError, UnclassifiedTelegramRpcError
 from .telethon_dialog import classify_dialog_type, observe_dialog_identity
 
@@ -204,6 +206,21 @@ class TelethonChannelProfileGateway(ChannelProfilePort):
                 reason="not_an_admin",
                 observation_started_at=started_at,
                 observation_completed_at=completed_at,
+            )
+        except RPCError as exc:
+            descriptor = describe_telegram_rpc_error(exc)
+            if (
+                descriptor.code != CHANNEL_CONTACT_UNSUPPORTED_RPC_CODE
+                or descriptor.symbol != CHANNEL_CONTACT_UNSUPPORTED_REASON
+            ):
+                raise
+            return ChannelContactOverlapObservation(
+                channel_id=channel_id,
+                contact_ids=None,
+                status=ProjectionStatus.UNAVAILABLE,
+                reason=CHANNEL_CONTACT_UNSUPPORTED_REASON,
+                observation_started_at=started_at,
+                observation_completed_at=self._now_provider(),
             )
         return ChannelContactOverlapObservation(
             channel_id=channel_id,
