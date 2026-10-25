@@ -96,6 +96,7 @@ from .telegram_demand import (
 )
 from .telegram_rpc import raise_if_flood_wait_error
 from .telegram_rpc_consumers import DemandKind
+from .telegram_rpc_error import describe_telegram_rpc_error
 from .telegram_rpc_scheduler import current_rpc_scope
 from .telethon_dialog import classify_dialog_type, observe_dialog_identity
 
@@ -105,6 +106,20 @@ class _LinkedChatFactCaptureUnavailable:
 
 
 _LINKED_CHAT_FACT_CAPTURE_UNAVAILABLE = _LinkedChatFactCaptureUnavailable()
+
+
+def _contact_rpc_error(section: str, exc: BaseException) -> bool:
+    return section == "contact_overlap" and isinstance(exc, RPCError)
+
+
+def _profile_section_failure_reason(section: str, exc: BaseException) -> str:
+    fallback = type(exc).__name__.lower()
+    if not _contact_rpc_error(section, exc):
+        return fallback
+    descriptor = describe_telegram_rpc_error(exc)
+    if descriptor.symbol is None or descriptor.code is None:
+        return fallback
+    return f"{descriptor.error_type.lower()}:{descriptor.code}:{descriptor.symbol}"
 
 
 def _raw_linked_chat_channel_id(canonical_id: int | None) -> int | None:
@@ -864,9 +879,10 @@ class DaemonEntityInfoService:
                     entity_type=entity_type,
                     context=context,
                     now=now,
-                    reason=type(exc).__name__.lower(),
+                    reason=_profile_section_failure_reason(cursor.next_section, exc),
                     retry_at=failure_retry_at(now),
-                )
+                ),
+                guard_scope=_contact_rpc_error(cursor.next_section, exc),
             )
         if self._profile_scope_changed_during_acquisition(context.captured_scope):
             await self._write_profiles(
@@ -898,14 +914,11 @@ class DaemonEntityInfoService:
             eligible_pair=cursor.pair_eligible and entity_type in {DialogType.USER, DialogType.BOT},
         )
 
-    async def _handle_profile_section_failure(self, failure: _ProfileSectionFailure) -> DurableRefreshTerminal | None:
+    async def _handle_profile_section_failure(
+        self, failure: _ProfileSectionFailure, *, guard_scope: bool = False
+    ) -> DurableRefreshTerminal | None:
         failed = await self._write_profiles(
-            lambda profiles: profiles.mark_section_failure(
-                failure.cursor,
-                now=failure.now,
-                reason=failure.reason,
-                retry_at=failure.retry_at,
-            )
+            lambda profiles: self._persist_profile_section_failure(profiles, failure, guard_scope=guard_scope)
         )
         actual_attempts = self._rpc_attempt_count() - failure.context.attempt_start
         if failure.context.pair_section and failure.context.eligible_pair and failure.context.pair_mode == "disabled":
@@ -918,6 +931,17 @@ class DaemonEntityInfoService:
             )
         self._observe_profile_section_failure(failure.cursor, failure.entity_type, actual_attempts=actual_attempts)
         return DurableRefreshTerminal.FAILURE if failed else None
+
+    def _persist_profile_section_failure(
+        self, profiles: EntityProfileRepository, failure: _ProfileSectionFailure, *, guard_scope: bool
+    ) -> bool:
+        changed = guard_scope and self._profile_scope_changed_during_acquisition(failure.context.captured_scope)
+        return profiles.mark_section_failure(
+            failure.cursor,
+            now=failure.now,
+            reason="auth_scope_changed" if changed else failure.reason,
+            retry_at=scope_changed_retry_at(failure.now) if changed else failure.retry_at,
+        )
 
     def _profile_scope_changed_during_acquisition(self, captured_scope: TelegramAuthScope | None) -> bool:
         return self._deps.full_user_auth_scope is not None and captured_scope != self._capture_pair_scope()
