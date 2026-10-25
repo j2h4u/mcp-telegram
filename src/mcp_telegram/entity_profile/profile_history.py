@@ -1,7 +1,8 @@
 """Observed meaningful changes, appended only after canonical merge acceptance.
 
 The canonical caller owns account/order/authority fences and baseline comparison.
-This module never acquires data, changes current facts, infers actors, or commits.
+Inputs are capability-free canonical facts from the normalizer. This module
+never acquires data, changes current facts, infers actors, or commits.
 """
 
 import json
@@ -18,6 +19,7 @@ _PROFILE_ROOTS = frozenset(
     {
         "user.first_name",
         "user.last_name",
+        "user.phone",
         "user.username",
         "user.usernames",
         "user.deleted",
@@ -41,6 +43,8 @@ _PROFILE_ROOTS = frozenset(
         "full_user.business_work_hours",
         "full_user.business_location",
         "full_user.business_intro",
+        "full_user.business_greeting_message",
+        "full_user.business_away_message",
         "full_user.bot_info",
         "full_user.personal_channel_id",
         "full_user.personal_channel_message",
@@ -65,34 +69,6 @@ _PHOTO_ROOTS = {
 }
 _COLLECTIONS = frozenset(
     {"avatar_history", "common_chats", "saved_music", "saved_gifts", "current_stories", "pinned_stories"}
-)
-_CURRENT_ONLY = frozenset(
-    {
-        "expires",
-        "until",
-        "was_online",
-        "status",
-        "online",
-        "last_seen",
-        "views",
-        "views_count",
-        "read_count",
-        "view_count",
-        "read_date",
-        "view_date",
-        "date",
-        "notify_settings",
-        "coverage",
-        "access_hash",
-        "file_reference",
-        "dc_id",
-        "bot_active_users",
-        "participants_count",
-        "unread_count",
-        "reactions_count",
-        "forwards_count",
-        "recent_viewers",
-    }
 )
 _MISSING = object()
 
@@ -142,11 +118,10 @@ def _history_root(path: str) -> str | None:
     return next((root for root in _PROFILE_ROOTS | _OWNER_ROOTS | _PHOTO_ROOTS.keys() if _under(path, root)), None)
 
 
-def _semantic_value(value: object) -> object:
-    if isinstance(value, Mapping):
-        return {str(key): _semantic_value(item) for key, item in value.items() if key not in _CURRENT_ONLY}
-    if isinstance(value, (list, tuple)):
-        return [_semantic_value(item) for item in value]
+def _history_value(root: str, value: object) -> object:
+    # Expiry is volatile only at this concrete status path; nested dates may be content.
+    if root == "user.emoji_status" and isinstance(value, Mapping):
+        return {str(key): item for key, item in value.items() if key != "until"}
     return value
 
 
@@ -182,7 +157,7 @@ def _profile_change(merge: ProfileHistoryMerge, root: str) -> tuple[str, str, ob
         category = "private_owner" if _personal_photo(root, merge.before[root], merge.after[root]) else "profile"
         key = f"photo.{_PHOTO_ROOTS[root]}"
     else:
-        before, after = _semantic_value(before), _semantic_value(after)
+        before, after = _history_value(root, before), _history_value(root, after)
         category = "private_owner" if root in _OWNER_ROOTS else "profile"
         key = root
     return (key, category, before, after) if _different_values(merge, root, before, after) else None

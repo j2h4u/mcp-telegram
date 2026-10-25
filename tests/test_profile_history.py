@@ -113,7 +113,7 @@ def test_volatile_unknown_and_internal_paths_are_current_only(db: sqlite3.Connec
     assert not rows(db)
 
 
-def test_emoji_expiry_technical_nested_fields_and_metadata_are_not_edits(db: sqlite3.Connection) -> None:
+def test_emoji_expiry_is_current_only_but_substantive_price_is_an_edit(db: sqlite3.Connection) -> None:
     value = merge("user.emoji_status", {"document_id": 9, "until": 10}, {"document_id": 9, "until": 20})
     with write_transaction(db):
         assert append_profile_history(db, replace(value, accepted_paths=frozenset({"user.emoji_status.until"}))) == 0
@@ -242,11 +242,11 @@ def test_comparable_legacy_photo_requires_explicit_role_and_identity(db: sqlite3
     assert len(rows(db)) == 1
 
 
-def test_explicit_clear_and_capability_exclusion_inside_meaningful_value(db: sqlite3.Connection) -> None:
-    value = merge("full_user.business_intro", {"title": "old", "sticker": {"id": 9, "access_hash": 5}}, None)
+def test_explicit_clear_preserves_meaningful_nested_metadata(db: sqlite3.Connection) -> None:
+    value = merge("full_user.business_intro", {"title": "old", "sticker": {"id": 9, "date": 5}}, None)
     with write_transaction(db):
         assert append_profile_history(db, value) == 1
-    assert json.loads(cast(str, rows(db)[0][5])) == {"title": "old", "sticker": {"id": 9}}
+    assert json.loads(cast(str, rows(db)[0][5])) == {"title": "old", "sticker": {"id": 9, "date": 5}}
     assert json.loads(cast(str, rows(db)[0][6])) is None
 
 
@@ -329,3 +329,76 @@ def test_photo_empty_placeholder_requires_explicit_clear_authority(db: sqlite3.C
         (8, None),
         (None, 9),
     ]
+
+
+def test_note_formatted_date_only_change_preserves_all_entity_fields(db: sqlite3.Connection) -> None:
+    before = {
+        "constructor": "TextWithEntities",
+        "text": " \tdate😀\n",
+        "entities": [
+            {
+                "constructor": "MessageEntityFormattedDate",
+                "offset": 2,
+                "length": 6,
+                "date": 1767225600,
+                "relative": True,
+                "short_date": True,
+                "long_time": False,
+            },
+        ],
+    }
+    after = {
+        "constructor": "TextWithEntities",
+        "text": " \tdate😀\n",
+        "entities": [
+            {
+                "constructor": "MessageEntityFormattedDate",
+                "offset": 2,
+                "length": 6,
+                "date": 1798761600,
+                "relative": True,
+                "short_date": True,
+                "long_time": False,
+            },
+        ],
+    }
+    value = replace(
+        merge("full_user.note", before, after), accepted_paths=frozenset({"full_user.note.entities[0].date"})
+    )
+    with write_transaction(db):
+        assert append_profile_history(db, value) == 1
+    row = rows(db)[0]
+    assert row[3:5] == ("full_user.note", "private_owner")
+    assert json.loads(cast(str, row[5])) == before
+    assert json.loads(cast(str, row[6])) == after
+
+
+@pytest.mark.parametrize(
+    ("path", "before", "after"),
+    [
+        ("user.phone", "123", "456"),
+        (
+            "full_user.business_greeting_message",
+            {"shortcut_id": 1, "recipients": {"users": [3]}},
+            {"shortcut_id": 2, "recipients": {"users": [3]}},
+        ),
+        (
+            "full_user.business_away_message",
+            {"schedule": {"constructor": "BusinessAwayMessageScheduleCustom", "start_date": 10, "end_date": 20}},
+            {"schedule": {"constructor": "BusinessAwayMessageScheduleCustom", "start_date": 30, "end_date": 40}},
+        ),
+    ],
+)
+def test_stable_contact_and_business_facts_have_observed_history(
+    db: sqlite3.Connection,
+    path: str,
+    before: object,
+    after: object,
+) -> None:
+    with write_transaction(db):
+        assert append_profile_history(db, merge(path, before, after)) == 1
+    row = rows(db)[0]
+    # Profile category is not an assertion about who acted or phonebook acquisition.
+    assert row[3:5] == (path, "profile")
+    assert json.loads(cast(str, row[5])) == before
+    assert json.loads(cast(str, row[6])) == after
