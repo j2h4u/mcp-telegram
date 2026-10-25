@@ -92,7 +92,7 @@ from .dialog_fact_observations import claim_dialog_fact
 from .dialog_identity import capture_identity_baseline, publish_dialog_identity
 from .dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation, ObservedText
 from .dialog_pin_observations import claim_pin_delta, claim_pin_snapshot, ordered_pin_overlay
-from .entity_profile.contracts import ProfileFieldObservation
+from .entity_profile.contracts import ProfileFieldObservation, SuppliedProfileUser
 from .entity_profile.repository import EntityProfileRepository
 from .entity_profile.updates import (
     ProfilePush,
@@ -2343,15 +2343,19 @@ class EventHandlerManager:
         push: ProfilePush,
         observation: ProfileFieldObservation,
     ) -> frozenset[str]:
-        fields = dict(push.fields)
-        photo = fields.pop("current_photo", None) if push.authoritative_photo else None
-        changed = profiles.apply_profile_update(push.entity_id, fields, observation=observation)
-        if push.authoritative_photo and "current_photo" in push.fields:
-            changed |= profiles.apply_profile_update(
+        changed = profiles.apply_supplied_user(
+            SuppliedProfileUser(
                 push.entity_id,
-                {"current_photo": photo},
-                observation=replace(observation, source="update"),
-            )
+                push.semantic_fields,
+                push.semantic_coverage,
+                push.fields,
+                push.minimal,
+                push.authoritative_photo,
+            ),
+            observation=observation,
+        )
+        if push.story is not None:
+            changed |= profiles.apply_story_update(push.entity_id, push.story, observation=observation)
         return changed
 
     def _write_profile_pushes(
@@ -2362,8 +2366,8 @@ class EventHandlerManager:
             return False, False, False
         profiles = EntityProfileRepository(conn, section_ttl_seconds=self._profile_detail_ttl_seconds)
         annotations: list[tuple[object, ProfileFieldObservation]] = []
-        offered = False
         handled_name = False
+        invalidations: dict[int, tuple[set[str], ProfileFieldObservation, bool]] = {}
         pushes = [(user, project_user_profile(user)) for user in users]
         pushes.append((update, project_profile_update(update)))
         with write_transaction(conn):
@@ -2376,16 +2380,50 @@ class EventHandlerManager:
                 changed = self._apply_profile_push(profiles, push, observation)
                 sections = self._profile_push_sections(source, changed)
                 if sections:
-                    offered |= profiles.request_section_refresh(
-                        push.entity_id, sections, now=observation.observed_at, pair_mode=self._profile_pair_mode
+                    self._coalesce_profile_invalidation(
+                        invalidations, push.entity_id, sections, observation, isinstance(source, UpdateUser)
                     )
                 handled_name |= source is update and isinstance(update, UpdateUserName)
                 annotations.append((source, observation))
+            offered = self._flush_profile_invalidations(profiles, invalidations)
             topics_changed = self._write_topic_capabilities(conn, topic_entities, annotations)
         # Object lifetime, not an evictable cache: a repeated bundle keeps its original order.
         for source, observation in annotations:
             mark_push_applied(source, self._profile_push_owner, observation)
         return offered, handled_name, topics_changed
+
+    def _flush_profile_invalidations(
+        self,
+        profiles: EntityProfileRepository,
+        invalidations: dict[int, tuple[set[str], ProfileFieldObservation, bool]],
+    ) -> bool:
+        offered = False
+        for entity_id, (sections, observation, whole_peer) in invalidations.items():
+            offered |= profiles.invalidate_profile_sections(
+                entity_id,
+                tuple(sorted(sections)),
+                observation=observation,
+                reason="user" if whole_peer else "supplied:" + ",".join(sorted(sections)),
+                pair_mode=self._profile_pair_mode,
+            )
+        return offered
+
+    @staticmethod
+    def _coalesce_profile_invalidation(
+        pending: dict[int, tuple[set[str], ProfileFieldObservation, bool]],
+        entity_id: int,
+        sections: tuple[str, ...],
+        observation: ProfileFieldObservation,
+        whole_peer: bool,
+    ) -> None:
+        previous = pending.get(entity_id)
+        combined = set(sections)
+        if previous is not None:
+            combined.update(previous[0])
+            whole_peer |= previous[2]
+            if previous[1].order > observation.order:
+                observation = previous[1]
+        pending[entity_id] = combined, observation, whole_peer
 
     @staticmethod
     def _filter_retained_profile_identity(
@@ -2420,12 +2458,27 @@ class EventHandlerManager:
         )
 
     def _profile_push_sections(self, source: object, changed: frozenset[str]) -> tuple[str, ...]:
-        sections: list[str] = []
-        if isinstance(source, UpdateUser) and push_marker(source, self._profile_push_owner) is None:
-            sections.extend(("full_profile", "personal_channel"))
-        if "current_photo" in changed:
-            sections.append("avatar_history")
-        return tuple(sections)
+        if isinstance(source, UpdateUser):
+            return (
+                "full_profile",
+                "personal_channel",
+                "avatar_history",
+                "common_chats",
+                "saved_music",
+                "saved_gifts",
+                "current_stories",
+                "pinned_stories",
+            )
+        if type(source).__name__ == "UpdateStory":
+            return tuple(sorted(changed & {"current_stories", "pinned_stories"}))
+        sections: set[str] = set()
+        if "current_photo" in changed or "photo" in changed:
+            sections.update(("avatar_history", "full_profile"))
+        if "bot_info_version" in changed:
+            sections.add("full_profile")
+        if changed & {"stories_max_id", "stories_unavailable"}:
+            sections.add("current_stories")
+        return tuple(sorted(sections))
 
     async def _persist_profile_pushes(self, *, update: object = None, sender: object = None) -> bool:
         users: Sequence[object] = (sender,) if sender is not None else bundled_profile_users(update)

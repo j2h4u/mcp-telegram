@@ -98,6 +98,9 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "topics/ports.py",  # Transaction-local projection binding to the shared SQLite owner.
             "unread_state.py",
             "entity_profile/repository.py",
+            "entity_profile/collection_repository.py",  # Canonical facts inside the daemon-owned write unit.
+            "entity_profile/profile_history.py",  # Journal appends require the same canonical write unit.
+            "entity_profile/profile_history_store.py",  # Accepted canonical merge-to-journal adapter.
         }
     ),
     "telethon": frozenset(

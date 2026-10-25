@@ -136,7 +136,9 @@ async def test_reused_bundle_cannot_revert_explicit_status(database: sqlite3.Con
 
 
 @pytest.mark.asyncio
-async def test_new_user_bundle_clears_photo_and_nullable_fields(database: sqlite3.Connection) -> None:
+async def test_new_user_bundle_clears_authorized_photo_and_retains_unreturned_phone(
+    database: sqlite3.Connection,
+) -> None:
     manager, _ = _manager(database)
     first = types.UpdateUserPhone(42, "123")
     _bundle(first, types.User(42, first_name="Peer", photo=types.UserProfilePhoto(9, 2), premium=True))
@@ -147,9 +149,9 @@ async def test_new_user_bundle_clears_photo_and_nullable_fields(database: sqlite
     await manager.on_raw_identity_or_notify(second)
     detail = _detail(database)
     assert detail["current_photo"] is None
-    assert detail["phone"] is None
+    assert detail["phone"] == "123"
     assert detail["premium"] is False
-    assert detail["status"] is None
+    assert detail.get("status") is None
     assert (
         database.execute(
             "SELECT status FROM entity_detail_sections WHERE entity_id=42 AND section='avatar_history'"
@@ -271,7 +273,21 @@ async def test_generic_user_change_requests_targeted_acquisition_without_rpc(dat
     update = types.UpdateUser(42)
     await manager.on_raw_identity_or_notify(update)
     sections = database.execute("SELECT section,status FROM entity_detail_sections ORDER BY section").fetchall()
-    assert [tuple(row) for row in sections] == [("full_profile", "pending"), ("personal_channel", "pending")]
+    assert [tuple(row) for row in sections] == [
+        (section, "pending")
+        for section in sorted(
+            (
+                "full_profile",
+                "personal_channel",
+                "avatar_history",
+                "common_chats",
+                "saved_music",
+                "saved_gifts",
+                "current_stories",
+                "pinned_stories",
+            )
+        )
+    ]
     state = database.execute("SELECT generation FROM entity_profile_refresh_state").fetchone()[0]
     await manager.on_raw_identity_or_notify(update)
     assert database.execute("SELECT generation FROM entity_profile_refresh_state").fetchone()[0] == state
@@ -324,3 +340,17 @@ async def test_failed_optional_profile_does_not_block_new_dm_admission(database:
     assert await manager._auto_enroll_dm(43, types.User(43, first_name="New peer"))
     assert 43 in manager._synced_dialog_ids
     assert database.execute("SELECT enabled FROM full_history_enrollment WHERE dialog_id=43").fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_peer_invalidation_coalesces_bundled_photo_trigger(database: sqlite3.Connection) -> None:
+    manager, client = _manager(database)
+    update = types.UpdateUser(42)
+    _bundle(update, types.User(42, first_name="Peer", photo=types.UserProfilePhoto(9, 2)))
+    await manager.on_raw_identity_or_notify(update)
+    assert database.execute("SELECT generation FROM entity_profile_refresh_state").fetchone()[0] == 1
+    fences = database.execute(
+        "SELECT field FROM entity_profile_field_observations WHERE field LIKE '__invalidation__:%'"
+    ).fetchall()
+    assert fences == [("__invalidation__:user",)]
+    client.assert_not_called()

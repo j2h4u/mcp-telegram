@@ -16,8 +16,9 @@ from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 88
+_CURRENT_SCHEMA_VERSION = 89
 _PROFILE_COLLECTION_MIGRATION = 88
+_PROFILE_HISTORY_MIGRATION = 89
 _SEMANTIC_PROFILE_MIGRATION = 87
 _UPDATE_DELIVERY_MIGRATION = 86
 _HISTORICAL_FTS_BACKFILL_MIGRATION = 85
@@ -4938,8 +4939,36 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_87(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _PROFILE_COLLECTION_MIGRATION:
         current = _apply_migration_88(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _PROFILE_HISTORY_MIGRATION:
+        current = _apply_migration_89(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
+
+
+def _apply_migration_89(conn: sqlite3.Connection, current: int) -> int:
+    return _apply_migration(
+        conn,
+        current,
+        _PROFILE_HISTORY_MIGRATION,
+        [
+            """CREATE TABLE entity_profile_change_events (
+            event_id INTEGER PRIMARY KEY,
+            owner_account_id INTEGER NOT NULL CHECK(owner_account_id>0),
+            entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+            observation_order INTEGER NOT NULL CHECK(observation_order>0),
+            change_key TEXT NOT NULL, category TEXT NOT NULL,
+            before_json TEXT NOT NULL, after_json TEXT NOT NULL, previous_provenance_json TEXT NOT NULL,
+            observation_started_at REAL, observation_completed_at REAL,
+            observed_at INTEGER NOT NULL, source TEXT NOT NULL, server_time REAL,
+            UNIQUE(owner_account_id,entity_id,observation_order,change_key)
+        )""",
+            "CREATE INDEX entity_profile_change_events_owner ON entity_profile_change_events(owner_account_id,entity_id,event_id)",
+            """UPDATE entity_detail_sections SET payload_json=json_set(payload_json,'$.published.history_event_id',0)
+            WHERE json_valid(payload_json) AND json_type(payload_json,'$.published')='object'""",
+            """UPDATE entity_profile_refresh_state SET page_cursor_json=json_set(page_cursor_json,'$.baseline.history_event_id',0)
+            WHERE json_valid(page_cursor_json) AND json_type(page_cursor_json,'$.baseline')='object'""",
+        ],
+    )
 
 
 def _apply_migration_88(conn: sqlite3.Connection, current: int) -> int:

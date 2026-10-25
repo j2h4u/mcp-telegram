@@ -10,6 +10,7 @@ import math
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import cast
 
 from ..sync_transactions import require_write_transaction
 from .contracts import ObservationBoundary, ProfileFieldObservation
@@ -143,24 +144,38 @@ def _profile_change(merge: ProfileHistoryMerge, root: str) -> tuple[str, str, ob
         return None
     before, after = merge.before[root], merge.after[root]
     if root in _PHOTO_ROOTS:
-        before = _photo_id(before, cleared=root in merge.previous_cleared_paths)
-        after = _photo_id(after, cleared=root in merge.cleared_paths)
-        if before is _MISSING or after is _MISSING:
-            return None
-        category = "private_owner" if _personal_photo(root, merge.before[root], merge.after[root]) else "profile"
-        key = f"photo.{_PHOTO_ROOTS[root]}"
-    else:
-        category = "private_owner" if root in _OWNER_ROOTS else "profile"
-        key = root
-    return (key, category, before, after) if _different_values(merge, root, before, after) else None
+        return _photo_change(merge, root)
+    category = "private_owner" if root in _OWNER_ROOTS else "profile"
+    return (root, category, before, after) if _different_values(merge, root, before, after) else None
+
+
+def _photo_change(merge: ProfileHistoryMerge, root: str) -> tuple[str, str, object, object] | None:
+    before = _photo_id(merge.before[root], cleared=root in merge.previous_cleared_paths)
+    after = _photo_id(merge.after[root], cleared=root in merge.cleared_paths)
+    if before is _MISSING or after is _MISSING:
+        return None
+    roles = _current_photo_roles(root, merge.before[root], merge.after[root])
+    if roles is not None:
+        before, after = {"photo_id": before, "personal": roles[0]}, {"photo_id": after, "personal": roles[1]}
+    category = "private_owner" if _personal_photo(root, merge.before[root], merge.after[root]) else "profile"
+    return (f"photo.{_PHOTO_ROOTS[root]}", category, before, after) if before != after else None
 
 
 def _different_values(merge: ProfileHistoryMerge, root: str, before: object, after: object) -> bool:
-    comparison = merge.comparison_values.get(root)
+    comparison = None if root in _PHOTO_ROOTS else merge.comparison_values.get(root)
     if root in {"legacy.name", "legacy.username"} and comparison is None:
         return False
     old_comparison, new_comparison = comparison if comparison is not None else (before, after)
     return old_comparison != new_comparison
+
+
+def _current_photo_roles(root: str, before: object, after: object) -> tuple[bool, bool] | None:
+    if root != "user.photo" or not isinstance(before, Mapping) or not isinstance(after, Mapping):
+        return None
+    old, new = before.get("personal"), after.get("personal")
+    if type(old) is bool and type(new) is bool and old != new:
+        return old, new
+    return None
 
 
 def _personal_photo(root: str, before: object, after: object) -> bool:
@@ -214,6 +229,72 @@ def append_collection_history(conn: sqlite3.Connection, merge: CollectionHistory
             merge.previous_provenance,
         )
     return inserted
+
+
+def append_explicit_collection_clear(
+    conn: sqlite3.Connection,
+    observation: HistoryObservation,
+    section: str,
+    item_key: str,
+    previous_provenance: Mapping[str, object],
+) -> int:
+    """An accepted explicit deletion of an ID in a known published stable set.
+
+    The caller verifies prior membership; this does not claim a new traversal or
+    infer a removal from partial scans, unknown baselines, or anonymous items.
+    """
+    require_write_transaction(conn)
+    if observation.field.source == "min" or section not in _COLLECTIONS:
+        return 0
+    if not item_key:
+        raise ValueError("explicit collection deletion requires a stable item key")
+    return _append(
+        conn, observation, (f"collection.{section}.{item_key}", "collection", item_key, None), previous_provenance
+    )
+
+
+def effective_collection_membership(
+    conn: sqlite3.Connection,
+    observation: HistoryObservation,
+    section: str,
+    published: Mapping[str, object],
+    membership: frozenset[str],
+) -> frozenset[str] | None:
+    """Fold accepted membership changes since a trustworthy real publication."""
+    require_write_transaction(conn)
+    watermark = published.get("history_event_id")
+    if type(watermark) is not int or watermark < 0:
+        return None
+    current = set(membership)
+    prefix = f"collection.{section}."
+    rows = cast(
+        list[tuple[str, str]],
+        conn.execute(
+            "SELECT change_key,after_json FROM entity_profile_change_events "
+            "WHERE owner_account_id=? AND entity_id=? AND event_id>? AND change_key GLOB ? ORDER BY event_id",
+            (observation.field.owner_account_id, observation.entity_id, watermark, prefix + "*"),
+        ).fetchall(),
+    )
+    for change_key, encoded in rows:
+        key = change_key[len(prefix) :]
+        value = cast(object, json.loads(encoded))
+        if value is None:
+            current.discard(key)
+        elif value == key:
+            current.add(key)
+    return frozenset(current)
+
+
+def collection_history_watermark(conn: sqlite3.Connection, observation: HistoryObservation) -> int:
+    require_write_transaction(conn)
+    row = cast(
+        tuple[int],
+        conn.execute(
+            "SELECT COALESCE(MAX(event_id),0) FROM entity_profile_change_events WHERE owner_account_id=? AND entity_id=?",
+            (observation.field.owner_account_id, observation.entity_id),
+        ).fetchone(),
+    )
+    return row[0]
 
 
 def _encode(value: object) -> str:

@@ -144,6 +144,7 @@ def test_anonymous_gifts_preserve_duplicate_occurrences_and_replay(database: Dat
     summary = _summary(repo, "saved_gifts")
     assert summary["retained_count"] == 2 and summary["retained_unique_count"] == 0
     assert summary["complete"] and not summary["comparable_membership"]
+    assert conn.execute("SELECT COUNT(*) FROM entity_profile_change_events").fetchone()[0] == 0
 
 
 def test_completed_scan_then_new_invalidation_isolates_membership_after_reopen(database: Database) -> None:
@@ -166,6 +167,9 @@ def test_completed_scan_then_new_invalidation_isolates_membership_after_reopen(d
         assert second["retained_count"] == second["reported_count"] == 2
         assert second["complete"]
         assert second["comparable_membership"]
+        assert reopened.execute(
+            "SELECT change_key FROM entity_profile_change_events ORDER BY change_key"
+        ).fetchall() == [("collection.pinned_stories.1",), ("collection.pinned_stories.3",)]
         assert reopened.execute("SELECT count(*) FROM entity_profile_collection_facts").fetchone()[0] == 3
     finally:
         reopened.close()

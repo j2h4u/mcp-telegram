@@ -8,14 +8,16 @@ import hashlib
 import json
 import sqlite3
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import cast
 
 from ..sync_transactions import require_write_transaction
 from .contracts import (
     ObservationBoundary,
+    ProfileCollectionItem,
     ProfileCollectionPage,
     ProfileFieldCoverage,
+    ProfileFieldObservation,
     ProfileFieldState,
     ProfileSemanticSnapshot,
 )
@@ -34,6 +36,7 @@ class EffectiveProfileMerge:
     snapshot: ProfileSemanticSnapshot
     order: int
     previous_provenance: Mapping[str, object]
+    previous_coverage: Mapping[str, object]
 
 
 @dataclass(slots=True)
@@ -210,7 +213,75 @@ def store_semantic_snapshot(
             snapshot.observation.completed_at,
         ),
     )
-    return EffectiveProfileMerge(previous, fields, accepted, provenance, snapshot, order, previous_provenance)
+    return EffectiveProfileMerge(
+        previous, fields, accepted, provenance, snapshot, order, previous_provenance, previous_coverage
+    )
+
+
+def store_semantic_patch(
+    conn: sqlite3.Connection, snapshot: ProfileSemanticSnapshot, observation: ProfileFieldObservation
+) -> EffectiveProfileMerge:
+    """Merge supplied paths without renewing a FullUser acquisition or coverage."""
+    require_write_transaction(conn)
+    snapshot.require_account(observation.owner_account_id)
+    row = conn.execute(
+        "SELECT fields_json,provenance_json,coverage_json FROM entity_profile_semantic_snapshots "
+        "WHERE owner_account_id=? AND entity_id=?",
+        (observation.owner_account_id, snapshot.target_id),
+    ).fetchone()
+    previous, provenance, old_coverage = (json.loads(value) for value in row) if row else ({}, {}, {})
+    paths = provenance.get("fields", {})
+    coverage = _ordered_item_coverage(snapshot.coverage, paths, observation.order)
+    incoming = replace(snapshot, coverage=coverage)
+    fields, accepted, effective_paths, _rejected = _merge_snapshot(
+        conn, incoming, (previous, paths, old_coverage), observation.order
+    )
+    effective_coverage = dict(old_coverage)
+    for path in accepted:
+        effective_paths[path] = {
+            "order": observation.order,
+            "observed_at": observation.observed_at,
+            "source": observation.source,
+            "observation_started_at": snapshot.observation.started_at,
+            "observation_completed_at": snapshot.observation.completed_at,
+        }
+        effective_coverage[path] = asdict(coverage[path])
+    new_provenance = {
+        **provenance,
+        "fields": effective_paths,
+        "supplied_observation": {
+            "order": observation.order,
+            "observed_at": observation.observed_at,
+            "source": observation.source,
+            "observation_started_at": snapshot.observation.started_at,
+            "observation_completed_at": snapshot.observation.completed_at,
+            "coverage": {path: asdict(value) for path, value in snapshot.coverage.items()},
+        },
+    }
+    unmapped = any(
+        value.state is ProfileFieldState.UNKNOWN and value.reason != "partial_value_unobserved"
+        for value in snapshot.coverage.values()
+    )
+    conn.execute(
+        "INSERT INTO entity_profile_semantic_snapshots(owner_account_id,entity_id,normalization_version,"
+        "fields_json,coverage_json,provenance_json,complete,observation_order,source) VALUES(?,?,?,?,?,?,0,0,?) "
+        "ON CONFLICT(owner_account_id,entity_id) DO UPDATE SET fields_json=excluded.fields_json,"
+        "coverage_json=excluded.coverage_json,provenance_json=excluded.provenance_json,"
+        "complete=CASE WHEN ? THEN 0 ELSE entity_profile_semantic_snapshots.complete END",
+        (
+            observation.owner_account_id,
+            snapshot.target_id,
+            snapshot.normalization_version,
+            encode(fields),
+            encode(effective_coverage),
+            encode(new_provenance),
+            observation.source,
+            int(unmapped),
+        ),
+    )
+    return EffectiveProfileMerge(
+        previous, fields, accepted, new_provenance, incoming, observation.order, provenance, old_coverage
+    )
 
 
 def _merge_snapshot(
@@ -307,6 +378,27 @@ def store_collection_page(  # noqa: PLR0913 - one captured page transaction
     return _collection_summary(conn, page, owner, generation, scan)
 
 
+def store_story_update(
+    conn: sqlite3.Connection, entity_id: int, item: ProfileCollectionItem, observation: ProfileFieldObservation
+) -> None:
+    """Persist supplied story/tombstone facts without guessing catalog membership."""
+    require_write_transaction(conn)
+    for section in ("current_stories", "pinned_stories"):
+        page = ProfileCollectionPage(
+            entity_id, section, (), ObservationBoundary(observation.observed_at, observation.observed_at)
+        )
+        _store_item(
+            conn,
+            page,
+            owner=observation.owner_account_id,
+            key=item.key,
+            fields=item.fields,
+            coverage=item.coverage,
+            order=observation.order,
+            source=observation.source,
+        )
+
+
 def _store_item(  # noqa: PLR0913 - persisted composite identity
     conn: sqlite3.Connection,
     page: ProfileCollectionPage,
@@ -316,6 +408,7 @@ def _store_item(  # noqa: PLR0913 - persisted composite identity
     fields: Mapping[str, object],
     coverage: Mapping[str, ProfileFieldCoverage],
     order: int,
+    source: str = "rpc",
 ) -> None:
     identity = (owner, page.entity_id, page.section, key)
     old = conn.execute(
@@ -323,16 +416,22 @@ def _store_item(  # noqa: PLR0913 - persisted composite identity
         "WHERE owner_account_id=? AND entity_id=? AND section=? AND item_key=?",
         identity,
     ).fetchone()
-    if old and old[1] >= order:
+    prior_paths = json.loads(old[2]) if old else {}
+    if old and old[1] >= order and not _has_later_delivered_leaf(prior_paths, order):
         return
+    coverage = _ordered_item_coverage(coverage, prior_paths, order)
     previous_fields = json.loads(old[0]) if old else {}
     previous_coverage = json.loads(old[3]) if old else {}
     authority = _MergeAuthority(previous_coverage)
     merged = merge_semantic_fields(previous_fields, dict(fields), coverage, "item", authority)
-    provenance = json.loads(old[2]) if old else {}
-    _retain_path_provenance(provenance, json.loads(old[0]) if old else {}, merged, "item")
+    provenance = dict(prior_paths)
+    _retain_path_provenance(provenance, previous_fields, merged, "item")
     retained_provenance = dict(provenance)
     accepted = _record_path_observation(coverage, "item", provenance, page.observation, order)
+    if source != "rpc":
+        provenance.update(
+            {path: {"order": order, "observed_at": page.observation.started_at, "source": source} for path in accepted}
+        )
     _restore_rejected_observations(provenance, retained_provenance, accepted, authority.rejected)
     effective_coverage = _item_coverage(coverage, previous_coverage, (previous_fields, merged), authority.rejected)
     conn.execute(
@@ -345,10 +444,29 @@ def _store_item(  # noqa: PLR0913 - persisted composite identity
             encode(merged),
             encode(effective_coverage),
             encode(provenance),
-            order,
+            max(order, old[1]) if old else order,
             page.observation.completed_at,
         ),
     )
+
+
+def _has_later_delivered_leaf(paths: Mapping[str, object], order: int) -> bool:
+    return any(
+        isinstance(value, dict) and value.get("source") == "update" and value.get("order", 0) > order
+        for value in paths.values()
+    )
+
+
+def _ordered_item_coverage(
+    coverage: Mapping[str, ProfileFieldCoverage], previous: Mapping[str, object], order: int
+) -> dict[str, ProfileFieldCoverage]:
+    blocked = {path for path, old in previous.items() if isinstance(old, dict) and old.get("order", 0) >= order}
+    return {
+        path: ProfileFieldCoverage(value.classification, ProfileFieldState.UNKNOWN)
+        if any(_path_under(path, old) for old in blocked)
+        else value
+        for path, value in coverage.items()
+    }
 
 
 def _collection_summary(

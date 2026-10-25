@@ -467,7 +467,7 @@ depends_on = ["mcp_telegram.entity_profile.contracts"]
 [[modules]]
 path = "mcp_telegram.entity_profile.updates"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.entity_profile.contracts", "mcp_telegram.entity_profile.full_user_normalization", "mcp_telegram.identity_observation"]
+depends_on = ["mcp_telegram.entity_profile.contracts", "mcp_telegram.entity_profile.full_user_normalization", "mcp_telegram.entity_profile.semantic_normalization", "mcp_telegram.identity_observation"]
 
 [[modules]]
 path = "mcp_telegram.reactions"
@@ -596,7 +596,7 @@ depends_on = ["mcp_telegram.models", "mcp_telegram.resolver", "mcp_telegram.sync
 [[modules]]
 path = "mcp_telegram.entity_profile.repository"
 layer = "persistence"
-depends_on = ["mcp_telegram.dialog_identity", "mcp_telegram.dialog_identity_contracts", "mcp_telegram.entity_profile.contracts", "mcp_telegram.entity_profile.collection_repository", "mcp_telegram.entity_store", "mcp_telegram.models", "mcp_telegram.resolver", "mcp_telegram.sync_transactions"]
+depends_on = ["mcp_telegram.dialog_identity", "mcp_telegram.dialog_fact_observations", "mcp_telegram.dialog_identity_contracts", "mcp_telegram.entity_profile.contracts", "mcp_telegram.entity_profile.profile_history", "mcp_telegram.entity_profile.profile_history_store", "mcp_telegram.entity_profile.supplied_profile", "mcp_telegram.entity_profile.collection_repository", "mcp_telegram.entity_store", "mcp_telegram.models", "mcp_telegram.resolver", "mcp_telegram.sync_transactions"]
 
 [[modules]]
 path = "mcp_telegram.entity_profile.collection_repository"
@@ -1066,3 +1066,19 @@ depends_on = ["mcp_telegram.observation_order", "mcp_telegram.sync_transactions"
 path = "mcp_telegram.dialog_pin_observations"
 layer = "persistence"
 depends_on = ["mcp_telegram.sync_transactions"]
+
+
+[[modules]]
+path = "mcp_telegram.entity_profile.profile_history"
+layer = "persistence"
+depends_on = ["mcp_telegram.entity_profile.contracts", "mcp_telegram.sync_transactions"]
+
+[[modules]]
+path = "mcp_telegram.entity_profile.profile_history_store"
+layer = "persistence"
+depends_on = ["mcp_telegram.entity_profile.contracts", "mcp_telegram.entity_profile.collection_repository", "mcp_telegram.entity_profile.profile_history"]
+
+[[modules]]
+path = "mcp_telegram.entity_profile.supplied_profile"
+layer = "persistence"
+depends_on = ["mcp_telegram.entity_profile.contracts", "mcp_telegram.entity_profile.collection_repository"]

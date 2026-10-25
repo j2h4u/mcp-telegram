@@ -14,7 +14,10 @@ from mcp_telegram.entity_profile.profile_history import (
     HistoryObservation,
     ProfileHistoryMerge,
     append_collection_history,
+    append_explicit_collection_clear,
     append_profile_history,
+    collection_history_watermark,
+    effective_collection_membership,
 )
 from mcp_telegram.sync_transactions import write_transaction
 
@@ -23,12 +26,12 @@ from mcp_telegram.sync_transactions import write_transaction
 def db() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(":memory:")
     conn.execute(
-        "CREATE TABLE entity_profile_change_events("
+        "CREATE TABLE entity_profile_change_events(event_id INTEGER PRIMARY KEY,"
         "owner_account_id INTEGER NOT NULL,entity_id INTEGER NOT NULL,observation_order INTEGER NOT NULL,"
         "change_key TEXT NOT NULL,category TEXT NOT NULL,before_json TEXT NOT NULL,after_json TEXT NOT NULL,"
         "previous_provenance_json TEXT NOT NULL,observation_started_at REAL,observation_completed_at REAL,"
         "observed_at INTEGER NOT NULL,source TEXT NOT NULL,server_time REAL,"
-        "PRIMARY KEY(owner_account_id,entity_id,observation_order,change_key))"
+        "UNIQUE(owner_account_id,entity_id,observation_order,change_key))"
     )
     conn.execute("CREATE TABLE canonical(value TEXT)")
     conn.commit()
@@ -54,7 +57,9 @@ def merge(path: str, before: object, after: object) -> ProfileHistoryMerge:
 def rows(db: sqlite3.Connection) -> list[tuple[object, ...]]:
     return cast(
         list[tuple[object, ...]],
-        db.execute("SELECT * FROM entity_profile_change_events ORDER BY change_key").fetchall(),
+        db.execute(
+            "SELECT owner_account_id,entity_id,observation_order,change_key,category,before_json,after_json,previous_provenance_json,observation_started_at,observation_completed_at,observed_at,source,server_time FROM entity_profile_change_events ORDER BY change_key"
+        ).fetchall(),
     )
 
 
@@ -412,3 +417,67 @@ def test_stable_contact_and_business_facts_have_observed_history(
     assert row[3:5] == (path, "profile")
     assert json.loads(cast(str, row[5])) == before
     assert json.loads(cast(str, row[6])) == after
+
+
+def test_publication_watermark_folds_delivered_removal_without_duplicate_and_allows_readd(
+    db: sqlite3.Connection,
+) -> None:
+    context = observation()
+    published: dict[str, object] = {"history_event_id": 0}
+    with write_transaction(db):
+        assert append_explicit_collection_clear(db, context, "current_stories", "8", published) == 1
+        effective = effective_collection_membership(db, context, "current_stories", published, frozenset({"8"}))
+        assert effective is not None
+        assert effective == frozenset()
+        assert (
+            append_collection_history(
+                db, CollectionHistoryMerge(observation(3), "current_stories", effective, frozenset(), True, published)
+            )
+            == 0
+        )
+        watermark = collection_history_watermark(db, context)
+        assert (
+            append_collection_history(
+                db,
+                CollectionHistoryMerge(
+                    observation(4),
+                    "current_stories",
+                    frozenset(),
+                    frozenset({"8"}),
+                    True,
+                    {"history_event_id": watermark},
+                ),
+            )
+            == 1
+        )
+        new_publication = {"history_event_id": collection_history_watermark(db, context)}
+        assert append_explicit_collection_clear(db, observation(5), "current_stories", "8", new_publication) == 1
+        assert (
+            effective_collection_membership(db, context, "current_stories", new_publication, frozenset({"8"}))
+            == frozenset()
+        )
+    assert len(rows(db)) == 3
+
+
+def test_unbounded_old_publication_cannot_infer_history_and_other_accounts_do_not_fold(db: sqlite3.Connection) -> None:
+    context = observation()
+    with write_transaction(db):
+        assert effective_collection_membership(db, context, "current_stories", {}, frozenset({"8"})) is None
+        other = replace(context, field=replace(context.field, owner_account_id=8))
+        append_explicit_collection_clear(db, other, "current_stories", "8", {"history_event_id": 0})
+        assert effective_collection_membership(
+            db, context, "current_stories", {"history_event_id": 0}, frozenset({"8"})
+        ) == frozenset({"8"})
+
+
+def test_same_photo_id_known_current_role_transition_is_meaningful_but_unknown_role_is_baseline(
+    db: sqlite3.Connection,
+) -> None:
+    value = merge("user.photo", {"photo_id": 8, "personal": False}, {"photo_id": 8, "personal": True})
+    with write_transaction(db):
+        assert append_profile_history(db, replace(value, before={"user.photo": {"photo_id": 8}})) == 0
+        assert append_profile_history(db, value) == 1
+    row = rows(db)[0]
+    assert row[3:5] == ("photo.current", "private_owner")
+    assert json.loads(cast(str, row[5])) == {"photo_id": 8, "personal": False}
+    assert json.loads(cast(str, row[6])) == {"photo_id": 8, "personal": True}

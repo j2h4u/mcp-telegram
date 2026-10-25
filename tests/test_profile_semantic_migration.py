@@ -63,7 +63,7 @@ def test_v87_fresh_schema_account_namespace_and_owner_constraints(tmp_path: Path
     path = tmp_path / "fresh.db"
     sync_db.ensure_sync_schema(path)
     with closing(sqlite3.connect(path)) as conn:
-        assert conn.execute("SELECT MAX(version),COUNT(DISTINCT version) FROM schema_version").fetchone() == (88, 88)
+        assert conn.execute("SELECT MAX(version),COUNT(DISTINCT version) FROM schema_version").fetchone() == (89, 89)
         assert conn.execute("SELECT COUNT(*) FROM entity_profile_semantic_snapshots").fetchone() == (0,)
         conn.execute("INSERT INTO entities(id,type,updated_at) VALUES (42,'user',1)")
         for owner in (77, 88):
@@ -80,3 +80,45 @@ def test_v87_fresh_schema_account_namespace_and_owner_constraints(tmp_path: Path
                     "INSERT INTO entity_profile_semantic_snapshots(owner_account_id,entity_id,normalization_version,source) VALUES (?,42,'entity-profile-full-user-v2','rpc')",
                     (invalid,),
                 )
+
+
+def test_history_migration_seeds_only_existing_publication_journal_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "history-upgrade.db"
+    with monkeypatch.context() as prior:
+        prior.setattr(sync_db, "_CURRENT_SCHEMA_VERSION", 88)
+        sync_db.ensure_sync_schema(path)
+    retained = '{"schema":1,"name":"exact  retained"}'
+    published = {"owner_account_id": 7, "generation": 1, "scan": 0, "identifiable": True}
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("INSERT INTO entities(id,type,name,updated_at) VALUES(42,'user','retained',1)")
+        conn.execute(
+            "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_owner_account_id) VALUES(42,?,1,7)",
+            (retained,),
+        )
+        conn.execute(
+            "INSERT INTO entity_detail_sections(entity_id,section,status,payload_json) VALUES(42,'current_stories','fresh',?)",
+            (json.dumps({"published": published}),),
+        )
+        conn.execute(
+            "INSERT INTO entity_profile_refresh_state(entity_id,status,next_section,updated_at,page_cursor_json) VALUES(42,'pending','current_stories',1,?)",
+            (json.dumps({"baseline": published}),),
+        )
+        conn.commit()
+    sync_db.ensure_sync_schema(path)
+    with closing(sqlite3.connect(path)) as conn:
+        row = cast(
+            tuple[str, str, str],
+            conn.execute(
+                "SELECT d.detail_json,s.payload_json,r.page_cursor_json FROM entity_details d JOIN entity_detail_sections s ON s.entity_id=d.entity_id JOIN entity_profile_refresh_state r ON r.entity_id=d.entity_id"
+            ).fetchone(),
+        )
+        assert row[0] == retained
+        assert json.loads(row[1])["published"] == {**published, "history_event_id": 0}
+        assert json.loads(row[2])["baseline"] == {**published, "history_event_id": 0}
+        assert conn.execute("SELECT COUNT(*) FROM entity_profile_change_events").fetchone()[0] == 0
+        assert (
+            conn.execute("SELECT name FROM sqlite_master WHERE name='entity_profile_invalidation_orders'").fetchone()
+            is None
+        )

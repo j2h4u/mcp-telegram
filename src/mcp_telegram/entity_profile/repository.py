@@ -14,9 +14,10 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import cast
 
+from ..dialog_fact_observations import claim_dialog_fact
 from ..dialog_identity import capture_identity_baseline, publish_dialog_identity
 from ..dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation, ObservedText
 from ..entity_store import EntitySnapshot, ensure_entity_stub, upsert_entity_snapshots
@@ -28,7 +29,9 @@ from .collection_repository import (
     collection_progress,
     encode,
     store_collection_page,
+    store_semantic_patch,
     store_semantic_snapshot,
+    store_story_update,
 )
 from .contracts import (
     FULL_PROFILE_OWNED_FIELDS,
@@ -37,11 +40,24 @@ from .contracts import (
     PERSONAL_CHANNEL_OWNED_FIELDS,
     PROFILE_COLLECTION_SECTIONS,
     PROFILE_SECTIONS,
+    ObservationBoundary,
     ProfileAcquisitionEvidence,
+    ProfileCollectionItem,
     ProfileCollectionPage,
     ProfileFieldObservation,
     ProfileSemanticSnapshot,
+    SuppliedProfileUser,
 )
+from .profile_history import (
+    CollectionHistoryMerge,
+    HistoryObservation,
+    append_collection_history,
+    append_explicit_collection_clear,
+    collection_history_watermark,
+    effective_collection_membership,
+)
+from .profile_history_store import append_effective_history
+from .supplied_profile import authorized_legacy_user_fields, summary_fingerprint, supplied_current_stories
 
 _DETAIL_SCHEMA = 1
 _EVIDENCE_MAX_JSON_BYTES = 4096
@@ -220,6 +236,113 @@ class EntityProfileRepository:
             self._store_field_observations(entity_id, accepted, observation)
             self._publish_updated_identity(entity_id, detail, changed, observation.observed_at)
             return changed
+
+    def apply_supplied_user(
+        self,
+        user: SuppliedProfileUser,
+        *,
+        observation: ProfileFieldObservation,
+        boundary: ObservationBoundary | None = None,
+    ) -> frozenset[str]:
+        """One authority path for delivered Users and finite collection sidecars."""
+        with write_savepoint(self._conn):
+            supplied = replace(observation, source="min") if user.minimal else observation
+            ordinary = user
+            if user.authoritative_photo:
+                ordinary = replace(
+                    user,
+                    fields={key: value for key, value in user.fields.items() if key != "user.photo"},
+                    legacy_fields={key: value for key, value in user.legacy_fields.items() if key != "current_photo"},
+                )
+            changed = self._apply_supplied_part(ordinary, supplied, boundary)
+            if user.authoritative_photo:
+                photo = replace(
+                    user,
+                    fields={"user.photo": user.fields.get("user.photo")},
+                    legacy_fields={"current_photo": user.legacy_fields.get("current_photo")},
+                    minimal=False,
+                )
+                changed |= self._apply_supplied_part(photo, replace(observation, source="update"), boundary)
+            return changed
+
+    def _apply_supplied_part(
+        self, user: SuppliedProfileUser, observation: ProfileFieldObservation, boundary: ObservationBoundary | None
+    ) -> frozenset[str]:
+        base = self._owned_history_base(user.entity_id, observation)
+        changed = self.apply_profile_update(
+            user.entity_id, authorized_legacy_user_fields(user), observation=observation
+        )
+        if user.fields:
+            self._observation_profile_base(user.entity_id, observation)
+            incoming = ProfileSemanticSnapshot(
+                user.entity_id,
+                observation.owner_account_id,
+                user.fields,
+                user.coverage,
+                boundary or ObservationBoundary(),
+                endpoint="supplied.User",
+            )
+            merged = store_semantic_patch(self._conn, incoming, observation)
+            append_effective_history(self._conn, merged, observation, base)
+            if observation.source != "min":
+                changed |= self._changed_semantic_roots(merged)
+        return changed
+
+    @staticmethod
+    def _changed_semantic_roots(merged: EffectiveProfileMerge) -> frozenset[str]:
+        return frozenset(
+            root.split(".", 1)[-1]
+            for root in merged.after
+            if summary_fingerprint(root, merged.before.get(root)) != summary_fingerprint(root, merged.after[root])
+            and any(path == root or path.startswith((root + ".", root + "[")) for path in merged.accepted_paths)
+        )
+
+    def apply_story_update(
+        self, entity_id: int, item: ProfileCollectionItem, *, observation: ProfileFieldObservation
+    ) -> frozenset[str]:
+        self._observation_profile_base(entity_id, observation)
+        prior = self._conn.execute(
+            "SELECT MAX(observation_order) FROM entity_profile_collection_facts WHERE owner_account_id=? AND entity_id=? AND item_key=?",
+            (observation.owner_account_id, entity_id, item.key),
+        ).fetchone()
+        if prior is not None and prior[0] is not None and prior[0] >= observation.order:
+            return frozenset()
+        store_story_update(self._conn, entity_id, item, observation)
+        if item.fields.get("constructor") != "StoryItemDeleted":
+            return frozenset({"current_stories", "pinned_stories"})
+        for section in ("current_stories", "pinned_stories"):
+            self._journal_story_deletion(entity_id, section, item.key, observation)
+        return frozenset({"current_stories", "pinned_stories"})
+
+    def _published_membership(self, entity_id: int, section: str, published: Mapping[str, object]) -> frozenset[str]:
+        return frozenset(
+            str(row[0])
+            for row in self._conn.execute(
+                "SELECT item_key FROM entity_profile_collection_membership WHERE owner_account_id=? "
+                "AND entity_id=? AND section=? AND generation=? AND scan=? AND identity_kind='remote'",
+                (published["owner_account_id"], entity_id, section, published["generation"], published["scan"]),
+            )
+        )
+
+    def _journal_story_deletion(
+        self, entity_id: int, section: str, key: str, observation: ProfileFieldObservation
+    ) -> None:
+        payload = self.read_section_payload(entity_id, section)
+        published = payload.get("published") if isinstance(payload, dict) else None
+        if (
+            not isinstance(published, dict)
+            or not published.get("identifiable")
+            or published.get("owner_account_id") != observation.owner_account_id
+        ):
+            return
+        context = HistoryObservation(entity_id, observation, ObservationBoundary())
+        members = effective_collection_membership(
+            self._conn, context, section, published, self._published_membership(entity_id, section, published)
+        )
+        if members is not None and key in members:
+            append_explicit_collection_clear(
+                self._conn, HistoryObservation(entity_id, observation, ObservationBoundary()), section, key, published
+            )
 
     def _observation_profile_base(
         self, entity_id: int, observation: ProfileFieldObservation
@@ -433,6 +556,44 @@ class EntityProfileRepository:
             self._reset_pair_measurement(entity_id)
             return True
 
+    def invalidate_profile_sections(
+        self,
+        entity_id: int,
+        sections: tuple[str, ...],
+        *,
+        observation: ProfileFieldObservation,
+        reason: str,
+        pair_mode: str,
+    ) -> bool:
+        """Persist the original invalidation order so replay cannot revive finished work."""
+        require_write_transaction(self._conn)
+        if reason != "user" and reason != "supplied:" + ",".join(sorted(set(sections))):
+            raise ValueError("invalid profile invalidation kind")
+        self._observation_profile_base(entity_id, observation)
+        previous = self._conn.execute(
+            "SELECT observation_order FROM entity_profile_field_observations "
+            "WHERE owner_account_id=? AND entity_id=? AND field=?",
+            (observation.owner_account_id, entity_id, "__invalidation__:" + reason),
+        ).fetchone()
+        if previous is not None and previous[0] >= observation.order:
+            return False
+        if not self.request_section_refresh(entity_id, sections, now=observation.observed_at, pair_mode=pair_mode):
+            return False
+        self._conn.execute(
+            "INSERT INTO entity_profile_field_observations(entity_id,field,owner_account_id,observation_order,observed_at,source) VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(entity_id,field) DO UPDATE SET owner_account_id=excluded.owner_account_id,"
+            "observation_order=excluded.observation_order,observed_at=excluded.observed_at,source=excluded.source",
+            (
+                entity_id,
+                "__invalidation__:" + reason,
+                observation.owner_account_id,
+                observation.order,
+                observation.observed_at,
+                observation.source,
+            ),
+        )
+        return True
+
     def complete_unchanged_section(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
         """Advance retained terminal knowledge without rewriting its observation."""
         with write_savepoint(self._conn):
@@ -462,7 +623,8 @@ class EntityProfileRepository:
         row = self._conn.execute(
             "SELECT source,fields_json FROM entity_profile_semantic_snapshots s JOIN entity_details p "
             "ON p.entity_id=s.entity_id AND p.profile_owner_account_id=s.owner_account_id "
-            "WHERE s.entity_id=? AND s.normalization_version=?",
+            "WHERE s.entity_id=? AND s.normalization_version=? AND s.source='rpc' "
+            "AND s.observation_order>0 AND s.observation_started_at IS NOT NULL AND s.observation_completed_at IS NOT NULL",
             (entity_id, NORMALIZATION_VERSION),
         ).fetchone()
         return row is not None and row[0] != "legacy" and row[1] != "{}"
@@ -1559,6 +1721,7 @@ class EntityProfileRepository:
             return False
         if commit.collection_page is not None:
             return self._commit_collection(cursor, commit, now=now)
+        history_base = self._owned_history_base(cursor.entity_id, commit.field_observation)
         detail, accepted, reset_owner = self._prepare_observed_commit(
             cursor.entity_id, commit.detail_patch, commit.field_observation
         )
@@ -1576,7 +1739,7 @@ class EntityProfileRepository:
         ):
             return False
         self._finish_observed_commit(cursor.entity_id, accepted, reset_owner, commit.field_observation)
-        self._store_semantic_commit(commit)
+        self._store_semantic_commit(commit, history_base)
         section_payload = _section_payload(detail, cursor.next_section) if commit.payload is None else commit.payload
         self._write_section(
             cursor.entity_id,
@@ -1598,7 +1761,22 @@ class EntityProfileRepository:
         self.persist_group_created(cursor.entity_id, commit.dialog_created)
         return True
 
-    def _store_semantic_commit(self, commit: EntitySectionCommit) -> EffectiveProfileMerge | None:
+    def _owned_history_base(self, entity_id: int, observation: ProfileFieldObservation | None) -> dict[str, object]:
+        detail, _at, owner, _scope = self._read_profile_blob(entity_id)
+        if observation is None or owner != observation.owner_account_id:
+            return {}
+        partial = {
+            str(row[0])
+            for row in self._conn.execute(
+                "SELECT field FROM entity_profile_field_observations WHERE entity_id=? AND owner_account_id=? AND source='min'",
+                (entity_id, owner),
+            )
+        }
+        return {key: value for key, value in detail.items() if key not in partial}
+
+    def _store_semantic_commit(
+        self, commit: EntitySectionCommit, legacy_before: Mapping[str, object]
+    ) -> EffectiveProfileMerge | None:
         snapshot = commit.semantic_snapshot
         observation = commit.field_observation
         if snapshot is not None:
@@ -1607,7 +1785,13 @@ class EntityProfileRepository:
             if observation is None:
                 raise ValueError("semantic commit requires account observation")
             snapshot.require_account(observation.owner_account_id)
-            return store_semantic_snapshot(self._conn, snapshot, observation.order)
+            merged = store_semantic_snapshot(self._conn, snapshot, observation.order)
+            if merged is not None:
+                append_effective_history(self._conn, merged, observation, legacy_before)
+                self._dirty_summary_sections(merged)
+                if commit.evidence is not None:
+                    self._store_supplied_stories(merged, commit.evidence.generation, observation)
+            return merged
         return None
 
     def _commit_collection(self, cursor: EntityRefreshCursor, commit: EntitySectionCommit, *, now: int) -> bool:
@@ -1622,6 +1806,9 @@ class EntityProfileRepository:
         ).fetchone()
         if owner is not None and owner[0] is not None and owner[0] != observation.owner_account_id:
             return False
+        self._apply_collection_sidecars(page, observation)
+        # Accepted sidecars can advance this page's own identity revision.
+        cursor = replace(cursor, profile_revision=self._profile_revision(cursor.entity_id))
         state = json.loads(cursor.page_cursor_json) if cursor.page_cursor_json else {}
         summary = store_collection_page(
             self._conn,
@@ -1631,9 +1818,19 @@ class EntityProfileRepository:
             cursor=state,
             order=observation.order,
         )
+        summary["history_order"] = observation.order
         if not self._advance_collection(cursor, page, state, summary, now=now):
             raise sqlite3.OperationalError("entity profile collection cursor advance was rejected")
         return True
+
+    def _apply_collection_sidecars(self, page: ProfileCollectionPage, observation: ProfileFieldObservation) -> None:
+        if page.supplied_user is not None:
+            if page.supplied_user.entity_id != page.entity_id:
+                raise ValueError("supplied user target mismatch")
+            self.apply_supplied_user(page.supplied_user, observation=observation, boundary=page.observation)
+        for identity in page.sidecar_identities:
+            if identity.dialog_id != page.entity_id:
+                self._publish_supplied_identity(identity, observation)
 
     def _advance_collection(
         self,
@@ -1647,6 +1844,7 @@ class EntityProfileRepository:
         progress = collection_progress(
             page, state, summary, self.read_section_payload(cursor.entity_id, cursor.next_section)
         )
+        self._journal_collection(cursor, page, progress.payload)
         self._write_section(
             cursor.entity_id,
             cursor.next_section,
@@ -1679,6 +1877,141 @@ class EntityProfileRepository:
             ).rowcount
             == 1
         )
+
+    def _store_supplied_stories(
+        self, merge: EffectiveProfileMerge, generation: int, observation: ProfileFieldObservation
+    ) -> None:
+        page = supplied_current_stories(merge)
+        if page is None:
+            return
+        previous = self.read_section_payload(page.entity_id, page.section)
+        # Use a distinct scan when supplied contents supersede a publication in this generation.
+        scan = (
+            1 + int(previous.get("scan", -1))
+            if isinstance(previous, dict) and previous.get("generation") == generation
+            else 0
+        )
+        state: dict[str, object] = {"scan": scan}
+        summary = store_collection_page(
+            self._conn,
+            page,
+            owner=observation.owner_account_id,
+            generation=generation,
+            cursor=state,
+            order=observation.order,
+        )
+        summary["history_order"] = observation.order
+        progress = collection_progress(page, state, summary, previous)
+        payload = {**progress.payload, "supplied_cursor": progress.cursor, "supplied_generation": generation}
+        self._journal_collection(
+            EntityRefreshCursor(page.entity_id, page.section, 0, None, generation=generation), page, payload
+        )
+        self._write_section(
+            page.entity_id,
+            page.section,
+            progress.status,
+            progress.reason,
+            payload,
+            now=observation.observed_at,
+            evidence=ProfileAcquisitionEvidence(
+                generation,
+                "usable" if progress.status == "fresh" else "partial",
+                observation_started_at=int(cast(float, page.observation.started_at)),
+                observation_completed_at=int(cast(float, page.observation.completed_at)),
+            ),
+        )
+
+    def _publish_supplied_identity(
+        self, identity: DialogIdentityObservation, observation: ProfileFieldObservation
+    ) -> None:
+        if not identity.complete or not self._read_entity_stub(identity.dialog_id):
+            return
+        name = identity.name
+        username = identity.username
+        if name is not IDENTITY_OMITTED and not claim_dialog_fact(
+            self._conn, identity.dialog_id, "name", observation.order
+        ):
+            name = IDENTITY_OMITTED
+        if username is not IDENTITY_OMITTED and not claim_dialog_fact(
+            self._conn, identity.dialog_id, "username", observation.order
+        ):
+            username = IDENTITY_OMITTED
+        identity = replace(
+            identity,
+            name=name,
+            username=username,
+            complete=name is not IDENTITY_OMITTED and username is not IDENTITY_OMITTED,
+        )
+        baseline = capture_identity_baseline(self._conn, identity.dialog_id)
+        patch = {
+            name: value
+            for name, value in (("name", identity.name), ("username", identity.username))
+            if value is not IDENTITY_OMITTED
+        }
+        self._update_canonical_identity(identity.dialog_id, patch, now=observation.observed_at)
+        self._publish_dialog_identity(identity, baseline)
+
+    def _dirty_summary_sections(self, merge: EffectiveProfileMerge) -> None:
+        dependencies = {
+            "full_user.saved_music": ("saved_music",),
+            "full_user.stargifts_count": ("saved_gifts",),
+            "full_user.common_chats_count": ("common_chats",),
+            "full_user.stories": ("current_stories", "pinned_stories"),
+            "full_user.stories_pinned_available": ("pinned_stories",),
+            "full_user.personal_channel_id": ("personal_channel",),
+            "user.photo": ("avatar_history",),
+            "full_user.profile_photo": ("avatar_history",),
+            "full_user.personal_photo": ("avatar_history",),
+            "full_user.fallback_photo": ("avatar_history",),
+        }
+        sections = {
+            section
+            for root, targets in dependencies.items()
+            if root in merge.after
+            and (
+                root not in merge.before
+                or summary_fingerprint(root, merge.before[root]) != summary_fingerprint(root, merge.after[root])
+            )
+            and any(path == root or path.startswith(root + ".") for path in merge.accepted_paths)
+            for section in targets
+        }
+        self._conn.executemany(
+            "INSERT INTO entity_detail_sections(entity_id,section,status,reason) VALUES (?,?,'pending','profile_summary_changed') "
+            "ON CONFLICT(entity_id,section) DO UPDATE SET status='pending',reason='profile_summary_changed'",
+            ((merge.snapshot.target_id, section) for section in sections),
+        )
+
+    def _journal_collection(
+        self, cursor: EntityRefreshCursor, page: ProfileCollectionPage, payload: Mapping[str, object]
+    ) -> None:
+        published = payload.get("published")
+        if payload.get("complete") is not True or not isinstance(published, dict):
+            return
+        observation = ProfileFieldObservation(
+            int(cast(int, published["owner_account_id"])),
+            int(cast(int, payload["history_order"])),
+            int(cast(float, page.observation.started_at)),
+            "rpc",
+        )
+        context = HistoryObservation(cursor.entity_id, observation, page.observation)
+        old = payload.get("previous_published")
+        if payload.get("comparable_membership") is True and isinstance(old, dict):
+            before = effective_collection_membership(
+                self._conn, context, page.section, old, self._published_membership(cursor.entity_id, page.section, old)
+            )
+            if before is not None:
+                append_collection_history(
+                    self._conn,
+                    CollectionHistoryMerge(
+                        context,
+                        page.section,
+                        before,
+                        self._published_membership(cursor.entity_id, page.section, published),
+                        True,
+                        old,
+                    ),
+                )
+        published["history_event_id"] = collection_history_watermark(self._conn, context)
 
     def _prepare_observed_commit(
         self, entity_id: int, fields: Mapping[str, object], observation: ProfileFieldObservation | None
@@ -1751,14 +2084,22 @@ class EntityProfileRepository:
         predicate, parameters = self._cursor_predicate(cursor)
         revision_assignment = ", profile_revision=?" if detail_revision is not None else ""
         revision_value = (detail_revision,) if detail_revision is not None else ()
+        payload = self.read_section_payload(cursor.entity_id, next_section)
+        supplied = (
+            payload.get("supplied_cursor")
+            if isinstance(payload, dict) and payload.get("supplied_generation") == cursor.generation
+            else None
+        )
+        page_assignment = ", page_cursor_json=?" if self._refresh_has("page_cursor_json") else ""
+        page_value = (encode(supplied) if supplied is not None else None,) if page_assignment else ()
         return self._conn.execute(
             "UPDATE entity_profile_refresh_state SET status='pending', retry_at=NULL, reason='refresh_queued', "
             "updated_at=?, next_section=?, acquisition_cursor=0"
-            + (", page_cursor_json=NULL" if self._refresh_has("page_cursor_json") else "")
+            + page_assignment
             + revision_assignment
             + " WHERE "
             + predicate,
-            (now, next_section, *revision_value, *parameters),
+            (now, next_section, *page_value, *revision_value, *parameters),
         ).rowcount
 
     def _write_detail(  # noqa: PLR0913
@@ -2148,13 +2489,14 @@ class EntityProfileRepository:
             and full_profile.field_observation != personal_channel.field_observation
         ):
             raise ValueError("paired profile field observations must match")
+        history_base = self._owned_history_base(cursor.entity_id, observation)
         detail, accepted, reset_owner = self._prepare_observed_commit(
             cursor.entity_id, {**full_profile.detail_patch, **personal_channel.detail_patch}, observation
         )
         if not self._write_pair_detail(cursor, detail, full_profile, personal_channel, now=now, accepted=accepted):
             return None
         self._finish_observed_commit(cursor.entity_id, accepted, reset_owner, observation)
-        self._store_semantic_commit(full_profile)
+        self._store_semantic_commit(full_profile, history_base)
         self._write_pair_section(cursor.entity_id, "full_profile", full_profile, detail, now=now)
         self._write_pair_section(cursor.entity_id, "personal_channel", personal_channel, detail, now=now)
         return detail

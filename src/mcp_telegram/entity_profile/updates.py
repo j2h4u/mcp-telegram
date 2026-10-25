@@ -1,14 +1,20 @@
 """Normalize supplied Telegram profile facts without acquiring anything remotely."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import cast
 
 from telethon.tl import types  # type: ignore[import-untyped]
 from telethon.tl.tlobject import TLObject  # type: ignore[import-untyped]
 
 from ..identity_observation import USERNAME_UNOBSERVED, observe_username
-from .contracts import ProfileFieldObservation
+from .contracts import (
+    ProfileCollectionItem,
+    ProfileFieldClass,
+    ProfileFieldCoverage,
+    ProfileFieldObservation,
+    ProfileFieldState,
+)
 from .full_user_normalization import (
     _USER_SCALAR_FIELDS,
     _normalize_names,
@@ -16,6 +22,7 @@ from .full_user_normalization import (
     _normalize_status,
     _normalize_user_optional,
 )
+from .semantic_normalization import normalize_collection_item
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +31,9 @@ class ProfilePush:
     fields: Mapping[str, object]
     minimal: bool = False
     authoritative_photo: bool = False
+    semantic_fields: Mapping[str, object] = field(default_factory=dict)
+    semantic_coverage: Mapping[str, ProfileFieldCoverage] = field(default_factory=dict)
+    story: ProfileCollectionItem | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,7 +143,15 @@ def project_user_profile(user: object) -> ProfilePush | None:
     fields = _user_profile_fields(user)
     if user.min:
         fields = _minimal_user_fields(user, fields)
-    return ProfilePush(user.id, fields, bool(user.min), bool(user.min and user.apply_min_photo))
+    semantic, coverage, _ = normalize_collection_item(user)
+    return ProfilePush(
+        user.id,
+        fields,
+        bool(user.min),
+        bool(user.min and user.apply_min_photo),
+        {f"user.{key}": value for key, value in semantic.items() if key != "constructor"},
+        {"user" + key[len("item") :]: value for key, value in coverage.items()},
+    )
 
 
 def profile_update_id(update: object) -> int | None:
@@ -151,8 +169,20 @@ def profile_update_id(update: object) -> int | None:
     peer: object = None
     if isinstance(update, types.UpdatePeerBlocked):
         peer = update.peer_id
-    elif isinstance(update, types.UpdatePeerHistoryTTL):
+    elif isinstance(
+        update,
+        (
+            types.UpdatePeerHistoryTTL,
+            types.UpdatePeerSettings,
+            types.UpdatePeerWallpaper,
+            types.UpdateStory,
+            types.UpdateReadStories,
+            types.UpdateSentStoryReaction,
+        ),
+    ):
         peer = update.peer
+    elif isinstance(update, types.UpdateNotifySettings):
+        peer = getattr(update.peer, "peer", None)
     return int(peer.user_id) if isinstance(peer, types.PeerUser) and _positive_id(peer.user_id) else None
 
 
@@ -191,4 +221,130 @@ def project_profile_update(update: object) -> ProfilePush | None:
             fields["blocked"] = bool(update.blocked)
     elif isinstance(update, types.UpdatePeerHistoryTTL):
         fields.update(_ttl_fields(update))
-    return ProfilePush(entity_id, fields)
+    semantic, coverage = _specific_semantics(update)
+    return ProfilePush(
+        entity_id, fields, semantic_fields=semantic, semantic_coverage=coverage, story=_supplied_story(update)
+    )
+
+
+def _specific_values(update: object) -> dict[str, object]:
+    if isinstance(update, types.UpdateUserName):
+        values: dict[str, object] = {
+            "user.first_name": update.first_name,
+            "user.last_name": update.last_name,
+            "user.usernames": update.usernames,
+        }
+        alias = _aliases(USERNAME_UNOBSERVED, update.usernames)
+        if "username" in alias:
+            values["user.username"] = alias["username"]
+        return values
+    if isinstance(update, types.UpdateUserPhone):
+        return {"user.phone": update.phone or None}
+    if isinstance(update, types.UpdateUserStatus):
+        return {"user.status": update.status}
+    if isinstance(update, types.UpdateUserEmojiStatus):
+        return {"user.emoji_status": update.emoji_status}
+    if isinstance(update, types.UpdatePeerBlocked) and not update.blocked_my_stories_from:
+        return {"full_user.blocked": bool(update.blocked)}
+    return _specific_settings(update)
+
+
+def _specific_settings(update: object) -> dict[str, object]:
+    if isinstance(update, types.UpdatePeerHistoryTTL):
+        return {"full_user.ttl_period": update.ttl_period}
+    if isinstance(update, types.UpdatePeerSettings):
+        return {"full_user.settings": update.settings}
+    if isinstance(update, types.UpdatePeerWallpaper):
+        return {
+            "full_user.wallpaper": update.wallpaper,
+            "full_user.wallpaper_overridden": bool(update.wallpaper_overridden),
+        }
+    if isinstance(update, types.UpdateNotifySettings):
+        return {"full_user.notify_settings": update.notify_settings}
+    return {}
+
+
+def _specific_semantics(update: object) -> tuple[dict[str, object], dict[str, ProfileFieldCoverage]]:
+    if isinstance(update, types.UpdateReadStories):
+        root = "full_user.stories"
+        return {root: {"constructor": "PeerStories", "max_read_id": update.max_id}}, {
+            root + ".max_read_id": ProfileFieldCoverage(ProfileFieldClass.PRIVATE_FACT, ProfileFieldState.PRESENT, True)
+        }
+    fields: dict[str, object] = {}
+    coverage: dict[str, ProfileFieldCoverage] = {}
+    for path, value in _specific_values(update).items():
+        normalized, evidence = _semantic_push_value(path, value)
+        fields[path] = normalized
+        if path in {
+            "user.phone",
+            "full_user.settings",
+            "full_user.notify_settings",
+            "full_user.blocked",
+            "full_user.ttl_period",
+            "full_user.wallpaper_overridden",
+        }:
+            evidence = {
+                key: replace(item, classification=ProfileFieldClass.PRIVATE_FACT)
+                if item.classification is ProfileFieldClass.PROFILE
+                else item
+                for key, item in evidence.items()
+            }
+        coverage.update(evidence)
+    return fields, coverage
+
+
+def _semantic_push_value(path: str, value: object) -> tuple[object, dict[str, ProfileFieldCoverage]]:
+    if isinstance(value, (list, tuple)):
+        values: list[object] = []
+        coverage = {path: ProfileFieldCoverage(ProfileFieldClass.PROFILE, ProfileFieldState.PRESENT, True)}
+        for index, item in enumerate(value):
+            normalized, evidence = _semantic_push_value(f"{path}[{index}]", item)
+            values.append(normalized)
+            coverage.update(evidence)
+        return values, coverage
+    if isinstance(value, TLObject):
+        fields, evidence, diagnostics = normalize_collection_item(value)
+        coverage = {path + key[len("item") :]: item for key, item in evidence.items()}
+        coverage.setdefault(
+            path,
+            ProfileFieldCoverage(
+                ProfileFieldClass.PROFILE,
+                ProfileFieldState.UNKNOWN if diagnostics else ProfileFieldState.PRESENT,
+                not diagnostics,
+            ),
+        )
+        return fields, coverage
+    state = ProfileFieldState.CLEARED if value is None else ProfileFieldState.PRESENT
+    return value, {path: ProfileFieldCoverage(ProfileFieldClass.PROFILE, state, True)}
+
+
+def _supplied_story(update: object) -> ProfileCollectionItem | None:
+    if isinstance(update, types.UpdateStory):
+        fields, facts, diagnostics = normalize_collection_item(update.story)
+        coverage = dict(facts)
+        coverage["item"] = ProfileFieldCoverage(
+            ProfileFieldClass.PROFILE,
+            ProfileFieldState.PRESENT,
+            not diagnostics
+            and not bool(getattr(update.story, "min", False))
+            and not isinstance(update.story, types.StoryItemSkipped),
+        )
+        identifier = fields.get("id")
+        if type(identifier) is int and identifier > 0:
+            return ProfileCollectionItem(
+                str(identifier),
+                fields,
+                coverage,
+                detail_complete=not diagnostics
+                and not bool(getattr(update.story, "min", False))
+                and not isinstance(update.story, types.StoryItemSkipped),
+            )
+    if isinstance(update, types.UpdateSentStoryReaction):
+        reaction, coverage = _semantic_push_value("item.sent_reaction", update.reaction)
+        return ProfileCollectionItem(
+            str(update.story_id),
+            {"constructor": "StoryItem", "id": update.story_id, "sent_reaction": reaction},
+            coverage,
+            detail_complete=False,
+        )
+    return None
