@@ -55,7 +55,9 @@ class _StartupUserProfilePort:
     def get_user_reference(self, user_id: int, *, is_self: bool = False) -> UserReference:
         return UserReference(user_id, 0, is_self=is_self)
 
-    async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
+    async def fetch_user_profile(
+        self, user_id: int, target_kind: TargetKind, *, owner_account_id: int | None = None
+    ) -> UserProfileObservation:
         if self.error is not None:
             raise self.error
         if self.observer is not None:

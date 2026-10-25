@@ -135,8 +135,12 @@ async def test_profile_observation_runs_after_pair_commit(tmp_path: Path) -> Non
         ("avatar_history", "pending"),
         ("common_chats", "pending"),
         ("contact_overlap", "pending"),
+        ("current_stories", "pending"),
         ("full_profile", "fresh"),
         ("personal_channel", "fresh"),
+        ("pinned_stories", "pending"),
+        ("saved_gifts", "pending"),
+        ("saved_music", "pending"),
     ]
     await service.shutdown()  # type: ignore[attr-defined]
     conn.close()

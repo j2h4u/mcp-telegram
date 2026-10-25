@@ -80,7 +80,7 @@ def _schema_value_types(annotation: object) -> set[str]:
 
 def test_manifest_exhaustively_matches_installed_recursive_schema() -> None:
     assert alltlobjects.LAYER == TL_PROFILE_LAYER == 229
-    queue = deque([types.User, types.UserFull, types.UserEmpty])
+    queue = deque([types.User, types.UserFull, types.UserEmpty, types.SavedStarGift])
     actual: dict[str, set[str]] = {}
     while queue:
         cls = queue.popleft()

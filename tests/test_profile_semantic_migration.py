@@ -63,7 +63,7 @@ def test_v87_fresh_schema_account_namespace_and_owner_constraints(tmp_path: Path
     path = tmp_path / "fresh.db"
     sync_db.ensure_sync_schema(path)
     with closing(sqlite3.connect(path)) as conn:
-        assert conn.execute("SELECT MAX(version),COUNT(DISTINCT version) FROM schema_version").fetchone() == (87, 87)
+        assert conn.execute("SELECT MAX(version),COUNT(DISTINCT version) FROM schema_version").fetchone() == (88, 88)
         assert conn.execute("SELECT COUNT(*) FROM entity_profile_semantic_snapshots").fetchone() == (0,)
         conn.execute("INSERT INTO entities(id,type,updated_at) VALUES (42,'user',1)")
         for owner in (77, 88):

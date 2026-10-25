@@ -8,11 +8,20 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
 
 import pytest
+from telethon.tl import types
 
-from mcp_telegram.entity_profile.contracts import PROFILE_SECTIONS, ProfileFieldObservation, completeness
+from mcp_telegram.entity_profile.collection_repository import store_semantic_snapshot
+from mcp_telegram.entity_profile.contracts import (
+    PROFILE_SECTIONS,
+    ObservationBoundary,
+    ProfileFieldObservation,
+    completeness,
+)
+from mcp_telegram.entity_profile.full_user_normalization import normalize_full_user_response
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_transactions import write_savepoint
@@ -39,6 +48,8 @@ def _peer(conn: sqlite3.Connection, entity_id: int, *, kind: str = "user", enabl
 
 
 def _collected(conn: sqlite3.Connection, entity_id: int, *, owner: int = 7) -> None:
+    kind = str(conn.execute("SELECT type FROM entities WHERE id=?", (entity_id,)).fetchone()[0]).lower()
+    personal = entity_id > 0 and kind in {"user", "bot"}
     with write_savepoint(conn):
         conn.execute(
             "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_owner_account_id) VALUES (?,?,100,?)",
@@ -47,8 +58,35 @@ def _collected(conn: sqlite3.Connection, entity_id: int, *, owner: int = 7) -> N
         conn.executemany(
             "INSERT INTO entity_detail_sections(entity_id,section,status,observed_at,payload_json) "
             "VALUES (?,?,'fresh',100,'[]')",
-            ((entity_id, section) for section in PROFILE_SECTIONS),
+            ((entity_id, section) for section in (PROFILE_SECTIONS if personal else PROFILE_SECTIONS[:5])),
         )
+        if personal:
+            conn.execute(
+                "UPDATE entity_detail_sections SET payload_json=? WHERE entity_id=? AND section IN "
+                "('common_chats','avatar_history','saved_music','saved_gifts','current_stories','pinned_stories')",
+                (json.dumps({"complete": True, "reported_count": 0, "retained_count": 0}), entity_id),
+            )
+            response = SimpleNamespace(
+                users=[types.User(id=entity_id, first_name=f"Peer {entity_id}", bot=kind == "bot")],
+                chats=[],
+                full_user=types.UserFull(
+                    id=entity_id,
+                    settings=types.PeerSettings(),
+                    notify_settings=types.PeerNotifySettings(),
+                    common_chats_count=0,
+                    about="Retained",
+                ),
+            )
+            observed = normalize_full_user_response(
+                response,
+                target_id=entity_id,
+                target_kind=kind,
+                owner_account_id=owner,
+                observation=ObservationBoundary(100, 100),
+            )
+            snapshot = observed.semantic_snapshot
+            assert snapshot is not None and snapshot.complete
+            assert store_semantic_snapshot(conn, snapshot, 0) is not None
         conn.execute(
             "INSERT INTO entity_profile_refresh_state(entity_id,status,reason,updated_at,generation) "
             "VALUES (?,'complete','refresh_complete',100,1)",
@@ -196,7 +234,7 @@ def test_unchanged_section_advances_without_renewing_observation(tmp_path: Path)
     untouched = conn.execute(
         "SELECT * FROM entity_detail_sections WHERE section<>'full_profile' ORDER BY section"
     ).fetchall()
-    for _ in range(4):
+    for _ in range(len(PROFILE_SECTIONS) - 1):
         cursor = repo.next_due_refresh(now=100_000)
         assert cursor is not None
         assert repo.complete_unchanged_section(cursor, now=100_000)

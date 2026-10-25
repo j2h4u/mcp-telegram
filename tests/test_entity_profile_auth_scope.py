@@ -63,7 +63,7 @@ async def test_scope_is_private_evidence_and_invalidated_pair_is_reacquired(tmp_
         "auth_scope": scope.as_private_mapping(),
         "entity_type": "user",
         "endpoint": "users.GetFullUser",
-        "normalization_version": "entity-profile-full-user-v1",
+        "normalization_version": "entity-profile-full-user-v2",
         "declared_fields": {
             "full_profile": list(cast(list[str], full_provenance["declared_fields"])),
             "personal_channel": list(cast(list[str], channel_provenance["declared_fields"])),
@@ -292,8 +292,10 @@ async def test_scope_change_during_rpc_rejects_receipt_and_progress(tmp_path: Pa
     current = [first]
 
     class ChangingClient(_PairClient):
-        async def fetch_user_profile(self, user_id: int, target_kind: object) -> UserProfileObservation:
-            result = await super().fetch_user_profile(user_id, target_kind)  # type: ignore[arg-type]
+        async def fetch_user_profile(
+            self, user_id: int, target_kind: object, *, owner_account_id: int | None = None
+        ) -> UserProfileObservation:
+            result = await super().fetch_user_profile(user_id, target_kind, owner_account_id=owner_account_id)  # type: ignore[arg-type]
             current[0] = second
             return result
 

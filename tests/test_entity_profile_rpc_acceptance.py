@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import pytest
 from jsonschema import validate  # type: ignore[import-untyped]
+from telethon.tl import types
 
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
 from mcp_telegram.entity_profile.contracts import (
@@ -59,25 +60,28 @@ class _FailureClient(_PairClient):
         self.failure = failure
         self.response = response
 
-    async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
+    async def fetch_user_profile(
+        self, user_id: int, target_kind: TargetKind, *, owner_account_id: int | None = None
+    ) -> UserProfileObservation:
         scope = current_rpc_scope()
         assert scope.attempt_budget is not None
         scope.attempt_budget.debit()
         if self.failure is not None:
             raise self.failure
         if self.response is None:
-            return await super().fetch_user_profile(user_id, target_kind)
+            return await super().fetch_user_profile(user_id, target_kind, owner_account_id=owner_account_id)
         return normalize_full_user_response(
             self.response,
             target_id=user_id,
             target_kind=target_kind,
+            owner_account_id=owner_account_id,
             observation=ObservationBoundary(100.0, 100.0),
         )
 
 
 class _CompletePairClient(_FailureClient):
     def __init__(self) -> None:
-        user = SimpleNamespace(
+        user = types.User(
             id=42,
             first_name="Target",
             last_name=None,
@@ -99,7 +103,11 @@ class _CompletePairClient(_FailureClient):
             fake=False,
             restricted=False,
         )
-        full_user = SimpleNamespace(
+        full_user = types.UserFull(
+            id=42,
+            settings=types.PeerSettings(),
+            notify_settings=types.PeerNotifySettings(),
+            common_chats_count=0,
             about="about",
             blocked=False,
             ttl_period=None,

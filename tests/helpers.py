@@ -24,6 +24,10 @@ from mcp_telegram.entity_profile.contracts import (
     CommonChatSummary,
     GroupProfileObservation,
     GroupReference,
+    ObservationBoundary,
+    ProfileCollectionItem,
+    ProfileCollectionPage,
+    ProfileFieldObservation,
     ProjectionOutcome,
     ProjectionStatus,
     TargetKind,
@@ -31,6 +35,8 @@ from mcp_telegram.entity_profile.contracts import (
     UserProfileObservation,
     UserReference,
 )
+from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
+from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.sync_db import _apply_migrations
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_savepoint
 
@@ -92,10 +98,22 @@ async def acquire_entity_profile(service: DaemonEntityInfoService, entity_id: in
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     adapter = EntityProfileDemandAdapter(coordinator)
-    for _ in range(8):
+    for _ in range(len(PROFILE_SECTIONS) + 1):
         await adapter.run_slice(RpcAttemptBudget(limit=1))
         if service._profiles.next_due_refresh(now=100) is None:
             break
+
+
+def finish_empty_profile_collections(repo: EntityProfileRepository, entity_id: int, *, now: int) -> None:
+    """Commit the four additional empty collection pages in a repository fixture."""
+    for section in PROFILE_SECTIONS[5:]:
+        cursor = repo.next_due_refresh(now=now)
+        assert cursor is not None and cursor.entity_id == entity_id and cursor.next_section == section
+        page = ProfileCollectionPage(entity_id, section, (), ObservationBoundary(now, now), 0, terminal=True)
+        observation = ProfileFieldObservation(7, allocate_observation_order(repo._conn), now, "rpc")
+        assert repo.commit_section(
+            cursor, EntitySectionCommit({}, collection_page=page, field_observation=observation), now=now
+        )
 
 
 def bind_profile_test_account(service: DaemonEntityInfoService) -> None:
@@ -260,6 +278,33 @@ class ClientUserAvatarHistoryPort:
         )
 
 
+async def client_profile_collection_page(
+    client: object, reference: UserReference, section: str
+) -> ProfileCollectionPage:
+    if section == "common_chats":
+        observation = await ClientCommonChatsPort(client).fetch_common_chats(reference)
+        items = tuple(
+            ProfileCollectionItem(str(chat.chat_id), {"id": chat.chat_id, "name": chat.name}, {})
+            for chat in observation.chats
+        )
+        count = observation.reported_count
+    elif section == "avatar_history":
+        observation = await ClientUserAvatarHistoryPort(client).fetch_user_avatar_history(reference)
+        items = tuple(
+            ProfileCollectionItem(str(photo.photo_id), {"id": photo.photo_id, "date": photo.date}, {})
+            for photo in observation.photos
+        )
+        count = observation.reported_count
+    else:
+        from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
+
+        budget = current_rpc_scope().attempt_budget
+        assert budget is not None
+        budget.debit()
+        items, count = (), 0
+    return ProfileCollectionPage(reference.user_id, section, items, ObservationBoundary(100, 100), count, terminal=True)
+
+
 class ClientChatAvatarHistoryPort:
     """Neutral chat-avatar port backed by a test client's response queue."""
 
@@ -338,7 +383,9 @@ class LoudUserProfilePort:
     def get_user_reference(self, user_id: int, *, is_self: bool = False) -> None:
         raise AssertionError(f"unexpected user reference request for {user_id}/{is_self}")
 
-    async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
+    async def fetch_user_profile(
+        self, user_id: int, target_kind: TargetKind, *, owner_account_id: int | None = None
+    ) -> UserProfileObservation:
         raise AssertionError(f"unexpected user profile request for {user_id} ({target_kind})")
 
 
@@ -357,7 +404,9 @@ class FakeUserProfilePort:
     def get_user_reference(self, user_id: int, *, is_self: bool = False) -> UserReference:
         return UserReference(user_id, 0, is_self=is_self)
 
-    async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
+    async def fetch_user_profile(
+        self, user_id: int, target_kind: TargetKind, *, owner_account_id: int | None = None
+    ) -> UserProfileObservation:
         self.calls.append((user_id, target_kind))
         if self.error is not None:
             raise self.error
@@ -369,6 +418,7 @@ class FakeUserProfilePort:
 
 def remove_v80_schema_for_historical_fixture(conn: sqlite3.Connection) -> None:
     """Remove v80 and later physical additions before rewinding the migration ledger."""
+    remove_v87_schema_for_historical_fixture(conn)
     conn.execute("DROP TRIGGER IF EXISTS topic_catalog_identity_changed")
     conn.execute("DROP TRIGGER IF EXISTS message_fts_key_insert")
     conn.execute("DROP INDEX IF EXISTS idx_messages_nonchannel_message_id")
@@ -396,3 +446,36 @@ def remove_v80_schema_for_historical_fixture(conn: sqlite3.Connection) -> None:
         if column in {row[1] for row in rows}:
             conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
     conn.execute("DELETE FROM schema_version WHERE version>=80")
+
+
+def remove_v87_schema_for_historical_fixture(conn: sqlite3.Connection) -> None:
+    """Historical fixtures must remove later physical tables as well as ledger rows."""
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='full_history_enrollment'").fetchone():
+        conn.execute("DROP TRIGGER IF EXISTS topic_catalog_identity_changed")
+    for table in (
+        "entity_profile_collection_membership",
+        "entity_profile_collection_facts",
+        "entity_profile_semantic_snapshots",
+    ):
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+    if "page_cursor_json" in {row[1] for row in conn.execute("PRAGMA table_info(entity_profile_refresh_state)")}:
+        conn.execute("ALTER TABLE entity_profile_refresh_state DROP COLUMN page_cursor_json")
+
+
+def enable_profile_page_fixture(conn: sqlite3.Connection) -> None:
+    """Upgrade the small old executor fixture before enabling writer authorization."""
+    if "page_cursor_json" in {row[1] for row in conn.execute("PRAGMA table_info(entity_profile_refresh_state)")}:
+        return
+    from mcp_telegram.sync_db import _apply_migration_87, _apply_migration_88
+
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(entity_details)")}
+    if "profile_owner_account_id" not in columns:
+        conn.execute("ALTER TABLE entity_details ADD COLUMN profile_owner_account_id INTEGER")
+    conn.execute("CREATE TABLE IF NOT EXISTS daemon_state(key TEXT PRIMARY KEY,value TEXT)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS entity_profile_field_observations(entity_id INTEGER,field TEXT,"
+        "owner_account_id INTEGER,observation_order INTEGER,observed_at INTEGER,source TEXT,PRIMARY KEY(entity_id,field))"
+    )
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_version(version INTEGER PRIMARY KEY,applied_at INTEGER)")
+    _apply_migration_87(conn, 86)
+    _apply_migration_88(conn, 87)

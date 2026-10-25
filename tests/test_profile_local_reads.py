@@ -285,10 +285,12 @@ async def test_rpc_reserves_order_before_acquisition_and_newer_push_wins(tmp_pat
     release = asyncio.Event()
 
     class DelayedProfile(_PairClient):
-        async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
+        async def fetch_user_profile(
+            self, user_id: int, target_kind: TargetKind, *, owner_account_id: int | None = None
+        ) -> UserProfileObservation:
             entered.set()
             await release.wait()
-            return await super().fetch_user_profile(user_id, target_kind)
+            return await super().fetch_user_profile(user_id, target_kind, owner_account_id=owner_account_id)
 
     path = tmp_path / "ordered-profile.sqlite"
     ensure_sync_schema(path)
@@ -362,7 +364,9 @@ async def test_avatar_history_uses_canonical_push_photo_not_stale_full_payload(
 @pytest.mark.asyncio
 async def test_durable_user_profile_preserves_dynamic_relationship_and_emoji_fields(tmp_path: Path) -> None:
     class RelationshipProfile(_PairClient):
-        async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
+        async def fetch_user_profile(
+            self, user_id: int, target_kind: TargetKind, *, owner_account_id: int | None = None
+        ) -> UserProfileObservation:
             budget = current_rpc_scope().attempt_budget
             assert budget is not None
             budget.debit()
@@ -382,6 +386,7 @@ async def test_durable_user_profile_preserves_dynamic_relationship_and_emoji_fie
                 ),
                 target_id=user_id,
                 target_kind=target_kind,
+                owner_account_id=owner_account_id,
                 observation=ObservationBoundary(100, 100),
             )
 

@@ -156,7 +156,7 @@ class _GroupProfilePort:
 
 def _service() -> tuple[sqlite3.Connection, DaemonEntityInfoService, _GroupClient]:
     conn = sqlite3.connect(":memory:")
-    _fenced_schema(conn)
+    _fenced_schema(conn, semantic=False)
     conn.execute("INSERT INTO entities VALUES (-123, 'group', 'Group', NULL, NULL, 1)")
     conn.commit()
     client = _GroupClient(_full_chat())

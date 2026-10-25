@@ -149,7 +149,13 @@ async def test_gateway_preserves_personal_channel_metadata_without_post_capabili
         "title": "Channel",
         "username": "channel",
     }
-    assert "access_hash" not in repr(observation)
+    assert "access_hash" not in repr(
+        (
+            observation.full_profile.payload,
+            observation.personal_channel.payload,
+            observation.semantic_snapshot.fields if observation.semantic_snapshot else {},
+        )
+    )
     assert not hasattr(observation, "personal_channel_reference")
     assert client.message_ids == []
 
@@ -176,5 +182,11 @@ async def test_gateway_never_exposes_channel_capability(
         42, TargetKind.USER
     )
 
-    assert "access_hash" not in repr(observation)
+    assert "access_hash" not in repr(
+        (
+            observation.full_profile.payload,
+            observation.personal_channel.payload,
+            observation.semantic_snapshot.fields if observation.semantic_snapshot else {},
+        )
+    )
     assert not hasattr(observation, "personal_channel_reference")
