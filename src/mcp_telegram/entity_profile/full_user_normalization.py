@@ -11,9 +11,11 @@ boundary.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from datetime import date, datetime
 from typing import TypedDict, cast
 
+from ..dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
 from ..identity_observation import USERNAME_UNOBSERVED, observe_username
 from ..telethon_dialog import observe_dialog_identity
 from .contracts import (
@@ -617,6 +619,7 @@ def normalize_full_user_response(
         if boundary.valid and boundary.started_at is not None
         else None
     )
+    identity_patch, identity_observation = _authorized_identity(user, semantic, identity_patch, identity_observation)
     profile_provenance = _projection_provenance(FULL_PROFILE_OWNED_FIELDS, profile, boundary, authoritative=complete)
     return UserProfileObservation(
         target_id=target_id,
@@ -640,6 +643,7 @@ def _retain_authorized_legacy_fields(
     """Keep partial or privacy-dependent omission from erasing retained v1 facts."""
     aliases = {"extra_usernames": "usernames", "emoji_status_id": "emoji_status"}
     user_fields = {name for name, _kind in _USER_SCALAR_FIELDS} | {
+        "name",
         "first_name",
         "last_name",
         "extra_usernames",
@@ -654,8 +658,7 @@ def _retain_authorized_legacy_fields(
         path = f"{'user' if name in user_fields else 'full_user'}.{aliases.get(name, name)}"
         if not _legacy_field_authoritative(semantic, name, path):
             profile.pop(name)
-    if type(user).__name__ in {"User", "UserEmpty"} and "user:partial_user" in semantic.diagnostics:
-        _retain_positive_min_fields(profile, user_fields)
+    _retain_membership(profile, user, full_user, semantic)
 
 
 _LEGACY_COMPONENTS: dict[str, tuple[str, ...]] = {
@@ -669,25 +672,56 @@ _LEGACY_COMPONENTS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _paths_authoritative(semantic: ProfileSemanticSnapshot, paths: tuple[str, ...]) -> bool:
+    return all(path in semantic.coverage and semantic.coverage[path].authoritative for path in paths)
+
+
+def _retain_membership(
+    profile: dict[str, object], user: object, full_user: object, semantic: ProfileSemanticSnapshot
+) -> None:
+    paths: tuple[str, ...] = ()
+    if type(user).__name__ in {"User", "UserEmpty"}:
+        paths += ("user.contact", "user.mutual_contact", "user.close_friend")
+    if type(full_user).__name__ == "UserFull":
+        paths += ("full_user.blocked",)
+    if not _paths_authoritative(semantic, paths):
+        profile.pop("my_membership", None)
+
+
+def _authorized_identity(
+    user: object,
+    semantic: ProfileSemanticSnapshot,
+    patch: dict[str, object],
+    observation: DialogIdentityObservation | None,
+) -> tuple[dict[str, object], DialogIdentityObservation | None]:
+    if type(user).__name__ not in {"User", "UserEmpty"}:
+        return patch, observation
+    name = _paths_authoritative(semantic, ("user.first_name", "user.last_name"))
+    username = _paths_authoritative(semantic, ("user.username", "user.usernames"))
+    if not name:
+        patch.pop("name", None)
+    if not username:
+        patch.pop("username", None)
+    if observation is not None:
+        observation = replace(
+            observation,
+            name=observation.name if name else IDENTITY_OMITTED,
+            username=observation.username if username else IDENTITY_OMITTED,
+            complete=observation.complete and name and username,
+        )
+    return patch, observation
+
+
 def _legacy_field_authoritative(semantic: ProfileSemanticSnapshot, name: str, path: str) -> bool:
     # A v1 compound value may replace only its own observed components.
+    if name == "name":
+        return _paths_authoritative(semantic, ("user.first_name", "user.last_name"))
     for component in _LEGACY_COMPONENTS.get(name, ("",)):
         key = f"{path}.{component}" if component else path
         coverage = semantic.coverage.get(key) or semantic.coverage.get(path)
         if coverage is not None and not coverage.authoritative:
             return False
     return True
-
-
-def _retain_positive_min_fields(profile: dict[str, object], user_fields: set[str]) -> None:
-    for name in user_fields | {"name", "my_membership"}:
-        if profile.get(name) in (None, False, "", [], {}) or name in {
-            "contact",
-            "mutual_contact",
-            "close_friend",
-            "my_membership",
-        }:
-            profile.pop(name, None)
 
 
 __all__ = [

@@ -343,7 +343,7 @@ async def test_protective_disconnect_serves_valid_partial_profile_from_local_cac
 
 
 @pytest.mark.asyncio
-async def test_min_full_user_pair_publishes_only_positive_identity_fields(tmp_path: Path) -> None:
+async def test_min_full_user_pair_preserves_complete_identity(tmp_path: Path) -> None:
     conn, service = _prepare(tmp_path / "min-pair.sqlite", min_user=True)
     conn.execute("INSERT INTO dialogs(dialog_id,name,type,username) VALUES (42,'Old name','user','old_username')")
     conn.commit()
@@ -355,7 +355,7 @@ async def test_min_full_user_pair_publishes_only_positive_identity_fields(tmp_pa
 
     assert conn.execute(
         "SELECT name,username,type,identity_revision,revision FROM dialogs WHERE dialog_id=42"
-    ).fetchone() == ("Partial", "old_username", "user", 1, 0)
+    ).fetchone() == ("Old name", "old_username", "user", 0, 0)
     await service.shutdown()  # type: ignore[attr-defined]
     conn.close()
 

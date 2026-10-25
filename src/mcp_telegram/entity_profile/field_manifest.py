@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from .contracts import ProfileFieldClass
 
 TL_PROFILE_LAYER = 229
+PARTIAL_PROFILE_CONSTRUCTORS = frozenset({"User", "StoryItem", "Channel", "Community", "PollResults"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,7 +393,7 @@ PROFILE_FIELD_MANIFEST: Mapping[str, ProfileConstructorRule] = {
             "megagroup": ProfileFieldRule(("bool",), optional=True, flag=True),
             "restricted": ProfileFieldRule(("bool",), optional=True, flag=True),
             "signatures": ProfileFieldRule(("bool",), optional=True, flag=True),
-            "min": ProfileFieldRule(("bool",), optional=True, flag=True),
+            "min": ProfileFieldRule(("bool",), classification=ProfileFieldClass.CAPABILITY, optional=True, flag=True),
             "scam": ProfileFieldRule(("bool",), optional=True, flag=True),
             "has_link": ProfileFieldRule(("bool",), optional=True, flag=True),
             "has_geo": ProfileFieldRule(("bool",), optional=True, flag=True),
@@ -565,7 +566,7 @@ PROFILE_FIELD_MANIFEST: Mapping[str, ProfileConstructorRule] = {
             "date": ProfileFieldRule(("datetime",), optional=True),
             "creator": ProfileFieldRule(("bool",), optional=True, flag=True),
             "left": ProfileFieldRule(("bool",), optional=True, flag=True),
-            "min": ProfileFieldRule(("bool",), optional=True, flag=True),
+            "min": ProfileFieldRule(("bool",), classification=ProfileFieldClass.CAPABILITY, optional=True, flag=True),
             "collapsed_in_dialogs": ProfileFieldRule(("bool",), optional=True, flag=True),
             "access_hash": ProfileFieldRule(("int",), classification=ProfileFieldClass.CAPABILITY, optional=True),
             "admin_rights": ProfileFieldRule(("ChatAdminRights",), optional=True),
@@ -1965,7 +1966,7 @@ PROFILE_FIELD_MANIFEST: Mapping[str, ProfileConstructorRule] = {
     "PollResults": ProfileConstructorRule(
         0xBA7BB15E,
         {
-            "min": ProfileFieldRule(("bool",), optional=True, flag=True),
+            "min": ProfileFieldRule(("bool",), classification=ProfileFieldClass.CAPABILITY, optional=True, flag=True),
             "has_unread_votes": ProfileFieldRule(("bool",), optional=True, flag=True),
             "can_view_stats": ProfileFieldRule(("bool",), optional=True, flag=True),
             "results": ProfileFieldRule(("PollAnswerVoters",), optional=True, vector=True),
@@ -2242,7 +2243,7 @@ PROFILE_FIELD_MANIFEST: Mapping[str, ProfileConstructorRule] = {
             "pinned": ProfileFieldRule(("bool",), optional=True, flag=True),
             "public": ProfileFieldRule(("bool",), optional=True, flag=True),
             "close_friends": ProfileFieldRule(("bool",), optional=True, flag=True),
-            "min": ProfileFieldRule(("bool",), optional=True, flag=True),
+            "min": ProfileFieldRule(("bool",), classification=ProfileFieldClass.CAPABILITY, optional=True, flag=True),
             "noforwards": ProfileFieldRule(("bool",), optional=True, flag=True),
             "edited": ProfileFieldRule(("bool",), optional=True, flag=True),
             "contacts": ProfileFieldRule(("bool",), optional=True, flag=True),

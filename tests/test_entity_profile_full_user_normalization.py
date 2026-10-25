@@ -114,7 +114,7 @@ def test_dynamic_user_fields_and_membership_are_real_normalized_facts() -> None:
     }
 
 
-def test_min_telethon_user_emits_only_positive_partial_identity_on_fresh_boundary() -> None:
+def test_min_telethon_user_does_not_publish_derived_partial_identity() -> None:
     user = User(id=42, first_name="Partial", last_name="", username=None, usernames=None, min=True)
     result = normalize_full_user_response(
         SimpleNamespace(full_user=SimpleNamespace(), users=[user], chats=[]),
@@ -126,7 +126,7 @@ def test_min_telethon_user_emits_only_positive_partial_identity_on_fresh_boundar
     identity = result.full_profile.dialog_identity_observation
     assert identity is not None
     assert (identity.name, identity.username, identity.dialog_type, identity.complete, identity.observed_at) == (
-        "Partial",
+        IDENTITY_OMITTED,
         IDENTITY_OMITTED,
         IDENTITY_OMITTED,
         False,

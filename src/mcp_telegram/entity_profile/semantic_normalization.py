@@ -14,7 +14,12 @@ from .contracts import (
     ProfileFieldState,
     ProfileSemanticSnapshot,
 )
-from .field_manifest import PROFILE_FIELD_MANIFEST, ProfileConstructorRule, ProfileFieldRule
+from .field_manifest import (
+    PARTIAL_PROFILE_CONSTRUCTORS,
+    PROFILE_FIELD_MANIFEST,
+    ProfileConstructorRule,
+    ProfileFieldRule,
+)
 
 _MISSING = object()
 _EMPTY_CONSTRUCTORS = frozenset({"UserProfilePhotoEmpty", "EmojiStatusEmpty"})
@@ -105,13 +110,10 @@ class _SemanticNormalizer:
         return output
 
     def field_value(self, value: object, rule: ProfileFieldRule, path: str, *, authoritative: bool) -> object:
-        if rule.classification is ProfileFieldClass.CAPABILITY:
-            self.coverage[path] = ProfileFieldCoverage(
-                rule.classification, ProfileFieldState.INAPPLICABLE, reason="transport_capability_excluded"
-            )
-            return _MISSING
         if value is _MISSING:
             return self.unknown(path, rule.classification, "field_missing")
+        if not authoritative and _negative_partial_value(value):
+            return self.unknown(path, rule.classification, "partial_value_unobserved")
         if value is None:
             value = self.absent(path, rule, authoritative=authoritative)
             if value is _MISSING or value is None:
@@ -169,6 +171,11 @@ class _SemanticNormalizer:
         output: dict[str, object] = {}
         for name, original_rule in schema.fields.items():
             rule = original_rule
+            if rule.classification is ProfileFieldClass.CAPABILITY:
+                self.coverage[f"{path}.{name}"] = ProfileFieldCoverage(
+                    rule.classification, ProfileFieldState.INAPPLICABLE, reason="transport_capability_excluded"
+                )
+                continue
             if inherited is ProfileFieldClass.PRIVATE_FACT and rule.classification is ProfileFieldClass.PROFILE:
                 rule = ProfileFieldRule(
                     rule.value_types,
@@ -205,18 +212,26 @@ class _SemanticNormalizer:
             return _MISSING
         if id(value) in self.active:
             return self.unknown(path, inherited, "constructor_cycle")
-        actual_name = _constructor_name(value)
-        concrete = actual_name == name and _read(value, "CONSTRUCTOR_ID") == schema.constructor_id
-        if not concrete:
-            self.diagnostics.append(f"{path}:constructor_identity_unverified")
+        trusted = self.source_authority(value, name, path, schema, authoritative)
         self.active.add(id(value))
         try:
             return {
                 "constructor": name,
-                **self.fields(value, schema, path, authoritative=authoritative and concrete, inherited=inherited),
+                **self.fields(value, schema, path, authoritative=trusted, inherited=inherited),
             }
         finally:
             self.active.remove(id(value))
+
+    def source_authority(
+        self, value: object, name: str, path: str, schema: ProfileConstructorRule, authoritative: bool
+    ) -> bool:
+        concrete = _constructor_name(value) == name and _read(value, "CONSTRUCTOR_ID") == schema.constructor_id
+        if not concrete:
+            self.diagnostics.append(f"{path}:constructor_identity_unverified")
+        partial = _partial_constructor(value, name)
+        if partial:
+            self.diagnostics.append(f"{path}:partial_constructor")
+        return authoritative and concrete and not partial and not (_attributes(value) - schema.fields.keys())
 
 
 def normalize_semantic_profile(
@@ -255,6 +270,19 @@ def _minimal_user(user: object, normalizer: _SemanticNormalizer) -> bool:
         return raw is True
     normalizer.diagnostics.append("user:min_flag_unknown")
     return True
+
+
+def _partial_constructor(value: object, name: str) -> bool:
+    if name not in PARTIAL_PROFILE_CONSTRUCTORS:
+        return False
+    raw = _read(value, "min")
+    return raw is not None and raw is not False
+
+
+def _negative_partial_value(value: object) -> bool:
+    if value is None or value is False:
+        return True
+    return isinstance(value, (str, list, tuple, dict)) and not value
 
 
 def _validate_target(user: object, full_user: object, target_id: int) -> bool:

@@ -3,8 +3,10 @@
 import inspect
 import json
 import re
+import sqlite3
 import typing
 from collections import deque
+from collections.abc import Callable
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import cast
@@ -13,6 +15,8 @@ import pytest
 from telethon.tl import alltlobjects, types  # type: ignore[import-untyped]
 from telethon.tl.tlobject import TLObject  # type: ignore[import-untyped]
 
+from mcp_telegram.dialog_identity import publish_dialog_identity
+from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED
 from mcp_telegram.entity_profile.contracts import (
     NORMALIZATION_VERSION,
     ObservationBoundary,
@@ -22,6 +26,7 @@ from mcp_telegram.entity_profile.contracts import (
 )
 from mcp_telegram.entity_profile.field_manifest import PROFILE_FIELD_MANIFEST, TL_PROFILE_LAYER
 from mcp_telegram.entity_profile.full_user_normalization import normalize_full_user_response
+from mcp_telegram.entity_profile.repository import _apply_identity_patch
 from mcp_telegram.entity_profile.semantic_normalization import normalize_semantic_profile
 
 BOUNDARY = ObservationBoundary(100.0, 101.0)
@@ -358,3 +363,63 @@ def test_malformed_min_flag_cannot_authorize_clears() -> None:
     assert not snapshot.coverage["user.photo"].authoritative
     assert not snapshot.coverage["user.username"].authoritative
     assert "user.photo" not in snapshot.fields
+
+
+def test_partial_user_cannot_replace_legacy_name_membership_or_published_identity(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
+    user = types.User(id=42, min=True, first_name="Ada", last_name=None)
+    result = normalize_full_user_response(
+        SimpleNamespace(users=[user], full_user=_full(), chats=[]),
+        target_id=42,
+        target_kind="user",
+        owner_account_id=77,
+        observation=BOUNDARY,
+    )
+    assert result.full_profile.payload is not None
+    assert "name" not in result.full_profile.payload
+    assert "my_membership" not in result.full_profile.payload
+    patch = result.full_profile.identity_patch or {}
+    assert "name" not in patch and "username" not in patch
+    assert (
+        _apply_identity_patch({"id": 42, "name": "Ada Lovelace", "username": "retained"}, patch)["name"]
+        == "Ada Lovelace"
+    )
+    identity = result.full_profile.dialog_identity_observation
+    assert identity is not None and identity.name is IDENTITY_OMITTED and identity.username is IDENTITY_OMITTED
+    conn = make_synced_db()
+    conn.execute(
+        "INSERT INTO dialogs(dialog_id,name,username,type,identity_revision,identity_complete) VALUES (42,'Ada Lovelace','retained','user',0,1)"
+    )
+    assert not publish_dialog_identity(conn, 42, identity, 0)
+    assert conn.execute("SELECT name,username FROM dialogs WHERE dialog_id=42").fetchone() == (
+        "Ada Lovelace",
+        "retained",
+    )
+
+
+def test_nested_story_min_does_not_authorize_absence_or_complete() -> None:
+    from mcp_telegram.entity_profile.field_manifest import PARTIAL_PROFILE_CONSTRUCTORS
+
+    story = types.StoryItem(
+        id=7,
+        date=datetime(2025, 1, 1, tzinfo=UTC),
+        expire_date=datetime(2025, 1, 2, tzinfo=UTC),
+        media=types.MessageMediaEmpty(),
+        min=True,
+        caption="known",
+        public=False,
+    )
+    snapshot = _snapshot(full=_full(stories=types.PeerStories(peer=types.PeerUser(42), stories=[story])))
+    assert not snapshot.complete
+    path = "full_user.stories.stories[0]"
+    assert f"{path}:partial_constructor" in snapshot.diagnostics
+    stories = cast(dict[str, object], snapshot.fields["full_user.stories"])
+    normalized = cast(list[dict[str, object]], stories["stories"])[0]
+    assert normalized["id"] == 7 and normalized["caption"] == "known"
+    assert "pinned" not in normalized and "public" not in normalized
+    assert not snapshot.coverage[f"{path}.public"].authoritative
+    assert snapshot.coverage[f"{path}.public"].state is ProfileFieldState.UNKNOWN
+    assert {"User", "StoryItem", "Channel", "Community", "PollResults"} == PARTIAL_PROFILE_CONSTRUCTORS
+    for constructor in PARTIAL_PROFILE_CONSTRUCTORS:
+        assert PROFILE_FIELD_MANIFEST[constructor].fields["min"].classification is ProfileFieldClass.CAPABILITY
