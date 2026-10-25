@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Literal, TypedDict, cast
 
@@ -20,6 +20,14 @@ PROFILE_SECTIONS: tuple[str, ...] = (
     "contact_overlap",
     "avatar_history",
     "personal_channel",
+    "saved_music",
+    "saved_gifts",
+    "current_stories",
+    "pinned_stories",
+)
+
+PROFILE_COLLECTION_SECTIONS = frozenset(
+    {"avatar_history", "common_chats", "saved_music", "saved_gifts", "current_stories", "pinned_stories"}
 )
 
 PROFILE_ACQUISITION_OUTCOMES: frozenset[str] = frozenset({"usable", "partial", "absent", "unavailable"})
@@ -113,6 +121,55 @@ class ProfileSemanticSnapshot:
         _validate_positive_id(owner_account_id, field_name="owner_account_id")
         if self.owner_account_id != owner_account_id:
             raise ValueError("semantic profile account does not match requested owner")
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCollectionItem:
+    key: str
+    fields: Mapping[str, object]
+    coverage: Mapping[str, ProfileFieldCoverage]
+    identity_kind: str = "remote"
+    detail_complete: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.key or self.identity_kind not in {"remote", "observation"}:
+            raise ValueError("invalid collection item identity")
+
+
+@dataclass(frozen=True, slots=True)
+class SuppliedProfileUser:
+    entity_id: int
+    fields: Mapping[str, object]
+    coverage: Mapping[str, ProfileFieldCoverage]
+    legacy_fields: Mapping[str, object]
+    minimal: bool
+    authoritative_photo: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCollectionPage:
+    entity_id: int
+    section: str
+    items: tuple[ProfileCollectionItem, ...]
+    observation: ObservationBoundary
+    reported_count: int | None = None
+    next_cursor: Mapping[str, object] | None = None
+    terminal: bool = False
+    diagnostics: tuple[str, ...] = ()
+    reason: str | None = None
+    detail_ids: tuple[int, ...] = ()
+    metadata: Mapping[str, object] = field(default_factory=dict)
+    supplied_user: SuppliedProfileUser | None = None
+    sidecar_identities: tuple[DialogIdentityObservation, ...] = ()
+
+    def __post_init__(self) -> None:
+        _validate_positive_id(self.entity_id, field_name="entity_id")
+        if self.section not in PROFILE_COLLECTION_SECTIONS or not self.observation.valid:
+            raise ValueError("invalid collection page boundary")
+        if self.reported_count is not None:
+            _validate_count(self.reported_count)
+        if self.terminal and self.next_cursor is not None:
+            raise ValueError("terminal page cannot have continuation")
 
 
 @dataclass(frozen=True, slots=True)

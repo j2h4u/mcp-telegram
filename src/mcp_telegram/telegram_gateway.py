@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime
 from typing import Protocol, cast
@@ -21,8 +21,17 @@ from telethon.tl.functions.messages import (
     GetScheduledHistoryRequest,  # type: ignore[import-untyped]
     SearchRequest,
 )
+from telethon.tl.functions.payments import GetSavedStarGiftsRequest  # type: ignore[import-untyped]
 from telethon.tl.functions.photos import GetUserPhotosRequest  # type: ignore[import-untyped]
-from telethon.tl.functions.users import GetFullUserRequest  # type: ignore[import-untyped]
+from telethon.tl.functions.stories import (  # type: ignore[import-untyped]
+    GetPeerStoriesRequest,
+    GetPinnedStoriesRequest,
+    GetStoriesByIDRequest,
+)
+from telethon.tl.functions.users import (
+    GetFullUserRequest,  # type: ignore[import-untyped]
+    GetSavedMusicRequest,  # type: ignore[import-untyped]
+)
 from telethon.tl.types import (  # type: ignore[import-untyped]
     ChannelParticipantsContacts,
     TypeInputPeer,
@@ -45,7 +54,10 @@ from .entity_profile.contracts import (
     GroupProfileObservation,
     GroupReference,
     ObservationBoundary,
+    ProfileCollectionItem,
+    ProfileCollectionPage,
     ProjectionStatus,
+    SuppliedProfileUser,
     TargetKind,
     UserAvatarHistoryObservation,
     UserProfileObservation,
@@ -60,6 +72,8 @@ from .entity_profile.ports import (
     UserAvatarHistoryPort,
     UserProfilePort,
 )
+from .entity_profile.semantic_normalization import normalize_collection_item
+from .entity_profile.updates import project_user_profile
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .identity_observation import USERNAME_UNOBSERVED, observe_username
 from .telegram_access import ACCESS_LOST_ERRORS
@@ -69,6 +83,9 @@ from .telegram_rpc_scheduler import RpcAdmissionClosedError, RpcAdmissionError, 
 from .telethon_dialog import classify_dialog_type, observe_dialog_identity
 
 CATCHABLE_GATEWAY_FAILURES = (Exception,)
+
+
+_PROFILE_PAGE_LIMIT = 100
 
 
 class ScheduledHistoryClient(Protocol):
@@ -383,7 +400,9 @@ class TelethonUserProfileGateway(UserProfilePort):
             return None
         return _user_reference_from_peer(_session_entity(self._client, user_id), user_id, is_self=is_self)
 
-    async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
+    async def fetch_user_profile(
+        self, user_id: int, target_kind: TargetKind, *, owner_account_id: int | None = None
+    ) -> UserProfileObservation:
         if not isinstance(user_id, int) or isinstance(user_id, bool) or user_id <= 0:
             raise ValueError("user target id must be a positive integer")
         try:
@@ -397,10 +416,275 @@ class TelethonUserProfileGateway(UserProfilePort):
             result,
             target_id=user_id,
             target_kind=normalized_kind,
+            owner_account_id=owner_account_id,
             observation=ObservationBoundary(started_at=started_at, completed_at=completed_at),
         )
         current_photo = _normalize_user_current_photo(result, user_id)
         return replace(observation, current_photo=current_photo)
+
+    async def fetch_profile_collection_page(
+        self, reference: UserReference, section: str, cursor: Mapping[str, object]
+    ) -> ProfileCollectionPage:
+        _validate_user_reference(reference)
+        request = _collection_request(reference, section, cursor)
+        started = self._now_provider()
+        try:
+            result = await self._client(request)
+        except (*ACCESS_LOST_ERRORS, ChatAdminRequiredError):
+            return ProfileCollectionPage(
+                reference.user_id,
+                section,
+                (),
+                ObservationBoundary(started, self._now_provider()),
+                reason="access_lost",
+            )
+        page = _collection_page(reference, section, cursor, result, ObservationBoundary(started, self._now_provider()))
+        return _collection_sidecars(page, result)
+
+
+def _cursor_int(cursor: Mapping[str, object], key: str) -> int:
+    value = cursor.get(key, 0)
+    if type(value) is not int or value < 0:
+        raise ValueError("invalid collection cursor")
+    return value
+
+
+def _collection_request(reference: UserReference, section: str, cursor: Mapping[str, object]) -> object:
+    user = _input_user(reference)
+    peer = types.InputPeerSelf() if reference.is_self else types.InputPeerUser(reference.user_id, reference.access_hash)
+    if cursor.get("phase") == "details":
+        if section not in {"current_stories", "pinned_stories"}:
+            raise ValueError("story detail cursor has wrong collection")
+        return _story_detail_request(peer, cursor)
+    if section in {"avatar_history", "common_chats", "saved_music"}:
+        return _user_collection_request(user, section, cursor)
+    if section == "saved_gifts":
+        offset = cursor.get("offset", "")
+        if not isinstance(offset, str):
+            raise ValueError("invalid gift cursor")
+        return GetSavedStarGiftsRequest(peer=peer, offset=offset, limit=100)
+    if section == "current_stories":
+        return GetPeerStoriesRequest(peer=peer)
+    if section != "pinned_stories":
+        raise ValueError("unknown profile collection")
+    return GetPinnedStoriesRequest(peer=peer, offset_id=_cursor_int(cursor, "offset_id"), limit=100)
+
+
+def _user_collection_request(user: TypeInputUser, section: str, cursor: Mapping[str, object]) -> object:
+    if section == "avatar_history":
+        return GetUserPhotosRequest(user, offset=_cursor_int(cursor, "offset"), max_id=0, limit=100)
+    if section == "common_chats":
+        return GetCommonChatsRequest(user, max_id=_cursor_int(cursor, "max_id"), limit=100)
+    return GetSavedMusicRequest(user, offset=_cursor_int(cursor, "offset"), limit=100, hash=0)
+
+
+def _story_detail_request(peer: TypeInputPeer, cursor: Mapping[str, object]) -> object:
+    ids = cursor.get("ids")
+    if not isinstance(ids, list) or not ids or any(type(value) is not int or value <= 0 for value in ids):
+        raise ValueError("invalid story detail cursor")
+    return GetStoriesByIDRequest(peer=peer, id=ids[:100])
+
+
+def _collection_result(section: str, result: object) -> tuple[list[object], int | None, bool]:
+    name = type(result).__name__
+    if section == "current_stories" and name == "PeerStories":
+        peer_stories = getattr(result, "stories", None)
+        stories = cast(object, getattr(peer_stories, "stories", None))
+        if not isinstance(stories, list):
+            raise ValueError("current story vector missing")
+        return cast(list[object], stories), None, True
+    fields = {
+        "avatar_history": "photos",
+        "common_chats": "chats",
+        "saved_music": "documents",
+        "saved_gifts": "gifts",
+        "pinned_stories": "stories",
+    }
+    allowed = {
+        "avatar_history": {"Photos", "PhotosSlice"},
+        "common_chats": {"Chats", "ChatsSlice"},
+        "saved_music": {"SavedMusic"},
+        "saved_gifts": {"SavedStarGifts"},
+        "pinned_stories": {"Stories"},
+    }
+    if name not in allowed.get(section, set()):
+        raise ValueError("unsupported profile collection result")
+    values = getattr(result, fields[section], None)
+    if not isinstance(values, list):
+        raise ValueError("profile collection vector missing")
+    count = cast(object, getattr(result, "count", None))
+    if count is not None and (type(count) is not int or count < 0):
+        raise ValueError("invalid reported collection count")
+    return values, count, name in {"Photos", "Chats"}
+
+
+def _item_identity(section: str, value: object, index: int) -> tuple[str, str]:
+    identifier = getattr(value, "id", None)
+    if section == "saved_gifts":
+        for field_name in ("msg_id", "saved_id"):
+            candidate = getattr(value, field_name, None)
+            if type(candidate) is int and candidate > 0:
+                return f"{field_name}:{candidate}", "remote"
+        gift = getattr(value, "gift", None)
+        if type(gift).__name__ == "StarGiftUnique":
+            identifier = getattr(gift, "id", None)
+        else:
+            return str(index), "observation"
+    if type(identifier) is not int or identifier <= 0:
+        return str(index), "observation"
+    if section == "common_chats":
+        kind = "channel" if type(value).__name__.startswith("Channel") else "chat"
+        return f"{kind}:{identifier}", "remote"
+    return str(identifier), "remote"
+
+
+def _collection_items(
+    section: str, values: list[object], *, details: bool
+) -> tuple[tuple[ProfileCollectionItem, ...], tuple[int, ...], tuple[str, ...]]:
+    items: list[ProfileCollectionItem] = []
+    missing: list[int] = []
+    diagnostics: list[str] = []
+    for index, value in enumerate(values):
+        fields, coverage, problems = normalize_collection_item(value)
+        key, identity = _item_identity(section, value, index)
+        story_partial = _partial_story(value)
+        deferred = story_partial and section in {"current_stories", "pinned_stories"} and not details
+        if deferred:
+            identifier = getattr(value, "id", None)
+            if type(identifier) is int and identifier > 0:
+                missing.append(identifier)
+            else:
+                diagnostics.append("story_identity_missing")
+        else:
+            diagnostics.extend(problems)
+        if identity != "remote" and section != "saved_gifts":
+            diagnostics.append("item_identity_missing")
+        items.append(ProfileCollectionItem(key, fields, coverage, identity, not story_partial and not problems))
+    return tuple(items), tuple(missing), tuple(diagnostics)
+
+
+def _partial_story(value: object) -> bool:
+    return type(value).__name__ == "StoryItemSkipped" or bool(getattr(value, "min", False))
+
+
+def _collection_page(
+    reference: UserReference, section: str, cursor: Mapping[str, object], result: object, boundary: ObservationBoundary
+) -> ProfileCollectionPage:
+    if cursor.get("phase") == "details":
+        return _story_detail_page(reference, section, cursor, result, boundary)
+    values, count, terminal = _collection_result(section, result)
+    if section == "avatar_history":
+        _validate_collection_photo_target(reference, result)
+    if section == "current_stories":
+        peer = getattr(getattr(result, "stories", None), "peer", None)
+        if getattr(peer, "user_id", None) != reference.user_id:
+            raise ValueError("story response peer mismatch")
+    terminal, next_cursor = _collection_continuation(section, cursor, result, values, terminal)
+    items, missing, diagnostics = _collection_items(section, values, details=False)
+    if missing:
+        next_cursor = {
+            "phase": "details",
+            "ids": list(missing),
+            "after": next_cursor,
+            "reported_count": count,
+            "listing_terminal": terminal,
+        }
+        terminal = False
+    return ProfileCollectionPage(
+        reference.user_id,
+        section,
+        items,
+        boundary,
+        count,
+        next_cursor,
+        terminal,
+        diagnostics,
+        detail_ids=missing,
+        metadata=_collection_metadata(section, result),
+    )
+
+
+def _validate_collection_photo_target(reference: UserReference, result: object) -> None:
+    users = getattr(result, "users", None)
+    if not isinstance(users, list):
+        raise ValueError("user photos users missing")
+    identifiers = _normalize_photo_user_ids(users)
+    if users and reference.user_id not in identifiers:
+        raise ValueError("user photos target mismatch")
+
+
+def _collection_metadata(section: str, result: object) -> Mapping[str, object]:
+    source = getattr(result, "stories", None) if section == "current_stories" else result
+    metadata: dict[str, object] = {}
+    for name in ("pinned_to_top", "max_read_id", "chat_notifications_enabled"):
+        value = cast(object, getattr(source, name, None))
+        if value is not None:
+            metadata[name] = value
+    return metadata
+
+
+def _collection_sidecars(page: ProfileCollectionPage, result: object) -> ProfileCollectionPage:
+    users = cast(list[object], getattr(result, "users", []) or [])
+    chats = cast(list[object], getattr(result, "chats", []) or [])
+    identities: list[DialogIdentityObservation] = []
+    target: SuppliedProfileUser | None = None
+    for value in [*users, *chats]:
+        if not isinstance(
+            value, (types.User, types.UserEmpty, types.Chat, types.ChatForbidden, types.Channel, types.ChannelForbidden)
+        ):
+            continue
+        peer_id = int(get_peer_id(value))
+        identity = observe_dialog_identity(
+            value, dialog_id=peer_id, source="profile", observed_at=int(cast(float, page.observation.started_at))
+        )
+        if identity is not None:
+            identities.append(identity)
+        if peer_id == page.entity_id and isinstance(value, (types.User, types.UserEmpty)):
+            target = _supplied_profile_user(value)
+    return replace(page, supplied_user=target, sidecar_identities=tuple(identities))
+
+
+def _supplied_profile_user(value: types.User | types.UserEmpty) -> SuppliedProfileUser:
+    fields, coverage, _diagnostics = normalize_collection_item(value)
+    push = project_user_profile(value)
+    return SuppliedProfileUser(
+        value.id,
+        {f"user.{key}": item for key, item in fields.items() if key != "constructor"},
+        {"user" + key[len("item") :]: item for key, item in coverage.items()},
+        push.fields if push else {},
+        push.minimal if push else True,
+        push.authoritative_photo if push else False,
+    )
+
+
+def _story_detail_page(
+    reference: UserReference, section: str, cursor: Mapping[str, object], result: object, boundary: ObservationBoundary
+) -> ProfileCollectionPage:
+    if type(result).__name__ != "Stories":
+        raise ValueError("story details response missing")
+    requested = cast(list[int], cursor["ids"])
+    values = getattr(result, "stories", None)
+    if not isinstance(values, list):
+        raise ValueError("story detail vector missing")
+    returned = [getattr(value, "id", None) for value in values]
+    if set(returned) != set(requested[:100]):
+        raise ValueError("story detail identities mismatch")
+    items, _missing, diagnostics = _collection_items(section, values, details=True)
+    after = cursor.get("after")
+    next_cursor = cast(Mapping[str, object] | None, after)
+    if len(requested) > _PROFILE_PAGE_LIMIT:
+        next_cursor = {**cursor, "ids": requested[100:]}
+    terminal = next_cursor is None and bool(cursor.get("listing_terminal"))
+    return ProfileCollectionPage(
+        reference.user_id,
+        section,
+        items,
+        boundary,
+        cast(int | None, cursor.get("reported_count")),
+        next_cursor,
+        terminal,
+        diagnostics,
+    )
 
 
 def _is_canonical_channel_id(channel_id: object) -> bool:
@@ -1133,3 +1417,29 @@ async def fetch_scheduled_history_snapshot(
         if callable(finish_init):
             finish_init(client, entities, input_entity)
     return messages
+
+
+def _collection_continuation(
+    section: str, cursor: Mapping[str, object], result: object, values: list[object], terminal: bool
+) -> tuple[bool, Mapping[str, object] | None]:
+    next_cursor: Mapping[str, object] | None = None
+    if section == "saved_gifts":
+        return _gift_continuation(result)
+    if not terminal:
+        terminal = not values
+        if values:
+            if section in {"avatar_history", "saved_music"}:
+                next_cursor = {"offset": _cursor_int(cursor, "offset") + len(values)}
+            else:
+                identifier = getattr(values[-1], "id", None)
+                if type(identifier) is not int or identifier <= 0:
+                    raise ValueError("collection continuation identity missing")
+                next_cursor = {"max_id" if section == "common_chats" else "offset_id": identifier}
+    return terminal, next_cursor
+
+
+def _gift_continuation(result: object) -> tuple[bool, Mapping[str, object] | None]:
+    offset = getattr(result, "next_offset", None)
+    if offset is not None and not isinstance(offset, str):
+        raise ValueError("gift continuation is not opaque text")
+    return not offset, {"offset": offset} if offset else None

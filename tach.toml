@@ -452,7 +452,17 @@ depends_on = ["mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consume
 [[modules]]
 path = "mcp_telegram.entity_profile.full_user_normalization"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.entity_profile.contracts", "mcp_telegram.identity_observation", "mcp_telegram.telethon_dialog"]
+depends_on = ["mcp_telegram.entity_profile.contracts", "mcp_telegram.dialog_identity_contracts", "mcp_telegram.entity_profile.semantic_normalization", "mcp_telegram.identity_observation", "mcp_telegram.telethon_dialog"]
+
+[[modules]]
+path = "mcp_telegram.entity_profile.semantic_normalization"
+layer = "telegram_gateway"
+depends_on = ["mcp_telegram.entity_profile.contracts", "mcp_telegram.entity_profile.field_manifest"]
+
+[[modules]]
+path = "mcp_telegram.entity_profile.field_manifest"
+layer = "foundation"
+depends_on = ["mcp_telegram.entity_profile.contracts"]
 
 [[modules]]
 path = "mcp_telegram.entity_profile.updates"
@@ -497,7 +507,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.telegram_gateway"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.entity_profile.contracts", "mcp_telegram.entity_profile.full_user_normalization", "mcp_telegram.entity_profile.ports", "mcp_telegram.telegram_access", "mcp_telegram.telegram_reading", "mcp_telegram.flood", "mcp_telegram.telegram_rpc_error", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.identity_observation", "mcp_telegram.telethon_dialog"]
+depends_on = ["mcp_telegram.entity_profile.contracts", "mcp_telegram.entity_profile.full_user_normalization", "mcp_telegram.entity_profile.semantic_normalization", "mcp_telegram.entity_profile.updates", "mcp_telegram.entity_profile.ports", "mcp_telegram.telegram_access", "mcp_telegram.telegram_reading", "mcp_telegram.flood", "mcp_telegram.telegram_rpc_error", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.identity_observation", "mcp_telegram.telethon_dialog"]
 [[modules]]
 path = "mcp_telegram.telegram"
 layer = "telegram_gateway"
@@ -586,7 +596,12 @@ depends_on = ["mcp_telegram.models", "mcp_telegram.resolver", "mcp_telegram.sync
 [[modules]]
 path = "mcp_telegram.entity_profile.repository"
 layer = "persistence"
-depends_on = ["mcp_telegram.dialog_identity", "mcp_telegram.dialog_identity_contracts", "mcp_telegram.entity_profile.contracts", "mcp_telegram.entity_store", "mcp_telegram.models", "mcp_telegram.resolver", "mcp_telegram.sync_transactions"]
+depends_on = ["mcp_telegram.dialog_identity", "mcp_telegram.dialog_identity_contracts", "mcp_telegram.entity_profile.contracts", "mcp_telegram.entity_profile.collection_repository", "mcp_telegram.entity_store", "mcp_telegram.models", "mcp_telegram.resolver", "mcp_telegram.sync_transactions"]
+
+[[modules]]
+path = "mcp_telegram.entity_profile.collection_repository"
+layer = "persistence"
+depends_on = ["mcp_telegram.entity_profile.contracts", "mcp_telegram.sync_transactions"]
 
 [[modules]]
 path = "mcp_telegram.sync_db"

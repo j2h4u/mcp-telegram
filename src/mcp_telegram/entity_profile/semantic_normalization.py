@@ -185,7 +185,9 @@ class _SemanticNormalizer:
                     rule.flag,
                     rule.clear_on_none,
                 )
-            normalized = self.field_value(_read(value, name), rule, f"{path}.{name}", authoritative=authoritative)
+            normalized = self.field_value(
+                _read(value, name), rule, f"{path}.{name}", authoritative=_field_authority(value, name, authoritative)
+            )
             if normalized is not _MISSING:
                 output[name] = normalized
         for name in sorted(_attributes(value) - schema.fields.keys()):
@@ -259,6 +261,31 @@ def normalize_semantic_profile(
             fields.update({f"{prefix}.{key}": value for key, value in node.items() if key != "constructor"})
     return ProfileSemanticSnapshot(
         target_id, owner_account_id, fields, normalizer.coverage, observation, tuple(normalizer.diagnostics)
+    )
+
+
+def normalize_collection_item(
+    value: object,
+) -> tuple[Mapping[str, object], Mapping[str, ProfileFieldCoverage], tuple[str, ...]]:
+    """Use the same finite semantic manifest for collection response roots."""
+    normalizer = _SemanticNormalizer()
+    result = normalizer.node(value, _constructor_name(value), "item", authoritative=True)
+    if _constructor_name(value) in _NONRETURN_CONSTRUCTORS:
+        normalizer.coverage["item"] = ProfileFieldCoverage(
+            ProfileFieldClass.PROFILE, ProfileFieldState.API_NOT_RETURNED, reason="empty_value_not_returned"
+        )
+    fields = cast(dict[str, object], result) if isinstance(result, dict) else {}
+    return fields, normalizer.coverage, tuple(normalizer.diagnostics)
+
+
+def _field_authority(value: object, name: str, default: bool) -> bool:
+    if _constructor_name(value) != "User" or name != "photo":
+        return default
+    if _read(value, "apply_min_photo") is not True or _read(value, "photo") in (None, _MISSING):
+        return default
+    return (
+        _constructor_name(value) == "User"
+        and getattr(type(value), "CONSTRUCTOR_ID", None) == PROFILE_FIELD_MANIFEST["User"].constructor_id
     )
 
 

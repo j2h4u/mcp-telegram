@@ -16,7 +16,8 @@ from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 87
+_CURRENT_SCHEMA_VERSION = 88
+_PROFILE_COLLECTION_MIGRATION = 88
 _SEMANTIC_PROFILE_MIGRATION = 87
 _UPDATE_DELIVERY_MIGRATION = 86
 _HISTORICAL_FTS_BACKFILL_MIGRATION = 85
@@ -4935,8 +4936,72 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_86(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _SEMANTIC_PROFILE_MIGRATION:
         current = _apply_migration_87(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _PROFILE_COLLECTION_MIGRATION:
+        current = _apply_migration_88(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
+
+
+def _apply_migration_88(conn: sqlite3.Connection, current: int) -> int:
+    if current >= _PROFILE_COLLECTION_MIGRATION:
+        return current
+    statements: list[str] = []
+    for table in ("entity_detail_sections", "entity_profile_refresh_state"):
+        indexes = [
+            row[0]
+            for row in cast(
+                list[tuple[str]],
+                conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL", (table,)
+                ).fetchall(),
+            )
+        ]
+        sql = cast(
+            tuple[str], conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+        )[0]
+        # Preserve every historical column while extending only the section CHECK.
+        sql = sql.replace(table, f"{table}_v88", 1).replace(
+            "'personal_channel'", "'personal_channel','saved_music','saved_gifts','current_stories','pinned_stories'"
+        )
+        if table == "entity_profile_refresh_state":
+            position = sql.rfind(")")
+            sql = sql[:position] + ", page_cursor_json TEXT" + sql[position:]
+        columns = ",".join(
+            str(row[1])
+            for row in cast(list[tuple[object, ...]], conn.execute(f"PRAGMA table_info({table})").fetchall())
+        )
+        statements.extend(
+            [
+                sql,
+                f"INSERT INTO {table}_v88({columns}) SELECT {columns} FROM {table}",
+                f"DROP TABLE {table}",
+                f"ALTER TABLE {table}_v88 RENAME TO {table}",
+            ]
+        )
+        statements.extend(indexes)
+    statements.extend(
+        [
+            """CREATE TABLE entity_profile_collection_facts (
+            owner_account_id INTEGER NOT NULL CHECK(owner_account_id>0),
+            entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+            section TEXT NOT NULL, item_key TEXT NOT NULL,
+            fields_json TEXT NOT NULL, coverage_json TEXT NOT NULL, provenance_json TEXT NOT NULL DEFAULT '{}',
+            observation_order INTEGER NOT NULL CHECK(observation_order>0), observed_at INTEGER NOT NULL,
+            PRIMARY KEY(owner_account_id,entity_id,section,item_key)
+        ) WITHOUT ROWID""",
+            """CREATE TABLE entity_profile_collection_membership (
+            owner_account_id INTEGER NOT NULL, entity_id INTEGER NOT NULL, section TEXT NOT NULL,
+            generation INTEGER NOT NULL, scan INTEGER NOT NULL DEFAULT 0, item_key TEXT NOT NULL,
+            identity_kind TEXT NOT NULL CHECK(identity_kind IN ('remote','observation')),
+            page_key TEXT NOT NULL, ordinal INTEGER NOT NULL,
+            detail_complete INTEGER NOT NULL CHECK(detail_complete IN (0,1)),
+            PRIMARY KEY(owner_account_id,entity_id,section,generation,scan,item_key),
+            FOREIGN KEY(owner_account_id,entity_id,section,item_key)
+              REFERENCES entity_profile_collection_facts(owner_account_id,entity_id,section,item_key) ON DELETE CASCADE
+        ) WITHOUT ROWID""",
+        ]
+    )
+    return _apply_migration(conn, current, _PROFILE_COLLECTION_MIGRATION, statements)
 
 
 def _apply_migration_87(conn: sqlite3.Connection, current: int) -> int:
