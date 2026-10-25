@@ -310,14 +310,19 @@ async def test_registered_entity_profile_pending_keeps_partial_identity_under_pr
 async def test_registered_entity_info_keeps_owned_partial_cache_success_under_protection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     monkeypatch.setattr(mcp_server, "_schedule_telemetry", lambda _event: None)
     sync_path = tmp_path / "sync.db"
     seed_conn, raw_seed_service = _prepare(sync_path, migrated=True)
+    request.addfinalizer(seed_conn.close)
     seed_service = cast(DaemonEntityInfoService, raw_seed_service)
     coordinator = seed_service.refresh_coordinator
     assert coordinator is not None
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    assert seed_conn.execute("SELECT profile_owner_account_id FROM entity_details WHERE entity_id=42").fetchone() == (
+        42,
+    )
     await seed_service.shutdown()
     seed_conn.close()
 
@@ -349,7 +354,7 @@ async def test_registered_entity_info_keeps_owned_partial_cache_success_under_pr
     assert payload["completeness"] == "partial"
     assert cast(dict[str, object], payload["sections"])["common_chats"] == {
         "status": "pending",
-        "reason": "profile_owner_unverified",
+        "reason": "profile_summary_changed",
     }
     assert cast(dict[str, object], payload["account_protection"])["status"] == "active"
     assert mcp_server.tool_by_name["get_entity_info"].output_schema is not None

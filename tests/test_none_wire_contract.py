@@ -83,27 +83,64 @@ def test_mixed_null_enum_is_optional_but_keeps_non_null_values() -> None:
 
 
 def test_registered_output_schemas_do_not_advertise_null() -> None:
+    """Canonical profile clears are the sole mapping-null wire exception."""
     for name, entry in tools.TOOL_REGISTRY.items():
-        schema_name = name
         schema = entry.output_schema
-        assert schema is not None, schema_name
+        assert schema is not None, name
+        _assert_registered_null_boundary(name, schema)
 
-        def check(node: object, *, schema_name: str = schema_name) -> None:
-            if isinstance(node, list):
-                for item in node:
-                    check(item)
-                return
-            if not isinstance(node, dict):
-                return
-            assert not _schema_has_null(node), schema_name
-            properties = node.get("properties")
-            required = node.get("required")
-            if isinstance(properties, dict) and isinstance(required, list):
-                assert set(required) <= set(properties), schema_name
-            for child in node.values():
-                check(child)
 
-        check(schema)
+def _assert_registered_null_boundary(name: str, schema: dict[str, object]) -> None:
+    definitions = cast(dict[str, object], schema.get("$defs", {}))
+    visited: set[tuple[str, bool]] = set()
+
+    def check(node: object, path: tuple[str, ...] = (), *, nullable: bool = False) -> None:
+        if isinstance(node, list):
+            for item in node:
+                check(item, path, nullable=nullable)
+            return
+        if not isinstance(node, dict):
+            return
+        # Definitions are shared schemas, not output positions. Every reference
+        # below is also checked with the allowance of its actual output caller.
+        nullable = nullable or (
+            name == "get_entity_info"
+            and (path[:1] == ("$defs",) or path in {("properties", "semantic"), ("properties", "page")})
+        )
+        assert nullable or not _schema_has_null(node), (name, path)
+        properties, required = node.get("properties"), node.get("required")
+        if isinstance(properties, dict) and isinstance(required, list):
+            assert set(required) <= set(properties), (name, path)
+        reference = node.get("$ref")
+        if isinstance(reference, str):
+            assert reference.startswith("#/$defs/"), reference
+            key = (reference, nullable)
+            if key not in visited:
+                visited.add(key)
+                check(definitions[reference.removeprefix("#/$defs/")], ("$ref", reference), nullable=nullable)
+        for key, child in node.items():
+            check(child, (*path, key), nullable=nullable)
+
+    check(schema)
+
+
+@pytest.mark.parametrize(
+    ("name", "schema"),
+    [
+        ("get_entity_info", {"type": ["object", "null"]}),
+        ("get_entity_info", {"properties": {"legacy": {"type": ["string", "null"]}}}),
+        ("list_dialogs", {"properties": {"semantic": {"type": ["string", "null"]}}}),
+        (
+            "get_entity_info",
+            {"properties": {"legacy": {"$ref": "#/$defs/shared"}}, "$defs": {"shared": {"type": ["string", "null"]}}},
+        ),
+    ],
+)
+def test_profile_null_exception_does_not_escape_to_legacy_root_or_other_tools(
+    name: str, schema: dict[str, object]
+) -> None:
+    with pytest.raises(AssertionError):
+        _assert_registered_null_boundary(name, schema)
 
 
 def _schema_has_null(value: object) -> bool:
