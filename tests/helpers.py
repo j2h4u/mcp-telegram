@@ -453,6 +453,7 @@ def remove_v87_schema_for_historical_fixture(conn: sqlite3.Connection) -> None:
     if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='full_history_enrollment'").fetchone():
         conn.execute("DROP TRIGGER IF EXISTS topic_catalog_identity_changed")
     for table in (
+        "entity_profile_change_events",
         "entity_profile_collection_membership",
         "entity_profile_collection_facts",
         "entity_profile_semantic_snapshots",
@@ -466,7 +467,7 @@ def enable_profile_page_fixture(conn: sqlite3.Connection) -> None:
     """Upgrade the small old executor fixture before enabling writer authorization."""
     if "page_cursor_json" in {row[1] for row in conn.execute("PRAGMA table_info(entity_profile_refresh_state)")}:
         return
-    from mcp_telegram.sync_db import _apply_migration_87, _apply_migration_88
+    from mcp_telegram.sync_db import _apply_migration_87, _apply_migration_88, _apply_migration_89
 
     columns = {row[1] for row in conn.execute("PRAGMA table_info(entity_details)")}
     if "profile_owner_account_id" not in columns:
@@ -479,3 +480,4 @@ def enable_profile_page_fixture(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE TABLE IF NOT EXISTS schema_version(version INTEGER PRIMARY KEY,applied_at INTEGER)")
     _apply_migration_87(conn, 86)
     _apply_migration_88(conn, 87)
+    _apply_migration_89(conn, 88)

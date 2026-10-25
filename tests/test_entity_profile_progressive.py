@@ -977,7 +977,7 @@ async def test_durable_channel_reference_miss_commits_unavailable_without_rpc_at
 
 
 @pytest.mark.asyncio
-async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt() -> None:
+async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt(request: pytest.FixtureRequest) -> None:
     class BudgetedClient:
         def __init__(self) -> None:
             self.calls: list[str] = []
@@ -1010,6 +1010,7 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt() 
             raise AssertionError("dialog traversal is not part of a profile section")
 
     conn = sqlite3.connect(":memory:")
+    request.addfinalizer(conn.close)
     with write_savepoint(conn):
         conn.execute(
             "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
