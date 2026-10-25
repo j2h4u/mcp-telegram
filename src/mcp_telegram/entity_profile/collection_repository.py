@@ -440,8 +440,13 @@ def _newer_aliases(
 ) -> dict[str, str]:
     blocked: dict[str, str] = {}
     for path in fields:
-        alias = path.split(".", 1)[-1]
-        alias = {"photo": "current_photo", "profile_photo": "current_photo"}.get(alias, alias)
+        if path == "full_user.profile_photo":
+            continue
+        alias = {
+            "user.photo": "current_photo",
+            "user.usernames": "extra_usernames",
+            "user.emoji_status": "emoji_status_id",
+        }.get(path, path.split(".", 1)[-1])
         if alias in fences and fences[alias][0] > order:
             blocked[path] = alias
     return blocked
@@ -459,19 +464,30 @@ def _adopt_canonical_alias(
     existing = paths.get(root)
     if root in fields and _exact_newer_path(existing, fences[alias][0]):
         return
+    replacement = canonical.get(alias)
+    if alias in {"extra_usernames", "emoji_status_id"} or (
+        isinstance(replacement, (dict, list)) and alias != "current_photo"
+    ):
+        _retain_unbridged_alias(paths, root, existing, fences[alias])
+        return
     fields.pop(root, None)
     _drop_path_provenance(paths, root)
     if alias in canonical:
         replacement = canonical[alias]
         if alias == "current_photo" and isinstance(replacement, dict):
-            replacement = (
-                {"constructor": "Photo", "id": replacement["photo_id"]}
-                if root.startswith("full_user.")
-                else {"constructor": "UserProfilePhoto", "photo_id": replacement["photo_id"]}
-            )
+            replacement = {"constructor": "UserProfilePhoto", "photo_id": replacement["photo_id"]}
         fields[root] = replacement
     field_order, observed_at, source = fences[alias]
     paths[root] = {"order": field_order, "observed_at": observed_at, "source": source, "reason": "legacy_alias_bridge"}
+
+
+def _retain_unbridged_alias(paths: dict[str, object], root: str, existing: object, fence: tuple[int, int, str]) -> None:
+    order, observed_at, source = fence
+    paths[root] = {
+        **(existing if isinstance(existing, dict) else {}),
+        "reason": "legacy_alias_bridge",
+        "invalidated_by": {"order": order, "observed_at": observed_at, "source": source},
+    }
 
 
 def _record_path_observation(
@@ -579,7 +595,9 @@ def _snapshot_coverage(
     _restore_rejected_coverage(coverage, retained_coverage, values[2])
     for root in snapshot.fields:
         evidence = paths.get(root)
-        if isinstance(evidence, dict) and evidence.get("order", 0) > order:
+        if isinstance(evidence, dict) and (
+            evidence.get("order", 0) > order or evidence.get("reason") == "legacy_alias_bridge"
+        ):
             _restore_newer_coverage(coverage, root, evidence, previous)
     return coverage
 

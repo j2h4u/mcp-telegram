@@ -1740,8 +1740,7 @@ class DaemonEntityInfoService:
         *,
         committed: bool,
     ) -> DurableRefreshTerminal | None:
-        state = self._profiles.refresh_state(cursor.entity_id, now=int(self._deps.now_provider()))
-        if committed and state is not None and state.get("status") == "complete":
+        if committed and self._profiles.refresh_is_complete(cursor):
             return DurableRefreshTerminal.SUCCESS
         return None
 

@@ -916,6 +916,19 @@ class EntityProfileRepository:
         except sqlite3.OperationalError, ValueError:
             return False
 
+    def refresh_is_complete(self, cursor: EntityRefreshCursor) -> bool:
+        """Read completion for the committed generation without exposing resolved state."""
+        generation = self._refresh_has("generation")
+        row = self._conn.execute(
+            "SELECT status"
+            + (", generation" if generation else "")
+            + " FROM entity_profile_refresh_state WHERE entity_id=?",
+            (cursor.entity_id,),
+        ).fetchone()
+        if row is None:
+            return not generation and self._next_section(cursor) is None
+        return row[0] == "complete" and (not generation or row[1] == cursor.generation)
+
     def refresh_state(self, entity_id: int, *, now: int) -> dict[str, object] | None:
         """Return a durable unresolved-refresh state while it is relevant."""
         try:
@@ -1618,7 +1631,9 @@ class EntityProfileRepository:
             cursor=state,
             order=observation.order,
         )
-        return self._advance_collection(cursor, page, state, summary, now=now)
+        if not self._advance_collection(cursor, page, state, summary, now=now):
+            raise sqlite3.OperationalError("entity profile collection cursor advance was rejected")
+        return True
 
     def _advance_collection(
         self,

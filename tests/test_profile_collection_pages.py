@@ -249,6 +249,66 @@ def test_newer_exact_semantic_push_preserves_complete_value_and_original_age(dat
     assert _mapping(_mapping(merged.provenance["fields"])["user.first_name"])["observed_at"] == 150
 
 
+@pytest.mark.parametrize("prior", ["retained", "missing", "newer_exact"])
+def test_legacy_alias_fences_keep_public_photo_and_composite_identity(database: Database, prior: str) -> None:
+    _path, conn, repo = database
+    fields: dict[str, object] = {
+        "full_user.profile_photo": {"constructor": "Photo", "id": 1},
+        "user.photo": {"constructor": "UserProfilePhoto", "photo_id": 2},
+        "user.usernames": [{"constructor": "Username", "username": "old", "active": True}],
+        "user.emoji_status": {"constructor": "EmojiStatus", "document_id": 7},
+    }
+    coverage = {path: _coverage() for path in fields}
+    first = ProfileSemanticSnapshot(42, 77, fields, coverage, ObservationBoundary(100, 101))
+    composites = {"user.usernames", "user.emoji_status"}
+    with write_transaction(conn):
+        initial = replace(
+            first, fields={key: value for key, value in fields.items() if prior != "missing" or key not in composites}
+        )
+        store_semantic_snapshot(conn, initial, 1)
+        repo.apply_profile_update(
+            42,
+            {"current_photo": {"photo_id": 9}, "extra_usernames": ["new"], "emoji_status_id": 8},
+            observation=ProfileFieldObservation(77, 3, 150, "update"),
+        )
+        if prior == "newer_exact":
+            row = conn.execute("SELECT fields_json,provenance_json FROM entity_profile_semantic_snapshots").fetchone()
+            exact, provenance = json.loads(row[0]), json.loads(row[1])
+            exact["user.usernames"][0]["username"] = "new"
+            exact["user.emoji_status"]["document_id"] = 8
+            for root in composites:
+                provenance["fields"][root] = {"order": 3, "observed_at": 150, "source": "update"}
+            conn.execute(
+                "UPDATE entity_profile_semantic_snapshots SET fields_json=?,provenance_json=?",
+                (json.dumps(exact), json.dumps(provenance)),
+            )
+        merged = store_semantic_snapshot(conn, replace(first, observation=ObservationBoundary(200, 201)), 2)
+    assert merged is not None
+    assert _mapping(merged.after["full_user.profile_photo"])["id"] == 1
+    assert _mapping(merged.after["user.photo"])["photo_id"] == 9
+    canonical = json.loads(conn.execute("SELECT detail_json FROM entity_details WHERE entity_id=42").fetchone()[0])
+    assert canonical["extra_usernames"] == ["new"] and canonical["emoji_status_id"] == 8
+    persisted_coverage = json.loads(
+        conn.execute("SELECT coverage_json FROM entity_profile_semantic_snapshots").fetchone()[0]
+    )
+    for root in composites:
+        assert not any(path == root or path.startswith(root + ".") for path in merged.accepted_paths)
+        if prior == "missing":
+            assert root not in merged.after
+        else:
+            assert _mapping(_mapping(merged.provenance["fields"])[root])["observed_at"] == (
+                150 if prior == "newer_exact" else 100
+            )
+            assert _mapping(_mapping(merged.provenance["fields"])[root])["source"] == (
+                "update" if prior == "newer_exact" else "rpc"
+            )
+        assert persisted_coverage[root]["state"] == ("present" if prior == "newer_exact" else "unknown")
+    if prior != "missing":
+        usernames = cast(list[dict[str, object]], merged.after["user.usernames"])
+        assert usernames[0]["username"] == ("new" if prior == "newer_exact" else "old")
+        assert _mapping(merged.after["user.emoji_status"])["document_id"] == (8 if prior == "newer_exact" else 7)
+
+
 def test_min_changed_name_cannot_replace_known_full_fact_or_renew_its_age(database: Database) -> None:
     from types import SimpleNamespace
 
@@ -768,3 +828,62 @@ def _summary(repo: EntityProfileRepository, section: str) -> dict[str, object]:
 def _mapping(value: object) -> dict[str, object]:
     assert isinstance(value, dict)
     return cast(dict[str, object], value)
+
+
+@pytest.mark.parametrize(
+    "entity_id,kind,section",
+    [(7, "user", "pinned_stories"), (-7, "group", "personal_channel"), (-1000000000007, "channel", "personal_channel")],
+)
+async def test_terminal_owner_releases_completion_admission(
+    tmp_path: Path, entity_id: int, kind: str, section: str
+) -> None:
+    from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, RefreshEnqueueResult
+    from mcp_telegram.telegram_demand import RpcAttemptBudget
+    from tests.test_entity_profile_full_user_pair import _pair_service, _PairClient
+
+    path = tmp_path / "terminal.db"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    writer = await SQLiteWriter.open(path)
+    service = cast(DaemonEntityInfoService, _pair_service(conn, _PairClient(), enabled=False))
+    service._deps = replace(service._deps, writer=writer)
+
+    def prepare(connection: sqlite3.Connection) -> None:
+        profiles = EntityProfileRepository(connection, section_ttl_seconds=300)
+        profiles.save_core({"id": entity_id, "type": kind}, now=100)
+        profiles.mark_pending(entity_id, now=100)
+        with write_transaction(connection):
+            connection.execute(
+                "UPDATE entity_profile_refresh_state SET next_section=? WHERE entity_id=?", (section, entity_id)
+            )
+
+    try:
+        await writer.run(prepare)
+        coordinator = service.refresh_coordinator
+        assert coordinator is not None
+        assert coordinator.enqueue(entity_id) is RefreshEnqueueResult.QUEUED
+        event = coordinator._completion_events[entity_id]
+        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        assert conn.execute(
+            "SELECT status FROM entity_profile_refresh_state WHERE entity_id=?", (entity_id,)
+        ).fetchone() == ("complete",)
+        assert coordinator.queue_depth == 0 and event.is_set()
+        assert service._profiles.refresh_state(entity_id, now=100) is None
+    finally:
+        await service.shutdown()
+        conn.close()
+        await writer.aclose()
+
+
+def test_post_write_collection_cursor_rejection_rolls_back_facts(database: Database) -> None:
+    _path, conn, repo = database
+    with write_transaction(conn):
+        conn.execute(
+            "CREATE TRIGGER reject_collection_advance BEFORE UPDATE OF page_cursor_json ON entity_profile_refresh_state BEGIN SELECT RAISE(IGNORE); END"
+        )
+    with pytest.raises(sqlite3.OperationalError, match="collection cursor advance was rejected"):
+        with write_transaction(conn):
+            _commit(repo, _page(_item("one"), cursor={"offset": 1}))
+    assert conn.execute("SELECT count(*) FROM entity_profile_collection_facts").fetchone() == (0,)
+    assert conn.execute("SELECT count(*) FROM entity_profile_collection_membership").fetchone() == (0,)
+    assert repo.read_section_payload(42, "avatar_history") is None
