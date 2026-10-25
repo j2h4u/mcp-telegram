@@ -189,7 +189,7 @@ depends_on = ["mcp_telegram.entity_profile.reader",
     "mcp_telegram.entity_profile.repository",
     "mcp_telegram.flood", "mcp_telegram.folders.read_model",
     "mcp_telegram.linked_chat_fact", "mcp_telegram.models", "mcp_telegram.telegram_access", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc", "mcp_telegram.telegram_rpc_consumers",
-    "mcp_telegram.telethon_dialog",
+    "mcp_telegram.telethon_dialog", "mcp_telegram.telegram_rpc_error",
     "mcp_telegram.dialog_identity",
     "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.sync_transactions", "mcp_telegram.sqlite_writer"]
 [[modules]]
