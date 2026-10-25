@@ -7,6 +7,7 @@ returned to a caller while enrichment is incomplete.
 from __future__ import annotations
 
 import math
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -29,6 +30,63 @@ PROFILE_SECTIONS: tuple[str, ...] = (
 PROFILE_COLLECTION_SECTIONS = frozenset(
     {"avatar_history", "common_chats", "saved_music", "saved_gifts", "current_stories", "pinned_stories"}
 )
+
+type StoryProfileValidationCategory = Literal[
+    "reference_unavailable",
+    "cursor_invalid",
+    "response_type",
+    "vector_missing",
+    "ids_missing",
+    "ids_unexpected",
+    "ids_mixed",
+    "ids_invalid",
+    "normalization",
+    "sidecar",
+    "transport",
+]
+
+
+class StoryProfileValidationError(ValueError):
+    """Safe story-stage identity and unique positive-ID counts, never source data."""
+
+    def __init__(
+        self,
+        category: StoryProfileValidationCategory,
+        *,
+        requested: int | None = None,
+        returned: int | None = None,
+        missing: int | None = None,
+        unexpected: int | None = None,
+    ) -> None:
+        if category not in {
+            "reference_unavailable",
+            "cursor_invalid",
+            "response_type",
+            "vector_missing",
+            "ids_missing",
+            "ids_unexpected",
+            "ids_mixed",
+            "ids_invalid",
+            "normalization",
+            "sidecar",
+            "transport",
+        }:
+            raise ValueError("invalid story validation category")
+        parts = ["story_validation", category]
+        for name, count in (
+            ("requested", requested),
+            ("returned", returned),
+            ("missing", missing),
+            ("unexpected", unexpected),
+        ):
+            if count is None:
+                continue
+            if type(count) is not int or not 0 <= count <= sys.maxsize:
+                raise ValueError("invalid story validation count")
+            parts.append(f"{name}={count}")
+        self.reason = ":".join(parts)
+        super().__init__(self.reason)
+
 
 PROFILE_ACQUISITION_OUTCOMES: frozenset[str] = frozenset({"usable", "partial", "absent", "unavailable"})
 PROFILE_NORMALIZATION_VERSION = "entity-profile-v1"
