@@ -25,7 +25,7 @@ PROFILE_SECTIONS: tuple[str, ...] = (
 PROFILE_ACQUISITION_OUTCOMES: frozenset[str] = frozenset({"usable", "partial", "absent", "unavailable"})
 PROFILE_NORMALIZATION_VERSION = "entity-profile-v1"
 FULL_USER_ENDPOINT = "users.GetFullUser"
-NORMALIZATION_VERSION = "entity-profile-full-user-v1"
+NORMALIZATION_VERSION = "entity-profile-full-user-v2"
 GROUP_PROFILE_ENDPOINT = "messages.GetFullChat"
 GROUP_PROFILE_NORMALIZATION_VERSION = "entity-profile-group-full-chat-v1"
 CHANNEL_PROFILE_ENDPOINT = "channels.GetFullChannel"
@@ -49,6 +49,70 @@ class ProjectionStatus(StrEnum):
     PARTIAL = "partial"
     ABSENT = "absent"
     UNAVAILABLE = "unavailable"
+
+
+class ProfileFieldClass(StrEnum):
+    """Classify account-visible facts separately from excluded protocol state."""
+
+    PROFILE = "profile"
+    PRIVATE_FACT = "private_fact"
+    CAPABILITY = "capability"
+    INAPPLICABLE = "inapplicable"
+
+
+class ProfileFieldState(StrEnum):
+    PRESENT = "present"
+    CLEARED = "cleared"
+    API_NOT_RETURNED = "api_not_returned"
+    UNKNOWN = "unknown"
+    INAPPLICABLE = "inapplicable"
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileFieldCoverage:
+    """Only authoritative paths may replace or clear a retained value."""
+
+    classification: ProfileFieldClass
+    state: ProfileFieldState
+    authoritative: bool = False
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileSemanticSnapshot:
+    """Current facts and per-path evidence; API non-return never deletes knowledge."""
+
+    target_id: int
+    owner_account_id: int | None
+    fields: Mapping[str, object]
+    coverage: Mapping[str, ProfileFieldCoverage]
+    observation: ObservationBoundary
+    diagnostics: tuple[str, ...] = ()
+    normalization_version: str = NORMALIZATION_VERSION
+    schema_layer: int = 229
+    endpoint: str = FULL_USER_ENDPOINT
+
+    def __post_init__(self) -> None:
+        _validate_positive_id(self.target_id, field_name="target_id")
+        if self.owner_account_id is not None:
+            _validate_positive_id(self.owner_account_id, field_name="owner_account_id")
+
+    @property
+    def complete(self) -> bool:
+        """Complete response coverage includes explicitly unavailable fields, not their values."""
+        return (
+            self.owner_account_id is not None
+            and self.observation.valid
+            and bool(self.coverage)
+            and not self.diagnostics
+            and all(field.state is not ProfileFieldState.UNKNOWN for field in self.coverage.values())
+        )
+
+    def require_account(self, owner_account_id: int) -> None:
+        """Call before persisting or projecting account-private facts."""
+        _validate_positive_id(owner_account_id, field_name="owner_account_id")
+        if self.owner_account_id != owner_account_id:
+            raise ValueError("semantic profile account does not match requested owner")
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +227,7 @@ class UserProfileObservation:
     full_profile: ProjectionOutcome
     personal_channel: ProjectionOutcome
     current_photo: ChatCurrentPhoto | None = None
+    semantic_snapshot: ProfileSemanticSnapshot | None = None
 
     def __post_init__(self) -> None:
         _validate_positive_id(self.target_id, field_name="target_id")
@@ -170,6 +235,8 @@ class UserProfileObservation:
             raise TypeError("target_kind must be a TargetKind")
         if self.current_photo is not None and not isinstance(self.current_photo, ChatCurrentPhoto):
             raise TypeError("current_photo must be ChatCurrentPhoto or None")
+        if self.semantic_snapshot is not None and self.semantic_snapshot.target_id != self.target_id:
+            raise ValueError("semantic snapshot target does not match profile observation")
 
 
 @dataclass(frozen=True, slots=True)

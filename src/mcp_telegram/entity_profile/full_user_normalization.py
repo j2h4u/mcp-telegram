@@ -22,12 +22,14 @@ from .contracts import (
     NORMALIZATION_VERSION,
     PERSONAL_CHANNEL_OWNED_FIELDS,
     ObservationBoundary,
+    ProfileSemanticSnapshot,
     ProjectionOutcome,
     ProjectionProvenance,
     ProjectionStatus,
     TargetKind,
     UserProfileObservation,
 )
+from .semantic_normalization import normalize_semantic_profile
 
 
 class FullProfileFacts(TypedDict, total=False):
@@ -225,8 +227,9 @@ def _normalize_business_hours(value: object) -> dict[str, str | None] | None:
 
 def _normalize_note(value: object) -> str | None:
     if isinstance(value, str):
-        return _string(value)
-    return _string(_attr(value, "text"))
+        return value
+    text = _attr(value, "text")
+    return text if isinstance(text, str) else None
 
 
 def _normalize_status(value: object) -> dict[str, str] | None:  # noqa: PLR0911
@@ -442,6 +445,8 @@ def _find_matching_user(
     if len(matches) != 1:
         return None, "target_identity_ambiguous"
     user = matches[0]
+    if type(user).__name__ == "UserEmpty":
+        return user, None
     raw_bot = _attr(user, "bot")
     is_bot = False if raw_bot is None else _boolean(raw_bot)
     if is_bot is None or is_bot is not (target_kind is TargetKind.BOT):
@@ -556,6 +561,9 @@ def _resolve_response_target(
         return full_user, None, "invalid_response"
     if full_user is _MISSING or full_user is None:
         return full_user, None, "missing_full_user"
+    full_id = _attr(full_user, "id")
+    if full_id is not _MISSING and _positive_integer(full_id) != target_id:
+        return full_user, None, "full_user_identity_mismatch"
     if users is None:
         return full_user, None, "missing_users"
     user, reason = _find_matching_user(users, target_id, target_kind)
@@ -568,6 +576,7 @@ def normalize_full_user_response(
     target_id: int,
     target_kind: TargetKind | str,
     observation: ObservationBoundary | None = None,
+    owner_account_id: int | None = None,
 ) -> UserProfileObservation:
     """Validate and normalize one response for a User or Bot target.
 
@@ -593,6 +602,11 @@ def normalize_full_user_response(
     profile, complete, identity_patch = _normalize_full_profile(
         full_user, user, target_id=target_id, target_kind=normalized_kind
     )
+    semantic = normalize_semantic_profile(
+        user, full_user, target_id=target_id, owner_account_id=owner_account_id, observation=boundary
+    )
+    _retain_authorized_legacy_fields(profile, user, full_user, semantic)
+    complete = complete and semantic.complete
     identity_observation = (
         observe_dialog_identity(
             user,
@@ -616,7 +630,64 @@ def normalize_full_user_response(
             dialog_identity_observation=identity_observation,
         ),
         personal_channel=_normalize_personal_channel(full_user, _attr(response, "chats"), boundary),
+        semantic_snapshot=semantic,
     )
+
+
+def _retain_authorized_legacy_fields(
+    profile: dict[str, object], user: object, full_user: object, semantic: ProfileSemanticSnapshot
+) -> None:
+    """Keep partial or privacy-dependent omission from erasing retained v1 facts."""
+    aliases = {"extra_usernames": "usernames", "emoji_status_id": "emoji_status"}
+    user_fields = {name for name, _kind in _USER_SCALAR_FIELDS} | {
+        "first_name",
+        "last_name",
+        "extra_usernames",
+        "emoji_status_id",
+        "status",
+        "restriction_reason",
+    }
+    for name in tuple(profile):
+        source = user if name in user_fields else full_user
+        if type(source).__name__ not in {"User", "UserFull"}:
+            continue
+        path = f"{'user' if name in user_fields else 'full_user'}.{aliases.get(name, name)}"
+        if not _legacy_field_authoritative(semantic, name, path):
+            profile.pop(name)
+    if type(user).__name__ in {"User", "UserEmpty"} and "user:partial_user" in semantic.diagnostics:
+        _retain_positive_min_fields(profile, user_fields)
+
+
+_LEGACY_COMPONENTS: dict[str, tuple[str, ...]] = {
+    "birthday": ("day", "month", "year"),
+    "bot_info": ("description", "commands"),
+    "business_location": ("address", "geo_point.lat", "geo_point.long"),
+    "business_intro": ("title", "description"),
+    "business_work_hours": ("timezone_id",),
+    "note": ("text",),
+    "emoji_status_id": ("document_id",),
+}
+
+
+def _legacy_field_authoritative(semantic: ProfileSemanticSnapshot, name: str, path: str) -> bool:
+    # A v1 compound value may replace only its own observed components.
+    for component in _LEGACY_COMPONENTS.get(name, ("",)):
+        key = f"{path}.{component}" if component else path
+        coverage = semantic.coverage.get(key) or semantic.coverage.get(path)
+        if coverage is not None and not coverage.authoritative:
+            return False
+    return True
+
+
+def _retain_positive_min_fields(profile: dict[str, object], user_fields: set[str]) -> None:
+    for name in user_fields | {"name", "my_membership"}:
+        if profile.get(name) in (None, False, "", [], {}) or name in {
+            "contact",
+            "mutual_contact",
+            "close_friend",
+            "my_membership",
+        }:
+            profile.pop(name, None)
 
 
 __all__ = [
