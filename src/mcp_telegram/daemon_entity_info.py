@@ -51,6 +51,7 @@ from .entity_profile.contracts import (
     ProfileSemanticSnapshot,
     ProjectionOutcome,
     ProjectionStatus,
+    StoryProfileValidationError,
     TargetKind,
     UserProfileObservation,
     UserReference,
@@ -116,6 +117,8 @@ def _contact_rpc_error(section: str, exc: BaseException) -> bool:
 
 
 def _profile_section_failure_reason(section: str, exc: BaseException) -> str:
+    if section in {"current_stories", "pinned_stories"} and isinstance(exc, StoryProfileValidationError):
+        return exc.reason
     fallback = type(exc).__name__.lower()
     if not _contact_rpc_error(section, exc):
         return fallback
@@ -123,6 +126,12 @@ def _profile_section_failure_reason(section: str, exc: BaseException) -> str:
     if descriptor.symbol is None or descriptor.code is None:
         return fallback
     return f"{descriptor.error_type.lower()}:{descriptor.code}:{descriptor.symbol}"
+
+
+def _scope_bound_profile_failure(section: str, exc: BaseException) -> bool:
+    return _contact_rpc_error(section, exc) or (
+        section in {"current_stories", "pinned_stories"} and isinstance(exc, StoryProfileValidationError)
+    )
 
 
 def _raw_linked_chat_channel_id(canonical_id: int | None) -> int | None:
@@ -885,7 +894,7 @@ class DaemonEntityInfoService:
                     reason=_profile_section_failure_reason(cursor.next_section, exc),
                     retry_at=failure_retry_at(now),
                 ),
-                guard_scope=_contact_rpc_error(cursor.next_section, exc),
+                guard_scope=_scope_bound_profile_failure(cursor.next_section, exc),
             )
         if self._profile_scope_changed_during_acquisition(context.captured_scope):
             await self._write_profiles(
@@ -1841,9 +1850,7 @@ class DaemonEntityInfoService:
     ) -> EntitySectionCommit:
         section = cursor.next_section
         if section in PROFILE_COLLECTION_SECTIONS and entity_type in {DialogType.USER, DialogType.BOT}:
-            reference = self._user_reference(cursor.entity_id)
-            if reference is None:
-                raise ValueError("collection user reference unavailable")
+            reference = self._collection_user_reference(cursor.entity_id, section)
             state = json.loads(cursor.page_cursor_json) if cursor.page_cursor_json else {}
             page = await cast(ProfileCollectionPort, self._deps.user_profile_port).fetch_profile_collection_page(
                 reference, section, state.get("request", {})
@@ -2315,6 +2322,14 @@ class DaemonEntityInfoService:
         is_self = self._deps.self_id == entity_id
         reference = self._deps.user_profile_port.get_user_reference(entity_id, is_self=is_self)
         return reference if isinstance(reference, UserReference) else None
+
+    def _collection_user_reference(self, entity_id: int, section: str) -> UserReference:
+        reference = self._user_reference(entity_id)
+        if reference is None:
+            if section in {"current_stories", "pinned_stories"}:
+                raise StoryProfileValidationError("reference_unavailable")
+            raise ValueError("collection user reference unavailable")
+        return reference
 
     async def _acquire_personal_channel(self, entity_id: int, entity_type: DialogType) -> EntitySectionCommit:
         target_kind = self._target_kind(entity_type)

@@ -59,6 +59,8 @@ from .entity_profile.contracts import (
     ProfileCollectionItem,
     ProfileCollectionPage,
     ProjectionStatus,
+    StoryProfileValidationCategory,
+    StoryProfileValidationError,
     SuppliedProfileUser,
     TargetKind,
     UserAvatarHistoryObservation,
@@ -455,8 +457,40 @@ class TelethonUserProfileGateway(UserProfilePort):
                 ObservationBoundary(started, self._now_provider()),
                 reason="access_lost",
             )
-        page = _collection_page(reference, section, cursor, result, ObservationBoundary(started, self._now_provider()))
+        except StoryProfileValidationError:
+            raise
+        except ValueError:
+            if _story_detail_phase(section, cursor):
+                raise StoryProfileValidationError("transport") from None
+            raise
+        return _collection_page_with_sidecars(
+            reference, section, cursor, result, ObservationBoundary(started, self._now_provider())
+        )
+
+
+def _story_detail_phase(section: str, cursor: Mapping[str, object]) -> bool:
+    return section in {"current_stories", "pinned_stories"} and cursor.get("phase") == "details"
+
+
+def _collection_page_with_sidecars(
+    reference: UserReference, section: str, cursor: Mapping[str, object], result: object, boundary: ObservationBoundary
+) -> ProfileCollectionPage:
+    try:
+        page = _collection_page(reference, section, cursor, result, boundary)
+    except StoryProfileValidationError:
+        raise
+    except ValueError:
+        if _story_detail_phase(section, cursor):
+            raise StoryProfileValidationError("normalization") from None
+        raise
+    try:
         return _collection_sidecars(page, result)
+    except StoryProfileValidationError:
+        raise
+    except ValueError:
+        if _story_detail_phase(section, cursor):
+            raise StoryProfileValidationError("sidecar") from None
+        raise
 
 
 def _cursor_int(cursor: Mapping[str, object], key: str) -> int:
@@ -498,7 +532,7 @@ def _user_collection_request(user: TypeInputUser, section: str, cursor: Mapping[
 def _story_detail_request(peer: TypeInputPeer, cursor: Mapping[str, object]) -> object:
     ids = cursor.get("ids")
     if not isinstance(ids, list) or not ids or any(type(value) is not int or value <= 0 for value in ids):
-        raise ValueError("invalid story detail cursor")
+        raise StoryProfileValidationError("cursor_invalid")
     return GetStoriesByIDRequest(peer=peer, id=ids[:100])
 
 
@@ -677,14 +711,14 @@ def _story_detail_page(
     reference: UserReference, section: str, cursor: Mapping[str, object], result: object, boundary: ObservationBoundary
 ) -> ProfileCollectionPage:
     if type(result).__name__ != "Stories":
-        raise ValueError("story details response missing")
+        raise StoryProfileValidationError("response_type")
     requested = cast(list[int], cursor["ids"])
     values = getattr(result, "stories", None)
     if not isinstance(values, list):
-        raise ValueError("story detail vector missing")
+        raise StoryProfileValidationError("vector_missing")
     returned = [getattr(value, "id", None) for value in values]
     if set(returned) != set(requested[:100]):
-        raise ValueError("story detail identities mismatch")
+        raise _story_identity_mismatch(requested[:100], returned)
     items, _missing, diagnostics = _collection_items(section, values, details=True)
     after = cursor.get("after")
     next_cursor = cast(Mapping[str, object] | None, after)
@@ -700,6 +734,28 @@ def _story_detail_page(
         next_cursor,
         terminal,
         diagnostics,
+    )
+
+
+def _story_identity_mismatch(requested: Sequence[int], returned: Sequence[object]) -> StoryProfileValidationError:
+    requested_ids = set(requested)
+    returned_ids = {value for value in returned if type(value) is int and value > 0}
+    missing, unexpected = requested_ids - returned_ids, returned_ids - requested_ids
+    category: StoryProfileValidationCategory
+    if any(type(value) is not int or value <= 0 for value in returned):
+        category = "ids_invalid"
+    elif missing and unexpected:
+        category = "ids_mixed"
+    elif missing:
+        category = "ids_missing"
+    else:
+        category = "ids_unexpected"
+    return StoryProfileValidationError(
+        category,
+        requested=len(requested_ids),
+        returned=len(returned_ids),
+        missing=len(missing),
+        unexpected=len(unexpected),
     )
 
 
