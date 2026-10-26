@@ -36,7 +36,10 @@ from tests.test_story_profile_diagnostics import _DATE, _END, _IDS, _Client
 
 
 def _story(identifier: int, caption: str) -> types.StoryItem:
-    return types.StoryItem(identifier, _DATE, _END, types.MessageMediaEmpty(), pinned=True, caption=caption)
+    area = types.MediaAreaUrl(types.MediaAreaCoordinates(1, 2, 3, 4, 5, radius=6), "https://example.invalid/story")
+    return types.StoryItem(
+        identifier, _DATE, _END, types.MessageMediaEmpty(), pinned=True, caption=caption, media_areas=[area]
+    )
 
 
 def _listing(*items: types.TypeStoryItem) -> types.stories.PeerStories:
