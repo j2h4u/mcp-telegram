@@ -347,6 +347,8 @@ def _merge_snapshot(
 
 
 def _retain_path_provenance(paths: dict[str, object], old: object, new: object, root: str) -> None:
+    if old == new:
+        return
     if isinstance(new, dict) and isinstance(old, dict) and _same_node(old, new):
         for key, value in new.items():
             _retain_path_provenance(paths, old.get(key), value, f"{root}.{key}")
