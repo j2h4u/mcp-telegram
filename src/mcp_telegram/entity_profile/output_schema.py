@@ -1,4 +1,4 @@
-"""Closed wire schema for the finite, normalized personal-profile manifest."""
+"""Closed wire schema for retained facts from the finite personal-profile manifest."""
 
 from collections.abc import Mapping
 from copy import deepcopy
@@ -6,7 +6,7 @@ from typing import cast
 
 from ..structured import TELEGRAM_CONTENT_OUTPUT_SCHEMA, TelegramContentKind, telegram_content
 from .contracts import ProfileFieldClass
-from .field_manifest import PROFILE_FIELD_MANIFEST, ProfileConstructorRule, ProfileFieldRule
+from .field_manifest import PROFILE_FIELD_MANIFEST, ProfileFieldRule
 
 _PRIMITIVES: dict[str, dict[str, object]] = {
     "bool": {"type": "boolean"},
@@ -19,12 +19,12 @@ _PRIMITIVES: dict[str, dict[str, object]] = {
 }
 
 
-def _retained_rules(constructor: ProfileConstructorRule) -> dict[str, ProfileFieldRule]:
-    return {
-        name: rule
-        for name, rule in constructor.fields.items()
-        if rule.classification is not ProfileFieldClass.CAPABILITY
-    }
+def _retained_rules(name: str) -> dict[str, ProfileFieldRule]:
+    fields = PROFILE_FIELD_MANIFEST[name].fields
+    if name in {"StoryItem", "StoryItemSkipped"}:
+        # A skipped observation does not erase older story details.
+        fields = {**PROFILE_FIELD_MANIFEST["StoryItem"].fields, **PROFILE_FIELD_MANIFEST["StoryItemSkipped"].fields}
+    return {name: rule for name, rule in fields.items() if rule.classification is not ProfileFieldClass.CAPABILITY}
 
 
 def _atom_schema(name: str) -> dict[str, object] | None:
@@ -60,7 +60,7 @@ def _constructor_schema(name: str) -> dict[str, object]:
         "type": "object",
         "properties": {
             "constructor": {"const": name},
-            **_properties(_retained_rules(PROFILE_FIELD_MANIFEST[name])),
+            **_properties(_retained_rules(name)),
         },
         "required": ["constructor"],
         "additionalProperties": False,
@@ -76,7 +76,7 @@ def _reachable_constructors() -> list[str]:
         if name in visited or constructor is None or constructor.protocol_only:
             continue
         visited.add(name)
-        for rule in _retained_rules(constructor).values():
+        for rule in _retained_rules(name).values():
             pending.extend(child for child in rule.value_types if child in PROFILE_FIELD_MANIFEST)
     return sorted(visited)
 
@@ -85,7 +85,7 @@ def _root_rules() -> dict[str, ProfileFieldRule]:
     return {
         f"{prefix}.{name}": rule
         for prefix, constructor in (("user", "User"), ("full_user", "UserFull"))
-        for name, rule in _retained_rules(PROFILE_FIELD_MANIFEST[constructor]).items()
+        for name, rule in _retained_rules(constructor).items()
     }
 
 
@@ -140,7 +140,7 @@ def _project_atom(value: object, rule: ProfileFieldRule, kind: TelegramContentKi
     constructor = PROFILE_FIELD_MANIFEST[name]
     if constructor.protocol_only:
         raise ValueError("Protocol-only profile constructor")
-    return {"constructor": name, **_project_properties(node, _retained_rules(constructor), kind)}
+    return {"constructor": name, **_project_properties(node, _retained_rules(name), kind)}
 
 
 def _project_field(value: object, rule: ProfileFieldRule, kind: TelegramContentKind) -> object:

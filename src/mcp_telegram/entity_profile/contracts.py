@@ -72,6 +72,7 @@ class StoryProfileValidationError(ValueError):
             "transport",
         }:
             raise ValueError("invalid story validation category")
+        self.category = category
         parts = ["story_validation", category]
         for name, count in (
             ("requested", requested),

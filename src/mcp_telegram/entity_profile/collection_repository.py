@@ -681,7 +681,17 @@ def _collection_summary(
 
 
 def _same_node(old: Mapping[str, object], new: Mapping[str, object]) -> bool:
-    return old.get("constructor") == new.get("constructor") and _identity(old) == _identity(new)
+    if old.get("constructor") == new.get("constructor"):
+        return _identity(old) == _identity(new)
+    old_id, new_id = old.get("id"), new.get("id")
+    return (
+        old.get("constructor") in {"StoryItem", "StoryItemSkipped"}
+        and new.get("constructor") in {"StoryItem", "StoryItemSkipped"}
+        and type(old_id) is int
+        and old_id > 0
+        and type(new_id) is int
+        and new_id == old_id
+    )
 
 
 def _merge_semantic_node(

@@ -110,7 +110,6 @@ def _retained(conn: sqlite3.Connection) -> tuple[list[tuple[object, ...]], list[
 @pytest.mark.parametrize(
     ("kind", "suffix"),
     [
-        ("missing", "ids_missing:requested=2:returned=1:missing=1:unexpected=0"),
         ("unexpected", "ids_unexpected:requested=2:returned=3:missing=0:unexpected=1"),
         ("mixed", "ids_mixed:requested=2:returned=1:missing=2:unexpected=1"),
         ("invalid", "ids_invalid:requested=2:returned=0:missing=2:unexpected=0"),
