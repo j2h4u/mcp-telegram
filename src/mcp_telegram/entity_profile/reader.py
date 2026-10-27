@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from typing import cast
 
 from ..pagination import ProfileNavigationToken, decode_profile_navigation, encode_profile_navigation
-from .contracts import PROFILE_COLLECTION_SECTIONS
+from .contracts import PROFILE_COLLECTION_SECTIONS, profile_value_paths
 from .output_schema import (
     project_collection_item,
     project_history_value,
@@ -66,7 +66,7 @@ def semantic_profile(conn: sqlite3.Connection, owner: int, entity: int, now: int
     paths = provenance.get("fields", {})
     paths = cast(dict[str, object], paths) if isinstance(paths, dict) else {}
     coverage = _object(row[1])
-    evidence = _field_evidence(coverage, paths, now, _profile_values(_object(row[0])))
+    evidence = _field_evidence(coverage, paths, now, profile_value_paths(_object(row[0])))
     return {
         "fields": project_profile_fields(_object(row[0])),
         "field_evidence": evidence,
@@ -117,23 +117,6 @@ def _value_evidence(
         "source": observed.get("source"),
         "age_seconds": _age(now, observed.get("observed_at", observed.get("observation_completed_at"))),
     }
-
-
-def _profile_values(fields: dict[str, object]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for path, value in fields.items():
-        _collect_values(result, path, value)
-    return result
-
-
-def _collect_values(result: dict[str, object], path: str, value: object) -> None:
-    result[path] = value
-    if isinstance(value, dict):
-        for key, child in cast(dict[str, object], value).items():
-            _collect_values(result, path + "." + key, child)
-    elif isinstance(value, list):
-        for index, child in enumerate(cast(list[object], value)):
-            _collect_values(result, f"{path}[{index}]", child)
 
 
 def _acquisition_evidence(provenance: dict[str, object], bounds: tuple[object, ...], now: int) -> dict[str, object]:
@@ -429,7 +412,7 @@ def _collection_item(section: str, row: tuple[object, ...], now: int) -> dict[st
         "value": value,
         "observed_at": row[5],
         "age_seconds": _age(now, row[5]),
-        "field_evidence": _field_evidence(_object(row[3]), _object(row[4]), now, _profile_values({"item": fields})),
+        "field_evidence": _field_evidence(_object(row[3]), _object(row[4]), now, profile_value_paths({"item": fields})),
         "acquisition": {"availability": "unknown"},
     }
 

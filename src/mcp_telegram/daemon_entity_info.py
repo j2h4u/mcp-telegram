@@ -419,17 +419,25 @@ class DaemonEntityInfoService:
 
     async def reconcile_history_profiles(self) -> int:
         """Recover one bounded batch of locally missing DM profile observations."""
-        count = await self._write_profiles(
-            lambda profiles: profiles.reconcile_history_profiles(
-                now=int(self._deps.now_provider()),
-                limit=32,
-                pair_mode=self._current_pair_mode(),
-                self_id=self._deps.self_id,
-            )
-        )
+        scope = self._capture_pair_scope()
+        count = await self._write_profiles(lambda profiles: self._reconcile_owned_profiles(profiles, scope))
         if count:
             offer_durable_demand(self._require_demand_sink(), DemandKind.ENTITY_PROFILE_REFRESH)
         return count
+
+    def _reconcile_owned_profiles(self, profiles: EntityProfileRepository, scope: TelegramAuthScope | None) -> int:
+        owner = (
+            scope.account_id
+            if scope is not None and not self._profile_scope_changed_during_acquisition(scope)
+            else None
+        )
+        return profiles.reconcile_history_profiles(
+            now=int(self._deps.now_provider()),
+            limit=32,
+            pair_mode=self._current_pair_mode(),
+            self_id=self._deps.self_id,
+            coverage_owner_account_id=owner,
+        )
 
     async def _write_profiles[T](self, operation: Callable[[EntityProfileRepository], T]) -> T:
         return await self._deps.writer.run(
