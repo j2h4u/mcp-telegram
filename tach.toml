@@ -447,7 +447,7 @@ depends_on = ["mcp_telegram.flood", "mcp_telegram.folders.contracts", "mcp_teleg
 [[modules]]
 path = "mcp_telegram.entity_profile.refresh"
 layer = "capability"
-depends_on = ["mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
+depends_on = ["mcp_telegram.entity_profile.contracts", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
 
 [[modules]]
 path = "mcp_telegram.entity_profile.full_user_normalization"
