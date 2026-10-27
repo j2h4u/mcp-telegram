@@ -30,6 +30,7 @@ from .collection_repository import (
     encode,
     patch_embedded_story,
     reconcile_embedded_stories,
+    refine_published_story_coverage,
     store_collection_page,
     store_semantic_patch,
     store_semantic_snapshot,
@@ -470,12 +471,25 @@ class EntityProfileRepository:
             baseline,
         )
 
-    def reconcile_history_profiles(self, *, now: int, limit: int, pair_mode: str, self_id: int | None) -> int:
+    def reconcile_history_profiles(
+        self,
+        *,
+        now: int,
+        limit: int,
+        pair_mode: str,
+        self_id: int | None,
+        coverage_owner_account_id: int | None = None,
+    ) -> int:
         """Advance the finite personal-peer admission checkpoint."""
         if isinstance(limit, bool) or limit < 1:
             raise ValueError("profile reconciliation limit must be positive")
         if self_id is None or not self._history_profile_schema_available():
             return 0
+        if coverage_owner_account_id == self_id and self._columns("entity_profile_collection_facts"):
+            with write_savepoint(self._conn):
+                examined = _refine_story_coverage_pass(self._conn, self_id, limit)
+            if examined:
+                return examined
         return _reconcile_profile_admission(self._conn, self_id, now=now, limit=limit, pair_mode=pair_mode)
 
     def _history_profile_schema_available(self) -> bool:
@@ -3788,3 +3802,57 @@ def bound_profile_account(conn: sqlite3.Connection) -> int | None:
         conn.execute("SELECT account_id FROM dialog_directory_state WHERE singleton=1").fetchone(),
     )
     return int(cast(int, row[0])) if row and row[0] is not None else None
+
+
+_STORY_COVERAGE_REPAIR_VERSION = 1
+
+
+def _refine_story_coverage_pass(conn: sqlite3.Connection, owner: int, limit: int) -> int:
+    """Examine a finite indexed peer range once, without re-admitting profiles."""
+    require_write_transaction(conn)
+    state = _read_profile_admission_state(conn, owner)
+    repair = state.get("story_coverage_refinement")
+    if repair is None:
+        repair = {
+            "version": _STORY_COVERAGE_REPAIR_VERSION,
+            "last_peer": 0,
+            "completed": False,
+            "items": 0,
+            "slots": 0,
+            "unresolved": 0,
+        }
+    if not _valid_story_repair_checkpoint(repair) or cast(dict[str, object], repair)["completed"]:
+        return 0
+    repair = dict(cast(dict[str, object], repair))
+    examined = 0
+    for _ in range(min(limit, 32)):
+        row = conn.execute(
+            "SELECT entity_id FROM entity_profile_collection_facts WHERE owner_account_id=? AND entity_id>? "
+            "ORDER BY entity_id LIMIT 1",
+            (owner, repair["last_peer"]),
+        ).fetchone()
+        if row is None:
+            repair["completed"] = True
+            break
+        peer = int(row[0])
+        if personal_profile_peer(conn, owner, peer):
+            items, slots, unresolved = refine_published_story_coverage(conn, owner, peer)
+            for key, count in (("items", items), ("slots", slots), ("unresolved", unresolved)):
+                repair[key] = int(cast(int, repair[key])) + count
+        repair["last_peer"] = peer
+        examined += 1
+    state["story_coverage_refinement"] = repair
+    _save_profile_admission_state(conn, state)
+    return examined
+
+
+def _valid_story_repair_checkpoint(value: object) -> bool:
+    if (
+        not isinstance(value, dict)
+        or type(value.get("version")) is not int
+        or value["version"] != _STORY_COVERAGE_REPAIR_VERSION
+    ):
+        return False
+    return type(value.get("completed")) is bool and all(
+        type(value.get(key)) is int and value[key] >= 0 for key in ("last_peer", "items", "slots", "unresolved")
+    )
