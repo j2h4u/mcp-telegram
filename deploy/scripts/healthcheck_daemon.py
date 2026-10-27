@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Healthcheck: verify sync daemon is alive and responding on its Unix socket."""
+"""Healthcheck: verify local serving and absence of a blocking account latch."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ class _HealthcheckResponse(TypedDict, total=False):
     ok: bool
     error: str
     detail: str
+    data: dict[str, object]
 
 
 def _config_path() -> Path:
@@ -40,24 +41,45 @@ def _load_socket_path() -> Path:
     return Path(state_dir).expanduser() / "daemon.sock"
 
 
-async def _probe(socket_path: Path) -> _HealthcheckResponse:
+async def _request(socket_path: Path, method: str) -> _HealthcheckResponse:
     from mcp_telegram.daemon_ipc import REQUEST_LIMIT, read_response
 
     reader, writer = await asyncio.open_unix_connection(str(socket_path), limit=REQUEST_LIMIT)
     try:
-        writer.write(json.dumps({"method": "get_sync_status", "params": {}}).encode() + b"\n")
+        writer.write(json.dumps({"method": method, "params": {}}).encode() + b"\n")
         await writer.drain()
         data = await read_response(reader)
         if not data:
             raise RuntimeError("daemon closed connection before sending response")
-        return cast(_HealthcheckResponse, json.loads(data))
+        response = cast(object, json.loads(data))
+        if not isinstance(response, dict) or not isinstance(response.get("ok"), bool):
+            raise ValueError("malformed daemon health response")
+        return cast(_HealthcheckResponse, response)
     finally:
         writer.close()
         await writer.wait_closed()
 
 
+async def _probe(socket_path: Path) -> _HealthcheckResponse:
+    response = await _request(socket_path, "get_sync_status")
+    if not response.get("ok"):
+        return response
+    response = await _request(socket_path, "get_account_protection")
+    if not response.get("ok"):
+        return response
+    data = response.get("data")
+    if not isinstance(data, dict) or "account_protection" not in data:
+        raise ValueError("missing account protection status")
+    protection = data["account_protection"]
+    if protection is not None:
+        if not isinstance(protection, dict) or protection.get("status") != "active":
+            raise ValueError("malformed account protection status")
+        return {"ok": False, "error": "account_protection_active"}
+    return response
+
+
 def main() -> int:
-    """Send get_sync_status using the installed daemon response transport."""
+    """Check local serving and whether account protection has stopped acquisition."""
     socket_path: Path | None = None
     try:
         socket_path = _load_socket_path()

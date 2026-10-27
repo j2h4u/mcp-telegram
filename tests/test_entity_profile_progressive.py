@@ -313,13 +313,15 @@ def test_last_good_survives_refresh_failure() -> None:
         EntitySectionCommit({}, status="unavailable", reason="not_an_admin", payload=None),
         now=100,
     )
-    repo.mark_refresh_failure(42, now=101, reason="timeout")
+    cursor = repo.next_due_refresh(now=101)
+    assert cursor is not None
+    assert repo.mark_section_failure(cursor, now=101, reason="timeout", retry_at=161)
     stored = repo.read(42, now=101)
     assert stored is not None
     assert stored.detail["common_chats"] == [{"id": 7}]
     assert stored.observed_at == 100
     assert stored.sections["common_chats"]["status"] == "unavailable"
-    assert stored.sections["common_chats"]["reason"] == "timeout"
+    assert stored.sections["common_chats"]["reason"] == "not_an_admin"
     conn.close()
 
 
@@ -389,7 +391,7 @@ async def test_flood_wait_refresh_failure_signals_terminal_waiter_and_persists_r
         tuple[int | None] | None,
         conn.execute("SELECT retry_at FROM entity_profile_refresh_state WHERE entity_id = 42").fetchone(),
     )
-    assert retry_at == (107,)
+    assert retry_at == (400,)
     stored = repo.read(42, now=100)
     assert stored is not None
     assert stored.detail["name"] == "Good"
@@ -1284,7 +1286,7 @@ async def test_refresh_resolution_preserves_success_and_failure_semantics() -> N
     assert await service._acquire_durable_refresh_core(cursor, now=100) is DurableRefreshTerminal.FAILURE
     assert service._profiles.refresh_state(42, now=100) == {
         "status": "failed",
-        "retry_at": 107,
+        "retry_at": 400,
         "reason": "flood_wait",
     }
     await service.shutdown()
@@ -1714,17 +1716,20 @@ async def test_durable_unknown_core_timeout_retains_cursor_and_retry_resolves_id
 
 
 @pytest.mark.asyncio
-async def test_durable_unknown_core_flood_wait_does_not_invent_identity() -> None:
+async def test_durable_unknown_core_flood_wait_does_not_invent_identity(request: pytest.FixtureRequest) -> None:
     class FloodResolve(_UnusedClient):
         async def get_entity(self, entity_id: int) -> object:
             raise TelegramRpcThrottled(retry_after_seconds=7)
 
     conn = sqlite3.connect(":memory:")
+    request.addfinalizer(conn.close)
+    conn.execute("PRAGMA foreign_keys=ON")
     _apply_migrations(conn)
+    conn.commit()
+    conn.execute("INSERT INTO entity_profile_refresh_state(entity_id,status,updated_at) VALUES (42,'pending',100)")
     conn.commit()
     service = _test_service(conn, limits=RefreshLimits())
     service._deps = replace(service._deps, client=FloodResolve())
-    service._profiles.mark_pending(42, now=100)
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     try:
@@ -1732,7 +1737,7 @@ async def test_durable_unknown_core_flood_wait_does_not_invent_identity() -> Non
         assert conn.execute("SELECT type,name FROM entities WHERE id=42").fetchone() is None
         assert conn.execute(
             "SELECT status,retry_at,reason FROM entity_profile_refresh_state WHERE entity_id=42"
-        ).fetchone() == ("failed", 107, "flood_wait")
+        ).fetchone() == ("failed", 400, "flood_wait")
     finally:
         await service.shutdown()
         conn.close()

@@ -213,3 +213,19 @@ a second scheduler.
 This architecture is enforced as a green current-state frontier. Future work
 removes named deprecated edges one slice at a time; it does not normalize them
 into broad module allowlists.
+
+### Protected acquisition health and profile retries
+
+The daemon health probe checks both local socket serving and the existing account
+protection status. Active account protection makes container health fail while
+retained local MCP reads remain available. Docker health alone does not restart
+the service; the account latch still requires controlled operator recovery.
+
+A failed profile section retains its durable retry deadline. FloodWait starts
+with a 300-second delay, conservatively doubles the previous effective failed
+delay up to 3600 seconds, and always honors longer server/account deadlines.
+Ordinary retryable failures preserve that delay; actual acquisition progress
+starts a fresh basis. The control-plane `auth_scope_changed` retry keeps its
+short revalidation delay; the shared account cooldown still applies. This is scheduled-delay backoff, not a count of consecutive
+FloodWait events. Failure observation time anchors the deadline. Account-wide
+protection remains unchanged and can still stop acquisition across peers.

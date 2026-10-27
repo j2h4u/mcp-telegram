@@ -15,6 +15,9 @@ from typing import Literal, TypedDict, cast
 
 from ..dialog_identity_contracts import DialogIdentityObservation
 
+PROFILE_FLOOD_RETRY_BASE_SECONDS = 300
+PROFILE_FLOOD_RETRY_CAP_SECONDS = 3600
+
 PROFILE_SECTIONS: tuple[str, ...] = (
     "full_profile",
     "common_chats",
