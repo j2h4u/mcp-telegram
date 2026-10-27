@@ -313,13 +313,15 @@ def test_last_good_survives_refresh_failure() -> None:
         EntitySectionCommit({}, status="unavailable", reason="not_an_admin", payload=None),
         now=100,
     )
-    repo.mark_refresh_failure(42, now=101, reason="timeout")
+    cursor = repo.next_due_refresh(now=101)
+    assert cursor is not None
+    assert repo.mark_section_failure(cursor, now=101, reason="timeout", retry_at=161)
     stored = repo.read(42, now=101)
     assert stored is not None
     assert stored.detail["common_chats"] == [{"id": 7}]
     assert stored.observed_at == 100
     assert stored.sections["common_chats"]["status"] == "unavailable"
-    assert stored.sections["common_chats"]["reason"] == "timeout"
+    assert stored.sections["common_chats"]["reason"] == "not_an_admin"
     conn.close()
 
 

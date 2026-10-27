@@ -2932,35 +2932,6 @@ class EntityProfileRepository:
             )
         return max(retry_at, previous_retry, now + prior_delay)
 
-    def mark_refresh_failure(
-        self,
-        entity_id: int,
-        *,
-        now: int,
-        reason: str,
-        retry_at: int | None = None,
-    ) -> None:
-        """Record failure while preserving payload and its last successful timestamp."""
-        try:
-            with write_savepoint(self._conn):
-                try:
-                    self._conn.execute(
-                        "INSERT INTO entity_profile_refresh_state(entity_id, status, retry_at, reason, updated_at) "
-                        "VALUES (?, 'failed', ?, ?, ?) ON CONFLICT(entity_id) DO UPDATE SET status=excluded.status, "
-                        "retry_at=excluded.retry_at, reason=excluded.reason, updated_at=excluded.updated_at",
-                        (entity_id, retry_at, reason, now),
-                    )
-                except sqlite3.OperationalError:
-                    pass
-                self._conn.execute(
-                    "UPDATE entity_detail_sections SET status=CASE WHEN observed_at IS NULL "
-                    "THEN 'unavailable' ELSE 'stale' END, reason=?, retry_at=? "
-                    "WHERE entity_id=? AND status <> 'not_applicable'",
-                    (reason, retry_at, entity_id),
-                )
-        except sqlite3.OperationalError:
-            return
-
     def _read_sections(
         self,
         entity_id: int,
