@@ -43,6 +43,8 @@ from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
+from mcp_telegram.telegram_demand import RpcAttemptBudget
+from mcp_telegram.telegram_demand_progress import SliceOutcomeKind
 
 
 class _DirectoryWriter:
@@ -2441,5 +2443,114 @@ async def test_complete_pin_publication_preserves_newer_raw_collection_changes(t
             (101, int(not rewrite)),
             (202, 1),
         ]
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_directory_demand_slice_publishes_exact_selected_revision_in_its_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    monkeypatch.setattr("mcp_telegram.dialog_directory.time.time", lambda: 1_000)
+    shutdown = asyncio.Event()
+    client = _FakeClient([_pinned_response()])
+    directory = CanonicalDialogDirectory(client, db_path, shutdown, writer=_writer(db_path))
+    await directory.bind_account_id(123)
+    conn = _open_sync_db(db_path)
+    try:
+        adapter = CanonicalDialogDirectoryDemandAdapter(directory, conn)
+        status = adapter.status(1_000.0)
+        assert status is not None and status.selected is not None
+        assert status.selected.key.target == "directory"
+
+        outcome = await adapter.run_slice(RpcAttemptBudget(limit=1, selected=status.selected))
+
+        assert outcome.kind is SliceOutcomeKind.PROGRESSED
+        assert outcome.selected == status.selected
+        successor = adapter.status(1_000.0)
+        assert successor is not None and successor.selected is not None
+        assert outcome.committed_revision == successor.selected.revision
+        assert conn.execute(
+            "SELECT status,pinned_main_status,pinned_archive_status FROM dialog_directory_state"
+        ).fetchone() == ("in_progress", "complete", "pending")
+        assert len(client.requests) == 1
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_directory_demand_slice_rejects_a_stale_selected_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    monkeypatch.setattr("mcp_telegram.dialog_directory.time.time", lambda: 1_000)
+    client = _FakeClient([_pinned_response()])
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
+    await directory.bind_account_id(123)
+    conn = _open_sync_db(db_path)
+    try:
+        adapter = CanonicalDialogDirectoryDemandAdapter(directory, conn)
+        status = adapter.status(1_000.0)
+        assert status is not None and status.selected is not None
+        with write_transaction(conn):
+            conn.execute("UPDATE dialog_directory_state SET generation=generation+1 WHERE singleton=1")
+
+        outcome = await adapter.run_slice(RpcAttemptBudget(limit=1, selected=status.selected))
+
+        assert outcome.kind is SliceOutcomeKind.STALE
+        assert client.requests == []
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_directory_demand_slice_defers_an_exhausted_unbound_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    monkeypatch.setattr("mcp_telegram.dialog_directory.time.time", lambda: 1_000)
+    client = _FakeClient([_pinned_response()])
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
+    await directory.bind_account_id(123)
+    conn = _open_sync_db(db_path)
+    try:
+        adapter = CanonicalDialogDirectoryDemandAdapter(directory, conn)
+        status = adapter.status(1_000.0)
+        assert status is not None and status.selected is not None
+
+        outcome = await adapter.run_slice(RpcAttemptBudget(limit=1, attempts=1, selected=status.selected))
+
+        assert outcome.kind is SliceOutcomeKind.DEFERRED
+        assert client.requests == []
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_directory_demand_slice_reports_no_progress_when_owner_is_stopping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    monkeypatch.setattr("mcp_telegram.dialog_directory.time.time", lambda: 1_000)
+    shutdown = asyncio.Event()
+    client = _FakeClient([_pinned_response()])
+    directory = CanonicalDialogDirectory(client, db_path, shutdown, writer=_writer(db_path))
+    await directory.bind_account_id(123)
+    conn = _open_sync_db(db_path)
+    try:
+        adapter = CanonicalDialogDirectoryDemandAdapter(directory, conn)
+        status = adapter.status(1_000.0)
+        assert status is not None and status.selected is not None
+        shutdown.set()
+
+        outcome = await adapter.run_slice(RpcAttemptBudget(limit=1, selected=status.selected))
+
+        assert outcome.kind is SliceOutcomeKind.NO_PROGRESS
+        assert client.requests == []
     finally:
         conn.close()

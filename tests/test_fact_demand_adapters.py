@@ -41,6 +41,7 @@ from mcp_telegram.telegram_demand_progress import SliceOutcome, SliceOutcomeKind
 from mcp_telegram.telegram_read_receipts import TelethonTelegramReadReceiptGateway
 from mcp_telegram.telegram_rpc_consumers import DURABLE_DEMAND_ORDER, DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
+    RpcAdmissionSaturatedError,
     TelegramRpcAdmissionDeferred,
     TelegramRpcScope,
     TelegramRpcSource,
@@ -60,6 +61,10 @@ def _hydration_db() -> sqlite3.Connection:
 async def test_hydration_adapters_partition_existing_queue_without_mutation(request: pytest.FixtureRequest) -> None:
     conn = _hydration_db()
     request.addfinalizer(conn.close)
+    conn.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+        "VALUES (1, 1, 1, NULL, 'other', '{}')"
+    )
     conn.executemany(
         "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, priority, terminal) "
         "VALUES ('test', 1, ?, ?, ?, ?)",
@@ -78,8 +83,9 @@ async def test_hydration_adapters_partition_existing_queue_without_mutation(requ
     assert conn.total_changes == before
 
     budget = RpcAttemptBudget(limit=1, selected=live.status(100.0).selected)  # type: ignore[union-attr]
-    await live.run_slice(budget)
+    outcome = await live.run_slice(budget)
 
+    assert outcome.kind is SliceOutcomeKind.TERMINAL
     assert live.status(100.0) is None
     assert backfill.status(100.0) is not None
     assert budget.attempts == 1
@@ -225,6 +231,62 @@ def _hydration_worker(
         backfill_debt_limit=1,
         clock=clock,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["terminal", "deferred", "saturated"])
+async def test_hydration_adapter_returns_or_raises_committed_request_receipt(failure: str) -> None:
+    class ReceiptHandler(_HydrationHandler):
+        async def request(self, client: object, jobs: Sequence[HydrationJob]) -> object:
+            del client, jobs
+            scope = current_rpc_scope()
+            self.scope = scope
+            if failure == "terminal":
+                raise RuntimeError("terminal hydration response")
+            if failure == "deferred":
+                raise TelegramRpcAdmissionDeferred(retry_after_seconds=17)
+            raise RpcAdmissionSaturatedError(scope, "hydration admission is saturated")
+
+        def is_terminal_error(self, exc: BaseException) -> bool:
+            del exc
+            return failure == "terminal"
+
+    conn = _hydration_db()
+    try:
+        conn.execute(
+            "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+            "VALUES (1, 1, 1, NULL, 'voice', '{}')"
+        )
+        conn.execute(
+            "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, priority) VALUES ('test', 1, 1, 7, 1)"
+        )
+        handler = ReceiptHandler()
+        adapter = FactHydrationDemandAdapter(
+            _hydration_worker(conn, handler, clock=lambda: 100.0),
+            HydrationPriority.FOREGROUND,
+            account_id=1,
+        )
+        selected = adapter.status(100.0)
+        assert selected is not None and selected.selected is not None
+        budget = RpcAttemptBudget(limit=1, selected=selected.selected)
+
+        if failure == "deferred":
+            with pytest.raises(TelegramRpcAdmissionDeferred):
+                await adapter.run_slice(budget)
+        else:
+            outcome = await adapter.run_slice(budget)
+            assert outcome.kind is (SliceOutcomeKind.TERMINAL if failure == "terminal" else SliceOutcomeKind.DEFERRED)
+
+        if failure == "terminal":
+            assert conn.execute(
+                "SELECT terminal,last_outcome FROM hydration_jobs WHERE kind='test' AND message_id=1"
+            ).fetchone() == (1, "terminal_error")
+        else:
+            assert conn.execute(
+                "SELECT due_at,attempts,terminal,last_outcome FROM hydration_jobs WHERE kind='test' AND message_id=1"
+            ).fetchone() == (7, 0, 0, "temporary_failure")
+    finally:
+        conn.close()
 
 
 @pytest.mark.asyncio
@@ -552,10 +614,13 @@ async def test_backfill_repair_failure_keeps_deadline_due() -> None:
     handler = _HydrationHandler()
     worker = _repair_hydration_worker(conn, handler)
 
-    def fail(_conn: sqlite3.Connection, _now: int) -> bool:
+    def fail(
+        _conn: sqlite3.Connection,
+        _now: int,
+    ) -> tuple[bool, tuple[HydrationRepairCursor | None, HydrationRepairCursor | None, HydrationRepairCursor | None]]:
         raise RuntimeError("producer failed")
 
-    worker._run_repair_producers = fail  # type: ignore[method-assign]
+    worker._run_repair_producers = fail  # type: ignore[assignment]
     with pytest.raises(RuntimeError, match="producer failed"):
         await worker.run_priority_slice(HydrationPriority.BACKFILL, RpcAttemptBudget(limit=1))
 
