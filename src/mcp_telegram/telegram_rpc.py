@@ -27,7 +27,7 @@ from telethon import (  # type: ignore[import-untyped]
     helpers,
     types,
 )
-from telethon._updates import ChannelState, SessionState  # type: ignore[import-untyped]
+from telethon._updates import ChannelState, MessageBox, SessionState  # type: ignore[import-untyped]
 from telethon.client.telegrambaseclient import (  # type: ignore[import-untyped]
     DEFAULT_DC_ID,
     DEFAULT_IPV4_IP,
@@ -49,6 +49,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
 )
 from telethon.events import Raw  # type: ignore[import-untyped]
 from telethon.events.common import EventBuilder  # type: ignore[import-untyped]
+from telethon.tl.alltlobjects import tlobjects  # type: ignore[import-untyped]
 from telethon.tl.functions.updates import (  # type: ignore[import-untyped]
     GetChannelDifferenceRequest,
     GetDifferenceRequest,
@@ -65,7 +66,9 @@ from .telegram_demand import (
     AcquisitionKind,
     DemandToken,
     MissingTelegramDemandContextError,
+    RpcAttemptAccounting,
     RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
     RpcAttemptEvidence,
     UnclassifiedTelegramDemandError,
     acquisition_context,
@@ -75,6 +78,7 @@ from .telegram_demand import (
     require_execution_mode,
     transferred_demand_context,
 )
+from .telegram_demand_progress import WorkRevision
 from .telegram_rpc_consumers import CONNECTION_BOOTSTRAP_MAX_RPC_ATTEMPTS, DemandKind, ExecutionMode, demand_contract
 from .telegram_rpc_scheduler import (
     AdmissionObserver,
@@ -85,6 +89,7 @@ from .telegram_rpc_scheduler import (
     RpcTransportReadiness,
     TelegramRpcAdmissionDeferred,
     TelegramRpcAdmissionScheduler,
+    TelegramRpcMethodRecoveryPending,
     TelegramRpcSchedulerPolicy,
     TelegramRpcScope,
     TelegramRpcSource,
@@ -95,9 +100,16 @@ from .telegram_rpc_scheduler import (
     rpc_scope,
 )
 from .telegram_transport import GuardedConnectionTcpFull, GuardedMTProtoSender, ProtocolOrigin
+from .telegram_update_admission import GateMessageBox
 from .update_delivery import UpdateDeliveryRepository
 
 logger = logging.getLogger(__name__)
+
+_METHOD_BACKOFF_BASE_SECONDS = 300
+_METHOD_BACKOFF_MAX_SECONDS = 3600
+_SAFETY_RECEIPT_VERSION = 2
+_CANONICAL_METHOD_MAX_LENGTH = 256
+_TL_CONSTRUCTOR_HEX_WIDTH = 8
 
 
 def raise_if_flood_wait_error(error: BaseException) -> None:
@@ -403,7 +415,7 @@ def _valid_scope_binding(value: dict[str, object]) -> bool:
 
 
 def _validate_safety_record(value: object) -> bool:
-    if not isinstance(value, dict) or set(value) != {
+    fields = {
         "version",
         "generation",
         "scope",
@@ -412,7 +424,12 @@ def _validate_safety_record(value: object) -> bool:
         "protection",
         "recovery",
         "transition",
-    }:
+    }
+    if not isinstance(value, dict):
+        return False
+    if value.get("version") == _SAFETY_RECEIPT_VERSION:
+        fields.add("methods")
+    if set(value) != fields:
         return False
     if not _valid_safety_record_identity(value):
         return False
@@ -427,6 +444,7 @@ def _validate_safety_record(value: object) -> bool:
             isinstance(intents, dict) and all(_valid_safety_intent(key, item) for key, item in intents.items()),
             _valid_safety_recovery(value["recovery"]),
             _valid_safety_transition(value["transition"]),
+            _valid_method_episodes(value.get("methods", {})),
         )
     )
 
@@ -443,10 +461,61 @@ def _valid_safety_record_identity(value: dict[str, object]) -> bool:
     return all(
         (
             type(value["version"]) is int,
-            value["version"] == 1,
+            value["version"] in {1, _SAFETY_RECEIPT_VERSION},
             isinstance(value["generation"], str),
             bool(value["generation"]),
         )
+    )
+
+
+def _valid_method_episodes(value: object) -> bool:
+    if not isinstance(value, dict) or len(value) > len(tlobjects):
+        return False
+    return all(_valid_method_key(method) and _valid_method_episode(episode) for method, episode in value.items())
+
+
+def _valid_method_key(method: object) -> bool:
+    if not isinstance(method, str) or len(method) > _CANONICAL_METHOD_MAX_LENGTH:
+        return False
+    name, separator, constructor = method.rpartition(":")
+    if (
+        not separator
+        or len(constructor) != _TL_CONSTRUCTOR_HEX_WIDTH
+        or any(c not in "0123456789abcdef" for c in constructor)
+    ):
+        return False
+    kind = tlobjects.get(int(constructor, 16))
+    return kind is not None and issubclass(kind, TLRequest) and name == f"{kind.__module__}.{kind.__name__}"
+
+
+def _valid_method_episode(value: object) -> bool:
+    fields = {"generation", "consecutive_actual_floods", "floor", "claim"}
+    if not isinstance(value, dict) or set(value) not in (fields, fields | {"state"}):
+        return False
+    count = value["consecutive_actual_floods"]
+    state = value.get("state", "live")
+    if not isinstance(value["generation"], str) or not value["generation"] or type(count) is not int:
+        return False
+    return all(
+        (
+            _valid_method_state(state, count, value["claim"]),
+            _valid_safety_floor(value["floor"]),
+            _valid_method_claim(value["claim"]),
+        )
+    )
+
+
+def _valid_method_state(state: object, count: int, claim: object) -> bool:
+    if state == "live":
+        return count >= 1
+    return state == "recovered" and count == 0 and claim is None
+
+
+def _valid_method_claim(value: object) -> bool:
+    return value is None or (
+        isinstance(value, dict)
+        and set(value) == {"attempt_id", "run"}
+        and all(isinstance(value[k], str) and bool(value[k]) for k in ("attempt_id", "run"))
     )
 
 
@@ -529,6 +598,44 @@ def _valid_transition_key(phase: object, key: object) -> bool:
     return phase == "logout_confirmed" and (key is None or type(key) is int)
 
 
+@dataclass(slots=True)
+class _MethodRetryCredit:
+    selected: WorkRevision
+    method: str
+    generation: str
+    accounting: RpcAttemptAccounting
+    allowance: int
+    granted: bool = False
+
+    @property
+    def limit(self) -> int:
+        return self.accounting.limit
+
+    @property
+    def attempts(self) -> int:
+        return self.accounting.attempts
+
+    @property
+    def available(self) -> bool:
+        return self.attempts < self.limit or not self.granted
+
+    def debit(self, budget: RpcAttemptBudget) -> None:
+        if self.attempts >= self.limit:
+            self.accounting.limit += self.allowance
+            self.granted = True
+        self.accounting.attempts += 1
+        budget._accounting = self.accounting
+
+
+class _MethodReceipt(dict[str, object]):
+    """Durable method payload with bounded run-local retry bindings."""
+
+    def __init__(self, payload: dict[str, object], *, credit_enabled: bool = False) -> None:
+        super().__init__(payload)
+        self.credit_enabled = credit_enabled
+        self.credits: dict[WorkRevision, _MethodRetryCredit] = {}
+
+
 class TelegramRpcSafetyLedger:
     """Keep prewrite uncertainty durable without binding it to caller cancellation."""
 
@@ -562,6 +669,8 @@ class TelegramRpcSafetyLedger:
         if not _validate_safety_record(decoded):
             raise ValueError("invalid Telegram safety receipt")
         self._record = cast(dict[str, object], decoded)
+        if self._record["version"] == 1:
+            self._record.update(version=_SAFETY_RECEIPT_VERSION, methods={})
         scope = cast(dict[str, object], self._record["scope"])
         self._startup_hold = self._scope_startup_hold(scope, dc_id, key_id)
         self._restore_startup_protection(scope)
@@ -569,12 +678,15 @@ class TelegramRpcSafetyLedger:
         floor = cast(dict[str, object], self._record["floor"])
         floor["until_utc"] = max(float(cast(float, floor["until_utc"])), float(legacy or 0))
         self._rebase_floor(floor)
+        for episode in cast(dict[str, dict[str, object]], self._record["methods"]).values():
+            self._rebase_floor(cast(dict[str, object], episode["floor"]))
+        self._retain_method_bindings(self._record)
 
     def _initialize_record(self, dc_id: int, key_id: int | None) -> None:
         legacy = self._load_legacy_floor()
         owners = self._store.canonical_owners()
         self._record = {
-            "version": 1,
+            "version": _SAFETY_RECEIPT_VERSION,
             "generation": uuid.uuid4().hex,
             "scope": {
                 "stage": "transport_only" if key_id is not None else "key_pending",
@@ -592,6 +704,7 @@ class TelegramRpcSafetyLedger:
             "protection": None,
             "recovery": None,
             "transition": None,
+            "methods": {},
         }
         if not _validate_safety_record(self._record):
             raise ValueError("invalid initial transport safety scope")
@@ -647,11 +760,79 @@ class TelegramRpcSafetyLedger:
     def floor_deadline(self) -> float:
         if not self._record:
             return math.inf
-        floor = cast(dict[str, object], self._record["floor"])
+        return self._floor_release_at(cast(dict[str, object], self._record["floor"]))
+
+    def _floor_release_at(self, floor: dict[str, object]) -> float:
         utc_remaining = max(0.0, float(cast(float, floor["until_utc"])) - time.time())
         if floor["boot_id"] == self._boot_id:
             return max(float(cast(float, floor["until_monotonic"])), time.monotonic() + utc_remaining)
         return time.monotonic() + max(utc_remaining, float(cast(float, floor["remaining_seconds"])))
+
+    def method_release_at(self, method: str | None, attempt_id: str | None = None) -> float:
+        if self._storage_failed:
+            return math.inf
+        episode = cast(dict[str, dict[str, object]], self._record.get("methods", {})).get(method or "")
+        if episode is None or episode.get("state") == "recovered":
+            return 0.0
+        claim = episode["claim"]
+        if isinstance(claim, dict) and (claim["attempt_id"] != attempt_id or claim["run"] != self._run):
+            return math.inf
+        return self._floor_release_at(cast(dict[str, object], episode["floor"]))
+
+    def method_claim_valid(self, method: str, attempt_id: str, generation: str | None) -> bool:
+        episode = cast(dict[str, dict[str, object]], self._record["methods"]).get(method)
+        if episode is None or episode.get("state") == "recovered":
+            return generation is None
+        return episode["generation"] == generation and episode["claim"] == {
+            "attempt_id": attempt_id,
+            "run": self._run,
+        }
+
+    async def prepare_method_trial(self, attempt_id: str, method: str, *, auth_only: bool = False) -> str | None:
+        """Issue the single current-episode permission before any physical claim."""
+        self.require_writable(auth_only=auth_only)
+        current = cast(dict[str, dict[str, object]], self._record["methods"]).get(method)
+        if current is None or current.get("state") == "recovered":
+            return None
+        generation: str | None = None
+
+        def reserve(record: dict[str, object]) -> None:
+            nonlocal generation
+            self.require_writable(auth_only=auth_only)
+            episode = cast(dict[str, dict[str, object]], record["methods"]).get(method)
+            if episode is None or episode.get("state") == "recovered":
+                return
+            generation = cast(str, episode["generation"])
+            deferred = self.method_deferral(method, attempt_id)
+            if deferred is not None:
+                raise deferred
+            if attempt_id not in cast(dict[str, object], record["intents"]):
+                raise RuntimeError("method recovery lacks its durable application intent")
+            episode["claim"] = {"attempt_id": attempt_id, "run": self._run}
+
+        await self._commit(reserve)
+        return generation
+
+    def method_deferral(
+        self, method: str, attempt_id: str | None = None
+    ) -> TelegramRpcAdmissionDeferred | TelegramRpcMethodRecoveryPending | None:
+        episode = cast(dict[str, dict[str, object]], self._record["methods"]).get(method)
+        if episode is None or episode.get("state") == "recovered":
+            return None
+        generation = cast(str, episode["generation"])
+        claim = episode["claim"]
+        if isinstance(claim, dict) and (claim["attempt_id"] != attempt_id or claim["run"] != self._run):
+            return TelegramRpcMethodRecoveryPending(method, generation)
+        deadline = self._floor_release_at(cast(dict[str, object], episode["floor"]))
+        if deadline <= time.monotonic():
+            return None
+        return TelegramRpcAdmissionDeferred(
+            max(1, math.ceil(deadline - time.monotonic())),
+            method_key=method,
+            generation=generation,
+            eligible_at=deadline,
+            reason="method",
+        )
 
     @property
     def protection_reason(self) -> str | None:
@@ -707,6 +888,7 @@ class TelegramRpcSafetyLedger:
     async def _commit_owned(self, change: Callable[[dict[str, object]], None]) -> None:
         async with self._lock:
             updated = cast(dict[str, object], json.loads(json.dumps(self._record)))
+            self._retain_method_bindings(updated)
             change(updated)
             if not _validate_safety_record(updated):
                 raise ValueError("invalid outbound safety mutation")
@@ -717,6 +899,46 @@ class TelegramRpcSafetyLedger:
                 self._storage_failed = True
                 raise
             self._record, self._encoded = updated, encoded
+
+    def _retain_method_bindings(self, updated: dict[str, object]) -> None:
+        previous = cast(dict[str, dict[str, object]], self._record["methods"])
+        episodes = cast(dict[str, dict[str, object]], updated["methods"])
+        for method, payload in episodes.items():
+            receipt = _MethodReceipt(payload)
+            prior = previous.get(method)
+            if isinstance(prior, _MethodReceipt) and prior["generation"] == payload["generation"]:
+                receipt.credit_enabled = prior.credit_enabled
+                receipt.credits = prior.credits
+            episodes[method] = receipt
+
+    def bind_method_retry(self, budget: RpcAttemptBudget, method: str, capacity: int) -> _MethodRetryCredit | None:
+        selected = budget.selected
+        episode = cast(dict[str, dict[str, object]], self._record["methods"]).get(method)
+        if selected is None or not isinstance(episode, _MethodReceipt):
+            return None
+        if selected.key.account_id != self.verified_account_id or not episode.credit_enabled:
+            return None
+        credit = episode.credits.get(selected)
+        if credit is None:
+            if episode.get("state") == "recovered" or len(episode.credits) >= capacity:
+                return None
+            contract = demand_contract(selected.key.demand_kind)
+            allowance = contract.max_rpc_attempts_per_slice
+            if allowance is None:
+                return None
+            credit = _MethodRetryCredit(
+                selected, method, cast(str, episode["generation"]), self._revision_accounting(budget), allowance
+            )
+            episode.credits[selected] = credit
+        budget._accounting = credit.accounting
+        return credit
+
+    def _revision_accounting(self, budget: RpcAttemptBudget) -> RpcAttemptAccounting:
+        selected = budget.selected
+        for receipt in cast(dict[str, dict[str, object]], self._record["methods"]).values():
+            if isinstance(receipt, _MethodReceipt) and selected is not None and selected in receipt.credits:
+                return receipt.credits[selected].accounting
+        return budget._accounting
 
     def _operation_done(self, task: asyncio.Task[None]) -> None:
         self._operations.discard(task)
@@ -774,15 +996,19 @@ class TelegramRpcSafetyLedger:
             raise RuntimeError("outbound attempt lacks durable intent")
         self._claimed.add(attempt_id)
 
-    async def complete(
+    async def complete(  # noqa: PLR0913 - one atomic terminal receipt owns account and method restrictions.
         self,
         attempt_id: str,
         *,
         known_outcome: bool,
         floor_until_utc: float | None = None,
         circuit_open: bool = False,
+        actual_flood: bool = False,
+        method_generation: str | None = None,
+        method_success: bool = False,
     ) -> None:
         def settle(record: dict[str, object]) -> None:
+            self._settle_method(record, attempt_id, actual_flood, method_generation, method_success)
             self._settle_intent(record, attempt_id, known_outcome)
             if floor_until_utc is not None:
                 self._extend_floor(record, floor_until_utc)
@@ -800,6 +1026,56 @@ class TelegramRpcSafetyLedger:
             self._startup_hold = "unresolved_outbound_outcome"
         await self._commit(settle)
         self._claimed.discard(attempt_id)
+
+    def _settle_method(
+        self,
+        record: dict[str, object],
+        attempt_id: str,
+        actual_flood: bool,
+        generation: str | None,
+        success: bool,
+    ) -> None:
+        intent = cast(dict[str, dict[str, object]], record["intents"]).get(attempt_id)
+        if intent is None or intent["run"] != self._run:
+            return
+        method = cast(str, intent["method"])
+        episodes = cast(dict[str, dict[str, object]], record["methods"])
+        episode = episodes.get(method)
+        if actual_flood and attempt_id in self._claimed and _valid_method_key(method):
+            self._record_method_flood(episodes, method, episode)
+        elif episode is not None and episode["claim"] == {"attempt_id": attempt_id, "run": self._run}:
+            if success and episode["generation"] == generation:
+                episode.update(state="recovered", consecutive_actual_floods=0, claim=None)
+            else:
+                episode["claim"] = None
+
+    def _record_method_flood(
+        self, episodes: dict[str, dict[str, object]], method: str, previous: dict[str, object] | None
+    ) -> None:
+        prior_live = previous is not None and previous.get("state", "live") == "live"
+        count = (cast(int, previous["consecutive_actual_floods"]) if prior_live and previous is not None else 0) + 1
+        delay = min(_METHOD_BACKOFF_BASE_SECONDS * (1 << min(count - 1, 4)), _METHOD_BACKOFF_MAX_SECONDS)
+        remaining = float(delay)
+        if prior_live:
+            assert previous is not None
+            remaining = max(
+                remaining, self._floor_release_at(cast(dict[str, object], previous["floor"])) - time.monotonic()
+            )
+        episodes[method] = _MethodReceipt(
+            {
+                "state": "live",
+                "generation": uuid.uuid4().hex,
+                "consecutive_actual_floods": count,
+                "floor": {
+                    "boot_id": self._boot_id,
+                    "until_monotonic": time.monotonic() + remaining,
+                    "until_utc": time.time() + remaining,
+                    "remaining_seconds": remaining,
+                },
+                "claim": None,
+            },
+            credit_enabled=True,
+        )
 
     def _settle_intent(self, record: dict[str, object], attempt_id: str, known_outcome: bool) -> None:
         intents = cast(dict[str, object], record["intents"])
@@ -1243,6 +1519,8 @@ class TelegramRpcSafetyLedger:
             record["generation"] = uuid.uuid4().hex
             for intent in cast(dict[str, dict[str, object]], record["intents"]).values():
                 intent["phase"] = "acknowledged_unknown"
+            for episode in cast(dict[str, dict[str, object]], record["methods"]).values():
+                episode["claim"] = None
             record["protection"] = None
 
         await self._commit(consume)
@@ -1326,6 +1604,7 @@ class _WireAttempt:
     revoked: bool = False
     preparing_task: asyncio.Task[object] | None = None
     timing: DaemonRequestTiming | None = None
+    method_generation: str | None = None
 
 
 def _application_request(request: object) -> TLRequest:
@@ -1364,6 +1643,7 @@ class _WirePermit:
     owner: _WireAttempt
     admission: RpcAdmission
     generation: tuple[int, int]
+    method_generation: str | None = None
     released: bool = False
 
 
@@ -1426,6 +1706,7 @@ class TelegramRpcGate(TelegramClient):
             limiter=self._limiter,
             minimum_spacing_seconds=rpc_budget.period_seconds / rpc_budget.max_calls_per_period,
             release_at=self._wire_release_at,
+            deferral=self._difference_admission_deferral,
             observer=admission_observer,
             readiness=RpcTransportReadiness(
                 probe=self._scheduler_transport_ready,
@@ -1482,6 +1763,11 @@ class TelegramRpcGate(TelegramClient):
         self._connection_budgets: WeakKeyDictionary[RpcAttemptEvidence, RpcAttemptBudget] = WeakKeyDictionary()
         self._wire_budgets: WeakKeyDictionary[RpcAttemptEvidence, RpcAttemptBudget] = WeakKeyDictionary()
         self._wire_fault: str | None = None
+        self._pending_method_receipts: dict[str, int] = {}
+        self._rpc_eligibility_observer: Callable[[str | None], None] | None = None
+        self._update_loop_owner: asyncio.Task[object] | None = None
+        previous = cast(MessageBox, object.__getattribute__(self, "_message_box"))
+        self._message_box = GateMessageBox(previous, self.rpc_eligibility, _canonical_wire_method)
         if self._offline_wire_identity()[0] > 0:
             self._ensure_safety_ledger()
         self._cooldown_save_tasks: dict[int, asyncio.Task[None]] = {}
@@ -1817,6 +2103,65 @@ class TelegramRpcGate(TelegramClient):
         """Attach bounded per-request-class attempt telemetry."""
         self._rpc_request_observer = observer
 
+    def set_rpc_eligibility_observer(self, observer: Callable[[str | None], None] | None) -> None:
+        """Wake the existing demand owner when cached gate eligibility changes."""
+        self._rpc_eligibility_observer = observer
+
+    def prepare_durable_retry(self, budget: RpcAttemptBudget, method_key: str | None) -> bool:
+        """Bind live-episode credit; only final physical claim can spend it."""
+        if method_key is None or budget.selected is None:
+            return False
+        ledger = self._ensure_safety_ledger()
+        if self.account_safety_status() is not None:
+            return False
+        capacity = sum(self._admission_scheduler._capacities.values())
+        credit = ledger.bind_method_retry(budget, method_key, capacity)
+        if credit is None:
+            return False
+        budget._retry_candidate = credit
+        return credit.available and self.rpc_eligibility(method_key) is None
+
+    def _retry_credit(self, budget: RpcAttemptBudget) -> _MethodRetryCredit | None:
+        credit = budget._retry_candidate
+        if not isinstance(credit, _MethodRetryCredit) or credit.selected != budget.selected:
+            return None
+        ledger = self._ensure_safety_ledger()
+        episode = cast(dict[str, dict[str, object]], ledger._record["methods"]).get(credit.method)
+        if not isinstance(episode, _MethodReceipt) or episode.credits.get(credit.selected) is not credit:
+            return None
+        if episode["generation"] != credit.generation or credit.selected.key.account_id != ledger.verified_account_id:
+            return None
+        return credit
+
+    def rpc_eligibility(
+        self, method_key: str | None = None
+    ) -> TelegramRpcThrottled | TelegramRpcMethodRecoveryPending | None:
+        """Read current application eligibility; this hint never grants a write."""
+        ledger = self._ensure_safety_ledger()
+        if self.account_safety_status() is not None or self._rpc_circuit_status().open:
+            return TelegramRpcThrottled(latched=True, detail="Telegram account acquisition remains protected")
+        deadline = max(account_cooldown_deadline(), ledger.floor_deadline)
+        if deadline > time.monotonic():
+            return TelegramRpcAdmissionDeferred(
+                max(1, math.ceil(deadline - time.monotonic())),
+                method_key=method_key,
+                eligible_at=deadline,
+                reason="server",
+            )
+        return None if method_key is None else ledger.method_deferral(method_key)
+
+    def _notify_rpc_eligibility_changed(self, method: str | None = None) -> None:
+        self._admission_scheduler.notify_eligibility_changed()
+        box = self._message_box
+        if isinstance(box, GateMessageBox) and not box.wakeup_queued:
+            box.wakeup_queued = True
+            self._updates_queue.put_nowait(box.wakeup)
+        if self._rpc_eligibility_observer is not None:
+            try:
+                self._rpc_eligibility_observer(method)
+            except Exception:
+                logger.exception("rpc_eligibility_observer_failed")
+
     def set_flood_event_observer(self, observer: Callable[[FloodWaitObservation], None] | None) -> None:
         """Attach content-free FloodWait telemetry owned by the daemon."""
         self._flood_event_observer = observer
@@ -1905,15 +2250,17 @@ class TelegramRpcGate(TelegramClient):
             self._connect_owner is asyncio.current_task() or asyncio.current_task() in self._connection_rpc_tasks
         )
         self._check_unverified_application(request, bootstrap)
+        attempt_id = uuid.uuid4().hex
         bound = replace(
             scope,
             request_method=method,
+            owned_attempt_id=attempt_id,
             attempt_budget=self._wire_budget(scope),
             transport_control=False,
             transport_bootstrap=bootstrap,
             transport_auth=self._authentication_mode or self._logout_mode,
         )
-        owner = _WireAttempt(self._wire_issuer, uuid.uuid4().hex, method, bound, timing=current_timing())
+        owner = _WireAttempt(self._wire_issuer, attempt_id, method, bound, timing=current_timing())
         actual = _application_request(request)
         owner.self_lookup = self._is_self_lookup(actual)
         return owner
@@ -1976,15 +2323,17 @@ class TelegramRpcGate(TelegramClient):
         if type(constructor_id) is not int:
             raise RuntimeError("invalid Telegram protocol constructor")
         method = f"{kind.__module__}.{kind.__name__}:{constructor_id:08x}"
+        attempt_id = uuid.uuid4().hex
         bound = replace(
             scope,
             request_method=method,
+            owned_attempt_id=attempt_id,
             attempt_budget=self._wire_budget(scope),
             transport_control=origin != "auth",
             transport_bootstrap=origin == "auth",
             transport_auth=self._authentication_mode and origin == "auth",
         )
-        return _WireAttempt(self._wire_issuer, uuid.uuid4().hex, method, bound)
+        return _WireAttempt(self._wire_issuer, attempt_id, method, bound)
 
     def _require_wire_owner(self, value: object) -> _WireAttempt:
         if not isinstance(value, _WireAttempt) or value.issuer is not self._wire_issuer:
@@ -1998,16 +2347,29 @@ class TelegramRpcGate(TelegramClient):
             return 0.0 if self._control_scope_valid() else math.inf
         if self._wire_fault is not None or self._safety is None:
             return math.inf
-        auth_blocked, ordinary_blocked = self._application_holds(scope)
-        if (
-            auth_blocked
-            or ordinary_blocked
-            or (self._transport_state is not _TransportBoundaryState.READY and not scope.transport_bootstrap)
-        ):
+        if self._application_holds(scope):
             return math.inf
-        return max(account_cooldown_deadline(), self._safety.floor_deadline)
+        if scope.request_method in self._pending_method_receipts:
+            return math.inf
+        return max(
+            account_cooldown_deadline(),
+            self._safety.floor_deadline,
+            self._safety.method_release_at(scope.request_method, scope.owned_attempt_id),
+        )
 
-    def _application_holds(self, scope: TelegramRpcScope) -> tuple[bool, bool]:
+    def _difference_admission_deferral(
+        self, scope: TelegramRpcScope
+    ) -> TelegramRpcThrottled | TelegramRpcMethodRecoveryPending | None:
+        if scope.source is not TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE or scope.transport_bootstrap:
+            return None
+        if scope.owner_task is not self._update_loop_owner:
+            return None
+        global_hold = self.rpc_eligibility()
+        if global_hold is not None or scope.request_method is None:
+            return global_hold
+        return self._ensure_safety_ledger().method_deferral(scope.request_method, scope.owned_attempt_id)
+
+    def _application_holds(self, scope: TelegramRpcScope) -> bool:
         assert self._safety is not None
         auth_blocked = scope.transport_auth and (
             not self._safety._authentication_authorized or self._authentication_parent_cancelled()
@@ -2015,7 +2377,11 @@ class TelegramRpcGate(TelegramClient):
         ordinary_blocked = not scope.transport_auth and (
             self._logout_mode or self._rpc_circuit_status().open or self._safety.protection_reason is not None
         )
-        return auth_blocked, ordinary_blocked
+        return (
+            auth_blocked
+            or ordinary_blocked
+            or (self._transport_state is not _TransportBoundaryState.READY and not scope.transport_bootstrap)
+        )
 
     def _connection_write_ready(self, scope: TelegramRpcScope) -> bool:
         return (
@@ -2075,13 +2441,31 @@ class TelegramRpcGate(TelegramClient):
             owner.admission = None
         generation = self._wire_token()
         admission = await self._admission_scheduler.admit(scope)
-        return _WirePermit(owner, admission, generation)
+        try:
+            method_generation = await self._prepare_method_permission(owner)
+        except BaseException:
+            self._admission_scheduler.complete(admission)
+            raise
+        if owner.claimed == 0:
+            owner.method_generation = method_generation
+        return _WirePermit(owner, admission, generation, method_generation)
+
+    async def _prepare_method_permission(self, owner: _WireAttempt) -> str | None:
+        if owner.scope.transport_control:
+            return None
+        generation = await self._ensure_safety_ledger().prepare_method_trial(
+            owner.attempt_id, owner.method, auth_only=owner.scope.transport_auth
+        )
+        if generation is not None:
+            self._notify_rpc_eligibility_changed(owner.method)
+        return generation
 
     async def _prepare_application_intent(self, owner: _WireAttempt) -> None:
         scope = owner.scope
         ledger = self._ensure_safety_ledger()
         if not scope.transport_control:
             ledger.require_writable(auth_only=scope.transport_auth)
+            self._check_method_eligibility(owner)
             dc_id, key_id = self._offline_wire_identity()
             recorded_scope = cast(dict[str, object], ledger._record["scope"])
             if key_id is not None and (
@@ -2092,6 +2476,12 @@ class TelegramRpcGate(TelegramClient):
             await ledger.prepare(
                 owner.attempt_id, owner.method, transport_identity=(dc_id, key_id), auth_only=scope.transport_auth
             )
+            self._check_method_eligibility(owner)
+
+    def _check_method_eligibility(self, owner: _WireAttempt) -> None:
+        deferred = self._ensure_safety_ledger().method_deferral(owner.method, owner.attempt_id)
+        if deferred is not None:
+            raise deferred
 
     def _revoke_wire_owner(self, owner: _WireAttempt) -> None:
         owner.revoked = True
@@ -2105,20 +2495,37 @@ class TelegramRpcGate(TelegramClient):
             raise RuntimeError("unowned Telegram write permission")
         if not self._permit_still_eligible(owner, permit):
             return False
+        budget = owner.scope.attempt_budget
+        if budget is None:
+            raise RuntimeError("physical Telegram attempt lacks its original budget")
+        ledger = self._ensure_safety_ledger()
+        self._validate_claim_intent(owner, ledger)
         if not self._admission_scheduler.record_dispatch(permit.admission):
             return False
-        if owner.scope.attempt_budget is None:
-            raise RuntimeError("physical Telegram attempt lacks its original budget")
-        owner.scope.attempt_budget.debit()
+        credit = self._retry_credit(budget)
+        if credit is not None:
+            credit.debit(budget)
+        else:
+            budget.debit()
         if not owner.scope.transport_control:
-            self._ensure_safety_ledger().mark_claimed(owner.attempt_id, auth_only=owner.scope.transport_auth)
+            ledger._claimed.add(owner.attempt_id)
         self._record_wire_dispatch(owner, permit)
         return True
+
+    @staticmethod
+    def _validate_claim_intent(owner: _WireAttempt, ledger: TelegramRpcSafetyLedger) -> None:
+        if owner.scope.transport_control:
+            return
+        ledger.require_writable(auth_only=owner.scope.transport_auth)
+        if owner.attempt_id not in cast(dict[str, object], ledger._record["intents"]):
+            raise RuntimeError("outbound attempt lacks durable intent")
 
     def _record_wire_dispatch(self, owner: _WireAttempt, permit: _WirePermit) -> None:
         owner.claimed += 1
         owner.dispatch_at = time.monotonic()
         owner.admission = permit.admission
+        if owner.scope.attempt_budget is not None:
+            owner.scope.attempt_budget.last_method = owner.method
         permit.released = True
         if owner.timing is not None:
             owner.timing.record_rpc_attempt()
@@ -2131,10 +2538,27 @@ class TelegramRpcGate(TelegramClient):
             return False
         if permit.generation != self._wire_token() or self._wire_release_at(owner.scope) > time.monotonic():
             return False
+        if not owner.scope.transport_control and not self._ensure_safety_ledger().method_claim_valid(
+            owner.method, owner.attempt_id, permit.method_generation
+        ):
+            return False
         task = owner.scope.owner_task
         if task is not None and (task.done() or task.cancelling()):
             return False
-        return not (owner.scope.attempt_budget is not None and owner.scope.attempt_budget.exhausted)
+        return self._budget_can_claim(owner)
+
+    def _budget_can_claim(self, owner: _WireAttempt) -> bool:
+        budget = owner.scope.attempt_budget
+        if budget is None:
+            return True
+        credit = self._retry_credit(budget)
+        if credit is not None:
+            return credit.available and (
+                credit.attempts < credit.limit or credit.granted or owner.method == credit.method
+            )
+        if budget._retry_candidate is not None:
+            return False
+        return not budget.exhausted
 
     def defer_write(self, owner: object, permit: object) -> None:
         owner = self._require_wire_owner(owner)
@@ -2156,10 +2580,10 @@ class TelegramRpcGate(TelegramClient):
             )
             _seconds, receipt = self._record_flood(error, scope=owner.scope, wire_owner=owner)
             owner.receipt = receipt
-            self._admission_scheduler.notify_eligibility_changed()
+            self._notify_rpc_eligibility_changed()
         elif not isinstance(error, RPCError) and owner.claimed and not owner.scope.transport_control:
             self._wire_fault = "unresolved_outbound_outcome"
-            self._admission_scheduler.notify_eligibility_changed()
+            self._notify_rpc_eligibility_changed()
 
     async def observe_result(
         self, owner: object, error: BaseException | None, result: object = None
@@ -2174,19 +2598,27 @@ class TelegramRpcGate(TelegramClient):
             if owner.receipt is not None:
                 await asyncio.shield(owner.receipt)
             return None
+        method_affected = owner.method in cast(dict[str, object], self._ensure_safety_ledger()._record["methods"])
         try:
             rejected = await self._guard_identity_result(owner, error, result)
             if owner.receipt is not None:
                 await asyncio.shield(owner.receipt)
             else:
                 known = error is None or isinstance(error, RPCError)
-                await self._ensure_safety_ledger().complete(owner.attempt_id, known_outcome=known)
+                await self._ensure_safety_ledger().complete(
+                    owner.attempt_id,
+                    known_outcome=known,
+                    method_generation=owner.method_generation,
+                    method_success=error is None and rejected is None,
+                )
             owner.terminal = True
             return rejected
         finally:
             if owner.admission is not None:
                 self._admission_scheduler.complete(owner.admission)
                 owner.admission = None
+            if method_affected:
+                self._notify_rpc_eligibility_changed(owner.method)
 
     async def _guard_identity_result(
         self, owner: _WireAttempt, error: BaseException | None, result: object
@@ -2245,7 +2677,7 @@ class TelegramRpcGate(TelegramClient):
     def protect_transport(self, error: BaseException) -> None:
         del error
         self._wire_fault = "unresolved_outbound_outcome"
-        self._admission_scheduler.notify_eligibility_changed()
+        self._notify_rpc_eligibility_changed()
 
     def transport_terminated(self, error: BaseException | None) -> BaseException | None:
         expected = self._transport_state is _TransportBoundaryState.DISCONNECTING
@@ -2254,7 +2686,7 @@ class TelegramRpcGate(TelegramClient):
             self._transport_state = _TransportBoundaryState.FAILED
             self._wire_fault = self._wire_fault or "transport_terminated"
             error = error or RuntimeError("Telegram transport terminated unexpectedly")
-        self._admission_scheduler.notify_eligibility_changed()
+        self._notify_rpc_eligibility_changed()
         return error
 
     def account_safety_status(self) -> dict[str, object] | None:
@@ -2685,9 +3117,14 @@ class TelegramRpcGate(TelegramClient):
 
     def _reject_exhausted_attempt_budget(self, scope: TelegramRpcScope) -> None:
         budget = scope.attempt_budget
-        if budget is not None and budget.exhausted:
+        if budget is None:
+            return
+        credit = self._retry_credit(budget)
+        if credit is not None and credit.available:
+            return
+        if budget.exhausted or budget._retry_candidate is not None:
             self._admission_scheduler.record_attempt_budget_exhausted(scope)
-            budget.debit()
+            raise RpcAttemptBudgetExhaustedError("Telegram RPC attempt budget is exhausted")
 
     async def _get_dc(self, dc_id: int, cdn: bool = False) -> object:
         dc = await super()._get_dc(dc_id, cdn=cdn)  # type: ignore[misc]
@@ -2862,21 +3299,33 @@ class TelegramRpcGate(TelegramClient):
         task = asyncio.current_task()
         connection_owned = task is self._connect_owner or task in self._connection_rpc_tasks
         try:
-            try:
-                token = current_demand_token()
-            except MissingTelegramDemandContextError:
-                with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE):
-                    with acquisition_context(AcquisitionKind.UPDATE_DIFFERENCE):
-                        return await self._call_registered(request, ordered=ordered)
-            if token.kind is not DemandKind.TELETHON_UPDATE_DIFFERENCE:
-                raise RuntimeError("Telethon update difference request inherited an incompatible demand root")
-            require_execution_mode(ExecutionMode.PROTOCOL)
-            with acquisition_context(AcquisitionKind.UPDATE_DIFFERENCE):
-                return await self._call_registered(request, ordered=ordered)
+            return await self._call_classified_difference(request, ordered=ordered)
+        except (TelegramRpcThrottled, TelegramRpcMethodRecoveryPending) as exc:
+            if (
+                task is self._update_loop_owner
+                and not connection_owned
+                and isinstance(self._message_box, GateMessageBox)
+            ):
+                self._message_box.preserve_deferred(request, exc)
+                raise ValueError("Telegram difference waits for gate eligibility") from exc
+            raise
         except RpcAdmissionExpiredError as exc:
             if not connection_owned and exc.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
                 raise OSError("Telegram update difference admission deadline elapsed") from exc
             raise
+
+    async def _call_classified_difference(self, request: object, *, ordered: bool) -> object:
+        try:
+            token = current_demand_token()
+        except MissingTelegramDemandContextError:
+            with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE):
+                with acquisition_context(AcquisitionKind.UPDATE_DIFFERENCE):
+                    return await self._call_registered(request, ordered=ordered)
+        if token.kind is not DemandKind.TELETHON_UPDATE_DIFFERENCE:
+            raise RuntimeError("Telethon update difference request inherited an incompatible demand root")
+        require_execution_mode(ExecutionMode.PROTOCOL)
+        with acquisition_context(AcquisitionKind.UPDATE_DIFFERENCE):
+            return await self._call_registered(request, ordered=ordered)
 
     async def _call_registered(
         self,
@@ -2951,9 +3400,7 @@ class TelegramRpcGate(TelegramClient):
             except TelegramRpcAdmissionDeferred:
                 raise
             except TelegramRpcThrottled:
-                if connection_owned or scope.source is not TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
-                    raise
-                await self._retry_update_source(scope, reason="account_circuit")
+                raise
             except (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError) as exc:
                 await self._handle_flood_wait(scope, exc, connection_owned=connection_owned)
 
@@ -3045,9 +3492,6 @@ class TelegramRpcGate(TelegramClient):
         connection_owned: bool,
     ) -> None:
         seconds = await self._observe_flood(exc, scope=scope)
-        if not connection_owned and scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
-            self._admission_scheduler.record_retry(scope, reason="flood_wait")
-            return
         raise TelegramRpcThrottled(
             retry_after_seconds=seconds,
             latched=False,
@@ -3123,7 +3567,11 @@ class TelegramRpcGate(TelegramClient):
                 raise RuntimeError("Telegram update admission is closed")
             assert self._delivery_account_id is not None
             self._restore_delivery_message_box(self._delivery_account_id)
-        await super()._update_loop()  # type: ignore[misc]
+        self._update_loop_owner = asyncio.current_task()
+        try:
+            await super()._update_loop()  # type: ignore[misc]
+        finally:
+            self._update_loop_owner = None
 
     async def _authentication_update_loop(self) -> None:
         """Deliver login-token notifications without fetching or saving history."""
@@ -3258,6 +3706,9 @@ class TelegramRpcGate(TelegramClient):
         if deadline is None:
             raise RuntimeError("Telegram RPC scope must carry its absolute admission deadline")
         while True:
+            deferred = self._difference_admission_deferral(scope)
+            if deferred is not None:
+                raise deferred
             self.check_circuit()
             now = time.monotonic()
             remaining_scope_seconds = deadline - now
@@ -3301,14 +3752,18 @@ class TelegramRpcGate(TelegramClient):
         receipt = None
         deadline_utc = time.time() + max(0.0, _COOLDOWN_DEADLINE - now)
         if wire_owner is not None:
+            method = wire_owner.method
+            self._pending_method_receipts[method] = self._pending_method_receipts.get(method, 0) + 1
             receipt = asyncio.create_task(
                 self._ensure_safety_ledger().complete(
                     wire_owner.attempt_id,
                     known_outcome=True,
                     floor_until_utc=deadline_utc,
                     circuit_open=self._rpc_circuit_status().open,
+                    actual_flood=bool(wire_owner.claimed),
                 )
             )
+            receipt.add_done_callback(lambda _task: self._method_receipt_finished(wire_owner.method), context=Context())
         else:
             receipt = asyncio.create_task(
                 self._ensure_safety_ledger().record_floor(deadline_utc, circuit_open=self._rpc_circuit_status().open)
@@ -3317,6 +3772,14 @@ class TelegramRpcGate(TelegramClient):
         receipt.add_done_callback(lambda _task: self._cooldown_save_tasks.pop(id(exc), None), context=Context())
         self._observe_flood_event(scope, attempt, seconds)
         return seconds, receipt
+
+    def _method_receipt_finished(self, method: str) -> None:
+        remaining = self._pending_method_receipts[method] - 1
+        if remaining:
+            self._pending_method_receipts[method] = remaining
+        else:
+            self._pending_method_receipts.pop(method)
+        self._notify_rpc_eligibility_changed(method)
 
     @staticmethod
     def _flood_already_observed(exc: BaseException) -> bool:
@@ -3404,6 +3867,7 @@ __all__ = [
     "TelegramRpcAdmissionDeferred",
     "TelegramRpcBudget",
     "TelegramRpcGate",
+    "TelegramRpcMethodRecoveryPending",
     "TelegramRpcSafetyStore",
     "TelegramRpcSource",
     "TransientRpcErrors",

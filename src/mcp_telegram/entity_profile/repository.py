@@ -24,6 +24,8 @@ from ..entity_store import EntitySnapshot, ensure_entity_stub, upsert_entity_sna
 from ..models import DialogType
 from ..resolver import latinize
 from ..sync_transactions import require_write_transaction, write_savepoint
+from ..telegram_demand_progress import WorkKey, WorkRevision
+from ..telegram_rpc_consumers import DemandKind
 from .collection_repository import (
     EffectiveProfileMerge,
     collection_progress,
@@ -166,8 +168,7 @@ class EntityProfileRepository:
         flood_retry_base_seconds: int = PROFILE_FLOOD_RETRY_BASE_SECONDS,
         flood_retry_cap_seconds: int = PROFILE_FLOOD_RETRY_CAP_SECONDS,
     ) -> None:
-        self._flood_retry_base_seconds = flood_retry_base_seconds
-        self._flood_retry_cap_seconds = flood_retry_cap_seconds
+        del flood_retry_base_seconds, flood_retry_cap_seconds
         self._conn = conn
         self._section_ttl_seconds = max(1, int(section_ttl_seconds))
         self._column_cache: dict[str, set[str]] = {}
@@ -1405,22 +1406,31 @@ class EntityProfileRepository:
             return self._legacy_section_status(detail, section, payload, observed_at, now=now) == "pending"
         return _profile_section_missing(row)
 
-    def next_refresh_release_at(self) -> float | None:
+    def next_refresh_release_at(self, *, after: int | None = None) -> float | None:
         """Return the earliest durable pending or retryable refresh release."""
         try:
-            row = cast(
-                tuple[int | None] | None,
-                self._conn.execute(
-                    "SELECT MIN(COALESCE(retry_at, 0)) FROM entity_profile_refresh_state "
-                    "WHERE status IN ('pending', 'failed')"
-                ).fetchone(),
+            query = (
+                "SELECT MIN(COALESCE(retry_at, 0)) FROM entity_profile_refresh_state "
+                "WHERE status IN ('pending', 'failed')"
             )
+            parameters: tuple[object, ...] = ()
+            if after is not None:
+                query += " AND retry_at IS NOT NULL AND retry_at > ?"
+                parameters = (after,)
+            row = cast(tuple[int | None] | None, self._conn.execute(query, parameters).fetchone())
         except sqlite3.OperationalError:
             return None
         return float(row[0]) if row is not None and row[0] is not None else None
 
-    def next_due_refresh(self, *, now: int) -> EntityRefreshCursor | None:
-        """Read the oldest due entity cursor without claiming or changing it."""
+    def next_due_refresh(
+        self,
+        *,
+        now: int,
+        account_id: int | None = None,
+        excluded: frozenset[WorkRevision] = frozenset(),
+        entity_id: int | None = None,
+    ) -> EntityRefreshCursor | None:
+        """Read the oldest due entity cursor, optionally skipping exact held revisions."""
         try:
             columns = self._columns("entity_profile_refresh_state")
             selected = ["entity_id", "next_section", "acquisition_cursor", "retry_at"]
@@ -1437,29 +1447,115 @@ class EntityProfileRepository:
                 )
                 if column in columns
             )
-            row = self._conn.execute(
+            predicate = "status IN ('pending', 'failed') AND (retry_at IS NULL OR retry_at <= ?)"
+            parameters: tuple[object, ...] = (now,)
+            if entity_id is not None:
+                predicate += " AND entity_id=?"
+                parameters += (entity_id,)
+            rows = self._conn.execute(
                 f"SELECT {', '.join(selected)} FROM entity_profile_refresh_state "
-                "WHERE status IN ('pending', 'failed') AND (retry_at IS NULL OR retry_at <= ?) "
-                "ORDER BY updated_at, entity_id LIMIT 1",
-                (now,),
+                f"WHERE {predicate} ORDER BY updated_at, entity_id",
+                parameters,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return None
+        return self._first_unexcluded_refresh_cursor(rows, selected, account_id=account_id, excluded=excluded)
+
+    def _first_unexcluded_refresh_cursor(
+        self,
+        rows: list[tuple[object, ...]],
+        selected: list[str],
+        *,
+        account_id: int | None,
+        excluded: frozenset[WorkRevision],
+    ) -> EntityRefreshCursor | None:
+        for row in rows:
+            cursor = self._refresh_cursor_from_row(row, selected)
+            if account_id is None or self.refresh_work_revision(cursor, account_id) not in excluded:
+                return cursor
+        return None
+
+    @staticmethod
+    def _refresh_cursor_from_row(row: tuple[object, ...], selected: list[str]) -> EntityRefreshCursor:
+        values = dict(zip(selected, row, strict=False))
+        return EntityRefreshCursor(
+            entity_id=int(cast(int, values["entity_id"])),
+            next_section=str(values["next_section"]),
+            acquisition_cursor=int(cast(int, values["acquisition_cursor"])),
+            retry_at=cast(int | None, values["retry_at"]),
+            generation=int(cast(int, values.get("generation") or 0)),
+            started_at=cast(int | None, values.get("started_at")),
+            pair_eligible=bool(values.get("pair_eligible", 0)),
+            profile_revision=int(cast(int, values.get("profile_revision") or 0)),
+            pair_mode=(str(values["pair_mode"]) if values.get("pair_mode") in {"enabled", "disabled"} else None),
+            page_cursor_json=cast(str | None, values.get("page_cursor_json")),
+        )
+
+    @staticmethod
+    def refresh_work_revision(
+        cursor: EntityRefreshCursor, account_id: int, *, terminal_status: str | None = None
+    ) -> WorkRevision:
+        """Build the stable owner key and exact persisted cursor revision."""
+        revision = json.dumps(
+            {
+                "generation": cursor.generation,
+                "next_section": cursor.next_section,
+                "acquisition_cursor": cursor.acquisition_cursor,
+                "profile_revision": cursor.profile_revision,
+                "page_cursor_json": cursor.page_cursor_json,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if terminal_status is not None:
+            revision = f"terminal:{terminal_status}:{revision}"
+        return WorkRevision(
+            WorkKey(DemandKind.ENTITY_PROFILE_REFRESH, account_id, str(cursor.entity_id)),
+            revision,
+        )
+
+    def refresh_work_state(self, entity_id: int, account_id: int) -> tuple[WorkRevision, str] | None:
+        """Read one target's persisted revision and status after a writer result."""
+        try:
+            columns = self._columns("entity_profile_refresh_state")
+            selected = ["entity_id", "next_section", "acquisition_cursor", "retry_at", "status"]
+            selected.extend(
+                column
+                for column in (
+                    "generation",
+                    "started_at",
+                    "pair_eligible",
+                    "follow_up_required",
+                    "profile_revision",
+                    "pair_mode",
+                    "page_cursor_json",
+                )
+                if column in columns
+            )
+            row = self._conn.execute(
+                f"SELECT {', '.join(selected)} FROM entity_profile_refresh_state WHERE entity_id=?",
+                (entity_id,),
             ).fetchone()
         except sqlite3.OperationalError:
             return None
         if row is None:
             return None
         values = dict(zip(selected, row, strict=False))
-        return EntityRefreshCursor(
-            entity_id=int(values["entity_id"]),
+        cursor = EntityRefreshCursor(
+            entity_id=int(cast(int, values["entity_id"])),
             next_section=str(values["next_section"]),
-            acquisition_cursor=int(values["acquisition_cursor"]),
+            acquisition_cursor=int(cast(int, values["acquisition_cursor"])),
             retry_at=cast(int | None, values["retry_at"]),
-            generation=int(values.get("generation") or 0),
+            generation=int(cast(int, values.get("generation") or 0)),
             started_at=cast(int | None, values.get("started_at")),
             pair_eligible=bool(values.get("pair_eligible", 0)),
-            profile_revision=int(values.get("profile_revision") or 0),
+            profile_revision=int(cast(int, values.get("profile_revision") or 0)),
             pair_mode=(str(values["pair_mode"]) if values.get("pair_mode") in {"enabled", "disabled"} else None),
             page_cursor_json=cast(str | None, values.get("page_cursor_json")),
         )
+        status = str(values["status"])
+        terminal_status = status if status in {"complete", "rejected"} else None
+        return self.refresh_work_revision(cursor, account_id, terminal_status=terminal_status), status
 
     def prepare_refresh_revision(self, cursor: EntityRefreshCursor, *, owner_account_id: int | None) -> bool:
         """Return whether this captured cursor is ready; repair owned divergence then yield."""
@@ -2884,16 +2980,25 @@ class EntityProfileRepository:
             parameters.append(cursor.page_cursor_json)
         return " AND ".join(clauses), tuple(parameters)
 
-    def mark_refresh_rejected(self, entity_id: int, *, now: int, reason: str = "refresh_rejected") -> None:
+    def mark_refresh_rejected(
+        self,
+        entity_id: int,
+        *,
+        now: int,
+        reason: str = "refresh_rejected",
+        cursor: EntityRefreshCursor | None = None,
+    ) -> bool:
         """Persist queue rejection without claiming that work was queued."""
         try:
             with write_savepoint(self._conn):
+                if cursor is not None and (cursor.entity_id != entity_id or not self._cursor_matches(cursor)):
+                    return False
                 active = self._conn.execute(
                     "SELECT 1 FROM entity_profile_refresh_state WHERE entity_id=? AND status IN ('pending','failed')",
                     (entity_id,),
                 ).fetchone()
                 if reason == "refresh_rejected" and active is not None:
-                    return
+                    return False
                 self._conn.execute(
                     "INSERT INTO entity_profile_refresh_state(entity_id, status, retry_at, reason, updated_at) "
                     "VALUES (?, 'rejected', NULL, ?, ?) ON CONFLICT(entity_id) DO UPDATE SET status=excluded.status, "
@@ -2910,12 +3015,13 @@ class EntityProfileRepository:
                     "WHERE entity_id=? AND status <> 'not_applicable'",
                     (reason, entity_id),
                 )
+            return True
         except sqlite3.OperationalError, sqlite3.IntegrityError:
-            return
+            return False
 
-    def mark_refresh_not_found(self, entity_id: int, *, now: int) -> None:
+    def mark_refresh_not_found(self, entity_id: int, *, now: int, cursor: EntityRefreshCursor | None = None) -> bool:
         """Persist terminal resolution failure without leaving pending work."""
-        self.mark_refresh_rejected(entity_id, now=now, reason="entity_not_found")
+        return self.mark_refresh_rejected(entity_id, now=now, reason="entity_not_found", cursor=cursor)
 
     def mark_section_failure(
         self,
@@ -2976,18 +3082,9 @@ class EntityProfileRepository:
         return retry_at
 
     def _section_failure_deadline(self, previous: tuple[object, ...], *, now: int, reason: str, retry_at: int) -> int:
-        if reason == "auth_scope_changed":
-            return retry_at
+        del now, reason
         previous_retry = previous[1] if isinstance(previous[1], int) else 0
-        previous_updated = previous[2] if isinstance(previous[2], int) else now
-        prior_delay = max(0, previous_retry - previous_updated) if previous[0] == "failed" else 0
-        # Effective scheduled delay survives ordinary failures; it is not a Flood event count.
-        if reason == "flood_wait":
-            prior_delay = min(
-                self._flood_retry_cap_seconds,
-                max(self._flood_retry_base_seconds, prior_delay * 2),
-            )
-        return max(retry_at, previous_retry, now + prior_delay)
+        return max(retry_at, previous_retry)
 
     def _read_sections(
         self,

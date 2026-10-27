@@ -50,8 +50,9 @@ from .telegram_demand import (
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
     acquisition_context,
-    demand_context,
+    durable_demand_context,
 )
+from .telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkKey, WorkRevision
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 from .telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
@@ -265,50 +266,57 @@ class CanonicalDialogDirectory:
         self._startup_detail_setter = startup_detail_setter
         self._writer = writer
 
-    def status(self, now: float, conn: sqlite3.Connection) -> DemandStatus | None:
+    def status(  # noqa: PLR0911
+        self, now: float, conn: sqlite3.Connection, *, excluded: frozenset[WorkRevision] = frozenset()
+    ) -> DemandStatus | None:
         """Expose the strictest current eventual freshness target (900 seconds)."""
         state = self._load_state(conn)
+        if state.account_id is None:
+            return None
+        revision = _directory_work_revision(state)
+        selected = WorkRevision(WorkKey(DemandKind.DIALOG_BOOTSTRAP, state.account_id, "directory"), revision)
+        if selected in excluded:
+            return None
         if state.cursor_error:
-            return DemandStatus(release_at=0.0)
+            return DemandStatus(release_at=0.0, selected=selected)
         if state.retry_at is not None and now < state.retry_at:
-            return DemandStatus(release_at=float(state.retry_at))
+            return DemandStatus(release_at=float(state.retry_at), selected=selected)
         if state.status == "invalid":
             return None
         if state.status != "complete" or state.observation_started_at is None:
-            return DemandStatus(release_at=0.0)
+            return DemandStatus(release_at=0.0, selected=selected)
         interval = demand_freshness_seconds(DemandKind.DIALOG_BOOTSTRAP)
         # A long-running acquisition may already be stale at publication. The
         # completion time is a receipt timestamp, never a freshness rewrite.
         release_at = state.observation_started_at + interval
-        return DemandStatus(release_at=release_at, freshness_deadline=release_at)
+        return DemandStatus(release_at=release_at, freshness_deadline=release_at, selected=selected)
 
-    async def run_slice(self) -> None:
+    async def run_slice(self) -> str | None:  # noqa: PLR0911
         """Run exactly one pinned or ordinary raw request, then commit its result."""
         if self._shutdown_event.is_set():
-            return
+            return None
         conn = open_sync_db_reader(self._db_path)
         try:
             initial_state = self._load_state(conn)
             if initial_state.cursor_error:
                 await self._writer.run(lambda db: self._invalidate_cursor(db, initial_state.generation))
-                return
+                return None
             if initial_state.status == "invalid":
-                return
+                return None
             account_id = await self._bound_account_id(conn)
             state = await self._writer.run(self._prepare_or_resume)
             if state is None or self._shutdown_event.is_set():
-                return
+                return None
             if state.pinned_main_status != "complete":
                 self._set_detail("canonical dialog directory: pinned main")
-                await self._acquire_pinned(conn, state, 0, account_id)
-                return
+                return await self._acquire_pinned(conn, state, 0, account_id)
             if state.pinned_archive_status != "complete":
                 self._set_detail("canonical dialog directory: pinned archive")
-                await self._acquire_pinned(conn, state, 1, account_id)
-                return
+                return await self._acquire_pinned(conn, state, 1, account_id)
             if state.ordinary_status != "complete":
                 self._set_detail("canonical dialog directory: ordinary page")
-                await self._acquire_ordinary(conn, state, account_id)
+                return await self._acquire_ordinary(conn, state, account_id)
+            return None
         finally:
             conn.close()
 
@@ -429,7 +437,7 @@ class CanonicalDialogDirectory:
 
     async def _acquire_pinned(
         self, conn: sqlite3.Connection, state: _DirectoryState, folder_id: int, account_id: int
-    ) -> None:
+    ) -> str | None:
         observation_order = await self._writer.run(allocate_observation_order)
         try:
             response = await self._client(get_pinned_dialogs_request(folder_id))
@@ -440,13 +448,14 @@ class CanonicalDialogDirectory:
                 lambda db: self._mark_source_incomplete(db, state.generation, reason, account_id, source_column=None)
             )
             self._set_detail(f"canonical dialog directory: retry ({reason})")
-            return
+            return None
         page = normalize_pinned_dialogs_response(response)
-        detail = await self._writer.run(
+        detail, successor = await self._writer.run(
             lambda db: self._commit_pinned_response(db, state, folder_id, account_id, page, observation_order)
         )
         if detail is not None:
             self._set_detail(detail)
+        return successor
 
     def _commit_pinned_response(  # noqa: PLR0913, PLR0917
         self,
@@ -456,12 +465,12 @@ class CanonicalDialogDirectory:
         account_id: int,
         page: RawDialogPage,
         observation_order: int | None = None,
-    ) -> str | None:
+    ) -> tuple[str | None, str | None]:
         if page.kind == "invalid":
             self._latch_semantic_invalid(
                 conn, state.generation, f"pinned_{folder_id}", page.reason or "invalid", account_id
             )
-            return f"canonical dialog directory: invalid pinned_{folder_id} ({page.reason or 'invalid'})"
+            return f"canonical dialog directory: invalid pinned_{folder_id} ({page.reason or 'invalid'})", None
         if page.kind == "not_modified":
             self._mark_not_modified_without_cache(
                 conn,
@@ -470,18 +479,21 @@ class CanonicalDialogDirectory:
                 account_id,
                 source_column="pinned_main_status" if folder_id == 0 else "pinned_archive_status",
             )
-            return f"canonical dialog directory: retry (pinned_{folder_id}:not_modified_without_cache)"
+            return f"canonical dialog directory: retry (pinned_{folder_id}:not_modified_without_cache)", None
         if page.kind not in {"terminal", "page"}:
             raise RuntimeError(f"unexpected normalized pinned response: {page.kind}")
         with write_transaction(conn):
-            self._stage_facts(
+            staged = self._stage_facts(
                 conn,
                 state.generation,
                 page.facts,
                 folder_id=folder_id,
                 account_id=account_id,
                 observation_order=observation_order,
+                expected_revision=_directory_work_revision(state),
             )
+            if not staged:
+                return None, None
             _commit_pinned_generation(
                 conn,
                 state.generation,
@@ -494,9 +506,10 @@ class CanonicalDialogDirectory:
                 f"UPDATE dialog_directory_state SET {column}='complete', retry_at=NULL WHERE singleton=1 AND account_id=? AND generation=?",
                 (account_id, state.generation),
             )
-        return None
+            successor = _directory_work_revision(self._load_state(conn))
+        return None, successor
 
-    async def _acquire_ordinary(self, conn: sqlite3.Connection, state: _DirectoryState, account_id: int) -> None:
+    async def _acquire_ordinary(self, conn: sqlite3.Connection, state: _DirectoryState, account_id: int) -> str | None:
         observation_order = await self._writer.run(allocate_observation_order)
         try:
             response = await self._client(get_dialogs_request(state.cursor))
@@ -507,70 +520,101 @@ class CanonicalDialogDirectory:
                 lambda db: self._mark_source_incomplete(db, state.generation, reason, account_id, source_column=None)
             )
             self._set_detail(f"canonical dialog directory: retry ({reason})")
-            return
+            return None
         page = normalize_dialogs_response(response, state.cursor)
-        detail = await self._writer.run(
+        detail, successor = await self._writer.run(
             lambda db: self._commit_ordinary_response(db, state, account_id, page, observation_order)
         )
         if detail is not None:
             self._set_detail(detail)
+        return successor
 
-    def _commit_ordinary_response(  # noqa: PLR0911 - preserves bounded page outcome branches
+    def _commit_ordinary_response(
         self,
         conn: sqlite3.Connection,
         state: _DirectoryState,
         account_id: int,
         page: RawDialogPage,
         observation_order: int | None = None,
-    ) -> str | None:
+    ) -> tuple[str | None, str | None]:
         if self._handle_ordinary_non_authoritative(conn, state, account_id, page, observation_order):
-            if page.kind == "invalid":
-                return f"canonical dialog directory: invalid ordinary ({page.reason or 'invalid'})"
-            if page.kind == "not_modified":
-                return "canonical dialog directory: retry (ordinary:not_modified_without_cache)"
-            return None
+            return self._ordinary_non_authoritative_result(page)
+        return self._commit_ordinary_authoritative(conn, state, account_id, page, observation_order)
+
+    @staticmethod
+    def _ordinary_non_authoritative_result(page: RawDialogPage) -> tuple[str | None, str | None]:
+        if page.kind == "invalid":
+            return f"canonical dialog directory: invalid ordinary ({page.reason or 'invalid'})", None
+        if page.kind == "not_modified":
+            return "canonical dialog directory: retry (ordinary:not_modified_without_cache)", None
+        return None, None
+
+    def _commit_ordinary_authoritative(
+        self,
+        conn: sqlite3.Connection,
+        state: _DirectoryState,
+        account_id: int,
+        page: RawDialogPage,
+        observation_order: int | None,
+    ) -> tuple[str | None, str | None]:
         published = False
         with write_transaction(conn):
+            if _directory_work_revision(self._load_state(conn)) != _directory_work_revision(state):
+                return None, None
             new_ids = self._new_dialog_ids(conn, state.generation, page.facts)
-            self._stage_facts(
+            staged = self._stage_facts(
                 conn,
                 state.generation,
                 page.facts,
                 folder_id=None,
                 account_id=account_id,
                 observation_order=observation_order,
+                expected_revision=_directory_work_revision(state),
             )
+            if not staged:
+                return None, None
             if page.kind == "page":
-                if page.cursor is None:
-                    raise RuntimeError("ordinary page cannot commit without a cursor")
-                self._save_cursor(conn, page.cursor, state.generation, account_id)
-                if not new_ids:
-                    conn.execute(
-                        "UPDATE dialog_directory_state SET status='incomplete', ordinary_status='incomplete', "
-                        "reason='pagination_no_new_dialogs', retry_at=? "
-                        "WHERE singleton=1 AND account_id=? AND generation=?",
-                        (
-                            int(time.time()) + demand_freshness_seconds(DemandKind.DIALOG_BOOTSTRAP),
-                            account_id,
-                            state.generation,
-                        ),
-                    )
-                    return None
-                conn.execute(
-                    "UPDATE dialog_directory_state SET observed_count=observed_count+?, reason=NULL, retry_at=NULL "
-                    "WHERE singleton=1 AND account_id=? AND generation=?",
-                    (len(page.facts), account_id, state.generation),
-                )
-                return None
+                return self._commit_ordinary_page(conn, state, account_id, page, new_ids)
             conn.execute(
                 "UPDATE dialog_directory_state SET ordinary_status='complete', observed_count=observed_count+?, reason=NULL "
                 "WHERE singleton=1 AND account_id=? AND generation=?",
                 (len(page.facts), account_id, state.generation),
             )
             published = self._publish_if_complete(conn, state.generation, account_id)
+            successor = _directory_work_revision(self._load_state(conn))
         if published:
-            return "canonical dialog directory: complete"
-        return None
+            return "canonical dialog directory: complete", successor
+        return None, successor
+
+    def _commit_ordinary_page(
+        self,
+        conn: sqlite3.Connection,
+        state: _DirectoryState,
+        account_id: int,
+        page: RawDialogPage,
+        new_ids: set[int],
+    ) -> tuple[str | None, str | None]:
+        if page.cursor is None:
+            raise RuntimeError("ordinary page cannot commit without a cursor")
+        self._save_cursor(conn, page.cursor, state.generation, account_id)
+        if not new_ids:
+            conn.execute(
+                "UPDATE dialog_directory_state SET status='incomplete', ordinary_status='incomplete', "
+                "reason='pagination_no_new_dialogs', retry_at=? "
+                "WHERE singleton=1 AND account_id=? AND generation=?",
+                (
+                    int(time.time()) + demand_freshness_seconds(DemandKind.DIALOG_BOOTSTRAP),
+                    account_id,
+                    state.generation,
+                ),
+            )
+            return None, _directory_work_revision(self._load_state(conn))
+        conn.execute(
+            "UPDATE dialog_directory_state SET observed_count=observed_count+?, reason=NULL, retry_at=NULL "
+            "WHERE singleton=1 AND account_id=? AND generation=?",
+            (len(page.facts), account_id, state.generation),
+        )
+        return None, _directory_work_revision(self._load_state(conn))
 
     def _handle_ordinary_non_authoritative(
         self,
@@ -598,14 +642,17 @@ class CanonicalDialogDirectory:
         with write_transaction(conn):
             # An incomplete page may still contribute catalog rows.
             # It never advances the committed cursor or publishes.
-            self._stage_facts(
+            staged = self._stage_facts(
                 conn,
                 state.generation,
                 page.facts,
                 folder_id=None,
                 account_id=account_id,
                 observation_order=observation_order,
+                expected_revision=_directory_work_revision(state),
             )
+            if not staged:
+                return True
             conn.execute(
                 "UPDATE dialog_directory_state SET status='incomplete', ordinary_status='incomplete', reason=?, retry_at=? "
                 "WHERE singleton=1 AND account_id=? AND generation=?",
@@ -681,9 +728,12 @@ class CanonicalDialogDirectory:
         folder_id: int | None,
         account_id: int,
         observation_order: int | None = None,
-    ) -> None:
+        expected_revision: str | None = None,
+    ) -> bool:
         require_write_transaction(conn)
         state = self._load_state(conn)
+        if expected_revision is not None and _directory_work_revision(state) != expected_revision:
+            return False
         observed_at = state.observation_started_at
         if observed_at is None:
             raise RuntimeError("directory generation has no observation start")
@@ -692,80 +742,90 @@ class CanonicalDialogDirectory:
         source = "ordinary" if folder_id is None else f"pinned:{folder_id}"
         rows = [self._staged_fact(fact, observed_at, folder_id, source) for fact in facts]
         for row in rows:
-            baseline = cast(
-                tuple[object, ...] | None,
-                conn.execute(
-                    "SELECT baseline_revision,baseline_identity_revision FROM dialog_directory_baseline WHERE generation=? AND dialog_id=?",
-                    (generation, row.dialog_id),
-                ).fetchone(),
-            )
-            baseline_revision = _required_int(baseline[0], "baseline revision") if baseline is not None else None
-            baseline_identity_revision = (
-                _required_int(baseline[1], "baseline identity revision") if baseline is not None else None
-            )
+            self._stage_fact_row(conn, generation, row, observation_order)
+        return True
+
+    def _stage_fact_row(
+        self,
+        conn: sqlite3.Connection,
+        generation: int,
+        row: _StagedFact,
+        observation_order: int | None,
+    ) -> None:
+        baseline = cast(
+            tuple[object, ...] | None,
             conn.execute(
-                "INSERT INTO dialog_directory_staging("
-                "generation,dialog_id,source,peer_kind,top_message,name,type,archived,pinned,members,created,last_message_at,read_inbox_max_id,read_outbox_max_id,unread_mentions_count,unread_reactions_count,unread_count,unread_mark,snapshot_at,baseline_revision,baseline_identity_revision,identity_fields_observed,username,identity_observed_at,identity_complete,identity_source,eligibility_category,eligibility_archived,eligibility_unread,eligibility_mute_until,eligibility_observed_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(generation,dialog_id) DO UPDATE SET "
-                "source=excluded.source,peer_kind=excluded.peer_kind,top_message=excluded.top_message,"
-                "name=CASE WHEN (excluded.identity_fields_observed & 1) != 0 THEN excluded.name ELSE dialog_directory_staging.name END,"
-                "type=CASE WHEN (excluded.identity_fields_observed & 4) != 0 THEN excluded.type ELSE dialog_directory_staging.type END,"
-                "archived=excluded.archived,pinned=excluded.pinned,members=excluded.members,"
-                "created=COALESCE(excluded.created,dialog_directory_staging.created),last_message_at=excluded.last_message_at,read_inbox_max_id=excluded.read_inbox_max_id,"
-                "read_outbox_max_id=excluded.read_outbox_max_id,unread_mentions_count=excluded.unread_mentions_count,"
-                "unread_reactions_count=excluded.unread_reactions_count,unread_count=COALESCE(excluded.unread_count,dialog_directory_staging.unread_count),"
-                "unread_mark=COALESCE(excluded.unread_mark,dialog_directory_staging.unread_mark),snapshot_at=excluded.snapshot_at,"
-                "baseline_revision=excluded.baseline_revision,baseline_identity_revision=excluded.baseline_identity_revision,"
-                "identity_fields_observed=dialog_directory_staging.identity_fields_observed | excluded.identity_fields_observed,"
-                "username=CASE WHEN (excluded.identity_fields_observed & 2) != 0 THEN excluded.username ELSE dialog_directory_staging.username END,"
-                "identity_observed_at=CASE WHEN excluded.identity_fields_observed=0 THEN dialog_directory_staging.identity_observed_at "
-                "WHEN excluded.identity_complete=1 OR dialog_directory_staging.identity_fields_observed=0 THEN excluded.identity_observed_at "
-                "ELSE MIN(dialog_directory_staging.identity_observed_at,excluded.identity_observed_at) END,"
-                "identity_complete=CASE WHEN excluded.identity_fields_observed=0 THEN dialog_directory_staging.identity_complete ELSE excluded.identity_complete END,"
-                "identity_source=CASE WHEN excluded.identity_fields_observed=0 THEN dialog_directory_staging.identity_source ELSE excluded.identity_source END,"
-                "eligibility_category=excluded.eligibility_category,"
-                "eligibility_archived=excluded.eligibility_archived,eligibility_unread=excluded.eligibility_unread,"
-                "eligibility_mute_until=COALESCE(excluded.eligibility_mute_until,dialog_directory_staging.eligibility_mute_until),eligibility_observed_at=excluded.eligibility_observed_at",
-                (
-                    generation,
-                    row.dialog_id,
-                    row.source,
-                    row.peer_kind,
-                    row.top_message,
-                    row.name,
-                    row.dialog_type,
-                    row.archived,
-                    row.pinned,
-                    row.members,
-                    row.created,
-                    row.last_message_at,
-                    row.read_inbox_max_id,
-                    row.read_outbox_max_id,
-                    row.unread_mentions_count,
-                    row.unread_reactions_count,
-                    row.unread_count,
-                    row.unread_mark,
-                    row.snapshot_at,
-                    baseline_revision,
-                    baseline_identity_revision,
-                    row.identity_fields_observed,
-                    row.username,
-                    row.snapshot_at,
-                    row.identity_complete,
-                    row.identity_source,
-                    row.eligibility_category,
-                    row.eligibility_archived,
-                    row.eligibility_unread,
-                    row.eligibility_mute_until,
-                    row.snapshot_at,
-                ),
-            )
-            _stage_fact_orders(conn, generation, row, observation_order)
-            conn.execute(
-                "UPDATE dialog_directory_baseline SET seen=1 WHERE generation=? AND dialog_id=?",
+                "SELECT baseline_revision,baseline_identity_revision FROM dialog_directory_baseline WHERE generation=? AND dialog_id=?",
                 (generation, row.dialog_id),
-            )
+            ).fetchone(),
+        )
+        baseline_revision = _required_int(baseline[0], "baseline revision") if baseline is not None else None
+        baseline_identity_revision = (
+            _required_int(baseline[1], "baseline identity revision") if baseline is not None else None
+        )
+        conn.execute(
+            "INSERT INTO dialog_directory_staging("
+            "generation,dialog_id,source,peer_kind,top_message,name,type,archived,pinned,members,created,last_message_at,read_inbox_max_id,read_outbox_max_id,unread_mentions_count,unread_reactions_count,unread_count,unread_mark,snapshot_at,baseline_revision,baseline_identity_revision,identity_fields_observed,username,identity_observed_at,identity_complete,identity_source,eligibility_category,eligibility_archived,eligibility_unread,eligibility_mute_until,eligibility_observed_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(generation,dialog_id) DO UPDATE SET "
+            "source=excluded.source,peer_kind=excluded.peer_kind,top_message=excluded.top_message,"
+            "name=CASE WHEN (excluded.identity_fields_observed & 1) != 0 THEN excluded.name ELSE dialog_directory_staging.name END,"
+            "type=CASE WHEN (excluded.identity_fields_observed & 4) != 0 THEN excluded.type ELSE dialog_directory_staging.type END,"
+            "archived=excluded.archived,pinned=excluded.pinned,members=excluded.members,"
+            "created=COALESCE(excluded.created,dialog_directory_staging.created),last_message_at=excluded.last_message_at,read_inbox_max_id=excluded.read_inbox_max_id,"
+            "read_outbox_max_id=excluded.read_outbox_max_id,unread_mentions_count=excluded.unread_mentions_count,"
+            "unread_reactions_count=excluded.unread_reactions_count,unread_count=COALESCE(excluded.unread_count,dialog_directory_staging.unread_count),"
+            "unread_mark=COALESCE(excluded.unread_mark,dialog_directory_staging.unread_mark),snapshot_at=excluded.snapshot_at,"
+            "baseline_revision=excluded.baseline_revision,baseline_identity_revision=excluded.baseline_identity_revision,"
+            "identity_fields_observed=dialog_directory_staging.identity_fields_observed | excluded.identity_fields_observed,"
+            "username=CASE WHEN (excluded.identity_fields_observed & 2) != 0 THEN excluded.username ELSE dialog_directory_staging.username END,"
+            "identity_observed_at=CASE WHEN excluded.identity_fields_observed=0 THEN dialog_directory_staging.identity_observed_at "
+            "WHEN excluded.identity_complete=1 OR dialog_directory_staging.identity_fields_observed=0 THEN excluded.identity_observed_at "
+            "ELSE MIN(dialog_directory_staging.identity_observed_at,excluded.identity_observed_at) END,"
+            "identity_complete=CASE WHEN excluded.identity_fields_observed=0 THEN dialog_directory_staging.identity_complete ELSE excluded.identity_complete END,"
+            "identity_source=CASE WHEN excluded.identity_fields_observed=0 THEN dialog_directory_staging.identity_source ELSE excluded.identity_source END,"
+            "eligibility_category=excluded.eligibility_category,"
+            "eligibility_archived=excluded.eligibility_archived,eligibility_unread=excluded.eligibility_unread,"
+            "eligibility_mute_until=COALESCE(excluded.eligibility_mute_until,dialog_directory_staging.eligibility_mute_until),eligibility_observed_at=excluded.eligibility_observed_at",
+            (
+                generation,
+                row.dialog_id,
+                row.source,
+                row.peer_kind,
+                row.top_message,
+                row.name,
+                row.dialog_type,
+                row.archived,
+                row.pinned,
+                row.members,
+                row.created,
+                row.last_message_at,
+                row.read_inbox_max_id,
+                row.read_outbox_max_id,
+                row.unread_mentions_count,
+                row.unread_reactions_count,
+                row.unread_count,
+                row.unread_mark,
+                row.snapshot_at,
+                baseline_revision,
+                baseline_identity_revision,
+                row.identity_fields_observed,
+                row.username,
+                row.snapshot_at,
+                row.identity_complete,
+                row.identity_source,
+                row.eligibility_category,
+                row.eligibility_archived,
+                row.eligibility_unread,
+                row.eligibility_mute_until,
+                row.snapshot_at,
+            ),
+        )
+        _stage_fact_orders(conn, generation, row, observation_order)
+        conn.execute(
+            "UPDATE dialog_directory_baseline SET seen=1 WHERE generation=? AND dialog_id=?",
+            (generation, row.dialog_id),
+        )
 
     @staticmethod
     def _new_dialog_ids(conn: sqlite3.Connection, generation: int, facts: tuple[RawDialogFact, ...]) -> set[int]:
@@ -1047,17 +1107,51 @@ class CanonicalDialogDirectoryDemandAdapter:
         self._directory = directory
         self._conn = conn
 
-    def status(self, now: float) -> DemandStatus | None:
-        return self._directory.status(now, self._conn)
+    def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
+        return self._directory.status(now, self._conn, excluded=excluded)
 
-    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+    async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
-        with demand_context(self.demand_kind):
+        selected = budget.selected
+        if selected is None:
+            raise ValueError("directory demand requires a selected revision")
+        current = self.status(time.time())
+        if current is None or current.selected != selected:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        if budget.exhausted and not budget.can_prepare_retry:
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        with durable_demand_context(self.demand_kind):
             with acquisition_context(AcquisitionKind.DIALOG_TRAVERSAL):
                 with rpc_attempt_budget(budget):
                     with rpc_scope(TelegramRpcSource.DIALOG_SYNC):
-                        await self._directory.run_slice()
+                        successor = await self._directory.run_slice()
+        if successor is None:
+            return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
+        return SliceOutcome(selected, SliceOutcomeKind.PROGRESSED, successor)
+
+
+def _directory_work_revision(state: _DirectoryState) -> str:
+    phase = next(
+        (
+            name
+            for name, status in (
+                ("pinned_main", state.pinned_main_status),
+                ("pinned_archive", state.pinned_archive_status),
+                ("ordinary", state.ordinary_status),
+            )
+            if status != "complete"
+        ),
+        "refresh",
+    )
+    cursor = state.cursor
+    return repr(
+        (
+            state.generation,
+            phase,
+            None if cursor is None else (cursor.offset_date.isoformat(), cursor.offset_id, _encode_input_peer(cursor)),
+        )
+    )
 
 
 def _stage_fact_orders(

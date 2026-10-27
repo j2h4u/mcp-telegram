@@ -35,6 +35,7 @@ from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_gateway import TelethonUserProfileGateway
+from tests.demand_adapter_helpers import run_ready_slice
 
 type Database = tuple[Path, sqlite3.Connection, EntityProfileRepository]
 
@@ -638,7 +639,6 @@ async def test_full_user_semantic_fields_use_captured_owner_and_same_commit(tmp_
 
     from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
     from mcp_telegram.sync_db import open_sync_db_reader
-    from mcp_telegram.telegram_demand import RpcAttemptBudget
     from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
     from tests.test_entity_profile_full_user_pair import _pair_service, _PairClient
 
@@ -681,7 +681,7 @@ async def test_full_user_semantic_fields_use_captured_owner_and_same_commit(tmp_
         await writer.run(prepare)
         coordinator = service.refresh_coordinator
         assert coordinator is not None
-        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        await run_ready_slice(EntityProfileDemandAdapter(coordinator), now=100)
         owner, target, fields = reader.execute(
             "SELECT owner_account_id,entity_id,fields_json FROM entity_profile_semantic_snapshots"
         ).fetchone()
@@ -842,7 +842,6 @@ async def test_terminal_owner_releases_completion_admission(
     tmp_path: Path, entity_id: int, kind: str, section: str
 ) -> None:
     from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, RefreshEnqueueResult
-    from mcp_telegram.telegram_demand import RpcAttemptBudget
     from tests.test_entity_profile_full_user_pair import _pair_service, _PairClient
 
     path = tmp_path / "terminal.db"
@@ -867,7 +866,7 @@ async def test_terminal_owner_releases_completion_admission(
         assert coordinator is not None
         assert coordinator.enqueue(entity_id) is RefreshEnqueueResult.QUEUED
         event = coordinator._completion_events[entity_id]
-        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        await run_ready_slice(EntityProfileDemandAdapter(coordinator), now=100)
         assert conn.execute(
             "SELECT status FROM entity_profile_refresh_state WHERE entity_id=?", (entity_id,)
         ).fetchone() == ("complete",)

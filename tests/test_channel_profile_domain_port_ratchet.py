@@ -17,7 +17,7 @@ from mcp_telegram.entity_profile.contracts import (
 from mcp_telegram.entity_profile.ports import ChannelProfilePort
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, RefreshLimits
 from mcp_telegram.linked_chat_fact import LinkedChatState, read_fact
-from mcp_telegram.telegram_demand import RpcAttemptBudget
+from tests.demand_adapter_helpers import run_ready_slice
 from tests.helpers import FakeChannelProfilePort, bind_profile_test_account, in_memory_sync_db
 from tests.test_entity_profile_progressive import _test_service
 
@@ -68,7 +68,7 @@ async def test_broadcast_link_is_not_written_to_legacy_entity_detail_payload(lin
         await service._write_profiles(lambda profiles: profiles.mark_pending(channel_id, now=100))
         coordinator = service.refresh_coordinator
         assert coordinator is not None
-        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        await run_ready_slice(EntityProfileDemandAdapter(coordinator), now=100)
 
         row = cast(
             tuple[str] | None,

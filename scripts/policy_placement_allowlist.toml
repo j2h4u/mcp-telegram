@@ -57,6 +57,16 @@ rationale = "This is process-global mutable gate state, not an operator-configur
 
 [[entry]]
 category = "policy_assignments"
+key = "src/mcp_telegram/telegram_rpc.py:<module>:_METHOD_BACKOFF_BASE_SECONDS"
+rationale = "Approved central method adaptation starts at the existing 300-second recovery contract; it is not an operator knob or a server-wait cap."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/telegram_rpc.py:<module>:_METHOD_BACKOFF_MAX_SECONDS"
+rationale = "Approved 3600-second ceiling applies only to extra method-local adaptation; the mandatory global Telegram server floor remains uncapped."
+
+[[entry]]
+category = "policy_assignments"
 key = "src/mcp_telegram/reading/service.py:ReadingService._fetch_telegram_batches:last_batch_size"
 rationale = "This is observed batch-result metadata, not an operator-tuned limit."
 
@@ -536,3 +546,23 @@ rationale = "Reviewed conservative same-cursor failure pacing in validated injec
 category = "policy_assignments"
 key = "src/mcp_telegram/entity_profile/contracts.py:<module>:PROFILE_FLOOD_RETRY_CAP_SECONDS"
 rationale = "Reviewed conservative same-cursor failure pacing in validated injected RefreshLimits; no new TOML knobs in this incident scope. The cap never shortens a server/account deadline."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/telegram_demand_coordinator.py:TelegramDemandCoordinator._prepare_expired_gate_waits:invocation.deadline"
+rationale = "Only an explicit Gate recovery binding authorizes a distinct invocation with the unchanged code-owned contract deadline; the Coordinator does not choose retry delays or renew physical owners."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/telegram_demand_coordinator.py:TelegramDemandCoordinator._authorize_invocation:invocation.deadline"
+rationale = "An explicit Gate recovery binding authorizes this invocation deadline from the existing demand contract while retaining the same consumed budget; no independent network retry policy."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon.py:_acquire_startup_identity_before_updates:deadline"
+rationale = "Convert the existing startup owner's remaining deadline once to the event loop clock; retries retain that same finite invocation boundary."
+
+[[entry]]
+category = "policy_call_keywords"
+key = "src/mcp_telegram/daemon.py:_acquire_startup_identity_before_updates:deadline"
+rationale = "Pass the existing startup owner's original finite boundary into its classified Gate scope; no new retry or timeout policy."

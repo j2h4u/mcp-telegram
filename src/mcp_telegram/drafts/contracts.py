@@ -211,6 +211,7 @@ class DraftApplyResult:
     revision: int | None = None
     publication_changed: bool = False
     decision: str | None = None
+    work_revision: str | None = None
 
 
 __all__ = [

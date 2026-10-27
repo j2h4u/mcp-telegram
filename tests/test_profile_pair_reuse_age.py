@@ -12,7 +12,7 @@ from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.entity_profile.repository import EntityRefreshCursor
 from mcp_telegram.sync_transactions import write_savepoint
-from mcp_telegram.telegram_demand import RpcAttemptBudget
+from tests.demand_adapter_helpers import run_ready_slice
 from tests.test_entity_profile_full_user_pair import _PairClient, _prepare
 
 type AcquiredPair = tuple[sqlite3.Connection, DaemonEntityInfoService, EntityRefreshCursor]
@@ -27,7 +27,7 @@ async def acquired_pair(tmp_path: Path) -> AsyncIterator[AcquiredPair]:
         assert cursor is not None
         coordinator = service.refresh_coordinator
         assert coordinator is not None
-        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        await run_ready_slice(EntityProfileDemandAdapter(coordinator), now=100)
         client = service._deps.client
         assert isinstance(client, _PairClient)
         assert client.full_user_calls == 1

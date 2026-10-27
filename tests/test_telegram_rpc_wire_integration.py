@@ -6,7 +6,7 @@ import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -15,6 +15,7 @@ import pytest
 from telethon.crypto import AuthKey
 from telethon.errors import FloodWaitError
 from telethon.network.connection.tcpfull import FullPacketCodec
+from telethon.network.requeststate import RequestState
 from telethon.sessions import MemorySession
 from telethon.tl import functions, types
 from telethon.tl.functions import channels, messages
@@ -39,8 +40,14 @@ from mcp_telegram.telegram_rpc import (
     _AdmissionAwareSender,
     _TransportBoundaryState,
 )
-from mcp_telegram.telegram_rpc_scheduler import RpcServiceClass, TelegramRpcScope, TelegramRpcSource
-from mcp_telegram.telegram_transport import GuardedConnectionTcpFull, GuardedMTProtoSender
+from mcp_telegram.telegram_rpc_scheduler import (
+    RpcAdmissionClosedError,
+    RpcAdmissionExpiredError,
+    RpcServiceClass,
+    TelegramRpcScope,
+    TelegramRpcSource,
+)
+from mcp_telegram.telegram_transport import GuardedConnectionTcpFull, GuardedMTProtoSender, _RequestState
 from tests.helpers import reset_rpc_process_policy
 from tests.test_telegram_transport import _Writer
 
@@ -409,3 +416,113 @@ async def test_cancelled_receipt_drain_retains_storage_ownership_until_completio
         await drain
     assert receipt.done() and not gate._cooldown_save_tasks
     assert gate._ensure_safety_ledger().floor_deadline > time.monotonic()
+
+
+@pytest.mark.parametrize("failure", ["expired", "closed"])
+async def test_unsent_failed_ping_allows_fresh_keepalive_without_reconnect(
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    gate, sender, connection, sink = wire
+    reconnects: list[Exception | None] = []
+    monkeypatch.setattr(sender, "_start_reconnect", lambda error: reconnects.append(error))
+    before = gate._safety_store.load_record()
+    sender._keepalive_ping(7)
+    state = await sender._send_queue.next_state()
+    owned = sender.require_owned(state)
+    owner = gate._require_wire_owner(owned.owner)
+    if failure == "expired":
+        owner.scope = replace(owner.scope, deadline=time.monotonic() - 1)
+        expected_error = RpcAdmissionExpiredError
+    else:
+        await gate._admission_scheduler.close()
+        expected_error = RpcAdmissionClosedError
+    with pytest.raises(expected_error):
+        await sender._prepare_state(state)
+    await asyncio.sleep(0)
+    await asyncio.gather(*sender._observing)
+    assert owned.claims == 0 and sender._ping is None and sink.frames == []
+    assert owner.scope.attempt_budget is not None and owner.scope.attempt_budget.attempts == 0
+    assert gate._safety_store.load_record() == before
+    sender._keepalive_ping(8)
+    fresh = await asyncio.wait_for(sender._send_queue.next_state(), 0.2)
+    assert isinstance(fresh.request, functions.PingRequest) and fresh.request.ping_id == 8
+    assert sender._ping == 8 and reconnects == []
+    if failure == "expired":
+        await sender._prepare_state(fresh)
+        packet = connection._send_queue.get_nowait()
+        assert sender.write_packet(packet, connection._send)
+        assert len(sink.frames) == 1
+
+
+@pytest.mark.parametrize("claimed,newer_marker", [(True, False), (False, True)])
+async def test_failed_ping_cleanup_preserves_claimed_or_newer_ping(
+    wire: _WireHarness, claimed: bool, newer_marker: bool
+) -> None:
+    gate, sender, connection, sink = wire
+    sender._keepalive_ping(7)
+    state = await sender._send_queue.next_state()
+    owned = sender.require_owned(state)
+    if claimed:
+        await sender._prepare_state(state)
+        packet = connection._send_queue.get_nowait()
+        assert sender.write_packet(packet, connection._send)
+        assert owned.claims == 1 and len(sink.frames) == 1
+    if newer_marker:
+        sender._ping = 8
+    state.future.set_exception(
+        RpcAdmissionExpiredError(gate._require_wire_owner(owned.owner).scope, "terminal ping failure")
+    )
+    await asyncio.sleep(0)
+    await asyncio.gather(*sender._observing)
+    assert sender._ping == (8 if newer_marker else 7)
+
+
+async def test_unsent_ack_is_not_evicted_by_sent_replay_cache_pressure(wire: _WireHarness) -> None:
+    _gate, sender, connection, sink = wire
+    states: list[_RequestState] = []
+    token = sender._control_origin.set((asyncio.current_task(), "ack"))
+    try:
+        for message_id in range(11):
+            state = cast(_RequestState, RequestState(types.MsgsAck([message_id])))
+            states.append(state)
+            sender._send_queue.append(state)
+            if message_id == 0:
+                first = await sender._send_queue.next_state()
+                await sender._prepare_state(first)
+    finally:
+        sender._control_origin.reset(token)
+    first = states[0]
+    packet = connection._send_queue.get_nowait()
+    assert sender.require_owned(first).claims == 0
+    assert not sender.require_owned(first).retired and len(sender._last_acks) == 0
+    assert sender.write_packet(packet, connection._send)
+    assert len(sink.frames) == 1 and sender.require_owned(first).claims == 1
+    for expected in states[1:]:
+        state = await sender._send_queue.next_state()
+        assert state is expected
+        await sender._prepare_state(state)
+        assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+        await asyncio.gather(*sender._observing)
+    assert len(sink.frames) == 11 and len(sender._last_acks) == 10
+    assert set(sender._owned_states) == set(sender._last_acks)
+    assert first not in sender._owned_states
+
+
+async def test_unsent_terminal_ack_does_not_enter_sent_replay_cache(wire: _WireHarness) -> None:
+    gate, sender, _connection, sink = wire
+    token = sender._control_origin.set((asyncio.current_task(), "ack"))
+    try:
+        state = cast(_RequestState, RequestState(types.MsgsAck([99])))
+        sender._send_queue.append(state)
+    finally:
+        sender._control_origin.reset(token)
+    assert await sender._send_queue.next_state() is state
+    owned = sender.require_owned(state)
+    owner = gate._require_wire_owner(owned.owner)
+    owner.scope = replace(owner.scope, deadline=time.monotonic() - 1)
+    with pytest.raises(RpcAdmissionExpiredError):
+        await sender._prepare_state(state)
+    await asyncio.sleep(0)
+    await asyncio.gather(*sender._observing)
+    assert owned.claims == 0 and sink.frames == []
+    assert not sender._last_acks and state not in sender._owned_states

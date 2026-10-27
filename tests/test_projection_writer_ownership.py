@@ -29,11 +29,12 @@ from mcp_telegram.scheduled_messages import (
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
-from mcp_telegram.telegram_demand import RpcAttemptBudget, demand_context
+from mcp_telegram.telegram_demand import demand_context
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.topics.contracts import TopicFact
 from mcp_telegram.topics.refresh import TopicRefresher
 from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
+from tests.demand_adapter_helpers import run_ready_slice
 from tests.test_scheduled_messages import _message, _ScheduledSnapshotClient
 
 
@@ -86,7 +87,9 @@ async def test_folder_refresh_and_retry_use_writer(storage: tuple[sqlite3.Connec
     policy = FolderProjectionConfig(retry_delays_seconds=(1,))
     worker = FolderProjectionWorker(refresher, repository, asyncio.Event(), policy, writer=writer, clock=lambda: 1000)
     await worker._attempt("test")
-    assert repository.read_next_retry_at() == 1001
+    assert repository.read_next_retry_at() is None
+    assert repository.read_last_outcome() == "source_unavailable"
+    assert repository.read_consecutive_failures() == 1
     gateway.fail = False
     await refresher.refresh(completed_at=1002)
     await refresher.reproject_current_rules(now=1003)
@@ -116,7 +119,7 @@ async def test_draft_realtime_and_recovery_use_writer(storage: tuple[sqlite3.Con
     )
     assert reader.execute("SELECT COUNT(*) FROM draft_current").fetchone()[0] == 1
     await owner.request_recovery("test")
-    await owner.run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(owner)
     assert repository.recovery_due_at() is None
 
 

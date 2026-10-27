@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 from collections.abc import AsyncIterator, Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,6 +36,7 @@ from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncWorker, _FetchedBatchPage
 from mcp_telegram.telegram_demand import RpcAttemptBudget
+from mcp_telegram.telegram_demand_progress import SliceOutcomeKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
     RpcAdmissionSaturatedError,
@@ -42,6 +44,12 @@ from mcp_telegram.telegram_rpc_scheduler import (
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.sqlite_writer_helpers import inline_writer
+
+
+def _selected_budget(adapter: FullSyncDemandAdapter) -> RpcAttemptBudget:
+    status = adapter.status(time.time())
+    assert status is not None and status.selected is not None
+    return RpcAttemptBudget(limit=1, selected=status.selected)
 
 
 class _SQLiteCursor(Protocol):
@@ -208,6 +216,47 @@ async def test_automatic_group_first_page_is_saved_once(sync_db: _SQLiteConnecti
 
 
 @pytest.mark.asyncio
+async def test_full_sync_adapter_commits_exact_selected_nonterminal_dialog(sync_db: _SQLiteConnection) -> None:
+    for dialog_id in (601, 602):
+        sync_db.execute(
+            "INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (?, 'syncing', 0)", (dialog_id,)
+        )
+        seed_full_history_enrollment(cast(sqlite3.Connection, sync_db), dialog_id, enabled=True)
+    sync_db.commit()
+    calls: list[int] = []
+
+    class Port:
+        async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            del before_message_id
+            calls.append(dialog_id)
+            messages = tuple(
+                extract_message_row(dialog_id, build_mock_message(id=message_id, text=str(message_id)))
+                for message_id in range(100, 0, -1)
+            )
+            return FullHistoryPage(messages, 100, 1)
+
+    worker = FullSyncWorker(
+        Port(),
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        writer=inline_writer(cast(sqlite3.Connection, sync_db)),
+    )
+    adapter = FullSyncDemandAdapter(worker, account_id=123)
+    first = adapter.status(1000.0)
+    assert first is not None and first.selected is not None
+    selected = adapter.status(1000.0, excluded=frozenset({first.selected}))
+    assert selected is not None and selected.selected is not None
+    assert selected.selected.key.target == "dialog:602"
+
+    outcome = await adapter.run_slice(RpcAttemptBudget(limit=1, selected=selected.selected))
+
+    assert outcome.kind is SliceOutcomeKind.PROGRESSED
+    assert calls == [602]
+    assert sync_db.execute("SELECT sync_progress FROM synced_dialogs WHERE dialog_id=602").fetchone() == (1,)
+    assert sync_db.execute("SELECT sync_progress FROM synced_dialogs WHERE dialog_id=601").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("enabled", [False, True])
 async def test_automatic_group_rechecks_explicit_race(sync_db: _SQLiteConnection, enabled: bool) -> None:
     class Port:
@@ -256,10 +305,11 @@ async def test_full_sync_adapter_runs_one_automatic_first_page_under_budget(
         automatic_group_history=AutomaticGroupHistoryConfig(),
         writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
-    adapter = FullSyncDemandAdapter(worker)
+    adapter = FullSyncDemandAdapter(worker, account_id=123)
 
-    assert adapter.status(1_000.0) is not None
-    budget = RpcAttemptBudget(limit=1)
+    status = adapter.status(1_000.0)
+    assert status is not None and status.selected is not None
+    budget = RpcAttemptBudget(limit=1, selected=status.selected)
     await adapter.run_slice(budget)
 
     assert observed_scopes and observed_scopes[0].attempt_budget is budget  # type: ignore[union-attr]
@@ -295,8 +345,11 @@ async def test_automatic_group_storage_failure_rolls_back_receipt_and_enrollment
         writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
 
+    adapter = FullSyncDemandAdapter(worker, account_id=123)
+    budget = _selected_budget(adapter)
+    assert budget.selected is not None and budget.selected.key.target == "automatic-group:505"
     with pytest.raises(sqlite3.IntegrityError, match="test storage failure"):
-        await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(budget)
 
     assert sync_db.execute("SELECT * FROM full_history_enrollment WHERE dialog_id=505").fetchone() is None
     assert sync_db.execute("SELECT status,sync_progress FROM synced_dialogs WHERE dialog_id=505").fetchone() == (
@@ -336,11 +389,11 @@ async def test_automatic_group_retry_skips_failed_candidate_and_reports_release(
         automatic_group_history=policy,
         writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
-    adapter = FullSyncDemandAdapter(worker)
+    adapter = FullSyncDemandAdapter(worker, account_id=123)
 
     with patch("mcp_telegram.sync_worker.time.time", return_value=1_000):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_selected_budget(adapter))
+        await adapter.run_slice(_selected_budget(adapter))
         release = adapter.status(1_000.0)
 
     assert port.calls == 2
@@ -374,10 +427,10 @@ async def test_automatic_group_ordinary_error_does_not_block_next_candidate(sync
         automatic_group_history=AutomaticGroupHistoryConfig(probe_retry_seconds=60),
         writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
-    adapter = FullSyncDemandAdapter(worker)
+    adapter = FullSyncDemandAdapter(worker, account_id=123)
     with patch("mcp_telegram.sync_worker.time.time", return_value=1_000):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_selected_budget(adapter))
+        await adapter.run_slice(_selected_budget(adapter))
 
     assert port.attempted == [510, 511]
     assert sync_db.execute("SELECT enabled FROM full_history_enrollment WHERE dialog_id=511").fetchone() == (1,)
@@ -412,10 +465,10 @@ async def test_ready_total_repair_runs_during_automatic_candidate_backoff(sync_d
         automatic_group_history=AutomaticGroupHistoryConfig(probe_retry_seconds=60),
         writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
-    adapter = FullSyncDemandAdapter(worker)
+    adapter = FullSyncDemandAdapter(worker, account_id=123)
     with patch("mcp_telegram.sync_worker.time.time", return_value=1_000):
         assert adapter.status(1_000.0) is not None
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_selected_budget(adapter))
 
     assert probe.attempted == [513]
     assert sync_db.execute("SELECT total_messages FROM synced_dialogs WHERE dialog_id=513").fetchone() == (42,)
@@ -446,7 +499,9 @@ async def test_automatic_group_acceptance_resumes_partial_history_and_counts_top
         writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
 
-    await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+    await FullSyncDemandAdapter(worker, account_id=123).run_slice(
+        _selected_budget(FullSyncDemandAdapter(worker, account_id=123))
+    )
 
     assert sync_db.execute(
         "SELECT enabled,source FROM full_history_enrollment WHERE dialog_id=?", (dialog_id,)
@@ -629,6 +684,36 @@ async def test_full_sync_disable_race_discards_fetched_body_and_checkpoint(tmp_p
     assert await task == (0, True)
     assert first.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=77").fetchone() == (0,)
     assert first.execute("SELECT status FROM synced_dialogs WHERE dialog_id=77").fetchone() == ("not_synced",)
+    first.close()
+    second.close()
+
+
+@pytest.mark.asyncio
+async def test_full_sync_adapter_reports_stale_when_selected_cursor_loses_cas(tmp_path: Path) -> None:
+    db_path = tmp_path / "adapter-cas.db"
+    ensure_sync_schema(db_path)
+    first = cast(sqlite3.Connection, _open_sync_db(db_path))
+    second = cast(sqlite3.Connection, _open_sync_db(db_path))
+    first.execute("INSERT INTO synced_dialogs(dialog_id, status, sync_progress) VALUES (78, 'syncing', 0)")
+    first.execute("INSERT INTO full_history_enrollment VALUES (78, 1, 'explicit', 1)")
+    first.commit()
+
+    async def fetch_page(_dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+        assert before_message_id == 0
+        second.execute("UPDATE synced_dialogs SET sync_progress=5 WHERE dialog_id=78")
+        second.commit()
+        return FullHistoryPage((extract_message_row(78, build_mock_message(id=4, text="stale")),), 3, 1)
+
+    adapter = FullSyncDemandAdapter(
+        FullSyncWorker(SimpleNamespace(fetch_page=fetch_page), first, asyncio.Event(), writer=inline_writer(first)),
+        account_id=123,
+    )
+    selected = adapter.status(0.0).selected  # type: ignore[union-attr]
+    outcome = await adapter.run_slice(RpcAttemptBudget(limit=1, selected=selected))
+
+    assert outcome.kind is SliceOutcomeKind.STALE
+    assert first.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=78").fetchone() == (0,)
+    assert first.execute("SELECT sync_progress FROM synced_dialogs WHERE dialog_id=78").fetchone() == (5,)
     first.close()
     second.close()
 
@@ -1000,12 +1085,12 @@ async def test_progress_atomic_commit(
 
 
 @pytest.mark.asyncio
-async def test_floodwait_sleep_continues(
+async def test_floodwait_is_not_slept_in_domain_worker(
     mock_client: _MockClient,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """TelegramRpcThrottled causes interruptible sleep and returns (progress, False)."""
+    """The daemon coordinator owns throttle delay; the worker returns without sleeping."""
     from mcp_telegram.flood import TelegramRpcThrottled
 
     dialog_id = 3001
@@ -1034,9 +1119,7 @@ async def test_floodwait_sleep_continues(
 
     # Must return False (not done) after FloodWait
     assert result is False
-    # asyncio.wait_for must have been called with the FloodWait duration
-    assert slept_for, "asyncio.wait_for should have been called for FloodWait sleep"
-    assert slept_for[0] == pytest.approx(5.0)
+    assert not slept_for
 
 
 @pytest.mark.asyncio
@@ -2743,10 +2826,14 @@ async def test_failed_history_peer_does_not_starve_ready_peer(
             return FullHistoryPage(messages=(), next_before_message_id=None, total_messages=0)
 
     worker = FullSyncWorker(Port(), sync_db, asyncio.Event(), writer=inline_writer(sync_db))
-    await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
-    await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+    await FullSyncDemandAdapter(worker, account_id=123).run_slice(
+        _selected_budget(FullSyncDemandAdapter(worker, account_id=123))
+    )
+    await FullSyncDemandAdapter(worker, account_id=123).run_slice(
+        _selected_budget(FullSyncDemandAdapter(worker, account_id=123))
+    )
     assert calls == [1, 2]
-    assert sync_db.execute("SELECT full_sync_retry_at FROM synced_dialogs WHERE dialog_id=1").fetchone()[0] is not None
+    assert sync_db.execute("SELECT full_sync_retry_at FROM synced_dialogs WHERE dialog_id=1").fetchone()[0] is None
 
 
 @pytest.mark.asyncio
@@ -2774,8 +2861,12 @@ async def test_failed_total_repair_peer_does_not_starve_ready_peer(
     worker = FullSyncWorker(
         Port(), sync_db, asyncio.Event(), total_messages_probe=Probe(), writer=inline_writer(sync_db)
     )
-    await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
-    await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+    await FullSyncDemandAdapter(worker, account_id=123).run_slice(
+        _selected_budget(FullSyncDemandAdapter(worker, account_id=123))
+    )
+    await FullSyncDemandAdapter(worker, account_id=123).run_slice(
+        _selected_budget(FullSyncDemandAdapter(worker, account_id=123))
+    )
     assert calls == [1, 2]
 
 
@@ -2798,8 +2889,14 @@ async def test_cancelled_full_page_rotates_peer_and_resumes_checkpoint(sync_db: 
 
     worker = FullSyncWorker(Port(), sync_db, asyncio.Event(), writer=inline_writer(sync_db))
     with pytest.raises(asyncio.CancelledError):
-        await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+        await FullSyncDemandAdapter(worker, account_id=123).run_slice(
+            _selected_budget(FullSyncDemandAdapter(worker, account_id=123))
+        )
     assert sync_db.execute("SELECT sync_progress FROM synced_dialogs WHERE dialog_id=1").fetchone() == (12,)
-    await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
-    await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+    await FullSyncDemandAdapter(worker, account_id=123).run_slice(
+        _selected_budget(FullSyncDemandAdapter(worker, account_id=123))
+    )
+    await FullSyncDemandAdapter(worker, account_id=123).run_slice(
+        _selected_budget(FullSyncDemandAdapter(worker, account_id=123))
+    )
     assert calls == [(1, 12), (2, 12), (1, 12)]

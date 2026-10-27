@@ -60,8 +60,9 @@ from .telegram_demand import (
     UnclassifiedTelegramDemandError,
     acquisition_context,
     current_demand_token,
-    demand_context,
+    durable_demand_context,
 )
+from .telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkKey, WorkRevision
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
@@ -76,18 +77,41 @@ from .telegram_rpc_scheduler import (
 logger = logging.getLogger(__name__)
 
 
+def _target_dialog_id(target: str, expected_prefix: str) -> int | None:
+    prefix, separator, raw_dialog_id = target.partition(":")
+    if prefix != expected_prefix or not separator:
+        return None
+    try:
+        dialog_id = int(raw_dialog_id)
+    except ValueError:
+        return None
+    return dialog_id if dialog_id != 0 and str(dialog_id) == raw_dialog_id else None
+
+
 @contextmanager
 def _delta_demand_scope(kind: DemandKind, acquisition_kind: AcquisitionKind) -> Iterator[None]:
     """Install a precise root for direct calls while preserving an adapter root."""
     try:
-        current_demand_token()
+        token = current_demand_token()
     except UnclassifiedTelegramDemandError:
-        with demand_context(kind):
+        with durable_demand_context(kind):
             with acquisition_context(acquisition_kind):
                 yield
+        return
+    if token.kind is not kind and not (
+        kind is DemandKind.DELTA_GAP_FILL and token.kind is DemandKind.DELTA_ACCESS_PROBE
+    ):
+        raise UnclassifiedTelegramDemandError("delta worker inherited an incompatible demand root")
     else:
         with acquisition_context(acquisition_kind):
             yield
+
+
+@contextmanager
+def _delta_root_scope(kind: DemandKind) -> Iterator[None]:
+    """Reuse the coordinator's bounded root or create one for direct calls."""
+    with durable_demand_context(kind):
+        yield
 
 
 def _delta_rpc_scope[**P, R](
@@ -147,6 +171,46 @@ ORDER BY
     sd.dialog_id
 """
 _SELECT_DELTA_MESSAGE_ID_SQL = "SELECT COALESCE(delta_message_id, 0) FROM synced_dialogs WHERE dialog_id = ?"
+
+
+def _delta_completion_generation_key(dialog_id: int) -> str:
+    return f"delta_completion_generation:{dialog_id}"
+
+
+def _delta_completion_generation(conn: sqlite3.Connection, dialog_id: int) -> int:
+    row = cast(
+        tuple[str | None] | None,
+        conn.execute(
+            "SELECT value FROM daemon_state WHERE key=?", (_delta_completion_generation_key(dialog_id),)
+        ).fetchone(),
+    )
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def _delta_selection_is_current(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    expected_cursor: int,
+    generation: int,
+    expected_completion_generation: int | None,
+) -> bool:
+    row = cast(
+        tuple[int, int | None] | None,
+        conn.execute(
+            "SELECT COALESCE(delta_message_id,0),delta_refresh_generation FROM synced_dialogs WHERE dialog_id=?",
+            (dialog_id,),
+        ).fetchone(),
+    )
+    return (
+        row is not None
+        and (int(row[0]), int(row[1] or 0)) == (expected_cursor, generation)
+        and (
+            expected_completion_generation is None
+            or _delta_completion_generation(conn, dialog_id) == expected_completion_generation
+        )
+    )
+
+
 # Stamp delta checkpoint on successful delta completion.
 # Distinct from FullSyncWorker's _UPDATE_PROGRESS_DONE_SQL (different column set).
 _UPDATE_DELTA_CHECKPOINT_SQL = (
@@ -173,6 +237,10 @@ _DmGapScanState = DmDeletionCheckpoint
 
 class DmGapScanStateError(RuntimeError):
     """Persisted DM reconciliation state is invalid and must fail closed."""
+
+
+class DmGapScanStaleError(DmGapScanStateError):
+    """The selected DM scan revision was replaced before its commit."""
 
 
 class DmGapScanPage(Protocol):
@@ -202,6 +270,12 @@ def _load_dm_gap_scan_state(conn: sqlite3.Connection) -> _DmGapScanState | None:
         conn.execute("SELECT value FROM daemon_state WHERE key = ?", (_DM_GAP_SCAN_STATE_KEY,)).fetchone(),
     )
     return decode_dm_deletion_checkpoint(row)
+
+
+def _dm_gap_scan_revision(state: _DmGapScanState | None) -> str:
+    if state is None:
+        return "idle"
+    return repr((state.generation, state.dialog_id_cursor, state.message_cursor, state.policy_version, state.status))
 
 
 def _store_dm_gap_scan_state(conn: sqlite3.Connection, state: _DmGapScanState) -> None:
@@ -361,6 +435,8 @@ class DeltaSyncWorker:
         self._shutdown_event = shutdown_event
         self._last_delta_slice_completed = False
         self._last_delta_slice_succeeded = False
+        self._last_delta_slice_stale = False
+        self._last_delta_slice_committed_revision: str | None = None
         self._last_delta_slice_error: BaseException | None = None
         self._last_delta_slice_access_lost = False
         self._last_delta_slice_skipped = False
@@ -371,10 +447,17 @@ class DeltaSyncWorker:
         self, conn: sqlite3.Connection, dialog_id: int, checked_at: int, generation: int
     ) -> None:
         require_write_transaction(conn)
-        conn.execute(_UPDATE_DELTA_CHECKPOINT_SQL, (checked_at, checked_at, generation, dialog_id, dialog_id))
+        result = conn.execute(_UPDATE_DELTA_CHECKPOINT_SQL, (checked_at, checked_at, generation, dialog_id, dialog_id))
+        if result.rowcount:
+            key = _delta_completion_generation_key(dialog_id)
+            row = cast(tuple[str] | None, conn.execute("SELECT value FROM daemon_state WHERE key=?", (key,)).fetchone())
+            completed = int(row[0]) if row and row[0] is not None else 0
+            conn.execute("INSERT OR REPLACE INTO daemon_state(key,value) VALUES(?,?)", (key, str(completed + 1)))
 
     @_delta_rpc_scope(DemandKind.DELTA_GAP_FILL, AcquisitionKind.MESSAGE_HISTORY_PAGE)
-    async def fetch_delta_slice_for_dialog(self, dialog_id: int) -> int:
+    async def fetch_delta_slice_for_dialog(
+        self, dialog_id: int, *, expected_completion_generation: int | None = None
+    ) -> int:
         """Fetch and commit one resumable forward-history page."""
         self._reset_delta_slice_state()
         if not full_history_enabled(self._conn, dialog_id):
@@ -390,11 +473,13 @@ class DeltaSyncWorker:
         outcome = await self._collect_delta_slice(dialog_id, cursor, generation)
         if outcome.result is not None:
             return outcome.result
-        return await self._commit_delta_slice(dialog_id, outcome, generation)
+        return await self._commit_delta_slice(dialog_id, outcome, generation, cursor, expected_completion_generation)
 
     def _reset_delta_slice_state(self) -> None:
         self._last_delta_slice_completed = False
         self._last_delta_slice_succeeded = False
+        self._last_delta_slice_stale = False
+        self._last_delta_slice_committed_revision = None
         self._last_delta_slice_error = None
         self._last_delta_slice_access_lost = False
         self._last_delta_slice_skipped = False
@@ -468,19 +553,35 @@ class DeltaSyncWorker:
         with write_transaction(conn):
             set_access_lost(conn, dialog_id, int(time.time()), reason=reason, refresh_generation=generation)
 
-    async def _commit_delta_slice(self, dialog_id: int, outcome: _DeltaFetchOutcome, generation: int) -> int:
+    async def _commit_delta_slice(
+        self,
+        dialog_id: int,
+        outcome: _DeltaFetchOutcome,
+        generation: int,
+        expected_cursor: int,
+        expected_completion_generation: int | None,
+    ) -> int:
         continuation_required = not outcome.completed or len(outcome.rows) == _DELTA_SLICE_MESSAGE_LIMIT
         now = int(time.time())
-        unique_message_ids, existing_ids, committed_new_count = await self._writer.run(
+        unique_message_ids, existing_ids, committed_new_count, committed_revision = await self._writer.run(
             lambda conn: self._commit_delta_transaction(
-                conn, dialog_id, outcome, continuation_required, now, generation
+                conn,
+                dialog_id,
+                outcome,
+                continuation_required,
+                now,
+                generation,
+                expected_cursor,
+                expected_completion_generation,
             )
         )
         self._record_uncommitted_delta_counts(unique_message_ids, existing_ids)
         if committed_new_count is None:
+            self._last_delta_slice_stale = True
             return 0
         self._last_delta_slice_completed = not continuation_required
         self._last_delta_slice_succeeded = True
+        self._last_delta_slice_committed_revision = committed_revision
         if self._delta_gap_fill_observation_enabled and outcome.rows:
             self._last_delta_page_metrics.update(
                 new_key_count=committed_new_count,
@@ -496,11 +597,17 @@ class DeltaSyncWorker:
         continuation_required: bool,
         now: int,
         generation: int,
-    ) -> tuple[list[int], set[int], int | None]:
+        expected_cursor: int,
+        expected_completion_generation: int | None,
+    ) -> tuple[list[int], set[int], int | None, str | None]:
         with write_transaction(conn):
+            if not _delta_selection_is_current(
+                conn, dialog_id, expected_cursor, generation, expected_completion_generation
+            ):
+                return [], set(), None, None
             unique_message_ids, existing_ids = self._existing_delta_message_ids(conn, dialog_id, outcome.rows)
             if not full_history_enabled(conn, dialog_id):
-                return unique_message_ids, existing_ids, None
+                return unique_message_ids, existing_ids, None, None
             committed_new_count = self._insert_delta_messages(
                 conn, dialog_id, outcome, unique_message_ids, existing_ids, now
             )
@@ -510,17 +617,38 @@ class DeltaSyncWorker:
                 "WHERE dialog_id = ?",
                 (next_cursor, dialog_id),
             )
-            if continuation_required:
-                if (
-                    conn.execute(
-                        "SELECT delta_refresh_requested_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
-                    ).fetchone()[0]
-                    is None
-                ):
-                    request_delta_refresh(conn, dialog_id, now)
-            else:
-                self._stamp_delta_checkpoint(conn, dialog_id, now, generation)
-        return unique_message_ids, existing_ids, committed_new_count
+            self._persist_delta_continuation(conn, dialog_id, continuation_required, now, generation)
+            current = cast(
+                tuple[int, int | None] | None,
+                conn.execute(
+                    "SELECT COALESCE(delta_message_id,0),delta_refresh_generation FROM synced_dialogs WHERE dialog_id=?",
+                    (dialog_id,),
+                ).fetchone(),
+            )
+            revision = (
+                (f"{int(current[0] or 0)}:{int(current[1] or 0)}:{_delta_completion_generation(conn, dialog_id)}")
+                if current is not None
+                else None
+            )
+        return unique_message_ids, existing_ids, committed_new_count, revision
+
+    def _persist_delta_continuation(
+        self, conn: sqlite3.Connection, dialog_id: int, continuation_required: bool, now: int, generation: int
+    ) -> None:
+        if not continuation_required:
+            self._stamp_delta_checkpoint(conn, dialog_id, now, generation)
+            return
+        requested = cast(
+            tuple[int | None] | None,
+            conn.execute(
+                "SELECT delta_refresh_requested_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+            ).fetchone(),
+        )
+        if requested is None:
+            return
+        requested_at = requested[0]
+        if requested_at is None:
+            request_delta_refresh(conn, dialog_id, now)
 
     def _existing_delta_message_ids(
         self, conn: sqlite3.Connection, dialog_id: int, rows: Sequence[ExtractedMessage]
@@ -618,9 +746,12 @@ class DeltaGapFillDemandAdapter:
     def __init__(
         self,
         worker: DeltaSyncWorker,
+        *,
+        account_id: int,
         observer: DeltaGapFillObservationHook | None = None,
     ) -> None:
         self._worker = worker
+        self._account_id = account_id
         self._observer = observer
         if observer is not None:
             self._worker._delta_gap_fill_observation_enabled = True
@@ -640,11 +771,15 @@ class DeltaGapFillDemandAdapter:
         except Exception:  # noqa: BLE001 - telemetry cannot change sync behavior
             logger.debug("delta_gap_fill_observation_failed")
 
-    async def _run_forward_slice(self, budget: RpcAttemptBudget, dialog_id: int) -> None:
+    async def _run_forward_slice(
+        self, budget: RpcAttemptBudget, dialog_id: int, expected_completion_generation: int
+    ) -> None:
         attempts_before = budget.attempts
         outcome, reason = "completed", "completed"
         try:
-            await self._worker.fetch_delta_slice_for_dialog(dialog_id)
+            await self._worker.fetch_delta_slice_for_dialog(
+                dialog_id, expected_completion_generation=expected_completion_generation
+            )
             if self._worker._last_delta_slice_error is not None:
                 raise self._worker._last_delta_slice_error
             if self._worker._last_delta_slice_access_lost:
@@ -662,63 +797,115 @@ class DeltaGapFillDemandAdapter:
         finally:
             self._observe_forward_slice(budget, attempts_before, outcome=outcome, reason=reason)
 
-    def _ordinary_candidate(self, now: float) -> tuple[float, int] | None:
+    def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
+        """Report the oldest local delta release boundary without writes."""
         rows = cast(
             list[tuple[int, int | None, int | None, int | None, int | None, int | None]],
             self._worker._conn.execute(_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL).fetchall(),
         )
-        cursor_row = cast(
+        peer_cursor = self._peer_cursor()
+        candidates = [self._candidate(row, excluded) for row in rows]
+        usable = [candidate for candidate in candidates if candidate is not None]
+        if not usable:
+            return None
+        ready = [item for item in usable if item[0] <= now]
+        release, _, selected = min(ready or usable, key=lambda item: (item[1] <= peer_cursor, item[1]))
+        return DemandStatus(release_at=release, selected=selected)
+
+    def _peer_cursor(self) -> int:
+        row = cast(
             tuple[str] | None,
             self._worker._conn.execute("SELECT value FROM daemon_state WHERE key='delta_peer_cursor'").fetchone(),
         )
-        peer_cursor = int(cursor_row[0]) if cursor_row else 0
-        candidates = [
-            (
-                max(0.0 if cursor is None else _delta_release_at(last_synced, last_checked, requested), retry or 0),
-                int(dialog_id),
-            )
-            for dialog_id, last_synced, last_checked, requested, cursor, retry in rows
-        ]
-        ready = [candidate for candidate in candidates if candidate[0] <= now]
-        if ready:
-            return min(ready, key=lambda candidate: (candidate[1] <= peer_cursor, candidate[1]))
-        return min(candidates) if candidates else None
+        return int(row[0]) if row else 0
 
-    def status(self, now: float) -> DemandStatus | None:
-        """Report the oldest local delta release boundary without writes."""
-        candidate = self._ordinary_candidate(now)
-        if candidate is None:
+    def _candidate(
+        self,
+        row: tuple[int, int | None, int | None, int | None, int | None, int | None],
+        excluded: frozenset[WorkRevision],
+    ) -> tuple[float, int, WorkRevision] | None:
+        dialog_id, last_synced, last_checked, requested, cursor, retry = row
+        dialog_id = int(dialog_id)
+        generation_row = cast(
+            tuple[int | None] | None,
+            self._worker._conn.execute(
+                "SELECT delta_refresh_generation FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+            ).fetchone(),
+        )
+        generation = int(generation_row[0] or 0) if generation_row else 0
+        selected = WorkRevision(
+            WorkKey(self.demand_kind, self._account_id, f"dialog:{dialog_id}"),
+            f"{int(cursor or 0)}:{generation}:{_delta_completion_generation(self._worker._conn, dialog_id)}",
+        )
+        if selected in excluded:
             return None
-        return DemandStatus(release_at=candidate[0])
+        release = max(0.0 if cursor is None else _delta_release_at(last_synced, last_checked, requested), retry or 0)
+        return release, dialog_id, selected
 
-    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+    async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
         """Fetch one due dialog page and leave continuation in domain state."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
+        selected = budget.selected
+        if selected is None:
+            raise RuntimeError("delta gap slice requires an owner-selected revision")
         now = time.time()
-        candidate = self._ordinary_candidate(now)
-        if candidate is None or candidate[0] > now:
-            return
-        with demand_context(DemandKind.DELTA_GAP_FILL):
+        validation = self._validate_selected(selected, now)
+        if validation is not None:
+            return validation
+        dialog_id = int(selected.key.target.split(":", 1)[1])
+        await self._dispatch_slice(selected, budget, dialog_id)
+        return self._slice_outcome(selected)
+
+    def _validate_selected(self, selected: WorkRevision, now: float) -> SliceOutcome | None:
+        if selected.key.account_id != self._account_id or selected.key.demand_kind is not self.demand_kind:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        dialog_id = _target_dialog_id(selected.key.target, "dialog")
+        if dialog_id is None:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        rows = cast(
+            list[tuple[int, int | None, int | None, int | None, int | None, int | None]],
+            self._worker._conn.execute(_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL).fetchall(),
+        )
+        candidate = next((self._candidate(row, frozenset()) for row in rows if row[0] == dialog_id), None)
+        if candidate is None or candidate[2] != selected:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        if candidate[0] > now:
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        return None
+
+    async def _dispatch_slice(self, selected: WorkRevision, budget: RpcAttemptBudget, dialog_id: int) -> None:
+        with _delta_root_scope(DemandKind.DELTA_GAP_FILL):
             with rpc_attempt_budget(budget):
-                dialog_id = candidate[1]
-
-                def persist_peer_cursor(conn: sqlite3.Connection) -> None:
-                    with write_transaction(conn):
-                        conn.execute(
-                            "INSERT OR REPLACE INTO daemon_state(key,value) VALUES('delta_peer_cursor',?)",
-                            (str(dialog_id),),
-                        )
-
-                await self._worker._writer.run(persist_peer_cursor)
+                await self._worker._writer.run(lambda conn: self._persist_peer_cursor(conn, dialog_id))
                 try:
-                    await self._run_forward_slice(budget, dialog_id)
+                    await self._run_forward_slice(budget, dialog_id, int(selected.revision.rsplit(":", 1)[1]))
                 except MessageHistoryUnavailableError, TimeoutError:
-                    await self._worker._writer.run(
-                        lambda conn: self._persist_retry(conn, dialog_id, int(time.time()) + 60)
-                    )
-                else:
-                    await self._worker._writer.run(lambda conn: self._persist_retry(conn, dialog_id, None))
+                    return
+                await self._worker._writer.run(lambda conn: self._persist_retry(conn, dialog_id, None))
+
+    @staticmethod
+    def _persist_peer_cursor(conn: sqlite3.Connection, dialog_id: int) -> None:
+        with write_transaction(conn):
+            conn.execute(
+                "INSERT OR REPLACE INTO daemon_state(key,value) VALUES('delta_peer_cursor',?)", (str(dialog_id),)
+            )
+
+    def _slice_outcome(self, selected: WorkRevision) -> SliceOutcome:
+        error = self._worker._last_delta_slice_error
+        if isinstance(
+            error,
+            (TelegramRpcThrottled, TelegramRpcAdmissionDeferred, RpcAdmissionSaturatedError, RpcAdmissionExpiredError),
+        ):
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        if error is not None or self._worker._last_delta_slice_access_lost:
+            return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
+        if self._worker._last_delta_slice_stale:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        revision = self._worker._last_delta_slice_committed_revision
+        if self._worker._last_delta_slice_succeeded and revision is not None and revision != selected.revision:
+            return SliceOutcome(selected, SliceOutcomeKind.PROGRESSED, revision)
+        return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
 
     def _persist_retry(self, conn: sqlite3.Connection, dialog_id: int, retry_at: int | None) -> None:
         with write_transaction(conn):
@@ -730,15 +917,29 @@ class DmDeletionReconciliationDemandAdapter:
 
     demand_kind = DemandKind.DM_DELETION_RECONCILIATION
 
-    def __init__(self, conn: sqlite3.Connection, scanner: DmGapScanPage, *, writer: SQLiteWriter) -> None:
+    def __init__(
+        self, conn: sqlite3.Connection, scanner: DmGapScanPage, *, writer: SQLiteWriter, account_id: int
+    ) -> None:
         self._conn = conn
         self._writer = writer
         self._scanner = scanner
+        self._account_id = account_id
 
-    def status(self, now: float) -> DemandStatus | None:
+    def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
         """Project local scan state to coordinator readiness without writes."""
         release_at = _dm_gap_scan_release_at(self._conn, now)
-        return None if release_at is None else DemandStatus(release_at=release_at)
+        if release_at is None:
+            return None
+        state = _load_dm_gap_scan_state(self._conn)
+        revision = (
+            "idle"
+            if state is None
+            else repr(
+                (state.generation, state.dialog_id_cursor, state.message_cursor, state.policy_version, state.status)
+            )
+        )
+        selected = WorkRevision(WorkKey(self.demand_kind, self._account_id, "dm-gap-scan"), revision)
+        return None if selected in excluded else DemandStatus(release_at=release_at, selected=selected)
 
     def _start_scan(self, conn: sqlite3.Connection, now: int) -> _DmGapScanState | None:
         with write_transaction(conn):
@@ -782,7 +983,7 @@ class DmDeletionReconciliationDemandAdapter:
         with write_transaction(conn):
             current = _load_dm_gap_scan_state(conn)
             if current != old_state:
-                raise DmGapScanStateError("DM deletion reconciliation state changed during a slice")
+                raise DmGapScanStaleError("DM deletion reconciliation state changed during a slice")
             _store_dm_gap_scan_state(conn, new_state)
 
     def _suspend_after_throttle(self, conn: sqlite3.Connection, state: _DmGapScanState, now: int) -> None:
@@ -864,7 +1065,7 @@ class DmDeletionReconciliationDemandAdapter:
 
     def _commit_page(
         self, conn: sqlite3.Connection, state: _DmGapScanState, dialog_id: int, next_cursor: int, now: int
-    ) -> None:
+    ) -> str:
         advanced = _DmGapScanState(
             "running",
             state.generation,
@@ -877,6 +1078,7 @@ class DmDeletionReconciliationDemandAdapter:
             now,
         )
         self._write_transition(conn, state, advanced)
+        return _dm_gap_scan_revision(advanced)
 
     def _select_page(self, conn: sqlite3.Connection, now: int) -> tuple[_DmGapScanState, int, tuple[int, ...]] | None:
         state = self._start_scan(conn, now)
@@ -916,10 +1118,10 @@ class DmDeletionReconciliationDemandAdapter:
         dialog_id: int,
         page: tuple[int, ...],
         budget: RpcAttemptBudget,
-    ) -> None:
+    ) -> str:
         token: DemandToken | None = None
         try:
-            with demand_context(self.demand_kind) as token:
+            with durable_demand_context(self.demand_kind) as token:
                 if (
                     token is None
                     or token.kind is not self.demand_kind
@@ -944,21 +1146,36 @@ class DmDeletionReconciliationDemandAdapter:
             await self._handle_throttle(state)
             raise
 
-        await self._writer.run(lambda conn: self._commit_page(conn, state, dialog_id, page[-1], int(time.time())))
+        return await self._writer.run(
+            lambda conn: self._commit_page(conn, state, dialog_id, page[-1], int(time.time()))
+        )
 
-    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+    async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
         """Claim and verify at most one page, failing closed on ambiguity."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
+        selected_revision = budget.selected
+        if selected_revision is None:
+            raise RuntimeError("DM deletion slice requires an owner-selected revision")
+        state = _load_dm_gap_scan_state(self._conn)
+        revision = _dm_gap_scan_revision(state)
+        if selected_revision.key.account_id != self._account_id or selected_revision.revision != revision:
+            return SliceOutcome(selected_revision, SliceOutcomeKind.STALE)
         try:
             selected = await self._writer.run(lambda conn: self._select_page(conn, int(time.time())))
             if selected is None:
-                return
+                return SliceOutcome(selected_revision, SliceOutcomeKind.NO_PROGRESS)
             state, dialog_id, page = selected
             claimed = await self._writer.run(lambda conn: self._claim_page(conn, state, int(time.time())))
-            await self._verify_claimed_page(claimed, dialog_id, page, budget)
+            successor = await self._verify_claimed_page(claimed, dialog_id, page, budget)
+        except DmGapScanStaleError:
+            return SliceOutcome(selected_revision, SliceOutcomeKind.STALE)
         except InvalidDmDeletionCheckpointError:
             logger.warning("dm_deletion_reconciliation_checkpoint_invalid_during_slice")
+            return SliceOutcome(selected_revision, SliceOutcomeKind.NO_PROGRESS)
+        if successor != selected_revision.revision:
+            return SliceOutcome(selected_revision, SliceOutcomeKind.PROGRESSED, successor)
+        return SliceOutcome(selected_revision, SliceOutcomeKind.NO_PROGRESS)
 
 
 def _restore_revalidated_access(
@@ -978,35 +1195,30 @@ class _DurableAccessRecovery:
     dialog_id: int
     total_messages: int | None
     retry_at: int | None
+    probe_succeeded_at: int
 
 
-def _due_access_recovery(conn: sqlite3.Connection, *, now: int) -> _DurableAccessRecovery | None:
-    row = cast(
-        tuple[int, int | None, int | None] | None,
-        conn.execute(
-            """
-            SELECT recovery.dialog_id, recovery.total_messages, recovery.retry_at
-              FROM delta_access_recovery_state AS recovery
-              JOIN synced_dialogs AS synced ON synced.dialog_id=recovery.dialog_id
-             WHERE synced.status='access_lost'
-               AND (recovery.retry_at IS NULL OR recovery.retry_at <= ?)
-             ORDER BY COALESCE(recovery.retry_at, 0), recovery.probe_succeeded_at, recovery.dialog_id
-             LIMIT 1
-            """,
-            (now,),
-        ).fetchone(),
-    )
-    if row is None:
-        return None
-    return _DurableAccessRecovery(*row)
-
-
-def _set_access_recovery_retry(conn: sqlite3.Connection, dialog_id: int, retry_at: int | None) -> None:
+def _set_access_recovery_retry(
+    conn: sqlite3.Connection, recovery: _DurableAccessRecovery, retry_at: int | None
+) -> str | None:
     with write_transaction(conn):
         conn.execute(
             "UPDATE delta_access_recovery_state SET retry_at=?, updated_at=? WHERE dialog_id=?",
-            (retry_at, int(time.time()), dialog_id),
+            (retry_at, int(time.time()), recovery.dialog_id),
         )
+        if retry_at is not None:
+            return None
+        row = cast(
+            tuple[int, int] | None,
+            conn.execute(
+                "SELECT COALESCE(delta_message_id,0),COALESCE(delta_refresh_generation,0) "
+                "FROM synced_dialogs WHERE dialog_id=?",
+                (recovery.dialog_id,),
+            ).fetchone(),
+        )
+        if row is None:
+            return None
+        return repr((recovery.total_messages, recovery.probe_succeeded_at, f"{int(row[0])}:{int(row[1])}"))
 
 
 def _finish_durable_access_recovery(
@@ -1034,67 +1246,156 @@ class DeltaAccessProbeDemandAdapter:
         worker: DeltaSyncWorker,
         policy: AccessProbePolicy,
         probe: AccessProbe,
+        *,
+        account_id: int,
         observer: DeltaGapFillObservationHook | None = None,
     ) -> None:
         self._worker = worker
         self._policy = policy
         self._probe = probe
         self._observer = observer
+        if type(account_id) is not int or account_id <= 0:
+            raise ValueError("account_id must be a positive integer")
+        self._account_id = account_id
         if observer is not None:
             self._worker._delta_gap_fill_observation_enabled = True
 
-    def status(self, now: float) -> DemandStatus | None:
+    def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
         """Report the earliest access revalidation boundary without writes."""
-        del now
         if not self._policy.enabled:
             return None
-        row = cast(
-            tuple[int | None] | None,
+        rows = cast(
+            list[tuple[int, int, int | None, int | None, int | None, int, int]],
             self._worker._conn.execute(
-                """
-                SELECT MIN(release_at)
-                  FROM (
-                    SELECT COALESCE(recovery.retry_at, 0) AS release_at
-                      FROM delta_access_recovery_state AS recovery
-                      JOIN synced_dialogs AS synced ON synced.dialog_id=recovery.dialog_id
-                     WHERE synced.status='access_lost'
-                    UNION ALL
-                    SELECT COALESCE(synced.access_next_revalidate_at,
-                                    COALESCE(synced.access_lost_at, 0) + ?) AS release_at
-                      FROM synced_dialogs AS synced
-                     WHERE synced.status='access_lost'
-                       AND NOT EXISTS (
-                           SELECT 1 FROM delta_access_recovery_state AS recovery
-                            WHERE recovery.dialog_id=synced.dialog_id
-                       )
-                  )
-                """,
+                "SELECT recovery.dialog_id,1,recovery.total_messages,recovery.probe_succeeded_at,recovery.retry_at,"
+                "COALESCE(synced.delta_message_id,0),COALESCE(synced.delta_refresh_generation,0) "
+                "FROM delta_access_recovery_state recovery JOIN synced_dialogs synced ON synced.dialog_id=recovery.dialog_id "
+                "WHERE synced.status='access_lost' "
+                "UNION ALL SELECT synced.dialog_id,0,NULL,NULL,COALESCE(synced.access_next_revalidate_at, "
+                "COALESCE(synced.access_lost_at,0)+?),COALESCE(synced.delta_message_id,0),"
+                "COALESCE(synced.delta_refresh_generation,0) FROM synced_dialogs synced WHERE synced.status='access_lost' "
+                "AND NOT EXISTS (SELECT 1 FROM delta_access_recovery_state recovery WHERE recovery.dialog_id=synced.dialog_id)",
                 (self._policy.cooldown_seconds,),
-            ).fetchone(),
+            ).fetchall(),
         )
-        if row is None or row[0] is None:
+        candidates: list[tuple[float, int, WorkRevision]] = []
+        for dialog_id, is_recovery, total, probe_succeeded, release, delta_cursor, generation in rows:
+            target = f"recovery:{int(dialog_id)}" if is_recovery else f"probe:{int(dialog_id)}"
+            revision = WorkRevision(
+                WorkKey(self.demand_kind, self._account_id, target),
+                repr((total, probe_succeeded, f"{int(delta_cursor or 0)}:{int(generation or 0)}"))
+                if is_recovery
+                else str(
+                    int(
+                        cast(
+                            tuple[int],
+                            self._worker._conn.execute(
+                                "SELECT COALESCE(access_lost_at,0) FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+                            ).fetchone(),
+                        )[0]
+                    )
+                ),
+            )
+            if revision not in excluded:
+                candidates.append((float(release or 0), int(dialog_id), revision))
+        if not candidates:
             return None
-        return DemandStatus(release_at=float(row[0]))
+        release_at, _, selected = min(candidates, key=lambda item: (item[0] > now, item[0], item[1]))
+        return DemandStatus(release_at=release_at, selected=selected)
 
-    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+    async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
         """Commit probe success before a later slice performs gap fill."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
-        with demand_context(DemandKind.DELTA_ACCESS_PROBE):
+        selected = budget.selected
+        if selected is None:
+            raise RuntimeError("access probe slice requires an owner-selected revision")
+        now = int(time.time())
+        validation = self._validate_selected(selected, now)
+        if validation is not None:
+            return validation
+        successor: str | None = None
+        with durable_demand_context(DemandKind.DELTA_ACCESS_PROBE):
             with rpc_attempt_budget(budget):
-                recovery = _due_access_recovery(self._worker._conn, now=int(time.time()))
-                if recovery is not None:
-                    await self._run_observed_recovery_slice(budget, recovery)
-                    return
-                await self._run_probe_slice()
+                if selected.key.target.startswith("recovery:"):
+                    dialog_id = int(selected.key.target.split(":", 1)[1])
+                    persisted = self._selected_persisted_work(selected, now)
+                    recovery = persisted[2] if persisted is not None and persisted[1] == selected.revision else None
+                    if recovery is None or recovery.dialog_id != dialog_id:
+                        return SliceOutcome(selected, SliceOutcomeKind.STALE)
+                    successor = await self._run_observed_recovery_slice(budget, recovery)
+                else:
+                    dialog_id = int(selected.key.target.split(":", 1)[1])
+                    successor = await self._probe_dialog_for_recovery(dialog_id, now)
+        if successor is None:
+            return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
+        return SliceOutcome(selected, SliceOutcomeKind.PROGRESSED, successor)
 
-    async def _run_observed_recovery_slice(self, budget: RpcAttemptBudget, recovery: _DurableAccessRecovery) -> None:
+    def _validate_selected(self, selected: WorkRevision, now: float) -> SliceOutcome | None:
+        if selected.key.account_id != self._account_id or selected.key.demand_kind is not self.demand_kind:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        target_kind = selected.key.target.partition(":")[0]
+        if target_kind not in {"probe", "recovery"}:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        dialog_id = _target_dialog_id(selected.key.target, target_kind)
+        if dialog_id is None:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        persisted = self._selected_persisted_work(selected, int(now))
+        if persisted is None or persisted[1] != selected.revision:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        if persisted[0] > now:
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        return None
+
+    def _selected_persisted_work(
+        self, selected: WorkRevision, now: int
+    ) -> tuple[float, str, _DurableAccessRecovery | None] | None:
+        """Read one selected peer's local status without reselecting another peer."""
+        target_kind, _, raw_dialog_id = selected.key.target.partition(":")
+        dialog_id = int(raw_dialog_id)
+        if target_kind == "recovery":
+            row = cast(
+                tuple[int | None, int, int | None, int, int] | None,
+                self._worker._conn.execute(
+                    "SELECT recovery.total_messages,recovery.probe_succeeded_at,recovery.retry_at,"
+                    "COALESCE(synced.delta_message_id,0),COALESCE(synced.delta_refresh_generation,0) "
+                    "FROM delta_access_recovery_state recovery "
+                    "JOIN synced_dialogs synced ON synced.dialog_id=recovery.dialog_id "
+                    "WHERE recovery.dialog_id=? AND synced.status='access_lost'",
+                    (dialog_id,),
+                ).fetchone(),
+            )
+            if row is None:
+                return None
+            recovery = _DurableAccessRecovery(dialog_id, row[0], row[2], row[1])
+            revision = repr((row[0], row[1], f"{row[3]}:{row[4]}"))
+            return float(row[2] or 0), revision, recovery
+
+        probe_row = cast(
+            tuple[int, int | None, int, int, int] | None,
+            self._worker._conn.execute(
+                "SELECT COALESCE(synced.access_lost_at,0),synced.access_next_revalidate_at,"
+                "COALESCE(synced.delta_message_id,0),COALESCE(synced.delta_refresh_generation,0),"
+                "EXISTS(SELECT 1 FROM delta_access_recovery_state recovery WHERE recovery.dialog_id=synced.dialog_id) "
+                "FROM synced_dialogs synced WHERE synced.dialog_id=? AND synced.status='access_lost'",
+                (dialog_id,),
+            ).fetchone(),
+        )
+        if probe_row is None or probe_row[4]:
+            return None
+        release = float(probe_row[1] if probe_row[1] is not None else probe_row[0] + self._policy.cooldown_seconds)
+        return release, str(probe_row[0]), None
+
+    async def _run_observed_recovery_slice(
+        self, budget: RpcAttemptBudget, recovery: _DurableAccessRecovery
+    ) -> str | None:
         attempts_before = budget.attempts
         self._worker._reset_delta_slice_state()
         outcome, reason = "completed", "completed"
+        successor: str | None = None
         recovery_completed = False
         try:
-            recovery_completed = await self._run_gap_fill_slice(recovery)
+            recovery_completed, successor = await self._run_gap_fill_slice(recovery)
             if self._worker._last_delta_slice_error is not None:
                 outcome, reason = _delta_gap_fill_error_result(self._worker._last_delta_slice_error)
             elif self._worker._last_delta_slice_access_lost:
@@ -1117,44 +1418,14 @@ class DeltaAccessProbeDemandAdapter:
                     self._observer.observe_delta_gap_fill(metrics, reason=reason)
                 except Exception:  # noqa: BLE001 - telemetry cannot change sync behavior
                     logger.debug("delta_gap_fill_observation_failed")
-
-    async def _run_probe_slice(self) -> None:
-        now = int(time.time())
-        dialog_id = self._due_probe_dialog_id(now)
-        if dialog_id is None:
-            return
-        await self._probe_dialog_for_recovery(dialog_id, now)
-
-    def _due_probe_dialog_id(self, now: int) -> int | None:
-        policy = self._policy
-        row = cast(
-            tuple[int] | None,
-            self._worker._conn.execute(
-                """
-                SELECT synced.dialog_id
-                  FROM synced_dialogs AS synced
-                 WHERE synced.status='access_lost'
-                   AND COALESCE(synced.access_next_revalidate_at,
-                                COALESCE(synced.access_lost_at, 0) + ?) <= ?
-                   AND NOT EXISTS (
-                       SELECT 1 FROM delta_access_recovery_state AS recovery
-                        WHERE recovery.dialog_id=synced.dialog_id
-                   )
-                 ORDER BY COALESCE(synced.access_next_revalidate_at,
-                                   COALESCE(synced.access_lost_at, 0) + ?), synced.dialog_id
-                 LIMIT 1
-                """,
-                (policy.cooldown_seconds, now, policy.cooldown_seconds),
-            ).fetchone(),
-        )
-        return None if row is None else row[0]
+        return successor
 
     async def _request_probe(self, dialog_id: int) -> int | None:
         with acquisition_context(AcquisitionKind.MESSAGE_LOOKUP):
             with rpc_scope(TelegramRpcSource.DELTA_SYNC):
                 return await self._probe.probe_total_messages(dialog_id)
 
-    async def _probe_dialog_for_recovery(self, dialog_id: int, now: int) -> None:
+    async def _probe_dialog_for_recovery(self, dialog_id: int, now: int) -> str | None:
         try:
             result = await self._request_probe(dialog_id)
         except (
@@ -1163,17 +1434,17 @@ class DeltaAccessProbeDemandAdapter:
         ) as exc:
             admission_error = exc
             await self._worker._writer.run(lambda conn: self._handle_probe_error(conn, dialog_id, now, admission_error))
-            return
+            return None
         except MessageHistoryAccessLostError as exc:
             access_error = exc
             await self._worker._writer.run(lambda conn: self._handle_probe_error(conn, dialog_id, now, access_error))
-            return
+            return None
         except MessageHistoryUnavailableError as exc:
             remote_error = exc
             await self._worker._writer.run(lambda conn: self._handle_probe_error(conn, dialog_id, now, remote_error))
-            return
+            return None
 
-        await self._worker._writer.run(lambda conn: self._persist_probe_success(conn, dialog_id, now, result))
+        return await self._worker._writer.run(lambda conn: self._persist_probe_success(conn, dialog_id, now, result))
 
     def _handle_probe_error(self, conn: sqlite3.Connection, dialog_id: int, now: int, exc: BaseException) -> None:
         if isinstance(exc, TelegramRpcAdmissionDeferred):
@@ -1203,7 +1474,7 @@ class DeltaAccessProbeDemandAdapter:
 
     def _persist_probe_success(
         self, conn: sqlite3.Connection, dialog_id: int, now: int, total_messages: int | None
-    ) -> None:
+    ) -> str | None:
         with write_transaction(conn):
             if not full_history_enabled(conn, dialog_id):
                 _restore_revalidated_access(
@@ -1211,7 +1482,7 @@ class DeltaAccessProbeDemandAdapter:
                     dialog_id,
                     total_messages=total_messages,
                 )
-                return
+                return None
             conn.execute(
                 """
                 INSERT INTO delta_access_recovery_state(
@@ -1225,26 +1496,33 @@ class DeltaAccessProbeDemandAdapter:
                 (dialog_id, total_messages, now, now),
             )
             complete_access_revalidation(conn, dialog_id, now)
+            cursor = cast(
+                tuple[int, int] | None,
+                conn.execute(
+                    "SELECT COALESCE(delta_message_id,0),COALESCE(delta_refresh_generation,0) "
+                    "FROM synced_dialogs WHERE dialog_id=?",
+                    (dialog_id,),
+                ).fetchone(),
+            )
+            return None if cursor is None else repr((total_messages, now, f"{int(cursor[0])}:{int(cursor[1])}"))
 
-    async def _run_gap_fill_slice(self, recovery: _DurableAccessRecovery) -> bool:
+    async def _run_gap_fill_slice(self, recovery: _DurableAccessRecovery) -> tuple[bool, str | None]:
         if not full_history_enabled(self._worker._conn, recovery.dialog_id):
             self._worker._reset_delta_slice_state()
             await self._worker._writer.run(lambda conn: _finish_durable_access_recovery(conn, recovery))
             self._worker._last_delta_slice_skipped = True
-            return True
+            return True, None
         await self._worker.fetch_delta_slice_for_dialog(recovery.dialog_id)
         if self._worker._last_delta_slice_completed:
             await self._worker._writer.run(lambda conn: _finish_durable_access_recovery(conn, recovery))
-            return True
+            return True, None
         if self._worker._last_delta_slice_succeeded:
-            await self._worker._writer.run(lambda conn: _set_access_recovery_retry(conn, recovery.dialog_id, None))
-            return False
+            successor = await self._worker._writer.run(lambda conn: _set_access_recovery_retry(conn, recovery, None))
+            return False, successor
         await self._worker._writer.run(
-            lambda conn: _set_access_recovery_retry(
-                conn, recovery.dialog_id, int(time.time()) + self._policy.cooldown_seconds
-            )
+            lambda conn: _set_access_recovery_retry(conn, recovery, int(time.time()) + self._policy.cooldown_seconds)
         )
-        return False
+        return False, None
 
 
 _EXPORTED_SYMBOLS = (

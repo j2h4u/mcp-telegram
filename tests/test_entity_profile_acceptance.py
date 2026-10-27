@@ -26,6 +26,9 @@ from mcp_telegram.entity_profile.refresh import (
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.telegram_demand import DemandStatus, RpcAttemptBudget
+from mcp_telegram.telegram_demand_progress import WorkKey, WorkRevision
+from mcp_telegram.telegram_rpc_consumers import DemandKind
+from tests.demand_adapter_helpers import run_ready_slice
 from tests.test_entity_profile_full_user_pair import _pair_service, _PairClient, _prepare
 
 
@@ -43,7 +46,7 @@ async def test_closed_adapter_does_not_read_or_acquire_unknown_entity() -> None:
     status_calls = 0
     acquisition_calls = 0
 
-    def status(_now: float) -> DemandStatus:
+    def status(_now: float, _excluded: frozenset[object]) -> DemandStatus:
         nonlocal status_calls
         status_calls += 1
         return DemandStatus(release_at=0.0)
@@ -55,7 +58,8 @@ async def test_closed_adapter_does_not_read_or_acquire_unknown_entity() -> None:
 
     coordinator.bind_durable_executor(status, run_slice)
     await coordinator.shutdown()
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    selected = WorkRevision(WorkKey(DemandKind.ENTITY_PROFILE_REFRESH, 1, "unknown"), "prior")
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1, selected=selected))
 
     assert status_calls == 0
     assert acquisition_calls == 0
@@ -71,7 +75,7 @@ async def test_actual_sink_loss_is_durable_and_does_not_change_pair_state(
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
     client = cast(_PairClient, service._deps.client)  # type: ignore[attr-defined]
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     assert client.full_user_calls == 1
     assert conn.execute(
         "SELECT status FROM entity_detail_sections WHERE entity_id=42 "
@@ -164,7 +168,7 @@ async def test_file_backed_pending_pair_shutdown_preserves_state_then_reopens_fo
     restarted_coordinator = restarted.refresh_coordinator  # type: ignore[attr-defined]
     assert restarted_coordinator is not None
     restarted_client = cast(_PairClient, restarted._deps.client)  # type: ignore[attr-defined]
-    await EntityProfileDemandAdapter(restarted_coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(restarted_coordinator))
 
     assert restarted_client.full_user_calls == 1
     assert reopened.execute(

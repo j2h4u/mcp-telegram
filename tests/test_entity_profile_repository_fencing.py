@@ -12,7 +12,7 @@ import pytest
 import mcp_telegram.entity_profile.repository as repository_module
 import mcp_telegram.sync_db as sync_db_module
 from mcp_telegram.entity_profile.contracts import FULL_PROFILE_OWNED_FIELDS, ProfileAcquisitionEvidence
-from mcp_telegram.entity_profile.refresh import failure_retry_at, scope_changed_retry_at, throttled_retry_at
+from mcp_telegram.entity_profile.refresh import scope_changed_retry_at
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_transactions import write_savepoint
@@ -950,12 +950,7 @@ def test_receipts_with_invalid_observation_bounds_are_rejected(
     conn.close()
 
 
-def test_profile_retry_boundaries_are_pure_and_bounded() -> None:
-    assert throttled_retry_at(100, None) == 101
-    assert throttled_retry_at(100, 0) == 101
-    assert throttled_retry_at(100, -5) == 101
-    assert throttled_retry_at(100, 7) == 107
-    assert failure_retry_at(100) == 160
+def test_auth_scope_change_retry_boundary_is_immediate() -> None:
     assert scope_changed_retry_at(100) == 101
 
 

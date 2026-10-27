@@ -20,7 +20,7 @@ from mcp_telegram.entity_profile.contracts import (
     StoryProfileValidationError,
     UserReference,
 )
-from mcp_telegram.entity_profile.refresh import RefreshLimits, failure_retry_at, scope_changed_retry_at
+from mcp_telegram.entity_profile.refresh import RefreshLimits, scope_changed_retry_at
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_transactions import write_transaction
@@ -156,11 +156,11 @@ async def test_scheduled_story_failures_have_distinct_safe_identity(scenario: Sc
     assert conn.execute("SELECT status,reason,retry_at FROM entity_profile_refresh_state").fetchone() == (
         "failed",
         reason,
-        failure_retry_at(200),
+        200,
     )
     assert conn.execute("SELECT observed_at,payload_json FROM entity_detail_sections").fetchall() == section
     assert _retained(conn) == retained
-    resumed = service._profiles.next_due_refresh(now=failure_retry_at(200))
+    resumed = service._profiles.next_due_refresh(now=200)
     assert cursor is not None and resumed is not None
     assert (resumed.generation, resumed.acquisition_cursor, resumed.page_cursor_json) == (
         cursor.generation,
@@ -209,18 +209,21 @@ async def test_transport_wrapper_preserves_typed_category(scenario: Scenario) ->
 
 
 @pytest.mark.parametrize("kind", ["rpc", "timeout", "flood_wait"])
-async def test_other_story_failures_keep_existing_retry_contract(scenario: Scenario, kind: str) -> None:
+async def test_other_story_failures_use_current_gate_owned_retry_boundary(scenario: Scenario, kind: str) -> None:
     conn, service, client = scenario
     if kind == "rpc":
         client.failure = BadRequestError(None, "UNKNOWN_STORY_SYMBOL")
-        reason, retry_at = "badrequesterror", failure_retry_at(200)
+        reason, retry_at = "badrequesterror", 200
     elif kind == "timeout":
         client.failure = TimeoutError("private-caption")
-        reason, retry_at = "timeouterror", failure_retry_at(200)
+        reason, retry_at = "timeouterror", 200
     else:
         client.failure = TelegramRpcThrottled(retry_after_seconds=7)
-        reason, retry_at = "flood_wait", 500
-    await _run(service)
+        reason, retry_at = "flood_wait", 200
+        with pytest.raises(TelegramRpcThrottled):
+            await _run(service)
+    if kind != "flood_wait":
+        await _run(service)
     assert conn.execute("SELECT reason,retry_at FROM entity_profile_refresh_state").fetchone() == (reason, retry_at)
 
 

@@ -15,7 +15,7 @@ from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.entity_profile.repository import EntityProfileRepository
 from mcp_telegram.sync_db import ensure_sync_schema
-from mcp_telegram.telegram_demand import RpcAttemptBudget
+from tests.demand_adapter_helpers import run_ready_slice
 from tests.test_entity_profile_full_user_pair import _prepare
 
 SCOPE = {"version": 1, "account_id": 42, "dc_id": 2, "auth_key_id": 99}
@@ -55,7 +55,7 @@ async def test_service_accepts_same_scope_at_ttl_boundary_without_db_changes(tmp
     assert isinstance(service, DaemonEntityInfoService)
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator), now=100)
     service._deps = replace(
         service._deps,
         now_provider=lambda: 400.0,

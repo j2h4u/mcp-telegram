@@ -27,9 +27,9 @@ from mcp_telegram.entity_profile.contracts import (
 )
 from mcp_telegram.entity_profile.ports import ChannelProfilePort, UserProfilePort
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
-from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.tools.entity_info import _entity_input_label, _format_relative_ymd
 from tests.daemon_api_policy import make_daemon_api_policy
+from tests.demand_adapter_helpers import run_ready_slice
 from tests.helpers import (
     ClientChatAvatarHistoryPort,
     ClientCommonChatsPort,
@@ -38,7 +38,6 @@ from tests.helpers import (
     LoudChannelProfilePort,
     LoudGroupProfilePort,
     LoudUserProfilePort,
-    acquire_entity_profile,
     bind_profile_test_account,
     in_memory_sync_db,
 )
@@ -158,7 +157,7 @@ async def _acquire_overlap_then_fail_profile(server: DaemonAPIServer, entity_id:
                 entity_id, (section,), now=100, pair_mode="disabled"
             )
         )
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await run_ready_slice(adapter)
 
 
 def _assert_failed_profile_is_retryable(conn: sqlite3.Connection, entity_id: int) -> None:
@@ -172,7 +171,10 @@ def _assert_failed_profile_is_retryable(conn: sqlite3.Connection, entity_id: int
     assert section is not None
     assert section[0] == "unavailable"
     assert section[1] is None
-    assert section[2] > 100
+    # Telegram retry timing belongs to the classified RPC gate. Persist the
+    # failed section at the observation boundary and let that gate admit the
+    # next network attempt.
+    assert section[2] == 100
 
 
 # ---------------------------------------------------------------------------
@@ -313,9 +315,17 @@ async def test_user_failed_acquisition_keeps_identity_without_fresh_detail() -> 
         user_profile_port=port,
         channel_profile_port=LoudChannelProfilePort(),
     )
-    await acquire_entity_profile(
-        server._get_entity_info_service(), 77, {"id": 77, "type": "user", "name": "Known user"}
+    service = server._get_entity_info_service()
+    bind_profile_test_account(service)
+    service._deps = replace(service._deps, now_provider=lambda: 100.0, enable_full_user_pair=False)
+    service.bind_demand_sink(MagicMock())
+    await service._write_profiles(
+        lambda profiles: profiles.save_core({"id": 77, "type": "user", "name": "Known user"}, now=100)
     )
+    await service._write_profiles(lambda profiles: profiles.mark_pending(77, now=100))
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator), now=100.0)
     _assert_failed_profile_is_retryable(conn, 77)
     changes = conn.total_changes
     calls = list(port.calls)
@@ -351,9 +361,19 @@ async def test_channel_failed_acquisition_keeps_identity_without_fresh_detail() 
         client=client,
         channel_profile_port=port,
     )
-    await acquire_entity_profile(
-        server._get_entity_info_service(), -3001, {"id": -3001, "type": "channel", "name": "Known channel"}
+    service = server._get_entity_info_service()
+    bind_profile_test_account(service)
+    service._deps = replace(service._deps, now_provider=lambda: 100.0, enable_full_user_pair=False)
+    service.bind_demand_sink(MagicMock())
+    await service._write_profiles(
+        lambda profiles: profiles.save_core({"id": -3001, "type": "channel", "name": "Known channel"}, now=100)
     )
+    await service._write_profiles(
+        lambda profiles: profiles.request_section_refresh(-3001, ("full_profile",), now=100, pair_mode="disabled")
+    )
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator), now=100.0)
     _assert_failed_profile_is_retryable(conn, -3001)
     changes = conn.total_changes
 

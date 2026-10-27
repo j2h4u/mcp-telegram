@@ -30,6 +30,7 @@ from mcp_telegram.telegram_demand import (
     RpcAttemptBudgetExhaustedError,
     current_demand_token,
 )
+from mcp_telegram.telegram_demand_progress import SliceOutcome
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 
@@ -89,13 +90,25 @@ class _Cadence:
     current: DemandStatus | None
     statuses: list[float] = field(default_factory=list)
     refreshed_at: list[float] = field(default_factory=list)
+    generation: int = 0
 
     def status(self, now: float) -> DemandStatus | None:
         self.statuses.append(now)
         return self.current
 
-    async def mark_refreshed(self, completed_at: float) -> None:
+    def business_revision(self) -> str:
+        return str(self.generation)
+
+    async def mark_refreshed(self, completed_at: float) -> str:
         self.refreshed_at.append(completed_at)
+        self.generation += 1
+        return str(self.generation)
+
+
+async def _run(adapter: SelfProfileMaintenanceDemandAdapter, *, limit: int = 1) -> SliceOutcome:
+    status = adapter.status(100.0)
+    assert status is not None and status.selected is not None
+    return await adapter.run_slice(RpcAttemptBudget(limit=limit, selected=status.selected))
 
 
 async def test_status_reads_authoritative_cadence_without_side_effects() -> None:
@@ -105,11 +118,12 @@ async def test_status_reads_authoritative_cadence_without_side_effects() -> None
         get_me=_unused_get_me,
         update_profile=_unused_update_profile,
     )
-    adapter = SelfProfileMaintenanceDemandAdapter(dependencies, clock=lambda: 100.0)
+    adapter = SelfProfileMaintenanceDemandAdapter(dependencies, account_id=42, clock=lambda: 100.0)
 
     status = adapter.status(100.0)
 
-    assert status == DemandStatus(release_at=50.0, freshness_deadline=75.0)
+    assert status is not None and status.release_at == 50.0 and status.freshness_deadline == 75.0
+    assert status.selected is not None and status.selected.revision == "0"
     assert cadence.statuses == [100.0]
     assert cadence.refreshed_at == []
 
@@ -129,9 +143,9 @@ async def test_run_slice_skips_profile_fetch_before_release() -> None:
         get_me=get_me,
         update_profile=_unused_update_profile,
     )
-    adapter = SelfProfileMaintenanceDemandAdapter(dependencies, clock=lambda: 100.0)
+    adapter = SelfProfileMaintenanceDemandAdapter(dependencies, account_id=42, clock=lambda: 100.0)
 
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await _run(adapter)
 
     assert not get_me_called
     assert cadence.refreshed_at == []
@@ -141,7 +155,6 @@ async def test_run_slice_skips_profile_fetch_before_release() -> None:
 async def test_run_slice_fetches_and_applies_one_profile_under_exact_demand() -> None:
     cadence = _Cadence(DemandStatus(release_at=100.0))
     seen: dict[str, object] = {}
-    now_values = iter((100.0, 101.0))
     profile = SimpleNamespace(id=42, username="account")
 
     async def get_me() -> object:
@@ -163,8 +176,10 @@ async def test_run_slice_fetches_and_applies_one_profile_under_exact_demand() ->
         get_me=get_me,
         update_profile=update_profile,
     )
-    adapter = SelfProfileMaintenanceDemandAdapter(dependencies, clock=lambda: next(now_values))
-    budget = RpcAttemptBudget(limit=1)
+    adapter = SelfProfileMaintenanceDemandAdapter(dependencies, account_id=42, clock=lambda: 100.0)
+    status = adapter.status(100.0)
+    assert status is not None and status.selected is not None
+    budget = RpcAttemptBudget(limit=1, selected=status.selected)
 
     await adapter.run_slice(budget)
 
@@ -173,7 +188,7 @@ async def test_run_slice_fetches_and_applies_one_profile_under_exact_demand() ->
     assert seen["scope_kind"] is DemandKind.SELF_PROFILE_MAINTENANCE
     assert seen["budget"] is budget
     assert seen["profile"] is profile
-    assert cadence.refreshed_at == [101.0]
+    assert cadence.refreshed_at == [100.0]
     assert budget.attempts == 1
 
 
@@ -193,16 +208,16 @@ async def test_run_slice_does_not_apply_profile_when_attempt_budget_is_exhausted
         get_me=get_me,
         update_profile=update_profile,
     )
-    adapter = SelfProfileMaintenanceDemandAdapter(dependencies, clock=lambda: 100.0)
+    adapter = SelfProfileMaintenanceDemandAdapter(dependencies, account_id=42, clock=lambda: 100.0)
 
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await _run(adapter)
 
     assert applied == []
     assert cadence.refreshed_at == []
 
 
 @pytest.mark.asyncio
-async def test_startup_bypasses_persisted_cadence_and_resumes_after_budget_split() -> None:
+async def test_startup_bypasses_persisted_cadence_and_resumes_after_budget_split() -> None:  # noqa: PLR0915
     cadence = _Cadence(DemandStatus(release_at=10_000.0))
     startup = StartupIdentityState(100.0, 200.0)
     profile = SimpleNamespace(id=42, username="account")
@@ -247,15 +262,18 @@ async def test_startup_bypasses_persisted_cadence_and_resumes_after_budget_split
             user_profile_port=user_profile_port,
             publish_startup_identity=publish_startup_identity,
         ),
+        account_id=42,
         clock=lambda: 100.0,
     )
 
-    assert adapter.status(100.0) == DemandStatus(release_at=0.0, freshness_deadline=200.0)
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    startup_status = adapter.status(100.0)
+    assert startup_status is not None and startup_status.release_at == 0.0
+    assert startup_status.freshness_deadline == 200.0
+    await _run(adapter)
     assert startup.phase is StartupIdentityPhase.FULL_USER
     assert applied_profiles == []
-
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    outcome = await _run(adapter)
+    assert startup.phase is StartupIdentityPhase.READY
 
     assert startup.phase is StartupIdentityPhase.READY
     assert startup.done_event.is_set()
@@ -265,7 +283,10 @@ async def test_startup_bypasses_persisted_cadence_and_resumes_after_budget_split
     assert applied_profiles == [profile]
     assert applied_contexts == [startup.result().own_only_context]
     assert cadence.refreshed_at == [100.0]
-    assert adapter.status(100.0) == DemandStatus(release_at=10_000.0)
+    assert outcome.committed_revision == "1"
+    status = adapter.status(100.0)
+    assert status is not None and status.release_at == 10_000.0
+    assert status.selected is not None and status.selected.revision == "1"
     assert observed == [(DemandKind.SELF_PROFILE_MAINTENANCE, AcquisitionKind.ACCOUNT_SELF_PROFILE)] * 4
 
 
@@ -296,10 +317,11 @@ async def test_startup_accepts_partial_personal_channel_id() -> None:
             user_profile_port=port,
             publish_startup_identity=_unused_publish_startup_identity,
         ),
+        account_id=42,
         clock=lambda: 100.0,
     )
 
-    await adapter.run_slice(RpcAttemptBudget(limit=2))
+    await _run(adapter, limit=2)
 
     assert startup.phase is StartupIdentityPhase.READY
     assert startup.result().own_only_context.personal_channel_id == -1000000009001
@@ -322,11 +344,14 @@ async def test_permanent_startup_profile_failure_signals_terminal_state() -> Non
             user_profile_port=_StartupUserProfilePort(error=RuntimeError("permanent")),
             publish_startup_identity=_unused_publish_startup_identity,
         ),
+        account_id=42,
         clock=lambda: 100.0,
     )
 
+    status = adapter.status(100.0)
+    assert status is not None and status.selected is not None
     with pytest.raises(StartupIdentityUnavailableError, match="profile failed"):
-        await adapter.run_slice(RpcAttemptBudget(limit=2))
+        await adapter.run_slice(RpcAttemptBudget(limit=2, selected=status.selected))
 
     assert startup.phase is StartupIdentityPhase.FAILED
     assert startup.done_event.is_set()

@@ -28,6 +28,12 @@ _TEST_TIMEOUT_S = 120.0
 _POLICY = ActivityHotSweepConfig(jitter_max_seconds=0)
 
 
+def _selected_budget(adapter: HotActivityDemandAdapter) -> RpcAttemptBudget:
+    status = adapter.status(time.time())
+    assert status is not None and status.selected is not None
+    return RpcAttemptBudget(limit=1, selected=status.selected)
+
+
 @contextmanager
 def _make_db() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(":memory:")
@@ -117,7 +123,7 @@ def test_hot_activity_adapter_reports_retry_gated_release() -> None:
         _enroll(conn, dialog_id, hot_cursor=10)
         _save_dialog_state(conn, dialog_id, hot_next_retry_at=now + 90)
         adapter = HotActivityDemandAdapter(
-            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn)
+            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
         )
 
         status = adapter.status(float(now))
@@ -139,10 +145,10 @@ async def test_hot_activity_adapter_resumes_page_window_before_advancing_cursor(
             monkeypatch, {dialog_id: [_make_sweep_result(first_page), _make_sweep_result(second_page)]}
         )
         adapter = HotActivityDemandAdapter(
-            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn)
+            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
         )
 
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_selected_budget(adapter))
 
         state = _get_state(conn, dialog_id)
         resume = cast(
@@ -156,9 +162,9 @@ async def test_hot_activity_adapter_resumes_page_window_before_advancing_cursor(
         assert resume == (min(first_page), max(first_page))
 
         restarted = HotActivityDemandAdapter(
-            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn)
+            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
         )
-        await restarted.run_slice(RpcAttemptBudget(limit=1))
+        await restarted.run_slice(_selected_budget(restarted))
 
         state = _get_state(conn, dialog_id)
         resume = cast(
@@ -174,6 +180,72 @@ async def test_hot_activity_adapter_resumes_page_window_before_advancing_cursor(
 
 
 @pytest.mark.asyncio
+async def test_hot_adapter_runs_exact_excluded_page_when_enrollment_is_held(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _make_db() as conn:
+        first_id, second_id = 100120, 100121
+        _enroll(conn, first_id, hot_cursor=10)
+        _enroll(conn, second_id, hot_cursor=20)
+        conn.execute(
+            "INSERT OR REPLACE INTO activity_sync_state(key,value) VALUES('activity_working_set_phase','supergroups')"
+        )
+        conn.execute("INSERT OR REPLACE INTO activity_sync_state(key,value) VALUES('activity_working_set_cursor','')")
+        conn.commit()
+        call_log = _patch_sweep(monkeypatch, {second_id: [_make_sweep_result([21])]})
+        adapter = HotActivityDemandAdapter(
+            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
+        )
+
+        enrollment = adapter.status(float(time.time()))
+        assert enrollment is not None and enrollment.selected is not None
+        assert enrollment.selected.key.target == "enrollment"
+        first_page = adapter.status(float(time.time()), excluded=frozenset({enrollment.selected}))
+        assert first_page is not None and first_page.selected is not None
+        assert first_page.selected.key.target == f"peer:{first_id}"
+        second_page = adapter.status(float(time.time()), excluded=frozenset({enrollment.selected, first_page.selected}))
+        assert second_page is not None and second_page.selected is not None
+        assert second_page.selected.key.target == f"peer:{second_id}"
+
+        await adapter.run_slice(RpcAttemptBudget(limit=1, selected=second_page.selected))
+
+        assert call_log == {second_id: [(0, 20)]}
+
+
+@pytest.mark.asyncio
+async def test_empty_hot_cycles_receive_new_business_revisions(monkeypatch: pytest.MonkeyPatch) -> None:
+    with _make_db() as conn:
+        dialog_id = 100130
+        _enroll(conn, dialog_id, hot_cursor=10)
+        conn.execute("UPDATE activity_dialog_state SET hot_next_due_at=100 WHERE dialog_id=?", (dialog_id,))
+        conn.commit()
+        calls = _patch_sweep(monkeypatch, {dialog_id: [_make_sweep_result([]), _make_sweep_result([])]})
+        adapter = HotActivityDemandAdapter(
+            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
+        )
+
+        with pytest.MonkeyPatch.context() as patcher:
+            patcher.setattr("mcp_telegram.activity_hot_sweep.time.time", lambda: 100)
+            first = adapter.status(100.0)
+            assert first is not None and first.selected is not None
+            await adapter.run_slice(RpcAttemptBudget(limit=1, selected=first.selected))
+        conn.execute("UPDATE activity_dialog_state SET hot_next_due_at=90 WHERE dialog_id=?", (dialog_id,))
+        conn.commit()
+
+        with pytest.MonkeyPatch.context() as patcher:
+            patcher.setattr("mcp_telegram.activity_hot_sweep.time.time", lambda: 90)
+            second = adapter.status(90.0, excluded=frozenset({first.selected}))
+            assert second is not None and second.selected is not None
+            assert second.selected.revision != first.selected.revision
+            await adapter.run_slice(RpcAttemptBudget(limit=1, selected=second.selected))
+
+        assert conn.execute(
+            "SELECT hot_last_sync_at,hot_empty_streak FROM activity_dialog_state WHERE dialog_id=?", (dialog_id,)
+        ).fetchone() == (90, 2)
+        assert len(calls[dialog_id]) == 2
+
+
+@pytest.mark.asyncio
 async def test_hot_activity_adapter_access_skip_preserves_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
     with _make_db() as conn:
         dialog_id = -100100000007
@@ -181,10 +253,10 @@ async def test_hot_activity_adapter_access_skip_preserves_cursor(monkeypatch: py
         _enroll(conn, dialog_id, hot_cursor=prior_cursor)
         _patch_sweep(monkeypatch, {dialog_id: [_make_sweep_result([], skip_reason=SkipReason.ACCESS_SKIP)]})
         adapter = HotActivityDemandAdapter(
-            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn)
+            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
         )
 
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_selected_budget(adapter))
 
         state = _get_state(conn, dialog_id)
         assert state["hot_cursor"] == prior_cursor
@@ -219,10 +291,10 @@ async def test_hot_activity_adapter_full_page_without_min_id_retries(monkeypatch
             },
         )
         adapter = HotActivityDemandAdapter(
-            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn)
+            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
         )
 
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_selected_budget(adapter))
 
         state = _get_state(conn, dialog_id)
         assert state["hot_cursor"] == prior_cursor
@@ -245,8 +317,24 @@ async def test_hot_sweep_includes_adjacent_id_with_exclusive_filter(monkeypatch:
     with _make_db() as conn:
         dialog_id = -100100000088
         _enroll(conn, dialog_id, hot_cursor=10)
-        await HotActivityDemandAdapter(
-            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn)
-        ).run_slice(RpcAttemptBudget(1))
+        adapter = HotActivityDemandAdapter(
+            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
+        )
+        await adapter.run_slice(_selected_budget(adapter))
         assert fetched == [11]
         assert _get_state(conn, dialog_id)["hot_cursor"] == 11
+
+
+def test_hot_completed_cycle_advances_identity_when_new_count_does_not_advance_cursor() -> None:
+    from mcp_telegram.activity_hot_sweep import _save_hot_completed_state
+
+    with _make_db() as conn:
+        dialog_id = -100100000019
+        _enroll(conn, dialog_id, hot_cursor=20)
+        for expected_streak in (1, 2):
+            _save_hot_completed_state(
+                conn, dialog_id, hot_cursor=20, completion_at=100, genuinely_new=1, policy=_POLICY
+            )
+            assert conn.execute(
+                "SELECT hot_empty_streak,hot_last_sync_at FROM activity_dialog_state WHERE dialog_id=?", (dialog_id,)
+            ).fetchone() == (expected_streak, 100)

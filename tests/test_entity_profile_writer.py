@@ -14,7 +14,7 @@ from mcp_telegram.entity_profile.repository import EntityProfileRepository
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import ensure_sync_schema, open_sync_db_reader
 from mcp_telegram.sync_transactions import write_transaction
-from mcp_telegram.telegram_demand import RpcAttemptBudget
+from tests.demand_adapter_helpers import run_ready_slice
 from tests.test_entity_profile_full_user_pair import _pair_service, _PairClient
 
 
@@ -43,7 +43,7 @@ async def test_profile_pair_commits_and_recovers_with_readonly_loop_connection(t
         coordinator = service.refresh_coordinator
         assert coordinator is not None
         assert service._durable_refresh_status(100) is not None
-        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        await run_ready_slice(EntityProfileDemandAdapter(coordinator))
         statuses = dict(
             reader.execute(
                 "SELECT section, status FROM entity_detail_sections "

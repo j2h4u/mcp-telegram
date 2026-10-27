@@ -31,7 +31,6 @@ class HydrationOutcome(StrEnum):
     NOT_APPLIED = "not_applied"
     TELEGRAM_PENDING = "telegram_pending"
     TEMPORARY_FAILURE = "temporary_failure"
-    RPC_PAUSED = "rpc_paused"
     TERMINAL_ERROR = "terminal_error"
     EXHAUSTED = "exhausted"
 

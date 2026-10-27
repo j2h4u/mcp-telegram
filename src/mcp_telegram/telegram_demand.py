@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Protocol
 
+from mcp_telegram.telegram_demand_progress import SliceOutcome, WorkRevision
 from mcp_telegram.telegram_rpc_consumers import (
     DemandContract,
     DemandKind,
@@ -99,11 +100,15 @@ class DemandStatus:
 
     release_at: float
     freshness_deadline: float | None = None
+    selected: WorkRevision | None = None
+    request_method: str | None = None
 
     def __post_init__(self) -> None:
         _validate_timestamp(self.release_at, "release_at")
         if self.freshness_deadline is not None:
             _validate_timestamp(self.freshness_deadline, "freshness_deadline")
+        if self.selected is not None and not isinstance(self.selected, WorkRevision):
+            raise TypeError("selected must be a WorkRevision")
 
     def is_ready(self, now: float) -> bool:
         """Return whether domain work may run at *now*."""
@@ -123,26 +128,63 @@ class RpcAttemptBudgetExhaustedError(RuntimeError):
 
 
 @dataclass(slots=True)
+class RpcAttemptAccounting:
+    """One cumulative counter shared by all bindings of an exact revision."""
+
+    limit: int
+    attempts: int
+
+
+@dataclass(slots=True, init=False)
 class RpcAttemptBudget:
     """Mutable, process-local accounting for actual RPC attempts in one slice."""
 
-    limit: int
-    attempts: int = 0
+    _accounting: RpcAttemptAccounting
+    selected: WorkRevision | None
+    last_method: str | None
+    _retry_candidate: object | None
 
-    def __post_init__(self) -> None:
-        if isinstance(self.limit, bool) or not isinstance(self.limit, int) or self.limit < 1:
+    def __init__(
+        self,
+        limit: int,
+        attempts: int = 0,
+        selected: WorkRevision | None = None,
+        last_method: str | None = None,
+    ) -> None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("limit must be a positive integer")
-        if (
-            isinstance(self.attempts, bool)
-            or not isinstance(self.attempts, int)
-            or not 0 <= self.attempts <= self.limit
-        ):
+        if isinstance(attempts, bool) or not isinstance(attempts, int) or not 0 <= attempts <= limit:
             raise ValueError("attempts must be an integer between zero and limit")
+        self._accounting = RpcAttemptAccounting(limit, attempts)
+        self.selected = selected
+        self.last_method = last_method
+        self._retry_candidate = None
+
+    @property
+    def limit(self) -> int:
+        return self._accounting.limit
+
+    @limit.setter
+    def limit(self, value: int) -> None:
+        self._accounting.limit = value
+
+    @property
+    def attempts(self) -> int:
+        return self._accounting.attempts
+
+    @attempts.setter
+    def attempts(self, value: int) -> None:
+        self._accounting.attempts = value
 
     @property
     def remaining(self) -> int:
         """Return how many actual attempts remain in this slice."""
         return self.limit - self.attempts
+
+    @property
+    def can_prepare_retry(self) -> bool:
+        """A gate binding may permit preparation; it never permits a write."""
+        return self._retry_candidate is not None
 
     @property
     def exhausted(self) -> bool:
@@ -159,9 +201,9 @@ class RpcAttemptBudget:
 class DurableDemandAdapter(Protocol):
     """Narrow view over durable state owned by one demand kind."""
 
-    def status(self, now: float) -> DemandStatus | None: ...
+    def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None: ...
 
-    async def run_slice(self, budget: RpcAttemptBudget) -> None: ...
+    async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome: ...
 
 
 class UnclassifiedTelegramDemandError(RuntimeError):
@@ -287,6 +329,20 @@ def current_demand_token() -> DemandToken:
         )
     _validate_token(token)
     return token
+
+
+@contextmanager
+def durable_demand_context(kind: DemandKind) -> Iterator[DemandToken]:
+    """Reuse the coordinator's exact invocation while supporting direct owner calls."""
+    try:
+        token = current_demand_token()
+    except MissingTelegramDemandContextError:
+        with demand_context(kind) as created:
+            yield created
+        return
+    if token.kind is not kind:
+        raise UnclassifiedTelegramDemandError("durable owner inherited an incompatible demand root")
+    yield token
 
 
 def require_execution_mode(expected: ExecutionMode) -> DemandToken:

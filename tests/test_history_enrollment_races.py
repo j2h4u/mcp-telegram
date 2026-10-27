@@ -15,6 +15,7 @@ from mcp_telegram.daemon import (
     _apply_read_positions_from_dialogs,
 )
 from mcp_telegram.history_enrollment import disable_history
+from mcp_telegram.message_fact_refresh import ReadReceiptDemandAdapter
 from mcp_telegram.sync_db import _apply_migrations
 
 
@@ -73,6 +74,10 @@ async def test_read_cursor_disable_before_apply_discards_positions(tmp_path) -> 
     first.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (3,'synced')")
     first.execute("INSERT INTO full_history_enrollment VALUES (3,1,'explicit',1)")
     first.commit()
+    adapter = ReadReceiptDemandAdapter(first, lambda _selected: None, account_id=1)  # type: ignore[arg-type]
+    status = adapter.status(0.0)
+    assert status is not None and status.selected is not None
+    selected = status.selected
     disable_history(second, 3, now=2)
     second.commit()
     result = SimpleNamespace(
@@ -83,7 +88,8 @@ async def test_read_cursor_disable_before_apply_discards_positions(tmp_path) -> 
     old = daemon.telethon_utils.get_peer_id
     daemon.telethon_utils.get_peer_id = lambda _: 3
     try:
-        assert _apply_read_positions_from_dialogs(first, result) == 0
+        filled, _outcome = _apply_read_positions_from_dialogs(first, result, selected=selected)
+        assert filled == 0
     finally:
         daemon.telethon_utils.get_peer_id = old
     assert first.execute(

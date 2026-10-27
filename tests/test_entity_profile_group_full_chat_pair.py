@@ -18,9 +18,10 @@ from mcp_telegram.entity_profile.contracts import GroupProfileObservation
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.entity_profile.repository import EntitySectionCommit
 from mcp_telegram.flood import TelegramRpcThrottled
-from mcp_telegram.telegram_demand import RpcAttemptBudget, RpcAttemptBudgetExhaustedError
+from mcp_telegram.telegram_demand import RpcAttemptBudgetExhaustedError
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 from mcp_telegram.telethon_dialog import observe_dialog_identity
+from tests.demand_adapter_helpers import run_ready_slice
 from tests.helpers import ClientChatAvatarHistoryPort
 from tests.test_entity_profile_full_user_pair import _fenced_schema, _pair_service
 
@@ -185,7 +186,7 @@ async def test_group_pair_uses_one_rpc_and_commits_independent_projections() -> 
         version=1,
     )
     client.response = _full_chat(participants=participants)
-    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+    await run_ready_slice(EntityProfileDemandAdapter(service.refresh_coordinator))  # type: ignore[attr-defined]
 
     assert client.calls == ["full_chat"]
     assert conn.execute(
@@ -221,7 +222,7 @@ async def test_forbidden_group_pair_publishes_complete_identity_without_mutating
     object.__setattr__(response, "chats", [types.ChatForbidden(id=123, title="Partial group")])
     client.response = response
 
-    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+    await run_ready_slice(EntityProfileDemandAdapter(service.refresh_coordinator))  # type: ignore[attr-defined]
 
     assert conn.execute("SELECT name,type,username,identity_revision FROM dialogs WHERE dialog_id=-123").fetchone() == (
         "Partial group",
@@ -237,7 +238,7 @@ async def test_forbidden_group_pair_publishes_complete_identity_without_mutating
 async def test_group_pair_real_empty_participants_are_complete_empty_overlap() -> None:
     conn, service, client = _service()
     client.response = _full_chat(participants=types.ChatParticipants(chat_id=123, participants=[], version=1))
-    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+    await run_ready_slice(EntityProfileDemandAdapter(service.refresh_coordinator))  # type: ignore[attr-defined]
 
     detail = service._profiles.read(-123, now=100)  # type: ignore[attr-defined]
     assert detail is not None
@@ -257,7 +258,7 @@ async def test_group_pair_requires_positive_non_bool_participant_chat_id(bad_cha
     participants = types.ChatParticipants(chat_id=123, participants=[], version=1)
     participants.chat_id = cast(int, bad_chat_id)
     client.response = _full_chat(participants=participants)
-    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+    await run_ready_slice(EntityProfileDemandAdapter(service.refresh_coordinator))  # type: ignore[attr-defined]
     assert conn.execute(
         "SELECT status, reason FROM entity_detail_sections WHERE entity_id=-123 AND section='contact_overlap'"
     ).fetchone() == ("unavailable", "participants_target_mismatch")
@@ -272,7 +273,8 @@ async def test_group_pair_rejects_non_positive_or_non_int_target(bad_target: obj
     response = _full_chat()
     response.full_chat.id = cast(int, bad_target)
     client.response = response
-    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+    with pytest.raises(ValueError):
+        await run_ready_slice(EntityProfileDemandAdapter(service.refresh_coordinator))  # type: ignore[attr-defined]
     assert conn.execute(
         "SELECT status, reason, next_section FROM entity_profile_refresh_state WHERE entity_id=-123"
     ).fetchone() == ("failed", "valueerror", "full_profile")
@@ -283,7 +285,7 @@ async def test_group_pair_rejects_non_positive_or_non_int_target(bad_target: obj
 @pytest.mark.asyncio
 async def test_group_pair_sections_share_the_observation_boundary() -> None:
     conn, service, _client = _service()
-    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+    await run_ready_slice(EntityProfileDemandAdapter(service.refresh_coordinator))  # type: ignore[attr-defined]
     assert conn.execute(
         "SELECT observation_started_at, observation_completed_at FROM entity_detail_sections "
         "WHERE entity_id=-123 AND section IN ('full_profile','contact_overlap') ORDER BY section"
@@ -299,13 +301,13 @@ async def test_group_profile_refresh_fills_missing_hidden_dialog_created_once() 
     client.created = 1_700_000_000
     conn.commit()
 
-    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+    await run_ready_slice(EntityProfileDemandAdapter(service.refresh_coordinator))  # type: ignore[attr-defined]
 
     assert conn.execute("SELECT created FROM dialogs WHERE dialog_id=-123").fetchone() == (1_700_000_000,)
     client.created = None
     conn.execute("UPDATE entity_profile_refresh_state SET next_section='full_profile' WHERE entity_id=-123")
     conn.commit()
-    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+    await run_ready_slice(EntityProfileDemandAdapter(service.refresh_coordinator))  # type: ignore[attr-defined]
     assert conn.execute("SELECT created FROM dialogs WHERE dialog_id=-123").fetchone() == (1_700_000_000,)
     await service.shutdown()  # type: ignore[attr-defined]
     conn.close()
@@ -336,7 +338,7 @@ async def test_old_contact_cursor_keeps_independent_fallback() -> None:
         "UPDATE entity_profile_refresh_state SET next_section='contact_overlap', acquisition_cursor=0 WHERE entity_id=-123"
     )
     conn.commit()
-    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+    await run_ready_slice(EntityProfileDemandAdapter(service.refresh_coordinator))  # type: ignore[attr-defined]
     assert client.calls == ["full_chat"]
     assert conn.execute("SELECT next_section FROM entity_profile_refresh_state WHERE entity_id=-123").fetchone() == (
         "avatar_history",
@@ -406,14 +408,14 @@ def test_group_pair_detail_revision_only_stale_cursor_does_not_mutate_anything()
 async def test_ordinary_completion_follow_up_starts_one_fenced_generation() -> None:
     conn, service, client = _service()
     adapter = EntityProfileDemandAdapter(service.refresh_coordinator)  # type: ignore[attr-defined]
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(adapter)
+    await run_ready_slice(adapter)
+    await run_ready_slice(adapter)
     assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=-123").fetchone() == (
         "complete",
     )
     assert service._profiles.request_follow_up(-123, now=100)  # type: ignore[attr-defined]
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(adapter)
     detail_revision = conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=-123").fetchone()[0]
     assert conn.execute(
         "SELECT generation, profile_revision, next_section, acquisition_cursor, follow_up_required "
@@ -445,7 +447,7 @@ async def test_group_pair_keeps_full_profile_when_participants_are_unavailable(k
     client.response = _full_chat(participants=participants)
     if kind == "missing":
         cast(types.ChatFull, client.response.full_chat).participants = None  # type: ignore[union-attr]
-    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+    await run_ready_slice(EntityProfileDemandAdapter(service.refresh_coordinator))  # type: ignore[attr-defined]
 
     assert conn.execute(
         "SELECT status, reason FROM entity_detail_sections WHERE entity_id=-123 AND section='full_profile'"
@@ -467,7 +469,7 @@ async def test_group_pair_invalid_participant_ids_do_not_create_empty_overlap(ba
     client.response = _full_chat(
         participants=types.ChatParticipants(chat_id=123, participants=[participant], version=1)
     )
-    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+    await run_ready_slice(EntityProfileDemandAdapter(service.refresh_coordinator))  # type: ignore[attr-defined]
     assert conn.execute(
         "SELECT status, reason FROM entity_detail_sections WHERE entity_id=-123 AND section='contact_overlap'"
     ).fetchone() == ("unavailable", "participants_malformed")
@@ -500,7 +502,8 @@ async def test_group_pair_invalid_participant_ids_do_not_create_empty_overlap(ba
 async def test_group_pair_rejects_wrong_envelope_and_nested_channel_full(response: object) -> None:
     conn, service, client = _service()
     client.response = response
-    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+    with pytest.raises(ValueError):
+        await run_ready_slice(EntityProfileDemandAdapter(service.refresh_coordinator))  # type: ignore[attr-defined]
     assert conn.execute(
         "SELECT status, reason, next_section FROM entity_profile_refresh_state WHERE entity_id=-123"
     ).fetchone() == ("failed", "valueerror", "full_profile")
@@ -513,7 +516,11 @@ async def test_group_pair_budget_and_flood_wait_leave_projections_unwritten() ->
     for failure in (RpcAttemptBudgetExhaustedError("budget"), TelegramRpcThrottled(retry_after_seconds=7)):
         conn, service, client = _service()
         client.failure = failure
-        await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+        if isinstance(failure, TelegramRpcThrottled):
+            with pytest.raises(TelegramRpcThrottled):
+                await run_ready_slice(EntityProfileDemandAdapter(service.refresh_coordinator))  # type: ignore[attr-defined]
+        else:
+            await run_ready_slice(EntityProfileDemandAdapter(service.refresh_coordinator))  # type: ignore[attr-defined]
         assert conn.execute(
             "SELECT COUNT(*) FROM entity_detail_sections WHERE entity_id=-123 AND status='fresh'"
         ).fetchone() == (0,)
@@ -562,17 +569,17 @@ def test_group_pair_repository_rolls_back_when_cursor_advance_is_rejected() -> N
 async def test_group_pair_follow_up_carries_detail_revision_into_next_generation() -> None:
     conn, service, client = _service()
     adapter = EntityProfileDemandAdapter(service.refresh_coordinator)  # type: ignore[attr-defined]
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(adapter)
     assert service._profiles.request_follow_up(-123, now=100)  # type: ignore[attr-defined]
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(adapter)
+    await run_ready_slice(adapter)
 
     detail_revision = conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=-123").fetchone()[0]
     assert conn.execute(
         "SELECT status, generation, profile_revision, next_section, acquisition_cursor, follow_up_required "
         "FROM entity_profile_refresh_state WHERE entity_id=-123"
     ).fetchone() == ("pending", 2, detail_revision, "full_profile", 0, 0)
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(adapter)
     assert client.calls == ["full_chat", "search", "full_chat"]
     await service.shutdown()  # type: ignore[attr-defined]
     conn.close()
@@ -590,7 +597,7 @@ async def test_group_pair_auth_scope_change_does_not_commit_evidence() -> None:
         scopes[0] = TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 3, 99)
 
     client.after_call = change_scope
-    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+    await run_ready_slice(EntityProfileDemandAdapter(service.refresh_coordinator))  # type: ignore[attr-defined]
     assert conn.execute(
         "SELECT status, reason, next_section FROM entity_profile_refresh_state WHERE entity_id=-123"
     ).fetchone() == ("failed", "auth_scope_changed", "full_profile")

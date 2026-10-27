@@ -82,10 +82,26 @@ def _operation(
         return lambda: activity_peer_sweep.sweep_peer_once(request)
     if kind == "backfill":
         monkeypatch.setattr(activity_sync, "_search_backfill_batch", rpc)
-        return lambda: activity_sync._run_backfill_slice(client, reader, asyncio.Event(), timeout_s=1, writer=writer)
+        adapter = activity_sync.ArchiveBackfillDemandAdapter(
+            client, reader, asyncio.Event(), timeout_s=1, writer=writer, account_id=1
+        )
+        status = adapter.status(0.0)
+        assert status is not None and status.selected is not None
+        expected_revision = status.selected.revision
+        return lambda: activity_sync._run_backfill_slice(
+            client, reader, asyncio.Event(), timeout_s=1, writer=writer, expected_revision=expected_revision
+        )
     assert kind == "incremental"
     monkeypatch.setattr(activity_sync, "_search_incremental_batch", rpc)
-    return lambda: activity_sync._run_incremental_slice(client, reader, asyncio.Event(), timeout_s=1, writer=writer)
+    adapter = activity_sync.ArchiveIncrementalDemandAdapter(
+        client, reader, asyncio.Event(), interval_s=1, timeout_s=1, writer=writer, account_id=1
+    )
+    status = adapter.status(0.0)
+    assert status is not None and status.selected is not None
+    expected_revision = status.selected.revision
+    return lambda: activity_sync._run_incremental_slice(
+        client, reader, asyncio.Event(), timeout_s=1, writer=writer, expected_revision=expected_revision
+    )
 
 
 async def _trace_jobs(writer: SQLiteWriter, monkeypatch: pytest.MonkeyPatch) -> tuple[list[str], list[str]]:
@@ -128,9 +144,20 @@ async def test_preparation_is_one_committed_job_before_acquisition(
         assert not reader.in_transaction
         if kind in {"full", "delta", "peer"}:
             assert reader.execute("SELECT needs_refresh FROM dialogs WHERE dialog_id=1").fetchone() == (1,)
+        elif kind == "backfill":
+            activity_state = dict(reader.execute("SELECT key,value FROM activity_sync_state"))
+            assert activity_state == {
+                "backfill_complete": "0",
+                "last_sync_at": "100",
+                "backfill_offset_id": "0",
+            }
         else:
-            key = "incremental_started_at" if kind == "incremental" else "backfill_started_at"
-            assert reader.execute("SELECT value FROM activity_sync_state WHERE key=?", (key,)).fetchone()
+            activity_state = dict(reader.execute("SELECT key,value FROM activity_sync_state"))
+            assert activity_state == {
+                "backfill_complete": "1",
+                "last_sync_at": "100",
+                "backfill_offset_id": "0",
+            }
 
     with pytest.raises(_AcquisitionReachedError):
         await _operation(kind, reader, writer, monkeypatch, rpc)()

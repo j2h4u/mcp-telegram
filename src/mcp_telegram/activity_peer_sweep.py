@@ -19,12 +19,11 @@ links missing from the activity projection are enrolled before the next scan.
 No scheduling loops live here — those are plans 03 and 04.
 """
 
-import asyncio
 import logging
 import math
 import sqlite3
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Protocol, cast
@@ -48,7 +47,7 @@ from .sqlite_writer import SQLiteWriter
 from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import RpcAttemptBudgetExhaustedError
-from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource
+from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcMethodRecoveryPending, TelegramRpcSource
 from .telethon_dialog import observe_response_dialog_identity
 
 logger = logging.getLogger(__name__)
@@ -130,6 +129,7 @@ class SweepResult:
     genuinely_new: int = field(default=0, compare=False)
     genuinely_new_keys: frozenset[tuple[int, int]] = field(default=frozenset(), compare=False)
     completed: bool = field(default=False, compare=False)
+    accepted: bool = field(default=True, compare=False)
 
     @property
     def hit_floor(self) -> bool:
@@ -155,6 +155,7 @@ class PeerSweepRequest:
     timeout_s: float
     writer: SQLiteWriter = field(kw_only=True)
     hydration_priority: HydrationPriority = HydrationPriority.BACKFILL
+    accept_page: Callable[[sqlite3.Connection], bool] | None = None
 
 
 _LEGACY_PEER_SWEEP_POSITIONAL_ARGS = 3
@@ -176,11 +177,6 @@ class _SearchOutcome:
     early_result: SweepResult | None = None
 
 
-async def _pace_successful_search_request() -> None:
-    """Apply a tiny fixed pause after a successful SearchRequest."""
-    await asyncio.sleep(_PACING.search.success_s)
-
-
 async def _resolve_peer_for_sweep(request: PeerSweepRequest) -> TypeInputPeer | SweepResult | None:
     """Resolve one peer while preserving the governed-RPC error boundary."""
     try:
@@ -191,6 +187,8 @@ async def _resolve_peer_for_sweep(request: PeerSweepRequest) -> TypeInputPeer | 
         # retry the same peer with a fresh budget.
         raise
     except RpcAdmissionClosedError:
+        raise
+    except TelegramRpcMethodRecoveryPending:
         raise
     except TelegramRpcThrottled as exc:
         _raise_if_latched(exc)
@@ -236,6 +234,8 @@ def _extract_and_persist_sweep_messages(  # noqa: PLR0913, PLR0917 - atomic page
     """Return page rows or an explicit non-completion processing error."""
     try:
         with write_transaction(conn):
+            if request.accept_page is not None and not request.accept_page(conn):
+                return SweepResult([], 0, None, None, completed=False, accepted=False)
             try:
                 extracted, genuinely_new_keys = _extract_sweep_messages(conn, request, batch)
             except Exception:
@@ -280,6 +280,7 @@ def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequ
         HydrationPriority,
         kwargs.pop("hydration_priority", HydrationPriority.BACKFILL),
     )
+    accept_page = cast(Callable[[sqlite3.Connection], bool] | None, kwargs.pop("accept_page", None))
     if kwargs:
         raise TypeError(f"sweep_peer_once: unexpected keyword arguments {sorted(kwargs)!r}")
 
@@ -293,6 +294,7 @@ def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequ
         timeout_s=timeout_s,
         writer=writer,
         hydration_priority=hydration_priority,
+        accept_page=accept_page,
     )
 
 
@@ -345,6 +347,8 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, 
             timeout_s=request.timeout_s,
         )
     except RpcAdmissionClosedError:
+        raise
+    except TelegramRpcMethodRecoveryPending:
         raise
     except RpcAttemptBudgetExhaustedError:
         # Do not turn a local slice bound into ACCESS_SKIP.  The caller owns
@@ -444,7 +448,6 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:  # no
         return search.early_result
 
     rpc_duration_s = search.rpc_duration_s
-    await _pace_successful_search_request()
     batch = list(cast(_SweepResultLike, search.result).messages or [])
     identity = observe_response_dialog_identity(
         search.result, request.dialog_id, source="profile", observed_at=int(time.time())

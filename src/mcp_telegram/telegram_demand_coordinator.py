@@ -9,6 +9,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
 
@@ -21,6 +22,7 @@ from mcp_telegram.telegram_demand import (
     RpcAttemptBudgetExhaustedError,
     demand_context,
 )
+from mcp_telegram.telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkRevision
 from mcp_telegram.telegram_rpc_consumers import (
     DURABLE_DEMAND_ORDER,
     TELEGRAM_DEMAND_CONTRACTS,
@@ -34,6 +36,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionExpiredError,
     RpcAdmissionSaturatedError,
     TelegramRpcAdmissionDeferred,
+    TelegramRpcMethodRecoveryPending,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,6 +45,7 @@ DEFAULT_SAFETY_SCAN_SECONDS = 60.0
 MIN_WAIT_SECONDS = 0.001
 _DEFERRED_ERRORS = (
     TelegramRpcAdmissionDeferred,
+    TelegramRpcMethodRecoveryPending,
     RpcAttemptBudgetExhaustedError,
     RpcAdmissionSaturatedError,
     RpcAdmissionExpiredError,
@@ -55,6 +59,12 @@ class CoordinatorState(StrEnum):
     RUNNING = "running"
     STOPPING = "stopping"
     STOPPED = "stopped"
+
+
+@dataclass(slots=True)
+class _Invocation:
+    budget: RpcAttemptBudget
+    deadline: float | None
 
 
 def _durable_kinds(contracts: Mapping[DemandKind, DemandContract]) -> frozenset[DemandKind]:
@@ -109,7 +119,7 @@ def _validate_adapter_contract(
 class TelegramDemandCoordinator:
     """Run one bounded durable slice at a time until shutdown."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - constructor dependencies are the coordinator's public wiring surface.
         self,
         adapters: Mapping[DemandKind, DurableDemandAdapter],
         shutdown_event: asyncio.Event | None = None,
@@ -117,6 +127,10 @@ class TelegramDemandCoordinator:
         clock: Callable[[], float] = time.time,
         safety_scan_seconds: float = DEFAULT_SAFETY_SCAN_SECONDS,
         observer: object | None = None,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+        rpc_eligibility: Callable[[str | None], TelegramRpcThrottled | TelegramRpcMethodRecoveryPending | None]
+        | None = None,
+        prepare_durable_retry: Callable[[RpcAttemptBudget, str | None], bool] | None = None,
     ) -> None:
         validate_durable_adapters(adapters)
         if not math.isfinite(safety_scan_seconds) or safety_scan_seconds <= 0:
@@ -124,6 +138,9 @@ class TelegramDemandCoordinator:
         self._adapters: Mapping[DemandKind, DurableDemandAdapter] = MappingProxyType(dict(adapters))
         self._shutdown_event = shutdown_event or asyncio.Event()
         self._clock = clock
+        self._monotonic_clock = monotonic_clock
+        self._rpc_eligibility = rpc_eligibility or (lambda _method: None)
+        self._prepare_durable_retry = prepare_durable_retry or (lambda _budget, _method: False)
         self._safety_scan_seconds = float(safety_scan_seconds)
         self._observer = observer
         self._wake = asyncio.Event()
@@ -137,8 +154,10 @@ class TelegramDemandCoordinator:
         self._active_kind: DemandKind | None = None
         self._next_release_at: float | None = None
         self._status_failed_until: dict[DemandKind, float] = {}
-        self._suppressed_until: dict[DemandKind, float] = {}
-        self._global_release_at: float | None = None
+        self._invocations: dict[WorkRevision, _Invocation] = {}
+        self._excluded: set[WorkRevision] = set()
+        self._eligibility_waits: dict[WorkRevision, float | None] = {}
+        self._revision_methods: dict[WorkRevision, str] = {}
         self.scan()
 
     @property
@@ -166,6 +185,23 @@ class TelegramDemandCoordinator:
         self._shutdown_event.set()
         self._wake.set()
 
+    def eligibility_changed(self, method_key: str | None = None) -> None:
+        """Wake the pump after gate eligibility changes."""
+        if method_key is None:
+            revisions = tuple(self._eligibility_waits)
+            self._eligibility_waits.clear()
+            self._excluded.difference_update(revisions)
+        else:
+            for revision, invocation in tuple(self._invocations.items()):
+                if self._method_for_work(revision, invocation.budget) == method_key:
+                    self._eligibility_waits.pop(revision, None)
+                    self._excluded.discard(revision)
+            for revision, method in tuple(self._revision_methods.items()):
+                if method == method_key:
+                    self._eligibility_waits.pop(revision, None)
+                    self._excluded.discard(revision)
+        self._wake.set()
+
     @contextmanager
     def protocol_scope(self, kind: DemandKind) -> Iterator[DemandToken]:
         """Attribute Telethon-owned recovery without owning its lifecycle."""
@@ -189,6 +225,7 @@ class TelegramDemandCoordinator:
     def scan(self, *, now: float | None = None, clear_offers: bool = True) -> tuple[DemandKind, ...]:
         """Perform one complete authoritative status scan in stable order."""
         observed_at = self._now() if now is None else self._validate_now(now)
+        self._prepare_expired_gate_waits(self._monotonic_clock())
         if clear_offers:
             self._offered.clear()
         for kind in DURABLE_DEMAND_ORDER:
@@ -196,18 +233,31 @@ class TelegramDemandCoordinator:
         self._recompute_next_release(observed_at)
         return self.ready_kinds
 
+    def _prepare_expired_gate_waits(self, monotonic_now: float) -> None:
+        for revision, eligible_at in tuple(self._eligibility_waits.items()):
+            if eligible_at is not None and monotonic_now >= eligible_at:
+                self._excluded.discard(revision)
+                self._eligibility_waits.pop(revision, None)
+
     def _scan_kind(self, kind: DemandKind, observed_at: float) -> None:
         if observed_at < self._status_failed_until.get(kind, -math.inf):
             return
         try:
-            status = self._adapters[kind].status(observed_at)
-            if status is not None and not isinstance(status, DemandStatus):
-                raise TypeError("adapter returned an invalid status")
+            while True:
+                excluded = frozenset(self._excluded)
+                status = self._adapters[kind].status(observed_at, excluded=excluded)
+                if status is not None and not isinstance(status, DemandStatus):
+                    raise TypeError("adapter returned an invalid status")
+                if status is None:
+                    self._apply_status(kind, None, observed_at)
+                    break
+                self._apply_status(kind, status, observed_at)
+                if status.selected is None or status.selected not in self._excluded or status.selected in excluded:
+                    break
         except Exception as exc:  # noqa: BLE001 - one bad domain cannot stop the pump
             self._record_status_failure(kind, observed_at, exc)
             return
         self._status_failed_until.pop(kind, None)
-        self._apply_status(kind, status, observed_at)
 
     def _record_status_failure(self, kind: DemandKind, observed_at: float, exc: Exception) -> None:
         self._status_failed_until[kind] = observed_at + self._safety_scan_seconds
@@ -227,7 +277,15 @@ class TelegramDemandCoordinator:
             self._remove_queued(kind)
             return
         self._statuses[kind] = status
-        is_ready = status.is_ready(observed_at) and not self._is_suppressed(kind, observed_at)
+        selected = status.selected
+        if selected is not None:
+            self._prune_revised_invocations(selected)
+        if selected is not None and selected in self._excluded:
+            self._authoritative_ready.discard(kind)
+            self._remove_queued(kind)
+            return
+        status, is_ready = self._eligibility_status(kind, status, observed_at)
+        self._statuses[kind] = status
         if not is_ready:
             self._authoritative_ready.discard(kind)
             self._remove_queued(kind)
@@ -237,6 +295,83 @@ class TelegramDemandCoordinator:
             self._queue.append(kind)
             self._queued.add(kind)
             self._queued_since[kind] = observed_at
+
+    def _prune_revised_invocations(self, selected: WorkRevision) -> None:
+        for revision in tuple(self._invocations):
+            if revision.key == selected.key and revision != selected:
+                self._invocations.pop(revision, None)
+                self._excluded.discard(revision)
+                self._eligibility_waits.pop(revision, None)
+                self._revision_methods.pop(revision, None)
+
+    def _method_for_work(
+        self,
+        selected: WorkRevision | None,
+        budget: RpcAttemptBudget | None = None,
+        advisory: str | None = None,
+    ) -> str | None:
+        pending = None if selected is None else self._revision_methods.get(selected)
+        physical = None if budget is None else budget.last_method
+        return pending or physical or advisory
+
+    def _eligibility_status(
+        self, kind: DemandKind, status: DemandStatus, observed_at: float
+    ) -> tuple[DemandStatus, bool]:
+        selected = status.selected
+        if not status.is_ready(observed_at) or selected is None:
+            return status, False
+        invocation = self._invocations.get(selected)
+        method = self._method_for_work(
+            selected, None if invocation is None else invocation.budget, status.request_method
+        )
+        gate = self._rpc_eligibility(method)
+        if isinstance(gate, TelegramRpcAdmissionDeferred):
+            self._park_method_deferral(kind, selected, method, gate)
+            return self._gate_release(status, gate.eligible_at, observed_at), False
+        if isinstance(gate, (TelegramRpcThrottled, TelegramRpcMethodRecoveryPending)):
+            if isinstance(gate, TelegramRpcMethodRecoveryPending):
+                self._revision_methods[selected] = gate.method_key
+            self._excluded.add(selected)
+            self._eligibility_waits[selected] = None
+            return status, False
+        self._eligibility_waits.pop(selected, None)
+        return status, True
+
+    def _park_method_deferral(
+        self,
+        kind: DemandKind,
+        selected: WorkRevision,
+        method: str | None,
+        gate: TelegramRpcAdmissionDeferred,
+    ) -> None:
+        method = gate.method_key or method
+        invocation = self._invocations.get(selected)
+        if invocation is None and gate.generation is not None:
+            contract = demand_contract(kind)
+            if contract.max_rpc_attempts_per_slice is None:
+                raise RuntimeError(f"durable demand {kind.value} has no slice budget")
+            invocation = _Invocation(
+                RpcAttemptBudget(limit=contract.max_rpc_attempts_per_slice, selected=selected),
+                None,
+            )
+            self._invocations[selected] = invocation
+        if method is not None and invocation is not None:
+            self._prepare_durable_retry(invocation.budget, method)
+        if method is not None:
+            self._revision_methods[selected] = method
+        self._excluded.add(selected)
+        self._eligibility_waits[selected] = gate.eligible_at
+
+    def _gate_release(self, status: DemandStatus, eligible_at: float | None, observed_at: float) -> DemandStatus:
+        if eligible_at is None:
+            return status
+        release_at = observed_at + max(0.0, eligible_at - self._monotonic_clock())
+        return DemandStatus(
+            max(status.release_at, release_at),
+            status.freshness_deadline,
+            status.selected,
+            status.request_method,
+        )
 
     async def run(self) -> None:
         """Run the critical process-wide durable pump until shutdown."""
@@ -261,9 +396,8 @@ class TelegramDemandCoordinator:
                     await asyncio.sleep(0)
         except asyncio.CancelledError:
             raise
-        except TelegramRpcThrottled as exc:
-            if not exc.latched:
-                raise
+        except TelegramRpcThrottled:
+            raise
         finally:
             self._state = CoordinatorState.STOPPING
             self._active_kind = None
@@ -274,15 +408,57 @@ class TelegramDemandCoordinator:
         limit = contract.max_rpc_attempts_per_slice
         if limit is None:
             raise RuntimeError(f"durable demand {kind.value} has no slice budget")
-        budget = RpcAttemptBudget(limit=limit)
         selected_at = self._now()
         queued_at = self._queued_since.pop(kind, selected_at)
         status = self._statuses.get(kind)
+        if status is None or status.selected is None:
+            raise RuntimeError(f"durable demand {kind.value} did not select an exact work revision")
+        invocation = self._invocations.get(status.selected)
+        if invocation is None:
+            invocation = _Invocation(
+                RpcAttemptBudget(limit=limit, selected=status.selected),
+                self._monotonic_clock() + contract.admission_timeout_seconds,
+            )
+            self._invocations[status.selected] = invocation
+        if not self._authorize_invocation(kind, status, invocation):
+            return
+        await self._run_invocation(kind, status, invocation, selected_at, queued_at)
+
+    def _authorize_invocation(self, kind: DemandKind, status: DemandStatus, invocation: _Invocation) -> bool:
+        if invocation.deadline is None:
+            invocation.deadline = self._monotonic_clock() + demand_contract(kind).admission_timeout_seconds
+        if not invocation.budget.exhausted and self._monotonic_clock() < invocation.deadline:
+            return True
+        method = self._method_for_work(status.selected, invocation.budget, status.request_method)
+        if self._prepare_durable_retry(invocation.budget, method):
+            invocation.deadline = self._monotonic_clock() + demand_contract(kind).admission_timeout_seconds
+            return True
+        if status.selected is not None:
+            self._excluded.add(status.selected)
+            self._eligibility_waits[status.selected] = None
+        self._observe("deferred", kind, actual_attempts=invocation.budget.attempts, reason="retry_not_authorized")
+        return False
+
+    async def _run_invocation(
+        self,
+        kind: DemandKind,
+        status: DemandStatus,
+        invocation: _Invocation,
+        selected_at: float,
+        queued_at: float,
+    ) -> None:
+        selected = status.selected
+        if selected is None:
+            return
+        budget = invocation.budget
         self._active_kind = kind
         self._observe("selected", kind, queue_age_seconds=max(0.0, selected_at - queued_at), status=status)
+        assert invocation.deadline is not None
         try:
-            async with asyncio.timeout(contract.admission_timeout_seconds):
-                await self._adapters[kind].run_slice(budget)
+            remaining = max(0.0, invocation.deadline - self._monotonic_clock())
+            with demand_context(kind, deadline=invocation.deadline):
+                async with asyncio.timeout(remaining):
+                    outcome = await self._run_adapter(kind, budget, selected)
         except asyncio.CancelledError:
             raise
         except RpcAdmissionClosedError:
@@ -292,12 +468,49 @@ class TelegramDemandCoordinator:
         except _DEFERRED_ERRORS as exc:
             self._handle_deferred(kind, budget, exc)
         except TelegramRpcThrottled as exc:
-            if self._handle_throttle(kind, budget, exc):
-                raise
+            self._handle_throttle(kind, budget, exc)
         except Exception as exc:  # noqa: BLE001 - adapter failure must not kill sibling demand
             self._handle_slice_failure(kind, budget, exc)
         else:
+            self._handle_outcome(kind, status, budget, outcome)
+
+    async def _run_adapter(self, kind: DemandKind, budget: RpcAttemptBudget, selected: WorkRevision) -> SliceOutcome:
+        attempts_before = budget.attempts
+        try:
+            return await self._adapters[kind].run_slice(budget)
+        finally:
+            if budget.attempts > attempts_before:
+                self._revision_methods.pop(selected, None)
+
+    def _handle_outcome(
+        self, kind: DemandKind, status: DemandStatus, budget: RpcAttemptBudget, outcome: object
+    ) -> None:
+        selected = status.selected
+        if selected is None:
+            return
+        if not isinstance(outcome, SliceOutcome) or outcome.selected != selected:
+            self._exclude_revision(kind, selected, budget, "invalid_slice_outcome")
+        elif (
+            outcome.kind in {SliceOutcomeKind.PROGRESSED, SliceOutcomeKind.TERMINAL}
+            and outcome.committed_revision_for(selected) is not None
+        ):
+            self._invocations.pop(selected, None)
+            self._excluded.discard(selected)
+            self._eligibility_waits.pop(selected, None)
+            self._revision_methods.pop(selected, None)
             self._observe("completed", kind, actual_attempts=budget.attempts)
+        elif outcome.kind is SliceOutcomeKind.DEFERRED and self._handle_outcome_deferred(kind, status, budget):
+            return
+        else:
+            self._exclude_revision(kind, selected, budget, outcome.kind.value)
+
+    def _handle_outcome_deferred(self, kind: DemandKind, status: DemandStatus, budget: RpcAttemptBudget) -> bool:
+        method = self._method_for_work(budget.selected, budget, status.request_method)
+        eligibility = self._rpc_eligibility(method)
+        if not isinstance(eligibility, (TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending)):
+            return False
+        self._handle_deferred(kind, budget, eligibility)
+        return True
 
     def _handle_closed_admission(self, kind: DemandKind, budget: RpcAttemptBudget) -> bool:
         if self._shutdown_event.is_set():
@@ -309,19 +522,37 @@ class TelegramDemandCoordinator:
 
     def _handle_deferred(self, kind: DemandKind, budget: RpcAttemptBudget, exc: Exception) -> None:
         if isinstance(exc, TelegramRpcAdmissionDeferred):
-            self._suppress(kind, exc.retry_after_seconds)
+            method = exc.method_key or self._method_for_work(budget.selected, budget)
+            if method is not None:
+                self._prepare_durable_retry(budget, method)
+            if budget.selected is not None:
+                if method is not None:
+                    self._revision_methods[budget.selected] = method
+                self._excluded.add(budget.selected)
+                self._eligibility_waits[budget.selected] = exc.eligible_at
             self._observe("deferred", kind, actual_attempts=budget.attempts, reason="admission_deferred")
+            return
+        if isinstance(exc, TelegramRpcMethodRecoveryPending):
+            if budget.selected is not None:
+                self._revision_methods[budget.selected] = exc.method_key
+                self._prepare_durable_retry(budget, exc.method_key)
+                self._excluded.add(budget.selected)
+                self._eligibility_waits[budget.selected] = None
+            self._observe("deferred", kind, actual_attempts=budget.attempts, reason="method_recovery_pending")
             return
         self._handle_pacing_deferred(kind, budget, exc)
 
-    def _handle_throttle(self, kind: DemandKind, budget: RpcAttemptBudget, exc: TelegramRpcThrottled) -> bool:
-        if exc.latched:
-            return True
-        now = self._now()
-        self._global_release_at = max(self._global_release_at or 0.0, now + (exc.retry_after_seconds or 0))
-        self._recompute_next_release(now)
+    def _handle_throttle(self, kind: DemandKind, budget: RpcAttemptBudget, exc: TelegramRpcThrottled) -> None:
+        method = self._method_for_work(budget.selected, budget)
+        hint = self._rpc_eligibility(method)
+        if isinstance(hint, (TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending)):
+            self._handle_deferred(kind, budget, hint)
+            return
+        if budget.selected is not None:
+            self._excluded.add(budget.selected)
+            if exc.latched or isinstance(hint, TelegramRpcThrottled):
+                self._eligibility_waits[budget.selected] = None
         self._observe("deferred", kind, actual_attempts=budget.attempts, reason="flood_wait")
-        return False
 
     def _handle_pacing_deferred(self, kind: DemandKind, budget: RpcAttemptBudget, exc: Exception) -> None:
         if isinstance(exc, RpcAttemptBudgetExhaustedError):
@@ -330,11 +561,13 @@ class TelegramDemandCoordinator:
             reason = "admission_saturated"
         else:
             reason = "admission_expired"
-        self._suppress(kind, self._safety_scan_seconds)
+        if budget.selected is not None:
+            self._excluded.add(budget.selected)
         self._observe("deferred", kind, actual_attempts=budget.attempts, reason=reason)
 
     def _handle_slice_failure(self, kind: DemandKind, budget: RpcAttemptBudget, exc: Exception) -> None:
-        self._suppress(kind, self._safety_scan_seconds)
+        if budget.selected is not None:
+            self._excluded.add(budget.selected)
         logger.warning(
             "telegram_demand_slice_failed kind=%s error_type=%s sqlite_errorcode=%s sqlite_errorname=%s",
             kind.value,
@@ -345,28 +578,11 @@ class TelegramDemandCoordinator:
         self._observe("failed", kind, actual_attempts=budget.attempts, reason=type(exc).__name__)
 
     def _pop_ready(self, *, now: float) -> DemandKind | None:
-        if self._global_release_at is not None and now < self._global_release_at:
-            return None
-        if self._global_release_at is not None:
-            self._global_release_at = None
         if not self._queue:
             return None
         kind = self._queue.popleft()
         self._queued.remove(kind)
         return kind
-
-    def _suppress(self, kind: DemandKind, seconds: int | float | None) -> None:
-        duration = self._safety_scan_seconds if seconds is None else max(0.0, float(seconds))
-        now = self._now()
-        self._suppressed_until[kind] = now + duration
-        self._recompute_next_release(now)
-
-    def _is_suppressed(self, kind: DemandKind, now: float) -> bool:
-        until = self._suppressed_until.get(kind)
-        if until is None or now >= until:
-            self._suppressed_until.pop(kind, None)
-            return False
-        return True
 
     async def _wait_for_wakeup(self, timeout: float) -> None:
         shutdown_wait = asyncio.create_task(self._shutdown_event.wait())
@@ -387,10 +603,14 @@ class TelegramDemandCoordinator:
         boundaries = [now + self._safety_scan_seconds]
         if self._next_release_at is not None:
             boundaries.append(self._next_release_at)
-        if self._global_release_at is not None:
-            boundaries.append(self._global_release_at)
-        boundaries.extend(until for until in self._suppressed_until.values() if until > now)
-        return max(MIN_WAIT_SECONDS, min(boundaries) - now)
+        delays = [min(boundaries) - now]
+        monotonic_now = self._monotonic_clock()
+        delays.extend(
+            eligible_at - monotonic_now
+            for eligible_at in self._eligibility_waits.values()
+            if eligible_at is not None and eligible_at > monotonic_now
+        )
+        return max(MIN_WAIT_SECONDS, min(delays))
 
     def _remove_queued(self, kind: DemandKind) -> None:
         if kind not in self._queued:
@@ -402,10 +622,13 @@ class TelegramDemandCoordinator:
     def _recompute_next_release(self, now: float) -> None:
         boundaries = [status.release_at for status in self._statuses.values() if status.release_at > now]
         boundaries.extend(until for until in self._status_failed_until.values() if until > now)
-        boundaries.extend(until for until in self._suppressed_until.values() if until > now)
-        if self._global_release_at is not None and self._global_release_at > now:
-            boundaries.append(self._global_release_at)
         self._next_release_at = min(boundaries, default=None)
+
+    def _exclude_revision(
+        self, kind: DemandKind, selected: WorkRevision, budget: RpcAttemptBudget, reason: str
+    ) -> None:
+        self._excluded.add(selected)
+        self._observe("deferred", kind, actual_attempts=budget.attempts, reason=reason)
 
     def _observe(  # noqa: PLR0913 - telemetry fields are an explicit bounded schema
         self,

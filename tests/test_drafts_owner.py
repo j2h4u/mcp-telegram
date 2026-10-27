@@ -25,6 +25,7 @@ from mcp_telegram.runtime_observations import encode_payload, record_runtime_obs
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred
 from tests.sqlite_writer_helpers import inline_writer
 
 
@@ -39,6 +40,8 @@ class _Repository:
         self.reasons: list[str] = []
         self.rearmed: list[tuple[str, float]] = []
         self.due_at: float | None = None
+        self.projection_revision = 0
+        self.sync_status = "recovery_needed"
         self.realtime_error: Exception | None = None
         self.realtime_result = DraftApplyResult(True, publication_changed=True)
         self.before_realtime: Callable[[], None] | None = None
@@ -67,7 +70,12 @@ class _Repository:
         if self.snapshot_error is not None:
             raise self.snapshot_error
         self.snapshot_calls.append((observations, coverage))
-        return DraftApplyResult(True)
+        self.projection_revision += 1
+        self.sync_status = "complete"
+        return DraftApplyResult(
+            True,
+            work_revision=repr(self.recovery_revision(coverage.account_id)),
+        )
 
     def mark_recovery_needed(self, *, reason: str, observed_at: datetime) -> None:
         assert observed_at.tzinfo is not None
@@ -77,16 +85,19 @@ class _Repository:
     def recovery_due_at(self) -> float | None:
         return self.due_at
 
+    def recovery_revision(self, account_id: int) -> tuple[str, int] | None:
+        return (self.sync_status, self.projection_revision) if account_id == self.account_id else None
+
     def claim_recovery(self, *, now: float) -> int | None:
         if self.due_at is None or self.due_at > now:
             return None
         self.due_at = None
         return int(now)
 
-    def rearm_recovery(self, *, reason: str, now: float, claim_token: int) -> bool:
+    def release_recovery_claim(self, *, claim_token: int, due_at: float) -> bool:
         assert claim_token >= 0
-        self.rearmed.append((reason, now))
-        self.due_at = now + 1
+        self.rearmed.append(("claim_released", due_at))
+        self.due_at = due_at
         return True
 
 
@@ -174,6 +185,12 @@ async def _owner(
     await owner.bind_account(42)
     barrier.open()
     return owner, client
+
+
+def _selected_budget(owner: DraftMessageOwner, limit: int = 1) -> RpcAttemptBudget:
+    status = owner.status(time.time())
+    assert status is not None and status.selected is not None
+    return RpcAttemptBudget(limit, selected=status.selected)
 
 
 @pytest.mark.asyncio
@@ -406,11 +423,58 @@ async def test_snapshot_claim_applies_authoritative_coverage_without_baselines()
     owner, _client = await _owner(repository, gateway)
     repository.due_at = 0.0
 
-    await owner.run_slice(RpcAttemptBudget(1))
+    await owner.run_slice(_selected_budget(owner))
 
     assert gateway.calls == 1
     assert len(repository.snapshot_calls) == 1
     assert repository.snapshot_calls[0][1].source_order_at == datetime(2026, 1, 1, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_zero_balance_retry_candidate_releases_draft_claim_on_admission_deferral() -> None:
+    repository = _Repository()
+    gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
+    gateway.failure = TelegramRpcAdmissionDeferred(
+        retry_after_seconds=5,
+        method_key="messages.GetAllDraftsRequest",
+        generation="retry-generation",
+        eligible_at=time.monotonic() + 60,
+    )
+    owner, _client = await _owner(repository, gateway)
+    repository.due_at = 0.0
+    status = owner.status(time.time())
+    assert status is not None and status.selected is not None
+    budget = RpcAttemptBudget(1, attempts=1, selected=status.selected)
+    budget._retry_candidate = object()
+
+    with pytest.raises(TelegramRpcAdmissionDeferred):
+        await owner.run_slice(budget)
+
+    assert gateway.calls == 1
+    assert budget.attempts == 1
+    assert repository.snapshot_calls == []
+    assert repository.due_at == 0.0
+    assert repository.rearmed == [("claim_released", 0.0)]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_draft_budget_without_retry_candidate_does_not_claim_or_fetch() -> None:
+    repository = _Repository()
+    gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
+    owner, _client = await _owner(repository, gateway)
+    repository.due_at = 0.0
+    status = owner.status(time.time())
+    assert status is not None and status.selected is not None
+    budget = RpcAttemptBudget(1, attempts=1, selected=status.selected)
+
+    outcome = await owner.run_slice(budget)
+
+    assert outcome.kind.value == "deferred"
+    assert gateway.calls == 0
+    assert budget.attempts == 1
+    assert repository.snapshot_calls == []
+    assert repository.due_at == 0.0
+    assert repository.rearmed == []
 
 
 @pytest.mark.asyncio
@@ -421,7 +485,7 @@ async def test_snapshot_recovery_does_not_emit_realtime_latency() -> None:
     owner, _client = await _owner(repository, gateway, observe=observer)
     repository.due_at = 0.0
 
-    await owner.run_slice(RpcAttemptBudget(1))
+    await owner.run_slice(_selected_budget(owner))
 
     assert observer.events == [
         {
@@ -442,10 +506,10 @@ async def test_incomplete_snapshot_never_calls_snapshot_apply_or_infers_absence(
     owner, _client = await _owner(repository, gateway)
     repository.due_at = 0.0
 
-    await owner.run_slice(RpcAttemptBudget(1))
+    await owner.run_slice(_selected_budget(owner))
 
     assert repository.snapshot_calls == []
-    assert [reason for reason, _now in repository.rearmed] == ["snapshot_coverage_incomplete"]
+    assert [reason for reason, _now in repository.rearmed] == ["claim_released"]
 
 
 @pytest.mark.asyncio
@@ -457,9 +521,9 @@ async def test_claimed_recovery_is_rearmed_when_snapshot_fetch_fails() -> None:
     repository.due_at = 0.0
 
     with pytest.raises(RuntimeError, match="transport failed"):
-        await owner.run_slice(RpcAttemptBudget(1))
+        await owner.run_slice(_selected_budget(owner))
 
-    assert [reason for reason, _now in repository.rearmed] == ["snapshot_fetch_failed"]
+    assert [reason for reason, _now in repository.rearmed] == ["claim_released"]
     assert repository.due_at is not None
 
 
@@ -470,7 +534,7 @@ async def test_claimed_recovery_does_not_use_snapshot_baselines() -> None:
     owner, _client = await _owner(repository, gateway)
     repository.due_at = 0.0
 
-    await owner.run_slice(RpcAttemptBudget(1))
+    await owner.run_slice(_selected_budget(owner))
 
     assert gateway.calls == 1
     assert repository.rearmed == []
@@ -485,9 +549,9 @@ async def test_claimed_recovery_is_rearmed_and_cancellation_propagates() -> None
     repository.due_at = 0.0
 
     with pytest.raises(asyncio.CancelledError):
-        await owner.run_slice(RpcAttemptBudget(1))
+        await owner.run_slice(_selected_budget(owner))
 
-    assert [reason for reason, _now in repository.rearmed] == ["snapshot_fetch_failed"]
+    assert [reason for reason, _now in repository.rearmed] == ["claim_released"]
 
 
 @pytest.mark.asyncio
@@ -499,9 +563,9 @@ async def test_claimed_recovery_is_rearmed_when_snapshot_publish_fails() -> None
     repository.due_at = 0.0
 
     with pytest.raises(RuntimeError, match="database failed"):
-        await owner.run_slice(RpcAttemptBudget(1))
+        await owner.run_slice(_selected_budget(owner))
 
-    assert [reason for reason, _now in repository.rearmed] == ["snapshot_publish_failed"]
+    assert [reason for reason, _now in repository.rearmed] == ["claim_released"]
 
 
 @pytest.mark.asyncio

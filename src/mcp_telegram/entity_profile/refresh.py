@@ -15,23 +15,14 @@ from ..telegram_demand import (
     DurableDemandAdapter,
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
-    demand_context,
+    durable_demand_context,
 )
+from ..telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkRevision
 from ..telegram_rpc_consumers import DemandKind
 from ..telegram_rpc_scheduler import TelegramRpcSource, rpc_attempt_budget, rpc_scope
 from .contracts import PROFILE_FLOOD_RETRY_BASE_SECONDS, PROFILE_FLOOD_RETRY_CAP_SECONDS
 
-DurableRefreshStatusCallback = Callable[[float], DemandStatus | None]
-
-
-def throttled_retry_at(now: int, retry_after: int | None) -> int:
-    """Return the next attempt boundary for a throttled acquisition."""
-    return now + max(1, int(retry_after or 1))
-
-
-def failure_retry_at(now: int) -> int:
-    """Return the bounded retry boundary for an ordinary acquisition failure."""
-    return now + 60
+DurableRefreshStatusCallback = Callable[[float, frozenset[WorkRevision]], DemandStatus | None]
 
 
 def scope_changed_retry_at(now: int) -> int:
@@ -92,10 +83,11 @@ class RefreshEnqueueResult(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class DurableRefreshSliceResult:
-    """Durable work advanced for one entity, optionally reaching a terminal state."""
+    """Foreground waiter result plus the independent durable slice receipt."""
 
     entity_id: int
     terminal: DurableRefreshTerminal | None = None
+    outcome: SliceOutcome | None = None
 
 
 class DurableRefreshTerminal(StrEnum):
@@ -153,11 +145,11 @@ class EntityRefreshCoordinator:
         self._durable_status_callback = status
         self._durable_slice_callback = run_slice
 
-    def durable_status(self, now: float) -> DemandStatus | None:
+    def durable_status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
         """Read durable entity refresh readiness without touching the queue."""
         if self._durable_status_callback is None:
             return None
-        return self._durable_status_callback(now)
+        return self._durable_status_callback(now, excluded)
 
     async def run_durable_slice(self, budget: RpcAttemptBudget) -> DurableRefreshSliceResult | None:
         """Run the bound restart-safe entity acquisition slice, when available."""
@@ -193,29 +185,50 @@ class EntityProfileDemandAdapter(DurableDemandAdapter):
     def __init__(self, coordinator: EntityRefreshCoordinator) -> None:
         self._coordinator = coordinator
 
-    def status(self, now: float) -> DemandStatus | None:
+    def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
         """Report the oldest persisted entity-section release boundary."""
-        return self._coordinator.durable_status(now)
+        return self._coordinator.durable_status(now, excluded=excluded)
 
-    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+    async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
         """Run at most the supplied actual-attempt budget and retain its cursor."""
-        if not isinstance(budget, RpcAttemptBudget):
-            raise TypeError("budget must be an RpcAttemptBudget")
+        selected = self._selected_revision(budget)
         if self._coordinator.is_closed:
-            return
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
         now = time.time()
         status = self.status(now)
         if status is None or not status.is_ready(now):
-            return
-        with demand_context(DemandKind.ENTITY_PROFILE_REFRESH):
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        try:
+            result = await self._run_scoped_slice(budget)
+        except RpcAttemptBudgetExhaustedError:
+            if budget.can_prepare_retry:
+                raise
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        return self._finish_slice(selected, result)
+
+    @staticmethod
+    def _selected_revision(budget: RpcAttemptBudget) -> WorkRevision:
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        selected = budget.selected
+        if selected is None:
+            raise RuntimeError("entity profile slice requires an owner-selected revision")
+        return selected
+
+    async def _run_scoped_slice(self, budget: RpcAttemptBudget) -> DurableRefreshSliceResult | None:
+        with durable_demand_context(DemandKind.ENTITY_PROFILE_REFRESH):
             with rpc_attempt_budget(budget):
                 with rpc_scope(
                     TelegramRpcSource.ENTITY_INFO_REFRESH,
                     acquisition_kind=AcquisitionKind.ENTITY_LOOKUP,
                 ):
-                    try:
-                        result = await self._coordinator.run_durable_slice(budget)
-                    except RpcAttemptBudgetExhaustedError:
-                        return
-        if result is not None:
+                    return await self._coordinator.run_durable_slice(budget)
+
+    def _finish_slice(self, selected: WorkRevision, result: DurableRefreshSliceResult | None) -> SliceOutcome:
+        if result is None:
+            return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
+        if result.terminal is not None:
             self._coordinator.signal_terminal(result)
+        if result.outcome is None:
+            return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
+        return result.outcome

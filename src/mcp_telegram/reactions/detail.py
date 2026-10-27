@@ -38,6 +38,8 @@ class ReactionDetailResult:
     next_offset: str | None = None
     failure_kind: str | None = None
     retry_after: int | None = None
+    committed_revision: str | None = None
+    committed_terminal: bool = False
 
     @property
     def stop_cycle(self) -> bool:
@@ -404,7 +406,12 @@ class ReactionDetailRefresher:
             )
             if status_update.rowcount != 1:
                 raise _StaleReactionWriterError
-            return ReactionDetailResult("complete", fetched_pages=1)
+            return ReactionDetailResult(
+                "complete",
+                fetched_pages=1,
+                committed_revision=repr((generation, "complete")),
+                committed_terminal=True,
+            )
         status_update = conn.execute(
             "UPDATE message_reaction_event_status SET detail_generation=?, checked_at=?, status='partial', "
             "returned_count=?, staged_count=?, next_offset=?, next_attempt_at=?, failure_kind=NULL "
@@ -425,7 +432,12 @@ class ReactionDetailRefresher:
         )
         if status_update.rowcount != 1:
             raise _StaleReactionWriterError
-        return ReactionDetailResult("partial", fetched_pages=1, next_offset=next_offset)
+        return ReactionDetailResult(
+            "partial",
+            fetched_pages=1,
+            next_offset=next_offset,
+            committed_revision=repr((generation, next_offset)),
+        )
 
     def _persist_failure(  # noqa: PLR0913
         self,

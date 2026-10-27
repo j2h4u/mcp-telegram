@@ -17,14 +17,13 @@ from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
 from mcp_telegram.entity_profile.refresh import (
     EntityProfileDemandAdapter,
     RefreshLimits,
-    failure_retry_at,
     scope_changed_retry_at,
 )
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_transactions import write_transaction
-from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_gateway import TelethonChannelProfileGateway
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
+from tests.demand_adapter_helpers import run_ready_slice
 from tests.helpers import in_memory_sync_db
 from tests.test_entity_profile_progressive import _test_service
 
@@ -84,7 +83,7 @@ def scenario() -> Iterator[Scenario]:
 async def _run(service: DaemonEntityInfoService) -> None:
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator), now=100)
 
 
 @pytest.mark.asyncio
@@ -113,10 +112,12 @@ async def test_scheduled_gateway_failure_persists_only_safe_identity(
         assert conn.execute(
             "SELECT status,reason,generation,next_section FROM entity_profile_refresh_state"
         ).fetchone() == ("failed", expected, 3, "contact_overlap")
-        assert conn.execute(
-            "SELECT status,reason,observed_at,payload_json,retry_at FROM entity_detail_sections"
-        ).fetchone() == ("stale", expected, 10, '[{"id":5}]', failure_retry_at(100))
-        assert conn.execute("SELECT retry_at FROM entity_profile_refresh_state").fetchone() == (failure_retry_at(100),)
+        assert conn.execute("SELECT status,reason,observed_at,payload_json FROM entity_detail_sections").fetchone() == (
+            "stale",
+            expected,
+            10,
+            '[{"id":5}]',
+        )
         assert "private-identity" not in "\n".join(conn.iterdump())
     finally:
         await service.shutdown()

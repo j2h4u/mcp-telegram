@@ -10,7 +10,7 @@ from typing import Protocol, cast
 
 from mcp_telegram.delivered_update import delivered_observed_datetime, fail_delivered_update
 from mcp_telegram.demand_wiring import DemandOfferSink, offer_durable_demand
-from mcp_telegram.drafts.contracts import DraftObservation, DraftObservationSource, SnapshotCoverage
+from mcp_telegram.drafts.contracts import DraftApplyResult, DraftObservation, DraftObservationSource, SnapshotCoverage
 from mcp_telegram.drafts.ports import DraftProjectionRepository, DraftSnapshotGateway
 from mcp_telegram.drafts.telethon_adapter import (
     TelethonDraftSnapshotGateway,
@@ -19,9 +19,19 @@ from mcp_telegram.drafts.telethon_adapter import (
 )
 from mcp_telegram.event_handlers import UpdateProcessingBarrier
 from mcp_telegram.sqlite_writer import SQLiteWriter
-from mcp_telegram.telegram_demand import DemandStatus, RpcAttemptBudget, demand_context
+from mcp_telegram.telegram_demand import (
+    DemandStatus,
+    RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
+    durable_demand_context,
+)
+from mcp_telegram.telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkKey, WorkRevision
 from mcp_telegram.telegram_rpc_consumers import DemandKind
-from mcp_telegram.telegram_rpc_scheduler import rpc_attempt_budget
+from mcp_telegram.telegram_rpc_scheduler import (
+    TelegramRpcAdmissionDeferred,
+    TelegramRpcMethodRecoveryPending,
+    rpc_attempt_budget,
+)
 
 
 class _DraftEventClient(Protocol):
@@ -203,32 +213,85 @@ class DraftMessageOwner:
             observed_at_ms=commit_utc_ms,
         )
 
-    def status(self, now: float) -> DemandStatus | None:
+    def _selected(self) -> WorkRevision | None:
+        account_id = self._account_id
+        if account_id is None:
+            return None
+        due_at = self._repository.recovery_due_at()
+        revision = self._repository.recovery_revision(account_id)
+        if due_at is None or revision is None:
+            return None
+        return WorkRevision(WorkKey(self.demand_kind, account_id, "account-draft-recovery"), repr(revision))
+
+    def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
         """Expose only a durable repository request to the coordinator."""
         if self._account_id is None:
             return None
         due_at = self._repository.recovery_due_at()
-        return None if due_at is None else DemandStatus(release_at=due_at)
+        selected = self._selected()
+        return (
+            None
+            if due_at is None or selected is None or selected in excluded
+            else DemandStatus(release_at=due_at, selected=selected)
+        )
 
-    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+    async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
         """Apply one account-wide snapshot without allowing a stale baseline to win."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
+        selected = budget.selected
+        if selected is None:
+            raise ValueError("draft demand requires a selected revision")
+        current = self._slice_status(selected, budget)
+        if isinstance(current, SliceOutcome):
+            return current
         snapshot_run = await self._prepare_snapshot_run(budget)
         if snapshot_run is None:
-            return
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
         gateway, claim_token = snapshot_run
+        fetched = await self._fetch_snapshot(gateway, claim_token, current.release_at, budget, selected)
+        if isinstance(fetched, SliceOutcome):
+            return fetched
+        coverage, observations = fetched
         try:
-            with demand_context(self.demand_kind):
-                with rpc_attempt_budget(budget):
-                    coverage, observations = await gateway.fetch_all_drafts()
+            result = await self._publish_snapshot(coverage, observations, claim_token, current.release_at)
         except BaseException:
-            await self._rearm_claimed_recovery("snapshot_fetch_failed", claim_token)
+            await self._release_claim(claim_token, current.release_at)
             raise
+        if not result.accepted:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        if result.work_revision is None:
+            raise RuntimeError("accepted draft snapshot has no committed work revision")
+        return SliceOutcome(selected, SliceOutcomeKind.PROGRESSED, result.work_revision)
+
+    def _slice_status(self, selected: WorkRevision, budget: RpcAttemptBudget) -> DemandStatus | SliceOutcome:
+        current = self.status(time.time())
+        if current is None or current.selected != selected:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        if not current.is_ready(time.time()) or (budget.exhausted and not budget.can_prepare_retry):
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        return current
+
+    async def _fetch_snapshot(
+        self,
+        gateway: DraftSnapshotGateway,
+        claim_token: int,
+        due_at: float,
+        budget: RpcAttemptBudget,
+        selected: WorkRevision,
+    ) -> tuple[SnapshotCoverage, tuple[DraftObservation, ...]] | SliceOutcome:
         try:
-            await self._publish_snapshot(coverage, observations, claim_token)
+            with durable_demand_context(self.demand_kind):
+                with rpc_attempt_budget(budget):
+                    return await gateway.fetch_all_drafts()
+        except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending:
+            await self._release_claim(claim_token, due_at)
+            raise
+        except RpcAttemptBudgetExhaustedError:
+            await self._release_claim(claim_token, due_at)
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
         except BaseException:
-            await self._rearm_claimed_recovery("snapshot_publish_failed", claim_token)
+            await self._release_claim(claim_token, due_at)
             raise
 
     async def _prepare_snapshot_run(
@@ -238,7 +301,7 @@ class DraftMessageOwner:
         account_id = self._account_id
         gateway = self._snapshot_gateway
         now = time.time()
-        if account_id is None or gateway is None or budget.exhausted:
+        if account_id is None or gateway is None or (budget.exhausted and not budget.can_prepare_retry):
             return None
         status = self.status(now)
         if status is None or not status.is_ready(now):
@@ -253,34 +316,34 @@ class DraftMessageOwner:
         coverage: SnapshotCoverage,
         observations: tuple[DraftObservation, ...],
         claim_token: int,
-    ) -> None:
+        due_at: float,
+    ) -> DraftApplyResult:
         if not coverage.authoritative:
             reason = _snapshot_recovery_reason(coverage)
-            await self._rearm_claimed_recovery(reason, claim_token)
+            await self._release_claim(claim_token, due_at)
             self._record("draft.recovery", "deferred", reason)
-            return
+            return DraftApplyResult(accepted=False, decision=reason)
         result = await self._writer.run(
             lambda conn: self._repository.for_connection(conn).apply_snapshot(
                 observations, coverage, claim_token=claim_token
             )
         )
         if result.ambiguous or not result.accepted:
-            await self._rearm_claimed_recovery(result.decision or "snapshot_failure", claim_token)
+            await self._release_claim(claim_token, due_at)
         self._record("draft.recovery", "applied" if result.accepted else "ignored", result.decision)
+        return result
 
-    async def _rearm_claimed_recovery(self, reason: str, claim_token: int) -> None:
-        """Return a claimed recovery to durable, bounded retry cadence."""
-        now = time.time()
-        if not await self._writer.run(
-            lambda conn: self._repository.for_connection(conn).rearm_recovery(
-                reason=reason, now=now, claim_token=claim_token
+    async def _release_claim(self, claim_token: int, due_at: float) -> None:
+        """Restore the selected durable request after a slice did not publish."""
+        await self._writer.run(
+            lambda conn: self._repository.for_connection(conn).release_recovery_claim(
+                claim_token=claim_token, due_at=due_at
             )
-        ):
-            return
+        )
         sink = self._demand_sink
         if sink is not None:
             offer_durable_demand(sink, self.demand_kind)
-        self._record("draft.recovery", "deferred", reason)
+        self._record("draft.recovery", "deferred", "claim_released")
 
     def _record(  # noqa: PLR0913 - mirrors the bounded runtime-observation contract
         self,

@@ -9,13 +9,13 @@ import logging
 import sqlite3
 import subprocess
 import sys
+import time
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock
 
 import pytest
 import telethon
@@ -2007,7 +2007,8 @@ async def test_inherited_connect_reservation_survives_failed_transport_cleanup()
     gate._flood_waited_requests.clear()
     sender.response = lambda _request: object()
     try:
-        await gate.connect()
+        with pytest.raises(TelegramRpcAdmissionDeferred):
+            await gate.connect()
         assert sender.connect_calls == 2
     finally:
         await _close_bootstrap_gate(gate)
@@ -2807,9 +2808,10 @@ async def test_one_update_difference_warning_cannot_amplify_during_cooldown() ->
     sender = _set_sender(gate, lambda _request: (_ for _ in ()).throw(FloodWaitError(request=None, capture=20)))
 
     try:
-        with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE):
-            with pytest.raises(TimeoutError):
-                await asyncio.wait_for(gate(_TestRequest("difference")), timeout=0.05)
+        with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE):
+            with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE):
+                with pytest.raises(TelegramRpcThrottled):
+                    await gate(_TestRequest("difference"))
         assert sender.calls == 1
         assert accumulator.kill_switch_status().events_in_window == 1
         assert gate._limiter.acquisitions == 1
@@ -3010,13 +3012,14 @@ async def test_five_independent_sender_warnings_latch_the_account_circuit() -> N
     accumulator.configure_kill_switch(
         FloodWaitKillSwitchPolicy(enabled=True, window_seconds=600, max_events=5, max_wait_seconds=900)
     )
-    gate = _gate()
-    gate._rpc_circuit_status = accumulator.kill_switch_status
-    gate._flood_observer = lambda **event: accumulator.observe(**event)
-    gate._cooldown_buffer_seconds = 0
     sender_calls = 0
+    import mcp_telegram.telegram_rpc as rpc
 
     for index in range(5):
+        gate = _gate()
+        gate._rpc_circuit_status = accumulator.kill_switch_status
+        gate._flood_observer = lambda **event: accumulator.observe(**event)
+        gate._cooldown_buffer_seconds = 0
 
         def send(_request: object, *, _index: int = index) -> object:
             nonlocal sender_calls
@@ -3024,22 +3027,26 @@ async def test_five_independent_sender_warnings_latch_the_account_circuit() -> N
             raise FloodWaitError(request=None, capture=1 + (_index % 2))
 
         _set_sender(gate, send)
-        with pytest.raises(TelegramRpcThrottled) as caught:
-            await _call(gate, f"request-{index}")
-        assert caught.value.latched is False
-        if index < 4:
-            import mcp_telegram.telegram_rpc as rpc
-
-            rpc._COOLDOWN_DEADLINE = 0
-            gate._flood_waited_requests.clear()
+        try:
+            with pytest.raises(TelegramRpcThrottled) as caught:
+                await _call(gate, f"request-{index}")
+            assert caught.value.latched is False
+        finally:
+            await gate.close_rpc_scheduler()
+        rpc._COOLDOWN_DEADLINE = 0
 
     assert sender_calls == 5
     assert accumulator.kill_switch_status().open is True
+    blocked_gate = _gate()
+    blocked_gate._rpc_circuit_status = accumulator.kill_switch_status
+    blocked_sender = _set_sender(blocked_gate, lambda _request: pytest.fail("latched gate sent"))
     with pytest.raises(TelegramRpcThrottled) as caught:
-        await _call(gate, "blocked")
+        await _call(blocked_gate, "blocked")
     assert caught.value.latched is True
     assert sender_calls == 5
-    assert gate._limiter.acquisitions == 5
+    assert blocked_sender.calls == 0
+    assert blocked_gate._limiter.acquisitions == 0
+    await blocked_gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
@@ -3437,7 +3444,18 @@ def _real_dm_page_adapter(
     gate.session.get_input_entity = lambda entity: types.InputPeerUser(int(entity), 0)
     scanner = _real_dm_page_scanner(gate, conn)
     prepare_dm_deletion_reconciliation(conn, now=100)
-    return gate, sender, DmDeletionReconciliationDemandAdapter(conn, scanner, writer=inline_writer(conn)), scanner
+    return (
+        gate,
+        sender,
+        DmDeletionReconciliationDemandAdapter(conn, scanner, writer=inline_writer(conn), account_id=123),
+        scanner,
+    )
+
+
+def _selected_dm_page_budget(adapter: DmDeletionReconciliationDemandAdapter) -> RpcAttemptBudget:
+    status = adapter.status(100)
+    assert status is not None and status.selected is not None
+    return RpcAttemptBudget(limit=1, selected=status.selected)
 
 
 async def _dispatch_forward_history_sibling(
@@ -3475,9 +3493,11 @@ async def _dispatch_forward_history_sibling(
             return ForwardGapPage(messages=(), complete=True)
 
     forward_adapter = DeltaGapFillDemandAdapter(
-        DeltaSyncWorker(GateForwardPort(), conn, asyncio.Event(), writer=inline_writer(conn))
+        DeltaSyncWorker(GateForwardPort(), conn, asyncio.Event(), writer=inline_writer(conn)), account_id=123
     )
-    sibling = asyncio.create_task(forward_adapter.run_slice(RpcAttemptBudget(limit=1)))
+    status = forward_adapter.status(time.time())
+    assert status is not None and status.selected is not None
+    sibling = asyncio.create_task(forward_adapter.run_slice(RpcAttemptBudget(limit=1, selected=status.selected)))
     await _wait_for(lambda: sender.calls == 2)
     assert isinstance(sender.requests[1], functions.messages.GetHistoryRequest)
     assert sender.requests[1].min_id == expected_cursor
@@ -3495,7 +3515,7 @@ async def test_dm_page_success_uses_real_get_messages_and_commits_tombstone_curs
     conn = _dm_reconciliation_test_db()
     gate, sender, adapter, scanner = _real_dm_page_adapter(conn)
     try:
-        budget = RpcAttemptBudget(limit=1)
+        budget = _selected_dm_page_budget(adapter)
         task = asyncio.create_task(adapter.run_slice(budget))
         await _wait_for(lambda: sender.calls == 1)
 
@@ -3535,7 +3555,7 @@ async def test_dm_page_cursor_commit_failure_preserves_tombstone_and_blocks_reco
         )
         conn.commit()
 
-        budget = RpcAttemptBudget(limit=1)
+        budget = _selected_dm_page_budget(adapter)
         task = asyncio.create_task(adapter.run_slice(budget))
         await _wait_for(lambda: sender.calls == 1)
         assert isinstance(sender.requests[0], functions.messages.GetMessagesRequest)
@@ -3552,9 +3572,11 @@ async def test_dm_page_cursor_commit_failure_preserves_tombstone_and_blocks_reco
         assert adapter.status(10_000_000) is None
 
         reconstructed_scanner = _real_dm_page_scanner(gate, conn)
-        reconstructed = DmDeletionReconciliationDemandAdapter(conn, reconstructed_scanner, writer=inline_writer(conn))
+        reconstructed = DmDeletionReconciliationDemandAdapter(
+            conn, reconstructed_scanner, writer=inline_writer(conn), account_id=123
+        )
         assert reconstructed.status(10_000_000) is None
-        await reconstructed.run_slice(RpcAttemptBudget(limit=1))
+        await reconstructed.run_slice(RpcAttemptBudget(limit=1, selected=budget.selected))
         assert reconstructed_scanner.calls == 0
         assert sender.calls == 1
     finally:
@@ -3581,7 +3603,8 @@ async def test_dm_page_flood_crosses_gate_with_durable_demand_and_acquisition(  
         observations: list[FloodWaitObservation] = []
         gate.set_flood_event_observer(observations.append)
 
-        task = asyncio.create_task(adapter.run_slice(RpcAttemptBudget(limit=1)))
+        budget = _selected_dm_page_budget(adapter)
+        task = asyncio.create_task(adapter.run_slice(budget))
         await _wait_for(lambda: sender.calls == 1)
         assert isinstance(sender.requests[0], functions.messages.GetMessagesRequest)
         assert sender.scopes[0].demand_kind is DemandKind.DM_DELETION_RECONCILIATION
@@ -3619,7 +3642,7 @@ async def test_dm_page_flood_crosses_gate_with_durable_demand_and_acquisition(  
         rpc._COOLDOWN_DEADLINE = rpc.time.monotonic() - 1
         await _dispatch_forward_history_sibling(gate, sender, conn, expected_cursor=delta_cursor or 0)
 
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(RpcAttemptBudget(limit=1, selected=budget.selected))
         assert scanner.calls == 1
         assert sender.calls == 2
         assert len(observations) == 1
@@ -3642,7 +3665,8 @@ async def test_cancelled_dm_page_late_gate_flood_stays_claimed_across_restart() 
         observations: list[FloodWaitObservation] = []
         gate.set_flood_event_observer(observations.append)
 
-        task = asyncio.create_task(adapter.run_slice(RpcAttemptBudget(limit=1)))
+        budget = _selected_dm_page_budget(adapter)
+        task = asyncio.create_task(adapter.run_slice(budget))
         await _wait_for(lambda: sender.calls == 1)
         assert isinstance(sender.requests[0], functions.messages.GetMessagesRequest)
         task.cancel()
@@ -3659,12 +3683,14 @@ async def test_cancelled_dm_page_late_gate_flood_stays_claimed_across_restart() 
         assert observations[0].acquisition_kind == AcquisitionKind.MESSAGE_LOOKUP.value
         assert accumulator.kill_switch_status().events_in_window == 1
         restarted_scanner = _real_dm_page_scanner(gate, conn)
-        restarted = DmDeletionReconciliationDemandAdapter(conn, restarted_scanner, writer=inline_writer(conn))
+        restarted = DmDeletionReconciliationDemandAdapter(
+            conn, restarted_scanner, writer=inline_writer(conn), account_id=123
+        )
         assert restarted.status(10_000_000) is None
         prepare_dm_deletion_reconciliation(conn, now=200)
         assert _dm_reconciliation_state_for_rpc_test(conn)["status"] == "suspended"
         assert _dm_reconciliation_state_for_rpc_test(conn)["reason"] == "interrupted"
-        await restarted.run_slice(RpcAttemptBudget(limit=1))
+        await restarted.run_slice(RpcAttemptBudget(limit=1, selected=budget.selected))
         assert scanner.calls == 1
         assert restarted_scanner.calls == 0
         assert sender.calls == 1
@@ -3687,8 +3713,8 @@ async def test_dm_local_deferral_after_nested_dispatch_keeps_page_claimed() -> N
 
     conn = _dm_reconciliation_test_db()
     prepare_dm_deletion_reconciliation(conn, now=100)
-    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
-    budget = RpcAttemptBudget(limit=1)
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
+    budget = _selected_dm_page_budget(adapter)
     with pytest.raises(TelegramRpcAdmissionDeferred):
         await adapter.run_slice(budget)
 
@@ -4554,24 +4580,12 @@ async def test_recursive_telethon_resolution_reenters_admission_without_deadlock
 
 
 @pytest.mark.asyncio
-async def test_update_difference_flood_wait_retries_inside_supported_gate_policy(
+async def test_update_difference_flood_wait_returns_to_durable_owner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mcp_telegram.telegram_rpc as rpc
 
     gate = _gate()
     attempts = 0
-    sleeps: list[float] = []
-    real_monotonic = rpc.time.monotonic
-    real_utc = rpc.time.time
-    original_sleep = asyncio.sleep
-    offset = [0.0]
-    moving_clock = SimpleNamespace(
-        monotonic=lambda: real_monotonic() + offset[0],
-        time=lambda: real_utc() + offset[0],
-    )
-    monkeypatch.setattr(rpc, "time", moving_clock)
-    gate._admission_scheduler._clock = moving_clock.monotonic
 
     def send(request: object) -> object:
         nonlocal attempts
@@ -4580,22 +4594,16 @@ async def test_update_difference_flood_wait_retries_inside_supported_gate_policy
             raise FloodWaitError(request=None, capture=1)
         return _request_value(request)
 
-    async def finish_cooldown(delay: float) -> None:
-        sleeps.append(delay)
-        offset[0] += delay
-        await original_sleep(0)
-
     _set_sender(gate, send)
-    monkeypatch.setattr("mcp_telegram.telegram_rpc.asyncio.sleep", finish_cooldown)
-    deadline = moving_clock.monotonic() + 4
+    deadline = asyncio.get_running_loop().time() + 4
     with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
         with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
-            result = await gate(_TestRequest("difference"))
+            with pytest.raises(TelegramRpcThrottled) as caught:
+                await gate(_TestRequest("difference"))
 
-    assert result == "difference"
-    assert attempts == 2
-    assert gate._limiter.acquisitions == 2
-    assert len(sleeps) == 1
+    assert caught.value.retry_after_seconds == 1
+    assert attempts == 1
+    assert gate._limiter.acquisitions == 1
 
 
 @pytest.mark.asyncio
@@ -4616,12 +4624,14 @@ async def test_update_difference_open_circuit_waits_without_fatal_exception(
 
     gate._rpc_circuit_status = status
     monkeypatch.setattr("mcp_telegram.telegram_rpc.asyncio.sleep", close_circuit)
-    with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE):
-        result = await gate(_TestRequest("difference"))
+    with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE):
+        with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE):
+            with pytest.raises(TelegramRpcThrottled) as caught:
+                await gate(_TestRequest("difference"))
 
-    assert result == "difference"
-    assert sleeps == [gate._scheduler_policy.update_loop_retry_seconds]
-    assert gate._limiter.acquisitions == 1
+    assert caught.value.latched
+    assert sleeps == []
+    assert gate._limiter.acquisitions == 0
 
 
 @pytest.mark.asyncio
@@ -4669,21 +4679,22 @@ async def test_update_difference_saturation_wait_is_bounded_by_original_deadline
 
 
 @pytest.mark.asyncio
-async def test_update_difference_open_circuit_wait_is_bounded_by_scope_deadline() -> None:
+async def test_update_difference_open_circuit_is_reported_before_scope_deadline() -> None:
     gate = _gate(_CircuitStatus(open=True))
     request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
     deadline = asyncio.get_running_loop().time() + 0.01
 
     with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
         with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
-            with pytest.raises(OSError, match="admission deadline elapsed"):
-                await asyncio.wait_for(gate(request), timeout=0.2)
+            with pytest.raises(TelegramRpcThrottled) as caught:
+                await gate(request)
 
+    assert caught.value.latched
     assert gate._test_server.seen == set()
 
 
 @pytest.mark.asyncio
-async def test_update_difference_flood_cooldown_expiry_does_not_send_again() -> None:
+async def test_update_difference_flood_does_not_retry_inside_vendor_call() -> None:
     gate = _gate()
     request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
     deadline = asyncio.get_running_loop().time() + 0.01
@@ -4694,8 +4705,8 @@ async def test_update_difference_flood_cooldown_expiry_does_not_send_again() -> 
     _set_sender(gate, flood_once)
     with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
         with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
-            with pytest.raises(OSError, match="admission deadline elapsed"):
-                await asyncio.wait_for(gate(request), timeout=0.2)
+            with pytest.raises(TelegramRpcThrottled):
+                await gate(request)
 
     assert len(gate._test_server.seen) == 1
     assert gate._limiter.acquisitions == 1
@@ -4751,66 +4762,6 @@ async def test_update_difference_next_outer_iteration_gets_a_fresh_scope() -> No
             assert await gate(request) is request
 
     assert sender.calls == 1
-
-
-@pytest.mark.asyncio
-async def test_vendor_update_loop_recovers_expired_difference_with_fresh_scope(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import mcp_telegram.telegram_demand as demand
-
-    loop = asyncio.get_running_loop()
-    gate = _gate()
-    request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
-    first_deadline = loop.time() + 0.03
-    fresh_deadline = loop.time() + 5
-    connected_checks = iter((True, True, False))
-    tokens = iter(
-        (
-            demand.create_demand_token(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=first_deadline),
-            demand.create_demand_token(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=fresh_deadline),
-        )
-    )
-    original_sleep = asyncio.sleep
-    circuit_open = [True]
-    events: list[RpcAdmissionEvent] = []
-    gate.set_rpc_admission_observer(events.append)
-
-    async def sleep(delay: float) -> None:
-        if delay >= 5:
-            circuit_open[0] = False
-            return
-        await original_sleep(delay)
-
-    sender = _set_sender(gate, _request_value)
-    gate._rpc_circuit_status = lambda: _CircuitStatus(open=circuit_open[0])
-    gate._transport_state = _TransportBoundaryState.READY
-    gate._message_box = SimpleNamespace(
-        is_empty=lambda: False,
-        get_difference=lambda: request,
-        apply_difference=lambda *_args: ([], [], []),
-    )
-    gate._mb_entity_cache = []
-    gate._entity_cache_limit = 100
-    gate._catch_up = False
-    gate._authorized = True
-    gate.is_connected = lambda: next(connected_checks)
-    gate._log = {"telethon.client.updates": logging.getLogger(__name__)}
-    monkeypatch.setattr(gate, "_preprocess_updates", AsyncMock(return_value=[]))
-    monkeypatch.setattr(demand, "create_demand_token", lambda _kind, **_kwargs: next(tokens))
-    monkeypatch.setattr("mcp_telegram.telegram_rpc.asyncio.sleep", sleep)
-    try:
-        await gate._update_loop()
-    finally:
-        await gate.close_rpc_scheduler()
-
-    assert [event.kind for event in events if event.kind is RpcAdmissionEventKind.EXPIRED] == [
-        RpcAdmissionEventKind.EXPIRED
-    ]
-    assert circuit_open == [False]
-    assert sender.calls == 1
-    assert sender.scopes[0].source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE
-    assert sender.scopes[0].deadline == fresh_deadline
 
 
 @pytest.mark.asyncio

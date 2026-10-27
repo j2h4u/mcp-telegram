@@ -28,7 +28,7 @@ from mcp_telegram.entity_profile.repository import EntityProfileRepository
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.models import DialogType
 from mcp_telegram.sync_db import ensure_sync_schema
-from mcp_telegram.telegram_demand import RpcAttemptBudget, demand_context
+from mcp_telegram.telegram_demand import demand_context
 from mcp_telegram.telegram_gateway import TelethonUserProfileGateway
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
@@ -38,6 +38,7 @@ from mcp_telegram.tools.entity_info import (
     _entity_structured_content,
     get_entity_info,
 )
+from tests.demand_adapter_helpers import run_ready_slice
 from tests.test_entity_profile_full_user_pair import _PairClient, _prepare
 
 
@@ -134,7 +135,7 @@ async def _baseline_then_fail(path: Path, client: _FailureClient) -> tuple[sqlit
     service = cast(DaemonEntityInfoService, raw_service)
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     baseline = service._profiles.read(42, now=100)  # type: ignore[attr-defined]
     assert baseline is not None and baseline.detail["about"] == "about"
     service._profiles.request_section_refresh(  # type: ignore[attr-defined]
@@ -160,12 +161,17 @@ async def test_enabled_pair_failures_preserve_prior_data_and_account_attempts(
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     try:
-        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        adapter = EntityProfileDemandAdapter(coordinator)
+        if isinstance(failure, TelegramRpcThrottled):
+            with pytest.raises(TelegramRpcThrottled):
+                await run_ready_slice(adapter)
+        else:
+            await run_ready_slice(adapter)
 
         assert conn.execute(
             "SELECT status, retry_at, reason, next_section, pair_attempts, pair_retries "
             "FROM entity_profile_refresh_state WHERE entity_id=42"
-        ).fetchone() == ("failed", retry_at, reason, "full_profile", 1, 0)
+        ).fetchone() == ("failed", 100, reason, "full_profile", 1, 0)
         assert conn.execute(
             "SELECT status FROM entity_detail_sections WHERE entity_id=42 AND section='full_profile'"
         ).fetchone() == ("stale",)
@@ -203,7 +209,7 @@ async def test_invalid_full_user_envelopes_do_not_create_positive_receipts(tmp_p
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     try:
-        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        await run_ready_slice(EntityProfileDemandAdapter(coordinator))
 
         assert conn.execute(
             "SELECT status, reason, next_section, pair_attempts FROM entity_profile_refresh_state WHERE entity_id=42"
@@ -267,7 +273,7 @@ async def test_service_refresh_keeps_canonical_service_type_when_full_user_uses_
     service._profiles.request_section_refresh(  # type: ignore[attr-defined]
         42, ("full_profile", "personal_channel"), now=100, pair_mode="enabled"
     )
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
 
     assert conn.execute("SELECT type FROM entities WHERE id=42").fetchone() == ("service",)
     state = cast(
@@ -345,7 +351,7 @@ async def test_file_backed_pair_receipt_ttl_is_strict_across_reopen(tmp_path: Pa
     service._deps = replace(service._deps, client=complete_client, user_profile_port=complete_client)
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     evidence = service._profiles.read_section_evidence(42, "full_profile")  # type: ignore[attr-defined]
     assert evidence is not None and isinstance(evidence.get("identity"), dict)
     identity = cast(dict[str, object], evidence["identity"])
@@ -450,7 +456,7 @@ async def test_actual_entity_info_tool_renders_persisted_user_and_bot_profile(
     )
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
 
     class ServiceConnection:
         async def get_entity_info(self, *, entity_id: int) -> dict[str, object]:
@@ -501,13 +507,13 @@ async def test_actual_entity_info_tool_renders_persisted_partial_on_target_kind_
     )
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     service._profiles.request_section_refresh(  # type: ignore[attr-defined]
         42, ("full_profile", "personal_channel"), now=100, pair_mode="enabled"
     )
     mismatch_client = _PairClient(bot=False)
     service._deps = replace(service._deps, client=mismatch_client, user_profile_port=mismatch_client)  # type: ignore[attr-defined]
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     assert mismatch_client.full_user_calls == 1
 
     class ServiceConnection:

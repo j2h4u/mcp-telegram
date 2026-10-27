@@ -29,6 +29,7 @@ from mcp_telegram.activity_cold_backfill import (
     ColdPassOutcome,
     ColdPassResult,
     ColdPeerPageDemandAdapter,
+    _claim_cold_backfill_peer,
     run_cold_backfill_pass,
 )
 from mcp_telegram.activity_peer_sweep import (
@@ -265,7 +266,7 @@ def test_cold_adapter_status_uses_retry_lease_and_access_filter() -> None:
         _enroll(conn, immediate_id)
         _enroll(conn, delayed_id, cold_next_retry_at=now + 120)
         adapter = ColdPeerPageDemandAdapter(
-            _FakeClient(), conn, asyncio.Event(), _PACING, _TEST_TIMEOUT_S, writer=inline_writer(conn)
+            _FakeClient(), conn, asyncio.Event(), _PACING, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
         )
 
         status = adapter.status(float(now))
@@ -277,6 +278,43 @@ def test_cold_adapter_status_uses_retry_lease_and_access_filter() -> None:
         status = adapter.status(float(now))
         assert status is not None
         assert status.release_at == now + 120
+
+
+def test_cold_adapter_falls_back_to_due_peer_when_enrollment_is_held() -> None:
+    with _make_db() as conn:
+        dialog_id = -100100000024
+        _enroll(conn, dialog_id)
+        conn.execute(
+            "INSERT OR REPLACE INTO activity_sync_state(key,value) VALUES('activity_working_set_phase','supergroups')"
+        )
+        conn.execute("INSERT OR REPLACE INTO activity_sync_state(key,value) VALUES('activity_working_set_cursor','')")
+        conn.commit()
+        adapter = ColdPeerPageDemandAdapter(
+            _FakeClient(), conn, asyncio.Event(), _PACING, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
+        )
+
+        enrollment = adapter.status(float(time.time()))
+        assert enrollment is not None and enrollment.selected is not None
+        assert enrollment.selected.key.target == "enrollment"
+        peer = adapter.status(float(time.time()), excluded=frozenset({enrollment.selected}))
+
+        assert peer is not None and peer.selected is not None
+        assert peer.selected.key.target == f"peer:{dialog_id}"
+
+
+def test_cold_peer_claim_rechecks_access_loss_at_final_cas() -> None:
+    with _make_db() as conn:
+        dialog_id = -100100000025
+        _enroll(conn, dialog_id)
+        conn.execute("UPDATE synced_dialogs SET status='access_lost' WHERE dialog_id=?", (dialog_id,))
+        conn.commit()
+
+        claim = _claim_cold_backfill_peer(conn, now=100, claim_until=200, expected_dialog=dialog_id, expected_offset=0)
+
+        assert claim is None
+        assert conn.execute(
+            "SELECT cold_status,cold_next_retry_at FROM activity_dialog_state WHERE dialog_id=?", (dialog_id,)
+        ).fetchone() == ("pending", None)
 
 
 @pytest.mark.asyncio
@@ -323,10 +361,12 @@ async def test_cold_adapter_runs_one_peer_page(monkeypatch: pytest.MonkeyPatch) 
         _enroll(conn, dialog_id)
         calls = _patch_sweep(monkeypatch, {dialog_id: [_normal_result([50, 60])]})
         adapter = ColdPeerPageDemandAdapter(
-            _FakeClient(), conn, asyncio.Event(), _PACING, _TEST_TIMEOUT_S, writer=inline_writer(conn)
+            _FakeClient(), conn, asyncio.Event(), _PACING, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
         )
 
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        status = adapter.status(time.time())
+        assert status is not None and status.selected is not None
+        await adapter.run_slice(RpcAttemptBudget(limit=1, selected=status.selected))
 
         assert calls[dialog_id] == [(0, 0)]
         assert _get_state(conn, dialog_id)["cold_offset_id"] == 50
@@ -461,8 +501,8 @@ async def test_access_skip_does_not_complete(monkeypatch: pytest.MonkeyPatch) ->
         scripted = {dialog_id: [_access_skip_result()]}
         _patch_sweep(monkeypatch, scripted)
         shutdown = asyncio.Event()
-
         before = int(time.time())
+
         result = await run_cold_backfill_pass(
             _FakeClient(), conn, shutdown, pacing=_PACING, timeout_s=_TEST_TIMEOUT_S, writer=inline_writer(conn)
         )
@@ -562,11 +602,8 @@ async def test_flood_wait_sets_cold_retry_not_hot(monkeypatch: pytest.MonkeyPatc
 
         state = _get_state(conn, dialog_id)
 
-        # cold_next_retry_at set in the future
-        assert state["cold_next_retry_at"] is not None, "cold_next_retry_at must be set on FloodWait"
-        assert cast(int, state["cold_next_retry_at"]) >= before + flood_seconds, (
-            f"cold_next_retry_at should be at least now+{flood_seconds}"
-        )
+        # The shared RPC coordinator owns the FloodWait delay.
+        assert state["cold_next_retry_at"] is None
 
         # cold_status must be 'pending' (not 'complete')
         assert state["cold_status"] == "pending"
@@ -635,14 +672,20 @@ async def test_cold_pass_result_outcomes_matrix(monkeypatch: pytest.MonkeyPatch)
         _patch_sweep(monkeypatch, scripted)
         shutdown = asyncio.Event()
 
-        # Collect all four pass results (each pass picks ONE peer; ORDER BY updated_at ASC)
+        # Collect each result from its own exact peer so another peer's durable
+        # retry/checkpoint cannot change which scenario this matrix exercises.
         outcomes: dict[ColdPassOutcome, ColdPassResult] = {}
-        for _ in range(4):
+        for dialog_id in (peer_wrote, peer_floor, peer_access, peer_flood):
             r = await run_cold_backfill_pass(
-                _FakeClient(), conn, shutdown, pacing=_PACING, timeout_s=_TEST_TIMEOUT_S, writer=inline_writer(conn)
+                _FakeClient(),
+                conn,
+                shutdown,
+                pacing=_PACING,
+                timeout_s=_TEST_TIMEOUT_S,
+                writer=inline_writer(conn),
+                expected_dialog=dialog_id,
+                expected_offset=0,
             )
-            # Re-enable any access/flood peers so they are selectable on the next pass
-            # (we just want one result per pass — this is a matrix, not chained state)
             outcomes[r.outcome] = r
 
         # All four distinct outcomes must appear across the four passes

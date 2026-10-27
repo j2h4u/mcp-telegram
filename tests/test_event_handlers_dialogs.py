@@ -1246,11 +1246,10 @@ async def test_on_new_message_advances_last_message_at(
         ),
     )
 
-    # Mock _build_fwd_entity_map and extract_message_row helpers
+    # Mock message persistence while exercising metadata projection.
     import unittest.mock as mock
 
     with (
-        mock.patch("mcp_telegram.event_handlers._build_fwd_entity_map", return_value={}),
         mock.patch("mcp_telegram.event_handlers.insert_messages_with_fts"),
     ):
         mgr = _make_manager(mock_client, sync_db, shutdown_event)
@@ -1283,7 +1282,6 @@ async def test_on_new_message_does_not_regress_last_message_at(
     import unittest.mock as mock
 
     with (
-        mock.patch("mcp_telegram.event_handlers._build_fwd_entity_map", return_value={}),
         mock.patch("mcp_telegram.event_handlers.insert_messages_with_fts"),
     ):
         mgr = _make_manager(mock_client, sync_db, shutdown_event)
@@ -1315,7 +1313,6 @@ async def test_on_new_message_missing_dialogs_row_is_noop(
     import unittest.mock as mock
 
     with (
-        mock.patch("mcp_telegram.event_handlers._build_fwd_entity_map", return_value={}),
         mock.patch("mcp_telegram.event_handlers.insert_messages_with_fts"),
     ):
         mgr = _make_manager(mock_client, sync_db, shutdown_event)
@@ -1422,7 +1419,6 @@ async def test_non_unread_handlers_do_not_insert_into_dialogs_table(
     import unittest.mock as mock
 
     with (
-        mock.patch("mcp_telegram.event_handlers._build_fwd_entity_map", return_value={}),
         mock.patch("mcp_telegram.event_handlers.insert_messages_with_fts"),
     ):
         await mgr.on_new_message(event)

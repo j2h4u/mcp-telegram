@@ -9,26 +9,33 @@ import sqlite3
 import threading
 from collections.abc import Callable
 from contextlib import closing
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
-from telethon import events, types
+from telethon import events, functions, types
 from telethon.sessions import SQLiteSession
 
 from mcp_telegram.delivered_update import DeliveredUpdate, current_delivered_update, delivered_update_context
 from mcp_telegram.delta_sync import _SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL, DeltaSyncWorker
-from mcp_telegram.event_handlers import EventHandlerManager, UpdateProcessingBarrier, _EventHandlerClient
+from mcp_telegram.event_handlers import EventHandlerManager, UpdateProcessingBarrier, _EventHandlerClient, _MessageLike
 from mcp_telegram.message_history.contracts import ForwardGapPage
 from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
 from mcp_telegram.messages.telegram_adapter import extract_message_row
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import _open_sync_db, open_sync_db_reader
 from mcp_telegram.sync_transactions import write_transaction
-from mcp_telegram.telegram_rpc import TelegramRpcGate
+from mcp_telegram.telegram_rpc import TelegramRpcGate, _canonical_wire_method
 from test_update_delivery import DATE, _client, _database, _message, _pending, _saved
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+
+
+@dataclass
+class _EditEvent:
+    chat_id: int | None
+    message: _MessageLike
 
 
 def _seed(path: Path, dialog_id: int, *, hidden: bool = False) -> None:
@@ -79,16 +86,15 @@ def _body(mid: int, text: str, *, group: bool = False) -> types.Message:
     return message
 
 
-async def _admit(client: TelegramRpcGate, updates: list[object]) -> list[object]:
+async def _admit(client: TelegramRpcGate, updates: list[object], *, include_fixture_user: bool = True) -> list[object]:
     processed: list[object] = []
     for update in updates:
         client._message_box.process_updates(
             types.UpdateShort(cast(types.TypeUpdate, update), DATE), client._mb_entity_cache, processed
         )
     assert len(processed) == len(updates)
-    return await client._preprocess_updates(
-        processed, [types.User(55, access_hash=555, first_name="Fixture")], [types.ChatForbidden(7, "Fixture")]
-    )
+    users: list[object] = [types.User(55, access_hash=555, first_name="Fixture")] if include_fixture_user else []
+    return await client._preprocess_updates(processed, users, [types.ChatForbidden(7, "Fixture")])
 
 
 async def _write(writer: SQLiteWriter, sql: str) -> None:
@@ -97,6 +103,101 @@ async def _write(writer: SQLiteWriter, sql: str) -> None:
             conn.execute(sql)
 
     await writer.run(apply)
+
+
+async def test_hard_method_hold_keeps_unknown_sender_forward_update_local(tmp_path: Path) -> None:
+    path = _database(tmp_path)
+    writer = await SQLiteWriter.open(path)
+    reader = open_sync_db_reader(path)
+    client = _client(tmp_path / "session", writer, channel=False)
+    _manager(client, reader, writer)
+    method = _canonical_wire_method(functions.users.GetUsersRequest([types.InputUser(77, 0)]))
+    ledger = client._ensure_safety_ledger()
+    episodes = cast(dict[str, dict[str, object]], ledger._record["methods"])
+    ledger._record_method_flood(episodes, method, None)
+    calls = 0
+    get_entity = client.get_entity
+
+    async def count_get_entity(entity: types.PeerUser) -> object:
+        nonlocal calls
+        calls += 1
+        return await get_entity(entity)
+
+    client.get_entity = count_get_entity  # type: ignore[method-assign]
+    try:
+        await client.start_update_delivery(99)
+        new_message = _body(11, "forwarded")
+        new_message.fwd_from = types.MessageFwdHeader(date=DATE, from_id=types.PeerUser(77))
+        new_update = await _admit(
+            client,
+            [types.UpdateNewMessage(new_message, 11, 1)],
+            include_fixture_user=False,
+        )
+        assert _pending(path) is not None
+        await client._dispatch_update(new_update[0])
+        assert _pending(path) is None
+        assert reader.execute("SELECT text FROM messages WHERE dialog_id=55 AND message_id=11").fetchone() == (
+            "forwarded",
+        )
+        assert reader.execute(
+            "SELECT fwd_from_peer_id,fwd_from_name FROM message_forwards WHERE dialog_id=55 AND message_id=11"
+        ).fetchone() == (77, None)
+
+        assert reader.execute(
+            "SELECT entity_id,status FROM entity_profile_refresh_state WHERE entity_id IN (55,77) ORDER BY entity_id"
+        ).fetchall() == [(55, "pending"), (77, "pending")]
+        assert calls == 0
+        assert ledger.method_release_at(method) > 0
+    finally:
+        cast(SQLiteSession, client.session).close()
+        reader.close()
+        await writer.aclose()
+
+
+async def test_edit_forward_paths_use_local_names_and_profile_queue_under_hold(tmp_path: Path) -> None:
+    path = _database(tmp_path)
+    _seed(path, 55)
+    writer = await SQLiteWriter.open(path)
+    reader = open_sync_db_reader(path)
+    client = _client(tmp_path / "session", writer, channel=False)
+    manager = _manager(client, reader, writer)
+    method = _canonical_wire_method(functions.users.GetUsersRequest([types.InputUser(77, 0)]))
+    ledger = client._ensure_safety_ledger()
+    ledger._record_method_flood(cast(dict[str, dict[str, object]], ledger._record["methods"]), method, None)
+    calls = 0
+    get_entity = client.get_entity
+
+    async def count_get_entity(entity: types.PeerUser) -> object:
+        nonlocal calls
+        calls += 1
+        return await get_entity(entity)
+
+    client.get_entity = count_get_entity  # type: ignore[method-assign]
+    try:
+        missing = _body(6, "missing edit")
+        missing.fwd_from = types.MessageFwdHeader(date=DATE, from_id=types.PeerUser(77))
+        await manager.on_message_edited(_EditEvent(chat_id=55, message=cast(_MessageLike, missing)))
+        assert reader.execute("SELECT text FROM messages WHERE dialog_id=55 AND message_id=6").fetchone() == (
+            "missing edit",
+        )
+        assert reader.execute(
+            "SELECT fwd_from_peer_id,fwd_from_name FROM message_forwards WHERE dialog_id=55 AND message_id=6"
+        ).fetchone() == (77, None)
+
+        changed = _body(5, "changed edit")
+        changed.fwd_from = types.MessageFwdHeader(date=DATE, from_id=types.PeerUser(88))
+        await manager.on_message_edited(_EditEvent(chat_id=55, message=cast(_MessageLike, changed)))
+        assert reader.execute("SELECT text FROM messages WHERE dialog_id=55 AND message_id=5").fetchone() == (
+            "changed edit",
+        )
+        assert reader.execute(
+            "SELECT entity_id,status FROM entity_profile_refresh_state WHERE entity_id IN (77,88) ORDER BY entity_id"
+        ).fetchall() == [(77, "pending"), (88, "pending")]
+        assert calls == 0
+    finally:
+        cast(SQLiteSession, client.session).close()
+        reader.close()
+        await writer.aclose()
 
 
 @pytest.mark.parametrize("scenario", ["visible_new", "hidden_new", "old_edit", "group_delete"])

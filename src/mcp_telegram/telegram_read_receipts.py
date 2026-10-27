@@ -6,7 +6,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Protocol, cast
 
-from telethon.tl.functions.messages import GetOutboxReadDateRequest
+from telethon.tl.functions.messages import GetOutboxReadDateRequest, GetPeerDialogsRequest
 from telethon.tl.types import TypeInputPeer
 
 from .flood import TelegramRpcThrottled, _raise_if_latched
@@ -25,6 +25,14 @@ from .telegram_rpc_scheduler import (
     TelegramRpcAdmissionDeferred,
     TelegramRpcSource,
     rpc_scope,
+)
+
+READ_AT_REQUEST_METHOD = (
+    f"{GetOutboxReadDateRequest.__module__}.{GetOutboxReadDateRequest.__name__}:"
+    f"{GetOutboxReadDateRequest.CONSTRUCTOR_ID:08x}"
+)
+READ_RECEIPT_REQUEST_METHOD = (
+    f"{GetPeerDialogsRequest.__module__}.{GetPeerDialogsRequest.__name__}:{GetPeerDialogsRequest.CONSTRUCTOR_ID:08x}"
 )
 
 

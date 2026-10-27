@@ -16,8 +16,8 @@ from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
 from mcp_telegram.entity_profile.contracts import UserProfileObservation
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.sync_transactions import write_savepoint
-from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind
+from tests.demand_adapter_helpers import run_ready_slice
 from tests.test_entity_profile_full_user_pair import _pair_service, _PairClient, _prepare
 
 
@@ -50,7 +50,7 @@ async def test_scope_is_private_evidence_and_invalidated_pair_is_reacquired(tmp_
     service._deps = replace(service._deps, full_user_auth_scope=lambda: scope)
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     client = cast(_PairClient, service._deps.client)
     assert client.full_user_calls == 1
     evidence = service._profiles.read_section_evidence(42, "full_profile")
@@ -77,12 +77,12 @@ async def test_scope_is_private_evidence_and_invalidated_pair_is_reacquired(tmp_
     )
 
     service._profiles.request_section_refresh(42, ("full_profile", "personal_channel"), now=100, pair_mode="enabled")
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     assert client.full_user_calls == 2
 
     service._profiles.request_section_refresh(42, ("full_profile", "personal_channel"), now=400, pair_mode="enabled")
     service._deps = replace(service._deps, now_provider=lambda: 400.0)
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     assert client.full_user_calls == 3
     await service.shutdown()
     conn.close()
@@ -98,14 +98,14 @@ async def test_disabled_baseline_scope_reuse_survives_restart_without_pair_recei
     assert coordinator is not None
 
     service._profiles.mark_pending(42, now=100, pair_mode_override="disabled")
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     with write_savepoint(conn):
         conn.execute(
             "UPDATE entity_profile_refresh_state SET next_section='personal_channel', acquisition_cursor=0 "
             "WHERE entity_id=42"
         )
     conn.commit()
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     with write_savepoint(conn):
         conn.execute(
             "UPDATE entity_detail_sections SET status='fresh', observed_at=100, reason=NULL WHERE entity_id=42"
@@ -172,7 +172,7 @@ async def test_ownership_invalid_cached_profile_admits_refresh_and_offers_demand
     sink = _DemandSink()
     service.bind_demand_sink(sink)
 
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     with write_savepoint(conn):
         conn.execute(
             "UPDATE entity_details SET profile_owner_account_id=NULL, profile_observation_scope_json=NULL "
@@ -207,7 +207,7 @@ async def test_ownership_invalid_cached_profile_preserves_failed_retry_state(tmp
     sink = _DemandSink()
     service.bind_demand_sink(sink)
 
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     with write_savepoint(conn):
         conn.execute(
             "UPDATE entity_details SET profile_owner_account_id=NULL, profile_observation_scope_json=NULL "
@@ -254,7 +254,7 @@ async def test_public_local_read_does_not_requeue_failed_refresh(tmp_path: Path)
     coordinator = service.refresh_coordinator
     assert coordinator is not None
 
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     with write_savepoint(conn):
         conn.execute("UPDATE entity_profile_refresh_state SET status='failed', retry_at=877, reason='flood_wait'")
     before = cast(
@@ -308,7 +308,7 @@ async def test_scope_change_during_rpc_rejects_receipt_and_progress(tmp_path: Pa
     )
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     assert conn.execute(
         "SELECT next_section, acquisition_cursor FROM entity_profile_refresh_state WHERE entity_id=42"
     ).fetchone() == ("full_profile", 0)
@@ -327,7 +327,7 @@ async def test_same_account_scope_rotation_keeps_local_facts_without_mutation(tm
     service._deps = replace(service._deps, full_user_auth_scope=lambda: current_scope[0])
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     before = {
         table: conn.execute(f"SELECT * FROM {table} WHERE entity_id=42").fetchall()
         for table in ("entity_details", "entity_detail_sections", "entity_profile_refresh_state")

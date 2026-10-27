@@ -305,7 +305,6 @@ async def test_imperfect_slice_advances_and_retains_every_identifiable_row(tmp_p
         assert conn.execute("SELECT COUNT(*) FROM dialog_directory_staging").fetchone() == (2,)
     finally:
         conn.close()
-
     await directory.run_slice()
     conn = _open_sync_db(db_path)
     try:
@@ -313,6 +312,40 @@ async def test_imperfect_slice_advances_and_retains_every_identifiable_row(tmp_p
             (1, None),
             (2, "user"),
         ]
+    finally:
+        conn.close()
+
+
+def test_ordinary_commit_rejects_same_generation_changed_cursor(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    directory = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event(), writer=_writer(db_path))
+    conn = _open_sync_db(db_path)
+    try:
+        directory._bind_account(conn, 99)
+        with write_transaction(conn):
+            directory._start_generation(conn, 1)
+            conn.execute(
+                "UPDATE dialog_directory_state SET pinned_main_status='complete',pinned_archive_status='complete' "
+                "WHERE singleton=1"
+            )
+        captured = directory._load_state(conn)
+        assert captured.ordinary_status == "pending"
+        conn.execute(
+            "UPDATE dialog_directory_state SET offset_date=?,offset_id=99,offset_peer=? WHERE singleton=1",
+            (
+                datetime(2026, 1, 1, tzinfo=UTC).isoformat(),
+                _encode_input_peer(DialogCursor(datetime(2026, 1, 1, tzinfo=UTC), 99, types.InputPeerSelf())),
+            ),
+        )
+        conn.commit()
+        page = normalize_dialogs_response(_response([_dialog(777, 7)]), captured.cursor)
+
+        detail, successor = directory._commit_ordinary_response(conn, captured, 99, page)
+
+        assert detail is None and successor is None
+        assert conn.execute("SELECT COUNT(*) FROM dialog_directory_staging").fetchone() == (0,)
+        assert conn.execute("SELECT offset_id FROM dialog_directory_state").fetchone() == (99,)
     finally:
         conn.close()
 
@@ -1642,6 +1675,8 @@ def test_sqlite_row_composition_does_not_depend_on_tuple_factory(tmp_path: Path)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
+        conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
+        conn.commit()
         directory = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event(), writer=_writer(db_path))
         status = directory.status(0.0, conn)
         assert status is not None
@@ -1656,7 +1691,7 @@ def test_freshness_uses_acquisition_start_not_publication_time(tmp_path: Path) -
     conn = _open_sync_db(db_path)
     try:
         conn.execute(
-            "UPDATE dialog_directory_state SET status='complete',observation_started_at=100,observation_completed_at=999"
+            "UPDATE dialog_directory_state SET account_id=123,status='complete',observation_started_at=100,observation_completed_at=999"
         )
         conn.commit()
         directory = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event(), writer=_writer(db_path))

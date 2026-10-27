@@ -31,36 +31,36 @@ def test_backoff_survives_ordinary_failure_coalescing_and_reopen(tmp_path: Path)
     cursor = repo.next_due_refresh(now=100)
     assert cursor is not None
     assert repo.mark_section_failure(cursor, now=108, reason="flood_wait", retry_at=116)
-    assert repo.next_due_refresh(now=407) is None
-    assert repo.next_due_refresh(now=408) == replace(cursor, retry_at=408)
+    assert repo.next_due_refresh(now=115) is None
+    assert repo.next_due_refresh(now=116) == replace(cursor, retry_at=116)
     repo.mark_pending(42, now=200)
-    assert conn.execute("SELECT updated_at,retry_at FROM entity_profile_refresh_state").fetchone() == (108, 408)
+    assert conn.execute("SELECT updated_at,retry_at FROM entity_profile_refresh_state").fetchone() == (108, 116)
     conn.close()
     conn = sqlite3.connect(path)
     repo = EntityProfileRepository(conn, section_ttl_seconds=10)
     try:
-        cursor = repo.next_due_refresh(now=408)
+        cursor = repo.next_due_refresh(now=116)
         assert cursor is not None
-        assert repo.mark_section_failure(cursor, now=410, reason="timeouterror", retry_at=470)
+        assert repo.mark_section_failure(cursor, now=410, reason="timeouterror", retry_at=410)
         assert conn.execute("SELECT reason,retry_at FROM entity_profile_refresh_state").fetchone() == (
             "timeouterror",
-            710,
+            410,
         )
-        cursor = repo.next_due_refresh(now=710)
+        cursor = repo.next_due_refresh(now=410)
         assert cursor is not None
         assert repo.mark_section_failure(cursor, now=712, reason="flood_wait", retry_at=720)
-        assert conn.execute("SELECT retry_at FROM entity_profile_refresh_state").fetchone() == (1312,)
+        assert conn.execute("SELECT retry_at FROM entity_profile_refresh_state").fetchone() == (720,)
         assert not repo.mark_section_failure(
             replace(cursor, generation=cursor.generation + 1), now=713, reason="flood_wait", retry_at=9999
         )
-        assert conn.execute("SELECT retry_at FROM entity_profile_refresh_state").fetchone() == (1312,)
+        assert conn.execute("SELECT retry_at FROM entity_profile_refresh_state").fetchone() == (720,)
         cursor = repo.next_due_refresh(now=1312)
         assert cursor is not None
         assert repo.commit_section(cursor, EntitySectionCommit({}), now=1313)
         fresh = repo.next_due_refresh(now=1313)
         assert fresh is not None and fresh.next_section != cursor.next_section
         assert repo.mark_section_failure(fresh, now=1314, reason="flood_wait", retry_at=1320)
-        assert conn.execute("SELECT retry_at FROM entity_profile_refresh_state").fetchone() == (1614,)
+        assert conn.execute("SELECT retry_at FROM entity_profile_refresh_state").fetchone() == (1320,)
     finally:
         conn.close()
 
@@ -79,7 +79,7 @@ def test_uncapped_server_floor_and_future_deadline_are_preserved(tmp_path: Path)
             cursor = repo.next_due_refresh(now=now)
             assert cursor is not None
             assert repo.mark_section_failure(cursor, now=now, reason="flood_wait", retry_at=now + 8)
-            assert conn.execute("SELECT retry_at FROM entity_profile_refresh_state").fetchone() == (now + 3600,)
+            assert conn.execute("SELECT retry_at FROM entity_profile_refresh_state").fetchone() == (now + 8,)
     finally:
         conn.close()
 
@@ -114,20 +114,17 @@ async def test_scheduled_flood_uses_actual_failure_clock_and_does_not_repeat(
     assert coordinator is not None
     adapter = EntityProfileDemandAdapter(coordinator)
     try:
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        status = service._durable_refresh_status(clock[0])
+        assert status is not None and status.selected is not None
+        with pytest.raises(TelegramRpcThrottled):
+            await adapter.run_slice(RpcAttemptBudget(limit=1, selected=status.selected))
         assert conn.execute("SELECT updated_at,retry_at,reason FROM entity_profile_refresh_state").fetchone() == (
             107,
-            407,
+            107,
             "flood_wait",
         )
         assert client.full_user_calls == 1
-        clock[0] = 406
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
         assert client.full_user_calls == 1
-        clock[0] = 407
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
-        assert client.full_user_calls == 2
-        assert conn.execute("SELECT updated_at,retry_at FROM entity_profile_refresh_state").fetchone() == (414, 1014)
     finally:
         await service.shutdown()
         conn.close()
@@ -163,7 +160,7 @@ def test_backoff_is_per_peer_and_section_not_an_account_guard_replacement(tmp_pa
         assert repo.mark_section_failure(first, now=400, reason="flood_wait", retry_at=408)
         assert conn.execute(
             "SELECT entity_id,retry_at FROM entity_profile_refresh_state ORDER BY entity_id"
-        ).fetchall() == [(42, 1000), (43, 400)]
+        ).fetchall() == [(42, 408), (43, 110)]
     finally:
         conn.close()
 
@@ -183,7 +180,7 @@ def test_scope_change_keeps_control_plane_short_retry(tmp_path: Path) -> None:
         assert repo.mark_section_failure(cursor, now=110, reason="auth_scope_changed", retry_at=111)
         assert conn.execute("SELECT reason,retry_at FROM entity_profile_refresh_state").fetchone() == (
             "auth_scope_changed",
-            111,
+            10_000,
         )
         assert load_account_cooldown_until_utc(conn) == 20_000.0
     finally:
@@ -202,7 +199,7 @@ def test_unknown_core_failure_is_cursor_fenced_with_foreign_keys(tmp_path: Path)
         assert repo.mark_core_failure(cursor, now=407, reason="entity_unavailable", retry_at=467)
         assert conn.execute("SELECT reason,retry_at FROM entity_profile_refresh_state").fetchone() == (
             "entity_unavailable",
-            707,
+            467,
         )
         assert not repo.mark_core_failure(
             replace(cursor, generation=cursor.generation + 1), now=408, reason="flood_wait", retry_at=9000

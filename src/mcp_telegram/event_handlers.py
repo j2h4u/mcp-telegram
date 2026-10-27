@@ -24,14 +24,12 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
-from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import wraps
 from typing import Protocol, cast, runtime_checkable
 
 from telethon import events  # type: ignore[import-untyped]
-from telethon.errors import RPCError  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
     Channel,
     ChannelParticipantBanned,
@@ -77,7 +75,6 @@ from .channel_full_siblings import (
 from .delivered_update import (
     current_delivered_update,
     delivered_observed_at,
-    delivered_update_context,
     fail_delivered_update,
 )
 from .demand_wiring import DemandOfferSink, offer_durable_demand
@@ -127,12 +124,6 @@ from .messages.sqlite_hydration import (
     stage_message_transcription,
 )
 from .messages.telegram_adapter import (
-    PeerNameClient as _PeerNameClient,
-)
-from .messages.telegram_adapter import (
-    build_forward_entity_name_map as _build_fwd_entity_map,
-)
-from .messages.telegram_adapter import (
     extract_message_row,
 )
 from .observation_order import delivered_observation_order
@@ -167,8 +158,15 @@ from .telegram_demand import (
     current_demand_token,
     demand_context,
 )
+from .telegram_demand_progress import SliceOutcome, SliceOutcomeKind
 from .telegram_rpc_consumers import DemandKind
-from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_scope
+from .telegram_rpc_scheduler import (
+    RpcAdmissionClosedError,
+    TelegramRpcAdmissionDeferred,
+    TelegramRpcMethodRecoveryPending,
+    TelegramRpcSource,
+    rpc_scope,
+)
 from .telethon_dialog import classify_dialog_type, observe_dialog_identity
 from .topics.catalog import TopicCatalogRepository
 from .topics.contracts import is_topic_capable
@@ -574,12 +572,6 @@ class _SQLiteRealtimeHistoryStatusReader:
         if row is None:
             return None, False
         return cast(str | None, row[0]), bool(row[1])
-
-
-_DM_AUTO_ENROLL_SENDER_EXCEPTIONS: tuple[type[BaseException], ...] = (
-    RPCError,
-    Exception,
-)
 
 
 def _first_non_empty_str(*values: object) -> str | None:
@@ -1146,7 +1138,8 @@ class EventHandlerManager:
         if admitted:
             self._offer(DemandKind.ENTITY_PROFILE_REFRESH)
         if event.is_private and self._self_id is not None:
-            await self._persist_optional_dm_profile(getattr(event.message, "sender", None), dialog_id)
+            sender = getattr(event, "sender", None) or getattr(event.message, "sender", None)
+            await self._persist_optional_dm_profile(sender, dialog_id)
         return observation_order, identity_baseline
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
@@ -1177,7 +1170,7 @@ class EventHandlerManager:
                     dialog_id, msg, coverage, observation_order=observation_order
                 )
                 return
-            entity_name_map = await _build_fwd_entity_map(msg, cast(_PeerNameClient, self._client))
+            entity_name_map = await self._forward_entity_name_map(msg)
             extracted = replace(
                 extract_message_row(dialog_id, msg, entity_name_map=entity_name_map),
                 observation_order=observation_order,
@@ -1266,26 +1259,60 @@ class EventHandlerManager:
         identity_baseline: _IdentityBaseline | None,
     ) -> None:
         peer_field = "chat" if bool(getattr(event.message, "out", False)) else "sender"
-        cached_peer = cast(_SenderLike | None, getattr(event, peer_field, None))
-        peer: _SenderLike | None = cached_peer
-        acquired_peer = False
-        try:
-            if peer is None or bool(cast(object, getattr(peer, "min", False))):
-                # The pinned get_entity(PeerUser) path returns a GetUsers RPC response, not a cached getter result.
-                peer = cast(_SenderLike | None, await self._client.get_entity(PeerUser(dialog_id)))
-                acquired_peer = peer is not None
-        except _DM_AUTO_ENROLL_SENDER_EXCEPTIONS:
-            logger.debug("dm_auto_enroll_peer_fetch_failed dialog_id=%d", dialog_id)
-        with delivered_update_context(None) if acquired_peer else nullcontext():
-            enrolled = await self._auto_enroll_dm(
-                dialog_id,
-                sender=peer,
-                message_date=event.message.date,
-                observed_at=delivered_observed_at(),
-                identity_baseline=identity_baseline,
-            )
+        peer = cast(
+            _SenderLike | None,
+            getattr(event, peer_field, None) or getattr(event.message, peer_field, None),
+        )
+        enrolled = await self._auto_enroll_dm(
+            dialog_id,
+            sender=peer,
+            message_date=event.message.date,
+            observed_at=delivered_observed_at(),
+            identity_baseline=identity_baseline,
+        )
         if not enrolled:
             fail_delivered_update()
+
+    async def _forward_entity_name_map(self, message: object) -> dict[int, str]:
+        """Use delivered/local forward names and queue missing profile evidence."""
+        fwd = cast(object | None, getattr(message, "fwd_from", None))
+        from_id = cast(object | None, getattr(fwd, "from_id", None)) if fwd is not None else None
+        if fwd is None or from_id is None or getattr(fwd, "from_name", None) is not None:
+            return {}
+        try:
+            peer_id = get_peer_id(cast(TypePeer, from_id))
+        except TypeError, ValueError:
+            return {}
+
+        def read_local_name(conn: sqlite3.Connection) -> tuple[str | None, bool]:
+            with write_transaction(conn):
+                row = cast(
+                    tuple[object, ...] | None,
+                    conn.execute("SELECT name FROM entities WHERE id=?", (peer_id,)).fetchone(),
+                )
+                name = cast(str | None, row[0]) if row is not None else None
+                if name or self._self_id is None or peer_id == self._self_id:
+                    return name, False
+                refresh = cast(
+                    tuple[object, ...] | None,
+                    conn.execute(
+                        "SELECT status FROM entity_profile_refresh_state WHERE entity_id=?", (peer_id,)
+                    ).fetchone(),
+                )
+                if refresh is not None and str(refresh[0]) in {"complete", "rejected"}:
+                    return None, False
+                queued = EntityProfileRepository(conn, section_ttl_seconds=self._profile_detail_ttl_seconds)
+                return name, queued.request_section_refresh(
+                    peer_id,
+                    ("full_profile",),
+                    now=delivered_observed_at(),
+                    pair_mode=self._profile_pair_mode,
+                )
+
+        name, queued = await self._writer.run(read_local_name)
+        if queued:
+            self._offer(DemandKind.ENTITY_PROFILE_REFRESH)
+        return {peer_id: name} if name else {}
 
     async def _project_denied_new_message_metadata(
         self,
@@ -1543,7 +1570,7 @@ class EventHandlerManager:
         outgoing = bool(getattr(msg, "out", False))
         if not allows_missing_body_insert(coverage, RealtimeBodyEvent.EDIT, outgoing=outgoing):
             return False
-        entity_name_map = await _build_fwd_entity_map(msg, cast(_PeerNameClient, self._client))
+        entity_name_map = await self._forward_entity_name_map(msg)
         extracted = replace(
             extract_message_row(dialog_id, msg, entity_name_map=entity_name_map), observation_order=observation_order
         )
@@ -1586,7 +1613,7 @@ class EventHandlerManager:
     ) -> int | None:
         edit_date_raw = msg.edit_date
         edit_date_unix = int(edit_date_raw.timestamp()) if edit_date_raw is not None else now
-        entity_name_map = await _build_fwd_entity_map(msg, cast(_PeerNameClient, self._client))
+        entity_name_map = await self._forward_entity_name_map(msg)
         extracted = replace(
             extract_message_row(dialog_id, msg, entity_name_map=entity_name_map), observation_order=observation_order
         )
@@ -2745,30 +2772,31 @@ class EventHandlerManager:
                 linked_chat_fact_owner.invalidate_from_update(conn, dialog_id, now)
         return changed, row
 
-    async def retry_one_pending_linked_chat_fact(self, budget: RpcAttemptBudget) -> bool:
-        """Acquire and publish one due linked-chat fact in this adapter task."""
-        if not isinstance(budget, RpcAttemptBudget):
-            raise TypeError("budget must be an RpcAttemptBudget")
+    async def retry_one_pending_linked_chat_fact(self, budget: RpcAttemptBudget) -> SliceOutcome:
+        """Acquire only the selected generation and report its own accepted publication."""
+        selected = budget.selected
+        if selected is None:
+            raise ValueError("linked-chat demand requires a selected revision")
         now = int(time.time())
-
-        # next_due performs a bounded self-heal UPDATE. End its write transaction
-        # before peer resolution or the first asynchronous Telegram RPC.
-        def _persist_event_0(conn: sqlite3.Connection) -> LinkedChatWork | None:
-            with write_transaction(conn):
-                return linked_chat_fact_owner.next_due(conn, now)
-
-        work = await self._writer.run(_persist_event_0)
+        work = next(
+            (
+                item
+                for item in linked_chat_fact_owner.pending_work(self._conn)
+                if str(item.channel_id) == selected.key.target
+                and repr((item.generation, item.generation)) == selected.revision
+            ),
+            None,
+        )
         if work is None:
-            return False
-
-        def _persist_event_1(conn: sqlite3.Connection) -> tuple[int, ChannelFullSiblingsToken]:
-            with write_transaction(conn):
-                generation = linked_chat_fact_owner.capture_generation(conn, work.channel_id)
-                siblings_token = capture_channel_full_siblings_token(conn, work.channel_id)
-            return (generation, siblings_token)
-
-        (generation, siblings_token) = await self._writer.run(_persist_event_1)
-        return await self._acquire_linked_chat_work(work, generation, siblings_token, now)
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        if work.retry_at > now:
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        siblings_token = capture_channel_full_siblings_token(self._conn, work.channel_id)
+        published = await self._acquire_linked_chat_work(work, work.generation, siblings_token, now)
+        if published:
+            return SliceOutcome(selected, SliceOutcomeKind.TERMINAL, repr((work.generation + 1, None)))
+        kind = SliceOutcomeKind.NO_PROGRESS if published is None else SliceOutcomeKind.STALE
+        return SliceOutcome(selected, kind)
 
     async def _acquire_linked_chat_work(
         self,
@@ -2776,18 +2804,18 @@ class EventHandlerManager:
         generation: int,
         siblings_token: ChannelFullSiblingsToken,
         now: int,
-    ) -> bool:
+    ) -> bool | None:
         """Run local peer resolution, one RPC, then publish the accepted observation."""
         channel_id = work.channel_id
         input_channel = linked_chat_fact_owner.resolve_cached_input_peer(self._client, channel_id)
         if input_channel is None:
             await self._writer.run(lambda conn: self._defer_linked_chat_work(conn, work, now))
             logger.debug("linked_chat_refresh_no_input_peer dialog_id=%d", channel_id)
-            return True
+            return None
 
         full_result = await self._request_linked_chat_full(work, input_channel, now)
         if full_result is None:
-            return True
+            return None
         return await self._publish_linked_chat_observation(work, generation, siblings_token, full_result, now)
 
     async def _request_linked_chat_full(
@@ -2800,29 +2828,19 @@ class EventHandlerManager:
         channel_id = work.channel_id
         try:
             return await linked_chat_fact_owner.acquire(self._client, input_channel)
-        except TelegramRpcThrottled as exc:
-            logger.warning(
-                "linked_chat_refresh_flood dialog_id=%d flood_wait_seconds=%s",
-                channel_id,
-                exc.retry_after_seconds,
-            )
-            retry_after_seconds = exc.retry_after_seconds
-            await self._writer.run(
-                lambda conn: self._defer_linked_chat_work(conn, work, now, flood_wait_seconds=retry_after_seconds)
-            )
-            if exc.latched:
-                raise
-            return None
-        except RpcAdmissionClosedError:
-            await self._writer.run(lambda conn: self._defer_linked_chat_work(conn, work, now))
+        except (
+            TelegramRpcAdmissionDeferred,
+            TelegramRpcMethodRecoveryPending,
+            TelegramRpcThrottled,
+            RpcAdmissionClosedError,
+        ):
             raise
         except ACCESS_LOST_ERRORS as exc:
             await self._mark_linked_chat_access_lost(channel_id, now, exc)
             return None
         except Exception:
             logger.debug("linked_chat_refresh_failed dialog_id=%d", channel_id, exc_info=True)
-            await self._writer.run(lambda conn: self._defer_linked_chat_work(conn, work, now))
-            return None
+            raise
 
     async def _publish_linked_chat_observation(
         self,
@@ -2831,7 +2849,7 @@ class EventHandlerManager:
         siblings_token: ChannelFullSiblingsToken,
         full_result: object,
         now: int,
-    ) -> bool:
+    ) -> bool | None:
         """Validate and atomically publish canonical and sibling facts."""
         channel_id = work.channel_id
         try:
@@ -2839,7 +2857,7 @@ class EventHandlerManager:
         except ValueError:
             await self._writer.run(lambda conn: self._defer_linked_chat_work(conn, work, now))
             logger.debug("linked_chat_refresh_invalid_observation dialog_id=%d", channel_id)
-            return True
+            return None
 
         def _persist_event_0(conn: sqlite3.Connection) -> bool:
             with write_transaction(conn):
@@ -2870,7 +2888,7 @@ class EventHandlerManager:
             channel_id,
             published,
         )
-        return True
+        return published
 
     def _defer_linked_chat_work(
         self,

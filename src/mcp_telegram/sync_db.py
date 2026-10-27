@@ -61,6 +61,7 @@ _DRAFT_SOURCE_ORDER_SCHEMA_76 = 76
 
 _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _RPC_SAFETY_RECORD_KEY = "telegram_rpc_safety"
+_RPC_SAFETY_RECORD_VERSION = 2
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
 
 # Product-owned scheduled reconciliation targets.  Keep these values here so
@@ -1633,14 +1634,63 @@ def _validate_rpc_safety_record(value: str) -> tuple[int | None, float]:
         record = cast(object, json.loads(value))
     except (TypeError, json.JSONDecodeError) as exc:
         raise ValueError("invalid Telegram RPC safety record JSON") from exc
-    if not isinstance(record, dict) or type(record.get("version")) is not int or record["version"] != 1:
+    if (
+        not isinstance(record, dict)
+        or type(record.get("version")) is not int
+        or record["version"] not in {1, _RPC_SAFETY_RECORD_VERSION}
+    ):
         raise ValueError("invalid Telegram RPC safety record version")
     account_id, expected_account = _validate_rpc_safety_scope(cast(dict[str, object], record))
     floor_utc = _validate_rpc_safety_floor(record.get("floor"))
     if not record.get("generation") or not isinstance(record.get("generation"), str):
         raise ValueError("invalid Telegram RPC safety record generation")
+    if record["version"] == _RPC_SAFETY_RECORD_VERSION:
+        _validate_rpc_method_episodes(record.get("methods"))
     scope = cast(dict[str, object], record.get("scope"))
     return (account_id if scope["stage"] == "verified" else expected_account, floor_utc)
+
+
+def _validate_rpc_method_episodes(value: object) -> None:
+    if not isinstance(value, dict):
+        raise ValueError("invalid Telegram RPC method episodes")
+    for method, episode in value.items():
+        if not isinstance(method, str) or not method or not isinstance(episode, dict):
+            raise ValueError("invalid Telegram RPC method episode")
+        _validate_rpc_method_episode(episode)
+
+
+def _validate_rpc_method_episode(episode: dict[object, object]) -> None:
+    fields = {"generation", "consecutive_actual_floods", "floor", "claim"}
+    if set(episode) not in (fields, fields | {"state"}):
+        raise ValueError("invalid Telegram RPC method episode fields")
+    _validate_rpc_safety_floor(episode.get("floor"))
+    count = episode.get("consecutive_actual_floods")
+    state = episode.get("state", "live")
+    if state not in {"live", "recovered"}:
+        raise ValueError("invalid Telegram RPC method episode state")
+    _validate_rpc_method_identity(episode, count, state)
+    if state == "recovered" and (count != 0 or episode["claim"] is not None):
+        raise ValueError("invalid recovered Telegram RPC method episode")
+    _validate_rpc_method_claim(episode["claim"])
+
+
+def _validate_rpc_method_identity(episode: dict[object, object], count: object, state: object) -> None:
+    if (
+        type(count) is not int
+        or count < (1 if state == "live" else 0)
+        or not isinstance(episode.get("generation"), str)
+        or not episode["generation"]
+    ):
+        raise ValueError("invalid Telegram RPC method episode identity")
+
+
+def _validate_rpc_method_claim(value: object) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != {"attempt_id", "run"}:
+        raise ValueError("invalid Telegram RPC method recovery claim")
+    if any(not isinstance(value[k], str) or not value[k] for k in ("attempt_id", "run")):
+        raise ValueError("invalid Telegram RPC method recovery owner")
 
 
 def save_rpc_safety_record(conn: sqlite3.Connection, expected: str | None, value: str) -> None:
@@ -1691,7 +1741,7 @@ def load_self_profile_last_success_at(conn: sqlite3.Connection) -> float | None:
     return completed_at
 
 
-def save_self_profile_last_success_at(conn: sqlite3.Connection, completed_at: float) -> None:
+def save_self_profile_last_success_at(conn: sqlite3.Connection, completed_at: float) -> str:
     """Atomically persist a finite account self-profile refresh epoch."""
     if (
         isinstance(completed_at, bool)
@@ -1705,6 +1755,18 @@ def save_self_profile_last_success_at(conn: sqlite3.Connection, completed_at: fl
             "INSERT INTO daemon_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (_SELF_PROFILE_LAST_SUCCESS_AT_KEY, repr(float(completed_at))),
         )
+
+        row = cast(
+            tuple[str] | None,
+            conn.execute("SELECT value FROM daemon_state WHERE key='self_profile_generation'").fetchone(),
+        )
+        generation = (int(row[0]) if row is not None else 0) + 1
+        conn.execute(
+            "INSERT INTO daemon_state(key,value) VALUES('self_profile_generation',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(generation),),
+        )
+        return str(generation)
 
 
 # ---------------------------------------------------------------------------

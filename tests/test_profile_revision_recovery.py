@@ -22,10 +22,11 @@ from mcp_telegram.entity_profile.repository import EntityProfileRepository, Enti
 from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_transactions import write_transaction
-from mcp_telegram.telegram_demand import DemandStatus, DurableDemandAdapter, RpcAttemptBudget
+from mcp_telegram.telegram_demand import DemandStatus, DurableDemandAdapter
 from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator
 from mcp_telegram.telegram_gateway import _supplied_profile_user
 from mcp_telegram.telegram_rpc_consumers import DemandKind
+from tests.demand_adapter_helpers import run_ready_slice
 from tests.test_dm_profile_repository import _peer, _repository
 from tests.test_entity_profile_full_user_pair import _pair_service, _PairClient
 from tests.test_story_profile_diagnostics import _QueuedWriter
@@ -171,11 +172,11 @@ async def test_scheduled_owner_repairs_without_rpc_then_refetches_and_progresses
     adapter = EntityProfileDemandAdapter(coordinator)
     before = _evidence(conn)
     try:
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await run_ready_slice(adapter, now=1000.0)
         assert client.full_user_calls == 0
         assert _evidence(conn) == before
         assert repo.next_due_refresh(now=1000) == replace(old, profile_revision=2)
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await run_ready_slice(adapter, now=1000.0)
         assert client.full_user_calls == 1
         fresh = repo.next_due_refresh(now=1000)
         assert fresh is not None and fresh.next_section == "common_chats"
@@ -243,7 +244,7 @@ async def test_queued_repair_rechecks_authenticated_account_before_writing(legac
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     before = (_record(conn, "entity_details"), _record(conn, "entity_profile_refresh_state"), _evidence(conn))
-    task = asyncio.create_task(EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1)))
+    task = asyncio.create_task(run_ready_slice(EntityProfileDemandAdapter(coordinator), now=1000.0))
     try:
         await asyncio.wait_for(writer.waiting.wait(), timeout=2)
         service._deps = replace(
@@ -267,7 +268,7 @@ async def test_queued_repair_rechecks_authenticated_account_before_writing(legac
 
 
 @pytest.mark.asyncio
-async def test_unowned_mismatch_uses_existing_domain_suppression_and_leaves_siblings_ready(legacy: Legacy) -> None:
+async def test_unowned_mismatch_excludes_selected_revision_and_leaves_siblings_ready(legacy: Legacy) -> None:
     conn = legacy[0]
     client = _PairClient(channel_id=None)
     service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=True))
@@ -294,9 +295,7 @@ async def test_unowned_mismatch_uses_existing_domain_suppression_and_leaves_sibl
 
     async def sibling_runs() -> None:
         assert kind not in coordinator.scan(now=1000)
-        assert coordinator.offer(kind)
-        assert kind not in coordinator.scan(now=1009)
-        assert kind in coordinator.scan(now=1010)
+        assert kind not in coordinator.scan(now=1010)
         shutdown.set()
 
     supplied[sibling].on_run = sibling_runs

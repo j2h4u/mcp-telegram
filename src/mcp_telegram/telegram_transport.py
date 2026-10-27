@@ -344,8 +344,6 @@ class GuardedMTProtoSender(MTProtoSender):
         owned = _OwnedState(state, owner, state.data, type(state.request), result, origin=origin)
         self._owned_states[state] = owned
         state.future.add_done_callback(lambda future: self._result_observed(state, future))
-        if origin == "ack":
-            self._retain_ack(state)
         return owned
 
     def require_owned(self, state: _RequestState) -> _OwnedState:
@@ -375,6 +373,7 @@ class GuardedMTProtoSender(MTProtoSender):
 
     async def _finish_result(self, owned: _OwnedState, future: asyncio.Future[object]) -> None:
         error = asyncio.CancelledError() if future.cancelled() else future.exception()
+        self._retire_unsent_ping(owned, error)
         try:
             rejected = await self._authority.observe_result(
                 owned.owner, error, None if error is not None else future.result()
@@ -388,10 +387,21 @@ class GuardedMTProtoSender(MTProtoSender):
         else:
             self._publish_owned_result(owned, future, error)
         finally:
-            if self._pending_state.get(owned.state.msg_id) is owned.state:
-                self._pending_state.pop(owned.state.msg_id, None)
-            if owned.origin != "ack" or owned.retired:
-                self._owned_states.pop(owned.state, None)
+            self._retire_completed_state(owned)
+
+    def _retire_completed_state(self, owned: _OwnedState) -> None:
+        if self._pending_state.get(owned.state.msg_id) is owned.state:
+            self._pending_state.pop(owned.state.msg_id, None)
+        if owned.origin != "ack" or owned.retired or owned.state not in self._last_acks:
+            self._owned_states.pop(owned.state, None)
+
+    def _retire_unsent_ping(self, owned: _OwnedState, error: BaseException | None) -> None:
+        """An unwritten failed ping cannot keep the vendor keepalive pending."""
+        if error is None or owned.origin != "ping" or owned.claims:
+            return
+        request = owned.state.request
+        if isinstance(request, PingRequest) and self._ping == request.ping_id:
+            self._ping = None
 
     @staticmethod
     def _publish_owned_result(owned: _OwnedState, future: asyncio.Future[object], error: BaseException | None) -> None:
@@ -540,6 +550,10 @@ class GuardedMTProtoSender(MTProtoSender):
         if isinstance(state.request, TLRequest):
             self._pending_state[state.msg_id] = state
         write(encrypted)
+        if owned.origin == "ack" and owned.claims == 1:
+            # Vendor retention bounds replay of sent acknowledgements. Pending
+            # obligations keep their existing queue ownership until first write.
+            self._retain_ack(state)
         if owned.origin in {"ack", "state_info"}:
             result: asyncio.Future[object] = asyncio.get_running_loop().create_future()
             result.set_result(None)
