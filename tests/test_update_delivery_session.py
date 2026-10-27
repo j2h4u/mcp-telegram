@@ -217,7 +217,9 @@ async def test_vendor_lifecycle_flush_keeps_pending_head_private_and_saves_peer_
     original_wait = asyncio.wait_for
 
     async def keepalive_tick(awaitable: Awaitable[object], timeout: float | None) -> object:
-        if awaitable is sender.disconnected and timeout == 60:
+        if timeout == 60:
+            assert isinstance(awaitable, asyncio.Future)
+            awaitable.cancel()
             raise TimeoutError
         return await original_wait(awaitable, timeout)
 
@@ -231,7 +233,7 @@ async def test_vendor_lifecycle_flush_keeps_pending_head_private_and_saves_peer_
         session.set_dc(2, "offline.invalid", 443)
         if owner == "keepalive":
             monkeypatch.setattr(asyncio, "wait_for", keepalive_tick)
-            monkeypatch.setattr(sender, "_keepalive_ping", lambda _random_id: setattr(sender, "_connected", False))
+            monkeypatch.setattr(sender, "_keepalive_ping", lambda _random_id: setattr(sender, "_user_connected", False))
             await TelegramClient._keepalive_loop(client)
         else:
             await TelegramClient._auth_key_callback(client, AuthKey(b"\x01" * 256))
@@ -241,10 +243,11 @@ async def test_vendor_lifecycle_flush_keeps_pending_head_private_and_saves_peer_
         assert _pending(path) is not None and _safe(path).pts == 10
         assert _durable_peers(Path(session.filename))[66] == 666
     finally:
-        await sender.disconnect()
-        await client.close_rpc_scheduler()
-        session.close()
-        await writer.aclose()
+        try:
+            await client.close_rpc_scheduler()
+        finally:
+            session.close()
+            await writer.aclose()
 
 
 @pytest.mark.integration
