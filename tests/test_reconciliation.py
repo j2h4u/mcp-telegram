@@ -15,9 +15,10 @@ import pytest
 from telethon.errors import ChannelPrivateError, PeerIdInvalidError
 from telethon.tl import types  # type: ignore[import-untyped]
 
-from mcp_telegram.dialog_sync import DialogReconciliationWorker
+from mcp_telegram.dialog_sync import DialogLightReconciliationDemandAdapter, DialogReconciliationWorker
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.topics.refresh import TopicRefresher
 from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from mcp_telegram.topics.telegram_adapter import TelethonTelegramTopicGateway
@@ -162,19 +163,29 @@ async def test_recon_light_pass_never_calls_iter_dialogs(
 
 
 @pytest.mark.asyncio
-async def test_recon_light_pass_flood_wait_advances_to_next_dialog(
+async def test_recon_light_pass_propagates_flood_and_keeps_excluded_sibling_runnable(
     sync_db: sqlite3.Connection, mock_client: _MockClient, shutdown_event: asyncio.Event
 ) -> None:
     _seed_dialog(sync_db, 100, needs_refresh=1)
     _seed_dialog(sync_db, 200, needs_refresh=1)
     mock_client.get_entity.side_effect = [TelegramRpcThrottled(retry_after_seconds=1), _user(200, "B")]
+    worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event, writer=inline_writer(sync_db))
+    adapter = DialogLightReconciliationDemandAdapter(worker, account_id=123)
 
-    count = await DialogReconciliationWorker(
-        mock_client, sync_db, shutdown_event, writer=inline_writer(sync_db)
-    ).run_light_pass()
+    first = adapter.status(0.0)
+    assert first is not None and first.selected is not None
+    with pytest.raises(TelegramRpcThrottled):
+        await adapter.run_slice(RpcAttemptBudget(limit=1, selected=first.selected))
+    assert mock_client.get_entity.await_count == 1
+    assert sync_db.execute("SELECT needs_refresh FROM dialogs WHERE dialog_id=100").fetchone() == (1,)
 
-    assert count == 1
-    assert mock_client.get_entity.call_count == 2
+    sibling = adapter.status(0.0, excluded=frozenset({first.selected}))
+    assert sibling is not None and sibling.selected is not None
+    assert sibling.selected.key.target == "200"
+    outcome = await adapter.run_slice(RpcAttemptBudget(limit=1, selected=sibling.selected))
+
+    assert outcome.kind.value == "progressed"
+    assert mock_client.get_entity.await_count == 2
     assert sync_db.execute("SELECT needs_refresh FROM dialogs WHERE dialog_id=100").fetchone() == (1,)
     assert sync_db.execute("SELECT needs_refresh FROM dialogs WHERE dialog_id=200").fetchone() == (0,)
 

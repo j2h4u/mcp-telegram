@@ -734,22 +734,40 @@ async def test_suspended_discovery_does_not_spin_coordinator_and_restore_reoffer
     callback_adapter = initial[callback_kind]
     callback_offers: list[bool] = []
     callback_adapter.on_run = _restore_link_callback(conn, clock, coordinator, shutdown, callback_offers)
+    try:
+        for _ in range(20):
+            coordinator.scan(now=clock.value)
+            assert DemandKind.SCHEDULED_DISCOVERY not in coordinator.ready_kinds
+        assert callback_adapter.run_calls == []
+        assert client.requests == []
 
-    for _ in range(20):
-        coordinator.scan(now=clock.value)
+        await coordinator.run()
+
+        assert len(callback_adapter.run_calls) == 1
+        assert callback_offers == [True]
+        assert client.requests == []
         assert DemandKind.SCHEDULED_DISCOVERY not in coordinator.ready_kinds
-    assert callback_adapter.run_calls == []
-    assert client.requests == []
 
-    await coordinator.run()
+        await _assert_suspended_discovery_seed_then_due(discovery, clock.value + 1, now)
+        assert client.requests == []
+    finally:
+        conn.close()
 
-    assert len(callback_adapter.run_calls) == 1
-    assert callback_offers == [True]
-    assert client.requests == []
-    assert DemandKind.SCHEDULED_DISCOVERY not in coordinator.ready_kinds
-    status = discovery.status(clock.value + 1)
-    assert status is not None and status.release_at == float(now) and status.selected is not None
-    conn.close()
+
+async def _assert_suspended_discovery_seed_then_due(
+    discovery: ScheduledDiscoveryDemandAdapter, now: float, due_at: int
+) -> None:
+    seed = discovery.status(now)
+    assert seed is not None and seed.release_at == 0 and seed.selected is not None
+    assert seed.selected.key.target == "unseeded"
+    outcome = await discovery.run_slice(RpcAttemptBudget(limit=16, selected=seed.selected))
+    assert outcome.kind is SliceOutcomeKind.PROGRESSED
+
+    newly_seeded = discovery.status(now)
+    assert newly_seeded is not None and newly_seeded.selected is not None
+    due = discovery.status(now, excluded=frozenset({newly_seeded.selected}))
+    assert due is not None and due.release_at == float(due_at) and due.selected is not None
+    assert due.selected.key.target == "42"
 
 
 class _CoordinatorScheduledClient:

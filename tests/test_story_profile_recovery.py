@@ -20,13 +20,14 @@ from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
 from mcp_telegram.entity_profile.collection_repository import merge_semantic_fields
 from mcp_telegram.entity_profile.contracts import UserReference
 from mcp_telegram.entity_profile.field_manifest import PROFILE_FIELD_MANIFEST
-from mcp_telegram.entity_profile.refresh import RefreshLimits, scope_changed_retry_at
+from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, RefreshLimits, scope_changed_retry_at
 from mcp_telegram.entity_profile.semantic_normalization import normalize_collection_item
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_gateway import TelethonUserProfileGateway
 from mcp_telegram.tools import entity_info
-from tests.test_channel_contact_failure_identity import _QueuedWriter, _run
+from tests.demand_adapter_helpers import run_ready_slice
+from tests.test_channel_contact_failure_identity import _QueuedWriter
 from tests.test_entity_profile_progressive import _test_service
 from tests.test_profile_collection_pages import Database
 from tests.test_profile_collection_pages import _Client as _DirectClient
@@ -47,6 +48,12 @@ def _listing(*items: types.TypeStoryItem) -> types.stories.PeerStories:
 
 
 type Recovery = tuple[sqlite3.Connection, DaemonEntityInfoService, _Client, list[float]]
+
+
+async def _run(service: DaemonEntityInfoService) -> None:
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator), now=service._deps.now_provider())
 
 
 @pytest.fixture
