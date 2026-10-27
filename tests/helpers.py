@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, TypedDict, Unpack, cast
 
+from mcp_telegram import telegram_rpc
 from mcp_telegram.entity_profile.contracts import (
     PROFILE_SECTIONS,
     ChannelContactOverlapObservation,
@@ -481,3 +482,9 @@ def enable_profile_page_fixture(conn: sqlite3.Connection) -> None:
     _apply_migration_87(conn, 86)
     _apply_migration_88(conn, 87)
     _apply_migration_89(conn, 88)
+
+
+def reset_rpc_process_policy() -> None:
+    """Isolate test processes without a production cooldown-reset capability."""
+    telegram_rpc._COOLDOWN_DEADLINE = 0.0
+    telegram_rpc._OBSERVED_FLOOD_IDS.clear()

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
+import argparse
 import asyncio
 import datetime
 import getpass
 import os
 import shutil
+import sqlite3
 import sys
-import tomllib
-import traceback
 from collections.abc import Awaitable
 from io import StringIO
 from pathlib import Path
@@ -14,10 +14,12 @@ from typing import Protocol, cast
 
 import qrcode as qrcode_module
 from dotenv import load_dotenv
-from telethon import TelegramClient
 from telethon.errors import PasswordHashInvalidError, RPCError, SessionPasswordNeededError
 
-load_dotenv()
+from mcp_telegram.config import load_config
+from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.telegram_auth import authenticate
+from mcp_telegram.telegram_rpc import TelegramRpcGate
 
 PRIVATE_STATE_DIR_MODE = 0o700
 PRIVATE_SESSION_FILE_MODE = 0o600
@@ -25,6 +27,13 @@ QR_LEFT_PADDING = " " * 6
 QR_BORDER = 4
 QR_REFRESH_MARGIN_SECONDS = 20
 QR_PROGRESS_BAR_WIDTH = 28
+REAUTHENTICATION_NOTICE = (
+    "Local credential replacement does not remotely log out the old authorization, which may remain listed in Telegram."
+)
+
+
+class LoginInputError(RuntimeError):
+    """An operator input failure whose message contains no account or credential data."""
 
 
 class _QrCodeConstants(Protocol):
@@ -73,40 +82,8 @@ class _TelegramUser(Protocol):
 qrcode = cast(_QrCodeModule, qrcode_module)
 
 
-def _load_telegram_credentials() -> tuple[int, str, str]:
-    """Load and validate Telegram auth settings from the environment."""
-    api_id_raw = os.getenv("TELEGRAM_API_ID", "").strip()
-    api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
-    two_fa_password = os.getenv("TELEGRAM_2FA_PASSWORD", "")
-
-    if not api_id_raw or not api_hash:
-        print("TELEGRAM_API_ID or TELEGRAM_API_HASH is not set in .env")
-        sys.exit(1)
-    if not api_id_raw.isdecimal():
-        print("TELEGRAM_API_ID must be an integer")
-        sys.exit(1)
-
-    return int(api_id_raw), api_hash, two_fa_password
-
-
 def _config_path() -> Path:
     return Path.cwd() / "config.toml"
-
-
-def _load_state_dir() -> Path:
-    """Load required state.dir from the operator config."""
-    path = _config_path()
-    if not path.exists():
-        raise SystemExit(f'Missing deploy config: {path}. Create it with:\n[state]\ndir = "/srv/mcp-telegram/database"')
-    with path.open("rb") as config_file:
-        config = tomllib.load(config_file)
-    state_config = config.get("state")
-    if not isinstance(state_config, dict):
-        raise SystemExit(f"Missing [state] section in {path}")
-    value = state_config.get("dir")
-    if not isinstance(value, str) or value.strip() == "":
-        raise SystemExit(f"Missing non-empty state.dir in {path}")
-    return Path(value).expanduser()
 
 
 def _ensure_private_state_dir(path: Path) -> Path:
@@ -169,9 +146,8 @@ def build_countdown_bar(remaining_seconds: int, total_seconds: int) -> str:
     return f"[{'#' * filled_width}{'-' * empty_width}]"
 
 
-async def _show_account_summary(client: TelegramClient, session_file: Path | None = None) -> None:
-    """Print account details for the current authenticated session."""
-    me = cast(_TelegramUser, await client.get_me())
+def _show_account_summary(me: _TelegramUser, session_file: Path | None = None) -> None:
+    """Print account details only after the shared gate verifies the account."""
     print(f"Phone: {me.phone}")
     print(f"Name: {me.first_name}")
     if session_file is not None:
@@ -196,7 +172,7 @@ def show_2fa_screen(using_env_password: bool) -> None:
     sys.stdout.flush()
 
 
-async def complete_2fa_login(client: TelegramClient, two_fa_password: str) -> None:
+async def complete_2fa_login(client: TelegramRpcGate, two_fa_password: str) -> None:
     """Complete login with a 2FA password."""
     if two_fa_password:
         show_2fa_screen(using_env_password=True)
@@ -206,7 +182,7 @@ async def complete_2fa_login(client: TelegramClient, two_fa_password: str) -> No
     show_2fa_screen(using_env_password=False)
 
     if not sys.stdin.isatty():
-        raise RuntimeError(
+        raise LoginInputError(
             "Entering a 2FA password requires an interactive terminal. "
             "Run this script in a normal TTY or set TELEGRAM_2FA_PASSWORD in .env."
         )
@@ -215,7 +191,7 @@ async def complete_2fa_login(client: TelegramClient, two_fa_password: str) -> No
         try:
             password = getpass.getpass("Enter Telegram cloud 2FA password: ")
         except EOFError as e:
-            raise RuntimeError(
+            raise LoginInputError(
                 "Could not read the 2FA password from the terminal. Run this script in an interactive console."
             ) from e
 
@@ -231,9 +207,10 @@ async def complete_2fa_login(client: TelegramClient, two_fa_password: str) -> No
             if remaining_attempts == 0:
                 raise
             print(f"Invalid 2FA password. Attempts remaining: {remaining_attempts}")
+    raise LoginInputError("No 2FA password was supplied.")
 
 
-async def _run_qr_login(client: TelegramClient, two_fa_password: str, session_file: Path) -> None:
+async def _run_qr_login(client: TelegramRpcGate, two_fa_password: str) -> None:
     """Run the QR login loop until authorization completes."""
     qr_login = cast(_QrLogin, await client.qr_login())
     qr_total_seconds = _qr_lifetime(qr_login)
@@ -275,46 +252,77 @@ async def _run_qr_login(client: TelegramClient, two_fa_password: str, session_fi
         except SessionPasswordNeededError:
             await complete_2fa_login(client, two_fa_password)
 
-        print("\nAuthorization successful.")
-        await _show_account_summary(client, session_file)
         return
 
 
-async def main() -> None:
-    api_id, api_hash, two_fa_password = _load_telegram_credentials()
-
-    state_dir = _load_state_dir()
-    session_file = state_dir / "mcp_telegram_session"
-    _ensure_private_state_dir(session_file.parent)
-
-    client = TelegramClient(str(session_file), api_id, api_hash)
-    await client.connect()
-
+async def main(*, acknowledge_unknown_outcome: bool = False, replace_credentials: bool = False) -> int:
+    """Authenticate while the daemon is stopped, without bypassing its RPC gate."""
     try:
-        if await client.is_user_authorized():
-            print("Already authorized.")
-            await _show_account_summary(client)
-            return
+        load_dotenv(Path.cwd() / ".env")
+        config = load_config(_config_path())
+        if replace_credentials:
+            print(REAUTHENTICATION_NOTICE)
 
-        print("Requesting a Telegram QR login code...\n")
-        await _run_qr_login(client, two_fa_password, session_file)
+        async def login(client: TelegramRpcGate) -> None:
+            print("Requesting a Telegram QR login code...\n")
+            await _run_qr_login(client, os.getenv("TELEGRAM_2FA_PASSWORD", ""))
+
+        user, already_authorized = await authenticate(
+            config,
+            login,
+            acknowledge_unknown_outcome=acknowledge_unknown_outcome,
+            replace_credentials=replace_credentials,
+        )
+        print("Already authorized." if already_authorized else "\nAuthorization successful.")
+        session_file = None if already_authorized else config.state.dir / "mcp_telegram_session.session"
+        _show_account_summary(cast(_TelegramUser, user), session_file)
+        return 0
     except asyncio.CancelledError:
-        print("\nCancelled by user.")
-    except TimeoutError as e:
-        print(f"\n{e}")
+        print("\nCancelled by user.", file=sys.stderr)
+        return 130
     except PasswordHashInvalidError:
-        print("\nInvalid 2FA password. Authorization was not completed.")
-    except (AttributeError, OSError, RPCError, RuntimeError, TypeError, ValueError) as e:
-        print(f"\nError: {e}")
-        traceback.print_exc()
-    finally:
-        await cast(Awaitable[None], client.disconnect())
-        _protect_session_file(session_file)
+        print("\nInvalid 2FA password. Authorization was not completed.", file=sys.stderr)
+        return 1
+    except LoginInputError as error:
+        print(f"\n{error}", file=sys.stderr)
+        return 1
+    except TelegramRpcThrottled as error:
+        if error.latched:
+            print("\nAccount protection is active. Authorization remains stopped.", file=sys.stderr)
+        else:
+            print(f"\nAuthorization was deferred for at least {error.retry_after_seconds} seconds.", file=sys.stderr)
+        return 1
+    except (AttributeError, OSError, RPCError, RuntimeError, TypeError, ValueError, sqlite3.Error) as error:
+        # Authentication errors can include credentials or details of an unverified account.
+        print(f"\nAuthorization did not complete ({type(error).__name__}).", file=sys.stderr)
+        return 1
+
+
+def cli() -> int:
+    """Parse explicit authentication options and report a process status."""
+    parser = argparse.ArgumentParser(description="Authenticate with Telegram while the daemon is stopped.")
+    parser.add_argument(
+        "--reauthenticate",
+        action="store_true",
+        help=REAUTHENTICATION_NOTICE,
+    )
+    parser.add_argument(
+        "--acknowledge-unknown-outcome",
+        action="store_true",
+        help="Acknowledge an unresolved prior operation for authentication only; does not resume synchronization.",
+    )
+    args = parser.parse_args()
+    try:
+        return asyncio.run(
+            main(
+                acknowledge_unknown_outcome=cast(bool, args.acknowledge_unknown_outcome),
+                replace_credentials=cast(bool, args.reauthenticate),
+            )
+        )
+    except KeyboardInterrupt:
+        print("\n\nCancelled by user.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n\nCancelled by user.")
-        sys.exit(0)
+    sys.exit(cli())

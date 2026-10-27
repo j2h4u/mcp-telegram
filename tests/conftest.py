@@ -61,7 +61,9 @@ def _mcp_telegram_test_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     state_dir = tmp_path / "state"
     config_dir = config_home / "mcp-telegram"
     config_dir.mkdir(parents=True)
-    (config_dir / "config.toml").write_text(f'[state]\ndir = "{state_dir}"\n', encoding="utf-8")
+    (config_dir / "config.toml").write_text(
+        f'[state]\ndir = "{state_dir}"\n\n[telegram_rpc]\ntransport_contract_version = 1\n', encoding="utf-8"
+    )
     monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
 
 

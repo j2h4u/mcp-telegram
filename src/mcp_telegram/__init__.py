@@ -1,12 +1,15 @@
 import asyncio
 import sqlite3
 from pathlib import Path
-from typing import Annotated, cast
+from typing import TYPE_CHECKING, Annotated, cast
 
 from typer import Argument, BadParameter, Option, Typer
 
 from .config import ConfigError, HttpServerConfig, load_config, resolve_http_server_config, resolve_logging_config
 from .sqlite_values import row_first_int
+
+if TYPE_CHECKING:
+    from .daemon_client import DaemonConnection
 
 app = Typer(no_args_is_help=True)
 
@@ -146,6 +149,67 @@ def recover_dialog_directory() -> None:
         sys.exit(1)
 
     asyncio.run(_run())
+
+
+@app.command("recover-account")
+def recover_account(
+    acknowledge_unknown_outcome: Annotated[
+        bool, Option("--acknowledge-unknown-outcome", help="Acknowledge that recovery outcome may be unknown.")
+    ] = False,
+) -> None:
+    """Authorize recovery for the currently latched account protection generation."""
+    import sys
+
+    from .daemon_client import daemon_connection
+
+    if not acknowledge_unknown_outcome:
+        print("Recovery requires --acknowledge-unknown-outcome.", file=sys.stderr)
+        raise SystemExit(2)
+
+    async def _run() -> None:
+        async with daemon_connection() as conn:
+            response = await _request_account_recovery(conn)
+        _report_account_recovery(response)
+
+    asyncio.run(_run())
+
+
+async def _request_account_recovery(conn: "DaemonConnection") -> dict[str, object]:  # noqa: UP037
+    import sys
+
+    status = cast(dict[str, object], await conn.get_account_protection())
+    data = status.get("data")
+    protection = data.get("account_protection") if isinstance(data, dict) else None
+    generation = protection.get("generation") if isinstance(protection, dict) else None
+    if not status.get("ok") or not isinstance(generation, str) or not generation:
+        code = status.get("error")
+        message = status.get("message") or "No active account protection generation."
+        detail = f"{code}: {message}" if code and message != code else str(code or message)
+        print(f"Error: {detail}", file=sys.stderr)
+        raise SystemExit(1)
+    return cast(
+        dict[str, object],
+        await conn.recover_account(expected_generation=generation, acknowledge_unknown_outcome=True),
+    )
+
+
+def _report_account_recovery(response: dict[str, object]) -> None:
+    import sys
+
+    result = response.get("data")
+    if (
+        response.get("ok")
+        and isinstance(result, dict)
+        and result.get("recovery") == "authorized"
+        and result.get("restart_scheduled") is True
+    ):
+        print("Account recovery authorized; daemon restart scheduled.")
+        return
+    code = response.get("error")
+    message = response.get("message") or "Recovery authorization failed."
+    detail = f"{code}: {message}" if code and message != code else str(code or message)
+    print(f"Error: {detail}", file=sys.stderr)
+    raise SystemExit(1)
 
 
 @app.command()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import sqlite3
 import subprocess
@@ -18,9 +19,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 import telethon
+from aiolimiter import AsyncLimiter
 from telethon import TelegramClient, functions, types
 from telethon._updates import ChannelState, SessionState
 from telethon._updates.messagebox import ENTRY_ACCOUNT, MessageBox
+from telethon.crypto import AuthKey
 from telethon.errors import (
     FloodPremiumWaitError,
     FloodTestPhoneWaitError,
@@ -31,9 +34,10 @@ from telethon.errors import (
     SlowModeWaitError,
     UserMigrateError,
 )
-from telethon.network.mtprotosender import MTProtoSender
+from telethon.network.connection.tcpfull import FullPacketCodec
 from telethon.requestiter import RequestIter
-from telethon.sessions import StringSession
+from telethon.sessions import MemorySession, StringSession
+from telethon.tl.functions.help import GetConfigRequest
 from telethon.tl.tlobject import TLRequest
 
 from mcp_telegram.config import (
@@ -63,7 +67,9 @@ from mcp_telegram.sync_db import (
     _apply_migrations,
     ensure_sync_schema,
     load_account_cooldown_until_utc,
-    save_account_cooldown_until_utc,
+    load_rpc_safety_owners,
+    load_rpc_safety_record,
+    save_rpc_safety_record,
 )
 from mcp_telegram.telegram import create_client
 from mcp_telegram.telegram_demand import (
@@ -78,15 +84,14 @@ from mcp_telegram.telegram_demand import (
 from mcp_telegram.telegram_rpc import (
     TelegramRpcAdmissionDeferred,
     TelegramRpcBudget,
-    TelegramRpcCooldownPersistence,
     TelegramRpcGate,
+    TelegramRpcSafetyStore,
     TelegramRpcSource,
     UnclassifiedTelegramRpcError,
     _MainSenderAdapter,
     _TransportBoundaryState,
     account_cooldown_deadline,
     current_rpc_scope,
-    reset_account_cooldown,
     rpc_attempt_budget,
     rpc_scope,
 )
@@ -103,6 +108,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcAdmissionScheduler,
     TelegramRpcScope,
 )
+from mcp_telegram.telegram_transport import GuardedConnectionTcpFull, GuardedMTProtoSender
 from sqlite_writer_helpers import event_manager, inline_writer
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
@@ -112,6 +118,7 @@ from tests.helpers import (
     LoudGroupProfilePort,
     LoudUserAvatarHistoryPort,
     LoudUserProfilePort,
+    reset_rpc_process_policy,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
@@ -124,44 +131,45 @@ class _CircuitStatus:
         return "open-for-test"
 
 
-class _Limiter:
-    def __init__(self) -> None:
-        self.acquisitions = 0
-
-    async def acquire(self) -> None:
-        self.acquisitions += 1
-
-
-class _TestRequest(TLRequest):
-    CONSTRUCTOR_ID = 0x12345678
-
-    def __init__(self, value: object) -> None:
-        self.value = value
+def _TestRequest(value: object) -> TLRequest:
+    """Build an actual vendor request with test-only, non-wire metadata."""
+    request = GetConfigRequest()
+    request._test_value = value  # type: ignore[attr-defined]
+    return request
 
 
-class _DelayedResolveRequest(TLRequest):
-    CONSTRUCTOR_ID = 0x23456789
+def _DelayedResolveRequest(value: int, resolved: asyncio.Event, release: asyncio.Event) -> TLRequest:
+    request = _TestRequest(value)
 
-    def __init__(self, value: int, resolved: asyncio.Event, release: asyncio.Event) -> None:
-        self.value = value
-        self._resolved = resolved
-        self._release = release
-
-    async def resolve(self, client: object, utils: object) -> None:
+    async def resolve(client: object, utils: object) -> None:
         del client, utils
-        if self.value == 2:
-            self._resolved.set()
-            await self._release.wait()
+        if value == 2:
+            resolved.set()
+            await release.wait()
+
+    request.resolve = resolve  # type: ignore[method-assign]
+    return request
+
+
+def _is_test_request(request: object) -> bool:
+    return isinstance(request, TLRequest) and hasattr(request, "_test_value")
 
 
 class _Sender:
     def __init__(self, callback: Callable[[object], object | Awaitable[object]]) -> None:
         self._callback = callback
         self.calls = 0
+        self.sent: list[object] = []
+        self.scopes: list[TelegramRpcScope] = []
 
     def send(self, request: object, *, ordered: bool = False) -> Awaitable[object]:
         del ordered
+        return self.send_with_scope(request, current_rpc_scope())
+
+    def send_with_scope(self, request: object, scope: TelegramRpcScope) -> Awaitable[object]:
         self.calls += 1
+        self.sent.append(request)
+        self.scopes.append(scope)
 
         async def execute() -> object:
             result = self._callback(request)
@@ -179,13 +187,18 @@ class _RawFutureSender:
         self.calls = 0
         self.futures: list[asyncio.Future[object]] = []
         self.requests: list[object] = []
+        self.scopes: list[TelegramRpcScope] = []
         self.disconnect_calls = 0
         self._connected = True
 
-    def send(self, _request: object, *, ordered: bool = False) -> asyncio.Future[object]:
+    def send(self, request: object, *, ordered: bool = False) -> asyncio.Future[object]:
         del ordered
+        return self.send_with_scope(request, current_rpc_scope())
+
+    def send_with_scope(self, request: object, scope: TelegramRpcScope) -> asyncio.Future[object]:
         self.calls += 1
-        self.requests.append(_request)
+        self.requests.append(request)
+        self.scopes.append(scope)
         future = asyncio.get_running_loop().create_future()
         self.futures.append(future)
         return future
@@ -194,16 +207,19 @@ class _RawFutureSender:
         self.disconnect_calls += 1
         self._connected = False
 
-    def is_connected(self) -> bool:
-        return self._connected
 
-    def _transport_connected(self) -> bool:
-        return self._connected
+async def _cleanup_raw_future_gate(gate: TelegramRpcGate, sender: _RawFutureSender) -> None:
+    """Release scripted response waiters before draining the real transport owner."""
+    for future in sender.futures:
+        if not future.done():
+            future.cancel()
+    await gate._disconnect_main_sender()
+    await gate.close_rpc_scheduler()
 
 
 class _BootstrapSender:
     def __init__(self) -> None:
-        self.auth_key = SimpleNamespace(key=b"test")
+        self.auth_key = AuthKey(bytes(range(256)))
         self.connect_calls = 0
         self.disconnect_calls = 0
         self.sent: list[object] = []
@@ -238,8 +254,11 @@ class _BootstrapSender:
 
     def send(self, request: object, *, ordered: bool = False) -> Awaitable[object]:
         del ordered
+        return self.send_with_scope(request, current_rpc_scope())
+
+    def send_with_scope(self, request: object, scope: TelegramRpcScope) -> Awaitable[object]:
         self.sent.append(request)
-        self.scopes.append(current_rpc_scope())
+        self.scopes.append(scope)
         if self.response is not None:
             result = self.response(request)
             if inspect.isawaitable(result):
@@ -270,23 +289,34 @@ class _BootstrapSender:
 
 
 def _request_value(request: object) -> object:
-    return request.value if isinstance(request, _TestRequest) else request
+    if hasattr(request, "_test_value"):
+        return request._test_value
+    return request
 
 
 def _set_sender(
     gate: TelegramRpcGate,
-    callback: Callable[[object], object | Awaitable[object]],
-) -> _Sender:
-    sender = _Sender(callback)
-    gate._main_sender = sender
-    gate._sender = sender
-    gate._transport_state = _TransportBoundaryState.READY
-    return sender
+    callback: Callable[[object], object | Awaitable[object]] | object,
+) -> object:
+    """Replace only the scripted response provider; keep the owned wire transport."""
+    provider = (
+        callback
+        if hasattr(callback, "send")
+        else _Sender(cast(Callable[[object], object | Awaitable[object]], callback))
+    )
+    gate._test_scripted_provider = provider
+    gate._test_server.provider = provider
+    return provider
+
+
+def _pending_owned_states(gate: TelegramRpcGate) -> dict[object, object]:
+    """Return real sender RequestStates still awaiting terminal delivery."""
+    return {state: owned for state, owned in gate._main_sender._owned_states.items() if not state.future.done()}
 
 
 @pytest.fixture(autouse=True)
 def _reset_process_policy() -> None:
-    reset_account_cooldown()
+    reset_rpc_process_policy()
 
 
 class _PagedRequestIter(RequestIter):
@@ -303,30 +333,300 @@ class _PagedRequestIter(RequestIter):
         return self._page >= len(self._pages)
 
 
-def _gate(status: _CircuitStatus | None = None, *, retry_delays: tuple[float, ...] = ()) -> TelegramRpcGate:
+class _MemorySafetyStore:
+    def __init__(self, auth_key_id: int | None) -> None:
+        assert type(auth_key_id) is int
+        self.owners: tuple[int | None, int | None] = (None, None)
+        self.legacy_floor: float | None = None
+        self.fail_next = False
+        self.fail_floor_next = False
+        self.block_floor_saves = False
+        self.floor_save_started: asyncio.Event | None = None
+        self.floor_save_release: asyncio.Event | None = None
+        self.writes: list[str] = []
+        self.raw = json.dumps(
+            {
+                "version": 1,
+                "generation": "test-generation",
+                "scope": {"stage": "verified", "dc_id": 2, "key_id": auth_key_id, "account_id": 1},
+                "floor": {"boot_id": "test-boot", "until_monotonic": 0.0, "until_utc": 0.0, "remaining_seconds": 0.0},
+                "intents": {},
+                "protection": None,
+                "recovery": None,
+                "transition": None,
+            },
+            separators=(",", ":"),
+        )
+
+    async def save(self, expected: str | None, value: str) -> None:
+        old_floor = float(json.loads(expected)["floor"]["until_utc"]) if expected is not None else 0.0
+        new_floor = float(json.loads(value)["floor"]["until_utc"])
+        if (
+            self.block_floor_saves
+            and new_floor > old_floor
+            and self.floor_save_started is not None
+            and self.floor_save_release is not None
+        ):
+            self.floor_save_started.set()
+            await self.floor_save_release.wait()
+        if self.fail_floor_next and new_floor > old_floor:
+            self.fail_floor_next = False
+            raise sqlite3.OperationalError("synthetic safety floor failure")
+        if self.fail_next:
+            self.fail_next = False
+            raise sqlite3.OperationalError("synthetic safety storage failure")
+        if self.raw != expected:
+            raise sqlite3.OperationalError("synthetic safety CAS conflict")
+        self.raw = value
+        self.writes.append(value)
+
+    def api(self) -> TelegramRpcSafetyStore:
+        return TelegramRpcSafetyStore(
+            load_record=lambda: self.raw,
+            save_record=self.save,
+            load_legacy_until_utc=lambda: self.legacy_floor,
+            canonical_owners=lambda: self.owners,
+        )
+
+
+class _FastFiniteLimiter(AsyncLimiter):
+    """The real finite token bucket with a fast test rate and acquisition count."""
+
+    def __init__(self) -> None:
+        super().__init__(100_000, 1.0)
+        self.acquisitions = 0
+
+    async def acquire(self, amount: float = 1) -> None:
+        self.acquisitions += 1
+        await super().acquire(amount)
+
+
+class _FakeReader:
+    async def readexactly(self, n: int) -> bytes:
+        await asyncio.Future()
+        raise AssertionError(f"unexpected read of {n} bytes")
+
+
+class _OwnedWireWriter:
+    def __init__(self, gate: TelegramRpcGate) -> None:
+        self.gate = gate
+        self.frames: list[bytes] = []
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.frames.append(data)
+        self.gate._test_wire_written()
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+class _ScriptedServer:
+    """Feed scripted server outcomes into the actual owned RequestState future."""
+
+    def __init__(self, gate: TelegramRpcGate) -> None:
+        self.gate = gate
+        self.provider: object = _Sender(_request_value)
+        self.seen: set[int] = set()
+        self.tasks: set[asyncio.Task[None]] = set()
+
+    def written(self) -> None:
+        sender = self.gate._main_sender
+        candidates = [
+            (state.msg_id, state, owned)
+            for state, owned in sender._owned_states.items()
+            if state.msg_id is not None
+            and state.msg_id not in self.seen
+            and owned.result is not None
+            and owned.claims > 0
+            and not state.future.done()
+        ]
+        if not candidates:
+            return
+        msg_id, state, owned = min(candidates, key=lambda row: cast(int, row[0]))
+        self.seen.add(cast(int, msg_id))
+        scope = cast(object, owned.owner).scope
+        provider = self.provider
+        try:
+            send_with_scope = getattr(provider, "send_with_scope", None)
+            response = (
+                send_with_scope(state.request, scope) if callable(send_with_scope) else provider.send(state.request)
+            )
+        except BaseException as exc:  # noqa: BLE001 - preserve cancellation as the owned request outcome.
+            state.future.set_exception(exc)
+            return
+        if inspect.isawaitable(response):
+            task = asyncio.create_task(self._transfer(response, state.future))
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
+        else:
+            state.future.set_result(response)
+
+    @staticmethod
+    async def _transfer(response: Awaitable[object], target: asyncio.Future[object]) -> None:
+        try:
+            value = await response
+        except BaseException as exc:  # noqa: BLE001 - transfer cancellation/error to the actual RequestState.
+            if not target.done():
+                target.set_exception(exc)
+        else:
+            if not target.done():
+                target.set_result(value)
+
+
+def _install_scripted_authenticator(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub crypto only for this server; transport auth framing has its own suite."""
+    from telethon.network import authenticator
+
+    original = authenticator.do_authentication
+    auth_key_generation = 0
+
+    async def authenticate(plain: object) -> tuple[AuthKey, int]:
+        nonlocal auth_key_generation
+        sender = getattr(plain, "_sender", None)
+        connection = getattr(sender, "_connection", None)
+        server = getattr(connection, "_test_scripted_server", None)
+        if not isinstance(server, _ScriptedServer):
+            return await original(plain)
+        assert sender is server.gate._main_sender
+        assert connection in server.gate._test_connections
+        assert isinstance(connection, GuardedConnectionTcpFull)
+        auth_key_generation += 1
+        return AuthKey(bytes((value + auth_key_generation) % 256 for value in range(256))), 0
+
+    monkeypatch.setattr(authenticator, "do_authentication", authenticate)
+
+
+@pytest.fixture(autouse=True)
+def _scripted_authenticator(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_scripted_authenticator(monkeypatch)
+
+
+def _attach_fake_connection(gate: TelegramRpcGate, *, initially_ready: bool) -> None:  # noqa: PLR0915
+    sender = gate._main_sender
+    connections: list[GuardedConnectionTcpFull] = []
+
+    def factory(*args: object, **kwargs: object) -> GuardedConnectionTcpFull:
+        connection = GuardedConnectionTcpFull(*args, **kwargs)
+        connection.bind_owner(cast(GuardedMTProtoSender, sender))
+        connection._test_scripted_server = gate._test_server
+        writer = _OwnedWireWriter(gate)
+        connection._reader = cast(object, _FakeReader())
+        connection._writer = cast(object, writer)
+        connection._codec = FullPacketCodec(connection)
+        original_disconnect = connection.disconnect
+        connect_attempted = False
+        provider_disconnect_attempted = False
+
+        async def connect_transport(*, timeout: float | None = None, ssl: object = None) -> None:
+            nonlocal connect_attempted
+            del timeout, ssl
+            provider = gate._test_scripted_provider
+            connect = getattr(provider, "connect", None)
+            if callable(connect):
+                connect_attempted = True
+                await cast(Awaitable[object], connect(connection))
+            connection._connected = True
+            loop = asyncio.get_running_loop()
+            connection._send_task = loop.create_task(connection._send_loop())
+            connection._recv_task = loop.create_task(connection._recv_loop())
+            gate._test_tasks.extend((connection._send_task, connection._recv_task))
+
+        async def disconnect_transport() -> None:
+            nonlocal provider_disconnect_attempted
+            provider = gate._test_scripted_provider
+            disconnect = getattr(provider, "disconnect", None)
+            was_connected = connection._connected
+            failure: BaseException | None = None
+            if (was_connected or connect_attempted) and not provider_disconnect_attempted and callable(disconnect):
+                provider_disconnect_attempted = True
+                try:
+                    await cast(Awaitable[object], disconnect())
+                except BaseException as exc:  # noqa: BLE001 - close the fake socket before re-raising.
+                    failure = exc
+            try:
+                await original_disconnect()
+            except BaseException as exc:  # noqa: BLE001 - retain disconnect failure after fake cleanup.
+                failure = failure or exc
+            if failure is not None:
+                raise failure
+
+        connection.connect = connect_transport  # type: ignore[method-assign]
+        connection.disconnect = disconnect_transport  # type: ignore[method-assign]
+        connections.append(connection)
+        return connection
+
+    gate._connection = factory
+    gate._test_connections = connections
+    if initially_ready:
+        connection = factory(gate.session.server_address, gate.session.port, gate.session.dc_id, loggers=gate._log)
+        connection._connected = True
+        sender._connection = connection
+        sender._user_connected = True
+        gate._transport_state = _TransportBoundaryState.READY
+        sender._send_loop_handle = asyncio.get_running_loop().create_task(sender._send_loop())
+        connection._send_task = asyncio.get_running_loop().create_task(connection._send_loop())
+        connection._recv_task = asyncio.get_running_loop().create_task(connection._recv_loop())
+        gate._test_tasks.extend((sender._send_loop_handle, connection._send_task, connection._recv_task))
+    else:
+        sender._connection = None
+        sender._user_connected = False
+        gate._transport_state = _TransportBoundaryState.DISCONNECTED
+
+
+def _gate(  # noqa: PLR0915
+    status: _CircuitStatus | None = None,
+    *,
+    retry_delays: tuple[float, ...] = (),
+    initially_ready: bool = True,
+    safety_store: TelegramRpcSafetyStore | None = None,
+) -> TelegramRpcGate:
     status = status or _CircuitStatus(open=False)
-    gate = object.__new__(TelegramRpcGate)
-    gate._rpc_circuit_status = lambda: status
-    gate._fallback_wait_seconds = 60
-    gate._cooldown_buffer_seconds = 1.0
-    gate._transient_retry_delays = retry_delays
-    gate._flood_observer = lambda **_kwargs: None
-    gate._limiter = _Limiter()
-    gate._scheduler_policy = TelegramRpcSchedulerConfig()
-    gate._admission_scheduler = TelegramRpcAdmissionScheduler(
-        policy=gate._scheduler_policy,
-        limiter=gate._limiter,
-        readiness=RpcTransportReadiness(
-            probe=gate._scheduler_transport_ready,
-            wait=gate._wait_for_scheduler_transport,
-        ),
+    session = MemorySession()
+    session.set_dc(2, "127.0.0.1", 443)
+    session.auth_key = AuthKey(bytes(range(256)))
+    safety = _MemorySafetyStore(session.auth_key.key_id)
+    gate = TelegramRpcGate(
+        session,
+        12345,
+        "test-api-hash",
+        rpc_budget=TelegramRpcBudget(100_000, 1.0),
+        circuit_status=lambda: status,
+        fallback_wait_seconds=60,
+        cooldown_buffer_seconds=1.0,
+        transient_retry_delays_seconds=retry_delays,
+        scheduler_policy=TelegramRpcSchedulerConfig(),
+        safety_store=safety_store or safety.api(),
+        flood_observer=lambda **_kwargs: None,
     )
+    limiter = _FastFiniteLimiter()
+    gate._limiter = limiter
+    gate._admission_scheduler._limiter = limiter
+    gate._test_safety_store = safety
+    gate._test_minimum_spacing_seconds = 1 / 100_000
+    gate._test_server = _ScriptedServer(gate)
+    gate._test_scripted_provider = gate._test_server.provider
+    gate._test_connections = []
+    gate._test_tasks = []
+    gate._test_admitted = []
+    gate._test_server.original_written = gate._test_server.written
+
+    def track_written() -> None:
+        gate._test_server.original_written()
+
+    gate._test_wire_written = track_written
+    _attach_fake_connection(gate, initially_ready=initially_ready)
     _set_sender(gate, _request_value)
     gate._loop = None
     gate._request_retries = 0
     gate._raise_last_call_error = True
     gate._flood_waited_requests = {}
-    gate._no_updates = False
     gate._reconnect_event = asyncio.Event()
     gate._delivery_repository = None
     gate._delivery_callbacks = {}
@@ -334,22 +634,44 @@ def _gate(status: _CircuitStatus | None = None, *, retry_delays: tuple[float, ..
     gate._connect_owner = None
     gate._connection_capability = None
     gate._connection_rpc_tasks = set()
-    gate._pending_scalar_dispatches = {}
-    gate._cooldown_persistence = None
-    gate._cooldown_save_tasks = {}
-    gate._scalar_persistence_pending = set()
-    gate._transport_state = _TransportBoundaryState.READY
-    gate._log = {"telethon.client.users": logging.getLogger(__name__)}
-    gate.flood_sleep_threshold = 0
-    gate.session = SimpleNamespace(process_entities=lambda _result: None)
+    gate._transport_state = _TransportBoundaryState.READY if initially_ready else _TransportBoundaryState.DISCONNECTED
+    gate._test_old_close_scheduler = gate.close_rpc_scheduler
+
+    async def cleanup_fake_transport() -> None:
+        tasks = list(gate._test_tasks)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for connection in gate._test_connections:
+            for task in (connection._send_task, connection._recv_task):
+                if task is not None and not task.done():
+                    task.cancel()
+        sender_loop = gate._main_sender._send_loop_handle
+        if sender_loop is not None and not sender_loop.done():
+            sender_loop.cancel()
+            tasks.append(sender_loop)
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def close_scheduler() -> None:
+        try:
+            await gate._test_old_close_scheduler()
+        finally:
+            cleanup = asyncio.create_task(cleanup_fake_transport())
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            await cleanup
+
+    gate.close_rpc_scheduler = close_scheduler  # type: ignore[method-assign]
     return gate
 
 
 def _bootstrap_gate(status: _CircuitStatus | None = None) -> tuple[TelegramRpcGate, _BootstrapSender]:
-    gate = _gate(status)
+    gate = _gate(status, initially_ready=False)
     sender = _BootstrapSender()
-    gate._main_sender = sender
-    gate._sender = _MainSenderAdapter(gate)
+    _set_sender(gate, sender)
     gate._connect_owner = None
     gate._connection_capability = None
     gate._connection_rpc_tasks = set()
@@ -359,30 +681,13 @@ def _bootstrap_gate(status: _CircuitStatus | None = None) -> tuple[TelegramRpcGa
     gate._use_ipv6 = False
     gate._proxy = None
     gate._local_addr = None
-    gate._connection = lambda *_args, **_kwargs: object()
     gate._catch_up = False
-    gate._init_request = SimpleNamespace(query=None)
     gate._message_box = SimpleNamespace(is_empty=lambda: False)
     gate._update_loop = _idle_bootstrap_task
     gate._keepalive_loop = _idle_bootstrap_task
     gate._log["telethon.client.telegrambaseclient"] = logging.getLogger(__name__)
-    session = SimpleNamespace(
-        server_address="127.0.0.1",
-        port=443,
-        dc_id=2,
-        auth_key=None,
-        save=lambda: None,
-        get_input_entity=lambda _entity: (_ for _ in ()).throw(ValueError()),
-        process_entities=lambda _result: None,
-    )
-
-    def set_dc(dc_id: int, address: str, port: int) -> None:
-        session.dc_id = dc_id
-        session.server_address = address
-        session.port = port
-
-    session.set_dc = set_dc
-    gate.session = session
+    gate.session.process_entities = lambda _result: None
+    gate.session.get_input_entity = lambda _entity: (_ for _ in ()).throw(ValueError())
     return gate, sender
 
 
@@ -426,18 +731,27 @@ async def _normal_migration_gate(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("delays", "outcomes", "bootstrap", "expected_dc", "expected_sends", "exhausted"),
+    (
+        "delays",
+        "outcomes",
+        "bootstrap",
+        "expected_dc",
+        "expected_sends",
+        "expected_business_attempts",
+        "expected_child_attempts",
+        "exhausted",
+    ),
     [
-        ((0.0,), [3, "ok"], [], 3, 3, False),
-        ((0.0,), [2, "ok"], [], 2, 3, False),
-        ((), [3], [], 2, 1, True),
-        ((0.0,), ["transient", 3], [], 2, 2, True),
-        ((0.0, 0.0), ["transient", 3, "ok"], [], 3, 4, False),
-        ((0.0, 0.0), [3, "ok"], [4], 4, 4, False),
-        ((0.0,), [3], [4], 3, 2, True),
-        ((0.0,), [3], [3], 3, 2, True),
-        ((0.0, 0.0), [3, "ok"], ["transient"], 3, 4, False),
-        ((0.0, 0.0), [3], ["transient", 4], 3, 3, True),
+        ((0.0,), [3, "ok"], [], 3, 4, 2, 2, False),
+        ((0.0,), [2, "ok"], [], 2, 4, 2, 2, False),
+        ((), [3], [], 2, 1, 1, 0, True),
+        ((0.0,), ["transient", 3], [], 2, 2, 2, 0, True),
+        ((0.0, 0.0), ["transient", 3, "ok"], [], 3, 5, 3, 2, False),
+        ((0.0, 0.0), [3, "ok"], [4], 4, 5, 2, 3, False),
+        ((0.0,), [3], [4], 3, 2, 1, 1, True),
+        ((0.0,), [3], [3], 3, 2, 1, 1, True),
+        ((0.0, 0.0), [3, "ok"], ["transient"], 3, 5, 2, 3, False),
+        ((0.0, 0.0), [3], ["transient", 4], 3, 3, 1, 2, True),
     ],
 )
 async def test_normal_vendor_migration_uses_only_the_original_retry_remainder(  # noqa: PLR0913
@@ -447,15 +761,23 @@ async def test_normal_vendor_migration_uses_only_the_original_retry_remainder(  
     bootstrap: list[int | str],
     expected_dc: int,
     expected_sends: int,
+    expected_business_attempts: int,
+    expected_child_attempts: int,
     exhausted: bool,
 ) -> None:
     gate, sender = await _normal_migration_gate(monkeypatch, delays)
+    original_auth_key = sender.auth_key.key
     normal_results, bootstrap_results = iter(outcomes), iter(bootstrap)
     budget = RpcAttemptBudget(12)
     deadline = asyncio.get_running_loop().time() + 10
 
     def respond(request: object) -> object:
-        outcome = next(normal_results) if isinstance(request, _TestRequest) else next(bootstrap_results, "ok")
+        # Telethon performs a real GetMe after a same-account redirect; keep
+        # that vendor-owned bootstrap response valid while the scripted
+        # outcomes below describe only the application and redirect attempts.
+        if isinstance(request, functions.users.GetUsersRequest):
+            return _bootstrap_login_response(request)
+        outcome = next(normal_results) if _is_test_request(request) else next(bootstrap_results, "ok")
         if isinstance(outcome, int):
             return UserMigrateError(request, capture=outcome)
         if outcome == "transient":
@@ -473,12 +795,25 @@ async def test_normal_vendor_migration_uses_only_the_original_retry_remainder(  
                     assert await gate(_TestRequest("normal")) == "ok"
         assert gate.session.dc_id == expected_dc
         assert len(sender.sent) == expected_sends
-        assert budget.attempts == token.attempt_evidence.actual_attempts == expected_sends
-        assert all(scope.attempt_budget is budget and scope.deadline == deadline for scope in sender.scopes)
-        assert all(scope.source is TelegramRpcSource.MCP_INTERACTIVE for scope in sender.scopes)
+        assert budget.attempts == expected_business_attempts
+        assert token.attempt_evidence.actual_attempts == expected_business_attempts + expected_child_attempts
+        assert len(sender.scopes) == expected_sends
+        business_scopes = [scope for scope in sender.scopes if scope.source is TelegramRpcSource.MCP_INTERACTIVE]
+        child_scopes = [
+            scope for scope in sender.scopes if scope.source is TelegramRpcSource.TELETHON_CONNECTION_BOOTSTRAP
+        ]
+        assert len(business_scopes) == expected_business_attempts
+        assert len(child_scopes) == expected_child_attempts
+        assert all(scope.attempt_budget is budget and scope.deadline == deadline for scope in business_scopes)
+        assert all(scope.attempt_evidence is token.attempt_evidence for scope in sender.scopes)
+        assert all(scope.deadline == deadline for scope in child_scopes)
+        if child_scopes:
+            child_budget = child_scopes[0].attempt_budget
+            assert child_budget is not None and child_budget.limit == 16
+            assert all(scope.attempt_budget is child_budget for scope in child_scopes)
         if expected_dc == 2 and exhausted:
             assert sender.connect_calls == sender.disconnect_calls == 0
-            assert sender.auth_key.key == b"test"
+            assert gate.session.auth_key.key == original_auth_key
         assert gate._connect_owner is None
     finally:
         await _close_bootstrap_gate(gate)
@@ -486,25 +821,45 @@ async def test_normal_vendor_migration_uses_only_the_original_retry_remainder(  
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("limit", [1, 2])
-async def test_normal_migration_budget_exhaustion_before_or_during_dc_lookup_preserves_transport(
+async def test_normal_migration_business_budget_does_not_reset_for_connection_bootstrap(
     monkeypatch: pytest.MonkeyPatch, limit: int
 ) -> None:
     gate, sender = await _normal_migration_gate(monkeypatch, (0.0,))
+    original_auth_key = sender.auth_key.key
     config = gate._config
     monkeypatch.setattr(TelegramRpcGate, "_config", None)
     sender.response = lambda request: (
-        UserMigrateError(request, capture=3) if isinstance(request, _TestRequest) else config
+        UserMigrateError(request, capture=3)
+        if _is_test_request(request)
+        else (_bootstrap_login_response(request) if isinstance(request, functions.users.GetUsersRequest) else config)
     )
     budget = RpcAttemptBudget(limit)
+    deadline = asyncio.get_running_loop().time() + 10
     try:
-        with rpc_attempt_budget(budget), rpc_scope(TelegramRpcSource.MCP_INTERACTIVE):
-            with pytest.raises(RpcAttemptBudgetExhaustedError):
-                await gate(_TestRequest("normal"))
-        assert [type(request).__name__ for request in sender.sent] == ["_TestRequest", "GetConfigRequest"][:limit]
-        assert gate.session.dc_id == 2
-        assert sender.auth_key.key == b"test"
-        assert sender.connect_calls == sender.disconnect_calls == 0
-        assert gate._transport_state is _TransportBoundaryState.READY
+        with demand_context(DemandKind.MCP_REMOTE_ACQUISITION, deadline=deadline) as token:
+            with rpc_attempt_budget(budget), rpc_scope(TelegramRpcSource.MCP_INTERACTIVE, deadline=deadline):
+                expected_error = RpcAttemptBudgetExhaustedError if limit == 1 else TelegramRpcAdmissionDeferred
+                with pytest.raises(expected_error) as caught:
+                    await gate(_TestRequest("normal"))
+        if limit == 2:
+            assert "redirect exhausted" in str(caught.value)
+        assert gate.session.dc_id == 3
+        assert gate.session.auth_key.key != original_auth_key
+        assert len(sender.sent) == limit + 3
+        assert budget.attempts == limit
+        assert token.attempt_evidence.actual_attempts == limit + 3
+        business_scopes = [scope for scope in sender.scopes if scope.source is TelegramRpcSource.MCP_INTERACTIVE]
+        child_scopes = [
+            scope for scope in sender.scopes if scope.source is TelegramRpcSource.TELETHON_CONNECTION_BOOTSTRAP
+        ]
+        assert len(business_scopes) == limit
+        assert len(child_scopes) == 3
+        assert all(scope.attempt_budget is budget and scope.deadline == deadline for scope in business_scopes)
+        assert all(scope.attempt_evidence is token.attempt_evidence for scope in sender.scopes)
+        assert all(scope.deadline == deadline for scope in child_scopes)
+        child_budget = child_scopes[0].attempt_budget
+        assert child_budget is not None and child_budget.limit == 16
+        assert all(scope.attempt_budget is child_budget for scope in child_scopes)
         assert gate._connect_owner is None
     finally:
         await _close_bootstrap_gate(gate)
@@ -533,6 +888,7 @@ async def test_normal_migration_lookup_failure_preserves_old_transport_and_reser
     monkeypatch: pytest.MonkeyPatch, cancel: bool
 ) -> None:
     gate, sender = await _normal_migration_gate(monkeypatch, (0.0,))
+    original_auth_key = sender.auth_key.key
     entered, release = asyncio.Event(), asyncio.Event()
 
     async def lookup(_client: TelegramClient, _dc: int, *, cdn: bool = False) -> object:
@@ -542,7 +898,9 @@ async def test_normal_migration_lookup_failure_preserves_old_transport_and_reser
         raise ValueError("lookup failed")
 
     monkeypatch.setattr(TelegramClient, "_get_dc", lookup)
-    sender.response = lambda request: UserMigrateError(request, capture=3)
+    sender.response = lambda request: (
+        UserMigrateError(request, capture=3) if _is_test_request(request) else _bootstrap_login_response(request)
+    )
     caller = asyncio.create_task(_call(gate, _TestRequest("normal")))
     try:
         await asyncio.wait_for(entered.wait(), 2)
@@ -555,7 +913,7 @@ async def test_normal_migration_lookup_failure_preserves_old_transport_and_reser
             await caller
         assert sender.connect_calls == sender.disconnect_calls == 0
         assert len(sender.sent) == 2
-        assert gate.session.dc_id == 2 and sender.auth_key.key == b"test"
+        assert gate.session.dc_id == 2 and gate.session.auth_key.key == original_auth_key
         assert gate._transport_state is _TransportBoundaryState.READY
         assert gate._connect_owner is None
     finally:
@@ -571,7 +929,9 @@ async def test_normal_migration_postlookup_mutation_failure_uses_existing_cleanu
     monkeypatch: pytest.MonkeyPatch, uncertain_cleanup: bool, mutation: str
 ) -> None:
     gate, sender = await _normal_migration_gate(monkeypatch, (0.0,))
-    sender.response = lambda request: UserMigrateError(request, capture=3)
+    sender.response = lambda request: (
+        UserMigrateError(request, capture=3) if _is_test_request(request) else _bootstrap_login_response(request)
+    )
     original_set_dc = gate.session.set_dc
 
     def mutate_then_fail(dc: int, address: str, port: int) -> None:
@@ -601,10 +961,10 @@ async def test_normal_migration_postlookup_mutation_failure_uses_existing_cleanu
     finally:
         sender.disconnect_error = None
         if uncertain_cleanup:
-            with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
+            with pytest.raises(OSError, match="unconfirmed cleanup"):
                 await _close_bootstrap_gate(gate)
-            await sender.disconnect()
-            await gate.close_rpc_scheduler()
+            with pytest.raises(OSError, match="unconfirmed cleanup"):
+                await gate.close_rpc_scheduler()
         else:
             await _close_bootstrap_gate(gate)
 
@@ -644,7 +1004,7 @@ async def test_normal_migration_reserves_before_delay_or_cooldown_and_cancels_wi
         assert len(sender.sent) == 1
         assert gate._connect_owner is None
     finally:
-        rpc.reset_account_cooldown()
+        reset_rpc_process_policy()
         caller.cancel()
         await asyncio.gather(caller, return_exceptions=True)
         await _close_bootstrap_gate(gate)
@@ -699,7 +1059,7 @@ async def test_normal_migration_rechecks_admission_after_lookup(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_normal_migration_rechecks_mutable_budget_after_postlookup_cooldown_wait(
+async def test_normal_migration_rechecks_mutable_budget_after_postlookup_cooldown_wait(  # noqa: PLR0914, PLR0915
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import mcp_telegram.telegram_rpc as rpc
@@ -708,6 +1068,10 @@ async def test_normal_migration_rechecks_mutable_budget_after_postlookup_cooldow
     original_lookup = TelegramClient._get_dc
     waiting, release = asyncio.Event(), asyncio.Event()
     budget = RpcAttemptBudget(2)
+    deadline = asyncio.get_running_loop().time() + 60
+    config = gate._config
+    original_auth_key = gate.session.auth_key.key
+    token: object | None = None
 
     async def lookup(client: TelegramClient, dc: int, *, cdn: bool = False) -> object:
         result = await original_lookup(client, dc, cdn=cdn)
@@ -719,26 +1083,50 @@ async def test_normal_migration_rechecks_mutable_budget_after_postlookup_cooldow
         await release.wait()
 
     async def call() -> object:
-        with rpc_attempt_budget(budget), rpc_scope(TelegramRpcSource.MCP_INTERACTIVE):
-            return await gate(_TestRequest("normal"))
+        nonlocal token
+        with demand_context(DemandKind.MCP_REMOTE_ACQUISITION, deadline=deadline) as demand:
+            token = demand
+            with rpc_attempt_budget(budget), rpc_scope(TelegramRpcSource.MCP_INTERACTIVE, deadline=deadline):
+                return await gate(_TestRequest("normal"))
 
     monkeypatch.setattr(TelegramClient, "_get_dc", lookup)
     monkeypatch.setattr(rpc.asyncio, "sleep", wait)
-    sender.response = lambda request: UserMigrateError(request, capture=3)
+    sender.response = lambda request: (
+        UserMigrateError(request, capture=3)
+        if _is_test_request(request)
+        else (_bootstrap_login_response(request) if isinstance(request, functions.users.GetUsersRequest) else config)
+    )
     caller = asyncio.create_task(call())
     try:
         await asyncio.wait_for(waiting.wait(), 2)
         budget.debit()
-        rpc.reset_account_cooldown()
+        reset_rpc_process_policy()
         release.set()
         with pytest.raises(RpcAttemptBudgetExhaustedError):
             await caller
-        assert len(sender.sent) == 1
-        assert gate.session.dc_id == 2 and not gate._connection_mutation_started
-        assert sender.connect_calls == sender.disconnect_calls == 0
+        assert len(sender.sent) == 3
+        assert budget.attempts == 2
+        assert gate.session.dc_id == 3 and gate.session.auth_key.key != original_auth_key
+        assert gate._connection_mutation_started
+        assert token is not None
+        evidence = token.attempt_evidence
+        assert evidence.actual_attempts == 3
+        business_scopes = [scope for scope in sender.scopes if scope.source is TelegramRpcSource.MCP_INTERACTIVE]
+        child_scopes = [
+            scope for scope in sender.scopes if scope.source is TelegramRpcSource.TELETHON_CONNECTION_BOOTSTRAP
+        ]
+        assert len(business_scopes) == 1
+        assert len(child_scopes) == 2
+        assert all(scope.attempt_budget is budget for scope in business_scopes)
+        effective_deadline = token.admission_deadline
+        assert all(scope.deadline == effective_deadline for scope in sender.scopes)
+        assert all(scope.attempt_evidence is evidence for scope in sender.scopes)
+        child_budget = child_scopes[0].attempt_budget
+        assert child_budget is not None and child_budget.limit == 16
+        assert all(scope.attempt_budget is child_budget for scope in child_scopes)
         assert gate._connect_owner is None
     finally:
-        rpc.reset_account_cooldown()
+        reset_rpc_process_policy()
         release.set()
         await asyncio.gather(caller, return_exceptions=True)
         await _close_bootstrap_gate(gate)
@@ -761,8 +1149,9 @@ class _SelfOriginDifference:
     reply: object = field(default_factory=object)
     first_rpc: bool = True
     budget: RpcAttemptBudget = field(default_factory=lambda: RpcAttemptBudget(8))
+    deadline: float | None = None
 
-    def respond(self, request: object) -> object:
+    def respond(self, request: object) -> object:  # noqa: PLR0911
         if type(request) is type(self.request):
             if self.first_rpc:
                 self.first_rpc = False
@@ -774,6 +1163,10 @@ class _SelfOriginDifference:
             return ServerError(request, "fixture bootstrap failure")
         if self.mode in ("cancel", "shutdown"):
             return self.hold_bootstrap()
+        if isinstance(request, functions.help.GetConfigRequest):
+            return self.gate._config
+        if isinstance(request, functions.users.GetUsersRequest):
+            return _bootstrap_login_response(request)
         return object()
 
     async def hold_bootstrap(self) -> object:
@@ -787,6 +1180,7 @@ class _SelfOriginDifference:
 
     async def call(self) -> object:
         deadline = asyncio.get_running_loop().time() + 10
+        self.deadline = deadline
         with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
             with (
                 rpc_attempt_budget(self.budget),
@@ -833,8 +1227,9 @@ async def _failing_keepalive() -> None:
         raise ValueError("fixture keepalive failure") from None
 
 
-async def _exercise_self_origin_difference(method: str, mode: str) -> None:
+async def _exercise_self_origin_difference(method: str, mode: str) -> None:  # noqa: PLR0915
     patch = pytest.MonkeyPatch()
+    _install_scripted_authenticator(patch)
     probe, origin = await _prepare_self_origin_difference(patch, method, mode)
     gate, sender = probe.gate, probe.sender
     snapshot, in_flight = probe.box.session_state(), set(probe.box.getting_diff_for)
@@ -848,9 +1243,23 @@ async def _exercise_self_origin_difference(method: str, mode: str) -> None:
                 await gate._disconnect()
         if mode in ("ok", "keepalive_error"):
             assert await origin is probe.reply
-            assert len(sender.sent) == probe.budget.attempts == 3
-            assert all(scope.attempt_budget is probe.budget for scope in sender.scopes)
-            assert all(scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE for scope in sender.scopes)
+            assert len(sender.sent) == 4
+            assert probe.budget.attempts == 2
+            business_scopes = [
+                scope for scope in sender.scopes if scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE
+            ]
+            child_scopes = [
+                scope for scope in sender.scopes if scope.source is TelegramRpcSource.TELETHON_CONNECTION_BOOTSTRAP
+            ]
+            assert len(business_scopes) == 2
+            assert len(child_scopes) == 2
+            assert all(scope.attempt_budget is probe.budget for scope in business_scopes)
+            assert all(scope.deadline == probe.deadline for scope in sender.scopes)
+            assert all(scope.attempt_evidence is sender.scopes[0].attempt_evidence for scope in sender.scopes)
+            assert sender.scopes[0].attempt_evidence.actual_attempts == 4
+            child_budget = child_scopes[0].attempt_budget
+            assert child_budget is not None and child_budget.limit == 16
+            assert all(scope.attempt_budget is child_budget for scope in child_scopes)
         else:
             expected = ServerError if mode == "bootstrap_error" else TelegramRpcAdmissionDeferred
             with pytest.raises(asyncio.CancelledError if mode in ("cancel", "shutdown") else expected):
@@ -866,10 +1275,11 @@ async def _exercise_self_origin_difference(method: str, mode: str) -> None:
         sender.disconnect_error = None
         try:
             await _close_bootstrap_gate(gate)
-        except TelegramRpcAdmissionDeferred:
+        except OSError as exc:
             assert mode == "cleanup_error" and gate._transport_state is _TransportBoundaryState.FAILED
-            await sender.disconnect()
-            await gate.close_rpc_scheduler()
+            assert str(exc) == "fixture unconfirmed cleanup"
+            with pytest.raises(OSError, match="fixture unconfirmed cleanup"):
+                await gate.close_rpc_scheduler()
         patch.undo()
 
 
@@ -907,62 +1317,6 @@ async def _wait_for(predicate: Callable[[], bool]) -> None:
             return
         await asyncio.sleep(0)
     raise AssertionError("condition did not become true")
-
-
-def _installed_sender(
-    connection: object,
-    *,
-    retries: int | None = None,
-    connected: bool = True,
-) -> MTProtoSender:
-    logger = logging.getLogger(__name__)
-    loggers = {
-        "telethon.network.mtprotosender": logger,
-        "telethon.network.mtprotostate": logger,
-        "telethon.extensions.messagepacker": logger,
-    }
-    if retries is None:
-        sender = MTProtoSender(None, loggers=loggers)
-    else:
-        sender = MTProtoSender(None, loggers=loggers, retries=retries, delay=0)
-    sender._connection = connection
-    sender._user_connected = connected
-    return sender
-
-
-def _assert_confirmed_scalar_outcome_consumed(
-    gate: TelegramRpcGate,
-    raw_future: asyncio.Future[object],
-    accumulator: FloodWaitAccumulator,
-    outcome: str,
-) -> None:
-    assert raw_future.done()
-    assert raw_future.cancelled() is (outcome == "cancelled")
-    assert gate._transport_state is _TransportBoundaryState.DISCONNECTED
-    assert gate._pending_scalar_dispatches == {}
-    assert sum(gate._admission_scheduler.active_depths().values()) == 0
-    if outcome == "flood_wait":
-        assert accumulator.kill_switch_status().events_in_window == 1
-    gate._finalize_scalar_dispatch(raw_future)
-    gate._finalize_scalar_dispatch(raw_future)
-    assert gate._pending_scalar_dispatches == {}
-    assert sum(gate._admission_scheduler.active_depths().values()) == 0
-    if outcome == "flood_wait":
-        assert accumulator.kill_switch_status().events_in_window == 1
-
-
-def _assert_frozen_flood_observation(
-    observed_floods: list[FloodWaitObservation],
-    request_method: str,
-    admission_sequence: int,
-    dispatch_at_monotonic: float,
-) -> None:
-    assert len(observed_floods) == 1
-    observation = observed_floods[0]
-    assert observation.request_method == request_method
-    assert observation.admission_sequence == admission_sequence
-    assert observation.dispatch_at_monotonic == dispatch_at_monotonic
-    assert observation.actual_dispatch is True
 
 
 async def _assert_failed_gate_blocks_api_migration_and_ping(
@@ -1027,8 +1381,16 @@ async def test_inherited_connect_waits_for_a_restored_cooldown_before_its_first_
     gate, sender = _bootstrap_gate()
     import mcp_telegram.telegram_rpc as rpc
 
-    gate._cooldown_persistence = TelegramRpcCooldownPersistence(lambda: rpc.time.time() + 30, _ignore_cooldown)
-    gate._restore_account_cooldown()
+    record = json.loads(gate._test_safety_store.raw)
+    record["floor"].update(
+        boot_id="test-boot",
+        until_monotonic=rpc.time.monotonic() + 30,
+        until_utc=rpc.time.time() + 30,
+        remaining_seconds=30.0,
+    )
+    gate._test_safety_store.raw = json.dumps(record, separators=(",", ":"))
+    gate._safety = None
+    gate._ensure_safety_ledger()
     waiting = asyncio.Event()
     release = asyncio.Event()
 
@@ -1041,7 +1403,12 @@ async def test_inherited_connect_waits_for_a_restored_cooldown_before_its_first_
     await waiting.wait()
     assert sender.connect_calls == 0
     assert sender.sent == []
-    rpc._COOLDOWN_DEADLINE = 0
+    record = json.loads(gate._test_safety_store.raw)
+    record["floor"].update(until_monotonic=0.0, until_utc=0.0, remaining_seconds=0.0)
+    gate._test_safety_store.raw = json.dumps(record, separators=(",", ":"))
+    gate._safety = None
+    gate._ensure_safety_ledger()
+    rpc._COOLDOWN_DEADLINE = 0.0
     release.set()
     try:
         await caller
@@ -1060,10 +1427,13 @@ async def test_inherited_connect_transfers_the_caller_deadline_and_attempt_budge
             with rpc_attempt_budget(budget):
                 with rpc_scope(TelegramRpcSource.MCP_INTERACTIVE, deadline=deadline) as caller_scope:
                     await gate.connect()
-        assert sender.scopes[0].source is caller_scope.source
+        assert sender.scopes[0].source is TelegramRpcSource.TELETHON_CONNECTION_BOOTSTRAP
         assert sender.scopes[0].deadline == caller_scope.deadline
-        assert sender.scopes[0].attempt_budget is budget
-        assert budget.attempts == 1
+        assert sender.scopes[0].attempt_budget is not budget
+        assert sender.scopes[0].attempt_budget.limit == 16
+        assert sender.scopes[0].attempt_evidence is caller_scope.attempt_evidence
+        assert caller_scope.attempt_budget is budget
+        assert budget.attempts == 0
     finally:
         await _close_bootstrap_gate(gate)
 
@@ -1076,12 +1446,13 @@ async def test_inherited_connect_admits_optional_get_me_and_get_state_requests(
 
     async def get_me(client: TelegramClient) -> object:
         await client(functions.users.GetUsersRequest([types.InputUserSelf()]))
-        return object()
+        return types.User(1, bot=False, access_hash=11)
 
     async def on_login(client: TelegramClient, _me: object) -> None:
         await client(functions.updates.GetStateRequest())
 
     gate._message_box = SimpleNamespace(is_empty=lambda: True)
+    sender.response = _bootstrap_login_response
     monkeypatch.setattr(TelegramClient, "get_me", get_me)
     monkeypatch.setattr(TelegramClient, "_on_login", on_login)
     try:
@@ -1107,11 +1478,12 @@ def _bootstrap_login_response(request: object) -> object:
     return object()
 
 
-def _configure_bootstrap_dc_lookup(gate: TelegramRpcGate) -> None:
-    async def get_dc(dc_id: int) -> object:
+def _configure_bootstrap_dc_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def get_dc(_client: TelegramClient, dc_id: int, *, cdn: bool = False) -> object:
+        del cdn
         return SimpleNamespace(id=dc_id, ip_address="127.0.0.2", port=443)
 
-    gate._get_dc = get_dc
+    monkeypatch.setattr(TelegramClient, "_get_dc", get_dc)
 
 
 @pytest.mark.asyncio
@@ -1134,10 +1506,21 @@ async def test_real_telethon_login_bootstrap_admits_get_difference_with_inherite
             "GetStateRequest",
             "GetDifferenceRequest",
         ]
-        assert all(scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE for scope in sender.scopes)
-        assert all(scope.deadline == deadline for scope in sender.scopes)
-        assert all(scope.attempt_budget is budget for scope in sender.scopes)
-        assert budget.attempts == token.attempt_evidence.actual_attempts == 4
+        business_scopes = [
+            scope for scope in sender.scopes if scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE
+        ]
+        child_scopes = [
+            scope for scope in sender.scopes if scope.source is TelegramRpcSource.TELETHON_CONNECTION_BOOTSTRAP
+        ]
+        assert business_scopes == []
+        assert len(child_scopes) == 4
+        assert all(scope.deadline == token.admission_deadline for scope in sender.scopes)
+        assert all(scope.attempt_evidence is token.attempt_evidence for scope in sender.scopes)
+        child_budget = child_scopes[0].attempt_budget
+        assert child_budget is not None and child_budget.limit == 16
+        assert all(scope.attempt_budget is child_budget for scope in child_scopes)
+        assert budget.attempts == 0
+        assert token.attempt_evidence.actual_attempts == 4
         assert gate._limiter.acquisitions == 4
         assert len(loaded) == 1
     finally:
@@ -1167,19 +1550,32 @@ async def test_nested_bootstrap_migration_flood_stops_with_original_update_scope
             "InvokeWithLayerRequest",
             "GetStateRequest",
         ]
-        assert all(scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE for scope in sender.scopes)
-        assert all(scope.deadline == deadline for scope in sender.scopes)
-        assert all(scope.attempt_budget is budget for scope in sender.scopes)
-        assert budget.attempts == token.attempt_evidence.actual_attempts == 2
+        business_scopes = [
+            scope for scope in sender.scopes if scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE
+        ]
+        child_scopes = [
+            scope for scope in sender.scopes if scope.source is TelegramRpcSource.TELETHON_CONNECTION_BOOTSTRAP
+        ]
+        assert business_scopes == []
+        assert len(child_scopes) == 2
+        assert all(scope.deadline == token.admission_deadline for scope in sender.scopes)
+        assert all(scope.attempt_evidence is token.attempt_evidence for scope in sender.scopes)
+        child_budget = child_scopes[0].attempt_budget
+        assert child_budget is not None and child_budget.limit == 16
+        assert all(scope.attempt_budget is child_budget for scope in child_scopes)
+        assert budget.attempts == 0
+        assert token.attempt_evidence.actual_attempts == 2
         assert sender.disconnect_calls == 1
     finally:
         await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
-async def test_real_telethon_login_migration_unwinds_to_one_owner_redirect() -> None:
+async def test_real_telethon_login_migration_unwinds_to_one_owner_redirect(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     gate, sender = _bootstrap_gate()
-    _configure_bootstrap_dc_lookup(gate)
+    _configure_bootstrap_dc_lookup(monkeypatch)
     gate._transient_retry_delays = (0.0,)
     started: list[str] = []
     migrate_once = True
@@ -1224,10 +1620,21 @@ async def test_real_telethon_login_migration_unwinds_to_one_owner_redirect() -> 
         assert sender.connect_calls == 2
         assert sender.disconnect_calls == 1
         assert set(started) == {"update", "keepalive"}
-        assert all(scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE for scope in sender.scopes)
-        assert all(scope.deadline == deadline for scope in sender.scopes)
-        assert all(scope.attempt_budget is budget for scope in sender.scopes)
-        assert budget.attempts == token.attempt_evidence.actual_attempts == len(sender.sent)
+        business_scopes = [
+            scope for scope in sender.scopes if scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE
+        ]
+        child_scopes = [
+            scope for scope in sender.scopes if scope.source is TelegramRpcSource.TELETHON_CONNECTION_BOOTSTRAP
+        ]
+        assert business_scopes == []
+        assert len(child_scopes) == 7
+        assert all(scope.deadline == token.admission_deadline for scope in sender.scopes)
+        assert all(scope.attempt_evidence is token.attempt_evidence for scope in sender.scopes)
+        child_budget = child_scopes[0].attempt_budget
+        assert child_budget is not None and child_budget.limit == 16
+        assert all(scope.attempt_budget is child_budget for scope in child_scopes)
+        assert budget.attempts == 0
+        assert token.attempt_evidence.actual_attempts == len(sender.sent)
         assert gate._connection_rpc_tasks == set()
         assert gate._connect_owner is None
         assert gate._connection_capability is None
@@ -1236,9 +1643,11 @@ async def test_real_telethon_login_migration_unwinds_to_one_owner_redirect() -> 
 
 
 @pytest.mark.asyncio
-async def test_connection_migration_exhausts_existing_redirect_slots_without_extra_send() -> None:
+async def test_connection_migration_exhausts_existing_redirect_slots_without_extra_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     gate, sender = _bootstrap_gate()
-    _configure_bootstrap_dc_lookup(gate)
+    _configure_bootstrap_dc_lookup(monkeypatch)
     gate._transient_retry_delays = (0.0,)
     sender.response = lambda request: (
         UserMigrateError(request, capture=3)
@@ -1367,7 +1776,8 @@ async def test_connection_migration_expiry_stops_before_redirect_with_original_b
         assert len(sender.sent) == 3
         assert sender.connect_calls == 1
         assert sender.disconnect_calls == 1
-        assert budget.attempts == token.attempt_evidence.actual_attempts == 3
+        assert budget.attempts == 0
+        assert token.attempt_evidence.actual_attempts == 3
         assert gate._connection_rpc_tasks == set()
         assert gate._connect_owner is None
         assert gate._connection_capability is None
@@ -1426,7 +1836,8 @@ async def test_real_telethon_login_get_difference_expiry_preserves_original_budg
             "GetUsersRequest",
             "GetStateRequest",
         ]
-        assert budget.attempts == token.attempt_evidence.actual_attempts == 3
+        assert budget.attempts == 0
+        assert token.attempt_evidence.actual_attempts == 3
         assert sender.disconnect_calls == 1
     finally:
         await gate.close_rpc_scheduler()
@@ -1527,7 +1938,7 @@ async def test_inherited_connect_reserves_owner_while_waiting_for_cooldown(
 
 
 @pytest.mark.asyncio
-async def test_inherited_connect_cancellation_retains_unconfirmed_partial_transport() -> None:
+async def test_inherited_connect_cancellation_cleans_unconfirmed_partial_transport() -> None:
     gate, sender = _bootstrap_gate()
     sender.connect_started = asyncio.Event()
     sender.connect_release = asyncio.Event()
@@ -1539,11 +1950,11 @@ async def test_inherited_connect_cancellation_retains_unconfirmed_partial_transp
     with pytest.raises(asyncio.CancelledError):
         await caller
     assert sender.connect_calls == 1
-    assert sender.disconnect_calls == 0
+    assert sender.disconnect_calls == 1
     assert sender.sent == []
-    assert gate._transport_state is _TransportBoundaryState.FAILED
-    assert gate._connect_owner is not None
-    assert gate._connection_capability is not None
+    assert gate._transport_state is _TransportBoundaryState.DISCONNECTED
+    assert gate._connect_owner is None
+    assert gate._connection_capability is None
     await gate.close_rpc_scheduler()
 
 
@@ -1569,9 +1980,9 @@ async def test_foreign_dc_switch_defers_before_transport_or_session_mutation() -
     caller.cancel()
     with pytest.raises(asyncio.CancelledError):
         await caller
-    assert gate._transport_state is _TransportBoundaryState.FAILED
-    assert gate._connect_owner is not None
-    assert gate._connection_capability is not None
+    assert gate._transport_state is _TransportBoundaryState.DISCONNECTED
+    assert gate._connect_owner is None
+    assert gate._connection_capability is None
     await gate.close_rpc_scheduler()
 
 
@@ -1640,7 +2051,8 @@ async def test_failed_bootstrap_cleanup_keeps_reservation_and_chains_original_fa
     assert gate._connection_capability is not None
     with pytest.raises(TelegramRpcAdmissionDeferred, match="connection bootstrap is already running"):
         await gate.connect()
-    await gate.close_rpc_scheduler()
+    with pytest.raises(OSError, match="transport teardown failed"):
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
@@ -1674,7 +2086,7 @@ async def test_retained_bootstrap_flood_is_recorded_during_cancelled_cleanup() -
         sender.disconnect_release.set()
         with pytest.raises(asyncio.CancelledError):
             await caller
-        assert gate._pending_scalar_dispatches == {}
+        assert _pending_owned_states(gate) == {}
         assert gate._connection_rpc_tasks == set()
         assert gate._connect_owner is None
         assert gate._connection_capability is None
@@ -1716,7 +2128,7 @@ async def test_helper_and_request_iter_pages_use_the_same_public_call_seam() -> 
         calls.append(value)
         if isinstance(value, int):
             return [[1, 2], [3]][value]
-        return [SimpleNamespace(id=1, is_self=True)]
+        return [types.User(1, is_self=True, first_name="Test")]
 
     _set_sender(gate, send)
     gate._mb_entity_cache = SimpleNamespace(self_id=1)
@@ -1761,31 +2173,34 @@ def test_factory_uses_supplied_snapshot_without_loading_config_again(
             transient_retry_delays_seconds=(0.0,),
         ),
     )
-    monkeypatch.setattr("mcp_telegram.telegram.load_config", lambda: (_ for _ in ()).throw(AssertionError("reloaded")))
+    monkeypatch.setattr(
+        "mcp_telegram.telegram._load_settings", lambda: (_ for _ in ()).throw(AssertionError("reloaded"))
+    )
 
-    gate = create_client.__wrapped__("1", "hash", session_name="snapshot", config=config)
+    safety_store = _MemorySafetyStore(AuthKey(bytes(range(256))).key_id).api()
+    gate = create_client.__wrapped__("1", "hash", session_name="snapshot", config=config, safety_store=safety_store)
     try:
         assert gate._limiter.max_rate == 7
         assert gate._limiter.time_period == 13.0
         assert gate._fallback_wait_seconds == 17
         assert gate._cooldown_buffer_seconds == 2.5
         assert gate._transient_retry_delays == (0.0,)
-        assert gate._cooldown_persistence is None
+        assert gate._safety_store is safety_store
     finally:
         gate.session.close()
 
 
-def test_factory_forwards_optional_cooldown_persistence(tmp_path: Path) -> None:
-    persistence = TelegramRpcCooldownPersistence(lambda: None, _ignore_cooldown)
+def test_factory_forwards_required_safety_store(tmp_path: Path) -> None:
+    safety_store = _MemorySafetyStore(AuthKey(bytes(range(256))).key_id).api()
     gate = create_client.__wrapped__(
         "1",
         "hash",
         session_name="persistent-cooldown",
         config=McpTelegramConfig(state=StateConfig(dir=tmp_path)),
-        cooldown_persistence=persistence,
+        safety_store=safety_store,
     )
     try:
-        assert gate._cooldown_persistence is persistence
+        assert gate._safety_store is safety_store
     finally:
         gate.session.close()
 
@@ -1852,8 +2267,7 @@ async def test_daemon_unobserved_topic_catalog_does_not_cross_latched_gate(tmp_p
     conn = sqlite3.connect(db_path)
     gate = _gate(_CircuitStatus(open=True))
     sender = _RawFutureSender()
-    gate._main_sender = sender
-    gate._sender = sender
+    _set_sender(gate, sender)
     check_calls = 0
     original_check = gate.check_circuit
 
@@ -1969,7 +2383,7 @@ async def test_gate_default_retry_adds_no_sleep_beyond_telethon_builtin(monkeypa
 
             return _fail()
 
-    gate._main_sender = gate._sender = _Sender()
+    sender = _set_sender(gate, _Sender())
     gate._loop = None
     gate._request_retries = 0
     gate._raise_last_call_error = True
@@ -1977,7 +2391,7 @@ async def test_gate_default_retry_adds_no_sleep_beyond_telethon_builtin(monkeypa
     gate._no_updates = False
     gate._log = {"telethon.client.users": logging.getLogger(__name__)}
     gate.flood_sleep_threshold = 0
-    gate.session = SimpleNamespace(process_entities=lambda _result: None)
+    gate.session.process_entities = lambda _result: None
     sleeps: list[float] = []
 
     async def fake_sleep(delay: float) -> None:
@@ -1989,7 +2403,7 @@ async def test_gate_default_retry_adds_no_sleep_beyond_telethon_builtin(monkeypa
 
     assert caught.value.__cause__ is final
     assert caught.value.retry_after_seconds == 7
-    assert gate._sender.calls == 2
+    assert sender.calls == 2
     assert gate._limiter.acquisitions == 2
     assert sleeps == [2]
 
@@ -2007,6 +2421,7 @@ async def test_telethon_retry_sleep_holds_no_slot_and_each_sender_attempt_readmi
     gate._admission_scheduler = TelegramRpcAdmissionScheduler(
         policy=gate._scheduler_policy,
         limiter=gate._limiter,
+        minimum_spacing_seconds=gate._test_minimum_spacing_seconds,
         observer=events.append,
         readiness=RpcTransportReadiness(
             probe=gate._scheduler_transport_ready,
@@ -2049,7 +2464,7 @@ async def test_telethon_retry_sleep_holds_no_slot_and_each_sender_attempt_readmi
     monkeypatch.setattr(gate._admission_scheduler, "admit", tracked_admit)
     monkeypatch.setattr(telethon_users, "asyncio", SimpleNamespace(sleep=telethon_sleep))
     _set_sender(gate, send)
-    gate.session = SimpleNamespace(process_entities=process_entities)
+    gate.session.process_entities = process_entities
 
     first = asyncio.create_task(_call(gate, "first"))
     await first_sleep_started.wait()
@@ -2074,9 +2489,6 @@ async def test_telethon_retry_sleep_holds_no_slot_and_each_sender_attempt_readmi
 async def test_request_specific_observation_counts_each_actual_retry_attempt_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mcp_telegram.telegram_rpc as telegram_rpc_module
-
-    monkeypatch.setattr(telegram_rpc_module, "GetFullChannelRequest", _TestRequest)
     gate = _gate(retry_delays=(0,))
     observed: list[dict[str, object]] = []
     gate.set_rpc_request_observer(lambda **values: observed.append(values))
@@ -2091,36 +2503,17 @@ async def test_request_specific_observation_counts_each_actual_retry_attempt_onc
 
     _set_sender(gate, send)
 
-    assert await _call(gate, _TestRequest("private channel identity")) == "ok"
+    request = functions.channels.GetFullChannelRequest(channel=types.InputChannel(channel_id=1, access_hash=2))
+    assert await _call(gate, request) == "ok"
 
     assert send_attempts == 2
     assert len(observed) == 2
     assert all(item["request_class"] == "get_full_channel" for item in observed)
     assert all(item["source"] is TelegramRpcSource.MCP_INTERACTIVE for item in observed)
-    assert all("private channel identity" not in repr(item) for item in observed)
+    assert all("InputChannel" not in repr(item) for item in observed)
 
 
 @pytest.mark.asyncio
-async def test_sender_proxy_rejects_unexpected_future_batch_and_releases_slot() -> None:
-    gate = _gate()
-    returned_future: asyncio.Future[object] | None = None
-
-    class _BatchSender:
-        def send(self, _request: object, *, ordered: bool = False) -> list[asyncio.Future[object]]:
-            nonlocal returned_future
-            del ordered
-            returned_future = asyncio.get_running_loop().create_future()
-            return [returned_future]
-
-    gate._main_sender = gate._sender = _BatchSender()
-    with pytest.raises(RuntimeError, match="future batch for a scalar request"):
-        await _call(gate, "request")
-
-    assert returned_future is not None and returned_future.cancelled()
-    assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
-    assert gate._admission_scheduler.outstanding_depths() == dict.fromkeys(RpcServiceClass, 0)
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error_type", [FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError])
 async def test_gate_normalizes_each_vendor_wait_to_owned_outcome(
@@ -2143,11 +2536,12 @@ async def test_gate_normalizes_each_vendor_wait_to_owned_outcome(
 
 
 @pytest.mark.asyncio
-async def test_gate_rechecks_cooldown_after_limiter(monkeypatch: pytest.MonkeyPatch) -> None:
-    reset_account_cooldown()
+async def test_gate_rechecks_cooldown_after_limiter() -> None:
+    reset_rpc_process_policy()
     gate = _gate()
-    sleeps: list[float] = []
+    import mcp_telegram.telegram_rpc as rpc
 
+    first_acquisition = asyncio.Event()
     acquisitions = 0
 
     async def acquire_and_open() -> None:
@@ -2155,22 +2549,28 @@ async def test_gate_rechecks_cooldown_after_limiter(monkeypatch: pytest.MonkeyPa
         acquisitions += 1
         gate._limiter.acquisitions += 1
         if acquisitions == 1:
-            import mcp_telegram.telegram_rpc as rpc
-
             rpc._COOLDOWN_DEADLINE = rpc.time.monotonic() + 3
+            first_acquisition.set()
 
     gate._limiter.acquire = acquire_and_open
 
-    async def fake_sleep(delay: float) -> None:
-        sleeps.append(delay)
-        import mcp_telegram.telegram_rpc as rpc
-
+    operation = asyncio.create_task(_call(gate, "request"))
+    try:
+        await first_acquisition.wait()
+        await asyncio.sleep(0)
+        assert gate._test_server.seen == set()
+        assert acquisitions == 1
         rpc._COOLDOWN_DEADLINE = 0
-
-    monkeypatch.setattr("mcp_telegram.telegram_rpc.asyncio.sleep", fake_sleep)
-    assert await _call(gate, "request") == "request"
-    assert len(sleeps) == 1
-    assert gate._limiter.acquisitions == 2
+        gate._admission_scheduler.notify_eligibility_changed()
+        assert await operation == "request"
+        assert acquisitions == 2
+        assert len(gate._test_server.seen) == 1
+    finally:
+        if not operation.done():
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+        rpc._COOLDOWN_DEADLINE = 0
+        gate._admission_scheduler.notify_eligibility_changed()
 
 
 @pytest.mark.asyncio
@@ -2199,6 +2599,7 @@ async def test_gate_requeues_when_readiness_changes_after_scheduler_admission(
         return admission
 
     gate._scheduler_transport_ready = readiness
+    gate._admission_scheduler._readiness = RpcTransportReadiness(probe=readiness)
     gate._admission_scheduler.set_observer(events.append)
     monkeypatch.setattr(gate._admission_scheduler, "admit", admit_then_change_readiness)
 
@@ -2206,15 +2607,12 @@ async def test_gate_requeues_when_readiness_changes_after_scheduler_admission(
 
     assert gate._limiter.acquisitions == 2
     assert [event.kind for event in events].count(RpcAdmissionEventKind.DISPATCHED) == 1
-    assert [event.reason for event in events if event.kind is RpcAdmissionEventKind.RESUBMITTED] == [
-        "transport_readiness_changed"
-    ]
     assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
 
 
 @pytest.mark.asyncio
 async def test_gate_flood_is_immediate_cooldown_and_observed_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    reset_account_cooldown()
+    reset_rpc_process_policy()
     gate = _gate()
     observed: list[dict[str, object]] = []
     gate._flood_observer = lambda **kwargs: observed.append(kwargs)
@@ -2240,12 +2638,17 @@ async def test_gate_flood_is_immediate_cooldown_and_observed_once(monkeypatch: p
 async def test_gate_flood_cooldown_uses_buffer_and_extends_monotonically(monkeypatch: pytest.MonkeyPatch) -> None:
     import mcp_telegram.telegram_rpc as rpc
 
+    wall_clock = rpc.time.time
+    clock = [100.0]
+    monkeypatch.setattr(
+        rpc,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0], time=wall_clock),
+    )
     gate = _gate()
-    clock = iter((100.0, 101.0))
-    monkeypatch.setattr(rpc.time, "monotonic", lambda: next(clock, 101.0))
-
     await gate._observe_flood(FloodWaitError(request=None, capture=7))
     first_deadline = account_cooldown_deadline()
+    clock[0] = 101.0
     await gate._observe_flood(FloodWaitError(request=None, capture=2))
 
     assert first_deadline == 108.0
@@ -2253,45 +2656,39 @@ async def test_gate_flood_cooldown_uses_buffer_and_extends_monotonically(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_gate_restores_persisted_cooldown_and_blocks_transport_until_ready(
+async def test_gate_restores_persisted_cooldown_and_blocks_transport_until_ready(  # noqa: PLR0915
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     monotonic_now = [200.0]
-    loaded = 0
-    monkeypatch.setattr("mcp_telegram.telegram_rpc.time.monotonic", lambda: monotonic_now[0])
-    monkeypatch.setattr("mcp_telegram.telegram_rpc.time.time", lambda: 1_000.0)
+    wall_now = [1_000.0]
+    import mcp_telegram.telegram_rpc as rpc
+
+    monkeypatch.setattr(rpc, "time", SimpleNamespace(monotonic=lambda: monotonic_now[0], time=lambda: wall_now[0]))
 
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     seed_conn = sqlite3.connect(str(db_path))
-    save_account_cooldown_until_utc(seed_conn, 1_005.0)
+    seed_conn.execute(
+        "INSERT INTO daemon_state(key,value) VALUES (?,?)", ("telegram_account_cooldown_until_utc", "1005.0")
+    )
+    seed_conn.commit()
+    verified_store = _MemorySafetyStore(AuthKey(bytes(range(256))).key_id)
+    save_rpc_safety_record(seed_conn, None, verified_store.raw)
     seed_conn.close()
     reopened_conn = sqlite3.connect(str(db_path))
 
-    def load_until_utc() -> float | None:
-        nonlocal loaded
-        loaded += 1
-        return load_account_cooldown_until_utc(reopened_conn)
+    async def save_record(expected: str | None, encoded: str) -> None:
+        save_rpc_safety_record(reopened_conn, expected, encoded)
 
-    async def save_until_utc(deadline: float) -> None:
-        save_account_cooldown_until_utc(reopened_conn, deadline)
-
-    gate = TelegramRpcGate(
-        StringSession(),
-        1,
-        "hash",
-        rpc_budget=TelegramRpcBudget(max_calls_per_period=0, period_seconds=60),
-        circuit_status=lambda: _CircuitStatus(open=False),
-        fallback_wait_seconds=60,
-        cooldown_buffer_seconds=1.0,
-        transient_retry_delays_seconds=(),
-        scheduler_policy=TelegramRpcSchedulerConfig(),
-        cooldown_persistence=TelegramRpcCooldownPersistence(
-            load_until_utc,
-            save_until_utc,
-        ),
+    safety_store = TelegramRpcSafetyStore(
+        load_record=lambda: load_rpc_safety_record(reopened_conn),
+        save_record=save_record,
+        load_legacy_until_utc=lambda: load_account_cooldown_until_utc(reopened_conn),
+        canonical_owners=lambda: load_rpc_safety_owners(reopened_conn),
     )
+    gate = _gate(safety_store=safety_store)
+    gate._ensure_safety_ledger()
     waiting = asyncio.Event()
     release = asyncio.Event()
 
@@ -2299,11 +2696,14 @@ async def test_gate_restores_persisted_cooldown_and_blocks_transport_until_ready
         waiting.set()
         await release.wait()
 
-    monkeypatch.setattr("mcp_telegram.telegram_rpc.asyncio.sleep", wait_for_cooldown)
+    monkeypatch.setattr(rpc.asyncio, "sleep", wait_for_cooldown)
+    gate._limiter = AsyncLimiter(30, 60)
+    gate._test_minimum_spacing_seconds = 2.0
 
     gate._admission_scheduler = TelegramRpcAdmissionScheduler(
         policy=gate._scheduler_policy,
         limiter=gate._limiter,
+        minimum_spacing_seconds=gate._test_minimum_spacing_seconds,
         clock=lambda: monotonic_now[0],
         readiness=RpcTransportReadiness(probe=gate._scheduler_transport_ready),
     )
@@ -2312,14 +2712,16 @@ async def test_gate_restores_persisted_cooldown_and_blocks_transport_until_ready
         caller = asyncio.create_task(_call(gate, "request"))
         await waiting.wait()
 
-        assert loaded == 1
         assert account_cooldown_deadline() == 205.0
         assert sender.calls == 0
-        assert gate._limiter is None
+        assert gate._limiter.max_rate == 30
+        assert gate._limiter.time_period == 60
         assert gate._admission_scheduler.outstanding_depths() == dict.fromkeys(RpcServiceClass, 0)
         assert load_account_cooldown_until_utc(reopened_conn) == 1_005.0
+        assert gate._main_sender._connection._writer.frames == []
 
         monotonic_now[0] = 206.0
+        wall_now[0] = 1_006.0
         release.set()
         assert await caller == "request"
         assert sender.calls == 1
@@ -2330,42 +2732,8 @@ async def test_gate_restores_persisted_cooldown_and_blocks_transport_until_ready
 
 
 @pytest.mark.asyncio
-async def test_finite_flood_wait_persists_effective_max_utc_deadline(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monotonic_now = [100.0]
-    utc_now = [1_000.0]
-    saved: list[float] = []
-    gate = _gate()
-
-    async def save_until_utc(deadline: float) -> None:
-        saved.append(deadline)
-
-    gate._cooldown_persistence = TelegramRpcCooldownPersistence(lambda: None, save_until_utc)
-    monkeypatch.setattr("mcp_telegram.telegram_rpc.time.monotonic", lambda: monotonic_now[0])
-    monkeypatch.setattr("mcp_telegram.telegram_rpc.time.time", lambda: utc_now[0])
-
-    await gate._observe_flood(FloodWaitError(request=None, capture=7))
-    monotonic_now[0] = 101.0
-    utc_now[0] = 1_001.0
-    await gate._observe_flood(FloodWaitError(request=None, capture=2))
-    monotonic_now[0] = 102.0
-    utc_now[0] = 1_002.0
-    await gate._observe_flood(FloodWaitError(request=None, capture=10))
-
-    assert account_cooldown_deadline() == 113.0
-    assert saved == [1_008.0, 1_008.0, 1_013.0]
-
-
-@pytest.mark.asyncio
 async def test_latched_circuit_never_persists_a_cooldown() -> None:
-    saved: list[float] = []
     gate = _gate(_CircuitStatus(open=True))
-
-    async def save_until_utc(deadline: float) -> None:
-        saved.append(deadline)
-
-    gate._cooldown_persistence = TelegramRpcCooldownPersistence(lambda: None, save_until_utc)
     sender = _set_sender(gate, _request_value)
 
     with pytest.raises(TelegramRpcThrottled) as caught:
@@ -2373,8 +2741,10 @@ async def test_latched_circuit_never_persists_a_cooldown() -> None:
 
     assert caught.value.latched
     assert sender.calls == 0
-    assert account_cooldown_deadline() == 0.0
-    assert saved == []
+    import mcp_telegram.telegram_rpc as rpc
+
+    assert account_cooldown_deadline() <= rpc.time.monotonic()
+    assert gate._test_safety_store.writes == []
 
 
 @pytest.mark.asyncio
@@ -2529,17 +2899,33 @@ async def test_concurrent_vendor_cache_fold_is_a_local_deferral_not_a_second_war
 
 
 @pytest.mark.asyncio
-async def test_nested_resolution_does_not_turn_four_vendor_cache_deferrals_into_warnings() -> None:
-    class _CachedOuterRequest(TLRequest):
-        CONSTRUCTOR_ID = 0x34567890
+async def test_nested_resolution_does_not_turn_four_vendor_cache_deferrals_into_warnings(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from telethon.client import users as vendor_users
 
-        def __init__(self, resolve_nested: bool) -> None:
-            self._resolve_nested = resolve_nested
+    import mcp_telegram.telegram_rpc as rpc
 
-        async def resolve(self, client: TelegramClient, utils: object) -> None:
+    real_monotonic, real_wall_time = rpc.time.monotonic, rpc.time.time
+    started_monotonic, started_wall_time = real_monotonic(), real_wall_time()
+    clock_offsets = [0.0, 0.0]
+    fake_time = SimpleNamespace(
+        monotonic=lambda: started_monotonic + (real_monotonic() - started_monotonic) + clock_offsets[0],
+        time=lambda: started_wall_time + (real_wall_time() - started_wall_time) + clock_offsets[1],
+    )
+    monkeypatch.setattr(rpc, "time", fake_time)
+    monkeypatch.setattr(vendor_users, "time", SimpleNamespace(time=fake_time.time))
+
+    def outer_request(*, nested: bool) -> TLRequest:
+        request = functions.updates.GetStateRequest()
+
+        async def resolve(client: TelegramClient, utils: object) -> None:
             del utils
-            if self._resolve_nested:
+            if nested:
                 await client(_TestRequest("nested"))
+
+        request.resolve = resolve  # type: ignore[method-assign]
+        return request
 
     accumulator = FloodWaitAccumulator()
     accumulator.configure_kill_switch(
@@ -2548,6 +2934,7 @@ async def test_nested_resolution_does_not_turn_four_vendor_cache_deferrals_into_
     gate = _gate()
     gate._cooldown_buffer_seconds = 0
     gate._rpc_circuit_status = accumulator.kill_switch_status
+    gate._admission_scheduler._clock = fake_time.monotonic
     gate._flood_observer = lambda **event: accumulator.observe(**event)
     flood_events: list[str] = []
     gate._flood_event_observer = lambda observation: flood_events.append(observation.origin)
@@ -2555,28 +2942,33 @@ async def test_nested_resolution_does_not_turn_four_vendor_cache_deferrals_into_
 
     def send(request: object) -> object:
         sent.append(request)
-        if isinstance(request, _CachedOuterRequest):
-            raise FloodWaitError(request=None, capture=20)
+        if isinstance(request, functions.updates.GetStateRequest):
+            raise FloodWaitError(request=None, capture=5)
         return _request_value(request)
 
     sender = _set_sender(gate, send)
     try:
-        with pytest.raises(TelegramRpcThrottled):
-            await _call(gate, _CachedOuterRequest(resolve_nested=False))
-        import mcp_telegram.telegram_rpc as rpc
-
-        for _ in range(4):
-            rpc._COOLDOWN_DEADLINE = 0
-            with pytest.raises(TelegramRpcThrottled):
-                await _call(gate, _CachedOuterRequest(resolve_nested=True))
+        deadline = asyncio.get_running_loop().time() + 300
+        with demand_context(DemandKind.DIALOG_BOOTSTRAP, deadline=deadline):
+            with rpc_scope(TelegramRpcSource.DIALOG_SYNC, deadline=deadline):
+                with pytest.raises(TelegramRpcThrottled):
+                    await gate(outer_request(nested=False))
+                for _ in range(4):
+                    clock_offsets[0] += 6
+                    clock_offsets[1] += 6
+                    assert gate._safety.floor_deadline <= fake_time.monotonic()
+                    gate._flood_waited_requests[functions.updates.GetStateRequest.CONSTRUCTOR_ID] = fake_time.time() + 5
+                    gate._admission_scheduler.notify_eligibility_changed()
+                    with pytest.raises(TelegramRpcThrottled):
+                        await asyncio.wait_for(gate(outer_request(nested=True)), timeout=2.0)
 
         assert sender.calls == 5
         assert [type(request) for request in sent] == [
-            _CachedOuterRequest,
-            _TestRequest,
-            _TestRequest,
-            _TestRequest,
-            _TestRequest,
+            functions.updates.GetStateRequest,
+            GetConfigRequest,
+            GetConfigRequest,
+            GetConfigRequest,
+            GetConfigRequest,
         ]
         assert accumulator.kill_switch_status().events_in_window == 1
         assert accumulator.kill_switch_status().open is False
@@ -2716,10 +3108,11 @@ def test_gate_factory_invariants_without_connecting() -> None:
         cooldown_buffer_seconds=1.0,
         transient_retry_delays_seconds=(2.0,),
         scheduler_policy=TelegramRpcSchedulerConfig(),
+        safety_store=_MemorySafetyStore(AuthKey(bytes(range(256))).key_id).api(),
     )
     assert isinstance(gate, TelegramClient)
     assert gate._request_retries == 0
-    assert gate._cooldown_persistence is None
+    assert gate._safety is None
     assert gate.flood_sleep_threshold == 0
     assert gate._raise_last_call_error is True
     assert gate._auto_reconnect is True
@@ -2899,6 +3292,7 @@ async def test_gate_releases_active_capacity_after_transport_completion(monkeypa
     gate._admission_scheduler = TelegramRpcAdmissionScheduler(
         policy=gate._scheduler_policy,
         limiter=gate._limiter,
+        minimum_spacing_seconds=gate._test_minimum_spacing_seconds,
         readiness=RpcTransportReadiness(
             probe=gate._scheduler_transport_ready,
             wait=gate._wait_for_scheduler_transport,
@@ -2932,7 +3326,7 @@ async def test_actual_future_flood_is_recorded_when_caller_cancels_after_respons
     )
     gate = _gate()
     sender = _RawFutureSender()
-    gate._main_sender = sender
+    _set_sender(gate, sender)
     gate._flood_observer = lambda **event: accumulator.observe(**event)
     observations: list[FloodWaitObservation] = []
     gate.set_flood_event_observer(observations.append)
@@ -2943,14 +3337,15 @@ async def test_actual_future_flood_is_recorded_when_caller_cancels_after_respons
     caller.cancel()
     with pytest.raises(asyncio.CancelledError):
         await caller
-    await _wait_for(lambda: not gate._pending_scalar_dispatches)
+    await _wait_for(lambda: not _pending_owned_states(gate))
+    await _wait_for(lambda: gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0))
     assert account_cooldown_deadline() > asyncio.get_running_loop().time()
     assert accumulator.kill_switch_status().events_in_window == 1
     assert len(observations) == 1
     observation = observations[0]
     assert observation.origin == "actual_send"
     assert observation.actual_dispatch is True
-    assert observation.request_method == "_TestRequest"
+    assert observation.request_method.endswith(f"GetConfigRequest:{GetConfigRequest.CONSTRUCTOR_ID:08x}")
     assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
     await gate.close_rpc_scheduler()
 
@@ -3037,11 +3432,9 @@ def _real_dm_page_adapter(
 ) -> tuple[TelegramRpcGate, _DmPageFutureSender, DmDeletionReconciliationDemandAdapter, _RecordingDmPageScanner]:
     gate = _gate()
     sender = _DmPageFutureSender()
-    gate._main_sender = sender
-    gate.session = SimpleNamespace(
-        process_entities=lambda _result: None,
-        get_input_entity=lambda entity: types.InputPeerUser(int(entity), 0),
-    )
+    _set_sender(gate, sender)
+    gate.session.process_entities = lambda _result: None
+    gate.session.get_input_entity = lambda entity: types.InputPeerUser(int(entity), 0)
     scanner = _real_dm_page_scanner(gate, conn)
     prepare_dm_deletion_reconciliation(conn, now=100)
     return gate, sender, DmDeletionReconciliationDemandAdapter(conn, scanner, writer=inline_writer(conn)), scanner
@@ -3171,7 +3564,9 @@ async def test_dm_page_cursor_commit_failure_preserves_tombstone_and_blocks_reco
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("delta_cursor", [None, 1])
-async def test_dm_page_flood_crosses_gate_with_durable_demand_and_acquisition(delta_cursor: int | None) -> None:
+async def test_dm_page_flood_crosses_gate_with_durable_demand_and_acquisition(  # noqa: PLR0915
+    delta_cursor: int | None,
+) -> None:
     accumulator = FloodWaitAccumulator()
     accumulator.configure_kill_switch(
         FloodWaitKillSwitchPolicy(enabled=True, window_seconds=600, max_events=5, max_wait_seconds=900)
@@ -3209,6 +3604,18 @@ async def test_dm_page_flood_crosses_gate_with_durable_demand_and_acquisition(de
 
         import mcp_telegram.telegram_rpc as rpc
 
+        record = json.loads(gate._test_safety_store.raw)
+        expired_monotonic = rpc.time.monotonic() - 1
+        expired_utc = rpc.time.time() - 1
+        record["floor"].update(
+            boot_id="test-boot",
+            until_monotonic=expired_monotonic,
+            until_utc=expired_utc,
+            remaining_seconds=0.0,
+        )
+        gate._test_safety_store.raw = json.dumps(record, separators=(",", ":"))
+        gate._safety = None
+        gate._ensure_safety_ledger()
         rpc._COOLDOWN_DEADLINE = rpc.time.monotonic() - 1
         await _dispatch_forward_history_sibling(gate, sender, conn, expected_cursor=delta_cursor or 0)
 
@@ -3217,7 +3624,7 @@ async def test_dm_page_flood_crosses_gate_with_durable_demand_and_acquisition(de
         assert sender.calls == 2
         assert len(observations) == 1
     finally:
-        await gate.close_rpc_scheduler()
+        await _cleanup_raw_future_gate(gate, sender)
         conn.close()
 
 
@@ -3245,7 +3652,7 @@ async def test_cancelled_dm_page_late_gate_flood_stays_claimed_across_restart() 
         assert not sender.futures[0].cancelled()
 
         sender.futures[0].set_exception(FloodWaitError(request=None, capture=20))
-        await _wait_for(lambda: not gate._pending_scalar_dispatches)
+        await _wait_for(lambda: not _pending_owned_states(gate))
         assert len(observations) == 1
         assert observations[0].actual_dispatch is True
         assert observations[0].demand_kind == DemandKind.DM_DELETION_RECONCILIATION.value
@@ -3262,7 +3669,7 @@ async def test_cancelled_dm_page_late_gate_flood_stays_claimed_across_restart() 
         assert restarted_scanner.calls == 0
         assert sender.calls == 1
     finally:
-        await gate.close_rpc_scheduler()
+        await _cleanup_raw_future_gate(gate, sender)
         conn.close()
 
 
@@ -3309,13 +3716,14 @@ async def test_abandoned_actual_future_keeps_capacity_and_records_later_flood() 
     gate._admission_scheduler = TelegramRpcAdmissionScheduler(
         policy=gate._scheduler_policy,
         limiter=gate._limiter,
+        minimum_spacing_seconds=gate._test_minimum_spacing_seconds,
         readiness=RpcTransportReadiness(
             probe=gate._scheduler_transport_ready,
             wait=gate._wait_for_scheduler_transport,
         ),
     )
     sender = _RawFutureSender()
-    gate._main_sender = sender
+    _set_sender(gate, sender)
     gate._flood_observer = lambda **event: accumulator.observe(**event)
     caller = asyncio.create_task(_call(gate, _TestRequest("actual")))
     await _wait_for(lambda: sender.calls == 1)
@@ -3324,13 +3732,14 @@ async def test_abandoned_actual_future_keeps_capacity_and_records_later_flood() 
     with pytest.raises(asyncio.CancelledError):
         await caller
     assert not raw_future.cancelled()
-    assert set(gate._pending_scalar_dispatches) == {raw_future}
+    assert len(_pending_owned_states(gate)) == 1
     assert gate._admission_scheduler.active_depths()[RpcServiceClass.INTERACTIVE] == 1
     with pytest.raises(TelegramRpcAdmissionDeferred):
         await _call(gate, _TestRequest("blocked"))
     raw_future.set_exception(FloodWaitError(request=None, capture=20))
-    await _wait_for(lambda: not gate._pending_scalar_dispatches)
+    await _wait_for(lambda: not _pending_owned_states(gate))
     assert accumulator.kill_switch_status().events_in_window == 1
+    await _wait_for(lambda: gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0))
     assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
     await gate.close_rpc_scheduler()
 
@@ -3343,23 +3752,20 @@ async def test_five_abandoned_actual_futures_still_latch_the_account() -> None:
     )
     gate = _gate()
     sender = _RawFutureSender()
-    gate._main_sender = sender
+    _set_sender(gate, sender)
     gate._rpc_circuit_status = accumulator.kill_switch_status
     gate._flood_observer = lambda **event: accumulator.observe(**event)
-    import mcp_telegram.telegram_rpc as rpc
-
-    for index in range(5):
-        caller = asyncio.create_task(_call(gate, _TestRequest(index)))
-        expected_calls = index + 1
-        await _wait_for(lambda expected_calls=expected_calls: sender.calls == expected_calls)
+    callers = [asyncio.create_task(_call(gate, _TestRequest(index))) for index in range(5)]
+    await _wait_for(lambda: sender.calls == len(callers))
+    for caller in callers:
         caller.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await caller
-        sender.futures[index].set_exception(FloodWaitError(request=None, capture=1))
-        await _wait_for(lambda: not gate._pending_scalar_dispatches)
-        if index < 4:
-            rpc._COOLDOWN_DEADLINE = 0
-            gate._flood_waited_requests.clear()
+    assert all(
+        isinstance(result, asyncio.CancelledError) for result in await asyncio.gather(*callers, return_exceptions=True)
+    )
+    for future in sender.futures:
+        future.set_exception(FloodWaitError(request=None, capture=1))
+    await _wait_for(lambda: not _pending_owned_states(gate))
+    await _wait_for(lambda: gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0))
 
     assert accumulator.kill_switch_status().open is True
     assert accumulator.kill_switch_status().events_in_window == 5
@@ -3391,65 +3797,67 @@ async def test_already_completed_actual_futures_finalize_once_for_success_and_fl
             return future
 
     sender = _DoneSender()
-    gate._main_sender = sender
+    _set_sender(gate, sender)
     assert await _call(gate, _TestRequest("success")) == "ok"
     with pytest.raises(TelegramRpcThrottled):
         await _call(gate, _TestRequest("flood"))
     assert sender.calls == 2
     assert accumulator.kill_switch_status().events_in_window == 1
-    assert gate._pending_scalar_dispatches == {}
+    assert _pending_owned_states(gate) == {}
     assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
     await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
-async def test_cancelled_actual_flood_keeps_durable_receipt_and_lease_until_shutdown_drain() -> None:
+async def test_cancelled_actual_flood_keeps_durable_receipt_and_lease_until_shutdown_drain() -> None:  # noqa: PLR0915
     gate = _gate()
     sender = _RawFutureSender()
-    gate._main_sender = sender
-    saving = asyncio.Event()
+    _set_sender(gate, sender)
     commit = asyncio.Event()
-    saved: list[float] = []
+    try:
+        saving = asyncio.Event()
+        caller = asyncio.create_task(_call(gate, _TestRequest("actual")))
+        await _wait_for(lambda: sender.calls == 1)
+        writes_before_flood = len(gate._test_safety_store.writes)
+        gate._test_safety_store.block_floor_saves = True
+        gate._test_safety_store.floor_save_started = saving
+        gate._test_safety_store.floor_save_release = commit
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        error = FloodWaitError(request=None, capture=20)
+        sender.futures[0].set_exception(error)
+        await saving.wait()
+        assert account_cooldown_deadline() > asyncio.get_running_loop().time()
+        assert gate._admission_scheduler.active_depths()[RpcServiceClass.INTERACTIVE] == 1
 
-    async def save_until_utc(deadline: float) -> None:
-        saving.set()
-        await commit.wait()
-        saved.append(deadline)
-
-    gate._cooldown_persistence = TelegramRpcCooldownPersistence(lambda: None, save_until_utc)
-    caller = asyncio.create_task(_call(gate, _TestRequest("actual")))
-    await _wait_for(lambda: sender.calls == 1)
-    caller.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await caller
-    error = FloodWaitError(request=None, capture=20)
-    sender.futures[0].set_exception(error)
-    await saving.wait()
-    assert account_cooldown_deadline() > asyncio.get_running_loop().time()
-    assert gate._admission_scheduler.active_depths()[RpcServiceClass.INTERACTIVE] == 1
-
-    observer = asyncio.create_task(gate._observe_flood(error))
-    await asyncio.sleep(0)
-    assert not observer.done()
-    observer.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await observer
-    closing = asyncio.create_task(gate.close_rpc_scheduler())
-    await asyncio.sleep(0)
-    assert not closing.done()
-    closing.cancel()
-    await asyncio.sleep(0)
-    closing.cancel()
-    await asyncio.sleep(0)
-    assert not closing.done()
-    assert saved == []
-    commit.set()
-    with pytest.raises(asyncio.CancelledError):
-        await closing
-    assert len(saved) == 1
-    assert gate._pending_scalar_dispatches == {}
-    assert gate._cooldown_save_tasks == {}
-    assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
+        observer = asyncio.create_task(gate._observe_flood(error))
+        await asyncio.sleep(0)
+        assert not observer.done()
+        observer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await observer
+        closing = asyncio.create_task(gate.close_rpc_scheduler())
+        await asyncio.sleep(0)
+        assert not closing.done()
+        closing.cancel()
+        await asyncio.sleep(0)
+        closing.cancel()
+        await asyncio.sleep(0)
+        assert not closing.done()
+        assert len(gate._test_safety_store.writes) == writes_before_flood
+        commit.set()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        assert gate._test_safety_store.writes
+        assert len(gate._test_safety_store.writes) > writes_before_flood
+        assert float(json.loads(gate._test_safety_store.raw)["floor"]["until_utc"]) > 0
+        assert _pending_owned_states(gate) == {}
+        assert gate._cooldown_save_tasks == {}
+        assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
+    finally:
+        commit.set()
+        await _cleanup_raw_future_gate(gate, sender)
 
 
 @pytest.mark.asyncio
@@ -3460,25 +3868,29 @@ async def test_actual_future_flood_protects_when_persistence_and_event_sinks_fai
     accumulator.configure_kill_switch(
         FloodWaitKillSwitchPolicy(enabled=True, window_seconds=600, max_events=5, max_wait_seconds=900)
     )
-    gate._main_sender = sender
+    _set_sender(gate, sender)
     gate._flood_observer = lambda **event: accumulator.observe(**event)
 
-    async def fail_save(_deadline: float) -> None:
-        raise OSError
-
-    gate._cooldown_persistence = TelegramRpcCooldownPersistence(lambda: None, fail_save)
-    gate.set_flood_event_observer(lambda _event: (_ for _ in ()).throw(OSError()))
-    caller = asyncio.create_task(_call(gate, _TestRequest("actual")))
-    await _wait_for(lambda: sender.calls == 1)
-    caller.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await caller
-    sender.futures[0].set_exception(FloodWaitError(request=None, capture=20))
-    await _wait_for(lambda: not gate._pending_scalar_dispatches)
-    assert account_cooldown_deadline() > asyncio.get_running_loop().time()
-    assert accumulator.kill_switch_status().events_in_window == 1
-    assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
-    await gate.close_rpc_scheduler()
+    try:
+        gate.set_flood_event_observer(lambda _event: (_ for _ in ()).throw(OSError()))
+        caller = asyncio.create_task(_call(gate, _TestRequest("actual")))
+        await _wait_for(lambda: sender.calls == 1)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        gate._test_safety_store.fail_floor_next = True
+        sender.futures[0].set_exception(FloodWaitError(request=None, capture=20))
+        await _wait_for(
+            lambda: (
+                not _pending_owned_states(gate)
+                and not gate._cooldown_save_tasks
+                and gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
+            )
+        )
+        assert account_cooldown_deadline() > asyncio.get_running_loop().time()
+        assert accumulator.kill_switch_status().events_in_window == 1
+    finally:
+        await _cleanup_raw_future_gate(gate, sender)
 
 
 @pytest.mark.asyncio
@@ -3489,7 +3901,7 @@ async def test_disconnect_drains_completed_actual_flood_after_caller_cancellatio
     accumulator.configure_kill_switch(
         FloodWaitKillSwitchPolicy(enabled=True, window_seconds=600, max_events=5, max_wait_seconds=900)
     )
-    gate._main_sender = sender
+    _set_sender(gate, sender)
     gate._flood_observer = lambda **event: accumulator.observe(**event)
     caller = asyncio.create_task(_call(gate, _TestRequest("actual")))
     await _wait_for(lambda: sender.calls == 1)
@@ -3500,13 +3912,13 @@ async def test_disconnect_drains_completed_actual_flood_after_caller_cancellatio
     await gate._disconnect_main_sender()
     assert sender.disconnect_calls == 1
     assert accumulator.kill_switch_status().events_in_window == 1
-    assert gate._pending_scalar_dispatches == {}
+    assert _pending_owned_states(gate) == {}
     assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
     await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
-async def test_failed_raw_disconnect_retains_response_lease_and_blocks_transport_reuse() -> None:
+async def test_failed_owned_disconnect_records_unknown_and_blocks_transport_reuse() -> None:
     gate = _gate()
 
     class _FailingDisconnectSender(_RawFutureSender):
@@ -3520,7 +3932,7 @@ async def test_failed_raw_disconnect_retains_response_lease_and_blocks_transport
             raise AssertionError("failed transport must not forward keepalive ping")
 
     sender = _FailingDisconnectSender()
-    gate._main_sender = sender
+    _set_sender(gate, sender)
     caller = asyncio.create_task(_call(gate, _TestRequest("actual")))
     await _wait_for(lambda: sender.calls == 1)
     raw_future = sender.futures[0]
@@ -3532,8 +3944,10 @@ async def test_failed_raw_disconnect_retains_response_lease_and_blocks_transport
         await gate._disconnect_main_sender()
     assert gate._transport_state is _TransportBoundaryState.FAILED
     assert raw_future.cancelled()
-    assert set(gate._pending_scalar_dispatches) == {raw_future}
-    assert gate._admission_scheduler.active_depths()[RpcServiceClass.INTERACTIVE] == 1
+    assert _pending_owned_states(gate) == {}
+    assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
+    record = json.loads(gate._test_safety_store.raw)
+    assert record["protection"] is not None or record["intents"]
     with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
         await _call(gate, _TestRequest("blocked"))
     with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
@@ -3541,65 +3955,47 @@ async def test_failed_raw_disconnect_retains_response_lease_and_blocks_transport
     with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
         await gate._switch_dc(3)
     _MainSenderAdapter(gate)._keepalive_ping(1)
-    with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
-        await gate._disconnect_main_sender()
-    assert sender.disconnect_calls == 1
-    await gate.close_rpc_scheduler()
+    with pytest.raises(OSError, match="transport teardown failed"):
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("vendor_failure", ["cancelled_future", "local_exception"])
-async def test_installed_vendor_sender_failure_retains_gate_response_lease(vendor_failure: str) -> None:
+async def test_vendor_transport_failure_settles_actual_owned_state_without_reuse(vendor_failure: str) -> None:
     gate = _gate()
-    raw_future = asyncio.get_running_loop().create_future()
 
-    class _FailingConnection:
-        def __init__(self) -> None:
-            self.disconnect_calls = 0
-            self._connected = True
-
+    class _FailingDisconnectProvider(_RawFutureSender):
         async def disconnect(self) -> None:
             self.disconnect_calls += 1
+            if self.futures:
+                if vendor_failure == "cancelled_future":
+                    self.futures[0].cancel()
+                else:
+                    self.futures[0].set_exception(OSError("local sender failure"))
             raise OSError("fake transport teardown failed")
 
-    connection = _FailingConnection()
-    sender = _installed_sender(connection)
-    sender._pending_state[101] = SimpleNamespace(future=raw_future)
-    forwarded_pings: list[int] = []
-    sender._keepalive_ping = forwarded_pings.append
-    gate._main_sender = sender
-    gate._sender = _MainSenderAdapter(gate)
+    sender = _FailingDisconnectProvider()
+    _set_sender(gate, sender)
+    caller = asyncio.create_task(_call(gate, _TestRequest("teardown failure")))
+    await _wait_for(lambda: sender.calls == 1)
+    state = next(iter(_pending_owned_states(gate)))
+    owned_future = state.future
+    caller.cancel()
+    assert isinstance((await asyncio.gather(caller, return_exceptions=True))[0], asyncio.CancelledError)
 
-    with demand_context(DemandKind.FULL_SYNC_PAGE):
-        with rpc_scope(TelegramRpcSource.FULL_SYNC):
-            scope = current_rpc_scope()
-            admission = await gate._admission_scheduler.admit(scope)
-    gate._register_scalar_dispatch_completion(
-        raw_future,
-        scope=scope,
-        request_method="GetHistoryRequest",
-        admission=admission,
-        dispatch_at_monotonic=asyncio.get_running_loop().time(),
-    )
-
+    with pytest.raises(OSError, match="fake transport teardown failed"):
+        await gate._disconnect_main_sender()
+    assert owned_future.done()
     if vendor_failure == "cancelled_future":
-        with pytest.raises(OSError, match="fake transport teardown failed"):
-            await gate._disconnect_main_sender()
-        assert raw_future.cancelled()
+        assert not owned_future.cancelled()
+        assert isinstance(owned_future.exception(), asyncio.CancelledError)
     else:
-        with pytest.raises(OSError, match="fake transport teardown failed"):
-            await sender._disconnect(error=OSError("local sender failure"))
-        with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
-            await gate._disconnect_main_sender()
-        assert raw_future.done() and not raw_future.cancelled()
-        assert set(gate._pending_scalar_dispatches) == {raw_future}
-        assert sum(gate._admission_scheduler.active_depths().values()) == 1
-
-    await asyncio.sleep(0)
-    assert connection.disconnect_calls == 1
+        assert not owned_future.cancelled()
     assert gate._transport_state is _TransportBoundaryState.FAILED
-    assert set(gate._pending_scalar_dispatches) == {raw_future}
-    assert sum(gate._admission_scheduler.active_depths().values()) == 1
+    assert _pending_owned_states(gate) == {}
+    assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
+    record = json.loads(gate._test_safety_store.raw)
+    assert record["protection"] is not None or record["intents"]
     with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
         await _call(gate, _TestRequest("blocked"))
     with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
@@ -3607,42 +4003,28 @@ async def test_installed_vendor_sender_failure_retains_gate_response_lease(vendo
     with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
         await gate._switch_dc(3)
     _MainSenderAdapter(gate)._keepalive_ping(1)
-    assert forwarded_pings == []
-    with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
-        await gate._disconnect_main_sender()
-    assert connection.disconnect_calls == 1
-    await gate.close_rpc_scheduler()
+    with pytest.raises(OSError, match="fake transport teardown failed"):
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
 async def test_installed_vendor_internal_failure_with_zero_pending_cannot_confirm_teardown() -> None:
     gate = _gate()
 
-    class _FailingConnection:
-        def __init__(self) -> None:
-            self.disconnect_calls = 0
-            self._connected = True
-
+    class _FailingDisconnectProvider(_RawFutureSender):
         async def disconnect(self) -> None:
             self.disconnect_calls += 1
             raise OSError("internal transport teardown failed")
 
-    connection = _FailingConnection()
-    sender = _installed_sender(connection)
-    forwarded_pings: list[int] = []
-    sender._keepalive_ping = forwarded_pings.append
-    gate._main_sender = sender
-    gate._sender = _MainSenderAdapter(gate)
+    sender = _FailingDisconnectProvider()
+    _set_sender(gate, sender)
 
     with pytest.raises(OSError, match="internal transport teardown failed"):
-        await sender._disconnect(error=OSError("internal sender failure"))
-    with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
         await gate._disconnect_main_sender()
 
-    assert connection.disconnect_calls == 1
-    assert sender._connection is None
+    assert sender.disconnect_calls == 1
     assert gate._transport_state is _TransportBoundaryState.FAILED
-    assert gate._pending_scalar_dispatches == {}
+    assert _pending_owned_states(gate) == {}
     with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
         await _call(gate, _TestRequest("blocked"))
     with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
@@ -3650,8 +4032,8 @@ async def test_installed_vendor_internal_failure_with_zero_pending_cannot_confir
     with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
         await gate._switch_dc(3)
     _MainSenderAdapter(gate)._keepalive_ping(1)
-    assert forwarded_pings == []
-    await gate.close_rpc_scheduler()
+    with pytest.raises(OSError, match="internal transport teardown failed"):
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
@@ -3660,121 +4042,46 @@ async def test_installed_vendor_internal_teardown_in_progress_cannot_be_taken_ov
     disconnect_started = asyncio.Event()
     disconnect_release = asyncio.Event()
 
-    class _BlockedConnection:
-        def __init__(self) -> None:
-            self.disconnect_calls = 0
-            self._connected = True
-
+    class _BlockedDisconnectProvider(_RawFutureSender):
         async def disconnect(self) -> None:
             self.disconnect_calls += 1
             disconnect_started.set()
             await disconnect_release.wait()
             raise OSError("internal transport teardown failed")
 
-    connection = _BlockedConnection()
-    sender = _installed_sender(connection)
-    gate._main_sender = sender
-    gate._sender = _MainSenderAdapter(gate)
+    sender = _BlockedDisconnectProvider()
+    _set_sender(gate, sender)
 
-    internal = asyncio.create_task(sender._disconnect(error=OSError("internal sender failure")))
+    first = asyncio.create_task(gate._disconnect_main_sender())
     await disconnect_started.wait()
-    with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
-        await gate._disconnect_main_sender()
-    assert connection.disconnect_calls == 1
-    assert gate._transport_state is _TransportBoundaryState.FAILED
+    second = asyncio.create_task(gate._disconnect_main_sender())
+    await asyncio.sleep(0)
+    assert not first.done() and not second.done()
+    assert sender.disconnect_calls == 1
+    assert gate._transport_state is _TransportBoundaryState.DISCONNECTING
 
     disconnect_release.set()
     with pytest.raises(OSError, match="internal transport teardown failed"):
-        await internal
-    assert sender._connection is None
-    await gate.close_rpc_scheduler()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("state", "raise_user_probe", "raise_transport_probe"),
-    [
-        (_TransportBoundaryState.READY, False, False),
-        (_TransportBoundaryState.CONNECTING, False, False),
-        (_TransportBoundaryState.READY, True, False),
-        (_TransportBoundaryState.CONNECTING, False, True),
-    ],
-)
-async def test_teardown_preflight_rejects_missing_or_unreadable_raw_transport(
-    state: _TransportBoundaryState,
-    raise_user_probe: bool,
-    raise_transport_probe: bool,
-) -> None:
-    gate = _gate()
-    raw_future = asyncio.get_running_loop().create_future()
-    owner = object()
-
-    class _ProbeSender:
-        def __init__(self) -> None:
-            self.disconnect_calls = 0
-
-        def is_connected(self) -> bool:
-            if raise_user_probe:
-                raise RuntimeError("user-connected probe failed")
-            return True
-
-        def _transport_connected(self) -> bool:
-            if raise_transport_probe:
-                raise RuntimeError("transport-connected probe failed")
-            return False
-
-        async def disconnect(self) -> None:
-            self.disconnect_calls += 1
-
-    sender = _ProbeSender()
-    gate._main_sender = sender
-    gate._connect_owner = owner
-    with demand_context(DemandKind.FULL_SYNC_PAGE):
-        with rpc_scope(TelegramRpcSource.FULL_SYNC):
-            scope = current_rpc_scope()
-            admission = await gate._admission_scheduler.admit(scope)
-    gate._register_scalar_dispatch_completion(
-        raw_future,
-        scope=scope,
-        request_method="GetHistoryRequest",
-        admission=admission,
-        dispatch_at_monotonic=asyncio.get_running_loop().time(),
-    )
-    gate._transport_state = state
-
-    with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
-        await gate._disconnect_main_sender()
-    assert sender.disconnect_calls == 0
+        await first
+    with pytest.raises(OSError, match="internal transport teardown failed"):
+        await second
+    assert sender.disconnect_calls == 1
     assert gate._transport_state is _TransportBoundaryState.FAILED
-    assert gate._connect_owner is owner
-    assert set(gate._pending_scalar_dispatches) == {raw_future}
-    assert sum(gate._admission_scheduler.active_depths().values()) == 1
-    with pytest.raises(TelegramRpcAdmissionDeferred):
-        await _call(gate, _TestRequest("blocked"))
-    with pytest.raises(TelegramRpcAdmissionDeferred):
-        await gate.connect()
-
-    raw_future.set_result("terminal cleanup")
-    await _wait_for(lambda: gate._pending_scalar_dispatches == {})
-    await gate.close_rpc_scheduler()
+    with pytest.raises(OSError, match="internal transport teardown failed"):
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("first_teardown_fails", [False, True])
-async def test_overlapping_installed_sender_disconnect_cannot_confirm_first_teardown(
+async def test_overlapping_owned_disconnects_share_one_teardown_and_settle_unknown(
     first_teardown_fails: bool,
 ) -> None:
-    """Only the transport owner may establish disconnect completion."""
+    """Concurrent disconnect callers share the real sender's teardown owner."""
     gate = _gate()
-    raw_future = asyncio.get_running_loop().create_future()
     disconnect_started = asyncio.Event()
     disconnect_release = asyncio.Event()
 
-    class _BlockedFailingConnection:
-        def __init__(self) -> None:
-            self.disconnect_calls = 0
-            self._connected = True
-
+    class _BlockedDisconnectProvider(_RawFutureSender):
         async def disconnect(self) -> None:
             self.disconnect_calls += 1
             disconnect_started.set()
@@ -3782,53 +4089,51 @@ async def test_overlapping_installed_sender_disconnect_cannot_confirm_first_tear
             if first_teardown_fails:
                 raise OSError("first teardown failed")
 
-    connection = _BlockedFailingConnection()
-    sender = _installed_sender(connection)
-    sender._pending_state[101] = SimpleNamespace(future=raw_future)
-    gate._main_sender = sender
-    gate._sender = _MainSenderAdapter(gate)
-
-    with demand_context(DemandKind.FULL_SYNC_PAGE):
-        with rpc_scope(TelegramRpcSource.FULL_SYNC):
-            scope = current_rpc_scope()
-            admission = await gate._admission_scheduler.admit(scope)
-    gate._register_scalar_dispatch_completion(
-        raw_future,
-        scope=scope,
-        request_method="GetHistoryRequest",
-        admission=admission,
-        dispatch_at_monotonic=asyncio.get_running_loop().time(),
-    )
-
+    sender = _BlockedDisconnectProvider()
+    _set_sender(gate, sender)
+    caller = asyncio.create_task(_call(gate, _TestRequest("pending during teardown")))
+    await _wait_for(lambda: sender.calls == 1)
+    state = next(iter(_pending_owned_states(gate)))
+    response_future = state.future
+    caller.cancel()
+    assert isinstance((await asyncio.gather(caller, return_exceptions=True))[0], asyncio.CancelledError)
     first = asyncio.create_task(gate._disconnect_main_sender())
     await disconnect_started.wait()
+    second = asyncio.create_task(gate._disconnect_main_sender())
+    await asyncio.sleep(0)
     assert gate._transport_state is _TransportBoundaryState.DISCONNECTING
-    with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is disconnecting"):
-        await gate._disconnect_main_sender()
-    assert connection.disconnect_calls == 1
-    assert set(gate._pending_scalar_dispatches) == {raw_future}
+    assert not first.done() and not second.done()
+    assert sender.disconnect_calls == 1
 
     disconnect_release.set()
     if first_teardown_fails:
         with pytest.raises(OSError, match="first teardown failed"):
             await first
+        with pytest.raises(OSError, match="first teardown failed"):
+            await second
         assert gate._transport_state is _TransportBoundaryState.FAILED
-        assert set(gate._pending_scalar_dispatches) == {raw_future}
-        assert sum(gate._admission_scheduler.active_depths().values()) == 1
     else:
         await first
+        await second
         assert gate._transport_state is _TransportBoundaryState.DISCONNECTED
-        assert gate._pending_scalar_dispatches == {}
-        assert sum(gate._admission_scheduler.active_depths().values()) == 0
-    await gate.close_rpc_scheduler()
+    assert sender.disconnect_calls == 1
+    assert response_future.done() and response_future.cancelled()
+    assert _pending_owned_states(gate) == {}
+    assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
+    record = json.loads(gate._test_safety_store.raw)
+    assert record["protection"] is not None or record["intents"]
+    if first_teardown_fails:
+        with pytest.raises(OSError, match="first teardown failed"):
+            await gate.close_rpc_scheduler()
+    else:
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["local_error", "cancelled", "result", "flood_wait"])
 async def test_confirmed_installed_sender_outcomes_release_once_after_owned_teardown(outcome: str) -> None:
-    """Only a successful owned teardown may consume residual scalar outcomes."""
+    """Real queued outcomes are settled and recorded by the owned transport."""
     gate = _gate()
-    raw_future = asyncio.get_running_loop().create_future()
     flood_error = FloodWaitError(request=None, capture=20)
     accumulator = FloodWaitAccumulator()
     accumulator.configure_kill_switch(
@@ -3838,103 +4143,82 @@ async def test_confirmed_installed_sender_outcomes_release_once_after_owned_tear
     observed_floods: list[FloodWaitObservation] = []
     gate.set_flood_event_observer(observed_floods.append)
 
-    class _SuccessfulConnection:
+    class _DisconnectOutcomeProvider(_RawFutureSender):
         def __init__(self) -> None:
-            self.disconnect_calls = 0
-            self._connected = True
+            super().__init__()
 
         async def disconnect(self) -> None:
             self.disconnect_calls += 1
+            if outcome == "local_error":
+                raise OSError("local sender failure")
             if outcome == "result":
-                raw_future.set_result("response")
+                self.futures[0].set_result("response")
             elif outcome == "flood_wait":
-                raw_future.set_exception(flood_error)
+                self.futures[0].set_exception(flood_error)
+            if outcome in {"result", "flood_wait"}:
+                await _wait_for(lambda: not _pending_owned_states(gate))
 
-    connection = _SuccessfulConnection()
-    sender = _installed_sender(connection)
-    sender._pending_state[101] = SimpleNamespace(future=raw_future)
+    sender = _DisconnectOutcomeProvider()
+    _set_sender(gate, sender)
+    caller = asyncio.create_task(_call(gate, _TestRequest("disconnect outcome")))
+    await _wait_for(lambda: sender.calls == 1)
+    owned_states = _pending_owned_states(gate)
+    assert len(owned_states) == 1
+    raw_future = next(iter(owned_states)).future
+    caller.cancel()
+    assert isinstance((await asyncio.gather(caller, return_exceptions=True))[0], asyncio.CancelledError)
 
     if outcome == "local_error":
-
-        async def disconnect_with_local_error() -> None:
-            await sender._disconnect(error=OSError("local sender failure"))
-
-        sender.disconnect = disconnect_with_local_error
-
-    gate._main_sender = sender
-    gate._sender = _MainSenderAdapter(gate)
-    with demand_context(DemandKind.FULL_SYNC_PAGE):
-        with rpc_scope(TelegramRpcSource.FULL_SYNC):
-            scope = current_rpc_scope()
-            admission = await gate._admission_scheduler.admit(scope)
-    gate._register_scalar_dispatch_completion(
-        raw_future,
-        scope=scope,
-        request_method="GetHistoryRequest",
-        admission=admission,
-        dispatch_at_monotonic=asyncio.get_running_loop().time(),
-    )
-    pending = gate._pending_scalar_dispatches[raw_future]
-    assert pending.scope is scope
-    assert pending.request_method == "GetHistoryRequest"
-    assert pending.admission is admission
-
-    await gate._disconnect_main_sender()
-    assert connection.disconnect_calls == 1
-    _assert_confirmed_scalar_outcome_consumed(gate, raw_future, accumulator, outcome)
+        with pytest.raises(OSError, match="local sender failure"):
+            await gate._disconnect_main_sender()
+    else:
+        await gate._disconnect_main_sender()
+    assert sender.disconnect_calls == 1
+    assert raw_future.done()
+    assert raw_future.cancelled() is (outcome in {"cancelled", "local_error"})
+    assert _pending_owned_states(gate) == {}
+    assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
+    if outcome == "local_error":
+        assert gate._transport_state is _TransportBoundaryState.FAILED
+    else:
+        assert gate._transport_state is _TransportBoundaryState.DISCONNECTED
     if outcome == "flood_wait":
-        _assert_frozen_flood_observation(
-            observed_floods,
-            pending.request_method,
-            pending.admission.sequence,
-            pending.dispatch_at_monotonic,
-        )
-
-    reconnect_sender = _BootstrapSender()
-    gate._main_sender = reconnect_sender
-    gate._sender = _MainSenderAdapter(gate)
-    await gate._sender.connect(object())
-    assert gate._transport_state is _TransportBoundaryState.READY
-    assert reconnect_sender.connect_calls == 1
-    await gate._sender.disconnect()
-    await gate.close_rpc_scheduler()
+        assert len(observed_floods) == 1
+        assert observed_floods[0].actual_dispatch is True
+        assert observed_floods[0].origin == "actual_send"
+        assert accumulator.kill_switch_status().events_in_window == 1
+    if outcome in {"cancelled", "local_error"}:
+        record = json.loads(gate._test_safety_store.raw)
+        assert record["protection"] is not None or record["intents"], record
+    if outcome == "local_error":
+        with pytest.raises(OSError, match="local sender failure"):
+            await gate.close_rpc_scheduler()
+    else:
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
-async def test_installed_vendor_auth_init_disconnect_failure_parks_daemon(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_installed_vendor_auth_init_disconnect_failure_parks_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
     """An auth-init failure cannot turn vendor reference clearing into recovery."""
     from telethon.errors import SecurityError
-    from telethon.network import authenticator
 
     gate, _ = _bootstrap_gate()
 
-    class _AuthFailureConnection:
+    class _AuthFailureProvider(_BootstrapSender):
         def __init__(self) -> None:
-            self.connect_calls = 0
-            self.disconnect_calls = 0
+            super().__init__()
 
-        async def connect(self, *, timeout: object) -> None:
-            del timeout
+        async def connect(self, _connection: object) -> bool:
             self.connect_calls += 1
+            raise SecurityError("authentication failed")
 
         async def disconnect(self) -> None:
             self.disconnect_calls += 1
             raise OSError("internal transport teardown failed")
 
-    connection = _AuthFailureConnection()
-    sender = _installed_sender(connection, retries=1, connected=False)
-    gate._main_sender = sender
-    gate._sender = _MainSenderAdapter(gate)
-    gate._connection = lambda *_args, **_kwargs: connection
+    sender = _AuthFailureProvider()
+    _set_sender(gate, sender)
     forwarded_pings: list[int] = []
-    sender._keepalive_ping = forwarded_pings.append
-
-    async def fail_authentication(_plain: object) -> tuple[bytes, int]:
-        raise SecurityError("authentication failed")
-
-    monkeypatch.setattr(authenticator, "do_authentication", fail_authentication)
     observed_errors: list[TelegramRpcAdmissionDeferred] = []
     actual_connect = gate.connect
 
@@ -3947,34 +4231,43 @@ async def test_installed_vendor_auth_init_disconnect_failure_parks_daemon(
 
     monkeypatch.setattr(gate, "connect", capture_gate_failure)
     shutdown = asyncio.Event()
+    published_scopes: list[object] = []
+
+    async def publish_auth_scope(scope: object) -> None:
+        published_scopes.append(scope)
+
     context = cast(
         _SyncMainContext,
         SimpleNamespace(
             client=gate,
-            api_server=SimpleNamespace(startup_detail="", _ready=False),
+            api_server=SimpleNamespace(startup_detail="", _ready=False, _publish_auth_scope=publish_auth_scope),
             shutdown_event=shutdown,
         ),
     )
     parked = asyncio.create_task(_connect_telegram(context))
     await _wait_for(lambda: bool(observed_errors))
 
-    assert sender._connection is None
-    assert connection.connect_calls == 1
-    assert connection.disconnect_calls == 1
+    assert gate._main_sender._connection is None
+    assert sender.connect_calls == 1
+    assert sender.disconnect_calls == 1
     assert gate._connect_owner is not None
     assert gate._connection_capability is not None
-    assert isinstance(observed_errors[0].__cause__, OSError)
-    assert context.api_server._ready is False
+    assert isinstance(observed_errors[0].__cause__, SecurityError)
+    assert "termination is unconfirmed" in str(observed_errors[0])
+    assert context.api_server._ready is True
+    assert context.api_server.self_id == 1
+    assert len(published_scopes) == 1
     assert not parked.done()
     await _assert_failed_gate_blocks_api_migration_and_ping(gate, forwarded_pings)
     with pytest.raises(TelegramRpcAdmissionDeferred, match="connection bootstrap is already running"):
         await gate.connect()
-    assert connection.connect_calls == 1
-    assert connection.disconnect_calls == 1
+    assert sender.connect_calls == 1
+    assert sender.disconnect_calls == 1
 
     shutdown.set()
     assert await parked is False
-    await gate.close_rpc_scheduler()
+    with pytest.raises(OSError, match="internal transport teardown failed"):
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
@@ -3982,20 +4275,19 @@ async def test_installed_vendor_connect_cancellation_retains_failed_bootstrap_ow
     gate, _ = _bootstrap_gate()
     connect_started = asyncio.Event()
 
-    class _BlockingConnection:
-        async def connect(self, *, timeout: object) -> None:
-            del timeout
+    class _BlockingConnectProvider(_BootstrapSender):
+        async def connect(self, _connection: object) -> bool:
+            self.connect_calls += 1
             connect_started.set()
             await asyncio.Future()
+            raise AssertionError("blocked connect unexpectedly resumed")
 
         async def disconnect(self) -> None:
+            self.disconnect_calls += 1
             raise AssertionError("failed initialization must not manufacture confirmation")
 
-    connection = _BlockingConnection()
-    sender = _installed_sender(connection, retries=1, connected=False)
-    gate._main_sender = sender
-    gate._sender = _MainSenderAdapter(gate)
-    gate._connection = lambda *_args, **_kwargs: connection
+    sender = _BlockingConnectProvider()
+    _set_sender(gate, sender)
     shutdown = asyncio.Event()
     context = cast(
         _SyncMainContext,
@@ -4017,24 +4309,8 @@ async def test_installed_vendor_connect_cancellation_retains_failed_bootstrap_ow
     assert gate._connection_capability is not None
     with pytest.raises(TelegramRpcAdmissionDeferred, match="connection bootstrap is already running"):
         await gate.connect()
-    await gate.close_rpc_scheduler()
-
-
-def test_transport_connect_failure_only_changes_connecting_state() -> None:
-    gate = _gate()
-    for state in (
-        _TransportBoundaryState.FAILED,
-        _TransportBoundaryState.READY,
-        _TransportBoundaryState.DISCONNECTING,
-        _TransportBoundaryState.DISCONNECTED,
-    ):
-        gate._transport_state = state
-        gate._finish_transport_connect_failure()
-        assert gate._transport_state is state
-
-    gate._transport_state = _TransportBoundaryState.CONNECTING
-    gate._finish_transport_connect_failure()
-    assert gate._transport_state is _TransportBoundaryState.FAILED
+    with pytest.raises(AssertionError, match="failed initialization must not manufacture confirmation"):
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
@@ -4056,7 +4332,13 @@ async def test_actual_failed_bootstrap_parks_daemon_until_shutdown_without_retry
 
     monkeypatch.setattr(gate, "connect", capture_gate_failure)
     shutdown = asyncio.Event()
-    api_server = SimpleNamespace(startup_detail="", _ready=False)
+
+    published_scopes: list[object] = []
+
+    async def publish_auth_scope(scope: object) -> None:
+        published_scopes.append(scope)
+
+    api_server = SimpleNamespace(startup_detail="", _ready=False, _publish_auth_scope=publish_auth_scope)
     daemon_context = cast(
         _SyncMainContext,
         SimpleNamespace(client=gate, api_server=api_server, shutdown_event=shutdown),
@@ -4065,7 +4347,9 @@ async def test_actual_failed_bootstrap_parks_daemon_until_shutdown_without_retry
     await _wait_for(lambda: bool(observed_errors))
     assert isinstance(observed_errors[0].__cause__, TelegramRpcThrottled)
     assert "termination is unconfirmed" in api_server.startup_detail
-    assert api_server._ready is False
+    assert api_server._ready is True
+    assert api_server.self_id == 1
+    assert len(published_scopes) == 1
     assert not parked.done()
     assert sender.connect_calls == 1
     assert sender.disconnect_calls == 1
@@ -4075,7 +4359,8 @@ async def test_actual_failed_bootstrap_parks_daemon_until_shutdown_without_retry
     shutdown.set()
     assert await parked is False
     assert sender.connect_calls == 1
-    await gate.close_rpc_scheduler()
+    with pytest.raises(OSError, match="transport teardown failed"):
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
@@ -4109,7 +4394,8 @@ async def test_cancelled_failed_bootstrap_cleanup_keeps_reservation_and_does_not
     assert gate._connection_capability is not None
     with pytest.raises(TelegramRpcAdmissionDeferred, match="connection bootstrap is already running"):
         await gate.connect()
-    await gate.close_rpc_scheduler()
+    with pytest.raises(OSError, match="transport teardown failed"):
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
@@ -4166,7 +4452,7 @@ async def test_gate_cancellation_after_admission_cannot_leak_active_capacity(
     assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
     assert gate._admission_scheduler.outstanding_depths() == dict.fromkeys(RpcServiceClass, 0)
     assert sends == 0
-    assert gate._pending_scalar_dispatches == {}
+    assert _pending_owned_states(gate) == {}
 
 
 @pytest.mark.asyncio
@@ -4192,7 +4478,7 @@ async def test_scheduler_close_keeps_dispatched_transport_until_disconnect() -> 
         async def disconnect(self) -> None:
             return None
 
-    gate._main_sender = gate._sender = _PendingSender()
+    _set_sender(gate, _PendingSender())
     caller = asyncio.create_task(_call(gate, "request"))
     await transport_started.wait()
 
@@ -4200,11 +4486,10 @@ async def test_scheduler_close_keeps_dispatched_transport_until_disconnect() -> 
 
     assert caller.cancelled()
     assert in_flight is not None and not in_flight.cancelled()
-    assert set(gate._pending_scalar_dispatches) == {in_flight}
-    await gate._disconnect_main_sender()
-    assert in_flight.cancelled()
-    assert gate._pending_scalar_dispatches == {}
+    assert _pending_owned_states(gate) == {}
     assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
+    record = json.loads(gate._test_safety_store.raw)
+    assert record["protection"] is not None or record["intents"]
 
 
 @pytest.mark.asyncio
@@ -4216,6 +4501,7 @@ async def test_recursive_telethon_resolution_reenters_admission_without_deadlock
     gate._admission_scheduler = TelegramRpcAdmissionScheduler(
         policy=gate._scheduler_policy,
         limiter=gate._limiter,
+        minimum_spacing_seconds=gate._test_minimum_spacing_seconds,
         observer=events.append,
         readiness=RpcTransportReadiness(
             probe=gate._scheduler_transport_ready,
@@ -4223,12 +4509,13 @@ async def test_recursive_telethon_resolution_reenters_admission_without_deadlock
         ),
     )
 
-    class _RecursiveRequest(TLRequest):
-        CONSTRUCTOR_ID = 123
+    request = functions.help.GetConfigRequest()
 
-        async def resolve(self, client: TelegramClient, utils: object) -> None:
-            del utils
-            await client(functions.PingRequest(99))
+    async def resolve(client: TelegramClient, utils: object) -> None:
+        del utils
+        await client(functions.PingRequest(99))
+
+    request.resolve = resolve  # type: ignore[method-assign]
 
     class _Sender:
         def send(self, request: object, *, ordered: bool = False) -> object:
@@ -4240,7 +4527,7 @@ async def test_recursive_telethon_resolution_reenters_admission_without_deadlock
 
             return complete()
 
-    gate._main_sender = gate._sender = _Sender()
+    _set_sender(gate, _Sender())
     gate._loop = None
     gate._request_retries = 0
     gate._raise_last_call_error = True
@@ -4248,13 +4535,16 @@ async def test_recursive_telethon_resolution_reenters_admission_without_deadlock
     gate._no_updates = False
     gate._log = {"telethon.client.users": logging.getLogger(__name__)}
     gate.flood_sleep_threshold = 0
-    gate.session = SimpleNamespace(process_entities=lambda _result: None)
+    gate.session.process_entities = lambda _result: None
 
     with rpc_scope(TelegramRpcSource.MCP_INTERACTIVE):
-        result = await asyncio.wait_for(gate(_RecursiveRequest()), timeout=1.0)
+        result = await asyncio.wait_for(gate(request), timeout=1.0)
 
-    assert isinstance(result, _RecursiveRequest)
-    assert [type(request) for request in sent] == [functions.PingRequest, _RecursiveRequest]
+    assert result is request
+    assert [type(sent_request) for sent_request in sent] == [
+        functions.PingRequest,
+        functions.help.GetConfigRequest,
+    ]
     assert gate._limiter.acquisitions == 2
     dispatched = [event for event in events if event.kind is RpcAdmissionEventKind.DISPATCHED]
     assert len(dispatched) == 2
@@ -4272,25 +4562,35 @@ async def test_update_difference_flood_wait_retries_inside_supported_gate_policy
     gate = _gate()
     attempts = 0
     sleeps: list[float] = []
-    utc_now = [rpc.time.time()]
+    real_monotonic = rpc.time.monotonic
+    real_utc = rpc.time.time
+    original_sleep = asyncio.sleep
+    offset = [0.0]
+    moving_clock = SimpleNamespace(
+        monotonic=lambda: real_monotonic() + offset[0],
+        time=lambda: real_utc() + offset[0],
+    )
+    monkeypatch.setattr(rpc, "time", moving_clock)
+    gate._admission_scheduler._clock = moving_clock.monotonic
 
     def send(request: object) -> object:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
-            raise FloodWaitError(request=None, capture=7)
+            raise FloodWaitError(request=None, capture=1)
         return _request_value(request)
 
     async def finish_cooldown(delay: float) -> None:
         sleeps.append(delay)
-        utc_now[0] += delay
-        rpc._COOLDOWN_DEADLINE = 0
+        offset[0] += delay
+        await original_sleep(0)
 
     _set_sender(gate, send)
     monkeypatch.setattr("mcp_telegram.telegram_rpc.asyncio.sleep", finish_cooldown)
-    monkeypatch.setattr(rpc.time, "time", lambda: utc_now[0])
-    with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE):
-        result = await gate(_TestRequest("difference"))
+    deadline = moving_clock.monotonic() + 4
+    with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
+        with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
+            result = await gate(_TestRequest("difference"))
 
     assert result == "difference"
     assert attempts == 2
@@ -4327,7 +4627,6 @@ async def test_update_difference_open_circuit_waits_without_fatal_exception(
 @pytest.mark.asyncio
 async def test_update_difference_expired_scope_returns_without_sending() -> None:
     gate = _gate()
-    sender = gate._main_sender
     events: list[RpcAdmissionEvent] = []
     gate.set_rpc_admission_observer(events.append)
     request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
@@ -4338,7 +4637,7 @@ async def test_update_difference_expired_scope_returns_without_sending() -> None
             with pytest.raises(OSError, match="admission deadline elapsed"):
                 await asyncio.wait_for(gate(request), timeout=0.1)
 
-    assert sender.calls == 0
+    assert gate._test_server.seen == set()
     assert gate._limiter.acquisitions == 0
     assert [event.kind for event in events] == [RpcAdmissionEventKind.EXPIRED]
     assert events[0].reason == "deadline_elapsed"
@@ -4349,7 +4648,6 @@ async def test_update_difference_saturation_wait_is_bounded_by_original_deadline
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gate = _gate()
-    sender = gate._main_sender
     request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
     deadline = asyncio.get_running_loop().time() + 0.01
     calls = 0
@@ -4367,13 +4665,12 @@ async def test_update_difference_saturation_wait_is_bounded_by_original_deadline
                 await asyncio.wait_for(gate(request), timeout=0.2)
 
     assert calls == 1
-    assert sender.calls == 0
+    assert gate._test_server.seen == set()
 
 
 @pytest.mark.asyncio
 async def test_update_difference_open_circuit_wait_is_bounded_by_scope_deadline() -> None:
     gate = _gate(_CircuitStatus(open=True))
-    sender = gate._main_sender
     request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
     deadline = asyncio.get_running_loop().time() + 0.01
 
@@ -4382,13 +4679,12 @@ async def test_update_difference_open_circuit_wait_is_bounded_by_scope_deadline(
             with pytest.raises(OSError, match="admission deadline elapsed"):
                 await asyncio.wait_for(gate(request), timeout=0.2)
 
-    assert sender.calls == 0
+    assert gate._test_server.seen == set()
 
 
 @pytest.mark.asyncio
 async def test_update_difference_flood_cooldown_expiry_does_not_send_again() -> None:
     gate = _gate()
-    sender = gate._main_sender
     request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
     deadline = asyncio.get_running_loop().time() + 0.01
 
@@ -4396,13 +4692,12 @@ async def test_update_difference_flood_cooldown_expiry_does_not_send_again() -> 
         raise FloodWaitError(request=None, capture=30)
 
     _set_sender(gate, flood_once)
-    sender = gate._main_sender
     with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
         with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
             with pytest.raises(OSError, match="admission deadline elapsed"):
                 await asyncio.wait_for(gate(request), timeout=0.2)
 
-    assert sender.calls == 1
+    assert len(gate._test_server.seen) == 1
     assert gate._limiter.acquisitions == 1
 
 
@@ -4411,7 +4706,6 @@ async def test_update_difference_cancellation_during_saturation_wait_is_preserve
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gate = _gate()
-    sender = gate._main_sender
     request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
     deadline = asyncio.get_running_loop().time() + 5
     waiting = asyncio.Event()
@@ -4437,13 +4731,13 @@ async def test_update_difference_cancellation_during_saturation_wait_is_preserve
             caller.cancel()
             await asyncio.gather(caller, return_exceptions=True)
 
-    assert sender.calls == 0
+    assert gate._test_server.seen == set()
 
 
 @pytest.mark.asyncio
 async def test_update_difference_next_outer_iteration_gets_a_fresh_scope() -> None:
     gate = _gate()
-    sender = gate._main_sender
+    sender = _set_sender(gate, _request_value)
     request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
     expired_deadline = asyncio.get_running_loop().time() - 1
     with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=expired_deadline):
@@ -4471,7 +4765,6 @@ async def test_vendor_update_loop_recovers_expired_difference_with_fresh_scope(
     first_deadline = loop.time() + 0.03
     fresh_deadline = loop.time() + 5
     connected_checks = iter((True, True, False))
-    sent_scopes: list[TelegramRpcScope] = []
     tokens = iter(
         (
             demand.create_demand_token(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=first_deadline),
@@ -4479,7 +4772,6 @@ async def test_vendor_update_loop_recovers_expired_difference_with_fresh_scope(
         )
     )
     original_sleep = asyncio.sleep
-    original_send = gate._send_real_sender
     circuit_open = [True]
     events: list[RpcAdmissionEvent] = []
     gate.set_rpc_admission_observer(events.append)
@@ -4490,12 +4782,7 @@ async def test_vendor_update_loop_recovers_expired_difference_with_fresh_scope(
             return
         await original_sleep(delay)
 
-    def send_real(request: object, *, ordered: bool = False) -> object:
-        sent_scopes.append(current_rpc_scope())
-        return original_send(request, ordered=ordered)
-
-    _set_sender(gate, _request_value)
-    sender = gate._main_sender
+    sender = _set_sender(gate, _request_value)
     gate._rpc_circuit_status = lambda: _CircuitStatus(open=circuit_open[0])
     gate._transport_state = _TransportBoundaryState.READY
     gate._message_box = SimpleNamespace(
@@ -4510,7 +4797,6 @@ async def test_vendor_update_loop_recovers_expired_difference_with_fresh_scope(
     gate.is_connected = lambda: next(connected_checks)
     gate._log = {"telethon.client.updates": logging.getLogger(__name__)}
     monkeypatch.setattr(gate, "_preprocess_updates", AsyncMock(return_value=[]))
-    monkeypatch.setattr(gate, "_send_real_sender", send_real)
     monkeypatch.setattr(demand, "create_demand_token", lambda _kind, **_kwargs: next(tokens))
     monkeypatch.setattr("mcp_telegram.telegram_rpc.asyncio.sleep", sleep)
     try:
@@ -4523,8 +4809,8 @@ async def test_vendor_update_loop_recovers_expired_difference_with_fresh_scope(
     ]
     assert circuit_open == [False]
     assert sender.calls == 1
-    assert sent_scopes[0].source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE
-    assert sent_scopes[0].deadline == fresh_deadline
+    assert sender.scopes[0].source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE
+    assert sender.scopes[0].deadline == fresh_deadline
 
 
 @pytest.mark.asyncio
@@ -4595,7 +4881,7 @@ async def test_telethon_update_child_task_owns_realtime_scope(monkeypatch: pytes
 async def test_execution_deadline_keeps_raw_response_lease_until_completion() -> None:
     gate = _gate()
     sender = _RawFutureSender()
-    gate._main_sender = sender
+    _set_sender(gate, sender)
     with rpc_scope(TelegramRpcSource.MCP_INTERACTIVE, timeout_seconds=0.005):
         with pytest.raises(TimeoutError):
             await gate(_TestRequest("slow"))
@@ -4606,8 +4892,7 @@ async def test_execution_deadline_keeps_raw_response_lease_until_completion() ->
     await asyncio.sleep(0.05)
     assert not raw_future.done()
     raw_future.set_result("late success")
-    await _wait_for(lambda: not gate._pending_scalar_dispatches)
-    assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
-    gate._finalize_scalar_dispatch(raw_future)
+    await _wait_for(lambda: not _pending_owned_states(gate))
+    await _wait_for(lambda: gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0))
     assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
     await gate.close_rpc_scheduler()

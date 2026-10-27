@@ -226,3 +226,21 @@ def test_individual_allowlist_entries_reject_whitespace_only_rationale(
 
     with pytest.raises(ValueError, match=r"each \[\[entry\]\] needs"):
         gate._load_manifest()
+
+
+def test_pending_cooldown_task_map_allowlist_is_exact() -> None:
+    gate = _load_gate()
+    allowed = gate._load_manifest()["policy_assignments"]
+    source = (
+        "class TelegramRpcGate:\n    def _initialize_wire_authority(self):\n        self._cooldown_save_tasks = {}\n"
+    )
+    findings = _findings_at("src/mcp_telegram/telegram_rpc.py", source)
+    assert findings
+    assert all(category == "policy_assignments" and key in allowed for category, key in findings)
+
+    for filename, changed in (
+        ("neighbor.py", source),
+        ("telegram_rpc.py", source.replace("_initialize_wire_authority", "adjacent")),
+        ("telegram_rpc.py", source.replace("self._cooldown_save_tasks = {}", "self.cooldown_seconds = 30")),
+    ):
+        assert any(key not in allowed for _, key in _findings_at(f"src/mcp_telegram/{filename}", changed))

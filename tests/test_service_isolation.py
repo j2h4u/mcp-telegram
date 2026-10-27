@@ -142,7 +142,9 @@ def test_http_survives_absent_and_stopped_daemon_without_restart() -> None:
         state.mkdir()
         config = root / "config" / "mcp-telegram"
         config.mkdir(parents=True)
-        (config / "config.toml").write_text(f'[state]\ndir = "{state}"\n', encoding="utf-8")
+        (config / "config.toml").write_text(
+            f'[state]\ndir = "{state}"\n\n[telegram_rpc]\ntransport_contract_version = 1\n', encoding="utf-8"
+        )
         env = dict(os.environ, XDG_CONFIG_HOME=str(root / "config"), PYTHONPATH=f"{_REPO}:{_REPO / 'tests'}")
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))

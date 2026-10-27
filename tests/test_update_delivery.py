@@ -23,6 +23,7 @@ import telethon
 from telethon import TelegramClient, events, functions, types
 from telethon._updates import ChannelState, SessionState
 from telethon._updates.messagebox import ENTRY_ACCOUNT
+from telethon.crypto.authkey import AuthKey
 from telethon.errors import UserMigrateError
 from telethon.sessions import SQLiteSession
 from telethon.tl.functions.users import GetUsersRequest
@@ -46,13 +47,19 @@ from mcp_telegram.telegram_rpc import (
     TelegramRpcBudget,
     TelegramRpcGate,
     TelegramRpcSource,
-    _MainSender,
-    _MainSenderAdapter,
-    _TransportBoundaryState,
     rpc_scope,
 )
 from mcp_telegram.update_delivery import UpdateDeliveryRepository
-from test_telegram_rpc import _BootstrapSender, _idle_bootstrap_task
+from test_telegram_rpc import (
+    _attach_fake_connection,
+    _bootstrap_login_response,
+    _FastFiniteLimiter,
+    _idle_bootstrap_task,
+    _install_scripted_authenticator,
+    _MemorySafetyStore,
+    _ScriptedServer,
+    _set_sender,
+)
 
 DATE = datetime(2026, 10, 1, tzinfo=UTC)
 
@@ -66,16 +73,25 @@ class _Circuit:
 
 
 def _client(path: Path, writer: SQLiteWriter, *, channel: bool = True) -> TelegramRpcGate:
+    session = SQLiteSession(str(path))
+    session.set_dc(2, "127.0.0.1", 443)
+    session.auth_key = AuthKey(bytes(range(256)))
+    safety = _MemorySafetyStore(session.auth_key.key_id)
+    safety.owners = (99, 99)
+    record = json.loads(safety.raw)
+    record["scope"]["account_id"] = 99
+    safety.raw = json.dumps(record, separators=(",", ":"))
     client = TelegramRpcGate(
-        SQLiteSession(str(path)),
+        session,
         12345,
         "offline-test",
-        rpc_budget=TelegramRpcBudget(max_calls_per_period=0, period_seconds=60),
+        rpc_budget=TelegramRpcBudget(max_calls_per_period=30, period_seconds=60),
         circuit_status=_Circuit,
         fallback_wait_seconds=60,
         cooldown_buffer_seconds=1.0,
         transient_retry_delays_seconds=(),
         scheduler_policy=TelegramRpcSchedulerConfig(),
+        safety_store=safety.api(),
     )
     client._mb_entity_cache.set_self_user(99, False, 999)
     channels = [ChannelState(123, 20)] if channel else []
@@ -160,13 +176,22 @@ class _ObservedDeliveryDone(asyncio.Event):
         return await super().wait()
 
 
-def _prepare_migration_transport(client: TelegramRpcGate, monkeypatch: pytest.MonkeyPatch) -> _BootstrapSender:
-    sender = _BootstrapSender()
-    sender._connected = True
-    client._main_sender, client._sender = cast(_MainSender, sender), _MainSenderAdapter(client)
-    client._transport_state = _TransportBoundaryState.READY
+def _prepare_migration_transport(client: TelegramRpcGate, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_scripted_authenticator(monkeypatch)
+    limiter = _FastFiniteLimiter()
+    client._limiter = limiter
+    client._admission_scheduler._limiter = limiter
+    client._admission_scheduler._minimum_spacing_seconds = 1 / 100_000
+    server = _ScriptedServer(client)
+    vars(client).update(
+        _test_server=server,
+        _test_scripted_provider=server.provider,
+        _test_connections=[],
+        _test_tasks=[],
+        _test_wire_written=server.written,
+    )
+    _attach_fake_connection(client, initially_ready=True)
     client._transient_retry_delays = (0.0,)
-    monkeypatch.setattr(client, "_connection", lambda *_args, **_kwargs: object())
     client._catch_up = True
     client._keepalive_loop = _idle_bootstrap_task
     monkeypatch.setattr(
@@ -174,7 +199,6 @@ def _prepare_migration_transport(client: TelegramRpcGate, monkeypatch: pytest.Mo
         "_config",
         SimpleNamespace(dc_options=[SimpleNamespace(id=3, ip_address="127.0.0.3", port=443, ipv6=False, cdn=False)]),
     )
-    return sender
 
 
 @dataclass
@@ -186,7 +210,7 @@ class _MigrationLoopProbe:
     futures: list[asyncio.Future[object]] = field(default_factory=list)
 
 
-def _observe_migration_delivery(client: TelegramRpcGate, sender: _BootstrapSender) -> _MigrationLoopProbe:
+def _observe_migration_delivery(client: TelegramRpcGate) -> _MigrationLoopProbe:
     probe = _MigrationLoopProbe()
     original_preprocess = client._preprocess_updates
     first_rpc = True
@@ -216,9 +240,23 @@ def _observe_migration_delivery(client: TelegramRpcGate, sender: _BootstrapSende
             pending = asyncio.get_running_loop().create_future()
             probe.futures.append(pending)
             return pending
-        return object()
+        if isinstance(request, functions.updates.GetStateRequest):
+            return types.updates.State(pts=1, qts=0, date=DATE, seq=1, unread_count=0)
+        return _bootstrap_login_response(request)
 
-    sender.response = response
+    class _MigrationProvider:
+        async def send_with_scope(self, request: object, _scope: object) -> object:
+            result = response(request)
+            if isinstance(result, BaseException):
+                raise result
+            if inspect.isawaitable(result):
+                return await result
+            return result
+
+        async def send(self, request: object) -> object:
+            return await self.send_with_scope(request, None)
+
+    _set_sender(client, _MigrationProvider())
     client._preprocess_updates = tracked
     client.add_event_handler(handler, events.Raw())
     return probe
@@ -253,7 +291,8 @@ async def test_callback_migration_replacement_vendor_loop_restores_latest_whole_
     path = _database(tmp_path)
     writer = await SQLiteWriter.open(path)
     client = _client(tmp_path / "session", writer)
-    probe = _observe_migration_delivery(client, _prepare_migration_transport(client, monkeypatch))
+    _prepare_migration_transport(client, monkeypatch)
+    probe = _observe_migration_delivery(client)
     dispatches: list[asyncio.Task[None]] = []
     try:
         await client.start_update_delivery(99)

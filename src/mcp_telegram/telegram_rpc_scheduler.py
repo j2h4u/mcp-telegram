@@ -114,6 +114,8 @@ LEGACY_DEMAND_KIND_BY_SOURCE: Mapping[TelegramRpcSource, DemandKind] = MappingPr
         TelegramRpcSource.DRAFT_SNAPSHOT: DemandKind.DRAFT_SNAPSHOT,
         TelegramRpcSource.MAINTENANCE: DemandKind.SELF_PROFILE_MAINTENANCE,
         TelegramRpcSource.LINKED_CHAT_REFRESH: DemandKind.LINKED_CHAT_REFRESH,
+        TelegramRpcSource.OPERATOR_AUTH: DemandKind.OPERATOR_AUTH,
+        TelegramRpcSource.OPERATOR_LOGOUT: DemandKind.OPERATOR_LOGOUT,
     }
 )
 
@@ -142,6 +144,10 @@ class TelegramRpcScope:
     source_outstanding_limit: int | None = None
     attempt_budget: RpcAttemptBudget | None = None
     attempt_evidence: RpcAttemptEvidence | None = None
+    request_method: str | None = None
+    transport_control: bool = False
+    transport_bootstrap: bool = False
+    transport_auth: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -433,6 +439,7 @@ class RpcAdmission:
     sequence: int
     demand_kind: DemandKind | None = None
     acquisition_kind: AcquisitionKind | None = None
+    request_method: str | None = None
 
 
 class RpcAdmissionError(RuntimeError):
@@ -458,11 +465,6 @@ class RpcAdmissionClosedError(RpcAdmissionError):
 
 class _RateLimiter(Protocol):
     async def acquire(self) -> None: ...
-
-
-class _UnlimitedRateLimiter:
-    async def acquire(self) -> None:
-        return None
 
 
 class _TicketState(StrEnum):
@@ -522,17 +524,24 @@ class TelegramRpcAdmissionScheduler:
     work bounded while allowing nested Telethon resolution to re-enter.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - the arbiter owns policy, physical readiness and observable clock seams
         self,
         *,
         policy: TelegramRpcSchedulerPolicy,
-        limiter: _RateLimiter | None,
+        limiter: _RateLimiter,
+        minimum_spacing_seconds: float,
+        release_at: Callable[[TelegramRpcScope], float] = lambda _scope: 0.0,
         observer: AdmissionObserver | None = None,
         clock: Clock = time.monotonic,
         readiness: RpcTransportReadiness | None = None,
     ) -> None:
         self._policy = policy
-        self._limiter: _RateLimiter = limiter or _UnlimitedRateLimiter()
+        self._validate_limiter(limiter, minimum_spacing_seconds)
+        self._limiter = limiter
+        self._minimum_spacing_seconds = minimum_spacing_seconds
+        self._next_write_at = 0.0
+        self._release_at = release_at
+        self._release_handle: asyncio.TimerHandle | None = None
         self._observer = observer
         self._clock = clock
         self._readiness = readiness or RpcTransportReadiness()
@@ -701,12 +710,23 @@ class TelegramRpcAdmissionScheduler:
         if not self._closed and self._has_dispatchable_ticket_locked():
             self._ensure_dispatcher_locked()
 
-    def record_dispatch(self, admission: RpcAdmission) -> None:
-        """Record release to Telethon after the final transport-readiness check."""
+    def record_dispatch(self, admission: RpcAdmission) -> bool:
+        """Claim one physical write synchronously, without accumulating burst credit."""
         active = self._active.get(admission.sequence)
         if active is None or active.dispatch_recorded:
-            return
+            return False
+        if (
+            self._closed
+            or not self._readiness.probe()
+            or self._next_write_at > self._clock()
+            or self._release_at(active.scope) > self._clock()
+        ):
+            return False
+        if active.scope.request_method != admission.request_method:
+            return False
         active.dispatch_recorded = True
+        self._next_write_at = self._clock() + self._minimum_spacing_seconds
+        self._schedule_release_locked()
         if active.scope.attempt_evidence is not None:
             active.scope.attempt_evidence.record_dispatch()
         self._emit_for_scope(
@@ -714,6 +734,7 @@ class TelegramRpcAdmissionScheduler:
             active.scope,
             wait_seconds=admission.wait_seconds,
         )
+        return True
 
     def record_retry(self, scope: TelegramRpcScope, *, reason: str) -> None:
         """Record that transport policy will submit the attempt again."""
@@ -773,6 +794,9 @@ class TelegramRpcAdmissionScheduler:
             if self._shutdown_task is not None:
                 return self._shutdown_task
             self._closed = True
+            if self._release_handle is not None:
+                self._release_handle.cancel()
+                self._release_handle = None
             initiator = _current_task()
             self._shutdown_task = asyncio.create_task(
                 self._drain_shutdown(
@@ -847,8 +871,57 @@ class TelegramRpcAdmissionScheduler:
             raise RuntimeError("Telegram RPC admission scheduler cannot move between event loops")
 
     def _ensure_dispatcher_locked(self) -> None:
+        if self._closed:
+            return
         if self._has_dispatchable_ticket_locked() and (self._dispatcher is None or self._dispatcher.done()):
             self._dispatcher = asyncio.create_task(self._dispatch_loop(), name="telegram-rpc-admission")
+        else:
+            self._schedule_release_locked()
+
+    def notify_eligibility_changed(self) -> None:
+        """Wake the same arbiter after an owned restriction or lifecycle change."""
+        if self._release_handle is not None:
+            self._release_handle.cancel()
+            self._release_handle = None
+        self._ensure_dispatcher_locked()
+
+    @staticmethod
+    def _validate_limiter(limiter: _RateLimiter, minimum_spacing_seconds: float) -> None:
+        if limiter is None or not callable(getattr(limiter, "acquire", None)):
+            raise TypeError("Telegram RPC scheduler requires a limiter")
+        if (
+            isinstance(minimum_spacing_seconds, bool)
+            or not isinstance(minimum_spacing_seconds, (int, float))
+            or not math.isfinite(minimum_spacing_seconds)
+            or minimum_spacing_seconds <= 0
+        ):
+            raise ValueError("minimum_spacing_seconds must be positive and finite")
+
+    def _schedule_release_locked(self) -> None:
+        if self._closed or self._loop is None:
+            return
+        now = self._clock()
+        releases = self._queued_release_times()
+        future = [value for value in releases if math.isfinite(value) and value > now]
+        if not future:
+            return
+        release = min(future)
+        if self._release_handle is None or self._release_handle.when() > release:
+            if self._release_handle is not None:
+                self._release_handle.cancel()
+            self._release_handle = self._loop.call_later(release - now, self._release_ready)
+
+    def _queued_release_times(self) -> list[float]:
+        return [
+            max(self._next_write_at, self._release_at(ticket.scope))
+            for queue in self._queues.values()
+            for ticket in queue
+            if ticket.state is _TicketState.QUEUED
+        ]
+
+    def _release_ready(self) -> None:
+        self._release_handle = None
+        self._ensure_dispatcher_locked()
 
     async def _dispatch_loop(self) -> None:
         current = asyncio.current_task()
@@ -908,6 +981,7 @@ class TelegramRpcAdmissionScheduler:
             ticket.sequence,
             ticket.scope.demand_kind,
             ticket.scope.acquisition_kind,
+            ticket.scope.request_method,
         )
         if not ticket.future.done():
             ticket.future.set_result(admission)
@@ -1071,7 +1145,10 @@ class TelegramRpcAdmissionScheduler:
         return any(self._ticket_can_dispatch_locked(ticket) for queue in self._queues.values() for ticket in queue)
 
     def _ticket_can_dispatch_locked(self, ticket: _AdmissionTicket) -> bool:
-        return self._active_counts[ticket.scope.service_class] < self._capacities[ticket.scope.service_class]
+        return (
+            self._active_counts[ticket.scope.service_class] < self._capacities[ticket.scope.service_class]
+            and max(self._next_write_at, self._release_at(ticket.scope)) <= self._clock()
+        )
 
     @staticmethod
     def _source_outstanding_limit(scope: TelegramRpcScope) -> int:
@@ -1082,6 +1159,8 @@ class TelegramRpcAdmissionScheduler:
     def _validate_scope_contract(scope: TelegramRpcScope) -> None:
         if not isinstance(scope, TelegramRpcScope):
             raise TypeError("scope must be a TelegramRpcScope")
+        if not isinstance(scope.request_method, str) or not scope.request_method:
+            raise ValueError("physical RPC admission requires a canonical request_method")
         kind = scope.demand_kind or LEGACY_DEMAND_KIND_BY_SOURCE[scope.source]
         contract = demand_contract(kind)
         if scope.source is not contract.source or scope.service_class is not contract.service_class:

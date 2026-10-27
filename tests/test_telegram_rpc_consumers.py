@@ -84,6 +84,8 @@ def test_demand_registry_has_exact_operation_and_source_coverage() -> None:
         TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE: {DemandKind.TELETHON_UPDATE_DIFFERENCE},
         TelegramRpcSource.TELETHON_RECONNECT_PROBE: {DemandKind.TELETHON_RECONNECT_PROBE},
         TelegramRpcSource.TELETHON_CONNECTION_BOOTSTRAP: {DemandKind.TELETHON_CONNECTION_BOOTSTRAP},
+        TelegramRpcSource.OPERATOR_AUTH: {DemandKind.OPERATOR_AUTH},
+        TelegramRpcSource.OPERATOR_LOGOUT: {DemandKind.OPERATOR_LOGOUT},
         TelegramRpcSource.RECONNECT_DIFFERENCE: {DemandKind.RECONNECT_DIFFERENCE},
         TelegramRpcSource.REALTIME_EVENT: {DemandKind.REALTIME_EVENT_ACQUISITION},
         TelegramRpcSource.DELTA_SYNC: {
@@ -186,6 +188,11 @@ def test_consumer_registry_and_records_are_immutable() -> None:
 
 
 def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
+    bounded_lifecycle = {
+        DemandKind.TELETHON_CONNECTION_BOOTSTRAP: 16,
+        DemandKind.OPERATOR_AUTH: 32,
+        DemandKind.OPERATOR_LOGOUT: 1,
+    }
     for contract in TELEGRAM_DEMAND_CONTRACTS.values():
         consumer = TELEGRAM_RPC_CONSUMERS[contract.source]
         assert contract.service_class is consumer.admission.service_class
@@ -195,7 +202,7 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
             assert contract.max_rpc_attempts_per_slice is not None
             assert contract.max_rpc_attempts_per_slice > 0
         else:
-            assert contract.max_rpc_attempts_per_slice is None
+            assert contract.max_rpc_attempts_per_slice == bounded_lifecycle.get(contract.kind)
             assert contract.freshness_target is None
 
     assert demand_contract(DemandKind.SCHEDULED_REPAIR).freshness_target == timedelta(minutes=15)

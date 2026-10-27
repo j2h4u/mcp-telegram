@@ -69,7 +69,7 @@ class DeltaGapFillObservationHook(Protocol):
     def observe_delta_gap_fill(self, metrics: Mapping[str, int], *, reason: str) -> None: ...
 
 
-@dataclass(slots=True, eq=False)
+@dataclass(slots=True, eq=False, weakref_slot=True)
 class RpcAttemptEvidence:
     """Mutable, non-enforcing count of real sends attributed to one root."""
 

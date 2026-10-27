@@ -92,6 +92,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "dialog_pin_observations.py",  # Pin collection replay ordering.  # Sole runtime sync.db connection owner.
             "transcription_hydration.py",
             "telegram_fact_queries.py",
+            "telegram.py",  # Stopped-service factory binds the shared SQLite safety store.
             "topics/catalog.py",  # Durable topic catalog receipts and page progress in sync.db.
             "topics/demand.py",  # Read projection bound to the shared writer for topic acquisition.
             "topics/sqlite_repository.py",
@@ -129,6 +130,8 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "message_history/telegram_adapter.py",
             "telegram.py",
             "telegram_access.py",
+            "telegram_auth.py",  # Verified User type returned by the shared authentication owner.
+            "telegram_transport.py",  # Owned physical transport and vendor framing adapter.
             "telegram_gateway.py",
             "telegram_rpc.py",
             "telegram_delivery.py",  # Versioned local TL recovery serialization, no acquisition.

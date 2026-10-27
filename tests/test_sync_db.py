@@ -20,7 +20,6 @@ from mcp_telegram.sync_db import (
     migrate_legacy_databases,
     open_runtime_sync_db,
     open_sync_db_reader,
-    save_account_cooldown_until_utc,
     save_self_profile_last_success_at,
 )
 
@@ -1731,17 +1730,20 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
         conn.close()
 
 
-def test_finite_account_cooldown_round_trips_and_clears(tmp_sync_db_path: Path) -> None:
+def test_legacy_account_cooldown_load_rejects_corrupt_deadlines(tmp_sync_db_path: Path) -> None:
     ensure_sync_schema(tmp_sync_db_path)
     with closing(_open_db(tmp_sync_db_path)) as conn:
         assert load_account_cooldown_until_utc(conn) is None
-        save_account_cooldown_until_utc(conn, 123.5)
+        conn.execute(
+            "INSERT INTO daemon_state(key,value) VALUES (?,?)", ("telegram_account_cooldown_until_utc", "123.5")
+        )
         assert load_account_cooldown_until_utc(conn) == 123.5
-        save_account_cooldown_until_utc(conn, None)
-        assert load_account_cooldown_until_utc(conn) is None
         for invalid in (float("inf"), float("nan"), -1.0, True):
-            with pytest.raises(ValueError, match="finite non-negative"):
-                save_account_cooldown_until_utc(conn, invalid)
+            conn.execute(
+                "UPDATE daemon_state SET value=? WHERE key=?", (repr(invalid), "telegram_account_cooldown_until_utc")
+            )
+            with pytest.raises(ValueError, match="invalid persisted Telegram account cooldown"):
+                load_account_cooldown_until_utc(conn)
 
 
 def test_self_profile_success_timestamp_round_trips_and_rejects_non_finite(

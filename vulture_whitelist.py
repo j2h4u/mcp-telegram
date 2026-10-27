@@ -157,3 +157,15 @@ isolation_level
 
 # Versioned export schema accessor is used by offline consumers and schema tests.
 schema_for_version
+
+# Pinned Telethon consumes these exact adapter overrides/fields internally.
+SQLiteSession.save_entities  # supported entity-cache write fence, read by vendor session.process_entities
+_RequestState.container_id  # vendor pending-state/container protocol; also assigned by guarded serialization
+GuardedConnectionTcpFull._send_loop  # started by inherited Connection.connect
+GuardedMTProtoSender._send_loop  # started by inherited MTProtoSender._connect
+GuardedMTProtoSender._try_gen_auth_key  # inherited sender's bounded authentication hook
+MTProtoState.time_offset  # vendor encryption/message-id clock, set after authentication
+
+# Public stopped-maintenance entrypoint called by deploy/telegram_qr_login.py,
+# outside this scan's src/scripts roots; covered by driver and CLI tests.
+telegram_auth.authenticate

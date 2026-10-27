@@ -45,6 +45,21 @@ number alone does not establish that compatibility. Do not run an older binary
 that ignores pending deliveries or the safe checkpoint, delete pending rows, or
 manually rewind offsets.
 
+The gateway safety receipt is rollback-incompatible even while the SQLite
+schema remains 89. Operational configuration must contain
+`[telegram_rpc] transport_contract_version = 1`; keep that marker during a
+binary rollback. An older binary may run only after an explicit compatibility
+review establishes that it will preserve every unresolved attempt and known
+restriction. Prefer a compatible protected binary or forward fix. Do not
+restore an old database pair to erase a restriction or discard newer facts.
+
+For this cutover, stop every daemon and standalone authentication owner before
+backing up the pair and changing configuration. Hold the stable
+`telegram-session.lock` throughout that offline interval, and never replace or
+unlink its inode. Old binaries and copied raw authentication helpers do not
+honor this lease; replace the deployed QR helper with the current repository
+wrapper before allowing maintenance use.
+
 After the service is healthy, the expected migration version is confirmed, and
 the official MCP smoke succeeds, remove only the matching backup pair and
 verification sidecars created for that rollout. Keep copies needed for a failed
@@ -93,7 +108,7 @@ from the existing recipes; it does not replace the standard MCP smoke.
 
 ## Auth
 
-Run the repository QR helper from this directory through the locked project
+Stop the service first. Run the repository QR helper from this directory through the locked project
 environment, for example:
 
 ```bash
@@ -105,3 +120,18 @@ It writes `/srv/mcp-telegram/database/mcp_telegram_session.session` according
 to `config.toml`, which is the same state directory the container uses. The
 retired Telegram-message/SMS login-code path is intentionally not used because
 repeated setup attempts did not receive codes.
+
+The helper shares the gateway, safety receipt and exclusive Session lease with
+the daemon. An already authorized key is retained by default. Explicit
+`--reauthenticate` replaces local credentials while preserving mirror facts
+and Session peer/update rows; it does not remotely revoke the old Telegram
+authorization. Existing uncertain outcomes or manual holds require the
+separate `--acknowledge-unknown-outcome` option, and known server waits still
+apply. Authentication does not authorize normal acquisition past those holds.
+
+For an interrupted daemon attempt, use
+`mcp-telegram recover-account --acknowledge-unknown-outcome` against the running
+protected daemon. It authorizes one conditional restart trial for the same
+verified account after known waits; success is reported only after the real
+startup identity operation completes. A failed or interrupted trial remains
+protected and requires a fresh explicit command.

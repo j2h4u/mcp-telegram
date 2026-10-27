@@ -119,7 +119,9 @@ def test_feedback_list_uses_config_state_dir(tmp_path: Path, monkeypatch: pytest
     config_home = tmp_path / "custom-config"
     config_dir = config_home / "mcp-telegram"
     config_dir.mkdir(parents=True)
-    (config_dir / "config.toml").write_text(f'[state]\ndir = "{state_dir}"\n', encoding="utf-8")
+    (config_dir / "config.toml").write_text(
+        f'[state]\ndir = "{state_dir}"\n\n[telegram_rpc]\ntransport_contract_version = 1\n', encoding="utf-8"
+    )
     monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
     state_dir.mkdir()

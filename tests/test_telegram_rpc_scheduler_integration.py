@@ -3,16 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections import Counter, deque
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import cast
 
 import pytest
-from aiolimiter import AsyncLimiter
 from telethon.errors import ServerError
-from telethon.tl.tlobject import TLRequest
+from telethon.tl import functions
 
 from mcp_telegram.config import TelegramRpcSchedulerConfig
 from mcp_telegram.telegram_demand import (
@@ -25,21 +22,19 @@ from mcp_telegram.telegram_demand import (
 from mcp_telegram.telegram_rpc import (
     TelegramRpcAdmissionDeferred,
     TelegramRpcGate,
-    _TransportBoundaryState,
-    reset_account_cooldown,
 )
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionEvent,
     RpcAdmissionEventKind,
     RpcServiceClass,
-    RpcTransportReadiness,
     TelegramRpcAdmissionScheduler,
     TelegramRpcSource,
-    current_rpc_scope,
     rpc_attempt_budget,
     rpc_scope,
 )
+from tests.helpers import reset_rpc_process_policy
+from tests.test_telegram_rpc import _gate, _pending_owned_states, _set_sender
 
 
 class _ControlledLimiter:
@@ -65,27 +60,6 @@ class _ImmediateLimiter:
 
     async def acquire(self) -> None:
         self.acquisitions += 1
-
-
-class _SynchronousSender:
-    """Telethon sender seam returning one already-resolved scalar future."""
-
-    def __init__(self, sent: list[tuple[TelegramRpcSource, object]]) -> None:
-        self._sent = sent
-
-    def send(self, request: object, *, ordered: bool = False) -> asyncio.Future[object]:
-        del ordered
-        self._sent.append((current_rpc_scope().source, request))
-        result = asyncio.get_running_loop().create_future()
-        result.set_result(request)
-        return result
-
-
-class _ScalarRequest(TLRequest):
-    CONSTRUCTOR_ID = 0x12345678
-
-    def __init__(self, value: object) -> None:
-        self.value = value
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,47 +129,31 @@ def _make_gate(
     policy: TelegramRpcSchedulerConfig,
     events: list[RpcAdmissionEvent],
 ) -> TelegramRpcGate:
-    """Build the production gate with only its network and limiter seams controlled."""
-    gate = object.__new__(TelegramRpcGate)
-    status = _CircuitStatus()
-    gate._rpc_circuit_status = lambda: status
-    gate._fallback_wait_seconds = 60
-    gate._cooldown_buffer_seconds = 1.0
-    gate._transient_retry_delays = ()
-    gate._flood_observer = lambda **_kwargs: None
+    """Build the guarded-writer fixture and control only scheduling and responses."""
+    gate = _gate()
     gate._scheduler_policy = policy
-    gate._limiter = cast(AsyncLimiter, limiter)
-    gate._loop = None
-    gate._request_retries = 0
-    gate._raise_last_call_error = True
-    gate._flood_waited_requests = {}
-    gate._no_updates = False
-    gate._connect_owner = None
-    gate._connection_capability = None
-    gate._connection_rpc_tasks = set()
-    gate._pending_scalar_dispatches = {}
-    gate._cooldown_persistence = None
-    gate._cooldown_save_tasks = {}
-    gate._scalar_persistence_pending = set()
-    gate._transport_state = _TransportBoundaryState.READY
-    gate._log = {"telethon.client.users": logging.getLogger(__name__)}
-    gate.flood_sleep_threshold = 0
-    gate.session = SimpleNamespace(process_entities=lambda _result: None)
-    gate._admission_scheduler = TelegramRpcAdmissionScheduler(
-        policy=policy,
-        limiter=limiter,
-        observer=events.append,
-        readiness=RpcTransportReadiness(
-            probe=gate._scheduler_transport_ready,
-            wait=gate._wait_for_scheduler_transport,
-        ),
+    gate._admission_scheduler._policy = policy
+    gate._admission_scheduler._capacities = {
+        RpcServiceClass.INTERACTIVE: policy.interactive_queue_capacity,
+        RpcServiceClass.LIVE_SYNC: policy.live_sync_queue_capacity,
+        RpcServiceClass.BACKGROUND: policy.background_queue_capacity,
+    }
+    gate._admission_scheduler._fair_cycle = gate._admission_scheduler._build_fair_cycle(
+        {
+            RpcServiceClass.INTERACTIVE: policy.interactive_weight,
+            RpcServiceClass.LIVE_SYNC: policy.live_sync_weight,
+            RpcServiceClass.BACKGROUND: policy.background_weight,
+        }
     )
+    gate._limiter = cast(object, limiter)
+    gate._admission_scheduler._limiter = limiter
+    gate._admission_scheduler.set_observer(events.append)
     return gate
 
 
 @pytest.fixture(autouse=True)
 def _reset_cooldown() -> None:
-    reset_account_cooldown()
+    reset_rpc_process_policy()
 
 
 @pytest.mark.asyncio
@@ -215,11 +173,28 @@ async def test_gate_shared_scheduler_keeps_interactive_bounded_and_shutdown_clea
     events: list[RpcAdmissionEvent] = []
     gate = _make_gate(limiter, policy, events)
     sent: list[tuple[TelegramRpcSource, object]] = []
-    gate._main_sender = gate._sender = _SynchronousSender(sent)
+
+    class _RecordingProvider:
+        def send_with_scope(self, request: object, scope: object) -> object:
+            sent.append((cast(object, scope).source, request))
+            return request
+
+        def send(self, request: object) -> object:
+            raise AssertionError(f"scope missing for {request!r}")
+
+    _set_sender(gate, _RecordingProvider())
 
     async def send(source: TelegramRpcSource, request: object) -> object:
-        with rpc_scope(source):
-            return await gate(_ScalarRequest(request))
+        demand = (
+            DemandKind.REALTIME_EVENT_ACQUISITION
+            if source is TelegramRpcSource.REALTIME_EVENT
+            else DemandKind.MCP_REMOTE_ACQUISITION
+            if source is TelegramRpcSource.MCP_INTERACTIVE
+            else DemandKind.FULL_SYNC_PAGE
+        )
+        with demand_context(demand):
+            with rpc_scope(source):
+                return await gate(functions.updates.GetStateRequest())
 
     backlog = [asyncio.create_task(send(TelegramRpcSource.REALTIME_EVENT, object())) for _ in range(8)] + [
         asyncio.create_task(send(TelegramRpcSource.FULL_SYNC, object())) for _ in range(8)
@@ -250,21 +225,22 @@ async def test_sender_debits_actual_attempts_and_stops_transport_retry_at_slice_
     attempts: list[tuple[DemandKind | None, AcquisitionKind | None]] = []
 
     class _FailingSender:
-        def send(self, _request: object, *, ordered: bool = False) -> asyncio.Future[object]:
-            del ordered
-            scope = current_rpc_scope()
+        def send_with_scope(self, _request: object, scope: object) -> asyncio.Future[object]:
             attempts.append((scope.demand_kind, scope.acquisition_kind))
             result = asyncio.get_running_loop().create_future()
             result.set_exception(ServerError(None, "temporary"))
             return result
 
-    gate._main_sender = gate._sender = _FailingSender()
+        def send(self, _request: object) -> asyncio.Future[object]:
+            raise AssertionError("scripted response must retain its admitted scope")
+
+    _set_sender(gate, _FailingSender())
     budget = RpcAttemptBudget(limit=1)
     with demand_context(DemandKind.FULL_SYNC_PAGE):
         with acquisition_context(AcquisitionKind.MESSAGE_HISTORY_PAGE):
             with rpc_attempt_budget(budget):
                 with pytest.raises(RpcAttemptBudgetExhaustedError):
-                    await gate(_ScalarRequest("page"))
+                    await gate(functions.updates.GetStateRequest())
 
     assert attempts == [(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)]
     assert budget.attempts == 1
@@ -283,16 +259,14 @@ async def _assert_abandoned_terminal_scalar_response_is_consumed_and_releases_on
     terminal: str,
 ) -> None:
     gate = _make_gate(_ImmediateLimiter(), TelegramRpcSchedulerConfig(), [])
-    raw_future: asyncio.Future[object] | None = None
+    provider_future: asyncio.Future[object] | None = None
 
-    class _PendingSender:
-        def send(self, _request: object, *, ordered: bool = False) -> asyncio.Future[object]:
-            nonlocal raw_future
-            del ordered
-            raw_future = asyncio.get_running_loop().create_future()
-            return raw_future
+    async def pending_response(_request: object) -> object:
+        nonlocal provider_future
+        provider_future = asyncio.get_running_loop().create_future()
+        return await provider_future
 
-    gate._main_sender = gate._sender = _PendingSender()
+    _set_sender(gate, pending_response)
     complete_calls = 0
     original_complete = gate._admission_scheduler.complete
 
@@ -311,22 +285,24 @@ async def _assert_abandoned_terminal_scalar_response_is_consumed_and_releases_on
         async def invoke() -> object:
             with demand_context(DemandKind.FULL_SYNC_PAGE):
                 with rpc_scope(TelegramRpcSource.FULL_SYNC):
-                    return await gate(_ScalarRequest(terminal))
+                    return await gate(functions.updates.GetStateRequest())
 
         caller = asyncio.create_task(invoke())
-        await _wait_until(lambda: raw_future is not None)
-        assert raw_future is not None
+        await _wait_until(lambda: bool(_pending_owned_states(gate)))
+        raw_future = next(iter(_pending_owned_states(gate))).future
+        await _wait_until(lambda: provider_future is not None)
         caller.cancel()
         with pytest.raises(asyncio.CancelledError):
             await caller
 
+        assert provider_future is not None
         if terminal == "success":
-            raw_future.set_result("ok")
+            provider_future.set_result("ok")
         else:
-            raw_future.set_exception(ServerError(None, "temporary"))
+            provider_future.set_exception(ServerError(None, "temporary"))
 
-        await _wait_until(lambda: raw_future not in gate._pending_scalar_dispatches)
-        await asyncio.sleep(0)
+        await _wait_until(lambda: complete_calls == 1)
+        assert not _pending_owned_states(gate)
         assert complete_calls == 1
         assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
         assert loop_errors == []
@@ -345,32 +321,30 @@ async def test_abandoned_terminal_scalar_response_variants(
 
 
 @pytest.mark.asyncio
-async def test_scalar_future_remains_owned_until_raw_disconnect_finishes(
+async def test_scalar_future_remains_owned_until_raw_disconnect_finishes(  # noqa: PLR0915
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gate = _make_gate(_ImmediateLimiter(), TelegramRpcSchedulerConfig(), [])
-    raw_future: asyncio.Future[object] | None = None
     disconnect_started = asyncio.Event()
     disconnect_release = asyncio.Event()
 
-    class _BlockedDisconnectSender:
-        def is_connected(self) -> bool:
-            return True
+    provider_future: asyncio.Future[object] | None = None
 
-        def _transport_connected(self) -> bool:
-            return True
+    async def pending_response(_request: object) -> object:
+        nonlocal provider_future
+        provider_future = asyncio.get_running_loop().create_future()
+        return await provider_future
 
-        def send(self, _request: object, *, ordered: bool = False) -> asyncio.Future[object]:
-            nonlocal raw_future
-            del ordered
-            raw_future = asyncio.get_running_loop().create_future()
-            return raw_future
+    _set_sender(gate, pending_response)
+    connection = gate._main_sender._connection
+    original_disconnect = connection.disconnect
 
-        async def disconnect(self) -> None:
-            disconnect_started.set()
-            await disconnect_release.wait()
+    async def blocked_disconnect() -> None:
+        disconnect_started.set()
+        await disconnect_release.wait()
+        await original_disconnect()
 
-    gate._main_sender = gate._sender = _BlockedDisconnectSender()
+    monkeypatch.setattr(connection, "disconnect", blocked_disconnect)
     complete_calls = 0
     original_complete = gate._admission_scheduler.complete
 
@@ -384,29 +358,34 @@ async def test_scalar_future_remains_owned_until_raw_disconnect_finishes(
     async def invoke() -> object:
         with demand_context(DemandKind.FULL_SYNC_PAGE):
             with rpc_scope(TelegramRpcSource.FULL_SYNC):
-                return await gate(_ScalarRequest("pending"))
+                return await gate(functions.updates.GetStateRequest())
 
     caller = asyncio.create_task(invoke())
-    await _wait_until(lambda: raw_future is not None)
-    assert raw_future is not None
+    await _wait_until(lambda: bool(_pending_owned_states(gate)))
+    await _wait_until(lambda: provider_future is not None)
+    raw_future = next(iter(_pending_owned_states(gate))).future
     caller.cancel()
     with pytest.raises(asyncio.CancelledError):
         await caller
 
     disconnect = asyncio.create_task(gate._disconnect_main_sender())
-    await disconnect_started.wait()
-    assert not raw_future.cancelled()
-    assert raw_future in gate._pending_scalar_dispatches
-    assert sum(gate._admission_scheduler.active_depths().values()) == 1
-    assert complete_calls == 0
+    try:
+        await disconnect_started.wait()
+        assert not raw_future.cancelled()
+        assert len(_pending_owned_states(gate)) == 1
+        assert sum(gate._admission_scheduler.active_depths().values()) == 1
+        assert complete_calls == 0
 
-    disconnect_release.set()
-    await disconnect
-    await _wait_until(lambda: raw_future not in gate._pending_scalar_dispatches)
-    assert raw_future.cancelled()
-    assert complete_calls == 1
-    assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
-    await gate.close_rpc_scheduler()
+        disconnect_release.set()
+        await disconnect
+        await _wait_until(lambda: not _pending_owned_states(gate))
+        assert raw_future.cancelled()
+        assert complete_calls == 1
+        assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
+    finally:
+        disconnect_release.set()
+        await asyncio.gather(disconnect, return_exceptions=True)
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
@@ -417,7 +396,7 @@ async def test_same_caller_timeouts_cannot_reuse_retained_scalar_capacity(capaci
         TelegramRpcSchedulerConfig(background_queue_capacity=capacity),
         [],
     )
-    raw_futures: list[asyncio.Future[object]] = []
+    provider_futures: list[asyncio.Future[object]] = []
 
     class _PendingSender:
         def is_connected(self) -> bool:
@@ -429,46 +408,46 @@ async def test_same_caller_timeouts_cannot_reuse_retained_scalar_capacity(capaci
         def send(self, _request: object, *, ordered: bool = False) -> asyncio.Future[object]:
             del ordered
             future = asyncio.get_running_loop().create_future()
-            raw_futures.append(future)
+            provider_futures.append(future)
             return future
 
         async def disconnect(self) -> None:
             return None
 
-    gate._main_sender = gate._sender = _PendingSender()
+    _set_sender(gate, _PendingSender())
 
     async def abandon(value: object) -> None:
         with pytest.raises(TimeoutError):
             async with asyncio.timeout(0.01):
                 with demand_context(DemandKind.FULL_SYNC_PAGE):
                     with rpc_scope(TelegramRpcSource.FULL_SYNC):
-                        await gate(_ScalarRequest(value))
+                        await gate(functions.updates.GetStateRequest())
 
     async def timed_scope_request(value: object) -> object:
         with demand_context(DemandKind.FULL_SYNC_PAGE):
             with rpc_scope(TelegramRpcSource.FULL_SYNC):
                 async with asyncio.timeout(0.01):
-                    return await gate(_ScalarRequest(value))
+                    return await gate(functions.updates.GetStateRequest())
 
     try:
         for value in range(capacity):
             await abandon(value)
-        assert len(raw_futures) == capacity
+        await _wait_until(lambda: len(_pending_owned_states(gate)) == capacity)
         assert gate._admission_scheduler.active_depths()[RpcServiceClass.BACKGROUND] == capacity
         if capacity == 1:
             for value in ("second-timeout-scope", "third-timeout-scope"):
                 with pytest.raises(TelegramRpcAdmissionDeferred, match="temporarily busy"):
                     await timed_scope_request(value)
-            assert len(raw_futures) == 1
+            assert len(provider_futures) == 1
             assert gate._admission_scheduler.active_depths()[RpcServiceClass.BACKGROUND] == 1
         with pytest.raises(TelegramRpcAdmissionDeferred, match="temporarily busy"):
             with demand_context(DemandKind.FULL_SYNC_PAGE):
                 with rpc_scope(TelegramRpcSource.FULL_SYNC):
-                    await gate(_ScalarRequest("blocked"))
-        raw_futures[0].set_result("released")
+                    await gate(functions.updates.GetStateRequest())
+        provider_futures[0].set_result("released")
         await _wait_until(lambda: gate._admission_scheduler.active_depths()[RpcServiceClass.BACKGROUND] == capacity - 1)
         await abandon("replacement")
-        assert len(raw_futures) == capacity + 1
+        assert len(provider_futures) == capacity + 1
         assert gate._admission_scheduler.active_depths()[RpcServiceClass.BACKGROUND] == capacity
     finally:
         await gate._disconnect_main_sender()

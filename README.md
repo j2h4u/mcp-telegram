@@ -80,6 +80,55 @@ Compose enables `init: true`; `serve` stops both workers if either exits, leavin
 restart to Docker. `mcp-telegram http` runs only the HTTP endpoint, while
 `mcp-telegram sync` owns Telegram and local writes.
 
+### Telegram RPC protection rollout
+
+The in-progress TG-126 transport contract routes every application write and
+replay through the daemon's existing priority gateway with the original request
+budget/deadline. Its final synchronous write claim must recheck cancellation,
+known account floors, authentication scope, protection generation and pacing.
+The target Telethon 1.45 adapter is repository-owned and version-guarded; the
+project does not patch a virtualenv or add a second queue.
+
+The deployed `config.toml` must contain the fixed integer marker:
+
+```toml
+[telegram_rpc]
+transport_contract_version = 1
+```
+
+This is a compatibility marker, not a tuning setting. The application rejects
+missing, non-integer or unknown marker values before connecting to Telegram;
+older binaries that reject this key cannot be used for rollback. Before the
+first incompatible-format rollout, stop the writer and make a matching backup
+of `sync.db`, the Telegram session and configuration. Follow the
+[deployment backup and rollback procedure](deploy/AGENTS.md#sqlite-backup-restore-and-retention).
+Keep the marker on rollback to a compatible binary. Do not restore an older
+database after new facts have been written; use a forward fix or a protected
+current compatible binary first.
+
+Active protection has one manual recovery path:
+
+```bash
+mcp-telegram recover-account --acknowledge-unknown-outcome
+```
+
+The command reads the active generation and requests a one-use conditional
+authorization. “Authorized; restart scheduled” does not mean Telegram access
+has recovered. Known cooldown floors remain; uncertain prior outcomes remain
+recorded and require the explicit acknowledgement. After restart, only the
+operator-authorized bounded bootstrap and identity trial may run. A confirmed
+trial clears that operator authorization, not an unseen server floor; failure,
+FloodWait or uncertainty returns the account to hold. A new explicit operator
+authorization may retry a failed trial. Recovery is not automatic and has no
+MCP tool.
+
+Protocol ACK, Ping and StateInfo controls use the same bounded central admission
+path during an application-write hold. They remain protocol-only: no application
+payload smuggling and no per-ACK filesystem sync. Local write of a protocol
+control is not confirmation that Telegram applied the corresponding application
+request. This rollout does not yet promise incoming-update continuity under a
+hard account latch; receive-only lifecycle work is deferred to later slices.
+
 The deployed compose template publishes HTTP only on host loopback:
 
 ```text

@@ -701,6 +701,9 @@ class DaemonAPIServer:
         channel_profile_port: ChannelProfilePort,
         policy: DaemonApiPolicy,
         health_status: Callable[[], DaemonHealthStatus] = _healthy_daemon_status,
+        account_safety_status: Callable[[], dict[str, object] | None] | None = None,
+        account_recovery: Callable[[str, bool], Awaitable[None]] | None = None,
+        account_logout: Callable[[], Awaitable[None]] | None = None,
         common_chats_port: CommonChatsPort,
         user_avatar_history_port: UserAvatarHistoryPort,
         chat_avatar_history_port: ChatAvatarHistoryPort,
@@ -735,6 +738,9 @@ class DaemonAPIServer:
         self._hydration_requester = hydration_requester
         self._policy = policy
         self._health_status = health_status
+        self._account_safety_status = account_safety_status
+        self._account_recovery = account_recovery
+        self._account_logout = account_logout
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
         self._entity_info_service: DaemonEntityInfoService | None = None
         self._demand_sink: DemandOfferSink | None = None
@@ -867,7 +873,7 @@ class DaemonAPIServer:
                 None,
             )
         request_id = request_result
-        if not self._ready:
+        if not self._ready and method not in {"get_account_protection", "recover_account", "logout_account"}:
             return (
                 {
                     "ok": False,
@@ -1126,8 +1132,10 @@ class DaemonAPIServer:
             request = cast(object, json.loads(line))
         except ValueError:
             request = {}
-        # Enrollment commits outlive their caller; only foreground work is owned here.
+        # Durable mutations outlive their caller; only foreground work is owned here.
         foreground = isinstance(request, dict) and request.get("method") not in {
+            "recover_account",
+            "logout_account",
             "mark_dialog_for_sync",
             "recover_dialog_directory",
             "record_telemetry",
@@ -1162,6 +1170,7 @@ class DaemonAPIServer:
         request_id: str | None = None
         pending_read: asyncio.Task[bytes] | None = None
         request_task: asyncio.Task[tuple[dict, str, str | None]] | None = None
+        restart_authorized = False
 
         async def read_line() -> bytes:
             try:
@@ -1177,7 +1186,10 @@ class DaemonAPIServer:
                 if await self._cancel_abandoned_foreground_request(line, pending_read, request_task):
                     break
                 response, method, request_id = await request_task
+                restart_authorized = method in {"recover_account", "logout_account"} and response.get("ok") is True
                 await write_response(writer, response)
+                if restart_authorized:
+                    break
                 line = await pending_read
                 pending_read = None
                 request_task = None
@@ -1198,6 +1210,8 @@ class DaemonAPIServer:
             )
         finally:
             await self._finish_client_connection(handler, writer, method, (pending_read, request_task))
+            if restart_authorized:
+                self._shutdown_event.set()
 
     async def _finish_client_connection(
         self,
@@ -1235,6 +1249,8 @@ class DaemonAPIServer:
             "list_topics": self._list_topics,
             "get_me": self._get_me,
             "get_account_protection": self._get_account_protection,
+            "recover_account": self._recover_account,
+            "logout_account": self._logout_account,
             "mark_dialog_for_sync": self._mark_dialog_for_sync,
             "get_sync_status": self._get_sync_status,
             "recover_dialog_directory": self._recover_dialog_directory,
@@ -1266,6 +1282,11 @@ class DaemonAPIServer:
                     if isinstance(result, dict):
                         return result
                     return cast(dict[str, object], await result)
+
+        if method == "logout_account":
+            with demand_context(DemandKind.OPERATOR_LOGOUT):
+                with _preserve_or_rpc_scope(TelegramRpcSource.OPERATOR_LOGOUT):
+                    return await self._logout_account(req)
 
         with _preserve_or_rpc_scope(TelegramRpcSource.MCP_INTERACTIVE):
             result = handler(req)
@@ -1812,7 +1833,8 @@ class DaemonAPIServer:
         """Return the current process-local account-protection status."""
         del req
         status = self._health_status()
-        if not status.open:
+        safety = self._account_safety_status() if self._account_safety_status is not None else None
+        if not status.open and safety is None:
             return {"ok": True, "data": {"account_protection": None}}
         protection: dict[str, object] = {
             "status": "active",
@@ -1827,7 +1849,43 @@ class DaemonAPIServer:
             protection["reason"] = status.reason
         if status.opened_at is not None:
             protection["opened_at"] = status.opened_at
+        if safety is not None:
+            protection.update(safety)
         return {"ok": True, "data": {"account_protection": protection}}
+
+    async def _recover_account(self, req: dict[str, object]) -> dict[str, object]:
+        generation = req.get("expected_generation")
+        if not isinstance(generation, str) or not generation or req.get("acknowledge_unknown_outcome") is not True:
+            return {"ok": False, "error": "recovery_not_available"}
+        if self._account_recovery is None:
+            return {"ok": False, "error": "recovery_not_available"}
+        try:
+            await self._account_recovery(generation, True)
+        except ValueError:
+            safety = self._account_safety_status() if self._account_safety_status is not None else None
+            if safety is not None and safety.get("generation") != generation:
+                return {"ok": False, "error": "stale_protection_generation"}
+            return {"ok": False, "error": "recovery_not_eligible"}
+        except RuntimeError, TelegramRpcThrottled:
+            return {"ok": False, "error": "safety_storage_failure"}
+        return {"ok": True, "data": {"recovery": "authorized", "restart_scheduled": True}}
+
+    async def _logout_account(self, req: dict[str, object]) -> dict[str, object]:
+        """Unpublish account identity only after the owned gate confirms logout."""
+        del req
+        if self._account_logout is None:
+            return {"ok": False, "error": "logout_not_available"}
+        try:
+            await self._account_logout()
+        except ValueError:
+            return {"ok": False, "error": "logout_not_eligible"}
+        except RuntimeError, TelegramRpcThrottled:
+            return {"ok": False, "error": "logout_not_confirmed"}
+        self._ready = False
+        self.self_id = None
+        self.self_profile = None
+        await self._publish_auth_scope(None)
+        return {"ok": True, "data": {"logout": "confirmed", "restart_scheduled": True}}
 
     # ------------------------------------------------------------------
     # mark_dialog_for_sync

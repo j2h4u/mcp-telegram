@@ -2705,6 +2705,61 @@ async def test_get_me_reports_unavailable_before_identity_is_primed() -> None:
     assert result == {"ok": False, "error": "not_found", "message": "account info unavailable"}
 
 
+async def test_protected_startup_exposes_safe_status_without_enabling_other_reads() -> None:
+    server = make_server()
+    server._ready = False
+    server._account_safety_status = lambda: {
+        "generation": "current",
+        "reason": "unresolved_outbound_outcome",
+        "known_retry_until_utc": 123,
+    }
+    response, _, _ = await server._handle_client_line(b'{"method":"get_account_protection"}', "", None)
+    assert response["ok"] is True
+    assert response["data"]["account_protection"]["generation"] == "current"
+    unavailable, _, _ = await server._handle_client_line(b'{"method":"get_me"}', "", None)
+    assert unavailable["error"] == "daemon_not_ready"
+
+
+async def test_recovery_authorization_reply_precedes_orderly_shutdown() -> None:
+    server = make_server()
+    server._ready = False
+    calls: list[tuple[str, bool]] = []
+
+    async def authorize(generation: str, acknowledged: bool) -> None:
+        calls.append((generation, acknowledged))
+
+    server._account_recovery = authorize
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        b'{"method":"recover_account","expected_generation":"current","acknowledge_unknown_outcome":true}\n'
+    )
+    reader.feed_eof()
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    writer.drain = AsyncMock()
+    writer.wait_closed = AsyncMock()
+
+    def capture_reply(data: bytes) -> None:
+        assert not server._shutdown_event.is_set()
+        assert b'"authorized"' in data
+
+    writer.write.side_effect = capture_reply
+    await server.handle_client(reader, writer)
+    assert calls == [("current", True)]
+    assert server._shutdown_event.is_set()
+
+
+async def test_recovery_without_acknowledgement_does_not_call_write_owner() -> None:
+    server = make_server()
+    authorize = AsyncMock()
+    server._account_recovery = authorize
+    response, _, _ = await server._handle_client_line(
+        b'{"method":"recover_account","expected_generation":"current"}', "", None
+    )
+    assert response["error"] == "recovery_not_available"
+    authorize.assert_not_called()
+    assert not server._shutdown_event.is_set()
+
+
 # ---------------------------------------------------------------------------
 # _dispatch — unknown method
 # ---------------------------------------------------------------------------
@@ -9223,14 +9278,21 @@ async def test_client_prefetch_preserves_next_request() -> None:
 
 @pytest.mark.asyncio
 async def test_client_eof_keeps_dispatched_raw_rpc_lease_and_prevents_followup() -> None:
-    from mcp_telegram.telegram_rpc import _MainSender
     from mcp_telegram.telegram_rpc_consumers import RpcServiceClass
-    from tests.test_telegram_rpc import _call, _gate, _RawFutureSender, _TestRequest, _wait_for
+    from tests.test_telegram_rpc import (
+        _call,
+        _gate,
+        _pending_owned_states,
+        _RawFutureSender,
+        _set_sender,
+        _TestRequest,
+        _wait_for,
+    )
 
     server = make_server()
     gate = _gate()
     sender = _RawFutureSender()
-    gate._main_sender = cast(_MainSender, sender)
+    _set_sender(gate, sender)
 
     async def dispatch(req: dict) -> dict:
         await _call(gate, _TestRequest("first"))
@@ -9252,7 +9314,8 @@ async def test_client_eof_keeps_dispatched_raw_rpc_lease_and_prevents_followup()
     assert gate._admission_scheduler.active_depths()[RpcServiceClass.INTERACTIVE] == 1
     assert sender.calls == 1
     raw_future.set_result("late completion")
-    await _wait_for(lambda: not gate._pending_scalar_dispatches)
+    await _wait_for(lambda: not _pending_owned_states(gate))
+    await _wait_for(lambda: gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0))
     assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
     writer.write.assert_not_called()
     await gate.close_rpc_scheduler()

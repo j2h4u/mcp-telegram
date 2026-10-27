@@ -98,7 +98,7 @@ depends_on = ["mcp_telegram.update_delivery",
     "mcp_telegram.telegram_read_receipts", "mcp_telegram.topics.refresh", "mcp_telegram.transcription_hydration",
     "mcp_telegram.topics.sqlite_repository", "mcp_telegram.topics.telegram_adapter",
     "mcp_telegram.topics.catalog",
-    "mcp_telegram.telegram_demand", "mcp_telegram.telegram_demand_coordinator", "mcp_telegram.telegram_gateway", "mcp_telegram.entity_profile.ports", "mcp_telegram.telegram_rpc", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.reactions", "mcp_telegram.sync_transactions", "mcp_telegram.sqlite_checkpoint", "mcp_telegram.sqlite_writer"]
+    "mcp_telegram.telegram_demand", "mcp_telegram.telegram_demand_coordinator", "mcp_telegram.telegram_gateway", "mcp_telegram.entity_profile.ports", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.reactions", "mcp_telegram.sync_transactions", "mcp_telegram.sqlite_checkpoint", "mcp_telegram.sqlite_writer"]
 
 # application — each horizontal worker/facade has its own narrow declaration.
 [[modules]]
@@ -511,12 +511,22 @@ depends_on = ["mcp_telegram.entity_profile.contracts", "mcp_telegram.entity_prof
 [[modules]]
 path = "mcp_telegram.telegram"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.config", "mcp_telegram.flood", "mcp_telegram.state", "mcp_telegram.telegram_rpc"]
+depends_on = ["mcp_telegram.config", "mcp_telegram.daemon_client", "mcp_telegram.flood", "mcp_telegram.sqlite_writer", "mcp_telegram.state", "mcp_telegram.sync_db", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc", "mcp_telegram.telegram_rpc_consumers"]
+
+[[modules]]
+path = "mcp_telegram.telegram_auth"
+layer = "telegram_gateway"
+depends_on = ["mcp_telegram.config", "mcp_telegram.telegram", "mcp_telegram.telegram_rpc"]
+
+[[modules]]
+path = "mcp_telegram.telegram_transport"
+layer = "telegram_gateway"
+depends_on = ["mcp_telegram.telegram_rpc_scheduler"]
 
 [[modules]]
 path = "mcp_telegram.telegram_rpc"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.delivered_update", "mcp_telegram.telegram_delivery", "mcp_telegram.update_delivery", "mcp_telegram.flood", "mcp_telegram.request_timing", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
+depends_on = ["mcp_telegram.auth_scope", "mcp_telegram.delivered_update", "mcp_telegram.telegram_delivery", "mcp_telegram.update_delivery", "mcp_telegram.flood", "mcp_telegram.request_timing", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.telegram_transport"]
 [[modules]]
 path = "mcp_telegram.telegram_fact_queries"
 layer = "telegram_gateway"
