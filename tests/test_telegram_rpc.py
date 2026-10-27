@@ -4266,7 +4266,8 @@ async def test_installed_vendor_auth_init_disconnect_failure_parks_daemon(monkey
 
     shutdown.set()
     assert await parked is False
-    await gate.close_rpc_scheduler()
+    with pytest.raises(OSError, match="internal transport teardown failed"):
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
@@ -4308,7 +4309,8 @@ async def test_installed_vendor_connect_cancellation_retains_failed_bootstrap_ow
     assert gate._connection_capability is not None
     with pytest.raises(TelegramRpcAdmissionDeferred, match="connection bootstrap is already running"):
         await gate.connect()
-    await gate.close_rpc_scheduler()
+    with pytest.raises(AssertionError, match="failed initialization must not manufacture confirmation"):
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
@@ -4357,7 +4359,8 @@ async def test_actual_failed_bootstrap_parks_daemon_until_shutdown_without_retry
     shutdown.set()
     assert await parked is False
     assert sender.connect_calls == 1
-    await gate.close_rpc_scheduler()
+    with pytest.raises(OSError, match="transport teardown failed"):
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
@@ -4391,7 +4394,8 @@ async def test_cancelled_failed_bootstrap_cleanup_keeps_reservation_and_does_not
     assert gate._connection_capability is not None
     with pytest.raises(TelegramRpcAdmissionDeferred, match="connection bootstrap is already running"):
         await gate.connect()
-    await gate.close_rpc_scheduler()
+    with pytest.raises(OSError, match="transport teardown failed"):
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
@@ -4505,12 +4509,13 @@ async def test_recursive_telethon_resolution_reenters_admission_without_deadlock
         ),
     )
 
-    class _RecursiveRequest(TLRequest):
-        CONSTRUCTOR_ID = 123
+    request = functions.help.GetConfigRequest()
 
-        async def resolve(self, client: TelegramClient, utils: object) -> None:
-            del utils
-            await client(functions.PingRequest(99))
+    async def resolve(client: TelegramClient, utils: object) -> None:
+        del utils
+        await client(functions.PingRequest(99))
+
+    request.resolve = resolve  # type: ignore[method-assign]
 
     class _Sender:
         def send(self, request: object, *, ordered: bool = False) -> object:
@@ -4533,10 +4538,13 @@ async def test_recursive_telethon_resolution_reenters_admission_without_deadlock
     gate.session.process_entities = lambda _result: None
 
     with rpc_scope(TelegramRpcSource.MCP_INTERACTIVE):
-        result = await asyncio.wait_for(gate(_RecursiveRequest()), timeout=1.0)
+        result = await asyncio.wait_for(gate(request), timeout=1.0)
 
-    assert isinstance(result, _RecursiveRequest)
-    assert [type(request) for request in sent] == [functions.PingRequest, _RecursiveRequest]
+    assert result is request
+    assert [type(sent_request) for sent_request in sent] == [
+        functions.PingRequest,
+        functions.help.GetConfigRequest,
+    ]
     assert gate._limiter.acquisitions == 2
     dispatched = [event for event in events if event.kind is RpcAdmissionEventKind.DISPATCHED]
     assert len(dispatched) == 2
@@ -4554,25 +4562,35 @@ async def test_update_difference_flood_wait_retries_inside_supported_gate_policy
     gate = _gate()
     attempts = 0
     sleeps: list[float] = []
-    utc_now = [rpc.time.time()]
+    real_monotonic = rpc.time.monotonic
+    real_utc = rpc.time.time
+    original_sleep = asyncio.sleep
+    offset = [0.0]
+    moving_clock = SimpleNamespace(
+        monotonic=lambda: real_monotonic() + offset[0],
+        time=lambda: real_utc() + offset[0],
+    )
+    monkeypatch.setattr(rpc, "time", moving_clock)
+    gate._admission_scheduler._clock = moving_clock.monotonic
 
     def send(request: object) -> object:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
-            raise FloodWaitError(request=None, capture=7)
+            raise FloodWaitError(request=None, capture=1)
         return _request_value(request)
 
     async def finish_cooldown(delay: float) -> None:
         sleeps.append(delay)
-        utc_now[0] += delay
-        rpc._COOLDOWN_DEADLINE = 0
+        offset[0] += delay
+        await original_sleep(0)
 
     _set_sender(gate, send)
     monkeypatch.setattr("mcp_telegram.telegram_rpc.asyncio.sleep", finish_cooldown)
-    monkeypatch.setattr(rpc.time, "time", lambda: utc_now[0])
-    with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE):
-        result = await gate(_TestRequest("difference"))
+    deadline = moving_clock.monotonic() + 4
+    with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
+        with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
+            result = await gate(_TestRequest("difference"))
 
     assert result == "difference"
     assert attempts == 2
@@ -4609,7 +4627,6 @@ async def test_update_difference_open_circuit_waits_without_fatal_exception(
 @pytest.mark.asyncio
 async def test_update_difference_expired_scope_returns_without_sending() -> None:
     gate = _gate()
-    sender = gate._main_sender
     events: list[RpcAdmissionEvent] = []
     gate.set_rpc_admission_observer(events.append)
     request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
@@ -4620,7 +4637,7 @@ async def test_update_difference_expired_scope_returns_without_sending() -> None
             with pytest.raises(OSError, match="admission deadline elapsed"):
                 await asyncio.wait_for(gate(request), timeout=0.1)
 
-    assert sender.calls == 0
+    assert gate._test_server.seen == set()
     assert gate._limiter.acquisitions == 0
     assert [event.kind for event in events] == [RpcAdmissionEventKind.EXPIRED]
     assert events[0].reason == "deadline_elapsed"
@@ -4631,7 +4648,6 @@ async def test_update_difference_saturation_wait_is_bounded_by_original_deadline
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gate = _gate()
-    sender = gate._main_sender
     request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
     deadline = asyncio.get_running_loop().time() + 0.01
     calls = 0
@@ -4649,13 +4665,12 @@ async def test_update_difference_saturation_wait_is_bounded_by_original_deadline
                 await asyncio.wait_for(gate(request), timeout=0.2)
 
     assert calls == 1
-    assert sender.calls == 0
+    assert gate._test_server.seen == set()
 
 
 @pytest.mark.asyncio
 async def test_update_difference_open_circuit_wait_is_bounded_by_scope_deadline() -> None:
     gate = _gate(_CircuitStatus(open=True))
-    sender = gate._main_sender
     request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
     deadline = asyncio.get_running_loop().time() + 0.01
 
@@ -4664,13 +4679,12 @@ async def test_update_difference_open_circuit_wait_is_bounded_by_scope_deadline(
             with pytest.raises(OSError, match="admission deadline elapsed"):
                 await asyncio.wait_for(gate(request), timeout=0.2)
 
-    assert sender.calls == 0
+    assert gate._test_server.seen == set()
 
 
 @pytest.mark.asyncio
 async def test_update_difference_flood_cooldown_expiry_does_not_send_again() -> None:
     gate = _gate()
-    sender = gate._main_sender
     request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
     deadline = asyncio.get_running_loop().time() + 0.01
 
@@ -4678,13 +4692,12 @@ async def test_update_difference_flood_cooldown_expiry_does_not_send_again() -> 
         raise FloodWaitError(request=None, capture=30)
 
     _set_sender(gate, flood_once)
-    sender = gate._main_sender
     with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
         with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
             with pytest.raises(OSError, match="admission deadline elapsed"):
                 await asyncio.wait_for(gate(request), timeout=0.2)
 
-    assert sender.calls == 1
+    assert len(gate._test_server.seen) == 1
     assert gate._limiter.acquisitions == 1
 
 
@@ -4693,7 +4706,6 @@ async def test_update_difference_cancellation_during_saturation_wait_is_preserve
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gate = _gate()
-    sender = gate._main_sender
     request = functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0)
     deadline = asyncio.get_running_loop().time() + 5
     waiting = asyncio.Event()
@@ -4719,7 +4731,7 @@ async def test_update_difference_cancellation_during_saturation_wait_is_preserve
             caller.cancel()
             await asyncio.gather(caller, return_exceptions=True)
 
-    assert sender.calls == 0
+    assert gate._test_server.seen == set()
 
 
 @pytest.mark.asyncio
