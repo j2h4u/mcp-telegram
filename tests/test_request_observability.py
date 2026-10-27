@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from types import MethodType, SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -27,12 +26,9 @@ from mcp_telegram.request_timing import (
 )
 from mcp_telegram.runtime_observations import RuntimeObservationSink
 from mcp_telegram.sync_db import _RUNTIME_OBSERVATIONS_V54_DDL
-from mcp_telegram.telegram_rpc import TelegramRpcGate, _AdmissionAwareSender
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmission,
-    RpcServiceClass,
     TelegramRpcScope,
-    TelegramRpcSource,
 )
 from tests.test_daemon_api import (
     _insert_message,
@@ -349,54 +345,23 @@ def test_daemon_timing_record_is_content_free_and_correlated() -> None:
 
 @pytest.mark.asyncio
 async def test_admission_wait_and_rpc_execution_are_separate_boundaries() -> None:
+    from tests.test_telegram_rpc import _call, _gate, _set_sender
+
     admission_started = asyncio.Event()
     release_admission = asyncio.Event()
+    gate = _gate()
+    original_admit = gate._admission_scheduler.admit
 
-    class Scheduler:
-        def record_dispatch(self, _admission: RpcAdmission) -> None:
-            return None
-
-        def complete(self, _admission: RpcAdmission) -> None:
-            return None
-
-    async def admit(_scope: TelegramRpcScope) -> RpcAdmission:
+    async def admit(scope: TelegramRpcScope) -> RpcAdmission:
         admission_started.set()
         await release_admission.wait()
-        return RpcAdmission(TelegramRpcSource.MCP_INTERACTIVE, RpcServiceClass.INTERACTIVE, 0.0, 1)
+        return await original_admit(scope)
 
-    def register_completion(
-        raw_future: asyncio.Future[object],
-        *,
-        admission: RpcAdmission,
-        **_kwargs: object,
-    ) -> None:
-        raw_future.add_done_callback(lambda _future: scheduler.complete(admission))
-
-    scheduler = Scheduler()
-    gate = SimpleNamespace(
-        _admit=admit,
-        _raise_if_transport_unavailable=lambda: None,
-        _scheduler_transport_ready=lambda: True,
-        _admission_scheduler=scheduler,
-        _register_scalar_dispatch_completion=register_completion,
-    )
-    gate._reject_exhausted_attempt_budget = MethodType(TelegramRpcGate._reject_exhausted_attempt_budget, gate)
-    scope = TelegramRpcScope(
-        source=TelegramRpcSource.MCP_INTERACTIVE,
-        service_class=RpcServiceClass.INTERACTIVE,
-        deadline=None,
-        owner_task=None,
-    )
-
-    async def send_attempt(request: object, *, ordered: bool = False) -> str:
-        del request
-        del ordered
-        return "ok"
+    gate._admission_scheduler.admit = admit
+    _set_sender(gate, lambda _request: "ok")
 
     with timing_context("op-rpc") as timing:
-        task = asyncio.create_task(
-            _AdmissionAwareSender(cast(TelegramRpcGate, gate), send_attempt, scope).send("request")
-        )
+        task = asyncio.create_task(_call(gate, "request"))
         admitted = asyncio.create_task(admission_started.wait())
         try:
             done, _ = await asyncio.wait({admitted, task}, timeout=2, return_when=asyncio.FIRST_COMPLETED)
@@ -414,6 +379,7 @@ async def test_admission_wait_and_rpc_execution_are_separate_boundaries() -> Non
             admitted.cancel()
             task.cancel()
             await asyncio.gather(admitted, task, return_exceptions=True)
+            await gate.close_rpc_scheduler()
 
     assert payload["rpc_admission_ms"] is not None
     assert payload["rpc_execution_ms"] is not None

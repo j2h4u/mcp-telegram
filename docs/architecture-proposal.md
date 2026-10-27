@@ -214,6 +214,57 @@ This architecture is enforced as a green current-state frontier. Future work
 removes named deprecated edges one slice at a time; it does not normalize them
 into broad module allowlists.
 
+### Telegram write admission and recovery (TG-126 in progress)
+
+The required transport contract sends every application write and replay
+through the existing gateway priority queue, preserving the original request
+budget and deadline. Immediately before a write, a synchronous final claim must
+recheck cancellation, known account cooldown floors, authentication scope,
+protection generation and pacing. Production transport uses a repository-owned,
+version-guarded adapter for Telethon 1.45 private APIs; it must not patch the
+installed virtualenv, fork Telethon or introduce a competing queue. These are
+release requirements for this in-progress slice, not a claim that every path
+has already passed integration.
+
+Runtime configuration has one fixed compatibility marker:
+
+```toml
+[telegram_rpc]
+transport_contract_version = 1
+```
+
+The marker must be the integral value `1`; it is not a policy knob. Missing or
+unknown values fail configuration loading before Telegram connection. Persisted
+format migration requires the writer stopped and a matching backup of the
+current `sync.db`, Telegram session and configuration; the deployment-local
+[backup and rollback procedure](../deploy/AGENTS.md#sqlite-backup-restore-and-retention)
+contains the supported SQLite-aware handling. Keep the marker when rolling
+back to a compatible binary. Never rewind the database after new facts have
+been committed or erase protection floors/intents. For a failed rollout, use a
+forward fix or protected current compatible binary first.
+
+Manual recovery is `mcp-telegram recover-account
+--acknowledge-unknown-outcome`. It reads the active protection generation, then
+requests one conditional, one-use authorization scoped to the known cooldown
+floor, authentication scope and valid persisted receipt. Success means only
+that recovery is authorized and a restart is scheduled; it does not mean the
+account has recovered. The command retains known floors and prior uncertain
+outcomes, with operator acknowledgement. A bounded bootstrap and identity trial
+may follow restart only under that authorization. Trial success opens that
+operator authorization but cannot prove an unseen server floor has elapsed.
+Failure, FloodWait or uncertainty returns to hold; retry requires a new explicit
+operator authorization. There is no MCP recovery tool, automatic timer, raw
+state reset or SQL-edit recovery path.
+
+Protocol ACK, Ping and StateInfo controls use exact, bounded central admission
+during an application-write hold. They remain protocol-only: no application
+payload smuggling and no per-ACK filesystem sync. A local protocol-control write
+is not evidence that Telegram applied an application request. This slice does
+not claim full incoming continuity under a hard latch: receive-only lifecycle
+behavior belongs to later B/C work. It also does not claim that a local
+operator with root or administrator access cannot bypass repository controls;
+the gateway guard prevents accidental application regressions.
+
 ### Protected acquisition health and profile retries
 
 The daemon health probe checks both local socket serving and the existing account

@@ -279,6 +279,24 @@ class TelegramRpcConfig:
     period_seconds: float = 60.0
     transient_retry_delays_seconds: tuple[float, ...] = (0.0,)
     scheduler: TelegramRpcSchedulerConfig = field(default_factory=TelegramRpcSchedulerConfig)
+    transport_contract_version: int = 1
+
+    def __post_init__(self) -> None:
+        if type(self.transport_contract_version) is not int or self.transport_contract_version != 1:
+            raise ValueError("transport_contract_version must be integer 1")
+        if (
+            isinstance(self.max_calls_per_period, bool)
+            or not isinstance(self.max_calls_per_period, int)
+            or self.max_calls_per_period < 1
+        ):
+            raise ValueError("max_calls_per_period must be a positive integer")
+        if (
+            isinstance(self.period_seconds, bool)
+            or not isinstance(self.period_seconds, (int, float))
+            or not math.isfinite(self.period_seconds)
+            or self.period_seconds <= 0
+        ):
+            raise ValueError("period_seconds must be a positive finite number")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1132,9 +1150,18 @@ def _parse_telegram_rpc(data: dict[str, object], path: Path) -> TelegramRpcConfi
     rpc_data = _optional_section(
         data,
         "telegram_rpc",
-        {"max_calls_per_period", "period_seconds", "transient_retry_delays_seconds", "scheduler"},
+        {
+            "transport_contract_version",
+            "max_calls_per_period",
+            "period_seconds",
+            "transient_retry_delays_seconds",
+            "scheduler",
+        },
         path,
     )
+    contract_version = rpc_data.get("transport_contract_version")
+    if type(contract_version) is not int or contract_version != 1:
+        raise ConfigError(f"Invalid telegram_rpc.transport_contract_version in {path}: expected integer 1")
     defaults = TelegramRpcConfig()
     scheduler_data = _nested_table(rpc_data, "scheduler", "telegram_rpc.scheduler", path) or {}
     scheduler_keys = {
@@ -1220,7 +1247,8 @@ def _parse_telegram_rpc(data: dict[str, object], path: Path) -> TelegramRpcConfi
         ),
     )
     return TelegramRpcConfig(
-        max_calls_per_period=_non_negative_int(
+        transport_contract_version=1,
+        max_calls_per_period=_positive_int(
             rpc_data,
             "max_calls_per_period",
             "telegram_rpc",

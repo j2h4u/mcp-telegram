@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Coroutine, Iterator
 from contextlib import AbstractContextManager
 from contextvars import Context
@@ -14,15 +16,25 @@ from datetime import datetime
 from enum import StrEnum
 from functools import wraps
 from itertools import chain
+from pathlib import Path
 from typing import Never, Protocol, cast
+from weakref import WeakKeyDictionary
 
 from aiolimiter import AsyncLimiter
 from telethon import (  # type: ignore[import-untyped]
     TelegramClient,  # type: ignore[import-untyped]
+    functions,
     helpers,
     types,
 )
 from telethon._updates import ChannelState, SessionState  # type: ignore[import-untyped]
+from telethon.client.telegrambaseclient import (  # type: ignore[import-untyped]
+    DEFAULT_DC_ID,
+    DEFAULT_IPV4_IP,
+    DEFAULT_IPV6_IP,
+    DEFAULT_PORT,
+)
+from telethon.crypto import AuthKey  # type: ignore[import-untyped]
 from telethon.errors import (  # type: ignore[import-untyped]
     FloodPremiumWaitError,
     FloodTestPhoneWaitError,
@@ -35,31 +47,35 @@ from telethon.errors import (  # type: ignore[import-untyped]
     ServerError,
     TimedOutError,
 )
+from telethon.events import Raw  # type: ignore[import-untyped]
 from telethon.events.common import EventBuilder  # type: ignore[import-untyped]
-from telethon.tl.functions.channels import GetFullChannelRequest  # type: ignore[import-untyped]
 from telethon.tl.functions.updates import (  # type: ignore[import-untyped]
     GetChannelDifferenceRequest,
     GetDifferenceRequest,
 )
+from telethon.tl.tlobject import TLRequest  # type: ignore[import-untyped]
 from telethon.utils import is_list_like  # type: ignore[import-untyped]
 
+from .auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from .delivered_update import DeliveredUpdate, delivered_update_context, fail_delivered_update
 from .flood import FloodWaitObservation, TelegramRpcThrottled, flood_seconds
-from .request_timing import current_timing, timing_phase
+from .request_timing import DaemonRequestTiming, current_timing
 from .telegram_delivery import DeliveryEnvelope, ProtocolSnapshot, load_delivery_envelope, load_protocol_snapshot
 from .telegram_demand import (
     AcquisitionKind,
     DemandToken,
     MissingTelegramDemandContextError,
     RpcAttemptBudget,
+    RpcAttemptEvidence,
     UnclassifiedTelegramDemandError,
     acquisition_context,
     create_demand_token,
     current_demand_token,
     demand_context,
     require_execution_mode,
+    transferred_demand_context,
 )
-from .telegram_rpc_consumers import DemandKind, ExecutionMode, demand_contract
+from .telegram_rpc_consumers import CONNECTION_BOOTSTRAP_MAX_RPC_ATTEMPTS, DemandKind, ExecutionMode, demand_contract
 from .telegram_rpc_scheduler import (
     AdmissionObserver,
     RpcAdmission,
@@ -78,6 +94,7 @@ from .telegram_rpc_scheduler import (
     rpc_attempt_budget,
     rpc_scope,
 )
+from .telegram_transport import GuardedConnectionTcpFull, GuardedMTProtoSender, ProtocolOrigin
 from .update_delivery import UpdateDeliveryRepository
 
 logger = logging.getLogger(__name__)
@@ -132,16 +149,7 @@ class CircuitStatus(Protocol):
     def detail(self) -> str: ...
 
 
-class _SendAttempt(Protocol):
-    def __call__(
-        self,
-        request: object,
-        *,
-        ordered: bool = False,
-    ) -> Awaitable[object] | list[asyncio.Future[object]]: ...
-
-
-class _MainSender(_SendAttempt, Protocol):
+class _MainSender(Protocol):
     """The only raw Telethon sender surface retained by the gate."""
 
     auth_key: object
@@ -153,9 +161,20 @@ class _MainSender(_SendAttempt, Protocol):
         ordered: bool = False,
     ) -> Awaitable[object] | list[asyncio.Future[object]]: ...
 
+    def send_owned(self, request: object, scope: TelegramRpcScope) -> asyncio.Future[object]: ...
+
+    def application_owner(self, result: asyncio.Future[object]) -> object: ...
+
+    @property
+    def write_generation(self) -> int: ...
+
+    def physical_connected(self) -> bool: ...
+
     async def connect(self, connection: object) -> object: ...
 
     async def disconnect(self) -> object: ...
+
+    async def settle_shutdown(self) -> None: ...
 
     def is_connected(self) -> bool: ...
 
@@ -170,9 +189,8 @@ class _MainSender(_SendAttempt, Protocol):
 class _AdmissionAwareSender:
     """Admit each scalar attempt at Telethon's synchronous sender seam."""
 
-    def __init__(self, gate: TelegramRpcGate, send_attempt: _SendAttempt, scope: TelegramRpcScope) -> None:
+    def __init__(self, gate: TelegramRpcGate, scope: TelegramRpcScope) -> None:
         self._gate = gate
-        self._send_attempt = send_attempt
         self._scope = scope
         self._dispatch_started = False
 
@@ -180,70 +198,40 @@ class _AdmissionAwareSender:
         return self._send(request, ordered=ordered)
 
     async def _send(self, request: object, *, ordered: bool) -> object:
-        while True:
-            self._gate._raise_if_transport_unavailable()
-            self._reject_exhausted_budget()
-            admission = await self._admit()
-            completion_transferred = False
-            try:
-                if not self._gate._scheduler_transport_ready():
-                    self._gate._admission_scheduler.record_retry(
-                        self._scope,
-                        reason="transport_readiness_changed",
-                    )
-                    continue
-                self._raise_if_cancel_pending()
-                self._debit_dispatched_attempt()
-                self._gate._admission_scheduler.record_dispatch(admission)
-                if isinstance(request, GetFullChannelRequest):
-                    self._gate._observe_rpc_request(self._scope)
-                if (timing := current_timing()) is not None:
-                    timing.record_rpc_attempt()
-                raw_future = self._start_dispatched_send(request, ordered=ordered, admission=admission)
-                completion_transferred = True
-                with timing_phase("rpc_execution"):
-                    async with asyncio.timeout_at(self._scope.deadline):
-                        await asyncio.wait({raw_future})
-                    return raw_future.result()
-            finally:
-                if not completion_transferred:
-                    self._gate._admission_scheduler.complete(admission)
-
-    def _reject_exhausted_budget(self) -> None:
+        del ordered
+        self._gate._raise_if_transport_unavailable()
         self._gate._reject_exhausted_attempt_budget(self._scope)
-
-    async def _admit(self) -> RpcAdmission:
-        with timing_phase("rpc_admission"):
-            return await self._gate._admit(self._scope)
-
-    def _debit_dispatched_attempt(self) -> None:
-        budget = self._scope.attempt_budget
-        if budget is not None:
-            self._reject_exhausted_budget()
-            budget.debit()
-
-    def _start_dispatched_send(
-        self,
-        request: object,
-        *,
-        ordered: bool,
-        admission: RpcAdmission,
-    ) -> asyncio.Future[object]:
-        self._raise_if_cancel_pending()
-        dispatch_at_monotonic = time.monotonic()
-        self._dispatch_started = True
-        raw_awaitable = self._send_attempt(request, ordered=ordered)
-        if isinstance(raw_awaitable, list):
-            self._reject_batch(raw_awaitable)
-        raw_future = asyncio.ensure_future(raw_awaitable)
-        self._gate._register_scalar_dispatch_completion(
-            raw_future,
-            scope=self._scope,
-            request_method=type(request).__name__,
-            admission=admission,
-            dispatch_at_monotonic=dispatch_at_monotonic,
-        )
-        return raw_future
+        raw_future = self._gate._main_sender.send_owned(request, self._scope)
+        wire_owner = self._gate._require_wire_owner(self._gate._main_sender.application_owner(raw_future))
+        started_at = time.monotonic()
+        timing = current_timing()
+        try:
+            async with asyncio.timeout_at(self._scope.deadline):
+                await asyncio.wait({raw_future})
+            return raw_future.result()
+        except TimeoutError:
+            self._gate._revoke_wire_owner(wire_owner)
+            raw_future.add_done_callback(self._consume_late_result, context=Context())
+            if self._gate._wire_fault is not None:
+                raise TelegramRpcThrottled(
+                    retry_after_seconds=None, latched=True, detail="Telegram outbound outcome is uncertain"
+                ) from None
+            raise
+        except asyncio.CancelledError:
+            self._gate._revoke_wire_owner(wire_owner)
+            raw_future.add_done_callback(self._consume_late_result, context=Context())
+            raise
+        except BaseException:
+            raw_future.add_done_callback(self._consume_late_result, context=Context())
+            raise
+        finally:
+            self._dispatch_started = wire_owner.claimed > 0
+            if timing is not None:
+                ended_at = time.monotonic()
+                admission_end = wire_owner.dispatch_at or ended_at
+                timing.add_phase("rpc_admission", (admission_end - started_at) * 1000)
+                if wire_owner.dispatch_at is not None:
+                    timing.add_phase("rpc_execution", (ended_at - wire_owner.dispatch_at) * 1000)
 
     @staticmethod
     def _raise_if_cancel_pending() -> None:
@@ -252,10 +240,9 @@ class _AdmissionAwareSender:
             raise asyncio.CancelledError
 
     @staticmethod
-    def _reject_batch(futures: list[asyncio.Future[object]]) -> Never:
-        for future in futures:
-            future.cancel()
-        raise RuntimeError("Telegram sender returned a future batch for a scalar request")
+    def _consume_late_result(future: asyncio.Future[object]) -> None:
+        if not future.cancelled():
+            future.exception()
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,6 +252,7 @@ class _ConnectionCapability:
     token: DemandToken
     deadline: float
     attempt_budget: RpcAttemptBudget | None
+    owned_generation: int = 0
 
 
 class _ConnectionDcMigrationRequestedError(Exception):
@@ -282,16 +270,6 @@ class _TransportBoundaryState(StrEnum):
     READY = "ready"
     DISCONNECTING = "disconnecting"
     FAILED = "failed"
-
-
-@dataclass(frozen=True, slots=True)
-class _PendingScalarDispatch:
-    """Frozen completion ownership for one dispatched scalar request."""
-
-    scope: TelegramRpcScope
-    request_method: str
-    admission: RpcAdmission
-    dispatch_at_monotonic: float
 
 
 class _MainSenderAdapter:
@@ -357,23 +335,947 @@ class TelegramRpcBudget:
     max_calls_per_period: int
     period_seconds: float
 
-    @property
-    def enabled(self) -> bool:
-        return self.max_calls_per_period > 0
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_calls_per_period, bool)
+            or not isinstance(self.max_calls_per_period, int)
+            or self.max_calls_per_period < 1
+        ):
+            raise ValueError("max_calls_per_period must be a positive integer")
+        if (
+            isinstance(self.period_seconds, bool)
+            or not isinstance(self.period_seconds, (int, float))
+            or not math.isfinite(self.period_seconds)
+            or self.period_seconds <= 0
+        ):
+            raise ValueError("period_seconds must be a positive finite number")
 
 
 @dataclass(frozen=True, slots=True)
-class TelegramRpcCooldownPersistence:
-    """Read-only startup load and asynchronous durable cooldown save."""
+class TelegramRpcSafetyStore:
+    """Daemon-owned CAS storage; callbacks never expose session credentials."""
 
-    load_until_utc: Callable[[], float | None]
-    save_until_utc: Callable[[float], Awaitable[None]]
+    load_record: Callable[[], str | None]
+    save_record: Callable[[str | None, str], Awaitable[None]]
+    load_legacy_until_utc: Callable[[], float | None]
+    canonical_owners: Callable[[], tuple[int | None, int | None]]
 
     def __post_init__(self) -> None:
-        if not callable(self.load_until_utc):
-            raise TypeError("load_until_utc must be callable")
-        if not callable(self.save_until_utc):
-            raise TypeError("save_until_utc must be callable")
+        if not all(
+            callable(value)
+            for value in (self.load_record, self.save_record, self.load_legacy_until_utc, self.canonical_owners)
+        ):
+            raise TypeError("Telegram RPC safety storage callbacks must be callable")
+
+
+def _system_boot_id() -> str:
+    value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    if not value:
+        raise RuntimeError("system boot identity unavailable")
+    return value
+
+
+def _finite_safety_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+
+
+def _validate_safety_scope(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {"stage", "dc_id", "key_id", "account_id"}:
+        return False
+    if type(value["dc_id"]) is not int or value["dc_id"] < 1:
+        return False
+    if value["key_id"] is not None and type(value["key_id"]) is not int:
+        return False
+    return _valid_scope_binding(value)
+
+
+def _valid_scope_binding(value: dict[str, object]) -> bool:
+    if value["stage"] == "key_pending":
+        return value["key_id"] is None and value["account_id"] is None
+    if value["stage"] == "transport_only":
+        return value["key_id"] is not None and value["account_id"] is None
+    return (
+        value["stage"] == "verified"
+        and value["key_id"] is not None
+        and type(value["account_id"]) is int
+        and value["account_id"] > 0
+    )
+
+
+def _validate_safety_record(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "version",
+        "generation",
+        "scope",
+        "floor",
+        "intents",
+        "protection",
+        "recovery",
+        "transition",
+    }:
+        return False
+    if not _valid_safety_record_identity(value):
+        return False
+    if not _valid_safety_floor(value["floor"]):
+        return False
+    if value["protection"] is not None and not isinstance(value["protection"], str):
+        return False
+    intents = value["intents"]
+    return all(
+        (
+            _validate_safety_scope(value["scope"]),
+            isinstance(intents, dict) and all(_valid_safety_intent(key, item) for key, item in intents.items()),
+            _valid_safety_recovery(value["recovery"]),
+            _valid_safety_transition(value["transition"]),
+        )
+    )
+
+
+def _valid_safety_floor(floor: object) -> bool:
+    if not isinstance(floor, dict) or set(floor) != {"boot_id", "until_monotonic", "until_utc", "remaining_seconds"}:
+        return False
+    return isinstance(floor["boot_id"], str) and all(
+        _finite_safety_number(floor[key]) for key in ("until_monotonic", "until_utc", "remaining_seconds")
+    )
+
+
+def _valid_safety_record_identity(value: dict[str, object]) -> bool:
+    return all(
+        (
+            type(value["version"]) is int,
+            value["version"] == 1,
+            isinstance(value["generation"], str),
+            bool(value["generation"]),
+        )
+    )
+
+
+def _valid_safety_intent(key: object, value: object) -> bool:
+    return (
+        isinstance(key, str)
+        and bool(key)
+        and isinstance(value, dict)
+        and set(value) == {"method", "run", "phase", "scope"}
+        and isinstance(value["method"], str)
+        and isinstance(value["run"], str)
+        and value["phase"] in {"prepared", "unknown", "acknowledged_unknown"}
+        and _valid_intent_scope(value["scope"])
+    )
+
+
+def _valid_intent_scope(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"dc_id", "key_id", "account_id"}
+        and type(value["dc_id"]) is int
+        and value["dc_id"] > 0
+        and (value["key_id"] is None or type(value["key_id"]) is int)
+        and (value["account_id"] is None or (type(value["account_id"]) is int and value["account_id"] > 0))
+    )
+
+
+def _valid_safety_recovery(value: object) -> bool:
+    if value is None:
+        return True
+    return (
+        isinstance(value, dict)
+        and set(value) == {"generation", "state", "scope", "consumed_run", "acknowledged_protection"}
+        and isinstance(value["generation"], str)
+        and value["state"] in {"authorized", "consumed", "succeeded", "failed"}
+        and _validate_safety_scope(value["scope"])
+        and (value["consumed_run"] is None or isinstance(value["consumed_run"], str))
+        and (value["acknowledged_protection"] is None or isinstance(value["acknowledged_protection"], str))
+    )
+
+
+def _valid_safety_transition(value: object) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, dict) or set(value) != {
+        "purpose",
+        "from",
+        "to_dc",
+        "phase",
+        "target_key",
+        "owned_generation",
+        "run",
+        "expected_account",
+        "validated_account",
+        "acknowledged_protection",
+    }:
+        return False
+    return all(
+        (
+            value["purpose"] in {"dc_migration", "authentication", "logout"},
+            _validate_safety_scope(value["from"]),
+            type(value["to_dc"]) is int and value["to_dc"] > 0,
+            _valid_transition_key(value["phase"], value["target_key"]),
+            type(value["owned_generation"]) is int and value["owned_generation"] >= 0,
+            isinstance(value["run"], str),
+            all(
+                value[key] is None or (type(value[key]) is int and value[key] > 0)
+                for key in ("expected_account", "validated_account")
+            ),
+            value["acknowledged_protection"] is None or isinstance(value["acknowledged_protection"], str),
+        )
+    )
+
+
+def _valid_transition_key(phase: object, key: object) -> bool:
+    if phase == "prepared":
+        return key is None
+    if phase == "key_bound":
+        return type(key) is int
+    return phase == "logout_confirmed" and (key is None or type(key) is int)
+
+
+class TelegramRpcSafetyLedger:
+    """Keep prewrite uncertainty durable without binding it to caller cancellation."""
+
+    def __init__(
+        self, store: TelegramRpcSafetyStore, *, dc_id: int, key_id: int | None, boot_id: str | None = None
+    ) -> None:
+        self._store = store
+        self._authentication_authorized = False
+        self._boot_id = boot_id if boot_id is not None else _system_boot_id()
+        self._run = uuid.uuid4().hex
+        self._lock = asyncio.Lock()
+        self._operations: set[asyncio.Task[None]] = set()
+        self._claimed: set[str] = set()
+        self._storage_failed = False
+        self._startup_hold: str | None = None
+        self._encoded: str | None = None
+        self._record: dict[str, object] = {}
+        self._read_scope_valid = False
+        try:
+            self._encoded = store.load_record()
+            self._load(dc_id, key_id)
+        except Exception:  # noqa: BLE001 - an unreadable safety backend cannot grant outbound writes.
+            self._storage_failed = True
+            self._startup_hold = self._startup_hold or "invalid_safety_receipt"
+
+    def _load(self, dc_id: int, key_id: int | None) -> None:
+        if self._encoded is None:
+            self._initialize_record(dc_id, key_id)
+            return
+        decoded = cast(object, json.loads(self._encoded))
+        if not _validate_safety_record(decoded):
+            raise ValueError("invalid Telegram safety receipt")
+        self._record = cast(dict[str, object], decoded)
+        scope = cast(dict[str, object], self._record["scope"])
+        self._startup_hold = self._scope_startup_hold(scope, dc_id, key_id)
+        self._restore_startup_protection(scope)
+        legacy = self._load_legacy_floor()
+        floor = cast(dict[str, object], self._record["floor"])
+        floor["until_utc"] = max(float(cast(float, floor["until_utc"])), float(legacy or 0))
+        self._rebase_floor(floor)
+
+    def _initialize_record(self, dc_id: int, key_id: int | None) -> None:
+        legacy = self._load_legacy_floor()
+        owners = self._store.canonical_owners()
+        self._record = {
+            "version": 1,
+            "generation": uuid.uuid4().hex,
+            "scope": {
+                "stage": "transport_only" if key_id is not None else "key_pending",
+                "dc_id": dc_id,
+                "key_id": key_id,
+                "account_id": None,
+            },
+            "floor": {
+                "boot_id": self._boot_id,
+                "until_monotonic": 0.0,
+                "until_utc": float(legacy or 0),
+                "remaining_seconds": max(0.0, float(legacy or 0) - time.time()),
+            },
+            "intents": {},
+            "protection": None,
+            "recovery": None,
+            "transition": None,
+        }
+        if not _validate_safety_record(self._record):
+            raise ValueError("invalid initial transport safety scope")
+        if key_id is None and any(owner is not None for owner in owners):
+            self._startup_hold = "new_key_conflicts_with_owned_state"
+
+    def _scope_startup_hold(self, scope: dict[str, object], dc_id: int, key_id: int | None) -> str | None:
+        if (scope["dc_id"], scope["key_id"]) != (dc_id, key_id):
+            return "safety_auth_scope_mismatch"
+        if scope["stage"] == "verified" and any(
+            owner is not None and owner != scope["account_id"] for owner in self._store.canonical_owners()
+        ):
+            return "safety_canonical_owner_mismatch"
+        return None
+
+    def _restore_startup_protection(self, scope: dict[str, object]) -> None:
+        self._read_scope_valid = self._startup_hold is None and scope["stage"] == "verified"
+        if self._unresolved():
+            self._startup_hold = self._startup_hold or "unresolved_outbound_outcome"
+        if self._record["transition"] is not None:
+            self._startup_hold = self._startup_hold or "transport_transition_incomplete"
+        recovery = self._record["recovery"]
+        if (
+            isinstance(recovery, dict)
+            and recovery["state"] == "consumed"
+            and self._startup_hold not in {"safety_auth_scope_mismatch", "safety_canonical_owner_mismatch"}
+        ):
+            self._startup_hold = "recovery_trial_incomplete"
+
+    def _rebase_floor(self, floor: dict[str, object]) -> None:
+        if floor["boot_id"] != self._boot_id:
+            remaining = max(
+                float(cast(float, floor["remaining_seconds"])),
+                float(cast(float, floor["until_utc"])) - time.time(),
+                0.0,
+            )
+            floor.update(
+                boot_id=self._boot_id,
+                until_monotonic=time.monotonic() + remaining,
+                until_utc=max(float(cast(float, floor["until_utc"])), time.time() + remaining),
+                remaining_seconds=remaining,
+            )
+
+    def _load_legacy_floor(self) -> float | None:
+        value = self._store.load_legacy_until_utc()
+        return _validate_cooldown_until_utc(value) if value is not None else None
+
+    def _unresolved(self) -> bool:
+        intents = cast(dict[str, dict[str, object]], self._record.get("intents", {}))
+        return any(item["phase"] != "acknowledged_unknown" for item in intents.values())
+
+    @property
+    def floor_deadline(self) -> float:
+        if not self._record:
+            return math.inf
+        floor = cast(dict[str, object], self._record["floor"])
+        utc_remaining = max(0.0, float(cast(float, floor["until_utc"])) - time.time())
+        if floor["boot_id"] == self._boot_id:
+            return max(float(cast(float, floor["until_monotonic"])), time.monotonic() + utc_remaining)
+        return time.monotonic() + max(utc_remaining, float(cast(float, floor["remaining_seconds"])))
+
+    @property
+    def protection_reason(self) -> str | None:
+        if self._storage_failed:
+            return "safety_storage_failure"
+        return self._startup_hold or cast(str | None, self._record.get("protection"))
+
+    @property
+    def verified_account_id(self) -> int | None:
+        if not self._read_scope_valid:
+            return None
+        if self._startup_hold in {"safety_auth_scope_mismatch", "safety_canonical_owner_mismatch"} or self._record.get(
+            "protection"
+        ) in {"safety_auth_scope_mismatch", "safety_canonical_owner_mismatch"}:
+            return None
+        transition = self._record.get("transition")
+        if (
+            isinstance(transition, dict)
+            and transition["purpose"] == "logout"
+            and transition["phase"] == "logout_confirmed"
+        ):
+            return None
+        scope = self._record.get("scope")
+        return cast(int, scope["account_id"]) if isinstance(scope, dict) and scope["stage"] == "verified" else None
+
+    def status(self) -> dict[str, object]:
+        return {
+            "generation": self._record.get("generation"),
+            "reason": self.protection_reason,
+            "retry_until_utc": time.time() + max(0.0, self.floor_deadline - time.monotonic())
+            if math.isfinite(self.floor_deadline)
+            else None,
+        }
+
+    def require_writable(self, *, auth_only: bool = False) -> None:
+        if auth_only:
+            if self._authentication_authorized and not self._storage_failed:
+                return
+            raise RuntimeError("authentication authorization is not active")
+        if self.protection_reason is not None:
+            raise TelegramRpcThrottled(
+                retry_after_seconds=None, latched=True, detail="Telegram outbound safety protection is active"
+            )
+
+    async def _commit(self, change: Callable[[dict[str, object]], None]) -> None:
+        if self._storage_failed:
+            self.require_writable()
+        task = asyncio.create_task(self._commit_owned(change))
+        self._operations.add(task)
+        task.add_done_callback(self._operation_done)
+        await asyncio.shield(task)
+
+    async def _commit_owned(self, change: Callable[[dict[str, object]], None]) -> None:
+        async with self._lock:
+            updated = cast(dict[str, object], json.loads(json.dumps(self._record)))
+            change(updated)
+            if not _validate_safety_record(updated):
+                raise ValueError("invalid outbound safety mutation")
+            encoded = json.dumps(updated, separators=(",", ":"), sort_keys=True, allow_nan=False)
+            try:
+                await self._store.save_record(self._encoded, encoded)
+            except Exception:
+                self._storage_failed = True
+                raise
+            self._record, self._encoded = updated, encoded
+
+    def _operation_done(self, task: asyncio.Task[None]) -> None:
+        self._operations.discard(task)
+        if not task.cancelled():
+            error = task.exception()
+            if error is None:
+                self._claimed.intersection_update(cast(dict[str, object], self._record["intents"]))
+
+    async def drain(self) -> None:
+        """Finish shielded mutations before the sole SQLite owner closes."""
+        cancelled = False
+        while self._operations:
+            batch = tuple(self._operations)
+            pending = asyncio.gather(*batch, return_exceptions=True)
+            while not pending.done():
+                try:
+                    await asyncio.wait({pending})
+                except asyncio.CancelledError:
+                    cancelled = True
+            # Each mutation has already applied its own storage-failure fence;
+            # retrieve semantic refusals without relabeling them as I/O faults.
+            pending.result()
+            self._operations.difference_update(batch)
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def prepare(
+        self,
+        attempt_id: str,
+        method: str,
+        *,
+        transport_identity: tuple[int, int | None] | None = None,
+        auth_only: bool = False,
+    ) -> None:
+        self.require_writable(auth_only=auth_only)
+
+        def add(record: dict[str, object]) -> None:
+            if self.protection_reason is not None:
+                self.require_writable(auth_only=auth_only)
+            intents = cast(dict[str, object], record["intents"])
+            scope = cast(dict[str, object], record["scope"])
+            dc_id, key_id = transport_identity or (cast(int, scope["dc_id"]), cast(int | None, scope["key_id"]))
+            transition = record["transition"]
+            previous = cast(dict[str, object], transition["from"]) if isinstance(transition, dict) else scope
+            binding = {"dc_id": dc_id, "key_id": key_id, "account_id": previous["account_id"]}
+            intents.setdefault(attempt_id, {"method": method, "run": self._run, "phase": "prepared", "scope": binding})
+            floor = cast(dict[str, object], record["floor"])
+            self._rebase_floor(floor)
+
+        await self._commit(add)
+
+    def mark_claimed(self, attempt_id: str, *, auth_only: bool = False) -> None:
+        self.require_writable(auth_only=auth_only)
+        if attempt_id not in cast(dict[str, object], self._record["intents"]):
+            raise RuntimeError("outbound attempt lacks durable intent")
+        self._claimed.add(attempt_id)
+
+    async def complete(
+        self,
+        attempt_id: str,
+        *,
+        known_outcome: bool,
+        floor_until_utc: float | None = None,
+        circuit_open: bool = False,
+    ) -> None:
+        def settle(record: dict[str, object]) -> None:
+            self._settle_intent(record, attempt_id, known_outcome)
+            if floor_until_utc is not None:
+                self._extend_floor(record, floor_until_utc)
+                transition = record["transition"]
+                if isinstance(transition, dict) and transition["purpose"] == "authentication":
+                    record["protection"] = "authentication_trial_failed"
+                    record["generation"] = uuid.uuid4().hex
+            if circuit_open:
+                record["protection"] = "flood_wait_circuit_open"
+                record["generation"] = uuid.uuid4().hex
+            if not known_outcome or floor_until_utc is not None:
+                self._invalidate_recovery_trial(record)
+
+        if not known_outcome and attempt_id in self._claimed:
+            self._startup_hold = "unresolved_outbound_outcome"
+        await self._commit(settle)
+        self._claimed.discard(attempt_id)
+
+    def _settle_intent(self, record: dict[str, object], attempt_id: str, known_outcome: bool) -> None:
+        intents = cast(dict[str, object], record["intents"])
+        prior = intents.get(attempt_id)
+        if isinstance(prior, dict) and prior["run"] != self._run:
+            raise ValueError("completion does not own this outbound intent")
+        if known_outcome or (
+            attempt_id not in self._claimed and (not isinstance(prior, dict) or prior["phase"] == "prepared")
+        ):
+            intents.pop(attempt_id, None)
+        elif attempt_id in intents:
+            cast(dict[str, object], intents[attempt_id])["phase"] = "unknown"
+            record["protection"] = "unresolved_outbound_outcome"
+            record["generation"] = uuid.uuid4().hex
+
+    @staticmethod
+    def _invalidate_recovery_trial(record: dict[str, object]) -> None:
+        trial = record["recovery"]
+        if not isinstance(trial, dict):
+            return
+        if trial["state"] == "authorized":
+            record["generation"] = uuid.uuid4().hex
+        if trial["state"] == "consumed":
+            trial["state"] = "failed"
+            record["protection"] = "recovery_trial_failed"
+            record["generation"] = uuid.uuid4().hex
+
+    def _extend_floor(self, record: dict[str, object], until_utc: float) -> None:
+        if not _finite_safety_number(until_utc):
+            raise ValueError("invalid safety floor")
+        floor = cast(dict[str, object], record["floor"])
+        remaining = max(0.0, until_utc - time.time())
+        floor.update(
+            boot_id=self._boot_id,
+            until_utc=max(float(cast(float, floor["until_utc"])), until_utc),
+            until_monotonic=max(self.floor_deadline, time.monotonic() + remaining),
+            remaining_seconds=max(0.0, self.floor_deadline - time.monotonic(), remaining),
+        )
+
+    async def record_floor(self, until_utc: float, *, circuit_open: bool = False) -> None:
+        def update(record: dict[str, object]) -> None:
+            self._extend_floor(record, until_utc)
+            trial = record["recovery"]
+            if isinstance(trial, dict) and trial["state"] in {"authorized", "consumed"}:
+                record["generation"] = uuid.uuid4().hex
+                if trial["state"] == "consumed":
+                    trial["state"] = "failed"
+                    record["protection"] = "recovery_trial_failed"
+            if circuit_open:
+                record["protection"] = "flood_wait_circuit_open"
+                record["generation"] = uuid.uuid4().hex
+
+        await self._commit(update)
+
+    async def verify_account(self, account_id: int) -> None:
+        if type(account_id) is not int or account_id < 1:
+            raise ValueError("invalid verified account")
+
+        def bind(record: dict[str, object]) -> None:
+            scope = cast(dict[str, object], record["scope"])
+            self._check_account_publication(scope, account_id)
+            previous = scope["account_id"]
+            if previous is not None and previous != account_id:
+                raise RuntimeError("verified safety account changed")
+            transition = record["transition"]
+            if isinstance(transition, dict) and transition["expected_account"] not in {None, account_id}:
+                raise RuntimeError("transport transition account changed")
+            scope.update(stage="verified", account_id=account_id)
+            if isinstance(transition, dict) and transition["purpose"] == "dc_migration":
+                transition["validated_account"] = account_id
+
+        await self._commit(bind)
+        self._read_scope_valid = True
+
+    def _check_account_publication(self, scope: dict[str, object], account_id: int) -> None:
+        if scope["key_id"] is None:
+            raise ValueError("account verification requires a bound transport key")
+        owners = self._store.canonical_owners()
+        verified_same = scope["stage"] == "verified" and scope["account_id"] == account_id
+        compatible = all(owner is None or owner == account_id for owner in owners)
+        if not compatible or (not verified_same and owners not in {(None, None), (account_id, account_id)}):
+            self._startup_hold = "safety_canonical_owner_mismatch"
+            self.require_writable()
+
+    async def bind_key(self, dc_id: int, key_id: int, *, auth_only: bool = False) -> None:
+        self.require_writable(auth_only=auth_only)
+
+        def bind(record: dict[str, object]) -> None:
+            self.require_writable(auth_only=auth_only)
+            scope = cast(dict[str, object], record["scope"])
+            transition = record["transition"]
+            if isinstance(transition, dict) and transition["to_dc"] == dc_id and transition["run"] == self._run:
+                if transition["phase"] != "prepared" and transition["target_key"] != key_id:
+                    raise RuntimeError("DC transition transport key changed")
+                transition.update(phase="key_bound", target_key=key_id)
+                scope.update(stage="transport_only", dc_id=dc_id, key_id=key_id, account_id=None)
+                return
+            if scope["stage"] != "key_pending" or scope["dc_id"] != dc_id:
+                raise RuntimeError("unowned authentication transition")
+            scope.update(stage="transport_only", key_id=key_id)
+
+        await self._commit(bind)
+
+    async def begin_dc_transition(self, dc_id: int, owned_generation: int) -> None:
+        self.require_writable(auth_only=self._authentication_authorized)
+
+        def begin(record: dict[str, object]) -> None:
+            self.require_writable(auth_only=self._authentication_authorized)
+            prior = record["transition"]
+            if prior is not None:
+                if isinstance(prior, dict) and prior["purpose"] == "authentication" and prior["run"] == self._run:
+                    prior.update(
+                        to_dc=dc_id,
+                        phase="prepared",
+                        target_key=None,
+                        owned_generation=owned_generation,
+                        validated_account=None,
+                    )
+                    return
+                if (
+                    isinstance(prior, dict)
+                    and prior["purpose"] == "dc_migration"
+                    and prior["run"] == self._run
+                    and prior["owned_generation"] == owned_generation
+                ):
+                    prior.update(to_dc=dc_id, phase="prepared", target_key=None, validated_account=None)
+                    return
+                raise RuntimeError("another Telegram transport transition is unresolved")
+            record["transition"] = {
+                "purpose": "dc_migration",
+                "from": dict(cast(dict[str, object], record["scope"])),
+                "to_dc": dc_id,
+                "phase": "prepared",
+                "target_key": None,
+                "owned_generation": owned_generation,
+                "run": self._run,
+                "expected_account": cast(dict[str, object], record["scope"])["account_id"],
+                "validated_account": None,
+                "acknowledged_protection": None,
+            }
+
+        await self._commit(begin)
+
+    async def finish_dc_transition(self, account_id: int) -> None:
+        if type(account_id) is not int or account_id < 1:
+            raise ValueError("invalid DC transition account")
+
+        def finish(record: dict[str, object]) -> None:
+            self.require_writable()
+            transition = record["transition"]
+            scope = cast(dict[str, object], record["scope"])
+            self._check_dc_completion(transition, scope, account_id)
+            if any(owner is not None and owner != account_id for owner in self._store.canonical_owners()):
+                raise RuntimeError("DC transition canonical account changed")
+            scope.update(stage="verified", account_id=account_id)
+            record["transition"] = None
+
+        await self._commit(finish)
+
+    def _check_dc_completion(self, transition: object, scope: dict[str, object], account_id: int) -> None:
+        if not isinstance(transition, dict) or transition["run"] != self._run or transition["phase"] != "key_bound":
+            raise RuntimeError("DC transition identity is not current")
+        previous = cast(dict[str, object], transition["from"])
+        expected = previous["account_id"]
+        if expected is not None and expected != account_id:
+            raise RuntimeError("DC transition changed Telegram account")
+        if scope["dc_id"] != transition["to_dc"] or scope["key_id"] != transition["target_key"]:
+            raise RuntimeError("DC transition transport binding changed")
+
+    async def reject_identity_result(self, *, mismatched_account: bool) -> None:
+        def reject(record: dict[str, object]) -> None:
+            record["protection"] = (
+                "safety_canonical_owner_mismatch" if mismatched_account else "invalid_account_identity"
+            )
+            record["generation"] = uuid.uuid4().hex
+
+        await self._commit(reject)
+        self._authentication_authorized = False
+
+    async def begin_authentication(
+        self, dc_id: int, key_id: int | None, *, acknowledged: bool, replace_credentials: bool = False
+    ) -> bool:
+        """Authorize bounded AUTH; return whether the owned local key must clear."""
+        if self._storage_failed or not self._record:
+            raise RuntimeError("authentication safety storage is unavailable")
+        clear_key = False
+
+        def begin(record: dict[str, object]) -> None:
+            nonlocal clear_key
+            if self.floor_deadline > time.monotonic():
+                raise ValueError("authentication cannot override a known Telegram restriction")
+            scope = cast(dict[str, object], record["scope"])
+            prior = record["transition"]
+            origin = cast(dict[str, object], prior["from"]) if isinstance(prior, dict) else scope
+            expected = self._authentication_expected_account(origin, prior)
+            clear_key = self._authentication_clear_key(
+                record, (dc_id, key_id), acknowledged=acknowledged, replace_credentials=replace_credentials
+            )
+            record["transition"] = {
+                "purpose": "authentication",
+                "from": dict(origin),
+                "to_dc": dc_id,
+                "phase": "prepared" if clear_key or key_id is None else "key_bound",
+                "target_key": None if clear_key else key_id,
+                "owned_generation": 0,
+                "run": self._run,
+                "expected_account": expected,
+                "validated_account": None,
+                "acknowledged_protection": self.protection_reason,
+            }
+            if clear_key:
+                scope.update(stage="key_pending", dc_id=dc_id, key_id=None, account_id=None)
+
+        await self._commit(begin)
+        self._authentication_authorized = True
+        return clear_key
+
+    def _authentication_clear_key(
+        self,
+        record: dict[str, object],
+        identity: tuple[int, int | None],
+        *,
+        acknowledged: bool,
+        replace_credentials: bool,
+    ) -> bool:
+        scope = cast(dict[str, object], record["scope"])
+        prior = record["transition"]
+        known_logout, pending_clear = self._authentication_prior_options(prior)
+        self._require_authentication_ack(record, prior, known_logout, acknowledged)
+        identity_matches = (scope["dc_id"], scope["key_id"]) == identity
+        clear_key = replace_credentials or pending_clear or known_logout
+        if not identity_matches and not clear_key:
+            raise RuntimeError("authentication transport binding does not match")
+        return clear_key
+
+    @staticmethod
+    def _authentication_prior_options(prior: object) -> tuple[bool, bool]:
+        if not isinstance(prior, dict):
+            return False, False
+        return (
+            prior["purpose"] == "logout" and prior["phase"] == "logout_confirmed",
+            prior["purpose"] == "authentication" and prior["phase"] == "prepared",
+        )
+
+    def _require_authentication_ack(
+        self,
+        record: dict[str, object],
+        prior: object,
+        known_logout: bool,
+        acknowledged: bool,
+    ) -> None:
+        requires_ack = self._unresolved() or record["protection"] not in {None, "authentication_required"}
+        if (requires_ack or (prior is not None and not known_logout)) and not acknowledged:
+            raise ValueError("authentication requires acknowledgement of retained protection")
+
+    def _authentication_expected_account(self, origin: dict[str, object], prior: object) -> int | None:
+        expected = cast(int | None, origin["account_id"])
+        if isinstance(prior, dict) and prior["expected_account"] is not None:
+            expected = cast(int, prior["expected_account"])
+        owners = self._store.canonical_owners()
+        if expected is None and owners != (None, None):
+            if owners[0] is None or owners[0] != owners[1]:
+                raise RuntimeError("authentication canonical owners disagree")
+            expected = owners[0]
+        if any(owner is not None and owner != expected for owner in owners):
+            raise RuntimeError("authentication canonical account changed")
+        return expected
+
+    async def begin_logout(self, owned_generation: int) -> None:
+        self.require_writable()
+        if self.verified_account_id is None:
+            raise ValueError("logout requires the currently verified account")
+
+        def begin(record: dict[str, object]) -> None:
+            self.require_writable()
+            if self.floor_deadline > time.monotonic() or record["transition"] is not None:
+                raise ValueError("logout is not eligible")
+            scope = cast(dict[str, object], record["scope"])
+            record["transition"] = {
+                "purpose": "logout",
+                "from": dict(scope),
+                "to_dc": scope["dc_id"],
+                "phase": "key_bound",
+                "target_key": scope["key_id"],
+                "owned_generation": owned_generation,
+                "run": self._run,
+                "expected_account": scope["account_id"],
+                "validated_account": scope["account_id"],
+                "acknowledged_protection": None,
+            }
+
+        await self._commit(begin)
+        self._authentication_authorized = True
+
+    async def confirm_logout(self) -> None:
+        def confirm(record: dict[str, object]) -> None:
+            transition = record["transition"]
+            if not isinstance(transition, dict) or transition["purpose"] != "logout" or transition["run"] != self._run:
+                raise RuntimeError("logout transition is not owned")
+            transition["phase"] = "logout_confirmed"
+            record["protection"] = record["protection"] or "authentication_required"
+            record["generation"] = uuid.uuid4().hex
+
+        await self._commit(confirm)
+        self._authentication_authorized = False
+
+    async def clear_logged_out_key(self) -> None:
+        def clear(record: dict[str, object]) -> None:
+            transition = record["transition"]
+            if (
+                not isinstance(transition, dict)
+                or transition["purpose"] != "logout"
+                or transition["phase"] != "logout_confirmed"
+            ):
+                raise RuntimeError("logout has not been confirmed")
+            scope = cast(dict[str, object], record["scope"])
+            scope.update(stage="key_pending", key_id=None, account_id=None)
+            transition["target_key"] = None
+
+        await self._commit(clear)
+
+    async def validate_authentication_account(self, account_id: int, *, finish: bool = False) -> bool:
+        if type(account_id) is not int or account_id < 1:
+            raise ValueError("invalid authentication account")
+
+        accepted = False
+
+        def validate(record: dict[str, object]) -> None:
+            nonlocal accepted
+            self.require_writable(auth_only=True)
+            transition = record["transition"]
+            if (
+                not isinstance(transition, dict)
+                or transition["purpose"] != "authentication"
+                or transition["run"] != self._run
+            ):
+                raise RuntimeError("authentication transition is not owned")
+            if transition["expected_account"] not in {None, account_id} or any(
+                owner is not None and owner != account_id for owner in self._store.canonical_owners()
+            ):
+                self._authentication_authorized = False
+                record["protection"] = "authentication_account_mismatch"
+                record["generation"] = uuid.uuid4().hex
+                return
+            accepted = True
+            transition["validated_account"] = account_id
+            if finish:
+                self._finish_authentication_binding(record, transition, account_id)
+
+        await self._commit(validate)
+        if finish and accepted:
+            self._read_scope_valid = True
+            self._authentication_authorized = False
+            if self._startup_hold in {
+                "new_key_conflicts_with_owned_state",
+                "transport_transition_incomplete",
+                "safety_auth_scope_mismatch",
+                "safety_canonical_owner_mismatch",
+            }:
+                self._startup_hold = None
+        return accepted
+
+    @staticmethod
+    def _finish_authentication_binding(
+        record: dict[str, object], transition: dict[str, object], account_id: int
+    ) -> None:
+        scope = cast(dict[str, object], record["scope"])
+        if transition["phase"] != "key_bound" or scope["key_id"] != transition["target_key"]:
+            raise RuntimeError("authentication transport key is not bound")
+        scope.update(stage="verified", account_id=account_id)
+        record["transition"] = None
+        if record["protection"] in {
+            "authentication_required",
+            "authentication_account_mismatch",
+            "invalid_account_identity",
+            "safety_auth_scope_mismatch",
+            "safety_canonical_owner_mismatch",
+        }:
+            record["protection"] = None
+
+    async def authorize_recovery(self, expected_generation: str, *, acknowledged: bool) -> str:
+        if not acknowledged or self.verified_account_id is None or self._storage_failed:
+            raise ValueError("recovery requires acknowledged verified safety scope")
+        if self.protection_reason not in {
+            "unresolved_outbound_outcome",
+            "recovery_trial_incomplete",
+            "recovery_trial_failed",
+            "flood_wait_circuit_open",
+            "invalid_account_identity",
+            "authentication_trial_failed",
+        }:
+            raise ValueError("account safety recovery is not available")
+        if self.floor_deadline > time.monotonic():
+            raise ValueError("known Telegram restriction has not elapsed")
+        grant = uuid.uuid4().hex
+
+        def authorize(record: dict[str, object]) -> None:
+            if self.floor_deadline > time.monotonic():
+                raise ValueError("known Telegram restriction has not elapsed")
+            if self.verified_account_id is None or self._storage_failed:
+                raise ValueError("account recovery scope is not valid")
+            if record["generation"] != expected_generation:
+                raise ValueError("stale account protection generation")
+            prior = record["recovery"]
+            if (
+                isinstance(prior, dict)
+                and prior["state"] == "authorized"
+                and prior["generation"] == record["generation"]
+            ):
+                raise ValueError("account recovery is already authorized")
+            record["generation"] = grant
+            record["recovery"] = {
+                "generation": grant,
+                "state": "authorized",
+                "scope": dict(cast(dict[str, object], record["scope"])),
+                "consumed_run": None,
+                "acknowledged_protection": self.protection_reason,
+            }
+
+        await self._commit(authorize)
+        return grant
+
+    async def consume_recovery(self) -> bool:
+        recovery = self._record.get("recovery")
+        if not isinstance(recovery, dict) or recovery["state"] != "authorized":
+            return False
+        if self._storage_failed or self.verified_account_id is None or self.floor_deadline > time.monotonic():
+            self.require_writable()
+
+        def consume(record: dict[str, object]) -> None:
+            if self._storage_failed or self.verified_account_id is None or self.floor_deadline > time.monotonic():
+                raise ValueError("recovery cannot override a current restriction or invalid scope")
+            trial = cast(dict[str, object], record["recovery"])
+            if (
+                trial["state"] != "authorized"
+                or trial["scope"] != record["scope"]
+                or trial["generation"] != record["generation"]
+            ):
+                raise ValueError("invalid recovery authorization")
+            trial.update(state="consumed", consumed_run=self._run)
+            record["generation"] = uuid.uuid4().hex
+            for intent in cast(dict[str, dict[str, object]], record["intents"]).values():
+                intent["phase"] = "acknowledged_unknown"
+            record["protection"] = None
+
+        await self._commit(consume)
+        self._startup_hold = None
+        return True
+
+    async def finish_recovery(self, account_id: int) -> None:
+        def finish(record: dict[str, object]) -> None:
+            if self.protection_reason is not None or self._unresolved() or self.floor_deadline > time.monotonic():
+                raise ValueError("recovery remains restricted or uncertain")
+            trial = record["recovery"]
+            scope = cast(dict[str, object], record["scope"])
+            if (
+                not isinstance(trial, dict)
+                or trial["state"] != "consumed"
+                or trial["consumed_run"] != self._run
+                or scope["account_id"] != account_id
+            ):
+                raise ValueError("recovery trial identity is not current")
+            trial["state"] = "succeeded"
+            record["protection"] = None
+
+        await self._commit(finish)
+
+    async def fail_recovery(self) -> None:
+        def fail(record: dict[str, object]) -> None:
+            trial = record["recovery"]
+            if isinstance(trial, dict) and trial["state"] == "consumed" and trial["consumed_run"] == self._run:
+                trial["state"] = "failed"
+                record["protection"] = "recovery_trial_failed"
+                record["generation"] = uuid.uuid4().hex
+
+        await self._commit(fail)
 
 
 _COOLDOWN_DEADLINE = 0.0
@@ -383,13 +1285,6 @@ _OBSERVED_FLOOD_IDS: set[int] = set()
 def account_cooldown_deadline() -> float:
     """Return the current process-wide monotonic cooldown deadline."""
     return _COOLDOWN_DEADLINE
-
-
-def reset_account_cooldown() -> None:
-    """Reset process policy for isolated tests and process startup."""
-    global _COOLDOWN_DEADLINE
-    _COOLDOWN_DEADLINE = 0.0
-    _OBSERVED_FLOOD_IDS.clear()
 
 
 def _validate_cooldown_until_utc(deadline_utc: float) -> float:
@@ -416,6 +1311,62 @@ class _ActiveDelivery:
     done: asyncio.Event
 
 
+@dataclass(slots=True, eq=False)
+class _WireAttempt:
+    issuer: object
+    attempt_id: str
+    method: str
+    scope: TelegramRpcScope
+    claimed: int = 0
+    dispatch_at: float | None = None
+    admission: RpcAdmission | None = None
+    receipt: asyncio.Task[None] | None = None
+    terminal: bool = False
+    self_lookup: bool = False
+    revoked: bool = False
+    preparing_task: asyncio.Task[object] | None = None
+    timing: DaemonRequestTiming | None = None
+
+
+def _application_request(request: object) -> TLRequest:
+    wrappers = (
+        functions.InvokeWithLayerRequest,
+        functions.InitConnectionRequest,
+        functions.InvokeWithoutUpdatesRequest,
+        functions.InvokeAfterMsgRequest,
+        functions.InvokeAfterMsgsRequest,
+    )
+    for _ in range(4):
+        if type(request) not in wrappers:
+            break
+        request = getattr(request, "query", None)
+    if isinstance(getattr(request, "query", None), TLRequest):
+        raise RuntimeError("unsupported nested Telegram RPC wrapper")
+    kind = type(request)
+    constructor = getattr(kind, "CONSTRUCTOR_ID", None)
+    if (
+        not isinstance(request, TLRequest)
+        or type(constructor) is not int
+        or not kind.__module__.startswith("telethon.tl.functions")
+    ):
+        raise RuntimeError("unclassified Telegram application method")
+    return request
+
+
+def _canonical_wire_method(request: object) -> str:
+    actual = _application_request(request)
+    kind = type(actual)
+    return f"{kind.__module__}.{kind.__name__}:{actual.CONSTRUCTOR_ID:08x}"
+
+
+@dataclass(slots=True)
+class _WirePermit:
+    owner: _WireAttempt
+    admission: RpcAdmission
+    generation: tuple[int, int]
+    released: bool = False
+
+
 class TelegramRpcGate(TelegramClient):
     """A Telethon client with account-global admission and transient retry.
 
@@ -438,12 +1389,16 @@ class TelegramRpcGate(TelegramClient):
         cooldown_buffer_seconds: float,
         transient_retry_delays_seconds: tuple[float, ...],
         scheduler_policy: TelegramRpcSchedulerPolicy,
+        safety_store: TelegramRpcSafetyStore,
         admission_observer: AdmissionObserver | None = None,
         rpc_request_observer: Callable[..., None] | None = None,
         flood_observer: Callable[..., None] | None = None,
-        cooldown_persistence: TelegramRpcCooldownPersistence | None = None,
         **kwargs: object,
     ) -> None:
+        requested_connection = kwargs.pop("connection", GuardedConnectionTcpFull)
+        if requested_connection is not GuardedConnectionTcpFull:
+            raise ValueError("only the owned Telegram connection is supported")
+        kwargs["connection"] = GuardedConnectionTcpFull
         kwargs["request_retries"] = 0
         kwargs["flood_sleep_threshold"] = 0
         kwargs["raise_last_call_error"] = True
@@ -463,24 +1418,36 @@ class TelegramRpcGate(TelegramClient):
         self._flood_observer = flood_observer
         self._flood_event_observer: Callable[[FloodWaitObservation], None] | None = None
         self._rpc_request_observer = rpc_request_observer
-        self._cooldown_persistence = cooldown_persistence
-        self._cooldown_save_tasks: dict[int, asyncio.Task[None]] = {}
-        self._scalar_persistence_pending: set[asyncio.Future[object]] = set()
-        self._restore_account_cooldown()
+        self._initialize_wire_authority(safety_store)
         self._scheduler_policy = scheduler_policy
-        self._limiter = (
-            AsyncLimiter(rpc_budget.max_calls_per_period, rpc_budget.period_seconds) if rpc_budget.enabled else None
-        )
+        self._limiter = AsyncLimiter(rpc_budget.max_calls_per_period, rpc_budget.period_seconds)
         self._admission_scheduler = TelegramRpcAdmissionScheduler(
             policy=self._scheduler_policy,
             limiter=self._limiter,
+            minimum_spacing_seconds=rpc_budget.period_seconds / rpc_budget.max_calls_per_period,
+            release_at=self._wire_release_at,
             observer=admission_observer,
             readiness=RpcTransportReadiness(
                 probe=self._scheduler_transport_ready,
                 wait=self._wait_for_scheduler_transport,
             ),
         )
-        self._main_sender = cast(_MainSender, object.__getattribute__(self, "_sender"))
+        unused_sender = cast(_MainSender, object.__getattribute__(self, "_sender"))
+        self._main_sender = cast(
+            _MainSender,
+            GuardedMTProtoSender(
+                unused_sender.auth_key,
+                authority=self,
+                loggers=self._log,
+                retries=self._connection_retries,
+                delay=self._retry_delay,
+                auto_reconnect=self._auto_reconnect,
+                connect_timeout=self._timeout,
+                auth_key_callback=self._auth_key_callback,
+                updates_queue=self._updates_queue,
+                auto_reconnect_callback=self._handle_auto_reconnect,
+            ),
+        )
         self._sender = _MainSenderAdapter(self)
         self._connect_owner: asyncio.Task[object] | object | None = None
         self._connection_capability: _ConnectionCapability | None = None
@@ -488,7 +1455,6 @@ class TelegramRpcGate(TelegramClient):
         self._connection_mutation_started = False
         self._connection_update_loop: asyncio.Task[object] | None = None
         self._connection_rpc_tasks: set[asyncio.Task[object]] = set()
-        self._pending_scalar_dispatches: dict[asyncio.Future[object], _PendingScalarDispatch] = {}
         self._transport_state = _TransportBoundaryState.DISCONNECTED
         self._delivery_repository: UpdateDeliveryRepository | None = None
         self._delivery_closed = False
@@ -498,6 +1464,27 @@ class TelegramRpcGate(TelegramClient):
         self._delivery_account_id: int | None = None
         self._active_delivery: _ActiveDelivery | None = None
         self._delivery_callbacks: dict[object, object] = {}
+
+    def _initialize_wire_authority(self, safety_store: TelegramRpcSafetyStore) -> None:
+        """Initialize one account-owned physical-attempt authority."""
+        self._safety_store = safety_store
+        self._safety: TelegramRpcSafetyLedger | None = None
+        self._wire_issuer = object()
+        self._vendor_call_tasks: set[asyncio.Task[object]] = set()
+        self._dc_transition_target: int | None = None
+        self._owned_disconnect: asyncio.Task[None] | None = None
+        self._scheduler_shutdown: asyncio.Task[None] | None = None
+        self._main_disconnect: asyncio.Task[object] | None = None
+        self._authentication_mode = False
+        self._logout_mode = False
+        self._authentication_token: DemandToken | None = None
+        self._wire_generation = 0
+        self._connection_budgets: WeakKeyDictionary[RpcAttemptEvidence, RpcAttemptBudget] = WeakKeyDictionary()
+        self._wire_budgets: WeakKeyDictionary[RpcAttemptEvidence, RpcAttemptBudget] = WeakKeyDictionary()
+        self._wire_fault: str | None = None
+        if self._offline_wire_identity()[0] > 0:
+            self._ensure_safety_ledger()
+        self._cooldown_save_tasks: dict[int, asyncio.Task[None]] = {}
 
     def configure_update_delivery(self, repository: UpdateDeliveryRepository) -> None:
         """Hold the vendor loop before connect; auth RPC remains available."""
@@ -645,6 +1632,8 @@ class TelegramRpcGate(TelegramClient):
     async def _preprocess_updates(
         self, updates: list[object], users: list[object], chats: list[object]
     ) -> list[object]:
+        if self._authentication_mode:
+            return self._authentication_token_updates(updates)
         repository = self._delivery_repository
         if repository is None:
             return cast(list[object], await super()._preprocess_updates(updates, users, chats))
@@ -667,6 +1656,13 @@ class TelegramRpcGate(TelegramClient):
         except BaseException:
             self._delivery_failure.set()
             raise
+
+    @staticmethod
+    def _authentication_token_updates(updates: list[object]) -> list[object]:
+        selected: list[object] = [update for update in updates if type(update) is types.UpdateLoginToken]
+        for update in selected:
+            vars(update)["_entities"] = {}
+        return selected
 
     async def _complete_update_delivery(self) -> None:
         active = self._active_delivery
@@ -705,6 +1701,8 @@ class TelegramRpcGate(TelegramClient):
             active.done.set()
 
     async def _save_states_and_entities(self) -> None:
+        if self._authentication_mode or self._logout_mode:
+            return
         if self.session is None:
             return
         if self._delivery_repository is None:
@@ -741,23 +1739,72 @@ class TelegramRpcGate(TelegramClient):
             acquisition_kind=acquisition_kind,
         )
 
+    def _close_owned_session(self) -> None:
+        if self.session is not None:
+            self.session.close()
+
+    @staticmethod
+    async def _join_vendor_disconnect(teardown: asyncio.Future[None]) -> bool:
+        cancelled = False
+        while not teardown.done():
+            try:
+                await asyncio.wait({teardown})
+            except asyncio.CancelledError:
+                cancelled = True
+        teardown.result()
+        return cancelled
+
     async def close_rpc_scheduler(self) -> None:
-        """Cancel queued admission work during final daemon shutdown."""
+        """Join all physical and persistence owners before releasing storage."""
+        if self._scheduler_shutdown is None:
+            self._scheduler_shutdown = asyncio.create_task(self._close_rpc_scheduler_owned(), context=Context())
+        cancelled = False
+        while not self._scheduler_shutdown.done():
+            try:
+                await asyncio.wait({self._scheduler_shutdown})
+            except asyncio.CancelledError:
+                cancelled = True
+        self._scheduler_shutdown.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _close_rpc_scheduler_owned(self) -> None:
+        operations = [
+            self._disconnect_main_sender,
+            self._admission_scheduler.close,
+            self._main_sender.settle_shutdown,
+            self._drain_cooldown_saves,
+        ]
+        if self._safety is not None:
+            operations.append(self._safety.drain)
+        primary: BaseException | None = None
+        for operation in operations:
+            try:
+                await operation()
+            except BaseException as error:  # noqa: BLE001 - finish every ownership barrier before re-raising.
+                primary = primary or error
         try:
-            await self._admission_scheduler.close()
-        finally:
-            await self._drain_cooldown_saves()
+            if self.session is not None:
+                self.session.close()
+        except Exception as error:  # noqa: BLE001 - retain the original teardown failure.
+            primary = primary or error
+        if primary is not None:
+            raise primary
 
     async def _drain_cooldown_saves(self) -> None:
         """Keep durable FloodWait receipts owned until shutdown can close storage."""
         cancelled = False
         while self._cooldown_save_tasks:
-            receipts = asyncio.gather(*tuple(self._cooldown_save_tasks.values()))
+            batch = dict(self._cooldown_save_tasks)
+            receipts = asyncio.gather(*batch.values())
             while not receipts.done():
                 try:
                     await asyncio.wait({receipts})
                 except asyncio.CancelledError:
                     cancelled = True
+            for key, task in batch.items():
+                if self._cooldown_save_tasks.get(key) is task:
+                    self._cooldown_save_tasks.pop(key)
             receipts.result()
         if cancelled:
             raise asyncio.CancelledError
@@ -795,6 +1842,8 @@ class TelegramRpcGate(TelegramClient):
             logger.debug("telegram_rpc_request_observation_failed", exc_info=True)
 
     def check_circuit(self) -> None:
+        if (self._authentication_mode or self._logout_mode) and self._ensure_safety_ledger()._authentication_authorized:
+            return
         status = self._rpc_circuit_status()
         if status.open:
             raise TelegramRpcThrottled(
@@ -803,33 +1852,558 @@ class TelegramRpcGate(TelegramClient):
                 detail=status.detail(),
             )
 
-    def _restore_account_cooldown(self) -> None:
-        """Translate a persisted UTC deadline into current monotonic time."""
-        persistence = self._cooldown_persistence
-        if persistence is None:
-            return
-        persisted = persistence.load_until_utc()
-        if persisted is None:
-            return
-        deadline_utc = _validate_cooldown_until_utc(persisted)
-        remaining = deadline_utc - time.time()
-        if remaining <= 0:
-            return
-        global _COOLDOWN_DEADLINE
-        _COOLDOWN_DEADLINE = max(_COOLDOWN_DEADLINE, time.monotonic() + remaining)
+    def _offline_wire_identity(self) -> tuple[int, int | None]:
+        session = self.session
+        if session is None:
+            raise RuntimeError("Telegram session identity is unavailable")
+        dc_id = cast(object, session.dc_id)
+        key = cast(object, session.auth_key)
+        key_id = cast(object, getattr(key, "key_id", None))
+        if type(dc_id) is not int or dc_id < 0 or (key_id is not None and type(key_id) is not int):
+            raise RuntimeError("invalid offline Telegram transport identity")
+        return dc_id, cast(int | None, key_id)
 
-    async def _persist_account_cooldown(self, deadline_utc: float) -> None:
-        """Persist the effective process deadline without changing FloodWait semantics."""
-        persistence = cast(
-            TelegramRpcCooldownPersistence | None,
-            getattr(self, "_cooldown_persistence", None),
+    def _ensure_safety_ledger(self) -> TelegramRpcSafetyLedger:
+        if self._safety is None:
+            dc_id, key_id = self._offline_wire_identity()
+            if dc_id < 1:
+                # Establish the vendor's ordinary initial DC before key-pending
+                # persistence; this is local session setup, not a network grant.
+                assert self.session is not None
+                self.session.set_dc(DEFAULT_DC_ID, DEFAULT_IPV6_IP if self._use_ipv6 else DEFAULT_IPV4_IP, DEFAULT_PORT)
+                dc_id, key_id = self._offline_wire_identity()
+            self._safety = TelegramRpcSafetyLedger(self._safety_store, dc_id=dc_id, key_id=key_id)
+            global _COOLDOWN_DEADLINE
+            if math.isfinite(self._safety.floor_deadline):
+                _COOLDOWN_DEADLINE = max(_COOLDOWN_DEADLINE, self._safety.floor_deadline)
+        return self._safety
+
+    def _wire_token(self) -> tuple[int, int]:
+        return self._wire_generation, self._main_sender.write_generation
+
+    def _wire_budget(self, scope: TelegramRpcScope) -> RpcAttemptBudget:
+        if scope.attempt_budget is not None:
+            return scope.attempt_budget
+        evidence = scope.attempt_evidence
+        if evidence is None:
+            raise RuntimeError("Telegram application attempt lacks a causal root")
+        budget = self._wire_budgets.get(evidence)
+        if budget is None:
+            contract = demand_contract(scope.demand_kind or current_demand_token().kind)
+            budget = RpcAttemptBudget(
+                limit=contract.max_rpc_attempts_per_slice or CONNECTION_BOOTSTRAP_MAX_RPC_ATTEMPTS
+            )
+            self._wire_budgets[evidence] = budget
+        return budget
+
+    def register_application(self, request: object, body: bytes, scope: TelegramRpcScope) -> object:
+        if not isinstance(body, bytes) or scope.deadline is None or not math.isfinite(scope.deadline):
+            raise RuntimeError("invalid owned Telegram application scope")
+        method = _canonical_wire_method(request)
+        self._check_operator_application(request, scope)
+        bootstrap = self._connection_capability is not None and (
+            self._connect_owner is asyncio.current_task() or asyncio.current_task() in self._connection_rpc_tasks
         )
-        if persistence is None:
-            return
+        self._check_unverified_application(request, bootstrap)
+        bound = replace(
+            scope,
+            request_method=method,
+            attempt_budget=self._wire_budget(scope),
+            transport_control=False,
+            transport_bootstrap=bootstrap,
+            transport_auth=self._authentication_mode or self._logout_mode,
+        )
+        owner = _WireAttempt(self._wire_issuer, uuid.uuid4().hex, method, bound, timing=current_timing())
+        actual = _application_request(request)
+        owner.self_lookup = self._is_self_lookup(actual)
+        return owner
+
+    def _check_operator_application(self, request: object, scope: TelegramRpcScope) -> None:
+        if self._logout_mode and (
+            type(_application_request(request)) is not functions.auth.LogOutRequest
+            or scope.demand_kind is not DemandKind.OPERATOR_LOGOUT
+        ):
+            raise RuntimeError("ordinary acquisition is unavailable during logout")
+        if self._authentication_mode and not self._authentication_method_allowed(request):
+            raise RuntimeError("ordinary Telegram acquisition is unavailable during authentication")
+
+    def _check_unverified_application(self, request: object, bootstrap: bool) -> None:
+        if (
+            self._ensure_safety_ledger().verified_account_id is None
+            and not bootstrap
+            and not self._authentication_mode
+            and not self._logout_mode
+            and not self._is_self_lookup(request)
+        ):
+            raise RuntimeError("unverified Telegram transport permits only owned startup identity")
+
+    @staticmethod
+    def _is_self_lookup(request: object) -> bool:
+        if type(request) is not functions.users.GetUsersRequest:
+            return False
+        actual = cast(functions.users.GetUsersRequest, request)
+        return len(actual.id) == 1 and type(actual.id[0]) is types.InputUserSelf
+
+    def register_protocol(self, request: object, body: bytes, origin: ProtocolOrigin) -> object:
+        allowed: dict[str, tuple[type[object], ...]] = {
+            "ack": (types.MsgsAck,),
+            "ping": (functions.PingRequest,),
+            "state_info": (types.MsgsStateInfo,),
+            "auth": (functions.ReqPqMultiRequest, functions.ReqDHParamsRequest, functions.SetClientDHParamsRequest),
+        }
+        if origin not in allowed or type(request) not in allowed[origin] or not isinstance(body, bytes):
+            raise RuntimeError("unclassified Telegram protocol origin")
+        if origin == "auth":
+            capability = self._connection_capability
+            if capability is None:
+                raise RuntimeError("authentication lacks an owned lifecycle capability")
+            scope = self._scope_for_connection_capability(capability)
+        else:
+            token = create_demand_token(DemandKind.TELETHON_RECONNECT_PROBE)
+            contract = demand_contract(token.kind)
+            scope = TelegramRpcScope(
+                source=token.source,
+                service_class=token.service_class,
+                deadline=token.admission_deadline,
+                owner_task=token.owner_task,
+                demand_kind=token.kind,
+                acquisition_kind=token.acquisition_kind,
+                source_outstanding_limit=contract.source_outstanding_limit,
+                attempt_evidence=token.attempt_evidence,
+            )
+        kind = type(request)
+        constructor_id = getattr(kind, "CONSTRUCTOR_ID", None)
+        if type(constructor_id) is not int:
+            raise RuntimeError("invalid Telegram protocol constructor")
+        method = f"{kind.__module__}.{kind.__name__}:{constructor_id:08x}"
+        bound = replace(
+            scope,
+            request_method=method,
+            attempt_budget=self._wire_budget(scope),
+            transport_control=origin != "auth",
+            transport_bootstrap=origin == "auth",
+            transport_auth=self._authentication_mode and origin == "auth",
+        )
+        return _WireAttempt(self._wire_issuer, uuid.uuid4().hex, method, bound)
+
+    def _require_wire_owner(self, value: object) -> _WireAttempt:
+        if not isinstance(value, _WireAttempt) or value.issuer is not self._wire_issuer:
+            raise RuntimeError("unowned Telegram transport attempt")
+        return value
+
+    def _wire_release_at(self, scope: TelegramRpcScope) -> float:
+        if not self._connection_write_ready(scope):
+            return math.inf
+        if scope.transport_control:
+            return 0.0 if self._control_scope_valid() else math.inf
+        if self._wire_fault is not None or self._safety is None:
+            return math.inf
+        auth_blocked, ordinary_blocked = self._application_holds(scope)
+        if (
+            auth_blocked
+            or ordinary_blocked
+            or (self._transport_state is not _TransportBoundaryState.READY and not scope.transport_bootstrap)
+        ):
+            return math.inf
+        return max(account_cooldown_deadline(), self._safety.floor_deadline)
+
+    def _application_holds(self, scope: TelegramRpcScope) -> tuple[bool, bool]:
+        assert self._safety is not None
+        auth_blocked = scope.transport_auth and (
+            not self._safety._authentication_authorized or self._authentication_parent_cancelled()
+        )
+        ordinary_blocked = not scope.transport_auth and (
+            self._logout_mode or self._rpc_circuit_status().open or self._safety.protection_reason is not None
+        )
+        return auth_blocked, ordinary_blocked
+
+    def _connection_write_ready(self, scope: TelegramRpcScope) -> bool:
+        return (
+            self._main_sender.physical_connected() and scope.deadline is not None and scope.deadline > time.monotonic()
+        )
+
+    def _authentication_parent_cancelled(self) -> bool:
+        if self._authentication_token is None:
+            return False
+        parent = self._authentication_token.owner_task
+        return parent is not None and (parent.done() or bool(parent.cancelling()))
+
+    def _control_scope_valid(self) -> bool:
+        ledger = self._safety
+        if ledger is None or ledger._storage_failed:
+            return False
+        identity_failures = {
+            "safety_auth_scope_mismatch",
+            "safety_canonical_owner_mismatch",
+            "authentication_account_mismatch",
+        }
+        if ledger._startup_hold in identity_failures or ledger._record.get("protection") in identity_failures:
+            return False
+        if self._transport_state in {_TransportBoundaryState.FAILED, _TransportBoundaryState.DISCONNECTING}:
+            return False
+        scope = ledger._record.get("scope")
+        return (
+            isinstance(scope, dict)
+            and scope["key_id"] is not None
+            and (scope["dc_id"], scope["key_id"]) == self._offline_wire_identity()
+        )
+
+    async def prepare_write(self, owner: object) -> object:
+        owner = self._require_wire_owner(owner)
+        task = asyncio.current_task()
+        owner.preparing_task = task
         try:
-            await persistence.save_until_utc(deadline_utc)
-        except Exception:
-            logger.exception("telegram_rpc_cooldown_persist_failed")
+            return await self._prepare_wire_write(owner)
+        finally:
+            if owner.preparing_task is task:
+                owner.preparing_task = None
+
+    async def _prepare_wire_write(self, owner: _WireAttempt) -> _WirePermit:
+        scope = owner.scope
+        if owner.revoked:
+            raise asyncio.CancelledError
+        if owner.terminal and not scope.transport_control:
+            raise RuntimeError("Telegram application attempt is terminal")
+        if scope.owner_task is not None and (scope.owner_task.done() or scope.owner_task.cancelling()):
+            raise asyncio.CancelledError
+        self._reject_exhausted_attempt_budget(scope)
+        await self._prepare_application_intent(owner)
+        if owner.admission is not None:
+            # A vendor replay starts a new physical admission, retaining the
+            # same unresolved durable operation and original budget/deadline.
+            self._admission_scheduler.complete(owner.admission)
+            owner.admission = None
+        generation = self._wire_token()
+        admission = await self._admission_scheduler.admit(scope)
+        return _WirePermit(owner, admission, generation)
+
+    async def _prepare_application_intent(self, owner: _WireAttempt) -> None:
+        scope = owner.scope
+        ledger = self._ensure_safety_ledger()
+        if not scope.transport_control:
+            ledger.require_writable(auth_only=scope.transport_auth)
+            dc_id, key_id = self._offline_wire_identity()
+            recorded_scope = cast(dict[str, object], ledger._record["scope"])
+            if key_id is not None and (
+                recorded_scope["stage"] == "key_pending"
+                or (recorded_scope["dc_id"], recorded_scope["key_id"]) != (dc_id, key_id)
+            ):
+                await ledger.bind_key(dc_id, key_id, auth_only=scope.transport_auth)
+            await ledger.prepare(
+                owner.attempt_id, owner.method, transport_identity=(dc_id, key_id), auth_only=scope.transport_auth
+            )
+
+    def _revoke_wire_owner(self, owner: _WireAttempt) -> None:
+        owner.revoked = True
+        preparing = owner.preparing_task
+        if preparing is not None and preparing is not asyncio.current_task() and not preparing.done():
+            preparing.cancel()
+
+    def claim_write(self, owner: object, permit: object) -> bool:
+        owner = self._require_wire_owner(owner)
+        if not isinstance(permit, _WirePermit) or permit.owner is not owner or permit.released:
+            raise RuntimeError("unowned Telegram write permission")
+        if not self._permit_still_eligible(owner, permit):
+            return False
+        if not self._admission_scheduler.record_dispatch(permit.admission):
+            return False
+        if owner.scope.attempt_budget is None:
+            raise RuntimeError("physical Telegram attempt lacks its original budget")
+        owner.scope.attempt_budget.debit()
+        if not owner.scope.transport_control:
+            self._ensure_safety_ledger().mark_claimed(owner.attempt_id, auth_only=owner.scope.transport_auth)
+        self._record_wire_dispatch(owner, permit)
+        return True
+
+    def _record_wire_dispatch(self, owner: _WireAttempt, permit: _WirePermit) -> None:
+        owner.claimed += 1
+        owner.dispatch_at = time.monotonic()
+        owner.admission = permit.admission
+        permit.released = True
+        if owner.timing is not None:
+            owner.timing.record_rpc_attempt()
+        kind = functions.channels.GetFullChannelRequest
+        if owner.method == f"{kind.__module__}.{kind.__name__}:{kind.CONSTRUCTOR_ID:08x}":
+            self._observe_rpc_request(owner.scope)
+
+    def _permit_still_eligible(self, owner: _WireAttempt, permit: _WirePermit) -> bool:
+        if owner.revoked:
+            return False
+        if permit.generation != self._wire_token() or self._wire_release_at(owner.scope) > time.monotonic():
+            return False
+        task = owner.scope.owner_task
+        if task is not None and (task.done() or task.cancelling()):
+            return False
+        return not (owner.scope.attempt_budget is not None and owner.scope.attempt_budget.exhausted)
+
+    def defer_write(self, owner: object, permit: object) -> None:
+        owner = self._require_wire_owner(owner)
+        if not isinstance(permit, _WirePermit) or permit.owner is not owner:
+            raise RuntimeError("unowned deferred Telegram write")
+        if not permit.released:
+            permit.released = True
+            self._admission_scheduler.complete(permit.admission)
+
+    def observe_error_now(self, owner: object, error: BaseException) -> None:
+        owner = self._require_wire_owner(owner)
+        if isinstance(error, (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError)):
+            _annotate_flood_attempt(
+                error,
+                request_method=owner.method,
+                admission_sequence=owner.admission.sequence if owner.admission is not None else None,
+                dispatch_at_monotonic=owner.dispatch_at,
+                dispatch_kind="actual_send" if owner.claimed else "never_dispatched",
+            )
+            _seconds, receipt = self._record_flood(error, scope=owner.scope, wire_owner=owner)
+            owner.receipt = receipt
+            self._admission_scheduler.notify_eligibility_changed()
+        elif not isinstance(error, RPCError) and owner.claimed and not owner.scope.transport_control:
+            self._wire_fault = "unresolved_outbound_outcome"
+            self._admission_scheduler.notify_eligibility_changed()
+
+    async def observe_result(
+        self, owner: object, error: BaseException | None, result: object = None
+    ) -> BaseException | None:
+        owner = self._require_wire_owner(owner)
+        if owner.scope.transport_control:
+            if owner.admission is not None:
+                self._admission_scheduler.complete(owner.admission)
+                owner.admission = None
+            return None
+        if owner.terminal:
+            if owner.receipt is not None:
+                await asyncio.shield(owner.receipt)
+            return None
+        try:
+            rejected = await self._guard_identity_result(owner, error, result)
+            if owner.receipt is not None:
+                await asyncio.shield(owner.receipt)
+            else:
+                known = error is None or isinstance(error, RPCError)
+                await self._ensure_safety_ledger().complete(owner.attempt_id, known_outcome=known)
+            owner.terminal = True
+            return rejected
+        finally:
+            if owner.admission is not None:
+                self._admission_scheduler.complete(owner.admission)
+                owner.admission = None
+
+    async def _guard_identity_result(
+        self, owner: _WireAttempt, error: BaseException | None, result: object
+    ) -> BaseException | None:
+        if error is not None:
+            return None
+        user = self._identity_result_user(owner, result)
+        if isinstance(user, RuntimeError):
+            await self._ensure_safety_ledger().reject_identity_result(mismatched_account=False)
+            return user
+        if user is None:
+            return None
+        ledger = self._ensure_safety_ledger()
+        if owner.scope.transport_auth:
+            if not await ledger.validate_authentication_account(user.id):
+                return RuntimeError("Telegram authentication returned a different account")
+        else:
+            transition = ledger._record["transition"]
+            scope = cast(dict[str, object], ledger._record["scope"])
+            expected = transition["expected_account"] if isinstance(transition, dict) else scope["account_id"]
+            if await self._reject_conflicting_identity(expected, user.id):
+                return RuntimeError("DC transition returned a different Telegram account")
+            await ledger.verify_account(user.id)
+        return None
+
+    async def _reject_conflicting_identity(self, expected: object, account_id: int) -> bool:
+        ledger = self._ensure_safety_ledger()
+        if expected not in {None, account_id} or any(
+            owner is not None and owner != account_id for owner in ledger._store.canonical_owners()
+        ):
+            await ledger.reject_identity_result(mismatched_account=True)
+            return True
+        return False
+
+    @staticmethod
+    def _identity_result_user(owner: _WireAttempt, result: object) -> types.User | RuntimeError | None:
+        if owner.self_lookup:
+            if isinstance(result, list) and len(result) == 1 and type(result[0]) is types.User:
+                return result[0]
+            return RuntimeError("Telegram self identity response is invalid")
+        if not owner.scope.transport_auth:
+            return None
+        if type(result) is types.auth.LoginTokenSuccess:
+            result = cast(object, cast(types.auth.LoginTokenSuccess, result).authorization)
+            if type(result) is not types.auth.Authorization:
+                return RuntimeError("Telegram authentication response is invalid")
+        if type(result) is types.auth.Authorization:
+            authorization = cast(types.auth.Authorization, result)
+            return (
+                authorization.user
+                if type(authorization.user) is types.User
+                else RuntimeError("Telegram authentication response has no account")
+            )
+        return None
+
+    def protect_transport(self, error: BaseException) -> None:
+        del error
+        self._wire_fault = "unresolved_outbound_outcome"
+        self._admission_scheduler.notify_eligibility_changed()
+
+    def transport_terminated(self, error: BaseException | None) -> BaseException | None:
+        expected = self._transport_state is _TransportBoundaryState.DISCONNECTING
+        self._wire_generation += 1
+        if not expected:
+            self._transport_state = _TransportBoundaryState.FAILED
+            self._wire_fault = self._wire_fault or "transport_terminated"
+            error = error or RuntimeError("Telegram transport terminated unexpectedly")
+        self._admission_scheduler.notify_eligibility_changed()
+        return error
+
+    def account_safety_status(self) -> dict[str, object] | None:
+        """Expose only safe protection state, never session binding material."""
+        ledger = self._ensure_safety_ledger()
+        reason = (
+            self._wire_fault
+            or ledger.protection_reason
+            or (
+                "transport_terminated"
+                if self._transport_state is _TransportBoundaryState.FAILED
+                else "operator_logout"
+                if self._logout_mode
+                else None
+            )
+        )
+        if reason is None:
+            return None
+        status = ledger.status()
+        return {
+            "generation": status["generation"],
+            "reason": reason,
+            "known_retry_until_utc": status["retry_until_utc"],
+        }
+
+    def _authentication_method_allowed(self, request: object) -> bool:
+        actual = _application_request(request)
+        if type(actual) is functions.users.GetUsersRequest:
+            return len(actual.id) == 1 and type(actual.id[0]) is types.InputUserSelf
+        if type(actual) is functions.updates.GetDifferenceRequest:
+            transition = self._ensure_safety_ledger()._record["transition"]
+            return isinstance(transition, dict) and transition["validated_account"] is not None
+        method = _canonical_wire_method(request)
+        allowed = (
+            functions.auth.ExportLoginTokenRequest,
+            functions.auth.ImportLoginTokenRequest,
+            functions.auth.CheckPasswordRequest,
+            functions.account.GetPasswordRequest,
+            functions.updates.GetStateRequest,
+            functions.updates.GetDifferenceRequest,
+            functions.help.GetConfigRequest,
+            functions.users.GetUsersRequest,
+        )
+        return any(method == f"{kind.__module__}.{kind.__name__}:{kind.CONSTRUCTOR_ID:08x}" for kind in allowed)
+
+    async def begin_authentication(
+        self, *, acknowledge_unknown_outcome: bool = False, replace_credentials: bool = False
+    ) -> None:
+        token = current_demand_token()
+        if token.kind is not DemandKind.OPERATOR_AUTH:
+            raise RuntimeError("authentication requires an explicit operator demand")
+        ledger = self._ensure_safety_ledger()
+        dc_id, key_id = self._offline_wire_identity()
+        clear_key = await ledger.begin_authentication(
+            dc_id, key_id, acknowledged=acknowledge_unknown_outcome, replace_credentials=replace_credentials
+        )
+        if clear_key:
+            assert self.session is not None
+            self.session.auth_key = None
+            cast(AuthKey, self._main_sender.auth_key).key = None
+            self.session.save()
+        self._authentication_token = token
+        self._authentication_mode = True
+
+    async def _on_login(self, user: object) -> object:
+        if not isinstance(user, types.User):
+            raise RuntimeError("login result lacks an owned authentication purpose")
+        ledger = self._ensure_safety_ledger()
+        if self._authentication_mode:
+            if not await ledger.validate_authentication_account(user.id):
+                raise RuntimeError("Telegram authentication returned a different account")
+        elif self._connection_capability is None or self._connect_owner is not asyncio.current_task():
+            raise RuntimeError("login callback lacks an owned startup purpose")
+        elif ledger.verified_account_id != user.id:
+            raise RuntimeError("startup identity was not verified before login mutation")
+        return cast(object, await super()._on_login(user))
+
+    async def finish_authentication(self) -> types.User:
+        if not self._authentication_mode:
+            raise RuntimeError("authentication is not active")
+        profile = cast(object, await self.get_me())
+        if not isinstance(profile, types.User):
+            raise RuntimeError("authentication did not return an account identity")
+        if not await self._ensure_safety_ledger().validate_authentication_account(profile.id, finish=True):
+            raise RuntimeError("Telegram authentication returned a different account")
+        # The client remains AUTH-only through teardown: it must not save the
+        # vendor message-box head or resume ordinary acquisition after binding.
+        return profile
+
+    async def logout_account(self) -> None:
+        if current_demand_token().kind is not DemandKind.OPERATOR_LOGOUT or not self.is_connected():
+            raise ValueError("logout requires the connected owned account")
+        ledger = self._ensure_safety_ledger()
+        ledger.require_writable()
+        self._logout_mode = True
+        self._admission_scheduler.notify_eligibility_changed()
+        prepared = False
+        try:
+            await ledger.begin_logout(self._wire_generation)
+            prepared = True
+            result = await self(functions.auth.LogOutRequest())
+            if type(result) is not types.auth.LoggedOut:
+                raise RuntimeError("Telegram logout was not confirmed")
+            await ledger.confirm_logout()
+            self.close_update_delivery()
+            assert self.session is not None
+            self.session.auth_key = None
+            cast(AuthKey, self._main_sender.auth_key).key = None
+            self.session.save()
+            await ledger.clear_logged_out_key()
+        except BaseException:
+            if not prepared:
+                self._logout_mode = False
+                self._admission_scheduler.notify_eligibility_changed()
+            raise
+
+    def retained_auth_scope(self) -> TelegramAuthScope | None:
+        """Previously verified matching offline scope authorizes retained reads."""
+        ledger = self._ensure_safety_ledger()
+        account_id = ledger.verified_account_id
+        if account_id is None:
+            return None
+        dc_id, key_id = self._offline_wire_identity()
+        if key_id is None:
+            return None
+        return TelegramAuthScope(AUTH_SCOPE_VERSION, account_id, dc_id, key_id)
+
+    async def authorize_account_recovery(self, expected_generation: str, acknowledged: bool) -> None:
+        await self._ensure_safety_ledger().authorize_recovery(expected_generation, acknowledged=acknowledged)
+
+    async def prepare_startup_safety(self) -> None:
+        """Consume an explicit one-use grant before any connection/bootstrap write."""
+        ledger = self._ensure_safety_ledger()
+        await ledger.consume_recovery()
+        ledger.require_writable()
+
+    async def verify_startup_account(self, account_id: int) -> None:
+        ledger = self._ensure_safety_ledger()
+        await ledger.verify_account(account_id)
+        trial = ledger._record["recovery"]
+        if isinstance(trial, dict) and trial["state"] == "consumed":
+            await ledger.finish_recovery(account_id)
+
+    async def fail_startup_recovery(self) -> None:
+        ledger = self._ensure_safety_ledger()
+        trial = ledger._record.get("recovery")
+        if ledger._storage_failed or not isinstance(trial, dict) or trial["state"] != "consumed":
+            return
+        await ledger.fail_recovery()
 
     async def __call__(
         self, request: object, ordered: bool = False, flood_sleep_threshold: int | None = None
@@ -852,6 +2426,8 @@ class TelegramRpcGate(TelegramClient):
 
     async def _call_classified(self, request: object, *, ordered: bool) -> object:
         """Dispatch after a demand context has been installed explicitly."""
+        if self._authentication_mode:
+            return await self._call_registered(request, ordered=ordered)
         if isinstance(request, (GetDifferenceRequest, GetChannelDifferenceRequest)):
             return await self._call_update_difference(request, ordered=ordered)
         return await self._call_registered(request, ordered=ordered)
@@ -896,6 +2472,36 @@ class TelegramRpcGate(TelegramClient):
                 return
             raise self._transport_unavailable()
         await self._connect_with_retry_slots()
+
+    def disconnect(self) -> asyncio.Task[None]:
+        if self._owned_disconnect is None:
+            self._owned_disconnect = self.loop.create_task(self._disconnect_owned())
+        return self._owned_disconnect
+
+    async def _disconnect_owned(self) -> None:
+        """Keep vendor teardown, late receipts and Session close owned on failure."""
+        teardown = super().disconnect()
+        if teardown is None:
+            return
+        cancelled = False
+        primary: BaseException | None = None
+        try:
+            cancelled = await self._join_vendor_disconnect(teardown)
+        except BaseException as error:  # noqa: BLE001 - Session close and receipt drain must still run.
+            primary = error
+        try:
+            if self._safety is not None:
+                await self._safety.drain()
+        except BaseException as error:  # noqa: BLE001 - preserve the first failure after all owners settle.
+            primary = primary or error
+        try:
+            self._close_owned_session()
+        except Exception as error:  # noqa: BLE001 - preserve the original transport failure.
+            primary = primary or error
+        if primary is not None:
+            raise primary
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def _connect_with_retry_slots(
         self,
@@ -1056,7 +2662,20 @@ class TelegramRpcGate(TelegramClient):
         if retry_delay:
             await asyncio.sleep(retry_delay)
         await self._check_connection_admission(scope)
-        await super()._switch_dc(dc_id)  # type: ignore[misc]
+        self._dc_transition_target = dc_id
+        try:
+            await super()._switch_dc(dc_id)  # type: ignore[misc]
+            transition = self._ensure_safety_ledger()._record["transition"]
+            if isinstance(transition, dict) and transition["purpose"] == "dc_migration":
+                account_id = transition["validated_account"]
+                if type(account_id) is not int:
+                    profile = cast(object, await self.get_me())
+                    if not isinstance(profile, types.User):
+                        raise RuntimeError("DC transition did not verify the account")
+                    account_id = profile.id
+                await self._ensure_safety_ledger().finish_dc_transition(account_id)
+        finally:
+            self._dc_transition_target = None
 
     async def _check_connection_admission(self, scope: TelegramRpcScope) -> None:
         await self._wait_for_account_cooldown(scope)
@@ -1075,6 +2694,8 @@ class TelegramRpcGate(TelegramClient):
         capability = self._connection_capability
         if capability is not None and asyncio.current_task() is self._connect_owner:
             await self._check_connection_admission(self._scope_for_connection_capability(capability))
+            if self._dc_transition_target == dc_id:
+                await self._ensure_safety_ledger().begin_dc_transition(dc_id, capability.owned_generation)
             # The vendor mutates session/auth keys immediately after this return.
             self._connection_mutation_started = True
         return dc
@@ -1138,20 +2759,38 @@ class TelegramRpcGate(TelegramClient):
                 raise self._connection_owner_deferred()
         self._raise_if_transport_unavailable()
         if owner is None:
+            if self._authentication_mode and asyncio.current_task() not in self._vendor_call_tasks:
+                await self._connect_with_retry_slots(initial_dc=new_dc)
+                return
             raise _ConnectionDcMigrationRequestedError(new_dc)
         await super()._switch_dc(new_dc)  # type: ignore[misc]
 
     def _capture_connection_capability(self) -> _ConnectionCapability:
-        """Capture an existing root or create the sole protocol bootstrap root."""
+        """Coalesce one finite mechanical allowance under the original cause."""
         try:
             token = current_demand_token()
         except MissingTelegramDemandContextError:
-            token = replace(
-                create_demand_token(DemandKind.TELETHON_CONNECTION_BOOTSTRAP),
-                acquisition_kind=AcquisitionKind.CONNECTION_BOOTSTRAP,
-            )
-            return _ConnectionCapability(token, token.admission_deadline, None)
-        return self._connection_capability_from_scope(token, current_rpc_scope())
+            token = create_demand_token(DemandKind.TELETHON_CONNECTION_BOOTSTRAP)
+            deadline = token.admission_deadline
+        else:
+            scope = current_rpc_scope()
+            if scope.deadline is None:
+                raise RuntimeError("connection owner lacks its original deadline")
+            deadline = scope.deadline
+        contract = demand_contract(DemandKind.TELETHON_CONNECTION_BOOTSTRAP)
+        child = replace(
+            token,
+            kind=contract.kind,
+            source=contract.source,
+            service_class=contract.service_class,
+            admission_deadline=deadline,
+            acquisition_kind=AcquisitionKind.CONNECTION_BOOTSTRAP,
+        )
+        budget = self._connection_budgets.get(token.attempt_evidence)
+        if budget is None:
+            budget = RpcAttemptBudget(CONNECTION_BOOTSTRAP_MAX_RPC_ATTEMPTS)
+            self._connection_budgets[token.attempt_evidence] = budget
+        return _ConnectionCapability(child, deadline, budget, self._wire_generation)
 
     @staticmethod
     def _scope_for_connection_capability(capability: _ConnectionCapability) -> TelegramRpcScope:
@@ -1331,125 +2970,46 @@ class TelegramRpcGate(TelegramClient):
         self._admission_scheduler.record_expired_before_dispatch(scope, wait_seconds=0.0)
         raise RpcAdmissionExpiredError(scope, "Telegram RPC admission deadline elapsed")
 
-    def _send_real_sender(
-        self,
-        request: object,
-        *,
-        ordered: bool = False,
-    ) -> Awaitable[object] | list[asyncio.Future[object]]:
-        return cast(_SendAttempt, self._main_sender.send)(request, ordered=ordered)
-
-    def _register_scalar_dispatch_completion(
-        self,
-        raw_future: asyncio.Future[object],
-        *,
-        scope: TelegramRpcScope,
-        request_method: str,
-        admission: RpcAdmission,
-        dispatch_at_monotonic: float,
-    ) -> None:
-        """Transfer one dispatched scalar response and its lease to the gate."""
-        self._pending_scalar_dispatches[raw_future] = _PendingScalarDispatch(
-            scope=scope,
-            request_method=request_method,
-            admission=admission,
-            dispatch_at_monotonic=dispatch_at_monotonic,
-        )
-
-        def finalize(future: asyncio.Future[object]) -> None:
-            self._finalize_scalar_dispatch(future)
-
-        raw_future.add_done_callback(finalize, context=Context())
-        if raw_future.done():
-            finalize(raw_future)
-
-    def _finalize_scalar_dispatch(self, raw_future: asyncio.Future[object]) -> None:
-        """Record terminal actual-send outcomes and release their admission once."""
-        pending = self._pending_scalar_dispatches.get(raw_future)
-        if pending is None or raw_future in self._scalar_persistence_pending:
-            return
-        if raw_future.cancelled():
-            self._settle_unconfirmed_scalar_dispatch(raw_future, pending)
-            return
-        exc = raw_future.exception()
-        if exc is not None and not isinstance(exc, RPCError):
-            self._settle_unconfirmed_scalar_dispatch(raw_future, pending)
-            return
-        if isinstance(exc, (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError)):
-            _annotate_flood_attempt(
-                exc,
-                request_method=pending.request_method,
-                admission_sequence=pending.admission.sequence,
-                dispatch_at_monotonic=pending.dispatch_at_monotonic,
-                dispatch_kind="actual_send",
-            )
-            _, receipt = self._record_flood(exc, scope=pending.scope)
-            if receipt is not None:
-                self._scalar_persistence_pending.add(raw_future)
-
-                def release(_receipt: asyncio.Task[None]) -> None:
-                    self._scalar_persistence_pending.discard(raw_future)
-                    self._release_scalar_dispatch(raw_future, pending)
-
-                receipt.add_done_callback(release, context=Context())
-                return
-        self._release_scalar_dispatch(raw_future, pending)
-
-    def _settle_unconfirmed_scalar_dispatch(
-        self, raw_future: asyncio.Future[object], pending: _PendingScalarDispatch
-    ) -> None:
-        if self._transport_state is _TransportBoundaryState.DISCONNECTED:
-            self._release_scalar_dispatch(raw_future, pending)
-        elif self._transport_state is not _TransportBoundaryState.DISCONNECTING:
-            self._transport_state = _TransportBoundaryState.FAILED
-
-    def _release_scalar_dispatch(
-        self,
-        raw_future: asyncio.Future[object],
-        pending: _PendingScalarDispatch,
-    ) -> None:
-        """Release an admission only after a response or confirmed teardown."""
-        if self._pending_scalar_dispatches.pop(raw_future, None) is not None:
-            self._admission_scheduler.complete(pending.admission)
-
     async def _disconnect_main_sender(self) -> object:
-        """Terminate raw transport, then settle every gate-owned scalar response."""
-        if self._transport_state in {_TransportBoundaryState.FAILED, _TransportBoundaryState.DISCONNECTING}:
-            raise self._transport_unavailable()
-        if self._transport_state is _TransportBoundaryState.DISCONNECTED:
-            return None
-        try:
-            connected = self._main_sender.is_connected() and self._main_sender._transport_connected()
-        except Exception:  # noqa: BLE001 - a sender-probe failure is unconfirmed termination evidence.
-            connected = False
-        if not connected:
-            self._transport_state = _TransportBoundaryState.FAILED
-            raise self._transport_unavailable()
-        self._transport_state = _TransportBoundaryState.DISCONNECTING
-        try:
-            result = await self._main_sender.disconnect()
-        except BaseException:
-            self._transport_state = _TransportBoundaryState.FAILED
-            raise
-        pending = tuple(self._pending_scalar_dispatches)
-        for raw_future in pending:
-            if not raw_future.done():
-                raw_future.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        self._transport_state = _TransportBoundaryState.DISCONNECTED
-        self._release_confirmed_teardown_dispatches()
-        await self._drain_cooldown_saves()
+        """Coalesce every public/internal teardown under one transport owner."""
+        if self._main_disconnect is None:
+            self._transport_state = _TransportBoundaryState.DISCONNECTING
+            self._wire_generation += 1
+            self._admission_scheduler.notify_eligibility_changed()
+            self._main_disconnect = asyncio.create_task(self._perform_main_disconnect(), context=Context())
+        task = self._main_disconnect
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.wait({task})
+            except asyncio.CancelledError:
+                cancelled = True
+        result = task.result()
+        if cancelled:
+            raise asyncio.CancelledError
         return result
 
-    def _release_confirmed_teardown_dispatches(self) -> None:
-        """A confirmed raw teardown is the sole fallback completion evidence."""
-        for raw_future, _pending in tuple(self._pending_scalar_dispatches.items()):
-            if raw_future.done() and not raw_future.cancelled():
-                self._finalize_scalar_dispatch(raw_future)
-            remaining = self._pending_scalar_dispatches.get(raw_future)
-            if remaining is not None and raw_future not in self._scalar_persistence_pending:
-                self._release_scalar_dispatch(raw_future, remaining)
+    async def _perform_main_disconnect(self) -> object:
+        """Stop transport, then durably retain every unresolved written attempt."""
+        primary: BaseException | None = None
+        result: object = None
+        try:
+            result = await self._main_sender.disconnect()
+        except BaseException as error:  # noqa: BLE001 - drain all owners, then re-raise the original failure.
+            primary = error
+        try:
+            await self._main_sender.settle_shutdown()
+        except BaseException as error:  # noqa: BLE001 - drain all owners, then re-raise the original failure.
+            primary = primary or error
+        try:
+            await self._drain_cooldown_saves()
+        except BaseException as error:  # noqa: BLE001 - drain all owners, then re-raise the original failure.
+            primary = primary or error
+        if primary is not None:
+            self._transport_state = _TransportBoundaryState.FAILED
+            raise primary
+        self._transport_state = _TransportBoundaryState.DISCONNECTED
+        return result
 
     async def _handle_admission_deferral(
         self,
@@ -1511,19 +3071,25 @@ class TelegramRpcGate(TelegramClient):
         self.check_circuit()
         await self._wait_for_account_cooldown(scope)
         self.check_circuit()
-        sender = _AdmissionAwareSender(self, self._send_real_sender, scope)
+        sender = _AdmissionAwareSender(self, scope)
+        task = asyncio.current_task()
+        assert task is not None
+        self._vendor_call_tasks.add(task)
         try:
             return await super()._call(sender, request, ordered=ordered)  # type: ignore[misc]
         except (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError) as exc:
             vendor_cache = self._is_vendor_cache_deferral(exc, request, sender)
-            _annotate_flood_attempt(
-                exc,
-                request_method=type(request).__name__ if vendor_cache else "unknown",
-                admission_sequence=None,
-                dispatch_at_monotonic=None,
-                dispatch_kind="vendor_cache" if vendor_cache else "unknown",
-            )
+            if vendor_cache:
+                _annotate_flood_attempt(
+                    exc,
+                    request_method=_canonical_wire_method(request),
+                    admission_sequence=None,
+                    dispatch_at_monotonic=None,
+                    dispatch_kind="vendor_cache",
+                )
             raise
+        finally:
+            self._vendor_call_tasks.discard(task)
 
     def _is_vendor_cache_deferral(
         self,
@@ -1539,12 +3105,11 @@ class TelegramRpcGate(TelegramClient):
         due = self._flood_waited_requests.get(constructor_id)
         return isinstance(due, (int, float)) and due > time.time()
 
-    async def _admit(self, scope: TelegramRpcScope) -> RpcAdmission:
-        self.check_circuit()
-        return await self._admission_scheduler.admit(scope)
-
     async def _update_loop(self) -> None:
         """Let each difference RPC and dispatched update establish its own root."""
+        if self._authentication_mode:
+            await self._authentication_update_loop()
+            return
         if self._delivery_repository is not None:
             await self._delivery_ready.wait()
             self._require_delivery_open()
@@ -1560,8 +3125,42 @@ class TelegramRpcGate(TelegramClient):
             self._restore_delivery_message_box(self._delivery_account_id)
         await super()._update_loop()  # type: ignore[misc]
 
+    async def _authentication_update_loop(self) -> None:
+        """Deliver login-token notifications without fetching or saving history."""
+        while self._main_sender.physical_connected():
+            envelope = cast(object, await self._updates_queue.get())
+            if type(envelope) in {types.Updates, types.UpdatesCombined}:
+                candidates = cast(list[object], cast(types.Updates | types.UpdatesCombined, envelope).updates)
+            elif type(envelope) is types.UpdateShort:
+                candidates = [cast(types.UpdateShort, envelope).update]
+            else:
+                candidates = [envelope]
+            for update in candidates:
+                if type(update) is not types.UpdateLoginToken:
+                    continue
+                vars(update)["_entities"] = {}
+                for builder, callback in tuple(self._event_builders):
+                    # QRLogin.wait registers this exact local-only Raw builder.
+                    # Generic dispatch would implicitly fetch GetMe first.
+                    if type(builder) is Raw and builder.types is types.UpdateLoginToken and builder.func is None:
+                        await callback(update)
+
     async def _handle_auto_reconnect(self) -> None:
         """Classify and signal Telethon's vendor reconnect probe."""
+        if self._authentication_mode:
+            token = self._authentication_token
+            if token is None:
+                raise RuntimeError("authentication reconnect lacks its original owner")
+            try:
+                active = current_demand_token()
+            except UnclassifiedTelegramDemandError:
+                with transferred_demand_context(token):
+                    await super()._handle_auto_reconnect()  # type: ignore[misc]
+            else:
+                if active.kind is not DemandKind.OPERATOR_AUTH or active.attempt_evidence is not token.attempt_evidence:
+                    raise RuntimeError("authentication reconnect inherited another owner")
+                await super()._handle_auto_reconnect()  # type: ignore[misc]
+            return
         try:
             current_demand_token()
         except UnclassifiedTelegramDemandError:
@@ -1609,32 +3208,28 @@ class TelegramRpcGate(TelegramClient):
 
     def _scheduler_transport_ready(self) -> bool:
         return (
-            self._transport_state is _TransportBoundaryState.READY
-            and not self._rpc_circuit_status().open
-            and account_cooldown_deadline() <= time.monotonic()
+            self._transport_state in {_TransportBoundaryState.READY, _TransportBoundaryState.CONNECTING}
+            and self._main_sender.physical_connected()
         )
 
     async def _wait_for_scheduler_transport(self) -> None:
         while not self._scheduler_transport_ready():
-            status = self._rpc_circuit_status()
-            delay: float
-            if self._transport_state is not _TransportBoundaryState.READY:
-                delay = self._scheduler_policy.admission_retry_seconds
-            elif status.open:
-                delay = self._scheduler_policy.update_loop_retry_seconds
-            else:
-                delay = max(account_cooldown_deadline() - time.monotonic(), 0.0)
-            await asyncio.sleep(delay)
+            await asyncio.sleep(self._scheduler_policy.admission_retry_seconds)
 
     def _begin_transport_connect(self) -> None:
         self._raise_if_transport_unavailable(allow_disconnected=True)
         if self._transport_state is not _TransportBoundaryState.DISCONNECTED:
             raise self._transport_unavailable()
+        self._owned_disconnect = None
+        self._main_disconnect = None
+        self._wire_generation += 1
         self._transport_state = _TransportBoundaryState.CONNECTING
+        self._admission_scheduler.notify_eligibility_changed()
 
     def _finish_transport_connect(self) -> None:
         if self._transport_state is _TransportBoundaryState.CONNECTING:
             self._transport_state = _TransportBoundaryState.READY
+            self._admission_scheduler.notify_eligibility_changed()
 
     def _finish_transport_connect_failure(self) -> None:
         if self._transport_state is _TransportBoundaryState.CONNECTING:
@@ -1688,7 +3283,7 @@ class TelegramRpcGate(TelegramClient):
         return seconds
 
     def _record_flood(
-        self, exc: BaseException, *, scope: TelegramRpcScope | None = None
+        self, exc: BaseException, *, scope: TelegramRpcScope | None = None, wire_owner: _WireAttempt | None = None
     ) -> tuple[int, asyncio.Task[None] | None]:
         """Extend cooldown and record one terminal FloodWait without caller ownership."""
         seconds = flood_seconds(exc, default=self._fallback_wait_seconds)
@@ -1704,11 +3299,22 @@ class TelegramRpcGate(TelegramClient):
         except Exception:
             logger.exception("flood_wait_warning_observer_failed")
         receipt = None
-        if self._cooldown_persistence is not None:
-            deadline_utc = time.time() + max(0.0, _COOLDOWN_DEADLINE - now)
-            receipt = asyncio.create_task(self._persist_account_cooldown(deadline_utc))
-            self._cooldown_save_tasks[id(exc)] = receipt
-            receipt.add_done_callback(lambda _task: self._cooldown_save_tasks.pop(id(exc), None), context=Context())
+        deadline_utc = time.time() + max(0.0, _COOLDOWN_DEADLINE - now)
+        if wire_owner is not None:
+            receipt = asyncio.create_task(
+                self._ensure_safety_ledger().complete(
+                    wire_owner.attempt_id,
+                    known_outcome=True,
+                    floor_until_utc=deadline_utc,
+                    circuit_open=self._rpc_circuit_status().open,
+                )
+            )
+        else:
+            receipt = asyncio.create_task(
+                self._ensure_safety_ledger().record_floor(deadline_utc, circuit_open=self._rpc_circuit_status().open)
+            )
+        self._cooldown_save_tasks[id(exc)] = receipt
+        receipt.add_done_callback(lambda _task: self._cooldown_save_tasks.pop(id(exc), None), context=Context())
         self._observe_flood_event(scope, attempt, seconds)
         return seconds, receipt
 
@@ -1797,14 +3403,13 @@ __all__ = [
     "RpcAdmissionSaturatedError",
     "TelegramRpcAdmissionDeferred",
     "TelegramRpcBudget",
-    "TelegramRpcCooldownPersistence",
     "TelegramRpcGate",
+    "TelegramRpcSafetyStore",
     "TelegramRpcSource",
     "TransientRpcErrors",
     "UnclassifiedTelegramRpcError",
     "account_cooldown_deadline",
     "current_rpc_scope",
-    "reset_account_cooldown",
     "rpc_attempt_budget",
     "rpc_scope",
 ]

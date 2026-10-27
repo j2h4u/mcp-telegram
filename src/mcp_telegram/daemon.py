@@ -40,7 +40,7 @@ import os
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
-from contextlib import AsyncExitStack
+from contextlib import AbstractContextManager, AsyncExitStack
 from contextvars import Context
 from dataclasses import dataclass, field
 from functools import partial
@@ -129,20 +129,18 @@ from .startup_identity import (
     StartupIdentityResult,
     StartupIdentityState,
 )
-from .state import StatePaths, ensure_private_state_dir
+from .state import StatePaths, ensure_private_state_dir, telegram_session_lease
 from .sync_db import (
     _open_sync_db,
     ensure_sync_schema,
-    load_account_cooldown_until_utc,
     load_self_profile_last_success_at,
     migrate_legacy_databases,
     open_sync_db_reader,
-    save_account_cooldown_until_utc,
     save_self_profile_last_success_at,
 )
 from .sync_transactions import enable_runtime_writes, write_transaction
 from .sync_worker import FullSyncWorker
-from .telegram import create_client
+from .telegram import create_client, make_rpc_safety_store
 from .telegram_demand import AcquisitionKind, DemandStatus, RpcAttemptBudget, acquisition_context, demand_context
 from .telegram_demand_coordinator import TelegramDemandCoordinator
 from .telegram_gateway import (
@@ -154,7 +152,6 @@ from .telegram_gateway import (
     TelethonUserProfileGateway,
 )
 from .telegram_read_receipts import TelethonTelegramReadReceiptGateway
-from .telegram_rpc import TelegramRpcCooldownPersistence
 from .telegram_rpc_consumers import DemandKind, demand_contract
 from .telegram_rpc_scheduler import (
     AdmissionObserver,
@@ -241,6 +238,19 @@ def read_operator_summary_snapshot(
 
 
 class _DaemonClient(Protocol):
+    async def logout_account(self) -> None: ...
+    def account_safety_status(self) -> dict[str, object] | None: ...
+
+    def retained_auth_scope(self) -> TelegramAuthScope | None: ...
+
+    async def prepare_startup_safety(self) -> None: ...
+
+    async def verify_startup_account(self, account_id: int) -> None: ...
+
+    async def fail_startup_recovery(self) -> None: ...
+
+    async def authorize_account_recovery(self, expected_generation: str, acknowledged: bool) -> None: ...
+
     def close_update_delivery(self) -> None: ...
 
     def configure_update_delivery(self, repository: UpdateDeliveryRepository) -> None: ...
@@ -354,6 +364,7 @@ class _SyncMainContext:
     fact_hydration_worker: MessageFactHydrationWorker
     socket_path: Path
     self_profile_cadence: SQLiteSelfProfileCadence
+    session_lease: AbstractContextManager[None] | None = None
     rpc_observation_sink: RuntimeObservationSink | None = None
     rpc_admission_observer: RpcAdmissionObservationAggregator | None = None
     coordinator: TelegramDemandCoordinator | None = None
@@ -1077,19 +1088,13 @@ def _create_telegram_client(
 ) -> _DaemonClient:
     """Create the daemon-owned Telethon subclass with account-wide policy."""
 
-    async def save_cooldown(deadline: float) -> None:
-        await writer.run(lambda owned: save_account_cooldown_until_utc(owned, deadline))
-
-    cooldown_persistence = TelegramRpcCooldownPersistence(
-        load_until_utc=partial(load_account_cooldown_until_utc, conn),
-        save_until_utc=save_cooldown,
-    )
+    safety_store = make_rpc_safety_store(conn, writer)
     client = cast(
         _DaemonClient,
         create_client(
             catch_up=True,
             config=config,
-            cooldown_persistence=cooldown_persistence,
+            safety_store=safety_store,
         ),
     )
     client.configure_update_delivery(UpdateDeliveryRepository(writer))
@@ -1101,13 +1106,27 @@ async def _build_sync_main_context() -> _SyncMainContext:
     scheduling = resolve_scheduling_config(config.scheduling)
     state_paths = StatePaths.from_state_dir(ensure_private_state_dir(config.state.dir))
     db_path = state_paths.sync_db_path
-    await asyncio.to_thread(_bootstrap_sync_database, db_path, state_paths.state_dir, config)
     async with AsyncExitStack() as cleanup:
+        lease = telegram_session_lease(state_paths.state_dir)
+        cleanup.enter_context(lease)
+        bootstrap = asyncio.create_task(
+            asyncio.to_thread(_bootstrap_sync_database, db_path, state_paths.state_dir, config)
+        )
+        cancelled = False
+        while not bootstrap.done():
+            try:
+                await asyncio.wait({bootstrap})
+            except asyncio.CancelledError:
+                cancelled = True
+        bootstrap.result()
+        if cancelled:
+            raise asyncio.CancelledError
         writer = await SQLiteWriter.open(db_path)
         cleanup.push_async_callback(writer.aclose)
         conn = open_sync_db_reader(db_path)
         cleanup.callback(conn.close)
         ctx = await _compose_sync_main_context(config, scheduling, state_paths, writer, conn, cleanup=cleanup)
+        ctx.session_lease = lease
         cleanup.pop_all()
         return ctx
 
@@ -1165,6 +1184,8 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
     _install_flood_wait_kill_switch(config, flood_wait_kill_switch_event)
 
     client = _create_telegram_client(config, conn, writer)
+    cleanup.push_async_callback(client.close_rpc_scheduler)
+    cleanup.push_async_callback(client.disconnect)
     rpc_scheduler_failure: dict[str, str | None] = {"detail": None}
 
     def health_status() -> DaemonHealthStatus:
@@ -1172,6 +1193,9 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
             return _RpcSchedulerFailureStatus("SQLite write owner is unavailable")
         if rpc_scheduler_failure["detail"] is not None:
             return _RpcSchedulerFailureStatus(rpc_scheduler_failure["detail"])
+        safety = client.account_safety_status()
+        if safety is not None:
+            return _RpcSchedulerFailureStatus(str(safety["reason"]))
         return flood_wait_kill_switch_status()
 
     topic_refresher = TopicRefresher(
@@ -1191,6 +1215,17 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
     common_chats_port = TelethonCommonChatsGateway(client)
     user_avatar_history_port = TelethonUserAvatarHistoryGateway(client)
     chat_avatar_history_port = TelethonChatAvatarHistoryGateway(client)
+
+    async def logout_account() -> None:
+        try:
+            await client.logout_account()
+        finally:
+            if client.retained_auth_scope() is None:
+                api_server._ready = False
+                api_server.self_id = None
+                api_server.self_profile = None
+                await api_server._publish_auth_scope(None)
+
     api_server = DaemonAPIServer(
         conn,
         cast(DaemonClientLike, client),
@@ -1232,6 +1267,9 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
             full_user_pair_enabled=config.entity_profile.full_user_pair_enabled,
         ),
         health_status=health_status,
+        account_safety_status=client.account_safety_status,
+        account_recovery=client.authorize_account_recovery,
+        account_logout=logout_account,
     )
     cleanup.push_async_callback(api_server.shutdown)
     socket_path = state_paths.daemon_socket_path
@@ -1338,14 +1376,21 @@ async def _connect_telegram(ctx: _SyncMainContext) -> bool:
     try:
         ctx.api_server.startup_detail = "connecting to Telegram"
         _ = ctx.api_server.startup_detail
+        await ctx.client.prepare_startup_safety()
         await ctx.client.connect()
     except (TimeoutError, OSError) as exc:
         ctx.api_server.startup_detail = f"connection failed: {exc}"
         logger.exception("sync-daemon connection failed: %s", exc)
         return False
     except (TelegramRpcThrottled, RpcAdmissionError) as exc:
+        await ctx.client.fail_startup_recovery()
         ctx.api_server.startup_detail = f"Telegram admission unavailable: {exc}"
         ctx.api_server._ready = False
+        retained_scope = ctx.client.retained_auth_scope()
+        if retained_scope is not None:
+            ctx.api_server.self_id = retained_scope.account_id
+            await ctx.api_server._publish_auth_scope(retained_scope)
+            ctx.api_server._ready = True
         logger.warning("sync-daemon Telegram admission unavailable: %s", exc)
         await ctx.shutdown_event.wait()
         return False
@@ -1368,10 +1413,18 @@ async def _acquire_startup_identity_before_updates(
         await directory.bind_account_id(own_only_context.account_id)
         await _publish_startup_identity(ctx, profile, own_only_context)
 
+    async def get_verified_self() -> object:
+        profile = await ctx.client.get_me()
+        account_id = getattr(profile, "id", None)
+        if type(account_id) is not int or account_id < 1:
+            raise RuntimeError("startup Telegram account identity is invalid")
+        await ctx.client.verify_startup_account(account_id)
+        return profile
+
     adapter = SelfProfileMaintenanceDemandAdapter(
         SelfProfileMaintenanceDependencies(
             cadence=ctx.self_profile_cadence,
-            get_me=ctx.client.get_me,
+            get_me=get_verified_self,
             update_profile=lambda profile: _update_self_profile(ctx.api_server, cast(_MeLike, profile)),
             startup=startup,
             get_input_entity=get_self_input_entity,
@@ -1777,7 +1830,12 @@ async def _close_runtime_connections(ctx: _SyncMainContext) -> None:
     try:
         await ctx.writer.aclose()
     finally:
-        ctx.conn.close()
+        try:
+            ctx.conn.close()
+        finally:
+            if ctx.session_lease is not None:
+                ctx.session_lease.__exit__(None, None, None)
+                ctx.session_lease = None
 
 
 def _record_stopped(conn: sqlite3.Connection) -> None:

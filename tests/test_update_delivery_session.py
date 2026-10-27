@@ -211,7 +211,9 @@ async def test_vendor_lifecycle_flush_keeps_pending_head_private_and_saves_peer_
     writer = await SQLiteWriter.open(path)
     client = _client(tmp_path / "session", writer)
     session = cast(SQLiteSession, client.session)
-    sender = _prepare_migration_transport(client, monkeypatch)
+    _prepare_migration_transport(client, monkeypatch)
+    sender = client._main_sender
+    assert sender is not None
     original_wait = asyncio.wait_for
 
     async def keepalive_tick(awaitable: Awaitable[object], timeout: float | None) -> object:

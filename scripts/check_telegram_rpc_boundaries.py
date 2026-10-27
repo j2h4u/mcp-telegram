@@ -1,10 +1,9 @@
 """Enforce the application-owned Telegram transport boundary.
 
 Application code receives an injected Telegram facade and must use its public
-methods. Only the transport owner may reach Telethon's private sender seam or
-an unbound superclass implementation. The two explicit exceptions are the
-maintenance client factory (used by ``logout``) and the daemon's connection
-lifecycle helpers.
+methods. Only registered transport owners may reach Telethon's private sender
+seams or an unbound superclass implementation. Lifecycle exceptions name the
+maintenance factory, stopped-service authentication and daemon connection helpers.
 """
 
 from __future__ import annotations
@@ -19,6 +18,8 @@ SOURCE_ROOT = ROOT / "src" / "mcp_telegram"
 GATE_PATH = SOURCE_ROOT / "telegram_rpc.py"
 FACTORY_PATH = SOURCE_ROOT / "telegram.py"
 DAEMON_PATH = SOURCE_ROOT / "daemon.py"
+AUTH_PATH = SOURCE_ROOT / "telegram_auth.py"
+TRANSPORT_PATH = SOURCE_ROOT / "telegram_transport.py"
 
 # These paths own the concrete Telethon type. The deploy QR helper lives in a
 # separate maintenance surface and is intentionally outside SOURCE_ROOT.
@@ -26,12 +27,32 @@ _CONCRETE_CLIENT_OWNER_PATHS = frozenset({GATE_PATH, FACTORY_PATH})
 _TRANSPORT_OWNER_PATHS = frozenset({GATE_PATH})
 _MAINTENANCE_CONSTRUCTOR_FUNCTIONS = frozenset({"create_maintenance_client"})
 _LIFECYCLE_ALLOWLIST: dict[Path, dict[str, frozenset[str]]] = {
-    FACTORY_PATH: {"logout_from_telegram": frozenset({"connect", "log_out"})},
+    FACTORY_PATH: {
+        "logout_from_telegram": frozenset({"connect", "log_out"}),
+        "maintenance_client": frozenset({"connect"}),
+    },
+    AUTH_PATH: {"authenticate": frozenset({"is_user_authorized"})},
     DAEMON_PATH: {
         "_connect_telegram": frozenset({"connect"}),
         "_monitor_flood_wait_kill_switch": frozenset({"disconnect"}),
         "_shutdown_sync_main_context": frozenset({"disconnect"}),
     },
+}
+
+# Access to an owned sender is distinct from permission to call its raw send.
+_PRIVATE_SENDER_SEAMS: dict[Path, frozenset[tuple[str, str, str]]] = {
+    GATE_PATH: frozenset({("_AdmissionAwareSender", "_send", "self._gate._main_sender")}),
+    TRANSPORT_PATH: frozenset(
+        {
+            ("_OwnedPacker", "__init__", "self._sender"),
+            ("_OwnedPacker", "append", "self._sender"),
+            ("_AuthConnectionProxy", "__init__", "self._sender"),
+            ("_AuthConnectionProxy", "send", "self._sender"),
+            ("_AuthConnectionProxy", "recv", "self._sender"),
+            ("GuardedMTProtoPlainSender", "__init__", "self._sender"),
+            ("GuardedMTProtoPlainSender", "send", "self._sender"),
+        }
+    ),
 }
 
 _LIFECYCLE_METHODS = frozenset(
@@ -63,7 +84,7 @@ _UNADMITTED_TRANSPORT_METHODS = frozenset(
 _PRIVATE_SENDER_ATTRIBUTES = frozenset({"_sender", "_main_sender"})
 _MIN_CLIENT_CHAIN_PARTS = 2
 _VENDOR_WAIT_NAMES = frozenset({"FloodWaitError", "FloodPremiumWaitError", "FloodTestPhoneWaitError"})
-_REMOVED_NAMES = frozenset({"TelegramRpcCircuitOpenError", "FloodWaitErrors"})
+_REMOVED_NAMES = frozenset({"TelegramRpcCircuitOpenError", "FloodWaitErrors", "reset_account_cooldown"})
 _GATE_NAME = "TelegramRpcGate"
 _TRANSPORT_OWNER_CLASSES = frozenset({"TelegramRpcGate", "_MainSenderAdapter"})
 _LIMITER_NAME = "AsyncLimiter"
@@ -398,7 +419,7 @@ class _BoundaryVisitor(ast.NodeVisitor):
     def _check_private_telegram_attribute(self, node: ast.Attribute) -> None:
         if node.attr == "_call" and not self.in_transport_owner:
             self._add(node, "private Telegram _call bypasses admission")
-        if node.attr in _PRIVATE_SENDER_ATTRIBUTES and not self.in_transport_owner:
+        if node.attr in _PRIVATE_SENDER_ATTRIBUTES and not (self.in_transport_owner or self._owned_sender_access(node)):
             self._add(node, "private Telegram transport sender bypasses admission")
         if (
             node.attr in _UNADMITTED_TRANSPORT_METHODS
@@ -406,6 +427,13 @@ class _BoundaryVisitor(ast.NodeVisitor):
             and not self.in_transport_owner
         ):
             self._add(node, f"Telethon {node.attr} bypasses admission through inherited transport")
+
+    def _owned_sender_access(self, node: ast.Attribute) -> bool:
+        if len(self._class_stack) != 1 or len(self._function_stack) != 1:
+            return False
+        return (self._class_stack[0], self._function_stack[0], _qualified_name(node)) in _PRIVATE_SENDER_SEAMS.get(
+            self.path, frozenset()
+        )
 
     def _check_private_sender_send(self, node: ast.Attribute) -> None:
         if (
@@ -467,6 +495,8 @@ class _BoundaryVisitor(ast.NodeVisitor):
         return False
 
     def _lifecycle_allowed(self, method: str) -> bool:
+        if self._class_stack or len(self._function_stack) != 1:
+            return False
         allowed_functions = _LIFECYCLE_ALLOWLIST.get(self.path, {})
         return method in allowed_functions.get(self.function_name or "", frozenset())
 

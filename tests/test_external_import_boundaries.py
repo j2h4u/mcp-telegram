@@ -80,6 +80,33 @@ def test_draft_import_owners_are_limited_to_projection_and_telethon_adapter() ->
     assert "drafts/owner.py" not in gate.ALLOWED_IMPORTER_PATHS["telethon"]
 
 
+def test_transport_auth_and_factory_import_owners_are_exact() -> None:
+    gate = _load_gate()
+
+    for filename, dependency in (
+        ("telegram.py", "sqlite3"),
+        ("telegram_auth.py", "telethon"),
+        ("telegram_transport.py", "telethon"),
+    ):
+        assert filename in gate.ALLOWED_IMPORTER_PATHS[dependency]
+        assert (
+            gate.violations_for(
+                gate.SOURCE_ROOT / filename,
+                f"import {dependency}\n",
+                allowed_importer_paths=gate.ALLOWED_IMPORTER_PATHS,
+                source_root=gate.SOURCE_ROOT,
+            )
+            == []
+        )
+        for neighbor in (f"neighbor_{filename}", f"nested/{filename}"):
+            assert gate.violations_for(
+                gate.SOURCE_ROOT / neighbor,
+                f"import {dependency}\n",
+                allowed_importer_paths=gate.ALLOWED_IMPORTER_PATHS,
+                source_root=gate.SOURCE_ROOT,
+            )
+
+
 def test_forbidden_import_owner_is_rejected() -> None:
     gate = _load_gate()
     path = gate.SOURCE_ROOT / "not_an_owner.py"

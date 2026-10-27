@@ -9,6 +9,11 @@ from datetime import timedelta
 from enum import StrEnum
 from types import MappingProxyType
 
+# Protective operation caps for the pinned bootstrap/auth paths, independent of
+# account rate. These are not claimed Telegram protocol maxima.
+CONNECTION_BOOTSTRAP_MAX_RPC_ATTEMPTS = 16
+OPERATOR_AUTH_MAX_RPC_ATTEMPTS = 32
+
 
 class RpcServiceClass(StrEnum):
     """Internal service classes for account-wide Telegram RPC admission."""
@@ -49,6 +54,8 @@ class TelegramRpcSource(StrEnum):
     DRAFT_SNAPSHOT = "draft_snapshot"
     MAINTENANCE = "maintenance"
     LINKED_CHAT_REFRESH = "linked_chat_refresh"
+    OPERATOR_AUTH = "operator_auth"
+    OPERATOR_LOGOUT = "operator_logout"
 
 
 class DemandKind(StrEnum):
@@ -88,6 +95,8 @@ class DemandKind(StrEnum):
     DRAFT_SNAPSHOT = "draft_snapshot"
     SELF_PROFILE_MAINTENANCE = "self_profile_maintenance"
     LINKED_CHAT_REFRESH = "linked_chat_refresh"
+    OPERATOR_AUTH = "operator_auth"
+    OPERATOR_LOGOUT = "operator_logout"
 
 
 # Scheduler order is an independent product contract.  Keep this literal: deriving
@@ -290,6 +299,26 @@ _P = AcquisitionTrigger.PERIODIC
 _PRODUCER = DemandPolicyOwner.PRODUCER
 
 _REGISTRY: dict[TelegramRpcSource, TelegramRpcConsumerSpec] = {
+    TelegramRpcSource.OPERATOR_AUTH: _consumer(
+        "Operator authentication",
+        "Authenticate the exclusively owned account Session",
+        _B,
+        TelegramFactDomain.ACCOUNT,
+        _D,
+        AcquisitionTrigger.REQUEST,
+        FanoutScope.ACCOUNT,
+        DemandPolicyOwner.CALLER,
+    ),
+    TelegramRpcSource.OPERATOR_LOGOUT: _consumer(
+        "Operator logout",
+        "Explicitly terminate the owned Telegram authorization",
+        _B,
+        TelegramFactDomain.ACCOUNT,
+        _D,
+        AcquisitionTrigger.REQUEST,
+        FanoutScope.ACCOUNT,
+        DemandPolicyOwner.CALLER,
+    ),
     TelegramRpcSource.MCP_INTERACTIVE: _consumer(
         "MCP interactive",
         "Serve an explicit MCP request requiring Telegram facts",
@@ -652,6 +681,18 @@ _PROTOCOL = ExecutionMode.PROTOCOL
 _DURABLE = ExecutionMode.DURABLE
 
 _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
+    DemandKind.OPERATOR_AUTH: _contract(
+        DemandKind.OPERATOR_AUTH,
+        TelegramRpcSource.OPERATOR_AUTH,
+        _PROTOCOL,
+        max_rpc_attempts_per_slice=OPERATOR_AUTH_MAX_RPC_ATTEMPTS,
+    ),
+    DemandKind.OPERATOR_LOGOUT: _contract(
+        DemandKind.OPERATOR_LOGOUT,
+        TelegramRpcSource.OPERATOR_LOGOUT,
+        _INLINE,
+        max_rpc_attempts_per_slice=1,
+    ),
     DemandKind.MCP_REMOTE_ACQUISITION: _contract(
         DemandKind.MCP_REMOTE_ACQUISITION, TelegramRpcSource.MCP_INTERACTIVE, _INLINE
     ),
@@ -684,6 +725,7 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         DemandKind.TELETHON_CONNECTION_BOOTSTRAP,
         TelegramRpcSource.TELETHON_CONNECTION_BOOTSTRAP,
         _PROTOCOL,
+        max_rpc_attempts_per_slice=CONNECTION_BOOTSTRAP_MAX_RPC_ATTEMPTS,
     ),
     DemandKind.RECONNECT_DIFFERENCE: _contract(
         DemandKind.RECONNECT_DIFFERENCE,
@@ -883,10 +925,10 @@ def _validate_contract_freshness(kind: DemandKind, contract: DemandContract) -> 
         raise RuntimeError(f"Telegram demand contract {kind.value} has an invalid freshness target")
 
 
-def _validate_durable_slice_bound(kind: DemandKind, contract: DemandContract) -> None:
+def _validate_attempt_bound(kind: DemandKind, contract: DemandContract) -> None:
     bound = contract.max_rpc_attempts_per_slice
     if isinstance(bound, bool) or not isinstance(bound, int) or bound < 1:
-        raise RuntimeError(f"Durable demand contract {kind.value} must have a positive slice bound")
+        raise RuntimeError(f"Demand contract {kind.value} must have a positive attempt bound")
 
 
 def _validate_durable_producer(kind: DemandKind, contract: DemandContract) -> None:
@@ -901,8 +943,13 @@ def _validate_durable_producer(kind: DemandKind, contract: DemandContract) -> No
 def _validate_contract_durable_policy(kind: DemandKind, contract: DemandContract) -> None:
     _validate_contract_freshness(kind, contract)
     if contract.execution_mode is ExecutionMode.DURABLE:
-        _validate_durable_slice_bound(kind, contract)
+        _validate_attempt_bound(kind, contract)
         _validate_durable_producer(kind, contract)
+        return
+    if kind in {DemandKind.OPERATOR_AUTH, DemandKind.OPERATOR_LOGOUT, DemandKind.TELETHON_CONNECTION_BOOTSTRAP}:
+        _validate_attempt_bound(kind, contract)
+        if contract.freshness_target is not None:
+            raise RuntimeError(f"Lifecycle demand contract {kind.value} cannot own fact freshness")
         return
     if contract.max_rpc_attempts_per_slice is not None or contract.freshness_target is not None:
         raise RuntimeError(f"Non-durable demand contract {kind.value} has durable-only policy")

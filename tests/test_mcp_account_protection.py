@@ -21,7 +21,7 @@ from mcp_telegram.feedback_service import FeedbackApplicationService
 from mcp_telegram.flood import FloodWaitKillSwitchStatus
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import RpcAttemptBudget
-from mcp_telegram.telegram_rpc import TelegramRpcGate, _MainSender, _MainSenderAdapter
+from mcp_telegram.telegram_rpc import TelegramRpcGate
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     LoudChannelProfilePort,
@@ -33,7 +33,7 @@ from tests.helpers import (
 )
 from tests.sqlite_writer_helpers import inline_writer
 from tests.test_entity_profile_full_user_pair import _prepare
-from tests.test_telegram_rpc import _CircuitStatus, _gate, _RawFutureSender, _TestRequest
+from tests.test_telegram_rpc import _CircuitStatus, _gate, _RawFutureSender, _set_sender, _TestRequest
 
 _ACTIVE_NOTICE = (
     "Telegram acquisition is blocked by account protection. Freshness and incoming coverage may be limited. "
@@ -48,8 +48,7 @@ class _SenderCallCount(Protocol):
 def _protection_gate_client() -> tuple[TelegramRpcGate, _SenderCallCount, object]:
     gate: TelegramRpcGate = _gate(_CircuitStatus(open=True))
     sender = _RawFutureSender()
-    gate._main_sender = cast(_MainSender, sender)
-    gate._sender = _MainSenderAdapter(gate)
+    _set_sender(gate, sender)
 
     class GateClient:
         async def get_entity(self, dialog_id: int) -> object:
@@ -206,12 +205,11 @@ async def test_registered_unobserved_topic_catalog_stays_local_under_protection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(mcp_server, "_schedule_telemetry", lambda _event: None)
-    from tests.test_telegram_rpc import _CircuitStatus, _gate, _RawFutureSender, _TestRequest
+    from tests.test_telegram_rpc import _CircuitStatus, _gate, _RawFutureSender, _set_sender, _TestRequest
 
     gate: TelegramRpcGate = _gate(_CircuitStatus(open=True))
     sender = _RawFutureSender()
-    gate._main_sender = cast(_MainSender, sender)
-    gate._sender = _MainSenderAdapter(gate)
+    _set_sender(gate, sender)
     circuit_checks = 0
     original_check = gate.check_circuit
 

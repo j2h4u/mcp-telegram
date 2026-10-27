@@ -25,11 +25,10 @@ from mcp_telegram.telegram_rpc_scheduler import (
     current_rpc_scope,
     rpc_attempt_budget,
 )
+from tests.test_telegram_rpc import _Sender, _set_sender, _TestRequest
 from tests.test_telegram_rpc_scheduler_integration import (
     _ControlledLimiter,
     _make_gate,
-    _ScalarRequest,
-    _SynchronousSender,
     _wait_until,
 )
 
@@ -186,10 +185,10 @@ async def test_parent_cancel_removes_actual_gate_ticket_before_limiter_release()
     limiter = _ControlledLimiter()
     events: list[RpcAdmissionEvent] = []
     gate = _make_gate(limiter, TelegramRpcSchedulerConfig(), events)
-    sent: list[tuple[TelegramRpcSource, object]] = []
-    gate._main_sender = gate._sender = _SynchronousSender(sent)  # pyright: ignore[reportAttributeAccessIssue]
-    cancelled_request = _ScalarRequest("cancelled")
-    survivor_request = _ScalarRequest("survivor")
+    sender = _Sender(lambda request: request)
+    _set_sender(gate, sender)
+    cancelled_request = _TestRequest("cancelled")
+    survivor_request = _TestRequest("survivor")
 
     async def parent() -> None:
         with demand_context(DemandKind.ARCHIVE_INCREMENTAL):
@@ -210,9 +209,12 @@ async def test_parent_cancel_removes_actual_gate_ticket_before_limiter_release()
             await asyncio.wait_for(task, timeout=1)
         await _wait_until(lambda: all(depth == 0 for depth in gate._admission_scheduler.queue_depths().values()))
         following = asyncio.create_task(survivor())
+        await _wait_until(lambda: sum(gate._admission_scheduler.queue_depths().values()) == 1)
         await limiter.allow_one()
         await asyncio.wait_for(following, timeout=1)
-        assert sent == [(TelegramRpcSource.FULL_SYNC, survivor_request)]
+        assert [(scope.source, request) for scope, request in zip(sender.scopes, sender.sent, strict=True)] == [
+            (TelegramRpcSource.FULL_SYNC, survivor_request)
+        ]
         assert any(event.kind is RpcAdmissionEventKind.CANCELLED for event in events)
         assert gate._admission_scheduler.queue_depths() == dict.fromkeys(RpcServiceClass, 0)
         assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)

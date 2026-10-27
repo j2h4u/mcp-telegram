@@ -38,6 +38,16 @@ from mcp_telegram.telegram_rpc_scheduler import RPC_SOURCE_SERVICE_CLASS
 
 def _write_config(tmp_path: Path, contents: str) -> Path:
     path = tmp_path / "config.toml"
+    if "[telegram_rpc]" in contents:
+        contents = contents.replace("[telegram_rpc]\n", "[telegram_rpc]\ntransport_contract_version = 1\n", 1)
+    elif "[telegram_rpc.scheduler]" in contents:
+        contents = contents.replace(
+            "[telegram_rpc.scheduler]",
+            "[telegram_rpc]\ntransport_contract_version = 1\n\n[telegram_rpc.scheduler]",
+            1,
+        )
+    else:
+        contents += "\n[telegram_rpc]\ntransport_contract_version = 1\n"
     path.write_text(contents, encoding="utf-8")
     return path
 
@@ -63,6 +73,16 @@ def test_load_config_uses_frozen_typed_defaults(tmp_path: Path) -> None:
     assert config.logging.daemon_api_slow_request_seconds == 1.0
     with pytest.raises(FrozenInstanceError):
         config.freshness.read_receipts.read_at_ttl_seconds = 1  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("version", [None, "true", "2", "1.0", "'1'"])
+def test_load_config_requires_exact_transport_contract_version(tmp_path: Path, version: str | None) -> None:
+    path = tmp_path / "config.toml"
+    marker = "" if version is None else f"transport_contract_version = {version}\n"
+    path.write_text(f'[state]\ndir = "/state"\n\n[telegram_rpc]\n{marker}', encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="transport_contract_version"):
+        load_config(path)
 
 
 def test_runtime_observation_row_cap_covers_rpc_summary_retention_budget() -> None:
@@ -645,6 +665,9 @@ def test_load_config_reports_malformed_toml_with_path(tmp_path: Path) -> None:
 
 def test_load_config_rejects_removed_entity_refresh_concurrency(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
-    path.write_text('[state]\ndir = "/state"\n\n[entity_profile]\nmax_concurrent_refreshes = 1\n')
+    path.write_text(
+        '[state]\ndir = "/state"\n\n[telegram_rpc]\ntransport_contract_version = 1\n'
+        "\n[entity_profile]\nmax_concurrent_refreshes = 1\n"
+    )
     with pytest.raises(ConfigError, match="max_concurrent_refreshes"):
         load_config(path)

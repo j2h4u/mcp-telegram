@@ -1,14 +1,28 @@
 import logging
-from functools import cache
+import sqlite3
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
+from functools import cache, partial
 from typing import cast
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from telethon import TelegramClient  # type: ignore[import-untyped]
+from telethon.sessions import SQLiteSession
 
-from .config import McpTelegramConfig, load_config
+from .config import McpTelegramConfig
 from .flood import flood_wait_kill_switch_status, observe_flood_wait
-from .state import ensure_private_state_dir
-from .telegram_rpc import TelegramRpcBudget, TelegramRpcCooldownPersistence, TelegramRpcGate
+from .sqlite_writer import SQLiteWriter
+from .state import StatePaths, ensure_private_state_dir, telegram_session_lease
+from .sync_db import (
+    ensure_sync_schema,
+    load_account_cooldown_until_utc,
+    load_rpc_safety_owners,
+    load_rpc_safety_record,
+    open_sync_db_reader,
+    save_rpc_safety_record,
+)
+from .telegram_demand import demand_context
+from .telegram_rpc import TelegramRpcBudget, TelegramRpcGate, TelegramRpcSafetyStore
+from .telegram_rpc_consumers import DemandKind
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +34,7 @@ def _load_settings() -> TelegramSettings:
 class TelegramSettings(BaseSettings):
     """Reads TELEGRAM_* settings from environment or ``.env`` in CWD."""
 
-    model_config = SettingsConfigDict(env_prefix="TELEGRAM_", env_file=".env")
+    model_config = SettingsConfigDict(env_prefix="TELEGRAM_", env_file=".env", extra="ignore")
 
     api_id: str
     api_hash: str
@@ -28,9 +42,12 @@ class TelegramSettings(BaseSettings):
 
 async def logout_from_telegram() -> None:
     """Terminate the active Telegram session and delete the local session file."""
-    client = create_maintenance_client()
-    await client.connect()
-    await client.log_out()
+    from .daemon_client import daemon_connection
+
+    async with daemon_connection() as connection:
+        response = await connection.request({"method": "logout_account"})
+    if response.get("ok") is not True:
+        raise RuntimeError("Telegram logout was not confirmed by the owned daemon")
     print("You are now logged out from Telegram.")
 
 
@@ -42,12 +59,12 @@ def create_client(  # noqa: PLR0913 - explicit cached client construction depend
     catch_up: bool = False,
     *,
     config: McpTelegramConfig,
-    cooldown_persistence: TelegramRpcCooldownPersistence | None = None,
+    safety_store: TelegramRpcSafetyStore,
 ) -> TelegramRpcGate:
     """Return a cached TelegramClient singleton for the given credentials.
 
     ``@cache`` means the same instance is returned for identical
-    ``(api_id, api_hash, session_name, catch_up, config, cooldown_persistence)``
+    ``(api_id, api_hash, session_name, catch_up, config, safety_store)``
     arguments within the process lifetime.
     Callers should use ``connected_client()`` for connection lifecycle management.
 
@@ -85,26 +102,50 @@ def create_client(  # noqa: PLR0913 - explicit cached client construction depend
         transient_retry_delays_seconds=config.telegram_rpc.transient_retry_delays_seconds,
         scheduler_policy=config.telegram_rpc.scheduler,
         flood_observer=observe_flood_wait,
-        cooldown_persistence=cooldown_persistence,
+        safety_store=safety_store,
     )
 
 
-@cache
-def create_maintenance_client(
-    api_id: str | None = None,
-    api_hash: str | None = None,
-    session_name: str = "mcp_telegram_session",
-) -> TelegramClient:
-    """Return a plain Telethon client for explicit maintenance operations."""
-    if api_id is not None and api_hash is not None:
-        settings = TelegramSettings(api_id=api_id, api_hash=api_hash)
-    else:
-        settings = _load_settings()
-    state_home = ensure_private_state_dir(load_config().state.dir, mode=0o700)
-    return TelegramClient(
-        state_home / session_name,
-        cast(int, settings.api_id),
-        cast(str, settings.api_hash),
-        base_logger="telethon",
-        auto_reconnect=True,
+def make_rpc_safety_store(conn: sqlite3.Connection, writer: SQLiteWriter) -> TelegramRpcSafetyStore:
+    """Use the same serialized safety backend for daemon and stopped auth."""
+
+    async def save(expected: str | None, encoded: str) -> None:
+        await writer.run(lambda owned: save_rpc_safety_record(owned, expected, encoded))
+
+    return TelegramRpcSafetyStore(
+        partial(load_rpc_safety_record, conn),
+        save,
+        partial(load_account_cooldown_until_utc, conn),
+        partial(load_rpc_safety_owners, conn),
     )
+
+
+@asynccontextmanager
+async def maintenance_client(
+    config: McpTelegramConfig, *, acknowledge_unknown_outcome: bool = False, replace_credentials: bool = False
+) -> AsyncIterator[TelegramRpcGate]:
+    """Stopped-service AUTH shares the daemon's Session and safety ownership."""
+    state_home = ensure_private_state_dir(config.state.dir, mode=0o700)
+    paths = StatePaths.from_state_dir(state_home)
+    async with AsyncExitStack() as resources:
+        resources.enter_context(telegram_session_lease(state_home))
+        ensure_sync_schema(paths.sync_db_path)
+        writer = await SQLiteWriter.open(paths.sync_db_path)
+        resources.push_async_callback(writer.aclose)
+        reader = open_sync_db_reader(paths.sync_db_path)
+        resources.callback(reader.close)
+        client = create_client.__wrapped__(config=config, safety_store=make_rpc_safety_store(reader, writer))
+        if not isinstance(client.session, SQLiteSession):
+            raise RuntimeError("stopped authentication requires the owned SQLite Session")
+        client.session.save_entities = False
+        resources.push_async_callback(client.close_rpc_scheduler)
+        resources.push_async_callback(client.disconnect)
+        session_path = state_home / "mcp_telegram_session.session"
+        if session_path.exists():
+            session_path.chmod(0o600)
+        with demand_context(DemandKind.OPERATOR_AUTH):
+            await client.begin_authentication(
+                acknowledge_unknown_outcome=acknowledge_unknown_outcome, replace_credentials=replace_credentials
+            )
+            await client.connect()
+            yield client

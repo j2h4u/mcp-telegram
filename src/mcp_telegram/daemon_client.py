@@ -695,6 +695,16 @@ class DaemonConnection:
         """Read the daemon's current account-protection status."""
         return await self.request({"method": "get_account_protection"})
 
+    async def recover_account(self, *, expected_generation: str, acknowledge_unknown_outcome: bool) -> dict:
+        """Authorize a bounded account recovery using a generation compare-and-swap."""
+        return await self.request(
+            {
+                "method": "recover_account",
+                "expected_generation": expected_generation,
+                "acknowledge_unknown_outcome": acknowledge_unknown_outcome,
+            }
+        )
+
 
 # ---------------------------------------------------------------------------
 # Context manager

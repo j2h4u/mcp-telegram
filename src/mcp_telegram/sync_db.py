@@ -1,4 +1,5 @@
 import fcntl
+import json
 import logging
 import math
 import sqlite3
@@ -59,6 +60,7 @@ _DRAFT_RECOVERY_SCHEMA_75 = 75
 _DRAFT_SOURCE_ORDER_SCHEMA_76 = 76
 
 _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
+_RPC_SAFETY_RECORD_KEY = "telegram_rpc_safety"
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
 
 # Product-owned scheduled reconciliation targets.  Keep these values here so
@@ -1549,32 +1551,124 @@ def load_account_cooldown_until_utc(conn: sqlite3.Connection) -> float | None:
         return None
     try:
         deadline = float(cast(str | bytes | int | float, row[0]))
-    except TypeError, ValueError:
-        logger.warning("invalid persisted Telegram account cooldown deadline")
-        return None
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid persisted Telegram account cooldown deadline") from exc
     if not math.isfinite(deadline) or deadline < 0:
-        logger.warning("invalid persisted Telegram account cooldown deadline")
-        return None
+        raise ValueError("invalid persisted Telegram account cooldown deadline")
     return deadline
 
 
-def save_account_cooldown_until_utc(conn: sqlite3.Connection, deadline_utc: float | None) -> None:
-    """Atomically replace or clear the finite account cooldown UTC deadline."""
-    if deadline_utc is None:
-        with write_transaction(conn):
-            conn.execute("DELETE FROM daemon_state WHERE key = ?", (_ACCOUNT_COOLDOWN_UNTIL_UTC_KEY,))
-        return
-    if (
-        isinstance(deadline_utc, bool)
-        or not isinstance(deadline_utc, (int, float))
-        or not math.isfinite(float(deadline_utc))
-        or deadline_utc < 0
-    ):
-        raise ValueError("deadline_utc must be a finite non-negative Unix timestamp or None")
+def load_rpc_safety_record(conn: sqlite3.Connection) -> str | None:
+    """Load the exact durable Telegram RPC safety record encoding."""
+    row = cast(
+        tuple[object] | None,
+        conn.execute("SELECT value FROM daemon_state WHERE key = ?", (_RPC_SAFETY_RECORD_KEY,)).fetchone(),
+    )
+    if row is None:
+        return None
+    if not isinstance(row[0], str):
+        raise ValueError("persisted Telegram RPC safety record is not text")
+    return row[0]
+
+
+def load_rpc_safety_owners(conn: sqlite3.Connection) -> tuple[int | None, int | None]:
+    """Return canonical directory and update-delivery account owners."""
+    directory = cast(
+        tuple[int | None] | None,
+        conn.execute("SELECT account_id FROM dialog_directory_state WHERE singleton=1").fetchone(),
+    )
+    delivery = cast(
+        tuple[int | None] | None, conn.execute("SELECT account_id FROM update_delivery WHERE singleton=1").fetchone()
+    )
+    return (None if directory is None else directory[0], None if delivery is None else delivery[0])
+
+
+def _validate_rpc_safety_scope_fields(scope: dict[object, object]) -> int | None:
+    dc_id = scope.get("dc_id")
+    key_id = scope.get("key_id")
+    account_id = scope.get("account_id")
+    if type(dc_id) is not int or dc_id <= 0:
+        raise ValueError("invalid Telegram RPC safety record scope")
+    if any(identity is not None and (type(identity) is not int or identity <= 0) for identity in (key_id, account_id)):
+        raise ValueError("invalid Telegram RPC safety record scope")
+    return cast(int | None, account_id)
+
+
+def _validate_rpc_safety_transition(record: dict[str, object], account_id: int | None) -> int | None:
+    transition = record.get("transition")
+    expected_account = transition.get("expected_account") if isinstance(transition, dict) else None
+    if expected_account is not None and (type(expected_account) is not int or expected_account <= 0):
+        raise ValueError("invalid Telegram RPC safety transition owner")
+    if account_id is not None and expected_account is not None and account_id != expected_account:
+        raise ValueError("Telegram RPC safety transition owner conflicts with scope")
+    return cast(int | None, expected_account)
+
+
+def _validate_rpc_safety_scope(record: dict[str, object]) -> tuple[int | None, int | None]:
+    scope = record.get("scope")
+    if not isinstance(scope, dict) or scope.get("stage") not in {"key_pending", "transport_only", "verified"}:
+        raise ValueError("invalid Telegram RPC safety record scope")
+    account_id = _validate_rpc_safety_scope_fields(cast(dict[object, object], scope))
+    return account_id, _validate_rpc_safety_transition(record, account_id)
+
+
+def _validate_rpc_safety_floor(floor: object) -> float:
+    if not isinstance(floor, dict) or not isinstance(floor.get("boot_id"), str):
+        raise ValueError("invalid Telegram RPC safety record floor")
+    until_utc = floor.get("until_utc")
+    for field in ("until_monotonic", "until_utc", "remaining_seconds"):
+        number = floor.get(field)
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, (int, float))
+            or not math.isfinite(float(number))
+            or number < 0
+        ):
+            raise ValueError("invalid Telegram RPC safety record floor")
+    return float(cast(int | float, until_utc))
+
+
+def _validate_rpc_safety_record(value: str) -> tuple[int | None, float]:
+    try:
+        record = cast(object, json.loads(value))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid Telegram RPC safety record JSON") from exc
+    if not isinstance(record, dict) or type(record.get("version")) is not int or record["version"] != 1:
+        raise ValueError("invalid Telegram RPC safety record version")
+    account_id, expected_account = _validate_rpc_safety_scope(cast(dict[str, object], record))
+    floor_utc = _validate_rpc_safety_floor(record.get("floor"))
+    if not record.get("generation") or not isinstance(record.get("generation"), str):
+        raise ValueError("invalid Telegram RPC safety record generation")
+    scope = cast(dict[str, object], record.get("scope"))
+    return (account_id if scope["stage"] == "verified" else expected_account, floor_utc)
+
+
+def save_rpc_safety_record(conn: sqlite3.Connection, expected: str | None, value: str) -> None:
+    """CAS-write the encoded safety record and atomically preserve its UTC cooldown floor."""
+    if not isinstance(value, str):
+        raise ValueError("Telegram RPC safety record must be text")
+    account_id, floor_utc = _validate_rpc_safety_record(value)
     with write_transaction(conn):
+        current = load_rpc_safety_record(conn)
+        if current != expected:
+            raise ValueError("stale Telegram RPC safety record")
+        if account_id is not None:
+            owners = load_rpc_safety_owners(conn)
+            if any(owner is not None and owner != account_id for owner in owners):
+                raise ValueError("Telegram RPC safety account conflicts with canonical owner")
+        legacy_row = cast(
+            tuple[object] | None,
+            conn.execute("SELECT value FROM daemon_state WHERE key = ?", (_ACCOUNT_COOLDOWN_UNTIL_UTC_KEY,)).fetchone(),
+        )
+        previous_floor = load_account_cooldown_until_utc(conn) if legacy_row is not None else None
+        maximum_floor = max(floor_utc, previous_floor or 0.0)
         conn.execute(
-            "INSERT INTO daemon_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (_ACCOUNT_COOLDOWN_UNTIL_UTC_KEY, repr(float(deadline_utc))),
+            "INSERT INTO daemon_state(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (_RPC_SAFETY_RECORD_KEY, value),
+        )
+        conn.execute(
+            "INSERT INTO daemon_state(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (_ACCOUNT_COOLDOWN_UNTIL_UTC_KEY, repr(maximum_floor)),
         )
 
 

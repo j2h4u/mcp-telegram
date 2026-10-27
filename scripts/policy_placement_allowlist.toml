@@ -57,11 +57,6 @@ rationale = "This is process-global mutable gate state, not an operator-configur
 
 [[entry]]
 category = "policy_assignments"
-key = "src/mcp_telegram/telegram_rpc.py:reset_account_cooldown:_COOLDOWN_DEADLINE"
-rationale = "This test/process reset clears process-global mutable gate state."
-
-[[entry]]
-category = "policy_assignments"
 key = "src/mcp_telegram/reading/service.py:ReadingService._fetch_telegram_batches:last_batch_size"
 rationale = "This is observed batch-result metadata, not an operator-tuned limit."
 
@@ -347,6 +342,11 @@ rationale = "This is fixed text for a daemon timeout error response."
 
 # These are local SQLite/API contract values, not daemon operator policy.  Keep
 # each new exclusion individually justified so additions are reviewable.
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/telegram_rpc.py:TelegramRpcGate._initialize_wire_authority:self._cooldown_save_tasks"
+rationale = "Empty runtime task map tracks pending cooldown persistence receipts; it sets no timeout or scheduling policy."
+
 [[entry]]
 category = "policy_call_keywords"
 key = "src/mcp_telegram/__init__.py:feedback_list:timeout"

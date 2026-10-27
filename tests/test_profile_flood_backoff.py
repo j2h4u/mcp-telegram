@@ -16,7 +16,7 @@ from mcp_telegram.entity_profile.contracts import TargetKind, UserProfileObserva
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, RefreshLimits
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
 from mcp_telegram.flood import TelegramRpcThrottled
-from mcp_telegram.sync_db import load_account_cooldown_until_utc, save_account_cooldown_until_utc
+from mcp_telegram.sync_db import load_account_cooldown_until_utc
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 from tests.test_dm_profile_repository import _peer, _repository
@@ -171,7 +171,10 @@ def test_backoff_is_per_peer_and_section_not_an_account_guard_replacement(tmp_pa
 def test_scope_change_keeps_control_plane_short_retry(tmp_path: Path) -> None:
     conn, repo = _repository(tmp_path / "scope.sqlite")
     try:
-        save_account_cooldown_until_utc(conn, 20_000.0)
+        conn.execute(
+            "INSERT INTO daemon_state(key,value) VALUES (?,?)", ("telegram_account_cooldown_until_utc", "20000.0")
+        )
+        conn.commit()
         _peer(conn, 42)
         repo.mark_pending(42, now=100)
         cursor = repo.next_due_refresh(now=100)

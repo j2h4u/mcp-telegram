@@ -90,6 +90,11 @@ class _ControlledLimiter:
         await asyncio.sleep(0)
 
 
+class _ImmediateLimiter:
+    async def acquire(self) -> None:
+        return None
+
+
 class _FailAfterOneLimiter:
     def __init__(self) -> None:
         self.acquisitions = 0
@@ -110,13 +115,24 @@ async def _wait_until(predicate: object, *, attempts: int = 100) -> None:
 
 def _scope(source: TelegramRpcSource, *, deadline: float | None = None) -> TelegramRpcScope:
     with rpc_scope(source, deadline=deadline):
-        return current_rpc_scope()
+        return replace(current_rpc_scope(), request_method="tests.Request")
+
+
+def _scheduler(
+    *, policy: TelegramRpcSchedulerConfig, limiter: object, **kwargs: object
+) -> TelegramRpcAdmissionScheduler:
+    return TelegramRpcAdmissionScheduler(
+        policy=policy,
+        limiter=limiter,  # type: ignore[arg-type]
+        minimum_spacing_seconds=1e-9,
+        **kwargs,  # type: ignore[arg-type]
+    )
 
 
 @pytest.mark.asyncio
 async def test_waiting_background_does_not_reserve_next_limiter_token_from_interactive() -> None:
     limiter = _ControlledLimiter()
-    scheduler = TelegramRpcAdmissionScheduler(policy=TelegramRpcSchedulerConfig(), limiter=limiter)
+    scheduler = _scheduler(policy=TelegramRpcSchedulerConfig(), limiter=limiter)
     background = asyncio.create_task(scheduler.admit(_scope(TelegramRpcSource.FULL_SYNC)))
     await _wait_until(lambda: limiter.acquisitions == 1)
 
@@ -137,7 +153,7 @@ async def test_waiting_background_does_not_reserve_next_limiter_token_from_inter
 async def test_full_backlog_dispatches_exact_configured_weight_cycle_and_all_classes_progress() -> None:
     policy = TelegramRpcSchedulerConfig(interactive_weight=5, live_sync_weight=3, background_weight=2)
     limiter = _ControlledLimiter()
-    scheduler = TelegramRpcAdmissionScheduler(policy=policy, limiter=limiter)
+    scheduler = _scheduler(policy=policy, limiter=limiter)
     sources = (
         TelegramRpcSource.MCP_INTERACTIVE,
         TelegramRpcSource.REALTIME_EVENT,
@@ -182,7 +198,7 @@ async def test_interactive_admission_stays_within_configured_worst_case_weight_b
         background_queue_capacity=64,
     )
     limiter = _ControlledLimiter()
-    scheduler = TelegramRpcAdmissionScheduler(policy=policy, limiter=limiter)
+    scheduler = _scheduler(policy=policy, limiter=limiter)
     admitted: list[RpcAdmission] = []
 
     async def admit(source: TelegramRpcSource) -> RpcAdmission:
@@ -239,9 +255,9 @@ async def test_interactive_admission_stays_within_configured_worst_case_weight_b
 
 
 def test_fair_cycle_normalizes_equivalent_weight_ratio() -> None:
-    scheduler = TelegramRpcAdmissionScheduler(
+    scheduler = _scheduler(
         policy=TelegramRpcSchedulerConfig(interactive_weight=60, live_sync_weight=30, background_weight=10),
-        limiter=None,
+        limiter=_ImmediateLimiter(),
     )
 
     assert len(scheduler.fair_cycle) == 10
@@ -255,7 +271,7 @@ def test_fair_cycle_normalizes_equivalent_weight_ratio() -> None:
 @pytest.mark.asyncio
 async def test_fifo_is_preserved_within_one_service_class() -> None:
     limiter = _ControlledLimiter()
-    scheduler = TelegramRpcAdmissionScheduler(policy=TelegramRpcSchedulerConfig(), limiter=limiter)
+    scheduler = _scheduler(policy=TelegramRpcSchedulerConfig(), limiter=limiter)
     completed: list[int] = []
 
     async def admit(label: int) -> None:
@@ -276,7 +292,7 @@ async def test_fifo_is_preserved_within_one_service_class() -> None:
 @pytest.mark.asyncio
 async def test_same_class_sources_rotate_while_each_source_remains_fifo() -> None:
     limiter = _ControlledLimiter()
-    scheduler = TelegramRpcAdmissionScheduler(policy=TelegramRpcSchedulerConfig(), limiter=limiter)
+    scheduler = _scheduler(policy=TelegramRpcSchedulerConfig(), limiter=limiter)
     admitted: list[str] = []
 
     async def admit(source: TelegramRpcSource, label: str) -> None:
@@ -303,7 +319,7 @@ async def test_same_class_sources_rotate_while_each_source_remains_fifo() -> Non
 @pytest.mark.asyncio
 async def test_source_bound_rejects_one_producer_without_blocking_its_class_peer() -> None:
     limiter = _ControlledLimiter()
-    scheduler = TelegramRpcAdmissionScheduler(policy=TelegramRpcSchedulerConfig(), limiter=limiter)
+    scheduler = _scheduler(policy=TelegramRpcSchedulerConfig(), limiter=limiter)
     source_limit = demand_contract(DemandKind.FULL_SYNC_PAGE).source_outstanding_limit
     full_sync = [asyncio.create_task(scheduler.admit(_scope(TelegramRpcSource.FULL_SYNC))) for _ in range(source_limit)]
     await _wait_until(lambda: scheduler.source_queue_depths()[TelegramRpcSource.FULL_SYNC] == source_limit)
@@ -328,7 +344,7 @@ async def test_source_bound_rejects_one_producer_without_blocking_its_class_peer
 
 @pytest.mark.asyncio
 async def test_scheduler_rejects_caller_overrides_of_registered_transport_policy() -> None:
-    scheduler = TelegramRpcAdmissionScheduler(policy=TelegramRpcSchedulerConfig(), limiter=None)
+    scheduler = _scheduler(policy=TelegramRpcSchedulerConfig(), limiter=_ImmediateLimiter())
     scope = _scope(TelegramRpcSource.FULL_SYNC)
 
     with pytest.raises(ValueError, match="source outstanding limit"):
@@ -342,7 +358,7 @@ async def test_scheduler_rejects_caller_overrides_of_registered_transport_policy
 @pytest.mark.asyncio
 async def test_nested_attempt_from_same_task_still_consumes_another_slot() -> None:
     policy = replace(TelegramRpcSchedulerConfig(), background_queue_capacity=1)
-    scheduler = TelegramRpcAdmissionScheduler(policy=policy, limiter=None)
+    scheduler = _scheduler(policy=policy, limiter=_ImmediateLimiter())
     scope = _scope(TelegramRpcSource.FULL_SYNC)
 
     outer = await scheduler.admit(scope)
@@ -363,7 +379,7 @@ async def test_background_saturation_is_typed_and_does_not_consume_other_class_c
         live_sync_queue_capacity=1,
     )
     limiter = _ControlledLimiter()
-    scheduler = TelegramRpcAdmissionScheduler(policy=policy, limiter=limiter)
+    scheduler = _scheduler(policy=policy, limiter=limiter)
     backgrounds = [asyncio.create_task(scheduler.admit(_scope(TelegramRpcSource.FULL_SYNC))) for _ in range(2)]
     await _wait_until(lambda: scheduler.queue_depths()[RpcServiceClass.BACKGROUND] == 2)
 
@@ -385,7 +401,7 @@ async def test_background_saturation_is_typed_and_does_not_consume_other_class_c
 async def test_active_attempt_counts_toward_capacity_without_burning_another_limiter_token() -> None:
     policy = replace(TelegramRpcSchedulerConfig(), background_queue_capacity=1)
     limiter = _ControlledLimiter()
-    scheduler = TelegramRpcAdmissionScheduler(policy=policy, limiter=limiter)
+    scheduler = _scheduler(policy=policy, limiter=limiter)
     first_task = asyncio.create_task(scheduler.admit(_scope(TelegramRpcSource.FULL_SYNC)))
     await limiter.allow_one()
     first = await first_task
@@ -412,7 +428,7 @@ async def test_dispatcher_rechecks_readiness_after_limiter_before_releasing_tick
     async def wait_until_ready() -> None:
         await ready_event.wait()
 
-    scheduler = TelegramRpcAdmissionScheduler(
+    scheduler = _scheduler(
         policy=TelegramRpcSchedulerConfig(),
         limiter=limiter,
         observer=events.append,
@@ -445,9 +461,7 @@ async def test_dispatcher_rechecks_readiness_after_limiter_before_releasing_tick
 async def test_cancelled_ticket_is_removed_and_never_dispatched_later() -> None:
     limiter = _ControlledLimiter()
     events: list[RpcAdmissionEvent] = []
-    scheduler = TelegramRpcAdmissionScheduler(
-        policy=TelegramRpcSchedulerConfig(), limiter=limiter, observer=events.append
-    )
+    scheduler = _scheduler(policy=TelegramRpcSchedulerConfig(), limiter=limiter, observer=events.append)
     background = asyncio.create_task(scheduler.admit(_scope(TelegramRpcSource.FULL_SYNC)))
     await _wait_until(lambda: limiter.acquisitions == 1)
     background.cancel()
@@ -470,7 +484,7 @@ async def test_fake_clock_expiry_removes_ticket_before_dispatch() -> None:
     now = [100.0]
     limiter = _ControlledLimiter()
     events: list[RpcAdmissionEvent] = []
-    scheduler = TelegramRpcAdmissionScheduler(
+    scheduler = _scheduler(
         policy=TelegramRpcSchedulerConfig(),
         limiter=limiter,
         observer=events.append,
@@ -500,7 +514,7 @@ async def test_dispatcher_rechecks_deadline_after_queued_observer_returns() -> N
         if event.kind is RpcAdmissionEventKind.QUEUED:
             now[0] = 101.0
 
-    scheduler = TelegramRpcAdmissionScheduler(
+    scheduler = _scheduler(
         policy=TelegramRpcSchedulerConfig(),
         limiter=limiter,
         observer=observe,
@@ -523,7 +537,7 @@ async def test_cancelled_and_closed_tickets_report_terminal_queue_wait() -> None
     now = [100.0]
     limiter = _ControlledLimiter()
     events: list[RpcAdmissionEvent] = []
-    scheduler = TelegramRpcAdmissionScheduler(
+    scheduler = _scheduler(
         policy=TelegramRpcSchedulerConfig(),
         limiter=limiter,
         observer=events.append,
@@ -555,7 +569,7 @@ async def test_cancelled_and_closed_tickets_report_terminal_queue_wait() -> None
 @pytest.mark.asyncio
 async def test_close_rejects_waiters_and_leaves_no_dispatcher() -> None:
     limiter = _ControlledLimiter()
-    scheduler = TelegramRpcAdmissionScheduler(policy=TelegramRpcSchedulerConfig(), limiter=limiter)
+    scheduler = _scheduler(policy=TelegramRpcSchedulerConfig(), limiter=limiter)
     waiting = asyncio.create_task(scheduler.admit(_scope(TelegramRpcSource.FULL_SYNC)))
     await _wait_until(lambda: limiter.acquisitions == 1)
 
@@ -569,7 +583,7 @@ async def test_close_rejects_waiters_and_leaves_no_dispatcher() -> None:
 @pytest.mark.asyncio
 async def test_limiter_failure_closes_waiters_and_cancels_active_owner() -> None:
     limiter = _FailAfterOneLimiter()
-    scheduler = TelegramRpcAdmissionScheduler(policy=TelegramRpcSchedulerConfig(), limiter=limiter)
+    scheduler = _scheduler(policy=TelegramRpcSchedulerConfig(), limiter=limiter)
     active_started = asyncio.Event()
     cleanup_started = asyncio.Event()
     release_cleanup = asyncio.Event()
@@ -671,10 +685,10 @@ async def test_detached_task_can_explicitly_transfer_precise_root_demand() -> No
 
 @pytest.mark.asyncio
 async def test_detached_dispatch_updates_root_evidence_once_at_dispatch_boundary() -> None:
-    scheduler = TelegramRpcAdmissionScheduler(policy=TelegramRpcSchedulerConfig(), limiter=None)
+    scheduler = _scheduler(policy=TelegramRpcSchedulerConfig(), limiter=_ImmediateLimiter())
 
     async def dispatch() -> None:
-        scope = current_rpc_scope()
+        scope = replace(current_rpc_scope(), request_method="tests.Request")
         admission = await scheduler.admit(scope)
         try:
             scheduler.record_dispatch(admission)
@@ -752,9 +766,9 @@ def test_only_optional_forward_budget_rejection_is_debug(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     events: list[RpcAdmissionEvent] = []
-    scheduler = TelegramRpcAdmissionScheduler(
+    scheduler = _scheduler(
         policy=TelegramRpcSchedulerConfig(),
-        limiter=None,
+        limiter=_ImmediateLimiter(),
         observer=events.append,
     )
     event = RpcAdmissionEvent(

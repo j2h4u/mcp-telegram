@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import mcp_telegram.daemon as daemon
+from mcp_telegram.auth_scope import TelegramAuthScope
 from mcp_telegram.config import AutomaticGroupHistoryConfig, RuntimeObservationConfig, load_config
 from mcp_telegram.daemon import (
     _acquire_startup_identity_before_updates,
@@ -102,6 +103,7 @@ def _ctx(**overrides: object) -> SimpleNamespace:
         "feedback_conn": MagicMock(),
         "rpc_admission_observer": None,
         "rpc_observation_sink": None,
+        "session_lease": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -115,7 +117,9 @@ def test_message_fact_policy_uses_resolved_scheduling_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path = tmp_path / "config.toml"
-    config_path.write_text('[state]\ndir = "/state"\n', encoding="utf-8")
+    config_path.write_text(
+        '[state]\ndir = "/state"\n\n[telegram_rpc]\ntransport_contract_version = 1\n', encoding="utf-8"
+    )
     config = load_config(config_path)
     monkeypatch.setenv("REACTION_DETAIL_MAX_PAGES_PER_CYCLE", "2")
 
@@ -168,6 +172,25 @@ class _ApiStub:
 
 
 class _ClientStub:
+    def account_safety_status(self) -> dict[str, object] | None:
+        return None
+
+    def retained_auth_scope(self) -> TelegramAuthScope | None:
+        return None
+
+    async def prepare_startup_safety(self) -> None:
+        pass
+
+    async def verify_startup_account(self, account_id: int) -> None:
+        del account_id
+
+    async def fail_startup_recovery(self) -> None:
+        pass
+
+    async def authorize_account_recovery(self, expected_generation: str, acknowledged: bool) -> None:
+        del expected_generation, acknowledged
+        raise ValueError("test recovery is unavailable")
+
     def close_update_delivery(self) -> None:
         pass
 
@@ -238,6 +261,28 @@ async def test_admission_blocked_startup_cancellation_propagates() -> None:
     pending.cancel()
     with pytest.raises(asyncio.CancelledError):
         await pending
+
+
+async def test_verified_protected_startup_keeps_retained_scope_without_connecting() -> None:
+    class Protected(_ClientStub):
+        async def prepare_startup_safety(self) -> None:
+            raise TelegramRpcThrottled(retry_after_seconds=None, latched=True, detail="retained safety hold")
+
+        def retained_auth_scope(self) -> TelegramAuthScope:
+            return TelegramAuthScope(1, 42, 2, 9)
+
+        async def connect(self) -> None:
+            pytest.fail("protected startup must not connect")
+
+    shutdown = asyncio.Event()
+    api = _ApiStub()
+    pending = asyncio.create_task(
+        _connect_telegram(_typed_ctx(client=Protected(), api_server=api, shutdown_event=shutdown))
+    )
+    await asyncio.sleep(0)
+    assert api._ready and api.self_id == 42
+    shutdown.set()
+    assert await pending is False
 
 
 class _UserProfilePort:

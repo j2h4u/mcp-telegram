@@ -2,10 +2,28 @@
 
 from __future__ import annotations
 
+import fcntl
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 PRIVATE_STATE_DIR_MODE = 0o700
+
+
+@contextmanager
+def telegram_session_lease(state_dir: Path) -> Iterator[None]:
+    """One daemon or stopped maintenance owner may use the Session at a time."""
+    descriptor = os.open(state_dir / "telegram-session.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Telegram session is already owned by another process") from None
+        yield
+    finally:
+        os.close(descriptor)
 
 
 @dataclass(frozen=True, slots=True)
