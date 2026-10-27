@@ -3804,14 +3804,14 @@ def bound_profile_account(conn: sqlite3.Connection) -> int | None:
     return int(cast(int, row[0])) if row and row[0] is not None else None
 
 
-_STORY_COVERAGE_REPAIR_VERSION = 1
+_STORY_COVERAGE_REPAIR_VERSION = 2
 
 
 def _refine_story_coverage_pass(conn: sqlite3.Connection, owner: int, limit: int) -> int:
     """Examine a finite indexed peer range once, without re-admitting profiles."""
     require_write_transaction(conn)
     state = _read_profile_admission_state(conn, owner)
-    repair = state.get("story_coverage_refinement")
+    repair = state.get("story_coverage_refinement_v2")
     if repair is None:
         repair = {
             "version": _STORY_COVERAGE_REPAIR_VERSION,
@@ -3836,12 +3836,13 @@ def _refine_story_coverage_pass(conn: sqlite3.Connection, owner: int, limit: int
             break
         peer = int(row[0])
         if personal_profile_peer(conn, owner, peer):
-            items, slots, unresolved = refine_published_story_coverage(conn, owner, peer)
-            for key, count in (("items", items), ("slots", slots), ("unresolved", unresolved)):
-                repair[key] = int(cast(int, repair[key])) + count
+            for section in ("current_stories", "pinned_stories"):
+                items, slots, unresolved = refine_published_story_coverage(conn, owner, peer, section=section)
+                for key, count in (("items", items), ("slots", slots), ("unresolved", unresolved)):
+                    repair[key] = int(cast(int, repair[key])) + count
         repair["last_peer"] = peer
         examined += 1
-    state["story_coverage_refinement"] = repair
+    state["story_coverage_refinement_v2"] = repair
     _save_profile_admission_state(conn, state)
     return examined
 
