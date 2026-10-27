@@ -70,6 +70,7 @@ from .telegram_demand import (
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
     RpcAttemptEvidence,
+    RpcRetryAuthorization,
     UnclassifiedTelegramDemandError,
     acquisition_context,
     create_demand_token,
@@ -606,6 +607,7 @@ class _MethodRetryCredit:
     accounting: RpcAttemptAccounting
     allowance: int
     granted: bool = False
+    authorization: RpcRetryAuthorization | None = None
 
     @property
     def limit(self) -> int:
@@ -617,10 +619,26 @@ class _MethodRetryCredit:
 
     @property
     def available(self) -> bool:
+        if self.authorization is not None and time.monotonic() >= self.authorization.deadline:
+            return False
         return self.attempts < self.limit or not self.granted
+
+    def authorize(self) -> RpcRetryAuthorization | None:
+        if not self.available:
+            return None
+        if self.authorization is None:
+            self.authorization = self._new_authorization()
+        return self.authorization
+
+    def _new_authorization(self) -> RpcRetryAuthorization:
+        return RpcRetryAuthorization(
+            time.monotonic() + demand_contract(self.selected.key.demand_kind).admission_timeout_seconds
+        )
 
     def debit(self, budget: RpcAttemptBudget) -> None:
         if self.attempts >= self.limit:
+            if self.authorization is None:
+                self.authorization = self._new_authorization()
             self.accounting.limit += self.allowance
             self.granted = True
         self.accounting.attempts += 1
@@ -1707,6 +1725,7 @@ class TelegramRpcGate(TelegramClient):
             minimum_spacing_seconds=rpc_budget.period_seconds / rpc_budget.max_calls_per_period,
             release_at=self._wire_release_at,
             deferral=self._difference_admission_deferral,
+            capacity_released=self._notify_rpc_capacity_released,
             observer=admission_observer,
             readiness=RpcTransportReadiness(
                 probe=self._scheduler_transport_ready,
@@ -2107,19 +2126,19 @@ class TelegramRpcGate(TelegramClient):
         """Wake the existing demand owner when cached gate eligibility changes."""
         self._rpc_eligibility_observer = observer
 
-    def prepare_durable_retry(self, budget: RpcAttemptBudget, method_key: str | None) -> bool:
+    def prepare_durable_retry(self, budget: RpcAttemptBudget, method_key: str | None) -> RpcRetryAuthorization | None:
         """Bind live-episode credit; only final physical claim can spend it."""
         if method_key is None or budget.selected is None:
-            return False
+            return None
         ledger = self._ensure_safety_ledger()
         if self.account_safety_status() is not None:
-            return False
+            return None
         capacity = sum(self._admission_scheduler._capacities.values())
         credit = ledger.bind_method_retry(budget, method_key, capacity)
         if credit is None:
-            return False
+            return None
         budget._retry_candidate = credit
-        return credit.available and self.rpc_eligibility(method_key) is None
+        return credit.authorize() if self.rpc_eligibility(method_key) is None else None
 
     def _retry_credit(self, budget: RpcAttemptBudget) -> _MethodRetryCredit | None:
         credit = budget._retry_candidate
@@ -2156,6 +2175,13 @@ class TelegramRpcGate(TelegramClient):
         if isinstance(box, GateMessageBox) and not box.wakeup_queued:
             box.wakeup_queued = True
             self._updates_queue.put_nowait(box.wakeup)
+        self._notify_rpc_eligibility_observer(method)
+
+    def _notify_rpc_capacity_released(self) -> None:
+        """Wake durable capacity waiters without recursively dispatching the arbiter."""
+        self._notify_rpc_eligibility_observer(None)
+
+    def _notify_rpc_eligibility_observer(self, method: str | None) -> None:
         if self._rpc_eligibility_observer is not None:
             try:
                 self._rpc_eligibility_observer(method)
@@ -3475,6 +3501,8 @@ class TelegramRpcGate(TelegramClient):
             retry_after_seconds=retry_seconds,
             latched=False,
             detail=f"Telegram is temporarily busy; retry in {retry_seconds:g}s",
+            method_key=scope.request_method,
+            reason="capacity" if isinstance(exc, RpcAdmissionSaturatedError) else None,
         ) from None
 
     async def _retry_update_source(self, scope: TelegramRpcScope, *, reason: str) -> None:

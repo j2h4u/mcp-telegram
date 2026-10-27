@@ -761,7 +761,10 @@ class MessageFactHydrationWorker:
             retried=retried,
             stopped=True,
             deferred_error=exc
-            if isinstance(exc, (TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending))
+            if isinstance(
+                exc,
+                (RpcAdmissionSaturatedError, TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending),
+            )
             else None,
         )
 

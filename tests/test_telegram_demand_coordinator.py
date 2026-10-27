@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from types import SimpleNamespace
 from typing import cast
@@ -22,6 +23,7 @@ from mcp_telegram.telegram_demand import (
     DurableDemandAdapter,
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
+    RpcRetryAuthorization,
 )
 from mcp_telegram.telegram_demand_coordinator import (
     CoordinatorState,
@@ -55,6 +57,59 @@ class _Clock:
 
 async def _noop() -> None:
     return None
+
+
+async def test_capacity_notification_is_snapshotted_again_before_each_slice() -> None:
+    kind = DemandKind.DELTA_GAP_FILL
+    adapters = _adapters({kind: DemandStatus(0)})
+    adapter = adapters[kind]
+    coordinator = TelegramDemandCoordinator(adapters)
+
+    async def acquire() -> None:
+        if len(adapter.run_calls) == 1:
+            coordinator.eligibility_changed(None)
+        if len(adapter.run_calls) <= 2:
+            raise TelegramRpcAdmissionDeferred(1, reason="capacity")
+        adapter.run_calls[-1].debit()
+
+    adapter.on_run = acquire
+    await coordinator._execute_slice(kind)
+    budget = adapter.run_calls[0]
+    deadline = coordinator._invocations[adapter.selected].deadline
+    coordinator._active_kind = None
+    coordinator.scan()
+    assert coordinator.ready_kinds == (kind,)
+    await coordinator._execute_slice(kind)
+    coordinator._active_kind = None
+    coordinator.scan()
+    assert coordinator.ready_kinds == ()
+    assert adapter.selected in coordinator._eligibility_waits
+    assert budget.attempts == 0
+    assert coordinator._invocations[adapter.selected].deadline == deadline
+    coordinator.eligibility_changed(None)
+    coordinator.scan()
+    await coordinator._execute_slice(kind)
+    assert adapter.run_calls == [budget, budget, budget]
+    assert budget.attempts == 1
+
+
+def test_capacity_notification_retains_unrelated_current_method_floor() -> None:
+    kind = DemandKind.DELTA_GAP_FILL
+    adapters = _adapters({kind: DemandStatus(0, request_method="held.method")})
+    adapter = adapters[kind]
+    hint = TelegramRpcAdmissionDeferred(50, method_key="held.method", eligible_at=150, reason="method")
+    coordinator = TelegramDemandCoordinator(
+        adapters,
+        clock=_Clock(100),
+        monotonic_clock=_Clock(100),
+        rpc_eligibility=lambda _method: hint,
+    )
+    waits = dict(coordinator._eligibility_waits)
+    for _ in range(3):
+        coordinator.eligibility_changed(None)
+        assert coordinator._eligibility_waits == waits
+        assert adapter.selected in coordinator._excluded
+    assert adapter.run_calls == []
 
 
 class _Adapter:
@@ -455,7 +510,7 @@ async def test_throttle_catch_uses_current_gate_method_deferral() -> None:
         clock=_Clock(100),
         monotonic_clock=_Clock(100),
         rpc_eligibility=eligibility,
-        prepare_durable_retry=lambda budget, method: prepared.append((budget, method)) or True,
+        prepare_durable_retry=lambda budget, method: prepared.append((budget, method)) or RpcRetryAuthorization(200),
     )
     attempted = True
     await coordinator._execute_slice(target)
@@ -482,9 +537,9 @@ async def test_exception_method_overrides_advisory_method_before_first_send() ->
         gate_methods.append(method)
         return None
 
-    def prepare(_budget: RpcAttemptBudget, method: str | None) -> bool:
+    def prepare(_budget: RpcAttemptBudget, method: str | None) -> RpcRetryAuthorization:
         prepared_methods.append(method)
-        return True
+        return RpcRetryAuthorization(time.monotonic() + 60)
 
     coordinator = TelegramDemandCoordinator(
         adapters,
@@ -552,9 +607,11 @@ async def test_gate_candidate_reentry_reuses_budget_and_renews_deadline() -> Non
     gate_held = False
     prepared: list[tuple[RpcAttemptBudget, str | None]] = []
 
-    def prepare(budget: RpcAttemptBudget, method: str | None) -> bool:
+    authorization = RpcRetryAuthorization(52 + TELEGRAM_DEMAND_CONTRACTS[target].admission_timeout_seconds)
+
+    def prepare(budget: RpcAttemptBudget, method: str | None) -> RpcRetryAuthorization | None:
         prepared.append((budget, method))
-        return True
+        return authorization if monotonic.value >= 52 else None
 
     coordinator = TelegramDemandCoordinator(
         adapters,
@@ -887,9 +944,9 @@ async def test_typed_next_method_survives_older_physical_method_until_a_new_send
     prepared: list[str | None] = []
     checked: list[str | None] = []
 
-    def prepare(_budget: RpcAttemptBudget, method: str | None) -> bool:
+    def prepare(_budget: RpcAttemptBudget, method: str | None) -> RpcRetryAuthorization | None:
         prepared.append(method)
-        return method == "blocked.B" and mono.value >= 170
+        return RpcRetryAuthorization(230) if method == "blocked.B" and mono.value >= 170 else None
 
     def eligibility(method: str | None) -> None:
         checked.append(method)
@@ -939,7 +996,7 @@ async def test_restored_method_floor_preserves_untouched_base_without_starting_d
             if mono.value < 350
             else None
         ),
-        prepare_durable_retry=lambda _budget, _method: False,
+        prepare_durable_retry=lambda _budget, _method: None,
     )
     selected = adapters[target].selected
     invocation = coordinator._invocations[selected]
@@ -979,7 +1036,7 @@ async def test_renewed_typed_method_wait_survives_no_send_outcome(throttled: boo
         clock=_Clock(),
         monotonic_clock=mono,
         rpc_eligibility=eligibility,
-        prepare_durable_retry=lambda _budget, method: method == "blocked.B",
+        prepare_durable_retry=lambda _budget, method: RpcRetryAuthorization(230) if method == "blocked.B" else None,
     )
     await coordinator._execute_slice(target)
     coordinator._active_kind = None

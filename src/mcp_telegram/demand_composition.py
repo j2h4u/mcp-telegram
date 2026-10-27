@@ -66,6 +66,7 @@ from mcp_telegram.telegram_demand import (
     DemandStatus,
     DurableDemandAdapter,
     RpcAttemptBudget,
+    RpcRetryAuthorization,
     acquisition_context,
     durable_demand_context,
 )
@@ -88,7 +89,9 @@ class DemandCompositionClient(ActivityClient, Protocol):
         self, method_key: str | None = None
     ) -> TelegramRpcThrottled | TelegramRpcMethodRecoveryPending | None: ...
 
-    def prepare_durable_retry(self, budget: RpcAttemptBudget, method_key: str | None) -> bool: ...
+    def prepare_durable_retry(
+        self, budget: RpcAttemptBudget, method_key: str | None
+    ) -> RpcRetryAuthorization | None: ...
 
     def set_rpc_eligibility_observer(self, observer: Callable[[str | None], None] | None) -> None: ...
 

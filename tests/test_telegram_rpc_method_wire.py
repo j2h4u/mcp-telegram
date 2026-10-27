@@ -242,6 +242,41 @@ async def test_credit_is_shared_by_trial_continuation_and_duplicate_budgets(
         await result
 
 
+async def test_credit_authorization_horizon_survives_duplicate_budgets_and_only_new_episode_renews(
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate, sender, _, sink = wire
+    clock = _clock(wire, monkeypatch)
+    method = await _flood(wire, clock)
+    budget = _selected_budget()
+    assert gate.prepare_durable_retry(budget, method) is None
+    clock.advance(301)
+    authorization = gate.prepare_durable_retry(budget, method)
+    assert authorization is not None
+    initial = budget.limit, budget.attempts
+    clock.advance(1)
+    duplicate = _selected_budget()
+    assert gate.prepare_durable_retry(duplicate, method) is authorization
+    clock.advance(authorization.deadline - clock.monotonic() + 1)
+    assert gate.prepare_durable_retry(budget, method) is None
+    assert gate.prepare_durable_retry(duplicate, method) is None
+    request = functions.users.GetFullUserRequest(types.InputUserSelf())
+    result = sender.send_owned(request, replace(_scope(clock), attempt_budget=duplicate))
+    state = await sender._send_queue.next_state()
+    with pytest.raises(RpcAttemptBudgetExhaustedError):
+        await sender._prepare_state(state)
+    with pytest.raises(RpcAttemptBudgetExhaustedError):
+        await result
+    assert (budget.limit, budget.attempts) == (duplicate.limit, duplicate.attempts) == initial
+    assert len(sink.frames) == 1
+    assert await _flood(wire, clock) == method
+    clock.advance(601)
+    renewed = gate.prepare_durable_retry(duplicate, method)
+    assert renewed is not None and renewed is not authorization
+    assert renewed.deadline > authorization.deadline
+    assert (duplicate.limit, duplicate.attempts) == initial
+
+
 @pytest.mark.parametrize("refusal", ["revoked", "expired", "generation", "missing_intent", "storage"])
 async def test_denied_final_claim_never_spends_credit_or_grows_budget(
     wire: _WireHarness, monkeypatch: pytest.MonkeyPatch, refusal: str

@@ -33,7 +33,7 @@ async def test_daemon_runtime_binds_gate_and_verified_account_to_real_local_seed
     dependencies, _objects = composition_dependencies
     client = cast(MagicMock, dependencies.client)
     cast(MagicMock, client.rpc_eligibility).return_value = None
-    cast(MagicMock, client.prepare_durable_retry).return_value = False
+    cast(MagicMock, client.prepare_durable_retry).return_value = None
     scheduling = SchedulingConfig()
     writer = await SQLiteWriter.open(dependencies.db_path)
     try:

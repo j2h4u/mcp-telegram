@@ -270,12 +270,13 @@ async def test_hydration_adapter_returns_or_raises_committed_request_receipt(fai
         assert selected is not None and selected.selected is not None
         budget = RpcAttemptBudget(limit=1, selected=selected.selected)
 
-        if failure == "deferred":
-            with pytest.raises(TelegramRpcAdmissionDeferred):
+        if failure in {"deferred", "saturated"}:
+            expected_error = TelegramRpcAdmissionDeferred if failure == "deferred" else RpcAdmissionSaturatedError
+            with pytest.raises(expected_error):
                 await adapter.run_slice(budget)
         else:
             outcome = await adapter.run_slice(budget)
-            assert outcome.kind is (SliceOutcomeKind.TERMINAL if failure == "terminal" else SliceOutcomeKind.DEFERRED)
+            assert outcome.kind is SliceOutcomeKind.TERMINAL
 
         if failure == "terminal":
             assert conn.execute(
@@ -285,6 +286,100 @@ async def test_hydration_adapter_returns_or_raises_committed_request_receipt(fai
             assert conn.execute(
                 "SELECT due_at,attempts,terminal,last_outcome FROM hydration_jobs WHERE kind='test' AND message_id=1"
             ).fetchone() == (7, 0, 0, "temporary_failure")
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("release_before_park", [False, True])
+async def test_saturated_hydration_resumes_same_coordinator_invocation_after_capacity_release(
+    release_before_park: bool,
+) -> None:
+    conn = _hydration_db()
+    conn.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+        "VALUES (1, 1, 1, NULL, 'voice', '{}')"
+    )
+    conn.execute(
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, priority) VALUES ('test', 1, 1, 7, 1)"
+    )
+    conn.commit()
+    shutdown = asyncio.Event()
+
+    class SaturatingHandler(_HydrationHandler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.coordinator: TelegramDemandCoordinator | None = None
+            self.budgets: list[RpcAttemptBudget] = []
+            self.deadlines: list[float | None] = []
+            self.calls = 0
+
+        async def request(self, client: object, jobs: Sequence[HydrationJob]) -> object:
+            self.scope = current_rpc_scope()
+            budget = self.scope.attempt_budget
+            assert budget is not None and budget.selected is not None
+            self.budgets.append(budget)
+            assert self.coordinator is not None
+            self.deadlines.append(self.coordinator._invocations[budget.selected].deadline)
+            self.calls += 1
+            if self.calls == 1:
+                assert budget.attempts == 0
+                if release_before_park:
+                    self.coordinator.eligibility_changed(None)
+                raise RpcAdmissionSaturatedError(self.scope, "temporary test saturation")
+            return await super().request(client, jobs)
+
+        def apply(  # noqa: PLR0913
+            self,
+            conn: sqlite3.Connection,
+            queue: HydrationQueueRepository,
+            jobs: Sequence[HydrationJob],
+            result: object,
+            *,
+            now: int,
+            observation_order: int | None = None,
+        ) -> AppliedFacts:
+            applied = super().apply(conn, queue, jobs, result, now=now, observation_order=observation_order)
+            shutdown.set()
+            return applied
+
+    class CapacityReleaseObserver(_DemandObserver):
+        def __init__(self) -> None:
+            super().__init__()
+            self.coordinator: TelegramDemandCoordinator | None = None
+
+        def observe_demand(self, **event: object) -> None:
+            super().observe_demand(**event)
+            if (
+                not release_before_park
+                and event.get("outcome") == "deferred"
+                and event.get("reason") == "admission_saturated"
+            ):
+                assert self.coordinator is not None
+                self.coordinator.eligibility_changed(None)
+
+    try:
+        handler = SaturatingHandler()
+        adapter = FactHydrationDemandAdapter(
+            _hydration_worker(conn, handler, clock=lambda: 100.0),
+            HydrationPriority.FOREGROUND,
+            account_id=1,
+        )
+        observer = CapacityReleaseObserver()
+        coordinator = _hydration_coordinator(adapter, observer=observer, shutdown_event=shutdown)
+        handler.coordinator = coordinator
+        observer.coordinator = coordinator
+
+        await asyncio.wait_for(coordinator.run(), timeout=2.0)
+
+        assert handler.calls == 2
+        assert len(handler.budgets) == 2 and handler.budgets[0] is handler.budgets[1]
+        assert handler.budgets[1].limit == handler.budgets[0].limit
+        assert handler.budgets[0].attempts == 1
+        assert handler.deadlines[0] == handler.deadlines[1]
+        assert [event["outcome"] for event in observer.events].count("deferred") == 1
+        assert [event["outcome"] for event in observer.events].count("completed") == 1
+        assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
     finally:
         conn.close()
 

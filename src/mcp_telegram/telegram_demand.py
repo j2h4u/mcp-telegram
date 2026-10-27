@@ -135,6 +135,13 @@ class RpcAttemptAccounting:
     attempts: int
 
 
+@dataclass(frozen=True, slots=True)
+class RpcRetryAuthorization:
+    """One Gate-owned authorization horizon, shared by exact-revision bindings."""
+
+    deadline: float
+
+
 @dataclass(slots=True, init=False)
 class RpcAttemptBudget:
     """Mutable, process-local accounting for actual RPC attempts in one slice."""
