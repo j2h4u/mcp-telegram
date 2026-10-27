@@ -447,7 +447,7 @@ depends_on = ["mcp_telegram.flood", "mcp_telegram.folders.contracts", "mcp_teleg
 [[modules]]
 path = "mcp_telegram.entity_profile.refresh"
 layer = "capability"
-depends_on = ["mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
+depends_on = ["mcp_telegram.entity_profile.contracts", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
 
 [[modules]]
 path = "mcp_telegram.entity_profile.full_user_normalization"
@@ -601,7 +601,7 @@ depends_on = ["mcp_telegram.dialog_identity", "mcp_telegram.dialog_fact_observat
 [[modules]]
 path = "mcp_telegram.entity_profile.collection_repository"
 layer = "persistence"
-depends_on = ["mcp_telegram.entity_profile.contracts", "mcp_telegram.sync_transactions"]
+depends_on = ["mcp_telegram.entity_profile.field_manifest", "mcp_telegram.entity_profile.contracts", "mcp_telegram.sync_transactions"]
 
 [[modules]]
 path = "mcp_telegram.sync_db"

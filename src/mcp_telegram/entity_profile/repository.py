@@ -30,6 +30,7 @@ from .collection_repository import (
     encode,
     patch_embedded_story,
     reconcile_embedded_stories,
+    refine_published_story_coverage,
     store_collection_page,
     store_semantic_patch,
     store_semantic_snapshot,
@@ -42,6 +43,8 @@ from .contracts import (
     NORMALIZATION_VERSION,
     PERSONAL_CHANNEL_OWNED_FIELDS,
     PROFILE_COLLECTION_SECTIONS,
+    PROFILE_FLOOD_RETRY_BASE_SECONDS,
+    PROFILE_FLOOD_RETRY_CAP_SECONDS,
     PROFILE_SECTIONS,
     ObservationBoundary,
     ProfileAcquisitionEvidence,
@@ -155,7 +158,16 @@ class _ValidatedReceipt:
 class EntityProfileRepository:
     """Read and write entity profiles without making Telegram calls."""
 
-    def __init__(self, conn: sqlite3.Connection, *, section_ttl_seconds: int) -> None:
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        section_ttl_seconds: int,
+        flood_retry_base_seconds: int = PROFILE_FLOOD_RETRY_BASE_SECONDS,
+        flood_retry_cap_seconds: int = PROFILE_FLOOD_RETRY_CAP_SECONDS,
+    ) -> None:
+        self._flood_retry_base_seconds = flood_retry_base_seconds
+        self._flood_retry_cap_seconds = flood_retry_cap_seconds
         self._conn = conn
         self._section_ttl_seconds = max(1, int(section_ttl_seconds))
         self._column_cache: dict[str, set[str]] = {}
@@ -225,16 +237,21 @@ class EntityProfileRepository:
             changed = frozenset(field for field in accepted if field not in base or detail[field] != base[field])
             if reset_owner:
                 self._reset_unowned_sections(entity_id)
+            columns = "entity_id,detail_json,fetched_at,profile_owner_account_id"
+            values: tuple[object, ...] = (
+                entity_id,
+                json.dumps({"schema": _DETAIL_SCHEMA, **detail}),
+                observation.observed_at,
+                observation.owner_account_id,
+            )
+            if self._detail_has("profile_revision"):
+                columns += ",profile_revision"
+                values += (self._profile_revision(entity_id),)
             self._conn.execute(
-                "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_owner_account_id) VALUES (?,?,?,?) "
+                f"INSERT INTO entity_details({columns}) VALUES ({','.join(['?'] * len(values))}) "
                 "ON CONFLICT(entity_id) DO UPDATE SET detail_json=excluded.detail_json,"
                 "profile_owner_account_id=excluded.profile_owner_account_id",
-                (
-                    entity_id,
-                    json.dumps({"schema": _DETAIL_SCHEMA, **detail}),
-                    observation.observed_at,
-                    observation.owner_account_id,
-                ),
+                values,
             )
             self._store_field_observations(entity_id, accepted, observation)
             self._publish_updated_identity(entity_id, detail, changed, observation.observed_at)
@@ -454,12 +471,25 @@ class EntityProfileRepository:
             baseline,
         )
 
-    def reconcile_history_profiles(self, *, now: int, limit: int, pair_mode: str, self_id: int | None) -> int:
+    def reconcile_history_profiles(
+        self,
+        *,
+        now: int,
+        limit: int,
+        pair_mode: str,
+        self_id: int | None,
+        coverage_owner_account_id: int | None = None,
+    ) -> int:
         """Advance the finite personal-peer admission checkpoint."""
         if isinstance(limit, bool) or limit < 1:
             raise ValueError("profile reconciliation limit must be positive")
         if self_id is None or not self._history_profile_schema_available():
             return 0
+        if coverage_owner_account_id == self_id and self._columns("entity_profile_collection_facts"):
+            with write_savepoint(self._conn):
+                examined = _refine_story_coverage_pass(self._conn, self_id, limit)
+            if examined:
+                return examined
         return _reconcile_profile_admission(self._conn, self_id, now=now, limit=limit, pair_mode=pair_mode)
 
     def _history_profile_schema_available(self) -> bool:
@@ -1429,6 +1459,44 @@ class EntityProfileRepository:
             profile_revision=int(values.get("profile_revision") or 0),
             pair_mode=(str(values["pair_mode"]) if values.get("pair_mode") in {"enabled", "disabled"} else None),
             page_cursor_json=cast(str | None, values.get("page_cursor_json")),
+        )
+
+    def prepare_refresh_revision(self, cursor: EntityRefreshCursor, *, owner_account_id: int | None) -> bool:
+        """Return whether this captured cursor is ready; repair owned divergence then yield."""
+        with write_savepoint(self._conn):
+            if not self._cursor_matches(cursor):
+                return False
+            if not self._detail_has("profile_revision") or not self._refresh_has("profile_revision"):
+                return True
+            row = self._read_detail_fence(cursor.entity_id)
+            if row is None or row[0] == cursor.profile_revision:
+                return True
+            if owner_account_id is None or row[1] != owner_account_id:
+                raise RuntimeError("profile revision ownership unavailable")
+            revision = max(cursor.profile_revision, int(row[0])) + 1
+            changed = self._conn.execute(
+                "UPDATE entity_details SET profile_revision=? "
+                "WHERE entity_id=? AND profile_revision=? AND profile_owner_account_id=?",
+                (revision, cursor.entity_id, row[0], owner_account_id),
+            ).rowcount
+            if changed != 1:
+                return False
+            predicate, parameters = self._cursor_predicate(cursor)
+            changed = self._conn.execute(
+                "UPDATE entity_profile_refresh_state SET profile_revision=? WHERE " + predicate,
+                (revision, *parameters),
+            ).rowcount
+            if changed != 1:
+                raise sqlite3.OperationalError("profile revision reconciliation cursor changed")
+        return False
+
+    def _read_detail_fence(self, entity_id: int) -> tuple[int, int | None] | None:
+        owner_column = "profile_owner_account_id" if self._detail_has("profile_owner_account_id") else "NULL"
+        return cast(
+            tuple[int, int | None] | None,
+            self._conn.execute(
+                f"SELECT profile_revision,{owner_column} FROM entity_details WHERE entity_id=?", (entity_id,)
+            ).fetchone(),
         )
 
     def recover_pair_measurements(self, *, now: int) -> None:
@@ -2859,13 +2927,8 @@ class EntityProfileRepository:
     ) -> bool:
         """Atomically defer only the section owned by the current durable cursor."""
         with write_savepoint(self._conn):
-            predicate, parameters = self._cursor_predicate(cursor)
-            changed = self._conn.execute(
-                "UPDATE entity_profile_refresh_state SET status='failed', retry_at=?, reason=?, updated_at=? "
-                "WHERE " + predicate,
-                (retry_at, reason, now, *parameters),
-            ).rowcount
-            if changed != 1:
+            deadline = self._defer_cursor_failure(cursor, now=now, reason=reason, retry_at=retry_at)
+            if deadline is None:
                 return False
             self._conn.execute(
                 """
@@ -2876,38 +2939,55 @@ class EntityProfileRepository:
                     status=CASE WHEN entity_detail_sections.observed_at IS NULL THEN 'unavailable' ELSE 'stale' END,
                     reason=excluded.reason, retry_at=excluded.retry_at
                 """,
-                (cursor.entity_id, cursor.next_section, reason, retry_at),
+                (cursor.entity_id, cursor.next_section, reason, deadline),
             )
         return True
 
-    def mark_refresh_failure(
-        self,
-        entity_id: int,
-        *,
-        now: int,
-        reason: str,
-        retry_at: int | None = None,
-    ) -> None:
-        """Record failure while preserving payload and its last successful timestamp."""
-        try:
-            with write_savepoint(self._conn):
-                try:
-                    self._conn.execute(
-                        "INSERT INTO entity_profile_refresh_state(entity_id, status, retry_at, reason, updated_at) "
-                        "VALUES (?, 'failed', ?, ?, ?) ON CONFLICT(entity_id) DO UPDATE SET status=excluded.status, "
-                        "retry_at=excluded.retry_at, reason=excluded.reason, updated_at=excluded.updated_at",
-                        (entity_id, retry_at, reason, now),
-                    )
-                except sqlite3.OperationalError:
-                    pass
-                self._conn.execute(
-                    "UPDATE entity_detail_sections SET status=CASE WHEN observed_at IS NULL "
-                    "THEN 'unavailable' ELSE 'stale' END, reason=?, retry_at=? "
-                    "WHERE entity_id=? AND status <> 'not_applicable'",
-                    (reason, retry_at, entity_id),
-                )
-        except sqlite3.OperationalError:
-            return
+    def mark_core_failure(self, cursor: EntityRefreshCursor, *, now: int, reason: str, retry_at: int) -> bool:
+        """Defer unresolved core work without inventing a referenced entity or section."""
+        with write_savepoint(self._conn):
+            deadline = self._defer_cursor_failure(cursor, now=now, reason=reason, retry_at=retry_at)
+            if deadline is None:
+                return False
+            self._conn.execute(
+                "UPDATE entity_detail_sections SET status=CASE WHEN observed_at IS NULL "
+                "THEN 'unavailable' ELSE 'stale' END, reason=?, retry_at=? WHERE entity_id=? AND section=?",
+                (reason, deadline, cursor.entity_id, cursor.next_section),
+            )
+        return True
+
+    def _defer_cursor_failure(self, cursor: EntityRefreshCursor, *, now: int, reason: str, retry_at: int) -> int | None:
+        require_write_transaction(self._conn)
+        predicate, parameters = self._cursor_predicate(cursor)
+        previous = self._conn.execute(
+            "SELECT status,retry_at,updated_at FROM entity_profile_refresh_state WHERE " + predicate,
+            parameters,
+        ).fetchone()
+        if previous is None:
+            return None
+        retry_at = self._section_failure_deadline(previous, now=now, reason=reason, retry_at=retry_at)
+        changed = self._conn.execute(
+            "UPDATE entity_profile_refresh_state SET status='failed', retry_at=?, reason=?, updated_at=? "
+            "WHERE " + predicate,
+            (retry_at, reason, now, *parameters),
+        ).rowcount
+        if changed != 1:
+            return None
+        return retry_at
+
+    def _section_failure_deadline(self, previous: tuple[object, ...], *, now: int, reason: str, retry_at: int) -> int:
+        if reason == "auth_scope_changed":
+            return retry_at
+        previous_retry = previous[1] if isinstance(previous[1], int) else 0
+        previous_updated = previous[2] if isinstance(previous[2], int) else now
+        prior_delay = max(0, previous_retry - previous_updated) if previous[0] == "failed" else 0
+        # Effective scheduled delay survives ordinary failures; it is not a Flood event count.
+        if reason == "flood_wait":
+            prior_delay = min(
+                self._flood_retry_cap_seconds,
+                max(self._flood_retry_base_seconds, prior_delay * 2),
+            )
+        return max(retry_at, previous_retry, now + prior_delay)
 
     def _read_sections(
         self,
@@ -3722,3 +3802,58 @@ def bound_profile_account(conn: sqlite3.Connection) -> int | None:
         conn.execute("SELECT account_id FROM dialog_directory_state WHERE singleton=1").fetchone(),
     )
     return int(cast(int, row[0])) if row and row[0] is not None else None
+
+
+_STORY_COVERAGE_REPAIR_VERSION = 2
+
+
+def _refine_story_coverage_pass(conn: sqlite3.Connection, owner: int, limit: int) -> int:
+    """Examine a finite indexed peer range once, without re-admitting profiles."""
+    require_write_transaction(conn)
+    state = _read_profile_admission_state(conn, owner)
+    repair = state.get("story_coverage_refinement_v2")
+    if repair is None:
+        repair = {
+            "version": _STORY_COVERAGE_REPAIR_VERSION,
+            "last_peer": 0,
+            "completed": False,
+            "items": 0,
+            "slots": 0,
+            "unresolved": 0,
+        }
+    if not _valid_story_repair_checkpoint(repair) or cast(dict[str, object], repair)["completed"]:
+        return 0
+    repair = dict(cast(dict[str, object], repair))
+    examined = 0
+    for _ in range(min(limit, 32)):
+        row = conn.execute(
+            "SELECT entity_id FROM entity_profile_collection_facts WHERE owner_account_id=? AND entity_id>? "
+            "ORDER BY entity_id LIMIT 1",
+            (owner, repair["last_peer"]),
+        ).fetchone()
+        if row is None:
+            repair["completed"] = True
+            break
+        peer = int(row[0])
+        if personal_profile_peer(conn, owner, peer):
+            for section in ("current_stories", "pinned_stories"):
+                items, slots, unresolved = refine_published_story_coverage(conn, owner, peer, section=section)
+                for key, count in (("items", items), ("slots", slots), ("unresolved", unresolved)):
+                    repair[key] = int(cast(int, repair[key])) + count
+        repair["last_peer"] = peer
+        examined += 1
+    state["story_coverage_refinement_v2"] = repair
+    _save_profile_admission_state(conn, state)
+    return examined
+
+
+def _valid_story_repair_checkpoint(value: object) -> bool:
+    if (
+        not isinstance(value, dict)
+        or type(value.get("version")) is not int
+        or value["version"] != _STORY_COVERAGE_REPAIR_VERSION
+    ):
+        return False
+    return type(value.get("completed")) is bool and all(
+        type(value.get(key)) is int and value[key] >= 0 for key in ("last_peer", "items", "slots", "unresolved")
+    )

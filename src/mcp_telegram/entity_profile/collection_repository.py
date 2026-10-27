@@ -6,21 +6,26 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
-from typing import cast
+from typing import Literal, cast
 
 from ..sync_transactions import require_write_transaction
 from .contracts import (
+    PROFILE_NORMALIZATION_VERSION,
     ObservationBoundary,
     ProfileCollectionItem,
     ProfileCollectionPage,
+    ProfileFieldClass,
     ProfileFieldCoverage,
     ProfileFieldObservation,
     ProfileFieldState,
     ProfileSemanticSnapshot,
+    profile_value_paths,
 )
+from .field_manifest import PROFILE_FIELD_MANIFEST
 
 
 def encode(value: object) -> str:
@@ -633,7 +638,11 @@ def _store_item(  # noqa: PLR0913 - persisted composite identity
     _restore_rejected_observations(provenance, retained_provenance, accepted, authority.rejected)
     _restore_parent_observations(provenance, retained_provenance, accepted, authority.retained)
     effective_coverage = _item_coverage(
-        coverage, previous_coverage, (previous_fields, merged), authority.rejected, authority.retained
+        coverage,
+        previous_coverage,
+        (previous_fields, merged),
+        replace(authority, observations=provenance),
+        _attributed_boundary(page.observation, source),
     )
     conn.execute(
         "INSERT INTO entity_profile_collection_facts(owner_account_id,entity_id,section,item_key,fields_json,"
@@ -912,7 +921,13 @@ def _snapshot_coverage(
     for root in snapshot.fields:
         _retain_path_provenance(coverage, values[0].get(root), values[1].get(root), root)
     retained_coverage = dict(coverage)
-    _accept_value_coverage(coverage, snapshot.coverage)
+    _accept_value_coverage(
+        coverage,
+        snapshot.coverage,
+        profile_value_paths(values[1]),
+        replace(values[2], observations=paths),
+        _attributed_boundary(snapshot.observation),
+    )
     _restore_rejected_coverage(coverage, retained_coverage, values[2].rejected)
     for root in snapshot.fields:
         evidence = paths.get(root)
@@ -922,12 +937,50 @@ def _snapshot_coverage(
     return coverage
 
 
-def _accept_value_coverage(retained: dict[str, object], incoming: Mapping[str, ProfileFieldCoverage]) -> None:
-    """Non-return retains the accepted evidence alongside its retained value."""
+def _accept_value_coverage(
+    retained: dict[str, object],
+    incoming: Mapping[str, ProfileFieldCoverage],
+    values: Mapping[str, object],
+    authority: _MergeAuthority,
+    attributed: bool,
+) -> None:
+    """Non-return preserves facts but may clarify a newer observed absence."""
     for path, evidence in incoming.items():
-        if evidence.state in {ProfileFieldState.UNKNOWN, ProfileFieldState.API_NOT_RETURNED} and path in retained:
+        if (
+            evidence.state in {ProfileFieldState.UNKNOWN, ProfileFieldState.API_NOT_RETURNED}
+            and path in retained
+            and not (attributed and _refines_unknown_absence(path, retained[path], evidence, values, authority))
+        ):
             continue
         retained[path] = asdict(evidence)
+
+
+def _attributed_boundary(observation: ObservationBoundary, source: str = "rpc") -> bool:
+    return source == "rpc" and observation.valid
+
+
+def _refines_unknown_absence(
+    path: str,
+    previous: object,
+    incoming: ProfileFieldCoverage,
+    values: Mapping[str, object],
+    authority: _MergeAuthority,
+) -> bool:
+    if incoming.state is not ProfileFieldState.API_NOT_RETURNED:
+        return False
+    if not isinstance(previous, dict) or previous.get("state") != "unknown" or path in values:
+        return False
+    if authority.order is None or any(_path_under(key, path) for key in authority.observations):
+        return False
+    return not any(
+        _conflicting_ancestor(path, key, value, authority.order) for key, value in authority.observations.items()
+    )
+
+
+def _conflicting_ancestor(path: str, ancestor: str, value: object, order: int) -> bool:
+    return _path_under(path, ancestor) and (
+        not isinstance(value, dict) or type(value.get("order")) is not int or value["order"] > order
+    )
 
 
 def _restore_rejected_coverage(coverage: dict[str, object], retained: Mapping[str, object], rejected: set[str]) -> None:
@@ -971,15 +1024,15 @@ def _item_coverage(
     incoming: Mapping[str, ProfileFieldCoverage],
     previous: Mapping[str, object],
     values: tuple[object, object],
-    rejected: set[str],
-    retained: set[str],
+    authority: _MergeAuthority,
+    attributed: bool,
 ) -> dict[str, object]:
     result = dict(previous)
     _retain_path_provenance(result, values[0], values[1], "item")
     retained_coverage = dict(result)
-    _accept_value_coverage(result, incoming)
-    _restore_rejected_coverage(result, retained_coverage, rejected)
-    _restore_parent_coverage(result, retained_coverage, retained)
+    _accept_value_coverage(result, incoming, profile_value_paths({"item": values[1]}), authority, attributed)
+    _restore_rejected_coverage(result, retained_coverage, authority.rejected)
+    _restore_parent_coverage(result, retained_coverage, authority.retained)
     return result
 
 
@@ -1085,3 +1138,304 @@ def _exact_newer_path(evidence: object, fence: int) -> bool:
         and evidence.get("order", 0) >= fence
         and evidence.get("reason") != "legacy_alias_bridge"
     )
+
+
+_STORY_ABSENCE_FIELDS = {
+    "StoryItem": frozenset(
+        {
+            "albums",
+            "caption",
+            "entities",
+            "from_id",
+            "fwd_from",
+            "media_areas",
+            "music",
+            "privacy",
+            "sent_reaction",
+            "views",
+        }
+    ),
+    "MessageMediaPhoto": frozenset({"ttl_seconds", "video"}),
+    "Photo": frozenset({"video_sizes"}),
+}
+_STORY_CONSTRUCTORS = {"item": "StoryItem", "item.media": "MessageMediaPhoto", "item.media.photo": "Photo"}
+_STORY_ANCHORS = {
+    "item.id": int,
+    "item.date": str,
+    "item.pinned": bool,
+    "item.media.photo.id": int,
+    "item.media.photo.has_stickers": bool,
+}
+
+
+def _positive_bounds(start: object, end: object) -> tuple[float, float] | None:
+    if not all(
+        isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
+        for value in (start, end)
+    ):
+        return None
+    if cast(float, end) < cast(float, start):
+        return None
+    return float(cast(float, start)), float(cast(float, end))
+
+
+def _rpc_path_bounds(value: object, order: int) -> tuple[float, float] | None:
+    if (
+        not isinstance(value, dict)
+        or value.get("source") != "rpc"
+        or type(value.get("order")) is not int
+        or value["order"] != order
+    ):
+        return None
+    return _positive_bounds(
+        value.get("observation_started_at", value.get("observed_at")), value.get("observation_completed_at")
+    )
+
+
+def _story_receipt(
+    conn: sqlite3.Connection, owner: int, peer: int, section: Literal["current_stories", "pinned_stories"]
+) -> tuple[str, dict[str, object]] | None:
+    row = conn.execute(
+        "SELECT s.payload_json,s.normalization_version,s.status,s.reason,d.profile_owner_account_id "
+        "FROM entity_detail_sections s JOIN entity_details d ON d.entity_id=s.entity_id "
+        "WHERE s.entity_id=? AND s.section=?",
+        (peer, section),
+    ).fetchone()
+    if row is None or row[1:] != (PROFILE_NORMALIZATION_VERSION, "fresh", None, owner):
+        return None
+    payload = _coverage_json_mapping(row[0])
+    if payload is None or not all(
+        payload.get(key) is True for key in ("complete", "details_complete", "traversal_complete")
+    ):
+        return None
+    published = payload.get("published")
+    if (
+        payload.get("diagnostics") != []
+        or not isinstance(published, dict)
+        or published.get("owner_account_id") != owner
+    ):
+        return None
+    if not _published_story_identity(published, payload, owner):
+        return None
+    return str(row[0]), payload
+
+
+def _published_story_identity(published: Mapping[str, object], payload: Mapping[str, object], owner: int) -> bool:
+    if type(payload.get("owner_account_id")) is not int or payload["owner_account_id"] != owner:
+        return False
+    return all(
+        type(published.get(key)) is int
+        and cast(int, published[key]) >= 0
+        and type(payload.get(key)) is int
+        and payload[key] == published[key]
+        for key in ("generation", "scan")
+    )
+
+
+def _coverage_json_mapping(encoded: object) -> dict[str, object] | None:
+    if not isinstance(encoded, str):
+        return None
+    try:
+        value = json.loads(encoded)
+    except json.JSONDecodeError:
+        return None
+    return cast(dict[str, object], value) if isinstance(value, dict) else None
+
+
+def _story_anchor(path: str, values: Mapping[str, object], coverage: Mapping[str, object]) -> bool:
+    value, evidence = values.get(path), coverage.get(path)
+    return bool(
+        type(value) is _STORY_ANCHORS[path]
+        and isinstance(evidence, dict)
+        and evidence.get("state") == "present"
+        and evidence.get("authoritative") is True
+    )
+
+
+def _complete_story_bounds(
+    values: Mapping[str, object], coverage: Mapping[str, object], paths: Mapping[str, object], order: int
+) -> tuple[float, float] | None:
+    if not all(
+        isinstance(values.get(path), dict) and cast(dict[str, object], values[path]).get("constructor") == kind
+        for path, kind in _STORY_CONSTRUCTORS.items()
+    ):
+        return None
+    if not all(_story_anchor(path, values, coverage) for path in _STORY_ANCHORS) or cast(int, values["item.id"]) <= 0:
+        return None
+    bounds = _rpc_path_bounds(paths.get("item.id"), order)
+    if bounds is None:
+        return None
+    if not all(
+        _rpc_path_bounds(paths.get(path), order) == bounds
+        for path in (*_STORY_ANCHORS, "item.media", "item.media.photo")
+    ):
+        return None
+    return bounds
+
+
+def _optional_story_slot(path: str, values: Mapping[str, object]) -> bool:
+    parent, separator, name = path.rpartition(".")
+    node = values.get(parent)
+    if not separator or not isinstance(node, dict):
+        return False
+    constructor = _STORY_CONSTRUCTORS.get(parent)
+    if constructor is None or node.get("constructor") != constructor:
+        return False
+    if name not in _STORY_ABSENCE_FIELDS[constructor]:
+        return False
+    rule = PROFILE_FIELD_MANIFEST[constructor].fields.get(name)
+    return (
+        rule is not None
+        and rule.classification is ProfileFieldClass.PROFILE
+        and rule.optional
+        and not rule.flag
+        and not rule.clear_on_none
+    )
+
+
+def _story_coverage_refinement(row: tuple[object, ...], payload: Mapping[str, object]) -> dict[str, object] | None:
+    key, fields_json, coverage_json, paths_json, order, observed_at = row
+    fields, coverage, paths = (_coverage_json_mapping(value) for value in (fields_json, coverage_json, paths_json))
+    if fields is None or coverage is None or paths is None or type(order) is not int or order <= 0:
+        return None
+    values = profile_value_paths({"item": fields})
+    if not _linked_story_observation(
+        key, values, coverage, paths, order=order, observed_at=observed_at, payload=payload
+    ):
+        return None
+    return _refine_story_absent_slots(coverage, values, paths, order)
+
+
+def _refine_story_absent_slots(
+    coverage: Mapping[str, object], values: Mapping[str, object], paths: Mapping[str, object], order: int
+) -> dict[str, object]:
+    result = dict(coverage)
+    authority = _MergeAuthority(coverage, observations=paths, order=order)
+    incoming = ProfileFieldCoverage(
+        ProfileFieldClass.PROFILE, ProfileFieldState.API_NOT_RETURNED, False, "endpoint_did_not_return_value"
+    )
+    for path, evidence in coverage.items():
+        if not isinstance(evidence, dict) or evidence.get("reason") != "partial_value_unobserved":
+            continue
+        if _optional_story_slot(path, values) and _refines_unknown_absence(path, evidence, incoming, values, authority):
+            result[path] = asdict(incoming)
+    return result
+
+
+def _linked_story_observation(  # noqa: PLR0913 - one persisted receipt proof
+    key: object,
+    values: Mapping[str, object],
+    coverage: Mapping[str, object],
+    paths: Mapping[str, object],
+    *,
+    order: int,
+    observed_at: object,
+    payload: Mapping[str, object],
+) -> bool:
+    if str(values.get("item.id")) != key:
+        return False
+    bounds = _complete_story_bounds(values, coverage, paths, order)
+    scan_bounds = _positive_bounds(payload.get("observation_started_at"), payload.get("observation_completed_at"))
+    return (
+        bounds is not None
+        and scan_bounds is not None
+        and observed_at == bounds[1]
+        and scan_bounds[0] <= bounds[0] <= bounds[1] <= scan_bounds[1]
+    )
+
+
+def refine_published_story_coverage(
+    conn: sqlite3.Connection,
+    owner: int,
+    peer: int,
+    *,
+    section: Literal["current_stories", "pinned_stories"] = "pinned_stories",
+) -> tuple[int, int, int]:
+    """Refine proven past optional omissions without creating a new observation."""
+    require_write_transaction(conn)
+    if section not in {"current_stories", "pinned_stories"}:
+        raise ValueError("unsupported story coverage section")
+    receipt = _story_receipt(conn, owner, peer, section)
+    if receipt is None:
+        return 0, 0, 0
+    encoded_receipt, payload = receipt
+    published = cast(dict[str, object], payload["published"])
+    rows = conn.execute(
+        "SELECT f.item_key,f.fields_json,f.coverage_json,f.provenance_json,f.observation_order,f.observed_at "
+        "FROM entity_profile_collection_facts f JOIN entity_profile_collection_membership m "
+        "USING(owner_account_id,entity_id,section,item_key) WHERE f.owner_account_id=? AND f.entity_id=? "
+        "AND f.section=? AND m.generation=? AND m.scan=? AND m.detail_complete=1 "
+        "AND m.identity_kind='remote' AND f.coverage_json LIKE '%partial_value_unobserved%' ORDER BY f.item_key",
+        (owner, peer, section, published["generation"], published["scan"]),
+    ).fetchall()
+    items, slots, unresolved = 0, 0, 0
+    for row in rows:
+        coverage = _story_coverage_refinement(row, payload)
+        previous = _coverage_json_mapping(row[2])
+        changed = (
+            sum(previous.get(path) != value for path, value in coverage.items())
+            if coverage is not None and previous is not None
+            else 0
+        )
+        if not changed:
+            unresolved += 1
+            continue
+        assert coverage is not None
+        _write_story_coverage_refinement(
+            conn, (owner, peer, section), row, (encoded_receipt, published), encode(coverage)
+        )
+        items += 1
+        slots += changed
+        if _unresolved_story_absence(coverage):
+            unresolved += 1
+    return items, slots, unresolved
+
+
+def _unresolved_story_absence(coverage: Mapping[str, object]) -> bool:
+    return any(
+        isinstance(value, dict)
+        and value.get("state") == "unknown"
+        and value.get("reason") == "partial_value_unobserved"
+        for value in coverage.values()
+    )
+
+
+def _write_story_coverage_refinement(
+    conn: sqlite3.Connection,
+    identity: tuple[int, int, str],
+    row: tuple[object, ...],
+    receipt: tuple[str, Mapping[str, object]],
+    coverage: str,
+) -> None:
+    owner, peer, section = identity
+    encoded_receipt, published = receipt
+    changed = conn.execute(
+        "UPDATE entity_profile_collection_facts SET coverage_json=? WHERE owner_account_id=? AND entity_id=? "
+        "AND section=? AND item_key=? AND fields_json=? AND coverage_json=? AND provenance_json=? "
+        "AND observation_order=? AND observed_at=? AND EXISTS(SELECT 1 FROM entity_detail_sections s "
+        "JOIN entity_details d ON d.entity_id=s.entity_id WHERE s.entity_id=? AND s.section=? "
+        "AND s.payload_json=? AND s.normalization_version=? AND s.status='fresh' AND s.reason IS NULL "
+        "AND d.profile_owner_account_id=?) AND EXISTS(SELECT 1 FROM entity_profile_collection_membership m "
+        "WHERE m.owner_account_id=? AND m.entity_id=? AND m.section=? AND m.item_key=? "
+        "AND m.generation=? AND m.scan=? AND m.detail_complete=1 AND m.identity_kind='remote')",
+        (
+            coverage,
+            owner,
+            peer,
+            section,
+            *row,
+            peer,
+            section,
+            encoded_receipt,
+            PROFILE_NORMALIZATION_VERSION,
+            owner,
+            owner,
+            peer,
+            section,
+            row[0],
+            published["generation"],
+            published["scan"],
+        ),
+    ).rowcount
+    if changed != 1:
+        raise sqlite3.OperationalError("published story coverage refinement changed")

@@ -219,7 +219,7 @@ async def test_other_story_failures_keep_existing_retry_contract(scenario: Scena
         reason, retry_at = "timeouterror", failure_retry_at(200)
     else:
         client.failure = TelegramRpcThrottled(retry_after_seconds=7)
-        reason, retry_at = "flood_wait", 207
+        reason, retry_at = "flood_wait", 500
     await _run(service)
     assert conn.execute("SELECT reason,retry_at FROM entity_profile_refresh_state").fetchone() == (reason, retry_at)
 

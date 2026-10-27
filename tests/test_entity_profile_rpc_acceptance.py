@@ -149,7 +149,7 @@ async def _baseline_then_fail(path: Path, client: _FailureClient) -> tuple[sqlit
     ("failure", "reason", "retry_at"),
     (
         (TimeoutError("timeout"), "timeouterror", 160),
-        (TelegramRpcThrottled(retry_after_seconds=7), "flood_wait", 107),
+        (TelegramRpcThrottled(retry_after_seconds=7), "flood_wait", 400),
         (ConnectionError("transport"), "connectionerror", 160),
     ),
 )

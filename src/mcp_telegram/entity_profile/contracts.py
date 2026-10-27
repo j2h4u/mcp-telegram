@@ -15,6 +15,9 @@ from typing import Literal, TypedDict, cast
 
 from ..dialog_identity_contracts import DialogIdentityObservation
 
+PROFILE_FLOOD_RETRY_BASE_SECONDS = 300
+PROFILE_FLOOD_RETRY_CAP_SECONDS = 3600
+
 PROFILE_SECTIONS: tuple[str, ...] = (
     "full_profile",
     "common_chats",
@@ -805,3 +808,21 @@ def completeness(sections: dict[str, dict[str, object]]) -> str:
         return "partial"
     statuses = {str(value.get("status")) for value in sections.values()}
     return "complete" if statuses <= {"fresh", "not_applicable"} else "partial"
+
+
+def profile_value_paths(fields: Mapping[str, object]) -> dict[str, object]:
+    """Index retained values by their existing dotted/bracketed evidence paths."""
+    result: dict[str, object] = {}
+    for path, value in fields.items():
+        _collect_profile_values(result, path, value)
+    return result
+
+
+def _collect_profile_values(result: dict[str, object], path: str, value: object) -> None:
+    result[path] = value
+    if isinstance(value, dict):
+        for key, child in cast(dict[str, object], value).items():
+            _collect_profile_values(result, path + "." + key, child)
+    elif isinstance(value, list):
+        for index, child in enumerate(cast(list[object], value)):
+            _collect_profile_values(result, f"{path}[{index}]", child)

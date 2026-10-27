@@ -402,7 +402,12 @@ class DaemonEntityInfoService:
 
     def __init__(self, deps: EntityInfoDeps, *, enable_refresh_coordinator: bool = True) -> None:
         self._deps = deps
-        self._profiles = EntityProfileRepository(deps.conn, section_ttl_seconds=deps.detail_ttl_seconds)
+        self._profiles = EntityProfileRepository(
+            deps.conn,
+            section_ttl_seconds=deps.detail_ttl_seconds,
+            flood_retry_base_seconds=deps.refresh_limits.flood_retry_base_seconds,
+            flood_retry_cap_seconds=deps.refresh_limits.flood_retry_cap_seconds,
+        )
         self._demand_sink: DemandOfferSink | None = None
         self._refresh = EntityRefreshCoordinator(limits=deps.refresh_limits) if enable_refresh_coordinator else None
         if self._refresh is not None:
@@ -414,21 +419,36 @@ class DaemonEntityInfoService:
 
     async def reconcile_history_profiles(self) -> int:
         """Recover one bounded batch of locally missing DM profile observations."""
-        count = await self._write_profiles(
-            lambda profiles: profiles.reconcile_history_profiles(
-                now=int(self._deps.now_provider()),
-                limit=32,
-                pair_mode=self._current_pair_mode(),
-                self_id=self._deps.self_id,
-            )
-        )
+        scope = self._capture_pair_scope()
+        count = await self._write_profiles(lambda profiles: self._reconcile_owned_profiles(profiles, scope))
         if count:
             offer_durable_demand(self._require_demand_sink(), DemandKind.ENTITY_PROFILE_REFRESH)
         return count
 
+    def _reconcile_owned_profiles(self, profiles: EntityProfileRepository, scope: TelegramAuthScope | None) -> int:
+        owner = (
+            scope.account_id
+            if scope is not None and not self._profile_scope_changed_during_acquisition(scope)
+            else None
+        )
+        return profiles.reconcile_history_profiles(
+            now=int(self._deps.now_provider()),
+            limit=32,
+            pair_mode=self._current_pair_mode(),
+            self_id=self._deps.self_id,
+            coverage_owner_account_id=owner,
+        )
+
     async def _write_profiles[T](self, operation: Callable[[EntityProfileRepository], T]) -> T:
         return await self._deps.writer.run(
-            lambda conn: operation(EntityProfileRepository(conn, section_ttl_seconds=self._deps.detail_ttl_seconds))
+            lambda conn: operation(
+                EntityProfileRepository(
+                    conn,
+                    section_ttl_seconds=self._deps.detail_ttl_seconds,
+                    flood_retry_base_seconds=self._deps.refresh_limits.flood_retry_base_seconds,
+                    flood_retry_cap_seconds=self._deps.refresh_limits.flood_retry_cap_seconds,
+                )
+            )
         )
 
     def bind_profile_observer(self, observer: ProfilePairObservationHook) -> None:
@@ -587,11 +607,23 @@ class DaemonEntityInfoService:
         cursor = self._profiles.next_due_refresh(now=now)
         if cursor is None:
             return None
+        scope = self._capture_pair_scope()
+        if not await self._write_profiles(lambda profiles: self._prepare_refresh_revision(profiles, cursor, scope)):
+            return DurableRefreshSliceResult(cursor.entity_id)
         pair_mode = await self._capture_refresh_pair_mode(cursor)
         entity_type = self._stored_entity_type(cursor.entity_id, now=now)
         if entity_type is DialogType.UNKNOWN:
             return await self._run_unknown_entity_refresh(cursor, now=now)
         return await self._run_known_entity_refresh(cursor, entity_type, pair_mode=pair_mode, now=now)
+
+    def _prepare_refresh_revision(
+        self, profiles: EntityProfileRepository, cursor: EntityRefreshCursor, scope: TelegramAuthScope | None
+    ) -> bool:
+        if self._profile_scope_changed_during_acquisition(scope):
+            raise _AuthScopeUnavailableError("profile revision scope changed")
+        return profiles.prepare_refresh_revision(
+            cursor, owner_account_id=scope.account_id if scope is not None else None
+        )
 
     async def _capture_refresh_pair_mode(self, cursor: EntityRefreshCursor) -> str:
         return await self._write_profiles(
@@ -656,6 +688,7 @@ class DaemonEntityInfoService:
             raise
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
+            now = int(self._deps.now_provider())
             terminal = await self._handle_profile_section_failure(
                 _ProfileSectionFailure(
                     cursor=cursor,
@@ -678,6 +711,7 @@ class DaemonEntityInfoService:
             sqlite3.Error,
         ) as exc:
             raise_if_flood_wait_error(exc)
+            now = int(self._deps.now_provider())
             terminal = await self._handle_profile_section_failure(
                 _ProfileSectionFailure(
                     cursor=cursor,
@@ -872,6 +906,7 @@ class DaemonEntityInfoService:
             raise
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
+            now = int(self._deps.now_provider())
             retry_at = throttled_retry_at(now, exc.retry_after_seconds)
             return await self._handle_profile_section_failure(
                 _ProfileSectionFailure(
@@ -885,6 +920,7 @@ class DaemonEntityInfoService:
             )
         except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError, sqlite3.Error) as exc:
             raise_if_flood_wait_error(exc)
+            now = int(self._deps.now_provider())
             return await self._handle_profile_section_failure(
                 _ProfileSectionFailure(
                     cursor=cursor,
@@ -1095,6 +1131,7 @@ class DaemonEntityInfoService:
             raise
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
+            now = int(self._deps.now_provider())
             return await self._handle_full_user_pair_failure(
                 _PairFailure(
                     cursor=cursor,
@@ -1108,6 +1145,7 @@ class DaemonEntityInfoService:
             )
         except (TimeoutError, OSError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
             raise_if_flood_wait_error(exc)
+            now = int(self._deps.now_provider())
             return await self._handle_full_user_pair_failure(
                 _PairFailure(
                     cursor=cursor,
@@ -1793,10 +1831,11 @@ class DaemonEntityInfoService:
             raise
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
+            now = int(self._deps.now_provider())
             retry_at = throttled_retry_at(now, exc.retry_after_seconds)
             await self._write_profiles(
-                lambda profiles: profiles.mark_refresh_failure(
-                    cursor.entity_id,
+                lambda profiles: profiles.mark_core_failure(
+                    cursor,
                     now=now,
                     reason="flood_wait",
                     retry_at=retry_at,
@@ -1804,13 +1843,14 @@ class DaemonEntityInfoService:
             )
             return self._persisted_failure(cursor.entity_id, now=now)
         if entity is None or error is not None:
+            now = int(self._deps.now_provider())
             if error is not None and error.get("error") == "entity_not_found":
                 await self._write_profiles(lambda profiles: profiles.mark_refresh_not_found(cursor.entity_id, now=now))
                 return DurableRefreshTerminal.FAILURE
             reason, retry_at = self._refresh_failure_details(error, now=now)
             await self._write_profiles(
-                lambda profiles: profiles.mark_refresh_failure(
-                    cursor.entity_id,
+                lambda profiles: profiles.mark_core_failure(
+                    cursor,
                     now=now,
                     reason=reason,
                     retry_at=retry_at,
