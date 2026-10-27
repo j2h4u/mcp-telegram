@@ -599,11 +599,23 @@ class DaemonEntityInfoService:
         cursor = self._profiles.next_due_refresh(now=now)
         if cursor is None:
             return None
+        scope = self._capture_pair_scope()
+        if not await self._write_profiles(lambda profiles: self._prepare_refresh_revision(profiles, cursor, scope)):
+            return DurableRefreshSliceResult(cursor.entity_id)
         pair_mode = await self._capture_refresh_pair_mode(cursor)
         entity_type = self._stored_entity_type(cursor.entity_id, now=now)
         if entity_type is DialogType.UNKNOWN:
             return await self._run_unknown_entity_refresh(cursor, now=now)
         return await self._run_known_entity_refresh(cursor, entity_type, pair_mode=pair_mode, now=now)
+
+    def _prepare_refresh_revision(
+        self, profiles: EntityProfileRepository, cursor: EntityRefreshCursor, scope: TelegramAuthScope | None
+    ) -> bool:
+        if self._profile_scope_changed_during_acquisition(scope):
+            raise _AuthScopeUnavailableError("profile revision scope changed")
+        return profiles.prepare_refresh_revision(
+            cursor, owner_account_id=scope.account_id if scope is not None else None
+        )
 
     async def _capture_refresh_pair_mode(self, cursor: EntityRefreshCursor) -> str:
         return await self._write_profiles(

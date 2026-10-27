@@ -236,16 +236,21 @@ class EntityProfileRepository:
             changed = frozenset(field for field in accepted if field not in base or detail[field] != base[field])
             if reset_owner:
                 self._reset_unowned_sections(entity_id)
+            columns = "entity_id,detail_json,fetched_at,profile_owner_account_id"
+            values: tuple[object, ...] = (
+                entity_id,
+                json.dumps({"schema": _DETAIL_SCHEMA, **detail}),
+                observation.observed_at,
+                observation.owner_account_id,
+            )
+            if self._detail_has("profile_revision"):
+                columns += ",profile_revision"
+                values += (self._profile_revision(entity_id),)
             self._conn.execute(
-                "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_owner_account_id) VALUES (?,?,?,?) "
+                f"INSERT INTO entity_details({columns}) VALUES ({','.join(['?'] * len(values))}) "
                 "ON CONFLICT(entity_id) DO UPDATE SET detail_json=excluded.detail_json,"
                 "profile_owner_account_id=excluded.profile_owner_account_id",
-                (
-                    entity_id,
-                    json.dumps({"schema": _DETAIL_SCHEMA, **detail}),
-                    observation.observed_at,
-                    observation.owner_account_id,
-                ),
+                values,
             )
             self._store_field_observations(entity_id, accepted, observation)
             self._publish_updated_identity(entity_id, detail, changed, observation.observed_at)
@@ -1440,6 +1445,44 @@ class EntityProfileRepository:
             profile_revision=int(values.get("profile_revision") or 0),
             pair_mode=(str(values["pair_mode"]) if values.get("pair_mode") in {"enabled", "disabled"} else None),
             page_cursor_json=cast(str | None, values.get("page_cursor_json")),
+        )
+
+    def prepare_refresh_revision(self, cursor: EntityRefreshCursor, *, owner_account_id: int | None) -> bool:
+        """Return whether this captured cursor is ready; repair owned divergence then yield."""
+        with write_savepoint(self._conn):
+            if not self._cursor_matches(cursor):
+                return False
+            if not self._detail_has("profile_revision") or not self._refresh_has("profile_revision"):
+                return True
+            row = self._read_detail_fence(cursor.entity_id)
+            if row is None or row[0] == cursor.profile_revision:
+                return True
+            if owner_account_id is None or row[1] != owner_account_id:
+                raise RuntimeError("profile revision ownership unavailable")
+            revision = max(cursor.profile_revision, int(row[0])) + 1
+            changed = self._conn.execute(
+                "UPDATE entity_details SET profile_revision=? "
+                "WHERE entity_id=? AND profile_revision=? AND profile_owner_account_id=?",
+                (revision, cursor.entity_id, row[0], owner_account_id),
+            ).rowcount
+            if changed != 1:
+                return False
+            predicate, parameters = self._cursor_predicate(cursor)
+            changed = self._conn.execute(
+                "UPDATE entity_profile_refresh_state SET profile_revision=? WHERE " + predicate,
+                (revision, *parameters),
+            ).rowcount
+            if changed != 1:
+                raise sqlite3.OperationalError("profile revision reconciliation cursor changed")
+        return False
+
+    def _read_detail_fence(self, entity_id: int) -> tuple[int, int | None] | None:
+        owner_column = "profile_owner_account_id" if self._detail_has("profile_owner_account_id") else "NULL"
+        return cast(
+            tuple[int, int | None] | None,
+            self._conn.execute(
+                f"SELECT profile_revision,{owner_column} FROM entity_details WHERE entity_id=?", (entity_id,)
+            ).fetchone(),
         )
 
     def recover_pair_measurements(self, *, now: int) -> None:
