@@ -16,7 +16,7 @@ from telethon.crypto import AuthKey
 from telethon.errors import FloodWaitError
 from telethon.network.connection.tcpfull import FullPacketCodec
 from telethon.sessions import MemorySession
-from telethon.tl import types
+from telethon.tl import functions, types
 from telethon.tl.functions import channels, messages
 from telethon.tl.functions.updates import GetStateRequest
 
@@ -311,3 +311,101 @@ async def test_revoked_written_owner_keeps_its_late_flood_receipt(wire: _WireHar
     finally:
         release.set()
         await task
+
+
+@pytest.mark.parametrize("reason", ["unresolved_outbound_outcome", "flood_wait_circuit_open"])
+async def test_protocol_controls_remain_owned_during_application_protection(wire: _WireHarness, reason: str) -> None:
+    gate, _, _, _ = wire
+    ledger = gate._ensure_safety_ledger()
+    ledger._record["protection"] = reason
+    assert gate._control_scope_valid()
+    for request, origin in (
+        (types.MsgsAck([1]), "ack"),
+        (functions.PingRequest(1), "ping"),
+        (types.MsgsStateInfo(1, ""), "state_info"),
+    ):
+        owner = gate._require_wire_owner(
+            gate.register_protocol(request, bytes(request), cast(telegram_rpc.ProtocolOrigin, origin))
+        )
+        assert owner.scope.transport_control and not owner.scope.transport_bootstrap
+        assert owner.scope.attempt_budget is not None
+        assert gate._wire_release_at(owner.scope) == 0
+    with pytest.raises(RuntimeError, match="unclassified"):
+        gate.register_protocol(GetStateRequest(), bytes(GetStateRequest()), "ack")
+    request = functions.ReqPqMultiRequest(1)
+    with pytest.raises(RuntimeError, match="lifecycle capability"):
+        gate.register_protocol(request, bytes(request), "auth")
+    gate._connection_capability = gate._capture_connection_capability()
+    owner = gate._require_wire_owner(gate.register_protocol(request, bytes(request), "auth"))
+    assert owner.scope.transport_bootstrap and not owner.scope.transport_control
+    assert owner.scope.attempt_budget is gate._connection_capability.attempt_budget
+
+
+@pytest.mark.parametrize(
+    "reason", ["safety_auth_scope_mismatch", "safety_canonical_owner_mismatch", "authentication_account_mismatch"]
+)
+async def test_live_identity_rejection_denies_protocol_controls(wire: _WireHarness, reason: str) -> None:
+    gate, _, _, _ = wire
+    gate._ensure_safety_ledger()._record["protection"] = reason
+    assert not gate._control_scope_valid()
+
+
+async def test_protocol_controls_require_healthy_storage_and_current_transport(wire: _WireHarness) -> None:
+    gate, _, _, _ = wire
+    ledger = gate._ensure_safety_ledger()
+    assert gate._control_scope_valid()
+    ledger._storage_failed = True
+    assert not gate._control_scope_valid()
+    ledger._storage_failed = False
+    gate._transport_state = _TransportBoundaryState.FAILED
+    assert not gate._control_scope_valid()
+    gate._transport_state = _TransportBoundaryState.READY
+    scope = cast(dict[str, object], ledger._record["scope"])
+    scope["key_id"] = None
+    assert not gate._control_scope_valid()
+
+
+async def test_account_safety_status_reports_protection_without_session_material(wire: _WireHarness) -> None:
+    gate, _, _, _ = wire
+    assert gate.account_safety_status() is None
+    ledger = gate._ensure_safety_ledger()
+    ledger._record["protection"] = "unresolved_outbound_outcome"
+    status = gate.account_safety_status()
+    assert status is not None and set(status) == {"generation", "reason", "known_retry_until_utc"}
+    assert status["reason"] == "unresolved_outbound_outcome"
+    gate._wire_fault = "storage_failure"
+    status = gate.account_safety_status()
+    assert status is not None and status["reason"] == "storage_failure"
+    gate._wire_fault = None
+    ledger._record["protection"] = None
+    gate._transport_state = _TransportBoundaryState.FAILED
+    status = gate.account_safety_status()
+    assert status is not None and status["reason"] == "transport_terminated"
+    gate._transport_state = _TransportBoundaryState.READY
+    gate._logout_mode = True
+    status = gate.account_safety_status()
+    assert status is not None and status["reason"] == "operator_logout"
+
+
+async def test_cancelled_receipt_drain_retains_storage_ownership_until_completion(wire: _WireHarness) -> None:
+    gate, _, _, _ = wire
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def persist() -> None:
+        entered.set()
+        await release.wait()
+        await gate._ensure_safety_ledger().record_floor(time.time() + 7)
+
+    receipt = asyncio.create_task(persist())
+    gate._cooldown_save_tasks[1] = receipt
+    drain = asyncio.create_task(gate._drain_cooldown_saves())
+    await entered.wait()
+    drain.cancel()
+    await asyncio.sleep(0)
+    assert not drain.done() and not receipt.cancelled()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await drain
+    assert receipt.done() and not gate._cooldown_save_tasks
+    assert gate._ensure_safety_ledger().floor_deadline > time.monotonic()
