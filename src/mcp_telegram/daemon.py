@@ -40,7 +40,7 @@ import os
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
-from contextlib import AbstractContextManager, AsyncExitStack
+from contextlib import AsyncExitStack, ExitStack
 from contextvars import Context
 from dataclasses import dataclass, field
 from functools import partial
@@ -364,7 +364,7 @@ class _SyncMainContext:
     fact_hydration_worker: MessageFactHydrationWorker
     socket_path: Path
     self_profile_cadence: SQLiteSelfProfileCadence
-    session_lease: AbstractContextManager[None] | None = None
+    session_lease: ExitStack | None = None
     rpc_observation_sink: RuntimeObservationSink | None = None
     rpc_admission_observer: RpcAdmissionObservationAggregator | None = None
     coordinator: TelegramDemandCoordinator | None = None
@@ -1107,8 +1107,9 @@ async def _build_sync_main_context() -> _SyncMainContext:
     state_paths = StatePaths.from_state_dir(ensure_private_state_dir(config.state.dir))
     db_path = state_paths.sync_db_path
     async with AsyncExitStack() as cleanup:
-        lease = telegram_session_lease(state_paths.state_dir)
+        lease = ExitStack()
         cleanup.enter_context(lease)
+        lease.enter_context(telegram_session_lease(state_paths.state_dir))
         bootstrap = asyncio.create_task(
             asyncio.to_thread(_bootstrap_sync_database, db_path, state_paths.state_dir, config)
         )
@@ -1834,7 +1835,7 @@ async def _close_runtime_connections(ctx: _SyncMainContext) -> None:
             ctx.conn.close()
         finally:
             if ctx.session_lease is not None:
-                ctx.session_lease.__exit__(None, None, None)
+                ctx.session_lease.close()
                 ctx.session_lease = None
 
 

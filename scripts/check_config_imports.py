@@ -22,6 +22,7 @@ ALLOWED_CONFIG_IMPORTER_PATHS = frozenset(
         "daemon_client.py",
         "server.py",
         "telegram.py",
+        "telegram_auth.py",
     }
 )
 

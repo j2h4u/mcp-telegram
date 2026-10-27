@@ -152,6 +152,39 @@ async def test_wrong_self_reply_is_rejected_before_public_future_succeeds(wire: 
     assert gate._ensure_safety_ledger().protection_reason == "authentication_account_mismatch"
 
 
+async def test_confirmed_logout_clears_only_credentials_after_the_durable_reply(wire: _WireHarness) -> None:
+    gate, sender, connection, _sink = wire
+    assert gate.session is not None and gate.session.auth_key is not None
+    gate.session.process_entities([types.User(777, access_hash=123, first_name="retained")])
+    peer = gate.session.get_input_entity(777)
+    original_key = gate.session.auth_key.key
+
+    async def logout() -> None:
+        with demand_context(DemandKind.OPERATOR_LOGOUT):
+            await gate.logout_account()
+
+    operation = asyncio.create_task(logout())
+    try:
+        state = await asyncio.wait_for(sender._send_queue.next_state(), 2)
+        assert type(state.request) is functions.auth.LogOutRequest
+        await sender._prepare_state(state)
+        packet = connection._send_queue.get_nowait()
+        assert sender.write_packet(packet, connection._send)
+        assert gate.session.auth_key.key == original_key
+        assert not operation.done()
+        state.future.set_result(types.auth.LoggedOut())
+        await asyncio.wait_for(operation, 2)
+        assert gate.session.auth_key is None
+        assert gate.session.get_input_entity(777) == peer
+        receipt = gate._ensure_safety_ledger()._record
+        assert receipt["intents"] == {}
+        assert cast(dict[str, object], receipt["scope"])["stage"] == "key_pending"
+        assert cast(dict[str, object], receipt["transition"])["phase"] == "logout_confirmed"
+    finally:
+        operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
+
+
 async def test_auth_receive_dispatches_only_login_tokens_without_implicit_acquisition(
     auth_backend: tuple[TelegramRpcGate, Store, SQLiteSession], monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -89,6 +89,7 @@ async def test_shutdown_preserves_finalizer_commit_loss_boundary_and_final_marke
             demand_runtime=None,
             rpc_admission_observer=Observer(),
             rpc_observation_sink=sink,
+            session_lease=None,
         ),
     )
     try:

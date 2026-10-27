@@ -55,6 +55,7 @@ def test_state_config_import_spellings_are_rejected(source: str) -> None:
         ("daemon.py", "from . import config as configured\n"),
         ("daemon_client.py", "from mcp_telegram.config import FreshnessConfig\n"),
         ("telegram.py", "import mcp_telegram.config as configured\n"),
+        ("telegram_auth.py", "from .config import McpTelegramConfig\n"),
         ("__init__.py", "from mcp_telegram import config as configured\n"),
         ("config.py", "from .config import FreshnessConfig\n"),
         ("server.py", "from .config import HttpServerConfig\n"),
@@ -83,3 +84,10 @@ def test_nested_server_module_is_not_an_allowed_runtime_entrypoint() -> None:
     assert gate.violations_for(path, "from mcp_telegram import config\n") == [
         "src/mcp_telegram/nested/server.py:1: direct config import is allowed only in runtime entrypoints"
     ]
+
+
+@pytest.mark.parametrize("name", ["telegram_auth_worker.py", "nested/telegram_auth.py"])
+def test_authentication_config_import_permission_is_exact(name: str) -> None:
+    gate = _load_gate()
+    path = Path(__file__).parents[1] / "src/mcp_telegram" / name
+    assert gate.violations_for(path, "from .config import McpTelegramConfig\n")
