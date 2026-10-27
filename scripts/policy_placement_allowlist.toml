@@ -526,3 +526,13 @@ rationale = "This is the code-owned finite single-slice Telegram request and det
 category = "policy_call_keywords"
 key = "src/mcp_telegram/entity_profile/repository.py:admit_profile_peer:section_ttl_seconds"
 rationale = "This queue-only repository adapter checks stored presence/status and enqueues sections; this path never evaluates receipt reuse or TTL. The constructor requires this otherwise inert argument."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/entity_profile/contracts.py:<module>:PROFILE_FLOOD_RETRY_BASE_SECONDS"
+rationale = "Reviewed conservative same-cursor failure pacing in validated injected RefreshLimits; no new TOML knobs in this incident scope. This is retry policy, not a protocol constant."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/entity_profile/contracts.py:<module>:PROFILE_FLOOD_RETRY_CAP_SECONDS"
+rationale = "Reviewed conservative same-cursor failure pacing in validated injected RefreshLimits; no new TOML knobs in this incident scope. The cap never shortens a server/account deadline."

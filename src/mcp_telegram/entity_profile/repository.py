@@ -42,6 +42,8 @@ from .contracts import (
     NORMALIZATION_VERSION,
     PERSONAL_CHANNEL_OWNED_FIELDS,
     PROFILE_COLLECTION_SECTIONS,
+    PROFILE_FLOOD_RETRY_BASE_SECONDS,
+    PROFILE_FLOOD_RETRY_CAP_SECONDS,
     PROFILE_SECTIONS,
     ObservationBoundary,
     ProfileAcquisitionEvidence,
@@ -155,7 +157,16 @@ class _ValidatedReceipt:
 class EntityProfileRepository:
     """Read and write entity profiles without making Telegram calls."""
 
-    def __init__(self, conn: sqlite3.Connection, *, section_ttl_seconds: int) -> None:
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        section_ttl_seconds: int,
+        flood_retry_base_seconds: int = PROFILE_FLOOD_RETRY_BASE_SECONDS,
+        flood_retry_cap_seconds: int = PROFILE_FLOOD_RETRY_CAP_SECONDS,
+    ) -> None:
+        self._flood_retry_base_seconds = flood_retry_base_seconds
+        self._flood_retry_cap_seconds = flood_retry_cap_seconds
         self._conn = conn
         self._section_ttl_seconds = max(1, int(section_ttl_seconds))
         self._column_cache: dict[str, set[str]] = {}
@@ -2859,13 +2870,8 @@ class EntityProfileRepository:
     ) -> bool:
         """Atomically defer only the section owned by the current durable cursor."""
         with write_savepoint(self._conn):
-            predicate, parameters = self._cursor_predicate(cursor)
-            changed = self._conn.execute(
-                "UPDATE entity_profile_refresh_state SET status='failed', retry_at=?, reason=?, updated_at=? "
-                "WHERE " + predicate,
-                (retry_at, reason, now, *parameters),
-            ).rowcount
-            if changed != 1:
+            deadline = self._defer_cursor_failure(cursor, now=now, reason=reason, retry_at=retry_at)
+            if deadline is None:
                 return False
             self._conn.execute(
                 """
@@ -2876,38 +2882,55 @@ class EntityProfileRepository:
                     status=CASE WHEN entity_detail_sections.observed_at IS NULL THEN 'unavailable' ELSE 'stale' END,
                     reason=excluded.reason, retry_at=excluded.retry_at
                 """,
-                (cursor.entity_id, cursor.next_section, reason, retry_at),
+                (cursor.entity_id, cursor.next_section, reason, deadline),
             )
         return True
 
-    def mark_refresh_failure(
-        self,
-        entity_id: int,
-        *,
-        now: int,
-        reason: str,
-        retry_at: int | None = None,
-    ) -> None:
-        """Record failure while preserving payload and its last successful timestamp."""
-        try:
-            with write_savepoint(self._conn):
-                try:
-                    self._conn.execute(
-                        "INSERT INTO entity_profile_refresh_state(entity_id, status, retry_at, reason, updated_at) "
-                        "VALUES (?, 'failed', ?, ?, ?) ON CONFLICT(entity_id) DO UPDATE SET status=excluded.status, "
-                        "retry_at=excluded.retry_at, reason=excluded.reason, updated_at=excluded.updated_at",
-                        (entity_id, retry_at, reason, now),
-                    )
-                except sqlite3.OperationalError:
-                    pass
-                self._conn.execute(
-                    "UPDATE entity_detail_sections SET status=CASE WHEN observed_at IS NULL "
-                    "THEN 'unavailable' ELSE 'stale' END, reason=?, retry_at=? "
-                    "WHERE entity_id=? AND status <> 'not_applicable'",
-                    (reason, retry_at, entity_id),
-                )
-        except sqlite3.OperationalError:
-            return
+    def mark_core_failure(self, cursor: EntityRefreshCursor, *, now: int, reason: str, retry_at: int) -> bool:
+        """Defer unresolved core work without inventing a referenced entity or section."""
+        with write_savepoint(self._conn):
+            deadline = self._defer_cursor_failure(cursor, now=now, reason=reason, retry_at=retry_at)
+            if deadline is None:
+                return False
+            self._conn.execute(
+                "UPDATE entity_detail_sections SET status=CASE WHEN observed_at IS NULL "
+                "THEN 'unavailable' ELSE 'stale' END, reason=?, retry_at=? WHERE entity_id=? AND section=?",
+                (reason, deadline, cursor.entity_id, cursor.next_section),
+            )
+        return True
+
+    def _defer_cursor_failure(self, cursor: EntityRefreshCursor, *, now: int, reason: str, retry_at: int) -> int | None:
+        require_write_transaction(self._conn)
+        predicate, parameters = self._cursor_predicate(cursor)
+        previous = self._conn.execute(
+            "SELECT status,retry_at,updated_at FROM entity_profile_refresh_state WHERE " + predicate,
+            parameters,
+        ).fetchone()
+        if previous is None:
+            return None
+        retry_at = self._section_failure_deadline(previous, now=now, reason=reason, retry_at=retry_at)
+        changed = self._conn.execute(
+            "UPDATE entity_profile_refresh_state SET status='failed', retry_at=?, reason=?, updated_at=? "
+            "WHERE " + predicate,
+            (retry_at, reason, now, *parameters),
+        ).rowcount
+        if changed != 1:
+            return None
+        return retry_at
+
+    def _section_failure_deadline(self, previous: tuple[object, ...], *, now: int, reason: str, retry_at: int) -> int:
+        if reason == "auth_scope_changed":
+            return retry_at
+        previous_retry = previous[1] if isinstance(previous[1], int) else 0
+        previous_updated = previous[2] if isinstance(previous[2], int) else now
+        prior_delay = max(0, previous_retry - previous_updated) if previous[0] == "failed" else 0
+        # Effective scheduled delay survives ordinary failures; it is not a Flood event count.
+        if reason == "flood_wait":
+            prior_delay = min(
+                self._flood_retry_cap_seconds,
+                max(self._flood_retry_base_seconds, prior_delay * 2),
+            )
+        return max(retry_at, previous_retry, now + prior_delay)
 
     def _read_sections(
         self,

@@ -19,6 +19,7 @@ from ..telegram_demand import (
 )
 from ..telegram_rpc_consumers import DemandKind
 from ..telegram_rpc_scheduler import TelegramRpcSource, rpc_attempt_budget, rpc_scope
+from .contracts import PROFILE_FLOOD_RETRY_BASE_SECONDS, PROFILE_FLOOD_RETRY_CAP_SECONDS
 
 DurableRefreshStatusCallback = Callable[[float], DemandStatus | None]
 
@@ -55,6 +56,8 @@ class RefreshLimits:
     whole_refresh_seconds: float = 25.0
     max_queued_refreshes: int = 128
     foreground_refresh_wait_seconds: float = 15.0
+    flood_retry_base_seconds: int = PROFILE_FLOOD_RETRY_BASE_SECONDS
+    flood_retry_cap_seconds: int = PROFILE_FLOOD_RETRY_CAP_SECONDS
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -69,6 +72,10 @@ class RefreshLimits:
         if self.per_rpc_seconds > self.whole_refresh_seconds:
             raise ValueError("per-RPC budget cannot exceed whole-refresh budget")
         _validate_positive_integer(self.max_queued_refreshes, "refresh queue capacity")
+        _validate_positive_integer(self.flood_retry_base_seconds, "Flood retry base")
+        _validate_positive_integer(self.flood_retry_cap_seconds, "Flood retry cap")
+        if self.flood_retry_base_seconds > self.flood_retry_cap_seconds:
+            raise ValueError("entity profile Flood retry base cannot exceed cap")
 
 
 class RefreshEnqueueResult(StrEnum):
