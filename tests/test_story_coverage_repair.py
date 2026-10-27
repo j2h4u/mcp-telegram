@@ -6,7 +6,7 @@ import json
 import sqlite3
 from collections.abc import Iterator
 from dataclasses import asdict
-from typing import cast
+from typing import Literal, cast
 
 import pytest
 
@@ -173,7 +173,7 @@ def test_checkpoint_and_coverage_roll_back_together(repair: Repair) -> None:
             now=300, limit=32, pair_mode="enabled", self_id=77, coverage_owner_account_id=77
         )
     assert fact(conn) == before and unaffected(conn) == other
-    assert "story_coverage_refinement" not in _read_profile_admission_state(conn, 77)
+    assert "story_coverage_refinement_v2" not in _read_profile_admission_state(conn, 77)
     with write_transaction(conn):
         conn.execute("DROP TRIGGER reject_refinement")
     assert (
@@ -181,8 +181,8 @@ def test_checkpoint_and_coverage_roll_back_together(repair: Repair) -> None:
         == 1
     )
     state = _read_profile_admission_state(conn, 77)
-    assert state["story_coverage_refinement"] == {
-        "version": 1,
+    assert state["story_coverage_refinement_v2"] == {
+        "version": 2,
         "last_peer": 42,
         "completed": False,
         "items": 1,
@@ -202,13 +202,13 @@ def test_checkpoint_is_bounded_restartable_and_idle(repair: Repair) -> None:
         )
         assert _refine_story_coverage_pass(conn, 77, 100) == 32
     state = _read_profile_admission_state(conn, 77)
-    checkpoint = cast(dict[str, object], state["story_coverage_refinement"])
+    checkpoint = cast(dict[str, object], state["story_coverage_refinement_v2"])
     assert checkpoint["last_peer"] == 130 and checkpoint["completed"] is False
     second = sqlite3.connect(conn.execute("PRAGMA database_list").fetchone()[2])
     try:
         with write_transaction(second):
             assert _refine_story_coverage_pass(second, 77, 32) == 4
-        checkpoint = cast(dict[str, object], _read_profile_admission_state(second, 77)["story_coverage_refinement"])
+        checkpoint = cast(dict[str, object], _read_profile_admission_state(second, 77)["story_coverage_refinement_v2"])
         assert checkpoint["completed"] is True and checkpoint["slots"] == 13
         statements: list[str] = []
         second.set_trace_callback(statements.append)
@@ -219,7 +219,7 @@ def test_checkpoint_is_bounded_restartable_and_idle(repair: Repair) -> None:
         second.close()
 
 
-@pytest.mark.parametrize("version", [0, 2, True, "1"])
+@pytest.mark.parametrize("version", [0, 1, 3, True, "2"])
 def test_unknown_checkpoint_version_is_not_replayed(repair: Repair, version: object) -> None:
     from mcp_telegram.entity_profile.repository import (
         _read_profile_admission_state,
@@ -231,11 +231,11 @@ def test_unknown_checkpoint_version_is_not_replayed(repair: Repair, version: obj
     before = fact(conn)
     with write_transaction(conn):
         state = _read_profile_admission_state(conn, 77)
-        state["story_coverage_refinement"] = {"version": version}
+        state["story_coverage_refinement_v2"] = {"version": version}
         _save_profile_admission_state(conn, state)
         assert _refine_story_coverage_pass(conn, 77, 32) == 0
     assert fact(conn) == before
-    assert _read_profile_admission_state(conn, 77)["story_coverage_refinement"] == {"version": version}
+    assert _read_profile_admission_state(conn, 77)["story_coverage_refinement_v2"] == {"version": version}
 
 
 @pytest.mark.parametrize("value", [None, "", False, 0, [], {}, {"constructor": "Unsupported"}])
@@ -345,4 +345,82 @@ async def test_queued_scope_change_cannot_repair_or_checkpoint(repair: Repair) -
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
     assert fact(conn) == before
-    assert "story_coverage_refinement" not in _read_profile_admission_state(conn, 77)
+    assert "story_coverage_refinement_v2" not in _read_profile_admission_state(conn, 77)
+
+
+def _copy_current_story(conn: sqlite3.Connection) -> None:
+    for table in ("entity_profile_collection_facts", "entity_profile_collection_membership", "entity_detail_sections"):
+        columns = [str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")]
+        projection = ",".join("'current_stories'" if column == "section" else column for column in columns)
+        conn.execute(f"INSERT INTO {table} SELECT {projection} FROM {table} WHERE section='pinned_stories'")
+
+
+@pytest.mark.parametrize("section", ["current_stories", "pinned_stories"])
+def test_repair_isolates_identical_item_keys_in_each_story_section(repair: Repair, section: str) -> None:
+    conn, _repo = repair
+    with write_transaction(conn):
+        _copy_current_story(conn)
+    other = "pinned_stories" if section == "current_stories" else "current_stories"
+    before = conn.execute("SELECT * FROM entity_profile_collection_facts WHERE section=?", (other,)).fetchall()
+    with write_transaction(conn):
+        assert refine_published_story_coverage(
+            conn, 77, 42, section=cast(Literal["current_stories", "pinned_stories"], section)
+        ) == (1, 13, 0)
+    assert conn.execute("SELECT * FROM entity_profile_collection_facts WHERE section=?", (other,)).fetchall() == before
+
+
+def test_v2_revisits_current_once_and_preserves_completed_v1_receipt(repair: Repair) -> None:
+    from mcp_telegram.entity_profile.repository import (
+        _read_profile_admission_state,
+        _refine_story_coverage_pass,
+        _save_profile_admission_state,
+    )
+
+    conn, _repo = repair
+    old = {"version": 1, "last_peer": 42, "completed": True, "items": 1, "slots": 13, "unresolved": 0}
+    with write_transaction(conn):
+        _copy_current_story(conn)
+        assert refine_published_story_coverage(conn, 77, 42) == (1, 13, 0)
+        state = _read_profile_admission_state(conn, 77)
+        state["story_coverage_refinement"] = old
+        _save_profile_admission_state(conn, state)
+        assert _refine_story_coverage_pass(conn, 77, 1) == 1
+    state = _read_profile_admission_state(conn, 77)
+    assert state["story_coverage_refinement"] == old
+    assert state["story_coverage_refinement_v2"] == {
+        "version": 2,
+        "last_peer": 42,
+        "completed": False,
+        "items": 1,
+        "slots": 13,
+        "unresolved": 0,
+    }
+    reopened = sqlite3.connect(conn.execute("PRAGMA database_list").fetchone()[2])
+    try:
+        with write_transaction(reopened):
+            assert _refine_story_coverage_pass(reopened, 77, 32) == 0
+        assert _read_profile_admission_state(reopened, 77)["story_coverage_refinement"] == old
+        statements: list[str] = []
+        reopened.set_trace_callback(statements.append)
+        with write_transaction(reopened):
+            assert _refine_story_coverage_pass(reopened, 77, 32) == 0
+        assert not any("FROM entity_profile_collection_facts" in statement for statement in statements)
+    finally:
+        reopened.close()
+
+
+def test_v2_second_section_failure_rolls_back_first_section_and_checkpoint(repair: Repair) -> None:
+    from mcp_telegram.entity_profile.repository import _read_profile_admission_state, _refine_story_coverage_pass
+
+    conn, _repo = repair
+    with write_transaction(conn):
+        _copy_current_story(conn)
+        conn.execute(
+            "CREATE TRIGGER reject_second_section BEFORE UPDATE OF coverage_json ON entity_profile_collection_facts WHEN OLD.section='pinned_stories' BEGIN SELECT RAISE(IGNORE); END"
+        )
+    before = conn.execute("SELECT * FROM entity_profile_collection_facts ORDER BY section").fetchall()
+    with pytest.raises(sqlite3.OperationalError, match="refinement changed"):
+        with write_transaction(conn):
+            _refine_story_coverage_pass(conn, 77, 32)
+    assert conn.execute("SELECT * FROM entity_profile_collection_facts ORDER BY section").fetchall() == before
+    assert "story_coverage_refinement_v2" not in _read_profile_admission_state(conn, 77)

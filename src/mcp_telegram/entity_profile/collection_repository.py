@@ -10,7 +10,7 @@ import math
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
-from typing import cast
+from typing import Literal, cast
 
 from ..sync_transactions import require_write_transaction
 from .contracts import (
@@ -1192,12 +1192,14 @@ def _rpc_path_bounds(value: object, order: int) -> tuple[float, float] | None:
     )
 
 
-def _story_receipt(conn: sqlite3.Connection, owner: int, peer: int) -> tuple[str, dict[str, object]] | None:
+def _story_receipt(
+    conn: sqlite3.Connection, owner: int, peer: int, section: Literal["current_stories", "pinned_stories"]
+) -> tuple[str, dict[str, object]] | None:
     row = conn.execute(
         "SELECT s.payload_json,s.normalization_version,s.status,s.reason,d.profile_owner_account_id "
         "FROM entity_detail_sections s JOIN entity_details d ON d.entity_id=s.entity_id "
-        "WHERE s.entity_id=? AND s.section='pinned_stories'",
-        (peer,),
+        "WHERE s.entity_id=? AND s.section=?",
+        (peer, section),
     ).fetchone()
     if row is None or row[1:] != (PROFILE_NORMALIZATION_VERSION, "fresh", None, owner):
         return None
@@ -1342,10 +1344,18 @@ def _linked_story_observation(  # noqa: PLR0913 - one persisted receipt proof
     )
 
 
-def refine_published_story_coverage(conn: sqlite3.Connection, owner: int, peer: int) -> tuple[int, int, int]:
+def refine_published_story_coverage(
+    conn: sqlite3.Connection,
+    owner: int,
+    peer: int,
+    *,
+    section: Literal["current_stories", "pinned_stories"] = "pinned_stories",
+) -> tuple[int, int, int]:
     """Refine proven past optional omissions without creating a new observation."""
     require_write_transaction(conn)
-    receipt = _story_receipt(conn, owner, peer)
+    if section not in {"current_stories", "pinned_stories"}:
+        raise ValueError("unsupported story coverage section")
+    receipt = _story_receipt(conn, owner, peer, section)
     if receipt is None:
         return 0, 0, 0
     encoded_receipt, payload = receipt
@@ -1354,9 +1364,9 @@ def refine_published_story_coverage(conn: sqlite3.Connection, owner: int, peer: 
         "SELECT f.item_key,f.fields_json,f.coverage_json,f.provenance_json,f.observation_order,f.observed_at "
         "FROM entity_profile_collection_facts f JOIN entity_profile_collection_membership m "
         "USING(owner_account_id,entity_id,section,item_key) WHERE f.owner_account_id=? AND f.entity_id=? "
-        "AND f.section='pinned_stories' AND m.generation=? AND m.scan=? AND m.detail_complete=1 "
+        "AND f.section=? AND m.generation=? AND m.scan=? AND m.detail_complete=1 "
         "AND m.identity_kind='remote' AND f.coverage_json LIKE '%partial_value_unobserved%' ORDER BY f.item_key",
-        (owner, peer, published["generation"], published["scan"]),
+        (owner, peer, section, published["generation"], published["scan"]),
     ).fetchall()
     items, slots, unresolved = 0, 0, 0
     for row in rows:
@@ -1371,7 +1381,9 @@ def refine_published_story_coverage(conn: sqlite3.Connection, owner: int, peer: 
             unresolved += 1
             continue
         assert coverage is not None
-        _write_story_coverage_refinement(conn, (owner, peer), row, (encoded_receipt, published), encode(coverage))
+        _write_story_coverage_refinement(
+            conn, (owner, peer, section), row, (encoded_receipt, published), encode(coverage)
+        )
         items += 1
         slots += changed
         if _unresolved_story_absence(coverage):
@@ -1390,33 +1402,36 @@ def _unresolved_story_absence(coverage: Mapping[str, object]) -> bool:
 
 def _write_story_coverage_refinement(
     conn: sqlite3.Connection,
-    identity: tuple[int, int],
+    identity: tuple[int, int, str],
     row: tuple[object, ...],
     receipt: tuple[str, Mapping[str, object]],
     coverage: str,
 ) -> None:
-    owner, peer = identity
+    owner, peer, section = identity
     encoded_receipt, published = receipt
     changed = conn.execute(
         "UPDATE entity_profile_collection_facts SET coverage_json=? WHERE owner_account_id=? AND entity_id=? "
-        "AND section='pinned_stories' AND item_key=? AND fields_json=? AND coverage_json=? AND provenance_json=? "
+        "AND section=? AND item_key=? AND fields_json=? AND coverage_json=? AND provenance_json=? "
         "AND observation_order=? AND observed_at=? AND EXISTS(SELECT 1 FROM entity_detail_sections s "
-        "JOIN entity_details d ON d.entity_id=s.entity_id WHERE s.entity_id=? AND s.section='pinned_stories' "
+        "JOIN entity_details d ON d.entity_id=s.entity_id WHERE s.entity_id=? AND s.section=? "
         "AND s.payload_json=? AND s.normalization_version=? AND s.status='fresh' AND s.reason IS NULL "
         "AND d.profile_owner_account_id=?) AND EXISTS(SELECT 1 FROM entity_profile_collection_membership m "
-        "WHERE m.owner_account_id=? AND m.entity_id=? AND m.section='pinned_stories' AND m.item_key=? "
+        "WHERE m.owner_account_id=? AND m.entity_id=? AND m.section=? AND m.item_key=? "
         "AND m.generation=? AND m.scan=? AND m.detail_complete=1 AND m.identity_kind='remote')",
         (
             coverage,
             owner,
             peer,
+            section,
             *row,
             peer,
+            section,
             encoded_receipt,
             PROFILE_NORMALIZATION_VERSION,
             owner,
             owner,
             peer,
+            section,
             row[0],
             published["generation"],
             published["scan"],
