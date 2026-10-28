@@ -144,6 +144,7 @@ class TelegramDemandCoordinator:
         self._prepare_durable_retry = prepare_durable_retry or (lambda _budget, _method: None)
         self._safety_scan_seconds = float(safety_scan_seconds)
         self._observer = observer
+        self._canonical_progress: Callable[[], None] | None = None
         self._wake = asyncio.Event()
         self._state = CoordinatorState.NEW
         self._queue = deque[DemandKind]()
@@ -162,6 +163,10 @@ class TelegramDemandCoordinator:
         self._eligibility_generation = 0
         self._slice_eligibility_generation = 0
         self.scan()
+
+    def bind_canonical_progress(self, callback: Callable[[], None]) -> None:
+        """Attach the account owner's accepted business progress signal."""
+        self._canonical_progress = callback
 
     @property
     def state(self) -> CoordinatorState:
@@ -511,6 +516,8 @@ class TelegramDemandCoordinator:
             self._excluded.discard(selected)
             self._eligibility_waits.pop(selected, None)
             self._revision_methods.pop(selected, None)
+            if budget.attempts > 0 and self._canonical_progress is not None:
+                self._canonical_progress()
             self._observe("completed", kind, actual_attempts=budget.attempts)
         elif outcome.kind is SliceOutcomeKind.DEFERRED and self._handle_outcome_deferred(kind, status, budget):
             return

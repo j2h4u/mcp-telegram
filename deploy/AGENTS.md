@@ -135,3 +135,17 @@ protected daemon. It authorizes one conditional restart trial for the same
 verified account after known waits; success is reported only after the real
 startup identity operation completes. A failed or interrupted trial remains
 protected and requires a fresh explicit command.
+
+Settled FloodWait stops resume automatically by default. The typed
+`[flood_wait] auto_resume_enabled` setting can disable future automatic trials
+without clearing known restrictions or spent attempts. The six waits are
+1/2/4/8/16/24 hours, extended by longer Telegram restrictions. Interrupted
+consumed trials and unknown outcomes still require manual recovery. A full
+restart restores pending delivery before normal acquisition; health remains
+degraded during protection while retained local reads stay available.
+
+Automatic episode metadata extends the existing gateway safety receipt;
+older readers reject that extension. Disable on the current compatible binary
+for rollback; never remove the receipt, restore stale data, or downgrade to a
+reader that cannot preserve the episode and its floors. Follow the stopped
+matching-backup procedure above before this persisted-format cutover.

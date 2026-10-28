@@ -23,6 +23,7 @@ from mcp_telegram.daemon import (
     _ensure_demand_runtime,
     _HistorySyncRuntime,
     _message_fact_refresh_policy_from_config,
+    _monitor_auto_resume,
     _monitor_flood_wait_kill_switch,
     _offer_startup_demands,
     _prime_runtime,
@@ -188,6 +189,15 @@ class _ClientStub:
     async def fail_startup_recovery(self) -> None:
         pass
 
+    async def maintain_auto_resume(self) -> bool:
+        return False
+
+    async def finish_startup_auto_resume(self) -> None:
+        pass
+
+    def note_canonical_progress(self) -> None:
+        pass
+
     async def authorize_account_recovery(self, expected_generation: str, acknowledged: bool) -> None:
         del expected_generation, acknowledged
         raise ValueError("test recovery is unavailable")
@@ -227,6 +237,91 @@ class _ClientStub:
 
     async def get_me(self) -> object:
         return SimpleNamespace(id=1)
+
+
+@pytest.mark.parametrize("error", [OSError("offline"), TimeoutError("connect timeout")])
+async def test_connection_failure_reports_startup_recovery(error: Exception) -> None:
+    failed = AsyncMock()
+    client = SimpleNamespace(
+        prepare_startup_safety=AsyncMock(), connect=AsyncMock(side_effect=error), fail_startup_recovery=failed
+    )
+    assert not await _connect_telegram(_typed_ctx(client=client))
+    failed.assert_awaited_once()
+
+
+@pytest.mark.parametrize("already_stopped", [False, True])
+async def test_startup_stop_during_consumption_preserves_receipt_without_connecting(already_stopped: bool) -> None:
+    shutdown = asyncio.Event()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    receipts: list[str] = []
+
+    async def consume() -> None:
+        entered.set()
+        await release.wait()
+        receipts.append("consumed")
+
+    prepare = AsyncMock(side_effect=consume)
+    connect = AsyncMock()
+    fail = AsyncMock()
+    client = SimpleNamespace(prepare_startup_safety=prepare, connect=connect, fail_startup_recovery=fail)
+    if already_stopped:
+        shutdown.set()
+    task = asyncio.create_task(_connect_telegram(_typed_ctx(client=client, shutdown_event=shutdown)))
+    if not already_stopped:
+        await entered.wait()
+        shutdown.set()
+        assert not task.done() and receipts == []
+        release.set()
+    assert await task is False
+    assert receipts == ([] if already_stopped else ["consumed"])
+    assert prepare.await_count == (0 if already_stopped else 1)
+    connect.assert_not_awaited()
+    fail.assert_not_awaited()
+
+
+@pytest.mark.parametrize("stop_during_maintenance", [False, True])
+async def test_auto_resume_waits_for_central_owner_before_requesting_shutdown(
+    stop_during_maintenance: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    shutdown = asyncio.Event()
+    entered = asyncio.Event()
+    settled = asyncio.Event()
+
+    async def maintain() -> bool:
+        entered.set()
+        await settled.wait()
+        return True
+
+    maintenance = AsyncMock(side_effect=maintain)
+    client = SimpleNamespace(maintain_auto_resume=maintenance)
+    task = asyncio.create_task(_monitor_auto_resume(_typed_ctx(client=client, shutdown_event=shutdown)))
+    await entered.wait()
+    assert not task.done() and not shutdown.is_set()
+    if stop_during_maintenance:
+        shutdown.set()
+    with caplog.at_level(logging.INFO, logger="mcp_telegram.daemon"):
+        settled.set()
+        await task
+    assert shutdown.is_set()
+    assert ("automatic_sync_resume_restarting" in caplog.messages) is not stop_during_maintenance
+    maintenance.assert_awaited_once()
+
+
+async def test_auto_resume_checks_locally_at_bounded_interval_and_stop_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    shutdown = asyncio.Event()
+    maintenance = AsyncMock(return_value=False)
+    client = SimpleNamespace(maintain_auto_resume=maintenance)
+
+    async def wait(stop: asyncio.Event, seconds: float) -> bool:
+        assert stop is shutdown and seconds == 60
+        shutdown.set()
+        return True
+
+    monkeypatch.setattr(daemon, "sleep_through_flood", wait)
+    await _monitor_auto_resume(_typed_ctx(client=client, shutdown_event=shutdown))
+    await _monitor_auto_resume(_typed_ctx(client=client, shutdown_event=shutdown))
+    maintenance.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -460,17 +555,26 @@ def test_ensure_demand_runtime_reuses_existing_runtime(monkeypatch: pytest.Monke
     )
 
 
-@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_stage",
+    [None, "identity", "identity_cancelled", "identity_reporting_failed", "delivery:replayed", "startup:restored"],
+)
 async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noqa: PLR0915
     monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str | None,
 ) -> None:
     from mcp_telegram import daemon
 
     events: list[str] = []
     writer_connection = object()
     writer_active = False
+    shutdown_event = asyncio.Event()
 
     class _Client:
+        def set_auto_resume_stop(self, stopped: Callable[[], bool]) -> None:
+            assert stopped == shutdown_event.is_set
+            events.append("stop:bound")
+
         async def wait_update_delivery_failure(self) -> None:
             await asyncio.Event().wait()
 
@@ -479,6 +583,18 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
             assert "catalog:bootstrap" in events
             assert f"owner:bind:{account_id}" in events
             events.append("delivery:replayed")
+            if failure_stage == "delivery:replayed":
+                raise RuntimeError("synthetic startup failure")
+
+        async def finish_startup_auto_resume(self) -> None:
+            events.append("startup:restored")
+            if failure_stage == "startup:restored":
+                raise RuntimeError("synthetic startup failure")
+
+        async def fail_startup_recovery(self) -> None:
+            events.append("startup:failed")
+            if failure_stage == "identity_reporting_failed":
+                raise OSError("synthetic receipt failure")
 
     class _Writer:
         async def run(self, operation: Callable[[object], object]) -> object:
@@ -542,7 +658,7 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
         client=_Client(),
         conn=writer_connection,
         db_path=Path("/tmp/mcp-telegram-sync-main-test.db"),
-        shutdown_event=asyncio.Event(),
+        shutdown_event=shutdown_event,
         scheduling=SimpleNamespace(
             draft_recovery=object(),
             reconnect_catch_up_interval_seconds=5.0,
@@ -572,6 +688,10 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
 
     async def acquire(_ctx: object, _directory: object) -> object:
         events.append("identity")
+        if failure_stage == "identity_cancelled":
+            raise asyncio.CancelledError("synthetic startup failure")
+        if failure_stage in {"identity", "identity_reporting_failed"}:
+            raise RuntimeError("synthetic startup failure")
         return object()
 
     async def run_reconnect(*_args: object, **_kwargs: object) -> None:
@@ -608,13 +728,20 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
     monkeypatch.setattr(daemon, "_run_daemon_lifetime", lifetime)
     monkeypatch.setattr(daemon, "_shutdown_sync_main_context", shutdown)
 
-    await daemon.sync_main()
+    if failure_stage is None:
+        await daemon.sync_main()
+    else:
+        expected_error = asyncio.CancelledError if failure_stage == "identity_cancelled" else RuntimeError
+        with pytest.raises(expected_error, match="synthetic startup failure"):
+            await daemon.sync_main()
 
-    assert events == [
+    expected = [
         "context",
+        "stop:bound",
         "task:sqlite_write_owner",
         "task:update_delivery",
         "task:flood_wait_kill_switch_monitor",
+        "task:automatic_sync_resume_monitor",
         "barrier:True",
         "owner:init",
         "owner:register",
@@ -633,6 +760,7 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
         "writer:done",
         "barrier:open",
         "delivery:replayed",
+        "startup:restored",
         "task:telegram_demand_coordinator",
         "task:reconnect_catch_up_loop",
         "prime",
@@ -640,6 +768,11 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
         "lifetime",
         "shutdown",
     ]
+    if failure_stage is not None:
+        if failure_stage.startswith("identity"):
+            failure_stage = "identity"
+        expected = [*expected[: expected.index(failure_stage) + 1], "startup:failed", "shutdown"]
+    assert events == expected
 
 
 def test_startup_demands_are_offered_to_coordinator() -> None:

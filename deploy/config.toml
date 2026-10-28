@@ -42,6 +42,10 @@ shutdown_drain_grace_seconds = 2.0
 rpc_summary_interval_seconds = 300
 row_cap = 250000
 
+[flood_wait]
+# Resume settled protective stops after 1/2/4/8/16/24h, then require manual action.
+auto_resume_enabled = true
+
 [telegram_rpc]
 # One account-wide limiter shared by every service class.
 transport_contract_version = 1

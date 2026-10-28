@@ -399,6 +399,7 @@ async def test_account_safety_status_reports_protection_without_session_material
         "unresolved_request_count",
         "unresolved_requests",
         "unresolved_requests_truncated",
+        "automatic_resume",
     }
     assert status["unresolved_request_count"] == 0 and status["unresolved_requests"] == []
     assert status["reason"] == "unresolved_outbound_outcome"

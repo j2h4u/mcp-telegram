@@ -1852,6 +1852,15 @@ class DaemonAPIServer:
             protection["opened_at"] = status.opened_at
         if safety is not None:
             protection.update(safety)
+            automatic = safety.get("automatic_resume")
+            match automatic:
+                case {"enabled": True, "state": "waiting"}:
+                    protection["recovery"] = "automatic"
+                    protection["notice"] = (
+                        "Background Telegram acquisition is paused by account protection. A cautious automatic "
+                        "restart is scheduled after the recovery delay and Telegram restrictions. Retained local "
+                        "reads remain available; new incoming data and freshness may be limited."
+                    )
             if safety.get("reason") == "unresolved_outbound_outcome":
                 protection["notice"] = (
                     "Background Telegram acquisition is blocked because a persisted request has no confirmed "
