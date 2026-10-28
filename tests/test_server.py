@@ -1628,6 +1628,41 @@ async def test_protection_snapshot_bounds_text_without_hiding_blocked_state(monk
     assert protection["reason"] == "r" * 5000
 
 
+@pytest.mark.parametrize("floor", [float("nan"), float("inf"), -1, True, "soon"])
+def test_account_protection_rejects_invalid_server_floors(floor: object) -> None:
+    assert not server._is_valid_active_account_protection(
+        {
+            "status": "active",
+            "outbound_acquisition": "blocked",
+            "recovery": "manual",
+            "notice": "blocked",
+            "known_retry_until_utc": floor,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"key_id": "secret"},
+        {"generation": ""},
+        {"generation": 123},
+        {"unresolved_request_count": True},
+        {"unresolved_requests": [{"method": "safe", "phase": "acknowledged_unknown"}]},
+    ],
+)
+def test_account_protection_rejects_private_or_invalid_diagnostics(extra: dict[str, object]) -> None:
+    assert not server._is_valid_active_account_protection(
+        {
+            "status": "active",
+            "outbound_acquisition": "blocked",
+            "recovery": "manual",
+            "notice": "blocked",
+            **extra,
+        }
+    )
+
+
 @pytest.mark.asyncio
 async def test_typed_protection_error_has_manual_action_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(server.tools, "tool_args", lambda tool, **kwargs: object())

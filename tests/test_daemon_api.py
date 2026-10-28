@@ -2720,6 +2720,52 @@ async def test_protected_startup_exposes_safe_status_without_enabling_other_read
     assert unavailable["error"] == "daemon_not_ready"
 
 
+async def test_protected_startup_diagnostics_reach_mcp_through_actual_ipc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import asynccontextmanager
+
+    from jsonschema import validate
+
+    from mcp_telegram import server as mcp_server
+    from mcp_telegram.daemon_client import DaemonConnection
+    from mcp_telegram.tools._base import ACTIVE_ACCOUNT_PROTECTION_SCHEMA
+
+    api = make_server()
+    api._ready = False
+    method = "telethon.tl.functions.messages.GetHistoryRequest:4423e6c5"
+    api._account_safety_status = lambda: {
+        "generation": "operator-only-generation",
+        "reason": "unresolved_outbound_outcome",
+        "known_retry_until_utc": 123.0,
+        "unresolved_request_count": 1,
+        "unresolved_requests": [{"method": method, "phase": "unknown"}],
+        "unresolved_requests_truncated": False,
+    }
+    socket_path = tmp_path / "diagnostics.sock"
+
+    @asynccontextmanager
+    async def connection() -> AsyncIterator[DaemonConnection]:
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        try:
+            yield DaemonConnection(reader, writer)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    monkeypatch.setattr(mcp_server, "daemon_connection", connection)
+    async with await asyncio.start_unix_server(api.handle_client, path=socket_path):
+        result = await mcp_server._account_protection_status()
+    status = cast(dict[str, object], result["account_protection"])
+    validate(status, ACTIVE_ACCOUNT_PROTECTION_SCHEMA)
+    assert status["status"] == "active"
+    assert "generation" not in status
+    assert status["unresolved_requests"] == [{"method": method, "phase": "unknown"}]
+    assert status["known_retry_until_utc"] == 123.0
+    assert "no confirmed response" in cast(str, status["notice"])
+
+
 async def test_recovery_authorization_reply_precedes_orderly_shutdown() -> None:
     server = make_server()
     server._ready = False

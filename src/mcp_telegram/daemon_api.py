@@ -1851,6 +1851,12 @@ class DaemonAPIServer:
             protection["opened_at"] = status.opened_at
         if safety is not None:
             protection.update(safety)
+            if safety.get("reason") == "unresolved_outbound_outcome":
+                protection["notice"] = (
+                    "Telegram acquisition is blocked because a persisted request has no confirmed response. "
+                    "Whether Telegram processed it or applied a rate limit is unknown. "
+                    "Retained local data is preserved. Recovery requires operator acknowledgement."
+                )
         return {"ok": True, "data": {"account_protection": protection}}
 
     async def _recover_account(self, req: dict[str, object]) -> dict[str, object]:

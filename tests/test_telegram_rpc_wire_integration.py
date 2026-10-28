@@ -378,7 +378,15 @@ async def test_account_safety_status_reports_protection_without_session_material
     ledger = gate._ensure_safety_ledger()
     ledger._record["protection"] = "unresolved_outbound_outcome"
     status = gate.account_safety_status()
-    assert status is not None and set(status) == {"generation", "reason", "known_retry_until_utc"}
+    assert status is not None and set(status) == {
+        "generation",
+        "reason",
+        "known_retry_until_utc",
+        "unresolved_request_count",
+        "unresolved_requests",
+        "unresolved_requests_truncated",
+    }
+    assert status["unresolved_request_count"] == 0 and status["unresolved_requests"] == []
     assert status["reason"] == "unresolved_outbound_outcome"
     gate._wire_fault = "storage_failure"
     status = gate.account_safety_status()

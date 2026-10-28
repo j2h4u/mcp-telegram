@@ -105,6 +105,8 @@ from .telegram_update_admission import GateMessageBox
 from .update_delivery import UpdateDeliveryRepository
 
 logger = logging.getLogger(__name__)
+_DIAGNOSTIC_REQUESTS_MAX = 8
+_TL_CONSTRUCTOR_HEX_CHARS = 8
 
 _METHOD_BACKOFF_BASE_SECONDS = 300
 _METHOD_BACKOFF_MAX_SECONDS = 3600
@@ -877,12 +879,23 @@ class TelegramRpcSafetyLedger:
         return cast(int, scope["account_id"]) if isinstance(scope, dict) and scope["stage"] == "verified" else None
 
     def status(self) -> dict[str, object]:
+        unresolved = [
+            item
+            for item in cast(dict[str, dict[str, object]], self._record.get("intents", {})).values()
+            if item["phase"] != "acknowledged_unknown"
+        ]
         return {
             "generation": self._record.get("generation"),
             "reason": self.protection_reason,
             "retry_until_utc": time.time() + max(0.0, self.floor_deadline - time.monotonic())
             if math.isfinite(self.floor_deadline)
             else None,
+            "unresolved_request_count": len(unresolved),
+            "unresolved_requests": [
+                {"method": _safe_diagnostic_method(cast(str, item["method"])), "phase": item["phase"]}
+                for item in unresolved[:_DIAGNOSTIC_REQUESTS_MAX]
+            ],
+            "unresolved_requests_truncated": len(unresolved) > _DIAGNOSTIC_REQUESTS_MAX,
         }
 
     def require_writable(self, *, auth_only: bool = False) -> None:
@@ -1654,6 +1667,19 @@ def _canonical_wire_method(request: object) -> str:
     actual = _application_request(request)
     kind = type(actual)
     return f"{kind.__module__}.{kind.__name__}:{actual.CONSTRUCTOR_ID:08x}"
+
+
+def _safe_diagnostic_method(method: str) -> str:
+    """Only disclose names matching installed Telegram request constructors."""
+    _, _, constructor = method.rpartition(":")
+    if len(constructor) != _TL_CONSTRUCTOR_HEX_CHARS or any(char not in "0123456789abcdef" for char in constructor):
+        return "unrecognized"
+    kind = tlobjects.get(int(constructor, 16))
+    if kind is not None and issubclass(kind, TLRequest):
+        canonical = f"{kind.__module__}.{kind.__name__}:{kind.CONSTRUCTOR_ID:08x}"
+        if method == canonical:
+            return canonical
+    return "unrecognized"
 
 
 @dataclass(slots=True)
@@ -2736,6 +2762,9 @@ class TelegramRpcGate(TelegramClient):
             "generation": status["generation"],
             "reason": reason,
             "known_retry_until_utc": status["retry_until_utc"],
+            "unresolved_request_count": status["unresolved_request_count"],
+            "unresolved_requests": status["unresolved_requests"],
+            "unresolved_requests_truncated": status["unresolved_requests_truncated"],
         }
 
     def _authentication_method_allowed(self, request: object) -> bool:

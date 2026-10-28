@@ -74,7 +74,14 @@ async def _probe(socket_path: Path) -> _HealthcheckResponse:
     if protection is not None:
         if not isinstance(protection, dict) or protection.get("status") != "active":
             raise ValueError("malformed account protection status")
-        return {"ok": False, "error": "account_protection_active"}
+        diagnostic_fields = (
+            "reason",
+            "unresolved_request_count",
+            "unresolved_requests",
+            "unresolved_requests_truncated",
+        )
+        detail = {key: protection[key] for key in diagnostic_fields if key in protection}
+        return {"ok": False, "error": "account_protection_active", "detail": json.dumps(detail, ensure_ascii=True)}
     return response
 
 
@@ -88,6 +95,8 @@ def main() -> int:
             error = response.get("error", "unknown")
             detail = response.get("detail", "")
             msg = f"daemon not ready: {detail}" if error == "daemon_not_ready" else f"daemon error: {error}"
+            if error == "account_protection_active" and detail:
+                msg += f": {detail}"
             print(msg, file=sys.stderr)
             return 1
         return 0
