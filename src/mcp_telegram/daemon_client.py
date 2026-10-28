@@ -10,7 +10,8 @@ the same async-with block, then closes the socket on exit.
 Error handling:
 - FileNotFoundError: daemon is not running (socket file absent)
 - ConnectionRefusedError: socket file exists but daemon is not listening
-- Both raise DaemonNotRunningError with an actionable "mcp-telegram sync" message.
+- Both raise DaemonNotRunningError; a genuinely absent daemon retains start guidance.
+- A connect timeout means no connection was established; send/response timeouts leave completion unconfirmed.
 - EOF on read (daemon closed connection unexpectedly): DaemonNotRunningError.
 
 DaemonConnection provides convenience methods for all fifteen daemon API methods.
@@ -226,7 +227,8 @@ class DaemonConnection:
         except TimeoutError as exc:
             self._writer.close()
             raise DaemonNotRunningError(
-                "Sync daemon timed out waiting for response. Restart it with: mcp-telegram sync",
+                "Sync daemon response timed out; request completion is unconfirmed and may still be owned by the "
+                "running service. Inspect service status and wait before retrying a mutation.",
                 kind="response_timeout",
             ) from exc
         except (ValueError, asyncio.IncompleteReadError) as exc:
@@ -288,7 +290,8 @@ class DaemonConnection:
             except TimeoutError as exc:
                 self._writer.close()
                 raise DaemonNotRunningError(
-                    "Sync daemon timed out while sending request. Restart it with: mcp-telegram sync",
+                    "Sync daemon send timed out; delivery and completion are unconfirmed and the request may still "
+                    "be owned by the running service. Inspect service status and wait before retrying a mutation.",
                     kind="send_timeout",
                 ) from exc
             finally:
@@ -736,14 +739,15 @@ async def daemon_connection(
         )
     except TimeoutError as exc:
         raise DaemonNotRunningError(
-            "Sync daemon timed out while connecting. Restart it with: mcp-telegram sync",
+            "Sync daemon connection was not established before the IPC timeout. Inspect existing service status "
+            "and try connecting again later.",
             kind="connect_timeout",
         ) from exc
     except OSError as exc:
         raise DaemonNotRunningError("Sync daemon is not running. Start it with: mcp-telegram sync") from exc
 
     if reader is None or writer is None:
-        raise DaemonNotRunningError("Sync daemon connection was not established. Restart it with: mcp-telegram sync")
+        raise DaemonNotRunningError("Sync daemon connection was not established.")
 
     conn = DaemonConnection(reader, writer, timeout_seconds=timeout_seconds)
     conn._config_path_seconds = config_path_seconds

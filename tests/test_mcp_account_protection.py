@@ -36,7 +36,7 @@ from tests.test_entity_profile_full_user_pair import _prepare
 from tests.test_telegram_rpc import _CircuitStatus, _gate, _RawFutureSender, _set_sender, _TestRequest
 
 _ACTIVE_NOTICE = (
-    "Telegram acquisition is blocked by account protection. Freshness and incoming coverage may be limited. "
+    "Background Telegram acquisition is blocked by account protection. Retained local reads remain available; use this result's source and coverage to assess requested data. New incoming data and freshness may be limited. "
     "Recovery requires operator action."
 )
 
@@ -386,7 +386,7 @@ async def test_feedback_persists_when_only_following_status_operation_fails(
     assert payload["accepted"] is True
     assert payload["account_protection"] == {
         "status": "unavailable",
-        "notice": "Account protection status is unavailable; Telegram acquisition state could not be confirmed.",
+        "notice": "Global background Telegram acquisition status is unavailable. This does not change the tool result; assess retained data using its source and coverage.",
     }
     readback = sqlite3.connect(feedback_path)
     try:
@@ -483,7 +483,7 @@ async def test_feedback_status_missing_or_malformed_stays_unavailable_over_real_
     assert payload["accepted"] is True
     assert payload["account_protection"] == {
         "status": "unavailable",
-        "notice": "Account protection status is unavailable; Telegram acquisition state could not be confirmed.",
+        "notice": "Global background Telegram acquisition status is unavailable. This does not change the tool result; assess retained data using its source and coverage.",
     }
     readback = sqlite3.connect(feedback_path)
     try:

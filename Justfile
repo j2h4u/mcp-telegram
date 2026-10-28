@@ -142,13 +142,7 @@ runtime-build:
 
 # Wait until the live Docker container reports healthy.
 runtime-wait:
-    for _ in {1..60}; do \
-      status="$(docker inspect {{container}} 2>/dev/null | jq -r '.[0].State.Health.Status // empty')"; \
-      echo "$status"; \
-      [ "$status" = healthy ] && exit 0; \
-      sleep 1; \
-    done; \
-    exit 1
+    python3 devtools/runtime_wait.py {{container}}
 
 # Run the redacted MCP integration smoke over the production HTTP transport.
 runtime-smoke-http:

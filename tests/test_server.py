@@ -1459,6 +1459,11 @@ def test_all_registered_output_schemas_validate_success_and_canonical_error_exam
             instance={"error": {**error["error"], "details": {"source": "daemon"}}},
             schema=schema,
         )
+        protection_schema = cast(dict[str, object], cast(dict[str, object], schema["properties"])["account_protection"])
+        assert "global background telegram acquisition status" in cast(str, protection_schema["description"]).lower()
+        active, unavailable = cast(list[dict[str, object]], protection_schema["oneOf"])
+        assert "global background telegram acquisition status" in cast(str, active["description"]).lower()
+        assert "global background acquisition status" in cast(str, unavailable["description"]).lower()
         validate(
             instance={**error, "account_protection": {"status": "unavailable", "notice": "unavailable"}},
             schema=schema,
@@ -1503,7 +1508,7 @@ async def test_unavailable_protection_status_keeps_successful_local_feedback_res
         "status": "open",
         "account_protection": {
             "status": "unavailable",
-            "notice": "Account protection status is unavailable; Telegram acquisition state could not be confirmed.",
+            "notice": "Global background Telegram acquisition status is unavailable. This does not change the tool result; assess retained data using its source and coverage.",
         },
     }
 
@@ -1522,7 +1527,7 @@ async def test_validation_error_includes_active_account_protection_notice(monkey
                         "outbound_acquisition": "blocked",
                         "recovery": "manual",
                         "notice": (
-                            "Telegram acquisition is blocked by account protection. Freshness and incoming coverage "
+                            "Background Telegram acquisition is blocked by account protection. Retained local reads remain available; use this result's source and coverage to assess requested data. New incoming data and freshness "
                             "may be limited. Recovery requires operator action."
                         ),
                     }
@@ -1543,7 +1548,7 @@ async def test_validation_error_includes_active_account_protection_notice(monkey
         "outbound_acquisition": "blocked",
         "recovery": "manual",
         "notice": (
-            "Telegram acquisition is blocked by account protection. Freshness and incoming coverage may be limited. "
+            "Background Telegram acquisition is blocked by account protection. Retained local reads remain available; use this result's source and coverage to assess requested data. New incoming data and freshness may be limited. "
             "Recovery requires operator action."
         ),
     }
@@ -1559,7 +1564,7 @@ async def test_each_registered_tool_response_gets_one_active_protection_snapshot
         "outbound_acquisition": "blocked",
         "recovery": "manual",
         "notice": (
-            "Telegram acquisition is blocked by account protection. Freshness and incoming coverage may be limited. "
+            "Background Telegram acquisition is blocked by account protection. Retained local reads remain available; use this result's source and coverage to assess requested data. New incoming data and freshness may be limited. "
             "Recovery requires operator action."
         ),
     }
@@ -1595,7 +1600,7 @@ async def test_each_registered_tool_response_gets_one_active_protection_snapshot
         validate(
             {
                 "status": "unavailable",
-                "notice": "Account protection status is unavailable; Telegram acquisition state could not be confirmed.",
+                "notice": "Global background Telegram acquisition status is unavailable. This does not change the tool result; assess retained data using its source and coverage.",
             },
             protection_schema,
         )
@@ -1954,7 +1959,7 @@ async def test_registered_ambiguity_action_points_to_canonical_error_details(  #
                         "status": "active",
                         "outbound_acquisition": "blocked",
                         "recovery": "manual",
-                        "notice": "Telegram acquisition is blocked by account protection. Freshness and incoming coverage may be limited. Recovery requires operator action.",
+                        "notice": "Background Telegram acquisition is blocked by account protection. Retained local reads remain available; use this result's source and coverage to assess requested data. New incoming data and freshness may be limited. Recovery requires operator action.",
                     }
                 },
             }
@@ -1978,7 +1983,7 @@ async def test_registered_ambiguity_action_points_to_canonical_error_details(  #
         "status": "active",
         "outbound_acquisition": "blocked",
         "recovery": "manual",
-        "notice": "Telegram acquisition is blocked by account protection. Freshness and incoming coverage may be limited. Recovery requires operator action.",
+        "notice": "Background Telegram acquisition is blocked by account protection. Retained local reads remain available; use this result's source and coverage to assess requested data. New incoming data and freshness may be limited. Recovery requires operator action.",
     }
     validate(payload, cast(dict[str, object], server.tool_by_name[tool_name].output_schema))
 
@@ -2025,6 +2030,76 @@ async def test_list_messages_resolves_natural_dialog_topic_without_sending_zero_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("coverage_state", "selection_state"),
+    [("complete_as_of", "present"), ("partial", "known_empty"), ("unknown", "unknown")],
+)
+@pytest.mark.parametrize("tool_name", ["list_messages", "search_messages"])
+async def test_registered_local_reads_keep_selection_during_global_protection(
+    monkeypatch: pytest.MonkeyPatch, coverage_state: str, selection_state: str, tool_name: str
+) -> None:
+    row = {"dialog_id": 701, "message_id": 42, "sent_at": 100, "text": "retained needle", "out": 0}
+    retained_rows = [row] if selection_state == "present" else []
+    response = {
+        "ok": True,
+        "data": {
+            "messages": retained_rows,
+            "source": "sync_db",
+            "coverage": coverage_state,
+            "selection_state": selection_state,
+            "observation_horizon_at": 123,
+        },
+    }
+
+    class _DisconnectedLocalReadConnection:
+        async def list_messages(self, **_kwargs: object) -> dict[str, object]:
+            return response
+
+        async def search_messages(self, **_kwargs: object) -> dict[str, object]:
+            return response
+
+    @asynccontextmanager
+    async def local_read_context() -> AsyncIterator[object]:
+        yield _DisconnectedLocalReadConnection()
+
+    protection = {
+        "status": "active",
+        "outbound_acquisition": "blocked",
+        "recovery": "manual",
+        "notice": "Background Telegram acquisition is blocked by account protection. Retained local reads remain available; use this result's source and coverage to assess requested data. New incoming data and freshness may be limited. Recovery requires operator action.",
+    }
+
+    monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", local_read_context)
+    monkeypatch.setattr(
+        server,
+        "daemon_connection",
+        lambda: _status_context({"ok": True, "data": {"account_protection": protection}}),
+    )
+    monkeypatch.setattr(server, "_schedule_telemetry", lambda _event: None)
+
+    arguments: dict[str, object]
+    if tool_name == "list_messages":
+        arguments = {"exact_dialog_id": 701}
+    else:
+        arguments = {"query": "needle"}
+    result = _call_tool_result(await server.call_tool(tool_name, arguments))
+
+    assert result.is_error is False
+    assert result.content == []
+    payload = cast(dict[str, object], result.structured_content)
+    assert payload["source"] == "sync_db"
+    assert payload["account_protection"] == protection
+    coverage = cast(dict[str, object], payload["coverage"])
+    assert coverage["state"] == coverage_state
+    assert coverage["selection_state"] == selection_state
+    assert coverage["observation_horizon_at"] == "1970-01-01T00:02:03+00:00"
+    assert len(cast(list[object], payload["messages"] if tool_name == "list_messages" else payload["results"])) == len(
+        retained_rows
+    )
+    validate(payload, cast(dict[str, object], server.tool_by_name[tool_name].output_schema))
+
+
+@pytest.mark.asyncio
 async def test_list_messages_natural_topic_lookup_projects_dialog_ambiguity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2058,7 +2133,7 @@ async def test_list_messages_natural_topic_lookup_projects_dialog_ambiguity(
                         "status": "active",
                         "outbound_acquisition": "blocked",
                         "recovery": "manual",
-                        "notice": "Telegram acquisition is blocked by account protection. Freshness and incoming coverage may be limited. Recovery requires operator action.",
+                        "notice": "Background Telegram acquisition is blocked by account protection. Retained local reads remain available; use this result's source and coverage to assess requested data. New incoming data and freshness may be limited. Recovery requires operator action.",
                     }
                 },
             }
@@ -2335,7 +2410,7 @@ async def test_registered_dialog_ambiguity_uses_domain_code_and_nested_candidate
                         "status": "active",
                         "outbound_acquisition": "blocked",
                         "recovery": "manual",
-                        "notice": "Telegram acquisition is blocked by account protection. Freshness and incoming coverage may be limited. Recovery requires operator action.",
+                        "notice": "Background Telegram acquisition is blocked by account protection. Retained local reads remain available; use this result's source and coverage to assess requested data. New incoming data and freshness may be limited. Recovery requires operator action.",
                     }
                 },
             }

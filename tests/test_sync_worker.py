@@ -2742,23 +2742,27 @@ async def test_resolve_peer_name_budget_exhaustion_is_silent(
 
 
 @pytest.mark.asyncio
-async def test_build_fwd_entity_map_resolves_channel_keyed_by_marked_id() -> None:
-    """End-to-end: channel forward resolves via typed Peer; map keyed by marked id."""
+async def test_forward_batch_resolver_uses_typed_peer_and_marked_id() -> None:
+    """Batch enrichment resolves a typed channel peer and extraction uses its marked key."""
     from telethon.tl import types
 
-    from mcp_telegram.messages.telegram_adapter import _build_fwd_entity_map
+    from mcp_telegram.messages.telegram_adapter import extract_fwd_row, resolve_forward_entity_name_map
 
     peer = cast(_PeerLike, types.PeerChannel(channel_id=1579759981))
     fwd = SimpleNamespace(from_id=peer, from_name=None, date=None, channel_post=None)
     msg = SimpleNamespace(fwd_from=fwd)
     client = _PeerLookupClient()
 
-    result = await _build_fwd_entity_map(msg, client)
+    result = await resolve_forward_entity_name_map([msg], client)
 
     # Resolution used the typed Peer...
     assert isinstance(client.passed_peer, types.PeerChannel)
     # ...and the map key is the MARKED id (JOINable, kind-unambiguous storage contract).
     assert result == {-1001579759981: "Private meme collection"}
+    forward = extract_fwd_row(4, 5, msg, entity_name_map=result)
+    assert forward is not None
+    assert forward.fwd_from_peer_id == -1001579759981
+    assert forward.fwd_from_name == "Private meme collection"
 
 
 def test_marked_peer_id_matches_telethon_convention() -> None:

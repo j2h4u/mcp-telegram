@@ -350,6 +350,11 @@ category = "policy_assignments"
 key = "src/mcp_telegram/tools/_base.py:<module>:_DAEMON_TIMEOUT_TEXT"
 rationale = "This is fixed text for a daemon timeout error response."
 
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/tools/_base.py:<module>:_DAEMON_CONNECT_TIMEOUT_TEXT"
+rationale = "This is fixed MCP error text describing a daemon connection timeout."
+
 # These are local SQLite/API contract values, not daemon operator policy.  Keep
 # each new exclusion individually justified so additions are reviewable.
 [[entry]]
@@ -376,6 +381,11 @@ rationale = "sync.db read and write connections share SQLite's local connection 
 category = "policy_dict_values"
 key = "src/mcp_telegram/tools/unread.py:<module>:group_size_threshold"
 rationale = "This is an MCP response field name, not a placement of an operator policy value."
+
+[[entry]]
+category = "policy_dict_values"
+key = "src/mcp_telegram/tools/_base.py:<module>:connect_timeout"
+rationale = "This names the daemon IPC failure kind handled by the fixed MCP error text."
 
 [[entry]]
 category = "policy_defaults"
@@ -496,11 +506,6 @@ rationale = "Finite export IPC timeout has 60 seconds of headroom over the 360-s
 category = "policy_assignments"
 key = "src/mcp_telegram/chat_export_cli.py:<module>:IPC_TIMEOUT_SECONDS"
 rationale = "Reviewed export Unix-socket response contract: 420 seconds covers the 360-second operation deadline plus scheduling headroom under host pressure."
-
-[[entry]]
-category = "policy_assignments"
-key = "src/mcp_telegram/message_fact_refresh.py:<module>:_REACTION_DISCOVERY_PAGE_SIZE"
-rationale = "Reviewed SQLite discovery work bound: at most 256 raw aggregate rows are examined before yielding; this is an adapter resource contract, not a scheduling interval."
 
 [[entry]]
 category = "policy_assignments"

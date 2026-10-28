@@ -206,7 +206,7 @@ def _make_service_msg(msg_id: int, action: object, reply_to_obj: object = None) 
     msg.out = False
     msg.post_author = None
     msg.reply_to = reply_to_obj
-    # No forward — prevents _build_fwd_entity_map from processing MagicMock attrs
+    # No forward — keeps the forward field absent on this MagicMock fixture.
     msg.fwd_from = None
     return msg
 

@@ -37,15 +37,20 @@ _TOOL_TITLE_WORDS_MAX = 3
 _DAEMON_NOT_RUNNING_KIND = "not_running"
 _DAEMON_NOT_RUNNING_TEXT = "Telegram backend is not running.\nAction: Start it with: mcp-telegram sync"
 _DAEMON_TIMEOUT_TEXT = (
-    "Telegram backend did not respond before the IPC timeout.\n"
-    "Action: Retry the tool call. If this repeats, narrow the request scope and inspect service logs."
+    "Telegram backend IPC timed out; request completion may be unconfirmed and the running service may still own "
+    "the request.\nAction: Inspect service status and wait before retrying a mutation."
+)
+_DAEMON_CONNECT_TIMEOUT_TEXT = (
+    "Telegram backend connection was not established before the IPC timeout.\n"
+    "Action: Inspect the existing service and try connecting again later."
 )
 _DAEMON_CONNECTION_FAILURE_TEXT = (
     "Telegram backend connection failed while handling the request.\n"
     "Action: Retry the tool call. If this repeats, inspect service logs for daemon IPC errors."
 )
 _DAEMON_NOT_RUNNING_TEXT_BY_KIND = {
-    **dict.fromkeys(("connect_timeout", "send_timeout", "response_timeout"), _DAEMON_TIMEOUT_TEXT),
+    "connect_timeout": _DAEMON_CONNECT_TIMEOUT_TEXT,
+    **dict.fromkeys(("send_timeout", "response_timeout"), _DAEMON_TIMEOUT_TEXT),
     **dict.fromkeys(("connection_broken", "malformed_response"), _DAEMON_CONNECTION_FAILURE_TEXT),
     _DAEMON_NOT_RUNNING_KIND: _DAEMON_NOT_RUNNING_TEXT,
 }
@@ -54,6 +59,10 @@ _PURE_NULL_SCHEMA = object()
 
 ACTIVE_ACCOUNT_PROTECTION_SCHEMA: dict[str, object] = {
     "type": "object",
+    "description": (
+        "Global background Telegram acquisition status. It does not describe this tool's outcome, "
+        "data source, completeness, or a request caused by this read."
+    ),
     "properties": {
         "status": {"const": "active"},
         "outbound_acquisition": {"const": "blocked"},
@@ -292,10 +301,18 @@ def _protection_output_schema(schema: dict[str, object] | None) -> dict[str, obj
         "additionalProperties": False,
     }
     properties["account_protection"] = {
+        "description": (
+            "Global background Telegram acquisition status; this does not change the tool result or "
+            "establish its source or coverage."
+        ),
         "oneOf": [
             deepcopy(ACTIVE_ACCOUNT_PROTECTION_SCHEMA),
             {
                 "type": "object",
+                "description": (
+                    "Global background acquisition status could not be confirmed; the tool result and "
+                    "its source and coverage remain independent."
+                ),
                 "properties": {"status": {"const": "unavailable"}, "notice": {"type": "string"}},
                 "required": ["status", "notice"],
                 "additionalProperties": False,

@@ -38,6 +38,12 @@ code, pull-request and CI host, not a task tracker.
 Use `wgr list-tickets --project TG --state active` to find current work; do not
 infer that the project is absent when automatic Git-context detection is unbound.
 
+Complete the ordinary backlog end to end. Prepare incomplete tasks before
+execution; missing preparation is work to do, not permission to skip them.
+Respect explicit WorkGraph suspension decisions such as `deferred`. Backlog
+membership or wording such as "later" in a title is not a suspension, and agents
+must not defer authorized work on their own to avoid completing it.
+
 ## Architecture
 
 Default Docker runtime is one container with two worker processes:
@@ -234,6 +240,11 @@ Smoke и точечные запросы требуют живого daemon (к�
 The agent owns the full development cycle end to end: writing code, running tests, rebuilding the container, verifying live behavior, and reporting results. Nothing is handed off to the operator for execution. If something requires a command to be run, the agent runs it.
 
 ## Runtime Discipline
+
+This shared build host can queue disk I/O for 5–10 minutes before an operation
+completes; ten minutes is not a guaranteed upper bound. Account for this normal
+operating constraint when assessing startup, shutdown and readiness. Preserve
+transaction/request ownership and Telegram safety during long I/O waits.
 
 - After any runtime-affecting change: rebuild the container and verify live behavior — do not hand off to the operator.
 - Do not mark work done until the restarted runtime exposes the expected behavior.

@@ -102,7 +102,6 @@ DIALOG_IDENTITY_ROLE_FUNCTIONS: Mapping[str, Mapping[str, frozenset[str]]] = {
         name: frozenset({"type"})
         for name in (
             "_REACTION_CANDIDATES_SQL",
-            "_REACTION_DISCOVERY_PAGE_SQL",
             "_NEXT_REACTION_RELEASE_SQL",
         )
     },

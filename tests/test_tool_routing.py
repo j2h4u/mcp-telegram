@@ -2210,8 +2210,8 @@ def test_daemon_not_running_text_for_missing_daemon_mentions_start_command() -> 
 def test_daemon_not_running_text_for_timeout_mentions_retry_not_start_command() -> None:
     text = _daemon_not_running_text(DaemonNotRunningError("timed out", kind="response_timeout"))
 
-    assert "did not respond before the IPC timeout" in text
-    assert "Retry the tool call" in text
+    assert "request completion may be unconfirmed" in text
+    assert "wait before retrying a mutation" in text
     assert "mcp-telegram sync" not in text
 
 
@@ -2243,7 +2243,8 @@ async def test_list_dialogs_daemon_response_timeout_is_not_reported_as_not_runni
         result = await list_dialogs(ListDialogs())
 
     text = _result_text(result)
-    assert "did not respond" in text
+    assert "request completion may be unconfirmed" in text
+    assert "wait before retrying a mutation" in text
     assert "Start it with: mcp-telegram sync" not in text
 
 
@@ -2268,7 +2269,8 @@ async def test_list_messages_daemon_response_timeout_is_not_reported_as_not_runn
         result = await list_messages(ListMessages(exact_dialog_id=123))
 
     text = _result_text(result)
-    assert "did not respond" in text
+    assert "request completion may be unconfirmed" in text
+    assert "wait before retrying a mutation" in text
     assert "Start it with: mcp-telegram sync" not in text
 
 

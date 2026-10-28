@@ -180,7 +180,7 @@ async def test_call_tool_omits_none_from_direct_tool_result(monkeypatch: pytest.
         "items": [None, {"keep": 2}],
         "account_protection": {
             "status": "unavailable",
-            "notice": "Account protection status is unavailable; Telegram acquisition state could not be confirmed.",
+            "notice": "Global background Telegram acquisition status is unavailable. This does not change the tool result; assess retained data using its source and coverage.",
         },
     }
 
@@ -206,7 +206,7 @@ async def test_call_tool_omits_none_from_direct_structured_error(monkeypatch: py
         },
         "account_protection": {
             "status": "unavailable",
-            "notice": "Account protection status is unavailable; Telegram acquisition state could not be confirmed.",
+            "notice": "Global background Telegram acquisition status is unavailable. This does not change the tool result; assess retained data using its source and coverage.",
         },
     }
 

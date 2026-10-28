@@ -16,6 +16,11 @@ Observation age and incomplete coverage describe what is known; they do not
 make previously collected information disappear. Confirmed changes, deletions
 and account/privacy boundaries retain their normal meaning.
 
+A successful retained-message read can satisfy a bounded local task while
+global protection limits new incoming acquisition. That status alone says
+nothing about whether the selected local result is complete; use its source,
+coverage, time horizon, and selection warnings.
+
 Profile reads use local observations. Background profile collection covers all
 local personal user/bot dialogs, including archived and history-disabled dialogs,
 plus peers known from retained private-message history, excluding the account
@@ -121,6 +126,13 @@ trial clears that operator authorization, not an unseen server floor; failure,
 FloodWait or uncertainty returns the account to hold. A new explicit operator
 authorization may retry a failed trial. Recovery is not automatic and has no
 MCP tool.
+
+Container health reports readiness, not process death, and a health failure
+does not restart the service. Deployment verification waits up to 15 minutes;
+if readiness is not observed in that interval, the runtime is left running and
+`just runtime-wait` can continue observation. A caller timeout does not release
+an accepted write or receipt from its owner; forced termination can leave an
+outcome unknown and require the existing manual recovery path.
 
 Protocol ACK, Ping and StateInfo controls use the same bounded central admission
 path during an application-write hold. They remain protocol-only: no application

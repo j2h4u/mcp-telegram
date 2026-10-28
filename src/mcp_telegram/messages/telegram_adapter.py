@@ -462,26 +462,6 @@ async def _resolve_peer_name(client: PeerNameClient, peer: _PeerLike) -> str | N
         return None
 
 
-async def _build_fwd_entity_map(msg: object, client: PeerNameClient) -> dict[int, str]:
-    """Return {peer_id: name} for the forward source of a single message.
-
-    Returns an empty dict when the message is not a forward, already has
-    fwd_from.from_name, or the peer cannot be resolved.
-    """
-    fwd = _attr(msg, "fwd_from", None)
-    if not fwd or fwd.from_name is not None:
-        return {}
-    from_id = fwd.from_id
-    if from_id is None:
-        return {}
-    peer_id = _marked_peer_id(from_id)
-    if peer_id is None:
-        return {}
-    # Resolve with the typed Peer (preserves channel/chat kind); key by marked id.
-    name = await _resolve_peer_name(client, from_id)
-    return {peer_id: name} if name else {}
-
-
 def _extract_sent_at(msg: object) -> int:
     date = _attr(msg, "date", None)
     return int(date.timestamp()) if isinstance(date, datetime) else 0
