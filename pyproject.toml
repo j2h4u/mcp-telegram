@@ -4,7 +4,7 @@ version = "0.1.2"
 description = "MCP server to work with Telegram through MTProto"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.14"
+requires-python = ">=3.15,<3.16"
 dependencies = [
   "mcp>=2.3.0,<3",
   "telethon==1.45.0",
@@ -54,7 +54,7 @@ mcp-telegram = "mcp_telegram:app"
 [tool.ruff]
 src = ["src", "deploy", "devtools", "tests", "scripts"]
 line-length = 120
-target-version = "py314"
+target-version = "py315"
 indent-width = 4
 exclude = [
   ".bzr",
@@ -293,7 +293,7 @@ skip_covered = true
 
 [tool.pyright]
 include = ["src/mcp_telegram", "deploy", "scripts", "tests"]
-pythonVersion = "3.14"
+pythonVersion = "3.15"
 typeCheckingMode = "standard"
 reportAny = "error"
 reportExplicitAny = "error"

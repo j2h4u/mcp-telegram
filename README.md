@@ -341,7 +341,7 @@ current workflow guide and important interpretation rules.
 
 - Telegram API ID and hash from [my.telegram.org](https://my.telegram.org/auth).
 - Docker Compose for the deployed runtime.
-- Python 3.14.6 (pinned by `.python-version`) and
+- Python 3.15.2 (pinned by `.python-version`) and
   [uv](https://docs.astral.sh/uv/) for local development.
 - `just` for the checked-in developer workflow.
 - An MCP client that supports Streamable HTTP.
