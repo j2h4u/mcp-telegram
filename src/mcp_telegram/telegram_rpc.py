@@ -4012,11 +4012,18 @@ class TelegramRpcGate(TelegramClient):
         *,
         connection_owned: bool,
     ) -> None:
-        seconds = await self._observe_flood(exc, scope=scope)
+        request_rejected = self._flood_attempt(exc).get("dispatch_kind") == "actual_send"
+        try:
+            seconds = await self._observe_flood(exc, scope=scope)
+        except TelegramRpcThrottled as outcome:
+            if request_rejected:
+                outcome.request_rejected = True
+            raise
         raise TelegramRpcThrottled(
             retry_after_seconds=seconds,
             latched=False,
             detail=f"Telegram RPC throttled for {seconds}s",
+            request_rejected=request_rejected,
         ) from exc
 
     async def _dispatch_attempt(

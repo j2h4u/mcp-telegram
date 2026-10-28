@@ -38,10 +38,13 @@ class TelegramRpcThrottled(RuntimeError):  # noqa: N818 - public domain outcome 
     after waiting.  A latched outcome has no finite retry duration: the
     account circuit is open and work must remain stopped until the process is
     restarted or the circuit is otherwise reset by its owner.
+    ``request_rejected`` records a confirmed refusal of this request, independently
+    of whether account-wide admission is currently latched.
     """
 
     retry_after_seconds: int | None
     latched: bool
+    request_rejected: bool
 
     def __init__(
         self,
@@ -49,10 +52,14 @@ class TelegramRpcThrottled(RuntimeError):  # noqa: N818 - public domain outcome 
         *,
         latched: bool = False,
         detail: str | None = None,
+        request_rejected: bool = False,
     ) -> None:
         _validate_throttle_state(retry_after_seconds, latched)
+        if not isinstance(request_rejected, bool):
+            raise ValueError("request_rejected must be a bool")
         self.retry_after_seconds = retry_after_seconds
         self.latched = latched
+        self.request_rejected = request_rejected
         super().__init__(detail or ("Telegram RPC circuit is latched" if latched else "Telegram RPC throttled"))
 
 

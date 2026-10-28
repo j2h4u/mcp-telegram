@@ -37,6 +37,7 @@ from mcp_telegram.drafts.snapshot import (
     build_save_draft_request,
     build_text_draft_request,
 )
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_demand import RpcAttemptBudget, demand_context, require_execution_mode
@@ -256,13 +257,16 @@ class DraftCommandOwner:
                     command,
                 )
             except Exception as exc:  # noqa: BLE001 - sanitize the pre-dispatch external boundary
-                logger.warning("draft_command_rejected error_type=%s", type(exc).__name__)
-                return self._failure(
-                    DraftCommandError(
-                        "preflight_unavailable", "Draft verification is unavailable; no change was dispatched."
-                    ),
-                    command,
-                )
+                return self._preflight_failure(command, exc)
+
+    def _preflight_failure(self, command: _Command, error: Exception) -> dict[str, object]:
+        if isinstance(error, TelegramRpcThrottled):
+            return self._throttled_failure(command, error, prepared=False)
+        logger.warning("draft_command_rejected error_type=%s", type(error).__name__)
+        return self._failure(
+            DraftCommandError("preflight_unavailable", "Draft verification is unavailable; no change was dispatched."),
+            command,
+        )
 
     def _duplicate(self, command: _Command) -> dict[str, object] | None:
         receipt = read_draft_operation(self._reader, self._account_id, command.operation_key)
@@ -397,6 +401,14 @@ class DraftCommandOwner:
     def _dispatch_failure(
         self, command: _Command, error: BaseException, budget: RpcAttemptBudget, backup_history_id: int | None
     ) -> dict[str, object]:
+        if isinstance(error, TelegramRpcThrottled):
+            if budget.attempts and not error.request_rejected:
+                return self._result(command, "unknown", backup_history_id, dispatched=True, acknowledged=None)
+            result = self._throttled_failure(command, error, prepared=True)
+            result.update(
+                mutation_dispatched=bool(budget.attempts), save_acknowledged=False, backup_history_id=backup_history_id
+            )
+            return result
         descriptor = describe_telegram_rpc_error(error)
         definite = (
             isinstance(error, RPCError) and descriptor.code is not None and 400 <= descriptor.code < 500  # noqa: PLR2004 - Telegram's definitive client-error range
@@ -412,6 +424,34 @@ class DraftCommandOwner:
         )
         result.update(
             mutation_dispatched=bool(budget.attempts), save_acknowledged=False, backup_history_id=backup_history_id
+        )
+        return result
+
+    def _throttled_failure(
+        self, command: _Command, error: TelegramRpcThrottled, *, prepared: bool
+    ) -> dict[str, object]:
+        if error.latched:
+            reason = "flood_wait_kill_switch_open"
+            message = "Telegram draft changes are blocked by account protection."
+            action = "Inspect account_protection and wait until the gateway allows requests again."
+        else:
+            reason = "telegram_rpc_throttled"
+            message = f"Telegram requires a wait of {error.retry_after_seconds} seconds."
+            action = f"Wait at least {error.retry_after_seconds} seconds."
+        action += (
+            " Read get_draft before a new command with a new operation_key; this operation_key retains the rejection."
+            if prepared
+            else " Retry the same command with the same operation_key; no draft change was dispatched."
+        )
+        result = self._failure(DraftCommandError(reason, message), command)
+        result.update(
+            message=f"{message}\nAction: {action}",
+            required_action=action,
+            details={
+                "retry_after_seconds": error.retry_after_seconds,
+                "latched": error.latched,
+                "request_rejected": error.request_rejected,
+            },
         )
         return result
 
@@ -477,11 +517,13 @@ class DraftCommandOwner:
         )
         result: dict[str, object] = {
             "ok": False,
+            "result_persisted": False,
+            "mutation_dispatched": False,
             "outcome": "conflict"
             if error.reason in {"version_conflict", "draft_exists", "operation_conflict"}
             else "rejected",
             "error": error.reason,
-            "message": f"{error.message} Action: {action}",
+            "message": f"{error.message}\nAction: {action}",
         }
         if command is not None:
             result["operation_key"] = command.operation_key

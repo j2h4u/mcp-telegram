@@ -2807,10 +2807,12 @@ async def test_gate_flood_observation_opens_accumulator_and_rejects_next_admissi
     with pytest.raises(TelegramRpcThrottled) as caught:
         await _call(gate, "request")
     assert caught.value.retry_after_seconds == 7
+    assert caught.value.request_rejected
     with pytest.raises(TelegramRpcThrottled) as caught:
         await _call(gate, "request")
     assert caught.value.latched
     assert caught.value.retry_after_seconds is None
+    assert not caught.value.request_rejected
 
     status = accumulator.kill_switch_status()
     assert status.open is True
@@ -2906,7 +2908,7 @@ async def test_concurrent_vendor_cache_fold_is_a_local_deferral_not_a_second_war
             with pytest.raises(TelegramRpcThrottled) as cached:
                 await delayed
 
-        assert cached.value.retry_after_seconds == 20
+        assert cached.value.retry_after_seconds == 20 and not cached.value.request_rejected
         assert sender_calls == sender.calls == 1
         assert gate._limiter.acquisitions == 1
         assert budget.attempts == 1

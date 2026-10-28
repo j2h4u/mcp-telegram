@@ -307,7 +307,9 @@ def _error_fields_from_text(text: str, code: str) -> dict[str, object]:
 def _protection_error_call_result(exc: AccountProtectionError) -> CallToolResult:
     response = exc.response
     message = str(response.get("message", "Telegram acquisition is blocked by account protection."))
-    action = "Recovery requires operator action."
+    action = response.get("required_action")
+    if not isinstance(action, str) or not action.strip() or action == "manual_operator_recovery":
+        action = "Inspect account_protection for the recovery status before retrying."
     text = f"{message}\nAction: {action}"
     details = {key: value for key, value in response.items() if key not in {"ok", "error", "message"}}
     error: dict[str, object] = {

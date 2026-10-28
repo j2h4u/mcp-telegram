@@ -154,6 +154,26 @@ MANAGE_DRAFT_OUTPUT_SCHEMA = {
 }
 
 
+def _draft_error_response(response: Mapping[str, object]) -> ToolResult | None:
+    if response.get("ok") is True:
+        return None
+    supplied = response.get("details")
+    details = dict(cast(Mapping[str, object], supplied)) if isinstance(supplied, Mapping) else {}
+    for field in (
+        "outcome",
+        "operation_key",
+        "mutation_dispatched",
+        "save_acknowledged",
+        "result_persisted",
+        "backup_history_id",
+        "current",
+        "current_is_operation_confirmation",
+    ):
+        if field in response:
+            details[field] = response[field]
+    return _check_daemon_response({**response, "details": details})
+
+
 @mcp_tool(
     name="get_draft",
     title="Get Draft",
@@ -190,11 +210,13 @@ async def manage_draft(args: ManageDraft) -> ToolResult:
         if exc.kind in {"not_running", "connect_timeout"}:
             return error_result(_daemon_not_running_text(exc))
         return error_result(
-            "Draft completion is unconfirmed. Action: read get_draft and check the operation with "
+            "Draft completion is unconfirmed.\nAction: read get_draft and check the operation with "
             f"the same operation_key={args.operation_key!r}; do not blindly submit a new write. "
-            f"Connection status: {exc.kind}."
+            f"Connection status: {exc.kind}.",
+            error_code="draft_completion_unconfirmed",
+            details={"outcome": "unknown", "operation_key": args.operation_key, "failure_kind": exc.kind},
         )
-    if err := _check_daemon_response(response):
+    if err := _draft_error_response(response):
         return err
     response.pop("request_id", None)
     return structured_result(cast(Mapping[str, object], omit_none_mapping_values(response)))

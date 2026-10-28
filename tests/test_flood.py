@@ -27,6 +27,7 @@ from mcp_telegram.flood import (
         {"retry_after_seconds": 1, "latched": True},
         {"retry_after_seconds": 1.0},
         {"retry_after_seconds": True},
+        {"retry_after_seconds": 1, "request_rejected": "yes"},
     ],
 )
 def test_telegram_rpc_throttled_rejects_invalid_or_ambiguous_state(kwargs: dict[str, object]) -> None:
@@ -42,6 +43,15 @@ def test_telegram_rpc_throttled_accepts_exact_states(retry_after_seconds: int | 
     exc = TelegramRpcThrottled(retry_after_seconds, latched=latched)
     assert exc.retry_after_seconds == retry_after_seconds
     assert exc.latched is latched
+    assert not exc.request_rejected
+
+
+@pytest.mark.parametrize("latched", [False, True])
+def test_throttle_rejection_is_independent_of_account_latch(latched: bool) -> None:
+    exc = TelegramRpcThrottled(None if latched else 20, latched=latched, request_rejected=True)
+    assert exc.request_rejected
+    assert exc.latched is latched
+    assert exc.retry_after_seconds == (None if latched else 20)
 
 
 class _SecondsError(Exception):

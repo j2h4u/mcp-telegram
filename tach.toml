@@ -258,7 +258,7 @@ depends_on = ["mcp_telegram.drafts.contracts"]
 [[modules]]
 path = "mcp_telegram.drafts.commands"
 layer = "application"
-depends_on = ["mcp_telegram.telegram_rpc_error", "mcp_telegram.sqlite_writer", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.drafts.contracts", "mcp_telegram.drafts.history", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.telegram_demand", "mcp_telegram.sync_transactions", "mcp_telegram.drafts.snapshot", "mcp_telegram.drafts.ports"]
+depends_on = ["mcp_telegram.telegram_rpc_error", "mcp_telegram.sqlite_writer", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.drafts.contracts", "mcp_telegram.drafts.history", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.telegram_demand", "mcp_telegram.sync_transactions", "mcp_telegram.drafts.snapshot", "mcp_telegram.drafts.ports", "mcp_telegram.flood"]
 
 [[modules]]
 path = "mcp_telegram.drafts.read_service"

@@ -108,7 +108,7 @@ def read_draft_request(
         return {
             "ok": False,
             "error": "history_unavailable",
-            "message": "That previous state is unavailable or expired. Action: read get_draft for retained history.",
+            "message": "That previous state is unavailable or expired.\nAction: read get_draft for retained history.",
         }
     result: dict[str, object] = {
         "ok": True,

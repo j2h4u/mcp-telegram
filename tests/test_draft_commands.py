@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from telethon.errors import ChatWriteForbiddenError  # type: ignore[import-untyped]
+from telethon.errors import ChatWriteForbiddenError, FloodWaitError  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import GetAllDraftsRequest, SaveDraftRequest  # type: ignore[import-untyped]
 
@@ -29,11 +29,15 @@ from mcp_telegram.drafts.owner import DraftMessageOwner
 from mcp_telegram.drafts.sqlite_projection import SQLiteDraftProjection
 from mcp_telegram.drafts.telethon_adapter import normalize_update_draft
 from mcp_telegram.event_handlers import UpdateProcessingBarrier
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import current_demand_token
 from mcp_telegram.telegram_rpc_consumers import DemandKind
-from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
+from mcp_telegram.telegram_rpc_scheduler import TelegramRpcScope, current_rpc_scope
 from tests.sqlite_writer_helpers import inline_writer
+from tests.test_telegram_rpc_flood_outcome import _server_response
+from tests.test_telegram_rpc_wire_integration import _WireHarness
+from tests.test_telegram_rpc_wire_integration import wire as wire
 
 
 class _Harness:
@@ -57,9 +61,9 @@ class _Harness:
         self.publish()
         self.owner = self.new_owner()
 
-    def new_owner(self) -> DraftCommandOwner:
+    def new_owner(self, client: object | None = None) -> DraftCommandOwner:
         return DraftCommandOwner(
-            self,
+            self if client is None else client,
             self.conn,
             writer=inline_writer(self.conn),
             account_id=100,
@@ -316,6 +320,80 @@ async def test_definite_telegram_rejection_is_not_unknown(harness: _Harness) -> 
     assert result["mutation_dispatched"] is True
     receipt = read_draft_operation(harness.conn, 100, "forbidden")
     assert receipt is not None and receipt.outcome == "rejected"
+
+
+@pytest.mark.parametrize("latched", [False, True])
+async def test_server_flood_wait_is_persisted_as_rejected_through_actual_gate(
+    harness: _Harness, wire: _WireHarness, monkeypatch: pytest.MonkeyPatch, latched: bool
+) -> None:
+    gate = wire[0]
+    _server_response(wire, monkeypatch, FloodWaitError(None, capture=20))
+    if latched:
+        observe = gate._observe_flood
+
+        async def observe_then_latch(exc: BaseException, *, scope: TelegramRpcScope | None = None) -> int:
+            await observe(exc, scope=scope)
+            raise TelegramRpcThrottled(latched=True)
+
+        monkeypatch.setattr(gate, "_observe_flood", observe_then_latch)
+    owner = harness.new_owner(gate)
+    request = harness.command("create", "server-flood", text="still unsent")
+    result = await owner.execute(request)
+    assert result["ok"] is False and result["outcome"] == "rejected", result
+    assert result["mutation_dispatched"] is True and result["save_acknowledged"] is False
+    assert result["result_persisted"] is True
+    assert result["details"] == {
+        "retry_after_seconds": None if latched else 20,
+        "latched": latched,
+        "request_rejected": True,
+    }
+    assert ("account_protection" if latched else "20 seconds") in str(result["message"])
+    assert "new operation_key" in str(result["required_action"])
+    receipt = read_draft_operation(harness.conn, 100, "server-flood")
+    assert receipt is not None and receipt.outcome == "rejected" and receipt.result == result
+    assert await harness.new_owner(gate).execute(request) == result
+    assert len(wire[3].frames) == 1 and harness.remote is None
+
+
+@pytest.mark.parametrize("latched", [False, True])
+async def test_generic_throttle_after_physical_dispatch_remains_unknown(
+    harness: _Harness, wire: _WireHarness, monkeypatch: pytest.MonkeyPatch, latched: bool
+) -> None:
+    _server_response(
+        wire,
+        monkeypatch,
+        TelegramRpcThrottled(None if latched else 20, latched=latched),
+    )
+    owner = harness.new_owner(wire[0])
+    request = harness.command("create", "uncertain-throttle", text="maybe saved")
+    result = await owner.execute(request)
+    assert result["outcome"] == "unknown" and result["save_acknowledged"] is None
+    assert result["mutation_dispatched"] is True and result["result_persisted"] is True
+    assert result["current_is_operation_confirmation"] is False
+    assert await harness.new_owner(wire[0]).execute(request) == result
+    assert len(wire[3].frames) == 1
+
+
+@pytest.mark.parametrize("latched", [False, True])
+async def test_preflight_throttle_preserves_wait_and_same_key_retry(harness: _Harness, latched: bool) -> None:
+    def throttle() -> None:
+        raise TelegramRpcThrottled(None if latched else 20, latched=latched)
+
+    harness.after_preflight = throttle
+    request = harness.command("create", "preflight-throttle", text="draft")
+    result = await harness.owner.execute(request)
+    assert result["outcome"] == "rejected"
+    assert result["error"] == ("flood_wait_kill_switch_open" if latched else "telegram_rpc_throttled")
+    assert result["details"] == {
+        "retry_after_seconds": None if latched else 20,
+        "latched": latched,
+        "request_rejected": False,
+    }
+    assert "same operation_key" in str(result["required_action"])
+    assert read_draft_operation(harness.conn, 100, "preflight-throttle") is None
+    assert harness.requests == []
+    harness.after_preflight = None
+    assert (await harness.owner.execute(request))["outcome"] == "acknowledged"
 
 
 @pytest.mark.parametrize("action", ["update", "clear"])
