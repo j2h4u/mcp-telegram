@@ -89,6 +89,13 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.14.6", "3.15.2"]
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+      UV_PYTHON_DOWNLOADS: "never"
     # Include the full suite with instrumentation and both suite halves.
     timeout-minutes: 45
     steps:
@@ -99,7 +106,7 @@ jobs:
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.14.6"
+          python-version: ${{ matrix.python-version }}
 
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
@@ -111,6 +118,13 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --locked
+
+      - name: Verify selected interpreter
+        run: uv run python -c 'import os, sys; expected = tuple(map(int, os.environ["UV_PYTHON"].split("."))); actual = sys.version_info[:len(expected)]; print(sys.version); assert actual == expected, f"expected {expected}, got {actual}"'
+
+      - name: Package smoke
+        if: matrix.python-version == '3.15.2'
+        run: just package-smoke
 
       - name: CRAP threshold
         run: python3 scripts/ci_pytest_runner.py run -- just crap-threshold
