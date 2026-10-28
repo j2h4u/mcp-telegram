@@ -178,7 +178,6 @@ def test_operational_dialog_roles_are_read_only_and_field_limited() -> None:
 def test_reaction_sql_constants_have_exact_type_only_dialog_role() -> None:
     names = (
         "_REACTION_CANDIDATES_SQL",
-        "_REACTION_DISCOVERY_PAGE_SQL",
         "_NEXT_REACTION_RELEASE_SQL",
     )
     for name in names:

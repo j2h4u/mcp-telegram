@@ -74,29 +74,6 @@ LIMIT ?
 
 # ponytail: New read-at facts may take up to 60 seconds to become visible to scheduling.
 _REACTION_DISCOVERY_REFRESH_SECONDS = 60
-_REACTION_DISCOVERY_PAGE_SIZE = 256
-_REACTION_DISCOVERY_PAGE_SQL = """
-WITH aggregate_page AS MATERIALIZED (
-  SELECT dialog_id, message_id, generation, aggregate_row_count, can_see_list
-  FROM message_reaction_aggregate_state
-  {keyset}
-  ORDER BY dialog_id, message_id
-  LIMIT ?
-)
-SELECT p.dialog_id, p.message_id, p.generation, p.aggregate_row_count,
-       sd.status, fhe.enabled, m.is_deleted, m.sent_at,
-       d.aggregate_generation, d.status, d.next_offset, d.next_attempt_at, d.checked_at, p.can_see_list
-FROM aggregate_page p
-LEFT JOIN synced_dialogs sd ON sd.dialog_id=p.dialog_id
-  AND NOT EXISTS (
-      SELECT 1 FROM dialogs directory
-      WHERE directory.dialog_id=p.dialog_id AND directory.type='channel'
-  )
-LEFT JOIN full_history_enrollment fhe ON fhe.dialog_id=p.dialog_id
-LEFT JOIN messages m ON m.dialog_id=p.dialog_id AND m.message_id=p.message_id
-LEFT JOIN message_reaction_event_status d ON d.dialog_id=p.dialog_id AND d.message_id=p.message_id
-ORDER BY p.dialog_id, p.message_id
-"""
 
 
 _READ_AT_CANDIDATES_SQL = """
@@ -254,93 +231,6 @@ def _reaction_pacing_release_at(conn: sqlite3.Connection) -> float | None:
         conn.execute("SELECT release_at FROM reaction_detail_pacing_state WHERE singleton=1").fetchone(),
     )
     return None if row is None else float(cast(int | float, row[0]))
-
-
-def _reaction_discovery_page(
-    conn: sqlite3.Connection,
-    cursor: tuple[int, int] | None,
-    upper: tuple[int, int],
-) -> list[tuple[object, ...]]:
-    keyset = "WHERE (dialog_id,message_id) <= (?,?)"
-    params: tuple[object, ...] = (*upper, _REACTION_DISCOVERY_PAGE_SIZE)
-    if cursor is not None:
-        keyset = "WHERE (dialog_id,message_id) > (?,?) AND (dialog_id,message_id) <= (?,?)"
-        params = (*cursor, *upper, _REACTION_DISCOVERY_PAGE_SIZE)
-    query = _REACTION_DISCOVERY_PAGE_SQL.format(keyset=keyset)
-    return cast(list[tuple[object, ...]], conn.execute(query, params).fetchall())
-
-
-def _reaction_dialog_is_eligible(row: tuple[object, ...]) -> bool:
-    return row[4] == "synced" and row[5] == 1 and row[6] == 0 and row[7] is not None and row[13] != 0
-
-
-def _reaction_page_identity(
-    row: tuple[object, ...],
-) -> tuple[int, int, int, int, str | None, int, object, int] | None:
-    dialog_id, message_id, generation, aggregate_count = (int(cast(int, row[i])) for i in range(4))
-    if not _reaction_dialog_is_eligible(row):
-        return None
-    detail_status = None if row[9] is None else str(row[9])
-    if aggregate_count <= 0 and detail_status not in {"partial", "unavailable"}:
-        return None
-    sent_at = int(cast(int, row[7]))
-    checked_at = 0 if row[12] is None else int(cast(int, row[12]))
-    return dialog_id, message_id, generation, aggregate_count, detail_status, sent_at, row[10], checked_at
-
-
-def _reaction_detail_is_stale(row: tuple[object, ...], generation: int) -> bool:
-    detail_generation = None if row[8] is None else int(cast(int, row[8]))
-    detail_status = None if row[9] is None else str(row[9])
-    return (
-        detail_status is None or detail_generation is None or detail_generation < generation or detail_status == "stale"
-    )
-
-
-def _reaction_detail_release(
-    row: tuple[object, ...], generation: int, now: float
-) -> tuple[float, bool, bool, int | None] | None:
-    detail_status = None if row[9] is None else str(row[9])
-    stale = _reaction_detail_is_stale(row, generation)
-    next_attempt = None if row[11] is None else int(cast(int, row[11]))
-    if not stale and (detail_status not in {"partial", "unavailable"} or next_attempt is None):
-        return None
-    release_at = 0.0 if stale else float(next_attempt or 0)
-    return release_at, release_at <= now, stale, next_attempt
-
-
-def _ranked_reaction_candidate(
-    identity: tuple[int, int, int, int, str | None, int, object, int],
-    *,
-    stale: bool,
-    next_attempt: int | None,
-) -> tuple[tuple[int, int, int, int, int, int], _ReactionCandidate]:
-    dialog_id, message_id, generation, _, detail_status, sent_at, offset_value, checked_at = identity
-    offset = None if offset_value is None else str(offset_value)
-    partial_first = detail_status == "partial" and offset is not None
-    priority = (
-        0 if partial_first else 1 if stale else 2,
-        0 if stale else next_attempt or 0,
-        checked_at,
-        -sent_at,
-        dialog_id,
-        message_id,
-    )
-    return priority, (dialog_id, message_id, generation, offset)
-
-
-def _reaction_page_candidate(
-    row: tuple[object, ...], now: float
-) -> tuple[float, tuple[tuple[int, int, int, int, int, int], _ReactionCandidate] | None] | None:
-    identity = _reaction_page_identity(row)
-    if identity is None:
-        return None
-    release = _reaction_detail_release(row, identity[2], now)
-    if release is None:
-        return None
-    release_at, due, stale, next_attempt = release
-    if not due:
-        return release_at, None
-    return release_at, _ranked_reaction_candidate(identity, stale=stale, next_attempt=next_attempt)
 
 
 def _reaction_release_at(conn: sqlite3.Connection, now: float) -> float | None:

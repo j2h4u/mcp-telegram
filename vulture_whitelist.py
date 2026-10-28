@@ -179,6 +179,3 @@ TopicCatalogRepository.next_pending  # retained repository projection/fencing te
 TopicCatalogRepository.apply_page  # retained pure page projection transaction tests
 TopicCatalogRepository.mark_not_applicable  # account/eligibility fencing tests
 EntityProfileRepository.refresh_state  # repository collection-page fencing assertions
-_build_fwd_entity_map  # pure Telegram envelope projection exercised by adapter and metadata tests
-_reaction_discovery_page  # bounded SQL page projection/visibility regression tests
-_reaction_page_candidate  # pure row decoding checked by reaction visibility tests

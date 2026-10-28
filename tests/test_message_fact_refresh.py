@@ -20,8 +20,6 @@ from mcp_telegram.message_fact_refresh import (
     _cutoff_backlog_suppressed,
     _next_release_at,
     _reaction_candidates,
-    _reaction_discovery_page,
-    _reaction_page_candidate,
     _reaction_release_at,
     _read_at_candidates,
     _terminal_read_at_suppressed,
@@ -720,13 +718,24 @@ def test_due_reaction_window_without_pacing_reads_normal_release() -> None:
 
 
 def test_terminal_reaction_does_not_hide_future_retry_release() -> None:
-    terminal = (1, 1, 1, 1, "synced", 1, 0, 100, 1, "unavailable", None, None, 50, None)
-    retry = (1, 2, 1, 1, "synced", 1, 0, 100, 1, "partial", None, 120, 50, None)
+    conn = _make_db()
+    try:
+        _seed_reaction_candidates(conn, count=2)
+        conn.execute(
+            "UPDATE message_reaction_event_status SET status='unavailable', next_attempt_at=NULL "
+            "WHERE dialog_id=1 AND message_id=1"
+        )
+        conn.execute(
+            "UPDATE message_reaction_event_status SET status='partial', next_attempt_at=120 "
+            "WHERE dialog_id=1 AND message_id=2"
+        )
+        conn.commit()
 
-    assert _reaction_page_candidate(terminal, now=100) is None
-    retry_entry = _reaction_page_candidate(retry, now=100)
-    assert retry_entry is not None
-    assert retry_entry == (120.0, None)
+        assert _reaction_release_at(conn, 100) == 120
+        assert _reaction_candidates(conn, stale_before_utc=100, limit=5) == []
+        assert _reaction_candidates(conn, stale_before_utc=120, limit=5) == [(1, 2, 1, None)]
+    finally:
+        conn.close()
 
 
 def test_read_at_status_cache_keeps_release_without_requerying() -> None:
@@ -911,11 +920,15 @@ def test_broadcast_reaction_details_are_excluded_from_all_scheduler_paths() -> N
         ]
         assert _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, (0,)) == 200
 
-        page_rows = _reaction_discovery_page(conn, None, (3, 1))
-        assert len(page_rows) == 3
-        assert all(len(row) == 14 for row in page_rows)
-        discovered = [_reaction_page_candidate(row, 1_000) for row in page_rows]
-        assert [item[1][1][0] for item in discovered if item is not None and item[1] is not None] == [2, 3]
+        claimed = _claim_reaction_pages(
+            conn,
+            now=1_000,
+            max_pages=3,
+            cycle_seconds=600,
+            candidate_limit=3,
+            candidates=[(1, 1, 1, None), (2, 1, 1, None), (3, 1, 1, None)],
+        )
+        assert claimed == [(2, 1, 1, None), (3, 1, 1, None)]
         assert conn.execute("SELECT COUNT(*) FROM message_reaction_aggregate_state").fetchone() == (3,)
     finally:
         conn.close()

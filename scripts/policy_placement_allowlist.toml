@@ -499,11 +499,6 @@ rationale = "Reviewed export Unix-socket response contract: 420 seconds covers t
 
 [[entry]]
 category = "policy_assignments"
-key = "src/mcp_telegram/message_fact_refresh.py:<module>:_REACTION_DISCOVERY_PAGE_SIZE"
-rationale = "Reviewed SQLite discovery work bound: at most 256 raw aggregate rows are examined before yielding; this is an adapter resource contract, not a scheduling interval."
-
-[[entry]]
-category = "policy_assignments"
 key = "src/mcp_telegram/daemon_client.py:<module>:DEFAULT_ENTITY_PROFILE_PAGE_LIMIT"
 rationale = "The default 50 is the bounded local get_entity_info response-page request contract, not operator scheduling policy."
 

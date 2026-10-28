@@ -14,8 +14,6 @@ from mcp_telegram.chat_export import _message_reactions
 from mcp_telegram.message_fact_refresh import (
     _claim_reaction_pages,
     _reaction_candidates,
-    _reaction_discovery_page,
-    _reaction_page_candidate,
     _reaction_release_at,
 )
 from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
@@ -110,8 +108,6 @@ def test_scheduler_gates_known_false_everywhere(conn: sqlite3.Connection, visibi
     _observe(conn, 1, visibility)
     expected = [] if visibility is False else [(1, 2, 1, None)]
     assert _reaction_candidates(conn, stale_before_utc=10, limit=5) == expected
-    rows = _reaction_discovery_page(conn, None, (1, 2))
-    assert (_reaction_page_candidate(rows[0], 10) is None) is (visibility is False)
     assert (_reaction_release_at(conn, 10) is None) is (visibility is False)
     assert (
         _claim_reaction_pages(
