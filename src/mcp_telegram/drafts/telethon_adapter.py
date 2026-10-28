@@ -32,6 +32,7 @@ from mcp_telegram.drafts.contracts import (
     SnapshotCoverage,
 )
 from mcp_telegram.drafts.ports import DraftSnapshotGateway
+from mcp_telegram.drafts.snapshot import capture_restore_snapshot
 from mcp_telegram.telegram_demand import AcquisitionKind, acquisition_context
 from mcp_telegram.telegram_rpc_consumers import TelegramRpcSource
 from mcp_telegram.telegram_rpc_scheduler import rpc_scope
@@ -273,6 +274,7 @@ def normalize_update_draft(
             composition,
             ambiguity=composition.date is None,
             source_order_at=composition.date,
+            restore_snapshot=capture_restore_snapshot(update.draft),
         )
     if isinstance(update.draft, types.DraftMessageEmpty):
         return DraftObservation(
@@ -281,6 +283,7 @@ def normalize_update_draft(
             source,
             observed_at,
             source_order_at=_draft_date(update.draft),
+            restore_snapshot=capture_restore_snapshot(update.draft),
         )
     return None
 

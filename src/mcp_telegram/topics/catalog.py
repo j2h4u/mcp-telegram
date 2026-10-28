@@ -41,6 +41,14 @@ class TopicCatalogRepository:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
+    def known_capability(self, dialog_id: int) -> bool | None:
+        """Read supplied topic capability, including private bot topics, without acquisition."""
+        row = cast(
+            tuple[int | None] | None,
+            self._conn.execute("SELECT applicable FROM topic_catalog_state WHERE dialog_id=?", (dialog_id,)).fetchone(),
+        )
+        return None if row is None or row[0] is None else bool(row[0])
+
     def _enabled(self, dialog_id: int) -> bool:
         return (
             self._conn.execute(

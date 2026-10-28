@@ -14,6 +14,10 @@ from mcp_telegram.drafts.contracts import (
 )
 
 
+class DraftPreflightBusyError(RuntimeError):
+    """An existing snapshot owns reconciliation; no draft change was attempted."""
+
+
 class DraftProjectionRepository(Protocol):
     """Single-writer projection contract supplied by the persistence worker."""
 
@@ -38,6 +42,8 @@ class DraftProjectionRepository(Protocol):
     def recovery_revision(self, account_id: int) -> tuple[str, int] | None: ...
 
     def claim_recovery(self, *, now: float) -> int | None: ...
+
+    def claim_mutation_preflight(self, *, now: float) -> int | None: ...
 
     def release_recovery_claim(self, *, claim_token: int, due_at: float) -> bool: ...
 

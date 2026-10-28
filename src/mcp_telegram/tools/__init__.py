@@ -21,6 +21,7 @@ from .conversation_changes import ListConversationChanges, list_conversation_cha
 
 # --- Domain modules (import triggers @mcp_tool registration) ---
 from .discovery import ListDialogs, ListTopics, list_dialogs, list_topics
+from .drafts import GetDraft, ManageDraft, get_draft, manage_draft
 from .entity_info import GetEntityInfo, get_entity_info
 from .feedback import SubmitFeedback, submit_feedback
 from .reading import ListMessages, SearchMessages, list_messages, search_messages
@@ -37,6 +38,7 @@ __all__ = [
     "TOOL_REGISTRY",
     "DaemonNotRunningError",
     "GetDialogStats",
+    "GetDraft",
     "GetEntityInfo",
     "GetInbox",
     "GetMyRecentActivity",
@@ -47,6 +49,7 @@ __all__ = [
     "ListDialogs",
     "ListMessages",
     "ListTopics",
+    "ManageDraft",
     "MarkDialogForSync",
     "SearchMessages",
     "SubmitFeedback",
@@ -55,6 +58,7 @@ __all__ = [
     "TraceAccountMessages",
     "daemon_connection",
     "get_dialog_stats",
+    "get_draft",
     "get_entity_info",
     "get_inbox",
     "get_my_recent_activity",
@@ -65,6 +69,7 @@ __all__ = [
     "list_dialogs",
     "list_messages",
     "list_topics",
+    "manage_draft",
     "mark_dialog_for_sync",
     "mcp_tool",
     "normalize_output_schema",

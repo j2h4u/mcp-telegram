@@ -97,7 +97,7 @@ depends_on = ["mcp_telegram.update_delivery",
     "mcp_telegram.telegram_read_receipts", "mcp_telegram.topics.refresh", "mcp_telegram.transcription_hydration",
     "mcp_telegram.topics.sqlite_repository", "mcp_telegram.topics.telegram_adapter",
     "mcp_telegram.topics.catalog",
-    "mcp_telegram.telegram_demand", "mcp_telegram.telegram_demand_coordinator", "mcp_telegram.telegram_gateway", "mcp_telegram.entity_profile.ports", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.reactions", "mcp_telegram.sync_transactions", "mcp_telegram.sqlite_checkpoint", "mcp_telegram.sqlite_writer", "mcp_telegram.telegram_demand_progress"]
+    "mcp_telegram.telegram_demand", "mcp_telegram.telegram_demand_coordinator", "mcp_telegram.telegram_gateway", "mcp_telegram.entity_profile.ports", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.reactions", "mcp_telegram.sync_transactions", "mcp_telegram.sqlite_checkpoint", "mcp_telegram.sqlite_writer", "mcp_telegram.telegram_demand_progress", "mcp_telegram.drafts.commands", "mcp_telegram.drafts.history", "mcp_telegram.drafts.contracts", "mcp_telegram.models", "mcp_telegram.dialog_identity"]
 
 # application — each horizontal worker/facade has its own narrow declaration.
 [[modules]]
@@ -131,7 +131,7 @@ depends_on = ["mcp_telegram.chat_export",
     "mcp_telegram.folders.read_model",
     "mcp_telegram.request_timing",
     "mcp_telegram.runtime_observations",
-    "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.sync_transactions", "mcp_telegram.inbox_projection", "mcp_telegram.daemon_ipc", "mcp_telegram.temporal", "mcp_telegram.sqlite_writer"]
+    "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.sync_transactions", "mcp_telegram.inbox_projection", "mcp_telegram.daemon_ipc", "mcp_telegram.temporal", "mcp_telegram.sqlite_writer", "mcp_telegram.drafts.read_service"]
 cannot_depend_on = [
     "mcp_telegram.folders.telegram_adapter", "mcp_telegram.messages", "mcp_telegram.messages.telegram_adapter",
     "mcp_telegram.reactions.telegram_adapter",
@@ -253,6 +253,26 @@ depends_on = ["mcp_telegram.observation_order", "mcp_telegram.access_lifecycle",
 [[modules]]
 path = "mcp_telegram.drafts"
 layer = "application"
+depends_on = ["mcp_telegram.drafts.contracts"]
+
+[[modules]]
+path = "mcp_telegram.drafts.commands"
+layer = "application"
+depends_on = ["mcp_telegram.telegram_rpc_error", "mcp_telegram.sqlite_writer", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.drafts.contracts", "mcp_telegram.drafts.history", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.telegram_demand", "mcp_telegram.sync_transactions", "mcp_telegram.drafts.snapshot", "mcp_telegram.drafts.ports"]
+
+[[modules]]
+path = "mcp_telegram.drafts.read_service"
+layer = "application"
+depends_on = ["mcp_telegram.drafts.history", "mcp_telegram.drafts.contracts"]
+
+[[modules]]
+path = "mcp_telegram.drafts.history"
+layer = "persistence"
+depends_on = ["mcp_telegram.sync_transactions", "mcp_telegram.drafts.contracts"]
+
+[[modules]]
+path = "mcp_telegram.drafts.snapshot"
+layer = "telegram_gateway"
 depends_on = ["mcp_telegram.drafts.contracts"]
 
 [[modules]]
@@ -543,7 +563,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.drafts.telethon_adapter"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.drafts.contracts", "mcp_telegram.drafts.ports", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
+depends_on = ["mcp_telegram.drafts.contracts", "mcp_telegram.drafts.ports", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.drafts.snapshot"]
 
 [[modules]]
 path = "mcp_telegram.telegram_message_projection"
@@ -709,7 +729,7 @@ depends_on = ["mcp_telegram.observation_order", "mcp_telegram.sync_transactions"
 [[modules]]
 path = "mcp_telegram.drafts.sqlite_projection"
 layer = "persistence"
-depends_on = ["mcp_telegram.drafts.contracts", "mcp_telegram.drafts.ports", "mcp_telegram.sync_transactions"]
+depends_on = ["mcp_telegram.drafts.contracts", "mcp_telegram.drafts.ports", "mcp_telegram.sync_transactions", "mcp_telegram.drafts.history"]
 
 # foundation — small neutral contracts, IPC, configuration, and primitives.
 [[modules]]

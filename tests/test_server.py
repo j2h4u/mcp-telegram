@@ -1268,7 +1268,7 @@ async def test_run_mcp_http_server_normalizes_mount_and_builds_transport(
     assert routes[1][1] == "/health"
     if missing_daemon:
         assert server.app.instructions is not None
-        assert server.app.instructions.startswith("Telegram-read-only access")
+        assert server.app.instructions.startswith("Local access")
         assert "Connected account: id=" not in server.app.instructions
         assert captured["serve"] is True
     else:
@@ -1432,7 +1432,7 @@ def test_list_tools_exposes_feedback_and_entity_info_output_schemas() -> None:
 
 
 def test_all_registered_output_schemas_validate_success_and_canonical_error_examples() -> None:
-    assert len(server.tool_by_name) == 15
+    assert len(server.tool_by_name) == 17
     for name, tool in server.tool_by_name.items():
         assert tool.output_schema is not None, name
         schema = cast(dict[str, object], tool.output_schema)
@@ -1605,7 +1605,7 @@ async def test_each_registered_tool_response_gets_one_active_protection_snapshot
             protection_schema,
         )
 
-    assert status_reads == len(server.tool_by_name) == 15
+    assert status_reads == len(server.tool_by_name) == 17
 
 
 @pytest.mark.asyncio

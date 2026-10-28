@@ -17,7 +17,8 @@ from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 89
+_CURRENT_SCHEMA_VERSION = 90
+_DRAFT_HISTORY_MIGRATION = 90
 _PROFILE_COLLECTION_MIGRATION = 88
 _PROFILE_HISTORY_MIGRATION = 89
 _SEMANTIC_PROFILE_MIGRATION = 87
@@ -5097,8 +5098,57 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_88(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _PROFILE_HISTORY_MIGRATION:
         current = _apply_migration_89(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _DRAFT_HISTORY_MIGRATION:
+        current = _apply_migration_90(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
+
+
+def _apply_migration_90(conn: sqlite3.Connection, current: int) -> int:
+    """Retain complete draft preimages without promoting legacy projections."""
+    return _apply_migration(
+        conn,
+        current,
+        _DRAFT_HISTORY_MIGRATION,
+        [
+            "ALTER TABLE draft_current ADD COLUMN restore_payload BLOB CHECK(restore_payload IS NULL OR length(restore_payload)<=1048576)",
+            "ALTER TABLE draft_current ADD COLUMN semantic_fingerprint TEXT CHECK(semantic_fingerprint IS NULL OR length(semantic_fingerprint)<=128)",
+            "ALTER TABLE draft_current ADD COLUMN restore_reason TEXT CHECK(restore_reason IS NULL OR length(restore_reason)<=256)",
+            """CREATE TABLE draft_versions (
+                history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL CHECK(account_id>0),
+                dialog_id INTEGER NOT NULL CHECK(dialog_id!=0),
+                top_message_id INTEGER NOT NULL DEFAULT 0,
+                subdialog_peer_id INTEGER NOT NULL DEFAULT 0,
+                source_revision INTEGER NOT NULL CHECK(source_revision>=0),
+                state TEXT NOT NULL CHECK(state IN ('present','empty','cleared')),
+                text TEXT,
+                restore_payload BLOB CHECK(restore_payload IS NULL OR length(restore_payload)<=1048576),
+                semantic_fingerprint TEXT,
+                restore_reason TEXT,
+                source_observed_at INTEGER NOT NULL,
+                source_order_at INTEGER,
+                archived_at INTEGER NOT NULL CHECK(archived_at>=0),
+                UNIQUE(account_id,dialog_id,top_message_id,subdialog_peer_id,source_revision)
+            )""",
+            "CREATE INDEX draft_versions_expiry ON draft_versions(archived_at,history_id)",
+            """CREATE TABLE draft_operation_receipts (
+                account_id INTEGER NOT NULL CHECK(account_id>0),
+                operation_key TEXT NOT NULL CHECK(length(operation_key) BETWEEN 1 AND 128),
+                dialog_id INTEGER NOT NULL CHECK(dialog_id!=0),
+                top_message_id INTEGER NOT NULL DEFAULT 0,
+                subdialog_peer_id INTEGER NOT NULL DEFAULT 0,
+                request_fingerprint TEXT NOT NULL CHECK(length(request_fingerprint) BETWEEN 1 AND 256),
+                outcome TEXT NOT NULL CHECK(length(outcome) BETWEEN 1 AND 64),
+                backup_history_id INTEGER,
+                result_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(result_json) AND length(result_json)<=524288),
+                created_at INTEGER NOT NULL CHECK(created_at>=0),
+                updated_at INTEGER NOT NULL CHECK(updated_at>=0),
+                PRIMARY KEY(account_id,operation_key)
+            ) WITHOUT ROWID""",
+            "CREATE INDEX draft_operation_receipts_expiry ON draft_operation_receipts(updated_at) WHERE outcome!='pending'",
+        ],
+    )
 
 
 def _apply_migration_89(conn: sqlite3.Connection, current: int) -> int:

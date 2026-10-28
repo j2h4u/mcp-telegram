@@ -11,7 +11,7 @@ from typing import Protocol, cast
 from mcp_telegram.delivered_update import delivered_observed_datetime, fail_delivered_update
 from mcp_telegram.demand_wiring import DemandOfferSink, offer_durable_demand
 from mcp_telegram.drafts.contracts import DraftApplyResult, DraftObservation, DraftObservationSource, SnapshotCoverage
-from mcp_telegram.drafts.ports import DraftProjectionRepository, DraftSnapshotGateway
+from mcp_telegram.drafts.ports import DraftPreflightBusyError, DraftProjectionRepository, DraftSnapshotGateway
 from mcp_telegram.drafts.telethon_adapter import (
     TelethonDraftSnapshotGateway,
     draft_update_event,
@@ -148,6 +148,25 @@ class DraftMessageOwner:
         if sink is not None:
             offer_durable_demand(sink, self.demand_kind)
         self._record("draft.recovery", "requested", reason)
+
+    async def refresh_for_mutation(self) -> bool:
+        """Publish one explicit preflight through the existing snapshot owner."""
+        gateway = self._snapshot_gateway
+        if gateway is None or self._shutdown_event.is_set():
+            raise RuntimeError("draft synchronization is not ready")
+        now = time.time()
+        claim = await self._writer.run(
+            lambda conn: self._repository.for_connection(conn).claim_mutation_preflight(now=now)
+        )
+        if claim is None:
+            raise DraftPreflightBusyError("draft reconciliation is already in progress; retry after it completes")
+        try:
+            coverage, observations = await gateway.fetch_all_drafts()
+            result = await self._publish_snapshot(coverage, observations, claim, now)
+            return result.accepted
+        except BaseException:
+            await self._release_claim(claim, now)
+            raise
 
     async def on_raw_draft_update(self, update: object) -> None:
         """Report required callback failures before Telethon can swallow them."""

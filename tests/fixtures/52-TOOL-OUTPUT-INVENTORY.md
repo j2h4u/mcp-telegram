@@ -34,6 +34,9 @@ Current Phase 52 completion status:
 | `submit_feedback` | Submit Feedback | primary | false | false | no | acknowledgement only; accepted severity/context/model/harness omitted from result; fire-and-forget write semantics; no tracking id by design | `accepted {message,severity,context_present,model,harness}`, `status`, `message`, `tracking_id:null`, `readback_available:false`, `side_effects {feedback_db_write:true}` | none |
 | `trace_account_messages` | Account Trace | primary | false | true | yes | text summary of resolved account, evidence count, coverage_state, gaps count, first five evidence snippets framed as untrusted_content, more-count, gap_summary, next_navigation; coverage_gaps/provenance already structured | `resolved_account`, `groups[]`, `groups[].evidence[] {text,media_description,untrusted_content:true}`, `coverage`, `gaps`, `provenance`, `coverage_gaps`, `next_navigation`, `result_count_semantics`, `is_error_conditions`, `preview {shown_count,hidden_count,gap_summary}` | none |
 
+| `get_draft` | Get Draft | primary | true | true | yes | local current draft and temporary undo history; unknown distinct from absent | `current`, `history[]`, `selected_history`, `next_action` | none |
+| `manage_draft` | Manage Draft | primary | false | false | yes | explicit native draft create/update/clear/restore, version conflict and uncertain result guidance; never sends | `outcome`, `operation_key`, `mutation_dispatched`, `save_acknowledged`, `backup_history_id`, `current`, `next_action` | native cloud draft mutation |
+
 ## Lossless Signal Checklist
 
 | Signal family | Current text source | Target structured path |
