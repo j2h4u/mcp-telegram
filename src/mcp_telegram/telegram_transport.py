@@ -49,6 +49,8 @@ class TransportAuthority(Protocol):
 
     def claim_write(self, owner: object, permit: object) -> bool: ...
 
+    def observe_write_return(self, owner: object) -> None: ...
+
     def defer_write(self, owner: object, permit: object) -> None: ...
 
     async def observe_result(
@@ -513,7 +515,14 @@ class GuardedMTProtoSender(MTProtoSender):
             if not owned.state.future.done():
                 owned.state.future.set_exception(error)
             raise
+        self._observe_write_return(owned.owner)
         return True
+
+    def _observe_write_return(self, owner: object) -> None:
+        try:
+            self._authority.observe_write_return(owner)
+        except Exception:  # noqa: BLE001 - passive telemetry must not change the completed write
+            pass
 
     def _claim_packet(self, packet: _OwnedPacket) -> bool:
         owned = packet.state

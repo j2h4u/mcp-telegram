@@ -43,6 +43,7 @@ from telethon.tl.tlobject import TLRequest
 from mcp_telegram.config import (
     FloodWaitConfig,
     McpTelegramConfig,
+    RuntimeObservationConfig,
     StateConfig,
     TelegramRpcConfig,
     TelegramRpcSchedulerConfig,
@@ -63,6 +64,7 @@ from mcp_telegram.flood import (
     TelegramRpcThrottled,
 )
 from mcp_telegram.message_history.contracts import ForwardGapPage
+from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.sync_db import (
     _apply_migrations,
     ensure_sync_schema,
@@ -121,6 +123,7 @@ from tests.helpers import (
     reset_rpc_process_policy,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.test_rpc_admission_observations import _Recorder
 
 
 @dataclass(frozen=True, slots=True)
@@ -2492,7 +2495,17 @@ async def test_request_specific_observation_counts_each_actual_retry_attempt_onc
 ) -> None:
     gate = _gate(retry_delays=(0,))
     observed: list[dict[str, object]] = []
-    gate.set_rpc_request_observer(lambda **values: observed.append(values))
+    recorder = _Recorder()
+    observer = RpcAdmissionObservationAggregator(
+        recorder, method_names=TelegramRpcGate.rpc_observation_methods(), policy=RuntimeObservationConfig()
+    )
+
+    def observe(**values: object) -> None:
+        observed.append(values)
+        observer.observe_rpc_event(**values)  # type: ignore[arg-type]
+
+    gate.set_rpc_request_observer(observe)
+    gate.set_rpc_admission_observer(observer.observe)
     send_attempts = 0
 
     def send(_request: object) -> object:
@@ -2508,10 +2521,18 @@ async def test_request_specific_observation_counts_each_actual_retry_attempt_onc
     assert await _call(gate, request) == "ok"
 
     assert send_attempts == 2
-    assert len(observed) == 2
-    assert all(item["request_class"] == "get_full_channel" for item in observed)
-    assert all(item["source"] is TelegramRpcSource.MCP_INTERACTIVE for item in observed)
+    claims = [item for item in observed if item["phase"] == "write_claim"]
+    assert len(claims) == 2
+    assert all("channels.GetFullChannelRequest:" in str(item["request_method"]) for item in claims)
+    assert all(item["scope"].source is TelegramRpcSource.MCP_INTERACTIVE for item in claims)
     assert all("InputChannel" not in repr(item) for item in observed)
+    observer.flush()
+    samples = [cast(dict[str, object], row["payload"]) for row in recorder.rows if row["outcome"] == "causal_sample"]
+    retries = [payload for payload in samples if payload["phase"] == "retry"]
+    assert len(retries) == 1
+    assert retries[0]["method"] == claims[0]["request_method"]
+    assert retries[0]["reason"] == "server_transient"
+    assert retries[0]["root_attempts"] == 1 and cast(int, retries[0]["budget_remaining"]) >= 1
 
 
 @pytest.mark.asyncio
@@ -2851,6 +2872,8 @@ async def test_concurrent_vendor_cache_fold_is_a_local_deferral_not_a_second_war
         FloodWaitKillSwitchPolicy(enabled=True, window_seconds=600, max_events=5, max_wait_seconds=900)
     )
     gate = _gate()
+    phases: list[str] = []
+    gate.set_rpc_request_observer(lambda **values: phases.append(values["phase"]))
     gate._rpc_circuit_status = accumulator.kill_switch_status
     gate._flood_observer = lambda **event: accumulator.observe(**event)
     flood_events: list[dict[str, object]] = []
@@ -2892,6 +2915,7 @@ async def test_concurrent_vendor_cache_fold_is_a_local_deferral_not_a_second_war
         assert [event["actual_dispatch"] for event in flood_events] == [True, False]
         assert flood_events[0]["admission_sequence"] is not None
         assert flood_events[1]["admission_sequence"] is None
+        assert phases.count("write_claim") == phases.count("vendor_cached") == 1
     finally:
         if delayed is not None and not delayed.done():
             release.set()

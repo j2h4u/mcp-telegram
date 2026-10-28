@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Protocol
 
@@ -75,6 +76,7 @@ class RpcAttemptEvidence:
     """Mutable, non-enforcing count of real sends attributed to one root."""
 
     actual_attempts: int = 0
+    observation_id: str = field(default_factory=lambda: uuid.uuid4().hex, repr=False)
 
     def record_dispatch(self) -> None:
         """Record one sender dispatch without changing transport behavior."""

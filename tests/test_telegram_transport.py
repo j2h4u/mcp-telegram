@@ -55,6 +55,7 @@ class _Authority:
         self.floor = False
         self.owners: list[_Owner] = []
         self.claims: list[_Owner] = []
+        self.write_returns: list[object] = []
         self.released: list[_Permit] = []
         self.prepared: asyncio.Queue[_Permit] = asyncio.Queue()
         self.deferred: asyncio.Queue[_Permit] = asyncio.Queue()
@@ -112,6 +113,9 @@ class _Authority:
         assert permit.owner is owner
         self.released.append(permit)
         self.deferred.put_nowait(permit)
+
+    def observe_write_return(self, owner: object) -> None:
+        self.write_returns.append(owner)
 
     async def observe_result(
         self, owner: object, error: BaseException | None, result: object | None = None
@@ -546,6 +550,7 @@ async def test_claimed_write_failure_settles_application_and_protects_transport(
     assert caught.value is failure
     assert wire.authority.protected == [failure]
     assert len(wire.authority.claims) == 1
+    assert wire.authority.write_returns == []
     assert not wire.authority.released
     assert not wire.writer.frames
     assert state not in wire.sender._owned_states

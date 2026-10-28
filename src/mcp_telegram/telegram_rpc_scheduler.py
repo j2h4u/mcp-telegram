@@ -10,7 +10,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import Context, ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Protocol
@@ -440,6 +440,8 @@ class RpcAdmissionEvent:
     reason: str | None = None
     demand_kind: DemandKind | None = None
     acquisition_kind: AcquisitionKind | None = None
+    observation_scope: TelegramRpcScope | None = field(default=None, repr=False, compare=False)
+    observation_method: str | None = field(default=None, repr=False, compare=False)
 
 
 def _admission_log_level(event: RpcAdmissionEvent) -> int:
@@ -780,9 +782,9 @@ class TelegramRpcAdmissionScheduler:
         )
         return True
 
-    def record_retry(self, scope: TelegramRpcScope, *, reason: str) -> None:
+    def record_retry(self, scope: TelegramRpcScope, *, reason: str, request_method: str | None = None) -> None:
         """Record that transport policy will submit the attempt again."""
-        self._emit_for_scope(RpcAdmissionEventKind.RESUBMITTED, scope, reason=reason)
+        self._emit_for_scope(RpcAdmissionEventKind.RESUBMITTED, scope, reason=reason, observation_method=request_method)
 
     def record_attempt_budget_exhausted(self, scope: TelegramRpcScope) -> None:
         """Record a durable slice yield before another sender attempt."""
@@ -1146,6 +1148,7 @@ class TelegramRpcAdmissionScheduler:
         *,
         wait_seconds: float | None = None,
         reason: str | None = None,
+        observation_method: str | None = None,
     ) -> None:
         self._emit(
             RpcAdmissionEvent(
@@ -1160,6 +1163,8 @@ class TelegramRpcAdmissionScheduler:
                 reason=reason,
                 demand_kind=scope.demand_kind,
                 acquisition_kind=scope.acquisition_kind,
+                observation_scope=scope,
+                observation_method=observation_method,
             )
         )
 

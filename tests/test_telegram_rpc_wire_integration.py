@@ -13,7 +13,7 @@ from typing import cast
 
 import pytest
 from telethon.crypto import AuthKey
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, ServerError
 from telethon.network.connection.tcpfull import FullPacketCodec
 from telethon.network.requeststate import RequestState
 from telethon.sessions import MemorySession
@@ -22,7 +22,8 @@ from telethon.tl.functions import channels, messages
 from telethon.tl.functions.updates import GetStateRequest
 
 from mcp_telegram import telegram_rpc
-from mcp_telegram.config import TelegramRpcSchedulerConfig
+from mcp_telegram.config import RuntimeObservationConfig, TelegramRpcSchedulerConfig
+from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import (
     ensure_sync_schema,
@@ -49,6 +50,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
 )
 from mcp_telegram.telegram_transport import GuardedConnectionTcpFull, GuardedMTProtoSender, _RequestState
 from tests.helpers import reset_rpc_process_policy
+from tests.test_rpc_admission_observations import _Recorder
 from tests.test_telegram_transport import _Writer
 
 
@@ -534,3 +536,204 @@ async def test_unsent_terminal_ack_does_not_enter_sent_replay_cache(wire: _WireH
     await asyncio.gather(*sender._observing)
     assert owned.claims == 0 and sink.frames == []
     assert not sender._last_acks and state not in sender._owned_states
+
+
+@pytest.mark.parametrize("outcome", ["success", "rpc_error", "write_failure", "response_lost"])
+async def test_rpc_observations_follow_writer_and_provider_boundaries(  # noqa: PLR0914, PLR0915 - four real transport outcomes share the owner fixture
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    gate, sender, connection, sink = wire
+    recorder = _Recorder()
+    observer = RpcAdmissionObservationAggregator(
+        recorder, method_names=TelegramRpcGate.rpc_observation_methods(), policy=RuntimeObservationConfig()
+    )
+    gate.set_rpc_request_observer(observer.observe_rpc_event)
+    budget = RpcAttemptBudget(2)
+    scope = TelegramRpcScope(
+        TelegramRpcSource.MCP_INTERACTIVE,
+        RpcServiceClass.INTERACTIVE,
+        time.monotonic() + 10,
+        asyncio.current_task(),
+        attempt_budget=budget,
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    result = sender.send_owned(GetStateRequest(), scope)
+    state = await sender._send_queue.next_state()
+    await sender._prepare_state(state)
+    packet = connection._send_queue.get_nowait()
+    owner = gate._require_wire_owner(packet.state.owner)
+    if outcome == "write_failure":
+
+        def fail_write(_data: bytes) -> None:
+            raise OSError("private error text must not enter telemetry")
+
+        monkeypatch.setattr(sink, "write", fail_write)
+        with pytest.raises(OSError):
+            sender.write_packet(packet, connection._send)
+        with pytest.raises(OSError):
+            await result
+    else:
+        assert sender.write_packet(packet, connection._send)
+        gate.observe_write_return(owner)  # A duplicate callback is not a second local write.
+        if outcome == "success":
+            state.future.set_result("private result body")
+            assert await result == "private result body"
+            await gate.observe_result(owner, None, "private result body")
+        elif outcome == "rpc_error":
+            state.future.set_exception(ServerError(None, "private server error"))
+            with pytest.raises(ServerError):
+                await result
+        else:
+            state.future.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await result
+    observer.flush()
+    summaries = [cast(dict[str, object], row["payload"]) for row in recorder.rows if row["outcome"] == "method_summary"]
+    assert len(summaries) == 1
+    summary = summaries[0]
+    assert summary["write_claim"] == budget.attempts == 1
+    assert summary["write_return"] == (0 if outcome == "write_failure" else 1)
+    assert summary["known_response"] == (1 if outcome in {"success", "rpc_error"} else 0)
+    assert summary["unknown_outcome"] == (1 if outcome in {"write_failure", "response_lost"} else 0)
+    samples = [cast(dict[str, object], row["payload"]) for row in recorder.rows if row["outcome"] == "causal_sample"]
+    terminal = [p for p in samples if p["phase"] in {"known_response", "unknown_outcome"}]
+    assert len(terminal) == 1
+    assert "attempt_ordinal" not in terminal[0] and "admission_sequence" not in terminal[0]
+    assert "private" not in repr(recorder.rows)
+
+
+async def test_rpc_replay_claims_keep_same_owner_and_distinct_physical_ordinals(
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate, sender, connection, sink = wire
+    now = [time.monotonic()]
+    monkeypatch.setattr(telegram_rpc, "time", SimpleNamespace(monotonic=lambda: now[0], time=time.time))
+    gate._admission_scheduler._clock = lambda: now[0]
+    recorder = _Recorder()
+    observer = RpcAdmissionObservationAggregator(
+        recorder,
+        method_names=TelegramRpcGate.rpc_observation_methods(),
+        policy=RuntimeObservationConfig(),
+        clock=lambda: now[0],
+    )
+    gate.set_rpc_request_observer(observer.observe_rpc_event)
+    budget = RpcAttemptBudget(2)
+    scope = TelegramRpcScope(
+        TelegramRpcSource.MCP_INTERACTIVE,
+        RpcServiceClass.INTERACTIVE,
+        now[0] + 10,
+        asyncio.current_task(),
+        attempt_budget=budget,
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    result = sender.send_owned(GetStateRequest(), scope)
+    state = await sender._send_queue.next_state()
+    for _ in range(2):
+        await sender._prepare_state(state)
+        assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+        now[0] += 2
+    state.future.set_result("complete")
+    assert await result == "complete"
+    observer.flush()
+    samples = [cast(dict[str, object], row["payload"]) for row in recorder.rows if row["outcome"] == "causal_sample"]
+    claims = [p for p in samples if p["phase"] == "write_claim"]
+    assert len(sink.frames) == budget.attempts == 2
+    assert [p["attempt_ordinal"] for p in claims] == [1, 2]
+    assert [p["replay_ordinal"] for p in claims] == [1, 2]
+    assert claims[0]["attempt_ref"] == claims[1]["attempt_ref"]
+    assert claims[0]["admission_sequence"] != claims[1]["admission_sequence"]
+    assert claims[1]["reason"] == "replay"
+    assert len([p for p in samples if p["phase"] == "known_response"]) == 1
+
+
+async def test_rpc_control_synthetic_success_is_not_a_provider_response(wire: _WireHarness) -> None:
+    gate, sender, connection, _sink = wire
+    recorder = _Recorder()
+    observer = RpcAdmissionObservationAggregator(
+        recorder, method_names=TelegramRpcGate.rpc_observation_methods(), policy=RuntimeObservationConfig()
+    )
+    gate.set_rpc_request_observer(observer.observe_rpc_event)
+    token = sender._control_origin.set((asyncio.current_task(), "ack"))
+    try:
+        state = cast(_RequestState, RequestState(types.MsgsAck([99])))
+        sender._send_queue.append(state)
+    finally:
+        sender._control_origin.reset(token)
+    assert await sender._send_queue.next_state() is state
+    await sender._prepare_state(state)
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    await asyncio.gather(*sender._observing)
+    observer.flush()
+    summary = next(
+        cast(dict[str, object], row["payload"]) for row in recorder.rows if row["outcome"] == "method_summary"
+    )
+    assert summary["write_claim"] == summary["write_return"] == 1
+    assert summary["known_response"] == summary["unknown_outcome"] == 0
+
+
+async def test_throwing_rpc_observer_cannot_change_write_receipt_or_returned_result(
+    wire: _WireHarness, caplog: pytest.LogCaptureFixture
+) -> None:
+    gate, sender, connection, sink = wire
+
+    def broken(**_values: object) -> None:
+        raise RuntimeError("private observer error")
+
+    gate.set_rpc_request_observer(broken)
+    scope = TelegramRpcScope(
+        TelegramRpcSource.MCP_INTERACTIVE,
+        RpcServiceClass.INTERACTIVE,
+        time.monotonic() + 10,
+        asyncio.current_task(),
+        attempt_budget=RpcAttemptBudget(1),
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    result = sender.send_owned(GetStateRequest(), scope)
+    state = await sender._send_queue.next_state()
+    await sender._prepare_state(state)
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    state.future.set_result("unchanged")
+    assert await result == "unchanged"
+    record = gate._safety_store.load_record()
+    assert record is not None and json.loads(record)["intents"] == {}
+    assert len(sink.frames) == 1 and gate._wire_fault is None
+    assert "private observer error" not in caplog.text
+
+
+async def test_due_flush_keeps_paired_admission_and_method_claim_in_one_window(wire: _WireHarness) -> None:
+    gate, sender, connection, _sink = wire
+    now = [0.0]
+    recorder = _Recorder()
+    observer = RpcAdmissionObservationAggregator(
+        recorder,
+        method_names=TelegramRpcGate.rpc_observation_methods(),
+        policy=RuntimeObservationConfig(),
+        clock=lambda: now[0],
+    )
+    gate.set_rpc_request_observer(observer.observe_rpc_event)
+    gate.set_rpc_admission_observer(observer.observe)
+    scope = TelegramRpcScope(
+        TelegramRpcSource.MCP_INTERACTIVE,
+        RpcServiceClass.INTERACTIVE,
+        time.monotonic() + 10,
+        asyncio.current_task(),
+        attempt_budget=RpcAttemptBudget(1),
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    result = sender.send_owned(GetStateRequest(), scope)
+    state = await sender._send_queue.next_state()
+    await sender._prepare_state(state)
+    now[0] = 300.0
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    admission = [
+        cast(dict[str, object], row["payload"]) for row in recorder.rows if row["kind"] == "telegram.rpc_admission"
+    ]
+    methods = [cast(dict[str, object], row["payload"]) for row in recorder.rows if row["outcome"] == "method_summary"]
+    assert (
+        sum(cast(int, p["dispatched_count"]) for p in admission)
+        == sum(cast(int, p["write_claim"]) for p in methods)
+        == 1
+    )
+    assert len([row for row in recorder.rows if row["outcome"] == "coverage"]) == 1
+    state.future.set_result("complete")
+    assert await result == "complete"

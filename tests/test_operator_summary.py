@@ -189,7 +189,7 @@ def test_summary_reconciles_get_full_channel_attempts_by_source_and_demand(tmp_p
                     int(now * 1000) - 3_000,
                     "telegram.rpc_request",
                     "current",
-                    "summary",
+                    "method_summary",
                     json.dumps(
                         {
                             "request_class": "get_full_channel",

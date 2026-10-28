@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from telethon.tl import functions
+from telethon.tl.alltlobjects import tlobjects
+from telethon.tl.tlobject import TLRequest
 
 from mcp_telegram.config import RuntimeObservationConfig
 from mcp_telegram.flood import FloodWaitObservation
@@ -16,12 +19,16 @@ from mcp_telegram.rpc_admission_observations import DemandEvidenceOutcome, RpcAd
 from mcp_telegram.runtime_observations import MAX_PAYLOAD_BYTES, RuntimeObservationSink, encode_payload
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import ensure_sync_schema
-from mcp_telegram.telegram_demand import AcquisitionKind
+from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget, RpcAttemptEvidence
+from mcp_telegram.telegram_demand_progress import WorkKey, WorkRevision
+from mcp_telegram.telegram_rpc import TelegramRpcGate
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RPC_SOURCE_SERVICE_CLASS,
     RpcAdmissionEvent,
     RpcAdmissionEventKind,
+    RpcServiceClass,
+    TelegramRpcScope,
     TelegramRpcSource,
 )
 
@@ -32,6 +39,30 @@ class _Recorder:
 
     def record(self, **values: object) -> bool | None:
         self.rows.append(values)
+
+
+def _method(kind: type) -> str:
+    return f"{kind.__module__}.{kind.__name__}:{kind.CONSTRUCTOR_ID:08x}"
+
+
+def _rpc_scope(target: str = "private-peer", revision: str = "cursor-secret") -> TelegramRpcScope:
+    selected = WorkRevision(WorkKey(DemandKind.ENTITY_PROFILE_REFRESH, 12345, target), revision)
+    return TelegramRpcScope(
+        TelegramRpcSource.ENTITY_INFO_REFRESH,
+        RpcServiceClass.BACKGROUND,
+        1000.0,
+        None,
+        demand_kind=DemandKind.ENTITY_PROFILE_REFRESH,
+        acquisition_kind=AcquisitionKind.ENTITY_LOOKUP,
+        attempt_budget=RpcAttemptBudget(8, selected=selected),
+        attempt_evidence=RpcAttemptEvidence(),
+        request_method=_method(functions.users.GetFullUserRequest),
+        owned_attempt_id="a" * 32,
+    )
+
+
+def _rpc_payloads(recorder: _Recorder, outcome: str) -> list[dict[str, object]]:
+    return [cast(dict[str, object], row["payload"]) for row in recorder.rows if row["outcome"] == outcome]
 
 
 def _event(
@@ -486,31 +517,36 @@ def test_transport_summary_carries_root_and_acquisition_dimensions() -> None:
 
 def test_get_full_channel_attempts_aggregate_by_source_and_demand_without_ids() -> None:
     recorder = _Recorder()
-    aggregator = RpcAdmissionObservationAggregator(recorder, policy=RuntimeObservationConfig(), clock=lambda: 0.0)
-    dimensions = {
-        "request_class": "get_full_channel",
-        "source": TelegramRpcSource.DIALOG_RESOLUTION,
-        "service_class": RPC_SOURCE_SERVICE_CLASS[TelegramRpcSource.DIALOG_RESOLUTION],
-        "demand_kind": DemandKind.ENTITY_LOOKUP,
-        "acquisition_kind": AcquisitionKind.ENTITY_LOOKUP,
-    }
-
-    aggregator.observe_request_attempt(**dimensions)
-    aggregator.observe_request_attempt(**dimensions)
+    aggregator = RpcAdmissionObservationAggregator(
+        recorder,
+        method_names=TelegramRpcGate.rpc_observation_methods(),
+        policy=RuntimeObservationConfig(),
+        clock=lambda: 0.0,
+    )
+    scope = TelegramRpcScope(
+        TelegramRpcSource.DIALOG_RESOLUTION,
+        RpcServiceClass.INTERACTIVE,
+        None,
+        None,
+        demand_kind=DemandKind.ENTITY_LOOKUP,
+        acquisition_kind=AcquisitionKind.ENTITY_LOOKUP,
+        request_method=_method(functions.channels.GetFullChannelRequest),
+    )
+    aggregator.observe_rpc_event(scope=scope, phase="write_claim")
+    aggregator.observe_rpc_event(scope=scope, phase="write_claim")
     aggregator.flush(now=300.0)
 
-    assert len(recorder.rows) == 1
+    assert len(recorder.rows) == 2
     assert recorder.rows[0]["kind"] == "telegram.rpc_request"
     assert recorder.rows[0]["result_count"] == 2
-    assert recorder.rows[0]["payload"] == {
-        "request_class": "get_full_channel",
-        "source": "dialog_resolution",
-        "service_class": "interactive",
-        "demand_kind": "entity_lookup",
-        "acquisition_kind": "entity_lookup",
-        "actual_attempts": 2,
-        "window_seconds": 300,
-    }
+    payload = cast(dict[str, object], recorder.rows[0]["payload"])
+    assert payload["request_class"] == "get_full_channel"
+    assert payload["source"] == "dialog_resolution"
+    assert payload["demand_kind"] == "entity_lookup"
+    assert payload["actual_attempts"] == payload["write_claim"] == 2
+    assert payload["dispatch_semantics"] == "write_claim_v1"
+    assert payload["window_seconds"] == 300
+    assert "operation_id" not in payload and "target_ref" not in payload
 
 
 def test_delta_gap_fill_summary_reconciles_and_stays_private_and_bounded() -> None:
@@ -663,3 +699,225 @@ def test_invalid_delta_gap_fill_slice_is_reported_without_corrupting_valid_total
     assert payload["rejected_slice_count"] == 1
     assert recorder.rows[0]["result_count"] == 1
     assert "private dialog 123" not in encode_payload(payload)
+
+
+def test_rpc_methods_reconstruct_retry_without_confusing_product_units(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 0.0
+    recorder = _Recorder()
+    aggregator = RpcAdmissionObservationAggregator(
+        recorder,
+        method_names=TelegramRpcGate.rpc_observation_methods(),
+        policy=RuntimeObservationConfig(),
+        clock=lambda: now,
+    )
+    monkeypatch.setattr("mcp_telegram.rpc_admission_observations.time.monotonic", lambda: now)
+    scope = _rpc_scope()
+    assert scope.attempt_budget is not None
+    for ordinal in (1, 2):
+        scope.attempt_budget.debit()
+        aggregator.observe_rpc_event(scope=scope, phase="write_claim", admission_sequence=ordinal)
+        aggregator.observe_rpc_event(scope=scope, phase="write_return", admission_sequence=ordinal)
+        aggregator.observe_rpc_event(scope=scope, phase="known_response", admission_sequence=ordinal)
+        if ordinal == 1:
+            aggregator.observe_rpc_event(scope=scope, phase="retry", reason="server_transient")
+    second = replace(scope, request_method=_method(functions.channels.GetFullChannelRequest))
+    scope.attempt_budget.debit()
+    aggregator.observe_rpc_event(scope=second, phase="write_claim", admission_sequence=3)
+    aggregator.observe_rpc_event(scope=second, phase="write_return", admission_sequence=3)
+    aggregator.observe_rpc_event(scope=second, phase="known_response", admission_sequence=3)
+    aggregator.observe_demand(outcome="completed", demand_kind=DemandKind.ENTITY_PROFILE_REFRESH, actual_attempts=3)
+    aggregator.flush(now=300.0)
+
+    methods = _rpc_payloads(recorder, "method_summary")
+    assert len(methods) == 2
+    assert sum(cast(int, p["write_claim"]) for p in methods) == 3
+    assert sum(cast(int, p["retry"]) for p in methods) == 1
+    samples = _rpc_payloads(recorder, "causal_sample")
+    assert [p["attempt_ordinal"] for p in samples if p["phase"] == "write_claim"] == [1, 2, 3]
+    assert [p["reason"] for p in samples if p["phase"] == "retry"] == ["server_transient"]
+    assert all(p["trigger"] == "durable_selection" and p["deadline_remaining_ms"] == 1_000_000 for p in samples)
+    assert samples[-1]["budget_remaining"] == 5
+    roots = {row["operation_id"] for row in recorder.rows if row["outcome"] == "causal_sample"}
+    assert len(roots) == 1
+    demand = [row for row in recorder.rows if row["kind"] == "telegram.demand"]
+    assert cast(dict[str, object], demand[0]["payload"])["demand_units"] == 1
+    assert "private-peer" not in repr(recorder.rows) and "cursor-secret" not in repr(recorder.rows)
+
+
+def test_rpc_owner_revision_identity_is_stable_private_and_runtime_scoped() -> None:
+    recorder = _Recorder()
+    aggregator = RpcAdmissionObservationAggregator(
+        recorder,
+        method_names=TelegramRpcGate.rpc_observation_methods(),
+        policy=RuntimeObservationConfig(),
+        clock=lambda: 0.0,
+    )
+    first, same, other = _rpc_scope(), _rpc_scope(), _rpc_scope("other-private-peer")
+    for scope in (first, same, other):
+        aggregator.observe_rpc_event(scope=scope, phase="vendor_cached")
+    aggregator.flush(now=300.0)
+    rows = [row for row in recorder.rows if row["outcome"] == "causal_sample"]
+    assert rows[0]["operation_id"] == rows[1]["operation_id"] != rows[2]["operation_id"]
+    target = cast(dict[str, object], rows[0]["payload"])["target_ref"]
+    recorder.rows.clear()
+    aggregator.observe_rpc_event(scope=_rpc_scope(revision="new-revision"), phase="rejected", reason="deadline_elapsed")
+    aggregator.flush(now=600.0)
+    changed = [row for row in recorder.rows if row["outcome"] == "causal_sample"][0]
+    assert changed["operation_id"] != rows[0]["operation_id"]
+    assert cast(dict[str, object], changed["payload"])["target_ref"] == target
+    fresh = RpcAdmissionObservationAggregator(
+        _Recorder(), method_names=TelegramRpcGate.rpc_observation_methods(), policy=RuntimeObservationConfig()
+    )
+    assert fresh._rpc_identity(first) != aggregator._rpc_identity(first)
+    assert all(p["write_claim"] == p["write_return"] == 0 for p in _rpc_payloads(recorder, "method_summary"))
+
+
+def test_rpc_method_and_sample_limits_preserve_totals_and_declare_bias() -> None:
+    recorder = _Recorder()
+    aggregator = RpcAdmissionObservationAggregator(
+        recorder,
+        method_names=TelegramRpcGate.rpc_observation_methods(),
+        policy=RuntimeObservationConfig(),
+        clock=lambda: 0.0,
+    )
+    methods = [_method(kind) for kind in tlobjects.values() if issubclass(kind, TLRequest)][:20]
+    roots = [_rpc_scope(str(number)) for number in range(3)]
+    for index in range(60):
+        aggregator.observe_rpc_event(
+            scope=replace(roots[index % 3], request_method=methods[index % len(methods)]), phase="write_claim"
+        )
+    assert len(aggregator._method_aggregates) == 16
+    assert len(aggregator._rpc_samples) == 2
+    assert all(len(events) == 12 for events in aggregator._rpc_samples.values())
+    aggregator.flush(now=300.0)
+    assert len(recorder.rows) == 42
+    assert sum(cast(int, p["write_claim"]) for p in _rpc_payloads(recorder, "method_summary")) == 60
+    coverage = _rpc_payloads(recorder, "coverage")[0]
+    assert coverage["overflow_events"] == 12
+    assert coverage["method_attribution_complete"] is False
+    assert coverage["unsampled_events"] == 20
+    assert coverage["truncated_events"] == 16
+    assert coverage["sampling"] == "first_roots_partial"
+    assert all(
+        len(encode_payload(cast(dict[str, object], row["payload"])).encode()) <= MAX_PAYLOAD_BYTES
+        for row in recorder.rows
+    )
+    aggregator.flush(now=900.0)
+    assert len(recorder.rows) == 42
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_rpc_sink_rejection_then_ten_minute_delay_keeps_bounded_real_window(raises: bool) -> None:
+    class RejectingRecorder(_Recorder):
+        reject = True
+
+        def record(self, **values: object) -> bool:
+            if self.reject:
+                if raises:
+                    raise RuntimeError("private sink error")
+                return False
+            self.rows.append(values)
+            return True
+
+    now = 0.0
+    recorder = RejectingRecorder()
+    aggregator = RpcAdmissionObservationAggregator(
+        recorder,
+        method_names=TelegramRpcGate.rpc_observation_methods(),
+        policy=RuntimeObservationConfig(),
+        clock=lambda: now,
+    )
+    scope = _rpc_scope()
+    aggregator.observe_rpc_event(scope=scope, phase="write_claim")
+    aggregator.flush(now=300.0)
+    assert len(aggregator._method_aggregates) == 1 and aggregator._rpc_samples == {}
+    recorder.reject = False
+    now = 900.0
+    aggregator.observe_rpc_event(scope=scope, phase="write_return")
+    summaries = _rpc_payloads(recorder, "method_summary")
+    assert len(summaries) == 1
+    assert summaries[0]["write_claim"] == summaries[0]["write_return"] == 1
+    assert summaries[0]["window_seconds"] == 900.0
+    coverage = _rpc_payloads(recorder, "coverage")
+    assert len(coverage) == 1 and coverage[0]["lost_rows"] == 2
+    assert coverage[0]["window_seconds"] == 600.0
+    assert coverage[0]["configured_window_seconds"] == 300.0
+    assert len(_rpc_payloads(recorder, "causal_sample")) == 1
+
+
+def test_rpc_untrusted_dimensions_are_redacted_and_samples_fit_payload_cap() -> None:
+    recorder = _Recorder()
+    aggregator = RpcAdmissionObservationAggregator(
+        recorder,
+        method_names=TelegramRpcGate.rpc_observation_methods(),
+        policy=RuntimeObservationConfig(),
+        clock=lambda: 0.0,
+    )
+    private = "private-value-do-not-log"
+    scope = replace(_rpc_scope(private, private), request_method=private, owned_attempt_id=private)
+    aggregator.observe_rpc_event(scope=scope, phase="retry", reason=private)
+    aggregator.flush(now=300.0)
+    assert private not in repr(recorder.rows)
+    sample = _rpc_payloads(recorder, "causal_sample")[0]
+    assert sample["method"] == sample["reason"] == "unknown"
+    assert "attempt_ref" not in sample
+    assert len(encode_payload(sample).encode()) <= MAX_PAYLOAD_BYTES
+
+
+def test_rpc_scheduler_rejection_and_retry_keep_scope_and_zero_physical_attempts() -> None:
+    recorder = _Recorder()
+    aggregator = RpcAdmissionObservationAggregator(
+        recorder,
+        method_names=TelegramRpcGate.rpc_observation_methods(),
+        policy=RuntimeObservationConfig(),
+        clock=lambda: 0.0,
+    )
+    scope = _rpc_scope()
+    for kind, reason in (
+        (RpcAdmissionEventKind.REJECTED, "attempt_budget_exhausted"),
+        (RpcAdmissionEventKind.RESUBMITTED, "server_transient"),
+    ):
+        aggregator.observe(replace(_event(kind), observation_scope=scope, reason=reason))
+    aggregator.flush(now=300.0)
+    summary = _rpc_payloads(recorder, "method_summary")[0]
+    assert summary["write_claim"] == summary["write_return"] == 0
+    assert summary["rejected"] == summary["retry"] == 1
+    assert all(p["root_attempts"] == 0 and "attempt_ordinal" not in p for p in _rpc_payloads(recorder, "causal_sample"))
+
+
+def test_rpc_maximum_sample_representation_is_finite_and_bounded() -> None:
+    recorder = _Recorder()
+    aggregator = RpcAdmissionObservationAggregator(
+        recorder,
+        method_names=TelegramRpcGate.rpc_observation_methods(),
+        policy=RuntimeObservationConfig(),
+        clock=lambda: 0.0,
+    )
+    method = max((_method(kind) for kind in tlobjects.values() if issubclass(kind, TLRequest)), key=len)
+    original = _rpc_scope()
+    assert original.attempt_budget is not None
+    scope = replace(
+        original,
+        request_method=method,
+        deadline=1e308,
+        source=max(TelegramRpcSource, key=lambda value: len(value.value)),
+        demand_kind=max(DemandKind, key=lambda value: len(value.value)),
+        acquisition_kind=max(AcquisitionKind, key=lambda value: len(value.value)),
+        attempt_budget=RpcAttemptBudget(2**63 - 1, 2**63 - 2, selected=original.attempt_budget.selected),
+    )
+    aggregator.observe_rpc_event(
+        scope=scope,
+        phase="write_claim",
+        admission_sequence=2**63 - 1,
+        replay_ordinal=2**63 - 1,
+        reason="attempt_budget_exhausted",
+    )
+    aggregator.flush(now=300.0)
+    assert len(_rpc_payloads(recorder, "causal_sample")) == 1
+    sample = _rpc_payloads(recorder, "causal_sample")[0]
+    assert sample["payload_truncated"] is True and "deadline_remaining_ms" not in sample
+    assert all(
+        len(encode_payload(cast(dict[str, object], row["payload"])).encode()) <= MAX_PAYLOAD_BYTES
+        for row in recorder.rows
+    )
+    assert all("Infinity" not in encode_payload(cast(dict[str, object], row["payload"])) for row in recorder.rows)

@@ -571,3 +571,28 @@ rationale = "Convert the existing startup owner's remaining deadline once to the
 category = "policy_call_keywords"
 key = "src/mcp_telegram/daemon.py:_acquire_startup_identity_before_updates:deadline"
 rationale = "Pass the existing startup owner's original finite boundary into its classified Gate scope; no new retry or timeout policy."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/rpc_admission_observations.py:<module>:_METHOD_NAME_LIMIT"
+rationale = "TG121 privacy contract bounds installed canonical constructor names before matching the vendor-owned allowlist; not an operator policy or transport limit."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/rpc_admission_observations.py:<module>:_METHOD_BUCKET_LIMIT"
+rationale = "TG121 panel-approved structural cardinality cap: sixteen method-dimension buckets plus one overflow preserves totals without unbounded telemetry memory."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/rpc_admission_observations.py:<module>:_SAMPLED_ROOT_LIMIT"
+rationale = "TG121 panel-approved privacy and volume contract selects at most two roots per existing configured aggregation window; it does not control RPC admission."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/rpc_admission_observations.py:<module>:_ROOT_EVENT_LIMIT"
+rationale = "TG121 panel-approved bounded sample representation retains at most twelve events per sampled root, with explicit truncation rather than operator tuning."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/rpc_admission_observations.py:RpcAdmissionObservationAggregator.__init__:self._rpc_window_started_wall_ms"
+rationale = "Observed current wall-clock timestamp records the real aggregation window start; it is runtime evidence, not a configurable cadence or deadline."

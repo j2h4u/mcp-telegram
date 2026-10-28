@@ -219,6 +219,9 @@ class _ClientStub:
     def set_rpc_request_observer(self, observer: object | None) -> None:
         self.request_observer_detached = observer is None
 
+    def rpc_observation_methods(self) -> frozenset[str]:
+        return frozenset()
+
     def set_flood_event_observer(self, observer: object | None) -> None:
         self.flood_event_observer_detached = observer is None
 

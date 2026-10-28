@@ -281,6 +281,8 @@ class _DaemonClient(Protocol):
 
     def set_rpc_request_observer(self, observer: Callable[..., None] | None) -> None: ...
 
+    def rpc_observation_methods(self) -> frozenset[str]: ...
+
     def set_flood_event_observer(self, observer: Callable[..., None] | None) -> None: ...
 
     async def get_me(self) -> object: ...
@@ -1209,6 +1211,7 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
     rpc_admission_observer = RpcAdmissionObservationAggregator(
         rpc_observation_sink,
         policy=config.telemetry.runtime_observations,
+        method_names=client.rpc_observation_methods(),
     )
     api_server.bind_runtime_observation_sink(rpc_observation_sink)
     api_server.bind_profile_observer(rpc_admission_observer)
@@ -1270,7 +1273,7 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
             fatal_callback=partial(_mark_rpc_scheduler_failed, ctx, rpc_scheduler_failure),
         )
     )
-    client.set_rpc_request_observer(rpc_admission_observer.observe_request_attempt)
+    client.set_rpc_request_observer(rpc_admission_observer.observe_rpc_event)
     client.set_flood_event_observer(rpc_admission_observer.observe_flood_wait)
     return ctx
 

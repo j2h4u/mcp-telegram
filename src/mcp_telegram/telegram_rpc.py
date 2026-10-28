@@ -1636,6 +1636,9 @@ class _WireAttempt:
     preparing_task: asyncio.Task[object] | None = None
     timing: DaemonRequestTiming | None = None
     method_generation: str | None = None
+    observed_write_returns: int = 0
+    observed_result: bool = False
+    observation_ordinal: int | None = None
 
 
 def _application_request(request: object) -> TLRequest:
@@ -2144,8 +2147,17 @@ class TelegramRpcGate(TelegramClient):
         """Attach the daemon-owned operational telemetry sink."""
         self._admission_scheduler.set_observer(observer)
 
+    @staticmethod
+    def rpc_observation_methods() -> frozenset[str]:
+        """Supply content-free constructor names from the existing vendor owner."""
+        return frozenset(
+            f"{kind.__module__}.{kind.__name__}:{kind.CONSTRUCTOR_ID:08x}"
+            for kind in tlobjects.values()
+            if issubclass(kind, TLRequest) or kind in {types.MsgsAck, types.MsgsStateInfo}
+        )
+
     def set_rpc_request_observer(self, observer: Callable[..., None] | None) -> None:
-        """Attach bounded per-request-class attempt telemetry."""
+        """Attach bounded physical phase and causal-sample telemetry."""
         self._rpc_request_observer = observer
 
     def set_rpc_eligibility_observer(self, observer: Callable[[str | None], None] | None) -> None:
@@ -2223,20 +2235,32 @@ class TelegramRpcGate(TelegramClient):
         """Signal Telethon's internal reconnect handler to daemon recovery."""
         return self._reconnect_event
 
-    def _observe_rpc_request(self, scope: TelegramRpcScope) -> None:
+    def _observe_rpc_request(  # noqa: PLR0913 - passive fields from the existing physical owner
+        self,
+        scope: TelegramRpcScope,
+        *,
+        phase: str = "write_claim",
+        admission_sequence: int | None = None,
+        replay_ordinal: int | None = None,
+        request_method: str | None = None,
+        reason: str | None = None,
+        attempt_ordinal: int | None = None,
+    ) -> None:
         observer = self._rpc_request_observer
         if observer is None:
             return
         try:
             observer(
-                request_class="get_full_channel",
-                source=scope.source,
-                service_class=scope.service_class,
-                demand_kind=scope.demand_kind,
-                acquisition_kind=scope.acquisition_kind,
+                scope=scope,
+                phase=phase,
+                request_method=request_method or scope.request_method,
+                admission_sequence=admission_sequence,
+                replay_ordinal=replay_ordinal,
+                reason=reason,
+                attempt_ordinal=attempt_ordinal,
             )
-        except Exception:
-            logger.debug("telegram_rpc_request_observation_failed", exc_info=True)
+        except Exception:  # noqa: BLE001 - diagnostic callbacks cannot alter RPC behavior
+            logger.debug("telegram_rpc_request_observation_failed")
 
     def check_circuit(self) -> None:
         if (self._authentication_mode or self._logout_mode) and self._ensure_safety_ledger()._authentication_authorized:
@@ -2578,12 +2602,34 @@ class TelegramRpcGate(TelegramClient):
         owner.admission = permit.admission
         if owner.scope.attempt_budget is not None:
             owner.scope.attempt_budget.last_method = owner.method
+            owner.observation_ordinal = owner.scope.attempt_budget.attempts
         permit.released = True
         if owner.timing is not None:
             owner.timing.record_rpc_attempt()
-        kind = functions.channels.GetFullChannelRequest
-        if owner.method == f"{kind.__module__}.{kind.__name__}:{kind.CONSTRUCTOR_ID:08x}":
-            self._observe_rpc_request(owner.scope)
+        self._observe_rpc_request(
+            owner.scope,
+            admission_sequence=permit.admission.sequence,
+            replay_ordinal=owner.claimed,
+            reason="replay" if owner.claimed > 1 else None,
+            attempt_ordinal=owner.observation_ordinal,
+        )
+
+    def observe_write_return(self, owner: object) -> None:
+        """Observe local writer acceptance, without claiming a provider receipt."""
+        try:
+            attempt = self._require_wire_owner(owner)
+            if attempt.observed_write_returns >= attempt.claimed:
+                return
+            attempt.observed_write_returns = attempt.claimed
+            self._observe_rpc_request(
+                attempt.scope,
+                phase="write_return",
+                replay_ordinal=attempt.claimed,
+                admission_sequence=None if attempt.admission is None else attempt.admission.sequence,
+                attempt_ordinal=attempt.observation_ordinal,
+            )
+        except Exception:  # noqa: BLE001 - observation cannot fail an already completed local write
+            logger.debug("telegram_rpc_write_observation_failed")
 
     def _permit_still_eligible(self, owner: _WireAttempt, permit: _WirePermit) -> bool:
         if owner.revoked:
@@ -2637,10 +2683,27 @@ class TelegramRpcGate(TelegramClient):
             self._wire_fault = "unresolved_outbound_outcome"
             self._notify_rpc_eligibility_changed()
 
+    def _observe_result_phase(self, owner: _WireAttempt, error: BaseException | None) -> None:
+        if (
+            owner.claimed
+            and not owner.observed_result
+            and (
+                not owner.scope.transport_control
+                or error is not None
+                or owner.method.startswith("telethon.tl.functions.PingRequest:")
+            )
+        ):
+            owner.observed_result = True
+            self._observe_rpc_request(
+                owner.scope,
+                phase="known_response" if error is None or isinstance(error, RPCError) else "unknown_outcome",
+            )
+
     async def observe_result(
         self, owner: object, error: BaseException | None, result: object = None
     ) -> BaseException | None:
         owner = self._require_wire_owner(owner)
+        self._observe_result_phase(owner, error)
         if owner.scope.transport_control:
             if owner.admission is not None:
                 self._admission_scheduler.complete(owner.admission)
@@ -3412,15 +3475,25 @@ class TelegramRpcGate(TelegramClient):
                     raise
                 migration_dc = exc.dc_id
                 delay = self._next_migration_delay(retry_delays)
-                self._admission_scheduler.record_retry(scope, reason="dc_migration")
+                self._record_rpc_retry(scope, request, reason="dc_migration")
             except TransientRpcErrors:
                 next_delay = next(retry_delays, None)
                 if next_delay is None:
                     raise
                 delay = next_delay
-                self._admission_scheduler.record_retry(scope, reason="server_transient")
+                self._record_rpc_retry(scope, request, reason="server_transient")
                 if delay and migration_dc is None:
                     await asyncio.sleep(delay)
+
+    def _record_rpc_retry(self, scope: TelegramRpcScope, request: object, *, reason: str) -> None:
+        observed_scope = scope
+        try:
+            method = _canonical_wire_method(request)
+            if scope.attempt_budget is None and scope.attempt_evidence is not None:
+                observed_scope = replace(scope, attempt_budget=self._wire_budgets.get(scope.attempt_evidence))
+        except Exception:  # noqa: BLE001 - diagnostic method resolution cannot change retry policy
+            method = None
+        self._admission_scheduler.record_retry(observed_scope, reason=reason, request_method=method)
 
     def _retry_delays_for_call(self, connection_owned: bool) -> Iterator[float]:
         if not connection_owned:
@@ -3451,7 +3524,7 @@ class TelegramRpcGate(TelegramClient):
             try:
                 return await self._dispatch_attempt(request, ordered=ordered, scope=scope)
             except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
-                await self._handle_admission_deferral(scope, exc, connection_owned=connection_owned)
+                await self._handle_admission_deferral(scope, exc, request=request, connection_owned=connection_owned)
             except TelegramRpcAdmissionDeferred:
                 raise
             except TelegramRpcThrottled:
@@ -3518,12 +3591,13 @@ class TelegramRpcGate(TelegramClient):
         scope: TelegramRpcScope,
         exc: RpcAdmissionError,
         *,
+        request: object,
         connection_owned: bool,
     ) -> None:
         if not connection_owned and scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
             if isinstance(exc, RpcAdmissionExpiredError):
                 raise exc
-            await self._retry_update_source(scope, reason=type(exc).__name__)
+            await self._retry_update_source(scope, request=request, reason=type(exc).__name__)
             return
         retry_seconds = self._scheduler_policy.admission_retry_seconds
         raise TelegramRpcAdmissionDeferred(
@@ -3534,8 +3608,8 @@ class TelegramRpcGate(TelegramClient):
             reason="capacity" if isinstance(exc, RpcAdmissionSaturatedError) else None,
         ) from None
 
-    async def _retry_update_source(self, scope: TelegramRpcScope, *, reason: str) -> None:
-        self._admission_scheduler.record_retry(scope, reason=reason)
+    async def _retry_update_source(self, scope: TelegramRpcScope, *, request: object, reason: str) -> None:
+        self._record_rpc_retry(scope, request, reason=reason)
         delay = self._scheduler_policy.update_loop_retry_seconds
         if scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE and scope.deadline is not None:
             delay = min(delay, max(0.0, scope.deadline - asyncio.get_running_loop().time()))
@@ -3587,6 +3661,12 @@ class TelegramRpcGate(TelegramClient):
                     admission_sequence=None,
                     dispatch_at_monotonic=None,
                     dispatch_kind="vendor_cache",
+                )
+                self._observe_rpc_request(
+                    scope,
+                    phase="vendor_cached",
+                    request_method=_canonical_wire_method(request),
+                    reason="flood_wait",
                 )
             raise
         finally:

@@ -58,6 +58,9 @@ async def test_shutdown_preserves_finalizer_commit_loss_boundary_and_final_marke
         def set_rpc_request_observer(self, _observer: object) -> None:
             pass
 
+        def rpc_observation_methods(self) -> frozenset[str]:
+            return frozenset()
+
         def set_flood_event_observer(self, _observer: object) -> None:
             pass
 
