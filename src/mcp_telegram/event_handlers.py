@@ -766,7 +766,7 @@ class EventHandlerManager:
         self._client.add_event_handler(self.on_message_deleted, events.MessageDeleted)
         # Phase 39.3-02: outbox read handler (peer→me side).
         # Dispatch path LOCKED to Path A: events.MessageRead(inbox=False).
-        # Verified against .venv/lib/python3.14/site-packages/telethon/events/
+        # Verified against .venv/lib/python3.15/site-packages/telethon/events/
         # messageread.py:37-48 — build() returns cls.Event(update.peer,
         # update.max_id, True) when the update is UpdateReadHistoryOutbox
         # (line 41-42); filter at lines 57-61 requires event.outbox == True
@@ -775,7 +775,7 @@ class EventHandlerManager:
         # Phase 39.2-01: 5th handler for raw reaction updates. Telethon emits
         # UpdateMessageReactions for User/Chat/Channel peers (single Update type;
         # peer field discriminates). Verified against
-        # .venv/lib/python3.14/site-packages/telethon/events/raw.py — single-arg
+        # .venv/lib/python3.15/site-packages/telethon/events/raw.py — single-arg
         # callback contract: `async def handler(update)`.
         self._client.add_event_handler(
             self.on_raw_reaction_update,
@@ -1783,7 +1783,7 @@ class EventHandlerManager:
         """Handle MessageRead(inbox=False): update read_outbox_max_id monotonically.
 
         Path A dispatch (LOCKED). Verified against
-        ``.venv/lib/python3.14/site-packages/telethon/events/messageread.py``
+        ``.venv/lib/python3.15/site-packages/telethon/events/messageread.py``
         lines 37-48: ``MessageRead.build()`` returns
         ``cls.Event(update.peer, update.max_id, True)`` when the update is an
         ``UpdateReadHistoryOutbox`` (lines 41-42); ``filter()`` at lines 57-61
@@ -1873,7 +1873,7 @@ class EventHandlerManager:
         """Handle raw UpdateMessageReactions for synced dialogs.
 
         Telethon contract (verified against
-        .venv/lib/python3.14/site-packages/telethon/events/raw.py:22-23 and
+        .venv/lib/python3.15/site-packages/telethon/events/raw.py:22-23 and
         .venv/.../telethon/tl/types/__init__.py UpdateMessageReactions):
             async def handler(update)  # single-arg
         ``update`` is the raw TL Update with attributes:

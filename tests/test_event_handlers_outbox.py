@@ -11,7 +11,7 @@ Covers AC-3 (live handler advances read_outbox_max_id) and related invariants:
 
 Telethon dispatch path LOCKED to Path A:
   ``events.MessageRead(inbox=False)`` — verified against the installed Telethon
-  source at ``.venv/lib/python3.14/site-packages/telethon/events/messageread.py``
+  source at ``.venv/lib/python3.15/site-packages/telethon/events/messageread.py``
   lines 37-48 (``build()`` returns ``cls.Event(update.peer, update.max_id, True)``
   when the update is an ``UpdateReadHistoryOutbox``; filter at lines 57-61
   requires ``event.outbox == True`` when ``inbox=False``). This maximises

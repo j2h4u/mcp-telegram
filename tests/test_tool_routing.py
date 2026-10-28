@@ -377,7 +377,7 @@ def _canonical_get_sync_status_data() -> dict[str, object]:
 STRUCTURED_TOOL_CASES = {
     "get_draft": (
         get_draft,
-        GetDraft(dialog_id=123),
+        GetDraft(exact_dialog_id=123),
         {
             "ok": True,
             "request_id": "internal",
@@ -390,7 +390,7 @@ STRUCTURED_TOOL_CASES = {
     ),
     "manage_draft": (
         manage_draft,
-        ManageDraft(dialog_id=123, action="create", operation_key="schema-test", text="draft"),
+        ManageDraft(exact_dialog_id=123, action="create", operation_key="schema-test", text="draft"),
         {
             "ok": True,
             "request_id": "internal",

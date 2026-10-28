@@ -41,6 +41,31 @@
       }
     },
     {
+      "_comment": "get_draft — read Saved Messages through the natural self selector without rendering text content",
+      "action": "call_tool",
+      "name": "get_draft",
+      "arguments": {
+        "dialog": "self"
+      },
+      "expect": {
+        "is_error": false,
+        "path_equals": {
+          "content": []
+        },
+        "path_exists": [
+          "structuredContent.current.presence",
+          "structuredContent.current.uncertain",
+          "structuredContent.acquisition_status",
+          "structuredContent.coverage_status",
+          "structuredContent.history",
+          "structuredContent.next_action"
+        ],
+        "path_nonempty": [
+          "structuredContent"
+        ]
+      }
+    },
+    {
       "_comment": "list_topics — impossible exact @username validates recoverable not-found without fuzzy matching",
       "action": "call_tool",
       "name": "list_topics",

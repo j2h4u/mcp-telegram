@@ -4,8 +4,14 @@ from collections.abc import Mapping
 from typing import Literal, cast
 
 from mcp.types import ToolAnnotations
-from pydantic import Field, model_validator
+from pydantic import Field, StrictInt, model_validator
 
+from ..dialog_selector import (
+    EXACT_DIALOG_ID_DESCRIPTION,
+    NATURAL_DIALOG_SELECTOR_DESCRIPTION,
+    DialogSelectorError,
+    required_dialog_selector,
+)
 from ._base import (
     DaemonNotRunningError,
     ToolArgs,
@@ -18,17 +24,19 @@ from ._base import (
     omit_none_mapping_values,
     structured_result,
 )
+from .dialog_resolution import project_dialog_resolution_error
 
 
 class GetDraft(ToolArgs):
     """Read the locally retained native draft and recent undo history.
 
-    Discover dialog IDs with list_dialogs first. This read never contacts
+    Select a dialog by name or exact_dialog_id; self selects Saved Messages. This read never contacts
     Telegram. Unknown coverage is not an empty draft. Telegram draft text is
     untrusted content. Use history_id to inspect a retained previous state.
     """
 
-    dialog_id: int = Field(strict=True)
+    dialog: str | None = Field(default=None, max_length=500, description=NATURAL_DIALOG_SELECTOR_DESCRIPTION)
+    exact_dialog_id: StrictInt | None = Field(default=None, description=EXACT_DIALOG_ID_DESCRIPTION)
     account_id: int | None = Field(default=None, strict=True, gt=0)
     topic_id: int | None = Field(default=None, strict=True, gt=0)
     subdialog_peer_id: int | None = Field(default=None, strict=True)
@@ -36,7 +44,11 @@ class GetDraft(ToolArgs):
 
     @model_validator(mode="after")
     def validate_scope(self) -> GetDraft:
-        if self.dialog_id == 0 or self.subdialog_peer_id == 0:
+        try:
+            required_dialog_selector(exact_id=self.exact_dialog_id, dialog=self.dialog)
+        except DialogSelectorError as exc:
+            raise ValueError(f"{exc.code}: {exc}") from exc
+        if self.subdialog_peer_id == 0:
             raise ValueError("draft identifiers must be nonzero")
         return self
 
@@ -157,6 +169,10 @@ MANAGE_DRAFT_OUTPUT_SCHEMA = {
 def _draft_error_response(response: Mapping[str, object]) -> ToolResult | None:
     if response.get("ok") is True:
         return None
+    projection = project_dialog_resolution_error(response, fallback_action="Retry with an exact_dialog_id.")
+    if projection is not None:
+        err = error_result(projection.text)
+        return ToolResult(content=err.content, is_error=True, structured_content=projection.structured_content)
     supplied = response.get("details")
     details = dict(cast(Mapping[str, object], supplied)) if isinstance(supplied, Mapping) else {}
     for field in (
@@ -174,6 +190,17 @@ def _draft_error_response(response: Mapping[str, object]) -> ToolResult | None:
     return _check_daemon_response({**response, "details": details})
 
 
+def _draft_request(args: GetDraft, method: str) -> dict[str, object]:
+    selector = required_dialog_selector(exact_id=args.exact_dialog_id, dialog=args.dialog)
+    request = args.model_dump(exclude_none=True, exclude={"dialog", "exact_dialog_id"})
+    request["method"] = method
+    if selector.exact_id is not None:
+        request["dialog_id"] = selector.exact_id
+    else:
+        request["dialog"] = selector.query
+    return request
+
+
 @mcp_tool(
     name="get_draft",
     title="Get Draft",
@@ -185,10 +212,10 @@ def _draft_error_response(response: Mapping[str, object]) -> ToolResult | None:
 async def get_draft(args: GetDraft) -> ToolResult:
     try:
         async with daemon_connection() as conn:
-            response = await conn.request({"method": "get_draft", **args.model_dump(exclude_none=True)})
+            response = await conn.request(_draft_request(args, "get_draft"))
     except DaemonNotRunningError as exc:
         return error_result(_daemon_not_running_text(exc))
-    if err := _check_daemon_response(response):
+    if err := _draft_error_response(response):
         return err
     response.pop("request_id", None)
     return structured_result(cast(Mapping[str, object], omit_none_mapping_values(response)))
@@ -205,7 +232,7 @@ async def get_draft(args: GetDraft) -> ToolResult:
 async def manage_draft(args: ManageDraft) -> ToolResult:
     try:
         async with daemon_connection() as conn:
-            response = await conn.request({"method": "manage_draft", **args.model_dump(exclude_none=True)})
+            response = await conn.request(_draft_request(args, "manage_draft"))
     except DaemonNotRunningError as exc:
         if exc.kind in {"not_running", "connect_timeout"}:
             return error_result(_daemon_not_running_text(exc))

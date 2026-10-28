@@ -142,7 +142,7 @@ runtime-build:
 
 # Wait until the live Docker container reports healthy.
 runtime-wait:
-    python3 devtools/runtime_wait.py {{container}}
+    uv run python devtools/runtime_wait.py {{container}}
 
 # Run the redacted MCP integration smoke over the production HTTP transport.
 runtime-smoke-http:
