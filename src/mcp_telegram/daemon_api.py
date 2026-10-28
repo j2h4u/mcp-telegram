@@ -70,7 +70,7 @@ from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_directory import recover_invalid_generation_in_transaction
 from .dialog_directory_coverage import DialogDirectoryCoverage, read_dialog_directory_coverage
 from .dialog_identity import read_local_dialog_identities
-from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
+from .dialog_selector import SELF_DIALOG_ALIASES, DialogSelector, DialogSelectorError, required_dialog_selector
 from .drafts.read_service import read_draft_request
 from .entity_profile.ports import (
     ChannelProfilePort,
@@ -1519,6 +1519,10 @@ class DaemonAPIServer:
         if selector.exact_id is not None:
             return ResolvedDialogId(selector.exact_id, read_dialog_directory_coverage(self._conn))
         assert selector.query is not None
+        if selector.query.strip().casefold() in SELF_DIALOG_ALIASES:
+            if type(self.self_id) is not int or self.self_id <= 0:
+                return {"ok": False, "error": "daemon_not_ready", "message": "Account identity is not ready."}
+            return ResolvedDialogId(self.self_id, read_dialog_directory_coverage(self._conn))
         directory_coverage = read_dialog_directory_coverage(self._conn)
         result = self._resolve_dialog_name(selector.query)
         if isinstance(result, Resolved):
@@ -1532,16 +1536,7 @@ class DaemonAPIServer:
         selector: DialogSelector,
     ) -> int | dict:
         """Resolve a read from the local directory without Telegram acquisition."""
-        if selector.exact_id is not None:
-            return ResolvedDialogId(selector.exact_id, read_dialog_directory_coverage(self._conn))
-        assert selector.query is not None
-        directory_coverage = read_dialog_directory_coverage(self._conn)
-        result = self._resolve_dialog_name(selector.query)
-        if isinstance(result, Resolved):
-            return ResolvedDialogId(result.entity_id, directory_coverage)
-        if isinstance(result, Candidates):
-            return self._dialog_resolution_candidates_response(selector, result, directory_coverage)
-        return self._local_dialog_resolution_no_match_response(selector, directory_coverage)
+        return await self._resolve_dialog_id(selector)
 
     @staticmethod
     def _local_dialog_resolution_no_match_response(
@@ -2210,13 +2205,38 @@ class DaemonAPIServer:
     # submit_feedback
     # ------------------------------------------------------------------
 
-    def _get_draft(self, req: dict[str, object]) -> dict[str, object]:
-        return read_draft_request(self._conn, req, account_id=self.self_id)
+    async def _draft_request(self, req: dict[str, object]) -> dict[str, object]:
+        if type(self.self_id) is not int or self.self_id <= 0:
+            return {"ok": False, "error": "daemon_not_ready", "message": "Account identity is not ready."}
+        account_id = req.get("account_id", self.self_id)
+        if type(account_id) is not int or account_id != self.self_id:
+            return {"ok": False, "error": "account_mismatch", "message": "Use the connected Telegram account."}
+        try:
+            selector = required_dialog_selector(exact_id=req.get("dialog_id"), dialog=req.get("dialog"))
+        except DialogSelectorError as exc:
+            return {"ok": False, "error": exc.code, "message": str(exc)}
+        resolved = await self._resolve_dialog_id_local(selector)
+        if isinstance(resolved, dict):
+            return resolved
+        return {
+            **{key: value for key, value in req.items() if key != "dialog"},
+            "dialog_id": int(resolved),
+            "account_id": self.self_id,
+        }
+
+    async def _get_draft(self, req: dict[str, object]) -> dict[str, object]:
+        resolved = await self._draft_request(req)
+        if resolved.get("ok") is False:
+            return resolved
+        return read_draft_request(self._conn, resolved, account_id=self.self_id)
 
     async def _manage_draft(self, req: dict[str, object]) -> dict[str, object]:
+        resolved = await self._draft_request(req)
+        if resolved.get("ok") is False:
+            return resolved
         if self._draft_commands is None:
             return {"ok": False, "error": "daemon_not_ready", "message": "Draft commands are not ready."}
-        return await self._draft_commands.execute(req)
+        return await self._draft_commands.execute(resolved)
 
     async def _submit_feedback(self, req: dict) -> dict:
         """Delegate feedback submission to the daemon-wired application service."""

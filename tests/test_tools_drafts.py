@@ -32,7 +32,7 @@ from tests.test_telegram_rpc_wire_integration import wire as wire
 )
 def test_invalid_mutations_fail_before_daemon_contact(extra: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
-        drafts.ManageDraft.model_validate({"dialog_id": 42, "operation_key": "test", **extra})
+        drafts.ManageDraft.model_validate({"exact_dialog_id": 42, "operation_key": "test", **extra})
 
 
 async def test_uncertain_ipc_failure_instructs_reusing_same_operation_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -46,7 +46,7 @@ async def test_uncertain_ipc_failure_instructs_reusing_same_operation_key(monkey
 
     monkeypatch.setattr(drafts, "daemon_connection", connection)
     result = await drafts.manage_draft(
-        drafts.ManageDraft(dialog_id=42, action="create", operation_key="same-key", text="draft")
+        drafts.ManageDraft(exact_dialog_id=42, action="create", operation_key="same-key", text="draft")
     )
     assert result.is_error
     rendered = str(result.content)
@@ -90,11 +90,11 @@ async def test_successful_draft_tools_validate_schema_without_ipc_metadata(
     monkeypatch.setattr(drafts, "daemon_connection", connection)
     if mutation:
         result = await drafts.manage_draft(
-            drafts.ManageDraft(dialog_id=42, action="create", operation_key="same-key", text="draft")
+            drafts.ManageDraft(exact_dialog_id=42, action="create", operation_key="same-key", text="draft")
         )
         schema = drafts.MANAGE_DRAFT_OUTPUT_SCHEMA
     else:
-        result = await drafts.get_draft(drafts.GetDraft(dialog_id=42))
+        result = await drafts.get_draft(drafts.GetDraft(exact_dialog_id=42))
         schema = drafts.GET_DRAFT_OUTPUT_SCHEMA
     assert not result.is_error
     assert not result.content
@@ -133,7 +133,7 @@ async def test_finite_throttle_retains_structured_action_and_receipt_through_mcp
         server, "_account_protection_status", AsyncMock(return_value=server._account_protection_unavailable())
     )
     result = await server.call_tool(
-        "manage_draft", {"dialog_id": 200, "action": "create", "operation_key": "flood-mcp", "text": "unsent"}
+        "manage_draft", {"exact_dialog_id": 200, "action": "create", "operation_key": "flood-mcp", "text": "unsent"}
     )
     assert result.is_error
     payload = cast(dict[str, object], result.structured_content)

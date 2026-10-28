@@ -209,8 +209,11 @@ time, not when a photo became an avatar.
 
 ## Common Agent Workflows
 
-For drafts, discover the exact dialog with `list_dialogs`, then read `get_draft`.
-Use `manage_draft(action="create", operation_key="<unique-key>", dialog_id=N, text="...")`
+For drafts, select the dialog by name, @username or `exact_dialog_id`, then read `get_draft`.
+Use `dialog="self"` for your own Saved Messages, just as with message reading.
+The exact names `self`, `me`, `Избранное` and `Saved Messages` are reserved for this
+(case-insensitive); use an exact ID or @username for another dialog with such a name.
+Use `manage_draft(action="create", operation_key="<unique-key>", dialog="self", text="...")`
 to create one. Updates, clears and restores require the `expected_version` from
 the current read. Forums require an explicit `topic_id`, including `1` for General.
 You can edit and send the result manually in Telegram; the service will not recreate
