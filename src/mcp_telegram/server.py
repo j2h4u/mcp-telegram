@@ -380,7 +380,10 @@ def _account_protection_unavailable() -> dict[str, object]:
     return {
         "account_protection": {
             "status": "unavailable",
-            "notice": "Account protection status is unavailable; Telegram acquisition state could not be confirmed.",
+            "notice": (
+                "Global background Telegram acquisition status is unavailable. This does not change the tool result; "
+                "assess retained data using its source and coverage."
+            ),
         }
     }
 

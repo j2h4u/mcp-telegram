@@ -1614,7 +1614,12 @@ async def test_search_messages_global_searches_all_dialogs() -> None:
         )
     conn.commit()
 
-    server = make_server(conn)
+    client = _TestClient()
+    client.iter_messages = MagicMock(side_effect=AssertionError("local search must not fetch Telegram"))
+    server = make_server(conn, client)
+    server._health_status = lambda: FloodWaitKillSwitchStatus(
+        open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+    )
     result = await server._search_messages({"query": "написали", "limit": 10})
 
     assert result["ok"] is True
@@ -1624,6 +1629,7 @@ async def test_search_messages_global_searches_all_dialogs() -> None:
     assert dialog_ids == {1, 2}
     dialog_names = {m["dialog_name"] for m in messages}
     assert dialog_names == {"Dialog One", "Dialog Two"}
+    client.iter_messages.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2870,8 +2876,9 @@ def test_get_account_protection_reports_only_process_local_status() -> None:
                 "outbound_acquisition": "blocked",
                 "recovery": "manual",
                 "notice": (
-                    "Telegram acquisition is blocked by account protection. "
-                    "Freshness and incoming coverage may be limited. Recovery requires operator action."
+                    "Background Telegram acquisition is blocked by account protection. Retained local reads remain "
+                    "available; use this result's source and coverage to assess requested data. New incoming data "
+                    "and freshness may be limited. Recovery requires operator action."
                 ),
                 "reason": "too_many_flood_wait_events",
                 "opened_at": 1_700_000_000,

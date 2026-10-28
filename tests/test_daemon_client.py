@@ -117,7 +117,8 @@ async def test_daemon_connection_timeout_raises(tmp_path: Path) -> None:
             async with daemon_connection():
                 pass  # pragma: no cover
 
-    assert "timed out while connecting" in str(exc_info.value)
+    assert "connection was not established" in str(exc_info.value)
+    assert "mcp-telegram sync" not in str(exc_info.value)
     assert exc_info.value.kind == "connect_timeout"
 
 
@@ -284,9 +285,12 @@ async def test_request_timeout_raises_daemon_not_running(tmp_path: Path) -> None
     try:
         with patch("mcp_telegram.daemon_client.get_daemon_socket_path", return_value=sock_path):
             async with daemon_connection(timeout_seconds=0.01) as conn:
-                with pytest.raises(DaemonNotRunningError, match="timed out") as exc_info:
+                with pytest.raises(DaemonNotRunningError, match="response timed out") as exc_info:
                     await conn.request({"method": "get_me"})
                 assert exc_info.value.kind == "response_timeout"
+                assert "completion is unconfirmed" in str(exc_info.value)
+                assert "mcp-telegram sync" not in str(exc_info.value)
+                assert conn._writer.is_closing()
     finally:
         server.close()
         await server.wait_closed()
@@ -301,9 +305,12 @@ async def test_request_send_timeout_raises_daemon_not_running() -> None:
 
     conn = DaemonConnection(reader, writer)
 
-    with pytest.raises(DaemonNotRunningError, match="timed out while sending request") as exc_info:
+    with pytest.raises(DaemonNotRunningError, match="send timed out") as exc_info:
         await conn.request({"method": "get_me"})
     assert exc_info.value.kind == "send_timeout"
+    assert "completion are unconfirmed" in str(exc_info.value)
+    assert "mcp-telegram sync" not in str(exc_info.value)
+    writer.close.assert_called_once()
 
 
 @pytest.mark.asyncio

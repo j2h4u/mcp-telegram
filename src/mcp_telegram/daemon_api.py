@@ -1841,8 +1841,9 @@ class DaemonAPIServer:
             "outbound_acquisition": "blocked",
             "recovery": "manual",
             "notice": (
-                "Telegram acquisition is blocked by account protection. "
-                "Freshness and incoming coverage may be limited. Recovery requires operator action."
+                "Background Telegram acquisition is blocked by account protection. Retained local reads remain "
+                "available; use this result's source and coverage to assess requested data. New incoming data and "
+                "freshness may be limited. Recovery requires operator action."
             ),
         }
         if status.reason is not None:
@@ -1853,9 +1854,10 @@ class DaemonAPIServer:
             protection.update(safety)
             if safety.get("reason") == "unresolved_outbound_outcome":
                 protection["notice"] = (
-                    "Telegram acquisition is blocked because a persisted request has no confirmed response. "
-                    "Whether Telegram processed it or applied a rate limit is unknown. "
-                    "Retained local data is preserved. Recovery requires operator acknowledgement."
+                    "Background Telegram acquisition is blocked because a persisted request has no confirmed "
+                    "response. Whether Telegram processed it or applied a rate limit is unknown. Retained local "
+                    "reads remain available; use this result's source and coverage to assess requested data. "
+                    "Recovery requires operator acknowledgement."
                 )
         return {"ok": True, "data": {"account_protection": protection}}
 
