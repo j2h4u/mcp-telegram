@@ -41,9 +41,11 @@ from mcp_telegram.telegram_rpc import (
     _AdmissionAwareSender,
     _TransportBoundaryState,
 )
+from mcp_telegram.telegram_rpc_consumers import DemandKind, demand_contract
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
     RpcAdmissionExpiredError,
+    RpcAdmissionSaturatedError,
     RpcServiceClass,
     TelegramRpcScope,
     TelegramRpcSource,
@@ -63,6 +65,16 @@ class _Circuit:
 
 
 type _WireHarness = tuple[TelegramRpcGate, GuardedMTProtoSender, GuardedConnectionTcpFull, _Writer]
+
+
+def _enqueue_ack_snapshot(sender: GuardedMTProtoSender, message_ids: list[int]) -> _RequestState:
+    token = sender._control_origin.set((asyncio.current_task(), "ack"))
+    try:
+        state = cast(_RequestState, RequestState(types.MsgsAck(message_ids)))
+        sender._send_queue.append(state)
+    finally:
+        sender._control_origin.reset(token)
+    return state
 
 
 @pytest.fixture
@@ -518,24 +530,170 @@ async def test_unsent_ack_is_not_evicted_by_sent_replay_cache_pressure(wire: _Wi
     assert first not in sender._owned_states
 
 
-async def test_unsent_terminal_ack_does_not_enter_sent_replay_cache(wire: _WireHarness) -> None:
-    gate, sender, _connection, sink = wire
-    token = sender._control_origin.set((asyncio.current_task(), "ack"))
-    try:
-        state = cast(_RequestState, RequestState(types.MsgsAck([99])))
-        sender._send_queue.append(state)
-    finally:
-        sender._control_origin.reset(token)
+async def test_unsent_terminal_ack_retains_ids_for_next_natural_snapshot(wire: _WireHarness) -> None:
+    gate, sender, connection, sink = wire
+    state = _enqueue_ack_snapshot(sender, [99, 100])
     assert await sender._send_queue.next_state() is state
     owned = sender.require_owned(state)
     owner = gate._require_wire_owner(owned.owner)
-    owner.scope = replace(owner.scope, deadline=time.monotonic() - 1)
+    old_budget = owner.scope.attempt_budget
+    expired_deadline = time.monotonic() - 1
+    owner.scope = replace(owner.scope, deadline=expired_deadline)
+    sender._pending_ack.update({100, 101})
     with pytest.raises(RpcAdmissionExpiredError):
         await sender._prepare_state(state)
     await asyncio.sleep(0)
     await asyncio.gather(*sender._observing)
     assert owned.claims == 0 and sink.frames == []
+    assert sender._pending_ack == {99, 100, 101}
     assert not sender._last_acks and state not in sender._owned_states
+    assert owner.scope.deadline == expired_deadline
+    assert owner.scope.attempt_budget is old_budget and old_budget is not None and old_budget.attempts == 0
+    assert not sender._preparing and not sender._observing
+    assert connection._send_queue.empty()
+
+    # Only an already-existing natural sender turn may give the retained IDs a
+    # fresh bounded snapshot; cleanup above creates no replacement owner/task.
+    send_loop = asyncio.create_task(sender._send_loop())
+    try:
+        packet = await asyncio.wait_for(connection._send_queue.get(), 1)
+        fresh_state = packet.state.state
+        fresh_owned = sender.require_owned(fresh_state)
+        fresh_owner = gate._require_wire_owner(fresh_owned.owner)
+        assert fresh_state is not state and isinstance(fresh_state.request, types.MsgsAck)
+        assert set(fresh_state.request.msg_ids) == {99, 100, 101}
+        assert fresh_owned.owner is not owned.owner
+        assert fresh_owner.scope.deadline is not None and fresh_owner.scope.deadline > time.monotonic()
+        assert fresh_owner.scope.attempt_budget is not old_budget
+        assert fresh_owner.scope.attempt_budget is not None
+        assert fresh_owner.scope.attempt_budget.limit == old_budget.limit
+        assert gate._limiter.max_rate == 30 and gate._limiter.time_period == 60
+        assert not sender._pending_ack and sink.frames == []
+        assert sender.write_packet(packet, connection._send)
+        assert fresh_owned.claims == 1
+        assert fresh_owner.scope.attempt_budget.attempts == 1 and len(sink.frames) == 1
+    finally:
+        send_loop.cancel()
+        await asyncio.gather(send_loop, return_exceptions=True)
+
+
+async def test_unsent_terminal_ack_capacity_rejection_retains_without_new_owner_or_task(
+    wire: _WireHarness,
+) -> None:
+    gate, sender, connection, sink = wire
+    source_limit = demand_contract(DemandKind.TELETHON_RECONNECT_PROBE).source_outstanding_limit
+    states: list[_RequestState] = []
+    for message_id in range(source_limit):
+        state = _enqueue_ack_snapshot(sender, [message_id])
+        assert await sender._send_queue.next_state() is state
+        states.append(state)
+        sender._offer_state(state)
+    for _ in range(source_limit):
+        await asyncio.sleep(0)
+        if (
+            gate._admission_scheduler._source_outstanding_depth(TelegramRpcSource.TELETHON_RECONNECT_PROBE)
+            == source_limit
+        ):
+            break
+    assert (
+        gate._admission_scheduler._source_outstanding_depth(TelegramRpcSource.TELETHON_RECONNECT_PROBE) == source_limit
+    )
+    preparing_before = len(sender._preparing)
+
+    rejected = _enqueue_ack_snapshot(sender, [99, 100])
+    assert await sender._send_queue.next_state() is rejected
+    rejected_owned = sender.require_owned(rejected)
+    rejected_owner = gate._require_wire_owner(rejected_owned.owner)
+    rejected_budget = rejected_owner.scope.attempt_budget
+    sender._pending_ack.update({100, 101})
+    sender._offer_state(rejected)
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if rejected.future.done():
+            break
+    assert rejected.future.done()
+    assert isinstance(rejected.future.exception(), RpcAdmissionSaturatedError)
+    await asyncio.sleep(0)
+    await asyncio.gather(*sender._observing)
+
+    assert rejected_owned.claims == 0 and sink.frames == []
+    assert rejected_budget is not None and rejected_budget.attempts == 0
+    assert sender._pending_ack == {99, 100, 101}
+    assert rejected not in sender._owned_states and not sender._last_acks
+    assert len(sender._preparing) == preparing_before - 1
+    assert (
+        gate._admission_scheduler._source_outstanding_depth(TelegramRpcSource.TELETHON_RECONNECT_PROBE) == source_limit
+    )
+    assert connection._send_queue.qsize() <= 1
+
+    # Release the real outstanding capacity tickets without creating writes.
+    for state in states:
+        if not state.future.done():
+            state.future.cancel()
+    await gate._admission_scheduler.close()
+    await asyncio.gather(*tuple(sender._preparing), return_exceptions=True)
+    await asyncio.sleep(0)
+    await asyncio.gather(*sender._observing, return_exceptions=True)
+
+
+async def test_claimed_ack_replay_expiry_does_not_restore_fresh_ids(wire: _WireHarness) -> None:
+    gate, sender, connection, sink = wire
+    state = _enqueue_ack_snapshot(sender, [99])
+    assert await sender._send_queue.next_state() is state
+    owned = sender.require_owned(state)
+    owner = gate._require_wire_owner(owned.owner)
+    await sender._prepare_state(state)
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    assert owned.claims == 1 and len(sender._last_acks) == 1
+
+    expired_deadline = time.monotonic() - 1
+    owner.scope = replace(owner.scope, deadline=expired_deadline)
+    with pytest.raises(RpcAdmissionExpiredError):
+        await sender._prepare_state(state)
+    await asyncio.gather(*sender._observing)
+    assert owned.claims == 1 and owner.scope.deadline == expired_deadline
+    assert state in sender._last_acks and state in sender._owned_states
+    assert not sender._pending_ack and len(sink.frames) == 1
+
+
+async def test_claimed_ack_unknown_write_failure_does_not_restore_fresh_ids(wire: _WireHarness) -> None:
+    gate, sender, connection, sink = wire
+    state = _enqueue_ack_snapshot(sender, [99])
+    assert await sender._send_queue.next_state() is state
+    owned = sender.require_owned(state)
+    owner = gate._require_wire_owner(owned.owner)
+    await sender._prepare_state(state)
+
+    def fail_write(_data: bytes) -> None:
+        raise OSError("indeterminate test write")
+
+    with pytest.raises(OSError, match="indeterminate test write"):
+        sender.write_packet(connection._send_queue.get_nowait(), fail_write)
+    await asyncio.sleep(0)
+    await asyncio.gather(*sender._observing)
+    assert owned.claims == 1 and owner.scope.attempt_budget is not None
+    assert owner.scope.attempt_budget.attempts == 1
+    assert not sender._pending_ack and not sender._last_acks and state not in sender._owned_states
+    assert sink.frames == [] and connection._send_queue.empty()
+
+
+@pytest.mark.parametrize("terminal", ["cancelled", "closed"])
+async def test_unsent_ack_cancel_or_closed_admission_does_not_promote_ids(wire: _WireHarness, terminal: str) -> None:
+    gate, sender, connection, sink = wire
+    state = _enqueue_ack_snapshot(sender, [99])
+    assert await sender._send_queue.next_state() is state
+    owned = sender.require_owned(state)
+    if terminal == "cancelled":
+        state.future.cancel()
+    else:
+        await gate._admission_scheduler.close()
+        with pytest.raises(RpcAdmissionClosedError):
+            await sender._prepare_state(state)
+    await asyncio.sleep(0)
+    await asyncio.gather(*sender._observing)
+    assert owned.claims == 0 and not sender._pending_ack
+    assert not sender._last_acks and state not in sender._owned_states
+    assert sink.frames == [] and connection._send_queue.empty()
 
 
 @pytest.mark.parametrize("outcome", ["success", "rpc_error", "write_failure", "response_lost"])
