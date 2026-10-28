@@ -350,6 +350,11 @@ category = "policy_assignments"
 key = "src/mcp_telegram/tools/_base.py:<module>:_DAEMON_TIMEOUT_TEXT"
 rationale = "This is fixed text for a daemon timeout error response."
 
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/tools/_base.py:<module>:_DAEMON_CONNECT_TIMEOUT_TEXT"
+rationale = "This is fixed MCP error text describing a daemon connection timeout."
+
 # These are local SQLite/API contract values, not daemon operator policy.  Keep
 # each new exclusion individually justified so additions are reviewable.
 [[entry]]
@@ -376,6 +381,11 @@ rationale = "sync.db read and write connections share SQLite's local connection 
 category = "policy_dict_values"
 key = "src/mcp_telegram/tools/unread.py:<module>:group_size_threshold"
 rationale = "This is an MCP response field name, not a placement of an operator policy value."
+
+[[entry]]
+category = "policy_dict_values"
+key = "src/mcp_telegram/tools/_base.py:<module>:connect_timeout"
+rationale = "This names the daemon IPC failure kind handled by the fixed MCP error text."
 
 [[entry]]
 category = "policy_defaults"

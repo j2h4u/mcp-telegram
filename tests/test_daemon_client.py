@@ -310,7 +310,7 @@ async def test_request_send_timeout_raises_daemon_not_running() -> None:
     assert exc_info.value.kind == "send_timeout"
     assert "completion are unconfirmed" in str(exc_info.value)
     assert "mcp-telegram sync" not in str(exc_info.value)
-    writer.close.assert_called_once()
+    cast(AsyncMock, writer.close).assert_called_once()
 
 
 @pytest.mark.asyncio

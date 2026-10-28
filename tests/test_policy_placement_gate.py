@@ -244,3 +244,30 @@ def test_pending_cooldown_task_map_allowlist_is_exact() -> None:
         ("telegram_rpc.py", source.replace("self._cooldown_save_tasks = {}", "self.cooldown_seconds = 30")),
     ):
         assert any(key not in allowed for _, key in _findings_at(f"src/mcp_telegram/{filename}", changed))
+
+
+def test_daemon_connect_timeout_ui_allowlist_is_exact() -> None:
+    gate = _load_gate()
+    allowed = gate._load_manifest()
+    source = (
+        '_DAEMON_CONNECT_TIMEOUT_TEXT = "Fixed connection timeout message"\n'
+        '_DAEMON_NOT_RUNNING_TEXT_BY_KIND = {"connect_timeout": _DAEMON_CONNECT_TIMEOUT_TEXT}\n'
+    )
+    findings = _findings_at("src/mcp_telegram/tools/_base.py", source)
+    assert findings == {
+        (
+            "policy_assignments",
+            "src/mcp_telegram/tools/_base.py:<module>:_DAEMON_CONNECT_TIMEOUT_TEXT",
+        ),
+        (
+            "policy_dict_values",
+            "src/mcp_telegram/tools/_base.py:<module>:connect_timeout",
+        ),
+    }
+    assert all(key in allowed[category] for category, key in findings)
+
+    for filename, changed in (
+        ("src/mcp_telegram/tools/neighbor.py", source),
+        ("src/mcp_telegram/tools/_base.py", source.replace("connect_timeout", "connection_timeout")),
+    ):
+        assert any(key not in allowed[category] for category, key in _findings_at(filename, changed))

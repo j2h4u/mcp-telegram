@@ -2077,7 +2077,11 @@ async def test_registered_local_reads_keep_selection_during_global_protection(
     )
     monkeypatch.setattr(server, "_schedule_telemetry", lambda _event: None)
 
-    arguments = {"exact_dialog_id": 701} if tool_name == "list_messages" else {"query": "needle"}
+    arguments: dict[str, object]
+    if tool_name == "list_messages":
+        arguments = {"exact_dialog_id": 701}
+    else:
+        arguments = {"query": "needle"}
     result = _call_tool_result(await server.call_tool(tool_name, arguments))
 
     assert result.is_error is False
