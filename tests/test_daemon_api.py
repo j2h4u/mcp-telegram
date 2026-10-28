@@ -2893,7 +2893,7 @@ def test_get_account_protection_reports_only_process_local_status() -> None:
 def test_account_protection_exposes_automatic_wait_without_changing_local_data(automatic_state: str, mode: str) -> None:
     from jsonschema import validate
 
-    from mcp_telegram.server import _bounded_account_protection
+    from mcp_telegram.server import _bounded_account_protection, _is_valid_active_account_protection
     from mcp_telegram.tools._base import ACTIVE_ACCOUNT_PROTECTION_SCHEMA
 
     server = make_server()
@@ -2914,7 +2914,11 @@ def test_account_protection_exposes_automatic_wait_without_changing_local_data(a
     protection = cast(dict[str, object], data["account_protection"])
     assert protection["recovery"] == mode
     assert protection["automatic_resume"] == automatic
-    validate(_bounded_account_protection(protection), ACTIVE_ACCOUNT_PROTECTION_SCHEMA)
+    assert _is_valid_active_account_protection(protection)
+    bounded = _bounded_account_protection(protection)
+    projected = cast(dict[str, object], bounded["automatic_resume"])
+    assert ("next_attempt_at_utc" in projected) == (automatic_state == "waiting")
+    validate(bounded, ACTIVE_ACCOUNT_PROTECTION_SCHEMA)
 
 
 @pytest.mark.asyncio
