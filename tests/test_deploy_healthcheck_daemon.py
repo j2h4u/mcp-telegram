@@ -51,6 +51,36 @@ async def test_daemon_health_requires_acquisition_not_protected(
         assert result.get("error") == "account_protection_active"
 
 
+def test_daemon_health_prints_specific_protection_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def request(_socket: Path, method: str) -> healthcheck_daemon._HealthcheckResponse:
+        if method == "get_sync_status":
+            return {"ok": True}
+        return {
+            "ok": True,
+            "data": {
+                "account_protection": {
+                    "status": "active",
+                    "reason": "unresolved_outbound_outcome",
+                    "unresolved_request_count": 1,
+                    "unresolved_requests": [{"method": "GetHistoryRequest", "phase": "unknown"}],
+                    "generation": "private-generation",
+                    "key_id": "private-key",
+                }
+            },
+        }
+
+    monkeypatch.setattr(healthcheck_daemon, "_load_socket_path", lambda: Path("/unused.sock"))
+    monkeypatch.setattr(healthcheck_daemon, "_request", request)
+    assert healthcheck_daemon.main() == 1
+    diagnostic = capsys.readouterr().err
+    assert "unresolved_outbound_outcome" in diagnostic and "GetHistoryRequest" in diagnostic
+    assert '"unresolved_request_count": 1' in diagnostic
+    assert "private-" not in diagnostic
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("response", [b"{}\n", b"[]\n", b'{"ok":true}\n', b'{"ok":true,"data":{}}\n', b"bad json\n"])
 async def test_daemon_health_rejects_malformed_protection(tmp_path: Path, response: bytes) -> None:

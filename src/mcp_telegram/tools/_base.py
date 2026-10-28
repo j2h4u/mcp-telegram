@@ -52,6 +52,36 @@ _DAEMON_NOT_RUNNING_TEXT_BY_KIND = {
 
 _PURE_NULL_SCHEMA = object()
 
+ACTIVE_ACCOUNT_PROTECTION_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "status": {"const": "active"},
+        "outbound_acquisition": {"const": "blocked"},
+        "recovery": {"const": "manual"},
+        "notice": {"type": "string"},
+        "reason": {"type": "string"},
+        "opened_at": {"type": "integer"},
+        "known_retry_until_utc": {"type": "number", "minimum": 0},
+        "unresolved_request_count": {"type": "integer", "minimum": 0},
+        "unresolved_requests": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "method": {"type": "string", "maxLength": 256},
+                    "phase": {"enum": ["prepared", "unknown"]},
+                },
+                "required": ["method", "phase"],
+                "additionalProperties": False,
+            },
+        },
+        "unresolved_requests_truncated": {"type": "boolean"},
+    },
+    "required": ["status", "outbound_acquisition", "recovery", "notice"],
+    "additionalProperties": False,
+}
+
 
 def omit_none_mapping_values(value: object) -> object:
     """Omit ``None``-valued mapping properties from an MCP response.
@@ -263,19 +293,7 @@ def _protection_output_schema(schema: dict[str, object] | None) -> dict[str, obj
     }
     properties["account_protection"] = {
         "oneOf": [
-            {
-                "type": "object",
-                "properties": {
-                    "status": {"const": "active"},
-                    "outbound_acquisition": {"const": "blocked"},
-                    "recovery": {"const": "manual"},
-                    "notice": {"type": "string"},
-                    "reason": {"type": "string"},
-                    "opened_at": {"type": "integer"},
-                },
-                "required": ["status", "outbound_acquisition", "recovery", "notice"],
-                "additionalProperties": False,
-            },
+            deepcopy(ACTIVE_ACCOUNT_PROTECTION_SCHEMA),
             {
                 "type": "object",
                 "properties": {"status": {"const": "unavailable"}, "notice": {"type": "string"}},

@@ -1628,6 +1628,76 @@ async def test_protection_snapshot_bounds_text_without_hiding_blocked_state(monk
     assert protection["reason"] == "r" * 5000
 
 
+@pytest.mark.parametrize("floor", [float("nan"), float("inf"), -1, True, "soon"])
+def test_account_protection_rejects_invalid_server_floors(floor: object) -> None:
+    assert not server._is_valid_active_account_protection(
+        {
+            "status": "active",
+            "outbound_acquisition": "blocked",
+            "recovery": "manual",
+            "notice": "blocked",
+            "known_retry_until_utc": floor,
+        }
+    )
+
+
+@pytest.mark.parametrize("floor", [None, 0, 123.5])
+async def test_account_protection_projects_optional_floor_without_null(
+    floor: float | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    protection = {
+        "status": "active",
+        "outbound_acquisition": "blocked",
+        "recovery": "manual",
+        "notice": "blocked",
+        "generation": "operator-only",
+        "known_retry_until_utc": floor,
+    }
+    monkeypatch.setattr(
+        server,
+        "daemon_connection",
+        lambda: _status_context(
+            {
+                "ok": True,
+                "data": {"account_protection": protection},
+            }
+        ),
+    )
+    status = cast(dict[str, object], (await server._account_protection_status())["account_protection"])
+    assert status["status"] == "active" and "generation" not in status
+    assert ("known_retry_until_utc" in status) is (floor is not None)
+    if floor is not None:
+        assert status["known_retry_until_utc"] == floor
+    for tool in server.tool_by_name.values():
+        schema = cast(dict[str, object], cast(dict[str, object], tool.output_schema)["properties"])[
+            "account_protection"
+        ]
+        validate(status, cast(dict[str, object], schema))
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"key_id": "secret"},
+        {"generation": ""},
+        {"generation": 123},
+        {"unresolved_request_count": True},
+        {"unresolved_requests": [{"method": "safe", "phase": "acknowledged_unknown"}]},
+    ],
+)
+def test_account_protection_rejects_private_or_invalid_diagnostics(extra: dict[str, object]) -> None:
+    assert not server._is_valid_active_account_protection(
+        {
+            "status": "active",
+            "outbound_acquisition": "blocked",
+            "recovery": "manual",
+            "notice": "blocked",
+            **extra,
+        }
+    )
+
+
 @pytest.mark.asyncio
 async def test_typed_protection_error_has_manual_action_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(server.tools, "tool_args", lambda tool, **kwargs: object())

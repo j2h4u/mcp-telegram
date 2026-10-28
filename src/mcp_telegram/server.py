@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import ipaddress
 import logging
+import math
 import sys
 import time
 import typing as t
@@ -16,6 +17,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from functools import cache
 
+from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from mcp.server import Server
 from mcp.types import (
     CallToolRequestParams,
@@ -47,7 +49,7 @@ from .correlation import correlation_context, current_correlation_ids
 from .daemon_client import AccountProtectionError, daemon_connection
 from .request_timing import standalone_operation_id
 from .runtime_logging import install_telethon_log_filter
-from .tools._base import _send_telemetry_event, safe_error_code
+from .tools._base import ACTIVE_ACCOUNT_PROTECTION_SCHEMA, _send_telemetry_event, safe_error_code
 
 logger = logging.getLogger(__name__)
 _MAX_ERROR_DETAIL_LENGTH = 160
@@ -323,10 +325,14 @@ def _protection_error_call_result(exc: AccountProtectionError) -> CallToolResult
 
 _PROTECTION_NOTICE_CHARS = 400
 _PROTECTION_REASON_CHARS = 128
+_ACTIVE_PROTECTION_VALIDATOR = Draft202012Validator(ACTIVE_ACCOUNT_PROTECTION_SCHEMA)
 
 
 def _bounded_account_protection(status: dict[str, object]) -> dict[str, object]:
     bounded = dict(status)
+    bounded.pop("generation", None)  # Recovery authorization is operator-only.
+    if bounded.get("known_retry_until_utc") is None:
+        bounded.pop("known_retry_until_utc", None)
     notice = t.cast(str, bounded["notice"])
     if len(notice) > _PROTECTION_NOTICE_CHARS:
         bounded["notice"] = notice[: _PROTECTION_NOTICE_CHARS - 3] + "..."
@@ -357,18 +363,17 @@ async def _account_protection_status() -> dict[str, object]:
 def _is_valid_active_account_protection(status: object) -> bool:
     if not isinstance(status, dict):
         return False
-    if (
-        status.get("status") != "active"
-        or status.get("outbound_acquisition") != "blocked"
-        or status.get("recovery") != "manual"
-        or not isinstance(status.get("notice"), str)
-    ):
+    generation = status.get("generation")
+    if "generation" in status and not (isinstance(generation, str) and 0 < len(generation) <= _PROTECTION_REASON_CHARS):
         return False
-    if not set(status).issubset({"status", "outbound_acquisition", "recovery", "notice", "reason", "opened_at"}):
+    floor = status.get("known_retry_until_utc")
+    if floor is not None and not (type(floor) in {int, float} and 0 <= floor < math.inf):
         return False
-    if "reason" in status and not isinstance(status["reason"], str):
-        return False
-    return "opened_at" not in status or (type(status["opened_at"]) is int)
+    projected = dict(status)
+    projected.pop("generation", None)
+    if floor is None:
+        projected.pop("known_retry_until_utc", None)
+    return bool(_ACTIVE_PROTECTION_VALIDATOR.is_valid(projected))
 
 
 def _account_protection_unavailable() -> dict[str, object]:

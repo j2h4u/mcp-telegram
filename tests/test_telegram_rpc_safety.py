@@ -120,6 +120,46 @@ async def consume_trial(store: Store) -> TelegramRpcSafetyLedger:
     return ledger
 
 
+async def test_protection_diagnostics_are_bounded_safe_and_read_only(clock: Clock) -> None:
+    store = Store()
+    ledger = store.ledger()
+    await ledger.verify_account(42)
+    store.owners = (42, 42)
+    method = "telethon.tl.functions.messages.GetHistoryRequest:4423e6c5"
+    for number in range(10):
+        await ledger.prepare(str(number), method)
+    ledger.mark_claimed("0")
+    await ledger.complete("0", known_outcome=False)
+    before = store.raw
+    writes = len(store.writes)
+    status = store.ledger().status()
+    assert status["unresolved_request_count"] == 10
+    rows = cast(list[dict[str, object]], status["unresolved_requests"])
+    assert len(rows) == 8 and status["unresolved_requests_truncated"] is True
+    assert all(set(row) == {"method", "phase"} and row["method"] == method for row in rows)
+    assert {row["phase"] for row in rows} == {"prepared", "unknown"}
+    assert store.raw == before and len(store.writes) == writes
+    await ledger.authorize_recovery(generation(ledger), acknowledged=True)
+    assert await ledger.consume_recovery()
+    assert ledger.status()["unresolved_request_count"] == 0
+    assert ledger.status()["unresolved_requests"] == []
+    assert ledger.status()["unresolved_requests_truncated"] is False
+
+
+async def test_protection_diagnostics_never_disclose_unrecognized_method_values(clock: Clock) -> None:
+    store = Store()
+    ledger = store.ledger()
+    await ledger.prepare("private-attempt", "private payload:01234567")
+    before = store.raw
+    assert ledger.status()["unresolved_requests"] == [{"method": "unrecognized", "phase": "prepared"}]
+    assert store.raw == before
+
+
+@pytest.mark.parametrize("method", ["secret", "private:00000000", "private:zzzzzzzz"])
+def test_non_request_constructor_diagnostics_are_redacted(method: str) -> None:
+    assert telegram_rpc._safe_diagnostic_method(method) == "unrecognized"
+
+
 async def test_prewrite_intent_is_durable_before_claim_and_terminal_clears_it(clock: Clock) -> None:
     store = Store()
     ledger = store.ledger()
