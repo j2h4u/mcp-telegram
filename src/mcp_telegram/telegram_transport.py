@@ -24,7 +24,7 @@ from telethon.tl.functions import PingRequest, ReqDHParamsRequest, ReqPqMultiReq
 from telethon.tl.tlobject import TLRequest  # type: ignore[import-untyped]
 from telethon.tl.types import MsgsAck, MsgsStateInfo  # type: ignore[import-untyped]
 
-from .telegram_rpc_scheduler import TelegramRpcScope
+from .telegram_rpc_scheduler import RpcAdmissionExpiredError, RpcAdmissionSaturatedError, TelegramRpcScope
 
 type ProtocolOrigin = Literal["ack", "ping", "state_info", "auth"]
 
@@ -375,6 +375,7 @@ class GuardedMTProtoSender(MTProtoSender):
 
     async def _finish_result(self, owned: _OwnedState, future: asyncio.Future[object]) -> None:
         error = asyncio.CancelledError() if future.cancelled() else future.exception()
+        self._retain_unsent_ack(owned, error)
         self._retire_unsent_ping(owned, error)
         try:
             rejected = await self._authority.observe_result(
@@ -404,6 +405,18 @@ class GuardedMTProtoSender(MTProtoSender):
         request = owned.state.request
         if isinstance(request, PingRequest) and self._ping == request.ping_id:
             self._ping = None
+
+    def _retain_unsent_ack(self, owned: _OwnedState, error: BaseException | None) -> None:
+        """Keep a never-written ACK obligation after definite admission rejection."""
+        if (
+            not isinstance(error, (RpcAdmissionExpiredError, RpcAdmissionSaturatedError))
+            or owned.origin != "ack"
+            or owned.claims
+            or type(owned.state.request) is not MsgsAck
+        ):
+            return
+        request = cast(MsgsAck, owned.state.request)
+        self._pending_ack.update(request.msg_ids)
 
     @staticmethod
     def _publish_owned_result(owned: _OwnedState, future: asyncio.Future[object], error: BaseException | None) -> None:
