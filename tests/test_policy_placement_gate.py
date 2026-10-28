@@ -271,3 +271,23 @@ def test_daemon_connect_timeout_ui_allowlist_is_exact() -> None:
         ("src/mcp_telegram/tools/_base.py", source.replace("connect_timeout", "connection_timeout")),
     ):
         assert any(key not in allowed[category] for category, key in _findings_at(filename, changed))
+
+
+@pytest.mark.parametrize(
+    "name", ["_METHOD_NAME_LIMIT", "_METHOD_BUCKET_LIMIT", "_SAMPLED_ROOT_LIMIT", "_ROOT_EVENT_LIMIT"]
+)
+def test_rpc_observation_structural_caps_are_narrowly_classified(name: str) -> None:
+    allowed = _load_gate()._load_manifest()["policy_assignments"]
+    source = f"{name} = 16\n"
+    exact = _findings_at("src/mcp_telegram/rpc_admission_observations.py", source)
+    assert exact and all(key in allowed for _, key in exact)
+    assert any(key not in allowed for _, key in _findings_at("src/mcp_telegram/neighbor.py", source))
+
+
+def test_rpc_observation_window_wallclock_is_runtime_evidence_only() -> None:
+    allowed = _load_gate()._load_manifest()["policy_assignments"]
+    source = "class RpcAdmissionObservationAggregator:\n    def __init__(self):\n        self._rpc_window_started_wall_ms = int(time.time() * 1000)\n"
+    exact = _findings_at("src/mcp_telegram/rpc_admission_observations.py", source)
+    assert exact and all(key in allowed for _, key in exact)
+    changed = source.replace("__init__", "adjacent")
+    assert any(key not in allowed for _, key in _findings_at("src/mcp_telegram/rpc_admission_observations.py", changed))

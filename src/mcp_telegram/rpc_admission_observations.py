@@ -2,18 +2,27 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import secrets
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol, TypedDict, cast
 
 from .flood import FloodWaitObservation
 from .telegram_demand import AcquisitionKind, DemandObservationHook
-from .telegram_rpc_consumers import DemandKind
-from .telegram_rpc_scheduler import RpcAdmissionEvent, RpcAdmissionEventKind, RpcServiceClass, TelegramRpcSource
+from .telegram_rpc_consumers import DemandKind, telegram_rpc_consumer
+from .telegram_rpc_scheduler import (
+    RpcAdmissionEvent,
+    RpcAdmissionEventKind,
+    RpcServiceClass,
+    TelegramRpcScope,
+    TelegramRpcSource,
+)
 
 logger = logging.getLogger(__name__)
 _MILLISECONDS_PER_SECOND = 1_000
@@ -90,6 +99,7 @@ class ObservationRecorder(Protocol):
         result_count: int | None = None,
         payload: Mapping[str, object] | None = None,
         observed_at_ms: int | None = None,
+        operation_id: str | None = None,
     ) -> bool | None: ...
 
 
@@ -151,7 +161,83 @@ _ProfileKey = tuple[
     bool,
     bool,
 ]
-_RequestKey = tuple[TelegramRpcSource, RpcServiceClass, DemandKind | None, AcquisitionKind | None]
+
+_METHOD_NAME_LIMIT = 256
+_RPC_PAYLOAD_BYTES = 1024
+_OBSERVATION_ID_HEX_LENGTH = 32
+_METHOD_BUCKET_LIMIT = 16
+_SAMPLED_ROOT_LIMIT = 2
+_ROOT_EVENT_LIMIT = 12
+_RPC_PHASES = (
+    "write_claim",
+    "write_return",
+    "known_response",
+    "unknown_outcome",
+    "vendor_cached",
+    "rejected",
+    "retry",
+)
+_RPC_REASONS = frozenset(
+    {
+        "dc_migration",
+        "server_transient",
+        "deadline_elapsed",
+        "attempt_budget_exhausted",
+        "capacity",
+        "queue_full",
+        "source_limit",
+        "closed",
+        "cancelled",
+        "replay",
+        "flood_wait",
+        "unknown",
+        "RpcAdmissionSaturatedError",
+        "RpcAdmissionExpiredError",
+    }
+)
+_MethodKey = tuple[str, TelegramRpcSource, RpcServiceClass, DemandKind | None, AcquisitionKind | None]
+
+
+def _observation_method(method: str | None, method_names: frozenset[str]) -> str:
+    """Validate against names supplied by the existing vendor owner."""
+    if isinstance(method, str) and len(method) <= _METHOD_NAME_LIMIT and method in method_names:
+        return method
+    return "unknown"
+
+
+def _rpc_payload_fits(payload: Mapping[str, object]) -> bool:
+    # Match the existing persistence wire contract without depending on its implementation.
+    encoded = json.dumps(dict(payload), ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return len(encoded.encode("utf-8")) <= _RPC_PAYLOAD_BYTES
+
+
+def _valid_rpc_scope(scope: TelegramRpcScope) -> bool:
+    return (
+        isinstance(scope.source, TelegramRpcSource)
+        and isinstance(scope.service_class, RpcServiceClass)
+        and (scope.demand_kind is None or isinstance(scope.demand_kind, DemandKind))
+        and (scope.acquisition_kind is None or isinstance(scope.acquisition_kind, AcquisitionKind))
+    )
+
+
+@dataclass(slots=True)
+class _MethodAggregate:
+    started_at: float
+    started_wall_ms: int
+    counts: dict[str, int] = field(default_factory=lambda: dict.fromkeys(_RPC_PHASES, 0))
+
+    def merge(self, other: _MethodAggregate) -> None:
+        if other.started_at < self.started_at:
+            self.started_at, self.started_wall_ms = other.started_at, other.started_wall_ms
+        for phase, count in other.counts.items():
+            self.counts[phase] += count
+
+
+@dataclass(frozen=True, slots=True)
+class _RpcSample:
+    operation_id: str
+    payload: dict[str, object]
+    observed_at_ms: int
 
 
 @dataclass(slots=True)
@@ -209,18 +295,28 @@ class RpcAdmissionObservationAggregator:
         *,
         policy: RpcAdmissionObservationPolicy,
         clock: Callable[[], float] = time.monotonic,
+        method_names: frozenset[str] = frozenset(),
     ) -> None:
         summary_interval_seconds = policy.rpc_summary_interval_seconds
         if summary_interval_seconds <= 0:
             raise ValueError("summary_interval_seconds must be positive")
         self._recorder = recorder
+        self._method_names = method_names
         self._summary_interval_seconds = summary_interval_seconds
         self._clock = clock
         self._last_flush_at = clock()
         self._aggregates: dict[_AdmissionKey, _AdmissionAggregate] = {}
         self._demand_aggregates: dict[_DemandKey, _DemandAggregate] = {}
         self._profile_aggregates: dict[_ProfileKey, _ProfilePairAggregate] = {}
-        self._request_attempts: dict[_RequestKey, int] = {}
+        self._method_aggregates: dict[_MethodKey, _MethodAggregate] = {}
+        self._method_overflow: _MethodAggregate | None = None
+        self._rpc_samples: dict[str, list[_RpcSample]] = {}
+        self._rpc_unsampled_events = 0
+        self._rpc_truncated_events = 0
+        self._rpc_lost_rows = 0
+        self._rpc_window_started_at = self._last_flush_at
+        self._rpc_window_started_wall_ms = int(time.time() * _MILLISECONDS_PER_SECOND)
+        self._rpc_secret = secrets.token_bytes(32)
         self._delta_gap_fill: dict[str, int] = dict.fromkeys(_DELTA_GAP_FILL_COUNTERS, 0)
         self._delta_gap_fill_reasons: dict[str, int] = {}
         self._delta_gap_fill_rejected = 0
@@ -231,40 +327,158 @@ class RpcAdmissionObservationAggregator:
     def observe(self, event: RpcAdmissionEvent) -> None:
         """Record one scheduler event without blocking its admission path."""
         try:
+            if event.observation_scope is not None and event.kind in {
+                RpcAdmissionEventKind.RESUBMITTED,
+                RpcAdmissionEventKind.REJECTED,
+                RpcAdmissionEventKind.EXPIRED,
+                RpcAdmissionEventKind.CANCELLED,
+                RpcAdmissionEventKind.CLOSED,
+            }:
+                self.observe_rpc_event(
+                    scope=event.observation_scope,
+                    phase="retry" if event.kind is RpcAdmissionEventKind.RESUBMITTED else "rejected",
+                    reason=event.reason,
+                    request_method=event.observation_method,
+                )
             if event.kind in {RpcAdmissionEventKind.QUEUED, RpcAdmissionEventKind.DISPATCHED}:
                 self._aggregate(event)
             else:
                 self._record_raw(event)
-            self.flush_if_due()
+            # The gate's paired claim callback must enter this same snapshot before flushing.
+            if event.kind is not RpcAdmissionEventKind.DISPATCHED or event.observation_scope is None:
+                self.flush_if_due()
         except Exception:  # noqa: BLE001 - telemetry cannot break scheduler admission
             # Operational telemetry remains best effort at the scheduler callback boundary.
             return
 
-    def observe_request_attempt(
+    def observe_rpc_event(  # noqa: PLR0913 - one passive callback shared by existing gate seams
         self,
         *,
-        request_class: str,
-        source: TelegramRpcSource,
-        service_class: RpcServiceClass,
-        demand_kind: DemandKind | None = None,
-        acquisition_kind: AcquisitionKind | None = None,
+        scope: TelegramRpcScope,
+        phase: str,
+        request_method: str | None = None,
+        admission_sequence: int | None = None,
+        replay_ordinal: int | None = None,
+        reason: str | None = None,
+        attempt_ordinal: int | None = None,
     ) -> None:
-        """Count physical dispatches for the one bounded request class in TG-4."""
+        """Bounded method counters and biased root samples; never admit work."""
         try:
-            if request_class != "get_full_channel":
-                raise ValueError("unsupported request class")
-            if not isinstance(source, TelegramRpcSource) or not isinstance(service_class, RpcServiceClass):
-                raise TypeError("source and service_class must be bounded enums")
-            if demand_kind is not None and not isinstance(demand_kind, DemandKind):
-                raise TypeError("demand_kind must be a DemandKind")
-            if acquisition_kind is not None and not isinstance(acquisition_kind, AcquisitionKind):
-                raise TypeError("acquisition_kind must be an AcquisitionKind")
-            key = (source, service_class, demand_kind, acquisition_kind)
+            if phase not in _RPC_PHASES or not _valid_rpc_scope(scope):
+                return
+            method = _observation_method(request_method or scope.request_method, self._method_names)
+            key = (method, scope.source, scope.service_class, scope.demand_kind, scope.acquisition_kind)
+            now, wall_ms = self._clock(), int(time.time() * _MILLISECONDS_PER_SECOND)
+            operation_id, target_ref = self._rpc_identity(scope)
+            payload = self._rpc_sample_payload(scope, phase, method, target_ref, reason)
+            if phase in {"write_claim", "write_return"}:
+                payload["attempt_ordinal"] = (
+                    attempt_ordinal if attempt_ordinal is not None else payload.get("root_attempts", 0)
+                )
+            if admission_sequence is not None:
+                payload["admission_sequence"] = admission_sequence
+            if replay_ordinal is not None:
+                payload["replay_ordinal"] = replay_ordinal
             with self._state_lock:
-                self._request_attempts[key] = self._request_attempts.get(key, 0) + 1
+                aggregate = self._method_bucket(key, now, wall_ms)
+                aggregate.counts[phase] += 1
+                self._sample_rpc_event(operation_id, payload, wall_ms)
             self.flush_if_due()
-        except Exception:  # noqa: BLE001 - telemetry cannot affect RPC dispatch
+        except Exception:  # noqa: BLE001 - neither payloads nor observer failures enter the product path
+            with self._state_lock:
+                self._rpc_lost_rows += 1
+
+    def _rpc_identity(self, scope: TelegramRpcScope) -> tuple[str | None, str | None]:
+        selected = None if scope.attempt_budget is None else scope.attempt_budget.selected
+        if selected is not None:
+            key = selected.key
+            target = json.dumps([key.demand_kind.value, key.account_id, key.target], separators=(",", ":"))
+            return self._rpc_ref([target, selected.revision]), self._rpc_ref([target])
+        if scope.attempt_evidence is not None:
+            return self._rpc_ref([scope.attempt_evidence.observation_id]), None
+        return None, None
+
+    def _rpc_ref(self, values: list[str]) -> str:
+        encoded = json.dumps(values, separators=(",", ":")).encode("utf-8")
+        return hashlib.blake2b(encoded, key=self._rpc_secret, digest_size=16).hexdigest()
+
+    @staticmethod
+    def _rpc_sample_payload(
+        scope: TelegramRpcScope, phase: str, method: str, target_ref: str | None, reason: str | None
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "method": method,
+            "source": scope.source.value,
+            "phase": phase,
+            "consumer_trigger": telegram_rpc_consumer(scope.source).acquisition.trigger.value,
+            "causal_scope": "partial_runtime_sample",
+        }
+        if reason is not None:
+            payload["reason"] = reason if reason in _RPC_REASONS else "unknown"
+        if scope.demand_kind is not None:
+            payload["demand_kind"] = scope.demand_kind.value
+        if scope.acquisition_kind is not None:
+            payload["acquisition_kind"] = scope.acquisition_kind.value
+        if target_ref is not None:
+            payload["target_ref"] = target_ref
+            payload["trigger"] = "durable_selection"
+        else:
+            payload["trigger"] = "unknown"
+        if scope.owned_attempt_id is not None:
+            # UUIDs originate in the gate; no protocol/session identifier is accepted.
+            token = scope.owned_attempt_id
+            if len(token) == _OBSERVATION_ID_HEX_LENGTH and all(char in "0123456789abcdef" for char in token):
+                payload["attempt_ref"] = token
+        payload.update(RpcAdmissionObservationAggregator._rpc_budget_fields(scope))
+        return payload
+
+    @staticmethod
+    def _rpc_budget_fields(scope: TelegramRpcScope) -> dict[str, object]:
+        payload: dict[str, object] = {}
+        budget = scope.attempt_budget
+        if budget is not None:
+            payload.update(root_attempts=budget.attempts, budget_limit=budget.limit, budget_remaining=budget.remaining)
+        elif scope.attempt_evidence is not None:
+            payload["root_attempts"] = scope.attempt_evidence.actual_attempts
+        if scope.deadline is not None and _is_finite(scope.deadline):
+            remaining_ms = (scope.deadline - time.monotonic()) * _MILLISECONDS_PER_SECOND
+            if _is_finite(remaining_ms):
+                payload["deadline_remaining_ms"] = max(0.0, remaining_ms)
+            else:
+                payload["payload_truncated"] = True
+        return payload
+
+    def _method_bucket(self, key: _MethodKey | None, now: float, wall_ms: int) -> _MethodAggregate:
+        if key is not None and key in self._method_aggregates:
+            return self._method_aggregates[key]
+        if key is not None and len(self._method_aggregates) < _METHOD_BUCKET_LIMIT:
+            aggregate = _MethodAggregate(now, wall_ms)
+            self._method_aggregates[key] = aggregate
+            return aggregate
+        if self._method_overflow is None:
+            self._method_overflow = _MethodAggregate(now, wall_ms)
+        return self._method_overflow
+
+    def _sample_rpc_event(self, operation_id: str | None, payload: dict[str, object], wall_ms: int) -> None:
+        if operation_id is None or (
+            operation_id not in self._rpc_samples and len(self._rpc_samples) >= _SAMPLED_ROOT_LIMIT
+        ):
+            self._rpc_unsampled_events += 1
             return
+        samples = self._rpc_samples.setdefault(operation_id, [])
+        if len(samples) >= _ROOT_EVENT_LIMIT:
+            self._rpc_truncated_events += 1
+            return
+        # Drop optional dimensions in a fixed order, retaining explicit truncation evidence.
+        for optional in (None, "acquisition_kind", "consumer_trigger", "demand_kind", "method"):
+            if optional is not None:
+                payload.pop(optional, None)
+                payload["payload_truncated"] = True
+            if not _rpc_payload_fits(payload):
+                continue
+            samples.append(_RpcSample(operation_id, payload, wall_ms))
+            return
+        self._rpc_truncated_events += 1
 
     def observe_flood_wait(
         self,
@@ -462,7 +676,6 @@ class RpcAdmissionObservationAggregator:
         self._flush_demand_aggregates(demand_aggregates)
         with self._state_lock:
             profile_aggregates, self._profile_aggregates = self._profile_aggregates, {}
-            request_attempts, self._request_attempts = self._request_attempts, {}
             delta_gap_fill, self._delta_gap_fill = (
                 self._delta_gap_fill,
                 cast(dict[str, int], dict.fromkeys(_DELTA_GAP_FILL_COUNTERS, 0)),
@@ -471,8 +684,135 @@ class RpcAdmissionObservationAggregator:
             delta_rejected, self._delta_gap_fill_rejected = self._delta_gap_fill_rejected, 0
             delta_window_started_at = self._delta_gap_fill_window_started_at
         self._flush_profile_aggregates(profile_aggregates)
-        self._flush_request_attempts(request_attempts)
+        self._flush_rpc_methods(flush_at)
         self._flush_delta_gap_fill(delta_gap_fill, delta_reasons, delta_rejected, delta_window_started_at, flush_at)
+        with self._state_lock:
+            self._last_flush_at = max(self._last_flush_at, self._clock())
+
+    def _record_rpc_row(
+        self,
+        *,
+        outcome: str,
+        payload: Mapping[str, object],
+        observed_at_ms: int,
+        operation_id: str | None = None,
+        result_count: int | None = None,
+    ) -> bool:
+        try:
+            return (
+                self._recorder.record(
+                    kind="telegram.rpc_request",
+                    outcome=outcome,
+                    payload=payload,
+                    observed_at_ms=observed_at_ms,
+                    operation_id=operation_id,
+                    result_count=result_count,
+                )
+                is not False
+            )
+        except Exception:  # noqa: BLE001 - sink rejection is coverage loss, never a gate failure
+            return False
+
+    def _flush_rpc_methods(self, flush_at: float) -> None:
+        flush_at = max(flush_at, self._clock())
+        wall_ms = int(time.time() * _MILLISECONDS_PER_SECOND)
+        with self._state_lock:
+            methods, self._method_aggregates = self._method_aggregates, {}
+            overflow, self._method_overflow = self._method_overflow, None
+            samples, self._rpc_samples = self._rpc_samples, {}
+            unsampled, self._rpc_unsampled_events = self._rpc_unsampled_events, 0
+            truncated, self._rpc_truncated_events = self._rpc_truncated_events, 0
+            lost, self._rpc_lost_rows = self._rpc_lost_rows, 0
+            started_at, self._rpc_window_started_at = self._rpc_window_started_at, flush_at
+            started_wall_ms, self._rpc_window_started_wall_ms = self._rpc_window_started_wall_ms, wall_ms
+        if not methods and overflow is None and not samples and not lost:
+            return
+        rejected = self._flush_method_summaries(methods, overflow, flush_at, wall_ms)
+        lost += self._flush_rpc_samples(samples)
+        coverage = {
+            "configured_window_seconds": self._summary_interval_seconds,
+            "window_seconds": max(0.0, flush_at - started_at),
+            "bucket_started_at_ms": started_wall_ms,
+            "bucket_ended_at_ms": wall_ms,
+            "method_bucket_limit": _METHOD_BUCKET_LIMIT,
+            "sample_root_limit": _SAMPLED_ROOT_LIMIT,
+            "sample_event_limit": _ROOT_EVENT_LIMIT,
+            "method_attribution_complete": overflow is None,
+            "overflow_events": 0 if overflow is None else sum(overflow.counts.values()),
+            "unsampled_events": unsampled,
+            "truncated_events": truncated,
+            "lost_rows": lost,
+            "unaccepted_summary_rows": rejected,
+            "sampling": "first_roots_partial",
+            "correlation_scope": "runtime_owner_target",
+        }
+        if not self._record_rpc_row(outcome="coverage", payload=coverage, observed_at_ms=wall_ms):
+            with self._state_lock:
+                self._rpc_lost_rows += lost + 1
+                self._rpc_unsampled_events += unsampled
+                self._rpc_truncated_events += truncated
+
+    def _flush_method_summaries(
+        self,
+        methods: dict[_MethodKey, _MethodAggregate],
+        overflow: _MethodAggregate | None,
+        flush_at: float,
+        wall_ms: int,
+    ) -> int:
+        rejected = 0
+        snapshots: list[tuple[_MethodKey | None, _MethodAggregate]] = list(methods.items())
+        if overflow is not None:
+            snapshots.append((None, overflow))
+        for key, aggregate in snapshots:
+            payload = self._method_payload(key, aggregate, flush_at, wall_ms)
+            if not self._record_rpc_row(
+                outcome="method_summary",
+                result_count=aggregate.counts["write_claim"],
+                payload=payload,
+                observed_at_ms=wall_ms,
+            ):
+                rejected += 1
+                with self._state_lock:
+                    self._method_bucket(key, aggregate.started_at, aggregate.started_wall_ms).merge(aggregate)
+        return rejected
+
+    def _flush_rpc_samples(self, samples: dict[str, list[_RpcSample]]) -> int:
+        lost = 0
+        for root_samples in samples.values():
+            for sample in root_samples:
+                if not self._record_rpc_row(
+                    outcome="causal_sample",
+                    operation_id=sample.operation_id,
+                    payload=sample.payload,
+                    observed_at_ms=sample.observed_at_ms,
+                ):
+                    lost += 1
+        return lost
+
+    @staticmethod
+    def _method_payload(
+        key: _MethodKey | None, aggregate: _MethodAggregate, flush_at: float, wall_ms: int
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            **aggregate.counts,
+            "dispatch_semantics": "write_claim_v1",
+            "actual_attempts": aggregate.counts["write_claim"],
+            "bucket_started_at_ms": aggregate.started_wall_ms,
+            "bucket_ended_at_ms": wall_ms,
+            "window_seconds": max(0.0, flush_at - aggregate.started_at),
+        }
+        if key is None:
+            payload["method"] = "overflow"
+            return payload
+        method, source, service, demand, acquisition = key
+        payload.update(method=method, source=source.value, service_class=service.value)
+        if demand is not None:
+            payload["demand_kind"] = demand.value
+        if acquisition is not None:
+            payload["acquisition_kind"] = acquisition.value
+        if method.startswith("telethon.tl.functions.channels.GetFullChannelRequest:"):
+            payload["request_class"] = "get_full_channel"
+        return payload
 
     def _flush_delta_gap_fill(
         self,
@@ -519,32 +859,6 @@ class RpcAdmissionObservationAggregator:
         for key, value in reasons.items():
             self._delta_gap_fill_reasons[key] = self._delta_gap_fill_reasons.get(key, 0) + value
         self._delta_gap_fill_rejected += rejected
-
-    def _flush_request_attempts(self, attempts: dict[_RequestKey, int]) -> None:
-        for (source, service_class, demand_kind, acquisition_kind), count in attempts.items():
-            payload: dict[str, object] = {
-                "request_class": "get_full_channel",
-                "source": source.value,
-                "service_class": service_class.value,
-                "actual_attempts": count,
-                "window_seconds": self._summary_interval_seconds,
-            }
-            if demand_kind is not None:
-                payload["demand_kind"] = demand_kind.value
-            if acquisition_kind is not None:
-                payload["acquisition_kind"] = acquisition_kind.value
-            try:
-                self._recorder.record(
-                    kind="telegram.rpc_request", outcome="summary", result_count=count, payload=payload
-                )
-            except Exception:
-                with self._state_lock:
-                    self._request_attempts[(source, service_class, demand_kind, acquisition_kind)] = (
-                        self._request_attempts.get((source, service_class, demand_kind, acquisition_kind), 0) + count
-                    )
-                logger.exception(
-                    "rpc_request_summary_flush_failed request_class=get_full_channel source=%s", source.value
-                )
 
     def _flush_admission_aggregates(
         self, aggregates: dict[_AdmissionKey, _AdmissionAggregate], *, flush_at: float, flush_wall_at: float

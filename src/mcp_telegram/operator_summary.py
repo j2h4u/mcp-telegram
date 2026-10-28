@@ -537,7 +537,9 @@ def _rpc_lines(
 
 def _linked_chat_rpc_lines(observations: list[Observation]) -> list[str]:
     attempts: dict[tuple[str, str, str | None], int] = defaultdict(int)
-    for row in _rows_for_outcome(_rows_for_kind(observations, "telegram.rpc_request"), "summary"):
+    for row in _rows_for_kind(observations, "telegram.rpc_request"):
+        if row["outcome"] not in {"summary", "method_summary"}:
+            continue
         parsed = _get_full_channel_attempt(row)
         if parsed is not None:
             key, count = parsed
@@ -551,7 +553,10 @@ def _linked_chat_rpc_lines(observations: list[Observation]) -> list[str]:
             attempts.items(), key=lambda item: (*item[0][:2], item[0][2] or "")
         )
     )
-    return [f"GetFullChannel RPC attempts: {total} ({dimensions})"]
+    return [
+        f"GetFullChannel RPC attempts: {total} ({dimensions})",
+        "  Legacy enqueue/current write-claim observations; not provider receipts. Method overflow/loss can omit detail.",
+    ]
 
 
 def _get_full_channel_attempt(
