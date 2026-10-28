@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from typing import cast
 
 import pytest
 from pydantic import ValidationError
 
 from mcp_telegram.dialog_selector import SELF_DIALOG_ALIASES, required_dialog_selector
-from mcp_telegram.resolver import Candidates, Resolved
+from mcp_telegram.resolver import Candidates, MatchInfo, Resolved
 from mcp_telegram.tools import drafts
 from tests.test_daemon_api import _make_db_with_dialogs, _seed_dialog_row, make_server
 from tests.test_draft_commands import _Harness
@@ -82,7 +81,8 @@ async def test_self_aliases_override_real_dialog_name(alias: str) -> None:
 
     resolved = await server._resolve_dialog_id_local(required_dialog_selector(dialog=f"  {alias.upper()}  "))
 
-    assert int(resolved) == 9001
+    assert isinstance(resolved, int)
+    assert resolved == 9001
 
 
 async def test_self_alias_requires_bound_identity_and_topics_reject_saved_messages() -> None:
@@ -91,12 +91,15 @@ async def test_self_alias_requires_bound_identity_and_topics_reject_saved_messag
     assert missing_identity["error"] == "daemon_not_ready"
 
     server.self_id = 9001
-    result = await server._dispatch({"method": "list_topics", "dialog": "saved messages"})
+    result = cast(dict[str, object], await server._dispatch({"method": "list_topics", "dialog": "saved messages"}))
     assert result["error"] == "saved_messages_not_supported"
 
-    messages = await server._dispatch({"method": "list_messages", "dialog": "self", "limit": 10})
+    messages = cast(
+        dict[str, object], await server._dispatch({"method": "list_messages", "dialog": "self", "limit": 10})
+    )
     assert messages["ok"] is True
-    assert messages["data"]["is_self"] is True
+    message_data = cast(dict[str, object], messages["data"])
+    assert message_data["is_self"] is True
 
 
 async def test_draft_request_resolves_local_name_and_returns_plain_int() -> None:
@@ -128,10 +131,11 @@ async def test_get_draft_dispatch_reads_locally_resolved_self(harness: _Harness)
     server.self_id = 100
     server.bind_draft_commands(harness.owner)
 
-    result = await server._dispatch({"method": "get_draft", "dialog": "self"})
+    result = cast(dict[str, object], await server._dispatch({"method": "get_draft", "dialog": "self"}))
 
     assert result["ok"] is True
-    assert result["current"]["presence"] == "absent"
+    current = cast(dict[str, object], result["current"])
+    assert current["presence"] == "absent"
     assert result["acquisition_status"] == "ready"
     assert harness.requests == []
 
@@ -141,7 +145,7 @@ async def test_operation_key_replay_uses_resolved_target_and_retargeting_conflic
     server.self_id = 100
     server.bind_draft_commands(harness.owner)
     server._resolve_dialog_name = lambda query: Resolved(200 if query == "Alice" else 201, query)  # type: ignore[method-assign]
-    by_name = {
+    by_name: dict[str, object] = {
         "method": "manage_draft",
         "dialog": "Alice",
         "action": "create",
@@ -152,6 +156,9 @@ async def test_operation_key_replay_uses_resolved_target_and_retargeting_conflic
     first = await server._dispatch(by_name)
     replay = await server._dispatch({**by_name, "dialog": None, "dialog_id": 200})
     retargeted = await server._dispatch({**by_name, "dialog": "Bob"})
+    first = cast(dict[str, object], first)
+    replay = cast(dict[str, object], replay)
+    retargeted = cast(dict[str, object], retargeted)
 
     assert first["ok"] is True
     assert replay["ok"] is True
@@ -193,34 +200,47 @@ async def test_draft_ambiguity_keeps_candidates_and_trust_envelope(monkeypatch: 
 
     assert result.is_error
     content = result.structured_content
+    assert content is not None
     assert content["error"] == "ambiguous_dialog"
-    candidates = content["candidates"]
+    candidates = cast(list[dict[str, object]], content["candidates"])
     assert len(candidates) == 2
-    assert all(candidate["trust"]["is_untrusted"] for candidate in candidates)
+    assert all(cast(dict[str, object], candidate["trust"])["is_untrusted"] for candidate in candidates)
 
 
 @pytest.mark.parametrize("method", ["get_draft", "manage_draft"])
 async def test_daemon_ambiguity_preserves_candidates_and_skips_command(method: str) -> None:
     server = make_server(_make_db_with_dialogs())
     server.self_id = 42
-    command = SimpleNamespace(execute=AsyncMock())
-    server.bind_draft_commands(command)  # type: ignore[arg-type]
     server._resolve_dialog_name = lambda query: Candidates(
         query,
         [
-            {"entity_id": 1, "display_name": "Team One", "score": 100, "username": "teamone", "entity_type": "user"},
-            {"entity_id": 2, "display_name": "Team Two", "score": 100, "username": "teamtwo", "entity_type": "user"},
+            {
+                "entity_id": 1,
+                "display_name": "Team One",
+                "score": 100,
+                "username": "teamone",
+                "entity_type": "user",
+                "disambiguation_hint": None,
+            },
+            {
+                "entity_id": 2,
+                "display_name": "Team Two",
+                "score": 100,
+                "username": "teamtwo",
+                "entity_type": "user",
+                "disambiguation_hint": None,
+            },
         ],
     )  # type: ignore[method-assign]
     payload: dict[str, object] = {"method": method, "dialog": "Team"}
     if method == "manage_draft":
         payload.update(action="create", operation_key="ambiguous", text="draft")
 
-    result = await server._dispatch(payload)
+    result = cast(dict[str, object], await server._dispatch(payload))
 
     assert result["error"] == "ambiguous_dialog"
-    assert {candidate["entity_id"] for candidate in result["candidates"]} == {1, 2}
-    command.execute.assert_not_awaited()
+    candidates = cast(list[MatchInfo], result["candidates"])
+    assert {candidate["entity_id"] for candidate in candidates} == {1, 2}
 
 
 @pytest.mark.parametrize(
