@@ -169,3 +169,16 @@ MTProtoState.time_offset  # vendor encryption/message-id clock, set after authen
 # Public stopped-maintenance entrypoint called by deploy/telegram_qr_login.py,
 # outside this scan's src/scripts roots; covered by driver and CLI tests.
 telegram_auth.authenticate
+
+# Explicit white-box acceptance/ledger setup entrypoints; production uses the
+# revision-bound owner adapters and the final physical transport claim.
+TelegramRpcSafetyLedger.mark_claimed  # tests/test_telegram_rpc_safety.py and method recovery/wire fixtures
+ScheduledMessageReconciler.run_demand_slice  # finite owner/writer boundary acceptance tests
+FullSyncWorker.consume_canonical_dm_publication  # canonical enrollment transaction acceptance tests
+TopicCatalogRepository.next_pending  # retained repository projection/fencing tests
+TopicCatalogRepository.apply_page  # retained pure page projection transaction tests
+TopicCatalogRepository.mark_not_applicable  # account/eligibility fencing tests
+EntityProfileRepository.refresh_state  # repository collection-page fencing assertions
+_build_fwd_entity_map  # pure Telegram envelope projection exercised by adapter and metadata tests
+_reaction_discovery_page  # bounded SQL page projection/visibility regression tests
+_reaction_page_candidate  # pure row decoding checked by reaction visibility tests

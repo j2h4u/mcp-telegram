@@ -95,6 +95,37 @@ class _ImmediateLimiter:
         return None
 
 
+@pytest.mark.parametrize("release", ["cancel", "expire", "close"])
+async def test_queued_capacity_release_notifies_once_for_each_actual_removed_slot(release: str) -> None:
+    clock = [0.0]
+    notifications: list[bool] = []
+    limiter = _ControlledLimiter()
+    scheduler = _scheduler(
+        policy=TelegramRpcSchedulerConfig(),
+        limiter=limiter,
+        clock=lambda: clock[0],
+        capacity_released=lambda: notifications.append(True),
+    )
+    scope = replace(_scope(TelegramRpcSource.FULL_SYNC), deadline=5.0)
+    holder = asyncio.create_task(scheduler.admit(scope))
+    try:
+        await _wait_until(lambda: limiter.acquisitions == 1)
+        assert notifications == []
+        if release == "cancel":
+            holder.cancel()
+        elif release == "expire":
+            clock[0] = 6.0
+            assert scheduler.expire_due() == 1
+        else:
+            await scheduler.close()
+        await asyncio.gather(holder, return_exceptions=True)
+        assert notifications == [True]
+        assert sum(scheduler.queue_depths().values()) == 0
+    finally:
+        await scheduler.close()
+    assert notifications == [True]
+
+
 class _FailAfterOneLimiter:
     def __init__(self) -> None:
         self.acquisitions = 0

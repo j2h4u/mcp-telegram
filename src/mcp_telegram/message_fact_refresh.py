@@ -23,17 +23,17 @@ from .telegram_demand import (
     DemandStatus,
     DurableDemandAdapter,
     RpcAttemptBudget,
-    RpcAttemptBudgetExhaustedError,
     acquisition_context,
-    demand_context,
+    durable_demand_context,
 )
+from .telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkKey, WorkRevision
 from .telegram_fact_queries import enrich_read_at
+from .telegram_read_receipts import READ_AT_REQUEST_METHOD, READ_RECEIPT_REQUEST_METHOD
 from .telegram_reading import READ_DATE_REASONS, TelegramReadReceiptGateway
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import rpc_attempt_budget
 
 _ReactionCandidate = tuple[int, int, int, str | None]
-_ReactionRankedCandidate = tuple[tuple[int, int, int, int, int, int], _ReactionCandidate]
 
 _REACTION_CANDIDATES_SQL = """
 {requested_cte}
@@ -72,9 +72,9 @@ ORDER BY
 LIMIT ?
 """
 
-_REACTION_DISCOVERY_PAGE_SIZE = 256
 # ponytail: New read-at facts may take up to 60 seconds to become visible to scheduling.
 _REACTION_DISCOVERY_REFRESH_SECONDS = 60
+_REACTION_DISCOVERY_PAGE_SIZE = 256
 _REACTION_DISCOVERY_PAGE_SQL = """
 WITH aggregate_page AS MATERIALIZED (
   SELECT dialog_id, message_id, generation, aggregate_row_count, can_see_list
@@ -96,13 +96,6 @@ LEFT JOIN full_history_enrollment fhe ON fhe.dialog_id=p.dialog_id
 LEFT JOIN messages m ON m.dialog_id=p.dialog_id AND m.message_id=p.message_id
 LEFT JOIN message_reaction_event_status d ON d.dialog_id=p.dialog_id AND d.message_id=p.message_id
 ORDER BY p.dialog_id, p.message_id
-"""
-
-_REACTION_UPPER_KEY_SQL = """
-SELECT dialog_id, message_id
-FROM message_reaction_aggregate_state
-ORDER BY dialog_id DESC, message_id DESC
-LIMIT 1
 """
 
 
@@ -263,11 +256,6 @@ def _reaction_pacing_release_at(conn: sqlite3.Connection) -> float | None:
     return None if row is None else float(cast(int | float, row[0]))
 
 
-def _reaction_upper_key(conn: sqlite3.Connection) -> tuple[int, int] | None:
-    row = cast(tuple[object, object] | None, conn.execute(_REACTION_UPPER_KEY_SQL).fetchone())
-    return None if row is None else (int(cast(int, row[0])), int(cast(int, row[1])))
-
-
 def _reaction_discovery_page(
     conn: sqlite3.Connection,
     cursor: tuple[int, int] | None,
@@ -325,7 +313,7 @@ def _ranked_reaction_candidate(
     *,
     stale: bool,
     next_attempt: int | None,
-) -> _ReactionRankedCandidate:
+) -> tuple[tuple[int, int, int, int, int, int], _ReactionCandidate]:
     dialog_id, message_id, generation, _, detail_status, sent_at, offset_value, checked_at = identity
     offset = None if offset_value is None else str(offset_value)
     partial_first = detail_status == "partial" and offset is not None
@@ -342,7 +330,7 @@ def _ranked_reaction_candidate(
 
 def _reaction_page_candidate(
     row: tuple[object, ...], now: float
-) -> tuple[float, _ReactionRankedCandidate | None] | None:
+) -> tuple[float, tuple[tuple[int, int, int, int, int, int], _ReactionCandidate] | None] | None:
     identity = _reaction_page_identity(row)
     if identity is None:
         return None
@@ -353,26 +341,6 @@ def _reaction_page_candidate(
     if not due:
         return release_at, None
     return release_at, _ranked_reaction_candidate(identity, stale=stale, next_attempt=next_attempt)
-
-
-def _merge_reaction_page(
-    rows: Sequence[tuple[object, ...]],
-    candidates: list[_ReactionRankedCandidate],
-    *,
-    now: float,
-    limit: int,
-    release_at: float | None,
-) -> tuple[list[_ReactionRankedCandidate], float | None]:
-    for row in rows:
-        entry = _reaction_page_candidate(row, now)
-        if entry is None:
-            continue
-        row_release, candidate = entry
-        release_at = row_release if release_at is None else min(release_at, row_release)
-        if candidate is not None:
-            candidates.append(candidate)
-    candidates.sort(key=lambda item: item[0])
-    return candidates[:limit], release_at
 
 
 def _reaction_release_at(conn: sqlite3.Connection, now: float) -> float | None:
@@ -401,29 +369,166 @@ class MessageFactRefreshDemandAdapter(DurableDemandAdapter):
         deps: MessageFactRefreshDeps,
         policy: MessageFactRefreshPolicy,
         *,
+        account_id: int,
         shutdown_event: asyncio.Event | None = None,
     ) -> None:
         self._deps = deps
         self._policy = policy
         self._shutdown_event = shutdown_event
-        self._reaction_upper: tuple[int, int] | None = None
-        self._reaction_cursor: tuple[int, int] | None = None
-        self._reaction_sweep_started = False
-        self._reaction_sweep_complete = False
-        self._reaction_next_scan_at: float | None = None
-        self._reaction_release_at: float | None = None
-        self._reaction_candidates: list[_ReactionRankedCandidate] = []
+        if type(account_id) is not int or account_id <= 0:
+            raise ValueError("account_id must be a positive integer")
+        self._account_id = account_id
         self._read_at_release_at: float | None = None
         self._read_at_checked_at: float | None = None
         self._reaction_candidate_limit = min(
             policy.reaction_max_messages_per_cycle, policy.reaction_detail_max_pages_per_cycle
         )
 
-    def status(self, now: float) -> DemandStatus | None:
+    def _selected(
+        self, now: float, excluded: frozenset[WorkRevision] = frozenset(), *, target: str | None = None
+    ) -> tuple[WorkRevision, str, _ReactionCandidate | ReadMessage] | None:
+        if target is not None:
+            if target.startswith("reaction:"):
+                return self._reaction_selection(now, excluded, target=target)[0]
+            if target.startswith("read_at:"):
+                return self._read_at_selection(now, excluded, target=target)
+            return None
+        selected, fallback = self._reaction_selection(now, excluded, target=target)
+        return selected or self._read_at_selection(now, excluded, target=target) or fallback
+
+    def _reaction_selection(
+        self, now: float, excluded: frozenset[WorkRevision], *, target: str | None = None
+    ) -> tuple[
+        tuple[WorkRevision, str, _ReactionCandidate | ReadMessage] | None,
+        tuple[WorkRevision, str, _ReactionCandidate | ReadMessage] | None,
+    ]:
+        future_reaction: tuple[WorkRevision, str, _ReactionCandidate | ReadMessage] | None = None
+        pacing_release = _reaction_pacing_release_at(self._deps.conn)
+        limit = max(
+            5, self._reaction_candidate_limit, _excluded_sibling_count(excluded, self.demand_kind, self._account_id) + 1
+        )
+        candidates = _reaction_candidates(
+            self._deps.conn,
+            stale_before_utc=2**63 - 1,
+            limit=limit,
+            keys=None if target is None else [_parse_work_target(target, "reaction")],
+        )
+        for dialog_id, message_id, generation, offset in candidates:
+            selected, delayed = self._reaction_candidate_work(
+                (dialog_id, message_id, generation, offset),
+                now=now,
+                pacing_release=pacing_release,
+                excluded=excluded,
+            )
+            if selected is not None:
+                return selected, future_reaction
+            if delayed and future_reaction is None:
+                future_reaction = self._revisioned_reaction_candidate(dialog_id, message_id, generation, offset)
+        return None, future_reaction
+
+    def _revisioned_reaction_candidate(
+        self, dialog_id: int, message_id: int, generation: int, offset: str | None
+    ) -> tuple[WorkRevision, str, _ReactionCandidate]:
+        selected = WorkRevision(
+            WorkKey(self.demand_kind, self._account_id, f"reaction:{dialog_id}:{message_id}"),
+            repr((generation, offset)),
+        )
+        return selected, "reaction", (dialog_id, message_id, generation, offset)
+
+    def _reaction_candidate_work(
+        self,
+        candidate: _ReactionCandidate,
+        *,
+        now: float,
+        pacing_release: float | None,
+        excluded: frozenset[WorkRevision],
+    ) -> tuple[tuple[WorkRevision, str, _ReactionCandidate] | None, bool]:
+        dialog_id, message_id = candidate[:2]
+        state = cast(
+            tuple[object, ...] | None,
+            self._deps.conn.execute(
+                "SELECT next_attempt_at FROM message_reaction_event_status WHERE dialog_id=? AND message_id=?",
+                (dialog_id, message_id),
+            ).fetchone(),
+        )
+        retry_at = None if state is None or state[0] is None else float(cast(int | float, state[0]))
+        delayed = (pacing_release is not None and pacing_release > now) or (retry_at is not None and retry_at > now)
+        selected = self._revisioned_reaction_candidate(*candidate)
+        available = selected[0] not in excluded
+        return (selected if not delayed and available else None), delayed and available
+
+    def _read_at_selection(
+        self, now: float, excluded: frozenset[WorkRevision], *, target: str | None = None
+    ) -> tuple[WorkRevision, str, _ReactionCandidate | ReadMessage] | None:
+        read_at = _read_at_candidates(
+            self._deps.conn,
+            stale_before_utc=2**63 - 1 if target is not None else int(now),
+            limit=max(
+                5,
+                self._policy.read_at_max_messages_per_cycle,
+                _excluded_sibling_count(excluded, self.demand_kind, self._account_id) + 1,
+            ),
+            target=None if target is None else _parse_work_target(target, "read_at"),
+        )
+        for message in read_at:
+            row = cast(
+                tuple[object] | None,
+                self._deps.conn.execute(
+                    "SELECT status, read_at, reason FROM message_read_facts WHERE dialog_id=? AND message_id=?",
+                    (message.dialog_id, message.message_id),
+                ).fetchone(),
+            )
+            selected = WorkRevision(
+                WorkKey(self.demand_kind, self._account_id, f"read_at:{message.dialog_id}:{message.message_id}"),
+                repr(None if row is None else tuple(row)),
+            )
+            if selected not in excluded:
+                return selected, "read_at", message
+        return None
+
+    def status(
+        self,
+        now: float,
+        *,
+        excluded: frozenset[WorkRevision] = frozenset(),
+        target: str | None = None,
+    ) -> DemandStatus | None:
         """Return the first missing or TTL-expired candidate release boundary."""
+        selected_item = self._selected(now, excluded, target=target)
+        if selected_item is None:
+            return None
+        selected, selected_kind, _ = selected_item
+        release_at = self._selection_release_at(now, selected_item, target=target)
+        return DemandStatus(
+            release_at=release_at,
+            selected=selected,
+            request_method=READ_AT_REQUEST_METHOD if selected_kind == "read_at" else None,
+        )
+
+    def _selection_release_at(
+        self,
+        now: float,
+        selected_item: tuple[WorkRevision, str, _ReactionCandidate | ReadMessage],
+        *,
+        target: str | None = None,
+    ) -> float:
+        _, selected_kind, candidate = selected_item
+        if selected_kind == "read_at":
+            if target is None:
+                self._message_fact_release_at(now)
+            return (
+                self._read_at_target_release(cast(ReadMessage, candidate))
+                if target is not None
+                else self._read_at_selection_release(now)
+            )
+        if selected_kind == "reaction":
+            return self._reaction_selection_release(cast(_ReactionCandidate, candidate))
+        return self._message_fact_release_at(now)
+
+    def _message_fact_release_at(self, now: float) -> float:
         releases: list[float] = []
         if self._policy.reaction_max_messages_per_cycle > 0:
-            reaction_release = self._reaction_status_release(now)
+            reaction_release = _reaction_release_at(self._deps.conn, now)
             if reaction_release is not None:
                 releases.append(reaction_release)
         if self._policy.read_at_max_messages_per_cycle > 0 and (
@@ -437,117 +542,94 @@ class MessageFactRefreshDemandAdapter(DurableDemandAdapter):
             self._read_at_checked_at = self._deps.clock()
         if self._policy.read_at_max_messages_per_cycle > 0 and self._read_at_release_at is not None:
             releases.append(self._read_at_release_at)
-        if not releases:
-            return None
-        return DemandStatus(release_at=min(releases))
+        return min(releases, default=now)
 
-    def _reaction_status_release(self, now: float) -> float | None:
+    def _read_at_target_release(self, target: ReadMessage) -> float:
+        row = cast(
+            tuple[object] | None,
+            self._deps.conn.execute(
+                "SELECT next_attempt_at FROM message_read_facts WHERE dialog_id=? AND message_id=?",
+                (target.dialog_id, target.message_id),
+            ).fetchone(),
+        )
+        return 0.0 if row is None or row[0] is None else float(cast(int | float, row[0]))
+
+    def _read_at_selection_release(self, now: float) -> float:
+        release_at = _next_release_at(self._deps.conn, _NEXT_READ_AT_RELEASE_SQL, ())
+        return now if release_at is None else release_at
+
+    def _reaction_selection_release(self, target: _ReactionCandidate) -> float:
+        dialog_id, message_id, _, _ = target
+        row = cast(
+            tuple[object, ...] | None,
+            self._deps.conn.execute(
+                "SELECT next_attempt_at FROM message_reaction_event_status WHERE dialog_id=? AND message_id=?",
+                (dialog_id, message_id),
+            ).fetchone(),
+        )
+        retry_at = 0.0 if row is None or row[0] is None else float(cast(int | float, row[0]))
         pacing_release = _reaction_pacing_release_at(self._deps.conn)
-        if pacing_release is not None and pacing_release > now:
-            return pacing_release
-        if not self._reaction_sweep_complete:
-            return now
-        if self._reaction_candidates:
-            return now
-        next_scan = self._reaction_next_scan_at or now
-        if self._reaction_release_at is not None:
-            next_scan = min(next_scan, self._reaction_release_at)
-        if now < next_scan:
-            return next_scan
-        return now
+        return max(retry_at, pacing_release or 0.0)
 
-    def _reset_reaction_sweep(self) -> None:
-        self._reaction_upper = None
-        self._reaction_cursor = None
-        self._reaction_sweep_started = False
-        self._reaction_sweep_complete = False
-        self._reaction_next_scan_at = None
-        self._reaction_release_at = None
-        self._reaction_candidates = []
-
-    def _restart_empty_sweep_if_due(self, now: float) -> None:
-        restart_at = self._reaction_next_scan_at
-        if self._reaction_release_at is not None:
-            restart_at = self._reaction_release_at if restart_at is None else min(restart_at, self._reaction_release_at)
-        if (
-            self._reaction_sweep_complete
-            and not self._reaction_candidates
-            and restart_at is not None
-            and restart_at <= now
-        ):
-            self._reset_reaction_sweep()
-
-    def _advance_reaction_sweep(self, now: float) -> bool:
-        if not self._reaction_sweep_started:
-            self._reaction_upper = _reaction_upper_key(self._deps.conn)
-            self._reaction_sweep_started = True
-            if self._reaction_upper is None:
-                self._finish_reaction_sweep(now)
-                return True
-        upper = self._reaction_upper
-        assert upper is not None
-        rows = _reaction_discovery_page(self._deps.conn, self._reaction_cursor, upper)
-        if rows:
-            last = rows[-1]
-            self._reaction_cursor = (int(cast(int, last[0])), int(cast(int, last[1])))
-            self._reaction_candidates, self._reaction_release_at = _merge_reaction_page(
-                rows,
-                self._reaction_candidates,
-                now=now,
-                limit=self._reaction_candidate_limit,
-                release_at=self._reaction_release_at,
-            )
-        if len(rows) < _REACTION_DISCOVERY_PAGE_SIZE:
-            self._finish_reaction_sweep(now)
-        return self._reaction_sweep_complete
-
-    def _reaction_candidates_for_slice(self, now: float) -> Sequence[_ReactionCandidate] | None:
-        if self._policy.reaction_max_messages_per_cycle <= 0:
-            return None
-        pacing_release = _reaction_pacing_release_at(self._deps.conn)
-        if pacing_release is not None and pacing_release > now:
-            return ()
-        if self._reaction_sweep_complete:
-            return tuple(item[1] for item in self._reaction_candidates)
-        if self._advance_reaction_sweep(now):
-            return tuple(item[1] for item in self._reaction_candidates)
-        return ()
-
-    def _finish_reaction_sweep(self, now: float) -> None:
-        self._reaction_sweep_complete = True
-        del now
-        self._reaction_next_scan_at = self._deps.clock() + _REACTION_DISCOVERY_REFRESH_SECONDS
-
-    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+    async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
         """Run one bounded candidate cycle under its registered root."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
         now = self._deps.clock()
-        status = self.status(now)
-        if status is None or not status.is_ready(now):
-            return
-        self._restart_empty_sweep_if_due(now)
-        reaction_candidates = self._reaction_candidates_for_slice(now)
-        read_at_due = self._read_at_release_at is not None and self._read_at_release_at <= now
-        if not reaction_candidates and not read_at_due:
-            return
+        selected = budget.selected
+        if selected is None:
+            raise ValueError("message fact demand requires a selected revision")
+        readiness = self._slice_readiness(budget, selected, now)
+        if readiness is not None:
+            return readiness
+        current = self._selected(now, target=selected.key.target)
+        if current is None or current[0] != selected:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        return await self._run_selected_slice(budget, selected, current, now)
+
+    def _slice_readiness(self, budget: RpcAttemptBudget, selected: WorkRevision, now: float) -> SliceOutcome | None:
+        status = self.status(now, target=selected.key.target)
+        if status is None or status.selected != selected:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        if not status.is_ready(now) or (budget.exhausted and not budget.can_prepare_retry):
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        return None
+
+    async def _run_selected_slice(
+        self,
+        budget: RpcAttemptBudget,
+        selected: WorkRevision,
+        current: tuple[WorkRevision, str, _ReactionCandidate | ReadMessage],
+        now: float,
+    ) -> SliceOutcome:
+        selected_kind = current[1]
+        reaction_candidates: Sequence[_ReactionCandidate] | None = (
+            (cast(_ReactionCandidate, current[2]),) if selected_kind == "reaction" else ()
+        )
+        read_at_due = selected_kind == "read_at"
+        accepted_revisions: list[str] = []
+        terminal_revisions: set[str] = set()
         if read_at_due:
             self._read_at_checked_at = None
-        with demand_context(DemandKind.MESSAGE_FACT_REFRESH):
+        with durable_demand_context(DemandKind.MESSAGE_FACT_REFRESH):
             with rpc_attempt_budget(budget):
-                try:
-                    await refresh_message_facts_once(
-                        self._deps,
-                        self._policy,
-                        read_at_due=read_at_due,
-                        reaction_candidates=reaction_candidates,
-                        shutdown_event=self._shutdown_event,
-                    )
-                except RpcAttemptBudgetExhaustedError:
-                    return
-                finally:
-                    if reaction_candidates:
-                        self._reset_reaction_sweep()
+                await refresh_message_facts_once(
+                    self._deps,
+                    self._policy,
+                    read_at_due=read_at_due,
+                    reaction_candidates=reaction_candidates,
+                    read_at_candidates=(cast(ReadMessage, current[2]),) if read_at_due else None,
+                    accepted_revisions=accepted_revisions,
+                    terminal_revisions=terminal_revisions,
+                    shutdown_event=self._shutdown_event,
+                )
+        committed_revision = next((revision for revision in accepted_revisions if revision != selected.revision), None)
+        if committed_revision is not None:
+            kind = (
+                SliceOutcomeKind.TERMINAL if committed_revision in terminal_revisions else SliceOutcomeKind.PROGRESSED
+            )
+            return SliceOutcome(selected, kind, committed_revision)
+        return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
 
 
 class ReadReceiptDemandAdapter(DurableDemandAdapter):
@@ -562,41 +644,119 @@ class ReadReceiptDemandAdapter(DurableDemandAdapter):
     def __init__(
         self,
         conn: sqlite3.Connection,
-        run_batch: Callable[[], Awaitable[object]],
+        run_batch: Callable[[WorkRevision], Awaitable[SliceOutcome]],
+        *,
+        account_id: int,
     ) -> None:
         self._conn = conn
         self._run_batch = run_batch
+        if type(account_id) is not int or account_id <= 0:
+            raise ValueError("account_id must be a positive integer")
+        self._account_id = account_id
 
-    def status(self, now: float) -> DemandStatus | None:
+    def status(
+        self,
+        now: float,
+        *,
+        excluded: frozenset[WorkRevision] = frozenset(),
+        target: str | None = None,
+    ) -> DemandStatus | None:
         """Return the earliest due read-position batch without changing state."""
-        del now
-        row = cast(
-            tuple[object] | None,
-            self._conn.execute(_NEXT_READ_POSITION_RELEASE_SQL).fetchone(),
+        excluded_count = sum(
+            revision.key.demand_kind is self.demand_kind and revision.key.account_id == self._account_id
+            for revision in excluded
         )
-        release_at = None if row is None else row[0]
-        if release_at is None:
+        target_id = _read_receipt_target_id(target)
+        if target is not None and target_id is None:
             return None
-        return DemandStatus(release_at=float(cast(int | float, release_at)))
+        rows = _read_receipt_status_rows(self._conn, target_id, excluded_count + 1)
+        for row in rows:
+            dialog_id = int(cast(int | str, row[0]))
+            selected = WorkRevision(
+                WorkKey(self.demand_kind, self._account_id, f"dialog:{dialog_id}"),
+                repr((row[1], row[2], row[3])),
+            )
+            if selected in excluded:
+                continue
+            release_at = now if row[4] is None else float(cast(int | float, row[4]))
+            return DemandStatus(release_at=release_at, selected=selected, request_method=READ_RECEIPT_REQUEST_METHOD)
+        return None
 
-    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+    async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
         """Run one existing read-position batch under the transport budget."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
-        status = self.status(time.time())
-        if status is None or not status.is_ready(time.time()):
-            return
-        with demand_context(DemandKind.READ_RECEIPT_BATCH):
+        selected = budget.selected
+        if selected is None:
+            raise ValueError("read receipt demand requires a selected revision")
+        now = time.time()
+        status = self.status(now, target=selected.key.target)
+        if status is None or status.selected != selected:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        if not status.is_ready(now) or (budget.exhausted and not budget.can_prepare_retry):
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        with durable_demand_context(DemandKind.READ_RECEIPT_BATCH):
             with acquisition_context(AcquisitionKind.READ_RECEIPT_SNAPSHOT):
                 with rpc_attempt_budget(budget):
-                    try:
-                        await self._run_batch()
-                    except RpcAttemptBudgetExhaustedError:
-                        return
+                    outcome = await self._run_batch(selected)
+        if outcome.selected != selected:
+            raise ValueError("read receipt owner returned a receipt for another selection")
+        return outcome
+
+
+def _read_receipt_target_id(target: str | None) -> int | None:
+    if target is None:
+        return None
+    prefix, separator, value = target.partition(":")
+    if prefix != "dialog" or not separator:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _read_receipt_status_rows(conn: sqlite3.Connection, target_id: int | None, limit: int) -> list[tuple[object, ...]]:
+    where_target = "AND sd.dialog_id=? " if target_id is not None else ""
+    params: tuple[object, ...] = (target_id, limit) if target_id is not None else (limit,)
+    return cast(
+        list[tuple[object, ...]],
+        conn.execute(
+            "SELECT sd.dialog_id, sd.read_inbox_max_id, sd.read_outbox_max_id, "
+            "COALESCE(d.unread_count, 0), sd.read_position_next_attempt_at "
+            "FROM synced_dialogs sd "
+            "JOIN full_history_enrollment fhe ON fhe.dialog_id=sd.dialog_id AND fhe.enabled=1 "
+            "LEFT JOIN dialogs d ON d.dialog_id=sd.dialog_id "
+            "WHERE sd.status='synced' AND (sd.read_inbox_max_id IS NULL "
+            "OR sd.read_outbox_max_id IS NULL OR COALESCE(d.unread_count,0)>0 "
+            "OR EXISTS (SELECT 1 FROM messages m WHERE m.dialog_id=sd.dialog_id "
+            "AND m.is_deleted=0 AND m.is_service=0 AND m.out=0 "
+            "AND m.message_id>COALESCE(sd.read_inbox_max_id,-1))) "
+            f"{where_target}ORDER BY COALESCE(sd.read_position_next_attempt_at,0), sd.dialog_id LIMIT ?",
+            params,
+        ).fetchall(),
+    )
 
 
 def _row_ints(row: Sequence[object]) -> tuple[int, ...]:
     return tuple(int(cast(int | str, value)) for value in row)
+
+
+def _parse_work_target(target: str, kind: str) -> tuple[int, int]:
+    try:
+        prefix, dialog_id, message_id = target.split(":")
+    except ValueError:
+        raise ValueError(f"invalid {kind} target") from None
+    if prefix != kind:
+        raise ValueError(f"invalid {kind} target")
+    try:
+        return int(dialog_id), int(message_id)
+    except ValueError as exc:
+        raise ValueError(f"invalid {kind} target") from exc
+
+
+def _excluded_sibling_count(excluded: frozenset[WorkRevision], kind: DemandKind, account_id: int) -> int:
+    return sum(revision.key.demand_kind is kind and revision.key.account_id == account_id for revision in excluded)
 
 
 def _reaction_candidates_query(*, keys: Sequence[tuple[int, int]] | None = None) -> tuple[str, tuple[int, ...]]:
@@ -618,8 +778,9 @@ def _reaction_candidates(
     *,
     stale_before_utc: int,
     limit: int,
+    keys: Sequence[tuple[int, int]] | None = None,
 ) -> list[tuple[int, int, int, str | None]]:
-    query, key_params = _reaction_candidates_query()
+    query, key_params = _reaction_candidates_query(keys=keys)
     rows = cast(
         list[tuple[object, ...]],
         conn.execute(query, (*key_params, stale_before_utc, limit)).fetchall(),
@@ -761,10 +922,19 @@ def _read_at_candidates(
     *,
     stale_before_utc: int,
     limit: int,
+    target: tuple[int, int] | None = None,
 ) -> list[ReadMessage]:
+    query = _READ_AT_CANDIDATES_SQL
+    params: tuple[object, ...] = (stale_before_utc, limit)
+    if target is not None:
+        query = query.replace(
+            "WHERE sd.status = 'synced'",
+            "WHERE sd.status = 'synced' AND m.dialog_id=? AND m.message_id=?",
+        )
+        params = (*target, stale_before_utc, limit)
     rows = cast(
         list[tuple[object, ...]],
-        conn.execute(_READ_AT_CANDIDATES_SQL, (stale_before_utc, limit)).fetchall(),
+        conn.execute(query, params).fetchall(),
     )
     return [
         ReadMessage(message_id=message_id, sent_at=sent_at, dialog_id=dialog_id, out=1)
@@ -883,36 +1053,25 @@ def _merge_read_at_counts(
     )
 
 
-async def _refresh_read_at_cycle(
+async def _refresh_read_at_cycle(  # noqa: PLR0913 - accepted receipt capture is explicit
     deps: MessageFactRefreshDeps,
     policy: MessageFactRefreshPolicy,
     *,
     checked_at: int,
+    candidates: Sequence[ReadMessage] | None,
     shutdown_event: asyncio.Event | None,
+    accepted_revisions: list[str] | None = None,
 ) -> _ReadAtCycleStats:
     if shutdown_event is not None and shutdown_event.is_set():
-        return _ReadAtCycleStats(
-            first_attempts=0,
-            retry_attempts=0,
-            terminal_suppressed=0,
-            complete=0,
-            missing=0,
-            unavailable=0,
-            reason_counts={},
-            rpc_attempts=0,
-            message_too_old_responses=0,
-            invalid_cutoff_witnesses=0,
-            locally_classified=0,
-            cutoff_backlog_suppressed=0,
-            cutoff_skipped=0,
-            fresh_skipped=0,
-            candidate_count=0,
-            measurement_complete=False,
+        return _empty_read_at_cycle_stats()
+    messages = (
+        list(candidates)
+        if candidates is not None
+        else _read_at_candidates(
+            deps.conn,
+            stale_before_utc=checked_at,
+            limit=policy.read_at_max_messages_per_cycle,
         )
-    messages = _read_at_candidates(
-        deps.conn,
-        stale_before_utc=checked_at,
-        limit=policy.read_at_max_messages_per_cycle,
     )
     terminal_suppressed = _terminal_read_at_suppressed(deps.conn)
     cycle_metrics = {
@@ -926,39 +1085,21 @@ async def _refresh_read_at_cycle(
         "cutoff_skipped": 0,
         "fresh_skipped": 0,
     }
-    complete = missing = unavailable = 0
-    measurement_complete = True
     reason_counts = {reason.value: 0 for reason in READ_DATE_REASONS}
     grouped_by_dialog: dict[int, list[ReadMessage]] = {}
     for message in messages:
         grouped_by_dialog.setdefault(message.dialog_id, []).append(message)
     grouped_messages = list(grouped_by_dialog.values())
-    for index, grouped in enumerate(grouped_messages):
-        counts: list[int] = []
-        await enrich_read_at(
-            deps.conn,
-            deps.read_receipt_gateway,
-            grouped[0].dialog_id,
-            grouped,
-            writer=deps.writer,
-            dialog_type="user",
-            read_at_ttl_seconds=policy.read_at_ttl_seconds,
-            checked_at=checked_at,
-            cycle_counts=counts,
-            cycle_reason_counts=reason_counts,
-            cycle_metrics=cycle_metrics,
-        )
-        complete, missing, unavailable = _merge_read_at_counts(
-            counts,
-            complete,
-            missing,
-            unavailable,
-        )
-        if shutdown_event is not None and shutdown_event.is_set():
-            measurement_complete = False
-            break
-        if shutdown_event is not None and index < len(grouped_messages) - 1:
-            await _interruptible_pause(shutdown_event, policy.pause_seconds)
+    complete, missing, unavailable, measurement_complete = await _process_read_at_groups(
+        deps,
+        policy,
+        grouped_messages,
+        checked_at=checked_at,
+        reason_counts=reason_counts,
+        cycle_metrics=cycle_metrics,
+        accepted_revisions=accepted_revisions,
+        shutdown_event=shutdown_event,
+    )
     return _ReadAtCycleStats(
         first_attempts=cycle_metrics["first_attempts"],
         retry_attempts=cycle_metrics["retry_attempts"],
@@ -979,16 +1120,59 @@ async def _refresh_read_at_cycle(
     )
 
 
+async def _process_read_at_groups(  # noqa: PLR0913 - exact receipt inputs are explicit
+    deps: MessageFactRefreshDeps,
+    policy: MessageFactRefreshPolicy,
+    grouped_messages: Sequence[Sequence[ReadMessage]],
+    *,
+    checked_at: int,
+    reason_counts: dict[str, int],
+    cycle_metrics: dict[str, int],
+    accepted_revisions: list[str] | None,
+    shutdown_event: asyncio.Event | None,
+) -> tuple[int, int, int, bool]:
+    complete = missing = unavailable = 0
+    measurement_complete = True
+    for index, grouped in enumerate(grouped_messages):
+        counts: list[int] = []
+        await enrich_read_at(
+            deps.conn,
+            deps.read_receipt_gateway,
+            grouped[0].dialog_id,
+            grouped,
+            writer=deps.writer,
+            dialog_type="user",
+            read_at_ttl_seconds=policy.read_at_ttl_seconds,
+            checked_at=checked_at,
+            cycle_counts=counts,
+            cycle_reason_counts=reason_counts,
+            cycle_metrics=cycle_metrics,
+            accepted_revisions=accepted_revisions,
+        )
+        complete, missing, unavailable = _merge_read_at_counts(
+            counts,
+            complete,
+            missing,
+            unavailable,
+        )
+        if shutdown_event is not None and shutdown_event.is_set():
+            measurement_complete = False
+            break
+        if shutdown_event is not None and index < len(grouped_messages) - 1:
+            await _interruptible_pause(shutdown_event, policy.pause_seconds)
+    return complete, missing, unavailable, measurement_complete
+
+
 async def _refresh_one_reaction_page(
     deps: MessageFactRefreshDeps,
     row: tuple[int, int, int, str | None],
     *,
     checked_at: int,
     shutdown_event: asyncio.Event | None,
-) -> tuple[int, bool]:
+) -> tuple[int, bool, str | None, bool]:
     dialog_id, message_id, generation, offset = row
     if not await deps.writer.run(_start_reaction_page):
-        return 0, True
+        return 0, True, None, False
     detail = await deps.reaction_detail_refresher.refresh_one(
         dialog_id,
         message_id,
@@ -1002,7 +1186,46 @@ async def _refresh_one_reaction_page(
     if retry_after is not None and detail.stop_cycle:
         release_now = int(deps.clock())
         await deps.writer.run(lambda conn: _extend_reaction_release(conn, now=release_now, retry_after=retry_after))
-    return detail.fetched_pages, detail.stop_cycle or detail.status == "cancelled"
+    return (
+        detail.fetched_pages,
+        detail.stop_cycle or detail.status == "cancelled",
+        detail.committed_revision,
+        detail.committed_terminal,
+    )
+
+
+def _empty_read_at_cycle_stats() -> _ReadAtCycleStats:
+    return _ReadAtCycleStats(
+        first_attempts=0,
+        retry_attempts=0,
+        terminal_suppressed=0,
+        complete=0,
+        missing=0,
+        unavailable=0,
+        reason_counts={},
+        rpc_attempts=0,
+        message_too_old_responses=0,
+        invalid_cutoff_witnesses=0,
+        locally_classified=0,
+        cutoff_backlog_suppressed=0,
+        cutoff_skipped=0,
+        fresh_skipped=0,
+        candidate_count=0,
+        measurement_complete=False,
+    )
+
+
+def _record_committed_reaction_revision(
+    revision: str | None,
+    terminal: bool,
+    accepted_revisions: list[str] | None,
+    terminal_revisions: set[str] | None,
+) -> None:
+    if revision is None or accepted_revisions is None:
+        return
+    accepted_revisions.append(revision)
+    if terminal and terminal_revisions is not None:
+        terminal_revisions.add(revision)
 
 
 async def _refresh_reaction_pages(  # noqa: PLR0913 - keeps transaction and demand inputs explicit
@@ -1013,6 +1236,8 @@ async def _refresh_reaction_pages(  # noqa: PLR0913 - keeps transaction and dema
     claim_at: int,
     candidates: Sequence[_ReactionCandidate] | None,
     shutdown_event: asyncio.Event | None,
+    accepted_revisions: list[str] | None = None,
+    terminal_revisions: set[str] | None = None,
 ) -> int:
     if shutdown_event is not None and shutdown_event.is_set():
         return 0
@@ -1028,13 +1253,14 @@ async def _refresh_reaction_pages(  # noqa: PLR0913 - keeps transaction and dema
     )
     reaction_refreshed = 0
     for index, row in enumerate(selected_reaction_rows):
-        fetched_pages, stop_page = await _refresh_one_reaction_page(
+        fetched_pages, stop_page, committed_revision, terminal = await _refresh_one_reaction_page(
             deps,
             row,
             checked_at=checked_at,
             shutdown_event=shutdown_event,
         )
         reaction_refreshed += fetched_pages
+        _record_committed_reaction_revision(committed_revision, terminal, accepted_revisions, terminal_revisions)
         if stop_page:
             break
         if shutdown_event is not None and index < len(selected_reaction_rows) - 1:
@@ -1049,6 +1275,9 @@ async def refresh_message_facts_once(  # noqa: PLR0913 - public orchestration in
     now: int | None = None,
     read_at_due: bool = True,
     reaction_candidates: Sequence[_ReactionCandidate] | None = None,
+    read_at_candidates: Sequence[ReadMessage] | None = None,
+    accepted_revisions: list[str] | None = None,
+    terminal_revisions: set[str] | None = None,
     shutdown_event: asyncio.Event | None = None,
 ) -> MessageFactRefreshResult:
     """Refresh a bounded batch of optional message facts into SQLite."""
@@ -1061,7 +1290,9 @@ async def refresh_message_facts_once(  # noqa: PLR0913 - public orchestration in
             deps,
             policy,
             checked_at=checked_at,
+            candidates=read_at_candidates,
             shutdown_event=shutdown_event,
+            accepted_revisions=accepted_revisions,
         )
     else:
         stats = None
@@ -1074,6 +1305,8 @@ async def refresh_message_facts_once(  # noqa: PLR0913 - public orchestration in
         claim_at=claim_at,
         candidates=reaction_candidates,
         shutdown_event=shutdown_event,
+        accepted_revisions=accepted_revisions,
+        terminal_revisions=terminal_revisions,
     )
 
     if stats is not None and stats.measurement_complete:

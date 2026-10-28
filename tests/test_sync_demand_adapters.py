@@ -25,7 +25,9 @@ from mcp_telegram.delta_sync import (
     DeltaGapFillDemandAdapter,
     DeltaSyncWorker,
     DmDeletionReconciliationDemandAdapter,
+    DmGapScanPage,
     DmGapScanStateError,
+    _DurableAccessRecovery,
     prepare_dm_deletion_reconciliation,
 )
 from mcp_telegram.dialog_sync import DialogLightReconciliationDemandAdapter, DialogReconciliationWorker
@@ -51,6 +53,7 @@ from mcp_telegram.telegram_demand import (
 from mcp_telegram.telegram_demand import (
     demand_context as task_demand_context,
 )
+from mcp_telegram.telegram_demand_progress import SliceOutcomeKind, WorkKey, WorkRevision
 from mcp_telegram.telegram_rpc_consumers import DemandKind, TelegramRpcSource
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
@@ -106,6 +109,32 @@ def _delta_policy() -> AccessProbePolicy:
         max_dialogs_per_cycle=1,
         cooldown_seconds=100,
     )
+
+
+def _selected_budget(adapter: object, limit: int = 1) -> RpcAttemptBudget:
+    status = adapter.status(0.0)  # type: ignore[attr-defined]
+    selected = None if status is None else status.selected
+    if selected is None and isinstance(adapter, DmDeletionReconciliationDemandAdapter):
+        row = cast(
+            tuple[str] | None,
+            adapter._conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone(),
+        )
+        state = json.loads(row[0]) if row is not None else None
+        if state is not None:
+            selected = WorkRevision(
+                WorkKey(DemandKind.DM_DELETION_RECONCILIATION, adapter._account_id, "dm-gap-scan"),
+                repr(
+                    (
+                        state["generation"],
+                        state["dialog_id_cursor"],
+                        state["message_cursor"],
+                        state["policy_version"],
+                        state["status"],
+                    )
+                ),
+            )
+    assert selected is not None
+    return RpcAttemptBudget(limit=limit, selected=selected)
 
 
 class _RawHistoryClient:
@@ -166,13 +195,13 @@ async def test_full_sync_adapter_status_is_read_only_and_slice_has_precise_scope
             return SimpleNamespace(messages=(), count=0, users=(), chats=())
 
     worker = FullSyncWorker(TelethonFullHistoryPageAdapter(Client()), conn, asyncio.Event(), writer=inline_writer(conn))
-    adapter = FullSyncDemandAdapter(worker)
+    adapter = FullSyncDemandAdapter(worker, account_id=123)
     changes_before = conn.total_changes
 
     assert adapter.status(500.0) is not None
     assert conn.total_changes == changes_before
 
-    budget = RpcAttemptBudget(limit=1)
+    budget = _selected_budget(adapter)
     await adapter.run_slice(budget)
     scope = observed_scopes[0]
     assert scope.demand_kind is DemandKind.FULL_SYNC_PAGE
@@ -212,8 +241,9 @@ async def test_full_history_forward_name_enrichment_keeps_entity_lookup_attribut
         asyncio.Event(),
         writer=inline_writer(conn),
     )
-    budget = RpcAttemptBudget(limit=1)
-    await FullSyncDemandAdapter(worker).run_slice(budget)
+    adapter = FullSyncDemandAdapter(worker, account_id=123)
+    budget = _selected_budget(adapter)
+    await adapter.run_slice(budget)
 
     assert observed_scopes[0].demand_kind is DemandKind.FULL_SYNC_PAGE
     assert observed_scopes[0].acquisition_kind is AcquisitionKind.FORWARD_NAME_LOOKUP
@@ -258,9 +288,10 @@ async def test_dm_enrollment_consumes_completed_publication_locally_and_idempote
     worker = FullSyncWorker(
         cast(FullHistoryPagePort, NoTelegramCalls()), conn, asyncio.Event(), writer=inline_writer(conn)
     )
-    adapter = FullSyncDmEnrollmentDemandAdapter(worker)
+    adapter = FullSyncDmEnrollmentDemandAdapter(worker, account_id=123)
     assert adapter.status(10.0) is not None
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    budget = _selected_budget(adapter)
+    await adapter.run_slice(budget)
 
     assert conn.execute(
         "SELECT dialog_id,status,read_inbox_max_id,read_outbox_max_id FROM synced_dialogs ORDER BY dialog_id"
@@ -283,7 +314,7 @@ async def test_dm_enrollment_consumes_completed_publication_locally_and_idempote
         "SELECT value FROM daemon_state WHERE key='full_sync_dm_enrollment_last_publication_generation'"
     ).fetchone() == ("1",)
     assert adapter.status(10.0) is None
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await adapter.run_slice(RpcAttemptBudget(limit=1, selected=budget.selected))
     assert conn.execute(
         "SELECT value FROM daemon_state WHERE key='full_sync_dm_enrollment_last_publication_generation'"
     ).fetchone() == ("1",)
@@ -291,7 +322,7 @@ async def test_dm_enrollment_consumes_completed_publication_locally_and_idempote
 
 def test_dm_enrollment_waits_for_a_completed_publication(conn: sqlite3.Connection) -> None:
     worker = FullSyncWorker(cast(FullHistoryPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
-    adapter = FullSyncDmEnrollmentDemandAdapter(worker)
+    adapter = FullSyncDmEnrollmentDemandAdapter(worker, account_id=123)
     assert adapter.status(10.0) is None
     conn.execute("UPDATE dialog_directory_state SET status='in_progress'")
     conn.commit()
@@ -319,8 +350,9 @@ async def test_dm_enrollment_restarts_after_interruption_without_replaying_teleg
         return original(write_conn, row, now)
 
     worker._consume_one_canonical_dm = fail_once  # type: ignore[method-assign]
+    adapter = FullSyncDmEnrollmentDemandAdapter(worker, account_id=123)
     with pytest.raises(RuntimeError, match="interrupted"):
-        await FullSyncDmEnrollmentDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_selected_budget(adapter))
     assert (
         conn.execute(
             "SELECT value FROM daemon_state WHERE key='full_sync_dm_enrollment_last_publication_generation'"
@@ -330,7 +362,7 @@ async def test_dm_enrollment_restarts_after_interruption_without_replaying_teleg
     assert conn.execute("SELECT dialog_id FROM full_history_enrollment").fetchall() == []
 
     worker._consume_one_canonical_dm = original  # type: ignore[method-assign]
-    await FullSyncDmEnrollmentDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+    await adapter.run_slice(_selected_budget(adapter))
     assert conn.execute("SELECT dialog_id FROM full_history_enrollment ORDER BY dialog_id").fetchall() == [
         (121,),
         (122,),
@@ -363,14 +395,14 @@ def test_delta_gap_status_uses_two_hour_fallback_and_immediate_explicit_refresh(
     )
     conn.commit()
     worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
-    adapter = DeltaGapFillDemandAdapter(worker)
+    adapter = DeltaGapFillDemandAdapter(worker, account_id=123)
 
     class Scanner:
         async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
             del dialog_id, message_ids
             raise AssertionError("suspended DM maintenance must not run")
 
-    dm_adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
+    dm_adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
     assert dm_adapter.status(7_300.0) is None
     changes_before = conn.total_changes
 
@@ -403,12 +435,12 @@ async def test_legacy_delta_cursor_rescans_immediately_despite_recent_check(conn
         asyncio.Event(),
         writer=inline_writer(conn),
     )
-    adapter = DeltaGapFillDemandAdapter(worker)
+    adapter = DeltaGapFillDemandAdapter(worker, account_id=123)
     changes_before = conn.total_changes
     assert adapter.status(101.0).is_ready(101.0)  # type: ignore[union-attr]
     assert conn.total_changes == changes_before
     with patch("mcp_telegram.delta_sync.time.time", return_value=101):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_selected_budget(adapter))
     assert len(requests) == 1 and requests[0].min_id == 0
     assert conn.execute(
         "SELECT delta_message_id,last_delta_checked_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
@@ -437,9 +469,9 @@ async def test_empty_delta_completion_persists_two_hour_cadence_across_restart(
         asyncio.Event(),
         writer=inline_writer(conn),
     )
-    adapter = DeltaGapFillDemandAdapter(worker)
+    adapter = DeltaGapFillDemandAdapter(worker, account_id=123)
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_selected_budget(adapter))
 
     assert conn.execute(
         "SELECT delta_refresh_requested_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id=?",
@@ -454,7 +486,8 @@ async def test_empty_delta_completion_persists_two_hour_cadence_across_restart(
                 restarted_conn,
                 asyncio.Event(),
                 writer=inline_writer(restarted_conn),
-            )
+            ),
+            account_id=123,
         )
         assert restarted.status(8199.0).release_at == 8200.0  # type: ignore[union-attr]
         assert not restarted.status(8199.0).is_ready(8199.0)  # type: ignore[union-attr]
@@ -489,8 +522,8 @@ async def test_delta_gap_slice_commits_one_page_and_keeps_durable_continuation(
         asyncio.Event(),
         writer=inline_writer(conn),
     )
-    adapter = DeltaGapFillDemandAdapter(worker)
-    budget = RpcAttemptBudget(limit=1)
+    adapter = DeltaGapFillDemandAdapter(worker, account_id=123)
+    budget = _selected_budget(adapter)
 
     await adapter.run_slice(budget)
 
@@ -508,7 +541,7 @@ async def test_delta_gap_slice_commits_one_page_and_keeps_durable_continuation(
     assert observed_scopes[0].acquisition_kind is AcquisitionKind.MESSAGE_HISTORY_PAGE
     assert observed_scopes[0].attempt_budget is budget
 
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await adapter.run_slice(_selected_budget(adapter))
     assert (
         conn.execute(
             "SELECT delta_refresh_requested_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id = ?",
@@ -539,10 +572,10 @@ async def test_delta_gap_adapter_resumes_dm_tombstone_cursor_after_restart(conn:
             return 0
 
     scanner = Scanner()
-    adapter = DmDeletionReconciliationDemandAdapter(conn, scanner, writer=inline_writer(conn))
+    adapter = DmDeletionReconciliationDemandAdapter(conn, scanner, writer=inline_writer(conn), account_id=123)
 
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_selected_budget(adapter))
     assert len(scanner.pages) == 1
     assert scanner.pages[0] == tuple(range(1, 101))
     state = cast(
@@ -550,9 +583,9 @@ async def test_delta_gap_adapter_resumes_dm_tombstone_cursor_after_restart(conn:
     )[0]
     assert '"message_cursor": 100' in state
 
-    restarted = DmDeletionReconciliationDemandAdapter(conn, scanner, writer=inline_writer(conn))
+    restarted = DmDeletionReconciliationDemandAdapter(conn, scanner, writer=inline_writer(conn), account_id=123)
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
-        await restarted.run_slice(RpcAttemptBudget(limit=1))
+        await restarted.run_slice(_selected_budget(restarted))
     assert scanner.pages[1] == (101,)
 
 
@@ -568,16 +601,18 @@ async def test_dm_empty_and_terminal_scan_persists_weekly_completion(conn: sqlit
             del dialog_id, message_ids
             raise AssertionError("empty DM history must not dispatch a lookup")
 
-    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
+    adapter = DmDeletionReconciliationDemandAdapter(
+        conn, cast(DmGapScanPage, Scanner()), writer=inline_writer(conn), account_id=123
+    )
     with patch("mcp_telegram.delta_sync.time.time", return_value=1_000):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_selected_budget(adapter))
+        await adapter.run_slice(_selected_budget(adapter))
 
     completed = _dm_reconciliation_state(conn)
     assert completed["status"] == "idle"
     assert completed["generation"] == 1
     assert completed["next_run_at"] == 605_800
-    restarted = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
+    restarted = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
     assert restarted.status(605_799).release_at == 605_800  # type: ignore[union-attr]
     assert not restarted.status(605_799).is_ready(605_799)  # type: ignore[union-attr]
     assert restarted.status(605_800).is_ready(605_800)  # type: ignore[union-attr]
@@ -606,18 +641,18 @@ async def test_delta_gap_tombstone_cursor_does_not_skip_after_earlier_dialog_is_
             return 0
 
     scanner = Scanner()
-    adapter = DmDeletionReconciliationDemandAdapter(conn, scanner, writer=inline_writer(conn))
+    adapter = DmDeletionReconciliationDemandAdapter(conn, scanner, writer=inline_writer(conn), account_id=123)
 
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_selected_budget(adapter))
+        await adapter.run_slice(_selected_budget(adapter))
     assert scanner.dialog_ids == [203]
 
     conn.execute("DELETE FROM synced_dialogs WHERE dialog_id=203")
     conn.commit()
-    restarted = DmDeletionReconciliationDemandAdapter(conn, scanner, writer=inline_writer(conn))
+    restarted = DmDeletionReconciliationDemandAdapter(conn, scanner, writer=inline_writer(conn), account_id=123)
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
-        await restarted.run_slice(RpcAttemptBudget(limit=1))
+        await restarted.run_slice(_selected_budget(restarted))
 
     assert scanner.dialog_ids == [203, 204]
     raw_state = cast(
@@ -656,9 +691,9 @@ async def test_dm_gap_scan_clears_removed_dialog_message_cursor_for_next_dialog(
             observed.append((dialog_id, tuple(message_ids)))
             return 0
 
-    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
     with patch("mcp_telegram.delta_sync.time.time", return_value=1_000):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_selected_budget(adapter))
 
     assert observed == [(next_dialog_id, (1,))]
     assert _dm_reconciliation_state(conn)["dialog_id_cursor"] == next_dialog_id
@@ -716,11 +751,11 @@ async def test_prepare_quarantines_legacy_running_checkpoint_without_advancing_i
         "state_changed_at": 200,
     }
 
-    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
     for now in (200, 1_000, 1_000_000):
         assert adapter.status(float(now)) is None
         with patch("mcp_telegram.delta_sync.time.time", return_value=now):
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
+            await adapter.run_slice(_selected_budget(adapter))
         prepare_dm_deletion_reconciliation(conn, now=now + 1)
     assert calls == []
     assert _dm_reconciliation_state(conn)["message_cursor"] == original["message_cursor"]
@@ -737,17 +772,17 @@ async def test_dm_throttle_suspends_generation_and_never_retries_page(conn: sqli
             calls.append(tuple(message_ids))
             raise TelegramRpcThrottled(retry_after_seconds=22)
 
-    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
     with patch("mcp_telegram.delta_sync.time.time", return_value=1_000):
         with pytest.raises(TelegramRpcThrottled):
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
+            await adapter.run_slice(_selected_budget(adapter))
     assert _dm_reconciliation_state(conn)["status"] == "suspended"
     assert _dm_reconciliation_state(conn)["reason"] == "account_throttle"
     assert _dm_reconciliation_state(conn)["message_cursor"] == 0
     for now in (1_023, 1_000_000):
         assert adapter.status(float(now)) is None
         with patch("mcp_telegram.delta_sync.time.time", return_value=now):
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
+            await adapter.run_slice(_selected_budget(adapter))
     prepare_dm_deletion_reconciliation(conn, now=2_000_000)
     assert calls == [(1,)]
     assert conn.execute("SELECT is_deleted FROM messages WHERE dialog_id=211 AND message_id=1").fetchone() == (0,)
@@ -795,8 +830,8 @@ async def test_dm_typed_deferrals_restore_only_with_zero_dispatch_evidence(
                     raise RpcAdmissionExpiredError(scope, "expired")
                 raise RpcAdmissionSaturatedError(scope, "saturated")
 
-    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
-    budget = RpcAttemptBudget(limit=1)
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
+    budget = _selected_budget(adapter)
     with patch("mcp_telegram.delta_sync.time.time", return_value=1_000):
         with pytest.raises(failure_type):
             await adapter.run_slice(budget)
@@ -850,11 +885,11 @@ async def test_dm_restore_write_failure_keeps_claim_blocked(conn: sqlite3.Connec
            BEGIN SELECT RAISE(ABORT, 'injected DM restore failure'); END"""
     )
     conn.commit()
-    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
 
     with patch("mcp_telegram.delta_sync.time.time", return_value=1_000):
         with pytest.raises(TelegramRpcAdmissionDeferred):
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
+            await adapter.run_slice(_selected_budget(adapter))
 
     assert _dm_reconciliation_state(conn)["status"] == "verifying"
     assert adapter.status(1_000_000) is None
@@ -875,8 +910,8 @@ async def test_dm_admission_deferral_after_nested_dispatch_stays_claimed(conn: s
             current_demand_token().attempt_evidence.record_dispatch()
             raise TelegramRpcAdmissionDeferred(retry_after_seconds=3)
 
-    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
-    budget = RpcAttemptBudget(limit=1)
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
+    budget = _selected_budget(adapter)
     with patch("mcp_telegram.delta_sync.time.time", return_value=1_000):
         with pytest.raises(TelegramRpcAdmissionDeferred):
             await adapter.run_slice(budget)
@@ -912,10 +947,10 @@ async def test_dm_missing_or_wrong_demand_identity_stays_claimed(
             with task_demand_context(DemandKind.DELTA_GAP_FILL) as token:
                 yield token
 
-    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
-    with patch("mcp_telegram.delta_sync.demand_context", invalid_identity):
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
+    with patch("mcp_telegram.delta_sync.durable_demand_context", invalid_identity):
         with pytest.raises(DmGapScanStateError):
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
+            await adapter.run_slice(_selected_budget(adapter))
 
     assert calls == 0
     assert _dm_reconciliation_state(conn)["status"] == "verifying"
@@ -942,20 +977,20 @@ async def test_dm_claim_write_failure_prevents_scanner_dispatch(conn: sqlite3.Co
            BEGIN SELECT RAISE(ABORT, 'injected DM claim failure'); END"""
     )
     conn.commit()
-    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
 
     for now in (1_000, 1_001):
         with patch("mcp_telegram.delta_sync.time.time", return_value=now):
             with pytest.raises(sqlite3.IntegrityError, match="injected DM claim failure"):
-                await adapter.run_slice(RpcAttemptBudget(limit=1))
+                await adapter.run_slice(_selected_budget(adapter))
 
     assert calls == 0
     assert _dm_reconciliation_state(conn)["status"] == "running"
     conn.execute("DROP TRIGGER fail_dm_claim")
     conn.commit()
-    restarted = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
+    restarted = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
     with patch("mcp_telegram.delta_sync.time.time", return_value=1_001):
-        await restarted.run_slice(RpcAttemptBudget(limit=1))
+        await restarted.run_slice(_selected_budget(restarted))
     assert calls == 1
     assert _dm_reconciliation_state(conn)["status"] == "running"
     assert _dm_reconciliation_state(conn)["message_cursor"] == 1
@@ -975,7 +1010,7 @@ async def test_dm_claim_commit_then_error_remains_blocked_after_reconstruction(
             calls += 1
             return 0
 
-    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
     claim = adapter._claim_page
 
     def commit_then_error(write_conn: sqlite3.Connection, state: object, now: int) -> object:
@@ -985,16 +1020,16 @@ async def test_dm_claim_commit_then_error_remains_blocked_after_reconstruction(
     with patch.object(adapter, "_claim_page", side_effect=commit_then_error):
         with patch("mcp_telegram.delta_sync.time.time", return_value=1_000):
             with pytest.raises(sqlite3.OperationalError, match="injected post-claim error"):
-                await adapter.run_slice(RpcAttemptBudget(limit=1))
+                await adapter.run_slice(_selected_budget(adapter))
 
     assert calls == 0
     assert _dm_reconciliation_state(conn)["status"] == "verifying"
-    reconstructed = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
+    reconstructed = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
     assert reconstructed.status(1_000_000) is None
     prepare_dm_deletion_reconciliation(conn, now=2_000)
     assert _dm_reconciliation_state(conn)["status"] == "suspended"
     assert _dm_reconciliation_state(conn)["reason"] == "interrupted"
-    await reconstructed.run_slice(RpcAttemptBudget(limit=1))
+    await reconstructed.run_slice(_selected_budget(reconstructed))
     assert calls == 0
 
 
@@ -1017,11 +1052,11 @@ async def test_dm_throttle_remains_claimed_when_suspension_write_fails(conn: sql
            BEGIN SELECT RAISE(ABORT, 'injected DM suspend failure'); END"""
     )
     conn.commit()
-    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
 
     with patch("mcp_telegram.delta_sync.time.time", return_value=1_000):
         with pytest.raises(TelegramRpcThrottled):
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
+            await adapter.run_slice(_selected_budget(adapter))
 
     assert calls == 1
     assert _dm_reconciliation_state(conn)["status"] == "verifying"
@@ -1044,14 +1079,14 @@ async def test_dm_unknown_failure_stays_verifying_until_startup_quarantines_it(c
             calls += 1
             raise RuntimeError("unknown page outcome")
 
-    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
     with patch("mcp_telegram.delta_sync.time.time", return_value=1_000):
         with pytest.raises(RuntimeError, match="unknown page outcome"):
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
+            await adapter.run_slice(_selected_budget(adapter))
     assert _dm_reconciliation_state(conn)["status"] == "verifying"
     assert adapter.status(1_000.0) is None
     with patch("mcp_telegram.delta_sync.time.time", return_value=2_000):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_selected_budget(adapter))
     prepare_dm_deletion_reconciliation(conn, now=2_001)
     assert _dm_reconciliation_state(conn)["status"] == "suspended"
     assert _dm_reconciliation_state(conn)["reason"] == "interrupted"
@@ -1077,10 +1112,10 @@ async def test_dm_success_before_cursor_commit_failure_stays_claimed(conn: sqlit
            BEGIN SELECT RAISE(ABORT, 'injected cursor commit failure'); END"""
     )
     conn.commit()
-    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
     with patch("mcp_telegram.delta_sync.time.time", return_value=1_000):
         with pytest.raises(sqlite3.IntegrityError, match="injected cursor commit failure"):
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
+            await adapter.run_slice(_selected_budget(adapter))
     assert calls == 1
     assert _dm_reconciliation_state(conn)["status"] == "verifying"
     assert _dm_reconciliation_state(conn)["message_cursor"] == 0
@@ -1100,9 +1135,11 @@ def test_prepare_fails_closed_on_corrupt_dm_scan_state(conn: sqlite3.Connection)
     prepare_dm_deletion_reconciliation(conn, now=100)
     assert conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone() == (original,)
     assert (
-        DmDeletionReconciliationDemandAdapter(conn, cast(object, None), writer=inline_writer(conn)).status(100.0)  # type: ignore[arg-type]
+        DmDeletionReconciliationDemandAdapter(
+            conn, cast(DmGapScanPage, None), writer=inline_writer(conn), account_id=123
+        ).status(100.0)
         is None
-    )  # type: ignore[arg-type]
+    )
 
 
 @pytest.mark.asyncio
@@ -1134,9 +1171,8 @@ async def test_invalid_dm_checkpoint_stays_raw_and_blocks_all_pages(
         conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone(),
     )
     prepare_dm_deletion_reconciliation(conn, now=500)
-    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
     assert adapter.status(10_000_000.0) is None
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
     assert calls == 0
     assert conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone() == before
 
@@ -1152,7 +1188,7 @@ def test_dm_checkpoint_sql_read_failure_is_not_contained_as_metadata(conn: sqlit
             del dialog_id, message_ids
             return 0
 
-    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn))
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
     with pytest.raises(sqlite3.OperationalError):
         adapter.status(500.0)
 
@@ -1196,28 +1232,25 @@ async def test_delta_gap_adapter_propagates_coordinator_outcomes_without_checkpo
             conn,
             asyncio.Event(),
             writer=inline_writer(conn),
-        )
+        ),
+        account_id=123,
     )
 
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
         if failure_type is RPCError:
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
+            await adapter.run_slice(_selected_budget(adapter))
         else:
             with pytest.raises(failure_type):
-                await adapter.run_slice(RpcAttemptBudget(limit=1))
+                await adapter.run_slice(_selected_budget(adapter))
     assert conn.execute(
         "SELECT delta_refresh_requested_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id=?",
         (dialog_id,),
     ).fetchone() == (1, None)
     if failure_type is RPCError:
         assert conn.execute("SELECT delta_retry_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
-            1060,
+            None,
         )
-        assert not adapter.status(1000.0).is_ready(1000.0)  # type: ignore[union-attr]
-        restarted = DeltaGapFillDemandAdapter(
-            DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
-        )
-        assert restarted.status(1060.0).is_ready(1060.0)  # type: ignore[union-attr]
+        assert adapter.status(1000.0).is_ready(1000.0)  # type: ignore[union-attr]
     else:
         assert conn.execute("SELECT delta_retry_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
             None,
@@ -1249,25 +1282,23 @@ async def test_full_sync_total_repair_uses_durable_retry_boundary(conn: sqlite3.
         total_messages_probe=TelethonHistoryAccessProbe(client),
         writer=inline_writer(conn),
     )
-    adapter = FullSyncDemandAdapter(worker)
+    adapter = FullSyncDemandAdapter(worker, account_id=123)
     with patch("mcp_telegram.sync_worker.time.time", return_value=1000):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_selected_budget(adapter))
     assert calls == 1
     assert conn.execute(
         "SELECT full_sync_retry_at,total_messages FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
-    ).fetchone() == (1060, None)
+    ).fetchone() == (None, None)
     assert (
         conn.execute("SELECT value FROM daemon_state WHERE key='full_sync_total_messages_repair_retry_at'").fetchone()
         is None
     )
 
     with patch("mcp_telegram.sync_worker.time.time", return_value=1001):
-        assert adapter.status(1001.0).release_at == 1060.0  # type: ignore[union-attr]
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
-    assert calls == 1
+        assert adapter.status(1001.0).is_ready(1001.0)  # type: ignore[union-attr]
+        await adapter.run_slice(_selected_budget(adapter))
+    assert calls == 2
 
-    with patch("mcp_telegram.sync_worker.time.time", return_value=1060):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
     assert calls == 2
     assert conn.execute("SELECT total_messages FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (17,)
 
@@ -1290,7 +1321,8 @@ async def test_full_sync_total_repair_persists_access_loss_reason(conn: sqlite3.
         writer=inline_writer(conn),
     )
 
-    await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+    adapter = FullSyncDemandAdapter(worker, account_id=123)
+    await adapter.run_slice(_selected_budget(adapter))
 
     assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
         "access_lost",
@@ -1312,15 +1344,16 @@ async def test_full_sync_page_adapter_defers_failed_peer_and_preserves_progress(
 
     client = _RawHistoryClient(get_messages)
     adapter = FullSyncDemandAdapter(
-        FullSyncWorker(TelethonFullHistoryPageAdapter(client), conn, asyncio.Event(), writer=inline_writer(conn))
+        FullSyncWorker(TelethonFullHistoryPageAdapter(client), conn, asyncio.Event(), writer=inline_writer(conn)),
+        account_id=123,
     )
     with patch("mcp_telegram.sync_worker.time.time", return_value=1000):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_selected_budget(adapter))
     assert conn.execute("SELECT full_sync_retry_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
-        1060,
+        None,
     )
     with patch("mcp_telegram.sync_worker.time.time", return_value=1001):
-        assert not adapter.status(1001.0).is_ready(1001.0)  # type: ignore[union-attr]
+        assert adapter.status(1001.0).is_ready(1001.0)  # type: ignore[union-attr]
     assert conn.execute(
         "SELECT status, sync_progress FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
     ).fetchone() == (
@@ -1339,14 +1372,11 @@ async def test_full_sync_page_adapter_defers_to_coordinator_without_local_sleep(
 
     client = _RawHistoryClient(get_messages)
     adapter = FullSyncDemandAdapter(
-        FullSyncWorker(TelethonFullHistoryPageAdapter(client), conn, asyncio.Event(), writer=inline_writer(conn))
+        FullSyncWorker(TelethonFullHistoryPageAdapter(client), conn, asyncio.Event(), writer=inline_writer(conn)),
+        account_id=123,
     )
-    with (
-        patch("mcp_telegram.sync_worker.sleep_through_flood", new=AsyncMock()) as sleep,
-        pytest.raises(TelegramRpcAdmissionDeferred),
-    ):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
-    sleep.assert_not_awaited()
+    with pytest.raises(TelegramRpcAdmissionDeferred):
+        await adapter.run_slice(_selected_budget(adapter))
 
 
 @pytest.mark.asyncio
@@ -1366,12 +1396,12 @@ async def test_access_probe_adapter_restores_non_enrolled_peer_with_precise_scop
 
     client = SimpleNamespace(get_messages=get_messages)
     worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
-    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), TelethonHistoryAccessProbe(client))
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), TelethonHistoryAccessProbe(client), account_id=123)
     changes_before = conn.total_changes
 
     assert adapter.status(500.0).release_at == 101.0  # type: ignore[union-attr]
     assert conn.total_changes == changes_before
-    budget = RpcAttemptBudget(limit=1)
+    budget = _selected_budget(adapter)
     await adapter.run_slice(budget)
 
     assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone() != (
@@ -1383,7 +1413,7 @@ async def test_access_probe_adapter_restores_non_enrolled_peer_with_precise_scop
 
 
 @pytest.mark.asyncio
-async def test_access_probe_adapter_persists_probe_to_gap_fill_handoff(conn: sqlite3.Connection) -> None:
+async def test_access_probe_adapter_persists_probe_to_gap_fill_handoff(conn: sqlite3.Connection) -> None:  # noqa: PLR0914
     dialog_id = 302
     conn.execute(
         "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at) VALUES (?, 'access_lost', 1)",
@@ -1392,16 +1422,19 @@ async def test_access_probe_adapter_persists_probe_to_gap_fill_handoff(conn: sql
     seed_full_history_enrollment(conn, dialog_id, enabled=True)
     conn.commit()
     get_messages = AsyncMock(return_value=MockTotalList([], total=12))
+    observed_roots: list[tuple[DemandKind, float]] = []
 
     async def send_history(_request: GetHistoryRequest) -> object:
+        token = current_demand_token()
+        observed_roots.append((token.kind, token.admission_deadline))
         return types.messages.Messages(messages=[], topics=[], chats=[], users=[])
 
     client = _ForwardHistoryClient(send_history)
     client.get_messages = get_messages  # type: ignore[method-assign]
     worker = DeltaSyncWorker(TelethonForwardGapPageAdapter(client), conn, asyncio.Event(), writer=inline_writer(conn))
-    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), TelethonHistoryAccessProbe(client))
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), TelethonHistoryAccessProbe(client), account_id=123)
 
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await adapter.run_slice(_selected_budget(adapter))
 
     get_messages.assert_awaited_once()
     assert conn.execute(
@@ -1419,11 +1452,27 @@ async def test_access_probe_adapter_persists_probe_to_gap_fill_handoff(conn: sql
             self.rows.append((metrics, reason))
 
     observer = Observer()
-    restarted = DeltaAccessProbeDemandAdapter(
-        worker, _delta_policy(), TelethonHistoryAccessProbe(client), observer=observer
-    )
-    await restarted.run_slice(RpcAttemptBudget(limit=1))
+    original_gap_slice = worker.fetch_delta_slice_for_dialog
+    recovery_root: list[tuple[DemandKind, float, DemandKind, float]] = []
 
+    async def observe_recovery_root(dialog_id: int, *, expected_completion_generation: int | None = None) -> int:
+        before = current_demand_token()
+        result = await original_gap_slice(dialog_id, expected_completion_generation=expected_completion_generation)
+        after = current_demand_token()
+        recovery_root.append((before.kind, before.admission_deadline, after.kind, after.admission_deadline))
+        return result
+
+    worker.fetch_delta_slice_for_dialog = observe_recovery_root
+    restarted = DeltaAccessProbeDemandAdapter(
+        worker, _delta_policy(), TelethonHistoryAccessProbe(client), account_id=123, observer=observer
+    )
+    await restarted.run_slice(_selected_budget(restarted))
+
+    assert observed_roots and all(kind is DemandKind.DELTA_ACCESS_PROBE for kind, _ in observed_roots)
+    assert len(recovery_root) == 1
+    before_kind, before_deadline, after_kind, after_deadline = recovery_root[0]
+    assert (before_kind, after_kind) == (DemandKind.DELTA_ACCESS_PROBE, DemandKind.DELTA_ACCESS_PROBE)
+    assert before_deadline == after_deadline
     assert len(observer.rows) == 1
     recovery_metrics, _ = observer.rows[0]
     assert recovery_metrics["recovery"] == recovery_metrics["recovery_completion_count"] == 1
@@ -1438,6 +1487,94 @@ async def test_access_probe_adapter_persists_probe_to_gap_fill_handoff(conn: sql
     )
     assert conn.execute("SELECT 1 FROM delta_access_recovery_state WHERE dialog_id=?", (dialog_id,)).fetchone() is None
     assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == ("syncing",)
+
+
+@pytest.mark.asyncio
+async def test_access_probe_runs_exact_excluded_sibling_and_rejects_its_stale_revision(
+    conn: sqlite3.Connection,
+) -> None:
+    dialog_ids = (-1000000401, -402)
+    for dialog_id in dialog_ids:
+        conn.execute(
+            "INSERT INTO synced_dialogs(dialog_id,status,access_lost_at) VALUES (?, 'access_lost', 1)",
+            (dialog_id,),
+        )
+        seed_full_history_enrollment(conn, dialog_id, enabled=True)
+    conn.commit()
+    calls: list[int] = []
+
+    class Probe:
+        async def probe_total_messages(self, dialog_id: int) -> int | None:
+            calls.append(dialog_id)
+            return 10
+
+    worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), Probe(), account_id=123)
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
+        first = adapter.status(1000.0)
+        assert first is not None and first.selected is not None
+        selected = adapter.status(1000.0, excluded=frozenset({first.selected}))
+        assert selected is not None and selected.selected is not None
+        assert selected.selected.key.target == "probe:-402"
+        conn.execute("UPDATE synced_dialogs SET access_lost_at=2 WHERE dialog_id=-402")
+        conn.commit()
+        outcome = await adapter.run_slice(RpcAttemptBudget(limit=1, selected=selected.selected))
+        assert outcome.kind is SliceOutcomeKind.STALE
+        assert calls == []
+
+        conn.execute("UPDATE synced_dialogs SET access_lost_at=1 WHERE dialog_id=-402")
+        conn.commit()
+        fresh = adapter.status(1000.0, excluded=frozenset({first.selected}))
+        assert fresh is not None and fresh.selected is not None
+        await adapter.run_slice(RpcAttemptBudget(limit=1, selected=fresh.selected))
+
+    assert calls == [-402]
+    assert conn.execute("SELECT total_messages FROM delta_access_recovery_state WHERE dialog_id=-402").fetchone() == (
+        10,
+    )
+    assert conn.execute("SELECT 1 FROM delta_access_recovery_state WHERE dialog_id=-1000000401").fetchone() is None
+
+
+@pytest.mark.asyncio
+async def test_access_recovery_runs_exact_excluded_sibling(conn: sqlite3.Connection) -> None:
+    for dialog_id in (411, 412):
+        conn.execute(
+            "INSERT INTO synced_dialogs(dialog_id,status,access_lost_at) VALUES (?, 'access_lost', 1)",
+            (dialog_id,),
+        )
+        seed_full_history_enrollment(conn, dialog_id, enabled=True)
+        conn.execute(
+            "INSERT INTO delta_access_recovery_state"
+            "(dialog_id,stage,total_messages,probe_succeeded_at,retry_at,updated_at) "
+            "VALUES (?, 'gap_fill', 5, 10, NULL, 10)",
+            (dialog_id,),
+        )
+    conn.commit()
+    worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
+
+    class Probe:
+        async def probe_total_messages(self, dialog_id: int) -> int | None:
+            del dialog_id
+            raise AssertionError("recovery slice must not probe")
+
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), Probe(), account_id=123)
+    recovered: list[int] = []
+
+    async def run_exact_recovery(_budget: RpcAttemptBudget, recovery: _DurableAccessRecovery) -> str:
+        recovered.append(recovery.dialog_id)
+        return "successor"
+
+    adapter._run_observed_recovery_slice = run_exact_recovery  # type: ignore[method-assign]
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
+        first = adapter.status(1000.0)
+        assert first is not None and first.selected is not None
+        selected = adapter.status(1000.0, excluded=frozenset({first.selected}))
+        assert selected is not None and selected.selected is not None
+        assert selected.selected.key.target == "recovery:412"
+        outcome = await adapter.run_slice(RpcAttemptBudget(limit=1, selected=selected.selected))
+
+    assert outcome.kind is SliceOutcomeKind.PROGRESSED
+    assert recovered == [412]
 
 
 @pytest.mark.asyncio
@@ -1465,8 +1602,8 @@ async def test_recovery_query_failure_does_not_reuse_prior_slice_metrics(conn: s
             self.rows.append((metrics, reason))
 
     observer = Observer()
-    scheduled = DeltaGapFillDemandAdapter(worker, observer=observer)
-    await scheduled.run_slice(RpcAttemptBudget(limit=1))
+    scheduled = DeltaGapFillDemandAdapter(worker, observer=observer, account_id=123)
+    await scheduled.run_slice(_selected_budget(scheduled))
     assert observer.rows[-1][0]["new_key_count"] == 7
 
     conn.execute("UPDATE synced_dialogs SET status='access_lost' WHERE dialog_id=?", (dialog_id,))
@@ -1476,11 +1613,13 @@ async def test_recovery_query_failure_does_not_reuse_prior_slice_metrics(conn: s
         (dialog_id,),
     )
     conn.commit()
-    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), TelethonHistoryAccessProbe(client), observer)
+    adapter = DeltaAccessProbeDemandAdapter(
+        worker, _delta_policy(), TelethonHistoryAccessProbe(client), account_id=123, observer=observer
+    )
 
     with patch("mcp_telegram.delta_sync.full_history_enabled", side_effect=RuntimeError("lookup failed")):
         with pytest.raises(RuntimeError, match="lookup failed"):
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
+            await adapter.run_slice(_selected_budget(adapter))
 
     metrics, reason = observer.rows[-1]
     assert reason == "error"
@@ -1515,9 +1654,9 @@ async def test_non_enrolled_recovery_is_observed_as_skipped_not_terminal(conn: s
 
     observer = Observer()
     worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
-    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), Probe(), observer)
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), Probe(), account_id=123, observer=observer)
 
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await adapter.run_slice(_selected_budget(adapter))
 
     assert len(observer.rows) == 1
     metrics, reason = observer.rows[0]
@@ -1578,14 +1717,14 @@ async def test_access_recovery_retains_local_flood_retry_and_observes_budget_def
 
     observer = Observer()
     worker = DeltaSyncWorker(cast(ForwardGapPagePort, HistoryPort()), conn, asyncio.Event(), writer=inline_writer(conn))
-    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), Probe(), observer=observer)
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), Probe(), account_id=123, observer=observer)
 
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
         if raises:
             with pytest.raises(RpcAttemptBudgetExhaustedError):
-                await adapter.run_slice(RpcAttemptBudget(limit=1))
+                await adapter.run_slice(_selected_budget(adapter))
         else:
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
+            await adapter.run_slice(_selected_budget(adapter))
 
     assert conn.execute(
         "SELECT retry_at FROM delta_access_recovery_state WHERE dialog_id=?", (dialog_id,)
@@ -1636,10 +1775,10 @@ async def test_access_probe_slice_records_retry_policy_for_probe_outcomes(
     get_messages.side_effect = fail
     client = SimpleNamespace(get_messages=get_messages)
     worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
-    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), TelethonHistoryAccessProbe(client))
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), TelethonHistoryAccessProbe(client), account_id=123)
 
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_selected_budget(adapter))
 
     assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
         "access_lost",
@@ -1666,11 +1805,11 @@ async def test_access_probe_propagates_admission_failure_without_retry_boundary(
             raise RpcAdmissionExpiredError(current_rpc_scope(), "probe deadline elapsed")
 
     worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
-    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), AdmissionFailureProbe())
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), AdmissionFailureProbe(), account_id=123)
 
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
         with pytest.raises((RpcAdmissionSaturatedError, RpcAdmissionExpiredError)):
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
+            await adapter.run_slice(_selected_budget(adapter))
 
     assert conn.execute(
         "SELECT access_next_revalidate_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
@@ -1688,11 +1827,11 @@ async def test_access_probe_propagates_exhausted_slice_budget(conn: sqlite3.Conn
             raise RpcAttemptBudgetExhaustedError("slice attempt budget exhausted")
 
     worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
-    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), ExhaustedProbe())
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), ExhaustedProbe(), account_id=123)
 
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
         with pytest.raises(RpcAttemptBudgetExhaustedError):
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
+            await adapter.run_slice(_selected_budget(adapter))
 
     assert conn.execute(
         "SELECT access_next_revalidate_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
@@ -1727,11 +1866,11 @@ async def test_dialog_light_adapter_clears_one_durable_dirty_flag(conn: sqlite3.
     worker = DialogReconciliationWorker(
         SimpleNamespace(get_entity=get_entity), conn, asyncio.Event(), writer=inline_writer(conn)
     )
-    adapter = DialogLightReconciliationDemandAdapter(worker)
+    adapter = DialogLightReconciliationDemandAdapter(worker, account_id=123)
     changes_before = conn.total_changes
     assert adapter.status(10.0) is not None
     assert conn.total_changes == changes_before
-    budget = RpcAttemptBudget(limit=8)
+    budget = _selected_budget(adapter, limit=8)
 
     await adapter.run_slice(budget)
 
@@ -1739,3 +1878,12 @@ async def test_dialog_light_adapter_clears_one_durable_dirty_flag(conn: sqlite3.
     assert observed_scopes[0].demand_kind is DemandKind.DIALOG_LIGHT_RECONCILIATION
     assert observed_scopes[0].acquisition_kind is AcquisitionKind.ENTITY_LOOKUP
     assert observed_scopes[0].attempt_budget is budget
+
+
+@pytest.mark.asyncio
+async def test_dialog_light_refresh_treats_deleted_row_as_stale(conn: sqlite3.Connection) -> None:
+    worker = DialogReconciliationWorker(
+        SimpleNamespace(get_entity=AsyncMock()), conn, asyncio.Event(), writer=inline_writer(conn)
+    )
+
+    assert await worker._refresh_light_dialog(999999) == (False, None)

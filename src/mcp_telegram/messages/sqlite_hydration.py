@@ -22,6 +22,24 @@ _SELECT_MESSAGE_MEDIA_SQL = (
 )
 
 
+def hydration_work_revision(conn: sqlite3.Connection, job: HydrationJob) -> str:
+    """Read canonical message and job business state for exact demand fencing."""
+    row = cast(
+        tuple[object, object, object, object, object] | None,
+        conn.execute(
+            "SELECT COALESCE(m.edit_date,0),COALESCE((SELECT MAX(v.version) FROM message_versions v "
+            "WHERE v.dialog_id=m.dialog_id AND v.message_id=m.message_id),0),"
+            "COALESCE(o.observation_order,0),COALESCE(o.is_deleted,0),"
+            "COALESCE((SELECT terminal FROM hydration_jobs h WHERE h.kind=? AND h.dialog_id=m.dialog_id "
+            "AND h.message_id=m.message_id),-1) "
+            "FROM messages m LEFT JOIN message_observations o USING(dialog_id,message_id) "
+            "WHERE m.dialog_id=? AND m.message_id=?",
+            (job.kind, job.dialog_id, job.message_id),
+        ).fetchone(),
+    )
+    return repr(None if row is None else tuple(row))
+
+
 def hydration_observation_current(
     conn: sqlite3.Connection, dialog_id: int, message_id: int, observation_order: int | None
 ) -> bool:

@@ -62,6 +62,7 @@ from mcp_telegram.telegram_demand import (
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
 )
+from mcp_telegram.telegram_demand_progress import WorkKey, WorkRevision
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope
 from mcp_telegram.tools.entity_info import GET_ENTITY_INFO_OUTPUT_SCHEMA, GetEntityInfo, _entity_structured_content
@@ -385,13 +386,16 @@ async def test_flood_wait_refresh_failure_signals_terminal_waiter_and_persists_r
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    with pytest.raises(TelegramRpcThrottled):
+        await EntityProfileDemandAdapter(coordinator).run_slice(
+            _select_profile_budget(service, RpcAttemptBudget(limit=1))
+        )
 
     retry_at = cast(
         tuple[int | None] | None,
         conn.execute("SELECT retry_at FROM entity_profile_refresh_state WHERE entity_id = 42").fetchone(),
     )
-    assert retry_at == (400,)
+    assert retry_at == (100,)
     stored = repo.read(42, now=100)
     assert stored is not None
     assert stored.detail["name"] == "Good"
@@ -435,6 +439,45 @@ def _test_service(
     )
     service.bind_demand_sink(MagicMock())
     return service
+
+
+def _select_profile_budget(service: DaemonEntityInfoService, budget: RpcAttemptBudget) -> RpcAttemptBudget:
+    if service._deps.full_user_auth_scope is None:
+        with write_savepoint(service._deps.conn):
+            service._deps.conn.execute(
+                "CREATE TABLE IF NOT EXISTS daemon_state(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            service._deps.conn.execute(
+                "CREATE TABLE IF NOT EXISTS entity_profile_field_observations("
+                "entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE, "
+                "field TEXT NOT NULL, owner_account_id INTEGER NOT NULL, observation_order INTEGER NOT NULL, "
+                "observed_at INTEGER NOT NULL, source TEXT NOT NULL, PRIMARY KEY(entity_id,field)) WITHOUT ROWID"
+            )
+            service._deps.conn.execute(
+                "CREATE TABLE IF NOT EXISTS entity_profile_semantic_snapshots("
+                "owner_account_id INTEGER NOT NULL, entity_id INTEGER NOT NULL, normalization_version TEXT NOT NULL, "
+                "fields_json TEXT NOT NULL DEFAULT '{}', coverage_json TEXT NOT NULL DEFAULT '{}', "
+                "provenance_json TEXT NOT NULL DEFAULT '{}', complete INTEGER NOT NULL DEFAULT 0, "
+                "observation_order INTEGER NOT NULL DEFAULT 0, observation_started_at INTEGER, "
+                "observation_completed_at INTEGER, source TEXT NOT NULL, PRIMARY KEY(owner_account_id,entity_id)) "
+                "WITHOUT ROWID"
+            )
+            detail_columns = {
+                row[1]
+                for row in cast(
+                    list[tuple[object, ...]], service._deps.conn.execute("PRAGMA table_info(entity_details)").fetchall()
+                )
+            }
+            if detail_columns and "profile_owner_account_id" not in detail_columns:
+                service._deps.conn.execute("ALTER TABLE entity_details ADD COLUMN profile_owner_account_id INTEGER")
+        service._deps = replace(
+            service._deps,
+            full_user_auth_scope=lambda: TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99),
+        )
+    status = service._durable_refresh_status(service._deps.now_provider())
+    assert status is not None and status.selected is not None
+    budget.selected = status.selected
+    return budget
 
 
 @pytest.mark.asyncio
@@ -711,7 +754,9 @@ async def test_durable_channel_adapter_publishes_linked_chat_fact_after_commit()
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     try:
-        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        await EntityProfileDemandAdapter(coordinator).run_slice(
+            _select_profile_budget(service, RpcAttemptBudget(limit=1))
+        )
         assert conn.execute(
             "SELECT linked_chat_id, linked_chat_resolved_at FROM dialogs WHERE dialog_id=-10048"
         ).fetchone() == (-1000000000777, 100)
@@ -773,7 +818,7 @@ async def test_durable_profile_publication_wakes_cold_adapter_for_local_link_enr
         observation_completed_at=100,
     )
     port = FakeChannelProfilePort(profile, overlap)
-    service = _test_service(conn, limits=RefreshLimits())
+    service = _test_service(conn, limits=RefreshLimits(), account_id=123)
     service._deps = replace(
         service._deps,
         channel_profile_port=port,
@@ -810,7 +855,9 @@ async def test_durable_profile_publication_wakes_cold_adapter_for_local_link_enr
     try:
         coordinator = service.refresh_coordinator
         assert coordinator is not None
-        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        await EntityProfileDemandAdapter(coordinator).run_slice(
+            _select_profile_budget(service, RpcAttemptBudget(limit=1))
+        )
         assert offered == [DemandKind.SCHEDULED_DISCOVERY, DemandKind.COLD_PEER_PAGE]
 
         adapter = ColdPeerPageDemandAdapter(
@@ -820,10 +867,11 @@ async def test_durable_profile_publication_wakes_cold_adapter_for_local_link_enr
             ColdBackfillPacing(ColdBackfillHistoryPacing(batch_s=0.0, enroll_s=1.0, access_retry_s=1.0)),
             writer=inline_writer(conn),
             timeout_s=1.0,
+            account_id=123,
         )
         status = adapter.status(time())
         assert status is not None and status.is_ready(time())
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(RpcAttemptBudget(limit=1, selected=status.selected))
 
         assert conn.execute(
             "SELECT source FROM activity_dialog_state WHERE dialog_id=?", (linked_chat_id,)
@@ -962,7 +1010,7 @@ async def test_durable_channel_reference_miss_commits_unavailable_without_rpc_at
     assert coordinator is not None
     budget = RpcAttemptBudget(limit=1)
 
-    await EntityProfileDemandAdapter(coordinator).run_slice(budget)
+    await EntityProfileDemandAdapter(coordinator).run_slice(_select_profile_budget(service, budget))
 
     assert provider.calls == 1
     assert budget.attempts == 0
@@ -1042,7 +1090,7 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt(re
     adapter = EntityProfileDemandAdapter(coordinator)
 
     first_budget = RpcAttemptBudget(limit=1)
-    await adapter.run_slice(first_budget)
+    await adapter.run_slice(_select_profile_budget(service, first_budget))
 
     assert first_budget.attempts == 1
     assert client.calls == ["full_user"]
@@ -1066,7 +1114,7 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt(re
     assert restarted_coordinator is not None
     restarted_adapter = EntityProfileDemandAdapter(restarted_coordinator)
     second_budget = RpcAttemptBudget(limit=1)
-    await restarted_adapter.run_slice(second_budget)
+    await restarted_adapter.run_slice(_select_profile_budget(restarted, second_budget))
 
     assert second_budget.attempts == 1
     assert client.calls == ["full_user", "common_chats"]
@@ -1074,7 +1122,7 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt(re
         "SELECT next_section, acquisition_cursor FROM entity_profile_refresh_state WHERE entity_id=42"
     ).fetchone() == ("contact_overlap", 0)
     local_budget = RpcAttemptBudget(limit=1)
-    await restarted_adapter.run_slice(local_budget)
+    await restarted_adapter.run_slice(_select_profile_budget(restarted, local_budget))
     assert local_budget.attempts == 0
     assert conn.execute("SELECT next_section FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
         "avatar_history",
@@ -1124,7 +1172,7 @@ async def test_durable_profile_adapter_checkpoints_core_resolution_before_sectio
     assert coordinator is not None
     budget = RpcAttemptBudget(limit=1)
 
-    await EntityProfileDemandAdapter(coordinator).run_slice(budget)
+    await EntityProfileDemandAdapter(coordinator).run_slice(_select_profile_budget(service, budget))
 
     assert budget.attempts == 1
     assert conn.execute("SELECT type, name FROM entities WHERE id=42").fetchone() == ("user", "Resolved")
@@ -1164,7 +1212,7 @@ async def test_durable_profile_budget_exhaustion_leaves_core_cursor_ready() -> N
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await EntityProfileDemandAdapter(coordinator).run_slice(_select_profile_budget(service, RpcAttemptBudget(limit=1)))
 
     assert conn.execute(
         "SELECT status, retry_at, next_section, acquisition_cursor FROM entity_profile_refresh_state WHERE entity_id=42"
@@ -1199,21 +1247,13 @@ async def test_entity_info_entrypoint_returns_local_facts_without_rpc_scope() ->
 @pytest.mark.asyncio
 async def test_entity_profile_adapter_sets_bounded_rpc_scope() -> None:
     conn = sqlite3.connect(":memory:")
-    with write_savepoint(conn):
-        conn.execute(
-            "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-            "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-        )
-    with write_savepoint(conn):
-        conn.execute(
-            "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-        )
-    _sections_schema(conn)
+    _apply_migrations(conn)
+    conn.commit()
     with write_savepoint(conn):
         conn.execute("INSERT INTO entities VALUES (42, 'user', 'Known', 'known', NULL, 1)")
     EntityProfileRepository(conn, section_ttl_seconds=300).mark_pending(42, now=100)
     limits = RefreshLimits(foreground_resolve_seconds=0.01, per_rpc_seconds=0.02, whole_refresh_seconds=0.05)
-    service = _test_service(conn, limits=limits)
+    service = _test_service(conn, limits=limits, account_id=42)
     observed: list[
         tuple[TelegramRpcSource, float | None, asyncio.Task[object] | None, DemandKind, AcquisitionKind]
     ] = []
@@ -1237,7 +1277,7 @@ async def test_entity_profile_adapter_sets_bounded_rpc_scope() -> None:
     )
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await EntityProfileDemandAdapter(coordinator).run_slice(_select_profile_budget(service, RpcAttemptBudget(limit=1)))
 
     source, deadline, owner_task, demand_kind, acquisition_kind = observed[0]
     assert source is TelegramRpcSource.ENTITY_INFO_REFRESH
@@ -1284,11 +1324,13 @@ async def test_refresh_resolution_preserves_success_and_failure_semantics() -> N
     cursor = service._profiles.next_due_refresh(now=100)
     assert cursor is not None
     assert await service._acquire_durable_refresh_core(cursor, now=100) is DurableRefreshTerminal.FAILURE
-    assert service._profiles.refresh_state(42, now=100) == {
-        "status": "failed",
-        "retry_at": 400,
-        "reason": "flood_wait",
-    }
+    assert conn.execute(
+        "SELECT status, retry_at, reason FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone() == (
+        "failed",
+        100,
+        "flood_wait",
+    )
     await service.shutdown()
     conn.close()
 
@@ -1334,10 +1376,12 @@ async def test_durable_enrichment_timeout_persists_retry_without_traceback(caplo
     assert coordinator is not None
     try:
         with caplog.at_level(logging.WARNING):
-            await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+            await EntityProfileDemandAdapter(coordinator).run_slice(
+                _select_profile_budget(service, RpcAttemptBudget(limit=1))
+            )
         assert conn.execute(
             "SELECT status, reason, retry_at FROM entity_detail_sections WHERE entity_id=42 AND section='common_chats'"
-        ).fetchone() == ("unavailable", "timeouterror", 160)
+        ).fetchone() == ("unavailable", "timeouterror", 100)
         assert all(not record.exc_info for record in caplog.records)
     finally:
         await service.shutdown()
@@ -1415,7 +1459,9 @@ async def test_partial_detail_uses_canonical_identity_and_skips_core_resolution(
         coordinator = service.refresh_coordinator
         assert coordinator is not None
         assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
-        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        await EntityProfileDemandAdapter(coordinator).run_slice(
+            _select_profile_budget(service, RpcAttemptBudget(limit=1))
+        )
 
         assert resolved_calls == []
         cursor = repo.next_due_refresh(now=100)
@@ -1549,7 +1595,9 @@ async def test_production_schema_core_write_syncs_revision_before_next_section_a
         coordinator = service.refresh_coordinator
         assert coordinator is not None
         assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
-        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        await EntityProfileDemandAdapter(coordinator).run_slice(
+            _select_profile_budget(service, RpcAttemptBudget(limit=1))
+        )
         assert core_calls == 1
         assert conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone() == (1,)
         assert conn.execute(
@@ -1558,7 +1606,9 @@ async def test_production_schema_core_write_syncs_revision_before_next_section_a
         coordinator.signal_terminal(DurableRefreshSliceResult(42, DurableRefreshTerminal.SUCCESS))
 
         assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
-        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        await EntityProfileDemandAdapter(coordinator).run_slice(
+            _select_profile_budget(service, RpcAttemptBudget(limit=1))
+        )
         assert core_calls == 1
         cursor = service._profiles.next_due_refresh(now=100)
         assert cursor is not None
@@ -1584,7 +1634,9 @@ async def test_production_schema_core_write_syncs_revision_before_next_section_a
         coordinator = reopened_service.refresh_coordinator
         assert coordinator is not None
         assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
-        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        await EntityProfileDemandAdapter(coordinator).run_slice(
+            _select_profile_budget(reopened_service, RpcAttemptBudget(limit=1))
+        )
         cursor = reopened_service._profiles.next_due_refresh(now=100)
         assert cursor is not None
         assert cursor.next_section == "contact_overlap"
@@ -1702,12 +1754,13 @@ async def test_durable_unknown_core_timeout_retains_cursor_and_retry_resolves_id
     assert coordinator is not None
     adapter = EntityProfileDemandAdapter(coordinator)
     try:
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
-        assert service._profiles.next_due_refresh(now=100) is None
+        await adapter.run_slice(_select_profile_budget(service, RpcAttemptBudget(limit=1)))
+        due = service._profiles.next_due_refresh(now=100)
+        assert due is not None and due.retry_at == 100
         due = service._profiles.next_due_refresh(now=160)
         assert due is not None and due.acquisition_cursor == 0
         service._deps = replace(service._deps, now_provider=lambda: 160.0)
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_select_profile_budget(service, RpcAttemptBudget(limit=1)))
         assert conn.execute("SELECT type,name FROM entities WHERE id=42").fetchone() == ("user", "Known")
         assert client.calls == 2
     finally:
@@ -1733,11 +1786,14 @@ async def test_durable_unknown_core_flood_wait_does_not_invent_identity(request:
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     try:
-        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        with pytest.raises(TelegramRpcThrottled):
+            await EntityProfileDemandAdapter(coordinator).run_slice(
+                _select_profile_budget(service, RpcAttemptBudget(limit=1))
+            )
         assert conn.execute("SELECT type,name FROM entities WHERE id=42").fetchone() is None
         assert conn.execute(
             "SELECT status,retry_at,reason FROM entity_profile_refresh_state WHERE entity_id=42"
-        ).fetchone() == ("failed", 400, "flood_wait")
+        ).fetchone() == ("failed", 100, "flood_wait")
     finally:
         await service.shutdown()
         conn.close()
@@ -1889,7 +1945,9 @@ async def test_durable_terminal_resolution_failure_does_not_make_local_read_retr
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     try:
-        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        await EntityProfileDemandAdapter(coordinator).run_slice(
+            _select_profile_budget(service, RpcAttemptBudget(limit=1))
+        )
         assert conn.execute("SELECT status,reason FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
             "rejected",
             "entity_not_found",
@@ -2013,9 +2071,13 @@ async def test_configured_whole_refresh_timeout_bounds_non_rpc_callback() -> Non
             cancelled.set()
         return None
 
-    coordinator.bind_durable_executor(lambda now: DemandStatus(0), slow_slice)
+    coordinator.bind_durable_executor(lambda now, excluded: DemandStatus(0, selected=budget.selected), slow_slice)
+    budget = RpcAttemptBudget(
+        limit=1,
+        selected=WorkRevision(WorkKey(DemandKind.ENTITY_PROFILE_REFRESH, 42, "42"), "test"),
+    )
     with pytest.raises(TimeoutError):
-        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        await EntityProfileDemandAdapter(coordinator).run_slice(budget)
     assert cancelled.is_set()
     assert not coordinator.is_closed
     await coordinator.shutdown()
@@ -2052,8 +2114,9 @@ async def test_entity_acquisition_timeout_persists_retry_and_keeps_cursor(known:
     assert before is not None
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
-    assert service._profiles.next_due_refresh(now=100) is None
+    await EntityProfileDemandAdapter(coordinator).run_slice(_select_profile_budget(service, RpcAttemptBudget(limit=1)))
+    retried_now = service._profiles.next_due_refresh(now=100)
+    assert retried_now is not None and retried_now.retry_at == 100
     retried = service._profiles.next_due_refresh(now=160)
     assert retried is not None
     assert (retried.entity_id, retried.next_section, retried.acquisition_cursor) == (

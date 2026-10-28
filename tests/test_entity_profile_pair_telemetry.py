@@ -11,7 +11,7 @@ from mcp_telegram.entity_profile.contracts import ProfileAcquisitionEvidence
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.entity_profile.repository import EntitySectionCommit, pair_readiness_latency_ms
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
-from mcp_telegram.telegram_demand import RpcAttemptBudget
+from tests.demand_adapter_helpers import run_ready_slice
 from tests.test_entity_profile_full_user_pair import _PairClient, _prepare
 
 
@@ -130,7 +130,7 @@ async def test_profile_observation_runs_after_pair_commit(tmp_path: Path) -> Non
     service._deps = replace(service._deps, profile_observer=_Observer())  # type: ignore[attr-defined]
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     assert rows == [
         ("avatar_history", "pending"),
         ("common_chats", "pending"),
@@ -157,7 +157,7 @@ async def test_broken_profile_observer_does_not_change_pair_commit(tmp_path: Pat
     service._deps = replace(service._deps, profile_observer=_BrokenObserver())  # type: ignore[attr-defined]
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     assert conn.execute(
         "SELECT status FROM entity_detail_sections WHERE entity_id=42 AND section='full_profile'"
     ).fetchone() == ("fresh",)

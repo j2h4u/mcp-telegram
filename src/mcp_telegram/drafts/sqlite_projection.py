@@ -301,7 +301,12 @@ class SQLiteDraftProjection:
                     revision=changed_revision,
                     decision="snapshot_scope_uncertain",
                 )
-            return DraftApplyResult(accepted=True, revision=changed_revision, decision="authoritative")
+            return DraftApplyResult(
+                accepted=True,
+                revision=changed_revision,
+                decision="authoritative",
+                work_revision=repr(self.recovery_revision(coverage.account_id)),
+            )
 
     def _apply_snapshot_observations(
         self,
@@ -495,6 +500,18 @@ class SQLiteDraftProjection:
             return None
         return float(cast(int, row[1]))
 
+    def recovery_revision(self, account_id: int) -> tuple[str, int] | None:
+        row = cast(
+            tuple[object, object, object] | None,
+            self._conn.execute(
+                "SELECT s.status,r.projection_revision,r.account_id FROM draft_projection_runtime r "
+                "LEFT JOIN draft_sync_state s ON s.account_id=r.account_id WHERE r.singleton=1"
+            ).fetchone(),
+        )
+        if row is None or row[2] != account_id:
+            return None
+        return str(row[0]), _database_int(row[1])
+
     def claim_recovery(self, *, now: float) -> int | None:
         """Claim a due recovery run exactly once for the active account."""
         now_int = _finite_non_negative_unix(now)
@@ -518,32 +535,22 @@ class SQLiteDraftProjection:
             )
             return now_int
 
-    def rearm_recovery(self, *, reason: str, now: float, claim_token: int) -> bool:
-        """Requeue a claimed recovery with durable exponential backoff."""
-        now_int = _finite_non_negative_unix(now)
+    def release_recovery_claim(self, *, claim_token: int, due_at: float) -> bool:
+        """Restore an un-dispatched local defer without changing its due floor."""
+        due = _finite_non_negative_unix(due_at)
         with write_savepoint(self._conn):
-            row = cast(
-                tuple[object | None, object | None] | None,
-                self._conn.execute(
-                    "SELECT account_id,recovery_failure_count FROM draft_projection_runtime WHERE singleton=1"
-                ).fetchone(),
+            cursor = self._conn.execute(
+                "UPDATE draft_projection_runtime SET recovery_due_at=?,recovery_claimed_at=NULL "
+                "WHERE singleton=1 AND recovery_claimed_at=?",
+                (due, claim_token),
             )
-            if row is None or row[0] is None:
-                raise DraftAccountFenceError("draft recovery requires a bound account")
-            if isinstance(row[1], bool) or not isinstance(row[1], int) or row[1] < 0:
-                raise RuntimeError("draft recovery failure count is invalid")
-            schedule = self._recovery_scheduling.retry_delays_seconds
-            if not schedule:
-                raise RuntimeError("draft recovery retry schedule is empty")
-            schedule_index = min(row[1], len(schedule) - 1)
-            delay = schedule[schedule_index]
-            return self._set_recovery_needed(
-                reason,
-                now_int,
-                recovery_due_at=now_int + delay,
-                failure_count=min(row[1] + 1, len(schedule) - 1),
-                expected_claim_token=claim_token,
+            if cursor.rowcount != 1:
+                return False
+            self._conn.execute(
+                "UPDATE draft_sync_state SET status='recovery_needed',coverage_status='unknown' "
+                "WHERE account_id=(SELECT account_id FROM draft_projection_runtime WHERE singleton=1)"
             )
+            return True
 
     def _require_active_account(self, account_id: int) -> None:
         row = cast(

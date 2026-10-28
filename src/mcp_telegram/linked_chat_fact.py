@@ -225,6 +225,21 @@ def next_release_at(conn: sqlite3.Connection) -> int | None:
     return None if row is None or row[0] is None else int(row[0])
 
 
+def pending_work(conn: sqlite3.Connection) -> tuple[LinkedChatWork, ...]:
+    """Read exact pending generations, excluding peers with lost access."""
+    rows = cast(
+        list[tuple[int, int, int]],
+        conn.execute(
+            f"SELECT s.channel_id,s.generation,COALESCE(s.retry_at, "
+            f"s.requested_at+{_LINKED_CHAT_RETRY_POLICY.base_delay_seconds},0) "
+            f"FROM {_LINKED_CHAT_FACT_STATE_TABLE} AS s "
+            "WHERE s.pending_generation=s.generation AND " + not_access_lost_sql("s.channel_id") + " "
+            "ORDER BY 3,s.channel_id"
+        ).fetchall(),
+    )
+    return tuple(LinkedChatWork(int(channel), int(generation), int(retry)) for channel, generation, retry in rows)
+
+
 def next_due(conn: sqlite3.Connection, now: int) -> LinkedChatWork | None:
     # Repair pending rows missing retry_at once, using a bounded delay.
     conn.execute(
@@ -382,6 +397,7 @@ class LinkedChatFactOwner:
     invalidate_from_update = staticmethod(invalidate_from_update)
     next_release_at = staticmethod(next_release_at)
     next_due = staticmethod(next_due)
+    pending_work = staticmethod(pending_work)
     defer = staticmethod(defer)
     publish = staticmethod(publish)
     validate_observation = staticmethod(validate_observation)

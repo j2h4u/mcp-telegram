@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Protocol, cast
@@ -24,6 +25,7 @@ from mcp_telegram.message_history.contracts import (
 from mcp_telegram.messages.telegram_adapter import extract_message_row
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_demand import RpcAttemptBudget, RpcAttemptBudgetExhaustedError
+from mcp_telegram.telegram_demand_progress import SliceOutcomeKind, WorkRevision
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionExpiredError,
     RpcAdmissionSaturatedError,
@@ -32,6 +34,14 @@ from mcp_telegram.telegram_rpc_scheduler import (
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.sqlite_writer_helpers import inline_writer
+
+
+def _selected_budget(
+    adapter: DeltaGapFillDemandAdapter, *, excluded: frozenset[WorkRevision] = frozenset()
+) -> RpcAttemptBudget:
+    status = adapter.status(time.time(), excluded=excluded)
+    assert status is not None and status.selected is not None
+    return RpcAttemptBudget(limit=1, selected=status.selected)
 
 
 class _SQLiteCursor(Protocol):
@@ -74,6 +84,7 @@ class _ForwardPort:
     ) -> None:
         self.pages = list(pages)
         self.calls: list[tuple[int, bool]] = []
+        self.dialog_ids: list[int] = []
         self.conn = conn
         self.disable_after_fetch = False
 
@@ -84,6 +95,7 @@ class _ForwardPort:
         after_message_id: int,
         should_stop: Callable[[], bool],
     ) -> ForwardGapPage:
+        self.dialog_ids.append(dialog_id)
         self.calls.append((after_message_id, should_stop()))
         page = self.pages.pop(0)
         if isinstance(page, str):
@@ -298,7 +310,7 @@ async def test_page_failures_preserve_checkpoint_and_reach_demand_coordinator(
         writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
     observer = _DeltaObserver()
-    adapter = DeltaGapFillDemandAdapter(worker, observer=observer)
+    adapter = DeltaGapFillDemandAdapter(worker, observer=observer, account_id=123)
 
     expected_error = {
         "deferred": TelegramRpcAdmissionDeferred,
@@ -316,14 +328,14 @@ async def test_page_failures_preserve_checkpoint_and_reach_demand_coordinator(
     }.get(error_kind, error_kind)
     worker._history_port = _ForwardPort([page_error])
     if error_kind == "ordinary":
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_selected_budget(adapter))
         retry_row = sync_db.execute(
             "SELECT delta_retry_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
         ).fetchone()
-        assert retry_row is not None and retry_row[0] is not None
+        assert retry_row == (None,)
     else:
         with pytest.raises(expected_error):
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
+            await adapter.run_slice(_selected_budget(adapter))
     assert len(observer.rows) == 1
     observed, reason = observer.rows[0]
     assert observed["slice_count"] == observed["deferred"] + observed["failed"] == 1
@@ -343,6 +355,12 @@ async def test_page_failures_preserve_checkpoint_and_reach_demand_coordinator(
         "SELECT delta_refresh_requested_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id=?",
         (dialog_id,),
     ).fetchone() == (1, None)
+    assert (
+        sync_db.execute(
+            "SELECT value FROM daemon_state WHERE key=?", (f"delta_completion_generation:{dialog_id}",)
+        ).fetchone()
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -424,10 +442,10 @@ async def test_forward_slice_observes_page_and_message_key_outcomes(
         asyncio.Event(),
         writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
-    adapter = DeltaGapFillDemandAdapter(worker, observer=observer)
+    adapter = DeltaGapFillDemandAdapter(worker, observer=observer, account_id=123)
 
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(_selected_budget(adapter))
 
     assert len(observer.rows) == 1
     metrics, reason = observer.rows[0]
@@ -589,7 +607,140 @@ async def test_failed_peer_does_not_starve_ready_peer_after_adapter_restart(
             return ForwardGapPage(messages=(), complete=True)
 
     worker = DeltaSyncWorker(Port(), sync_db, asyncio.Event(), writer=inline_writer(sync_db))
-    await DeltaGapFillDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
-    await DeltaGapFillDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+    adapter = DeltaGapFillDemandAdapter(worker, account_id=123)
+    first_budget = _selected_budget(adapter)
+    assert first_budget.selected is not None
+    await adapter.run_slice(first_budget)
+    await adapter.run_slice(_selected_budget(adapter, excluded=frozenset({first_budget.selected})))
     assert calls == [1, 2]
-    assert sync_db.execute("SELECT delta_retry_at FROM synced_dialogs WHERE dialog_id=1").fetchone()[0] is not None
+    assert sync_db.execute("SELECT delta_retry_at FROM synced_dialogs WHERE dialog_id=1").fetchone()[0] is None
+
+
+@pytest.mark.asyncio
+async def test_excluded_delta_peer_selection_executes_its_exact_sibling(sync_db: sqlite3.Connection) -> None:
+    _seed_dialog(cast(_SQLiteConnection, sync_db), -1001234567, refresh_requested_at=1)
+    _seed_dialog(cast(_SQLiteConnection, sync_db), -123, refresh_requested_at=1)
+    calls: list[int] = []
+
+    class Port:
+        async def fetch_page(
+            self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
+        ) -> ForwardGapPage:
+            del after_message_id, should_stop
+            calls.append(dialog_id)
+            return ForwardGapPage(messages=(), complete=True)
+
+    worker = DeltaSyncWorker(Port(), sync_db, asyncio.Event(), writer=inline_writer(sync_db))
+    adapter = DeltaGapFillDemandAdapter(worker, account_id=123)
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
+        held = adapter.status(1000.0)
+        assert held is not None and held.selected is not None
+        selected = adapter.status(1000.0, excluded=frozenset({held.selected}))
+        assert selected is not None and selected.selected is not None
+        assert selected.selected.key.target == "dialog:-123"
+        await adapter.run_slice(RpcAttemptBudget(limit=1, selected=selected.selected))
+
+    assert calls == [-123]
+    assert (
+        sync_db.execute("SELECT last_delta_checked_at FROM synced_dialogs WHERE dialog_id=-123").fetchone()[0]
+        is not None
+    )
+    assert (
+        sync_db.execute("SELECT last_delta_checked_at FROM synced_dialogs WHERE dialog_id=-1001234567").fetchone()[0]
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_empty_delta_cycles_receive_new_business_revisions(
+    sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_dialog(cast(_SQLiteConnection, sync_db), 1, refresh_requested_at=1)
+    monkeypatch.setattr("mcp_telegram.delta_sync.DELTA_AUTOMATIC_REFRESH_INTERVAL_S", 0)
+
+    class Port:
+        async def fetch_page(
+            self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
+        ) -> ForwardGapPage:
+            del dialog_id, after_message_id, should_stop
+            return ForwardGapPage(messages=(), complete=True)
+
+    worker = DeltaSyncWorker(Port(), sync_db, asyncio.Event(), writer=inline_writer(sync_db))
+    adapter = DeltaGapFillDemandAdapter(worker, account_id=123)
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
+        first = adapter.status(1000.0)
+        assert first is not None and first.selected is not None
+        await adapter.run_slice(RpcAttemptBudget(limit=1, selected=first.selected))
+        second = adapter.status(1000.0, excluded=frozenset({first.selected}))
+        assert second is not None and second.selected is not None
+        assert second.selected.revision != first.selected.revision
+        await adapter.run_slice(RpcAttemptBudget(limit=1, selected=second.selected))
+
+    assert sync_db.execute("SELECT value FROM daemon_state WHERE key='delta_completion_generation:1'").fetchone() == (
+        "2",
+    )
+
+
+@pytest.mark.asyncio
+async def test_delta_completion_cas_rejects_a_competing_empty_cycle(sync_db: sqlite3.Connection) -> None:
+    _seed_dialog(cast(_SQLiteConnection, sync_db), 1, refresh_requested_at=1)
+
+    class Port:
+        async def fetch_page(
+            self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
+        ) -> ForwardGapPage:
+            del dialog_id, after_message_id, should_stop
+            sync_db.execute(
+                "INSERT OR REPLACE INTO daemon_state(key,value) VALUES('delta_completion_generation:1','1')"
+            )
+            sync_db.commit()
+            return ForwardGapPage(messages=(), complete=True)
+
+    worker = DeltaSyncWorker(Port(), sync_db, asyncio.Event(), writer=inline_writer(sync_db))
+    adapter = DeltaGapFillDemandAdapter(worker, account_id=123)
+    with patch("mcp_telegram.delta_sync.DELTA_AUTOMATIC_REFRESH_INTERVAL_S", 0):
+        with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
+            status = adapter.status(1000.0)
+            assert status is not None and status.selected is not None
+            result = await adapter.run_slice(RpcAttemptBudget(limit=1, selected=status.selected))
+
+    assert result.kind is SliceOutcomeKind.STALE
+    assert sync_db.execute("SELECT last_delta_checked_at FROM synced_dialogs WHERE dialog_id=1").fetchone() == (None,)
+    assert sync_db.execute("SELECT value FROM daemon_state WHERE key='delta_completion_generation:1'").fetchone() == (
+        "1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_delta_peer_revision_change_rejects_only_that_selected_slice(sync_db: sqlite3.Connection) -> None:
+    _seed_dialog(cast(_SQLiteConnection, sync_db), -1001234567, refresh_requested_at=1)
+    _seed_dialog(cast(_SQLiteConnection, sync_db), -123, refresh_requested_at=1)
+    calls: list[int] = []
+
+    class Port:
+        async def fetch_page(
+            self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
+        ) -> ForwardGapPage:
+            del after_message_id, should_stop
+            calls.append(dialog_id)
+            return ForwardGapPage(messages=(), complete=True)
+
+    worker = DeltaSyncWorker(Port(), sync_db, asyncio.Event(), writer=inline_writer(sync_db))
+    adapter = DeltaGapFillDemandAdapter(worker, account_id=123)
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
+        first = adapter.status(1000.0)
+        assert first is not None and first.selected is not None
+        selected = adapter.status(1000.0, excluded=frozenset({first.selected}))
+        assert selected is not None and selected.selected is not None
+        sync_db.execute(
+            "UPDATE synced_dialogs SET delta_refresh_generation=delta_refresh_generation+1 WHERE dialog_id=-123"
+        )
+        sync_db.commit()
+        outcome = await adapter.run_slice(RpcAttemptBudget(limit=1, selected=selected.selected))
+
+    assert outcome.kind is SliceOutcomeKind.STALE
+    assert calls == []
+    assert (
+        sync_db.execute("SELECT value FROM daemon_state WHERE key='delta_completion_generation:-123'").fetchone()
+        is None
+    )

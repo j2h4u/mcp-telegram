@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,7 +37,7 @@ from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, Enti
 from mcp_telegram.fact_hydration import FactHydrationDemandAdapter, MessageFactHydrationWorker
 from mcp_telegram.folders.worker import FolderProjectionDemandAdapter, FolderProjectionWorker
 from mcp_telegram.hydration_queue import HydrationPriority
-from mcp_telegram.linked_chat_fact import linked_chat_fact_owner
+from mcp_telegram.linked_chat_fact import LinkedChatWork, linked_chat_fact_owner
 from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshDemandAdapter,
     MessageFactRefreshDeps,
@@ -65,12 +66,18 @@ from mcp_telegram.telegram_demand import (
     DemandStatus,
     DurableDemandAdapter,
     RpcAttemptBudget,
+    RpcRetryAuthorization,
     acquisition_context,
-    demand_context,
+    durable_demand_context,
 )
 from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator, validate_durable_adapters
+from mcp_telegram.telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkKey, WorkRevision
 from mcp_telegram.telegram_rpc_consumers import DemandKind, demand_freshness_seconds
-from mcp_telegram.telegram_rpc_scheduler import rpc_attempt_budget
+from mcp_telegram.telegram_rpc_scheduler import (
+    TelegramRpcMethodRecoveryPending,
+    TelegramRpcThrottled,
+    rpc_attempt_budget,
+)
 from mcp_telegram.topics.demand import TopicSnapshotDemandAdapter
 from mcp_telegram.topics.telegram_adapter import TelethonTelegramTopicGateway, TopicClient
 
@@ -78,13 +85,23 @@ from mcp_telegram.topics.telegram_adapter import TelethonTelegramTopicGateway, T
 class DemandCompositionClient(ActivityClient, Protocol):
     async def get_me(self) -> object: ...
 
+    def rpc_eligibility(
+        self, method_key: str | None = None
+    ) -> TelegramRpcThrottled | TelegramRpcMethodRecoveryPending | None: ...
+
+    def prepare_durable_retry(
+        self, budget: RpcAttemptBudget, method_key: str | None
+    ) -> RpcRetryAuthorization | None: ...
+
+    def set_rpc_eligibility_observer(self, observer: Callable[[str | None], None] | None) -> None: ...
+
 
 class DemandCompositionObserver(DemandObservationHook, DeltaGapFillObservationHook, Protocol):
     """Observer hooks consumed by coordinator and delta gap-fill adapters."""
 
 
 class LinkedChatFactRefreshPort(Protocol):
-    async def retry_one_pending_linked_chat_fact(self, budget: RpcAttemptBudget) -> bool: ...
+    async def retry_one_pending_linked_chat_fact(self, budget: RpcAttemptBudget) -> SliceOutcome: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +110,7 @@ class DemandCompositionDependencies:
 
     client: DemandCompositionClient
     conn: SyncDatabaseConnection
+    account_id: int
     writer: SQLiteWriter
     db_path: Path
     shutdown_event: asyncio.Event
@@ -112,7 +130,7 @@ class DemandCompositionDependencies:
     hot_sweep_policy: HotSweepPolicy
     cold_backfill_pacing: ColdBackfillPacing
     activity_rpc_timeout_seconds: float
-    read_receipt_batch: Callable[[], Awaitable[object]]
+    read_receipt_batch: Callable[[WorkRevision], Awaitable[SliceOutcome]]
     self_profile_cadence: SelfProfileCadenceState
     update_self_profile: Callable[[object], Awaitable[None]]
     startup_identity: StartupIdentityState
@@ -129,23 +147,51 @@ class LinkedChatFactDemandAdapter(DurableDemandAdapter):
 
     demand_kind = DemandKind.LINKED_CHAT_REFRESH
 
-    def __init__(self, port: LinkedChatFactRefreshPort, conn: SyncDatabaseConnection) -> None:
+    def __init__(self, port: LinkedChatFactRefreshPort, conn: SyncDatabaseConnection, *, account_id: int) -> None:
         self._port = port
         self._conn = conn
+        if type(account_id) is not int or account_id <= 0:
+            raise ValueError("account_id must be a positive integer")
+        self._account_id = account_id
 
-    def status(self, now: float) -> DemandStatus | None:
-        release_at = linked_chat_fact_owner.next_release_at(self._conn)
-        if release_at is None:
-            return None
-        return DemandStatus(release_at=float(release_at))
+    def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
+        del now
+        for work in linked_chat_fact_owner.pending_work(self._conn):
+            selected = self._selected(work)
+            if selected not in excluded:
+                return DemandStatus(float(work.retry_at), selected=selected)
+        return None
 
-    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+    def _selected(self, work: LinkedChatWork) -> WorkRevision:
+        return WorkRevision(
+            WorkKey(self.demand_kind, self._account_id, str(work.channel_id)),
+            repr((work.generation, work.generation)),
+        )
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
-        with demand_context(self.demand_kind):
+        selected = budget.selected
+        if selected is None:
+            raise ValueError("linked-chat demand requires a selected revision")
+        status = next(
+            (
+                DemandStatus(float(work.retry_at), selected=selected)
+                for work in linked_chat_fact_owner.pending_work(self._conn)
+                if self._selected(work) == selected
+            ),
+            None,
+        )
+        if status is None:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        if budget.exhausted and not budget.can_prepare_retry:
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        if not status.is_ready(time.time()):
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        with durable_demand_context(self.demand_kind):
             with acquisition_context(AcquisitionKind.LINKED_CHAT_RESOLUTION):
                 with rpc_attempt_budget(budget):
-                    await self._port.retry_one_pending_linked_chat_fact(budget)
+                    return await self._port.retry_one_pending_linked_chat_fact(budget)
 
 
 def build_durable_adapter_map(
@@ -159,16 +205,23 @@ def build_durable_adapter_map(
             TelethonTelegramTopicGateway(cast(TopicClient, dependencies.client)),
             dependencies.conn,
             writer=dependencies.writer,
+            account_id=dependencies.account_id,
         ),
         DemandKind.ENTITY_PROFILE_REFRESH: EntityProfileDemandAdapter(dependencies.entity_refresh_coordinator),
-        DemandKind.DELTA_GAP_FILL: DeltaGapFillDemandAdapter(dependencies.delta_sync_worker, observer=observer),
+        DemandKind.DELTA_GAP_FILL: DeltaGapFillDemandAdapter(
+            dependencies.delta_sync_worker, account_id=dependencies.account_id, observer=observer
+        ),
         DemandKind.DM_DELETION_RECONCILIATION: DmDeletionReconciliationDemandAdapter(
-            dependencies.conn, dependencies.dm_gap_scanner, writer=dependencies.writer
+            dependencies.conn,
+            dependencies.dm_gap_scanner,
+            account_id=dependencies.account_id,
+            writer=dependencies.writer,
         ),
         DemandKind.DELTA_ACCESS_PROBE: DeltaAccessProbeDemandAdapter(
             dependencies.delta_sync_worker,
             dependencies.access_probe_policy,
             dependencies.access_probe,
+            account_id=dependencies.account_id,
             observer=observer,
         ),
         DemandKind.HOT_ACTIVITY_PAGE: HotActivityDemandAdapter(
@@ -177,26 +230,33 @@ def build_durable_adapter_map(
             dependencies.shutdown_event,
             dependencies.hot_sweep_policy,
             dependencies.activity_rpc_timeout_seconds,
+            account_id=dependencies.account_id,
             writer=dependencies.writer,
         ),
         DemandKind.LIVE_HYDRATION_BATCH: FactHydrationDemandAdapter(
             dependencies.fact_hydration_worker,
             HydrationPriority.FOREGROUND,
+            account_id=dependencies.account_id,
         ),
-        DemandKind.FULL_SYNC_DM_ENROLLMENT: FullSyncDmEnrollmentDemandAdapter(dependencies.full_sync_worker),
-        DemandKind.FULL_SYNC_PAGE: FullSyncDemandAdapter(dependencies.full_sync_worker),
+        DemandKind.FULL_SYNC_DM_ENROLLMENT: FullSyncDmEnrollmentDemandAdapter(
+            dependencies.full_sync_worker, account_id=dependencies.account_id
+        ),
+        DemandKind.FULL_SYNC_PAGE: FullSyncDemandAdapter(
+            dependencies.full_sync_worker, account_id=dependencies.account_id
+        ),
         DemandKind.DIALOG_BOOTSTRAP: CanonicalDialogDirectoryDemandAdapter(
             dependencies.dialog_directory,
             dependencies.conn,
         ),
         DemandKind.DIALOG_LIGHT_RECONCILIATION: DialogLightReconciliationDemandAdapter(
-            dependencies.dialog_reconciliation_worker
+            dependencies.dialog_reconciliation_worker, account_id=dependencies.account_id
         ),
         DemandKind.ARCHIVE_BACKFILL: ArchiveBackfillDemandAdapter(
             dependencies.client,
             dependencies.conn,
             dependencies.shutdown_event,
             dependencies.activity_rpc_timeout_seconds,
+            account_id=dependencies.account_id,
             writer=dependencies.writer,
         ),
         DemandKind.ARCHIVE_INCREMENTAL: ArchiveIncrementalDemandAdapter(
@@ -205,6 +265,7 @@ def build_durable_adapter_map(
             dependencies.shutdown_event,
             demand_freshness_seconds(DemandKind.ARCHIVE_INCREMENTAL),
             dependencies.activity_rpc_timeout_seconds,
+            account_id=dependencies.account_id,
             writer=dependencies.writer,
         ),
         DemandKind.COLD_PEER_PAGE: ColdPeerPageDemandAdapter(
@@ -213,24 +274,34 @@ def build_durable_adapter_map(
             dependencies.shutdown_event,
             dependencies.cold_backfill_pacing,
             dependencies.activity_rpc_timeout_seconds,
+            account_id=dependencies.account_id,
             writer=dependencies.writer,
         ),
         DemandKind.BACKFILL_HYDRATION_BATCH: FactHydrationDemandAdapter(
             dependencies.fact_hydration_worker,
             HydrationPriority.BACKFILL,
+            account_id=dependencies.account_id,
         ),
-        DemandKind.FOLDER_SNAPSHOT: FolderProjectionDemandAdapter(dependencies.folder_projection_worker),
+        DemandKind.FOLDER_SNAPSHOT: FolderProjectionDemandAdapter(
+            dependencies.folder_projection_worker, account_id=dependencies.account_id
+        ),
         DemandKind.MESSAGE_FACT_REFRESH: MessageFactRefreshDemandAdapter(
             dependencies.message_fact_refresh_deps,
             dependencies.message_fact_refresh_policy,
+            account_id=dependencies.account_id,
             shutdown_event=dependencies.shutdown_event,
         ),
         DemandKind.READ_RECEIPT_BATCH: ReadReceiptDemandAdapter(
             dependencies.conn,
             dependencies.read_receipt_batch,
+            account_id=dependencies.account_id,
         ),
-        DemandKind.SCHEDULED_REPAIR: ScheduledRepairDemandAdapter(dependencies.scheduled_reconciler),
-        DemandKind.SCHEDULED_DISCOVERY: ScheduledDiscoveryDemandAdapter(dependencies.scheduled_reconciler),
+        DemandKind.SCHEDULED_REPAIR: ScheduledRepairDemandAdapter(
+            dependencies.scheduled_reconciler, account_id=dependencies.account_id
+        ),
+        DemandKind.SCHEDULED_DISCOVERY: ScheduledDiscoveryDemandAdapter(
+            dependencies.scheduled_reconciler, account_id=dependencies.account_id
+        ),
         DemandKind.DRAFT_SNAPSHOT: dependencies.draft_owner,
         DemandKind.SELF_PROFILE_MAINTENANCE: SelfProfileMaintenanceDemandAdapter(
             SelfProfileMaintenanceDependencies(
@@ -241,11 +312,13 @@ def build_durable_adapter_map(
                 get_input_entity=dependencies.get_self_input_entity,
                 user_profile_port=dependencies.user_profile_port,
                 publish_startup_identity=dependencies.publish_startup_identity,
-            )
+            ),
+            account_id=dependencies.account_id,
         ),
         DemandKind.LINKED_CHAT_REFRESH: LinkedChatFactDemandAdapter(
             dependencies.linked_chat_fact_refresh_port,
             dependencies.conn,
+            account_id=dependencies.account_id,
         ),
     }
     validate_durable_adapters(adapters)
@@ -261,11 +334,15 @@ def build_durable_coordinator(
     observer: DemandCompositionObserver | None = None,
 ) -> TelegramDemandCoordinator:
     """Construct the sole durable executor over the exhaustive adapter map."""
-    return TelegramDemandCoordinator(
+    coordinator = TelegramDemandCoordinator(
         build_durable_adapter_map(dependencies, observer=observer),
         dependencies.shutdown_event,
         observer=observer,
+        rpc_eligibility=dependencies.client.rpc_eligibility,
+        prepare_durable_retry=dependencies.client.prepare_durable_retry,
     )
+    dependencies.client.set_rpc_eligibility_observer(coordinator.eligibility_changed)
+    return coordinator
 
 
 __all__ = [

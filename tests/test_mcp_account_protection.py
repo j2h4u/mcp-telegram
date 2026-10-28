@@ -20,9 +20,9 @@ from mcp_telegram.feedback_db import SQLiteFeedbackStore, ensure_feedback_schema
 from mcp_telegram.feedback_service import FeedbackApplicationService
 from mcp_telegram.flood import FloodWaitKillSwitchStatus
 from mcp_telegram.sync_db import ensure_sync_schema
-from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc import TelegramRpcGate
 from tests.daemon_api_policy import make_daemon_api_policy
+from tests.demand_adapter_helpers import run_ready_slice
 from tests.helpers import (
     LoudChannelProfilePort,
     LoudChatAvatarHistoryPort,
@@ -317,7 +317,7 @@ async def test_registered_entity_info_keeps_owned_partial_cache_success_under_pr
     seed_service = cast(DaemonEntityInfoService, raw_seed_service)
     coordinator = seed_service.refresh_coordinator
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     assert seed_conn.execute("SELECT profile_owner_account_id FROM entity_details WHERE entity_id=42").fetchone() == (
         42,
     )

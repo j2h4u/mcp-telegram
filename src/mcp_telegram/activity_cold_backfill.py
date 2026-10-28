@@ -35,6 +35,7 @@ from typing import Protocol, cast
 from .activity_peer_sweep import (
     SkipReason,
     SweepResult,
+    _load_working_set_enrollment_state,
     run_working_set_enrollment_slice,
     sweep_peer_once,
     working_set_enrollment_release_at,
@@ -50,10 +51,9 @@ from .telegram_demand import (
     DurableDemandAdapter,
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
-    UnclassifiedTelegramDemandError,
-    current_demand_token,
-    demand_context,
+    durable_demand_context,
 )
+from .telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkKey, WorkRevision
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import TelegramRpcSource, rpc_attempt_budget, rpc_scope
 
@@ -63,15 +63,8 @@ logger = logging.getLogger(__name__)
 @contextmanager
 def _cold_demand_scope() -> Iterator[None]:
     """Install the cold-page root for direct legacy or adapter execution."""
-    try:
-        token = current_demand_token()
-    except UnclassifiedTelegramDemandError:
-        with demand_context(DemandKind.COLD_PEER_PAGE):
-            yield
-        return
-    if token.kind is not DemandKind.COLD_PEER_PAGE:
-        raise RuntimeError(f"active demand kind {token.kind.value} cannot execute cold peer page")
-    yield
+    with durable_demand_context(DemandKind.COLD_PEER_PAGE):
+        yield
 
 
 class _ColdBackfillScheduling(Protocol):
@@ -124,35 +117,129 @@ class ColdPeerPageDemandAdapter(DurableDemandAdapter):
     pacing: ColdBackfillPacing
     timeout_s: float
     writer: SQLiteWriter = field(kw_only=True)
+    account_id: int = field(kw_only=True)
     demand_kind = DemandKind.COLD_PEER_PAGE
 
-    def status(self, now: float) -> DemandStatus | None:
+    def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
         """Return the earliest release among enrollment and peer pages."""
-        page_release_at = _next_cold_release_at(self.conn, now=now)
-        enrollment_release_at = working_set_enrollment_release_at(
-            self.conn,
-            now=now,
-            cadence_s=self.pacing.history.enroll_s,
+        page_release = _next_cold_release_at(self.conn, now=now)
+        enrollment_release = working_set_enrollment_release_at(
+            self.conn, now=now, cadence_s=self.pacing.history.enroll_s
         )
-        if enrollment_release_at is None:
-            release_at = page_release_at
-        elif page_release_at is None:
-            release_at = enrollment_release_at
-        else:
-            release_at = min(page_release_at, enrollment_release_at)
-        if release_at is None:
+        if page_release is None and enrollment_release is None:
             return None
-        return DemandStatus(release_at=release_at)
+        enrollment_revision = self._enrollment_revision()
+        if (
+            enrollment_release is not None
+            and (page_release is None or enrollment_release <= page_release)
+            and enrollment_revision not in excluded
+        ):
+            return self._enrollment_status(enrollment_revision, enrollment_release, excluded)
+        return self._peer_or_enrollment_status(enrollment_revision, enrollment_release, page_release, excluded)
 
-    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+    def _enrollment_revision(self) -> WorkRevision:
+        state = _load_working_set_enrollment_state(self.conn)
+        revision = repr((state.get("activity_working_set_phase"), state.get("activity_working_set_cursor")))
+        return WorkRevision(WorkKey(self.demand_kind, self.account_id, "enrollment"), revision)
+
+    @staticmethod
+    def _enrollment_status(
+        revision: WorkRevision, release_at: float, excluded: frozenset[WorkRevision]
+    ) -> DemandStatus | None:
+        return None if revision in excluded else DemandStatus(release_at=release_at, selected=revision)
+
+    def _peer_or_enrollment_status(
+        self,
+        enrollment_revision: WorkRevision,
+        enrollment_release: float | None,
+        page_release: float | None,
+        excluded: frozenset[WorkRevision],
+    ) -> DemandStatus | None:
+        candidates = []
+        for dialog_id, offset_id, retry_at in self._cold_peer_rows():
+            selected = WorkRevision(
+                WorkKey(self.demand_kind, self.account_id, f"peer:{int(dialog_id)}"), str(int(offset_id or 0))
+            )
+            if selected not in excluded:
+                candidates.append((float(retry_at or 0), int(dialog_id), selected))
+        if candidates:
+            release, _, selected = min(candidates, key=lambda item: (item[0], item[1]))
+            if enrollment_release is not None and enrollment_release <= release and enrollment_revision not in excluded:
+                return DemandStatus(release_at=enrollment_release, selected=enrollment_revision)
+            return DemandStatus(release_at=release, selected=selected)
+        return self._enrollment_status(enrollment_revision, page_release or 0.0, excluded)
+
+    def _cold_peer_rows(self) -> list[tuple[int, int | None, int | None]]:
+        return cast(
+            list[tuple[int, int | None, int | None]],
+            self.conn.execute(
+                "SELECT dialog_id,COALESCE(cold_offset_id,0),cold_next_retry_at FROM activity_dialog_state "
+                "WHERE cold_status!='complete' "
+                "AND COALESCE((SELECT status FROM synced_dialogs WHERE dialog_id=activity_dialog_state.dialog_id),'')!='access_lost' "
+                "ORDER BY updated_at,dialog_id"
+            ).fetchall(),
+        )
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
         """Run one enrollment unit or one claimed peer page."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
+        selected = budget.selected
+        if selected is None:
+            raise RuntimeError("cold activity slice requires an owner-selected revision")
         if self.shutdown_event.is_set():
-            return
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        if selected.key.demand_kind is not self.demand_kind or selected.key.account_id != self.account_id:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        validation = self._validate_cold_selection(selected, time.time())
+        if validation is not None:
+            return validation
+        if selected.key.target == "enrollment":
+            await self._run_cold_enrollment(budget)
+            return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
+        return await self._run_cold_peer(selected, budget)
+
+    def _validate_cold_selection(self, selected: WorkRevision, now: float) -> SliceOutcome | None:
+        if selected.key.target == "enrollment":
+            return self._validate_cold_enrollment(selected, now)
+        return self._validate_cold_peer_selection(selected, now)
+
+    def _validate_cold_enrollment(self, selected: WorkRevision, now: float) -> SliceOutcome | None:
+        state = _load_working_set_enrollment_state(self.conn)
+        revision = repr((state.get("activity_working_set_phase"), state.get("activity_working_set_cursor")))
+        release = working_set_enrollment_release_at(self.conn, now=now, cadence_s=self.pacing.history.enroll_s)
+        if revision != selected.revision or release is None:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        if release > now:
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        return None
+
+    def _validate_cold_peer_selection(self, selected: WorkRevision, now: float) -> SliceOutcome | None:
+        dialog_id = int(selected.key.target.split(":", 1)[1])
+        row = cast(
+            tuple[int, str | None, int | None, str | None] | None,
+            self.conn.execute(
+                "SELECT COALESCE(activity.cold_offset_id,0),activity.cold_status,activity.cold_next_retry_at,synced.status "
+                "FROM activity_dialog_state activity LEFT JOIN synced_dialogs synced "
+                "ON synced.dialog_id=activity.dialog_id WHERE activity.dialog_id=?",
+                (dialog_id,),
+            ).fetchone(),
+        )
+        if (
+            row is None
+            or int(row[0]) != int(selected.revision)
+            or row[1] == "complete"
+            or row[3] == SyncStatus.ACCESS_LOST.value
+        ):
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        if float(row[2] or 0) > now:
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        return None
+
+    async def _run_cold_enrollment(self, budget: RpcAttemptBudget) -> None:
         with _cold_demand_scope():
             with rpc_attempt_budget(budget):
-                enrollment = await run_working_set_enrollment_slice(
+                await run_working_set_enrollment_slice(
                     self.client,
                     self.conn,
                     source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
@@ -160,19 +247,34 @@ class ColdPeerPageDemandAdapter(DurableDemandAdapter):
                     timeout_s=self.timeout_s,
                     writer=self.writer,
                 )
-                if enrollment.consumed:
-                    # Keep the enrollment cursor at the candidate when the
-                    # local attempt budget is exhausted; the next slice gets
-                    # a fresh budget and resumes the same bounded unit.
-                    return
-                await run_cold_backfill_pass(
+
+    async def _run_cold_peer(self, selected: WorkRevision, budget: RpcAttemptBudget) -> SliceOutcome:
+        dialog_id = int(selected.key.target.split(":", 1)[1])
+        with _cold_demand_scope():
+            with rpc_attempt_budget(budget):
+                result = await run_cold_backfill_pass(
                     self.client,
                     self.conn,
                     self.shutdown_event,
                     pacing=self.pacing,
                     timeout_s=self.timeout_s,
                     writer=self.writer,
+                    expected_dialog=dialog_id,
+                    expected_offset=int(selected.revision),
                 )
+        return self._cold_result(selected, result)
+
+    @staticmethod
+    def _cold_result(selected: WorkRevision, result: ColdPassResult) -> SliceOutcome:
+        if not result.accepted:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        if result.flood_wait_seconds is not None:
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        revision = result.committed_revision
+        if revision is None or revision == selected.revision:
+            return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
+        terminal = result.outcome is ColdPassOutcome.ZERO_PERSISTED and result.persisted == 0
+        return SliceOutcome(selected, SliceOutcomeKind.TERMINAL if terminal else SliceOutcomeKind.PROGRESSED, revision)
 
 
 _BACKFILL_BATCH_LIMIT = 100
@@ -202,6 +304,8 @@ class ColdPassResult:
     outcome: ColdPassOutcome
     persisted: int  # count of rows written this pass; 0 unless outcome==WROTE
     flood_wait_seconds: int | None = None
+    accepted: bool = True
+    committed_revision: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,9 +346,21 @@ def _claim_cold_backfill_peer(
     *,
     now: int,
     claim_until: int,
+    expected_dialog: int | None = None,
+    expected_offset: int | None = None,
 ) -> tuple[int, int | None] | None:
     """Atomically claim the oldest due peer using the existing retry field as a lease."""
     with write_transaction(conn):
+        if expected_dialog is not None:
+            cursor = conn.execute(
+                "UPDATE activity_dialog_state SET cold_status='running',cold_next_retry_at=?,updated_at=? "
+                "WHERE dialog_id=? AND COALESCE(cold_offset_id,0)=? AND cold_status!='complete' "
+                "AND (cold_next_retry_at IS NULL OR cold_next_retry_at<=?) "
+                "AND COALESCE((SELECT status FROM synced_dialogs WHERE dialog_id=activity_dialog_state.dialog_id),'')!=? "
+                "RETURNING dialog_id,cold_offset_id",
+                (claim_until, now, expected_dialog, expected_offset or 0, now, SyncStatus.ACCESS_LOST.value),
+            )
+            return cast(tuple[int, int | None] | None, cursor.fetchone())
         return cast(
             tuple[int, int | None] | None,
             conn.execute(
@@ -293,6 +409,17 @@ def _save_claimed_cold_state(ctx: _ColdPeerFinishContext, **fields: object) -> b
     return cursor.rowcount == 1
 
 
+def _cold_claim_matches(conn: sqlite3.Connection, dialog_id: int, offset_id: int, claim_until: int) -> bool:
+    row = cast(
+        tuple[int, str | None, int | None] | None,
+        conn.execute(
+            "SELECT COALESCE(cold_offset_id,0),cold_status,cold_next_retry_at FROM activity_dialog_state WHERE dialog_id=?",
+            (dialog_id,),
+        ).fetchone(),
+    )
+    return row is not None and (int(row[0]), row[1], row[2]) == (offset_id, "running", claim_until)
+
+
 def _release_cold_claim(conn: sqlite3.Connection, *, dialog_id: int, claim_until: int) -> bool:
     """Return an unfinished peer to the queue after a slice boundary."""
     with write_transaction(conn):
@@ -310,30 +437,17 @@ def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext, pacing: ColdBackfill
     result = ctx.result
     if result.skip_reason is SkipReason.FLOOD_WAIT:
         flood_wait_seconds = cast(int, result.flood_wait_seconds)
-        next_retry_at = ctx.now + flood_wait_seconds
-        _save_claimed_cold_state(
-            ctx,
-            cold_status="pending",
-            cold_next_retry_at=next_retry_at,
-        )
-        logger.warning(
-            "activity_cold_backfill_flood dialog_id=%r flood_wait_seconds=%d retry_delay_s=%d"
-            " cold_next_retry_at=%d duration_s=%.3f",
-            ctx.dialog_id,
-            flood_wait_seconds,
-            flood_wait_seconds,
-            next_retry_at,
-            time.monotonic() - ctx.started_at,
-        )
+        accepted = _release_cold_claim(ctx.conn, dialog_id=ctx.dialog_id, claim_until=ctx.claim_until)
         return ColdPassResult(
             outcome=ColdPassOutcome.FLOOD_WAIT,
             persisted=0,
             flood_wait_seconds=flood_wait_seconds,
+            accepted=accepted,
         )
 
     if result.skip_reason is SkipReason.ACCESS_SKIP:
         next_retry_at = int(ctx.now + pacing.history.access_retry_s)
-        _save_claimed_cold_state(
+        accepted = _save_claimed_cold_state(
             ctx,
             cold_status="pending",
             cold_next_retry_at=next_retry_at,
@@ -346,10 +460,10 @@ def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext, pacing: ColdBackfill
             next_retry_at,
             time.monotonic() - ctx.started_at,
         )
-        return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0)
+        return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0, accepted=accepted)
 
     if result.skip_reason is SkipReason.HISTORY_FLOOR:
-        _save_claimed_cold_state(
+        accepted = _save_claimed_cold_state(
             ctx,
             cold_status="complete",
             cold_next_retry_at=None,
@@ -360,10 +474,12 @@ def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext, pacing: ColdBackfill
             ctx.offset_id,
             time.monotonic() - ctx.started_at,
         )
-        return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0)
+        return ColdPassResult(
+            outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0, accepted=accepted, committed_revision="complete"
+        )
 
     new_offset = result.min_id
-    _save_claimed_cold_state(
+    accepted = _save_claimed_cold_state(
         ctx,
         cold_offset_id=new_offset,
         cold_status="pending",
@@ -378,8 +494,18 @@ def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext, pacing: ColdBackfill
         time.monotonic() - ctx.started_at,
     )
     if result.persisted and result.persisted > 0:
-        return ColdPassResult(outcome=ColdPassOutcome.WROTE, persisted=result.persisted)
-    return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0)
+        return ColdPassResult(
+            outcome=ColdPassOutcome.WROTE,
+            persisted=result.persisted,
+            accepted=accepted,
+            committed_revision=str(new_offset or 0) if accepted else None,
+        )
+    return ColdPassResult(
+        outcome=ColdPassOutcome.ZERO_PERSISTED,
+        persisted=0,
+        accepted=accepted,
+        committed_revision=str(new_offset or 0) if accepted else None,
+    )
 
 
 async def run_cold_backfill_pass(  # noqa: PLR0913 - explicit worker dependencies
@@ -390,6 +516,8 @@ async def run_cold_backfill_pass(  # noqa: PLR0913 - explicit worker dependencie
     pacing: ColdBackfillPacing,
     timeout_s: float,
     writer: SQLiteWriter,
+    expected_dialog: int | None = None,
+    expected_offset: int | None = None,
 ) -> ColdPassResult:
     """Run one cold peer-page operation under its precise durable root."""
     with _cold_demand_scope():
@@ -400,6 +528,8 @@ async def run_cold_backfill_pass(  # noqa: PLR0913 - explicit worker dependencie
             pacing=pacing,
             timeout_s=timeout_s,
             writer=writer,
+            expected_dialog=expected_dialog,
+            expected_offset=expected_offset,
         )
 
 
@@ -411,6 +541,8 @@ async def _run_cold_backfill_pass(  # noqa: PLR0913 - explicit worker dependenci
     pacing: ColdBackfillPacing,
     timeout_s: float,
     writer: SQLiteWriter,
+    expected_dialog: int | None = None,
+    expected_offset: int | None = None,
 ) -> ColdPassResult:
     """Run one Tier-B ColdBackfill pass.
 
@@ -432,7 +564,11 @@ async def _run_cold_backfill_pass(  # noqa: PLR0913 - explicit worker dependenci
     now = int(time.time())
 
     claim_until = now + max(1, math.ceil(timeout_s + pacing.history.batch_s))
-    row = await writer.run(lambda db: _claim_cold_backfill_peer(db, now=now, claim_until=claim_until))
+    row = await writer.run(
+        lambda db: _claim_cold_backfill_peer(
+            db, now=now, claim_until=claim_until, expected_dialog=expected_dialog, expected_offset=expected_offset
+        )
+    )
 
     if row is None:
         logger.debug("activity_cold_backfill_pass_no_due_peer")
@@ -466,12 +602,17 @@ async def _run_cold_backfill_pass(  # noqa: PLR0913 - explicit worker dependenci
                 timeout_s=timeout_s,
                 writer=writer,
                 hydration_priority=HydrationPriority.BACKFILL,
+                accept_page=lambda db: _cold_claim_matches(db, dialog_id, offset_id, claim_until),
             )
     except RpcAttemptBudgetExhaustedError:
         # A slice bound is not an access failure. Release the short claim so
         # status() exposes immediate durable continuation on the next slice.
         await writer.run(lambda db: _release_cold_claim(db, dialog_id=dialog_id, claim_until=claim_until))
         return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0)
+
+    if not result.accepted:
+        await writer.run(lambda db: _release_cold_claim(db, dialog_id=dialog_id, claim_until=claim_until))
+        return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0, accepted=False)
 
     return await writer.run(
         lambda db: _finish_cold_backfill_peer(

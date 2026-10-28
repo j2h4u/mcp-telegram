@@ -54,6 +54,7 @@ from mcp_telegram.startup_identity import (
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_demand import DemandStatus, RpcAttemptBudget
 from mcp_telegram.telegram_demand_coordinator import CoordinatorState, TelegramDemandCoordinator
+from mcp_telegram.telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkKey, WorkRevision
 from mcp_telegram.telegram_rpc_consumers import DURABLE_DEMAND_ORDER, DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RPC_SOURCE_SERVICE_CLASS,
@@ -736,9 +737,16 @@ async def test_classified_startup_identity_mismatch_preserves_directory_rows(
 
 
 @pytest.mark.asyncio
-async def test_classified_startup_identity_binds_matching_account(tmp_path: Path, shared_writer: SQLiteWriter) -> None:
+@pytest.mark.parametrize("retained_account", [False, True])
+async def test_classified_startup_identity_binds_matching_account(
+    tmp_path: Path, shared_writer: SQLiteWriter, retained_account: bool
+) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
+    if retained_account:
+        with closing(_open_sync_db(db_path)) as conn:
+            conn.execute("UPDATE dialog_directory_state SET account_id=101")
+            conn.commit()
     shutdown = asyncio.Event()
     ctx = _typed_ctx(
         db_path=db_path,
@@ -797,17 +805,27 @@ async def test_protective_stop_drains_producers_before_flushing_admission_observ
         async def disconnect(self) -> None:
             stages.append("disconnect")
 
-    async def producer() -> None:
+    async def coordinator() -> None:
         try:
             await asyncio.Future()
         finally:
-            stages.append("producer_cancelled")
+            stages.append("coordinator_cancelled")
 
-    task = asyncio.create_task(producer())
+    async def passive(name: str) -> None:
+        try:
+            await asyncio.Future()
+        finally:
+            stages.append(f"{name}_cancelled")
+
+    coordinator_task = asyncio.create_task(coordinator(), name="telegram_demand_coordinator")
+    passive_tasks = {
+        asyncio.create_task(passive(name), name=name)
+        for name in ("sqlite_writer", "update_delivery", "heartbeat", "reconnect", "local_api")
+    }
     await asyncio.sleep(0)
     ctx = _typed_ctx(
         client=_StoppingClient(),
-        background_tasks={task},
+        background_tasks={coordinator_task, *passive_tasks},
         flood_wait_kill_switch_event=event,
         rpc_admission_observer=cast(
             RpcAdmissionObservationAggregator,
@@ -818,9 +836,16 @@ async def test_protective_stop_drains_producers_before_flushing_admission_observ
         daemon, "flood_wait_kill_switch_status", lambda: SimpleNamespace(open=True, detail=lambda: "open")
     )
 
-    await _monitor_flood_wait_kill_switch(ctx)
-
-    assert stages == ["producer_cancelled", "disconnect", "flush"]
+    try:
+        await _monitor_flood_wait_kill_switch(ctx)
+        assert stages == ["coordinator_cancelled", "flush"]
+        assert coordinator_task.cancelled()
+        assert all(not task.done() for task in passive_tasks)
+        assert cast(_ClientStub, ctx.client).disconnect_calls == 0
+    finally:
+        for task in passive_tasks:
+            task.cancel()
+        await asyncio.gather(*passive_tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -828,7 +853,7 @@ async def test_latched_coordinator_stop_keeps_local_daemon_socket_available(  # 
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A latched durable acquisition stops its pump, then the monitor tears down Telegram only."""
+    """A protective hold cancels durable acquisition while local services stay available."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
@@ -860,21 +885,22 @@ async def test_latched_coordinator_stop_keeps_local_daemon_socket_available(  # 
     raw_sends: list[str] = []
 
     class _Adapter:
-        def __init__(self, *, ready: bool = False) -> None:
+        def __init__(self, kind: DemandKind, *, ready: bool = False) -> None:
+            self.selected = WorkRevision(WorkKey(kind, 1, kind.value), "r1")
             self.ready = ready
 
-        def status(self, now: float) -> DemandStatus | None:
+        def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
             del now
-            return DemandStatus(0) if self.ready else None
+            return DemandStatus(0, selected=self.selected) if self.ready and self.selected not in excluded else None
 
-        async def run_slice(self, budget: RpcAttemptBudget) -> None:
-            del budget
+        async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
+            assert budget.selected == self.selected
             raw_sends.append("attempt")
             kill_switch.set()
             raise TelegramRpcThrottled(latched=True)
 
     target = DemandKind.ENTITY_PROFILE_REFRESH
-    adapters = {kind: _Adapter(ready=kind is target) for kind in DURABLE_DEMAND_ORDER}
+    adapters = {kind: _Adapter(kind, ready=kind is target) for kind in DURABLE_DEMAND_ORDER}
     coordinator = TelegramDemandCoordinator(adapters, shutdown)
     noncritical_started = asyncio.Event()
 
@@ -893,6 +919,7 @@ async def test_latched_coordinator_stop_keeps_local_daemon_socket_available(  # 
     )
     socket_path = tmp_path / "daemon.sock"
     unix_server = await asyncio.start_unix_server(api.handle_client, path=socket_path)
+    noncritical_task: asyncio.Task[object] | None = None
     try:
         coordinator_task = daemon._create_tracked_task(
             ctx,
@@ -902,16 +929,17 @@ async def test_latched_coordinator_stop_keeps_local_daemon_socket_available(  # 
         )
         noncritical_task = daemon._create_tracked_task(ctx, noncritical_producer(), name="noncritical_producer")
         await noncritical_started.wait()
-        await coordinator_task
+        monitor_task = asyncio.create_task(_monitor_flood_wait_kill_switch(ctx))
+        await monitor_task
+        with pytest.raises(asyncio.CancelledError):
+            await coordinator_task
 
         assert coordinator.state is CoordinatorState.STOPPED
         assert shutdown.is_set() is False
         assert api._ready is True
         assert raw_sends == ["attempt"]
-
-        await _monitor_flood_wait_kill_switch(ctx)
-        assert client.disconnect_calls == 1
-        assert noncritical_task.cancelled()
+        assert client.disconnect_calls == 0
+        assert not noncritical_task.done()
         assert shutdown.is_set() is False
         assert api._ready is True
         assert unix_server.is_serving()
@@ -934,6 +962,10 @@ async def test_latched_coordinator_stop_keeps_local_daemon_socket_available(  # 
         assert feedback["ok"] is True
         assert feedback_conn.execute("SELECT message FROM feedback").fetchone() == ("local after latch",)
     finally:
+        if noncritical_task is not None and not noncritical_task.done():
+            noncritical_task.cancel()
+        if noncritical_task is not None:
+            await asyncio.gather(noncritical_task, return_exceptions=True)
         unix_server.close()
         await unix_server.wait_closed()
         await api.shutdown()
@@ -973,22 +1005,24 @@ async def test_protective_monitor_cancels_active_coordinator_without_closing_loc
     raw_sends: list[str] = []
 
     class _BlockedAdapter:
-        def __init__(self, *, ready: bool = False) -> None:
+        def __init__(self, kind: DemandKind, *, ready: bool = False) -> None:
+            self.selected = WorkRevision(WorkKey(kind, 1, kind.value), "r1")
             self.ready = ready
 
-        def status(self, now: float) -> DemandStatus | None:
+        def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
             del now
-            return DemandStatus(0) if self.ready else None
+            return DemandStatus(0, selected=self.selected) if self.ready and self.selected not in excluded else None
 
-        async def run_slice(self, budget: RpcAttemptBudget) -> None:
-            del budget
+        async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
+            assert budget.selected == self.selected
             started.set()
             await asyncio.Future()
             raw_sends.append("unexpected")
+            return SliceOutcome(self.selected, SliceOutcomeKind.NO_PROGRESS)
 
     target = DemandKind.ENTITY_PROFILE_REFRESH
     coordinator = TelegramDemandCoordinator(
-        {kind: _BlockedAdapter(ready=kind is target) for kind in DURABLE_DEMAND_ORDER}, shutdown
+        {kind: _BlockedAdapter(kind, ready=kind is target) for kind in DURABLE_DEMAND_ORDER}, shutdown
     )
     noncritical_started = asyncio.Event()
 
@@ -1007,6 +1041,7 @@ async def test_protective_monitor_cancels_active_coordinator_without_closing_loc
     )
     socket_path = tmp_path / "monitor-first.sock"
     unix_server = await asyncio.start_unix_server(api.handle_client, path=socket_path)
+    noncritical_task: asyncio.Task[object] | None = None
     try:
         coordinator_task = daemon._create_tracked_task(
             ctx,
@@ -1022,8 +1057,8 @@ async def test_protective_monitor_cancels_active_coordinator_without_closing_loc
             await coordinator_task
 
         assert coordinator.state is CoordinatorState.STOPPED
-        assert client.disconnect_calls == 1
-        assert noncritical_task.cancelled()
+        assert client.disconnect_calls == 0
+        assert not noncritical_task.done()
         assert shutdown.is_set() is False
         assert api._ready is True
         assert unix_server.is_serving()
@@ -1037,6 +1072,10 @@ async def test_protective_monitor_cancels_active_coordinator_without_closing_loc
         await writer.wait_closed()
         assert response["ok"] is True
     finally:
+        if noncritical_task is not None and not noncritical_task.done():
+            noncritical_task.cancel()
+        if noncritical_task is not None:
+            await asyncio.gather(noncritical_task, return_exceptions=True)
         unix_server.close()
         await unix_server.wait_closed()
         await api.shutdown()
@@ -1044,7 +1083,7 @@ async def test_protective_monitor_cancels_active_coordinator_without_closing_loc
 
 
 @pytest.mark.asyncio
-async def test_protective_stop_persists_pending_summary_while_daemon_remains_parked(
+async def test_protective_stop_persists_pending_summary_while_daemon_remains_parked(  # noqa: PLR0915
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     shared_writer: SQLiteWriter,
@@ -1088,17 +1127,21 @@ async def test_protective_stop_persists_pending_summary_while_daemon_remains_par
             stages.append("disconnect")
             await super().disconnect()
 
-    async def producer() -> None:
+    async def coordinator() -> None:
         try:
             await asyncio.Future()
         finally:
-            stages.append("producer_cancelled")
+            stages.append("coordinator_cancelled")
 
-    task = asyncio.create_task(producer())
+    async def delivery() -> None:
+        await asyncio.Future()
+
+    task = asyncio.create_task(coordinator(), name="telegram_demand_coordinator")
+    delivery_task = asyncio.create_task(delivery(), name="update_delivery")
     await asyncio.sleep(0)
     ctx = _typed_ctx(
         client=_StoppingClient(),
-        background_tasks={task},
+        background_tasks={task, delivery_task},
         shutdown_event=shutdown,
         flood_wait_kill_switch_event=kill_switch,
         rpc_admission_observer=observer,
@@ -1112,9 +1155,11 @@ async def test_protective_stop_persists_pending_summary_while_daemon_remains_par
 
     try:
         await _monitor_flood_wait_kill_switch(ctx)
-        assert stages == ["producer_cancelled", "disconnect"]
+        assert stages == ["coordinator_cancelled"]
+        assert task.cancelled()
+        assert not delivery_task.done()
         assert shutdown.is_set() is False
-        assert cast(_ClientStub, ctx.client).disconnect_calls == 1
+        assert cast(_ClientStub, ctx.client).disconnect_calls == 0
 
         row: tuple[object, ...] | None = None
         for _ in range(100):
@@ -1131,13 +1176,15 @@ async def test_protective_stop_persists_pending_summary_while_daemon_remains_par
             await asyncio.sleep(0.01)
         assert row is not None
         assert row[0] == "summary"
-        assert stages == ["producer_cancelled", "disconnect"]
+        assert stages == ["coordinator_cancelled"]
     finally:
+        delivery_task.cancel()
+        await asyncio.gather(delivery_task, return_exceptions=True)
         await sink.aclose()
 
 
 @pytest.mark.asyncio
-async def test_failed_protective_stop_flushes_without_disconnected_success_log(
+async def test_protective_stop_never_attempts_transport_disconnect(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -1195,9 +1242,9 @@ async def test_failed_protective_stop_flushes_without_disconnected_success_log(
 
     try:
         await _monitor_flood_wait_kill_switch(ctx)
-        assert cast(_ClientStub, ctx.client).disconnect_calls == 1
+        assert cast(_ClientStub, ctx.client).disconnect_calls == 0
         assert not ctx.shutdown_event.is_set()
-        assert "flood_wait_kill_switch_telegram_disconnect_failed" in caplog.messages
+        assert "flood_wait_kill_switch_telegram_disconnect_failed" not in caplog.messages
         assert "flood_wait_kill_switch_telegram_disconnected" not in caplog.messages
 
         row: tuple[object, ...] | None = None
@@ -1302,3 +1349,39 @@ async def test_shutdown_cancels_disconnects_and_detaches_before_flushing_telemet
 
 async def _append_async(stages: list[str], stage: str) -> None:
     stages.append(stage)
+
+
+@pytest.mark.asyncio
+async def test_preidentity_startup_retains_one_budget_and_deadline_across_gate_deferral(
+    tmp_path: Path, shared_writer: SQLiteWriter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred, current_rpc_scope
+
+    seen: list[tuple[RpcAttemptBudget | None, float | None]] = []
+
+    class DeferredClient(_StartupIdentityClient):
+        async def get_me(self) -> object:
+            scope = current_rpc_scope()
+            seen.append((scope.attempt_budget, scope.deadline))
+            assert scope.attempt_budget is not None and scope.attempt_budget.selected is None
+            if len(seen) == 1:
+                raise TelegramRpcAdmissionDeferred(1)
+            scope.attempt_budget.debit()
+            return await super().get_me()
+
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    shutdown = asyncio.Event()
+    ctx = _typed_ctx(
+        db_path=db_path,
+        shutdown_event=shutdown,
+        client=DeferredClient(101),
+        api_server=_ApiStub(),
+        self_profile_cadence=_CadenceStub(),
+    )
+    directory = CanonicalDialogDirectory(ctx.client, db_path, shutdown, writer=shared_writer)
+    monkeypatch.setattr(daemon, "sleep_through_flood", AsyncMock(return_value=False))
+    startup = await _acquire_startup_identity_before_updates(ctx, directory)
+    assert not startup.pending and ctx.api_server.self_id == 101
+    assert len(seen) == 2 and seen[0][0] is seen[1][0] and seen[0][1] == seen[1][1]
+    assert seen[1][0] is not None and seen[1][0].attempts == 1

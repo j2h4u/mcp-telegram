@@ -73,6 +73,23 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
     def read_next_retry_at(self) -> int | None:
         return _int_state(self._state("next_retry_at"))
 
+    def read_snapshot_revision(self) -> tuple[int | None, int | None, str | None, int | None] | None:
+        row = cast(
+            tuple[object, object, object, object] | None,
+            self._conn.execute(
+                "SELECT account_id,canonical_generation,accepted_rule_token,rule_observation_started_at "
+                "FROM telegram_folder_projection_state WHERE singleton=1"
+            ).fetchone(),
+        )
+        if row is None:
+            return None
+        return (
+            None if row[0] is None else _as_int(row[0]),
+            None if row[1] is None else _as_int(row[1]),
+            None if row[2] is None else str(row[2]),
+            None if row[3] is None else _as_int(row[3]),
+        )
+
     def rules_are_fresh(self, *, now: int) -> bool:
         started_at = self.read_last_success_at()
         return started_at is not None and now < started_at + RULE_TTL_SECONDS

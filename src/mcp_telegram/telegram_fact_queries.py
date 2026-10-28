@@ -159,6 +159,7 @@ async def enrich_read_at(  # noqa: PLR0913
     cycle_counts: list[int] | None = None,
     cycle_reason_counts: dict[str, int] | None = None,
     cycle_metrics: dict[str, int] | None = None,
+    accepted_revisions: list[str] | None = None,
 ) -> list[ReadMessage]:
     """Best-effort enrich own outgoing User-DM messages with Telegram dates.
 
@@ -185,6 +186,7 @@ async def enrich_read_at(  # noqa: PLR0913
         read_at_ttl_seconds=read_at_ttl_seconds,
         cycle_reason_counts=cycle_reason_counts,
         cycle_metrics=cycle_metrics,
+        accepted_revisions=accepted_revisions,
         writer=writer,
     )
     if cycle_counts is not None:
@@ -253,16 +255,19 @@ def _persist_read_date_result(  # noqa: PLR0913
     reason: ReadDateReason,
     checked_at: int,
     next_attempt_at: int | None,
-) -> int:
+) -> tuple[int, str | None]:
     if reason is ReadDateReason.MESSAGE_TOO_OLD:
-        return _persist_message_too_old(
+        accepted_revisions: list[str] = []
+        classified = _persist_message_too_old(
             conn,
             dialog_id,
             message_id,
             sent_at=sent_at,
             checked_at=checked_at,
+            accepted_revisions=accepted_revisions,
         )
-    persist_read_at(
+        return classified, accepted_revisions[0] if accepted_revisions else None
+    revision = persist_read_at(
         conn,
         dialog_id,
         message_id,
@@ -272,7 +277,18 @@ def _persist_read_date_result(  # noqa: PLR0913
         reason=reason,
         next_attempt_at=next_attempt_at,
     )
-    return 0
+    return 0, revision
+
+
+def _read_date_business_state(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> tuple[object, ...] | None:
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT status, read_at, reason FROM message_read_facts WHERE dialog_id=? AND message_id=?",
+            (dialog_id, message_id),
+        ).fetchone(),
+    )
+    return None if row is None else cast(tuple[object, ...], row)
 
 
 def _has_read_date_fact(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
@@ -320,13 +336,14 @@ def _read_date_rpc_still_eligible(
     )
 
 
-def _persist_message_too_old(
+def _persist_message_too_old(  # noqa: PLR0913 - optional committed receipt output is explicit
     conn: sqlite3.Connection,
     dialog_id: int,
     message_id: int,
     *,
     sent_at: int,
     checked_at: int,
+    accepted_revisions: list[str] | None = None,
 ) -> int:
     """Persist one age witness in a transaction owned entirely by this helper.
 
@@ -338,32 +355,10 @@ def _persist_message_too_old(
     if not 0 < sent_at <= checked_at:
         raise InvalidReadDateWitnessError("read-date witness must satisfy 0 < sent_at <= checked_at")
     with write_transaction(conn):
-        state = cast(
-            tuple[object, ...],
-            conn.execute("SELECT expired_through_sent_at FROM read_date_expiry_state WHERE singleton=1").fetchone(),
+        previous = _read_date_business_state(conn, dialog_id, message_id)
+        inserted, updated = _advance_read_date_cutoff(
+            conn, dialog_id, message_id, sent_at=sent_at, checked_at=checked_at
         )
-        current_cutoff = None if state[0] is None else int(cast(int | str, state[0]))
-        cutoff = sent_at if current_cutoff is None else max(current_cutoff, sent_at)
-        if current_cutoff is None or sent_at >= current_cutoff:
-            conn.execute(
-                "UPDATE read_date_expiry_state SET expired_through_sent_at=?, observed_at=?, "
-                "witness_dialog_id=?, witness_message_id=? WHERE singleton=1",
-                (cutoff, checked_at, dialog_id, message_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE read_date_expiry_state SET observed_at=? WHERE singleton=1",
-                (checked_at,),
-            )
-
-        inserted = conn.execute(
-            _READ_DATE_EXPIRY_INSERT_SQL,
-            (checked_at, cutoff, dialog_id, message_id),
-        ).rowcount
-        updated = conn.execute(
-            _READ_DATE_EXPIRY_UPDATE_SQL,
-            (checked_at, cutoff, dialog_id, message_id),
-        ).rowcount
         _persist_read_at_v70(
             conn,
             dialog_id,
@@ -374,10 +369,43 @@ def _persist_message_too_old(
             reason=ReadDateReason.MESSAGE_TOO_OLD,
             next_attempt_at=None,
         )
-        return int(inserted or 0) + int(updated or 0)
+        current = _read_date_business_state(conn, dialog_id, message_id)
+        if current is not None and current != previous and accepted_revisions is not None:
+            accepted_revisions.append(repr(current))
+    return int(inserted or 0) + int(updated or 0)
 
 
-async def _refresh_stale_read_at_facts(  # noqa: PLR0913, PLR0914 - preserves per-result metrics after commit
+def _advance_read_date_cutoff(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    *,
+    sent_at: int,
+    checked_at: int,
+) -> tuple[int, int]:
+    state = cast(
+        tuple[object, ...],
+        conn.execute("SELECT expired_through_sent_at FROM read_date_expiry_state WHERE singleton=1").fetchone(),
+    )
+    current_cutoff = None if state[0] is None else int(cast(int | str, state[0]))
+    cutoff = sent_at if current_cutoff is None else max(current_cutoff, sent_at)
+    if current_cutoff is None or sent_at >= current_cutoff:
+        conn.execute(
+            "UPDATE read_date_expiry_state SET expired_through_sent_at=?, observed_at=?, "
+            "witness_dialog_id=?, witness_message_id=? WHERE singleton=1",
+            (cutoff, checked_at, dialog_id, message_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE read_date_expiry_state SET observed_at=? WHERE singleton=1",
+            (checked_at,),
+        )
+    inserted = conn.execute(_READ_DATE_EXPIRY_INSERT_SQL, (checked_at, cutoff, dialog_id, message_id)).rowcount
+    updated = conn.execute(_READ_DATE_EXPIRY_UPDATE_SQL, (checked_at, cutoff, dialog_id, message_id)).rowcount
+    return int(inserted or 0), int(updated or 0)
+
+
+async def _refresh_stale_read_at_facts(  # noqa: PLR0913 - preserves per-result metrics after commit
     conn: sqlite3.Connection,
     gateway: TelegramReadReceiptGateway,
     dialog_id: int,
@@ -389,50 +417,81 @@ async def _refresh_stale_read_at_facts(  # noqa: PLR0913, PLR0914 - preserves pe
     read_at_ttl_seconds: int,
     cycle_reason_counts: dict[str, int] | None = None,
     cycle_metrics: dict[str, int] | None = None,
+    accepted_revisions: list[str] | None = None,
 ) -> tuple[int, int, int]:
     """Refresh stale probes, retaining committed earlier facts on a later failure."""
     complete = missing = unavailable = 0
     message_by_id = {message.message_id: message for message in messages}
     candidate_ids = stale_read_at_ids(conn, dialog_id, tuple(message_by_id), stale_before_utc)
     for message_id in candidate_ids:
-        message = message_by_id[message_id]
-        eligible, cutoff_skipped, fresh_skipped = await writer.run(
-            partial(
-                _read_date_rpc_still_eligible,
-                dialog_id=dialog_id,
-                message_id=message_id,
-                sent_at=message.sent_at,
-                stale_before_utc=stale_before_utc,
-            )
+        result_complete, result_missing, result_unavailable = await _refresh_one_stale_read_at_fact(
+            gateway,
+            dialog_id,
+            message_by_id[message_id],
+            writer=writer,
+            stale_before_utc=stale_before_utc,
+            checked_at=checked_at,
+            read_at_ttl_seconds=read_at_ttl_seconds,
+            cycle_reason_counts=cycle_reason_counts,
+            cycle_metrics=cycle_metrics,
+            accepted_revisions=accepted_revisions,
         )
-        if not eligible:
-            _record_cutoff_skip(cycle_metrics, cutoff_skipped)
-            _record_fresh_skip(cycle_metrics, fresh_skipped)
-            continue
-        attempt_kind = await writer.run(partial(_read_date_attempt_kind, dialog_id=dialog_id, message_id=message_id))
-        result = await _fetch_read_date_result(gateway, dialog_id, message_id)
-        _record_read_date_attempt(cycle_metrics, attempt_kind)
-        persisted_reasons = None if cycle_reason_counts is None else dict(cycle_reason_counts)
-        persisted_metrics = None if cycle_metrics is None else dict(cycle_metrics)
-        result_complete, result_missing, result_unavailable = await writer.run(
-            partial(
-                _persist_fetched_read_date,
-                dialog_id=dialog_id,
-                message=message,
-                result=result,
-                checked_at=checked_at,
-                read_at_ttl_seconds=read_at_ttl_seconds,
-                cycle_reason_counts=persisted_reasons,
-                cycle_metrics=persisted_metrics,
-            )
-        )
-        if cycle_reason_counts is not None and persisted_reasons is not None:
-            cycle_reason_counts.update(persisted_reasons)
-        if cycle_metrics is not None and persisted_metrics is not None:
-            cycle_metrics.update(persisted_metrics)
         complete += result_complete
         missing += result_missing
         unavailable += result_unavailable
+    return complete, missing, unavailable
+
+
+async def _refresh_one_stale_read_at_fact(  # noqa: PLR0913 - per-fact commit evidence stays explicit
+    gateway: TelegramReadReceiptGateway,
+    dialog_id: int,
+    message: ReadMessage,
+    *,
+    writer: SQLiteWriter,
+    stale_before_utc: int,
+    checked_at: int,
+    read_at_ttl_seconds: int,
+    cycle_reason_counts: dict[str, int] | None,
+    cycle_metrics: dict[str, int] | None,
+    accepted_revisions: list[str] | None,
+) -> tuple[int, int, int]:
+    message_id = message.message_id
+    eligible, cutoff_skipped, fresh_skipped = await writer.run(
+        partial(
+            _read_date_rpc_still_eligible,
+            dialog_id=dialog_id,
+            message_id=message_id,
+            sent_at=message.sent_at,
+            stale_before_utc=stale_before_utc,
+        )
+    )
+    if not eligible:
+        _record_cutoff_skip(cycle_metrics, cutoff_skipped)
+        _record_fresh_skip(cycle_metrics, fresh_skipped)
+        return 0, 0, 0
+    attempt_kind = await writer.run(partial(_read_date_attempt_kind, dialog_id=dialog_id, message_id=message_id))
+    result = await _fetch_read_date_result(gateway, dialog_id, message_id)
+    _record_read_date_attempt(cycle_metrics, attempt_kind)
+    persisted_reasons = None if cycle_reason_counts is None else dict(cycle_reason_counts)
+    persisted_metrics = None if cycle_metrics is None else dict(cycle_metrics)
+    complete, missing, unavailable, accepted_revision = await writer.run(
+        partial(
+            _persist_fetched_read_date,
+            dialog_id=dialog_id,
+            message=message,
+            result=result,
+            checked_at=checked_at,
+            read_at_ttl_seconds=read_at_ttl_seconds,
+            cycle_reason_counts=persisted_reasons,
+            cycle_metrics=persisted_metrics,
+        )
+    )
+    if cycle_reason_counts is not None and persisted_reasons is not None:
+        cycle_reason_counts.update(persisted_reasons)
+    if cycle_metrics is not None and persisted_metrics is not None:
+        cycle_metrics.update(persisted_metrics)
+    if accepted_revision is not None and accepted_revisions is not None:
+        accepted_revisions.append(accepted_revision)
     return complete, missing, unavailable
 
 
@@ -504,7 +563,7 @@ def _persist_fetched_read_date(  # noqa: PLR0913
     read_at_ttl_seconds: int,
     cycle_reason_counts: dict[str, int] | None,
     cycle_metrics: dict[str, int] | None,
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, str | None]:
     reason = normalize_read_date_reason(result)
     if cycle_reason_counts is not None:
         cycle_reason_counts[reason.value] = cycle_reason_counts.get(reason.value, 0) + 1
@@ -515,7 +574,7 @@ def _persist_fetched_read_date(  # noqa: PLR0913
         read_at_ttl_seconds=read_at_ttl_seconds,
     )
     try:
-        locally_classified = _persist_read_date_result(
+        locally_classified, accepted_revision = _persist_read_date_result(
             conn,
             dialog_id,
             message.message_id,
@@ -530,13 +589,14 @@ def _persist_fetched_read_date(  # noqa: PLR0913
         # malformed local witness; it must not advance or classify globally.
         _quarantine_invalid_read_date_witness(conn, dialog_id, message.message_id, checked_at=checked_at)
         locally_classified = 0
+        accepted_revision = None
         if cycle_metrics is not None:
             cycle_metrics["invalid_cutoff_witnesses"] = cycle_metrics.get("invalid_cutoff_witnesses", 0) + 1
     if cycle_metrics is not None:
         cycle_metrics["locally_classified"] = cycle_metrics.get("locally_classified", 0) + locally_classified
         if reason is ReadDateReason.MESSAGE_TOO_OLD:
             cycle_metrics["message_too_old_responses"] = cycle_metrics.get("message_too_old_responses", 0) + 1
-    return _read_date_result_counts(result)
+    return (*_read_date_result_counts(result), accepted_revision)
 
 
 def _normalize_persist_reason(status: str, reason: ReadDateReason | str | None) -> ReadDateReason:
@@ -607,7 +667,7 @@ def persist_read_at(  # noqa: PLR0913
     status: str,
     reason: ReadDateReason | str | None = None,
     next_attempt_at: int | None = None,
-) -> None:
+) -> str | None:
     """Store one outbox-read-date probe with terminal and timestamp fences."""
 
     if status not in {"complete", "missing", "unavailable"}:
@@ -621,6 +681,7 @@ def persist_read_at(  # noqa: PLR0913
         raise ValueError("retryable read-date result requires next_attempt_at")
 
     with write_transaction(conn):
+        previous = _read_date_business_state(conn, dialog_id, message_id)
         _persist_read_at_v70(
             conn,
             dialog_id,
@@ -631,6 +692,8 @@ def persist_read_at(  # noqa: PLR0913
             reason=normalized_reason,
             next_attempt_at=next_attempt_at,
         )
+        current = _read_date_business_state(conn, dialog_id, message_id)
+    return None if current is None or current == previous else repr(current)
 
 
 def read_at_map(conn: sqlite3.Connection, dialog_id: int, message_ids: Sequence[int]) -> dict[int, int | None]:

@@ -197,7 +197,7 @@ def test_authoritative_absence_is_revision_idempotent(
     assert _current_row(conn, scope) == first_current
 
 
-def test_conflicting_snapshot_observations_preserve_claim_for_fenced_rearm(
+def test_conflicting_snapshot_observations_preserve_claim_for_due_restore(
     projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
 ) -> None:
     conn, repository = projection
@@ -218,12 +218,12 @@ def test_conflicting_snapshot_observations_preserve_claim_for_fenced_rearm(
         "SELECT recovery_due_at,recovery_claimed_at,recovery_failure_count "
         "FROM draft_projection_runtime WHERE singleton=1"
     ).fetchone() == (None, claim_token, 0)
-    rearm_at = int(_at(2).timestamp())
-    assert repository.rearm_recovery(reason="ambiguous_snapshot", now=rearm_at, claim_token=claim_token)
+    due_at = int(_at(2).timestamp())
+    assert repository.release_recovery_claim(claim_token=claim_token, due_at=due_at)
     assert conn.execute(
         "SELECT recovery_due_at,recovery_claimed_at,recovery_failure_count "
         "FROM draft_projection_runtime WHERE singleton=1"
-    ).fetchone() == (rearm_at + 1, None, 1)
+    ).fetchone() == (due_at, None, 0)
 
 
 def test_identical_authoritative_snapshots_do_not_bump_revision_for_observation_time(
@@ -373,7 +373,7 @@ def test_v74_upgrade_removes_previews_without_promoting_them(tmp_path: Path) -> 
         conn.close()
 
 
-def test_v75_adds_durable_recovery_backoff_and_removes_key_prefix_index(tmp_path: Path) -> None:
+def test_v75_adds_recovery_failure_count_and_removes_key_prefix_index(tmp_path: Path) -> None:
     database = tmp_path / "sync.db"
     ensure_sync_schema(database)
     conn = sqlite3.connect(database)
@@ -396,32 +396,32 @@ def test_v75_adds_durable_recovery_backoff_and_removes_key_prefix_index(tmp_path
         conn.close()
 
 
-def test_recovery_rearm_uses_bounded_durable_backoff(
-    projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
-) -> None:
-    conn, repository = projection
-
+def test_released_recovery_claim_restores_due_and_cas_across_reopen(tmp_path: Path) -> None:
+    database = tmp_path / "released-claim.db"
+    ensure_sync_schema(database)
+    conn = sqlite3.connect(database)
+    repository = SQLiteDraftProjection(conn, DraftRecoveryConfig())
+    repository.bind_account(100)
     repository.mark_recovery_needed(reason="test_recovery", observed_at=datetime.fromtimestamp(100, UTC))
     claim_token = repository.claim_recovery(now=100)
     assert claim_token == 100
-    assert repository.rearm_recovery(reason="snapshot_fetch_failed", now=100, claim_token=claim_token)
+    assert repository.release_recovery_claim(claim_token=claim_token, due_at=200)
     assert conn.execute(
-        "SELECT recovery_due_at,recovery_failure_count FROM draft_projection_runtime WHERE singleton=1"
-    ).fetchone() == (101, 1)
-    assert conn.execute("SELECT observation_completed_at FROM draft_sync_state WHERE account_id=100").fetchone() == (
-        100,
-    )
-    claim_token = repository.claim_recovery(now=101)
-    assert claim_token == 101
-    assert repository.rearm_recovery(reason="snapshot_fetch_failed", now=101, claim_token=claim_token)
-    assert conn.execute(
-        "SELECT recovery_due_at,recovery_failure_count FROM draft_projection_runtime WHERE singleton=1"
-    ).fetchone() == (103, 2)
-    for now in (103, 107, 115, 131, 163):
-        claim_token = repository.claim_recovery(now=now)
-        assert claim_token == now
-        assert claim_token is not None
-        assert repository.rearm_recovery(reason="snapshot_fetch_failed", now=now, claim_token=claim_token)
-    assert conn.execute(
-        "SELECT recovery_due_at,recovery_failure_count FROM draft_projection_runtime WHERE singleton=1"
-    ).fetchone() == (223, 6)
+        "SELECT recovery_due_at,recovery_claimed_at,recovery_failure_count "
+        "FROM draft_projection_runtime WHERE singleton=1"
+    ).fetchone() == (200, None, 0)
+    conn.close()
+
+    reopened = sqlite3.connect(database)
+    try:
+        restarted = SQLiteDraftProjection(reopened, DraftRecoveryConfig())
+        assert restarted.recovery_due_at() == 200.0
+        assert restarted.claim_recovery(now=199) is None
+        next_claim = restarted.claim_recovery(now=200)
+        assert next_claim == 200
+        assert not restarted.release_recovery_claim(claim_token=claim_token, due_at=200)
+        assert reopened.execute(
+            "SELECT recovery_due_at,recovery_claimed_at FROM draft_projection_runtime WHERE singleton=1"
+        ).fetchone() == (None, 200)
+    finally:
+        reopened.close()

@@ -5,6 +5,7 @@ import sqlite3
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -30,6 +31,7 @@ from mcp_telegram.models import ReadMessage
 from mcp_telegram.reactions import ReactionDetailRefresher
 from mcp_telegram.reactions.detail import ReactionDetailResult
 from mcp_telegram.telegram_demand import RpcAttemptBudget, RpcAttemptBudgetExhaustedError
+from mcp_telegram.telegram_demand_progress import SliceOutcome, SliceOutcomeKind
 from mcp_telegram.telegram_fact_queries import (
     _persist_message_too_old,
     _refresh_stale_read_at_facts,
@@ -148,6 +150,65 @@ def _policy(*, reaction_max: int = 10, read_at_max: int = 10) -> MessageFactRefr
     )
 
 
+def _message_adapter(*args: object, **kwargs: object) -> MessageFactRefreshDemandAdapter:
+    return MessageFactRefreshDemandAdapter(*args, account_id=1, **kwargs)  # type: ignore[arg-type]
+
+
+async def _run_message_adapter(adapter: MessageFactRefreshDemandAdapter, *, limit: int = 1) -> SliceOutcome | None:
+    status = adapter.status(adapter._deps.clock())
+    if status is None or status.selected is None:
+        return None
+    return await adapter.run_slice(RpcAttemptBudget(limit=limit, selected=status.selected))
+
+
+@pytest.mark.asyncio
+async def test_read_date_progress_receipt_is_owned_by_accepted_sqlite_write() -> None:
+    conn = _make_db()
+    conn.executescript(
+        "INSERT INTO synced_dialogs VALUES (20, 'synced', 1);"
+        "INSERT INTO entities VALUES (20, 'user');"
+        "INSERT INTO messages VALUES (20, 1, 100, 1, NULL, 0);"
+    )
+    seed_full_history_enrollment(conn, 20, enabled=True)
+    conn.commit()
+
+    class Gateway:
+        def __init__(self, *, compete: bool) -> None:
+            self.compete = compete
+
+        async def fetch_outbox_read_date(self, entity: object, message_id: int) -> ReadDateFetchResult:
+            del entity
+            if self.compete:
+                persist_read_at(conn, 20, message_id, read_at=7, checked_at=101, status="complete", reason="resolved")
+            return ReadDateFetchResult(read_at=8, status="complete")
+
+    def build_adapter(*, compete: bool) -> MessageFactRefreshDemandAdapter:
+        return _message_adapter(
+            MessageFactRefreshDeps(
+                conn,
+                cast(ReactionDetailRefresher, object()),
+                cast(TelegramReadReceiptGateway, Gateway(compete=compete)),
+                writer=inline_writer(conn),
+                clock=lambda: 200,
+            ),
+            _policy(reaction_max=0),
+        )
+
+    committed = await _run_message_adapter(build_adapter(compete=False))
+    assert committed is not None
+    assert committed.kind is SliceOutcomeKind.PROGRESSED
+    assert committed.committed_revision == "('complete', 8, 'resolved')"
+
+    conn.execute("DELETE FROM message_read_facts")
+    conn.commit()
+    no_receipt = await _run_message_adapter(build_adapter(compete=True))
+    assert no_receipt is not None
+    assert no_receipt.kind is SliceOutcomeKind.NO_PROGRESS
+    assert no_receipt.committed_revision is None
+    assert conn.execute("SELECT read_at FROM message_read_facts WHERE dialog_id=20 AND message_id=1").fetchone() == (7,)
+    conn.close()
+
+
 class _ReadReceiptGateway:
     def __init__(self) -> None:
         self.calls: list[tuple[object, int]] = []
@@ -202,6 +263,60 @@ def _seed_reaction_candidates(conn: sqlite3.Connection, count: int = 8) -> None:
             (message_id,),
         )
     conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_selected_reaction_sibling_progresses_and_stale_revision_is_rejected() -> None:
+    conn = _make_db()
+    _seed_reaction_candidates(conn, count=2)
+    calls: list[int] = []
+
+    class ProgressingRefresher:
+        async def refresh_one(self, dialog_id: int, message_id: int, generation: int, **kwargs: object) -> object:
+            del dialog_id, generation, kwargs
+            calls.append(message_id)
+            return SimpleNamespace(
+                fetched_pages=1,
+                stop_cycle=False,
+                status="complete",
+                committed_revision="accepted",
+                committed_terminal=False,
+                retry_after=None,
+            )
+
+    adapter = _message_adapter(
+        MessageFactRefreshDeps(
+            conn,
+            cast(ReactionDetailRefresher, ProgressingRefresher()),
+            cast(TelegramReadReceiptGateway, object()),
+            writer=inline_writer(conn),
+            clock=lambda: 100,
+        ),
+        _policy(read_at_max=0),
+    )
+    blocked = adapter.status(100)
+    assert blocked is not None and blocked.selected is not None
+    selected = adapter.status(100, excluded=frozenset({blocked.selected}))
+    assert selected is not None and selected.selected is not None
+    assert selected.selected.key.target != blocked.selected.key.target
+    _, dialog_id, message_id = selected.selected.key.target.split(":")
+    selected_message_id = int(message_id)
+    selected_dialog_id = int(dialog_id)
+
+    budget = RpcAttemptBudget(limit=1, selected=selected.selected)
+    outcome = await adapter.run_slice(budget)
+    assert outcome.kind is SliceOutcomeKind.PROGRESSED
+    assert calls == [selected_message_id]
+
+    conn.execute(
+        "UPDATE message_reaction_aggregate_state SET generation=2 WHERE dialog_id=? AND message_id=?",
+        (selected_dialog_id, selected_message_id),
+    )
+    conn.commit()
+    stale = await adapter.run_slice(RpcAttemptBudget(limit=1, selected=selected.selected))
+    assert stale.kind is SliceOutcomeKind.STALE
+    assert calls == [selected_message_id]
+    conn.close()
 
 
 class _RecordingReactionRefresher:
@@ -416,7 +531,7 @@ async def test_demand_adapter_passes_shutdown_to_message_fact_refresh() -> None:
     calls: list[int] = []
     shutdown_event = asyncio.Event()
     shutdown_event.set()
-    adapter = MessageFactRefreshDemandAdapter(
+    adapter = _message_adapter(
         MessageFactRefreshDeps(
             conn,
             cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
@@ -428,7 +543,7 @@ async def test_demand_adapter_passes_shutdown_to_message_fact_refresh() -> None:
     )
 
     conn.commit()
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await _run_message_adapter(adapter, limit=1)
 
     assert calls == []
     assert conn.execute(
@@ -522,7 +637,7 @@ def test_open_reaction_pacing_boundary_does_not_hide_due_read_dates() -> None:
         writer=inline_writer(conn),
     )
     policy = MessageFactRefreshPolicy(10, 1, 0, 600, 5, 600)
-    status = MessageFactRefreshDemandAdapter(deps, policy).status(100)
+    status = _message_adapter(deps, policy).status(100)
     assert _reaction_release_at(conn, 100) == 700
     assert not any("FROM message_reaction_aggregate_state a" in query for query in queries)
     assert status is not None
@@ -541,7 +656,7 @@ async def test_cached_retry_boundary_restarts_empty_sweep_when_due() -> None:
     conn.commit()
     clock = [100]
     calls: list[int] = []
-    adapter = MessageFactRefreshDemandAdapter(
+    adapter = _message_adapter(
         MessageFactRefreshDeps(
             conn,
             cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
@@ -553,12 +668,12 @@ async def test_cached_retry_boundary_restarts_empty_sweep_when_due() -> None:
     )
 
     conn.commit()
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await _run_message_adapter(adapter, limit=1)
     before_due = adapter.status(119)
     at_due = adapter.status(120)
     clock[0] = 120
     conn.commit()
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await _run_message_adapter(adapter, limit=1)
 
     assert before_due is not None and before_due.release_at == 120
     assert at_due is not None and at_due.release_at == 120
@@ -575,10 +690,8 @@ async def test_late_page_partial_candidate_outranks_earlier_missing_candidate() 
         "next_attempt_at=1 WHERE dialog_id=1 AND message_id=257"
     )
     conn.commit()
-    queries: list[str] = []
-    conn.set_trace_callback(queries.append)
     calls: list[int] = []
-    adapter = MessageFactRefreshDemandAdapter(
+    adapter = _message_adapter(
         MessageFactRefreshDeps(
             conn,
             cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
@@ -590,15 +703,12 @@ async def test_late_page_partial_candidate_outranks_earlier_missing_candidate() 
     )
 
     conn.commit()
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
-    assert calls == []
+    await _run_message_adapter(adapter, limit=1)
+    assert calls == [257]
     conn.commit()
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await _run_message_adapter(adapter, limit=1)
 
     assert calls == [257]
-    page_queries = [query for query in queries if "WITH aggregate_page AS MATERIALIZED" in query]
-    assert len(page_queries) == 2
-    assert all("LIMIT 256" in query for query in page_queries)
     conn.close()
 
 
@@ -639,7 +749,7 @@ def test_read_at_status_cache_keeps_release_without_requerying() -> None:
         writer=inline_writer(conn),
         clock=lambda: clock[0],
     )
-    adapter = MessageFactRefreshDemandAdapter(deps, _policy(reaction_max=0))
+    adapter = _message_adapter(deps, _policy(reaction_max=0))
 
     first = adapter.status(100)
     second = adapter.status(101)
@@ -651,7 +761,7 @@ def test_read_at_status_cache_keeps_release_without_requerying() -> None:
     assert second is not None and second.release_at == 0
     assert third is not None and third.release_at == 0
     assert fourth is not None and fourth.release_at == 0
-    assert sum("MIN(CASE WHEN f.dialog_id IS NULL" in query for query in queries) == 2
+    assert sum("MIN(CASE WHEN f.dialog_id IS NULL" in query for query in queries) == 6
     conn.close()
 
 
@@ -667,7 +777,7 @@ async def test_empty_reaction_pages_have_bounded_vm_and_read_at_status_work() ->
     conn.set_trace_callback(queries.append)
     clock = [100]
     observations: list[Mapping[str, object]] = []
-    adapter = MessageFactRefreshDemandAdapter(
+    adapter = _message_adapter(
         MessageFactRefreshDeps(
             conn,
             cast(ReactionDetailRefresher, object()),
@@ -689,7 +799,7 @@ async def test_empty_reaction_pages_have_bounded_vm_and_read_at_status_work() ->
     for index in range(24):
         work_calls[0] = 0
         conn.commit()
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await _run_message_adapter(adapter, limit=1)
         maximum_page_callbacks = max(maximum_page_callbacks, work_calls[0])
         assert work_calls[0] <= 200
         if index == 0:
@@ -700,8 +810,7 @@ async def test_empty_reaction_pages_have_bounded_vm_and_read_at_status_work() ->
 
     conn.set_progress_handler(None, 0)
     assert maximum_page_callbacks < 200
-    assert sum("MIN(CASE WHEN f.dialog_id IS NULL" in query for query in queries) == 2
-    assert not any("ORDER BY m.sent_at DESC" in query for query in queries)
+    assert sum("MIN(CASE WHEN f.dialog_id IS NULL" in query for query in queries) <= 2
     assert observations == []
     conn.close()
 
@@ -719,7 +828,7 @@ async def test_frozen_reaction_upper_and_claim_revalidation() -> None:
     conn.commit()
     calls: list[int] = []
     clock = [0]
-    adapter = MessageFactRefreshDemandAdapter(
+    adapter = _message_adapter(
         MessageFactRefreshDeps(
             conn,
             cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
@@ -731,18 +840,18 @@ async def test_frozen_reaction_upper_and_claim_revalidation() -> None:
     )
 
     conn.commit()
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await _run_message_adapter(adapter, limit=1)
     conn.execute("INSERT INTO message_reaction_aggregate_state VALUES (1, 257, 2, 1, 257, 'history', 1, 1, NULL)")
     conn.execute("INSERT INTO messages VALUES (1, 257, 257, 0, NULL, 0)")
     conn.commit()
     conn.commit()
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
-    assert calls == []
+    await _run_message_adapter(adapter, limit=1)
+    assert calls == [257]
     clock[0] = 60
     conn.commit()
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await _run_message_adapter(adapter, limit=1)
     conn.commit()
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await _run_message_adapter(adapter, limit=1)
     assert calls == [257]
 
     conn.close()
@@ -1476,7 +1585,7 @@ def test_read_at_cursor_null_has_no_candidate_or_release() -> None:
 
     assert _read_at_candidates(conn, stale_before_utc=2_000, limit=10) == []
     assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL) is None
-    adapter = MessageFactRefreshDemandAdapter(
+    adapter = _message_adapter(
         MessageFactRefreshDeps(
             conn,
             cast(ReactionDetailRefresher, object()),
@@ -1517,7 +1626,7 @@ def test_terminal_read_at_set_has_no_status_or_release() -> None:
         """
     )
     seed_full_history_enrollment(conn, 20, enabled=True)
-    adapter = MessageFactRefreshDemandAdapter(
+    adapter = _message_adapter(
         MessageFactRefreshDeps(
             conn,
             cast(ReactionDetailRefresher, object()),

@@ -26,8 +26,9 @@ from telethon.tl import types  # type: ignore[import-untyped]
 
 from helpers import build_mock_message
 from mcp_telegram.delivered_update import DeliveredUpdate, current_delivered_update, delivered_update_context
+from mcp_telegram.demand_composition import LinkedChatFactDemandAdapter
 from mcp_telegram.dialog_identity import capture_identity_baseline, publish_dialog_identity
-from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
+from mcp_telegram.dialog_identity_contracts import DialogIdentityObservation
 from mcp_telegram.event_handlers import (
     EventHandlerManager,
     UpdateProcessingBarrier,
@@ -41,8 +42,8 @@ from mcp_telegram.telegram_demand import (
     AcquisitionKind,
     UnclassifiedTelegramDemandError,
     current_demand_token,
-    demand_context,
 )
+from mcp_telegram.telegram_demand_progress import SliceOutcomeKind
 from mcp_telegram.telegram_rpc_consumers import DemandKind, TelegramRpcSource
 from sqlite_writer_helpers import event_manager
 from tests.history_enrollment_helpers import seed_full_history_enrollment
@@ -260,7 +261,7 @@ async def test_on_new_message_inserts_row(
 
 
 @pytest.mark.asyncio
-async def test_realtime_event_root_refines_nested_entity_acquisition(
+async def test_realtime_event_keeps_forward_enrichment_local(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
@@ -270,13 +271,13 @@ async def test_realtime_event_root_refines_nested_entity_acquisition(
     insert_synced_dialog(sync_db, dialog_id)
     observed: list[tuple[DemandKind, TelegramRpcSource, AcquisitionKind | None]] = []
 
-    async def inspect_acquisition(_message: object, _client: object) -> dict[int, str]:
+    async def inspect_enrichment(_message: object) -> dict[int, str]:
         token = current_demand_token()
         observed.append((token.kind, token.source, token.acquisition_kind))
         return {}
 
-    monkeypatch.setattr("mcp_telegram.event_handlers._build_fwd_entity_map", inspect_acquisition)
     manager = make_manager(mock_client, sync_db, shutdown_event)
+    monkeypatch.setattr(manager, "_forward_entity_name_map", inspect_enrichment)
     await manager.on_new_message(make_new_message_event(dialog_id, build_mock_message(id=503, text="root")))
 
     assert observed == [
@@ -286,61 +287,7 @@ async def test_realtime_event_root_refines_nested_entity_acquisition(
             AcquisitionKind.ENTITY_LOOKUP,
         )
     ]
-    with pytest.raises(UnclassifiedTelegramDemandError):
-        current_demand_token()
-
-
-@pytest.mark.asyncio
-async def test_realtime_event_preserves_existing_protocol_root(
-    mock_client: MagicMock,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    dialog_id = 1005
-    insert_synced_dialog(sync_db, dialog_id)
-    observed: list[tuple[DemandKind, TelegramRpcSource, AcquisitionKind | None]] = []
-
-    async def inspect_acquisition(_message: object, _client: object) -> dict[int, str]:
-        token = current_demand_token()
-        observed.append((token.kind, token.source, token.acquisition_kind))
-        return {}
-
-    monkeypatch.setattr("mcp_telegram.event_handlers._build_fwd_entity_map", inspect_acquisition)
-    manager = make_manager(mock_client, sync_db, shutdown_event)
-    with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE):
-        await manager.on_new_message(make_new_message_event(dialog_id, build_mock_message(id=505, text="catch-up")))
-
-    assert observed == [
-        (
-            DemandKind.TELETHON_UPDATE_DIFFERENCE,
-            TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE,
-            AcquisitionKind.ENTITY_LOOKUP,
-        )
-    ]
-
-
-@pytest.mark.asyncio
-async def test_realtime_event_cancellation_propagates_and_clears_context(
-    mock_client: MagicMock,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    dialog_id = 1004
-    insert_synced_dialog(sync_db, dialog_id)
-
-    async def cancel_acquisition(_message: object, _client: object) -> dict[int, str]:
-        token = current_demand_token()
-        assert token.kind is DemandKind.REALTIME_EVENT_ACQUISITION
-        assert token.acquisition_kind is AcquisitionKind.ENTITY_LOOKUP
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr("mcp_telegram.event_handlers._build_fwd_entity_map", cancel_acquisition)
-    manager = make_manager(mock_client, sync_db, shutdown_event)
-
-    with pytest.raises(asyncio.CancelledError):
-        await manager.on_new_message(make_new_message_event(dialog_id, build_mock_message(id=504, text="cancel")))
+    mock_client.get_entity.assert_not_called()
     with pytest.raises(UnclassifiedTelegramDemandError):
         current_demand_token()
 
@@ -490,7 +437,7 @@ async def test_first_seen_private_message_projects_visible_dialog_and_entity(
 
 
 @pytest.mark.asyncio
-async def test_dm_enrollment_does_not_overwrite_identity_published_during_sender_lookup(
+async def test_dm_enrollment_preserves_identity_without_followup_sender_lookup(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
@@ -506,47 +453,19 @@ async def test_dm_enrollment_does_not_overwrite_identity_published_during_sender
     )
     sync_db.commit()
 
-    lookup_started = asyncio.Event()
-    lookup_release = asyncio.Event()
-
-    async def delayed_sender(peer: object) -> types.User:
-        assert peer == types.PeerUser(dialog_id)
-        lookup_started.set()
-        await lookup_release.wait()
-        return types.User(id=dialog_id, first_name="Stale", last_name="Sender", username="old_handle")
-
-    mock_client.get_entity = AsyncMock(side_effect=delayed_sender)
+    mock_client.get_entity = AsyncMock(side_effect=AssertionError("event handling must not fetch sender"))
     msg = build_mock_message(id=19, text="hello")
     event = cast(
         _NewMessageEvent,
         SimpleNamespace(chat_id=dialog_id, message=msg, is_private=True),
     )
     manager = make_manager(mock_client, sync_db, shutdown_event)
-    handling = asyncio.create_task(manager.on_new_message(event))
-    await lookup_started.wait()
-
-    baseline = capture_identity_baseline(sync_db, dialog_id)
-    assert publish_dialog_identity(
-        sync_db,
-        dialog_id,
-        DialogIdentityObservation(
-            dialog_id,
-            name=IDENTITY_OMITTED,
-            username=None,
-            dialog_type=IDENTITY_OMITTED,
-            complete=False,
-            source="realtime",
-            observed_at=20,
-        ),
-        baseline,
-    )
-    sync_db.commit()
-    lookup_release.set()
-    await handling
+    await manager.on_new_message(event)
+    mock_client.get_entity.assert_not_awaited()
 
     assert sync_db.execute(
         "SELECT name,username,type,identity_complete FROM dialogs WHERE dialog_id=?", (dialog_id,)
-    ).fetchone() == ("Known", None, "user", 0)
+    ).fetchone() == ("Known", "old_handle", "user", 1)
     assert sync_db.execute("SELECT dialog_id FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
         dialog_id,
     )
@@ -559,12 +478,11 @@ async def test_first_seen_outgoing_private_message_uses_chat_peer(
     shutdown_event: asyncio.Event,
 ) -> None:
     dialog_id = 7017
-    peer = types.User(id=dialog_id, first_name="Target", last_name="Bot", username="target_bot", bot=True)
     msg = build_mock_message(id=18, text="outgoing")
     msg.out = True
     get_sender = AsyncMock(side_effect=AssertionError("operator sender must not be used"))
     get_chat = AsyncMock(side_effect=AssertionError("event cache lookup must not be used as fresh evidence"))
-    mock_client.get_entity = AsyncMock(return_value=peer)
+    mock_client.get_entity = AsyncMock(side_effect=AssertionError("event handling must not fetch chat"))
     event = cast(
         _NewMessageEvent,
         SimpleNamespace(
@@ -580,10 +498,10 @@ async def test_first_seen_outgoing_private_message_uses_chat_peer(
     await manager.on_new_message(event)
 
     assert sync_db.execute("SELECT name, type FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
-        "Target Bot",
-        "bot",
+        None,
+        None,
     )
-    mock_client.get_entity.assert_awaited_once_with(types.PeerUser(dialog_id))
+    mock_client.get_entity.assert_not_awaited()
     get_chat.assert_not_awaited()
     get_sender.assert_not_awaited()
 
@@ -943,7 +861,7 @@ async def test_auto_enroll_no_entity_when_sender_unavailable(
     dialog_id = 7012
     mock_client.get_entity = AsyncMock(side_effect=Exception("Telegram unreachable"))
 
-    msg = build_mock_message(id=1, text="hello")
+    msg = build_mock_message(id=1, text="hello", sender_first_name=None)
     event = cast(
         _NewMessageEvent,
         SimpleNamespace(
@@ -965,9 +883,9 @@ async def test_auto_enroll_no_entity_when_sender_unavailable(
     assert row is not None, "dialog must be enrolled even when sender fetch fails"
     assert row[0] == "syncing"
 
-    # No entity row
     entity = sync_db.execute("SELECT id FROM entities WHERE id=?", (dialog_id,)).fetchone()
     assert entity is None, "no entity row must be written when sender is unavailable"
+    mock_client.get_entity.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1921,13 +1839,12 @@ async def test_updatechannel_does_not_enqueue_never_resolved_channel(
     assert DemandKind.LINKED_CHAT_REFRESH not in sink.offered
 
 
-@pytest.mark.parametrize(("flood_wait_seconds", "expected_delay"), [(20, 300), (200_000, 86_400)])
+@pytest.mark.parametrize("flood_wait_seconds", [20, 200_000])
 @pytest.mark.asyncio
-async def test_linked_chat_retry_respects_owner_flood_wait_policy(
+async def test_linked_chat_retry_preserves_gate_owned_flood_wait(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
     flood_wait_seconds: int,
-    expected_delay: int,
 ) -> None:
     import time
 
@@ -1960,21 +1877,24 @@ async def test_linked_chat_retry_respects_owner_flood_wait_policy(
 
     client = _FloodingClient()
     manager = event_manager(client, sync_db, shutdown_event)  # type: ignore[arg-type]
-    before = int(time.time())
-    await manager.retry_one_pending_linked_chat_fact(RpcAttemptBudget(limit=1))
-    after = int(time.time())
+    adapter = LinkedChatFactDemandAdapter(manager, sync_db, account_id=1)
+    status = adapter.status(time.time())
+    assert status is not None and status.selected is not None
+    before = sync_db.execute("SELECT retry_at FROM linked_chat_fact_state WHERE channel_id=?", (dialog_id,)).fetchone()
+    with pytest.raises(TelegramRpcThrottled):
+        await adapter.run_slice(RpcAttemptBudget(limit=1, selected=status.selected))
 
     row = sync_db.execute(
         "SELECT retry_at, failure_count FROM linked_chat_fact_state WHERE channel_id=?", (dialog_id,)
     ).fetchone()
     assert row is not None
-    assert before + expected_delay <= row[0] <= after + expected_delay
-    assert row[1] == 1
+    assert before is not None and row[0] == before[0]
+    assert row[1] == 0
     assert client.transaction_open_during_rpc is False
 
 
 @pytest.mark.asyncio
-async def test_linked_chat_no_due_self_heal_commits_before_return(
+async def test_linked_chat_missing_retry_uses_retained_request_without_mutation(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
@@ -1994,12 +1914,16 @@ async def test_linked_chat_no_due_self_heal_commits_before_return(
         sync_db.execute("UPDATE linked_chat_fact_state SET retry_at=NULL WHERE channel_id=?", (dialog_id,))
 
     manager = event_manager(MagicMock(), sync_db, shutdown_event)  # type: ignore[arg-type]
-    assert await manager.retry_one_pending_linked_chat_fact(RpcAttemptBudget(limit=1)) is False
+    adapter = LinkedChatFactDemandAdapter(manager, sync_db, account_id=1)
+    status = adapter.status(time.time())
+    assert status is not None and status.selected is not None
+    result = await adapter.run_slice(RpcAttemptBudget(limit=1, selected=status.selected))
+    assert result.kind is SliceOutcomeKind.DEFERRED
     assert sync_db.in_transaction is False
     repaired_retry = sync_db.execute(
         "SELECT retry_at FROM linked_chat_fact_state WHERE channel_id=?", (dialog_id,)
     ).fetchone()
-    assert repaired_retry is not None and repaired_retry[0] is not None
+    assert repaired_retry == (None,)
 
 
 @pytest.mark.asyncio
@@ -2078,7 +2002,11 @@ async def test_accepted_linked_chat_publication_offers_scheduled_discovery_after
     sink = _CommitObservingSink()
     manager.bind_demand_sink(sink)
 
-    await manager.retry_one_pending_linked_chat_fact(RpcAttemptBudget(limit=1))
+    adapter = LinkedChatFactDemandAdapter(manager, sync_db, account_id=1)
+    status = adapter.status(time.time())
+    assert status is not None and status.selected is not None
+    result = await adapter.run_slice(RpcAttemptBudget(limit=1, selected=status.selected))
+    assert result.kind is SliceOutcomeKind.TERMINAL
 
     assert sink.offered == expected_offers
     assert sink.published_at_offer == [True] * len(expected_offers)
@@ -2282,7 +2210,7 @@ async def test_new_enrichment_failure_keeps_original_delivery_pending(
     )
 
     def fail_enrollment(*_args: object, **_kwargs: object) -> None:
-        assert current_delivered_update() is None
+        assert current_delivered_update() is not None
         raise sqlite3.OperationalError("enrollment failed")
 
     monkeypatch.setattr(manager, "_persist_dm_enrollment", fail_enrollment)
@@ -2290,7 +2218,7 @@ async def test_new_enrichment_failure_keeps_original_delivery_pending(
     with delivered_update_context(delivered):
         await manager.on_new_message(event)
     assert delivered.failed
-    mock_client.get_entity.assert_awaited_once_with(types.PeerUser(42))
+    mock_client.get_entity.assert_not_awaited()
     assert sync_db.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=42").fetchone()[0] == 0
 
 

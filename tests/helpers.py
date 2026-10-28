@@ -40,6 +40,7 @@ from mcp_telegram.entity_profile.repository import EntityProfileRepository, Enti
 from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.sync_db import _apply_migrations
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_savepoint
+from tests.demand_adapter_helpers import run_ready_slice
 
 if TYPE_CHECKING:
     from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
@@ -85,7 +86,6 @@ async def acquire_entity_profile(service: DaemonEntityInfoService, entity_id: in
     from unittest.mock import MagicMock
 
     from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
-    from mcp_telegram.telegram_demand import RpcAttemptBudget
 
     bind_profile_test_account(service)
     service._deps = replace(service._deps, now_provider=lambda: 100.0, enable_full_user_pair=False)
@@ -100,7 +100,7 @@ async def acquire_entity_profile(service: DaemonEntityInfoService, entity_id: in
     assert coordinator is not None
     adapter = EntityProfileDemandAdapter(coordinator)
     for _ in range(len(PROFILE_SECTIONS) + 1):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await run_ready_slice(adapter, now=100.0)
         if service._profiles.next_due_refresh(now=100) is None:
             break
 

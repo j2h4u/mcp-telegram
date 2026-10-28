@@ -109,6 +109,8 @@ def test_detail_partial_offset_survives_restart_and_publishes(tmp_path: Path) ->
     conn.commit()
     first = asyncio.run(refresher.refresh_one(1, 2, 1, entity=SimpleNamespace(), now=20))
     assert first.status == "partial"
+    assert first.committed_revision == "(1, 'next')"
+    assert not first.committed_terminal
     assert conn.execute("SELECT next_offset FROM message_reaction_event_status").fetchone() == ("next",)
     assert conn.execute("SELECT COUNT(*) FROM message_reaction_events WHERE display_generation=0").fetchone() == (1,)
     assert reaction_event_projection(conn, 1, [2]) == ({}, {2: "partial"})
@@ -116,6 +118,8 @@ def test_detail_partial_offset_survives_restart_and_publishes(tmp_path: Path) ->
     conn.commit()
     second = asyncio.run(refresher.refresh_one(1, 2, 1, entity=SimpleNamespace(), offset="next", now=21))
     assert second.status == "complete"
+    assert second.committed_revision == "(1, 'complete')"
+    assert second.committed_terminal
     assert gateway.offsets == [None, "next"]
     assert conn.execute("SELECT status,display_generation FROM message_reaction_event_status").fetchone() == (
         "complete",
@@ -856,6 +860,8 @@ def test_detail_final_cas_discards_page_when_status_changes_before_update(tmp_pa
         )
     )
     assert result.status == "stale_writer"
+    assert result.committed_revision is None
+    assert not result.committed_terminal
     assert conn.execute("SELECT COUNT(*) FROM message_reaction_events").fetchone() == (0,)
     assert conn.execute("SELECT status, next_offset FROM message_reaction_event_status").fetchone() == (
         "stale",

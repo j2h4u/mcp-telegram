@@ -23,7 +23,6 @@ from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.entity_profile.contracts import GroupProfileObservation
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.sync_transactions import write_savepoint
-from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_gateway import (
     _group_identity_patch,
     _group_profile_entity_fields,
@@ -33,6 +32,7 @@ from mcp_telegram.telegram_gateway import (
     _optional_string,
 )
 from tests.daemon_api_policy import make_daemon_api_policy
+from tests.demand_adapter_helpers import run_ready_slice
 from tests.helpers import (
     ClientChatAvatarHistoryPort,
     LoudChannelProfilePort,
@@ -370,7 +370,8 @@ async def test_get_entity_info_group_profile_failure_retains_identity_without_re
         client.get_entity = AsyncMock(return_value=chat)
         client.side_effect = [RuntimeError("profile unavailable"), _empty_search()]
         server = make_server(client=client)
-        await _acquire_local_profile(server, -105, chat)
+        with pytest.raises(RuntimeError, match="profile unavailable"):
+            await _acquire_local_profile(server, -105, chat)
         calls_before_read = client.await_count
         r = await _read_local_profile(server, client, -105)
 
@@ -443,6 +444,42 @@ async def test_get_entity_info_group_unavailable_participants_remain_unknown() -
     assert detail["contacts_reason"] == "participants_missing"
 
 
+async def _exercise_contact_overlap_failure_and_recovery(
+    server: DaemonAPIServer,
+    client: AsyncMock,
+    adapter: EntityProfileDemandAdapter,
+    prior_contacts: object,
+) -> None:
+    service = server._get_entity_info_service()
+    with patch.object(service, "_enrich_contact_ids_with_names", side_effect=sqlite3.OperationalError("local read")):
+        await run_ready_slice(adapter)
+        partial = _dict((await _read_local_profile(server, client, -109))["data"])
+        assert partial["about"] == "updated"
+        assert partial["contacts_subscribed"] == prior_contacts
+        sections = _dict(partial["sections"])
+        assert _dict(sections["full_profile"])["status"] == "fresh"
+        assert _dict(sections["contact_overlap"])["status"] == "pending"
+        assert _dict(sections["contact_overlap"])["reason"] == "enumeration_failed"
+        await run_ready_slice(adapter)
+        immediate_retry = service._profiles.next_due_refresh(now=200)
+        assert immediate_retry is not None
+        assert immediate_retry.next_section == "contact_overlap"
+        assert immediate_retry.retry_at == 200
+        retry = service._profiles.next_due_refresh(now=260)
+        assert retry is not None and retry.next_section == "contact_overlap"
+        retained = _dict((await _read_local_profile(server, client, -109))["data"])
+        assert retained["about"] == "updated"
+        assert retained["contacts_subscribed"] == prior_contacts
+        assert _dict(_dict(retained["sections"])["contact_overlap"])["status"] == "unavailable"
+    service._deps = replace(service._deps, now_provider=lambda: 260.0)
+    await run_ready_slice(adapter)
+    recovered = _dict((await _read_local_profile(server, client, -109))["data"])
+    assert recovered["about"] == "updated"
+    assert recovered["contacts_subscribed"] == [{"id": 3, "name": "Bob", "username": None}]
+    assert _dict(_dict(recovered["sections"])["contact_overlap"])["status"] == "fresh"
+    assert client.await_count == 5  # initial profile/avatar, then paired, failed and recovered overlap
+
+
 @pytest.mark.asyncio
 async def test_group_overlap_failure_preserves_full_profile_and_retries_without_erasing_contacts() -> None:
     conn = _make_db()
@@ -470,27 +507,4 @@ async def test_group_overlap_failure_preserves_full_profile_and_retries_without_
     assert service._profiles.request_section_refresh(
         -109, ("full_profile", "contact_overlap"), now=200, pair_mode="disabled"
     )
-    with patch.object(service, "_enrich_contact_ids_with_names", side_effect=sqlite3.OperationalError("local read")):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
-        partial = _dict((await _read_local_profile(server, client, -109))["data"])
-        assert partial["about"] == "updated"
-        assert partial["contacts_subscribed"] == prior_contacts
-        sections = _dict(partial["sections"])
-        assert _dict(sections["full_profile"])["status"] == "fresh"
-        assert _dict(sections["contact_overlap"])["status"] == "pending"
-        assert _dict(sections["contact_overlap"])["reason"] == "enumeration_failed"
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
-        assert service._profiles.next_due_refresh(now=200) is None
-        retry = service._profiles.next_due_refresh(now=260)
-        assert retry is not None and retry.next_section == "contact_overlap"
-        retained = _dict((await _read_local_profile(server, client, -109))["data"])
-        assert retained["about"] == "updated"
-        assert retained["contacts_subscribed"] == prior_contacts
-        assert _dict(_dict(retained["sections"])["contact_overlap"])["status"] == "unavailable"
-    service._deps = replace(service._deps, now_provider=lambda: 260.0)
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
-    recovered = _dict((await _read_local_profile(server, client, -109))["data"])
-    assert recovered["about"] == "updated"
-    assert recovered["contacts_subscribed"] == [{"id": 3, "name": "Bob", "username": None}]
-    assert _dict(_dict(recovered["sections"])["contact_overlap"])["status"] == "fresh"
-    assert client.await_count == 5  # initial profile/avatar, then paired, failed and recovered overlap
+    await _exercise_contact_overlap_failure_and_recovery(server, client, adapter, prior_contacts)

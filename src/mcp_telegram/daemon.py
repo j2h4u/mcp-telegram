@@ -143,6 +143,7 @@ from .sync_worker import FullSyncWorker
 from .telegram import create_client, make_rpc_safety_store
 from .telegram_demand import AcquisitionKind, DemandStatus, RpcAttemptBudget, acquisition_context, demand_context
 from .telegram_demand_coordinator import TelegramDemandCoordinator
+from .telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkRevision
 from .telegram_gateway import (
     TelethonChannelProfileGateway,
     TelethonChatAvatarHistoryGateway,
@@ -387,7 +388,7 @@ class _DemandRuntime:
     dialog_reconciliation_worker: DialogReconciliationWorker
     dialog_directory: CanonicalDialogDirectory
     message_fact_refresh_deps: MessageFactRefreshDeps
-    read_receipt_batch: Callable[[], Awaitable[object]]
+    read_receipt_batch: Callable[[WorkRevision], Awaitable[SliceOutcome]]
     startup_identity: StartupIdentityState
     draft_owner: DraftMessageOwner
 
@@ -420,9 +421,16 @@ class SQLiteSelfProfileCadence:
         release_at = 0.0 if last_success_at is None else last_success_at + self.interval_seconds
         return DemandStatus(release_at=release_at)
 
-    async def mark_refreshed(self, completed_at: float) -> None:
-        """Commit a successful refresh timestamp atomically."""
-        await self.writer.run(lambda conn: save_self_profile_last_success_at(conn, completed_at))
+    def business_revision(self) -> str:
+        row = cast(
+            tuple[str] | None,
+            self.conn.execute("SELECT value FROM daemon_state WHERE key='self_profile_generation'").fetchone(),
+        )
+        return str(int(row[0])) if row is not None else "0"
+
+    async def mark_refreshed(self, completed_at: float) -> str:
+        """Commit the successful refresh and its business successor together."""
+        return await self.writer.run(lambda conn: save_self_profile_last_success_at(conn, completed_at))
 
 
 async def _initialize_read_positions(  # noqa: PLR0913
@@ -436,14 +444,13 @@ async def _initialize_read_positions(  # noqa: PLR0913
     batch_size: int | None = None,
     batch_pause_seconds: float | None = None,
     success_recheck_seconds: float | None = None,
-) -> int:
-    """One bounded sweep to bootstrap or reconcile read state.
+    selected: WorkRevision,
+) -> SliceOutcome:
+    """Reconcile one selected dialog's read state.
 
     Phase 39.3-02 R4: the same GetPeerDialogsRequest sweep that already
     populates ``read_inbox_max_id`` also populates ``read_outbox_max_id``
-    from the same ``Dialog`` object — same endpoint, batched at
-    ``ceil(N / 15)`` calls (Telethon's batch limit). No additional API
-    endpoints introduced.
+    from the same ``Dialog`` object; no additional API endpoint is introduced.
 
     D-03 LOCKED NULL preservation: if Telethon returns None for either
     cursor on a Dialog, ``apply_read_cursor`` is NOT called for that
@@ -454,129 +461,69 @@ async def _initialize_read_positions(  # noqa: PLR0913
     outbox. It tightens Phase 38's inbox-side behaviour (which used
     ``or 0``) — documented behavioural change.
 
-    Batch size and inter-batch pacing are supplied by the hierarchical
-    SchedulingConfig. The caller may also bound selected rows so a recurring
-    pass cannot issue an unbounded number of Telegram actions.
-
     All writes use monotonic UPDATE — ``MAX(COALESCE(existing, 0), incoming)``
     via the shared primitive — so a live MessageRead / outbox-read event
     that arrives during the bootstrap window cannot be overwritten by a
     stale bootstrap reply (designed race safety, not accidental).
     """
-    effective_batch_size, effective_batch_pause_seconds, effective_success_recheck_seconds = _read_position_pacing(
-        batch_size, batch_pause_seconds, success_recheck_seconds
+    del batch_size, batch_pause_seconds, failure_cooldown_seconds
+    effective_success_recheck_seconds = (
+        SchedulingConfig().read_position_reconciliation_seconds
+        if success_recheck_seconds is None
+        else success_recheck_seconds
     )
-    if effective_batch_size < 1:
-        raise ValueError("batch_size must be positive")
-    if effective_batch_pause_seconds <= 0:
-        raise ValueError("batch_pause_seconds must be positive")
 
     now = int(time.time())
+    dialog_id = int(selected.key.target.removeprefix("dialog:"))
     rows = _select_read_position_work_rows(conn, max_dialogs, now=now)
-    if not rows:
+    if (dialog_id,) not in rows:
         logger.debug("initialize_read_positions — no due rows, skipping")
-        return 0
+        return SliceOutcome(selected, SliceOutcomeKind.STALE)
 
-    dialog_ids = [dialog_id for (dialog_id,) in rows]
-    filled = 0
+    dialog_ids = [dialog_id]
 
-    for i in range(0, len(dialog_ids), effective_batch_size):
-        if shutdown_event.is_set():
-            break
-        batch_ids = dialog_ids[i : i + effective_batch_size]
-        batch_filled, stop = await _reconcile_read_position_batch(
-            client,
-            conn,
-            shutdown_event,
-            batch_ids,
-            failure_cooldown_seconds,
-            writer=writer,
-            success_recheck_seconds=effective_success_recheck_seconds,
-        )
-        filled += batch_filled
-        if stop:
-            return filled
-
-        if not await _sleep_read_pos_batch(shutdown_event, effective_batch_pause_seconds):
-            break
-
-    logger.info("initialize_read_positions filled=%d/%d", filled, len(dialog_ids))
-    return filled
-
-
-def _read_position_pacing(
-    batch_size: int | None,
-    batch_pause_seconds: float | None,
-    success_recheck_seconds: float | None,
-) -> tuple[int, float, float]:
-    defaults = SchedulingConfig()
-    return (
-        defaults.read_position_reconciliation_batch_size if batch_size is None else batch_size,
-        defaults.read_position_reconciliation_batch_pause_seconds
-        if batch_pause_seconds is None
-        else batch_pause_seconds,
-        defaults.read_position_reconciliation_seconds if success_recheck_seconds is None else success_recheck_seconds,
+    outcome = SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+    if shutdown_event.is_set():
+        return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+    outcome = await _reconcile_read_position_batch(
+        client,
+        conn,
+        dialog_ids,
+        writer=writer,
+        success_recheck_seconds=effective_success_recheck_seconds,
+        selected=selected,
     )
+
+    logger.info("initialize_read_positions completed dialog_id=%d", dialog_id)
+    return outcome
 
 
 async def _reconcile_read_position_batch(  # noqa: PLR0913
     client: _DaemonClient,
     conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
     batch_ids: list[int],
-    failure_cooldown_seconds: float | None,
     *,
     writer: SQLiteWriter,
     success_recheck_seconds: float,
-) -> tuple[int, bool]:
-    retry_ids: set[int] = set()
-    try:
-        input_peers, unresolved_ids = await _build_read_position_input_peers(client, batch_ids)
-        retry_ids.update(unresolved_ids)
-        if input_peers:
-            request_started_at = int(time.time())
-            result = cast(_ReadPositionsResultLike, await client(GetPeerDialogsRequest(peers=input_peers)))
-            returned_ids: set[int] = set()
-            success_due_at = int(time.time()) + max(1, math.ceil(success_recheck_seconds))
-            retry_at = _read_position_retry_at(int(time.time()), failure_cooldown_seconds)
-            filled = await writer.run(
-                lambda owned: _apply_read_positions_from_dialogs(
-                    owned,
-                    result,
-                    retry_at=retry_at,
-                    returned_ids=returned_ids,
-                    failed_ids=retry_ids,
-                    request_started_at=request_started_at,
-                    success_due_at=success_due_at,
-                )
+    selected: WorkRevision,
+) -> SliceOutcome:
+    input_peers, _unresolved_ids = await _build_read_position_input_peers(client, batch_ids)
+    if input_peers:
+        request_started_at = int(time.time())
+        result = cast(_ReadPositionsResultLike, await client(GetPeerDialogsRequest(peers=input_peers)))
+        success_due_at = int(time.time()) + max(1, math.ceil(success_recheck_seconds))
+        _, outcome = await writer.run(
+            lambda owned: _apply_read_positions_from_dialogs(
+                owned,
+                result,
+                request_started_at=request_started_at,
+                success_due_at=success_due_at,
+                selected=selected,
             )
-            retry_ids.update(set(batch_ids) - returned_ids)
-        else:
-            filled = 0
-    except TelegramRpcThrottled as exc:
-        if exc.retry_after_seconds is None:
-            raise
-        logger.warning("read_pos_bootstrap flood_wait seconds=%s", exc.retry_after_seconds)
-        retry_ids.update(batch_ids)
-        retry_at = _read_position_retry_at(int(time.time()), failure_cooldown_seconds)
-        if retry_ids and retry_at is not None:
-            await writer.run(lambda owned: _persist_read_position_retry(owned, retry_ids, retry_at))
-        if exc.retry_after_seconds is not None:
-            await sleep_through_flood(shutdown_event, exc.retry_after_seconds)
-        return 0, True
-    except (RPCError, sqlite3.DatabaseError) as exc:
-        logger.debug("read_pos_bootstrap batch_failed error=%s", exc)
-        retry_ids.update(batch_ids)
-        filled = 0
-    retry_at = _read_position_retry_at(int(time.time()), failure_cooldown_seconds)
-    if retry_ids and retry_at is not None:
-        await writer.run(lambda owned: _persist_read_position_retry(owned, retry_ids, retry_at))
-    return filled, False
-
-
-def _persist_read_position_retry(conn: sqlite3.Connection, dialog_ids: set[int], retry_at: int | None) -> None:
-    with write_transaction(conn):
-        _mark_read_position_retry(conn, dialog_ids, retry_at)
+        )
+    else:
+        outcome = SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
+    return outcome
 
 
 def _select_read_position_work_rows(
@@ -611,23 +558,6 @@ def _select_read_position_work_rows(
     )
 
 
-def _mark_read_position_retry(conn: sqlite3.Connection, dialog_ids: list[int] | set[int], retry_at: int | None) -> None:
-    if retry_at is None or not dialog_ids:
-        return
-    placeholders = ", ".join("?" for _ in dialog_ids)
-    conn.execute(
-        "UPDATE synced_dialogs "
-        "SET read_position_next_attempt_at = ?, "
-        "read_position_attempt_count = COALESCE(read_position_attempt_count, 0) + 1 "
-        f"WHERE status = 'synced' AND dialog_id IN ({placeholders})",
-        (retry_at, *sorted(dialog_ids)),
-    )
-
-
-def _read_position_retry_at(now: int, cooldown_seconds: float | None) -> int | None:
-    return None if cooldown_seconds is None else now + max(1, math.ceil(cooldown_seconds))
-
-
 async def _build_read_position_input_peers(
     client: _DaemonClient, batch_ids: list[int]
 ) -> tuple[list[TypeInputDialogPeer], list[int]]:
@@ -649,31 +579,49 @@ async def _build_read_position_input_peers(
     return input_peers, unresolved_ids
 
 
-def _apply_read_positions_from_dialogs(  # noqa: PLR0913
+def _apply_read_positions_from_dialogs(
     conn: sqlite3.Connection,
     result: _ReadPositionsResultLike,
     *,
-    retry_at: int | None = None,
-    returned_ids: set[int] | None = None,
-    failed_ids: set[int] | None = None,
     request_started_at: int | None = None,
     success_due_at: int | None = None,
-) -> int:
+    selected: WorkRevision,
+) -> tuple[int, SliceOutcome]:
     """Apply read cursors from a GetPeerDialogsRequest result."""
     filled = 0
+    outcome = SliceOutcome(selected, SliceOutcomeKind.STALE)
     with write_transaction(conn):
+        dialog_id = int(selected.key.target.removeprefix("dialog:"))
+        before = _read_position_business_state(conn, dialog_id)
+        if before is None or repr(before) != selected.revision:
+            return 0, outcome
         for dialog in result.dialogs:
+            if int(cast(int, telethon_utils.get_peer_id(dialog.peer))) != dialog_id:
+                continue
             if _apply_read_position_dialog(
                 conn,
                 dialog,
-                retry_at,
-                returned_ids,
-                failed_ids,
                 request_started_at=request_started_at,
                 success_due_at=success_due_at,
             ):
                 filled += 1
-    return filled
+        after = _read_position_business_state(conn, dialog_id)
+        if after is not None and after != before:
+            outcome = SliceOutcome(selected, SliceOutcomeKind.PROGRESSED, repr(after))
+        else:
+            outcome = SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
+    return filled, outcome
+
+
+def _read_position_business_state(conn: sqlite3.Connection, dialog_id: int) -> tuple[object, ...] | None:
+    return cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT sd.read_inbox_max_id, sd.read_outbox_max_id, COALESCE(d.unread_count,0) "
+            "FROM synced_dialogs sd LEFT JOIN dialogs d ON d.dialog_id=sd.dialog_id WHERE sd.dialog_id=?",
+            (dialog_id,),
+        ).fetchone(),
+    )
 
 
 def _record_read_reconciliation_event(
@@ -708,12 +656,9 @@ def _record_read_reconciliation_event(
         logger.exception("runtime_event_record_failed kind=sync.read_reconciliation dialog_id=%d", dialog_id)
 
 
-def _apply_read_position_dialog(  # noqa: PLR0913
+def _apply_read_position_dialog(
     conn: sqlite3.Connection,
     dialog: _ReadPositionDialogLike,
-    retry_at: int | None,
-    returned_ids: set[int] | None,
-    failed_ids: set[int] | None,
     *,
     request_started_at: int | None = None,
     success_due_at: int | None = None,
@@ -724,7 +669,6 @@ def _apply_read_position_dialog(  # noqa: PLR0913
     # distinct value (peer/me has read nothing) and is written as-is.
     inbox_max = cast(int | None, getattr(dialog, "read_inbox_max_id", None))
     outbox_max = cast(int | None, getattr(dialog, "read_outbox_max_id", None))
-    _add_returned_read_position_id(returned_ids, chat_id)
     state = _stored_reconcilable_read_position(conn, chat_id)
     if state is None:
         return False
@@ -746,9 +690,7 @@ def _apply_read_position_dialog(  # noqa: PLR0913
         chat_id,
         inbox_max=inbox_max,
         outbox_max=outbox_max,
-        retry_at=retry_at,
         success_due_at=success_due_at,
-        failed_ids=failed_ids,
     )
     _record_read_reconciliation_event(conn, chat_id, state, wrote_any=wrote_any)
     return wrote_any
@@ -797,45 +739,21 @@ def _apply_reconciled_unread_count(  # noqa: PLR0913
     )
 
 
-def _schedule_read_position_result(  # noqa: PLR0913
+def _schedule_read_position_result(
     conn: sqlite3.Connection,
     dialog_id: int,
     *,
     inbox_max: int | None,
     outbox_max: int | None,
-    retry_at: int | None,
     success_due_at: int | None,
-    failed_ids: set[int] | None,
 ) -> None:
-    if inbox_max is None or outbox_max is None:
-        if retry_at is not None and failed_ids is not None:
-            failed_ids.add(dialog_id)
-        return
-    due_at = success_due_at if success_due_at is not None else None
-    if success_due_at is None and retry_at is None:
+    if inbox_max is None or outbox_max is None or success_due_at is None:
         return
     conn.execute(
         "UPDATE synced_dialogs SET read_position_next_attempt_at = ?, "
         "read_position_attempt_count = 0 WHERE dialog_id = ?",
-        (due_at, dialog_id),
+        (success_due_at, dialog_id),
     )
-
-
-def _add_returned_read_position_id(returned_ids: set[int] | None, chat_id: int) -> None:
-    if returned_ids is not None:
-        returned_ids.add(chat_id)
-
-
-async def _sleep_read_pos_batch(shutdown_event: asyncio.Event, pause_seconds: float | None = None) -> bool:
-    # Inter-batch pause: SIGTERM-responsive
-    effective_pause_seconds = (
-        SchedulingConfig().read_position_reconciliation_batch_pause_seconds if pause_seconds is None else pause_seconds
-    )
-    try:
-        await asyncio.wait_for(shutdown_event.wait(), timeout=effective_pause_seconds)
-        return False
-    except TimeoutError:
-        return True
 
 
 # ---------------------------------------------------------------------------
@@ -1022,28 +940,20 @@ def _mark_rpc_scheduler_failed(
 
 
 async def _monitor_flood_wait_kill_switch(ctx: _SyncMainContext) -> None:
-    """Stop Telegram-facing work when the account-level FloodWait breaker opens."""
+    """Stop acquisition owners while retaining passive delivery and local service."""
     await ctx.flood_wait_kill_switch_event.wait()
     status = flood_wait_kill_switch_status()
     if not status.open:
         return
 
-    logger.critical("flood_wait_kill_switch_stopping_telegram_work %s", status.detail())
-    current_task = asyncio.current_task()
-    producers = [task for task in ctx.background_tasks if task is not current_task]
+    logger.critical("flood_wait_kill_switch_stopping_acquisition %s", status.detail())
+    producers = [task for task in ctx.background_tasks if task.get_name() == "telegram_demand_coordinator"]
     for task in producers:
         task.cancel()
     await asyncio.gather(*producers, return_exceptions=True)
-    try:
-        await ctx.client.disconnect()
-    except Exception:
-        logger.exception("flood_wait_kill_switch_telegram_disconnect_failed")
-    else:
-        logger.critical("flood_wait_kill_switch_telegram_disconnected")
-    finally:
-        observer = ctx.rpc_admission_observer
-        if observer is not None:
-            observer.flush()
+    observer = ctx.rpc_admission_observer
+    if observer is not None:
+        observer.flush()
 
 
 def _install_flood_wait_kill_switch(config: McpTelegramConfig, event: asyncio.Event) -> None:
@@ -1431,27 +1341,35 @@ async def _acquire_startup_identity_before_updates(
             get_input_entity=get_self_input_entity,
             user_profile_port=ctx.user_profile_port,
             publish_startup_identity=publish,
-        )
+        ),
+        account_id=None,
     )
     limit = demand_contract(DemandKind.SELF_PROFILE_MAINTENANCE).max_rpc_attempts_per_slice
     if limit is None:
         raise RuntimeError("startup identity has no RPC attempt bound")
-    while startup.pending:
-        if ctx.shutdown_event.is_set():
-            raise asyncio.CancelledError
-        await _run_startup_identity_slice(adapter, limit, ctx.shutdown_event)
+    budget = RpcAttemptBudget(limit)
+    deadline = asyncio.get_running_loop().time() + startup.remaining(time.time())
+    try:
+        with demand_context(DemandKind.SELF_PROFILE_MAINTENANCE, deadline=deadline):
+            async with asyncio.timeout_at(deadline):
+                while startup.pending:
+                    if ctx.shutdown_event.is_set():
+                        raise asyncio.CancelledError
+                    await _run_startup_identity_slice(adapter, budget, ctx.shutdown_event)
+    except TimeoutError:
+        startup.fail("startup identity deadline expired")
     startup.result()
     return startup
 
 
 async def _run_startup_identity_slice(
     adapter: SelfProfileMaintenanceDemandAdapter,
-    limit: int,
+    budget: RpcAttemptBudget,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Run one startup identity slice and handle admission backoff."""
     try:
-        await adapter.run_slice(RpcAttemptBudget(limit))
+        await adapter.run_startup(budget)
     except TelegramRpcAdmissionDeferred as exc:
         if await sleep_through_flood(shutdown_event, exc.retry_after_seconds or 1):
             raise asyncio.CancelledError from None
@@ -1673,7 +1591,7 @@ def _build_demand_runtime(
         writer=ctx.writer,
     )
 
-    async def read_receipt_batch() -> object:
+    async def read_receipt_batch(selected: WorkRevision) -> SliceOutcome:
         return await _initialize_read_positions(
             ctx.client,
             ctx.conn,
@@ -1684,6 +1602,7 @@ def _build_demand_runtime(
             batch_size=ctx.scheduling.read_position_reconciliation_batch_size,
             batch_pause_seconds=ctx.scheduling.read_position_reconciliation_batch_pause_seconds,
             success_recheck_seconds=ctx.scheduling.read_position_reconciliation_seconds,
+            selected=selected,
         )
 
     async def get_self_input_entity(account_id: int) -> object:
@@ -1697,8 +1616,12 @@ def _build_demand_runtime(
     if draft_owner is None:
         raise RuntimeError("draft owner must be registered before demand composition")
 
+    account_id = ctx.api_server.self_id
+    if account_id is None:
+        raise RuntimeError("demand composition requires the verified startup account")
     try:
         dependencies = DemandCompositionDependencies(
+            account_id=account_id,
             client=cast(DemandCompositionClient, ctx.client),
             conn=ctx.conn,
             writer=ctx.writer,

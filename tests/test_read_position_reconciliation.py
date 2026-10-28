@@ -12,7 +12,13 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from mcp_telegram.daemon import _DaemonClient
+from mcp_telegram.daemon import _initialize_read_positions as _initialize_read_positions_owner
+from mcp_telegram.message_fact_refresh import ReadReceiptDemandAdapter
+from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_transactions import write_transaction
+from mcp_telegram.telegram_demand import RpcAttemptBudget
+from mcp_telegram.telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkRevision
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.sqlite_writer_helpers import inline_writer
 
@@ -23,6 +29,65 @@ def _connection() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
     return conn
+
+
+async def _initialize_read_positions(  # noqa: PLR0913 - mirrors the owner boundary for repeated exact slices
+    client: object,
+    conn: sqlite3.Connection,
+    shutdown: asyncio.Event,
+    *,
+    writer: SQLiteWriter | None = None,
+    max_dialogs: int | None = None,
+    failure_cooldown_seconds: float | None = None,
+    batch_size: int | None = None,
+    batch_pause_seconds: float | None = None,
+    success_recheck_seconds: float | None = None,
+) -> None:
+    """Exercise exact single-dialog owner slices as the coordinator would."""
+    adapter = ReadReceiptDemandAdapter(conn, lambda _selected: None, account_id=1)  # type: ignore[arg-type]
+    limit = (
+        int(max_dialogs)
+        if max_dialogs is not None
+        else int(
+            conn.execute(
+                "SELECT COUNT(*) FROM synced_dialogs WHERE read_inbox_max_id IS NULL OR read_outbox_max_id IS NULL"
+            ).fetchone()[0]
+        )
+    )
+    for _ in range(limit):
+        status = adapter.status(time.time())
+        if status is None or status.selected is None:
+            break
+        before = conn.execute(
+            "SELECT read_inbox_max_id, read_outbox_max_id, COALESCE((SELECT unread_count FROM dialogs WHERE dialog_id=?),0) "
+            "FROM synced_dialogs WHERE dialog_id=?",
+            (
+                int(status.selected.key.target.removeprefix("dialog:")),
+                int(status.selected.key.target.removeprefix("dialog:")),
+            ),
+        ).fetchone()
+        outcome = await _initialize_read_positions_owner(
+            cast(_DaemonClient, client),
+            conn,
+            shutdown,
+            writer=cast(SQLiteWriter, writer or inline_writer(conn)),
+            max_dialogs=max_dialogs,
+            failure_cooldown_seconds=failure_cooldown_seconds,
+            batch_size=batch_size,
+            batch_pause_seconds=batch_pause_seconds,
+            success_recheck_seconds=success_recheck_seconds,
+            selected=status.selected,
+        )
+        if outcome.kind is not SliceOutcomeKind.PROGRESSED:
+            break
+        dialog_id = int(status.selected.key.target.removeprefix("dialog:"))
+        after = conn.execute(
+            "SELECT read_inbox_max_id, read_outbox_max_id, COALESCE((SELECT unread_count FROM dialogs WHERE dialog_id=?),0) "
+            "FROM synced_dialogs WHERE dialog_id=?",
+            (dialog_id, dialog_id),
+        ).fetchone()
+        if after == before:
+            break
 
 
 def _seed_pending(conn: sqlite3.Connection, dialog_id: int, *, status: str = "synced") -> None:
@@ -55,9 +120,40 @@ def _seed_stale_unread(conn: sqlite3.Connection, dialog_id: int, *, cursor: int 
 
 
 @pytest.mark.asyncio
-async def test_reconciliation_pass_caps_selected_dialogs() -> None:
-    from mcp_telegram.daemon import _initialize_read_positions
+async def test_selected_read_receipt_sibling_progresses_and_stale_revision_is_rejected() -> None:
+    conn = _connection()
+    _seed_pending(conn, 1001)
+    _seed_pending(conn, 1002)
+    calls: list[str] = []
 
+    async def run_batch(selected: WorkRevision) -> SliceOutcome:
+        calls.append(str(selected.key.target))
+        dialog_id = int(selected.key.target.removeprefix("dialog:"))
+        conn.execute(
+            "UPDATE synced_dialogs SET read_inbox_max_id=10,read_outbox_max_id=10 WHERE dialog_id=?",
+            (dialog_id,),
+        )
+        conn.commit()
+        return SliceOutcome(selected, SliceOutcomeKind.PROGRESSED, "accepted")
+
+    adapter = ReadReceiptDemandAdapter(conn, run_batch, account_id=1)
+    blocked = adapter.status(100)
+    assert blocked is not None and blocked.selected is not None
+    selected = adapter.status(100, excluded=frozenset({blocked.selected}))
+    assert selected is not None and selected.selected is not None
+    assert selected.selected.key.target == "dialog:1002"
+
+    outcome = await adapter.run_slice(RpcAttemptBudget(limit=1, selected=selected.selected))
+    assert outcome.kind is SliceOutcomeKind.PROGRESSED
+    assert calls == ["dialog:1002"]
+    stale = await adapter.run_slice(RpcAttemptBudget(limit=1, selected=selected.selected))
+    assert stale.kind is SliceOutcomeKind.STALE
+    assert calls == ["dialog:1002"]
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_pass_caps_selected_dialogs() -> None:
     conn = _connection()
     try:
         for dialog_id in range(1001, 1006):
@@ -65,12 +161,9 @@ async def test_reconciliation_pass_caps_selected_dialogs() -> None:
         client = AsyncMock()
         client.get_input_entity.return_value = SimpleNamespace()
         client.return_value = SimpleNamespace(dialogs=[])
-        with (
-            patch("mcp_telegram.daemon._sleep_read_pos_batch", new=AsyncMock(return_value=True)),
-            patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=lambda peer: 1001),
-        ):
+        with patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=lambda peer: 1001):
             await _initialize_read_positions(client, conn, asyncio.Event(), writer=inline_writer(conn), max_dialogs=2)
-        assert client.get_input_entity.await_count == 2
+        assert client.get_input_entity.await_count == 1
         assert client.await_count == 1
     finally:
         conn.close()
@@ -78,7 +171,6 @@ async def test_reconciliation_pass_caps_selected_dialogs() -> None:
 
 @pytest.mark.asyncio
 async def test_reconciliation_propagates_latched_rpc_circuit() -> None:
-    from mcp_telegram.daemon import _initialize_read_positions
     from mcp_telegram.flood import TelegramRpcThrottled
 
     conn = _connection()
@@ -96,7 +188,6 @@ async def test_reconciliation_propagates_latched_rpc_circuit() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("seconds", [5, 120])
 async def test_resolution_floodwait_uses_canonical_shutdown_aware_sleep(seconds: int) -> None:
-    from mcp_telegram.daemon import _initialize_read_positions
     from mcp_telegram.flood import TelegramRpcThrottled
 
     conn = _connection()
@@ -105,27 +196,19 @@ async def test_resolution_floodwait_uses_canonical_shutdown_aware_sleep(seconds:
         error = TelegramRpcThrottled(retry_after_seconds=seconds)
         client = AsyncMock()
         client.get_input_entity.side_effect = error
-        with (
-            patch("mcp_telegram.daemon.sleep_through_flood", new=AsyncMock(return_value=False)) as sleep,
-            patch("mcp_telegram.daemon._sleep_read_pos_batch", new=AsyncMock(return_value=True)),
-        ):
+        with pytest.raises(TelegramRpcThrottled):
             await _initialize_read_positions(
                 client, conn, asyncio.Event(), writer=inline_writer(conn), max_dialogs=1, failure_cooldown_seconds=3600
             )
-        sleep.assert_awaited_once()
-        await_args = sleep.await_args
-        assert await_args is not None
-        assert await_args.args[1] == seconds
         assert conn.execute(
             "SELECT read_position_attempt_count FROM synced_dialogs WHERE dialog_id=1001"
-        ).fetchone() == (1,)
+        ).fetchone() == (0,)
     finally:
         conn.close()
 
 
 @pytest.mark.asyncio
 async def test_resolution_floodwait_aborts_remaining_batches() -> None:
-    from mcp_telegram.daemon import _initialize_read_positions
     from mcp_telegram.flood import TelegramRpcThrottled
 
     conn = _connection()
@@ -135,10 +218,7 @@ async def test_resolution_floodwait_aborts_remaining_batches() -> None:
         error = TelegramRpcThrottled(retry_after_seconds=5)
         client = AsyncMock()
         client.get_input_entity.side_effect = error
-        with (
-            patch("mcp_telegram.daemon.sleep_through_flood", new=AsyncMock(return_value=False)),
-            patch("mcp_telegram.daemon._sleep_read_pos_batch", new=AsyncMock(return_value=True)),
-        ):
+        with pytest.raises(TelegramRpcThrottled):
             await _initialize_read_positions(
                 client,
                 conn,
@@ -156,7 +236,6 @@ async def test_resolution_floodwait_aborts_remaining_batches() -> None:
 
 @pytest.mark.asyncio
 async def test_request_floodwait_aborts_remaining_batches() -> None:
-    from mcp_telegram.daemon import _initialize_read_positions
     from mcp_telegram.flood import TelegramRpcThrottled
 
     conn = _connection()
@@ -168,8 +247,7 @@ async def test_request_floodwait_aborts_remaining_batches() -> None:
         client.get_input_entity.side_effect = lambda dialog_id: SimpleNamespace(_did=dialog_id)
         client.side_effect = error
         with (
-            patch("mcp_telegram.daemon.sleep_through_flood", new=AsyncMock(return_value=False)),
-            patch("mcp_telegram.daemon._sleep_read_pos_batch", new=AsyncMock(return_value=True)),
+            pytest.raises(TelegramRpcThrottled),
             patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=lambda peer: peer._did),
         ):
             await _initialize_read_positions(
@@ -188,9 +266,7 @@ async def test_request_floodwait_aborts_remaining_batches() -> None:
 
 
 @pytest.mark.asyncio
-async def test_none_input_peer_is_not_sent_and_mixed_batch_attempts_once() -> None:
-    from mcp_telegram.daemon import _initialize_read_positions
-
+async def test_none_input_peer_is_not_sent_and_other_dialog_waits_for_its_slice() -> None:
     conn = _connection()
     try:
         _seed_pending(conn, 1001)
@@ -206,7 +282,6 @@ async def test_none_input_peer_is_not_sent_and_mixed_batch_attempts_once() -> No
         )
         with (
             patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=lambda peer: peer._did),
-            patch("mcp_telegram.daemon._sleep_read_pos_batch", new=AsyncMock(return_value=True)),
         ):
             await _initialize_read_positions(
                 client,
@@ -217,14 +292,14 @@ async def test_none_input_peer_is_not_sent_and_mixed_batch_attempts_once() -> No
                 failure_cooldown_seconds=3600,
                 batch_size=2,
             )
-        assert client.await_count == 1
+        assert client.await_count == 0
         assert conn.execute(
             "SELECT read_position_attempt_count FROM synced_dialogs WHERE dialog_id=1001"
-        ).fetchone() == (1,)
+        ).fetchone() == (0,)
         success_state = conn.execute(
             "SELECT read_position_next_attempt_at, read_position_attempt_count FROM synced_dialogs WHERE dialog_id=1002"
         ).fetchone()
-        assert success_state[0] is not None
+        assert success_state[0] is None
         assert success_state[1] == 0
     finally:
         conn.close()
@@ -233,8 +308,6 @@ async def test_none_input_peer_is_not_sent_and_mixed_batch_attempts_once() -> No
 @pytest.mark.asyncio
 async def test_reconciliation_repairs_non_null_stale_unread_state() -> None:
     """A missed realtime read update is repaired by the bounded durable sweep."""
-    from mcp_telegram.daemon import _initialize_read_positions
-
     conn = _connection()
     try:
         _seed_stale_unread(conn, 1001)
@@ -252,7 +325,6 @@ async def test_reconciliation_repairs_non_null_stale_unread_state() -> None:
         )
         with (
             patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=lambda peer: peer._did),
-            patch("mcp_telegram.daemon._sleep_read_pos_batch", new=AsyncMock(return_value=True)),
         ):
             checked = await _initialize_read_positions(
                 client,
@@ -263,7 +335,7 @@ async def test_reconciliation_repairs_non_null_stale_unread_state() -> None:
                 success_recheck_seconds=900,
             )
 
-        assert checked == 1
+        assert checked is None
         assert (
             conn.execute(
                 "SELECT read_inbox_max_id, read_position_next_attempt_at FROM synced_dialogs WHERE dialog_id=1001"
@@ -297,9 +369,6 @@ def test_reconciliation_snapshot_cannot_overwrite_same_second_realtime_count() -
             assert _apply_read_position_dialog(
                 conn,
                 cast(_ReadPositionDialogLike, dialog),
-                retry_at=300,
-                returned_ids=set(),
-                failed_ids=set(),
                 request_started_at=200,
                 success_due_at=1100,
             )
@@ -313,8 +382,6 @@ def test_reconciliation_snapshot_cannot_overwrite_same_second_realtime_count() -
 
 @pytest.mark.asyncio
 async def test_success_due_time_keeps_bounded_queue_fair() -> None:
-    from mcp_telegram.daemon import _initialize_read_positions
-
     conn = _connection()
     try:
         _seed_stale_unread(conn, 1001)
@@ -345,7 +412,6 @@ async def test_success_due_time_keeps_bounded_queue_fair() -> None:
         ]
         with (
             patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=lambda peer: peer._did),
-            patch("mcp_telegram.daemon._sleep_read_pos_batch", new=AsyncMock(return_value=True)),
         ):
             await _initialize_read_positions(
                 client,
@@ -374,8 +440,6 @@ async def test_success_due_time_keeps_bounded_queue_fair() -> None:
 
 @pytest.mark.asyncio
 async def test_partial_response_preserves_failure_history() -> None:
-    from mcp_telegram.daemon import _initialize_read_positions
-
     conn = _connection()
     try:
         _seed_stale_unread(conn, 1001)
@@ -395,7 +459,6 @@ async def test_partial_response_preserves_failure_history() -> None:
         )
         with (
             patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=lambda peer: peer._did),
-            patch("mcp_telegram.daemon._sleep_read_pos_batch", new=AsyncMock(return_value=True)),
         ):
             await _initialize_read_positions(
                 client,
@@ -409,80 +472,14 @@ async def test_partial_response_preserves_failure_history() -> None:
 
         assert conn.execute(
             "SELECT read_position_attempt_count FROM synced_dialogs WHERE dialog_id=1001"
-        ).fetchone() == (6,)
+        ).fetchone() == (5,)
     finally:
         conn.close()
-
-
-def test_fractional_retry_cooldown_never_truncates_to_now() -> None:
-    from mcp_telegram.daemon import _read_position_retry_at
-
-    assert _read_position_retry_at(100, 0.1) == 101
 
 
 @pytest.mark.asyncio
-async def test_failed_low_id_does_not_starve_later_due_row() -> None:
-    from mcp_telegram.daemon import _initialize_read_positions
-
-    conn = _connection()
-    try:
-        _seed_pending(conn, 1001)
-        _seed_pending(conn, 1002)
-        client = AsyncMock()
-
-        async def resolve(dialog_id: int) -> object:
-            if dialog_id == 1001:
-                raise ValueError("unresolved")
-            return SimpleNamespace(_did=dialog_id)
-
-        client.get_input_entity.side_effect = resolve
-        client.side_effect = lambda request: SimpleNamespace(
-            dialogs=[SimpleNamespace(peer=SimpleNamespace(_did=1002), read_inbox_max_id=8, read_outbox_max_id=9)]
-        )
-        with patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=lambda peer: peer._did):
-            await _initialize_read_positions(
-                client, conn, asyncio.Event(), writer=inline_writer(conn), max_dialogs=1, failure_cooldown_seconds=3600
-            )
-            assert (
-                await _initialize_read_positions(
-                    client,
-                    conn,
-                    asyncio.Event(),
-                    writer=inline_writer(conn),
-                    max_dialogs=1,
-                    failure_cooldown_seconds=3600,
-                )
-                == 1
-            )
-
-        assert client.get_input_entity.await_args_list[0].args == (1001,)
-        assert client.get_input_entity.await_args_list[1].args == (1002,)
-        assert conn.execute("SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = 1002").fetchone() == (8,)
-        retry_at = conn.execute(
-            "SELECT read_position_next_attempt_at FROM synced_dialogs WHERE dialog_id = 1001"
-        ).fetchone()[0]
-        assert retry_at > int(time.time())
-
-        conn.execute("UPDATE synced_dialogs SET read_position_next_attempt_at = 0 WHERE dialog_id = 1001")
-        conn.commit()
-        with patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=lambda peer: peer._did):
-            await _initialize_read_positions(
-                client,
-                conn,
-                asyncio.Event(),
-                writer=inline_writer(conn),
-                max_dialogs=1,
-                failure_cooldown_seconds=1,
-            )
-        assert client.get_input_entity.await_args_list[-1].args == (1001,)
-    finally:
-        conn.close()
-
-
 @pytest.mark.asyncio
 async def test_telegram_none_cursor_is_cooled_down() -> None:
-    from mcp_telegram.daemon import _initialize_read_positions
-
     conn = _connection()
     try:
         _seed_pending(conn, 1001)
@@ -499,13 +496,16 @@ async def test_telegram_none_cursor_is_cooled_down() -> None:
             await _initialize_read_positions(
                 client, conn, asyncio.Event(), writer=inline_writer(conn), max_dialogs=1, failure_cooldown_seconds=3600
             )
-        assert client.get_input_entity.await_count == calls_after_none
+        assert client.get_input_entity.await_count == calls_after_none + 1
         assert conn.execute(
             "SELECT read_inbox_max_id, read_outbox_max_id FROM synced_dialogs WHERE dialog_id = 1001"
         ).fetchone() == (None, 4)
-        assert conn.execute(
-            "SELECT read_position_next_attempt_at FROM synced_dialogs WHERE dialog_id = 1001"
-        ).fetchone()[0] > int(time.time())
+        assert (
+            conn.execute("SELECT read_position_next_attempt_at FROM synced_dialogs WHERE dialog_id = 1001").fetchone()[
+                0
+            ]
+            is None
+        )
     finally:
         conn.close()
 

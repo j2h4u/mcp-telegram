@@ -10,6 +10,7 @@ import logging
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from dataclasses import replace as dataclass_replace
 from typing import Protocol, cast
@@ -74,9 +75,7 @@ from .entity_profile.refresh import (
     DurableRefreshTerminal,
     EntityRefreshCoordinator,
     RefreshLimits,
-    failure_retry_at,
     scope_changed_retry_at,
-    throttled_retry_at,
 )
 from .entity_profile.repository import (
     EntityProfileRepository,
@@ -98,10 +97,11 @@ from .telegram_demand import (
     RpcAttemptBudgetExhaustedError,
     UnclassifiedTelegramDemandError,
 )
+from .telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkRevision
 from .telegram_rpc import raise_if_flood_wait_error
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_error import describe_telegram_rpc_error
-from .telegram_rpc_scheduler import current_rpc_scope
+from .telegram_rpc_scheduler import TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending, current_rpc_scope
 from .telethon_dialog import classify_dialog_type, observe_dialog_identity
 
 
@@ -110,6 +110,18 @@ class _LinkedChatFactCaptureUnavailable:
 
 
 _LINKED_CHAT_FACT_CAPTURE_UNAVAILABLE = _LinkedChatFactCaptureUnavailable()
+
+
+@dataclass(slots=True)
+class _ProfileRefreshWriteReceipt:
+    selected: WorkRevision
+    accepted_state: tuple[WorkRevision, str] | None = None
+    rejected: bool = False
+
+
+_PROFILE_REFRESH_WRITES: ContextVar[_ProfileRefreshWriteReceipt | None] = ContextVar(
+    "profile_refresh_writes", default=None
+)
 
 
 def _contact_rpc_error(section: str, exc: BaseException) -> bool:
@@ -126,6 +138,37 @@ def _profile_section_failure_reason(section: str, exc: BaseException) -> str:
     if descriptor.symbol is None or descriptor.code is None:
         return fallback
     return f"{descriptor.error_type.lower()}:{descriptor.code}:{descriptor.symbol}"
+
+
+def _profile_write_receipt(result: object) -> tuple[bool, bool]:
+    """Classify only repository results that explicitly accepted or rejected a write."""
+    if result is True:
+        return True, False
+    if result is False:
+        return False, True
+    if isinstance(result, tuple) and result:
+        return result[0] is True, result[0] is False
+    return False, False
+
+
+def _accepted_profile_transition(
+    accepted: bool,
+    selected: WorkRevision,
+    before: tuple[WorkRevision, str] | None,
+    after: tuple[WorkRevision, str] | None,
+) -> tuple[WorkRevision, str] | None:
+    if accepted and before is not None and before[0] == selected and after is not None and after[0] != selected:
+        return after
+    return None
+
+
+def _selected_profile_target(selected: WorkRevision) -> int | None:
+    """Return a canonical nonzero entity id, including negative channel ids."""
+    try:
+        entity_id = int(selected.key.target)
+    except ValueError:
+        return None
+    return entity_id if entity_id != 0 and str(entity_id) == selected.key.target else None
 
 
 def _scope_bound_profile_failure(section: str, exc: BaseException) -> bool:
@@ -440,16 +483,30 @@ class DaemonEntityInfoService:
         )
 
     async def _write_profiles[T](self, operation: Callable[[EntityProfileRepository], T]) -> T:
-        return await self._deps.writer.run(
-            lambda conn: operation(
-                EntityProfileRepository(
-                    conn,
-                    section_ttl_seconds=self._deps.detail_ttl_seconds,
-                    flood_retry_base_seconds=self._deps.refresh_limits.flood_retry_base_seconds,
-                    flood_retry_cap_seconds=self._deps.refresh_limits.flood_retry_cap_seconds,
-                )
+        def write(conn: sqlite3.Connection) -> T:
+            profiles = EntityProfileRepository(
+                conn,
+                section_ttl_seconds=self._deps.detail_ttl_seconds,
+                flood_retry_base_seconds=self._deps.refresh_limits.flood_retry_base_seconds,
+                flood_retry_cap_seconds=self._deps.refresh_limits.flood_retry_cap_seconds,
             )
-        )
+            receipt = _PROFILE_REFRESH_WRITES.get()
+            before = (
+                profiles.refresh_work_state(int(receipt.selected.key.target), receipt.selected.key.account_id)
+                if receipt is not None
+                else None
+            )
+            result = operation(profiles)
+            if receipt is not None:
+                accepted, rejected = _profile_write_receipt(result)
+                after = profiles.refresh_work_state(int(receipt.selected.key.target), receipt.selected.key.account_id)
+                receipt.rejected = receipt.rejected or rejected
+                successor = _accepted_profile_transition(accepted, receipt.selected, before, after)
+                if receipt.accepted_state is None and successor is not None:
+                    receipt.accepted_state = successor
+            return result
+
+        return await self._deps.writer.run(write)
 
     def bind_profile_observer(self, observer: ProfilePairObservationHook) -> None:
         """Attach the best-effort profile telemetry hook after composition."""
@@ -593,28 +650,90 @@ class DaemonEntityInfoService:
             )
         }
 
-    def _durable_refresh_status(self, now: float) -> DemandStatus | None:
-        del now
-        release_at = self._profiles.next_refresh_release_at()
+    def _durable_refresh_status(
+        self, now: float, excluded: frozenset[WorkRevision] = frozenset()
+    ) -> DemandStatus | None:
+        scope = self._capture_pair_scope()
+        if scope is None:
+            return None
+        now_epoch = int(now)
+        cursor = self._profiles.next_due_refresh(now=now_epoch, account_id=scope.account_id, excluded=excluded)
+        if cursor is not None:
+            selected = self._profiles.refresh_work_revision(cursor, scope.account_id)
+            return DemandStatus(release_at=float(cursor.retry_at or 0), selected=selected)
+        release_at = self._profiles.next_refresh_release_at(after=now_epoch)
         return DemandStatus(release_at=release_at) if release_at is not None else None
 
-    async def _run_durable_refresh_slice(self, budget: RpcAttemptBudget) -> DurableRefreshSliceResult | None:
-        """Execute and commit at most one profile acquisition for one entity."""
+    async def _run_durable_refresh_slice(self, budget: RpcAttemptBudget) -> DurableRefreshSliceResult:
+        """Execute one exact owner-selected profile cursor and report its persisted outcome."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
-        now = int(self._deps.now_provider())
-        await self._write_profiles(lambda profiles: profiles.recover_pair_measurements(now=now))
-        cursor = self._profiles.next_due_refresh(now=now)
-        if cursor is None:
-            return None
+        selected = budget.selected
+        if selected is None:
+            raise RuntimeError("entity profile slice requires an owner-selected revision")
+        if selected.key.demand_kind is not DemandKind.ENTITY_PROFILE_REFRESH:
+            return DurableRefreshSliceResult(0, outcome=SliceOutcome(selected, SliceOutcomeKind.STALE))
+        entity_id = _selected_profile_target(selected)
+        if entity_id is None:
+            return DurableRefreshSliceResult(0, outcome=SliceOutcome(selected, SliceOutcomeKind.STALE))
         scope = self._capture_pair_scope()
-        if not await self._write_profiles(lambda profiles: self._prepare_refresh_revision(profiles, cursor, scope)):
-            return DurableRefreshSliceResult(cursor.entity_id)
+        if scope is None or scope.account_id != selected.key.account_id:
+            return DurableRefreshSliceResult(entity_id, outcome=SliceOutcome(selected, SliceOutcomeKind.STALE))
+        now = int(self._deps.now_provider())
+        cursor = self._profiles.next_due_refresh(now=now, account_id=scope.account_id, entity_id=entity_id)
+        if cursor is None or self._profiles.refresh_work_revision(cursor, scope.account_id) != selected:
+            return DurableRefreshSliceResult(entity_id, outcome=SliceOutcome(selected, SliceOutcomeKind.STALE))
+        return await self._execute_selected_profile_slice(selected, cursor, scope, entity_id, now)
+
+    async def _execute_selected_profile_slice(
+        self,
+        selected: WorkRevision,
+        cursor: EntityRefreshCursor,
+        scope: TelegramAuthScope,
+        entity_id: int,
+        now: int,
+    ) -> DurableRefreshSliceResult:
+        receipt = _ProfileRefreshWriteReceipt(selected)
+        token = _PROFILE_REFRESH_WRITES.set(receipt)
+        try:
+            await self._write_profiles(lambda profiles: profiles.recover_pair_measurements(now=now))
+            if not await self._write_profiles(lambda profiles: self._prepare_refresh_revision(profiles, cursor, scope)):
+                result = DurableRefreshSliceResult(entity_id)
+            else:
+                result = await self._run_selected_profile_owner(cursor, now=now)
+        finally:
+            _PROFILE_REFRESH_WRITES.reset(token)
+        current_state = self._profiles.refresh_work_state(entity_id, scope.account_id)
+        return dataclass_replace(
+            result,
+            outcome=self._profile_refresh_outcome(selected, result, receipt, current_state),
+        )
+
+    async def _run_selected_profile_owner(self, cursor: EntityRefreshCursor, *, now: int) -> DurableRefreshSliceResult:
         pair_mode = await self._capture_refresh_pair_mode(cursor)
         entity_type = self._stored_entity_type(cursor.entity_id, now=now)
         if entity_type is DialogType.UNKNOWN:
             return await self._run_unknown_entity_refresh(cursor, now=now)
         return await self._run_known_entity_refresh(cursor, entity_type, pair_mode=pair_mode, now=now)
+
+    @staticmethod
+    def _profile_refresh_outcome(
+        selected: WorkRevision,
+        result: DurableRefreshSliceResult,
+        receipt: _ProfileRefreshWriteReceipt,
+        current_state: tuple[WorkRevision, str] | None,
+    ) -> SliceOutcome:
+        if receipt.accepted_state is not None:
+            successor, status = receipt.accepted_state
+            kind = SliceOutcomeKind.TERMINAL if status in {"complete", "rejected"} else SliceOutcomeKind.PROGRESSED
+            return SliceOutcome(selected, kind, successor.revision)
+        if receipt.rejected:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        if current_state is not None and current_state[0] != selected:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        if result.terminal is DurableRefreshTerminal.FAILURE:
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
 
     def _prepare_refresh_revision(
         self, profiles: EntityProfileRepository, cursor: EntityRefreshCursor, scope: TelegramAuthScope | None
@@ -683,6 +802,8 @@ class DaemonEntityInfoService:
         try:
             async with asyncio.timeout(self._deps.refresh_limits.per_rpc_seconds):
                 full_profile, contact_overlap = await self._acquire_group_full_chat_pair(cursor)
+        except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending:
+            raise
         except RpcAttemptBudgetExhaustedError:
             self._observe_profile_section_failure(cursor, DialogType.GROUP, actual_attempts=0)
             raise
@@ -696,10 +817,12 @@ class DaemonEntityInfoService:
                     context=context,
                     now=now,
                     reason="flood_wait",
-                    retry_at=throttled_retry_at(now, exc.retry_after_seconds),
+                    retry_at=self._existing_refresh_retry_at(cursor, now),
                 )
             )
-            return DurableRefreshSliceResult(cursor.entity_id, terminal)
+            if terminal is not None:
+                self._signal_foreground_refresh_failure(cursor.entity_id)
+            raise
         except (
             TimeoutError,
             OSError,
@@ -723,10 +846,12 @@ class DaemonEntityInfoService:
                         if isinstance(exc, _AuthScopeUnavailableError)
                         else type(exc).__name__.lower()
                     ),
-                    retry_at=failure_retry_at(now),
+                    retry_at=self._existing_refresh_retry_at(cursor, now),
                 )
             )
-            return DurableRefreshSliceResult(cursor.entity_id, terminal)
+            if terminal is not None:
+                self._signal_foreground_refresh_failure(cursor.entity_id)
+            raise
 
         if self._profile_scope_changed_during_acquisition(context.captured_scope):
             await self._write_profiles(
@@ -813,7 +938,7 @@ class DaemonEntityInfoService:
                     cursor,
                     now=now,
                     reason="pair_receipt_invalid",
-                    retry_at=failure_retry_at(now),
+                    retry_at=self._existing_refresh_retry_at(cursor, now),
                 )
             )
             if not failed:
@@ -897,41 +1022,45 @@ class DaemonEntityInfoService:
                 else None
             )
             async with asyncio.timeout(self._deps.refresh_limits.per_rpc_seconds):
-                if entity_type is DialogType.CHANNEL and cursor.next_section == "full_profile":
-                    result = await self._acquire_profile_section(cursor, entity_type, context=context)
-                else:
-                    result = await self._acquire_profile_section(cursor, entity_type, context=context)
+                result = await self._acquire_profile_section(cursor, entity_type, context=context)
+        except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending:
+            raise
         except RpcAttemptBudgetExhaustedError:
             self._observe_profile_section_failure(cursor, entity_type, actual_attempts=0)
             raise
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
             now = int(self._deps.now_provider())
-            retry_at = throttled_retry_at(now, exc.retry_after_seconds)
-            return await self._handle_profile_section_failure(
+            terminal = await self._handle_profile_section_failure(
                 _ProfileSectionFailure(
                     cursor=cursor,
                     entity_type=entity_type,
                     context=context,
                     now=now,
                     reason="flood_wait",
-                    retry_at=retry_at,
+                    retry_at=self._existing_refresh_retry_at(cursor, now),
                 )
             )
+            if terminal is not None:
+                self._signal_foreground_refresh_failure(cursor.entity_id)
+            raise
         except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError, sqlite3.Error) as exc:
             raise_if_flood_wait_error(exc)
             now = int(self._deps.now_provider())
-            return await self._handle_profile_section_failure(
+            terminal = await self._handle_profile_section_failure(
                 _ProfileSectionFailure(
                     cursor=cursor,
                     entity_type=entity_type,
                     context=context,
                     now=now,
                     reason=_profile_section_failure_reason(cursor.next_section, exc),
-                    retry_at=failure_retry_at(now),
+                    retry_at=self._existing_refresh_retry_at(cursor, now),
                 ),
                 guard_scope=_scope_bound_profile_failure(cursor.next_section, exc),
             )
+            if terminal is not None:
+                self._signal_foreground_refresh_failure(cursor.entity_id)
+            return terminal
         if self._profile_scope_changed_during_acquisition(context.captured_scope):
             await self._write_profiles(
                 lambda profiles: profiles.mark_section_failure(
@@ -1126,36 +1255,21 @@ class DaemonEntityInfoService:
         try:
             async with asyncio.timeout(self._deps.refresh_limits.per_rpc_seconds):
                 full_profile, personal_channel = await self._acquire_full_user_pair(cursor)
-        except RpcAttemptBudgetExhaustedError:
-            await self._record_full_user_pair_failure(cursor, pair_mode, attempt_start, reuse_rejection_reason)
-            raise
-        except TelegramRpcThrottled as exc:
-            _raise_if_latched(exc)
-            now = int(self._deps.now_provider())
-            return await self._handle_full_user_pair_failure(
-                _PairFailure(
-                    cursor=cursor,
-                    now=now,
-                    pair_mode=pair_mode,
-                    attempt_start=attempt_start,
-                    reason="flood_wait",
-                    retry_at=throttled_retry_at(now, exc.retry_after_seconds),
-                    reuse_rejection_reason=reuse_rejection_reason,
-                )
-            )
-        except (TimeoutError, OSError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
-            raise_if_flood_wait_error(exc)
-            now = int(self._deps.now_provider())
-            return await self._handle_full_user_pair_failure(
-                _PairFailure(
-                    cursor=cursor,
-                    now=now,
-                    pair_mode=pair_mode,
-                    attempt_start=attempt_start,
-                    reason=type(exc).__name__.lower(),
-                    retry_at=failure_retry_at(now),
-                    reuse_rejection_reason=reuse_rejection_reason,
-                )
+        except (
+            TelegramRpcAdmissionDeferred,
+            TelegramRpcMethodRecoveryPending,
+            RpcAttemptBudgetExhaustedError,
+            TelegramRpcThrottled,
+            TimeoutError,
+            OSError,
+            RPCError,
+            RuntimeError,
+            TypeError,
+            AttributeError,
+            ValueError,
+        ) as exc:
+            return await self._handle_full_user_pair_acquisition_failure(
+                cursor, pair_mode, attempt_start, reuse_rejection_reason, exc
             )
         if self._pair_scope_mismatch(cursor, full_profile, now=now):
             return await self._handle_full_user_pair_failure(
@@ -1205,6 +1319,42 @@ class DaemonEntityInfoService:
                 stale_writer_rejected=True,
             )
         return self._success_if_refresh_finished(cursor, committed=committed)
+
+    async def _handle_full_user_pair_acquisition_failure(
+        self,
+        cursor: EntityRefreshCursor,
+        pair_mode: str,
+        attempt_start: int,
+        reuse_rejection_reason: str | None,
+        error: Exception,
+    ) -> DurableRefreshTerminal | None:
+        if isinstance(error, (TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending)):
+            raise error
+        if isinstance(error, RpcAttemptBudgetExhaustedError):
+            await self._record_full_user_pair_failure(cursor, pair_mode, attempt_start, reuse_rejection_reason)
+            raise error
+        flood_wait = isinstance(error, TelegramRpcThrottled)
+        if flood_wait:
+            _raise_if_latched(error)
+        else:
+            raise_if_flood_wait_error(error)
+        now = int(self._deps.now_provider())
+        terminal = await self._handle_full_user_pair_failure(
+            _PairFailure(
+                cursor=cursor,
+                now=now,
+                pair_mode=pair_mode,
+                attempt_start=attempt_start,
+                reason="flood_wait" if flood_wait else type(error).__name__.lower(),
+                retry_at=self._existing_refresh_retry_at(cursor, now),
+                reuse_rejection_reason=reuse_rejection_reason,
+            )
+        )
+        if terminal is not None:
+            self._signal_foreground_refresh_failure(cursor.entity_id)
+        if flood_wait:
+            raise error
+        return terminal
 
     async def _record_full_user_pair_failure(
         self,
@@ -1827,36 +1977,26 @@ class DaemonEntityInfoService:
         identity_started_at = int(self._deps.now_provider())
         try:
             entity, error = await self._resolve_entity(cursor.entity_id)
+        except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending:
+            raise
         except RpcAttemptBudgetExhaustedError:
             raise
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
             now = int(self._deps.now_provider())
-            retry_at = throttled_retry_at(now, exc.retry_after_seconds)
-            await self._write_profiles(
+            failed = await self._write_profiles(
                 lambda profiles: profiles.mark_core_failure(
                     cursor,
                     now=now,
                     reason="flood_wait",
-                    retry_at=retry_at,
+                    retry_at=self._existing_refresh_retry_at(cursor, now),
                 )
             )
-            return self._persisted_failure(cursor.entity_id, now=now)
+            if failed:
+                self._signal_foreground_refresh_failure(cursor.entity_id)
+            raise
         if entity is None or error is not None:
-            now = int(self._deps.now_provider())
-            if error is not None and error.get("error") == "entity_not_found":
-                await self._write_profiles(lambda profiles: profiles.mark_refresh_not_found(cursor.entity_id, now=now))
-                return DurableRefreshTerminal.FAILURE
-            reason, retry_at = self._refresh_failure_details(error, now=now)
-            await self._write_profiles(
-                lambda profiles: profiles.mark_core_failure(
-                    cursor,
-                    now=now,
-                    reason=reason,
-                    retry_at=retry_at,
-                )
-            )
-            return self._persisted_failure(cursor.entity_id, now=now)
+            return await self._persist_core_refresh_failure(cursor, error)
         core = self._core_from_entity(entity)
         core["id"] = cursor.entity_id
         committed = await self._write_profiles(
@@ -1882,12 +2022,41 @@ class DaemonEntityInfoService:
             return None
         return None
 
+    async def _persist_core_refresh_failure(
+        self, cursor: EntityRefreshCursor, error: Mapping[str, object] | None
+    ) -> DurableRefreshTerminal | None:
+        now = int(self._deps.now_provider())
+        if error is not None and error.get("error") == "entity_not_found":
+            await self._write_profiles(
+                lambda profiles: profiles.mark_refresh_not_found(cursor.entity_id, now=now, cursor=cursor)
+            )
+            return DurableRefreshTerminal.FAILURE
+        reason, _retry_at = self._refresh_failure_details(error, now=now)
+        failed = await self._write_profiles(
+            lambda profiles: profiles.mark_core_failure(
+                cursor,
+                now=now,
+                reason=reason,
+                retry_at=self._existing_refresh_retry_at(cursor, now),
+            )
+        )
+        if failed:
+            self._signal_foreground_refresh_failure(cursor.entity_id)
+        return DurableRefreshTerminal.FAILURE if failed else None
+
     @staticmethod
     def _refresh_failure_details(error: Mapping[str, object] | None, *, now: int) -> tuple[str, int]:
         retry_after = error.get("_retry_after_seconds") if error is not None else None
-        if isinstance(retry_after, int) and retry_after > 0:
-            return "flood_wait", throttled_retry_at(now, retry_after)
-        return "entity_unavailable", failure_retry_at(now)
+        return ("flood_wait", now) if isinstance(retry_after, int) and retry_after > 0 else ("entity_unavailable", now)
+
+    @staticmethod
+    def _existing_refresh_retry_at(cursor: EntityRefreshCursor, now: int) -> int:
+        """Keep an existing business retry floor without creating a new network delay."""
+        return max(now, cursor.retry_at or now)
+
+    def _signal_foreground_refresh_failure(self, entity_id: int) -> None:
+        if self._refresh is not None:
+            self._refresh.signal_terminal(DurableRefreshSliceResult(entity_id, DurableRefreshTerminal.FAILURE))
 
     def _success_if_refresh_finished(
         self,
@@ -1898,10 +2067,6 @@ class DaemonEntityInfoService:
         if committed and self._profiles.refresh_is_complete(cursor):
             return DurableRefreshTerminal.SUCCESS
         return None
-
-    def _persisted_failure(self, entity_id: int, *, now: int) -> DurableRefreshTerminal | None:
-        state = self._profiles.refresh_state(entity_id, now=now)
-        return DurableRefreshTerminal.FAILURE if state is not None and state.get("status") == "failed" else None
 
     async def _acquire_profile_section(
         self,
@@ -2583,7 +2748,13 @@ class DaemonEntityInfoService:
                 "entity_not_found",
                 f"{exc}. Action: retry with an exact entity id from ListDialogs.",
             )
-        except TelegramRpcThrottled, RpcAttemptBudgetExhaustedError, UnclassifiedTelegramDemandError:
+        except (
+            TelegramRpcAdmissionDeferred,
+            TelegramRpcMethodRecoveryPending,
+            TelegramRpcThrottled,
+            RpcAttemptBudgetExhaustedError,
+            UnclassifiedTelegramDemandError,
+        ):
             raise
         except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError) as exc:
             raise_if_flood_wait_error(exc)
@@ -2597,6 +2768,7 @@ class DaemonEntityInfoService:
                 exc_info=True,
             )
             error = self._error("telegram_api_error", str(exc))
+            error["_rpc_exception"] = exc
             retry_after = getattr(exc, "retry_after_seconds", None)
             if not isinstance(retry_after, int):
                 retry_after = getattr(exc, "seconds", None)

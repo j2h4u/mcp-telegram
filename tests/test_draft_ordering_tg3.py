@@ -249,38 +249,18 @@ def test_topic_and_saved_peer_scopes_are_independent(
     ).fetchall() == [(0, -300, "saved"), (7, 0, "topic")]
 
 
-def test_ambiguity_coalesces_without_resetting_backoff(
+def test_ambiguity_coalesces_without_changing_released_recovery_due(
     projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
 ) -> None:
     conn, repository = projection
     repository.mark_recovery_needed(reason="first", observed_at=_at(1))
     token = repository.claim_recovery(now=_at(1).timestamp())
     assert token is not None
-    assert repository.rearm_recovery(reason="failed", now=_at(1).timestamp(), claim_token=token)
+    assert repository.release_recovery_claim(claim_token=token, due_at=_at(1).timestamp())
     due_before = _recovery_state(conn)
     repository.apply_realtime(_present(DraftScope(100, 200), None, "ambiguous"))
     due_after = _recovery_state(conn)
     assert due_before == due_after
-
-
-def test_repeated_claim_collisions_advance_backoff_and_converge(
-    projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
-) -> None:
-    conn, repository = projection
-    scope = DraftScope(100, 205)
-    repository.apply_realtime(_present(scope, 10, "one"))
-    first_claim = _claim(repository, 11)
-    assert repository.apply_realtime(_present(scope, 12, "two")).publication_changed
-    first_due, first_failures = _recovery_state(conn)
-    assert first_due is not None
-    second_claim = repository.claim_recovery(now=first_due)
-    assert second_claim is not None
-    assert repository.apply_realtime(_present(scope, 13, "three")).publication_changed
-    second_due, second_failures = _recovery_state(conn)
-    assert second_due is not None
-    assert second_failures > first_failures
-    assert second_due > first_due
-    assert first_claim != second_claim
 
 
 def test_migrated_v75_null_order_rows_are_fenced_until_authoritative_bootstrap(

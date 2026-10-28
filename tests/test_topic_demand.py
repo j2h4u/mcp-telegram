@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from collections.abc import Iterator
 from contextlib import closing
 from datetime import UTC, datetime
@@ -26,6 +27,7 @@ from telethon.tl.types import (
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget
+from mcp_telegram.telegram_demand_progress import SliceOutcomeKind
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 from mcp_telegram.topics.catalog import TopicCatalogRepository
@@ -105,23 +107,36 @@ class _CountingClient:
 
 
 def _adapter(conn: sqlite3.Connection, client: _CountingClient) -> TopicSnapshotDemandAdapter:
-    return TopicSnapshotDemandAdapter(TelethonTelegramTopicGateway(client), conn, writer=inline_writer(conn))
+    return TopicSnapshotDemandAdapter(
+        TelethonTelegramTopicGateway(client), conn, writer=inline_writer(conn), account_id=1
+    )
+
+
+def _selected_budget(adapter: TopicSnapshotDemandAdapter, limit: int) -> RpcAttemptBudget:
+    status = adapter.status(time.time())
+    assert status is not None and status.selected is not None
+    return RpcAttemptBudget(limit=limit, selected=status.selected)
+
+
+async def _run_selected(adapter: TopicSnapshotDemandAdapter, limit: int) -> object:
+    return await adapter.run_slice(_selected_budget(adapter, limit))
 
 
 @pytest.mark.asyncio
 async def test_all_nested_rpc_attempts_count_and_successive_slices_advance(db: sqlite3.Connection) -> None:
     client = _CountingClient()
     adapter = _adapter(db, client)
-    first = RpcAttemptBudget(limit=4)
+    first = _selected_budget(adapter, 4)
 
     await adapter.run_slice(first)
 
     assert first.attempts == 4
     assert client.page_offsets == [0]
     assert TopicCatalogRepository(db).coverage(42)["coverage"] == "partial"
-    second = RpcAttemptBudget(limit=4)
+    second_adapter = _adapter(db, client)
+    second = _selected_budget(second_adapter, 4)
     # Recreate the owner to show that page position is not process-local memory.
-    await _adapter(db, client).run_slice(second)
+    await second_adapter.run_slice(second)
 
     assert second.attempts == 4
     assert client.page_offsets == [0, 1]
@@ -130,9 +145,40 @@ async def test_all_nested_rpc_attempts_count_and_successive_slices_advance(db: s
 
 
 @pytest.mark.asyncio
+async def test_selected_topic_sibling_progresses_and_stale_revision_is_rejected(db: sqlite3.Connection) -> None:
+    db.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (43,1,'explicit',100)")
+    db.commit()
+
+    class SiblingClient(_CountingClient):
+        async def get_entity(self, entity: object) -> object:
+            dialog_id = int(cast(int, entity))
+            self._attempt("entity_lookup")
+            return User(id=dialog_id, bot=True, bot_forum_view=True)
+
+        async def get_input_entity(self, entity: object) -> object:
+            self._attempt("input_peer_lookup")
+            return InputPeerUser(int(cast(User, entity).id), 0)
+
+    client = SiblingClient()
+    adapter = _adapter(db, client)
+    blocked = adapter.status(time.time())
+    assert blocked is not None and blocked.selected is not None
+    selected = adapter.status(time.time(), excluded=frozenset({blocked.selected}))
+    assert selected is not None and selected.selected is not None
+    assert selected.selected.key.target == "43"
+
+    outcome = await adapter.run_slice(RpcAttemptBudget(limit=4, selected=selected.selected))
+    assert outcome.kind is SliceOutcomeKind.PROGRESSED
+    assert client.page_offsets == [0]
+    stale = await adapter.run_slice(RpcAttemptBudget(limit=4, selected=selected.selected))
+    assert stale.kind is SliceOutcomeKind.STALE
+    assert client.page_offsets == [0]
+
+
+@pytest.mark.asyncio
 async def test_budget_exhaustion_prevents_extra_send_and_retains_pending(db: sqlite3.Connection) -> None:
     client = _CountingClient()
-    budget = RpcAttemptBudget(limit=3)
+    budget = _selected_budget(_adapter(db, client), 3)
 
     await _adapter(db, client).run_slice(budget)
 
@@ -141,7 +187,7 @@ async def test_budget_exhaustion_prevents_extra_send_and_retains_pending(db: sql
     coverage = TopicCatalogRepository(db).coverage(42)
     assert coverage["pending"] is True
     assert coverage["completed_at"] is None
-    assert coverage["reason"] == "attempt_budget_exhausted"
+    assert coverage["reason"] == "bootstrap"
 
 
 @pytest.mark.asyncio
@@ -153,22 +199,18 @@ async def test_flood_wait_defers_without_erasing_cursor_or_readable_facts(
     monkeypatch.setattr("mcp_telegram.topics.demand.time.time", lambda: now)
     client = _CountingClient()
     adapter = _adapter(db, client)
-    await adapter.run_slice(RpcAttemptBudget(limit=4))
+    await _run_selected(adapter, 4)
     client.failure = TelegramRpcThrottled(retry_after_seconds=30)
 
     with pytest.raises(TelegramRpcThrottled):
-        await adapter.run_slice(RpcAttemptBudget(limit=4))
+        await _run_selected(adapter, 4)
 
     coverage = TopicCatalogRepository(db).coverage(42)
     assert coverage["coverage"] == "partial"
-    assert coverage["retry_at"] == 1030
-    assert coverage["reason"] == "flood_wait"
-    attempts = list(client.attempts)
-    await adapter.run_slice(RpcAttemptBudget(limit=4))
-    assert client.attempts == attempts
+    assert coverage["retry_at"] is None
     client.failure = None
     now = 1031.0
-    await _adapter(db, client).run_slice(RpcAttemptBudget(limit=4))
+    await _run_selected(_adapter(db, client), 4)
 
     assert client.page_offsets == [0, 1, 1]
     assert TopicCatalogRepository(db).coverage(42)["coverage"] == "complete"
@@ -180,7 +222,7 @@ async def test_disabled_enrollment_never_acquires(db: sqlite3.Connection) -> Non
     db.commit()
     client = _CountingClient()
 
-    await _adapter(db, client).run_slice(RpcAttemptBudget(limit=4))
+    assert _adapter(db, client).status(time.time()) is None
 
     assert client.attempts == []
     assert TopicCatalogRepository(db).coverage(42)["coverage"] == "not_observed"
@@ -195,7 +237,7 @@ async def test_observed_complete_normal_user_is_not_applicable_without_rpc(db: s
     db.commit()
     client = _CountingClient()
 
-    await _adapter(db, client).run_slice(RpcAttemptBudget(limit=4))
+    await _run_selected(_adapter(db, client), 4)
 
     assert client.attempts == []
     coverage = TopicCatalogRepository(db).coverage(42)
@@ -223,7 +265,7 @@ async def test_missing_capability_in_uncertain_identity_does_not_imply_not_appli
     client = _CountingClient()
     client.entity = User(id=42, bot=True, bot_forum_view=True)
 
-    await _adapter(db, client).run_slice(RpcAttemptBudget(limit=4))
+    await _run_selected(_adapter(db, client), 4)
 
     assert client.page_offsets == [0]
     assert TopicCatalogRepository(db).coverage(42)["coverage"] == "partial"
@@ -233,7 +275,7 @@ async def test_missing_capability_in_uncertain_identity_does_not_imply_not_appli
 async def test_actual_non_topic_capable_entity_does_not_publish_empty_catalog(db: sqlite3.Connection) -> None:
     client = _CountingClient()
     client.entity = User(id=42, bot=True, bot_forum_view=False)
-    budget = RpcAttemptBudget(limit=4)
+    budget = _selected_budget(_adapter(db, client), 4)
 
     await _adapter(db, client).run_slice(budget)
 
@@ -250,7 +292,7 @@ async def test_latched_protection_escapes_to_shared_coordinator_without_retry_de
     client.failure = TelegramRpcThrottled(latched=True)
 
     with pytest.raises(TelegramRpcThrottled) as caught:
-        await _adapter(db, client).run_slice(RpcAttemptBudget(limit=4))
+        await _run_selected(_adapter(db, client), 4)
 
     assert caught.value.latched
     coverage = TopicCatalogRepository(db).coverage(42)
@@ -267,7 +309,7 @@ async def test_missing_capability_variants_preserve_observations_and_pending_wor
 ) -> None:
     client = _CountingClient()
     adapter = _adapter(db, client)
-    await adapter.run_slice(RpcAttemptBudget(limit=4))
+    await _run_selected(adapter, 4)
     if variant == "min_user":
         client.entity = User(id=42, min=True)
     elif variant == "empty_user":
@@ -275,13 +317,13 @@ async def test_missing_capability_variants_preserve_observations_and_pending_wor
     else:
         client.entity = SimpleNamespace(id=42)
 
-    await adapter.run_slice(RpcAttemptBudget(limit=4))
+    await _run_selected(adapter, 4)
 
     coverage = TopicCatalogRepository(db).coverage(42)
     assert coverage["coverage"] == "partial"
     assert coverage["pending"] is True
     assert coverage["reason"] == "capability_not_observed"
-    assert isinstance(coverage["retry_at"], int)
+    assert coverage["retry_at"] is None
     assert coverage["completed_at"] is None
     assert client.page_offsets == [0]
 
@@ -294,7 +336,7 @@ async def test_forbidden_access_blocks_without_retry_and_retains_resumable_page(
 ) -> None:
     client = _CountingClient()
     adapter = _adapter(db, client)
-    await adapter.run_slice(RpcAttemptBudget(limit=4))
+    await _run_selected(adapter, 4)
     client.entity = (
         ChannelForbidden(id=42, access_hash=0, title="Unavailable")
         if channel
@@ -303,7 +345,7 @@ async def test_forbidden_access_blocks_without_retry_and_retains_resumable_page(
     position_sql = "SELECT generation,offset_date,offset_id,offset_topic FROM topic_catalog_state WHERE dialog_id=42"
     cursor = cast(tuple[object, ...], db.execute(position_sql).fetchone())
 
-    await adapter.run_slice(RpcAttemptBudget(limit=4))
+    await _run_selected(adapter, 4)
 
     repository = TopicCatalogRepository(db)
     assert repository.coverage(42) == {
@@ -317,7 +359,6 @@ async def test_forbidden_access_blocks_without_retry_and_retains_resumable_page(
     assert db.execute("SELECT topic_id,title FROM topic_metadata").fetchall() == [(1, "Topic 1")]
     assert adapter.status(10**12) is None
     attempts = list(client.attempts)
-    await adapter.run_slice(RpcAttemptBudget(limit=4))
     repository.bootstrap()
     assert repository.next_pending() is None
     assert client.attempts == attempts
@@ -332,7 +373,7 @@ async def test_forbidden_access_blocks_without_retry_and_retains_resumable_page(
     client.entity = User(id=42, bot=True, bot_forum_view=True)
     repository.request(42, "explicit_enable")
     db.commit()
-    await _adapter(db, client).run_slice(RpcAttemptBudget(limit=4))
+    await _run_selected(_adapter(db, client), 4)
 
     assert client.page_offsets == [0, 1]
     assert repository.coverage(42)["reason"] != "source_access_unavailable"

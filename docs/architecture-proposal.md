@@ -214,17 +214,15 @@ This architecture is enforced as a green current-state frontier. Future work
 removes named deprecated edges one slice at a time; it does not normalize them
 into broad module allowlists.
 
-### Telegram write admission and recovery (TG-126 in progress)
+### Telegram write admission and recovery
 
-The required transport contract sends every application write and replay
-through the existing gateway priority queue, preserving the original request
-budget and deadline. Immediately before a write, a synchronous final claim must
-recheck cancellation, known account cooldown floors, authentication scope,
-protection generation and pacing. Production transport uses a repository-owned,
-version-guarded adapter for Telethon 1.45 private APIs; it must not patch the
-installed virtualenv, fork Telethon or introduce a competing queue. These are
-release requirements for this in-progress slice, not a claim that every path
-has already passed integration.
+Every application write and replay passes through the existing gateway
+priority queue with its bounded attempt accounting and deadline. Immediately
+before a write, a synchronous final claim rechecks cancellation, known account
+and method cooldown floors, authentication scope, protection generation and
+pacing. Production transport uses a repository-owned, version-guarded adapter
+for Telethon 1.45 private APIs; it does not patch the installed virtualenv, fork
+Telethon or introduce a competing queue.
 
 Runtime configuration has one fixed compatibility marker:
 
@@ -259,24 +257,46 @@ state reset or SQL-edit recovery path.
 Protocol ACK, Ping and StateInfo controls use exact, bounded central admission
 during an application-write hold. They remain protocol-only: no application
 payload smuggling and no per-ACK filesystem sync. A local protocol-control write
-is not evidence that Telegram applied an application request. This slice does
-not claim full incoming continuity under a hard latch: receive-only lifecycle
-behavior belongs to later B/C work. It also does not claim that a local
-operator with root or administrator access cannot bypass repository controls;
-the gateway guard prevents accidental application regressions.
+is not evidence that Telegram applied an application request. A never-sent
+failed Ping releases only its matching keepalive marker. The bounded ACK replay
+cache starts at the first physical write, preserving queued obligations. During an
+application acquisition hold, the daemon keeps the connected receiver, passive
+update persistence, local API, writer and heartbeat alive. Difference requests
+are deferred before a write while the existing vendor loop retains its genuine
+gaps and safe sequence/date checkpoints. Retained data remains readable;
+receive-only operation does not claim completeness across those gaps or restore
+a disconnected session. A local operator with root or administrator access can
+still bypass repository controls; the gateway guard prevents accidental
+application regressions.
 
-### Protected acquisition health and profile retries
+### Protected acquisition health and method recovery
 
 The daemon health probe checks both local socket serving and the existing account
 protection status. Active account protection makes container health fail while
 retained local MCP reads remain available. Docker health alone does not restart
 the service; the account latch still requires controlled operator recovery.
 
-A failed profile section retains its durable retry deadline. FloodWait starts
-with a 300-second delay, conservatively doubles the previous effective failed
-delay up to 3600 seconds, and always honors longer server/account deadlines.
-Ordinary retryable failures preserve that delay; actual acquisition progress
-starts a fresh basis. The control-plane `auth_scope_changed` retry keeps its
-short revalidation delay; the shared account cooldown still applies. This is scheduled-delay backoff, not a count of consecutive
-FloodWait events. Failure observation time anchors the deadline. Account-wide
-protection remains unchanged and can still stop acquisition across peers.
+The gateway owns network retry eligibility for all durable acquisition owners.
+Server/account floors are never capped. A canonical method's additional delay
+starts at 300 seconds, doubles on repeated actual method FloodWaits up to 3600 seconds,
+and resets only after the current generation's actual recovery request succeeds.
+Only one real request owns that method/generation recovery trial at a time.
+Durable method state retains its live or recovered generation across restart.
+
+The demand coordinator selects business work and keeps siblings runnable while
+a selected revision waits. Each owner identifies its account, target and exact
+persisted business revision, validates that selection before acquisition, and
+returns progress only from its own accepted transaction. A successful empty
+periodic cycle advances an accepted-cycle identity; retry timestamps and failed
+attempts do not create new business work. Supplied events remain local writes.
+
+The gateway can grant one additional original-contract allowance per canonical
+method/generation/exact revision within the running process. All bindings share
+cumulative actual-write accounting. Preparation alone grants no write, and a
+restart cannot recreate spent extra allowances for a restored generation; the
+ordinary finite base allowance remains available. A revision with no remaining
+allowance or eligible recovery stays parked until its business state changes or
+a permitted recovery/restart boundary applies. Producers retain cadence and
+local fact state, but do not add independent network retry delays. Failed
+profile acquisition preserves last-known facts and section failure evidence.
+Account protection and manual recovery remain separate from method recovery.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 from collections.abc import Awaitable, Callable, Generator, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -74,9 +75,11 @@ from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncDmEnrollment
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
     RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
     current_demand_token,
 )
 from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator
+from mcp_telegram.telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkRevision
 from mcp_telegram.telegram_rpc_consumers import (
     DemandKind,
     TelegramRpcSource,
@@ -112,6 +115,9 @@ class _IdleFolderRepository(FolderSnapshotRepository):
         return None
 
     def read_next_retry_at(self) -> int | None:
+        return None
+
+    def read_snapshot_revision(self) -> tuple[int | None, int | None, str | None, int | None] | None:
         return None
 
     def rules_are_fresh(self, *, now: int) -> bool:
@@ -161,7 +167,7 @@ class _LinkedChatRefresher:
         self.budgets: list[RpcAttemptBudget] = []
         self.contexts: list[tuple[DemandKind, str | None, str]] = []
 
-    async def retry_one_pending_linked_chat_fact(self, budget: RpcAttemptBudget) -> bool:
+    async def retry_one_pending_linked_chat_fact(self, budget: RpcAttemptBudget) -> SliceOutcome:
         self.budgets.append(budget)
         token = current_demand_token()
         scope = current_rpc_scope()
@@ -173,7 +179,8 @@ class _LinkedChatRefresher:
                 scope.source.value,
             )
         )
-        return True
+        assert budget.selected is not None
+        return SliceOutcome(budget.selected, SliceOutcomeKind.NO_PROGRESS)
 
 
 def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[str, object]]:
@@ -218,8 +225,8 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
         "linked_chat_refresh": _LinkedChatRefresher(),
     }
 
-    async def read_receipt_batch() -> object:
-        return None
+    async def read_receipt_batch(_selected: WorkRevision) -> SliceOutcome:
+        raise AssertionError("read receipt batch is not called by adapter-map tests")
 
     async def get_self_input_entity(_account_id: int) -> object:
         return object()
@@ -229,6 +236,7 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
     dependencies = DemandCompositionDependencies(
         client=cast(DemandCompositionClient, objects["client"]),
         conn=cast(sqlite3.Connection, objects["conn"]),
+        account_id=1,
         writer=inline_writer(conn),
         db_path=db_path,
         shutdown_event=cast(asyncio.Event, objects["shutdown"]),
@@ -248,7 +256,7 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
         hot_sweep_policy=cast(object, objects["hot_policy"]),  # type: ignore[arg-type]
         cold_backfill_pacing=cast(object, objects["cold_pacing"]),  # type: ignore[arg-type]
         activity_rpc_timeout_seconds=30.0,
-        read_receipt_batch=cast(Callable[[], Awaitable[object]], read_receipt_batch),
+        read_receipt_batch=read_receipt_batch,
         self_profile_cadence=cast(SelfProfileCadenceState, objects["cadence"]),
         update_self_profile=update_profile,
         startup_identity=StartupIdentityState.begin(now=100.0),
@@ -443,7 +451,7 @@ async def test_invalid_dm_checkpoint_does_not_block_forward_delta_coordinator(
 
 
 @pytest.mark.asyncio
-async def test_claim_write_failure_uses_coordinator_backoff_then_reclaims_before_scanner(
+async def test_claim_write_failure_preserves_demand_for_reclaim_before_scanner(
     composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
 ) -> None:
     dependencies, _objects = composition_dependencies
@@ -487,11 +495,10 @@ async def test_claim_write_failure_uses_coordinator_backoff_then_reclaims_before
     await first._execute_slice(kind)
     first._active_kind = None
     assert calls == 0
-    assert kind not in first.scan(now=1_059)
-    assert kind in first.scan(now=1_060)
-    await first._execute_slice(kind)
-    first._active_kind = None
-    assert calls == 0
+    assert (
+        '"status": "running"'
+        in dependencies.conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone()[0]
+    )
 
     dependencies.conn.execute("DROP TRIGGER fail_dm_claim")
     dependencies.conn.commit()
@@ -518,9 +525,9 @@ def test_linked_chat_adapter_selects_due_demand_and_passes_one_attempt_budget(
             (123, 1, 1, 100, 400),
         )
     status = adapter.status(100)
-    assert status is not None and status.release_at == 400
+    assert status is not None and status.release_at == 400 and status.selected is not None
 
-    budget = RpcAttemptBudget(limit=1)
+    budget = RpcAttemptBudget(limit=1, selected=status.selected)
     asyncio.run(adapter.run_slice(budget))
 
     assert refresher.budgets == [budget]
@@ -557,8 +564,8 @@ def test_scheduled_repair_remains_due_during_day_long_local_link_wait(
             dependencies.conn
         ),
     )
-    repair = ScheduledRepairDemandAdapter(reconciler).status(now)
-    discovery = ScheduledDiscoveryDemandAdapter(reconciler).status(now)
+    repair = ScheduledRepairDemandAdapter(reconciler, account_id=1).status(now)
+    discovery = ScheduledDiscoveryDemandAdapter(reconciler, account_id=1).status(now)
 
     assert repair is not None and repair.release_at == now
     assert discovery is not None and discovery.release_at == now + 86_400
@@ -632,9 +639,12 @@ async def test_linked_chat_adapter_real_gate_cannot_retry_physical_send(
     await manager.on_raw_channel_chat_update(UpdateChannel(channel_id=123))
     assert DemandKind.LINKED_CHAT_REFRESH in sink.offered
 
-    adapter = LinkedChatFactDemandAdapter(manager, dependencies.conn)
-    budget = RpcAttemptBudget(limit=1)
-    await adapter.run_slice(budget)
+    adapter = LinkedChatFactDemandAdapter(manager, dependencies.conn, account_id=dependencies.account_id)
+    status = adapter.status(time.time())
+    assert status is not None and status.selected is not None
+    budget = RpcAttemptBudget(limit=1, selected=status.selected)
+    with pytest.raises(RpcAttemptBudgetExhaustedError):
+        await adapter.run_slice(budget)
 
     assert physical_attempts == 1
     assert budget.attempts == 1
@@ -651,15 +661,13 @@ async def test_linked_chat_adapter_real_gate_cannot_retry_physical_send(
 
 
 @pytest.mark.asyncio
-async def test_malformed_dm_checkpoint_does_not_block_realtime_gate_acquisition(
+async def test_malformed_dm_checkpoint_does_not_block_realtime_receive_only_ingestion(
     composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from telethon.tl import functions, types  # type: ignore[import-untyped]
+    from telethon.tl import types  # type: ignore[import-untyped]
 
     from mcp_telegram.demand_wiring import DemandOfferSink
     from mcp_telegram.event_handlers import EventHandlerManager, _NewMessageEvent
-    from tests.test_telegram_rpc import _gate, _set_sender
 
     dependencies, _objects = composition_dependencies
     dialog_id = 7188
@@ -670,24 +678,6 @@ async def test_malformed_dm_checkpoint_does_not_block_realtime_gate_acquisition(
         (dialog_id,),
     )
     dependencies.conn.commit()
-    gate = _gate()
-    sends: list[object] = []
-    scopes: list[tuple[TelegramRpcSource, DemandKind, AcquisitionKind | None]] = []
-    gate.set_rpc_request_observer(
-        lambda **kwargs: scopes.append((kwargs["source"], kwargs["demand_kind"], kwargs["acquisition_kind"]))
-    )
-
-    def send(request: object) -> object:
-        sends.append(request)
-        return object()
-
-    _set_sender(gate, send)
-
-    async def acquire_forward_entity(_message: object, _client: object) -> dict[int, str]:
-        await gate(functions.channels.GetFullChannelRequest(types.InputChannel(channel_id=8, access_hash=9)))
-        return {}
-
-    monkeypatch.setattr("mcp_telegram.event_handlers._build_fwd_entity_map", acquire_forward_entity)
     manager = EventHandlerManager(
         SimpleNamespace(),  # type: ignore[arg-type]
         dependencies.conn,
@@ -703,25 +693,17 @@ async def test_malformed_dm_checkpoint_does_not_block_realtime_gate_acquisition(
     manager.bind_demand_sink(cast(DemandOfferSink, _DemandSink()))
     message = build_mock_message(id=1, text="realtime")
     message.fwd_from = SimpleNamespace(from_name=None, from_id=types.PeerChannel(channel_id=8))
-    try:
-        with rpc_scope(TelegramRpcSource.REALTIME_EVENT):
-            await manager.on_new_message(
-                cast(_NewMessageEvent, SimpleNamespace(chat_id=dialog_id, message=message, is_private=False))
-            )
+    with rpc_scope(TelegramRpcSource.REALTIME_EVENT):
+        await manager.on_new_message(
+            cast(_NewMessageEvent, SimpleNamespace(chat_id=dialog_id, message=message, is_private=False))
+        )
 
-        assert len(sends) == 1 and isinstance(sends[0], functions.channels.GetFullChannelRequest)
-        assert scopes == [
-            (
-                TelegramRpcSource.REALTIME_EVENT,
-                DemandKind.REALTIME_EVENT_ACQUISITION,
-                AcquisitionKind.ENTITY_LOOKUP,
-            )
-        ]
-        assert dependencies.conn.execute(
-            "SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'"
-        ).fetchone() == (None,)
-    finally:
-        await gate.close_rpc_scheduler()
+    assert dependencies.conn.execute(
+        "SELECT message_id,text FROM messages WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (1, "realtime")
+    assert dependencies.conn.execute(
+        "SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'"
+    ).fetchone() == (None,)
 
 
 @pytest.mark.asyncio
@@ -785,3 +767,98 @@ async def test_adapter_composition_is_readonly_and_shares_writer(
     finally:
         await writer.aclose()
         reader.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalidate_during_rpc", [False, True])
+async def test_linked_chat_coordinator_runs_selected_sibling_and_owns_publication(
+    composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
+    invalidate_during_rpc: bool,
+) -> None:
+    from telethon.tl.functions.channels import GetFullChannelRequest  # type: ignore[import-untyped]
+    from telethon.tl.types import Channel, ChatPhotoEmpty, InputChannel, InputPeerChannel, PeerChannel  # type: ignore[import-untyped]
+
+    from mcp_telegram.event_handlers import EventHandlerManager
+    from mcp_telegram.linked_chat_fact import linked_chat_fact_owner
+    from mcp_telegram.sync_transactions import write_transaction
+
+    dependencies, _ = composition_dependencies
+    conn = dependencies.conn
+    first, second = -1000000000123, -1000000000456
+    for dialog_id in (first, second):
+        conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (?,'channel')", (dialog_id,))
+        linked_chat_fact_owner.ensure_cold_demand(conn, dialog_id, 1)
+    conn.commit()
+    requested: list[int] = []
+
+    class Session:
+        def get_input_entity(self, peer: object) -> InputPeerChannel:
+            channel_id = cast(PeerChannel, peer).channel_id
+            return InputPeerChannel(channel_id, 1)
+
+    class Client:
+        session = Session()
+
+        async def __call__(self, request: object) -> object:
+            channel = cast(GetFullChannelRequest, request).channel
+            assert isinstance(channel, InputChannel)
+            raw = channel.channel_id
+            requested.append(raw)
+            if invalidate_during_rpc:
+
+                def invalidate(database: sqlite3.Connection) -> None:
+                    with write_transaction(database):
+                        linked_chat_fact_owner.invalidate_from_update(database, second, 2)
+
+                await dependencies.writer.run(invalidate)
+            return SimpleNamespace(
+                full_chat=SimpleNamespace(id=raw, linked_chat_id=None),
+                chats=[Channel(id=raw, title="channel", photo=ChatPhotoEmpty(), date=None)],
+            )
+
+    manager = EventHandlerManager(
+        Client(),  # type: ignore[arg-type]
+        conn,
+        dependencies.shutdown_event,
+        writer=dependencies.writer,
+        profile_detail_ttl_seconds=300,
+    )
+    adapter = LinkedChatFactDemandAdapter(manager, conn, account_id=dependencies.account_id)
+    # ORDER BY channel id makes the more negative second peer the first pending row.
+    initial = adapter.status(time.time())
+    assert initial is not None and initial.selected is not None
+    excluded = initial.selected
+    sibling = adapter.status(time.time(), excluded=frozenset({excluded}))
+    assert sibling is not None and sibling.selected is not None
+    # Select the actual second row regardless of the canonical negative-id ordering.
+    second = int(sibling.selected.key.target)
+    adapters = dict(build_durable_adapter_map(dependencies))
+    adapters[DemandKind.LINKED_CHAT_REFRESH] = adapter
+    coordinator = TelegramDemandCoordinator(adapters)
+    manager.bind_demand_sink(coordinator)
+    coordinator._excluded.add(excluded)
+    coordinator.scan()
+    await coordinator._execute_slice(DemandKind.LINKED_CHAT_REFRESH)
+    assert requested == [-second - 1_000_000_000_000]
+    row = cast(
+        tuple[int, int | None],
+        conn.execute(
+            "SELECT generation,pending_generation FROM linked_chat_fact_state WHERE channel_id=?", (second,)
+        ).fetchone(),
+    )
+    assert row == ((1, 1) if invalidate_during_rpc else (1, None))
+    if invalidate_during_rpc:
+        assert sibling.selected in coordinator._excluded
+        assert conn.execute("SELECT linked_chat_resolved_at FROM dialogs WHERE dialog_id=?", (second,)).fetchone() == (
+            None,
+        )
+    else:
+        assert sibling.selected not in coordinator._invocations
+        assert (
+            conn.execute("SELECT linked_chat_resolved_at FROM dialogs WHERE dialog_id=?", (second,)).fetchone()[0]
+            is not None
+        )
+    assert conn.execute(
+        "SELECT generation,pending_generation FROM linked_chat_fact_state WHERE channel_id=?",
+        (int(excluded.key.target),),
+    ).fetchone() == (0, 0)

@@ -78,6 +78,15 @@ DIALOG_IDENTITY_ROLE_FUNCTIONS: Mapping[str, Mapping[str, frozenset[str]]] = {
     "daemon_log_context.py": {"dialog_log_context": frozenset({"name", "type"})},
     "delta_sync.py": {"_dm_gap_scan_dialog_ids": frozenset({"type"})},
     "dialog_directory.py": {"CanonicalDialogDirectory._start_generation": frozenset({"identity_revision"})},
+    "dialog_sync.py": {
+        name: frozenset({"identity_revision"})
+        for name in (
+            "DialogReconciliationWorker._persist_light_dialog",
+            "DialogReconciliationWorker._refresh_light_dialog",
+            "DialogLightReconciliationDemandAdapter.status",
+            "DialogLightReconciliationDemandAdapter._selected_for",
+        )
+    },
     "dialog_directory_coverage.py": {
         "_read_identity_aggregate": frozenset({"identity_complete", "identity_observed_at"})
     },
@@ -99,8 +108,9 @@ DIALOG_IDENTITY_ROLE_FUNCTIONS: Mapping[str, Mapping[str, frozenset[str]]] = {
     },
     "scheduled_messages.py": {"ScheduledMessageReconciler._discover_eligibility": frozenset({"type"})},
     "sync_worker.py": {
-        "FullSyncWorker.consume_canonical_dm_publication": frozenset({"name", "type"}),
-        "FullSyncWorker._automatic_group_earliest_retry": frozenset({"type"}),
+        "FullSyncWorker._consume_dm_publication": frozenset({"name", "type"}),
+        "FullSyncWorker._automatic_group_retry_candidate": frozenset({"type"}),
+        "FullSyncDemandAdapter._automatic_group_status": frozenset({"type"}),
         "FullSyncWorker._eligible_automatic_group": frozenset({"type"}),
         "FullSyncWorker._is_eligible_automatic_group": frozenset({"type"}),
     },

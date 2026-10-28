@@ -22,8 +22,8 @@ from mcp_telegram.entity_profile.contracts import (
 )
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.sync_transactions import write_savepoint
-from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
+from tests.demand_adapter_helpers import run_ready_slice
 from tests.test_dm_profile_repository import _collected, _peer, _repository
 from tests.test_entity_profile_full_user_pair import _pair_service, _PairClient
 
@@ -57,7 +57,7 @@ class _RetryingFacts:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("section", ("common_chats", "avatar_history"))
-async def test_executor_retries_first_timeout_of_missing_section(tmp_path: Path, section: str) -> None:
+async def test_executor_persists_missing_section_failure_for_central_gate(tmp_path: Path, section: str) -> None:
     conn, repo = _repository(tmp_path / "retry-executor.sqlite")
     _peer(conn, 42)
     _collected(conn, 42, owner=42)
@@ -79,22 +79,17 @@ async def test_executor_retries_first_timeout_of_missing_section(tmp_path: Path,
     adapter = EntityProfileDemandAdapter(coordinator)
     repo.request_section_refresh(42, (section,), now=1000, pair_mode="enabled")
     try:
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await run_ready_slice(adapter, now=clock[0])
         assert facts.calls == 1
         state = conn.execute("SELECT status,retry_at,next_section FROM entity_profile_refresh_state").fetchone()
-        assert state[0] == "failed" and state[1] > 1000 and state[2] == section
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        assert state == ("failed", 1000, section)
+        # This helper invokes one selected slice directly; retry eligibility is
+        # owned by the central Gate, so a second direct call would bypass it.
         assert facts.calls == 1
-        clock[0] = float(state[1])
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
-        assert facts.calls == 2
         assert conn.execute(
             "SELECT status,retry_at FROM entity_detail_sections WHERE section=?", (section,)
-        ).fetchone() == ("fresh", None)
-        for _ in range(len(PROFILE_SECTIONS)):
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
-        assert repo.next_due_refresh(now=int(clock[0])) is None
-        assert facts.calls == 2
+        ).fetchone() == ("unavailable", 1000)
+        assert repo.next_due_refresh(now=int(clock[0])) is not None
         assert client.full_user_calls == 0
     finally:
         await service.shutdown()
@@ -117,7 +112,7 @@ async def test_executor_acquires_only_missing_personal_channel_without_pair_loop
     repo.request_section_refresh(42, ("personal_channel",), now=100_000, pair_mode="enabled")
     try:
         for _ in range(len(PROFILE_SECTIONS)):
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
+            await run_ready_slice(adapter, now=100_000.0)
         assert client.full_user_calls == 1
         assert repo.next_due_refresh(now=100_000) is None
         assert conn.execute(

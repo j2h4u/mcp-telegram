@@ -63,6 +63,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "fact_hydration.py",
             "feedback_db.py",
             "folders/sqlite_repository.py",
+            "folders/refresh.py",  # Typed writer callback for repository CAS and own-transaction receipt.
             "folders/ports.py",  # Transaction-local projection binding to the shared SQLite owner.
             "folders/read_repository.py",
             "fts.py",
@@ -134,6 +135,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "telegram_transport.py",  # Owned physical transport and vendor framing adapter.
             "telegram_gateway.py",
             "telegram_rpc.py",
+            "telegram_update_admission.py",  # Gate-owned vendor gap bookkeeping; no network dispatch.
             "telegram_delivery.py",  # Versioned local TL recovery serialization, no acquisition.
             "telegram_rpc_error.py",
             "telegram_read_receipts.py",

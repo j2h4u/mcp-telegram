@@ -172,13 +172,16 @@ async def test_worker_reserves_before_request_and_rejects_late_fact_and_queue_ef
     else:
         assert db.execute("SELECT text, media_payload FROM messages").fetchone() == ("newer", "{}")
         assert db.execute("SELECT due_at,attempts,terminal,last_outcome FROM hydration_jobs").fetchone() == (
-            401,
+            job.due_at,
             2,
             0,
             "not_applied",
         )
-        assert HydrationQueueRepository(db).due_jobs(400, 10) == []
-        assert HydrationQueueRepository(db).due_jobs(401, 10)
+        queue = HydrationQueueRepository(db)
+        assert queue.due_jobs(job.due_at - 1, 10) == []
+        # The central Telegram gate owns acquisition cooldown; the stale local
+        # result must not invent a second hydration retry deadline.
+        assert queue.due_jobs(job.due_at, 10)
         if kind == TRANSCRIPTION_HYDRATION_KIND:
             with write_transaction(db):
                 assert apply_message_transcription(
@@ -275,7 +278,7 @@ async def test_old_request_error_refunds_original_and_preserves_replacement(  # 
         assert cast(tuple[object, ...], db.execute("SELECT * FROM hydration_jobs").fetchone()) == replacement[0]
     else:
         assert db.execute("SELECT due_at,attempts,terminal,last_outcome FROM hydration_jobs").fetchone() == (
-            101,
+            job.due_at,
             0,
             0,
             "not_applied",

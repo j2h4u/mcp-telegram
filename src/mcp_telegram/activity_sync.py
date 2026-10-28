@@ -22,7 +22,7 @@ from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty, InputPee
 from .activity_substrate import ActivityClient, call_with_timeout
 from .entity_profile.repository import admit_profile_peer, bound_profile_account
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
-from .flood import TelegramRpcThrottled, sleep_through_flood
+from .flood import TelegramRpcThrottled
 from .hydration_queue import HydrationPriority
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_bundle import insert_messages_with_fts
@@ -38,9 +38,9 @@ from .telegram_demand import (
     DurableDemandAdapter,
     RpcAttemptBudget,
     UnclassifiedTelegramDemandError,
-    current_demand_token,
-    demand_context,
+    durable_demand_context,
 )
+from .telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkKey, WorkRevision
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
@@ -59,6 +59,10 @@ _SECONDS_PER_HOUR = 60 * _SECONDS_PER_MINUTE
 _INCREMENTAL_MIN_DATE_KEY = "incremental_min_date"
 _INCREMENTAL_OFFSET_ID_KEY = "incremental_offset_id"
 _INCREMENTAL_STARTED_AT_KEY = "incremental_started_at"
+_INCREMENTAL_COMPLETED_GENERATION_KEY = "incremental_completed_generation"
+_ARCHIVE_SEARCH_REQUEST_METHOD = (
+    f"{SearchRequest.__module__}.{SearchRequest.__name__}:{SearchRequest.CONSTRUCTOR_ID:08x}"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,26 +87,52 @@ class ArchiveBackfillDemandAdapter(DurableDemandAdapter):
     shutdown_event: asyncio.Event
     timeout_s: float
     writer: SQLiteWriter = field(kw_only=True)
+    account_id: int = field(kw_only=True)
     demand_kind = DemandKind.ARCHIVE_BACKFILL
 
-    def status(self, now: float) -> DemandStatus | None:
+    def _selected(self) -> WorkRevision:
+        revision = _backfill_revision(_load_state(self.conn))
+        return WorkRevision(WorkKey(self.demand_kind, self.account_id, "account-backfill"), revision)
+
+    def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
         """Report immediate work until the archive history floor is committed."""
         _validate_status_now(now)
-        if _load_state(self.conn).get("backfill_complete") == "1":
+        if self._selected().revision.endswith(":complete"):
             return None
-        return DemandStatus(release_at=0.0)
+        selected = self._selected()
+        return (
+            None
+            if selected in excluded
+            else DemandStatus(release_at=0.0, selected=selected, request_method=_ARCHIVE_SEARCH_REQUEST_METHOD)
+        )
 
-    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+    async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
         """Fetch and commit at most one backfill search page."""
+        selected = budget.selected
+        if selected is None:
+            raise RuntimeError("archive backfill requires an owner-selected revision")
+        if self.status(time.time()) is None or self._selected() != selected:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
         with _archive_demand_scope(DemandKind.ARCHIVE_BACKFILL):
             with rpc_attempt_budget(budget):
-                await _run_backfill_slice(
+                accepted = await _run_backfill_slice(
                     self.client,
                     self.conn,
                     self.shutdown_event,
                     timeout_s=self.timeout_s,
                     writer=self.writer,
+                    expected_revision=selected.revision,
                 )
+        if accepted is None:
+            return SliceOutcome(
+                selected, SliceOutcomeKind.STALE if self._selected() != selected else SliceOutcomeKind.NO_PROGRESS
+            )
+        if not accepted:
+            return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
+        if accepted == selected.revision:
+            return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
+        kind = SliceOutcomeKind.TERMINAL if accepted.endswith(":complete") else SliceOutcomeKind.PROGRESSED
+        return SliceOutcome(selected, kind, accepted)
 
 
 @dataclass(slots=True)
@@ -115,9 +145,17 @@ class ArchiveIncrementalDemandAdapter(DurableDemandAdapter):
     interval_s: float
     timeout_s: float
     writer: SQLiteWriter = field(kw_only=True)
+    account_id: int = field(kw_only=True)
     demand_kind = DemandKind.ARCHIVE_INCREMENTAL
 
-    def status(self, now: float) -> DemandStatus | None:
+    def _selected(self) -> WorkRevision | None:
+        state = _load_state(self.conn)
+        if state.get("backfill_complete") != "1" or not int(state.get("last_sync_at") or 0):
+            return None
+        revision = _incremental_revision(state)
+        return WorkRevision(WorkKey(self.demand_kind, self.account_id, "account-incremental"), revision)
+
+    def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
         """Report the current incremental page or the next periodic release."""
         _validate_status_now(now)
         state = _load_state(self.conn)
@@ -126,25 +164,44 @@ class ArchiveIncrementalDemandAdapter(DurableDemandAdapter):
         last_sync_at = int(state.get("last_sync_at") or 0)
         if last_sync_at == 0:
             return None
+        selected = self._selected()
+        if selected is None or selected in excluded:
+            return None
         return DemandStatus(
             0.0 if state.get(_INCREMENTAL_MIN_DATE_KEY) is not None else float(last_sync_at) + self.interval_s,
             float(last_sync_at) + self.interval_s,
+            selected=selected,
+            request_method=_ARCHIVE_SEARCH_REQUEST_METHOD,
         )
 
-    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+    async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
         """Fetch and commit at most one incremental search page."""
         status = self.status(time.time())
-        if status is None or not status.is_ready(time.time()):
-            return
+        selected = budget.selected
+        if selected is None:
+            raise RuntimeError("archive incremental requires an owner-selected revision")
+        if status is None or status.selected != selected:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        if not status.is_ready(time.time()):
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
         with _archive_demand_scope(DemandKind.ARCHIVE_INCREMENTAL):
             with rpc_attempt_budget(budget):
-                await _run_incremental_slice(
+                accepted = await _run_incremental_slice(
                     self.client,
                     self.conn,
                     self.shutdown_event,
                     timeout_s=self.timeout_s,
                     writer=self.writer,
+                    expected_revision=selected.revision,
                 )
+        if accepted is None:
+            return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
+        if not accepted:
+            return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
+        if accepted == selected.revision:
+            return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
+        kind = SliceOutcomeKind.TERMINAL if _incremental_window_complete(accepted) else SliceOutcomeKind.PROGRESSED
+        return SliceOutcome(selected, kind, accepted)
 
 
 @dataclass
@@ -212,6 +269,23 @@ def _load_state(conn: sqlite3.Connection) -> dict[str, str | None]:
     return dict(rows)
 
 
+def _backfill_revision(state: dict[str, str | None]) -> str:
+    phase = "complete" if state.get("backfill_complete") == "1" else "pending"
+    return f"{state.get('backfill_offset_id') or '0'}:{phase}"
+
+
+def _incremental_revision(state: dict[str, str | None]) -> str:
+    return (
+        f"{state.get(_INCREMENTAL_MIN_DATE_KEY) or '0'}:"
+        f"{state.get(_INCREMENTAL_OFFSET_ID_KEY) or '0'}:"
+        f"{state.get(_INCREMENTAL_COMPLETED_GENERATION_KEY) or '0'}"
+    )
+
+
+def _incremental_window_complete(revision: str) -> bool:
+    return revision.startswith("0:0:")
+
+
 def _validate_status_now(now: float) -> None:
     if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now) or now < 0:
         raise ValueError("now must be a finite non-negative timestamp")
@@ -220,15 +294,8 @@ def _validate_status_now(now: float) -> None:
 @contextmanager
 def _archive_demand_scope(kind: DemandKind) -> Iterator[None]:
     """Install the exact archive operation kind for an adapter slice."""
-    try:
-        token = current_demand_token()
-    except UnclassifiedTelegramDemandError:
-        with demand_context(kind):
-            yield
-        return
-    if token.kind is not kind:
-        raise RuntimeError(f"active demand kind {token.kind.value} cannot execute {kind.value}")
-    yield
+    with durable_demand_context(kind):
+        yield
 
 
 def _coordinator_owns_throttle() -> bool:
@@ -253,6 +320,7 @@ def _finish_incremental_slice(conn: sqlite3.Connection) -> None:
     state = _load_state(conn)
     # Legacy unfinished windows rescan conservatively when their start is unknown.
     next_anchor = state.get(_INCREMENTAL_STARTED_AT_KEY) or state.get("last_sync_at") or "0"
+    completed_generation = int(state.get(_INCREMENTAL_COMPLETED_GENERATION_KEY) or 0) + 1
     conn.execute(
         "DELETE FROM activity_sync_state WHERE key IN (?, ?, ?)",
         (_INCREMENTAL_MIN_DATE_KEY, _INCREMENTAL_OFFSET_ID_KEY, _INCREMENTAL_STARTED_AT_KEY),
@@ -261,6 +329,7 @@ def _finish_incremental_slice(conn: sqlite3.Connection) -> None:
         "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('last_sync_at', ?)",
         (next_anchor,),
     )
+    _set_state(conn, _INCREMENTAL_COMPLETED_GENERATION_KEY, str(completed_generation))
 
 
 def _normalize(text: str | None) -> str | None:
@@ -430,11 +499,7 @@ async def _search_backfill_batch(
         )
         if _coordinator_owns_throttle():
             raise
-        if exc.retry_after_seconds is None:
-            return _SEARCH_BATCH_STOP
-        if await sleep_through_flood(shutdown_event, exc.retry_after_seconds):
-            return _SEARCH_BATCH_STOP
-        return _SEARCH_BATCH_RETRY
+        return _SEARCH_BATCH_STOP
     except RpcAdmissionClosedError:
         raise
     except TimeoutError:
@@ -485,11 +550,7 @@ async def _search_incremental_batch(  # noqa: PLR0913 - explicit worker state an
         logger.warning("activity_sync_incremental_floodwait seconds=%s", exc.retry_after_seconds)
         if _coordinator_owns_throttle():
             raise
-        if exc.retry_after_seconds is None:
-            return _SEARCH_BATCH_STOP
-        if await sleep_through_flood(shutdown_event, exc.retry_after_seconds):
-            return _SEARCH_BATCH_STOP
-        return _SEARCH_BATCH_RETRY
+        return _SEARCH_BATCH_STOP
     except RpcAdmissionClosedError:
         raise
     except TimeoutError:
@@ -587,32 +648,33 @@ def _prepare_incremental_slice(
         raw_min_date = state.get(_INCREMENTAL_MIN_DATE_KEY)
         min_date = int(raw_min_date) if raw_min_date is not None else max(0, last_sync_at - 60)
         offset_id = int(state.get(_INCREMENTAL_OFFSET_ID_KEY) or 0)
-        if raw_min_date is None:
-            _set_state(conn, _INCREMENTAL_STARTED_AT_KEY, str(int(time.time())))
-            conn.execute(
-                "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
-                (_INCREMENTAL_MIN_DATE_KEY, str(min_date)),
-            )
-            conn.execute(
-                "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, '0')",
-                (_INCREMENTAL_OFFSET_ID_KEY,),
-            )
         return min_date, offset_id, allocate_observation_order(conn)
 
 
-def _commit_incremental_slice_result(
+def _commit_incremental_slice_result(  # noqa: PLR0913, PLR0917
     conn: sqlite3.Connection,
     search_result: _SearchResultLike,
     min_date: int,
     batch_started_at: float,
     observation_order: int,
-) -> None:
+    expected_revision: str,
+) -> str | None:
     """Persist one incremental page and its restart-safe continuation."""
     with write_transaction(conn):
+        state = _load_state(conn)
+        current = _incremental_revision(state)
+        if current != expected_revision:
+            return None
+        if state.get(_INCREMENTAL_MIN_DATE_KEY) is None:
+            min_date = max(0, int(state.get("last_sync_at") or 0) - 60)
+            _set_state(conn, _INCREMENTAL_STARTED_AT_KEY, str(int(time.time())))
+            _set_state(conn, _INCREMENTAL_MIN_DATE_KEY, str(min_date))
+            _set_state(conn, _INCREMENTAL_OFFSET_ID_KEY, "0")
         batch = list(search_result.messages or [])
         if not batch:
             _finish_incremental_slice(conn)
-            return
+            state = _load_state(conn)
+            return _incremental_revision(state)
 
         in_window, past_window = _trim_incremental_batch(batch, min_date)
         extracted = [replace(row, observation_order=observation_order) for row in _extract_own_message_rows(in_window)]
@@ -639,8 +701,10 @@ def _commit_incremental_slice_result(
         )
         if past_window:
             _finish_incremental_slice(conn)
-            return
-        _set_state(conn, _INCREMENTAL_OFFSET_ID_KEY, str(next_offset_id))
+        else:
+            _set_state(conn, _INCREMENTAL_OFFSET_ID_KEY, str(next_offset_id))
+        state = _load_state(conn)
+        return _incremental_revision(state)
 
 
 def _prepare_backfill_slice(
@@ -653,27 +717,24 @@ def _prepare_backfill_slice(
         if stopped or state.get("backfill_complete") == "1":
             return None
         checkpoint = int(state.get("backfill_offset_id") or 0)
-        conn.execute(
-            "INSERT OR IGNORE INTO activity_sync_state (key, value) VALUES ('backfill_started_at', ?)",
-            (str(int(time.time())),),
-        )
         state = _load_state(conn)
-        return checkpoint, state["backfill_started_at"] or "0", allocate_observation_order(conn)
+        return checkpoint, state.get("backfill_started_at") or str(int(time.time())), allocate_observation_order(conn)
 
 
-async def _run_backfill_slice(
+async def _run_backfill_slice(  # noqa: PLR0913
     client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
     timeout_s: float,
     writer: SQLiteWriter,
-) -> None:
+    expected_revision: str,
+) -> str | None:
     """Fetch one restart-safe archive-backfill page."""
     stopped = shutdown_event.is_set()
     window = await writer.run(lambda db: _prepare_backfill_slice(db, stopped))
     if window is None:
-        return
+        return None
     checkpoint, started_at, observation_order = window
     batch_started_at = time.monotonic()
     result = await _search_backfill_batch(
@@ -684,59 +745,73 @@ async def _run_backfill_slice(
         timeout_s=timeout_s,
     )
     if result is _SEARCH_BATCH_STOP or result is _SEARCH_BATCH_RETRY:
-        return
+        return None
     search_result = cast(_SearchResultLike, result)
     batch = list(search_result.messages or [])
     next_checkpoint = await writer.run(
-        lambda db: _commit_backfill_slice_result(db, search_result, batch, started_at, observation_order)
+        lambda db: _commit_backfill_slice_result(
+            db, search_result, batch, started_at, observation_order, expected_revision
+        )
     )
     if next_checkpoint is None:
-        return
-    _log_backfill_batch(
-        _BackfillState(
-            checkpoint=next_checkpoint,
-            total_fetched=len(batch),
-            batch_num=1,
-            loop_start=batch_started_at,
-        ),
-        len(batch),
-        time.monotonic() - batch_started_at,
-    )
+        return None
+    if batch:
+        _log_backfill_batch(
+            _BackfillState(
+                checkpoint=min(message.id for message in batch),
+                total_fetched=len(batch),
+                batch_num=1,
+                loop_start=batch_started_at,
+            ),
+            len(batch),
+            time.monotonic() - batch_started_at,
+        )
+    return next_checkpoint
 
 
-def _commit_backfill_slice_result(
+def _commit_backfill_slice_result(  # noqa: PLR0913, PLR0917
     conn: sqlite3.Connection,
     search_result: _SearchResultLike,
     batch: Sequence[_SearchMessageLike],
     started_at: str,
     observation_order: int,
-) -> int | None:
+    expected_revision: str,
+) -> str | None:
     with write_transaction(conn):
+        state = _load_state(conn)
+        current = _backfill_revision(state)
+        if current != expected_revision:
+            return None
         if not batch:
+            _set_state(conn, "backfill_started_at", started_at)
             _set_state(conn, "backfill_complete", "1")
             _set_state(conn, "last_sync_at", started_at)
-            return None
+            state = _load_state(conn)
+            return _backfill_revision(state)
         extracted = [replace(row, observation_order=observation_order) for row in _extract_own_message_rows(batch)]
         _persist_own_message_rows(conn, extracted, priority=HydrationPriority.BACKFILL)
         _upsert_entities_from_search(conn, search_result)
         checkpoint = min(message.id for message in batch)
+        _set_state(conn, "backfill_started_at", started_at)
         _set_state(conn, "backfill_offset_id", str(checkpoint))
-        return checkpoint
+        state = _load_state(conn)
+        return _backfill_revision(state)
 
 
-async def _run_incremental_slice(
+async def _run_incremental_slice(  # noqa: PLR0913
     client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
     timeout_s: float,
     writer: SQLiteWriter,
-) -> None:
+    expected_revision: str,
+) -> str | None:
     """Fetch one restart-safe page from the current incremental window."""
     stopped = shutdown_event.is_set()
     window = await writer.run(lambda db: _prepare_incremental_slice(db, stopped))
     if window is None:
-        return
+        return None
     min_date, offset_id, observation_order = window
 
     batch_started_at = time.monotonic()
@@ -749,9 +824,9 @@ async def _run_incremental_slice(
         timeout_s=timeout_s,
     )
     if result is _SEARCH_BATCH_RETRY or result is _SEARCH_BATCH_STOP:
-        return
-    await writer.run(
+        return None
+    return await writer.run(
         lambda db: _commit_incremental_slice_result(
-            db, cast(_SearchResultLike, result), min_date, batch_started_at, observation_order
+            db, cast(_SearchResultLike, result), min_date, batch_started_at, observation_order, expected_revision
         )
     )

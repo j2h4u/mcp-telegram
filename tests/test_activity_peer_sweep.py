@@ -515,9 +515,8 @@ def test_sweep_peer_once_success_invokes_pacing_sleep(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A successful SearchRequest should apply the fixed post-RPC pause."""
+    """A successful SearchRequest records pacing without sleeping in the adapter."""
     with closing(_make_db()) as conn:
-        sleep_calls: list[float] = []
 
         async def fake_resolve_input_peer(client: object, dialog_id: int) -> object:
             del client, dialog_id
@@ -526,9 +525,6 @@ def test_sweep_peer_once_success_invokes_pacing_sleep(
         async def fake_call_with_timeout(client: object, request: object, *, timeout_s: float) -> _FakeSweepResult:
             del client, request, timeout_s
             return _FakeSweepResult(messages=[_FakeSweepMessage(8, peer_id="keep")])
-
-        async def fake_sleep(seconds: float) -> None:
-            sleep_calls.append(seconds)
 
         def fake_extract_dialog_id(message: _FakeSweepMessage) -> int | None:
             return 101 if message.peer_id == "keep" else None
@@ -543,7 +539,6 @@ def test_sweep_peer_once_success_invokes_pacing_sleep(
 
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
-        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.asyncio.sleep", fake_sleep)
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.extract_dialog_id", fake_extract_dialog_id)
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.extract_message_row", fake_extract_message_row)
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.insert_messages_with_fts", fake_insert_messages_with_fts)
@@ -562,7 +557,6 @@ def test_sweep_peer_once_success_invokes_pacing_sleep(
                 )
             )
 
-        assert sleep_calls == [_PACING.search.success_s]
         assert result.rpc_calls == 2
         assert any(
             "sweep_peer_once_done" in record.message
@@ -584,7 +578,6 @@ def test_sweep_peer_once_floodwait_does_not_invoke_pacing_sleep(monkeypatch: pyt
     from mcp_telegram.flood import TelegramRpcThrottled
 
     with closing(_make_db()) as conn:
-        sleep_calls: list[float] = []
 
         async def fake_resolve_input_peer(client: object, dialog_id: int) -> object:
             del client, dialog_id
@@ -594,12 +587,8 @@ def test_sweep_peer_once_floodwait_does_not_invoke_pacing_sleep(monkeypatch: pyt
             del client, request, timeout_s
             raise TelegramRpcThrottled(retry_after_seconds=37)
 
-        async def fake_sleep(seconds: float) -> None:
-            sleep_calls.append(seconds)
-
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
-        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.asyncio.sleep", fake_sleep)
 
         result = asyncio.run(
             sweep_peer_once(
@@ -614,7 +603,6 @@ def test_sweep_peer_once_floodwait_does_not_invoke_pacing_sleep(monkeypatch: pyt
             )
         )
 
-        assert sleep_calls == []
         assert result.rpc_calls == 2, "a SearchRequest FloodWait still counts its attempt"
         assert result == SweepResult(
             fetched_ids=[],
@@ -723,7 +711,6 @@ def test_sweep_peer_once_access_lost_marks_dialog_without_traceback(
     with closing(_make_db()) as conn:
         dialog_id = -100789000001
         enroll_activity_dialog(conn, dialog_id, "supergroup", last_activity_at=int(time.time()))
-        sleep_calls: list[float] = []
 
         async def fake_resolve_input_peer(client: object, dialog_id: int) -> object:
             del client, dialog_id
@@ -733,12 +720,8 @@ def test_sweep_peer_once_access_lost_marks_dialog_without_traceback(
             del client, request, timeout_s
             raise ChannelPrivateError(request=None)
 
-        async def fake_sleep(seconds: float) -> None:
-            sleep_calls.append(seconds)
-
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
-        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.asyncio.sleep", fake_sleep)
 
         with caplog.at_level(logging.INFO, logger="mcp_telegram.access_lifecycle"):
             result = asyncio.run(
@@ -767,7 +750,6 @@ def test_sweep_peer_once_access_lost_marks_dialog_without_traceback(
         )
         access_lost_logs = [record for record in caplog.records if record.message.startswith("access_lost ")]
 
-        assert sleep_calls == []
         assert result.rpc_calls == 2, "an access-lost SearchRequest still counts its attempt"
         assert result == SweepResult(
             fetched_ids=[],

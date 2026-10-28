@@ -37,9 +37,9 @@ from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, Refr
 from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_transactions import write_savepoint
-from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
+from tests.demand_adapter_helpers import run_ready_slice
 from tests.helpers import FakeChannelProfilePort
 from tests.test_entity_profile_full_user_pair import _pair_service, _PairClient
 from tests.test_entity_profile_progressive import _test_service
@@ -301,7 +301,7 @@ async def test_rpc_reserves_order_before_acquisition_and_newer_push_wins(tmp_pat
     service._profiles.mark_pending(42, now=100)
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    acquisition = asyncio.create_task(EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1)))
+    acquisition = asyncio.create_task(run_ready_slice(EntityProfileDemandAdapter(coordinator), now=100_000.0))
     try:
         await asyncio.wait_for(entered.wait(), timeout=5)
         assert conn.execute("SELECT value FROM daemon_state WHERE key='canonical_observation_sequence'").fetchone() == (
@@ -399,7 +399,7 @@ async def test_durable_user_profile_preserves_dynamic_relationship_and_emoji_fie
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     try:
-        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        await run_ready_slice(EntityProfileDemandAdapter(coordinator), now=100)
         result = await service.get_entity_info({"entity_id": 42})
         assert result["ok"] is True
         data = _mapping(result["data"])
@@ -477,7 +477,7 @@ async def test_durable_chat_profile_preserves_observed_membership_and_type_facts
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     try:
-        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        await run_ready_slice(EntityProfileDemandAdapter(coordinator), now=100)
         result = await service.get_entity_info({"entity_id": entity_id})
         assert result["ok"] is True
         data = _mapping(result["data"])

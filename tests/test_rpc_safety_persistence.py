@@ -65,6 +65,31 @@ def test_absent_roundtrip_and_canonical_owners(conn: sqlite3.Connection) -> None
     assert load_rpc_safety_owners(conn) == (11, 11)
 
 
+def test_method_episode_floor_is_not_promoted_to_global_account_floor(conn: sqlite3.Connection) -> None:
+    record = cast(dict[str, object], json.loads(_record(11)))
+    record.update(
+        version=2,
+        methods={
+            "telethon.tl.functions.users.GetFullUserRequest:b60f5918": {
+                "generation": "method-generation",
+                "consecutive_actual_floods": 1,
+                "floor": {
+                    "boot_id": "boot-x",
+                    "until_monotonic": 50_000,
+                    "until_utc": 50_000,
+                    "remaining_seconds": 50_000,
+                },
+                "claim": {"attempt_id": "trial", "run": "run"},
+            }
+        },
+    )
+    encoded = json.dumps(record)
+    save_rpc_safety_record(conn, None, encoded)
+    assert load_account_cooldown_until_utc(conn) == 100
+    assert load_rpc_safety_record(conn) == encoded
+    assert conn.execute("SELECT * FROM durable_fact").fetchone() == (1, "kept", 123)
+
+
 def test_stale_cas_rolls_back_all_changes(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO daemon_state VALUES ('telegram_rpc_safety', ?)", (_record(11),))
     before = conn.execute("SELECT key,value FROM daemon_state ORDER BY key").fetchall()

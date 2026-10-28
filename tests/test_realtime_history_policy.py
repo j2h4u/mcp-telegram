@@ -257,8 +257,8 @@ async def test_new_message_status_race_fails_closed_after_fetch(
         sync_db.commit()
         return {}
 
-    monkeypatch.setattr("mcp_telegram.event_handlers._build_fwd_entity_map", fetch_forward)
     manager = event_manager(client, sync_db, asyncio.Event())
+    monkeypatch.setattr(manager, "_forward_entity_name_map", fetch_forward)
     manager.register()
     await manager.on_new_message(SimpleNamespace(chat_id=42, is_private=False, message=build_mock_message(id=4)))
     assert sync_db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0

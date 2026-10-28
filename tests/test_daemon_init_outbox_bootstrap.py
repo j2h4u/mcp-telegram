@@ -23,18 +23,23 @@ Test inventory (≥11):
 from __future__ import annotations
 
 import asyncio
-import math
 import sqlite3
 import time
 from collections.abc import Iterable
 from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from telethon.errors.rpcerrorlist import RPCError
 
+from mcp_telegram.daemon import _DaemonClient
+from mcp_telegram.daemon import _initialize_read_positions as _initialize_read_positions_owner
+from mcp_telegram.message_fact_refresh import ReadReceiptDemandAdapter
+from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_transactions import write_transaction
+from mcp_telegram.telegram_demand_progress import SliceOutcome, SliceOutcomeKind
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.sqlite_writer_helpers import inline_writer
 
@@ -80,10 +85,14 @@ def _patch_get_peer_id(mapping: Iterable[int]):
     Tests usually pass a dict keyed by an identity-free SimpleNamespace and rely
     on call order — we simplify via a side_effect counter.
     """
-    iterator = iter(mapping)
+    identities = list(mapping)
+    call = 0
 
     def _side_effect(peer: object) -> int:
-        return next(iterator)
+        nonlocal call
+        identity = identities[min(call // 2, len(identities) - 1)]
+        call += 1
+        return identity
 
     return patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=_side_effect)
 
@@ -110,6 +119,37 @@ def _fake_client_with_dialogs(dialogs_per_call: list[list[SimpleNamespace]]) -> 
     return _FakeClient(dialogs_per_call)
 
 
+async def _no_read_position_work(_selected: object) -> None:
+    return None
+
+
+async def _initialize_read_positions(  # noqa: PLR0913 - mirrors the selected owner call for focused tests
+    client: object,
+    conn: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+    *,
+    writer: object,
+    max_dialogs: int | None = None,
+    failure_cooldown_seconds: float | None = None,
+    batch_size: int | None = None,
+    batch_pause_seconds: float | None = None,
+    success_recheck_seconds: float | None = None,
+) -> SliceOutcome | None:
+    """Invoke one owner-selected dialog, matching a coordinator slice."""
+    del max_dialogs, failure_cooldown_seconds, batch_size, batch_pause_seconds
+    status = ReadReceiptDemandAdapter(conn, _no_read_position_work, account_id=1).status(time.time())  # type: ignore[arg-type]
+    if status is None or status.selected is None:
+        return None
+    return await _initialize_read_positions_owner(
+        cast(_DaemonClient, client),
+        conn,
+        shutdown_event,
+        writer=cast(SQLiteWriter, writer),
+        success_recheck_seconds=success_recheck_seconds,
+        selected=status.selected,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -118,7 +158,6 @@ def _fake_client_with_dialogs(dialogs_per_call: list[list[SimpleNamespace]]) -> 
 @pytest.mark.asyncio
 async def test_bootstrap_populates_outbox_for_null_rows():
     """AC-4 happy path: NULL outbox cursor gets filled from Telethon Dialog."""
-    from mcp_telegram.daemon import _initialize_read_positions
 
     with _make_conn() as conn:
         _seed(conn, [(1001, None, None, "synced")])
@@ -141,7 +180,6 @@ async def test_bootstrap_populates_outbox_for_null_rows():
 @pytest.mark.asyncio
 async def test_bootstrap_populates_inbox_too():
     """Plan 01 primitive regression guard — inbox still gets written."""
-    from mcp_telegram.daemon import _initialize_read_positions
 
     with _make_conn() as conn:
         _seed(conn, [(1001, None, None, "synced")])
@@ -164,32 +202,24 @@ async def test_bootstrap_populates_inbox_too():
 @pytest.mark.asyncio
 async def test_bootstrap_call_count_equals_ceil_n_over_15():
     """AC-4 tightened: GetPeerDialogsRequest call count == ceil(37/15) == 3."""
-    from mcp_telegram.daemon import _initialize_read_positions
 
     N = 37
     with _make_conn() as conn:
         _seed(conn, [(1000 + i, None, None, "synced") for i in range(N)])
 
-        # Build 3 batches of Dialog objects (15 + 15 + 7).
-        def _dialogs(start: int, count: int) -> list[SimpleNamespace]:
-            return [
-                SimpleNamespace(
-                    peer=SimpleNamespace(),
-                    read_inbox_max_id=start + i,
-                    read_outbox_max_id=start + i + 10_000,
-                )
-                for i in range(count)
-            ]
-
-        batches = [_dialogs(0, 15), _dialogs(15, 15), _dialogs(30, 7)]
+        batches = [
+            [SimpleNamespace(peer=SimpleNamespace(), read_inbox_max_id=i, read_outbox_max_id=i + 10_000)]
+            for i in range(N)
+        ]
         client = _fake_client_with_dialogs(batches)
 
         # get_peer_id returns sequential dialog_ids in the same order as we seeded.
         dialog_ids_in_order = [1000 + i for i in range(N)]
         with _patch_get_peer_id(dialog_ids_in_order):
-            await _initialize_read_positions(client, conn, asyncio.Event(), writer=inline_writer(conn))
+            for _ in range(N):
+                await _initialize_read_positions(client, conn, asyncio.Event(), writer=inline_writer(conn))
 
-        expected = math.ceil(N / 15)
+        expected = N
         assert client._call_count.n == expected, (
             f"Expected {expected} GetPeerDialogsRequest calls, got {client._call_count.n}"
         )
@@ -198,22 +228,20 @@ async def test_bootstrap_call_count_equals_ceil_n_over_15():
 @pytest.mark.asyncio
 async def test_bootstrap_skips_when_both_cursors_populated():
     """Both cursors non-NULL → SELECT is empty → zero API calls."""
-    from mcp_telegram.daemon import _initialize_read_positions
 
     with _make_conn() as conn:
         _seed(conn, [(1001, 100, 200, "synced")])
 
         client = _fake_client_with_dialogs([])
-        filled = await _initialize_read_positions(client, conn, asyncio.Event(), writer=inline_writer(conn))
+        outcome = await _initialize_read_positions(client, conn, asyncio.Event(), writer=inline_writer(conn))
 
-        assert filled == 0
+        assert outcome is None
         assert client._call_count.n == 0
 
 
 @pytest.mark.asyncio
 async def test_bootstrap_runs_when_only_outbox_null():
     """inbox=populated, outbox=NULL → row picked up by extended SELECT."""
-    from mcp_telegram.daemon import _initialize_read_positions
 
     with _make_conn() as conn:
         _seed(conn, [(1001, 100, None, "synced")])
@@ -233,7 +261,6 @@ async def test_bootstrap_runs_when_only_outbox_null():
 @pytest.mark.asyncio
 async def test_bootstrap_runs_when_only_inbox_null():
     """Phase 38 preservation: inbox=NULL, outbox=populated → still picked up."""
-    from mcp_telegram.daemon import _initialize_read_positions
 
     with _make_conn() as conn:
         _seed(conn, [(1001, None, 200, "synced")])
@@ -258,7 +285,6 @@ async def test_bootstrap_telethon_returns_none_outbox_preserves_null():
     pattern. NEVER convert None → 0; NEVER call apply_read_cursor with 0 as
     a stand-in.
     """
-    from mcp_telegram.daemon import _initialize_read_positions
 
     with _make_conn() as conn:
         _seed(conn, [(1001, None, None, "synced")])
@@ -288,7 +314,6 @@ async def test_bootstrap_telethon_returns_zero_outbox_writes_zero():
     Telethon may return 0 for a dialog where the peer has never read anything.
     Bootstrap must write 0, not leave NULL. Confirms None and 0 are not folded.
     """
-    from mcp_telegram.daemon import _initialize_read_positions
 
     with _make_conn() as conn:
         _seed(conn, [(1001, None, None, "synced")])
@@ -310,7 +335,6 @@ async def test_bootstrap_telethon_returns_zero_outbox_writes_zero():
 @pytest.mark.asyncio
 async def test_bootstrap_telethon_returns_none_inbox_preserves_null():
     """Symmetric: None → NULL for inbox too (consistency tightening)."""
-    from mcp_telegram.daemon import _initialize_read_positions
 
     with _make_conn() as conn:
         _seed(conn, [(1001, None, None, "synced")])
@@ -342,7 +366,6 @@ async def test_bootstrap_v12_upgrade_scenario():
       - Inbox cursors preserved (monotonic MAX — Telethon's value wins only
         if it is larger than the stored value).
     """
-    from mcp_telegram.daemon import _initialize_read_positions
 
     N = 20
     with _make_conn() as conn:
@@ -360,14 +383,15 @@ async def test_bootstrap_v12_upgrade_scenario():
                 for i in range(count)
             ]
 
-        batches = [_batch(0, 15), _batch(15, 5)]
+        batches = [[dialog] for batch in (_batch(0, 15), _batch(15, 5)) for dialog in batch]
         client = _fake_client_with_dialogs(batches)
 
         dialog_ids_in_order = [1000 + i for i in range(N)]
         with _patch_get_peer_id(dialog_ids_in_order):
-            await _initialize_read_positions(client, conn, asyncio.Event(), writer=inline_writer(conn))
+            for _ in range(N):
+                await _initialize_read_positions(client, conn, asyncio.Event(), writer=inline_writer(conn))
 
-        expected_calls = math.ceil(N / 15)
+        expected_calls = N
         assert client._call_count.n == expected_calls, (
             f"Expected {expected_calls} batched GetPeerDialogsRequest calls for "
             f"v12 upgrade re-bootstrap of N={N}; got {client._call_count.n}"
@@ -390,7 +414,6 @@ async def test_bootstrap_live_event_race_newer_wins():
     arrives and applies 999. The monotonic MAX semantics of apply_read_cursor
     must ensure the final cursor == 999 (not 500).
     """
-    from mcp_telegram.daemon import _initialize_read_positions
     from mcp_telegram.read_state import apply_read_cursor
 
     with _make_conn() as conn:
@@ -436,7 +459,6 @@ async def test_bootstrap_live_event_race_newer_wins():
 @pytest.mark.parametrize("failure_cooldown_seconds", [None, 3600])
 async def test_bootstrap_success_skips_empty_retry_transaction(failure_cooldown_seconds: float | None):
     """A fully returned peer needs only the transaction that applies its cursors."""
-    from mcp_telegram.daemon import _initialize_read_positions
 
     with _make_conn() as conn:
         _seed(conn, [(1001, None, None, "synced")])
@@ -462,9 +484,8 @@ async def test_bootstrap_success_skips_empty_retry_transaction(failure_cooldown_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure_mode", ["unresolved", "rpc"])
-async def test_bootstrap_failure_persists_retry_cooldown(failure_mode: str):
-    """Unresolved peers and request failures still use durable retry bookkeeping."""
-    from mcp_telegram.daemon import _initialize_read_positions
+async def test_bootstrap_failure_does_not_claim_business_progress(failure_mode: str):
+    """Unresolved peers do not mutate the selected fact; RPC errors propagate."""
 
     with _make_conn() as conn:
         _seed(conn, [(1001, None, None, "synced")])
@@ -475,19 +496,30 @@ async def test_bootstrap_failure_persists_retry_cooldown(failure_mode: str):
             client.get_input_entity.return_value = SimpleNamespace(_did=1001)
             client.side_effect = RPCError(None, "request failed")
 
-        await _initialize_read_positions(
-            client,
-            conn,
-            asyncio.Event(),
-            writer=inline_writer(conn),
-            failure_cooldown_seconds=3600,
-            batch_pause_seconds=0.001,
-        )
+        if failure_mode == "rpc":
+            with pytest.raises(RPCError):
+                await _initialize_read_positions(
+                    client,
+                    conn,
+                    asyncio.Event(),
+                    writer=inline_writer(conn),
+                    failure_cooldown_seconds=3600,
+                    batch_pause_seconds=0.001,
+                )
+        else:
+            outcome = await _initialize_read_positions(
+                client,
+                conn,
+                asyncio.Event(),
+                writer=inline_writer(conn),
+                failure_cooldown_seconds=3600,
+                batch_pause_seconds=0.001,
+            )
+            assert outcome is not None and outcome.kind is SliceOutcomeKind.NO_PROGRESS
 
         retry_at, attempts = conn.execute(
             "SELECT read_position_next_attempt_at, read_position_attempt_count "
             "FROM synced_dialogs WHERE dialog_id = 1001"
         ).fetchone()
-        assert retry_at is not None
-        assert retry_at > int(time.time())
-        assert attempts == 1
+        assert retry_at is None
+        assert attempts == 0

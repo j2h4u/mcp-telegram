@@ -145,6 +145,7 @@ class TelegramRpcScope:
     attempt_budget: RpcAttemptBudget | None = None
     attempt_evidence: RpcAttemptEvidence | None = None
     request_method: str | None = None
+    owned_attempt_id: str | None = None
     transport_control: bool = False
     transport_bootstrap: bool = False
     transport_auth: bool = False
@@ -166,6 +167,34 @@ UnclassifiedTelegramRpcError = UnclassifiedTelegramDemandError
 
 class TelegramRpcAdmissionDeferred(TelegramRpcThrottled):
     """Recoverable local deferral raised before Telegram received the RPC."""
+
+    def __init__(  # noqa: PLR0913 - preserve the existing finite outcome with optional eligibility evidence.
+        self,
+        retry_after_seconds: int | None = None,
+        *,
+        latched: bool = False,
+        detail: str | None = None,
+        method_key: str | None = None,
+        generation: str | None = None,
+        eligible_at: float | None = None,
+        reason: str | None = None,
+    ) -> None:
+        super().__init__(retry_after_seconds, latched=latched, detail=detail)
+        self.method_key = method_key
+        self.generation = generation
+        self.eligible_at = eligible_at
+        self.reason = reason
+
+
+class TelegramRpcMethodRecoveryPending(RuntimeError):  # noqa: N818 - scoped admission outcome, not an account latch.
+    """Another real request owns this method's current recovery trial."""
+
+    def __init__(self, method_key: str, generation: str) -> None:
+        super().__init__("Telegram method recovery is already owned")
+        self.method_key = method_key
+        self.generation = generation
+        self.eligible_at = None
+        self.reason = "recovery"
 
 
 def _current_task() -> asyncio.Task[object] | None:
@@ -473,6 +502,7 @@ class _TicketState(StrEnum):
     EXPIRED = "expired"
     CANCELLED = "cancelled"
     CLOSED = "closed"
+    DEFERRED = "deferred"
 
 
 @dataclass(slots=True)
@@ -531,6 +561,8 @@ class TelegramRpcAdmissionScheduler:
         limiter: _RateLimiter,
         minimum_spacing_seconds: float,
         release_at: Callable[[TelegramRpcScope], float] = lambda _scope: 0.0,
+        deferral: Callable[[TelegramRpcScope], Exception | None] = lambda _scope: None,
+        capacity_released: Callable[[], None] = lambda: None,
         observer: AdmissionObserver | None = None,
         clock: Clock = time.monotonic,
         readiness: RpcTransportReadiness | None = None,
@@ -541,6 +573,8 @@ class TelegramRpcAdmissionScheduler:
         self._minimum_spacing_seconds = minimum_spacing_seconds
         self._next_write_at = 0.0
         self._release_at = release_at
+        self._deferral = deferral
+        self._capacity_released = capacity_released
         self._release_handle: asyncio.TimerHandle | None = None
         self._observer = observer
         self._clock = clock
@@ -704,11 +738,21 @@ class TelegramRpcAdmissionScheduler:
         active = self._active.pop(admission.sequence, None)
         if active is None:
             return
+        self._release_active_capacity(active)
+        if not self._closed and self._has_dispatchable_ticket_locked():
+            self._ensure_dispatcher_locked()
+
+    def _notify_capacity_released(self) -> None:
+        try:
+            self._capacity_released()
+        except Exception:
+            logger.exception("rpc_capacity_observer_failed")
+
+    def _release_active_capacity(self, active: _ActiveAttempt) -> None:
         if active.owns_capacity_slot:
             self._active_counts[active.scope.service_class] -= 1
             self._active_source_counts[active.scope.source] -= 1
-        if not self._closed and self._has_dispatchable_ticket_locked():
-            self._ensure_dispatcher_locked()
+            self._notify_capacity_released()
 
     def record_dispatch(self, admission: RpcAdmission) -> bool:
         """Claim one physical write synchronously, without accumulating burst credit."""
@@ -827,7 +871,8 @@ class TelegramRpcAdmissionScheduler:
         detail = self._shutdown_error_detail(reason)
         for queue in self._queues.values():
             while queue:
-                ticket = queue.popleft()
+                ticket = queue[0]
+                self._remove_ticket_locked(ticket)
                 if ticket.state is not _TicketState.QUEUED:
                     continue
                 ticket.state = _TicketState.CLOSED
@@ -873,6 +918,7 @@ class TelegramRpcAdmissionScheduler:
     def _ensure_dispatcher_locked(self) -> None:
         if self._closed:
             return
+        self._defer_held_tickets()
         if self._has_dispatchable_ticket_locked() and (self._dispatcher is None or self._dispatcher.done()):
             self._dispatcher = asyncio.create_task(self._dispatch_loop(), name="telegram-rpc-admission")
         else:
@@ -884,6 +930,20 @@ class TelegramRpcAdmissionScheduler:
             self._release_handle.cancel()
             self._release_handle = None
         self._ensure_dispatcher_locked()
+
+    def _defer_held_tickets(self) -> None:
+        """Return unwritten work to its owner when waiting would block delivery."""
+        for queue in self._queues.values():
+            for ticket in tuple(queue):
+                error = self._deferral(ticket.scope)
+                if error is None or ticket.state is not _TicketState.QUEUED:
+                    continue
+                ticket.state = _TicketState.DEFERRED
+                self._cancel_timer(ticket)
+                self._remove_ticket_locked(ticket)
+                if not ticket.future.done():
+                    ticket.future.set_exception(error)
+                self._emit_for_scope(RpcAdmissionEventKind.REJECTED, ticket.scope, reason="eligibility_deferred")
 
     @staticmethod
     def _validate_limiter(limiter: _RateLimiter, minimum_spacing_seconds: float) -> None:
@@ -954,6 +1014,7 @@ class TelegramRpcAdmissionScheduler:
 
     async def _dispatch_one_ready_ticket(self) -> None:
         async with self._lock:
+            self._defer_held_tickets()
             self._prune_done_locked()
             self._expire_due_tickets()
             if self._closed or not self._readiness.probe():
@@ -1024,9 +1085,7 @@ class TelegramRpcAdmissionScheduler:
                 )
             elif ticket.state is _TicketState.DISPATCHED and ticket.sequence in self._active:
                 active = self._active.pop(ticket.sequence)
-                if active.owns_capacity_slot:
-                    self._active_counts[ticket.scope.service_class] -= 1
-                    self._active_source_counts[ticket.scope.source] -= 1
+                self._release_active_capacity(active)
                 self._emit_for_scope(
                     RpcAdmissionEventKind.CANCELLED,
                     ticket.scope,
@@ -1056,12 +1115,20 @@ class TelegramRpcAdmissionScheduler:
             queue.remove(ticket)
         except ValueError:
             pass
+        else:
+            if ticket.owns_capacity_slot:
+                self._notify_capacity_released()
 
     def _prune_done_locked(self) -> None:
         for queue in self._queues.values():
             retained = [ticket for ticket in queue if ticket.state is _TicketState.QUEUED and not ticket.future.done()]
+            released = sum(ticket.owns_capacity_slot for ticket in retained) < sum(
+                ticket.owns_capacity_slot for ticket in queue
+            )
             queue.clear()
             queue.extend(retained)
+            if released:
+                self._notify_capacity_released()
 
     async def _fail_closed_after_dispatch_error(self) -> None:
         await self._start_shutdown(reason="limiter_failure", failed_dispatcher=_current_task())
@@ -1202,6 +1269,7 @@ __all__ = [
     "RpcTransportReadiness",
     "TelegramRpcAdmissionDeferred",
     "TelegramRpcAdmissionScheduler",
+    "TelegramRpcMethodRecoveryPending",
     "TelegramRpcSchedulerPolicy",
     "TelegramRpcScope",
     "TelegramRpcSource",

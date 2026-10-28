@@ -16,6 +16,8 @@ from mcp_telegram.folders.worker import FolderAttemptResult, FolderProjectionDem
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_transactions import enable_runtime_writes
 from mcp_telegram.telegram_demand import RpcAttemptBudget
+from mcp_telegram.telegram_demand_progress import SliceOutcomeKind
+from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred
 from tests.sqlite_writer_helpers import inline_writer
 
 
@@ -33,6 +35,12 @@ class _Gateway:
     async def fetch_rules(self, *, started_at: int) -> FolderRuleObservation:
         self.calls += 1
         return FolderRuleObservation((FolderRule(1, "One"),), "token", started_at)
+
+
+def _budget(adapter: FolderProjectionDemandAdapter, now: float) -> RpcAttemptBudget:
+    status = adapter.status(now)
+    assert status is not None and status.selected is not None
+    return RpcAttemptBudget(limit=1, selected=status.selected)
 
 
 @pytest.mark.asyncio
@@ -57,7 +65,8 @@ async def test_worker_does_not_observe_rules_before_exact_900_second_deadline(tm
             writer=inline_writer(conn),
             clock=lambda: 999,
         )
-        await FolderProjectionDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+        adapter = FolderProjectionDemandAdapter(worker, account_id=1)
+        await adapter.run_slice(_budget(adapter, 999))
         assert gateway.calls == 0
         worker = FolderProjectionWorker(
             FolderRefresher(gateway, repository, writer=inline_writer(conn)),
@@ -67,7 +76,8 @@ async def test_worker_does_not_observe_rules_before_exact_900_second_deadline(tm
             writer=inline_writer(conn),
             clock=lambda: 1000,
         )
-        await FolderProjectionDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+        adapter = FolderProjectionDemandAdapter(worker, account_id=1)
+        await adapter.run_slice(_budget(adapter, 1000))
         assert gateway.calls == 1
         assert not conn.in_transaction
         assert conn.execute("PRAGMA query_only").fetchone() == (1,)
@@ -76,7 +86,7 @@ async def test_worker_does_not_observe_rules_before_exact_900_second_deadline(tm
 
 
 @pytest.mark.asyncio
-async def test_unexpected_folder_failure_uses_bounded_retry_cadence(tmp_path: Path) -> None:
+async def test_unexpected_folder_failure_keeps_durable_demand_due(tmp_path: Path) -> None:
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
@@ -102,14 +112,15 @@ async def test_unexpected_folder_failure_uses_bounded_retry_cadence(tmp_path: Pa
             writer=inline_writer(conn),
             clock=lambda: now[0],
         )
-        adapter = FolderProjectionDemandAdapter(worker)
+        adapter = FolderProjectionDemandAdapter(worker, account_id=1)
         with pytest.raises(ValueError, match="transient normalization"):
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
+            await adapter.run_slice(_budget(adapter, now[0]))
         status = adapter.status(now[0])
-        assert status is not None and status.release_at == 1001.0
+        assert status is not None and status.release_at == 1000.0
 
         now[0] = 1001.0
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        assert status.selected is not None
+        await adapter.run_slice(RpcAttemptBudget(limit=1, selected=status.selected))
         assert gateway.calls == 2
     finally:
         conn.close()
@@ -136,11 +147,163 @@ async def test_latched_folder_failure_propagates_without_private_retry(tmp_path:
             writer=inline_writer(conn),
             clock=lambda: 1000.0,
         )
-        adapter = FolderProjectionDemandAdapter(worker)
+        adapter = FolderProjectionDemandAdapter(worker, account_id=1)
         with pytest.raises(TelegramRpcThrottled, match="circuit open"):
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
+            await adapter.run_slice(_budget(adapter, 1000))
         assert repository.read_next_retry_at() is None
         assert adapter.status(1000.0) is not None
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_zero_balance_retry_candidate_runs_folder_preflight_without_spending_or_publishing(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    try:
+
+        class Gateway:
+            calls = 0
+
+            async def fetch_rules(self, *, started_at: int) -> FolderRuleObservation:
+                self.calls += 1
+                raise TelegramRpcAdmissionDeferred(
+                    retry_after_seconds=5,
+                    method_key="messages.GetDialogFiltersRequest",
+                    generation="retry-generation",
+                    eligible_at=1100.0,
+                )
+
+        repository = SQLiteFolderSnapshotRepository(conn)
+        gateway = Gateway()
+        worker = FolderProjectionWorker(
+            FolderRefresher(gateway, repository, writer=inline_writer(conn)),
+            repository,
+            asyncio.Event(),
+            _Policy(),
+            writer=inline_writer(conn),
+            clock=lambda: 1000.0,
+        )
+        adapter = FolderProjectionDemandAdapter(worker, account_id=1)
+        budget = _budget(adapter, 1000.0)
+        budget.debit()
+        budget._retry_candidate = object()
+
+        with pytest.raises(TelegramRpcAdmissionDeferred):
+            await adapter.run_slice(budget)
+
+        assert gateway.calls == 1
+        assert budget.attempts == 1
+        assert repository.read_snapshot_revision() == (None, None, None, None)
+        assert repository.read_next_retry_at() is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_folder_budget_without_retry_candidate_skips_gateway(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    try:
+        repository = SQLiteFolderSnapshotRepository(conn)
+        gateway = _Gateway()
+        worker = FolderProjectionWorker(
+            FolderRefresher(gateway, repository, writer=inline_writer(conn)),
+            repository,
+            asyncio.Event(),
+            _Policy(),
+            writer=inline_writer(conn),
+            clock=lambda: 1000.0,
+        )
+        adapter = FolderProjectionDemandAdapter(worker, account_id=1)
+        budget = _budget(adapter, 1000.0)
+        budget.debit()
+
+        outcome = await adapter.run_slice(budget)
+
+        assert outcome.kind.value == "deferred"
+        assert gateway.calls == 0
+        assert budget.attempts == 1
+        assert repository.read_snapshot_revision() == (None, None, None, None)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_folder_observation_without_canonical_generation_is_not_progress(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    try:
+        repository = SQLiteFolderSnapshotRepository(conn)
+        gateway = _Gateway()
+        worker = FolderProjectionWorker(
+            FolderRefresher(gateway, repository, writer=inline_writer(conn)),
+            repository,
+            asyncio.Event(),
+            _Policy(),
+            writer=inline_writer(conn),
+            clock=lambda: 1000.0,
+        )
+        adapter = FolderProjectionDemandAdapter(worker, account_id=1)
+
+        outcome = await adapter.run_slice(_budget(adapter, 1000.0))
+
+        assert gateway.calls == 1
+        assert outcome.kind is SliceOutcomeKind.NO_PROGRESS
+        assert repository.read_snapshot_revision() == (None, None, None, None)
+        assert conn.execute("SELECT COUNT(*) FROM telegram_folder_pending_observation").fetchone() == (1,)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_folder_refresh_rejects_publication_after_selected_projection_changes(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "UPDATE dialog_directory_publication SET account_id=1,generation=1,observation_started_at=1 WHERE singleton=1"
+        )
+        conn.commit()
+        enable_runtime_writes(conn)
+        repository = SQLiteFolderSnapshotRepository(conn)
+        repository.project_observation(
+            FolderRuleObservation((FolderRule(1, "Seed"),), "seed-token", 100), completed_at=100
+        )
+        newer_observation = FolderRuleObservation((FolderRule(3, "Newer"),), "newer-token", 1001)
+
+        class RacingGateway:
+            calls = 0
+
+            async def fetch_rules(self, *, started_at: int) -> FolderRuleObservation:
+                self.calls += 1
+                assert repository.project_observation(newer_observation, completed_at=1001) == 1
+                return FolderRuleObservation((FolderRule(2, "Older"),), "older-token", started_at)
+
+        gateway = RacingGateway()
+        worker = FolderProjectionWorker(
+            FolderRefresher(gateway, repository, writer=inline_writer(conn)),
+            repository,
+            asyncio.Event(),
+            _Policy(),
+            writer=inline_writer(conn),
+            clock=lambda: 1000.0,
+        )
+        adapter = FolderProjectionDemandAdapter(worker, account_id=1)
+        budget = _budget(adapter, 1000.0)
+
+        outcome = await adapter.run_slice(budget)
+
+        assert gateway.calls == 1
+        assert outcome.kind is SliceOutcomeKind.STALE
+        assert repository.read_snapshot_revision() == (1, 1, "newer-token", 1001)
+        assert conn.execute("SELECT title FROM telegram_folder_rules").fetchall() == [("Newer",)]
     finally:
         conn.close()
 
@@ -166,7 +329,8 @@ def test_legacy_failure_without_retry_is_immediately_due(tmp_path: Path, outcome
                 _Policy(),
                 writer=inline_writer(conn),
                 clock=lambda: 1000.0,
-            )
+            ),
+            account_id=1,
         )
         status = adapter.status(1000.0)
         assert status is not None and status.release_at == 1000.0

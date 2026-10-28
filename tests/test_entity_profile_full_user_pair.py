@@ -32,9 +32,9 @@ from mcp_telegram.entity_profile.ports import ProfileCollectionPort
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, RefreshLimits
 from mcp_telegram.flood import FloodWaitKillSwitchStatus
 from mcp_telegram.sync_db import ensure_sync_schema
-from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 from tests.daemon_api_policy import make_daemon_api_policy
+from tests.demand_adapter_helpers import run_ready_slice
 from tests.helpers import (
     LoudChannelProfilePort,
     LoudChatAvatarHistoryPort,
@@ -257,7 +257,7 @@ async def test_enabled_pair_commits_two_projections_with_one_full_user_call(tmp_
     client = cast(_PairClient, service._deps.client)  # type: ignore[attr-defined]
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
 
     assert client.full_user_calls == 1
     assert conn.execute(
@@ -294,7 +294,7 @@ async def test_protective_disconnect_serves_valid_partial_profile_from_local_cac
     seed_client = cast(_PairClient, seed_service._deps.client)  # type: ignore[attr-defined]
     coordinator = seed_service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     assert seed_client.full_user_calls == 1
     assert conn.execute(
         "SELECT status FROM entity_detail_sections WHERE entity_id=42 AND section='full_profile'"
@@ -356,7 +356,9 @@ async def test_protective_disconnect_serves_valid_partial_profile_from_local_cac
                 ),
             )
         )
-        assert client.disconnect_calls == 1
+        # The kill switch closes admission to new Telegram requests; it does
+        # not disconnect the receive-only client from update delivery.
+        assert client.disconnect_calls == 0
         assert api._auth_scope == scope
 
         result, _, _ = await api._handle_client_line(b'{"method":"get_entity_info","entity_id":42}', "", None)
@@ -370,7 +372,7 @@ async def test_protective_disconnect_serves_valid_partial_profile_from_local_cac
         assert sections["common_chats"]["status"] == "pending"
         assert "auth_scope" not in data
         assert "profile_owner_account_id" not in data
-        assert client.disconnect_calls == 1
+        assert client.disconnect_calls == 0
     finally:
         await api.shutdown()
         conn.close()
@@ -385,7 +387,7 @@ async def test_min_full_user_pair_preserves_complete_identity(tmp_path: Path) ->
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
 
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
 
     assert conn.execute(
         "SELECT name,username,type,identity_revision,revision FROM dialogs WHERE dialog_id=42"
@@ -402,7 +404,7 @@ async def test_enabled_pair_applies_to_user_and_bot(tmp_path: Path, entity_type:
     service._deps = replace(service._deps, client=replacement, user_profile_port=replacement)  # type: ignore[attr-defined]
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     assert conn.execute(
         "SELECT status FROM entity_detail_sections WHERE entity_id=42 AND section='full_profile'"
     ).fetchone() == ("fresh",)
@@ -416,7 +418,7 @@ async def test_pair_personal_channel_completion_is_local_and_does_not_repeat_ful
     client = cast(_PairClient, service._deps.client)  # type: ignore[attr-defined]
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     generation, revision = cast(
         tuple[int, int],
         conn.execute(
@@ -428,7 +430,7 @@ async def test_pair_personal_channel_completion_is_local_and_does_not_repeat_ful
         "WHERE entity_id=42"
     )
     conn.commit()
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
 
     assert client.full_user_calls == 1
     assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == ("pending",)
@@ -454,7 +456,7 @@ async def test_personal_channel_pair_guard_requires_pair_eligibility(
     client = cast(_PairClient, service._deps.client)  # type: ignore[attr-defined]
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     conn.execute(
         "UPDATE entity_profile_refresh_state SET next_section='personal_channel', acquisition_cursor=0, "
         "pair_eligible=0 WHERE entity_id=42"
@@ -462,7 +464,7 @@ async def test_personal_channel_pair_guard_requires_pair_eligibility(
     conn.execute("UPDATE entity_detail_sections SET status='pending' WHERE section='personal_channel'")
     conn.commit()
 
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
 
     assert client.full_user_calls == 2
     await service.shutdown()  # type: ignore[attr-defined]
@@ -476,13 +478,13 @@ async def test_disabled_switch_keeps_legacy_two_full_user_acquisitions(tmp_path:
     client = cast(_PairClient, service._deps.client)  # type: ignore[attr-defined]
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     conn.execute(
         "UPDATE entity_profile_refresh_state SET next_section='personal_channel', acquisition_cursor=0 "
         "WHERE entity_id=42"
     )
     conn.commit()
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     assert client.full_user_calls == 2
     await service.shutdown()  # type: ignore[attr-defined]
     conn.close()
@@ -499,7 +501,7 @@ async def test_pair_disabled_full_profile_applies_identity_patch_to_canonical_en
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
 
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
 
     assert conn.execute("SELECT name, username FROM entities WHERE id=42").fetchone() == ("Target", None)
     stored = service._profiles.read(42, now=100)  # type: ignore[attr-defined]
@@ -519,7 +521,7 @@ async def test_disabled_pair_measurement_survives_restart_at_section_boundary(tm
     coordinator = service.refresh_coordinator
     assert coordinator is not None
 
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     assert conn.execute(
         "SELECT pair_full_profile_outcome, pair_personal_channel_outcome, pair_attempts "
         "FROM entity_profile_refresh_state WHERE entity_id=42"
@@ -545,7 +547,7 @@ async def test_disabled_pair_measurement_survives_restart_at_section_boundary(tm
     restarted.bind_profile_observer(_Observer())
     coordinator = restarted.refresh_coordinator
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
 
     assert reopened.execute(
         "SELECT pair_full_profile_outcome, pair_personal_channel_outcome, pair_attempts, "
@@ -566,7 +568,7 @@ async def test_partial_channel_preserves_usable_profile_and_non_reusable_channel
     service._deps = replace(service._deps, client=client, user_profile_port=client)  # type: ignore[attr-defined]
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
 
     statuses = dict(conn.execute("SELECT section, status FROM entity_detail_sections WHERE entity_id=42").fetchall())
     assert statuses["full_profile"] == "fresh"
@@ -584,7 +586,7 @@ async def test_missing_channel_field_is_partial_while_full_profile_is_usable(tmp
     service._deps = replace(service._deps, client=replacement, user_profile_port=replacement)  # type: ignore[attr-defined]
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
-    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     profile_evidence = service._profiles.read_section_evidence(42, "full_profile")  # type: ignore[attr-defined]
     channel_evidence = service._profiles.read_section_evidence(42, "personal_channel")  # type: ignore[attr-defined]
     assert profile_evidence is not None and profile_evidence["outcome"] == "usable"
