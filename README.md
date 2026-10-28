@@ -56,8 +56,11 @@ never-collected non-DM profiles remain separate limitations. See
 - Lets agents submit tool feedback into a local operator queue.
 - Does not provide a tool for sending Telegram messages.
 
-The server is **Telegram-read-only**, not immutable: it never sends Telegram
-messages or mutates Telegram remotely. Every tool call may write local telemetry.
+The server never sends Telegram messages. `get_draft` reads locally retained
+drafts and their recent undo history; `manage_draft` creates, edits, clears and
+restores native cloud drafts. You review and send them manually in Telegram.
+Current drafts do not expire; undo history retains up to ten previous states
+for seven days. Other tools are **Telegram-read-only**. Every tool call may write local telemetry.
 `readOnlyHint=true` means no explicit domain/local-state mutation beyond that;
 `readOnlyHint=false` marks tools that intentionally write local MCP state such as
 sync scope or `feedback.db`.
@@ -170,7 +173,7 @@ this work themselves: they return the facts already persisted by the daemon.
 
 ## MCP Tools
 
-There are 15 MCP tools. Successful calls are machine-oriented: agents should
+There are 17 MCP tools. Successful calls are machine-oriented: agents should
 read `structuredContent` for IDs, counts, navigation tokens, coverage, warnings,
 and Telegram-originated content.
 
@@ -187,6 +190,8 @@ and Telegram-originated content.
 | `trace_account_messages` | Find observable messages authored by one account with explicit coverage and gap reporting. |
 | `mark_dialog_for_sync` | Enable or disable persistent sync for a dialog. |
 | `get_sync_status` | Inspect sync progress, coverage, access state, and local message counts. |
+| `get_draft` | Read the locally retained native draft, current version and temporary undo history. |
+| `manage_draft` | Explicitly create, update, clear or restore a native cloud draft; never sends it. |
 | `list_conversation_changes` | List incoming human-DM edits and deletions plus durable access loss and restoration. |
 | `get_usage_stats` | Summarize local MCP tool telemetry for the last 30 days. |
 | `get_dialog_stats` | Show dialog-level reaction, mention, hashtag, and forward statistics. |
@@ -203,6 +208,17 @@ unobserved names and change times remain unknown; `Photo.date` is upload/creatio
 time, not when a photo became an avatar.
 
 ## Common Agent Workflows
+
+For drafts, discover the exact dialog with `list_dialogs`, then read `get_draft`.
+Use `manage_draft(action="create", operation_key="<unique-key>", dialog_id=N, text="...")`
+to create one. Updates, clears and restores require the `expected_version` from
+the current read. Forums require an explicit `topic_id`, including `1` for General.
+You can edit and send the result manually in Telegram; the service will not recreate
+a draft after it is cleared. Operation receipts are retained for seven days;
+reuse the same key to inspect an interrupted operation instead of blindly writing again.
+Replacing formatted text requires explicit `drop_formatting=true`; replies and
+other supported composition fields are retained. Unsupported compositions return
+a reason rather than silently losing fields.
 
 Search, then read context:
 

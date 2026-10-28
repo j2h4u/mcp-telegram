@@ -54,6 +54,9 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "delta_sync.py",
             "dialog_identity.py",
             "drafts/sqlite_projection.py",
+            "drafts/history.py",  # Account-scoped draft history and receipt persistence.
+            "drafts/read_service.py",  # Local-only draft query projection.
+            "drafts/commands.py",  # Writer callbacks for native draft command receipts.
             "drafts/ports.py",  # Transaction-local projection binding to the shared SQLite owner.
             "dialog_sync.py",
             "dialog_directory.py",
@@ -122,6 +125,8 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "dialog_directory.py",
             "dialog_directory_tl.py",
             "drafts/telethon_adapter.py",
+            "drafts/snapshot.py",  # Private native composition codec and request construction.
+            "drafts/commands.py",  # Explicit draft mutation owner, using the sole RPC gate.
             "event_handlers.py",
             "folders/telegram_adapter.py",
             "entity_profile/updates.py",  # Normalizes supplied Telegram updates; never acquires remotely.

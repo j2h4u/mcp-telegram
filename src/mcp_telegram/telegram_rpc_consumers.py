@@ -52,6 +52,7 @@ class TelegramRpcSource(StrEnum):
     READ_RECEIPT_PROBE = "read_receipt_probe"
     SCHEDULED_MESSAGES = "scheduled_messages"
     DRAFT_SNAPSHOT = "draft_snapshot"
+    DRAFT_MUTATION = "draft_mutation"
     MAINTENANCE = "maintenance"
     LINKED_CHAT_REFRESH = "linked_chat_refresh"
     OPERATOR_AUTH = "operator_auth"
@@ -93,6 +94,7 @@ class DemandKind(StrEnum):
     SCHEDULED_REPAIR = "scheduled_repair"
     SCHEDULED_DISCOVERY = "scheduled_discovery"
     DRAFT_SNAPSHOT = "draft_snapshot"
+    DRAFT_MUTATION = "draft_mutation"
     SELF_PROFILE_MAINTENANCE = "self_profile_maintenance"
     LINKED_CHAT_REFRESH = "linked_chat_refresh"
     OPERATOR_AUTH = "operator_auth"
@@ -157,7 +159,7 @@ class TelegramFactDomain(StrEnum):
 
 
 class AcquisitionRole(StrEnum):
-    """Why the consumer acquires its facts."""
+    """How the consumer interacts with its declared fact domains."""
 
     DIRECT = "direct"
     REALTIME = "realtime"
@@ -165,6 +167,7 @@ class AcquisitionRole(StrEnum):
     RECONCILIATION = "reconciliation"
     BACKFILL = "backfill"
     ENRICHMENT = "enrichment"
+    MUTATION = "mutation"
 
 
 class AcquisitionTrigger(StrEnum):
@@ -215,7 +218,7 @@ class AdmissionSpec:
 
 @dataclass(frozen=True, slots=True)
 class AcquisitionSpec:
-    """Typed facts used to inspect acquisition overlap and demand ownership."""
+    """Affected facts and operation semantics for acquisition or explicit mutation."""
 
     domains: frozenset[TelegramFactDomain]
     role: AcquisitionRole
@@ -640,6 +643,16 @@ _REGISTRY: dict[TelegramRpcSource, TelegramRpcConsumerSpec] = {
         demand_bound=DemandBound.PRODUCER_BOUNDED,
         repairs=(TelegramRpcSource.REALTIME_EVENT, TelegramRpcSource.RECONNECT_DIFFERENCE),
     ),
+    TelegramRpcSource.DRAFT_MUTATION: _consumer(
+        "Draft mutation",
+        "Check native drafts once and save or clear one explicitly requested draft",
+        _I,
+        TelegramFactDomain.DRAFTS,
+        AcquisitionRole.MUTATION,
+        AcquisitionTrigger.REQUEST,
+        FanoutScope.ACCOUNT,
+        DemandPolicyOwner.CALLER,
+    ),
 }
 
 
@@ -859,6 +872,12 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         _DURABLE,
         max_rpc_attempts_per_slice=1,
     ),
+    DemandKind.DRAFT_MUTATION: _contract(
+        DemandKind.DRAFT_MUTATION,
+        TelegramRpcSource.DRAFT_MUTATION,
+        _INLINE,
+        max_rpc_attempts_per_slice=2,
+    ),
     DemandKind.SELF_PROFILE_MAINTENANCE: _contract(
         DemandKind.SELF_PROFILE_MAINTENANCE,
         TelegramRpcSource.MAINTENANCE,
@@ -946,7 +965,12 @@ def _validate_contract_durable_policy(kind: DemandKind, contract: DemandContract
         _validate_attempt_bound(kind, contract)
         _validate_durable_producer(kind, contract)
         return
-    if kind in {DemandKind.OPERATOR_AUTH, DemandKind.OPERATOR_LOGOUT, DemandKind.TELETHON_CONNECTION_BOOTSTRAP}:
+    if kind in {
+        DemandKind.OPERATOR_AUTH,
+        DemandKind.OPERATOR_LOGOUT,
+        DemandKind.TELETHON_CONNECTION_BOOTSTRAP,
+        DemandKind.DRAFT_MUTATION,
+    }:
         _validate_attempt_bound(kind, contract)
         if contract.freshness_target is not None:
             raise RuntimeError(f"Lifecycle demand contract {kind.value} cannot own fact freshness")

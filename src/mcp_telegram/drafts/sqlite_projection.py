@@ -6,7 +6,7 @@ import json
 import sqlite3
 import time
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import cast
 
 from mcp_telegram.drafts.contracts import (
@@ -19,6 +19,7 @@ from mcp_telegram.drafts.contracts import (
     DraftScope,
     SnapshotCoverage,
 )
+from mcp_telegram.drafts.history import archive_current_draft, trim_draft_history
 from mcp_telegram.drafts.ports import DraftRecoveryScheduling
 from mcp_telegram.sync_transactions import require_write_transaction, write_savepoint
 
@@ -42,6 +43,9 @@ _CURRENT_VALUE_COLUMNS = (
     "observation_started_at",
     "observation_completed_at",
     "normalization_version",
+    "restore_payload",
+    "semantic_fingerprint",
+    "restore_reason",
 )
 
 
@@ -440,11 +444,15 @@ class SQLiteDraftProjection:
     def _refresh_source_order(self, scope: DraftScope, candidate: Mapping[str, object]) -> None:
         require_write_transaction(self._conn)
         self._conn.execute(
-            "UPDATE draft_current SET source_observed_at=?,source_order_at=? WHERE account_id=? AND dialog_id=? "
+            "UPDATE draft_current SET source_observed_at=?,source_order_at=?,restore_payload=?,"
+            "semantic_fingerprint=?,restore_reason=? WHERE account_id=? AND dialog_id=? "
             "AND top_message_id=? AND subdialog_peer_id=?",
             (
                 candidate["source_observed_at"],
                 candidate["source_order_at"],
+                candidate["restore_payload"],
+                candidate["semantic_fingerprint"],
+                candidate["restore_reason"],
                 scope.account_id,
                 scope.dialog_id,
                 _zero_for_none(scope.top_message_id),
@@ -511,6 +519,17 @@ class SQLiteDraftProjection:
         if row is None or row[2] != account_id:
             return None
         return str(row[0]), _database_int(row[1])
+
+    def claim_mutation_preflight(self, *, now: float) -> int | None:
+        """Reuse the existing snapshot owner without superseding its active claim."""
+        now_int = _finite_non_negative_unix(now)
+        with write_savepoint(self._conn):
+            if self._recovery_claim_active():
+                return None
+            self.mark_recovery_needed(
+                reason="draft_mutation_preflight", observed_at=datetime.fromtimestamp(now_int, UTC)
+            )
+            return self.claim_recovery(now=now)
 
     def claim_recovery(self, *, now: float) -> int | None:
         """Claim a due recovery run exactly once for the active account."""
@@ -626,6 +645,7 @@ class SQLiteDraftProjection:
 
     def _upsert_current(self, scope: DraftScope, values: dict[str, object], revision: int) -> None:
         require_write_transaction(self._conn)
+        archive_current_draft(self._conn, scope)
         assignments = ",".join(f"{column}=excluded.{column}" for column in _CURRENT_VALUE_COLUMNS)
         placeholders = ",".join("?" for _ in range(5 + len(_CURRENT_VALUE_COLUMNS)))
         self._conn.execute(
@@ -642,6 +662,7 @@ class SQLiteDraftProjection:
                 revision,
             ),
         )
+        trim_draft_history(self._conn, scope)
 
 
 def _row_values(
@@ -672,13 +693,26 @@ def _row_values(
             "observation_started_at": observed_at,
             "observation_completed_at": completed,
             "normalization_version": _NORMALIZATION_VERSION,
+            **_snapshot_values(observation),
         }
     composition = observation.composition
     if composition is None:
         raise ValueError("present draft observation is missing its composition")
-    return _present_row(
-        composition, source_kind, observed_at, completed, _source_order(observation, source_order_override)
-    )
+    return {
+        **_present_row(
+            composition, source_kind, observed_at, completed, _source_order(observation, source_order_override)
+        ),
+        **_snapshot_values(observation),
+    }
+
+
+def _snapshot_values(observation: DraftObservation) -> dict[str, object]:
+    snapshot = observation.restore_snapshot
+    return {
+        "restore_payload": None if snapshot is None else snapshot.payload,
+        "semantic_fingerprint": None if snapshot is None else snapshot.semantic_fingerprint,
+        "restore_reason": None if snapshot is None else snapshot.restore_reason,
+    }
 
 
 def _present_row(
@@ -746,6 +780,9 @@ def _cleared_row(observed_at: int, source_order_at: int | None = None) -> dict[s
         "observation_started_at": observed_at,
         "observation_completed_at": observed_at,
         "normalization_version": _NORMALIZATION_VERSION,
+        "restore_payload": None,
+        "semantic_fingerprint": None,
+        "restore_reason": None,
     }
 
 
@@ -773,6 +810,14 @@ def _json_value(value: object) -> str | None:
 
 
 def _row_matches(existing: Mapping[str, object], candidate: Mapping[str, object]) -> bool:
+    old_fingerprint = existing.get("semantic_fingerprint")
+    new_fingerprint = candidate.get("semantic_fingerprint")
+    if (
+        existing["state"] == candidate["state"] == "present"
+        and old_fingerprint is not None
+        and old_fingerprint != new_fingerprint
+    ):
+        return False
     return all(
         existing[column] == value
         for column, value in candidate.items()
@@ -783,6 +828,9 @@ def _row_matches(existing: Mapping[str, object], candidate: Mapping[str, object]
             "source_order_at",
             "observation_started_at",
             "observation_completed_at",
+            "restore_payload",
+            "semantic_fingerprint",
+            "restore_reason",
         }
     )
 

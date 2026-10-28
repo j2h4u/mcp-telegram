@@ -112,6 +112,7 @@ def test_demand_registry_has_exact_operation_and_source_coverage() -> None:
             DemandKind.SCHEDULED_DISCOVERY,
         },
         TelegramRpcSource.DRAFT_SNAPSHOT: {DemandKind.DRAFT_SNAPSHOT},
+        TelegramRpcSource.DRAFT_MUTATION: {DemandKind.DRAFT_MUTATION},
         TelegramRpcSource.MAINTENANCE: {DemandKind.SELF_PROFILE_MAINTENANCE},
         TelegramRpcSource.LINKED_CHAT_REFRESH: {DemandKind.LINKED_CHAT_REFRESH},
     }
@@ -192,6 +193,7 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
         DemandKind.TELETHON_CONNECTION_BOOTSTRAP: 16,
         DemandKind.OPERATOR_AUTH: 32,
         DemandKind.OPERATOR_LOGOUT: 1,
+        DemandKind.DRAFT_MUTATION: 2,
     }
     for contract in TELEGRAM_DEMAND_CONTRACTS.values():
         consumer = TELEGRAM_RPC_CONSUMERS[contract.source]
@@ -218,6 +220,19 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
     assert demand_contract(DemandKind.TOPIC_SNAPSHOT).execution_mode is ExecutionMode.DURABLE
     assert demand_contract(DemandKind.TOPIC_SNAPSHOT).max_rpc_attempts_per_slice == 4
     assert demand_contract(DemandKind.RECONNECT_DIFFERENCE).execution_mode is ExecutionMode.INLINE
+
+
+def test_draft_mutation_is_explicit_interactive_inline_and_bounded() -> None:
+    consumer = telegram_rpc_consumer(TelegramRpcSource.DRAFT_MUTATION)
+    contract = demand_contract(DemandKind.DRAFT_MUTATION)
+    assert consumer.acquisition.role is AcquisitionRole.MUTATION
+    assert consumer.acquisition.domains == frozenset({TelegramFactDomain.DRAFTS})
+    assert consumer.acquisition.trigger is AcquisitionTrigger.REQUEST
+    assert consumer.demand.owner is DemandPolicyOwner.CALLER
+    assert contract.service_class is RpcServiceClass.INTERACTIVE
+    assert contract.execution_mode is ExecutionMode.INLINE
+    assert contract.max_rpc_attempts_per_slice == 2
+    assert DemandKind.DRAFT_MUTATION not in DURABLE_DEMAND_ORDER
 
 
 def test_durable_demand_order_is_a_literal_complete_contract() -> None:

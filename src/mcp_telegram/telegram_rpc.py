@@ -1833,6 +1833,7 @@ class _WireAttempt:
     observed_write_returns: int = 0
     observed_result: bool = False
     observation_ordinal: int | None = None
+    draft_mutation: bool = False
 
 
 def _application_request(request: object) -> TLRequest:
@@ -2483,6 +2484,17 @@ class TelegramRpcGate(TelegramClient):
             raise RuntimeError("invalid offline Telegram transport identity")
         return dc_id, cast(int | None, key_id)
 
+    def retained_draft_peer(self, dialog_id: int) -> object | None:
+        """Resolve only retained Session entities; never ask Telegram for a peer."""
+        if type(dialog_id) is not int or dialog_id == 0:
+            raise ValueError("draft dialog id must be a nonzero integer")
+        if self.session is None:
+            return None
+        try:
+            return self.session.get_input_entity(dialog_id)
+        except ValueError:
+            return None
+
     def _ensure_safety_ledger(self) -> TelegramRpcSafetyLedger:
         if self._safety is None:
             dc_id, key_id = self._offline_wire_identity()
@@ -2520,6 +2532,7 @@ class TelegramRpcGate(TelegramClient):
         if not isinstance(body, bytes) or scope.deadline is None or not math.isfinite(scope.deadline):
             raise RuntimeError("invalid owned Telegram application scope")
         method = _canonical_wire_method(request)
+        self._check_draft_application(request, scope)
         self._check_operator_application(request, scope)
         bootstrap = self._connection_capability is not None and (
             self._connect_owner is asyncio.current_task() or asyncio.current_task() in self._connection_rpc_tasks
@@ -2538,7 +2551,41 @@ class TelegramRpcGate(TelegramClient):
         owner = _WireAttempt(self._wire_issuer, attempt_id, method, bound, timing=current_timing())
         actual = _application_request(request)
         owner.self_lookup = self._is_self_lookup(actual)
+        owner.draft_mutation = type(actual) is functions.messages.SaveDraftRequest
         return owner
+
+    @staticmethod
+    def _draft_budget_valid(scope: TelegramRpcScope) -> bool:
+        budget = scope.attempt_budget
+        return (
+            budget is not None
+            and budget.limit == 1
+            and budget.selected is None
+            and budget._retry_candidate is None
+            and scope.attempt_evidence is not None
+        )
+
+    def _check_draft_application(self, request: object, scope: TelegramRpcScope) -> None:
+        actual = _application_request(request)
+        mutation = type(actual) is functions.messages.SaveDraftRequest
+        if (
+            not mutation
+            and scope.demand_kind is not DemandKind.DRAFT_MUTATION
+            and scope.source is not TelegramRpcSource.DRAFT_MUTATION
+        ):
+            return
+        self._require_draft_mutation_root(scope)
+        expected = None if mutation else AcquisitionKind.DRAFT_SNAPSHOT
+        if scope.acquisition_kind is not expected:
+            raise UnclassifiedTelegramRpcError("draft operation has incompatible acquisition classification")
+        if not mutation and type(actual) is not functions.messages.GetAllDraftsRequest:
+            raise UnclassifiedTelegramRpcError("draft mutation preflight permits only GetAllDrafts")
+
+    def _require_draft_mutation_root(self, scope: TelegramRpcScope) -> None:
+        if scope.demand_kind is not DemandKind.DRAFT_MUTATION or scope.source is not TelegramRpcSource.DRAFT_MUTATION:
+            raise UnclassifiedTelegramRpcError("SaveDraft requires its explicit draft mutation root")
+        if not self._draft_budget_valid(scope):
+            raise ValueError("draft operations require an explicit single-attempt budget without retry credit")
 
     def _check_operator_application(self, request: object, scope: TelegramRpcScope) -> None:
         if self._logout_mode and (
@@ -2812,6 +2859,7 @@ class TelegramRpcGate(TelegramClient):
         owner.claimed += 1
         owner.dispatch_at = time.monotonic()
         owner.admission = permit.admission
+        self._record_draft_dispatch(owner)
         if owner.scope.attempt_budget is not None:
             owner.scope.attempt_budget.last_method = owner.method
             owner.observation_ordinal = owner.scope.attempt_budget.attempts
@@ -2825,6 +2873,17 @@ class TelegramRpcGate(TelegramClient):
             reason="replay" if owner.claimed > 1 else None,
             attempt_ordinal=owner.observation_ordinal,
         )
+
+    @staticmethod
+    def _record_draft_dispatch(owner: _WireAttempt) -> None:
+        if owner.scope.demand_kind is not DemandKind.DRAFT_MUTATION:
+            return
+        evidence = owner.scope.attempt_evidence
+        assert evidence is not None
+        if owner.draft_mutation:
+            evidence.draft_mutation_dispatched = True
+        else:
+            evidence.draft_preflight_dispatched = True
 
     def observe_write_return(self, owner: object) -> None:
         """Observe local writer acceptance, without claiming a provider receipt."""
@@ -2858,6 +2917,8 @@ class TelegramRpcGate(TelegramClient):
         return self._budget_can_claim(owner)
 
     def _budget_can_claim(self, owner: _WireAttempt) -> bool:
+        if owner.scope.demand_kind is DemandKind.DRAFT_MUTATION:
+            return self._draft_budget_can_claim(owner)
         budget = owner.scope.attempt_budget
         if budget is None:
             return True
@@ -2869,6 +2930,15 @@ class TelegramRpcGate(TelegramClient):
         if budget._retry_candidate is not None:
             return False
         return not budget.exhausted
+
+    def _draft_budget_can_claim(self, owner: _WireAttempt) -> bool:
+        if not self._draft_budget_valid(owner.scope):
+            return False
+        budget = owner.scope.attempt_budget
+        evidence = owner.scope.attempt_evidence
+        assert budget is not None and evidence is not None
+        dispatched = evidence.draft_mutation_dispatched if owner.draft_mutation else evidence.draft_preflight_dispatched
+        return not dispatched and owner.claimed == 0 and not budget.exhausted
 
     def defer_write(self, owner: object, permit: object) -> None:
         owner = self._require_wire_owner(owner)
@@ -2951,6 +3021,8 @@ class TelegramRpcGate(TelegramClient):
     def _note_successful_acquisition(
         self, owner: _WireAttempt, error: BaseException | None, rejected: BaseException | None
     ) -> None:
+        if owner.draft_mutation:
+            return
         if (
             error is None
             and rejected is None
@@ -3767,6 +3839,11 @@ class TelegramRpcGate(TelegramClient):
     ) -> object:
         """Run one logical RPC after its root demand context is established."""
         scope = self._require_rpc_scope()
+        self._check_draft_application(request, scope)
+        if type(_application_request(request)) is functions.messages.SaveDraftRequest:
+            return await self._call_with_source_policy(
+                request, ordered=ordered, scope=scope, connection_owned=connection_owned
+            )
         retry_delays = self._retry_delays_for_call(connection_owned)
         migration_dc: int | None = None
         delay = 0.0
@@ -3935,11 +4012,18 @@ class TelegramRpcGate(TelegramClient):
         *,
         connection_owned: bool,
     ) -> None:
-        seconds = await self._observe_flood(exc, scope=scope)
+        request_rejected = self._flood_attempt(exc).get("dispatch_kind") == "actual_send"
+        try:
+            seconds = await self._observe_flood(exc, scope=scope)
+        except TelegramRpcThrottled as outcome:
+            if request_rejected:
+                outcome.request_rejected = True
+            raise
         raise TelegramRpcThrottled(
             retry_after_seconds=seconds,
             latched=False,
             detail=f"Telegram RPC throttled for {seconds}s",
+            request_rejected=request_rejected,
         ) from exc
 
     async def _dispatch_attempt(

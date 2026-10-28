@@ -700,6 +700,9 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
     async def prime(_ctx: object) -> None:
         events.append("prime")
 
+    async def bind_draft_commands(_ctx: object) -> None:
+        await cast(_Owner, ctx.draft_owner).bind_account(314)
+
     async def lifetime(_ctx: object) -> None:
         events.append("lifetime")
 
@@ -724,6 +727,7 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
     monkeypatch.setattr(daemon, "_ensure_demand_runtime", lambda *_args: events.append("ensure"))
     monkeypatch.setattr(daemon, "run_reconnect_catch_up_loop", run_reconnect)
     monkeypatch.setattr(daemon, "_prime_runtime", prime)
+    monkeypatch.setattr(daemon, "_bind_draft_commands", bind_draft_commands)
     monkeypatch.setattr(daemon, "_offer_startup_demands", lambda _ctx: events.append("offers"))
     monkeypatch.setattr(daemon, "_run_daemon_lifetime", lifetime)
     monkeypatch.setattr(daemon, "_shutdown_sync_main_context", shutdown)

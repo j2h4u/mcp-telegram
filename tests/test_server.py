@@ -959,6 +959,29 @@ def test_tool_error_action_is_projected_to_structured_error_action() -> None:
     }
 
 
+def test_already_structured_error_preserves_action_and_operation_evidence() -> None:
+    result = server._project_tool_result(
+        "manage_draft",
+        ToolResult(
+            is_error=True,
+            structured_content={
+                "error": {
+                    "code": "telegram_rpc_throttled",
+                    "message": "Telegram rejected the change.",
+                    "action": "Wait, then use a new operation_key.",
+                    "details": {"operation_key": "retained-key", "result_persisted": True},
+                },
+                "outcome": "rejected",
+            },
+        ),
+        server._CallTelemetry(),
+    )
+    payload = cast(dict[str, object], result.structured_content)
+    error = cast(dict[str, object], payload["error"])
+    assert error["action"] == "Wait, then use a new operation_key."
+    assert error["details"] == {"operation_key": "retained-key", "result_persisted": True, "outcome": "rejected"}
+
+
 def test_tool_error_without_action_uses_valid_fallback() -> None:
     tool_result = error_result("Request failed.", error_code="tool_error")
 
@@ -1268,7 +1291,7 @@ async def test_run_mcp_http_server_normalizes_mount_and_builds_transport(
     assert routes[1][1] == "/health"
     if missing_daemon:
         assert server.app.instructions is not None
-        assert server.app.instructions.startswith("Telegram-read-only access")
+        assert server.app.instructions.startswith("Local access")
         assert "Connected account: id=" not in server.app.instructions
         assert captured["serve"] is True
     else:
@@ -1432,7 +1455,7 @@ def test_list_tools_exposes_feedback_and_entity_info_output_schemas() -> None:
 
 
 def test_all_registered_output_schemas_validate_success_and_canonical_error_examples() -> None:
-    assert len(server.tool_by_name) == 15
+    assert len(server.tool_by_name) == 17
     for name, tool in server.tool_by_name.items():
         assert tool.output_schema is not None, name
         schema = cast(dict[str, object], tool.output_schema)
@@ -1605,7 +1628,7 @@ async def test_each_registered_tool_response_gets_one_active_protection_snapshot
             protection_schema,
         )
 
-    assert status_reads == len(server.tool_by_name) == 15
+    assert status_reads == len(server.tool_by_name) == 17
 
 
 @pytest.mark.asyncio
@@ -1704,7 +1727,9 @@ def test_account_protection_rejects_private_or_invalid_diagnostics(extra: dict[s
 
 
 @pytest.mark.asyncio
-async def test_typed_protection_error_has_manual_action_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_typed_protection_error_uses_recovery_status_without_forcing_manual_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(server.tools, "tool_args", lambda tool, **kwargs: object())
     monkeypatch.setattr(
         server.tools,
@@ -1734,9 +1759,28 @@ async def test_typed_protection_error_has_manual_action_without_retry(monkeypatc
     assert payload is not None
     error = cast(dict[str, object], payload["error"])
     assert error["code"] == "flood_wait_kill_switch_open"
-    assert error["action"] == "Recovery requires operator action."
-    assert "retry" not in str(error["action"]).lower()
+    assert error["action"] == "Inspect account_protection for the recovery status before retrying."
+    assert "operator" not in str(error["action"]).lower()
     assert "account_protection" not in payload
+
+
+def test_typed_protection_error_preserves_specific_gateway_guidance() -> None:
+    action = "Wait until account protection clears, then use a new operation_key."
+    result = server._protection_error_call_result(
+        AccountProtectionError(
+            {
+                "error": "flood_wait_kill_switch_open",
+                "message": "Telegram rejected the draft change.",
+                "required_action": action,
+                "outcome": "rejected",
+                "details": {"request_rejected": True, "latched": True},
+            }
+        )
+    )
+    payload = cast(dict[str, object], result.structured_content)
+    error = cast(dict[str, object], payload["error"])
+    assert error["action"] == action
+    assert cast(dict[str, object], error["details"])["outcome"] == "rejected"
 
 
 @pytest.mark.asyncio

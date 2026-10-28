@@ -73,10 +73,12 @@ class DeltaGapFillObservationHook(Protocol):
 
 @dataclass(slots=True, eq=False, weakref_slot=True)
 class RpcAttemptEvidence:
-    """Mutable, non-enforcing count of real sends attributed to one root."""
+    """Dispatch accounting retained by one root across its explicit budgets."""
 
     actual_attempts: int = 0
     observation_id: str = field(default_factory=lambda: uuid.uuid4().hex, repr=False)
+    draft_preflight_dispatched: bool = False
+    draft_mutation_dispatched: bool = False
 
     def record_dispatch(self) -> None:
         """Record one sender dispatch without changing transport behavior."""

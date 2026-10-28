@@ -453,6 +453,7 @@ def remove_v87_schema_for_historical_fixture(conn: sqlite3.Connection) -> None:
     """Historical fixtures must remove later physical tables as well as ledger rows."""
     if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='full_history_enrollment'").fetchone():
         conn.execute("DROP TRIGGER IF EXISTS topic_catalog_identity_changed")
+    remove_v90_schema_for_historical_fixture(conn)
     for table in (
         "entity_profile_change_events",
         "entity_profile_collection_membership",
@@ -462,6 +463,16 @@ def remove_v87_schema_for_historical_fixture(conn: sqlite3.Connection) -> None:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
     if "page_cursor_json" in {row[1] for row in conn.execute("PRAGMA table_info(entity_profile_refresh_state)")}:
         conn.execute("ALTER TABLE entity_profile_refresh_state DROP COLUMN page_cursor_json")
+
+
+def remove_v90_schema_for_historical_fixture(conn: sqlite3.Connection) -> None:
+    """Rewind physical draft history additions with the fixture's version ledger."""
+    conn.execute("DROP TABLE IF EXISTS draft_versions")
+    conn.execute("DROP TABLE IF EXISTS draft_operation_receipts")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(draft_current)")}
+    for column in ("restore_payload", "semantic_fingerprint", "restore_reason"):
+        if column in columns:
+            conn.execute(f"ALTER TABLE draft_current DROP COLUMN {column}")
 
 
 def enable_profile_page_fixture(conn: sqlite3.Connection) -> None:

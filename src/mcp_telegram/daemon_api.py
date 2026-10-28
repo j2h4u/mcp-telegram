@@ -71,6 +71,7 @@ from .dialog_directory import recover_invalid_generation_in_transaction
 from .dialog_directory_coverage import DialogDirectoryCoverage, read_dialog_directory_coverage
 from .dialog_identity import read_local_dialog_identities
 from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
+from .drafts.read_service import read_draft_request
 from .entity_profile.ports import (
     ChannelProfilePort,
     ChannelReferenceProvider,
@@ -404,6 +405,10 @@ class DaemonClientLike(Protocol):
     def iter_messages(self, dialog_id: int, **kwargs: object) -> AsyncIterator[object]: ...
 
     async def __call__(self, request: object) -> object: ...
+
+
+class DraftCommands(Protocol):
+    async def execute(self, request: Mapping[str, object]) -> dict[str, object]: ...
 
 
 class DaemonHealthStatus(Protocol):
@@ -749,6 +754,11 @@ class DaemonAPIServer:
         self._runtime_observation_sink: RuntimeObservationSink | None = None
         self._closing_clients = False
         self._client_handlers: dict[asyncio.Task[object], asyncio.StreamWriter] = {}
+        self._draft_commands: DraftCommands | None = None
+
+    def bind_draft_commands(self, commands: DraftCommands) -> None:
+        """Attach draft writes only after the authenticated account is bound."""
+        self._draft_commands = commands
 
     def bind_runtime_observation_sink(self, sink: RuntimeObservationSink) -> None:
         """Attach the bounded asynchronous sink used for daemon timing evidence."""
@@ -1142,6 +1152,7 @@ class DaemonAPIServer:
             "upsert_entities",
             "submit_feedback",
             "update_feedback_status",
+            "manage_draft",
         }
         if foreground:
             request_task.cancel()
@@ -1241,6 +1252,8 @@ class DaemonAPIServer:
         return {
             "export_chat": self._export_chat,
             "list_messages": self._list_messages,
+            "get_draft": self._get_draft,
+            "manage_draft": self._manage_draft,
             "search_messages": self._search_messages,
             "trace_account_messages": self._trace_account_messages,
             "list_dialogs": self._list_dialogs,
@@ -1288,11 +1301,12 @@ class DaemonAPIServer:
                 with _preserve_or_rpc_scope(TelegramRpcSource.OPERATOR_LOGOUT):
                     return await self._logout_account(req)
 
+        if method == "manage_draft":
+            return await self._manage_draft(req)
+
         with _preserve_or_rpc_scope(TelegramRpcSource.MCP_INTERACTIVE):
             result = handler(req)
-            if isinstance(result, dict):
-                return result
-            return cast(dict[str, object], await result)
+            return result if isinstance(result, dict) else cast(dict[str, object], await result)
 
     async def _export_chat(self, req: dict[str, object]) -> dict[str, object]:
         from .chat_export import export_operation
@@ -2195,6 +2209,14 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
     # submit_feedback
     # ------------------------------------------------------------------
+
+    def _get_draft(self, req: dict[str, object]) -> dict[str, object]:
+        return read_draft_request(self._conn, req, account_id=self.self_id)
+
+    async def _manage_draft(self, req: dict[str, object]) -> dict[str, object]:
+        if self._draft_commands is None:
+            return {"ok": False, "error": "daemon_not_ready", "message": "Draft commands are not ready."}
+        return await self._draft_commands.execute(req)
 
     async def _submit_feedback(self, req: dict) -> dict:
         """Delegate feedback submission to the daemon-wired application service."""

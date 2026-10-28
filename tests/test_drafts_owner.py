@@ -94,6 +94,10 @@ class _Repository:
         self.due_at = None
         return int(now)
 
+    def claim_mutation_preflight(self, *, now: float) -> int | None:
+        self.due_at = now
+        return self.claim_recovery(now=now)
+
     def release_recovery_claim(self, *, claim_token: int, due_at: float) -> bool:
         assert claim_token >= 0
         self.rearmed.append(("claim_released", due_at))
@@ -428,6 +432,26 @@ async def test_snapshot_claim_applies_authoritative_coverage_without_baselines()
     assert gateway.calls == 1
     assert len(repository.snapshot_calls) == 1
     assert repository.snapshot_calls[0][1].source_order_at == datetime(2026, 1, 1, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_mutation_preflight_reuses_authoritative_snapshot_publication() -> None:
+    repository = _Repository()
+    gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
+    owner, _client = await _owner(repository, gateway)
+    assert await owner.refresh_for_mutation() is True
+    assert gateway.calls == 1
+    assert len(repository.snapshot_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_mutation_preflight_rejects_incomplete_snapshot_and_releases_claim() -> None:
+    repository = _Repository()
+    gateway = _Gateway(SnapshotCoverage(42, False, 0), ())
+    owner, _client = await _owner(repository, gateway)
+    assert await owner.refresh_for_mutation() is False
+    assert not repository.snapshot_calls
+    assert repository.rearmed
 
 
 @pytest.mark.asyncio

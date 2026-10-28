@@ -43,6 +43,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextlib import AsyncExitStack, ExitStack
 from contextvars import Context
 from dataclasses import dataclass, field
+from datetime import timedelta
 from functools import partial
 from pathlib import Path
 from typing import Protocol, cast
@@ -74,7 +75,11 @@ from .demand_composition import (
     build_durable_coordinator,
 )
 from .dialog_directory import CanonicalDialogDirectory
+from .dialog_identity import read_dialog_identities
 from .dialog_sync import DialogReconciliationWorker
+from .drafts.commands import DraftCommandError, DraftCommandOwner
+from .drafts.contracts import DraftScope
+from .drafts.history import interrupt_draft_operations, prune_draft_history, prune_draft_operation_receipts
 from .drafts.owner import DraftMessageOwner
 from .drafts.sqlite_projection import SQLiteDraftProjection
 from .entity_profile.ports import UserProfilePort
@@ -107,6 +112,7 @@ from .message_history.telegram_adapter import (
     TelethonHistoryAccessProbe,
 )
 from .messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
+from .models import DialogType
 from .own_only_contracts import OwnOnlyContext
 from .reactions import ReactionDetailPolicy, ReactionDetailRefresher
 from .reactions.telegram_adapter import TelethonTelegramReactionGateway
@@ -239,6 +245,8 @@ def read_operator_summary_snapshot(
 
 
 class _DaemonClient(Protocol):
+    def retained_draft_peer(self, dialog_id: int) -> object | None: ...
+
     async def logout_account(self) -> None: ...
     def account_safety_status(self) -> dict[str, object] | None: ...
 
@@ -823,13 +831,13 @@ def _log_heartbeat(
 async def _run_daemon_lifetime(ctx: _SyncMainContext) -> None:
     """Keep local refresh and heartbeat work alive beside the coordinator."""
     sync_start = time.monotonic()
-    if ctx.coordinator is not None:
-        while not ctx.shutdown_event.is_set():
-            if not await ctx.api_server._get_entity_info_service().reconcile_history_profiles():
-                break
-            await asyncio.sleep(0)
+    next_draft_prune = sync_start
+    await _reconcile_initial_profile_history(ctx)
     while not ctx.shutdown_event.is_set():
         _log_heartbeat(ctx.conn, ctx.client, sync_start)
+        if time.monotonic() >= next_draft_prune:
+            await ctx.writer.run(_prune_draft_retention)
+            next_draft_prune = time.monotonic() + timedelta(hours=1).total_seconds()
         if ctx.handler_manager is not None:
             ctx.handler_manager.refresh_synced_dialogs()
         if ctx.coordinator is not None and not ctx.shutdown_event.is_set():
@@ -842,6 +850,21 @@ async def _run_daemon_lifetime(ctx: _SyncMainContext) -> None:
             for task in (shutdown_wait, heartbeat_wait):
                 if not task.done():
                     task.cancel()
+
+
+def _prune_draft_retention(conn: sqlite3.Connection) -> None:
+    with write_transaction(conn):
+        prune_draft_history(conn)
+        prune_draft_operation_receipts(conn)
+
+
+async def _reconcile_initial_profile_history(ctx: _SyncMainContext) -> None:
+    if ctx.coordinator is None:
+        return
+    while not ctx.shutdown_event.is_set():
+        if not await ctx.api_server._get_entity_info_service().reconcile_history_profiles():
+            return
+        await asyncio.sleep(0)
 
 
 def _create_tracked_task(
@@ -1934,6 +1957,65 @@ async def _release_updates_after_replay(ctx: _SyncMainContext, barrier: UpdatePr
     )
 
 
+async def _bind_draft_commands(ctx: _SyncMainContext) -> None:
+    owner = ctx.draft_owner
+    account_id = ctx.api_server.self_id
+    assert owner is not None and account_id is not None
+    await owner.bind_account(account_id)
+
+    async def resolve_peer(scope: DraftScope) -> object | None:
+        dialog = read_dialog_identities(ctx.conn, [scope.dialog_id]).get(scope.dialog_id)
+        if dialog is None or dialog.dialog_type is DialogType.UNKNOWN:
+            raise DraftCommandError("dialog_unavailable", "Exact dialog type is not retained; check list_dialogs.")
+        has_topics = _draft_has_topics(ctx.conn, scope.dialog_id, dialog.dialog_type)
+        if has_topics and scope.top_message_id is None:
+            raise DraftCommandError("topic_required", "Choose an explicit topic, including topic_id=1 for General.")
+        if not has_topics and scope.top_message_id is not None:
+            raise DraftCommandError(
+                "topic_mismatch", "No topic capability is retained for this dialog; check list_topics."
+            )
+        if scope.top_message_id is not None:
+            row = cast(
+                tuple[int] | None,
+                ctx.conn.execute(
+                    "SELECT 1 FROM topic_metadata WHERE dialog_id=? AND topic_id=? AND is_deleted=0 "
+                    "AND inaccessible_error IS NULL",
+                    (scope.dialog_id, scope.top_message_id),
+                ).fetchone(),
+            )
+            if row is None:
+                raise DraftCommandError(
+                    "topic_unavailable", "Exact topic is not retained or is inaccessible; check list_topics."
+                )
+        return ctx.client.retained_draft_peer(scope.dialog_id)
+
+    def settle_interrupted(conn: sqlite3.Connection) -> None:
+        with write_transaction(conn):
+            interrupt_draft_operations(conn, account_id)
+
+    await ctx.writer.run(settle_interrupted)
+    ctx.api_server.bind_draft_commands(
+        DraftCommandOwner(
+            ctx.client,
+            ctx.conn,
+            writer=ctx.writer,
+            account_id=account_id,
+            resolve_peer=resolve_peer,
+            preflight=owner.refresh_for_mutation,
+            request_recovery=owner.request_recovery,
+        )
+    )
+
+
+def _draft_has_topics(conn: sqlite3.Connection, dialog_id: int, kind: DialogType) -> bool:
+    capability = TopicCatalogRepository(conn).known_capability(dialog_id)
+    if kind is DialogType.BOT and capability is None:
+        raise DraftCommandError(
+            "topic_capability_unknown", "Bot topic capability has not been observed; wait for dialog synchronization."
+        )
+    return kind is DialogType.FORUM or capability is True
+
+
 async def sync_main() -> None:
     """Main entry point for the sync daemon process.
 
@@ -1981,7 +2063,7 @@ async def sync_main() -> None:
         startup_identity = await _acquire_startup_identity_before_updates(ctx, dialog_directory)
         assert ctx.api_server.self_id is not None
         ctx.handler_manager.set_self_id(ctx.api_server.self_id)
-        await ctx.draft_owner.bind_account(ctx.api_server.self_id)
+        await _bind_draft_commands(ctx)
         draft_owner = ctx.draft_owner
         assert draft_owner is not None
 

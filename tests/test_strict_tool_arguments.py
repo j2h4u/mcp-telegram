@@ -27,6 +27,8 @@ VALID_ARGUMENTS: dict[str, dict[str, object]] = {
     "get_dialog_stats": {"dialog": "123"},
     "mark_dialog_for_sync": {"dialog_id": 123},
     "get_sync_status": {"dialog_id": 123},
+    "get_draft": {"dialog_id": 123},
+    "manage_draft": {"dialog_id": 123, "action": "create", "operation_key": "validation", "text": "draft"},
     "get_inbox": {},
     "get_unread_summary": {},
 }

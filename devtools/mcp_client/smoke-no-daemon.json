@@ -1,7 +1,7 @@
 {
   "steps": [
     {
-      "_comment": "All 15 tools registered with output schemas",
+      "_comment": "All 17 tools registered with output schemas",
       "action": "list_tools",
       "expect": {
         "tool_names_include": [
@@ -19,7 +19,9 @@
           "mark_dialog_for_sync",
           "search_messages",
           "submit_feedback",
-          "trace_account_messages"
+          "trace_account_messages",
+          "get_draft",
+          "manage_draft"
         ],
         "tool_expectations": {
           "get_dialog_stats": {
@@ -77,12 +79,18 @@
           "list_conversation_changes": {
             "inputSchema.properties.page_limit.default": 50,
             "outputSchema.type": "object"
+          },
+          "get_draft": {
+            "outputSchema.type": "object"
+          },
+          "manage_draft": {
+            "outputSchema.type": "object"
           }
         }
       }
     },
     {
-      "_comment": "list_dialogs — daemon route",
+      "_comment": "list_dialogs \u2014 daemon route",
       "action": "call_tool",
       "name": "list_dialogs",
       "arguments": {},
@@ -95,7 +103,7 @@
       }
     },
     {
-      "_comment": "list_messages — daemon route",
+      "_comment": "list_messages \u2014 daemon route",
       "action": "call_tool",
       "name": "list_messages",
       "arguments": {
@@ -111,7 +119,7 @@
       }
     },
     {
-      "_comment": "search_messages — daemon route",
+      "_comment": "search_messages \u2014 daemon route",
       "action": "call_tool",
       "name": "search_messages",
       "arguments": {
@@ -128,7 +136,7 @@
       }
     },
     {
-      "_comment": "list_topics — daemon route",
+      "_comment": "list_topics \u2014 daemon route",
       "action": "call_tool",
       "name": "list_topics",
       "arguments": {
@@ -143,7 +151,7 @@
       }
     },
     {
-      "_comment": "mark_dialog_for_sync — daemon route",
+      "_comment": "mark_dialog_for_sync \u2014 daemon route",
       "action": "call_tool",
       "name": "mark_dialog_for_sync",
       "arguments": {
@@ -159,7 +167,7 @@
       }
     },
     {
-      "_comment": "get_sync_status — daemon route",
+      "_comment": "get_sync_status \u2014 daemon route",
       "action": "call_tool",
       "name": "get_sync_status",
       "arguments": {
@@ -174,7 +182,7 @@
       }
     },
     {
-      "_comment": "list_conversation_changes — daemon route",
+      "_comment": "list_conversation_changes \u2014 daemon route",
       "action": "call_tool",
       "name": "list_conversation_changes",
       "arguments": {
@@ -189,7 +197,7 @@
       }
     },
     {
-      "_comment": "get_entity_info — resolve first, daemon not running so returns not-running message",
+      "_comment": "get_entity_info \u2014 resolve first, daemon not running so returns not-running message",
       "action": "call_tool",
       "name": "get_entity_info",
       "arguments": {
@@ -204,7 +212,7 @@
       }
     },
     {
-      "_comment": "get_dialog_stats — daemon route",
+      "_comment": "get_dialog_stats \u2014 daemon route",
       "action": "call_tool",
       "name": "get_dialog_stats",
       "arguments": {
@@ -220,7 +228,7 @@
       }
     },
     {
-      "_comment": "get_my_recent_activity — daemon route",
+      "_comment": "get_my_recent_activity \u2014 daemon route",
       "action": "call_tool",
       "name": "get_my_recent_activity",
       "arguments": {
@@ -236,7 +244,7 @@
       }
     },
     {
-      "_comment": "get_inbox — daemon route",
+      "_comment": "get_inbox \u2014 daemon route",
       "action": "call_tool",
       "name": "get_inbox",
       "arguments": {},
@@ -249,7 +257,7 @@
       }
     },
     {
-      "_comment": "get_usage_stats — daemon route",
+      "_comment": "get_usage_stats \u2014 daemon route",
       "action": "call_tool",
       "name": "get_usage_stats",
       "arguments": {},
@@ -262,7 +270,7 @@
       }
     },
     {
-      "_comment": "submit_feedback — daemon route, fails gracefully when daemon is down",
+      "_comment": "submit_feedback \u2014 daemon route, fails gracefully when daemon is down",
       "action": "call_tool",
       "name": "submit_feedback",
       "arguments": {
@@ -278,7 +286,7 @@
       }
     },
     {
-      "_comment": "trace_account_messages — daemon route",
+      "_comment": "trace_account_messages \u2014 daemon route",
       "action": "call_tool",
       "name": "trace_account_messages",
       "arguments": {

@@ -1,6 +1,41 @@
 # Every entry is a reviewed exclusion, not permission for new operator policy.
 # New values must be placed in typed config and injected through a runtime sink.
 
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/drafts/commands.py:<module>:_OPERATION_KEY_LIMIT"
+rationale = "Native draft command wire-format bound, shared with the MCP input schema; not operator tuning."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/drafts/commands.py:<module>:_VERSION_LIMIT"
+rationale = "Opaque draft version input bound, shared with the MCP schema; not an acquisition policy."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/drafts/history.py:<module>:HISTORY_LIMIT"
+rationale = "Reviewed draft undo product contract: at most ten previous states per scope, with current state retained indefinitely."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/drafts/history.py:<module>:HISTORY_RETENTION_SECONDS"
+rationale = "Reviewed temporary undo and operation receipt contract: seven days, never an expiry of canonical current draft facts; no operator knob requested."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/drafts/history.py:list_draft_history:limit"
+rationale = "The local undo read is bounded by the fixed ten-state product contract."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/drafts/history.py:prune_draft_history:limit"
+rationale = "Finite per-transaction deletion-work ceiling for expired draft preimages; this does not configure retention."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/drafts/history.py:prune_draft_operation_receipts:limit"
+rationale = "Finite per-transaction deletion-work ceiling for settled command receipts; pending operations are excluded."
+
 [reviewed_protocol_domain]
 rationale = "No exclusions use this grouping; every entry below has its own rationale."
 

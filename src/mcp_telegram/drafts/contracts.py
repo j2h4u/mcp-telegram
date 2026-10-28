@@ -7,7 +7,7 @@ arrival has a globally meaningful order.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
@@ -141,6 +141,15 @@ class DraftComposition:
 
 
 @dataclass(frozen=True, slots=True)
+class RestoreSnapshot:
+    """Private, lossless composition envelope; never an agent-facing payload."""
+
+    payload: bytes = field(repr=False)
+    semantic_fingerprint: str
+    restore_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class DraftObservation:
     """One normalized observation, before persistence assigns a revision."""
 
@@ -151,6 +160,7 @@ class DraftObservation:
     composition: DraftComposition | None = None
     ambiguity: bool = False
     source_order_at: datetime | None = None
+    restore_snapshot: RestoreSnapshot | None = None
 
     def __post_init__(self) -> None:
         if self.disposition is DraftDisposition.PRESENT and self.composition is None:
