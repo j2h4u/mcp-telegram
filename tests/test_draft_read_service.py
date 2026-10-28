@@ -1,6 +1,7 @@
 import sqlite3
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -78,3 +79,41 @@ def test_invalid_or_other_account_requests_are_rejected(
 ) -> None:
     conn, _projection = database
     assert read_draft_request(conn, payload, account_id=42)["error"] == error
+
+
+@pytest.mark.parametrize("previous_kind", ["exact", "legacy", "unsupported_media"])
+def test_history_reads_preserve_restore_availability_and_hide_private_snapshots(
+    database: tuple[sqlite3.Connection, SQLiteDraftProjection], previous_kind: str
+) -> None:
+    conn, projection = database
+    first_at = datetime.now(UTC).replace(microsecond=0)
+    media = types.InputMediaContact("+0", "Test", "", "") if previous_kind == "unsupported_media" else None
+    previous = normalize_update_draft(
+        types.UpdateDraftMessage(types.PeerUser(100), types.DraftMessage("previous", first_at, media=media)),
+        account_id=42,
+        source=DraftObservationSource.REALTIME,
+        observed_at=first_at,
+    )
+    assert previous is not None
+    if previous_kind == "legacy":
+        previous = replace(previous, restore_snapshot=None)
+    assert projection.apply_realtime(previous).accepted
+    second_at = first_at + timedelta(seconds=1)
+    current = normalize_update_draft(
+        types.UpdateDraftMessage(types.PeerUser(100), types.DraftMessage("current", second_at)),
+        account_id=42,
+        source=DraftObservationSource.REALTIME,
+        observed_at=second_at,
+    )
+    assert current is not None and projection.apply_realtime(current).accepted
+    before = conn.total_changes
+    result = read_draft_request(conn, {"dialog_id": 100}, account_id=42)
+    history = cast(list[dict[str, object]], result["history"])
+    assert len(history) == 1
+    assert history[0]["text"] == "previous"
+    assert history[0]["restorable"] is (previous_kind == "exact")
+    assert ("restore_reason" in history[0]) is (previous_kind != "exact")
+    selected = read_draft_request(conn, {"dialog_id": 100, "history_id": history[0]["history_id"]}, account_id=42)
+    assert selected["selected_history"] == history[0]
+    assert conn.total_changes == before
+    assert "restore_payload" not in str(result)
