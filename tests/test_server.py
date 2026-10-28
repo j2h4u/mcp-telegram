@@ -1641,6 +1641,41 @@ def test_account_protection_rejects_invalid_server_floors(floor: object) -> None
     )
 
 
+@pytest.mark.parametrize("floor", [None, 0, 123.5])
+async def test_account_protection_projects_optional_floor_without_null(
+    floor: float | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    protection = {
+        "status": "active",
+        "outbound_acquisition": "blocked",
+        "recovery": "manual",
+        "notice": "blocked",
+        "generation": "operator-only",
+        "known_retry_until_utc": floor,
+    }
+    monkeypatch.setattr(
+        server,
+        "daemon_connection",
+        lambda: _status_context(
+            {
+                "ok": True,
+                "data": {"account_protection": protection},
+            }
+        ),
+    )
+    status = cast(dict[str, object], (await server._account_protection_status())["account_protection"])
+    assert status["status"] == "active" and "generation" not in status
+    assert ("known_retry_until_utc" in status) is (floor is not None)
+    if floor is not None:
+        assert status["known_retry_until_utc"] == floor
+    for tool in server.tool_by_name.values():
+        schema = cast(dict[str, object], cast(dict[str, object], tool.output_schema)["properties"])[
+            "account_protection"
+        ]
+        validate(status, cast(dict[str, object], schema))
+
+
 @pytest.mark.parametrize(
     "extra",
     [

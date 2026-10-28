@@ -331,6 +331,8 @@ _ACTIVE_PROTECTION_VALIDATOR = Draft202012Validator(ACTIVE_ACCOUNT_PROTECTION_SC
 def _bounded_account_protection(status: dict[str, object]) -> dict[str, object]:
     bounded = dict(status)
     bounded.pop("generation", None)  # Recovery authorization is operator-only.
+    if bounded.get("known_retry_until_utc") is None:
+        bounded.pop("known_retry_until_utc", None)
     notice = t.cast(str, bounded["notice"])
     if len(notice) > _PROTECTION_NOTICE_CHARS:
         bounded["notice"] = notice[: _PROTECTION_NOTICE_CHARS - 3] + "..."
@@ -367,7 +369,10 @@ def _is_valid_active_account_protection(status: object) -> bool:
     floor = status.get("known_retry_until_utc")
     if floor is not None and not (type(floor) in {int, float} and 0 <= floor < math.inf):
         return False
-    projected = {key: value for key, value in status.items() if key != "generation"}
+    projected = dict(status)
+    projected.pop("generation", None)
+    if floor is None:
+        projected.pop("known_retry_until_utc", None)
     return bool(_ACTIVE_PROTECTION_VALIDATOR.is_valid(projected))
 
 

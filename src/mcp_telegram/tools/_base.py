@@ -61,7 +61,7 @@ ACTIVE_ACCOUNT_PROTECTION_SCHEMA: dict[str, object] = {
         "notice": {"type": "string"},
         "reason": {"type": "string"},
         "opened_at": {"type": "integer"},
-        "known_retry_until_utc": {"type": ["number", "null"], "minimum": 0},
+        "known_retry_until_utc": {"type": "number", "minimum": 0},
         "unresolved_request_count": {"type": "integer", "minimum": 0},
         "unresolved_requests": {
             "type": "array",
