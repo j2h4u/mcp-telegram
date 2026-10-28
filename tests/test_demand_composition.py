@@ -85,7 +85,7 @@ from mcp_telegram.telegram_rpc_consumers import (
     TelegramRpcSource,
     demand_freshness_seconds,
 )
-from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope, rpc_scope
+from mcp_telegram.telegram_rpc_scheduler import TelegramRpcScope, current_rpc_scope, rpc_scope
 from mcp_telegram.topics.demand import TopicSnapshotDemandAdapter
 from tests.helpers import LoudUserProfilePort, build_mock_message
 from tests.sqlite_writer_helpers import inline_writer
@@ -585,11 +585,18 @@ async def test_linked_chat_adapter_real_gate_cannot_retry_physical_send(
     dependencies.conn.execute("INSERT INTO daemon_state(key,value) VALUES ('delta_dm_gap_scan_state', NULL)")
     dependencies.conn.commit()
     gate = _gate(retry_delays=(0.0,))
-    physical_scopes = []
+    physical_scopes: list[tuple[TelegramRpcSource, DemandKind, AcquisitionKind]] = []
     physical_attempts = 0
-    gate.set_rpc_request_observer(
-        lambda **kwargs: physical_scopes.append((kwargs["source"], kwargs["demand_kind"], kwargs["acquisition_kind"]))
-    )
+
+    def observe_physical_claim(**kwargs: object) -> None:
+        if kwargs["phase"] != "write_claim":
+            return
+        scope = cast(TelegramRpcScope, kwargs["scope"])
+        assert scope.demand_kind is not None
+        assert scope.acquisition_kind is not None
+        physical_scopes.append((scope.source, scope.demand_kind, scope.acquisition_kind))
+
+    gate.set_rpc_request_observer(observe_physical_claim)
 
     def send(_request: object) -> object:
         nonlocal physical_attempts
