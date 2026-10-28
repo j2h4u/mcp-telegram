@@ -1,5 +1,5 @@
 ### Stage 1: builder — builds Python venv ###
-FROM python:3.14.8-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170 AS builder
+FROM python:3.15.2-slim@sha256:c4158543ecb725b99e57d129dfd43d761d4c43e4577b5e23326aabb223cf7f4e AS builder
 
 # uv from official image — no curl or shell pipe
 COPY --from=ghcr.io/astral-sh/uv:0.12.5@sha256:e85be844203885286c60ffad8a858d48afb6c5a5c237ca0e67f12e74b8f174b1 /uv /usr/local/bin/uv
@@ -8,22 +8,27 @@ COPY --from=ghcr.io/astral-sh/uv:0.12.5@sha256:e85be844203885286c60ffad8a858d48a
 COPY pyproject.toml uv.lock /src/mcp-telegram/
 RUN --mount=type=cache,target=/root/.cache/uv \
     UV_PROJECT_ENVIRONMENT=/opt/venv UV_LINK_MODE=copy \
+    UV_PYTHON=/usr/local/bin/python UV_PYTHON_DOWNLOADS=never \
     uv sync --project /src/mcp-telegram --frozen --no-dev --no-install-project
 
 # --- Source layer (invalidated when src/ changes) ---
 COPY . /src/mcp-telegram/
 RUN --mount=type=cache,target=/root/.cache/uv \
     UV_PROJECT_ENVIRONMENT=/opt/venv UV_LINK_MODE=copy \
+    UV_PYTHON=/usr/local/bin/python UV_PYTHON_DOWNLOADS=never \
     uv sync --project /src/mcp-telegram --frozen --no-dev --no-editable
 
 
 ### Stage 2: runtime ###
-FROM python:3.14.8-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
+FROM python:3.15.2-slim@sha256:c4158543ecb725b99e57d129dfd43d761d4c43e4577b5e23326aabb223cf7f4e
 
 COPY --from=builder /opt/venv /opt/venv
 ENV HOME="/home/mcp-telegram" \
     XDG_CONFIG_HOME="/home/mcp-telegram/.config" \
     PATH="/opt/venv/bin:$PATH"
+
+RUN --network=none python -c 'import sqlite3, ssl, sys; assert sys.version_info[:3] == (3, 15, 2), sys.version; print(sys.version, ssl.OPENSSL_VERSION, sqlite3.sqlite_version); connection = sqlite3.connect(":memory:"); connection.execute("CREATE VIRTUAL TABLE smoke USING fts5(value)"); import _cffi_backend, cryptography.hazmat.bindings._rust, pydantic_core, ijson.backends.yajl2_c, rapidfuzz, rpds, mcp, jwt, starlette, uvicorn, telethon' \
+    && mcp-telegram --help
 
 COPY --chmod=755 deploy/scripts/healthcheck_daemon.py /usr/local/bin/healthcheck_daemon.py
 COPY --chmod=755 deploy/scripts/healthcheck_http.py /usr/local/bin/healthcheck_http.py
