@@ -210,6 +210,7 @@ class FloodWaitConfig:
     kill_switch_max_wait_seconds: int = 900
     fallback_wait_seconds: int = 60
     cooldown_buffer_seconds: float = 1.0
+    auto_resume_enabled: bool = True
 
 
 def _validate_scheduler_positive_integers(values: tuple[int, ...]) -> None:
@@ -1122,11 +1123,13 @@ def _parse_flood_wait(data: dict[str, object], path: Path) -> FloodWaitConfig:
             "kill_switch_max_wait_seconds",
             "fallback_wait_seconds",
             "cooldown_buffer_seconds",
+            "auto_resume_enabled",
         },
         path,
     )
     defaults = FloodWaitConfig()
     return FloodWaitConfig(
+        auto_resume_enabled=_bool(flood_data, "auto_resume_enabled", "flood_wait", path, defaults.auto_resume_enabled),
         kill_switch_enabled=_bool(flood_data, "kill_switch_enabled", "flood_wait", path, defaults.kill_switch_enabled),
         kill_switch_window_seconds=_positive_int(
             flood_data, "kill_switch_window_seconds", "flood_wait", path, defaults.kill_switch_window_seconds

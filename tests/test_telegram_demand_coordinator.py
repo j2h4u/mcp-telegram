@@ -156,6 +156,29 @@ def _adapters(statuses: Mapping[DemandKind, DemandStatus] | None = None) -> dict
     return {kind: _Adapter(kind, statuses.get(kind)) for kind in DURABLE_DEMAND_ORDER}
 
 
+@pytest.mark.parametrize("outcome_kind", list(SliceOutcomeKind))
+@pytest.mark.parametrize("actual_attempt", [False, True])
+async def test_canonical_progress_requires_accepted_commit_after_actual_acquisition(
+    outcome_kind: SliceOutcomeKind, actual_attempt: bool
+) -> None:
+    kind = DemandKind.DELTA_GAP_FILL
+    adapters = _adapters({kind: DemandStatus(0)})
+    adapter = adapters[kind]
+    adapter.outcome_kind = outcome_kind
+    progress: list[str] = []
+    coordinator = TelegramDemandCoordinator(adapters, clock=_Clock())
+    coordinator.bind_canonical_progress(lambda: progress.append("accepted"))
+
+    async def acquire() -> None:
+        if actual_attempt:
+            adapter.run_calls[-1].debit()
+
+    adapter.on_run = acquire
+    await coordinator._execute_slice(kind)
+    accepted = actual_attempt and outcome_kind in {SliceOutcomeKind.PROGRESSED, SliceOutcomeKind.TERMINAL}
+    assert progress == (["accepted"] if accepted else [])
+
+
 def test_startup_uses_explicit_order_and_full_authoritative_scan() -> None:
     adapters = _adapters(
         {

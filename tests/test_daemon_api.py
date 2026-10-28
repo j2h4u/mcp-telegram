@@ -2887,6 +2887,40 @@ def test_get_account_protection_reports_only_process_local_status() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "automatic_state,mode", [("waiting", "automatic"), ("manual", "manual"), ("disabled", "manual")]
+)
+def test_account_protection_exposes_automatic_wait_without_changing_local_data(automatic_state: str, mode: str) -> None:
+    from jsonschema import validate
+
+    from mcp_telegram.server import _bounded_account_protection, _is_valid_active_account_protection
+    from mcp_telegram.tools._base import ACTIVE_ACCOUNT_PROTECTION_SCHEMA
+
+    server = make_server()
+    automatic = {
+        "enabled": automatic_state != "disabled",
+        "state": automatic_state,
+        "attempts": 2,
+        "max_attempts": 6,
+        "next_attempt_at_utc": 12345.0 if automatic_state == "waiting" else None,
+    }
+    server._account_safety_status = lambda: {
+        "generation": "operator-only",
+        "reason": "flood_wait_circuit_open",
+        "automatic_resume": automatic,
+    }
+    response = server._get_account_protection({})
+    data = cast(dict[str, object], response["data"])
+    protection = cast(dict[str, object], data["account_protection"])
+    assert protection["recovery"] == mode
+    assert protection["automatic_resume"] == automatic
+    assert _is_valid_active_account_protection(protection)
+    bounded = _bounded_account_protection(protection)
+    projected = cast(dict[str, object], bounded["automatic_resume"])
+    assert ("next_attempt_at_utc" in projected) == (automatic_state == "waiting")
+    validate(bounded, ACTIVE_ACCOUNT_PROTECTION_SCHEMA)
+
+
 @pytest.mark.asyncio
 async def test_daemon_api_projects_latched_rpc_without_finite_retry() -> None:
     server = make_server()

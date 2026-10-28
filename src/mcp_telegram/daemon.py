@@ -250,6 +250,14 @@ class _DaemonClient(Protocol):
 
     async def fail_startup_recovery(self) -> None: ...
 
+    async def maintain_auto_resume(self) -> bool: ...
+
+    def set_auto_resume_stop(self, stopped: Callable[[], bool]) -> None: ...
+
+    async def finish_startup_auto_resume(self) -> None: ...
+
+    def note_canonical_progress(self) -> None: ...
+
     async def authorize_account_recovery(self, expected_generation: str, acknowledged: bool) -> None: ...
 
     def close_update_delivery(self) -> None: ...
@@ -958,6 +966,19 @@ async def _monitor_flood_wait_kill_switch(ctx: _SyncMainContext) -> None:
         observer.flush()
 
 
+async def _monitor_auto_resume(ctx: _SyncMainContext) -> None:
+    """Request full lifecycle reconstruction only when the central gate permits it."""
+    while not ctx.shutdown_event.is_set():
+        restart_due = await ctx.client.maintain_auto_resume()
+        if ctx.shutdown_event.is_set():
+            return
+        if restart_due:
+            logger.info("automatic_sync_resume_restarting")
+            ctx.shutdown_event.set()
+            return
+        await sleep_through_flood(ctx.shutdown_event, 60)
+
+
 def _install_flood_wait_kill_switch(config: McpTelegramConfig, event: asyncio.Event) -> None:
     policy_config = config.flood_wait
     configure_flood_wait_kill_switch(
@@ -1287,12 +1308,17 @@ async def _ensure_folder_projection(repository: SQLiteFolderSnapshotRepository, 
 
 
 async def _connect_telegram(ctx: _SyncMainContext) -> bool:
+    if ctx.shutdown_event.is_set():
+        return False
     try:
         ctx.api_server.startup_detail = "connecting to Telegram"
         _ = ctx.api_server.startup_detail
         await ctx.client.prepare_startup_safety()
+        if ctx.shutdown_event.is_set():
+            return False
         await ctx.client.connect()
     except (TimeoutError, OSError) as exc:
+        await ctx.client.fail_startup_recovery()
         ctx.api_server.startup_detail = f"connection failed: {exc}"
         logger.exception("sync-daemon connection failed: %s", exc)
         return False
@@ -1658,6 +1684,7 @@ def _build_demand_runtime(
             startup_detail_setter=lambda detail: setattr(ctx.api_server, "startup_detail", detail),
         )
         coordinator = build_durable_coordinator(dependencies, observer=ctx.rpc_admission_observer)
+        coordinator.bind_canonical_progress(ctx.client.note_canonical_progress)
     except BaseException:
         message_fact_refresh_deps.conn.close()
         raise
@@ -1883,11 +1910,21 @@ async def _monitor_sqlite_writer(ctx: _SyncMainContext) -> None:
     raise RuntimeError("SQLite write owner failed") from failure
 
 
+def _start_runtime_monitors(ctx: _SyncMainContext) -> None:
+    """Keep local safety monitoring live even while connection startup is held."""
+    ctx.client.set_auto_resume_stop(ctx.shutdown_event.is_set)
+    _create_tracked_task(ctx, _monitor_sqlite_writer(ctx), name="sqlite_write_owner", critical=True)
+    _create_tracked_task(ctx, ctx.client.wait_update_delivery_failure(), name="update_delivery", critical=True)
+    _create_tracked_task(ctx, _monitor_flood_wait_kill_switch(ctx), name="flood_wait_kill_switch_monitor")
+    _create_tracked_task(ctx, _monitor_auto_resume(ctx), name="automatic_sync_resume_monitor", critical=True)
+
+
 async def _release_updates_after_replay(ctx: _SyncMainContext, barrier: UpdateProcessingBarrier) -> None:
     """Bind owners before replay, and start background acquisitions only after restoration."""
     barrier.open()
     assert ctx.api_server.self_id is not None
     await ctx.client.start_update_delivery(ctx.api_server.self_id)
+    await ctx.client.finish_startup_auto_resume()
     assert ctx.coordinator is not None
     _create_tracked_task(
         ctx,
@@ -1905,13 +1942,7 @@ async def sync_main() -> None:
     """
     ctx = await _build_sync_main_context()
     try:
-        _create_tracked_task(ctx, _monitor_sqlite_writer(ctx), name="sqlite_write_owner", critical=True)
-        _create_tracked_task(ctx, ctx.client.wait_update_delivery_failure(), name="update_delivery", critical=True)
-        _create_tracked_task(
-            ctx,
-            _monitor_flood_wait_kill_switch(ctx),
-            name="flood_wait_kill_switch_monitor",
-        )
+        _start_runtime_monitors(ctx)
 
         update_barrier = UpdateProcessingBarrier(closed=True)
         ctx.draft_owner = DraftMessageOwner(
@@ -2004,6 +2035,9 @@ async def sync_main() -> None:
         await _prime_runtime(ctx)
         _offer_startup_demands(ctx)
         await _run_daemon_lifetime(ctx)
+    except BaseException as exc:
+        await _run_shutdown_stage("startup_recovery", ctx.client.fail_startup_recovery, exc)
+        raise
     finally:
         await _shutdown_sync_main_context(ctx)
 

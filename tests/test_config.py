@@ -59,6 +59,7 @@ def test_load_config_uses_frozen_typed_defaults(tmp_path: Path) -> None:
     assert config.freshness == FreshnessConfig()
     assert config.telemetry == TelemetryConfig()
     assert config.flood_wait == FloodWaitConfig()
+    assert config.flood_wait.auto_resume_enabled is True
     assert config.telegram_rpc == TelegramRpcConfig()
     assert config.entity_profile == EntityProfileConfig()
     assert config.entity_profile.full_user_pair_enabled is True
@@ -73,6 +74,20 @@ def test_load_config_uses_frozen_typed_defaults(tmp_path: Path) -> None:
     assert config.logging.daemon_api_slow_request_seconds == 1.0
     with pytest.raises(FrozenInstanceError):
         config.freshness.read_receipts.read_at_ttl_seconds = 1  # type: ignore[misc]
+
+
+def test_auto_resume_can_be_disabled_without_disabling_protection(tmp_path: Path) -> None:
+    config = load_config(
+        _write_config(tmp_path, '[state]\ndir = "/state"\n[flood_wait]\nauto_resume_enabled = false\n')
+    )
+    assert config.flood_wait.auto_resume_enabled is False
+    assert config.flood_wait.kill_switch_enabled is True
+
+
+@pytest.mark.parametrize("value", ["1", '"true"', "[]"])
+def test_auto_resume_requires_boolean(tmp_path: Path, value: str) -> None:
+    with pytest.raises(ConfigError, match="auto_resume_enabled"):
+        load_config(_write_config(tmp_path, f'[state]\ndir = "/state"\n[flood_wait]\nauto_resume_enabled = {value}\n'))
 
 
 @pytest.mark.parametrize("version", [None, "true", "2", "1.0", "'1'"])

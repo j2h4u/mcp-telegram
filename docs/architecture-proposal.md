@@ -241,6 +241,17 @@ back to a compatible binary. Never rewind the database after new facts have
 been committed or erase protection floors/intents. For a failed rollout, use a
 forward fix or protected current compatible binary first.
 
+Settled FloodWait account protection uses automatic full-lifecycle resumption
+by default (`[flood_wait] auto_resume_enabled = true`). The existing central
+receipt persists six waits of 1/2/4/8/16/24 hours and spent trials; mandatory
+server floors can only extend eligibility. Automatic consumption never
+acknowledges unknown intents or clears method claims. Unknown outcomes,
+consumed-trial crashes, identity/storage faults and exhausted attempts remain
+manual. Disable the mode on a compatible binary to disarm future trials while
+preserving receipt state. Stability requires a continuous verified hour plus
+successful application acquisition and accepted canonical progress; a restart
+does not replenish attempts.
+
 Manual recovery is `mcp-telegram recover-account
 --acknowledge-unknown-outcome`. It reads the active protection generation, then
 requests one conditional, one-use authorization scoped to the known cooldown

@@ -35,7 +35,7 @@ from mcp.types import (
     TextContent,
     Tool,
 )
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 from starlette.types import Receive, Scope, Send
 
 from . import tools
@@ -329,7 +329,7 @@ _ACTIVE_PROTECTION_VALIDATOR = Draft202012Validator(ACTIVE_ACCOUNT_PROTECTION_SC
 
 
 def _bounded_account_protection(status: dict[str, object]) -> dict[str, object]:
-    bounded = dict(status)
+    bounded = t.cast(dict[str, object], tools.omit_none_mapping_values(status))
     bounded.pop("generation", None)  # Recovery authorization is operator-only.
     if bounded.get("known_retry_until_utc") is None:
         bounded.pop("known_retry_until_utc", None)
@@ -369,7 +369,7 @@ def _is_valid_active_account_protection(status: object) -> bool:
     floor = status.get("known_retry_until_utc")
     if floor is not None and not (type(floor) in {int, float} and 0 <= floor < math.inf):
         return False
-    projected = dict(status)
+    projected = t.cast(dict[str, JsonValue], tools.omit_none_mapping_values(status))
     projected.pop("generation", None)
     if floor is None:
         projected.pop("known_retry_until_utc", None)

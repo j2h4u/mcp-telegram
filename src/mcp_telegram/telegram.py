@@ -86,7 +86,7 @@ def create_client(  # noqa: PLR0913 - explicit cached client construction depend
     else:
         settings = _load_settings()
     state_home = ensure_private_state_dir(config.state.dir, mode=0o700)
-    return TelegramRpcGate(
+    client = TelegramRpcGate(
         state_home / session_name,
         cast(int, settings.api_id),
         cast(str, settings.api_hash),
@@ -104,6 +104,8 @@ def create_client(  # noqa: PLR0913 - explicit cached client construction depend
         flood_observer=observe_flood_wait,
         safety_store=safety_store,
     )
+    client.configure_auto_resume(enabled=config.flood_wait.auto_resume_enabled)
+    return client
 
 
 def make_rpc_safety_store(conn: sqlite3.Connection, writer: SQLiteWriter) -> TelegramRpcSafetyStore:

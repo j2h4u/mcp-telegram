@@ -111,7 +111,16 @@ Keep the marker on rollback to a compatible binary. Do not restore an older
 database after new facts have been written; use a forward fix or a protected
 current compatible binary first.
 
-Active protection has one manual recovery path:
+Settled FloodWait protection automatically schedules a cautious full restart,
+enabled by `[flood_wait] auto_resume_enabled = true` (the default). Six attempts
+wait 1, 2, 4, 8, 16 and 24 hours after protection or a known failed trial;
+longer Telegram restrictions always extend the wait. Restarting does not reset
+the count. One uninterrupted hour with successful application acquisition and
+committed canonical progress resets the episode. Setting the option to false
+disables future automatic attempts without clearing restrictions or history.
+
+Unknown outcomes, interrupted consumed trials, identity/storage failures and
+exhausted attempts require the existing manual recovery path:
 
 ```bash
 mcp-telegram recover-account --acknowledge-unknown-outcome
@@ -124,8 +133,8 @@ recorded and require the explicit acknowledgement. After restart, only the
 operator-authorized bounded bootstrap and identity trial may run. A confirmed
 trial clears that operator authorization, not an unseen server floor; failure,
 FloodWait or uncertainty returns the account to hold. A new explicit operator
-authorization may retry a failed trial. Recovery is not automatic and has no
-MCP tool.
+authorization may retry a failed trial. Manual acknowledgement is never issued
+by automatic recovery. There is no MCP recovery tool.
 
 Container health reports readiness, not process death, and a health failure
 does not restart the service. Deployment verification waits up to 15 minutes;

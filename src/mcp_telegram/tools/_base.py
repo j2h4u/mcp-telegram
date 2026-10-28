@@ -66,7 +66,19 @@ ACTIVE_ACCOUNT_PROTECTION_SCHEMA: dict[str, object] = {
     "properties": {
         "status": {"const": "active"},
         "outbound_acquisition": {"const": "blocked"},
-        "recovery": {"const": "manual"},
+        "recovery": {"enum": ["manual", "automatic"]},
+        "automatic_resume": {
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "state": {"enum": ["waiting", "trial", "stability", "manual", "disabled"]},
+                "attempts": {"type": "integer", "minimum": 0, "maximum": 6},
+                "max_attempts": {"const": 6},
+                "next_attempt_at_utc": {"type": "number", "minimum": 0},
+            },
+            "required": ["enabled", "state", "attempts", "max_attempts"],
+            "additionalProperties": False,
+        },
         "notice": {"type": "string"},
         "reason": {"type": "string"},
         "opened_at": {"type": "integer"},
