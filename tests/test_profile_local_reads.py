@@ -266,6 +266,7 @@ async def test_lifetime_drains_startup_backlog_then_runs_one_local_heartbeat_pas
         return count
 
     service = SimpleNamespace(reconcile_history_profiles=reconcile)
+    writer_run = AsyncMock()
     ctx = SimpleNamespace(
         shutdown_event=shutdown,
         coordinator=object(),
@@ -273,10 +274,12 @@ async def test_lifetime_drains_startup_backlog_then_runs_one_local_heartbeat_pas
         conn=None,
         client=None,
         handler_manager=None,
+        writer=SimpleNamespace(run=writer_run),
     )
     monkeypatch.setattr(daemon, "_log_heartbeat", lambda *_args: None)
     await daemon._run_daemon_lifetime(cast(daemon._SyncMainContext, ctx))
     assert seen == [32, 7, 0, 0]
+    writer_run.assert_awaited_once_with(daemon._prune_draft_retention)
 
 
 @pytest.mark.asyncio

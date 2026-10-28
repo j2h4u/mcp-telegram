@@ -32,7 +32,7 @@ from mcp_telegram.entity_profile.repository import EntityProfileRepository, Enti
 from mcp_telegram.entity_profile.semantic_normalization import normalize_semantic_profile
 from mcp_telegram.entity_profile.updates import project_user_profile
 from mcp_telegram.observation_order import allocate_observation_order
-from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.sync_db import _CURRENT_SCHEMA_VERSION, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
 from sqlite_writer_helpers import event_manager
 
@@ -252,7 +252,7 @@ def test_event_identity_is_insertion_order_not_acquisition_order(db: sqlite3.Con
     assert row[4] == 200
     assert type(row[5]) is int
     assert db.execute("PRAGMA user_version").fetchone() is not None
-    assert db.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 89
+    assert db.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == _CURRENT_SCHEMA_VERSION
 
 
 def test_fulluser_effective_summary_changes_dirty_only_dependents(db: sqlite3.Connection) -> None:

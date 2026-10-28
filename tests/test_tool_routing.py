@@ -29,6 +29,7 @@ from mcp_telegram import server
 from mcp_telegram.sync_read_model import build_sync_read_model
 from mcp_telegram.tools import (
     TOOL_REGISTRY,
+    GetDraft,
     GetEntityInfo,
     GetInbox,
     GetMyRecentActivity,
@@ -38,10 +39,12 @@ from mcp_telegram.tools import (
     ListDialogs,
     ListMessages,
     ListTopics,
+    ManageDraft,
     MarkDialogForSync,
     SearchMessages,
     SubmitFeedback,
     TraceAccountMessages,
+    get_draft,
     get_entity_info,
     get_inbox,
     get_my_recent_activity,
@@ -51,6 +54,7 @@ from mcp_telegram.tools import (
     list_dialogs,
     list_messages,
     list_topics,
+    manage_draft,
     mark_dialog_for_sync,
     search_messages,
     submit_feedback,
@@ -203,6 +207,7 @@ def _text_content(result: StructuredResult) -> str:
 
 @dataclass
 class _DaemonConnStub:
+    request: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_messages: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     search_messages: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_dialogs: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
@@ -370,6 +375,35 @@ def _canonical_get_sync_status_data() -> dict[str, object]:
 
 
 STRUCTURED_TOOL_CASES = {
+    "get_draft": (
+        get_draft,
+        GetDraft(dialog_id=123),
+        {
+            "ok": True,
+            "request_id": "internal",
+            "current": {"presence": "present", "uncertain": False, "text": "draft", "observed_at": 1700000000},
+            "acquisition_status": "ready",
+            "coverage_status": "complete",
+            "history": [],
+            "next_action": "Review in Telegram.",
+        },
+    ),
+    "manage_draft": (
+        manage_draft,
+        ManageDraft(dialog_id=123, action="create", operation_key="schema-test", text="draft"),
+        {
+            "ok": True,
+            "request_id": "internal",
+            "outcome": "acknowledged",
+            "operation_key": "schema-test",
+            "mutation_dispatched": True,
+            "save_acknowledged": True,
+            "result_persisted": True,
+            "current_is_operation_confirmation": False,
+            "current": {"presence": "absent", "uncertain": False, "observed_at": 1700000000},
+            "next_action": "Read get_draft.",
+        },
+    ),
     "list_conversation_changes": (
         list_conversation_changes,
         ListConversationChanges(),
@@ -891,6 +925,7 @@ def _make_daemon_conn(response: dict | None = None) -> _DaemonConnStub:
     conn.upsert_entities = _AsyncMethodMock(return_value={"ok": True, "upserted": 0})
     conn.resolve_entity = _AsyncMethodMock(return_value=r)
     conn.get_my_recent_activity = _AsyncMethodMock(return_value=r)  # Phase 999.1 (B4b)
+    conn.request = _AsyncMethodMock(return_value=r)
     return conn
 
 
@@ -908,6 +943,7 @@ class _patch_daemon:
 
     def __enter__(self):
         targets = [
+            "mcp_telegram.tools.drafts.daemon_connection",
             "mcp_telegram.tools.discovery.daemon_connection",
             "mcp_telegram.tools.reading.daemon_connection",
             "mcp_telegram.tools.sync.daemon_connection",
@@ -942,6 +978,7 @@ class _patch_daemon_not_running:
 
         self._patches = []
         targets = [
+            "mcp_telegram.tools.drafts.daemon_connection",
             "mcp_telegram.tools.discovery.daemon_connection",
             "mcp_telegram.tools.reading.daemon_connection",
             "mcp_telegram.tools.sync.daemon_connection",

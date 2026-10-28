@@ -170,6 +170,7 @@ async def get_draft(args: GetDraft) -> ToolResult:
         return error_result(_daemon_not_running_text(exc))
     if err := _check_daemon_response(response):
         return err
+    response.pop("request_id", None)
     return structured_result(cast(Mapping[str, object], omit_none_mapping_values(response)))
 
 
@@ -195,4 +196,5 @@ async def manage_draft(args: ManageDraft) -> ToolResult:
         )
     if err := _check_daemon_response(response):
         return err
+    response.pop("request_id", None)
     return structured_result(cast(Mapping[str, object], omit_none_mapping_values(response)))
