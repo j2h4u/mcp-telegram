@@ -55,7 +55,7 @@ from telethon.tl.functions.updates import (  # type: ignore[import-untyped]
     GetDifferenceRequest,
 )
 from telethon.tl.tlobject import TLRequest  # type: ignore[import-untyped]
-from telethon.utils import is_list_like  # type: ignore[import-untyped]
+from telethon.utils import get_peer_id, is_list_like  # type: ignore[import-untyped]
 
 from .auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from .delivered_update import DeliveredUpdate, delivered_update_context, fail_delivered_update
@@ -1902,7 +1902,7 @@ class TelegramRpcGate(TelegramClient):
     _catch_up: bool
     _updates_handle: asyncio.Task[object] | None
 
-    def __init__(  # noqa: PLR0913 - Telethon constructor plus explicit account policy
+    def __init__(  # noqa: PLR0913, PLR0915 - Telethon constructor plus explicit account policy
         self,
         *args: object,
         rpc_budget: TelegramRpcBudget,
@@ -1988,6 +1988,11 @@ class TelegramRpcGate(TelegramClient):
         self._delivery_account_id: int | None = None
         self._active_delivery: _ActiveDelivery | None = None
         self._delivery_callbacks: dict[object, object] = {}
+        self._scheduled_continuity_recovery: Callable[[int | None, str], Awaitable[None]] | None = None
+
+    def set_scheduled_continuity_recovery(self, callback: Callable[[int | None, str], Awaitable[None]] | None) -> None:
+        """Bind the durable owner for Telegram's explicit DifferenceTooLong result."""
+        self._scheduled_continuity_recovery = callback
 
     def _initialize_wire_authority(self, safety_store: TelegramRpcSafetyStore) -> None:
         """Initialize one account-owned physical-attempt authority."""
@@ -3802,7 +3807,26 @@ class TelegramRpcGate(TelegramClient):
         task = asyncio.current_task()
         connection_owned = task is self._connect_owner or task in self._connection_rpc_tasks
         try:
-            return await self._call_classified_difference(request, ordered=ordered)
+            result = await self._call_classified_difference(request, ordered=ordered)
+            if self._authentication_mode:
+                return result
+            target: int | None = None
+            reason: str | None = None
+            if isinstance(result, types.updates.DifferenceTooLong):
+                reason = "account_difference_too_long"
+            elif isinstance(result, types.updates.ChannelDifferenceTooLong):
+                channel = cast(types.TypeInputChannel | None, getattr(request, "channel", None))
+                try:
+                    target = int(cast(int, get_peer_id(channel))) if channel is not None else None
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("Telegram channel difference gap has no canonical peer") from exc
+                reason = "channel_difference_too_long"
+            if reason is not None:
+                callback = self._scheduled_continuity_recovery
+                if callback is None or self._ensure_safety_ledger().verified_account_id is None:
+                    raise RuntimeError("scheduled continuity recovery is not bound to a verified account")
+                await callback(target, reason)
+            return result
         except (TelegramRpcThrottled, TelegramRpcMethodRecoveryPending) as exc:
             if (
                 task is self._update_loop_owner

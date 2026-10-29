@@ -382,7 +382,6 @@ class AutomaticGroupHistoryConfig:
 class SchedulingConfig:
     """Intervals for local daemon maintenance loops."""
 
-    scheduled_reconciliation_seconds: float = 900.0
     self_profile_refresh_seconds: float = 86_400.0
     read_position_reconciliation_seconds: float = 900.0
     read_position_reconciliation_max_dialogs_per_pass: int = 100
@@ -695,9 +694,6 @@ def resolve_scheduling_config(
     env = os.environ if environ is None else environ
     return replace(
         config,
-        scheduled_reconciliation_seconds=_env_positive_float(
-            env, "SCHEDULED_RECONCILIATION_SECONDS", config.scheduled_reconciliation_seconds
-        ),
         read_position_reconciliation_seconds=_env_positive_float(
             env, "READ_POSITION_RECONCILIATION_SECONDS", config.read_position_reconciliation_seconds
         ),
@@ -1517,7 +1513,6 @@ def _non_negative_float(data: dict[str, object], key: str, section: str, path: P
 def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
     defaults = SchedulingConfig()
     allowed = {
-        "scheduled_reconciliation_seconds",
         "self_profile_refresh_seconds",
         "read_position_reconciliation_seconds",
         "read_position_reconciliation_max_dialogs_per_pass",
@@ -1553,13 +1548,6 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
     activity_hot_sweep = _parse_activity_hot_sweep(scheduling_data, path, defaults.activity_hot_sweep)
     automatic_group_history = _parse_automatic_group_history(scheduling_data, path, defaults.automatic_group_history)
     return SchedulingConfig(
-        scheduled_reconciliation_seconds=_positive_float(
-            scheduling_data,
-            "scheduled_reconciliation_seconds",
-            "scheduling",
-            path,
-            defaults.scheduled_reconciliation_seconds,
-        ),
         self_profile_refresh_seconds=_positive_float(
             scheduling_data,
             "self_profile_refresh_seconds",

@@ -856,14 +856,12 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         DemandKind.SCHEDULED_REPAIR,
         TelegramRpcSource.SCHEDULED_MESSAGES,
         _DURABLE,
-        freshness_target=timedelta(minutes=15),
         max_rpc_attempts_per_slice=16,
     ),
     DemandKind.SCHEDULED_DISCOVERY: _contract(
         DemandKind.SCHEDULED_DISCOVERY,
         TelegramRpcSource.SCHEDULED_MESSAGES,
         _DURABLE,
-        freshness_target=timedelta(hours=24),
         max_rpc_attempts_per_slice=16,
     ),
     DemandKind.DRAFT_SNAPSHOT: _contract(

@@ -301,6 +301,10 @@ class _DaemonClient(Protocol):
 
     def set_flood_event_observer(self, observer: Callable[..., None] | None) -> None: ...
 
+    def set_scheduled_continuity_recovery(
+        self, callback: Callable[[int | None, str], Awaitable[None]] | None
+    ) -> None: ...
+
     async def get_me(self) -> object: ...
 
     async def get_input_entity(self, dialog_id: int, /) -> object: ...
@@ -1632,7 +1636,6 @@ def _build_demand_runtime(
         writer=ctx.writer,
         policy=ScheduledReconciliationPolicy(
             activity_rpc_timeout_seconds=ctx.scheduling.activity_rpc_timeout_seconds,
-            state_scan_seconds=ctx.scheduling.scheduled_reconciliation_seconds,
         ),
     )
     dialog_reconciliation_worker = DialogReconciliationWorker(
@@ -1740,6 +1743,7 @@ def _ensure_demand_runtime(
     )
     ctx.demand_runtime = demand_runtime
     ctx.coordinator = demand_runtime.coordinator
+    ctx.client.set_scheduled_continuity_recovery(demand_runtime.scheduled_reconciler.invalidate_continuity)
     ctx.api_server.bind_demand_sink(demand_runtime.coordinator)
     if ctx.handler_manager is not None:
         ctx.handler_manager.bind_demand_sink(demand_runtime.coordinator)

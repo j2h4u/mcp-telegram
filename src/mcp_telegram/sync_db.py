@@ -15,9 +15,9 @@ from .dialog_classification import (
 )
 from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
-from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 90
+_CURRENT_SCHEMA_VERSION = 91
+_SCHEDULED_FINITE_COVERAGE_MIGRATION = 91
 _DRAFT_HISTORY_MIGRATION = 90
 _PROFILE_COLLECTION_MIGRATION = 88
 _PROFILE_HISTORY_MIGRATION = 89
@@ -64,11 +64,7 @@ _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _RPC_SAFETY_RECORD_KEY = "telegram_rpc_safety"
 _RPC_SAFETY_RECORD_VERSION = 2
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
-
-# Product-owned scheduled reconciliation targets.  Keep these values here so
-# schema bootstrap and the legacy worker cannot drift apart.
-SCHEDULED_ACTIVE_REPAIR_SECONDS = demand_freshness_seconds(DemandKind.SCHEDULED_REPAIR)
-SCHEDULED_QUIET_DISCOVERY_SECONDS = demand_freshness_seconds(DemandKind.SCHEDULED_DISCOVERY)
+_LEGACY_SCHEDULED_QUIET_DISCOVERY_SECONDS = 86_400
 
 logger = logging.getLogger(__name__)
 
@@ -3611,7 +3607,7 @@ def _apply_migration_59(conn: sqlite3.Connection, current: int) -> int:
                 SELECT DISTINCT dialog_id FROM scheduled_messages WHERE message_state = 'scheduled'
             ) AS active ON active.dialog_id = candidate.dialog_id
             """,
-            {"now": now, "quiet_seconds": SCHEDULED_QUIET_DISCOVERY_SECONDS},
+            {"now": now, "quiet_seconds": _LEGACY_SCHEDULED_QUIET_DISCOVERY_SECONDS},
         )
         conn.execute(
             "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
@@ -5100,6 +5096,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_89(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _DRAFT_HISTORY_MIGRATION:
         current = _apply_migration_90(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _SCHEDULED_FINITE_COVERAGE_MIGRATION:
+        current = _apply_migration_91(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
@@ -5148,6 +5146,45 @@ def _apply_migration_90(conn: sqlite3.Connection, current: int) -> int:
             ) WITHOUT ROWID""",
             "CREATE INDEX draft_operation_receipts_expiry ON draft_operation_receipts(updated_at) WHERE outcome!='pending'",
         ],
+    )
+
+
+def _apply_migration_91(conn: sqlite3.Connection, current: int) -> int:
+    """Make scheduled reconciliation represent finite evidence obligations."""
+    return _apply_migration(
+        conn,
+        current,
+        91,
+        [
+            "ALTER TABLE scheduled_reconciliation_state RENAME TO scheduled_reconciliation_state_v90",
+            """CREATE TABLE scheduled_reconciliation_state (
+                dialog_id INTEGER PRIMARY KEY,
+                repair_due_at INTEGER,
+                discovery_due_at INTEGER,
+                dirty_since INTEGER,
+                dirty_generation INTEGER NOT NULL DEFAULT 0 CHECK(dirty_generation >= 0),
+                updated_at INTEGER NOT NULL,
+                snapshot_observation_order INTEGER,
+                baseline_observed_at INTEGER,
+                coverage_state TEXT NOT NULL DEFAULT 'unknown'
+                    CHECK(coverage_state IN ('unknown','complete','inaccessible','unsupported')),
+                coverage_reason TEXT,
+                directory_generation INTEGER
+            ) WITHOUT ROWID""",
+            """INSERT INTO scheduled_reconciliation_state (
+                dialog_id,repair_due_at,discovery_due_at,dirty_since,dirty_generation,
+                updated_at,snapshot_observation_order
+            ) SELECT dialog_id,NULL,unixepoch(),NULL,dirty_generation,updated_at,snapshot_observation_order
+                FROM scheduled_reconciliation_state_v90""",
+            "DROP TABLE scheduled_reconciliation_state_v90",
+            "DROP INDEX IF EXISTS idx_scheduled_reconciliation_repair_due",
+            "DROP INDEX IF EXISTS idx_scheduled_reconciliation_discovery_due",
+            "CREATE INDEX idx_scheduled_reconciliation_repair_due ON scheduled_reconciliation_state(repair_due_at,dialog_id) WHERE repair_due_at IS NOT NULL",
+            "CREATE INDEX idx_scheduled_reconciliation_discovery_due ON scheduled_reconciliation_state(discovery_due_at,dialog_id) WHERE discovery_due_at IS NOT NULL",
+            "ALTER TABLE scheduled_sync_state ADD COLUMN account_id INTEGER",
+            "ALTER TABLE scheduled_sync_state ADD COLUMN directory_generation INTEGER",
+        ],
+        ignore_duplicate_column=True,
     )
 
 

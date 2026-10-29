@@ -20,27 +20,21 @@ from telethon.tl.types import PeerUser
 from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
 from mcp_telegram.event_handlers import _NewMessageEvent
 from mcp_telegram.flood import TelegramRpcThrottled
-from mcp_telegram.linked_chat_fact import LinkedChatFact, LinkedChatState, linked_chat_fact_owner
 from mcp_telegram.observation_order import allocate_observation_order
-from mcp_telegram.own_only import OwnOnlyContext, query_own_only_candidates
+from mcp_telegram.own_only import OwnOnlyContext
 from mcp_telegram.scheduled_messages import (
     ScheduledDiscoveryDemandAdapter,
-    ScheduledDiscoveryPending,
     ScheduledMessageReconciler,
     ScheduledReconciliationPolicy,
     ScheduledRepairDemandAdapter,
     _unix_timestamp,
     mark_scheduled_messages_removed,
+    scheduled_dialog_has_due_work,
     scheduled_dialog_id,
     upsert_scheduled_message,
     verify_scheduled_publication,
 )
-from mcp_telegram.sync_db import (
-    SCHEDULED_ACTIVE_REPAIR_SECONDS,
-    SCHEDULED_QUIET_DISCOVERY_SECONDS,
-    _open_sync_db,
-    ensure_sync_schema,
-)
+from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_demand import AcquisitionKind, DemandStatus, DurableDemandAdapter, RpcAttemptBudget
 from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator
@@ -115,6 +109,8 @@ def conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     connection = _open_sync_db(path)
+    connection.execute("UPDATE scheduled_sync_state SET account_id=42 WHERE key='account'")
+    connection.commit()
     yield connection
     connection.close()
 
@@ -155,11 +151,11 @@ def test_upsert_reschedule_updates_same_queue_identity_without_sent_row(conn: sq
     assert conn.execute("SELECT stemmed_text FROM scheduled_messages_fts").fetchone() == ("rescheduled",)
 
 
-def test_upsert_drops_non_future_queue_rows(conn: sqlite3.Connection) -> None:
+def test_upsert_retains_due_queue_rows(conn: sqlite3.Connection) -> None:
     conn.commit()
     with write_transaction(conn):
         upsert_scheduled_message(conn, 42, _message(11, scheduled_at=100), now=101)
-    assert conn.execute("SELECT COUNT(*) FROM scheduled_messages").fetchone() == (0,)
+    assert conn.execute("SELECT scheduled_at,message_state FROM scheduled_messages").fetchone() == (100, "scheduled")
 
 
 def test_removal_retains_cancel_and_unverified_publication_evidence(conn: sqlite3.Connection) -> None:
@@ -318,7 +314,7 @@ async def test_reconciliation_floodwait_does_not_add_domain_retry(conn: sqlite3.
     )
 
     conn.commit()
-    adapter = ScheduledRepairDemandAdapter(worker, account_id=42)
+    adapter = ScheduledDiscoveryDemandAdapter(worker, account_id=42)
     status = adapter.status(time.time())
     assert status is not None and status.selected is not None
     with pytest.raises(TelegramRpcThrottled):
@@ -357,328 +353,23 @@ async def test_reconciliation_without_own_only_context_does_not_sweep_all_synced
 
 
 @pytest.mark.asyncio
-async def test_reconciliation_classifies_and_enrolls_own_only_candidates(
-    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    personal_id = -1000000009001
-    admin_id = -1000000009002
-    unrelated_id = -1000000009003
-    discussion_id = -1000000008001
+async def test_candidates_cover_directory_peers_and_archived_dialogs(conn: sqlite3.Connection) -> None:
     conn.executemany(
-        "INSERT INTO dialogs (dialog_id, type, hidden, linked_chat_id, linked_chat_resolved_at) VALUES (?, ?, 0, ?, ?)",
-        [
-            (7, "user", None, None),
-            (personal_id, "channel", discussion_id, 100),
-            (admin_id, "channel", None, None),
-            (unrelated_id, "channel", None, None),
-            (discussion_id, "forum", None, None),
-        ],
-    )
-    conn.commit()
-    conn.execute(
-        "INSERT INTO own_only_dialogs (dialog_id, inclusion_basis, updated_at) VALUES (?, ?, ?)",
-        (999, '["owned_channel"]', 100),
-    )
-    conn.commit()
-
-    client = _ScheduledSnapshotClient(
-        {personal_id: [_message(99, "personal scheduled")]},
-        entities={
-            admin_id: SimpleNamespace(creator=False, admin_rights=SimpleNamespace(post_messages=True)),
-            unrelated_id: SimpleNamespace(creator=False, admin_rights=SimpleNamespace(post_messages=False)),
-        },
-    )
-    captured: dict[str, float | None] = {}
-
-    async def fake_resolve_linked_chat_id(
-        client: object, conn: sqlite3.Connection, channel_id: int, *, timeout_s: float | None, writer: object
-    ) -> LinkedChatFact:
-        del client, conn, channel_id, writer
-        captured["timeout_s"] = timeout_s
-        return LinkedChatFact(LinkedChatState.KNOWN_LINK, discussion_id, 100, False, None, None)
-
-    monkeypatch.setattr("mcp_telegram.scheduled_messages.resolve_linked_chat_id", fake_resolve_linked_chat_id)
-    worker = ScheduledMessageReconciler(
-        client,
-        conn,
-        asyncio.Event(),
-        OwnOnlyContext(account_id=42, personal_channel_id=9001),
-        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=53.0),
-        writer=inline_writer(conn),
-    )
-    conn.executemany(
-        "INSERT OR REPLACE INTO scheduled_reconciliation_state "
-        "(dialog_id, repair_due_at, discovery_due_at, updated_at) VALUES (?, NULL, 0, 0)",
-        [(7,), (personal_id,), (admin_id,), (unrelated_id,), (discussion_id,), (999,)],
-    )
-    conn.commit()
-
-    conn.commit()
-    assert await _run_all_demand_slices(worker) == 0
-    assert conn.execute("SELECT message_id FROM scheduled_messages WHERE dialog_id=?", (personal_id,)).fetchone() == (
-        99,
-    )
-    enrolled = {
-        row[0]: row[1] for row in conn.execute("SELECT dialog_id, status FROM synced_dialogs ORDER BY dialog_id")
-    }
-    assert set(enrolled) == {7, personal_id, admin_id, discussion_id}
-    assert unrelated_id not in enrolled
-    assert conn.execute(
-        "SELECT inclusion_basis FROM own_only_dialogs WHERE dialog_id=?", (discussion_id,)
-    ).fetchone() == ('["personal_channel_discussion"]',)
-    # An absent dialog row is not proof that prior ownership was revoked.
-    assert conn.execute("SELECT 1 FROM own_only_dialogs WHERE dialog_id=999").fetchone() == (1,)
-    assert len(client.entity_calls) == 2
-    assert set(client.entity_calls) == {admin_id, unrelated_id}
-    assert captured == {"timeout_s": 53.0}
-
-
-@pytest.mark.asyncio
-async def test_scheduled_context_retries_unknown_and_rereads_newer_link(
-    conn: sqlite3.Connection,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from mcp_telegram.scheduled_messages import ScheduledMessageReconciler
-
-    worker = ScheduledMessageReconciler(
-        _ScheduledSnapshotClient({}),
-        conn,
-        asyncio.Event(),
-        OwnOnlyContext(account_id=42, personal_channel_id=9001),
-        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=1.0),
-        writer=inline_writer(conn),
-    )
-    current = LinkedChatFact(LinkedChatState.UNKNOWN, None, None, True, None, 200)
-
-    async def fake_resolve(*_args: object, **_kwargs: object) -> LinkedChatFact:
-        return current
-
-    monkeypatch.setattr("mcp_telegram.scheduled_messages.resolve_linked_chat_id", fake_resolve)
-    pending = await worker._context()
-    assert pending == ScheduledDiscoveryPending(retry_at=200)
-    assert worker._own_only_context is not None
-    assert worker._own_only_context.personal_channel_linked_chat_id is None
-
-    current = LinkedChatFact(LinkedChatState.KNOWN_LINK, -10077, 300, True, None, 400)
-    context = await worker._context()
-    assert not isinstance(context, ScheduledDiscoveryPending)
-    assert context is not None and context.personal_channel_linked_chat_id == -10077
-
-    current = LinkedChatFact(LinkedChatState.KNOWN_LINK, -10088, 500, False, None, None)
-    updated = await worker._context()
-    assert not isinstance(updated, ScheduledDiscoveryPending)
-    assert updated is not None and updated.personal_channel_linked_chat_id == -10088
-
-
-@pytest.mark.asyncio
-async def test_pending_linked_chat_gates_discovery_without_account_retry_and_allows_repair(
-    conn: sqlite3.Connection,
-) -> None:
-    now = int(time.time())
-    retry_at = now + 86_400
-    personal_channel_id = -1_000_000_000_900
-    conn.execute(
-        "INSERT INTO linked_chat_fact_state(channel_id,generation,pending_generation,requested_at,retry_at) "
-        "VALUES (?,0,0,?,?)",
-        (personal_channel_id, now, retry_at),
-    )
-    conn.execute(
-        "INSERT INTO scheduled_reconciliation_state(dialog_id,repair_due_at,discovery_due_at,updated_at) "
-        "VALUES (42,NULL,?,?)",
-        (now, now),
-    )
-    conn.commit()
-    client = _ScheduledSnapshotClient({42: []})
-    worker = ScheduledMessageReconciler(
-        client,
-        conn,
-        asyncio.Event(),
-        OwnOnlyContext(account_id=42, personal_channel_id=personal_channel_id),
-        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
-        writer=inline_writer(conn),
-    )
-
-    assert worker.discovery_retry_at(now) == retry_at
-    discovery_status = ScheduledDiscoveryDemandAdapter(worker, account_id=42).status(now)
-    assert discovery_status is not None
-    assert discovery_status.release_at == float(retry_at)
-    assert discovery_status.freshness_deadline == float(now)
-    assert await worker._prepare_discovery(42, now) == (0, True)
-    assert client.requests == []
-    assert conn.execute("SELECT next_retry_at,last_error FROM scheduled_sync_state WHERE key='account'").fetchone() == (
-        None,
-        None,
-    )
-
-    conn.commit()
-    with write_transaction(conn):
-        upsert_scheduled_message(conn, 42, _message(90), now=now)
-    repair_status = ScheduledRepairDemandAdapter(worker, account_id=42).status(now)
-    assert repair_status is not None and repair_status.release_at <= now
-    conn.commit()
-    assert await worker.run_demand_slice(DemandKind.SCHEDULED_REPAIR) == 1
-    assert len(client.requests) == 1
-    assert conn.execute("SELECT next_retry_at,last_error FROM scheduled_sync_state WHERE key='account'").fetchone() == (
-        None,
-        None,
-    )
-
-
-@pytest.mark.parametrize("linked_chat_id", [None, -1_000_000_000_777])
-def test_known_linked_chat_facts_do_not_gate_discovery(conn: sqlite3.Connection, linked_chat_id: int | None) -> None:
-    now = int(time.time())
-    personal_channel_id = -1_000_000_000_900
-    conn.execute(
-        "INSERT INTO dialogs(dialog_id,type,linked_chat_id,linked_chat_resolved_at) VALUES (?,'channel',?,?)",
-        (personal_channel_id, linked_chat_id, now),
-    )
-    conn.execute(
-        "INSERT INTO linked_chat_fact_state(channel_id,generation,pending_generation,requested_at,retry_at) "
-        "VALUES (?,0,0,?,?)",
-        (personal_channel_id, now, now + 86_400),
-    )
-    conn.execute(
-        "INSERT INTO scheduled_reconciliation_state(dialog_id,repair_due_at,discovery_due_at,updated_at) "
-        "VALUES (42,NULL,0,0)"
+        "INSERT INTO dialogs(dialog_id,type,hidden,archived) VALUES (?,?,1,1)",
+        [(7, "user"), (8, "bot"), (-9, "chat"), (-1_000_000_000_10, "channel")],
     )
     conn.commit()
     worker = ScheduledMessageReconciler(
         _ScheduledSnapshotClient(),
         conn,
         asyncio.Event(),
-        OwnOnlyContext(account_id=42, personal_channel_id=personal_channel_id),
-        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
+        OwnOnlyContext(account_id=42),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=53.0),
         writer=inline_writer(conn),
     )
 
-    assert worker.discovery_retry_at(now) is None
-    status = ScheduledDiscoveryDemandAdapter(worker, account_id=42).status(now)
-    assert status is not None and status.release_at == 0.0 and status.freshness_deadline == 0.0
-
-
-@pytest.mark.asyncio
-async def test_suspended_pending_fact_suppresses_only_discovery_and_restore_releases_it(
-    conn: sqlite3.Connection,
-) -> None:
-    now = int(time.time())
-    personal_channel_id = -1_000_000_000_900
-    conn.execute(
-        "INSERT INTO dialogs(dialog_id,type,hidden) VALUES(?,'channel',0)",
-        (personal_channel_id,),
-    )
-    conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(?,'access_lost')", (personal_channel_id,))
-    conn.execute(
-        "INSERT INTO linked_chat_fact_state(channel_id,generation,pending_generation,requested_at,retry_at) "
-        "VALUES (?,0,0,?,?)",
-        (personal_channel_id, now, now + 86_400),
-    )
-    conn.execute(
-        "INSERT INTO scheduled_reconciliation_state(dialog_id,repair_due_at,discovery_due_at,updated_at) "
-        "VALUES (42,?,?,?)",
-        (now, now, now),
-    )
-    conn.commit()
-    client = _ScheduledSnapshotClient({42: []})
-    worker = ScheduledMessageReconciler(
-        client,
-        conn,
-        asyncio.Event(),
-        OwnOnlyContext(account_id=42, personal_channel_id=personal_channel_id),
-        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
-        writer=inline_writer(conn),
-    )
-    discovery_adapter = ScheduledDiscoveryDemandAdapter(worker, account_id=42)
-    repair_adapter = ScheduledRepairDemandAdapter(worker, account_id=42)
-
-    assert worker.discovery_suspended()
-    assert discovery_adapter.status(now) is None
-    repair_status = repair_adapter.status(now)
-    assert repair_status is not None and repair_status.release_at == now
-    conn.commit()
-    await worker.run_demand_slice(DemandKind.SCHEDULED_DISCOVERY)
-    assert client.requests == []
-    assert conn.execute("SELECT next_retry_at,last_error FROM scheduled_sync_state WHERE key='account'").fetchone() == (
-        None,
-        None,
-    )
-
-    conn.commit()
-    with write_transaction(conn):
-        upsert_scheduled_message(conn, 42, _message(90), now=now)
-    conn.commit()
-    conn.commit()
-    assert await worker.run_demand_slice(DemandKind.SCHEDULED_REPAIR) == 1
-    assert len(client.requests) == 1
-
-    with conn:
-        conn.execute("UPDATE synced_dialogs SET status='synced' WHERE dialog_id=?", (personal_channel_id,))
-        linked_chat_fact_owner.invalidate_from_update(conn, personal_channel_id, now + 1)
-    assert not worker.discovery_suspended()
-    restored_status = discovery_adapter.status(now + 1)
-    assert restored_status is not None and restored_status.release_at <= now + 1
-
-
-@pytest.mark.asyncio
-async def test_reconciliation_access_lost_candidate_log_has_dialog_context(
-    conn: sqlite3.Connection,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    private_channel_id = -1000000009004
-    channel_name = "Archived Fixture Channel"
-    conn.execute(
-        "INSERT INTO dialogs (dialog_id, name, type, hidden, archived) VALUES (?, ?, ?, ?, ?)",
-        (private_channel_id, channel_name, "channel", 1, 1),
-    )
-    from mcp_telegram.linked_chat_fact import linked_chat_fact_owner
-
-    with conn:
-        personal_channel_id = -1_000_000_009_001
-        generation = linked_chat_fact_owner.capture_generation(conn, personal_channel_id)
-        assert linked_chat_fact_owner.publish(conn, personal_channel_id, generation, None, int(time.time()))
-    conn.commit()
-    client = _ScheduledSnapshotClient(
-        entities={
-            private_channel_id: ChannelPrivateError(request=None),
-        },
-    )
-    worker = ScheduledMessageReconciler(
-        client,
-        conn,
-        asyncio.Event(),
-        OwnOnlyContext(account_id=42, personal_channel_id=9001),
-        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
-        writer=inline_writer(conn),
-    )
-    conn.execute(
-        "INSERT OR REPLACE INTO scheduled_reconciliation_state "
-        "(dialog_id, repair_due_at, discovery_due_at, updated_at) VALUES (?, NULL, 0, 0)",
-        (private_channel_id,),
-    )
-    conn.commit()
-
-    with caplog.at_level("WARNING", logger="mcp_telegram.access_lifecycle"):
-        conn.commit()
-        assert await _run_all_demand_slices(worker) == 0
-
-    records = [record for record in caplog.records if record.message.startswith("access_lost ")]
-    assert len(records) == 1
-    assert f"dialog_id={private_channel_id}" in records[0].message
-    assert "reason_code=ChannelPrivateError" in records[0].message
-    assert channel_name not in records[0].message
-    assert records[0].exc_info is None
-    status_row = conn.execute(
-        "SELECT status, access_lost_at FROM synced_dialogs WHERE dialog_id = ?",
-        (private_channel_id,),
-    ).fetchone()
-    assert status_row is not None
-    assert status_row[0] == "access_lost"
-    assert status_row[1] is not None
-    event_row = conn.execute(
-        "SELECT kind, dialog_id FROM conversation_history_events WHERE dialog_id = ?",
-        (private_channel_id,),
-    ).fetchone()
-    assert event_row == ("access_lost", private_channel_id)
-    assert [row["dialog_id"] for row in query_own_only_candidates(conn, personal_channel_id=9001)] == []
+    assert worker._candidate_ids() == {7, 8, -9, -1_000_000_000_10, 42}
+    assert conn.execute("SELECT COUNT(*) FROM synced_dialogs").fetchone() == (0,)
 
 
 @pytest.mark.asyncio
@@ -711,6 +402,33 @@ async def test_raw_scheduled_updates_ingest_without_messages_row(conn: sqlite3.C
         DemandKind.SCHEDULED_REPAIR,
         DemandKind.SCHEDULED_DISCOVERY,
     ]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_events_on_complete_baseline_do_not_request_snapshots(conn: sqlite3.Connection) -> None:
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO scheduled_reconciliation_state(dialog_id,updated_at,baseline_observed_at,coverage_state) "
+        "VALUES(42,?,?, 'complete')",
+        (now, now),
+    )
+    conn.commit()
+    client = MagicMock()
+    manager = event_manager(client, conn, asyncio.Event())
+    sink = MagicMock()
+    manager.bind_demand_sink(sink)
+
+    await manager.on_raw_new_scheduled_message(
+        SimpleNamespace(message=_message(21, "created", scheduled_at=1_900_000_021))
+    )
+    await manager.on_raw_delete_scheduled_messages(
+        SimpleNamespace(peer=PeerUser(user_id=42), messages=[21], sent_messages=None)
+    )
+
+    assert sink.offer.call_count == 0
+    assert conn.execute(
+        "SELECT message_state FROM scheduled_messages WHERE dialog_id=42 AND message_id=21"
+    ).fetchone() == ("cancelled",)
 
 
 @pytest.mark.asyncio
@@ -812,12 +530,10 @@ def test_realtime_updates_coalesce_into_one_dirty_dialog(conn: sqlite3.Connectio
     conn.commit()
 
     state = conn.execute(
-        "SELECT repair_due_at, dirty_since, dirty_generation FROM scheduled_reconciliation_state WHERE dialog_id=42"
+        "SELECT repair_due_at, discovery_due_at, dirty_since, dirty_generation FROM scheduled_reconciliation_state WHERE dialog_id=42"
     ).fetchone()
-    assert state == (100, 100, 2)
-    assert conn.execute("SELECT inclusion_basis FROM own_only_dialogs WHERE dialog_id=42").fetchone() == (
-        '["scheduled_event"]',
-    )
+    assert state == (None, 100, 100, 2)
+    assert conn.execute("SELECT inclusion_basis FROM own_only_dialogs WHERE dialog_id=42").fetchone() is None
 
 
 @pytest.mark.asyncio
@@ -874,7 +590,7 @@ async def test_concurrent_event_prevents_stale_snapshot_apply(conn: sqlite3.Conn
         writer=inline_writer(conn),
     )
     conn.commit()
-    assert await worker.run_demand_slice(DemandKind.SCHEDULED_REPAIR) == 0
+    assert await worker.run_demand_slice(DemandKind.SCHEDULED_DISCOVERY) == 0
     assert conn.execute(
         "SELECT message_id FROM scheduled_messages WHERE dialog_id=42 AND message_state='scheduled' ORDER BY message_id"
     ).fetchall() == [(11,), (12,)]
@@ -883,16 +599,72 @@ async def test_concurrent_event_prevents_stale_snapshot_apply(conn: sqlite3.Conn
     ).fetchone() == (2, 100)
 
 
-def test_scheduled_policy_targets_have_one_code_owned_definition() -> None:
+@pytest.mark.asyncio
+async def test_continuity_gap_fences_snapshot_when_recovery_is_already_pending(conn: sqlite3.Connection) -> None:
+    conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES(42,'user',0)")
+    conn.execute(
+        "INSERT INTO scheduled_reconciliation_state(dialog_id,discovery_due_at,dirty_since,dirty_generation,updated_at,"
+        "coverage_state,coverage_reason) VALUES(42,0,0,1,0,'unknown','baseline_unknown')"
+    )
+    conn.commit()
+    snapshot_started = asyncio.Event()
+    release_snapshot = asyncio.Event()
+
+    class InFlightSnapshotClient(_ScheduledSnapshotClient):
+        async def __call__(self, _request: object, **_kwargs: object) -> object:
+            snapshot_started.set()
+            await release_snapshot.wait()
+            return types.messages.Messages(
+                messages=cast(list[types.TypeMessage], [_message(99)]), topics=[], users=[], chats=[]
+            )
+
+    worker = ScheduledMessageReconciler(
+        InFlightSnapshotClient(),
+        conn,
+        asyncio.Event(),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
+        writer=inline_writer(conn),
+    )
+    acquisition = asyncio.create_task(worker.run_demand_slice(DemandKind.SCHEDULED_DISCOVERY))
+    await snapshot_started.wait()
+
+    await worker.invalidate_continuity(42)
+    release_snapshot.set()
+    await acquisition
+
+    assert conn.execute(
+        "SELECT dirty_generation,discovery_due_at,coverage_state FROM scheduled_reconciliation_state WHERE dialog_id=42"
+    ).fetchone() == (2, 0, "unknown")
+    assert conn.execute("SELECT COUNT(*) FROM scheduled_messages WHERE dialog_id=42").fetchone() == (0,)
+    assert conn.execute("SELECT snapshot_observation_order FROM scheduled_reconciliation_state").fetchone() == (None,)
+
+
+@pytest.mark.parametrize("coverage_state", ["inaccessible", "unsupported"])
+def test_scheduled_event_reopens_terminal_coverage_for_finite_recovery(
+    conn: sqlite3.Connection, coverage_state: str
+) -> None:
+    conn.execute(
+        "INSERT INTO scheduled_reconciliation_state(dialog_id,updated_at,coverage_state,coverage_reason) "
+        "VALUES(42,100,?,'prior_terminal_state')",
+        (coverage_state,),
+    )
+    conn.commit()
+
+    with write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(21, scheduled_at=1_900_000_021), now=200)
+
+    assert conn.execute(
+        "SELECT discovery_due_at,dirty_generation,coverage_state,coverage_reason "
+        "FROM scheduled_reconciliation_state WHERE dialog_id=42"
+    ).fetchone() == (200, 1, "unknown", "scheduled_event_after_terminal_coverage")
+    assert scheduled_dialog_has_due_work(conn, 42)
+
+
+def test_scheduled_demands_have_no_periodic_freshness_target() -> None:
     policy = ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10)
-    repair_target = demand_contract(DemandKind.SCHEDULED_REPAIR).freshness_target
-    discovery_target = demand_contract(DemandKind.SCHEDULED_DISCOVERY).freshness_target
-    assert repair_target is not None
-    assert discovery_target is not None
-    assert int(repair_target.total_seconds()) == SCHEDULED_ACTIVE_REPAIR_SECONDS
-    assert int(discovery_target.total_seconds()) == SCHEDULED_QUIET_DISCOVERY_SECONDS
-    assert not hasattr(policy, "active_repair_seconds")
-    assert not hasattr(policy, "quiet_discovery_seconds")
+    assert demand_contract(DemandKind.SCHEDULED_REPAIR).freshness_target is None
+    assert demand_contract(DemandKind.SCHEDULED_DISCOVERY).freshness_target is None
+    assert not hasattr(policy, "state_scan_seconds")
 
 
 def test_scheduled_demand_status_reads_repair_and_discovery_due_state(conn: sqlite3.Connection) -> None:
@@ -1002,7 +774,7 @@ async def test_scheduled_seed_receipt_allows_later_unseeded_candidate_under_real
         client,
         conn,
         shutdown,
-        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10, state_scan_seconds=60),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
         writer=inline_writer(conn),
     )
     adapter = ScheduledDiscoveryDemandAdapter(reconciler, account_id=42)
@@ -1023,6 +795,50 @@ async def test_scheduled_seed_receipt_allows_later_unseeded_candidate_under_real
         (43,),
     ]
     assert client.requests == []
+
+
+@pytest.mark.asyncio
+async def test_scheduled_seed_binds_account_before_directory_generation_exists(
+    conn: sqlite3.Connection,
+) -> None:
+    conn.execute("UPDATE scheduled_sync_state SET account_id=NULL,directory_generation=NULL WHERE key='account'")
+    conn.commit()
+    reconciler = ScheduledMessageReconciler(
+        _ScheduledSnapshotClient(),
+        conn,
+        asyncio.Event(),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
+        writer=inline_writer(conn),
+    )
+    adapter = ScheduledDiscoveryDemandAdapter(reconciler, account_id=42)
+
+    initial_seed = adapter.status(time.time())
+    assert initial_seed is not None and initial_seed.selected is not None
+    assert initial_seed.selected.key.target == "seed"
+    await adapter.run_slice(RpcAttemptBudget(limit=16, selected=initial_seed.selected))
+    assert conn.execute(
+        "SELECT account_id,directory_generation FROM scheduled_sync_state WHERE key='account'"
+    ).fetchone() == (42, None)
+
+    conn.execute("UPDATE dialog_directory_publication SET account_id=42,generation=7 WHERE singleton=1")
+    conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES(43,'user',0)")
+    conn.commit()
+    published_seed = adapter.status(time.time())
+    assert published_seed is not None and published_seed.selected is not None
+    assert published_seed.selected.key.target == "seed"
+    await adapter.run_slice(RpcAttemptBudget(limit=16, selected=published_seed.selected))
+
+    assert conn.execute(
+        "SELECT account_id,directory_generation FROM scheduled_sync_state WHERE key='account'"
+    ).fetchone() == (42, 7)
+    new_peer_coverage = conn.execute(
+        "SELECT coverage_state,discovery_due_at FROM scheduled_reconciliation_state WHERE dialog_id=43"
+    ).fetchone()
+    assert new_peer_coverage is not None
+    assert new_peer_coverage[0] == "unknown" and new_peer_coverage[1] is not None
+    with pytest.raises(RuntimeError, match="account"):
+        ScheduledDiscoveryDemandAdapter(reconciler, account_id=99).status(time.time())
+    assert conn.execute("SELECT account_id FROM scheduled_sync_state WHERE key='account'").fetchone() == (42,)
 
 
 @pytest.mark.asyncio
@@ -1147,6 +963,11 @@ async def test_scheduled_selected_negative_channel_dialog_is_accepted(
     with write_transaction(conn):
         upsert_scheduled_message(conn, dialog_id, _message(11, scheduled_at=now + 3600), now=now)
     conn.execute(
+        "INSERT INTO scheduled_reconciliation_state(dialog_id,updated_at,baseline_observed_at,coverage_state) "
+        "VALUES(42,?,?, 'complete')",
+        (now, now),
+    )
+    conn.execute(
         "UPDATE scheduled_reconciliation_state SET repair_due_at=?, discovery_due_at=? WHERE dialog_id=?",
         (now, now, dialog_id),
     )
@@ -1204,6 +1025,19 @@ def test_scheduled_demand_status_honors_future_account_retry(
     assert status is not None
     assert status.release_at == 300
     assert status.freshness_deadline == queue_due_at
+
+
+def test_scheduled_demand_rejects_a_different_bound_account(conn: sqlite3.Connection) -> None:
+    reconciler = ScheduledMessageReconciler(
+        _ScheduledSnapshotClient(),
+        conn,
+        asyncio.Event(),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
+        writer=inline_writer(conn),
+    )
+
+    with pytest.raises(RuntimeError, match="different Telegram account"):
+        ScheduledDiscoveryDemandAdapter(reconciler, account_id=99).status(time.time())
 
 
 @pytest.mark.parametrize(
@@ -1289,13 +1123,13 @@ async def test_scheduled_discovery_adapter_runs_only_discovery_rows_with_precise
         client,
         conn,
         asyncio.Event(),
-        OwnOnlyContext(account_id=999),
+        OwnOnlyContext(account_id=42),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
         writer=inline_writer(conn),
     )
 
     conn.commit()
-    adapter = ScheduledDiscoveryDemandAdapter(reconciler, account_id=999)
+    adapter = ScheduledDiscoveryDemandAdapter(reconciler, account_id=42)
     status = adapter.status(time.time())
     assert status is not None and status.selected is not None
     await adapter.run_slice(RpcAttemptBudget(limit=16, selected=status.selected))
@@ -1322,7 +1156,7 @@ async def test_future_account_retry_does_not_appear_runnable(conn: sqlite3.Conne
         client,
         conn,
         asyncio.Event(),
-        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10, state_scan_seconds=60),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
         writer=inline_writer(conn),
     )
 
@@ -1332,29 +1166,36 @@ async def test_future_account_retry_does_not_appear_runnable(conn: sqlite3.Conne
 
 
 @pytest.mark.asyncio
-async def test_candidate_seed_is_not_repeated_for_an_immediate_slice(
-    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls = 0
-
-    def fake_candidates(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
-        nonlocal calls
-        calls += 1
-        return []
-
-    monkeypatch.setattr("mcp_telegram.scheduled_messages.query_own_only_candidates", fake_candidates)
+async def test_complete_scheduled_baseline_stays_idle_after_days_and_events(conn: sqlite3.Connection) -> None:
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO scheduled_reconciliation_state(dialog_id,repair_due_at,discovery_due_at,updated_at,"
+        "baseline_observed_at,coverage_state) VALUES(42,NULL,NULL,?,?, 'complete')",
+        (now, now),
+    )
+    conn.execute("UPDATE scheduled_sync_state SET account_id=42 WHERE key='account'")
+    conn.commit()
+    client = _ScheduledSnapshotClient()
     worker = ScheduledMessageReconciler(
-        _ScheduledSnapshotClient(),
+        client,
         conn,
         asyncio.Event(),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
         writer=inline_writer(conn),
     )
 
-    await worker._seed_candidates_if_due(100)
-    await worker._seed_candidates_if_due(100)
+    with write_transaction(conn):
+        upsert_scheduled_message(conn, 42, _message(11, scheduled_at=now + 60), now=now)
+    conn.commit()
 
-    assert calls == 1
+    adapter = ScheduledDiscoveryDemandAdapter(worker, account_id=42)
+    assert adapter.status(float(now + 5 * 86_400)) is None
+    assert await _run_all_demand_slices(worker) == 0
+    assert client.requests == []
+    assert conn.execute(
+        "SELECT dirty_generation,repair_due_at,discovery_due_at,coverage_state "
+        "FROM scheduled_reconciliation_state WHERE dialog_id=42"
+    ).fetchone() == (1, None, None, "complete")
 
 
 def test_due_selection_prioritizes_oldest_dirty_dialog(conn: sqlite3.Connection) -> None:
@@ -1373,39 +1214,6 @@ def test_due_selection_prioritizes_oldest_dirty_dialog(conn: sqlite3.Connection)
     )
 
     assert [row[0] for row in worker._due_rows(100)] == [42, 41, 43]
-
-
-@pytest.mark.asyncio
-async def test_excluded_discovery_removes_only_scheduled_ownership_basis(conn: sqlite3.Connection) -> None:
-    dialog_id = -1000000009005
-    conn.execute(
-        "INSERT INTO dialogs(dialog_id, type, hidden) VALUES (?, 'channel', 0)",
-        (dialog_id,),
-    )
-    conn.execute(
-        "INSERT INTO own_only_dialogs(dialog_id, inclusion_basis, updated_at) VALUES (?, ?, ?)",
-        (dialog_id, '["owned_channel","scheduled_event"]', 1),
-    )
-    conn.execute(
-        "INSERT INTO scheduled_reconciliation_state(dialog_id, repair_due_at, discovery_due_at, updated_at) "
-        "VALUES (?, NULL, 0, 0)",
-        (dialog_id,),
-    )
-    conn.commit()
-    worker = ScheduledMessageReconciler(
-        _ScheduledSnapshotClient(entities={dialog_id: SimpleNamespace(creator=False, admin_rights=None)}),
-        conn,
-        asyncio.Event(),
-        OwnOnlyContext(account_id=42),
-        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
-        writer=inline_writer(conn),
-    )
-
-    conn.commit()
-    assert await _run_all_demand_slices(worker) == 0
-    assert conn.execute("SELECT inclusion_basis FROM own_only_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
-        '["owned_channel"]',
-    )
 
 
 @pytest.mark.asyncio
@@ -1473,8 +1281,11 @@ async def test_authoritative_snapshot_fences_retained_create_including_unknown_a
 )
 @pytest.mark.asyncio
 async def test_incomplete_scheduled_response_never_advances_authoritative_absence_floor(
-    conn: sqlite3.Connection, response: object
+    conn: sqlite3.Connection, response: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    now = 1_800_000_000
+    monkeypatch.setattr("mcp_telegram.scheduled_messages.time.time", lambda: now)
+    conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES(42,'user',0)")
     conn.execute(
         "INSERT INTO scheduled_reconciliation_state(dialog_id,repair_due_at,discovery_due_at,updated_at) "
         "VALUES(42,0,0,0)"
@@ -1492,6 +1303,51 @@ async def test_incomplete_scheduled_response_never_advances_authoritative_absenc
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
         writer=inline_writer(conn),
     )
-    with pytest.raises(ValueError, match="scheduled history"):
-        await worker.run_demand_slice(DemandKind.SCHEDULED_REPAIR)
+    await worker.run_demand_slice(DemandKind.SCHEDULED_DISCOVERY)
     assert conn.execute("SELECT snapshot_observation_order FROM scheduled_reconciliation_state").fetchone() == (None,)
+    assert conn.execute(
+        "SELECT coverage_state,coverage_reason,repair_due_at,discovery_due_at FROM scheduled_reconciliation_state"
+    ).fetchone() == ("unknown", "rpc_error", now + 300, now + 300)
+    for adapter_type in (ScheduledRepairDemandAdapter, ScheduledDiscoveryDemandAdapter):
+        status = adapter_type(
+            ScheduledMessageReconciler(
+                Client(),
+                conn,
+                asyncio.Event(),
+                policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
+                writer=inline_writer(conn),
+            ),
+            account_id=42,
+        ).status(now)
+        assert status is not None and status.release_at == now + 300
+
+
+@pytest.mark.asyncio
+async def test_access_loss_marks_scheduled_coverage_inaccessible(conn: sqlite3.Connection) -> None:
+    dialog_id = -1_000_000_000_042
+    conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES(?,'channel',0)", (dialog_id,))
+    conn.execute(
+        "INSERT INTO scheduled_reconciliation_state(dialog_id,repair_due_at,discovery_due_at,updated_at) "
+        "VALUES(?,NULL,0,0)",
+        (dialog_id,),
+    )
+    conn.commit()
+    client = _ScheduledSnapshotClient(call_error=ChannelPrivateError(request=None))
+    worker = ScheduledMessageReconciler(
+        client,
+        conn,
+        asyncio.Event(),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
+        writer=inline_writer(conn),
+    )
+
+    await worker.run_demand_slice(DemandKind.SCHEDULED_DISCOVERY)
+
+    assert conn.execute(
+        "SELECT coverage_state,coverage_reason,repair_due_at,discovery_due_at "
+        "FROM scheduled_reconciliation_state WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone() == ("inaccessible", "ChannelPrivateError", None, None)
+    assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        "access_lost",
+    )
