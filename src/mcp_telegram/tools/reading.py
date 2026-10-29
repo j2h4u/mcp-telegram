@@ -1206,26 +1206,24 @@ def _format_search_result_row(row: dict, query: str, *, global_mode: bool) -> st
 
 class ListMessages(ToolArgs):
     """
-    List messages in one dialog, or list the scheduled queue across dialogs.
+    List messages in one dialog or page the local scheduled queue.
 
-    Provide dialog= for fuzzy/name/link resolution or exact_dialog_id= when known.
-    Set read_scope="all_dialogs" with message_state="scheduled" to page the
-    local account queue. This global mode rejects dialog and topic selectors.
+    Select a dialog with dialog= or exact_dialog_id=. Set read_scope="all_dialogs"
+    with message_state="scheduled" for the account queue; global mode rejects
+    dialog and topic selectors.
 
-    Pages are chronological. Omit navigation or use navigation="latest" for the
-    recent tail; use navigation="start" for the beginning. Reuse the exact
-    next_navigation token with the same filters, including message_state and unread.
+    Pages are chronological. Start with navigation="latest" or "start", then
+    reuse next_navigation with the same filters, including message_state and unread.
+    By default, message_state="all" returns the local combined stream. Use
+    message_state="sent" for published history, search-hit anchors and topic
+    resolution. Scheduled rows are author_only and unpublished.
 
-    The default message_state="all" returns the local combined stream. Use
-    message_state="sent" for published history, search-hit anchors, and natural
-    topic resolution. Scheduled rows are author_only and unpublished.
-
-    Use anchor_message_id with exact_dialog_id to read context around a search hit.
+    Use anchor_message_id with exact_dialog_id for context around a search hit.
     Reads use retained local facts in every sync state and never fetch Telegram.
-    Missing anchors are reported as unavailable. Sender, topic and unread filters
-    cannot be combined with anchors; UTC bounds remain supported. Coverage and
-    its observation horizon describe what is known; local page exhaustion does
-    not establish current Telegram completeness. DM rows include read_state.
+    Missing anchors are unavailable. Sender, topic and unread filters cannot
+    accompany anchors; UTC bounds remain supported. Coverage and its horizon
+    describe what is known; page exhaustion does not establish current Telegram
+    completeness. DM rows include read_state.
     """
 
     dialog: str | None = Field(
