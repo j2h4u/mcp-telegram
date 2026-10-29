@@ -194,9 +194,9 @@ def project_search_hit(
         "scheduled_at": lifecycle["scheduled_at"],
         "published_at": lifecycle["published_at"],
         "inclusion_basis": lifecycle["inclusion_basis"],
-        "repeat_period": lifecycle["repeat_period"],
-        "expected_version": lifecycle["expected_version"],
-        "scheduled_coverage": lifecycle["scheduled_coverage"],
+        "repeat_period": lifecycle.get("repeat_period"),
+        "expected_version": lifecycle.get("expected_version"),
+        "scheduled_coverage": lifecycle.get("scheduled_coverage"),
         "dialog_type": row.get("dialog_type"),
         "reaction_events": [
             _reaction_event_payload(event) for event in cast("Iterable[object]", row.get("reaction_events") or ())

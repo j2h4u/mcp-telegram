@@ -517,6 +517,8 @@ async def test_real_list_messages_seams_record_local_routes_without_fallback(sel
 
 @pytest.mark.asyncio
 async def test_non_sent_routes_measure_projection_and_response_shape() -> None:
+    from tests.test_scheduled_read_surface import _create_scheduled_table, _make_scheduled_server
+
     class Sink:
         def __init__(self) -> None:
             self.events: list[dict[str, object]] = []
@@ -527,9 +529,10 @@ async def test_non_sent_routes_measure_projection_and_response_shape() -> None:
     conn = _make_db()
     _insert_synced_dialog(conn, 1)
     _insert_message(conn, 1, 100, text="local")
+    _create_scheduled_table(conn)
     for index, message_state in enumerate(("scheduled", "all"), start=1):
         sink = Sink()
-        server = make_server(conn)
+        server = _make_scheduled_server(conn)
         server._runtime_observation_sink = cast(RuntimeObservationSink, sink)
         response, _, _ = await server._handle_client_line(
             json.dumps(
@@ -553,12 +556,14 @@ async def test_non_sent_routes_measure_projection_and_response_shape() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("message_state", ["scheduled", "all"])
+@pytest.mark.parametrize(
+    ("message_state", "read_scope"), [("scheduled", "dialog"), ("scheduled", "all_dialogs"), ("all", "dialog")]
+)
 async def test_scheduled_inner_shape_is_measured_independently(
-    message_state: str, monkeypatch: pytest.MonkeyPatch
+    message_state: str, read_scope: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from mcp_telegram.reading import service as reading_service_module
-    from tests.test_scheduled_read_surface import _create_scheduled_table, _insert_scheduled
+    from tests.test_scheduled_read_surface import _create_scheduled_table, _insert_scheduled, _make_scheduled_server
 
     conn = _make_db()
     _insert_synced_dialog(conn, 1)
@@ -566,12 +571,16 @@ async def test_scheduled_inner_shape_is_measured_independently(
     _create_scheduled_table(conn)
     _insert_scheduled(conn, 200, 2_000_000_000, "scheduled")
     original_mapper = reading_service_module.scheduled_row_to_wire
+    clock = [0.0]
+    monkeypatch.setattr(request_timing_module.time, "monotonic", lambda: clock[0])
 
-    def delayed_mapper(row: object, *, inclusion_basis: object) -> dict[str, object]:
-        item = original_mapper(cast(dict[str, object], row), inclusion_basis=cast(tuple[str, ...], inclusion_basis))
-        timing = current_timing()
-        assert timing is not None
-        timing.add_phase("response_shape", 41.0)
+    def delayed_mapper(row: object, *, inclusion_basis: object, account_id: int | None = None) -> dict[str, object]:
+        item = original_mapper(
+            cast(dict[str, object], row),
+            inclusion_basis=cast(tuple[str, ...], inclusion_basis),
+            account_id=account_id,
+        )
+        clock[0] += 0.041
         return item
 
     monkeypatch.setattr(reading_service_module, "scheduled_row_to_wire", delayed_mapper)
@@ -581,15 +590,16 @@ async def test_scheduled_inner_shape_is_measured_independently(
         def record(self, **kwargs: object) -> None:
             sink_events.append(kwargs)
 
-    server = make_server(conn)
+    server = _make_scheduled_server(conn)
     server._runtime_observation_sink = cast(RuntimeObservationSink, Sink())
     response, _, _ = await server._handle_client_line(
         json.dumps(
             {
                 "method": "list_messages",
                 "operation_id": ("a" if message_state == "scheduled" else "b") * 32,
-                "dialog_id": 1,
+                "dialog_id": 1 if read_scope == "dialog" else None,
                 "message_state": message_state,
+                "read_scope": read_scope,
             }
         ).encode(),
         "",
@@ -599,6 +609,10 @@ async def test_scheduled_inner_shape_is_measured_independently(
     assert response["ok"] is True
     payload = cast(dict[str, object], sink_events[0]["payload"])
     assert cast(float, payload["response_shape_ms"]) >= 41.0
+    assert payload["route_attempted"] == "local_non_sent_state"
+    assert payload["local_projection_ms"] is not None
+    assert payload["response_shape_ms"] is not None
+    assert payload["measured_required_phase_count"] == payload["required_phase_count"] == 3
 
 
 @pytest.mark.asyncio

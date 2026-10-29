@@ -1750,75 +1750,79 @@ class ReadingService:
         direction: str,
     ) -> dict:
         """Read pending scheduled facts with a local, account-bound keyset."""
-        account_result = self._scheduled_account_coverage()
+        _set_timing_route("local_non_sent_state")
+        with timing_phase("local_projection"):
+            account_result = self._scheduled_account_coverage()
         if isinstance(account_result, dict):
             return account_result
         account_id, coverage = account_result
-        fingerprint = self._scheduled_filter_fingerprint(
-            sender_id=request.sender_id,
-            sender_name=request.sender_name,
-            topic_id=request.topic_id,
-            since_utc=request.since_utc,
-            until_utc=request.until_utc,
-        )
-        navigation = self._bind_scheduled_queue_navigation(
-            request,
-            account_id=account_id,
-            fingerprint=fingerprint,
-            dialog_id=dialog_id,
-            read_scope=read_scope,
-            direction=direction,
-        )
+        with timing_phase("resolution"):
+            fingerprint = self._scheduled_filter_fingerprint(
+                sender_id=request.sender_id,
+                sender_name=request.sender_name,
+                topic_id=request.topic_id,
+                since_utc=request.since_utc,
+                until_utc=request.until_utc,
+            )
+            navigation = self._bind_scheduled_queue_navigation(
+                request,
+                account_id=account_id,
+                fingerprint=fingerprint,
+                dialog_id=dialog_id,
+                read_scope=read_scope,
+                direction=direction,
+            )
         if isinstance(navigation, dict):
             return navigation
         anchor, direction = navigation
         raw_rows = self._read_scheduled_queue_rows(request, dialog_id, direction, anchor)
-        has_more = len(raw_rows) > request.limit
-        selected = raw_rows[: request.limit]
-        selected_count = len(selected)
-        rows, identities = self._project_scheduled_queue_rows(selected, dialog_id, account_id)
-        bounded_rows, budget_truncated = self._bound_scheduled_queue_rows(rows)
-        if budget_truncated:
-            selected = selected[: len(bounded_rows)]
-            has_more = True
-        rows = bounded_rows if direction == "oldest" else list(reversed(bounded_rows))
-        next_navigation = None
-        if has_more and selected:
-            next_navigation = self._scheduled_queue_next_navigation(
-                selected[-1],
-                account_id=account_id,
-                read_scope=read_scope,
-                dialog_id=dialog_id,
-                direction=direction,
-                fingerprint=fingerprint,
-            )
-        data: dict[str, object] = {
-            "messages": rows,
-            "source": "scheduled_messages",
-            "next_navigation": next_navigation,
-            "message_state": "scheduled",
-            "read_scope": read_scope,
-            "navigation_direction": direction,
-            "scope": "all",
-            "scheduled_coverage": coverage,
-            "has_more": has_more,
-            "truncation": {
-                "is_truncated": budget_truncated,
-                "shown_count": len(rows),
-                "hidden_count": selected_count - len(rows) if budget_truncated else 0,
-                "reason": "response_budget" if budget_truncated else None,
-            },
-        }
-        if dialog_id is not None:
-            identity = identities[dialog_id]
-            data.update(
-                dialog_id=dialog_id,
-                dialog_name=identity.display_name,
-                dialog_name_source=identity.display_name_source,
-                dialog_type=identity.dialog_type.value,
-                dialog_scheduled_coverage=self._scheduled_dialog_coverage(dialog_id),
-            )
-        return {"ok": True, "data": data}
+        with timing_phase("response_shape"):
+            has_more = len(raw_rows) > request.limit
+            selected = raw_rows[: request.limit]
+            selected_count = len(selected)
+            rows, identities = self._project_scheduled_queue_rows(selected, dialog_id, account_id)
+            bounded_rows, budget_truncated = self._bound_scheduled_queue_rows(rows)
+            if budget_truncated:
+                selected = selected[: len(bounded_rows)]
+                has_more = True
+            rows = bounded_rows if direction == "oldest" else list(reversed(bounded_rows))
+            next_navigation = None
+            if has_more and selected:
+                next_navigation = self._scheduled_queue_next_navigation(
+                    selected[-1],
+                    account_id=account_id,
+                    read_scope=read_scope,
+                    dialog_id=dialog_id,
+                    direction=direction,
+                    fingerprint=fingerprint,
+                )
+            data: dict[str, object] = {
+                "messages": rows,
+                "source": "scheduled_messages",
+                "next_navigation": next_navigation,
+                "message_state": "scheduled",
+                "read_scope": read_scope,
+                "navigation_direction": direction,
+                "scope": "all",
+                "scheduled_coverage": coverage,
+                "has_more": has_more,
+                "truncation": {
+                    "is_truncated": budget_truncated,
+                    "shown_count": len(rows),
+                    "hidden_count": selected_count - len(rows) if budget_truncated else 0,
+                    "reason": "response_budget" if budget_truncated else None,
+                },
+            }
+            if dialog_id is not None:
+                identity = identities[dialog_id]
+                data.update(
+                    dialog_id=dialog_id,
+                    dialog_name=identity.display_name,
+                    dialog_name_source=identity.display_name_source,
+                    dialog_type=identity.dialog_type.value,
+                    dialog_scheduled_coverage=self._scheduled_dialog_coverage(dialog_id),
+                )
+            return {"ok": True, "data": data}
 
     @staticmethod
     def _bind_scheduled_queue_navigation(  # noqa: PLR0913

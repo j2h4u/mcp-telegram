@@ -8,10 +8,11 @@ Inventory source command:
 uv run python -c "from mcp_telegram import server; print(len(server.tool_by_name)); print('\n'.join(sorted(server.tool_by_name)))"
 ```
 
-Historical Phase 52 baseline registry count: 18 tools.
+Historical Phase 52 baseline registry count: 17 tools.
+Current registry count: 18 tools; `manage_scheduled_message` was added after this baseline.
 
 Current Phase 52 completion status:
-- The historical Phase 52 baseline recorded 18 registered tools declaring `outputSchema` in the live MCP tool descriptors at that time.
+- The historical Phase 52 baseline recorded 17 registered tools declaring `outputSchema` in the live MCP tool descriptors at that time. The current registry has 18 tools, including the scheduled-message tool added after the baseline.
 - Every successful tool path returns `structuredContent`; recoverable error paths may stay text-only.
 - The table below is the Plan 52-01 pre-implementation baseline and lossless migration map. Its
   `Baseline` columns intentionally preserve the state observed before later Phase 52 plans ran.
@@ -36,6 +37,7 @@ Current Phase 52 completion status:
 
 | `get_draft` | Get Draft | primary | true | true | yes | local current draft and temporary undo history; unknown distinct from absent | `current`, `history[]`, `selected_history`, `next_action` | none |
 | `manage_draft` | Manage Draft | primary | false | false | yes | explicit native draft create/update/clear/restore, version conflict and uncertain result guidance; never sends | `outcome`, `operation_key`, `mutation_dispatched`, `save_acknowledged`, `backup_history_id`, `current`, `next_action` | native cloud draft mutation |
+| `manage_scheduled_message` | Manage Scheduled Message | primary | false | not in baseline | not in baseline | create/update/cancel one native scheduled queue item; receipt lookup guidance; accepted items may publish automatically later | `ok`, `action`, `operation_key`, `account_id`, `dialog_id`, `scheduled_message_id`, `outcome`, `mutation_dispatched`, `acknowledged`, `receipt_persisted`, `current_is_operation_confirmation`, `schedule_at_utc` | scheduled queue mutation; no immediate-send action |
 
 ## Lossless Signal Checklist
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import cast
 
+import pytest
 from jsonschema import validate  # type: ignore[import-untyped]
 
 from mcp_telegram.message_content import MessageSnapshot, project_message_content
@@ -37,6 +38,7 @@ def _maximal_row() -> dict[str, object]:
     return {
         "dialog_id": -100,
         "dialog_name": "Search Chat",
+        "dialog_type": "supergroup",
         "message_id": 42,
         "sent_at": 1_700_000_000,
         "text": ("prefix " * 20) + "needle" + (" tail" * 25),
@@ -56,11 +58,21 @@ def _maximal_row() -> dict[str, object]:
 
 
 def test_search_hit_schema_and_maximal_projector_have_exact_field_parity() -> None:
-    hit = project_search_hit(_maximal_row(), "needle", lifecycle=_lifecycle())
+    lifecycle = {
+        **_lifecycle(message_state="scheduled", scheduled_at=1_900_000_000, published_at=None),
+        "repeat_period": 86_400,
+        "expected_version": "observed-version",
+        "scheduled_coverage": {"state": "complete"},
+    }
+    hit = project_search_hit(_maximal_row(), "needle", lifecycle=lifecycle)
+    assert hit["repeat_period"] == 86_400
+    assert hit["expected_version"] == "observed-version"
+    assert hit["scheduled_coverage"] == {"state": "complete"}
+    assert hit["dialog_type"] == "supergroup"
     properties = cast(dict[str, object], SEARCH_HIT_SCHEMA["properties"])
 
     assert set(hit) == set(properties)
-    assert len(properties) == 21
+    assert len(properties) == 25
     assert cast(list[str], SEARCH_HIT_SCHEMA["required"]) == [
         "dialog_id",
         "dialog_name",
@@ -75,6 +87,10 @@ def test_search_hit_schema_and_maximal_projector_have_exact_field_parity() -> No
         "scheduled_at",
         "published_at",
         "inclusion_basis",
+        "repeat_period",
+        "expected_version",
+        "scheduled_coverage",
+        "dialog_type",
         "reaction_events",
         "reaction_events_status",
         "read_at",
@@ -82,13 +98,13 @@ def test_search_hit_schema_and_maximal_projector_have_exact_field_parity() -> No
     validate(instance=hit, schema=SEARCH_HIT_SCHEMA)
 
 
-def test_registered_search_hit_schema_preserves_normalized_20_field_11_required_contract() -> None:
+def test_registered_search_hit_schema_keeps_scheduled_metadata_nullable() -> None:
     registered = cast(dict[str, object], TOOL_REGISTRY["search_messages"].output_schema)
     properties = cast(dict[str, object], registered["properties"])
     results = cast(dict[str, object], properties["results"])
     item = cast(dict[str, object], results["items"])
 
-    assert len(cast(dict[str, object], item["properties"])) == 21
+    assert len(cast(dict[str, object], item["properties"])) == 25
     assert cast(list[str], item["required"]) == [
         "dialog_id",
         "dialog_name_source",
@@ -99,7 +115,6 @@ def test_registered_search_hit_schema_preserves_normalized_20_field_11_required_
         "unpublished",
         "published",
         "unseen",
-        "inclusion_basis",
         "reaction_events",
         "reaction_events_status",
     ]
@@ -265,3 +280,15 @@ def test_sent_search_hit_anchor_coordinates_open_the_exact_result_message() -> N
         "anchor_message_id": hit["msg_id"],
         "message_state": "sent",
     }
+
+
+@pytest.mark.parametrize("missing_field", ["message_id", "visibility", "scheduled_at"])
+def test_search_hit_keeps_required_row_and_lifecycle_fields_strict(missing_field: str) -> None:
+    row = _maximal_row()
+    lifecycle = _lifecycle()
+    if missing_field == "message_id":
+        del row[missing_field]
+    else:
+        del lifecycle[missing_field]
+    with pytest.raises(KeyError, match=missing_field):
+        project_search_hit(row, "needle", lifecycle=lifecycle)
