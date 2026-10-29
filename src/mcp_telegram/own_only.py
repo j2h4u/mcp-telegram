@@ -28,7 +28,6 @@ class OwnOnlyBasis(StrEnum):
     PERSONAL_CHANNEL = "personal_channel"
     OWNED_CHANNEL = "owned_channel"
     PERSONAL_CHANNEL_DISCUSSION = "personal_channel_discussion"
-    SCHEDULED_EVENT = "scheduled_event"
 
 
 @dataclass(frozen=True, slots=True)

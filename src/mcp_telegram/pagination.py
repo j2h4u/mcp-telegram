@@ -52,6 +52,21 @@ class NavigationToken:
     scheduled_sent_at: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ScheduledQueueNavigationToken:
+    """Account- and filter-bound keyset cursor for the scheduled queue view."""
+
+    account_id: int
+    read_scope: Literal["dialog", "all_dialogs"]
+    dialog_id: int | None
+    direction: HistoryDirection
+    filter_fingerprint: str
+    time_bucket: int
+    scheduled_at: int | None
+    anchor_dialog_id: int
+    message_id: int
+
+
 @dataclass(frozen=True)
 class AccountTraceNavigationToken:
     """Opaque keyset cursor for Account Trace continuation.
@@ -316,12 +331,18 @@ def _validate_all_history_cursor(navigation: NavigationToken) -> None:
     """Validate the independent stream positions in an ``all`` continuation."""
     if (navigation.value is None) != (navigation.sent_at is None):
         raise ValueError("Invalid navigation token: all cursor sent position requires id and timestamp")
-    if (navigation.scheduled_message_id is None) != (navigation.scheduled_sent_at is None):
-        raise ValueError("Invalid navigation token: all cursor scheduled position requires id and timestamp")
+    _validate_all_scheduled_position(navigation)
     if navigation.draft_key is not None and navigation.draft_fingerprint is None:
         raise ValueError("Invalid navigation token: all cursor draft position requires fingerprint")
     if navigation.value is None and navigation.scheduled_message_id is None and navigation.draft_key is None:
         raise ValueError("Invalid navigation token: all cursor requires at least one stream position")
+
+
+def _validate_all_scheduled_position(navigation: NavigationToken) -> None:
+    if navigation.scheduled_sent_at is not None and navigation.scheduled_message_id is None:
+        raise ValueError("Invalid navigation token: all cursor scheduled timestamp requires an id")
+    if navigation.scheduled_message_id is not None and navigation.scheduled_message_id <= 0:
+        raise ValueError("Invalid navigation token: all cursor scheduled id must be positive")
 
 
 def _decode_optional_navigation_fields(
@@ -456,6 +477,80 @@ def encode_search_navigation(  # noqa: PLR0913
             until_utc=until_utc,
         )
     )
+
+
+def encode_scheduled_queue_navigation(token: ScheduledQueueNavigationToken) -> str:
+    """Encode one validated scheduled-queue keyset position."""
+    _validate_scheduled_queue_navigation(token)
+    payload: dict[str, object] = {
+        "kind": "scheduled_queue",
+        "account_id": token.account_id,
+        "read_scope": token.read_scope,
+        "direction": token.direction,
+        "filter_fingerprint": token.filter_fingerprint,
+        "time_bucket": token.time_bucket,
+        "anchor_dialog_id": token.anchor_dialog_id,
+        "message_id": token.message_id,
+    }
+    if token.dialog_id is not None:
+        payload["dialog_id"] = token.dialog_id
+    if token.scheduled_at is not None:
+        payload["scheduled_at"] = token.scheduled_at
+    return _encode_payload(payload)
+
+
+def decode_scheduled_queue_navigation(value: str) -> ScheduledQueueNavigationToken:
+    """Decode and validate an account-bound scheduled queue cursor."""
+    data = _decode_payload(value)
+    if data.get("kind") != "scheduled_queue":
+        raise ValueError("Invalid navigation token: kind must be scheduled_queue")
+    account_id = _scheduled_int(data, "account_id")
+    dialog_id = _scheduled_optional_int(data, "dialog_id")
+    direction = data.get("direction")
+    read_scope = data.get("read_scope")
+    filter_fingerprint = data.get("filter_fingerprint")
+    token = ScheduledQueueNavigationToken(
+        account_id=account_id,
+        read_scope=cast(Literal["dialog", "all_dialogs"], read_scope),
+        dialog_id=dialog_id,
+        direction=HistoryDirection(cast(str, direction)),
+        filter_fingerprint=cast(str, filter_fingerprint),
+        time_bucket=_scheduled_int(data, "time_bucket"),
+        scheduled_at=_scheduled_optional_int(data, "scheduled_at"),
+        anchor_dialog_id=_scheduled_int(data, "anchor_dialog_id"),
+        message_id=_scheduled_int(data, "message_id"),
+    )
+    _validate_scheduled_queue_navigation(token)
+    return token
+
+
+def _scheduled_int(data: dict[str, object], key: str) -> int:
+    value = data.get(key)
+    if type(value) is not int:
+        raise ValueError(f"Invalid navigation token: {key} must be an integer")
+    return value
+
+
+def _scheduled_optional_int(data: dict[str, object], key: str) -> int | None:
+    value = data.get(key)
+    if value is not None and type(value) is not int:
+        raise ValueError(f"Invalid navigation token: {key} must be an integer when present")
+    return cast(int | None, value)
+
+
+def _validate_scheduled_queue_navigation(token: ScheduledQueueNavigationToken) -> None:
+    if token.account_id <= 0 or token.anchor_dialog_id == 0 or token.message_id <= 0:
+        raise ValueError("Invalid navigation token: account, dialog, and message ids must be valid")
+    if token.read_scope not in {"dialog", "all_dialogs"}:
+        raise ValueError("Invalid navigation token: read_scope must be dialog or all_dialogs")
+    if (token.read_scope == "dialog") != (token.dialog_id is not None):
+        raise ValueError("Invalid navigation token: dialog id does not match scheduled read scope")
+    if token.time_bucket not in {0, 1} or (token.time_bucket == 0) != (token.scheduled_at is None):
+        raise ValueError("Invalid navigation token: scheduled time does not match null bucket")
+    if token.direction not in {HistoryDirection.NEWEST, HistoryDirection.OLDEST}:
+        raise ValueError("Invalid navigation token: invalid scheduled direction")
+    if not token.filter_fingerprint:
+        raise ValueError("Invalid navigation token: missing scheduled filter fingerprint")
 
 
 def encode_account_trace_navigation(request: AccountTraceNavigationRequest) -> str:

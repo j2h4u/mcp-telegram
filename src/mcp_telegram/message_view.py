@@ -55,7 +55,7 @@ MESSAGE_VIEW_SCHEMA: dict[str, object] = {
     "properties": {
         "dialog_id": {"type": "integer"},
         "msg_id": {"type": "integer"},
-        "sent_at": {"type": "integer"},
+        "sent_at": {"type": ["integer", "null"]},
         "sender": ENTITY_IDENTITY_SCHEMA,
         "out": {"type": "boolean"},
         "is_service": {"type": "boolean"},

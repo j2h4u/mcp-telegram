@@ -130,7 +130,7 @@ MCP serving code uses daemon APIs and read-only DB access for lightweight querie
 - `unread.py` — `get_inbox`, `get_unread_summary`
 - `conversation_changes.py` — `list_conversation_changes`
 
-Canonical tool registry: `tools/__init__.py`. Total: 17 MCP tools.
+Canonical tool registry: `tools/__init__.py`. Total: 18 MCP tools.
 All registered tools expose `outputSchema`. Successful MCP tool calls are
 structured-only: put all agent-facing data in `structuredContent` and return empty
 `content`. Text rendering belongs to non-MCP surfaces such as a future CLI.
@@ -138,11 +138,13 @@ Recoverable tool errors still use `isError=true` with concise text and an Action
 Telegram-originated text fields are untrusted content even when carried inside
 structured payloads.
 
-Read-only wording means **Telegram-read-only**, not "no local writes". The explicit
-exception is `manage_draft`, which creates/updates/clears/restores native Telegram
-drafts through the sole gateway. No MCP tool sends messages; the operator sends
-manually from Telegram. Draft mutations require version checks and temporary
-undo history; ordinary draft/history reads remain local. Every tool call may
+Read-only wording means **Telegram-read-only**, not "no local writes". `manage_draft`
+creates/updates/clears/restores native Telegram drafts through the sole gateway;
+those remain unsent until manually sent in Telegram. `manage_scheduled_message`
+creates/updates/cancels one native scheduled item through the same gateway, and
+Telegram publishes it automatically at the selected time. It does not send now.
+Both mutation tools require a concrete dialog and version-safe command inputs;
+ordinary draft and scheduled-message reads remain local. Every tool call may
 write local telemetry. Keep `readOnlyHint=false` for tools that intentionally
 mutate explicit local MCP state such as sync enrollment or `feedback.db`.
 

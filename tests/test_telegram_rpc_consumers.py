@@ -113,6 +113,7 @@ def test_demand_registry_has_exact_operation_and_source_coverage() -> None:
         },
         TelegramRpcSource.DRAFT_SNAPSHOT: {DemandKind.DRAFT_SNAPSHOT},
         TelegramRpcSource.DRAFT_MUTATION: {DemandKind.DRAFT_MUTATION},
+        TelegramRpcSource.SCHEDULED_MUTATION: {DemandKind.SCHEDULED_MUTATION},
         TelegramRpcSource.MAINTENANCE: {DemandKind.SELF_PROFILE_MAINTENANCE},
         TelegramRpcSource.LINKED_CHAT_REFRESH: {DemandKind.LINKED_CHAT_REFRESH},
     }
@@ -194,6 +195,7 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
         DemandKind.OPERATOR_AUTH: 32,
         DemandKind.OPERATOR_LOGOUT: 1,
         DemandKind.DRAFT_MUTATION: 2,
+        DemandKind.SCHEDULED_MUTATION: 1,
     }
     for contract in TELEGRAM_DEMAND_CONTRACTS.values():
         consumer = TELEGRAM_RPC_CONSUMERS[contract.source]
@@ -207,8 +209,8 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
             assert contract.max_rpc_attempts_per_slice == bounded_lifecycle.get(contract.kind)
             assert contract.freshness_target is None
 
-    assert demand_contract(DemandKind.SCHEDULED_REPAIR).freshness_target == timedelta(minutes=15)
-    assert demand_contract(DemandKind.SCHEDULED_DISCOVERY).freshness_target == timedelta(hours=24)
+    assert demand_contract(DemandKind.SCHEDULED_REPAIR).freshness_target is None
+    assert demand_contract(DemandKind.SCHEDULED_DISCOVERY).freshness_target is None
     assert demand_contract(DemandKind.ARCHIVE_INCREMENTAL).freshness_target == timedelta(hours=1)
     assert demand_freshness_seconds(DemandKind.ARCHIVE_INCREMENTAL) == 3_600
     assert demand_contract(DemandKind.FULL_SYNC_DM_ENROLLMENT).max_rpc_attempts_per_slice == 32
@@ -233,6 +235,20 @@ def test_draft_mutation_is_explicit_interactive_inline_and_bounded() -> None:
     assert contract.execution_mode is ExecutionMode.INLINE
     assert contract.max_rpc_attempts_per_slice == 2
     assert DemandKind.DRAFT_MUTATION not in DURABLE_DEMAND_ORDER
+
+
+def test_scheduled_mutation_is_explicit_interactive_inline_and_single_send() -> None:
+    consumer = telegram_rpc_consumer(TelegramRpcSource.SCHEDULED_MUTATION)
+    contract = demand_contract(DemandKind.SCHEDULED_MUTATION)
+    assert consumer.acquisition.role is AcquisitionRole.MUTATION
+    assert consumer.acquisition.domains == frozenset({TelegramFactDomain.SCHEDULED_MESSAGES})
+    assert consumer.acquisition.trigger is AcquisitionTrigger.REQUEST
+    assert consumer.acquisition.fanout is FanoutScope.DIALOG
+    assert consumer.demand.owner is DemandPolicyOwner.CALLER
+    assert contract.service_class is RpcServiceClass.INTERACTIVE
+    assert contract.execution_mode is ExecutionMode.INLINE
+    assert contract.max_rpc_attempts_per_slice == 1
+    assert DemandKind.SCHEDULED_MUTATION not in DURABLE_DEMAND_ORDER
 
 
 def test_durable_demand_order_is_a_literal_complete_contract() -> None:

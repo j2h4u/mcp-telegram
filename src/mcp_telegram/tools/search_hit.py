@@ -34,7 +34,7 @@ SEARCH_HIT_SCHEMA: dict[str, object] = {
         "content": {"type": ["object", "null"]},
         "media": MEDIA_OUTPUT_SCHEMA,
         "anchor_call": {"type": "object"},
-        "message_state": {"type": "string", "enum": ["sent", "scheduled"]},
+        "message_state": {"type": "string", "enum": ["sent", "scheduled", "unknown_missing"]},
         "visibility": {
             "type": "string",
             "description": "author_only before publication, chat_visible after publication.",
@@ -44,7 +44,11 @@ SEARCH_HIT_SCHEMA: dict[str, object] = {
         "unseen": {"type": "boolean"},
         "scheduled_at": {"type": ["integer", "null"]},
         "published_at": {"type": ["integer", "null"]},
-        "inclusion_basis": {"type": "array", "items": {"type": "string"}},
+        "inclusion_basis": {"type": ["array", "null"], "items": {"type": "string"}},
+        "repeat_period": {"type": ["integer", "null"]},
+        "expected_version": {"type": ["string", "null"]},
+        "scheduled_coverage": {"type": ["object", "null"]},
+        "dialog_type": {"type": ["string", "null"]},
         "reaction_events": {
             "type": "array",
             "items": {
@@ -75,6 +79,10 @@ SEARCH_HIT_SCHEMA: dict[str, object] = {
         "scheduled_at",
         "published_at",
         "inclusion_basis",
+        "repeat_period",
+        "expected_version",
+        "scheduled_coverage",
+        "dialog_type",
         "reaction_events",
         "reaction_events_status",
         "read_at",
@@ -110,7 +118,7 @@ def _search_date(row: Mapping[str, object]) -> int | None:
 
 def _anchor_call(dialog_id: int, msg_id: int, message_state: str) -> dict[str, object]:
     arguments: dict[str, object] = {"exact_dialog_id": dialog_id}
-    if message_state == "scheduled":
+    if message_state in {"scheduled", "unknown_missing"}:
         arguments["message_state"] = "scheduled"
     else:
         arguments["anchor_message_id"] = msg_id
@@ -186,6 +194,10 @@ def project_search_hit(
         "scheduled_at": lifecycle["scheduled_at"],
         "published_at": lifecycle["published_at"],
         "inclusion_basis": lifecycle["inclusion_basis"],
+        "repeat_period": lifecycle["repeat_period"],
+        "expected_version": lifecycle["expected_version"],
+        "scheduled_coverage": lifecycle["scheduled_coverage"],
+        "dialog_type": row.get("dialog_type"),
         "reaction_events": [
             _reaction_event_payload(event) for event in cast("Iterable[object]", row.get("reaction_events") or ())
         ],

@@ -54,13 +54,9 @@ never-collected non-DM profiles remain separate limitations. See
 - Tracks your own recent messages across group/forum chats by default, including
   reactions and `reply_count` for follow-up audits.
 - Lets agents submit tool feedback into a local operator queue.
-- Does not provide a tool for sending Telegram messages.
+- Does not provide an immediate-send tool. `manage_scheduled_message` can create, edit, or cancel a native scheduled item that Telegram will publish automatically at its scheduled time.
 
-The server never sends Telegram messages. `get_draft` reads locally retained
-drafts and their recent undo history; `manage_draft` creates, edits, clears and
-restores native cloud drafts. You review and send them manually in Telegram.
-Current drafts do not expire; undo history retains up to ten previous states
-for seven days. Other tools are **Telegram-read-only**. Every tool call may write local telemetry.
+`get_draft` reads locally retained drafts and their recent undo history; `manage_draft` creates, edits, clears and restores native cloud drafts. Drafts remain unsent until you send them manually in Telegram. Current drafts do not expire; undo history retains up to ten previous states for seven days. `manage_scheduled_message` edits or cancels one retained native scheduled item, while Telegram automatically publishes accepted scheduled items at their selected time. Other tools are **Telegram-read-only**. Every tool call may write local telemetry.
 `readOnlyHint=true` means no explicit domain/local-state mutation beyond that;
 `readOnlyHint=false` marks tools that intentionally write local MCP state such as
 sync scope or `feedback.db`.
@@ -173,7 +169,7 @@ this work themselves: they return the facts already persisted by the daemon.
 
 ## MCP Tools
 
-There are 17 MCP tools. Successful calls are machine-oriented: agents should
+There are 18 MCP tools. Successful calls are machine-oriented: agents should
 read `structuredContent` for IDs, counts, navigation tokens, coverage, warnings,
 and Telegram-originated content.
 
@@ -191,7 +187,8 @@ and Telegram-originated content.
 | `mark_dialog_for_sync` | Enable or disable persistent sync for a dialog. |
 | `get_sync_status` | Inspect sync progress, coverage, access state, and local message counts. |
 | `get_draft` | Read the locally retained native draft, current version and temporary undo history. |
-| `manage_draft` | Explicitly create, update, clear or restore a native cloud draft; never sends it. |
+| `manage_draft` | Explicitly create, update, clear or restore a native cloud draft; it remains unsent until manually sent in Telegram. |
+| `manage_scheduled_message` | Create, update or cancel one native scheduled item in a selected dialog; Telegram publishes it automatically at its scheduled time. |
 | `list_conversation_changes` | List incoming human-DM edits and deletions plus durable access loss and restoration. |
 | `get_usage_stats` | Summarize local MCP tool telemetry for the last 30 days. |
 | `get_dialog_stats` | Show dialog-level reaction, mention, hashtag, and forward statistics. |

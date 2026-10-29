@@ -46,6 +46,7 @@ from mcp_telegram.flood import FloodWaitKillSwitchStatus, TelegramRpcThrottled
 from mcp_telegram.own_only_contracts import OwnOnlyContext
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.runtime_observations import RuntimeObservationSink
+from mcp_telegram.scheduled_write_fence import ScheduledMutationFence
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.startup_identity import (
     StartupIdentityResult,
@@ -92,6 +93,7 @@ def _ctx(**overrides: object) -> SimpleNamespace:
         "shutdown_event": asyncio.Event(),
         "coordinator": None,
         "demand_runtime": None,
+        "scheduled_mutation_fence": ScheduledMutationFence(),
         "handler_manager": _HandlerStub(),
         "api_server": _ApiStub(),
         "conn": MagicMock(),
@@ -174,6 +176,9 @@ class _ApiStub:
 
 
 class _ClientStub:
+    def set_scheduled_continuity_recovery(self, _callback: object) -> None:
+        pass
+
     def account_safety_status(self) -> dict[str, object] | None:
         return None
 
@@ -475,7 +480,9 @@ def test_ensure_demand_runtime_wires_all_demand_sinks_once(monkeypatch: pytest.M
             return "coordinator"
 
     coordinator = _Coordinator()
-    runtime = SimpleNamespace(coordinator=coordinator)
+    runtime = SimpleNamespace(
+        coordinator=coordinator, scheduled_reconciler=SimpleNamespace(invalidate_continuity=lambda *_: None)
+    )
     entity_service = _Bindable("entity")
     api_server = SimpleNamespace(
         _get_entity_info_service=lambda: entity_service,
@@ -669,6 +676,7 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
             _policy=SimpleNamespace(full_user_pair_enabled=True, entity_detail_ttl_seconds=300),
         ),
         draft_owner=None,
+        scheduled_mutation_fence=ScheduledMutationFence(),
         handler_manager=None,
     )
 
@@ -728,6 +736,7 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
     monkeypatch.setattr(daemon, "run_reconnect_catch_up_loop", run_reconnect)
     monkeypatch.setattr(daemon, "_prime_runtime", prime)
     monkeypatch.setattr(daemon, "_bind_draft_commands", bind_draft_commands)
+    monkeypatch.setattr(daemon, "_bind_scheduled_commands", AsyncMock())
     monkeypatch.setattr(daemon, "_offer_startup_demands", lambda _ctx: events.append("offers"))
     monkeypatch.setattr(daemon, "_run_daemon_lifetime", lifetime)
     monkeypatch.setattr(daemon, "_shutdown_sync_main_context", shutdown)

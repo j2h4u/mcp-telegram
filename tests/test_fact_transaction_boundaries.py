@@ -14,7 +14,7 @@ from mcp_telegram.message_fact_refresh import _claim_reaction_pages
 from mcp_telegram.reactions.contracts import ReactionAggregate, ReactionDetailFetchResult, ReactionDetailPage
 from mcp_telegram.reactions.detail import ReactionDetailRefresher
 from mcp_telegram.reactions.persistence import apply_aggregate_observation
-from mcp_telegram.scheduled_messages import _clear_retry, upsert_scheduled_message
+from mcp_telegram.scheduled_messages import _record_snapshot_success, upsert_scheduled_message
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
 from mcp_telegram.telegram_fact_queries import persist_read_at
@@ -50,7 +50,7 @@ def _operation(conn: sqlite3.Connection, operation: Operation) -> None:
     elif operation == "read_date":
         persist_read_at(conn, 1, 2, read_at=5, checked_at=10, status="complete")
     elif operation == "scheduled":
-        _clear_retry(conn, 10)
+        _record_snapshot_success(conn, 10)
     else:
         ReactionDetailRefresher(conn, _Gateway(conn), writer=inline_writer(conn))._persist_failure(
             conn, 1, 2, 1, expected_status="stale", expected_offset=None, staged_count=0, failure=None, when=10
@@ -68,7 +68,7 @@ def test_owner_rejection_preserves_foreign_work(conn: sqlite3.Connection, operat
     assert conn.execute("SELECT value FROM unrelated").fetchall() == []
 
 
-@pytest.mark.parametrize("operation", ["access", "history", "read_date", "scheduled"])
+@pytest.mark.parametrize("operation", ["access", "history", "read_date"])
 def test_standalone_units_restore_runtime_guard(conn: sqlite3.Connection, operation: Operation) -> None:
     enable_runtime_writes(conn)
     _operation(conn, operation)
@@ -118,6 +118,7 @@ def test_scheduled_leaf_requires_owned_parent_and_never_commits_it(conn: sqlite3
         with write_transaction(conn):
             conn.execute("INSERT INTO unrelated VALUES (7)")
             upsert_scheduled_message(conn, 1, _message(3), now=10)
+            _record_snapshot_success(conn, 10)
             assert conn.in_transaction
             raise RuntimeError("abort parent")
     assert conn.execute("SELECT value FROM unrelated").fetchall() == []

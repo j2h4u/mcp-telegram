@@ -53,8 +53,10 @@ from telethon.errors.rpcerrorlist import RPCError  # type: ignore[import-untyped
 from telethon.tl.functions.messages import GetPeerDialogsRequest  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
     InputDialogPeer,
+    InputPeerSelf,
     TypeInputDialogPeer,
     TypeInputPeer,
+    User,
 )
 
 from . import daemon_shutdown
@@ -124,7 +126,9 @@ from .runtime_observations import (
     _prune_runtime_observations_batch,
     record_runtime_observation,
 )
+from .scheduled_commands import ScheduledCommandError, ScheduledCommandOwner, settle_interrupted_scheduled_operations
 from .scheduled_messages import ScheduledMessageReconciler, ScheduledReconciliationPolicy
+from .scheduled_write_fence import ScheduledMutationFence
 from .self_profile_maintenance import (
     SelfProfileMaintenanceDemandAdapter,
     SelfProfileMaintenanceDependencies,
@@ -395,6 +399,7 @@ class _SyncMainContext:
     unix_server: asyncio.AbstractServer | None = None
     handler_manager: EventHandlerManager | None = None
     draft_owner: DraftMessageOwner | None = None
+    scheduled_mutation_fence: ScheduledMutationFence = field(default_factory=ScheduledMutationFence)
     own_only_context: OwnOnlyContext | None = None
     scheduling: SchedulingConfig = field(default_factory=SchedulingConfig)
     background_tasks: set[asyncio.Task[object]] = field(default_factory=set)
@@ -1558,11 +1563,15 @@ async def _update_self_profile(api_server: DaemonAPIServer, me: _MeLike) -> None
     """Atomically replace the account identity exposed to local readers."""
     self_id = int(me.id)
     api_server.self_id = self_id
+    premium = getattr(me, "premium", None)
+    if isinstance(me, User):
+        premium = bool(premium)
     api_server.self_profile = {
         "id": self_id,
         "first_name": getattr(me, "first_name", None),
         "last_name": getattr(me, "last_name", None),
         "username": getattr(me, "username", None),
+        "premium": premium if type(premium) is bool else None,
     }
     await api_server._publish_auth_scope(capture_auth_scope(me, api_server._client))
 
@@ -1632,12 +1641,14 @@ def _build_demand_runtime(
         ctx.client,
         ctx.conn,
         ctx.shutdown_event,
-        ctx.own_only_context,
         writer=ctx.writer,
         policy=ScheduledReconciliationPolicy(
             activity_rpc_timeout_seconds=ctx.scheduling.activity_rpc_timeout_seconds,
         ),
+        mutation_fence=ctx.scheduled_mutation_fence,
     )
+    if ctx.api_server.self_id is not None:
+        scheduled_reconciler.bind_account_id(ctx.api_server.self_id)
     dialog_reconciliation_worker = DialogReconciliationWorker(
         ctx.client,
         ctx.conn,
@@ -1665,7 +1676,7 @@ def _build_demand_runtime(
 
     async def publish_startup_identity(profile: object, own_only_context: OwnOnlyContext) -> None:
         await _publish_startup_identity(ctx, profile, own_only_context)
-        scheduled_reconciler._own_only_context = own_only_context
+        scheduled_reconciler.bind_account_id(own_only_context.account_id)
 
     draft_owner = ctx.draft_owner
     if draft_owner is None:
@@ -2011,6 +2022,93 @@ async def _bind_draft_commands(ctx: _SyncMainContext) -> None:
     )
 
 
+def _validate_scheduled_topic(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    dialog_type: DialogType,
+    topic_id: int | None,
+) -> None:
+    try:
+        has_topics = _draft_has_topics(conn, dialog_id, dialog_type)
+    except DraftCommandError as error:
+        raise ScheduledCommandError(error.reason, str(error)) from error
+    if has_topics and topic_id is None:
+        raise ScheduledCommandError("topic_required", "Choose an explicit topic, including topic_id=1 for General.")
+    if not has_topics and topic_id is not None:
+        raise ScheduledCommandError("topic_mismatch", "No topic capability is retained; check list_topics.")
+    if topic_id is not None:
+        row = cast(
+            tuple[int] | None,
+            conn.execute(
+                "SELECT 1 FROM topic_metadata WHERE dialog_id=? AND topic_id=? AND is_deleted=0 "
+                "AND inaccessible_error IS NULL",
+                (dialog_id, topic_id),
+            ).fetchone(),
+        )
+        if row is None:
+            raise ScheduledCommandError("topic_unavailable", "Exact topic is not retained or is inaccessible.")
+
+
+async def _bind_scheduled_commands(ctx: _SyncMainContext) -> None:
+    account_id = ctx.api_server.self_id
+    runtime = ctx.demand_runtime
+    assert account_id is not None and runtime is not None
+
+    async def resolve_peer(dialog_id: int, topic_id: int | None) -> object | None:
+        if dialog_id == account_id:
+            if topic_id is not None:
+                raise ScheduledCommandError("topic_mismatch", "Saved Messages has no topic scope.")
+            return InputPeerSelf()
+        dialog = read_dialog_identities(ctx.conn, [dialog_id]).get(dialog_id)
+        if dialog is None or dialog.dialog_type is DialogType.UNKNOWN:
+            raise ScheduledCommandError("dialog_unavailable", "Exact dialog type is not retained; check list_dialogs.")
+        _validate_scheduled_topic(ctx.conn, dialog_id, dialog.dialog_type, topic_id)
+        return ctx.client.retained_draft_peer(dialog_id)
+
+    async def request_recovery(dialog_id: int, reason: str) -> None:
+        await runtime.scheduled_reconciler.invalidate_continuity(dialog_id, reason)
+        runtime.coordinator.offer(DemandKind.SCHEDULED_DISCOVERY)
+
+    def interrupted_targets(conn: sqlite3.Connection) -> tuple[int, ...]:
+        rows = cast(
+            list[tuple[int]],
+            conn.execute(
+                "SELECT DISTINCT dialog_id FROM scheduled_operation_receipts WHERE account_id=? AND outcome='pending'",
+                (account_id,),
+            ).fetchall(),
+        )
+        return tuple(row[0] for row in rows)
+
+    # Persist recovery first: a crash during startup must retain either pending
+    # receipts or a recovery obligation, never an unknown write with complete coverage.
+    for dialog_id in await ctx.writer.run(interrupted_targets):
+        await request_recovery(dialog_id, "scheduled_mutation_interrupted")
+
+    def settle_interrupted(conn: sqlite3.Connection) -> None:
+        with write_transaction(conn):
+            settle_interrupted_scheduled_operations(conn, account_id)
+
+    await ctx.writer.run(settle_interrupted)
+
+    def current_premium() -> bool | None:
+        profile = ctx.api_server.self_profile
+        premium = None if profile is None else profile.get("premium")
+        return premium if type(premium) is bool else None
+
+    ctx.api_server.bind_scheduled_commands(
+        ScheduledCommandOwner(
+            ctx.client,
+            ctx.conn,
+            writer=ctx.writer,
+            account_id=account_id,
+            fence=ctx.scheduled_mutation_fence,
+            resolve_peer=resolve_peer,
+            account_is_premium=current_premium,
+            request_recovery=request_recovery,
+        )
+    )
+
+
 def _draft_has_topics(conn: sqlite3.Connection, dialog_id: int, kind: DialogType) -> bool:
     capability = TopicCatalogRepository(conn).known_capability(dialog_id)
     if kind is DialogType.BOT and capability is None:
@@ -2020,7 +2118,7 @@ def _draft_has_topics(conn: sqlite3.Connection, dialog_id: int, kind: DialogType
     return kind is DialogType.FORUM or capability is True
 
 
-async def sync_main() -> None:
+async def sync_main() -> None:  # noqa: PLR0915 - composition root owns startup sequencing
     """Main entry point for the sync daemon process.
 
     Orchestrates: DB init → FTS backfill → Telegram connect → wire services →
@@ -2046,6 +2144,7 @@ async def sync_main() -> None:
             ctx.shutdown_event,
             update_barrier=update_barrier,
             writer=ctx.writer,
+            scheduled_mutation_fence=ctx.scheduled_mutation_fence,
             profile_pair_mode="enabled" if ctx.api_server._policy.full_user_pair_enabled else "disabled",
             profile_detail_ttl_seconds=ctx.api_server._policy.entity_detail_ttl_seconds,
         )
@@ -2093,6 +2192,7 @@ async def sync_main() -> None:
             dialog_directory,
             startup_identity,
         )
+        await _bind_scheduled_commands(ctx)
         await draft_owner.request_recovery("startup")
         await ctx.writer.run(lambda conn: TopicCatalogRepository(conn).bootstrap())
         await _release_updates_after_replay(ctx, update_barrier)

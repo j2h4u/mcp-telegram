@@ -367,16 +367,6 @@ rationale = "TG-8 sets the automatic forward-delta fallback to a deliberate two-
 
 [[entry]]
 category = "policy_assignments"
-key = "src/mcp_telegram/scheduled_messages.py:<module>:_DEFAULT_RECONCILIATION_INTERVAL_S"
-rationale = "This pre-existing scheduled-message loop cadence is outside the TTL migration."
-
-[[entry]]
-category = "policy_assignments"
-key = "src/mcp_telegram/scheduled_messages.py:ScheduledMessageReconciler.run_once:retry_at"
-rationale = "This records a retry time computed during scheduled-message reconciliation."
-
-[[entry]]
-category = "policy_assignments"
 key = "src/mcp_telegram/sync_worker.py:<module>:_BATCH_SIZE"
 rationale = "This inherited sync RPC batch cap is unrelated to retention or freshness configuration."
 
@@ -476,11 +466,6 @@ rationale = "This is a process-local diagnostic logging cadence."
 category = "policy_assignments"
 key = "src/mcp_telegram/flood.py:FloodWaitAccumulator:log_interval_s"
 rationale = "This is a process-local diagnostic logging cadence."
-
-[[entry]]
-category = "policy_defaults"
-key = "src/mcp_telegram/scheduled_messages.py:run_scheduled_reconciliation_loop:interval"
-rationale = "This pre-existing worker scheduling default is retained as a compatibility contract."
 
 [[entry]]
 category = "policy_assignments"
@@ -631,3 +616,13 @@ rationale = "TG121 panel-approved bounded sample representation retains at most 
 category = "policy_assignments"
 key = "src/mcp_telegram/rpc_admission_observations.py:RpcAdmissionObservationAggregator.__init__:self._rpc_window_started_wall_ms"
 rationale = "Observed current wall-clock timestamp records the real aggregation window start; it is runtime evidence, not a configurable cadence or deadline."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/scheduled_contracts.py:<module>:SCHEDULED_OPERATION_KEY_LIMIT"
+rationale = "Native scheduled idempotency-key input and storage contract shared by the command, MCP schema and dispatch fence; not operator acquisition policy."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/reading/service.py:ReadingService._bound_scheduled_queue_rows:budget_truncated"
+rationale = "Derived output reports actual response truncation using the already-injected presentation budget; not a configurable budget or acquisition policy."

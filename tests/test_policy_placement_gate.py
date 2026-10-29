@@ -291,3 +291,26 @@ def test_rpc_observation_window_wallclock_is_runtime_evidence_only() -> None:
     assert exact and all(key in allowed for _, key in exact)
     changed = source.replace("__init__", "adjacent")
     assert any(key not in allowed for _, key in _findings_at("src/mcp_telegram/rpc_admission_observations.py", changed))
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "source"),
+    [
+        ("src/mcp_telegram/scheduled_contracts.py", "SCHEDULED_OPERATION_KEY_LIMIT = 128\n"),
+        (
+            "src/mcp_telegram/reading/service.py",
+            "class ReadingService:\n    def _bound_scheduled_queue_rows(self):\n        budget_truncated = False\n",
+        ),
+    ],
+)
+def test_scheduled_contract_and_presentation_classifications_are_exact(relative_path: str, source: str) -> None:
+    allowed = _load_gate()._load_manifest()
+    findings = _findings_at(relative_path, source)
+    assert findings and all(key in allowed[category] for category, key in findings)
+    assert any(key not in allowed[category] for category, key in _findings_at("src/mcp_telegram/neighbor.py", source))
+
+
+def test_retired_scheduled_retry_values_have_no_policy_exclusion() -> None:
+    allowed = _load_gate()._load_manifest()
+    findings = _findings_at("src/mcp_telegram/scheduled_messages.py", "_SCHEDULED_RETRY_SECONDS = 300\n")
+    assert findings and all(key not in allowed[category] for category, key in findings)

@@ -79,6 +79,7 @@ class RpcAttemptEvidence:
     observation_id: str = field(default_factory=lambda: uuid.uuid4().hex, repr=False)
     draft_preflight_dispatched: bool = False
     draft_mutation_dispatched: bool = False
+    scheduled_mutation_dispatched: bool = False
 
     def record_dispatch(self) -> None:
         """Record one sender dispatch without changing transport behavior."""

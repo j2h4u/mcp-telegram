@@ -25,6 +25,7 @@ from .drafts import GetDraft, ManageDraft, get_draft, manage_draft
 from .entity_info import GetEntityInfo, get_entity_info
 from .feedback import SubmitFeedback, submit_feedback
 from .reading import ListMessages, SearchMessages, list_messages, search_messages
+from .scheduled import ManageScheduledMessage, manage_scheduled_message
 from .stats import GetDialogStats, GetUsageStats, get_dialog_stats, get_usage_stats
 from .sync import (
     GetSyncStatus,
@@ -50,6 +51,7 @@ __all__ = [
     "ListMessages",
     "ListTopics",
     "ManageDraft",
+    "ManageScheduledMessage",
     "MarkDialogForSync",
     "SearchMessages",
     "SubmitFeedback",
@@ -70,6 +72,7 @@ __all__ = [
     "list_messages",
     "list_topics",
     "manage_draft",
+    "manage_scheduled_message",
     "mark_dialog_for_sync",
     "mcp_tool",
     "normalize_output_schema",
