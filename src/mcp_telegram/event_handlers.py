@@ -142,11 +142,13 @@ from .realtime_history_policy import (
 from .runtime_observations import RuntimeObservationSink
 from .scheduled_messages import (
     mark_scheduled_messages_removed,
+    scheduled_dialog_has_due_work,
     scheduled_dialog_id,
     scheduled_message_dialog_id,
     upsert_scheduled_message,
     verify_scheduled_publication,
 )
+from .scheduled_write_fence import ScheduledMutationFence
 from .sqlite_writer import SQLiteWriter
 from .sync_transactions import require_write_transaction, write_savepoint, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
@@ -693,6 +695,7 @@ class EventHandlerManager:
         writer: SQLiteWriter,
         profile_detail_ttl_seconds: int,
         profile_pair_mode: str = "enabled",
+        scheduled_mutation_fence: ScheduledMutationFence | None = None,
     ) -> None:
         self._client = client
         self._conn = conn
@@ -708,6 +711,7 @@ class EventHandlerManager:
         self._profile_pair_mode = profile_pair_mode
         self._profile_detail_ttl_seconds = profile_detail_ttl_seconds
         self._profile_push_owner = object()
+        self._scheduled_mutation_fence = scheduled_mutation_fence
 
     def bind_observation_sink(self, sink: RuntimeObservationSink) -> None:
         self._observation_sink = sink
@@ -1083,8 +1087,8 @@ class EventHandlerManager:
     # Event handlers
     # ------------------------------------------------------------------
 
-    @staticmethod
     def _verify_scheduled_publication_if_needed(
+        self,
         conn: sqlite3.Connection,
         dialog_id: int,
         message: _MessageLike,
@@ -1099,6 +1103,8 @@ class EventHandlerManager:
                     conn,
                     dialog_id,
                     int(message.id),
+                    mutation_fence=self._scheduled_mutation_fence,
+                    account_id=self._self_id,
                     published_at=int(message.date.timestamp()) if isinstance(message.date, datetime) else None,
                 )
             else:
@@ -1107,6 +1113,8 @@ class EventHandlerManager:
                     dialog_id,
                     int(message.id),
                     now=now,
+                    mutation_fence=self._scheduled_mutation_fence,
+                    account_id=self._self_id,
                     published_at=int(message.date.timestamp()) if isinstance(message.date, datetime) else None,
                 )
 
@@ -1185,13 +1193,13 @@ class EventHandlerManager:
                 return
             now = delivered_observed_at()
 
-            def _persist_event_0(conn: sqlite3.Connection) -> bool:
+            def _persist_event_0(conn: sqlite3.Connection) -> tuple[bool, bool]:
                 with write_transaction(conn):
                     if not allows_new_message(
                         realtime_history_coverage(*_SQLiteRealtimeHistoryStatusReader(conn).read_status(dialog_id)),
                         outgoing=bool(getattr(msg, "out", False)),
                     ):
-                        return False
+                        return False, False
                     insert_messages_with_fts(
                         conn,
                         [extracted],
@@ -1209,13 +1217,15 @@ class EventHandlerManager:
                     # (no dialogs row) — silent no-op; bootstrap is the sole row creator.
                     self._project_new_message_metadata(conn, dialog_id, msg, now, observation_order=observation_order)
                     self._record_body_event(conn, dialog_id, now)
-                return True
+                    needs_scheduled_work = scheduled_dialog_has_due_work(conn, dialog_id)
+                return True, needs_scheduled_work
 
-            if not await self._writer.run(_persist_event_0):
+            accepted, needs_scheduled_work = await self._writer.run(_persist_event_0)
+            if not accepted:
                 return
 
             self._offer_message_ingestion()
-            if bool(getattr(msg, "from_scheduled", False)):
+            if bool(getattr(msg, "from_scheduled", False)) and needs_scheduled_work:
                 self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
             logger.debug("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
         except RpcAdmissionClosedError:
@@ -1239,12 +1249,13 @@ class EventHandlerManager:
         coverage = self._realtime_coverage(dialog_id)
         if coverage is not RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
             return coverage
-        await self._writer.run(
-            lambda conn: self._verify_scheduled_publication_if_needed(
-                conn, dialog_id, event.message, now=delivered_observed_at()
-            )
-        )
-        if bool(getattr(event.message, "from_scheduled", False)):
+
+        def verify_publication(conn: sqlite3.Connection) -> bool:
+            self._verify_scheduled_publication_if_needed(conn, dialog_id, event.message, now=delivered_observed_at())
+            return scheduled_dialog_has_due_work(conn, dialog_id)
+
+        needs_scheduled_work = await self._writer.run(verify_publication)
+        if bool(getattr(event.message, "from_scheduled", False)) and needs_scheduled_work:
             self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
         status, _ = self._realtime_history_status.read_status(dialog_id)
         if event.is_private and status is None:
@@ -1739,12 +1750,20 @@ class EventHandlerManager:
             return
         try:
 
-            def _persist_event_0(conn: sqlite3.Connection) -> None:
+            def _persist_event_0(conn: sqlite3.Connection) -> bool:
                 with write_transaction(conn):
-                    upsert_scheduled_message(conn, dialog_id, message, now=delivered_observed_at())
+                    upsert_scheduled_message(
+                        conn,
+                        dialog_id,
+                        message,
+                        now=delivered_observed_at(),
+                        mutation_fence=self._scheduled_mutation_fence,
+                        account_id=self._self_id,
+                    )
+                    return scheduled_dialog_has_due_work(conn, dialog_id)
 
-            await self._writer.run(_persist_event_0)
-            self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
+            if await self._writer.run(_persist_event_0):
+                self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
             message_id_attr = "id"
             logger.info(
                 "scheduled_new dialog_id=%d message_id=%d",
@@ -1765,14 +1784,21 @@ class EventHandlerManager:
         sent_message_ids = cast(Sequence[int] | None, getattr(update, "sent_messages", None))
         try:
 
-            def _persist_event_0(conn: sqlite3.Connection) -> None:
+            def _persist_event_0(conn: sqlite3.Connection) -> bool:
                 with write_transaction(conn):
                     mark_scheduled_messages_removed(
-                        conn, dialog_id, message_ids, sent_message_ids, now=delivered_observed_at()
+                        conn,
+                        dialog_id,
+                        message_ids,
+                        sent_message_ids,
+                        now=delivered_observed_at(),
+                        mutation_fence=self._scheduled_mutation_fence,
+                        account_id=self._self_id,
                     )
+                    return scheduled_dialog_has_due_work(conn, dialog_id)
 
-            await self._writer.run(_persist_event_0)
-            self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
+            if await self._writer.run(_persist_event_0):
+                self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
             logger.info("scheduled_removed dialog_id=%d count=%d", dialog_id, len(message_ids))
         except Exception:
             fail_delivered_update()

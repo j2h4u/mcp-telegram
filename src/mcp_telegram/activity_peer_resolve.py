@@ -70,8 +70,3 @@ def _read_linked_chat_fact(conn: sqlite3.Connection, channel_id: int, now: int) 
             linked_chat_fact_owner.ensure_cold_demand(conn, channel_id, now)
             fact = linked_chat_fact_owner.read_fact(conn, channel_id)
     return fact
-
-
-def linked_chat_retry_at(fact: LinkedChatFact, *, now: int) -> int:
-    """Return the retry timestamp using the linked-chat owner's policy."""
-    return linked_chat_fact_owner.effective_retry_at(fact.retry_at, fact.requested_at, now)

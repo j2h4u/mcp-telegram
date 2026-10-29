@@ -268,3 +268,24 @@ def test_comments_and_strings_do_not_trigger_detection() -> None:
         )
         == []
     )
+
+
+def test_native_scheduled_command_import_ownership_is_exact() -> None:
+    gate = _load_gate()
+    for dependency in ("sqlite3", "telethon"):
+        source = f"import {dependency}\n"
+        assert (
+            gate.violations_for(
+                gate.SOURCE_ROOT / "scheduled_commands.py",
+                source,
+                allowed_importer_paths=gate.ALLOWED_IMPORTER_PATHS,
+                source_root=gate.SOURCE_ROOT,
+            )
+            == []
+        )
+        assert gate.violations_for(
+            gate.SOURCE_ROOT / "scheduled_neighbor.py",
+            source,
+            allowed_importer_paths=gate.ALLOWED_IMPORTER_PATHS,
+            source_root=gate.SOURCE_ROOT,
+        )

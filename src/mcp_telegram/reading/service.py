@@ -2,6 +2,7 @@
 
 import asyncio
 import dataclasses
+import hashlib
 import json
 import sqlite3
 import time
@@ -9,7 +10,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 from rapidfuzz import fuzz as _fuzz
 
@@ -29,8 +30,11 @@ from ..own_only import own_only_basis_by_dialog
 from ..pagination import (
     HistoryDirection,
     NavigationToken,
+    ScheduledQueueNavigationToken,
     decode_navigation_token,
+    decode_scheduled_queue_navigation,
     encode_history_navigation,
+    encode_scheduled_queue_navigation,
     encode_search_navigation,
 )
 from ..reactions.contracts import ReactionFreshness
@@ -42,6 +46,7 @@ from ..temporal import parse_utc_boundary
 from .draft_projection import draft_message_key, read_drafts
 from .query_records import read_message_from_row
 from .scheduled_projection import (
+    build_scheduled_global_list_query,
     build_scheduled_list_query,
     build_scheduled_search_query,
     scheduled_message_time,
@@ -184,6 +189,7 @@ class _ListMessagesRequest:
     context_message_id: int | None
     context_size: int
     message_state: str
+    read_scope: str = "dialog"
     since_utc: int | None = None
     until_utc: int | None = None
 
@@ -262,6 +268,7 @@ class _AllLocalState:
     draft_rows: list[dict]
     draft_result: dict | None
     metadata: tuple[str, ReadState | None, dict[str, object]]
+    scheduled_coverage: dict[str, object] | None = None
 
 
 @dataclass
@@ -291,9 +298,9 @@ class _AllNavigationPosition:
         if state == "sent":
             self.sent_message_id = _message_id_from_item(row)
             self.sent_at = _object_to_int(row.get("sent_at"))
-        elif state == "scheduled":
+        elif state in {"scheduled", "unknown_missing"}:
             self.scheduled_message_id = _message_id_from_item(row)
-            self.scheduled_sent_at = _object_to_int(row.get("sent_at"))
+            self.scheduled_sent_at = _object_to_int_or_none(row.get("sent_at"))
         elif state == "draft":
             self.draft_key = str(row["message_key"])
 
@@ -556,6 +563,7 @@ class ReadingService:
             context_message_id=req.get("context_message_id"),
             context_size=_clamp(req.get("context_size", 10), 2, 50),
             message_state=req.get("message_state", "all"),
+            read_scope=req.get("read_scope", "dialog"),
             since_utc=since_utc,
             until_utc=until_utc,
         )
@@ -1018,6 +1026,11 @@ class ReadingService:
         The returned rows still use the same ReadMessage envelope plus lifecycle
         metadata as ordinary search results.
         """
+        account_coverage: dict[str, object] | None = None
+        coverage_result = self._scheduled_account_coverage()
+        if isinstance(coverage_result, dict):
+            return coverage_result
+        _, account_coverage = coverage_result
         if not scheduled_messages_available(self._conn):
             return {
                 "ok": True,
@@ -1027,24 +1040,20 @@ class ReadingService:
                     "next_navigation": None,
                     "offset": request.offset,
                     "source": "scheduled_messages",
+                    "scheduled_coverage": account_coverage,
                 },
             }
         with timing_phase("local_projection"):
             own_basis = self._own_only_basis_by_dialog()
-            if (request.dialog_id and request.dialog_id not in own_basis) or (not request.dialog_id and not own_basis):
-                raw_rows: list[object] = []
-            else:
-                sql, params = build_scheduled_search_query(
-                    dialog_id=request.dialog_id,
-                    own_dialog_ids=sorted(own_basis),
-                    query=stem_query(request.query),
-                    limit=request.limit,
-                    offset=request.offset,
-                    scheduled_now=int(time.time()),
-                    since_utc=request.since_utc,
-                    until_utc=request.until_utc,
-                )
-                raw_rows = _fetchall_rows(self._conn.execute(sql, params))
+            sql, params = build_scheduled_search_query(
+                dialog_id=request.dialog_id,
+                query=stem_query(request.query),
+                limit=request.limit,
+                offset=request.offset,
+                since_utc=request.since_utc,
+                until_utc=request.until_utc,
+            )
+            raw_rows = _fetchall_rows(self._conn.execute(sql, params))
         with timing_phase("response_shape"):
             dialog_ids = {_object_to_int(_row_value(raw_row, "dialog_id")) for raw_row in raw_rows}
             if request.dialog_id:
@@ -1054,12 +1063,17 @@ class ReadingService:
                 {
                     **scheduled_row_to_wire(
                         cast(Mapping[str, object], raw_row),
-                        inclusion_basis=own_basis.get(_object_to_int(_row_value(raw_row, "dialog_id")), ()),
+                        inclusion_basis=own_basis.get(_object_to_int(_row_value(raw_row, "dialog_id"))),
+                        account_id=self._deps.self_id,
                     ),
                     "dialog_name": identities[_object_to_int(_row_value(raw_row, "dialog_id"))].display_name,
                     "dialog_name_source": identities[
                         _object_to_int(_row_value(raw_row, "dialog_id"))
                     ].display_name_source,
+                    "dialog_type": identities[_object_to_int(_row_value(raw_row, "dialog_id"))].dialog_type.value,
+                    "scheduled_coverage": self._scheduled_dialog_coverage(
+                        _object_to_int(_row_value(raw_row, "dialog_id"))
+                    ),
                 }
                 for raw_row in raw_rows
             ]
@@ -1076,7 +1090,8 @@ class ReadingService:
                 "next_navigation": next_nav,
                 "offset": request.offset,
                 "source": "scheduled_messages",
-                "scope": "own_only",
+                "scope": "account",
+                "scheduled_coverage": account_coverage,
                 **(
                     {
                         "dialog_name": identities[request.dialog_id].display_name,
@@ -1131,8 +1146,25 @@ class ReadingService:
                 "source": "sync_db+scheduled_messages",
                 "read_state_per_dialog": sent_data.get("read_state_per_dialog", {}),
                 "scope": "all",
+                "scheduled_coverage": scheduled_data.get("scheduled_coverage"),
                 "dialog_name": sent_data.get("dialog_name", scheduled_data.get("dialog_name")),
                 "dialog_name_source": sent_data.get("dialog_name_source", scheduled_data.get("dialog_name_source")),
+            },
+        }
+
+    def _scheduled_search_for_mixed(self, request: _SearchMessagesRequest) -> dict:
+        result = self._search_scheduled_messages(request)
+        if result.get("ok"):
+            return result
+        return {
+            "ok": True,
+            "data": {
+                "messages": [],
+                "total": 0,
+                "next_navigation": None,
+                "offset": request.offset,
+                "source": "scheduled_messages",
+                "scheduled_coverage": {"state": "unknown", "reason": result.get("error")},
             },
         }
 
@@ -1236,20 +1268,19 @@ class ReadingService:
         sql_rows: Sequence[Mapping[str, object]],
         request: _ListDialogsRequest,
         dialog_filter: _ListDialogsFilter,
-        scheduled_summary: Mapping[int, tuple[int, int | None]],
+        scheduled_summary: Mapping[int, tuple[int, int | None, int]],
         own_basis: Mapping[int, tuple[str, ...]],
         identities: Mapping[int, DialogIdentity],
-    ) -> list[tuple[Mapping[str, object], tuple[int, int | None], tuple[str, ...] | None]]:
-        selected_rows: list[tuple[Mapping[str, object], tuple[int, int | None], tuple[str, ...] | None]] = []
+        conn: sqlite3.Connection,
+    ) -> list[tuple[Mapping[str, object], tuple[int, int | None, int], tuple[str, ...] | None]]:
+        selected_rows: list[tuple[Mapping[str, object], tuple[int, int | None, int], tuple[str, ...] | None]] = []
         for row in sql_rows:
             dialog_id = _object_to_int(row["dialog_id"])
             identity = identities[dialog_id]
-            if request.scope == "own_only" and dialog_id not in own_basis:
+            if request.message_state != "scheduled" and request.scope == "own_only" and dialog_id not in own_basis:
                 continue
-            summary = scheduled_summary.get(dialog_id, (0, None))
-            if dialog_id not in own_basis:
-                summary = (0, None)
-            if request.message_state == "scheduled" and summary[0] == 0:
+            summary = scheduled_summary.get(dialog_id, (0, None, 0))
+            if request.message_state == "scheduled" and summary[0] == 0 and summary[2] == 0:
                 continue
             if not self._dialog_row_matches_filter(dialog_filter, identity.display_name, identity.username):
                 continue
@@ -1260,6 +1291,7 @@ class ReadingService:
                         "name": identity.display_name,
                         "type": identity.dialog_type.value,
                         "display_name_source": identity.display_name_source,
+                        "scheduled_coverage": self._scheduled_dialog_coverage(dialog_id, conn),
                     },
                     summary,
                     own_basis.get(dialog_id),
@@ -1270,9 +1302,10 @@ class ReadingService:
     def _project_list_dialog_rows(
         self,
         conn: sqlite3.Connection,
-        selected_rows: Sequence[tuple[Mapping[str, object], tuple[int, int | None], tuple[str, ...] | None]],
+        selected_rows: Sequence[tuple[Mapping[str, object], tuple[int, int | None, int], tuple[str, ...] | None]],
         request: _ListDialogsRequest,
         directory_coverage: dict,
+        scheduled_coverage: dict[str, object],
     ) -> dict:
         dialog_ids = [_object_to_int(row["dialog_id"]) for row, _, _ in selected_rows]
         aggregates = self._fetch_list_dialog_aggregates(conn, dialog_ids)
@@ -1301,6 +1334,7 @@ class ReadingService:
                 "bootstrap_pending": False,
                 "scope": request.scope,
                 "directory_coverage": directory_coverage,
+                "scheduled_coverage": scheduled_coverage,
             },
         }
 
@@ -1308,6 +1342,7 @@ class ReadingService:
     def _empty_list_dialogs_response(
         scope: str,
         directory_coverage: dict,
+        scheduled_coverage: dict[str, object],
         *,
         bootstrap_pending: bool,
     ) -> dict:
@@ -1319,6 +1354,7 @@ class ReadingService:
                 "bootstrap_pending": bootstrap_pending,
                 "scope": scope,
                 "directory_coverage": directory_coverage,
+                "scheduled_coverage": scheduled_coverage,
             },
         }
 
@@ -1328,7 +1364,7 @@ class ReadingService:
         aggregate: _DialogMessageAggregate,
         enrollment_enabled: bool | None,
         read_model_now: int,
-        scheduled_summary: tuple[int, int | None] = (0, None),
+        scheduled_summary: tuple[int, int | None, int] = (0, None, 0),
         inclusion_basis: tuple[str, ...] | None = None,
     ) -> tuple[dict[str, object], int | None]:
         d_id = _object_to_int(row["dialog_id"])
@@ -1372,13 +1408,15 @@ class ReadingService:
     @staticmethod
     def _dialog_lifecycle_fields(
         row: Mapping[str, object],
-        scheduled_summary: tuple[int, int | None],
+        scheduled_summary: tuple[int, int | None, int],
         inclusion_basis: tuple[str, ...] | None,
     ) -> dict[str, object]:
         return {
             "scheduled_count": scheduled_summary[0],
             "next_scheduled_at": scheduled_summary[1],
+            "unresolved_scheduled_count": scheduled_summary[2],
             "inclusion_basis": list(inclusion_basis) if inclusion_basis is not None else None,
+            "scheduled_coverage": row.get("scheduled_coverage"),
         }
 
     async def _resolve_unread_position(
@@ -1549,6 +1587,373 @@ class ReadingService:
         source = self._conn if conn is None else conn
         return own_only_basis_by_dialog(source)
 
+    def _scheduled_account_coverage(
+        self, conn: sqlite3.Connection | None = None
+    ) -> tuple[int, dict[str, object]] | dict[str, object]:
+        """Read scheduled account and baseline coverage without acquiring or mutating facts."""
+        source = self._conn if conn is None else conn
+        account_id = self._deps.self_id
+        if type(account_id) is not int or account_id <= 0:
+            return {
+                "ok": False,
+                "error": "scheduled_account_unverified",
+                "message": "The local scheduled queue is not bound to a verified Telegram account.",
+            }
+        try:
+            account = _fetchone_row(
+                source.execute(
+                    "SELECT account_id,directory_generation,next_retry_at,last_snapshot_at,last_error "
+                    "FROM scheduled_sync_state WHERE key='account'"
+                )
+            )
+            directory = read_dialog_directory_coverage(source).to_wire()
+            state_count_rows = cast(
+                list[tuple[object, object]],
+                source.execute(
+                    "SELECT coverage_state,COUNT(*) FROM scheduled_reconciliation_state GROUP BY coverage_state"
+                ).fetchall(),
+            )
+            state_counts = {cast(str, row[0]): _object_to_int(row[1]) for row in state_count_rows}
+            baseline_missing_count = _object_to_int(
+                cast(
+                    tuple[object],
+                    source.execute(
+                        "SELECT COUNT(*) FROM ("
+                        "SELECT dialog_id FROM dialogs UNION "
+                        "SELECT dialog_id FROM scheduled_messages WHERE message_state IN ('scheduled','unknown_missing') UNION "
+                        "SELECT ?"
+                        ") AS candidates LEFT JOIN scheduled_reconciliation_state s USING(dialog_id) "
+                        "WHERE s.dialog_id IS NULL",
+                        (account_id,),
+                    ).fetchone(),
+                )[0]
+            )
+            acquisition_due = _object_to_int(
+                cast(
+                    tuple[object],
+                    source.execute(
+                        "SELECT COUNT(*) FROM scheduled_reconciliation_state "
+                        "WHERE repair_due_at IS NOT NULL OR discovery_due_at IS NOT NULL"
+                    ).fetchone(),
+                )[0]
+            )
+        except sqlite3.Error, TypeError, IndexError, KeyError:
+            return {
+                "ok": False,
+                "error": "scheduled_coverage_unavailable",
+                "message": "Scheduled queue account coverage could not be read safely.",
+            }
+        if account is None or _row_value(account, "account_id") != account_id:
+            return {
+                "ok": False,
+                "error": "scheduled_account_mismatch",
+                "message": "The local scheduled queue account does not match the verified Telegram account.",
+            }
+        return account_id, self._scheduled_account_coverage_data(
+            account_id=account_id,
+            account=account,
+            directory=directory,
+            state_counts=state_counts,
+            baseline_missing_count=baseline_missing_count,
+            acquisition_due=acquisition_due,
+        )
+
+    @staticmethod
+    def _scheduled_account_coverage_data(  # noqa: PLR0913
+        *,
+        account_id: int,
+        account: object,
+        directory: dict[str, object],
+        state_counts: dict[str, int],
+        baseline_missing_count: int,
+        acquisition_due: int,
+    ) -> dict[str, object]:
+        directory_generation = directory.get("publication_generation")
+        enumerated_generation = _object_to_int_or_none(_row_value(account, "directory_generation"))
+        generation_matches = enumerated_generation is not None and enumerated_generation == directory_generation
+        incomplete_count = sum(state_counts.get(state, 0) for state in ("unknown", "inaccessible"))
+        coverage_state = (
+            "complete" if generation_matches and incomplete_count == 0 and baseline_missing_count == 0 else "partial"
+        )
+        return {
+            "state": coverage_state,
+            "account_id": account_id,
+            "directory_generation": directory_generation,
+            "enumerated_generation": enumerated_generation,
+            "generation_matches": generation_matches,
+            "directory_coverage": directory,
+            "baseline_counts": {
+                "complete": state_counts.get("complete", 0),
+                "unknown": state_counts.get("unknown", 0),
+                "inaccessible": state_counts.get("inaccessible", 0),
+                "unsupported": state_counts.get("unsupported", 0),
+                "missing": baseline_missing_count,
+            },
+            "acquisition_due_dialog_count": acquisition_due,
+            "next_retry_at": _object_to_int_or_none(_row_value(account, "next_retry_at")),
+            "last_snapshot_at": _object_to_int_or_none(_row_value(account, "last_snapshot_at")),
+            "last_error": _object_to_str_or_none(_row_value(account, "last_error")),
+        }
+
+    def _scheduled_dialog_coverage(self, dialog_id: int, conn: sqlite3.Connection | None = None) -> dict[str, object]:
+        source = self._conn if conn is None else conn
+        try:
+            row = _fetchone_row(
+                source.execute(
+                    "SELECT coverage_state,coverage_reason,baseline_observed_at,directory_generation,"
+                    "repair_due_at,discovery_due_at FROM scheduled_reconciliation_state WHERE dialog_id=?",
+                    (dialog_id,),
+                )
+            )
+        except sqlite3.Error:
+            row = None
+        if row is None:
+            return {
+                "state": "unknown",
+                "reason": "baseline_missing",
+                "baseline_observed_at": None,
+                "directory_generation": None,
+                "acquisition_pending": False,
+            }
+        return {
+            "state": _row_value(row, "coverage_state"),
+            "reason": _row_value(row, "coverage_reason"),
+            "baseline_observed_at": _object_to_int_or_none(_row_value(row, "baseline_observed_at")),
+            "directory_generation": _object_to_int_or_none(_row_value(row, "directory_generation")),
+            "acquisition_pending": (
+                _row_value(row, "repair_due_at") is not None or _row_value(row, "discovery_due_at") is not None
+            ),
+        }
+
+    @staticmethod
+    def _scheduled_filter_fingerprint(
+        *,
+        sender_id: int | None,
+        sender_name: str | None,
+        topic_id: int | None,
+        since_utc: int | None,
+        until_utc: int | None,
+    ) -> str:
+        payload = json.dumps(
+            [sender_id, sender_name, topic_id, since_utc, until_utc],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+        return hashlib.sha256(payload).hexdigest()[:24]
+
+    def _list_scheduled_queue(  # noqa: PLR0914
+        self,
+        request: _ListMessagesRequest,
+        *,
+        dialog_id: int | None,
+        read_scope: str,
+        direction: str,
+    ) -> dict:
+        """Read pending scheduled facts with a local, account-bound keyset."""
+        _set_timing_route("local_non_sent_state")
+        with timing_phase("local_projection"):
+            account_result = self._scheduled_account_coverage()
+        if isinstance(account_result, dict):
+            return account_result
+        account_id, coverage = account_result
+        with timing_phase("resolution"):
+            fingerprint = self._scheduled_filter_fingerprint(
+                sender_id=request.sender_id,
+                sender_name=request.sender_name,
+                topic_id=request.topic_id,
+                since_utc=request.since_utc,
+                until_utc=request.until_utc,
+            )
+            navigation = self._bind_scheduled_queue_navigation(
+                request,
+                account_id=account_id,
+                fingerprint=fingerprint,
+                dialog_id=dialog_id,
+                read_scope=read_scope,
+                direction=direction,
+            )
+        if isinstance(navigation, dict):
+            return navigation
+        anchor, direction = navigation
+        raw_rows = self._read_scheduled_queue_rows(request, dialog_id, direction, anchor)
+        with timing_phase("response_shape"):
+            has_more = len(raw_rows) > request.limit
+            selected = raw_rows[: request.limit]
+            selected_count = len(selected)
+            rows, identities = self._project_scheduled_queue_rows(selected, dialog_id, account_id)
+            bounded_rows, budget_truncated = self._bound_scheduled_queue_rows(rows)
+            if budget_truncated:
+                selected = selected[: len(bounded_rows)]
+                has_more = True
+            rows = bounded_rows if direction == "oldest" else list(reversed(bounded_rows))
+            next_navigation = None
+            if has_more and selected:
+                next_navigation = self._scheduled_queue_next_navigation(
+                    selected[-1],
+                    account_id=account_id,
+                    read_scope=read_scope,
+                    dialog_id=dialog_id,
+                    direction=direction,
+                    fingerprint=fingerprint,
+                )
+            data: dict[str, object] = {
+                "messages": rows,
+                "source": "scheduled_messages",
+                "next_navigation": next_navigation,
+                "message_state": "scheduled",
+                "read_scope": read_scope,
+                "navigation_direction": direction,
+                "scope": "all",
+                "scheduled_coverage": coverage,
+                "has_more": has_more,
+                "truncation": {
+                    "is_truncated": budget_truncated,
+                    "shown_count": len(rows),
+                    "hidden_count": selected_count - len(rows) if budget_truncated else 0,
+                    "reason": "response_budget" if budget_truncated else None,
+                },
+            }
+            if dialog_id is not None:
+                identity = identities[dialog_id]
+                data.update(
+                    dialog_id=dialog_id,
+                    dialog_name=identity.display_name,
+                    dialog_name_source=identity.display_name_source,
+                    dialog_type=identity.dialog_type.value,
+                    dialog_scheduled_coverage=self._scheduled_dialog_coverage(dialog_id),
+                )
+            return {"ok": True, "data": data}
+
+    @staticmethod
+    def _bind_scheduled_queue_navigation(  # noqa: PLR0913
+        request: _ListMessagesRequest,
+        *,
+        account_id: int,
+        fingerprint: str,
+        dialog_id: int | None,
+        read_scope: str,
+        direction: str,
+    ) -> tuple[ScheduledQueueNavigationToken | None, str] | dict:
+        anchor: ScheduledQueueNavigationToken | None = None
+        if request.navigation not in (None, "latest", "start", "newest", "oldest"):
+            try:
+                anchor = decode_scheduled_queue_navigation(request.navigation)
+            except ValueError as exc:
+                return {"ok": False, "error": "invalid_navigation", "message": str(exc)}
+            # The opaque cursor owns its traversal direction. MCP's direction
+            # defaults to newest on continuation, including after start/oldest.
+            direction = anchor.direction.value
+            if (
+                anchor.account_id != account_id
+                or anchor.read_scope != read_scope
+                or anchor.dialog_id != dialog_id
+                or anchor.filter_fingerprint != fingerprint
+            ):
+                return {
+                    "ok": False,
+                    "error": "invalid_navigation",
+                    "message": "Navigation token belongs to a different account, scope, direction, or filter.",
+                }
+        elif request.navigation in {"oldest", "start"}:
+            direction = "oldest"
+        return anchor, direction
+
+    def _read_scheduled_queue_rows(
+        self,
+        request: _ListMessagesRequest,
+        dialog_id: int | None,
+        direction: str,
+        anchor: ScheduledQueueNavigationToken | None,
+    ) -> list[object]:
+        if not scheduled_messages_available(self._conn):
+            raw_rows: list[object] = []
+        else:
+            with timing_phase("local_projection"):
+                sql, params = build_scheduled_global_list_query(
+                    dialog_id=dialog_id,
+                    limit=request.limit + 1,
+                    direction=direction,
+                    anchor_bucket=anchor.time_bucket if anchor is not None else None,
+                    anchor_scheduled_at=anchor.scheduled_at if anchor is not None else None,
+                    anchor_dialog_id=anchor.anchor_dialog_id if anchor is not None else None,
+                    anchor_message_id=anchor.message_id if anchor is not None else None,
+                    sender_id=request.sender_id,
+                    sender_name=request.sender_name,
+                    topic_id=request.topic_id,
+                    since_utc=request.since_utc,
+                    until_utc=request.until_utc,
+                )
+                raw_rows = _fetchall_rows(self._conn.execute(sql, params))
+        return raw_rows
+
+    def _project_scheduled_queue_rows(
+        self,
+        selected: list[object],
+        dialog_id: int | None,
+        account_id: int,
+    ) -> tuple[list[dict], dict[int, DialogIdentity]]:
+        identities = read_dialog_identities(
+            self._conn,
+            {_object_to_int(_row_value(row, "dialog_id")) for row in selected}
+            | ({dialog_id} if dialog_id is not None else set()),
+        )
+        own_basis = self._own_only_basis_by_dialog()
+        rows: list[dict] = []
+        for raw_row in selected:
+            row_dialog_id = _object_to_int(_row_value(raw_row, "dialog_id"))
+            row = {
+                **scheduled_row_to_wire(
+                    cast(Mapping[str, object], raw_row),
+                    inclusion_basis=own_basis.get(row_dialog_id),
+                    account_id=account_id,
+                ),
+                "dialog_name": identities[row_dialog_id].display_name,
+                "dialog_name_source": identities[row_dialog_id].display_name_source,
+                "dialog_type": identities[row_dialog_id].dialog_type.value,
+                "scheduled_coverage": self._scheduled_dialog_coverage(row_dialog_id),
+            }
+            rows.append(row)
+        return rows, identities
+
+    def _bound_scheduled_queue_rows(self, rows: list[dict]) -> tuple[list[dict], bool]:
+        bounded_rows: list[dict] = []
+        payload_bytes = 0
+        budget_truncated = False
+        for row in rows:
+            row_bytes = len(json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode())
+            if bounded_rows and payload_bytes + row_bytes > self._deps.draft_response_budget_bytes:
+                budget_truncated = True
+                break
+            bounded_rows.append(row)
+            payload_bytes += row_bytes
+        return bounded_rows, budget_truncated
+
+    @staticmethod
+    def _scheduled_queue_next_navigation(  # noqa: PLR0913
+        last: object,
+        *,
+        account_id: int,
+        read_scope: str,
+        dialog_id: int | None,
+        direction: str,
+        fingerprint: str,
+    ) -> str:
+        last_dialog_id = _object_to_int(_row_value(last, "dialog_id"))
+        scheduled_at = _object_to_int_or_none(_row_value(last, "scheduled_at"))
+        return encode_scheduled_queue_navigation(
+            ScheduledQueueNavigationToken(
+                account_id=account_id,
+                read_scope=cast("Literal['dialog', 'all_dialogs']", read_scope),
+                dialog_id=dialog_id,
+                direction=HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST,
+                filter_fingerprint=fingerprint,
+                time_bucket=0 if scheduled_at is None else 1,
+                scheduled_at=scheduled_at,
+                anchor_dialog_id=last_dialog_id,
+                message_id=_object_to_int(_row_value(last, "message_id")),
+            )
+        )
+
     def _list_scheduled_messages_from_db(self, req: _ListMessagesDbRequest) -> dict:
         """Read pending scheduled messages from the separate local mirror.
 
@@ -1557,23 +1962,22 @@ class ReadingService:
         Telegram request when the mirror is empty or unavailable.
         When ``own_only_dialogs`` exists, its ownership cache is authoritative.
         """
+        coverage_result = self._scheduled_account_coverage()
+        if isinstance(coverage_result, dict):
+            return coverage_result
+        account_id, account_coverage = coverage_result
         with timing_phase("local_projection"):
             own_basis: dict[int, tuple[str, ...]] = {}
             if scheduled_messages_available(self._conn):
-                existing_basis = self._own_only_basis_by_dialog()
-                if req.dialog_id not in existing_basis:
-                    raw_rows: list[object] = []
-                else:
-                    own_basis = existing_basis
-                    anchor_sent_at = req.anchor_sent_at
-                    if req.anchor_msg_id is not None and anchor_sent_at is None:
-                        anchor_sent_at = scheduled_message_time(self._conn, req.dialog_id, req.anchor_msg_id)
-                    sql, params = build_scheduled_list_query(
-                        req,
-                        scheduled_now=int(time.time()),
-                        anchor_sent_at=anchor_sent_at,
-                    )
-                    raw_rows = _fetchall_rows(self._conn.execute(sql, params))
+                own_basis = self._own_only_basis_by_dialog()
+                anchor_sent_at = req.anchor_sent_at
+                if req.anchor_msg_id is not None and anchor_sent_at is None:
+                    anchor_sent_at = scheduled_message_time(self._conn, req.dialog_id, req.anchor_msg_id)
+                sql, params = build_scheduled_list_query(
+                    req,
+                    anchor_sent_at=anchor_sent_at,
+                )
+                raw_rows = _fetchall_rows(self._conn.execute(sql, params))
             else:
                 raw_rows = []
 
@@ -1586,11 +1990,16 @@ class ReadingService:
                     **scheduled_row_to_wire(
                         cast(Mapping[str, object], raw_row),
                         inclusion_basis=own_basis.get(_object_to_int(_row_value(raw_row, "dialog_id")), ()),
+                        account_id=account_id,
                     ),
                     "dialog_name": identities[_object_to_int(_row_value(raw_row, "dialog_id"))].display_name,
                     "dialog_name_source": identities[
                         _object_to_int(_row_value(raw_row, "dialog_id"))
                     ].display_name_source,
+                    "dialog_type": identities[_object_to_int(_row_value(raw_row, "dialog_id"))].dialog_type.value,
+                    "scheduled_coverage": self._scheduled_dialog_coverage(
+                        _object_to_int(_row_value(raw_row, "dialog_id"))
+                    ),
                 }
                 for raw_row in raw_rows
             ]
@@ -1616,7 +2025,9 @@ class ReadingService:
                     "source": "scheduled_messages",
                     "next_navigation": next_nav,
                     "message_state": "scheduled",
-                    "scope": "own_only",
+                    "scope": "all",
+                    "account_coverage": account_coverage,
+                    "scheduled_coverage": self._scheduled_dialog_coverage(req.dialog_id),
                     "dialog_name": identities[req.dialog_id].display_name,
                     "dialog_name_source": identities[req.dialog_id].display_name_source,
                 },
@@ -1909,7 +2320,13 @@ class ReadingService:
         )
         if not draft_result.get("ok"):
             return draft_result
-        scheduled_rows = self._list_scheduled_messages_from_db(scheduled_request)["data"]["messages"]
+        scheduled_result = self._list_scheduled_messages_from_db(scheduled_request)
+        scheduled_rows = scheduled_result.get("data", {}).get("messages", []) if scheduled_result.get("ok") else []
+        scheduled_coverage = (
+            scheduled_result.get("data", {}).get("account_coverage")
+            if scheduled_result.get("ok")
+            else {"state": "unknown", "reason": scheduled_result.get("error")}
+        )
         draft_rows = draft_result["data"]["messages"]
         state = _AllLocalState(
             all_request,
@@ -1918,6 +2335,7 @@ class ReadingService:
             draft_rows,
             draft_result,
             self._all_local_metadata(all_request.dialog_id, all_request.status),
+            scheduled_coverage,
         )
         return self._all_local_response(state)
 
@@ -1994,6 +2412,8 @@ class ReadingService:
                     "dialog_type": dialog_type,
                     "read_state": read_state,
                     **projection_metadata,
+                    "scheduled_coverage": state.scheduled_coverage,
+                    "dialog_scheduled_coverage": self._scheduled_dialog_coverage(state.request.dialog_id),
                     **topic_metadata,
                     **access_metadata,
                 },
@@ -2011,18 +2431,19 @@ class ReadingService:
         return combined
 
     @staticmethod
-    def _all_row_sort_key(row: dict) -> tuple[int, int, int | str, int]:
+    def _all_row_sort_key(row: dict) -> tuple[int, int, int, int | str, int]:
         state = str(row.get("message_state"))
-        state_order = {"sent": 0, "scheduled": 1, "draft": 2}
+        state_order = {"sent": 0, "scheduled": 1, "unknown_missing": 1, "draft": 2}
+        timestamp_value = row.get("sent_at")
         if state == "draft":
-            return (
-                int(row.get("sent_at") or row.get("draft_updated_at") or 0),
-                1,
-                str(row.get("message_key") or ""),
-                state_order["draft"],
-            )
+            timestamp_value = row.get("draft_updated_at")
+        has_time = 0 if timestamp_value is None else 1
+        timestamp = int(timestamp_value or 0)
+        if state == "draft":
+            return (has_time, timestamp, 1, str(row.get("message_key") or ""), state_order["draft"])
         return (
-            int(row.get("sent_at") or row.get("draft_updated_at") or 0),
+            has_time,
+            timestamp,
             0,
             _object_to_int(row.get("message_id")),
             state_order.get(state, 3),
@@ -2080,6 +2501,13 @@ class ReadingService:
         direction: str,
     ) -> dict:
         _set_timing_route("local_non_sent_state")
+        if request.message_state == "scheduled":
+            return self._scheduled_local_state_result(
+                dialog_id,
+                self._list_scheduled_messages_from_db(
+                    self._local_state_db_request(dialog_id, request, direction, None, None)
+                ),
+            )
         with timing_phase("local_projection"):
             row = _fetchone_row(self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)))
         status = _status_from_row(row)
@@ -2107,16 +2535,10 @@ class ReadingService:
         if isinstance(nav_result, dict):
             return nav_result
         anchor_msg_id, direction = nav_result
-        anchor_sent_at = None
-        all_navigation: NavigationToken | None = None
-        if request.message_state == "all" and request.navigation not in (None, "newest", "oldest"):
-            navigation = request.navigation
-            assert navigation is not None
-            try:
-                all_navigation = decode_navigation_token(navigation)
-                anchor_sent_at = all_navigation.sent_at
-            except ValueError as exc:
-                return {"ok": False, "error": "invalid_navigation", "message": str(exc)}
+        all_navigation = self._decode_all_history_navigation(request)
+        if isinstance(all_navigation, dict):
+            return all_navigation
+        anchor_sent_at = None if all_navigation is None else all_navigation.sent_at
         if request.message_state == "all" and request.unread:
             unread_position = await self._resolve_unread_position(dialog_id, request.unread_after_id)
             if isinstance(unread_position, _ReadPositionPending):
@@ -2131,6 +2553,18 @@ class ReadingService:
             anchor_sent_at,
             all_navigation,
         )
+
+    @staticmethod
+    def _decode_all_history_navigation(request: _ListMessagesRequest) -> NavigationToken | dict | None:
+        all_navigation: NavigationToken | None = None
+        if request.message_state == "all" and request.navigation not in (None, "newest", "oldest"):
+            navigation = request.navigation
+            assert navigation is not None
+            try:
+                all_navigation = decode_navigation_token(navigation)
+            except ValueError as exc:
+                return {"ok": False, "error": "invalid_navigation", "message": str(exc)}
+        return all_navigation
 
     async def _list_messages_for_state(
         self,
@@ -2163,15 +2597,80 @@ class ReadingService:
     async def _list_messages(self, req: dict) -> dict:
         """Return retained messages from sync.db without acquiring Telegram facts."""
         try:
-            selector = required_dialog_selector(
-                exact_id=req.get("dialog_id"),
-                dialog=req.get("dialog"),
-            )
             request = self._parse_list_messages_request(req)
+            if request.read_scope == "all_dialogs":
+                selector = None
+            else:
+                selector = required_dialog_selector(
+                    exact_id=req.get("dialog_id"),
+                    dialog=req.get("dialog"),
+                )
         except DialogSelectorError as exc:
             return _selector_error_response(exc)
         except ValueError as exc:
             return {"ok": False, "error": "invalid_time_range", "message": str(exc)}
+        if request.read_scope not in {"dialog", "all_dialogs"}:
+            return {"ok": False, "error": "invalid_read_scope", "message": "read_scope must be dialog or all_dialogs"}
+        if request.read_scope == "all_dialogs":
+            return self._list_all_dialogs_scheduled(request, req)
+        state_error = self._scheduled_list_filter_error(request)
+        if state_error is not None:
+            return state_error
+        assert selector is not None
+        return await self._list_messages_resolved(request, selector)
+
+    def _list_all_dialogs_scheduled(self, request: _ListMessagesRequest, req: dict) -> dict:
+        if request.message_state != "scheduled":
+            return {
+                "ok": False,
+                "error": "invalid_read_scope",
+                "message": 'read_scope="all_dialogs" is available only with message_state="scheduled".',
+            }
+        if (
+            any(
+                req.get(field) is not None
+                for field in (
+                    "dialog_id",
+                    "dialog",
+                    "topic_id",
+                    "topic",
+                    "exact_topic_id",
+                    "anchor_message_id",
+                    "context_message_id",
+                )
+            )
+            or request.unread
+        ):
+            return {
+                "ok": False,
+                "error": "invalid_read_scope",
+                "message": "All-dialog scheduled reads cannot include a dialog selector, topic, anchor, or unread filter.",
+            }
+        direction = request.direction if request.direction in {"newest", "oldest"} else "newest"
+        return self._list_scheduled_queue(
+            request,
+            dialog_id=None,
+            read_scope="all_dialogs",
+            direction=direction,
+        )
+
+    @staticmethod
+    def _scheduled_list_filter_error(request: _ListMessagesRequest) -> dict | None:
+        if request.message_state == "scheduled" and request.unread:
+            return {
+                "ok": False,
+                "error": "unread_state_unsupported",
+                "message": 'message_state="scheduled" has no unread semantics. Action: retry with message_state="sent" or message_state="all".',
+            }
+        if request.message_state == "scheduled" and request.context_message_id is not None:
+            return {
+                "ok": False,
+                "error": "scheduled_context_unsupported",
+                "message": 'message_state="scheduled" does not support sent-history context windows. Action: retry with message_state="sent".',
+            }
+        return None
+
+    async def _list_messages_resolved(self, request: _ListMessagesRequest, selector: DialogSelector) -> dict:
         direction = request.direction
         if direction not in ("newest", "oldest"):
             direction = "newest"
@@ -2191,6 +2690,17 @@ class ReadingService:
                 "error": "missing_dialog",
                 "message": "Either dialog_id or dialog name is required",
             }
+        if request.message_state == "scheduled":
+            result = self._list_scheduled_queue(
+                request,
+                dialog_id=dialog_id,
+                read_scope="dialog",
+                direction=direction,
+            )
+            if result.get("ok"):
+                result["data"]["dialog_id"] = dialog_id
+            with timing_phase("response_shape"):
+                return self._attach_directory_coverage(result, getattr(resolved, "coverage", None))
         result = await self._list_messages_for_state(dialog_id, request, direction)
         if result.get("ok"):
             data = result.get("data")
@@ -2224,7 +2734,7 @@ class ReadingService:
             return self._attach_directory_coverage(
                 self._merge_search_results(
                     sent_result,
-                    self._search_scheduled_messages(
+                    self._scheduled_search_for_mixed(
                         dataclasses.replace(request, offset=0, limit=request.offset + request.limit)
                     ),
                     request,
@@ -2276,7 +2786,7 @@ class ReadingService:
                     dataclasses.replace(request, offset=0, limit=request.offset + request.limit),
                     stemmed,
                 ),
-                self._search_scheduled_messages(
+                self._scheduled_search_for_mixed(
                     dataclasses.replace(request, offset=0, limit=request.offset + request.limit)
                 ),
                 request,
@@ -2829,7 +3339,19 @@ class ReadingService:
         if request_error is not None:
             return request_error
         dialog_filter = self._prepare_list_dialogs_filter(request.filter_raw)
-        scheduled_summary = scheduled_summary_by_dialog(conn, scheduled_now=int(time.time()))
+        coverage_result = self._scheduled_account_coverage(conn)
+        if isinstance(coverage_result, dict):
+            scheduled_summary: dict[int, tuple[int, int | None, int]] = {}
+            scheduled_coverage = {
+                "state": "unknown",
+                "account_id": self._deps.self_id,
+                "directory_generation": directory_coverage.get("publication_generation"),
+                "reason": coverage_result.get("error"),
+                "directory_coverage": directory_coverage,
+            }
+        else:
+            _, scheduled_coverage = coverage_result
+            scheduled_summary = scheduled_summary_by_dialog(conn, scheduled_now=int(time.time()))
         own_basis: dict[int, tuple[str, ...]] = self._own_only_basis_by_dialog(conn)
         sql_rows = self._fetch_list_dialog_rows(conn, request, dialog_filter)
         if not sql_rows:
@@ -2837,6 +3359,7 @@ class ReadingService:
             return self._empty_list_dialogs_response(
                 request.scope,
                 directory_coverage,
+                scheduled_coverage,
                 bootstrap_pending=count_total == 0,
             )
         identities = read_dialog_identities(conn, [_object_to_int(_row_value(row, "dialog_id")) for row in sql_rows])
@@ -2847,11 +3370,13 @@ class ReadingService:
             scheduled_summary,
             own_basis,
             identities,
+            conn,
         )
         if not selected_rows:
             return self._empty_list_dialogs_response(
                 request.scope,
                 directory_coverage,
+                scheduled_coverage,
                 bootstrap_pending=False,
             )
-        return self._project_list_dialog_rows(conn, selected_rows, request, directory_coverage)
+        return self._project_list_dialog_rows(conn, selected_rows, request, directory_coverage, scheduled_coverage)

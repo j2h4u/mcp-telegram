@@ -4,7 +4,7 @@ import sqlite3
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from typing import Literal
+from typing import Literal, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -27,6 +27,7 @@ def local_reading(make_synced_db: Callable[[], sqlite3.Connection]) -> ReadingSe
         "VALUES (1,7,100,'needle',0,0,0)"
     )
     conn.execute("INSERT INTO messages_fts(dialog_id,message_id,stemmed_text) VALUES (1,7,'needle')")
+    conn.execute("UPDATE scheduled_sync_state SET account_id=2 WHERE key='account'")
     return ReadingService(
         ReadingDeps(
             conn=conn,
@@ -115,3 +116,28 @@ async def test_non_fts_directory_errors_are_not_misclassified(local_reading: Rea
     local_reading._conn.execute("DROP TABLE dialogs")
     with pytest.raises(sqlite3.Error):
         await local_reading.search_messages({"query": "needle", "message_state": "sent"})
+
+
+async def test_sent_search_wire_omits_unavailable_scheduled_metadata(
+    local_reading: ReadingService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scheduled_metadata = {"repeat_period", "expected_version", "scheduled_coverage", "dialog_type"}
+    response = await local_reading.search_messages({"query": "needle", "message_state": "sent"})
+    assert response["ok"]
+    row = response["data"]["messages"][0]
+    assert scheduled_metadata.isdisjoint(row)
+    _connect_tool(monkeypatch, local_reading)
+    result = await reading.search_messages(reading.SearchMessages(query="needle", message_state="sent"))
+    assert not result.is_error
+    assert result.structured_content is not None
+    payload = cast(dict[str, object], omit_none_mapping_values(result.structured_content))
+    hit = cast(list[dict[str, object]], payload["results"])[0]
+    assert scheduled_metadata.isdisjoint(hit)
+    assert cast(dict[str, object], hit["content"])["content_kind"] == "snippet"
+    assert hit["anchor_call"] == {
+        "tool": "list_messages",
+        "arguments": {"exact_dialog_id": 1, "anchor_message_id": 7, "message_state": "sent"},
+    }
+    output_schema = TOOL_REGISTRY["search_messages"].output_schema
+    assert output_schema is not None
+    validate(payload, output_schema)

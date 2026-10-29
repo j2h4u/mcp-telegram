@@ -558,17 +558,22 @@ def test_scheduled_repair_remains_due_during_day_long_local_link_wait(
         cast(object, dependencies.client),  # type: ignore[arg-type]
         dependencies.conn,
         dependencies.shutdown_event,
-        OwnOnlyContext(account_id=1, personal_channel_id=channel_id),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=30.0),
         writer=inline_writer(  # type: ignore[arg-type]
             dependencies.conn
         ),
     )
+    with dependencies.conn:
+        dependencies.conn.execute("UPDATE scheduled_sync_state SET account_id=1 WHERE key='account'")
+        dependencies.conn.execute(
+            "INSERT INTO scheduled_reconciliation_state(dialog_id,updated_at,coverage_state) VALUES(1,?,'complete')",
+            (now,),
+        )
     repair = ScheduledRepairDemandAdapter(reconciler, account_id=1).status(now)
     discovery = ScheduledDiscoveryDemandAdapter(reconciler, account_id=1).status(now)
 
     assert repair is not None and repair.release_at == now
-    assert discovery is not None and discovery.release_at == now + 86_400
+    assert discovery is None
 
 
 @pytest.mark.asyncio

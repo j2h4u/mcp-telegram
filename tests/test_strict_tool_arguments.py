@@ -29,6 +29,13 @@ VALID_ARGUMENTS: dict[str, dict[str, object]] = {
     "get_sync_status": {"dialog_id": 123},
     "get_draft": {"exact_dialog_id": 123},
     "manage_draft": {"exact_dialog_id": 123, "action": "create", "operation_key": "validation", "text": "draft"},
+    "manage_scheduled_message": {
+        "exact_dialog_id": 123,
+        "action": "create",
+        "operation_key": "validation",
+        "text": "scheduled",
+        "schedule_at_utc": "2099-01-01T00:00:00Z",
+    },
     "get_inbox": {},
     "get_unread_summary": {},
 }

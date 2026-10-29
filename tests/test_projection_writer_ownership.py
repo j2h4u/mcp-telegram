@@ -140,6 +140,6 @@ async def test_scheduled_snapshot_uses_writer(storage: tuple[sqlite3.Connection,
         writer=writer,
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120),
     )
-    with demand_context(DemandKind.SCHEDULED_REPAIR):
-        assert await reconciler.run_demand_slice(DemandKind.SCHEDULED_REPAIR) == 1
+    with demand_context(DemandKind.SCHEDULED_DISCOVERY):
+        assert await reconciler.run_demand_slice(DemandKind.SCHEDULED_DISCOVERY) == 1
     assert reader.execute("SELECT message_state FROM scheduled_messages").fetchone()[0] == "unknown_missing"

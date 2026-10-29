@@ -9,8 +9,8 @@ from typing import cast
 
 import pytest
 
-from mcp_telegram.activity_peer_resolve import linked_chat_retry_at, resolve_input_peer, resolve_linked_chat_id
-from mcp_telegram.linked_chat_fact import LinkedChatFact, LinkedChatState, linked_chat_fact_owner
+from mcp_telegram.activity_peer_resolve import resolve_input_peer, resolve_linked_chat_id
+from mcp_telegram.linked_chat_fact import LinkedChatState, linked_chat_fact_owner
 from mcp_telegram.sync_db import _apply_migrations
 from sqlite_writer_helpers import inline_writer
 
@@ -95,15 +95,3 @@ async def test_confirmed_no_link_and_stale_known_link_remain_distinct_from_unkno
         assert no_link.state is LinkedChatState.KNOWN_NONE and no_link.linked_chat_id is None
         assert stale_link.state is LinkedChatState.KNOWN_LINK and stale_link.linked_chat_id == -10099
         assert stale_link.refresh_pending and stale_link.retry_at == 200
-
-
-def test_missing_pending_retry_uses_one_bounded_fallback() -> None:
-    fact = LinkedChatFact(LinkedChatState.UNKNOWN, None, None, True, 50, None)
-    assert linked_chat_retry_at(fact, now=100) == linked_chat_fact_owner.retry_policy.effective_retry_at(None, 50, 100)
-
-
-def test_missing_retry_and_request_use_owner_bounded_fallback() -> None:
-    fact = LinkedChatFact(LinkedChatState.UNKNOWN, None, None, True, None, None)
-    assert linked_chat_retry_at(fact, now=100) == linked_chat_fact_owner.retry_policy.effective_retry_at(
-        None, None, 100
-    )

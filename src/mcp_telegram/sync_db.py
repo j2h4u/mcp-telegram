@@ -13,11 +13,13 @@ from .dialog_classification import (
     is_bot_dialog_type,
     is_reserved_replies_username,
 )
+from .scheduled_receipts_schema import SCHEDULED_OPERATION_RECEIPT_DDL
 from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
-from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 90
+_CURRENT_SCHEMA_VERSION = 92
+_SCHEDULED_COMMAND_MIGRATION = 92
+_SCHEDULED_FINITE_COVERAGE_MIGRATION = 91
 _DRAFT_HISTORY_MIGRATION = 90
 _PROFILE_COLLECTION_MIGRATION = 88
 _PROFILE_HISTORY_MIGRATION = 89
@@ -64,11 +66,7 @@ _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _RPC_SAFETY_RECORD_KEY = "telegram_rpc_safety"
 _RPC_SAFETY_RECORD_VERSION = 2
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
-
-# Product-owned scheduled reconciliation targets.  Keep these values here so
-# schema bootstrap and the legacy worker cannot drift apart.
-SCHEDULED_ACTIVE_REPAIR_SECONDS = demand_freshness_seconds(DemandKind.SCHEDULED_REPAIR)
-SCHEDULED_QUIET_DISCOVERY_SECONDS = demand_freshness_seconds(DemandKind.SCHEDULED_DISCOVERY)
+_LEGACY_SCHEDULED_QUIET_DISCOVERY_SECONDS = 86_400
 
 logger = logging.getLogger(__name__)
 
@@ -3611,7 +3609,7 @@ def _apply_migration_59(conn: sqlite3.Connection, current: int) -> int:
                 SELECT DISTINCT dialog_id FROM scheduled_messages WHERE message_state = 'scheduled'
             ) AS active ON active.dialog_id = candidate.dialog_id
             """,
-            {"now": now, "quiet_seconds": SCHEDULED_QUIET_DISCOVERY_SECONDS},
+            {"now": now, "quiet_seconds": _LEGACY_SCHEDULED_QUIET_DISCOVERY_SECONDS},
         )
         conn.execute(
             "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
@@ -5088,6 +5086,13 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     current = _apply_migration_59(conn, current)
     current = _apply_migration_60(conn, current)
     current = _apply_late_migrations(conn, current)
+    _apply_migrations_85_to_92(conn, current)
+
+    logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
+
+
+def _apply_migrations_85_to_92(conn: sqlite3.Connection, current: int) -> int:
+    """Apply optional history, update-delivery, and command metadata in order."""
     if _CURRENT_SCHEMA_VERSION >= _HISTORICAL_FTS_BACKFILL_MIGRATION:
         current = _apply_migration_85(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _UPDATE_DELIVERY_MIGRATION:
@@ -5100,8 +5105,28 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_89(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _DRAFT_HISTORY_MIGRATION:
         current = _apply_migration_90(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _SCHEDULED_FINITE_COVERAGE_MIGRATION:
+        current = _apply_migration_91(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _SCHEDULED_COMMAND_MIGRATION:
+        current = _apply_migration_92(conn, current)
 
-    logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
+    return current
+
+
+def _apply_migration_92(conn: sqlite3.Connection, current: int) -> int:
+    """Retain native mutation receipts and known scheduled composition flags."""
+    return _apply_migration(
+        conn,
+        current,
+        _SCHEDULED_COMMAND_MIGRATION,
+        [
+            SCHEDULED_OPERATION_RECEIPT_DDL,
+            "ALTER TABLE scheduled_messages ADD COLUMN has_rich_message INTEGER CHECK(has_rich_message IN (0,1))",
+            "ALTER TABLE scheduled_messages ADD COLUMN invert_media INTEGER CHECK(invert_media IN (0,1))",
+            "ALTER TABLE scheduled_messages ADD COLUMN video_processing_pending INTEGER CHECK(video_processing_pending IN (0,1))",
+        ],
+        ignore_duplicate_column=True,
+    )
 
 
 def _apply_migration_90(conn: sqlite3.Connection, current: int) -> int:
@@ -5149,6 +5174,51 @@ def _apply_migration_90(conn: sqlite3.Connection, current: int) -> int:
             "CREATE INDEX draft_operation_receipts_expiry ON draft_operation_receipts(updated_at) WHERE outcome!='pending'",
         ],
     )
+
+
+def _apply_migration_91(conn: sqlite3.Connection, current: int) -> int:
+    """Make scheduled reconciliation represent finite evidence obligations."""
+    migrated = _apply_migration(
+        conn,
+        current,
+        91,
+        [
+            "ALTER TABLE scheduled_reconciliation_state RENAME TO scheduled_reconciliation_state_v90",
+            """CREATE TABLE scheduled_reconciliation_state (
+                dialog_id INTEGER PRIMARY KEY,
+                repair_due_at INTEGER,
+                discovery_due_at INTEGER,
+                dirty_since INTEGER,
+                dirty_generation INTEGER NOT NULL DEFAULT 0 CHECK(dirty_generation >= 0),
+                updated_at INTEGER NOT NULL,
+                snapshot_observation_order INTEGER,
+                baseline_observed_at INTEGER,
+                coverage_state TEXT NOT NULL DEFAULT 'unknown'
+                    CHECK(coverage_state IN ('unknown','complete','inaccessible','unsupported')),
+                coverage_reason TEXT,
+                directory_generation INTEGER
+            ) WITHOUT ROWID""",
+            """INSERT INTO scheduled_reconciliation_state (
+                dialog_id,repair_due_at,discovery_due_at,dirty_since,dirty_generation,
+                updated_at,snapshot_observation_order
+            ) SELECT dialog_id,NULL,unixepoch(),NULL,dirty_generation,updated_at,snapshot_observation_order
+                FROM scheduled_reconciliation_state_v90""",
+            "DROP TABLE scheduled_reconciliation_state_v90",
+            "DROP INDEX IF EXISTS idx_scheduled_reconciliation_repair_due",
+            "DROP INDEX IF EXISTS idx_scheduled_reconciliation_discovery_due",
+            "CREATE INDEX idx_scheduled_reconciliation_repair_due ON scheduled_reconciliation_state(repair_due_at,dialog_id) WHERE repair_due_at IS NOT NULL",
+            "CREATE INDEX idx_scheduled_reconciliation_discovery_due ON scheduled_reconciliation_state(discovery_due_at,dialog_id) WHERE discovery_due_at IS NOT NULL",
+            "ALTER TABLE scheduled_sync_state ADD COLUMN account_id INTEGER",
+            "ALTER TABLE scheduled_sync_state ADD COLUMN directory_generation INTEGER",
+        ],
+        ignore_duplicate_column=True,
+    )
+    # Unknown-missing rows retain useful message text and must remain searchable.
+    # Reuse the idempotent scheduled FTS repair so old rows whose index was
+    # removed by snapshot absence receive the same stemmed projection as new rows.
+    if current < _SCHEDULED_FINITE_COVERAGE_MIGRATION:
+        _ensure_scheduled_messages_fts(conn)
+    return migrated
 
 
 def _apply_migration_89(conn: sqlite3.Connection, current: int) -> int:
@@ -5346,7 +5416,7 @@ def _ensure_scheduled_messages_fts(conn: sqlite3.Connection) -> None:
             "FROM scheduled_messages sm "
             "LEFT JOIN scheduled_messages_fts sf "
             "  ON sf.dialog_id = sm.dialog_id AND sf.message_id = sm.message_id "
-            "WHERE sf.message_id IS NULL"
+            "WHERE sf.message_id IS NULL AND sm.message_state IN ('scheduled','unknown_missing')"
         ).fetchall(),
     )
     if rows:

@@ -76,6 +76,15 @@ def test_load_config_uses_frozen_typed_defaults(tmp_path: Path) -> None:
         config.freshness.read_receipts.read_at_ttl_seconds = 1  # type: ignore[misc]
 
 
+def test_deploy_config_template_loads_with_current_schema() -> None:
+    template = Path(__file__).resolve().parents[1] / "deploy" / "config.toml"
+
+    config = load_config(template)
+
+    assert config.state.dir == Path("/srv/mcp-telegram/database")
+    assert config.scheduling.self_profile_refresh_seconds == 86_400.0
+
+
 def test_auto_resume_can_be_disabled_without_disabling_protection(tmp_path: Path) -> None:
     config = load_config(
         _write_config(tmp_path, '[state]\ndir = "/state"\n[flood_wait]\nauto_resume_enabled = false\n')
@@ -342,7 +351,6 @@ max_calls_per_period = 12
 period_seconds = 30
 
 [scheduling]
-scheduled_reconciliation_seconds = 48
 read_position_reconciliation_seconds = 46.5
 read_position_reconciliation_max_dialogs_per_pass = 12
 read_position_reconciliation_failure_cooldown_seconds = 47
@@ -412,7 +420,6 @@ daemon_api_slow_request_seconds = 2.5
     )
     assert config.telegram_rpc == TelegramRpcConfig(max_calls_per_period=12, period_seconds=30.0)
     assert config.scheduling == SchedulingConfig(
-        scheduled_reconciliation_seconds=48.0,
         read_position_reconciliation_seconds=46.5,
         read_position_reconciliation_max_dialogs_per_pass=12,
         read_position_reconciliation_failure_cooldown_seconds=47.0,
@@ -466,7 +473,6 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
     scheduling = resolve_scheduling_config(
         SchedulingConfig(),
         {
-            "SCHEDULED_RECONCILIATION_SECONDS": "47.5",
             "READ_POSITION_RECONCILIATION_SECONDS": "45.5",
             "READ_POSITION_RECONCILIATION_MAX_DIALOGS_PER_PASS": "11",
             "READ_POSITION_RECONCILIATION_FAILURE_COOLDOWN_SECONDS": "46",
@@ -513,7 +519,6 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
     )
 
     assert scheduling == SchedulingConfig(
-        scheduled_reconciliation_seconds=47.5,
         read_position_reconciliation_seconds=45.5,
         read_position_reconciliation_max_dialogs_per_pass=11,
         read_position_reconciliation_failure_cooldown_seconds=46.0,

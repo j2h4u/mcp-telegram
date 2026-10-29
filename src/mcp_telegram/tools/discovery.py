@@ -101,12 +101,17 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "unread_reactions_count": {"type": "integer"},
                     "scheduled_count": {
                         "type": "integer",
-                        "description": "Count of pending author-only scheduled messages in this dialog.",
+                        "description": "Count of future scheduled messages in this dialog.",
                     },
                     "next_scheduled_at": {
                         "type": ["integer", "null"],
                         "description": "Earliest pending scheduled publication timestamp, if any.",
                     },
+                    "unresolved_scheduled_count": {
+                        "type": "integer",
+                        "description": "Due or timestamp-unknown pending queue records retained in this dialog.",
+                    },
+                    "scheduled_coverage": {"type": ["object", "null"]},
                     "inclusion_basis": {
                         "type": ["array", "null"],
                         "items": {"type": "string"},
@@ -154,6 +159,8 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "unread_reactions_count",
                     "scheduled_count",
                     "next_scheduled_at",
+                    "unresolved_scheduled_count",
+                    "scheduled_coverage",
                     "inclusion_basis",
                     "folder_ids",
                     "folders",
@@ -218,6 +225,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
             "additionalProperties": False,
         },
         "snapshot_age_h": {"type": ["integer", "null"]},
+        "scheduled_coverage": {"type": "object"},
         "directory_coverage": {
             "type": "object",
             "properties": {
@@ -268,6 +276,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
         "count",
         "filters",
         "snapshot_age_h",
+        "scheduled_coverage",
         "directory_coverage",
         "bootstrap_pending",
         "scope",
@@ -315,6 +324,8 @@ class _DialogSurface:
     unread_reactions_count: int
     scheduled_count: int
     next_scheduled_at: int | None
+    unresolved_scheduled_count: int
+    scheduled_coverage: dict[str, object] | None
     inclusion_basis: list[str] | None
     folder_ids: list[int]
     folders: list[tuple[int, str]]
@@ -341,6 +352,7 @@ class _ListDialogsSurface:
     scope: str
     folder_snapshot: _FolderSnapshotSurface
     directory_coverage: dict[str, object]
+    scheduled_coverage: dict[str, object]
     folder_membership_unknown_count: int
 
 
@@ -504,6 +516,10 @@ def _strict_dialog(value: object, index: int) -> _DialogSurface:
         unread_reactions_count=_strict_int(value, "unread_reactions_count", context=context),
         scheduled_count=_strict_int(value, "scheduled_count", context=context),
         next_scheduled_at=_strict_optional_int(value, "next_scheduled_at", context=context),
+        unresolved_scheduled_count=_strict_int(value, "unresolved_scheduled_count", context=context),
+        scheduled_coverage=(
+            dict(value["scheduled_coverage"]) if isinstance(value.get("scheduled_coverage"), Mapping) else None
+        ),
         inclusion_basis=_strict_string_list_or_none(value, "inclusion_basis", context=context),
         folder_ids=_strict_int_list(value, "folder_ids", context=context),
         folders=_strict_folders(value, context=context),
@@ -545,6 +561,11 @@ def _strict_list_dialogs_data(
                 "lookup_complete": False,
                 "lookup_fresh": False,
             }
+        ),
+        scheduled_coverage=(
+            dict(raw_data["scheduled_coverage"])
+            if isinstance(raw_data.get("scheduled_coverage"), Mapping)
+            else {"state": "unknown", "account_id": None, "reason": "coverage_unavailable"}
         ),
         folder_membership_unknown_count=(
             _strict_int(raw_data, "folder_membership_unknown_count", context="list_dialogs")
@@ -672,7 +693,7 @@ class ListDialogs(ToolArgs):
     unread by peer); both fields are null for non-DM rows.
 
     Dialog rows include a local scheduled buffer summary. Use message_state="scheduled" to
-    return only dialogs with pending author-only scheduled messages; "all" is the default.
+    return only dialogs with future or unresolved pending queue facts; "all" is the default.
     Use scope="own_only" to return only dialogs accepted by the own-message classifier.
 
     sync_status values:
@@ -759,6 +780,12 @@ def _folder_view_result(args: ListDialogs, response: Mapping[str, object]) -> To
         }
         for folder in folders
     ]
+    raw_data = response.get("data")
+    scheduled_coverage = (
+        dict(raw_data["scheduled_coverage"])
+        if isinstance(raw_data, Mapping) and isinstance(raw_data.get("scheduled_coverage"), Mapping)
+        else {"state": "unknown", "account_id": None, "reason": "coverage_not_returned_for_folder_view"}
+    )
     return structured_result(
         {
             "view": "folders",
@@ -767,6 +794,7 @@ def _folder_view_result(args: ListDialogs, response: Mapping[str, object]) -> To
             "count": len(structured_folders),
             "filters": _list_dialogs_filters(args),
             "snapshot_age_h": None,
+            "scheduled_coverage": scheduled_coverage,
             "bootstrap_pending": not snapshot.complete,
             "scope": "all",
             "folder_snapshot": snapshot.to_wire(),
@@ -859,6 +887,8 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 "unread_reactions_count": dialog.unread_reactions_count,
                 "scheduled_count": dialog.scheduled_count,
                 "next_scheduled_at": dialog.next_scheduled_at,
+                "unresolved_scheduled_count": dialog.unresolved_scheduled_count,
+                "scheduled_coverage": dialog.scheduled_coverage,
                 "inclusion_basis": dialog.inclusion_basis,
                 "folder_ids": dialog.folder_ids,
                 "folders": [
@@ -880,6 +910,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
         "scope": surface.scope,
         "folder_snapshot": surface.folder_snapshot.to_wire(),
         "directory_coverage": surface.directory_coverage,
+        "scheduled_coverage": surface.scheduled_coverage,
         "folder_membership_unknown_count": surface.folder_membership_unknown_count,
         "warnings": warnings,
     }

@@ -61,6 +61,7 @@ class _ListMessagesKwargs(TypedDict, total=False):
     context_message_id: int | None
     context_size: int | None
     message_state: str
+    read_scope: str
     since_utc: str | None
     until_utc: str | None
 
@@ -94,7 +95,10 @@ class _TraceAccountMessagesKwargs(TypedDict, total=False):
 
 def _list_messages_state_payload(kwargs: _ListMessagesKwargs) -> dict[str, object]:
     message_state = kwargs.get("message_state")
-    return {"message_state": message_state} if message_state is not None else {}
+    payload: dict[str, object] = {"message_state": message_state} if message_state is not None else {}
+    if (read_scope := kwargs.get("read_scope")) is not None:
+        payload["read_scope"] = read_scope
+    return payload
 
 
 def _list_messages_selector_payload(kwargs: _ListMessagesKwargs) -> dict[str, object]:

@@ -75,7 +75,6 @@ DIALOG_IDENTITY_ROLE_FUNCTIONS: Mapping[str, Mapping[str, frozenset[str]]] = {
             "_next_enrollment_dialog",
         )
     },
-    "daemon_log_context.py": {"dialog_log_context": frozenset({"name", "type"})},
     "delta_sync.py": {"_dm_gap_scan_dialog_ids": frozenset({"type"})},
     "dialog_directory.py": {"CanonicalDialogDirectory._start_generation": frozenset({"identity_revision"})},
     "dialog_sync.py": {
@@ -231,6 +230,12 @@ LIST_MESSAGE_LIFECYCLE_FIELDS = frozenset(
         "scheduled_at",
         "published_at",
         "inclusion_basis",
+        "dialog_name",
+        "dialog_name_source",
+        "dialog_type",
+        "expected_version",
+        "repeat_period",
+        "scheduled_coverage",
     }
 )
 MESSAGE_VIEW_BYPASS_NAMES = frozenset(

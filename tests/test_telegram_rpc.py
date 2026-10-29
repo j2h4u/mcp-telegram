@@ -4680,6 +4680,108 @@ async def test_update_difference_expired_scope_returns_without_sending() -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rpc_request", "response", "target", "reason"),
+    [
+        (
+            functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0),
+            types.updates.DifferenceTooLong(pts=5),
+            None,
+            "account_difference_too_long",
+        ),
+        (
+            functions.updates.GetChannelDifferenceRequest(
+                channel=types.InputChannel(channel_id=123, access_hash=456),
+                filter=types.ChannelMessagesFilterEmpty(),
+                pts=1,
+                limit=100,
+            ),
+            types.updates.ChannelDifferenceTooLong(
+                dialog=cast(types.TypeDialog, object()), messages=[], chats=[], users=[]
+            ),
+            -1_000_000_000_123,
+            "channel_difference_too_long",
+        ),
+    ],
+)
+async def test_difference_too_long_waits_for_scoped_scheduled_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+    rpc_request: object,
+    response: object,
+    target: int | None,
+    reason: str,
+) -> None:
+    gate = _gate()
+    order: list[object] = []
+
+    async def classified(_request: object, *, ordered: bool) -> object:
+        del _request, ordered
+        order.append("response")
+        return response
+
+    async def recover(actual_target: int | None, actual_reason: str) -> None:
+        order.append((actual_target, actual_reason))
+
+    monkeypatch.setattr(gate, "_call_classified_difference", classified)
+    monkeypatch.setattr(gate, "_ensure_safety_ledger", lambda: SimpleNamespace(verified_account_id=42))
+    gate.set_scheduled_continuity_recovery(recover)
+
+    assert await gate._call_update_difference(rpc_request, ordered=False) is response
+    assert order == ["response", (target, reason)]
+
+
+@pytest.mark.asyncio
+async def test_difference_too_long_does_not_return_when_scheduled_recovery_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = _gate()
+    response = types.updates.DifferenceTooLong(pts=5)
+
+    async def classified(_request: object, *, ordered: bool) -> object:
+        del _request, ordered
+        return response
+
+    async def recover(_target: int | None, _reason: str) -> None:
+        raise OSError("scheduled recovery persistence failed")
+
+    monkeypatch.setattr(gate, "_call_classified_difference", classified)
+    monkeypatch.setattr(gate, "_ensure_safety_ledger", lambda: SimpleNamespace(verified_account_id=42))
+    gate.set_scheduled_continuity_recovery(recover)
+
+    with pytest.raises(OSError, match="scheduled recovery persistence failed"):
+        await gate._call_update_difference(
+            functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0), ordered=False
+        )
+
+
+@pytest.mark.asyncio
+async def test_replayable_difference_result_does_not_invalidate_scheduled_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = _gate()
+    response = types.updates.DifferenceEmpty(date=datetime.now(UTC), seq=1)
+    invalidations: list[tuple[int | None, str]] = []
+
+    async def classified(_request: object, *, ordered: bool) -> object:
+        del _request, ordered
+        return response
+
+    async def recover(target: int | None, reason: str) -> None:
+        invalidations.append((target, reason))
+
+    monkeypatch.setattr(gate, "_call_classified_difference", classified)
+    gate.set_scheduled_continuity_recovery(recover)
+
+    assert (
+        await gate._call_update_difference(
+            functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0), ordered=False
+        )
+        is response
+    )
+    assert invalidations == []
+
+
+@pytest.mark.asyncio
 async def test_update_difference_saturation_wait_is_bounded_by_original_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

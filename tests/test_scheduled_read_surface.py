@@ -4,7 +4,7 @@ import sqlite3
 import time
 from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager
-from typing import Literal
+from typing import Literal, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -38,6 +38,14 @@ LIFECYCLE_FIELDS = {
     "scheduled_at",
     "published_at",
     "inclusion_basis",
+}
+EXTENDED_LIFECYCLE_FIELDS = {
+    "repeat_period",
+    "expected_version",
+    "scheduled_coverage",
+    "dialog_name",
+    "dialog_name_source",
+    "dialog_type",
 }
 
 
@@ -244,7 +252,7 @@ async def test_draft_cursor_rejects_changed_projection() -> None:
                 "unseen": True,
                 "scheduled_at": 300,
                 "published_at": 200,
-                "inclusion_basis": [],
+                "inclusion_basis": None,
             },
         ),
         (
@@ -267,8 +275,9 @@ async def test_draft_cursor_rejects_changed_projection() -> None:
 def test_message_lifecycle_fields_contract(row: dict[str, object], sent_at: int, expected: dict[str, object]) -> None:
     lifecycle = _message_lifecycle_fields(row, sent_at=sent_at)
 
-    assert set(lifecycle) == LIFECYCLE_FIELDS
-    assert lifecycle == expected
+    assert set(lifecycle) == LIFECYCLE_FIELDS | EXTENDED_LIFECYCLE_FIELDS
+    assert {field: lifecycle[field] for field in LIFECYCLE_FIELDS} == expected
+    assert all(lifecycle[field] is None for field in EXTENDED_LIFECYCLE_FIELDS)
 
 
 def test_message_lifecycle_fields_does_not_alias_mutable_inclusion_basis() -> None:
@@ -304,6 +313,7 @@ def test_scheduled_row_mapper_preserves_canonical_content_shape(  # noqa: PLR091
         {
             "message_id": 11,
             "sent_at": FUTURE_BASE + 200,
+            "scheduled_at": FUTURE_BASE + 200,
             "dialog_id": 1,
             "text": text,
             "media_kind": media_kind,
@@ -350,6 +360,7 @@ def _create_scheduled_table(conn: sqlite3.Connection) -> None:
             message_id INTEGER NOT NULL,
             scheduled_at INTEGER,
             text TEXT,
+            observation_order INTEGER,
             formatting_entities TEXT,
             service_action TEXT,
             sender_id INTEGER,
@@ -386,10 +397,30 @@ def _create_scheduled_table(conn: sqlite3.Connection) -> None:
     _create_own_only_table(conn)
 
 
+def _make_scheduled_server(conn: sqlite3.Connection | None = None, client: object | None = None):
+    server = make_server(conn, client)
+    server.self_id = 7
+    source = server._conn
+    source.execute(
+        "CREATE TABLE IF NOT EXISTS scheduled_sync_state (key TEXT PRIMARY KEY, account_id INTEGER, "
+        "directory_generation INTEGER, next_retry_at INTEGER, last_snapshot_at INTEGER, last_error TEXT)"
+    )
+    source.execute(
+        "INSERT OR REPLACE INTO scheduled_sync_state(key,account_id,directory_generation) VALUES ('account',7,0)"
+    )
+    source.execute(
+        "CREATE TABLE IF NOT EXISTS scheduled_reconciliation_state (dialog_id INTEGER PRIMARY KEY, "
+        "coverage_state TEXT, coverage_reason TEXT, baseline_observed_at INTEGER, directory_generation INTEGER, "
+        "repair_due_at INTEGER, discovery_due_at INTEGER)"
+    )
+    source.commit()
+    return server
+
+
 def _insert_scheduled(  # noqa: PLR0913
     conn: sqlite3.Connection,
     message_id: int,
-    at: int,
+    at: int | None,
     text: str,
     state: str = "scheduled",
     dialog_id: int = 1,
@@ -398,8 +429,8 @@ def _insert_scheduled(  # noqa: PLR0913
         """
         INSERT INTO scheduled_messages
         (dialog_id, message_id, scheduled_at, text, sender_id, sender_first_name,
-         message_state, visibility, unpublished, unseen, first_seen_at, updated_at)
-        VALUES (?, ?, ?, ?, 99, 'Me', ?, 'author_only', 1, 1, 1700000000, 1700000000)
+         message_state, visibility, unpublished, unseen, observation_order, first_seen_at, updated_at)
+        VALUES (?, ?, ?, ?, 99, 'Me', ?, 'author_only', 1, 1, 1, 1700000000, 1700000000)
         """,
         (dialog_id, message_id, at, text, state),
     )
@@ -424,7 +455,7 @@ def _create_own_only_table(conn: sqlite3.Connection) -> None:
 
 @pytest.mark.asyncio
 async def test_list_messages_scheduled_is_pending_only_and_local() -> None:
-    server = make_server()
+    server = _make_scheduled_server()
     conn = server._conn
     _create_scheduled_table(conn)
     _insert_scheduled(conn, 11, FUTURE_BASE + 200, "later")
@@ -450,8 +481,215 @@ async def test_list_messages_scheduled_is_pending_only_and_local() -> None:
 
 
 @pytest.mark.asyncio
+async def test_global_scheduled_queue_keyset_orders_nulls_and_real_dialog_ids() -> None:
+    conn = _make_db_with_dialogs()
+    server = _make_scheduled_server(conn)
+    _seed_dialog_row(conn, 1, name="First chat")
+    _seed_dialog_row(conn, 2, name="Second chat")
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 7, None, "unknown time", state="unknown_missing", dialog_id=2)
+    _insert_scheduled(conn, 8, FUTURE_BASE + 100, "same time first", dialog_id=1)
+    _insert_scheduled(conn, 3, FUTURE_BASE + 100, "same time second", dialog_id=2)
+    _insert_scheduled(conn, 4, FUTURE_BASE + 200, "later", dialog_id=2)
+
+    first = await server._list_messages(
+        {"message_state": "scheduled", "read_scope": "all_dialogs", "direction": "oldest", "limit": 2}
+    )
+    assert first["ok"] is True
+    first_rows = first["data"]["messages"]
+    assert [(row["dialog_id"], row["message_id"], row["scheduled_at"]) for row in first_rows] == [
+        (2, 7, None),
+        (1, 8, FUTURE_BASE + 100),
+    ]
+    assert first_rows[0]["dialog_name"] == "Second chat"
+    token = first["data"]["next_navigation"]
+    second = await server._list_messages(
+        {"message_state": "scheduled", "read_scope": "all_dialogs", "navigation": token, "limit": 2}
+    )
+    assert [(row["dialog_id"], row["message_id"]) for row in second["data"]["messages"]] == [(2, 3), (2, 4)]
+    assert second["data"]["next_navigation"] is None
+
+
+@pytest.mark.asyncio
+async def test_scheduled_queue_cursor_is_bound_to_account_scope_and_filters() -> None:
+    conn = _make_db_with_dialogs()
+    server = _make_scheduled_server(conn)
+    _seed_dialog_row(conn, 1, name="First chat")
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 1, FUTURE_BASE + 100, "one")
+    _insert_scheduled(conn, 2, FUTURE_BASE + 200, "two")
+    first = await server._list_messages(
+        {"message_state": "scheduled", "read_scope": "all_dialogs", "direction": "oldest", "limit": 1}
+    )
+    token = first["data"]["next_navigation"]
+
+    changed_filter = await server._list_messages(
+        {"message_state": "scheduled", "read_scope": "all_dialogs", "navigation": token, "sender_id": 9}
+    )
+    changed_scope = await server._list_messages(
+        {"message_state": "scheduled", "read_scope": "dialog", "dialog_id": 1, "navigation": token}
+    )
+    server.self_id = 8
+    server = _make_scheduled_server(conn)
+    server.self_id = 8
+    changed_account = await server._list_messages(
+        {"message_state": "scheduled", "read_scope": "all_dialogs", "navigation": token}
+    )
+
+    assert changed_filter["error"] == "invalid_navigation"
+    assert changed_scope["error"] == "invalid_navigation"
+    assert changed_account["error"] == "scheduled_account_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_scheduled_response_budget_cursor_resumes_after_emitted_row() -> None:
+    server = _make_scheduled_server()
+    conn = server._conn
+    _create_scheduled_table(conn)
+    for message_id in range(1, 6):
+        _insert_scheduled(conn, message_id, FUTURE_BASE + message_id, "x" * 65_536)
+
+    first = await server._list_messages(
+        {"dialog_id": 1, "message_state": "scheduled", "direction": "oldest", "limit": 5}
+    )
+    second = await server._list_messages(
+        {
+            "dialog_id": 1,
+            "message_state": "scheduled",
+            "navigation": first["data"]["next_navigation"],
+            "limit": 5,
+        }
+    )
+
+    assert [row["message_id"] for row in first["data"]["messages"]] == [1, 2, 3]
+    assert first["data"]["truncation"]["reason"] == "response_budget"
+    assert [row["message_id"] for row in second["data"]["messages"]] == [4, 5]
+    assert second["data"]["next_navigation"] is None
+
+
+@pytest.mark.asyncio
+async def test_scheduled_newest_budget_cursor_keeps_the_traversal_prefix() -> None:
+    server = _make_scheduled_server()
+    conn = server._conn
+    _create_scheduled_table(conn)
+    for message_id in range(1, 4):
+        _insert_scheduled(conn, message_id, FUTURE_BASE + message_id, "x" * 140_000)
+
+    request: dict[str, object] = {
+        "dialog_id": 1,
+        "message_state": "scheduled",
+        "direction": "newest",
+        "limit": 3,
+    }
+    seen: list[int] = []
+    pages: list[list[int]] = []
+    for _ in range(4):
+        page = await server._list_messages(request)
+        assert page["ok"] is True
+        ids = [row["message_id"] for row in page["data"]["messages"]]
+        pages.append(ids)
+        seen.extend(ids)
+        if page["data"]["next_navigation"] is None:
+            break
+        request["navigation"] = page["data"]["next_navigation"]
+
+    assert pages == [[3], [2], [1]]
+    assert seen == [3, 2, 1]
+
+
+@pytest.mark.asyncio
+async def test_mixed_newest_cursor_keeps_null_scheduled_rows_reachable() -> None:
+    server = _make_scheduled_server()
+    conn = server._conn
+    _insert_synced_dialog(conn, 1, status="synced")
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 1, None, "unknown one", state="unknown_missing")
+    _insert_scheduled(conn, 2, None, "unknown two", state="unknown_missing")
+    _insert_scheduled(conn, 3, FUTURE_BASE + 100, "future")
+
+    request: dict[str, object] = {"dialog_id": 1, "message_state": "all", "direction": "newest", "limit": 1}
+    seen: list[int] = []
+    for _ in range(4):
+        page = await server._list_messages(request)
+        assert page["ok"] is True
+        seen.extend(row["message_id"] for row in page["data"]["messages"])
+        if page["data"]["next_navigation"] is None:
+            break
+        request["navigation"] = page["data"]["next_navigation"]
+
+    assert seen == [3, 2, 1]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_list_and_search_fail_closed_for_unverified_account() -> None:
+    conn = _make_db_with_dialogs()
+    server = _make_scheduled_server(conn)
+    _seed_dialog_row(conn, 1, name="First chat")
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 1, FUTURE_BASE + 100, "needle")
+    server.self_id = None
+
+    listed = await server._list_messages({"dialog_id": 1, "message_state": "scheduled"})
+    searched = await server._search_messages({"dialog_id": 1, "message_state": "scheduled", "query": "needle"})
+
+    assert listed["error"] == "scheduled_account_unverified"
+    assert searched["error"] == "scheduled_account_unverified"
+
+
+@pytest.mark.asyncio
+async def test_scheduled_list_and_search_never_call_telegram_client() -> None:
+    conn = _make_db_with_dialogs()
+    client = MagicMock()
+    for method in ("get_entity", "get_input_entity", "iter_dialogs", "iter_messages", "get_me"):
+        setattr(client, method, AsyncMock(side_effect=AssertionError(f"unexpected Telegram call: {method}")))
+    server = _make_scheduled_server(conn, client)
+    _seed_dialog_row(conn, 1, name="Local chat")
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 1, FUTURE_BASE + 100, "needle")
+
+    scoped = await server._list_messages({"dialog_id": 1, "message_state": "scheduled"})
+    global_page = await server._list_messages({"read_scope": "all_dialogs", "message_state": "scheduled"})
+    search = await server._search_messages({"dialog_id": 1, "message_state": "scheduled", "query": "needle"})
+
+    assert scoped["ok"] and global_page["ok"] and search["ok"]
+    for method in ("get_entity", "get_input_entity", "iter_dialogs", "iter_messages", "get_me"):
+        cast(AsyncMock, getattr(client, method)).assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"message_state": "all"},
+        {"dialog_id": 1},
+        {"topic_id": 3},
+        {"anchor_message_id": 4},
+        {"context_message_id": 4},
+    ],
+)
+async def test_global_scheduled_scope_rejects_mixed_and_concrete_selectors(extra: dict[str, object]) -> None:
+    result = await make_server()._list_messages({"read_scope": "all_dialogs", "message_state": "scheduled", **extra})
+
+    assert result["ok"] is False
+    assert result["error"] == "invalid_read_scope"
+
+
+@pytest.mark.asyncio
+async def test_scoped_scheduled_context_is_rejected_instead_of_silently_ignored() -> None:
+    server = _make_scheduled_server()
+    conn = server._conn
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 1, FUTURE_BASE + 100, "scheduled")
+
+    result = await server._list_messages({"dialog_id": 1, "message_state": "scheduled", "context_message_id": 42})
+
+    assert result["ok"] is False
+    assert result["error"] == "scheduled_context_unsupported"
+
+
+@pytest.mark.asyncio
 async def test_list_messages_all_uses_one_unified_envelope() -> None:
-    server = make_server()
+    server = _make_scheduled_server()
     conn = server._conn
     _insert_synced_dialog(conn, 1, status="synced")
     _insert_message(conn, 1, 1, sent_at=1700000000, text="published")
@@ -471,7 +709,7 @@ async def test_list_messages_all_uses_one_unified_envelope() -> None:
 
 @pytest.mark.asyncio
 async def test_list_messages_defaults_to_all_and_sent_remains_explicit() -> None:
-    server = make_server()
+    server = _make_scheduled_server()
     conn = server._conn
     _insert_synced_dialog(conn, 1, status="synced")
     _insert_message(conn, 1, 1, sent_at=1700000000, text="published")
@@ -489,7 +727,7 @@ async def test_list_messages_defaults_to_all_and_sent_remains_explicit() -> None
 
 @pytest.mark.asyncio
 async def test_default_all_unread_uses_only_the_published_unread_cursor() -> None:
-    server = make_server()
+    server = _make_scheduled_server()
     server.self_id = 7
     conn = server._conn
     _insert_synced_dialog(conn, 1, status="synced")
@@ -515,7 +753,7 @@ async def test_default_all_unread_uses_only_the_published_unread_cursor() -> Non
 
 @pytest.mark.asyncio
 async def test_all_unread_pagination_skips_mutable_local_projections(monkeypatch: pytest.MonkeyPatch) -> None:
-    server = make_server()
+    server = _make_scheduled_server()
     server.self_id = 7
     conn = server._conn
     _insert_synced_dialog(conn, 1, status="synced")
@@ -682,7 +920,7 @@ async def test_default_all_marks_not_synced_empty_history_as_unknown() -> None:
 
 @pytest.mark.asyncio
 async def test_list_messages_all_uses_numeric_tie_break_for_sent_and_scheduled_rows() -> None:
-    server = make_server()
+    server = _make_scheduled_server()
     conn = server._conn
     _insert_synced_dialog(conn, 1, status="synced")
     shared_timestamp = FUTURE_BASE + 100
@@ -727,7 +965,7 @@ async def test_list_messages_all_topic_cursor_preserves_topic_scope() -> None:
 
 @pytest.mark.asyncio
 async def test_list_messages_all_paginates_across_sent_and_scheduled_rows() -> None:
-    server = make_server()
+    server = _make_scheduled_server()
     conn = server._conn
     _insert_synced_dialog(conn, 1, status="synced")
     _insert_message(conn, 1, 1, sent_at=FUTURE_BASE - 300, text="sent one")
@@ -754,7 +992,7 @@ async def test_list_messages_all_paginates_across_sent_and_scheduled_rows() -> N
 
 @pytest.mark.asyncio
 async def test_list_messages_all_paginates_drafts_without_hiding_later_sent_rows() -> None:
-    server = make_server()
+    server = _make_scheduled_server()
     server.self_id = 7
     conn = server._conn
     _insert_synced_dialog(conn, 1, status="synced")
@@ -790,8 +1028,46 @@ async def test_list_messages_all_paginates_drafts_without_hiding_later_sent_rows
 
 
 @pytest.mark.asyncio
+async def test_mixed_all_cursor_keeps_unknown_and_null_scheduled_rows_reachable() -> None:
+    server = _make_scheduled_server()
+    conn = server._conn
+    _insert_synced_dialog(conn, 1, status="synced")
+    _insert_message(conn, 1, 4, sent_at=FUTURE_BASE + 200, text="sent")
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 1, None, "unknown one", state="unknown_missing")
+    _insert_scheduled(conn, 2, None, "unknown two", state="unknown_missing")
+    _insert_scheduled(conn, 3, FUTURE_BASE + 100, "scheduled")
+    _create_draft_projection(conn)
+    conn.execute(
+        "INSERT INTO draft_current VALUES (7, 1, 0, 0, 'present', 'draft', '[]', NULL, NULL, NULL, NULL, NULL, "
+        "NULL, NULL, 1, 'realtime_present', ?, ?, ?, 1, 1)",
+        (FUTURE_BASE + 300, FUTURE_BASE + 300, FUTURE_BASE + 300),
+    )
+    conn.execute("INSERT INTO draft_sync_state VALUES (7, 'ready', 'complete', ?, ?, NULL)", (100, 101))
+    conn.commit()
+
+    seen: list[tuple[str, int | None]] = []
+    request: dict[str, object] = {"dialog_id": 1, "message_state": "all", "direction": "oldest", "limit": 1}
+    for _ in range(8):
+        page = await server._list_messages(request)
+        assert page["ok"] is True
+        seen.extend((row["message_state"], row.get("message_id")) for row in page["data"]["messages"])
+        if page["data"]["next_navigation"] is None:
+            break
+        request = {**request, "navigation": page["data"]["next_navigation"]}
+
+    assert seen == [
+        ("unknown_missing", 1),
+        ("unknown_missing", 2),
+        ("scheduled", 3),
+        ("sent", 4),
+        ("draft", None),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_list_messages_all_invalidates_cursor_when_unseen_draft_changes() -> None:
-    server = make_server()
+    server = _make_scheduled_server()
     server.self_id = 7
     conn = server._conn
     _insert_synced_dialog(conn, 1, status="synced")
@@ -843,8 +1119,8 @@ async def test_draft_sender_filter_reports_scope_mismatch_without_absence_claim(
 
 
 @pytest.mark.asyncio
-async def test_own_only_cache_fails_closed_for_scheduled_projection() -> None:
-    server = make_server()
+async def test_scheduled_projection_does_not_depend_on_own_only_cache() -> None:
+    server = _make_scheduled_server()
     conn = server._conn
     dialog_id = 42
     _insert_synced_dialog(conn, dialog_id, status="synced")
@@ -857,8 +1133,8 @@ async def test_own_only_cache_fails_closed_for_scheduled_projection() -> None:
     all_without_basis = await server._list_messages(
         {"dialog_id": dialog_id, "message_state": "all", "direction": "oldest"}
     )
-    assert scheduled_without_basis["data"]["messages"] == []
-    assert [row["message_id"] for row in all_without_basis["data"]["messages"]] == [1]
+    assert [row["message_id"] for row in scheduled_without_basis["data"]["messages"]] == [2]
+    assert [row["message_id"] for row in all_without_basis["data"]["messages"]] == [1, 2]
 
     conn.execute(
         "INSERT INTO own_only_dialogs(dialog_id, inclusion_basis, updated_at) VALUES (?, ?, ?)",
@@ -874,21 +1150,21 @@ async def test_own_only_cache_fails_closed_for_scheduled_projection() -> None:
 
 
 @pytest.mark.asyncio
-async def test_scheduled_reads_hide_non_future_rows() -> None:
-    server = make_server()
+async def test_scheduled_reads_keep_due_pending_rows() -> None:
+    server = _make_scheduled_server()
     conn = server._conn
     _create_scheduled_table(conn)
     _insert_scheduled(conn, 10, FUTURE_BASE + 100, "future")
     _insert_scheduled(conn, 11, int(time.time()) - 100, "expired")
 
     result = await server._list_messages({"dialog_id": 1, "message_state": "scheduled"})
-    assert [row["message_id"] for row in result["data"]["messages"]] == [10]
+    assert [row["message_id"] for row in result["data"]["messages"]] == [11, 10]
 
 
 @pytest.mark.asyncio
 async def test_search_messages_scheduled_is_local_and_explicit() -> None:
     conn = _make_db_with_dialogs()
-    server = make_server(conn)
+    server = _make_scheduled_server(conn)
     _create_scheduled_table(conn)
     _insert_scheduled(conn, 11, FUTURE_BASE + 200, "needle in future")
 
@@ -909,7 +1185,7 @@ async def test_search_messages_scheduled_is_local_and_explicit() -> None:
 @pytest.mark.parametrize("message_state", ["scheduled", "all"])
 async def test_scheduled_search_hits_use_canonical_username_identity(message_state: str) -> None:
     conn = _make_db_with_dialogs(with_fts=True)
-    server = make_server(conn)
+    server = _make_scheduled_server(conn)
     _seed_dialog_row(conn, 1, name=None)
     conn.execute(
         "UPDATE dialogs SET type='user',username='peer_handle',identity_source='directory',identity_complete=1 "
@@ -930,7 +1206,7 @@ async def test_scheduled_search_hits_use_canonical_username_identity(message_sta
 @pytest.mark.asyncio
 async def test_list_and_search_scheduled_rows_have_identical_wire_shape() -> None:
     conn = _make_db_with_dialogs()
-    server = make_server(conn)
+    server = _make_scheduled_server(conn)
     _create_scheduled_table(conn)
     _insert_scheduled(conn, 11, FUTURE_BASE + 200, "needle in future")
 
@@ -1070,7 +1346,7 @@ async def test_search_navigation_binds_name_resolved_dialog_scope() -> None:
 @pytest.mark.asyncio
 async def test_search_scheduled_scoped_navigation_roundtrip() -> None:
     conn = _make_db_with_dialogs()
-    server = make_server(conn)
+    server = _make_scheduled_server(conn)
     _create_scheduled_table(conn)
     for message_id, offset in enumerate((100, 200, 300), start=1):
         _insert_scheduled(conn, message_id, FUTURE_BASE + offset, f"needle {message_id}")
@@ -1098,7 +1374,7 @@ async def test_search_scheduled_scoped_navigation_roundtrip() -> None:
 @pytest.mark.asyncio
 async def test_search_scheduled_global_navigation_roundtrip() -> None:
     conn = _make_db_with_dialogs()
-    server = make_server(conn)
+    server = _make_scheduled_server(conn)
     _create_scheduled_table(conn)
     for message_id, (dialog_id, offset) in enumerate(((1, 100), (2, 200), (1, 300)), start=1):
         _insert_scheduled(conn, message_id, FUTURE_BASE + offset, f"needle {message_id}", dialog_id=dialog_id)
@@ -1120,7 +1396,7 @@ async def test_search_scheduled_global_navigation_roundtrip() -> None:
 @pytest.mark.parametrize("global_mode", [False, True], ids=["scoped", "global"])
 async def test_search_all_navigation_roundtrip_preserves_chronological_order(global_mode: bool) -> None:
     conn = _make_db_with_dialogs(with_fts=True)
-    server = make_server(conn)
+    server = _make_scheduled_server(conn)
     _create_scheduled_table(conn)
     _insert_message(conn, 1, 1, sent_at=FUTURE_BASE + 100, text="needle sent 1")
     conn.execute("INSERT INTO messages_fts(dialog_id, message_id, stemmed_text) VALUES (1, 1, 'needle')")
@@ -1147,7 +1423,7 @@ async def test_search_all_navigation_roundtrip_preserves_chronological_order(glo
 @pytest.mark.asyncio
 async def test_list_dialogs_scheduled_summary_and_filter() -> None:
     conn = _make_db_with_dialogs()
-    server = make_server(conn)
+    server = _make_scheduled_server(conn)
     _seed_dialog_row(conn, 1, name="Future chat")
     _create_scheduled_table(conn)
     _insert_scheduled(conn, 11, FUTURE_BASE + 200, "future")
@@ -1162,9 +1438,27 @@ async def test_list_dialogs_scheduled_summary_and_filter() -> None:
 
 
 @pytest.mark.asyncio
-async def test_scheduled_reads_filter_own_scope_and_expose_basis() -> None:
+async def test_scheduled_discovery_includes_due_only_dialog() -> None:
     conn = _make_db_with_dialogs()
-    server = make_server(conn)
+    server = _make_scheduled_server(conn)
+    _seed_dialog_row(conn, 1, name="Due chat")
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 11, int(time.time()) - 10, "due")
+
+    result = await server._list_dialogs({"message_state": "scheduled"})
+
+    assert result["ok"] is True
+    row = result["data"]["dialogs"][0]
+    assert row["id"] == 1
+    assert row["scheduled_count"] == 0
+    assert row["next_scheduled_at"] is None
+    assert row["unresolved_scheduled_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduled_search_and_discovery_cover_account_peers() -> None:
+    conn = _make_db_with_dialogs()
+    server = _make_scheduled_server(conn)
     _seed_dialog_row(conn, 1, name="Own chat")
     _seed_dialog_row(conn, 2, name="Other chat")
     _create_scheduled_table(conn)
@@ -1181,11 +1475,11 @@ async def test_scheduled_reads_filter_own_scope_and_expose_basis() -> None:
 
     result = await server._search_messages({"query": "future", "message_state": "scheduled"})
 
-    assert [row["dialog_id"] for row in result["data"]["messages"]] == [1]
-    assert result["data"]["scope"] == "own_only"
+    assert [row["dialog_id"] for row in result["data"]["messages"]] == [1, 2]
+    assert result["data"]["scope"] == "account"
     assert result["data"]["messages"][0]["inclusion_basis"] == ["direct_message"]
     dialogs = await server._list_dialogs({"scope": "own_only", "message_state": "scheduled"})
-    assert [row["id"] for row in dialogs["data"]["dialogs"]] == [1]
+    assert [row["id"] for row in dialogs["data"]["dialogs"]] == [1, 2]
     assert dialogs["data"]["dialogs"][0]["inclusion_basis"] == ["direct_message"]
 
 
@@ -1212,7 +1506,9 @@ def test_tool_read_and_search_lifecycle_matches_shared_contract(message_state: s
     expected = _message_lifecycle_fields(row, sent_at=FUTURE_BASE + 200)
 
     for item in [listed[0], searched[0]]:
-        assert {field: item[field] for field in LIFECYCLE_FIELDS} == expected
+        assert {field: item[field] for field in LIFECYCLE_FIELDS} == {
+            field: expected[field] for field in LIFECYCLE_FIELDS
+        }
 
 
 def test_tool_read_and_search_route_lifecycle_through_shared_helper(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1233,6 +1529,12 @@ def test_tool_read_and_search_route_lifecycle_through_shared_helper(monkeypatch:
         "scheduled_at": None,
         "published_at": FUTURE_BASE + 200,
         "inclusion_basis": ["shared-helper"],
+        "repeat_period": None,
+        "expected_version": None,
+        "scheduled_coverage": None,
+        "dialog_name": None,
+        "dialog_name_source": None,
+        "dialog_type": None,
     }
     calls: list[tuple[Mapping[str, object], int | None]] = []
 
@@ -1245,8 +1547,12 @@ def test_tool_read_and_search_route_lifecycle_through_shared_helper(monkeypatch:
     listed = _list_messages_structured_messages([row], dialog_type="User")[0]
     searched = _search_result_structured_rows([row], "future")[0]
 
-    assert {field: listed[field] for field in LIFECYCLE_FIELDS} == projected
-    assert {field: searched[field] for field in LIFECYCLE_FIELDS} == projected
+    assert {field: listed[field] for field in LIFECYCLE_FIELDS} == {
+        field: projected[field] for field in LIFECYCLE_FIELDS
+    }
+    assert {field: searched[field] for field in LIFECYCLE_FIELDS} == {
+        field: projected[field] for field in LIFECYCLE_FIELDS
+    }
     assert calls == [(row, FUTURE_BASE + 200), (row, FUTURE_BASE + 200)]
 
 
@@ -1255,7 +1561,7 @@ def test_tool_read_and_search_route_lifecycle_through_shared_helper(monkeypatch:
 @pytest.mark.parametrize("limit", [1, 2])
 async def test_search_all_pages_chronological_prefix_before_merge(global_mode: bool, limit: int) -> None:
     conn = _make_db_with_dialogs(with_fts=True)
-    server = make_server(conn)
+    server = _make_scheduled_server(conn)
     _create_scheduled_table(conn)
     for message_id, timestamp, text in [
         (1, 100, "needle"),

@@ -15,8 +15,8 @@ from mcp_telegram.fact_hydration import MessageFactHydrationWorker
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.sync_worker import FullSyncWorker
-from mcp_telegram.telegram_demand import RpcAttemptBudget
-from mcp_telegram.telegram_demand_progress import SliceOutcomeKind
+from mcp_telegram.telegram_demand import DurableDemandAdapter, RpcAttemptBudget
+from mcp_telegram.telegram_demand_progress import SliceOutcomeKind, WorkRevision
 from mcp_telegram.telegram_rpc_consumers import DURABLE_DEMAND_ORDER, DemandKind
 from tests.test_daemon import _typed_ctx
 from tests.test_demand_composition import composition_dependencies as composition_dependencies
@@ -25,6 +25,19 @@ from tests.test_demand_composition import composition_dependencies as compositio
 def _seed_dialog(conn: sqlite3.Connection) -> None:
     with write_transaction(conn):
         conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (42,'user',0)")
+
+
+async def _run_local_seed(adapter: DurableDemandAdapter) -> WorkRevision:
+    status = adapter.status(100.0)
+    assert status is not None and status.selected is not None
+    assert status.selected.key.account_id == 77
+    assert status.selected.key.target == "seed"
+    budget = RpcAttemptBudget(limit=1, selected=status.selected)
+    outcome = await adapter.run_slice(budget)
+    assert outcome.kind is SliceOutcomeKind.PROGRESSED
+    assert outcome.committed_revision is not None
+    assert budget.attempts == 0
+    return status.selected
 
 
 async def test_daemon_runtime_binds_gate_and_verified_account_to_real_local_seed(
@@ -90,18 +103,26 @@ async def test_daemon_runtime_binds_gate_and_verified_account_to_real_local_seed
                     "INSERT INTO daemon_state(key,value) VALUES ('unowned-test-write','forbidden')"
                 )
             runtime.message_fact_refresh_deps.conn.rollback()
-            await writer.run(_seed_dialog)
             adapter = runtime.coordinator._adapters[DemandKind.SCHEDULED_DISCOVERY]
-            selected = adapter.status(100.0)
-            assert selected is not None and selected.selected is not None
-            assert selected.selected.key.account_id == 77
-            assert selected.selected.key.target == "unseeded"
-            outcome = await adapter.run_slice(RpcAttemptBudget(limit=1, selected=selected.selected))
-            assert outcome.kind is SliceOutcomeKind.PROGRESSED
-            assert outcome.committed_revision is not None
+            initial = await _run_local_seed(adapter)
             assert dependencies.conn.execute("SELECT dialog_id FROM scheduled_reconciliation_state").fetchall() == [
-                (42,)
+                (77,)
             ]
+            assert dependencies.conn.execute(
+                "SELECT account_id,directory_generation FROM scheduled_sync_state WHERE key='account'"
+            ).fetchone() == (77, None)
+
+            # A later locally observed peer extends the verified account's finite seed.
+            await writer.run(_seed_dialog)
+            selected = await _run_local_seed(adapter)
+            assert selected != initial
+            assert dependencies.conn.execute(
+                "SELECT dialog_id,coverage_state,baseline_observed_at "
+                "FROM scheduled_reconciliation_state ORDER BY dialog_id"
+            ).fetchall() == [(42, "unknown", None), (77, "unknown", None)]
+            assert dependencies.conn.execute(
+                "SELECT account_id FROM scheduled_sync_state WHERE key='account'"
+            ).fetchone() == (77,)
             client.assert_not_called()
             cast(MagicMock, client.get_me).assert_not_called()
             cast(MagicMock, client.get_input_entity).assert_not_called()

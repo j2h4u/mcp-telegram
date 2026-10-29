@@ -45,7 +45,6 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "daemon_activity_stats.py",
             "daemon_api.py",
             "daemon_entity_info.py",
-            "daemon_log_context.py",
             "daemon_message.py",
             "reading/service.py",
             "reading/sqlite_projection.py",
@@ -84,6 +83,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "runtime_observations.py",
             "event_recovery.py",
             "resolver.py",
+            "scheduled_commands.py",  # Native scheduled receipt/fact writer through SQLiteWriter and the sole RPC gate.
             "scheduled_messages.py",
             "sync_db.py",
             "sync_transactions.py",
@@ -132,6 +132,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "entity_profile/updates.py",  # Normalizes supplied Telegram updates; never acquires remotely.
             "messages/telegram_adapter.py",
             "reactions/telegram_adapter.py",
+            "scheduled_commands.py",  # Native scheduled receipt/fact writer through SQLiteWriter and the sole RPC gate.
             "scheduled_messages.py",
             "message_history/telegram_adapter.py",
             "telegram.py",

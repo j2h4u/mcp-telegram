@@ -744,6 +744,7 @@ async def test_list_dialogs_structured_output_includes_unread_values_and_channel
         "draft_text": None,
         "scheduled_count": 0,
         "next_scheduled_at": None,
+        "unresolved_scheduled_count": 0,
         "inclusion_basis": None,
         "folder_ids": [],
         "folders": [],

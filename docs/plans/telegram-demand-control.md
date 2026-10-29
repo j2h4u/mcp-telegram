@@ -458,13 +458,17 @@ domain state can own it. After cutover, another generic mechanism requires the
 same proven need in at least three demand kinds and must delete the duplicated
 implementation it replaces.
 
-## Accepted scheduled-message targets
+## Superseded scheduled-message cadence targets
 
-The product targets are confirmed:
+The targets below were accepted for the original cadence-based design and are
+retained as historical context. TG-142 supersedes them with event-driven
+scheduled facts, finite baseline acquisition and classified recovery ([durable
+facts and acquisition evidence](../architecture-proposal.md#durable-facts-and-acquisition-evidence)).
+Coverage and outstanding classified work remain observable; elapsed time alone
+does not trigger polling. There is no hard 15-minute repair or 24-hour discovery
+promise.
 
-- changes to a known scheduled-message queue are repaired within 15 minutes;
-- a previously unknown scheduled-message queue is discovered within 24 hours.
+Historical targets:
 
-These targets define overdue work and acceptance for scheduled reconciliation.
-They may change later only from product need or production evidence, not as an
-operator tuning response to incidental load.
+- changes to a known scheduled-message queue repaired within 15 minutes;
+- a previously unknown scheduled-message queue discovered within 24 hours.

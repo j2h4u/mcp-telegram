@@ -54,6 +54,8 @@ def _make_dialog_dict(*, opts: _DialogDictOptions | None = None, **kwargs: objec
         "draft_text": opts.draft_text,
         "scheduled_count": 0,
         "next_scheduled_at": None,
+        "unresolved_scheduled_count": 0,
+        "scheduled_coverage": {"state": "unknown"},
         "inclusion_basis": None,
         "folder_ids": [],
         "folders": [],
@@ -90,6 +92,7 @@ def _canonical_catalog(*, dialogs: list[dict[str, object]] | None = None) -> dic
         "data": {
             "dialogs": [] if dialogs is None else dialogs,
             "snapshot_age_h": None,
+            "scheduled_coverage": {"state": "unknown", "account_id": None},
             "bootstrap_pending": False,
             "scope": "all",
             "folder_snapshot": {

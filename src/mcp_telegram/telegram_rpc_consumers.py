@@ -51,6 +51,7 @@ class TelegramRpcSource(StrEnum):
     MESSAGE_FACT_REFRESH = "message_fact_refresh"
     READ_RECEIPT_PROBE = "read_receipt_probe"
     SCHEDULED_MESSAGES = "scheduled_messages"
+    SCHEDULED_MUTATION = "scheduled_mutation"
     DRAFT_SNAPSHOT = "draft_snapshot"
     DRAFT_MUTATION = "draft_mutation"
     MAINTENANCE = "maintenance"
@@ -93,6 +94,7 @@ class DemandKind(StrEnum):
     READ_RECEIPT_BATCH = "read_receipt_batch"
     SCHEDULED_REPAIR = "scheduled_repair"
     SCHEDULED_DISCOVERY = "scheduled_discovery"
+    SCHEDULED_MUTATION = "scheduled_mutation"
     DRAFT_SNAPSHOT = "draft_snapshot"
     DRAFT_MUTATION = "draft_mutation"
     SELF_PROFILE_MAINTENANCE = "self_profile_maintenance"
@@ -653,6 +655,16 @@ _REGISTRY: dict[TelegramRpcSource, TelegramRpcConsumerSpec] = {
         FanoutScope.ACCOUNT,
         DemandPolicyOwner.CALLER,
     ),
+    TelegramRpcSource.SCHEDULED_MUTATION: _consumer(
+        "Scheduled message mutation",
+        "Create, edit, or cancel one explicitly selected native scheduled message",
+        _I,
+        TelegramFactDomain.SCHEDULED_MESSAGES,
+        AcquisitionRole.MUTATION,
+        AcquisitionTrigger.REQUEST,
+        FanoutScope.DIALOG,
+        DemandPolicyOwner.CALLER,
+    ),
 }
 
 
@@ -856,14 +868,12 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         DemandKind.SCHEDULED_REPAIR,
         TelegramRpcSource.SCHEDULED_MESSAGES,
         _DURABLE,
-        freshness_target=timedelta(minutes=15),
         max_rpc_attempts_per_slice=16,
     ),
     DemandKind.SCHEDULED_DISCOVERY: _contract(
         DemandKind.SCHEDULED_DISCOVERY,
         TelegramRpcSource.SCHEDULED_MESSAGES,
         _DURABLE,
-        freshness_target=timedelta(hours=24),
         max_rpc_attempts_per_slice=16,
     ),
     DemandKind.DRAFT_SNAPSHOT: _contract(
@@ -877,6 +887,12 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         TelegramRpcSource.DRAFT_MUTATION,
         _INLINE,
         max_rpc_attempts_per_slice=2,
+    ),
+    DemandKind.SCHEDULED_MUTATION: _contract(
+        DemandKind.SCHEDULED_MUTATION,
+        TelegramRpcSource.SCHEDULED_MUTATION,
+        _INLINE,
+        max_rpc_attempts_per_slice=1,
     ),
     DemandKind.SELF_PROFILE_MAINTENANCE: _contract(
         DemandKind.SELF_PROFILE_MAINTENANCE,
@@ -970,6 +986,7 @@ def _validate_contract_durable_policy(kind: DemandKind, contract: DemandContract
         DemandKind.OPERATOR_LOGOUT,
         DemandKind.TELETHON_CONNECTION_BOOTSTRAP,
         DemandKind.DRAFT_MUTATION,
+        DemandKind.SCHEDULED_MUTATION,
     }:
         _validate_attempt_bound(kind, contract)
         if contract.freshness_target is not None:

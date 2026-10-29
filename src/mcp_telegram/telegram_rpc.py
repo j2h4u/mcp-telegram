@@ -55,12 +55,19 @@ from telethon.tl.functions.updates import (  # type: ignore[import-untyped]
     GetDifferenceRequest,
 )
 from telethon.tl.tlobject import TLRequest  # type: ignore[import-untyped]
-from telethon.utils import is_list_like  # type: ignore[import-untyped]
+from telethon.utils import get_peer_id, is_list_like  # type: ignore[import-untyped]
 
 from .auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from .delivered_update import DeliveredUpdate, delivered_update_context, fail_delivered_update
 from .flood import FloodWaitObservation, TelegramRpcThrottled, flood_seconds
 from .request_timing import DaemonRequestTiming, current_timing
+from .scheduled_write_fence import (
+    ScheduledMutationCheck,
+    ScheduledMutationIntent,
+    ScheduledMutationToken,
+    ScheduledWriteRejected,
+    current_scheduled_mutation_check,
+)
 from .telegram_delivery import DeliveryEnvelope, ProtocolSnapshot, load_delivery_envelope, load_protocol_snapshot
 from .telegram_demand import (
     AcquisitionKind,
@@ -107,6 +114,8 @@ from .update_delivery import UpdateDeliveryRepository
 logger = logging.getLogger(__name__)
 _DIAGNOSTIC_REQUESTS_MAX = 8
 _TL_CONSTRUCTOR_HEX_CHARS = 8
+_SCHEDULED_ONLINE_SEND_TIMESTAMP = 0x7FFFFFFE
+_SCHEDULED_MINIMUM_LEAD_SECONDS = 60
 
 _METHOD_BACKOFF_BASE_SECONDS = 300
 _METHOD_BACKOFF_MAX_SECONDS = 3600
@@ -1834,6 +1843,8 @@ class _WireAttempt:
     observed_result: bool = False
     observation_ordinal: int | None = None
     draft_mutation: bool = False
+    scheduled_check: ScheduledMutationCheck | None = None
+    scheduled_mutation: bool = False
 
 
 def _application_request(request: object) -> TLRequest:
@@ -1886,6 +1897,7 @@ class _WirePermit:
     admission: RpcAdmission
     generation: tuple[int, int]
     method_generation: str | None = None
+    scheduled_token: ScheduledMutationToken | None = None
     released: bool = False
 
 
@@ -1902,7 +1914,7 @@ class TelegramRpcGate(TelegramClient):
     _catch_up: bool
     _updates_handle: asyncio.Task[object] | None
 
-    def __init__(  # noqa: PLR0913 - Telethon constructor plus explicit account policy
+    def __init__(  # noqa: PLR0913, PLR0915 - Telethon constructor plus explicit account policy
         self,
         *args: object,
         rpc_budget: TelegramRpcBudget,
@@ -1988,6 +2000,11 @@ class TelegramRpcGate(TelegramClient):
         self._delivery_account_id: int | None = None
         self._active_delivery: _ActiveDelivery | None = None
         self._delivery_callbacks: dict[object, object] = {}
+        self._scheduled_continuity_recovery: Callable[[int | None, str], Awaitable[None]] | None = None
+
+    def set_scheduled_continuity_recovery(self, callback: Callable[[int | None, str], Awaitable[None]] | None) -> None:
+        """Bind the durable owner for Telegram's explicit DifferenceTooLong result."""
+        self._scheduled_continuity_recovery = callback
 
     def _initialize_wire_authority(self, safety_store: TelegramRpcSafetyStore) -> None:
         """Initialize one account-owned physical-attempt authority."""
@@ -2538,6 +2555,8 @@ class TelegramRpcGate(TelegramClient):
             self._connect_owner is asyncio.current_task() or asyncio.current_task() in self._connection_rpc_tasks
         )
         self._check_unverified_application(request, bootstrap)
+        actual = _application_request(request)
+        scheduled_check = self._check_scheduled_application(actual, scope)
         attempt_id = uuid.uuid4().hex
         bound = replace(
             scope,
@@ -2549,9 +2568,12 @@ class TelegramRpcGate(TelegramClient):
             transport_auth=self._authentication_mode or self._logout_mode,
         )
         owner = _WireAttempt(self._wire_issuer, attempt_id, method, bound, timing=current_timing())
-        actual = _application_request(request)
         owner.self_lookup = self._is_self_lookup(actual)
         owner.draft_mutation = type(actual) is functions.messages.SaveDraftRequest
+        owner.scheduled_check = scheduled_check
+        owner.scheduled_mutation = scheduled_check is not None
+        if scheduled_check is not None:
+            self._require_scheduled_mutation_budget(bound)
         return owner
 
     @staticmethod
@@ -2586,6 +2608,135 @@ class TelegramRpcGate(TelegramClient):
             raise UnclassifiedTelegramRpcError("SaveDraft requires its explicit draft mutation root")
         if not self._draft_budget_valid(scope):
             raise ValueError("draft operations require an explicit single-attempt budget without retry credit")
+
+    @staticmethod
+    def _is_scheduled_native_mutation(request: object) -> bool:
+        return type(request) in {
+            functions.messages.SendMessageRequest,
+            functions.messages.EditMessageRequest,
+            functions.messages.DeleteScheduledMessagesRequest,
+            functions.messages.SendScheduledMessagesRequest,
+        }
+
+    @staticmethod
+    def _scheduled_budget_valid(scope: TelegramRpcScope) -> bool:
+        budget = scope.attempt_budget
+        return (
+            budget is not None
+            and budget.limit == 1
+            and budget.selected is None
+            and budget._retry_candidate is None
+            and scope.attempt_evidence is not None
+        )
+
+    def _require_scheduled_mutation_budget(self, scope: TelegramRpcScope) -> None:
+        if not self._scheduled_budget_valid(scope):
+            raise ValueError("scheduled mutations require an explicit single-attempt budget without retry credit")
+
+    @staticmethod
+    def _scheduled_peer_dialog_id(peer: object, account_id: int) -> int | None:
+        if type(peer) is types.InputPeerSelf:
+            return account_id
+        if type(peer) not in {types.InputPeerUser, types.InputPeerChannel, types.InputPeerChat}:
+            return None
+        try:
+            return int(get_peer_id(peer))
+        except TypeError, ValueError:
+            return None
+
+    @staticmethod
+    def _scheduled_date_timestamp(value: object) -> int | None:
+        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+            return None
+        return int(value.timestamp())
+
+    def _check_scheduled_application(
+        self, request: TLRequest, scope: TelegramRpcScope
+    ) -> ScheduledMutationCheck | None:
+        root_selected = (
+            scope.demand_kind is DemandKind.SCHEDULED_MUTATION or scope.source is TelegramRpcSource.SCHEDULED_MUTATION
+        )
+        method_selected = self._is_scheduled_native_mutation(request)
+        check = current_scheduled_mutation_check()
+        if not root_selected and not method_selected and check is None:
+            return None
+        request = self._require_scheduled_application_root(request, scope)
+        if check is None:
+            raise UnclassifiedTelegramRpcError("scheduled mutation requires its bound operation intent")
+        intent = check.intent
+        if intent.account_id != self._ensure_safety_ledger().verified_account_id:
+            raise UnclassifiedTelegramRpcError("scheduled mutation account does not match the authenticated account")
+        if self._scheduled_peer_dialog_id(request.peer, intent.account_id) != intent.dialog_id:
+            raise ScheduledWriteRejected("scheduled_target_mismatch")
+        self._validate_scheduled_request(request, intent)
+        if scope.attempt_budget is not None:
+            self._require_scheduled_mutation_budget(scope)
+        return check
+
+    @staticmethod
+    def _require_scheduled_application_root(
+        request: TLRequest, scope: TelegramRpcScope
+    ) -> (
+        functions.messages.SendMessageRequest
+        | functions.messages.EditMessageRequest
+        | functions.messages.DeleteScheduledMessagesRequest
+    ):
+        if (
+            scope.demand_kind is not DemandKind.SCHEDULED_MUTATION
+            or scope.source is not TelegramRpcSource.SCHEDULED_MUTATION
+            or scope.acquisition_kind is not None
+        ):
+            raise UnclassifiedTelegramRpcError("scheduled mutation requires its explicit inline root")
+        if not isinstance(
+            request,
+            (
+                functions.messages.SendMessageRequest,
+                functions.messages.EditMessageRequest,
+                functions.messages.DeleteScheduledMessagesRequest,
+            ),
+        ):
+            raise UnclassifiedTelegramRpcError("scheduled mutation permits only send/edit/delete scheduled methods")
+        return request
+
+    def _validate_scheduled_request(self, request: TLRequest, intent: ScheduledMutationIntent) -> None:
+        if intent.action == "create":
+            self._validate_scheduled_create(request, intent)
+        elif intent.action == "update":
+            self._validate_scheduled_update(request, intent)
+        else:
+            self._validate_scheduled_cancel(request, intent)
+
+    def _validate_scheduled_create(self, request: TLRequest, intent: ScheduledMutationIntent) -> None:
+        if type(request) is not functions.messages.SendMessageRequest:
+            raise UnclassifiedTelegramRpcError("create permits only messages.sendMessage")
+        actual_date = self._scheduled_date_timestamp(request.schedule_date)
+        if (
+            not self._scheduled_date_matches(actual_date, cast(float, intent.schedule_at_utc))
+            or type(request.random_id) is not int
+            or request.random_id != intent.random_id
+            or request.clear_draft is not None
+        ):
+            raise ScheduledWriteRejected("scheduled_create_request_mismatch")
+
+    def _validate_scheduled_update(self, request: TLRequest, intent: ScheduledMutationIntent) -> None:
+        if type(request) is not functions.messages.EditMessageRequest:
+            raise UnclassifiedTelegramRpcError("update permits only messages.editMessage")
+        actual_date = self._scheduled_date_timestamp(request.schedule_date)
+        if request.id != intent.scheduled_message_id or not self._scheduled_date_matches(
+            actual_date, cast(float, intent.schedule_at_utc)
+        ):
+            raise ScheduledWriteRejected("scheduled_update_request_mismatch")
+
+    @staticmethod
+    def _validate_scheduled_cancel(request: TLRequest, intent: ScheduledMutationIntent) -> None:
+        if type(request) is not functions.messages.DeleteScheduledMessagesRequest or request.id != [
+            intent.scheduled_message_id
+        ]:
+            raise UnclassifiedTelegramRpcError("cancel permits only the selected scheduled queue ID")
+
+    @staticmethod
+    def _scheduled_date_matches(actual: int | None, expected: float) -> bool:
+        return actual is not None and actual != _SCHEDULED_ONLINE_SEND_TIMESTAMP and actual == int(expected)
 
     def _check_operator_application(self, request: object, scope: TelegramRpcScope) -> None:
         if self._logout_mode and (
@@ -2778,12 +2929,22 @@ class TelegramRpcGate(TelegramClient):
         admission = await self._admission_scheduler.admit(scope)
         try:
             method_generation = await self._prepare_method_permission(owner)
+            scheduled_token = await self._revalidate_scheduled_write(owner)
         except BaseException:
             self._admission_scheduler.complete(admission)
             raise
         if owner.claimed == 0:
             owner.method_generation = method_generation
-        return _WirePermit(owner, admission, generation, method_generation)
+        return _WirePermit(owner, admission, generation, method_generation, scheduled_token)
+
+    @staticmethod
+    async def _revalidate_scheduled_write(owner: _WireAttempt) -> ScheduledMutationToken | None:
+        if owner.scheduled_check is None:
+            return None
+        token = await owner.scheduled_check.revalidate()
+        if not token.is_valid_for(owner.scheduled_check.intent):
+            raise ScheduledWriteRejected("scheduled_version_changed")
+        return token
 
     async def _prepare_method_permission(self, owner: _WireAttempt) -> str | None:
         if owner.scope.transport_control:
@@ -2828,6 +2989,7 @@ class TelegramRpcGate(TelegramClient):
         owner = self._require_wire_owner(owner)
         if not isinstance(permit, _WirePermit) or permit.owner is not owner or permit.released:
             raise RuntimeError("unowned Telegram write permission")
+        self._check_scheduled_claim(owner, permit)
         if not self._permit_still_eligible(owner, permit):
             return False
         budget = owner.scope.attempt_budget
@@ -2848,6 +3010,22 @@ class TelegramRpcGate(TelegramClient):
         return True
 
     @staticmethod
+    def _check_scheduled_claim(owner: _WireAttempt, permit: _WirePermit) -> None:
+        if not owner.scheduled_mutation:
+            return
+        check = owner.scheduled_check
+        token = permit.scheduled_token
+        if check is None or token is None or not token.is_valid_for(check.intent):
+            raise ScheduledWriteRejected("scheduled_version_changed")
+        if check.intent.schedule_at_utc is not None and (
+            check.intent.schedule_at_utc - time.time() < _SCHEDULED_MINIMUM_LEAD_SECONDS
+        ):
+            raise ScheduledWriteRejected("scheduled_window_expired")
+        evidence = owner.scope.attempt_evidence
+        if owner.claimed or evidence is None or evidence.scheduled_mutation_dispatched:
+            raise ScheduledWriteRejected("scheduled_attempt_already_dispatched")
+
+    @staticmethod
     def _validate_claim_intent(owner: _WireAttempt, ledger: TelegramRpcSafetyLedger) -> None:
         if owner.scope.transport_control:
             return
@@ -2860,6 +3038,7 @@ class TelegramRpcGate(TelegramClient):
         owner.dispatch_at = time.monotonic()
         owner.admission = permit.admission
         self._record_draft_dispatch(owner)
+        self._record_scheduled_dispatch(owner)
         if owner.scope.attempt_budget is not None:
             owner.scope.attempt_budget.last_method = owner.method
             owner.observation_ordinal = owner.scope.attempt_budget.attempts
@@ -2884,6 +3063,13 @@ class TelegramRpcGate(TelegramClient):
             evidence.draft_mutation_dispatched = True
         else:
             evidence.draft_preflight_dispatched = True
+
+    @staticmethod
+    def _record_scheduled_dispatch(owner: _WireAttempt) -> None:
+        if owner.scope.demand_kind is DemandKind.SCHEDULED_MUTATION:
+            evidence = owner.scope.attempt_evidence
+            assert evidence is not None
+            evidence.scheduled_mutation_dispatched = True
 
     def observe_write_return(self, owner: object) -> None:
         """Observe local writer acceptance, without claiming a provider receipt."""
@@ -2919,6 +3105,8 @@ class TelegramRpcGate(TelegramClient):
     def _budget_can_claim(self, owner: _WireAttempt) -> bool:
         if owner.scope.demand_kind is DemandKind.DRAFT_MUTATION:
             return self._draft_budget_can_claim(owner)
+        if owner.scope.demand_kind is DemandKind.SCHEDULED_MUTATION:
+            return self._scheduled_budget_can_claim(owner)
         budget = owner.scope.attempt_budget
         if budget is None:
             return True
@@ -2939,6 +3127,14 @@ class TelegramRpcGate(TelegramClient):
         assert budget is not None and evidence is not None
         dispatched = evidence.draft_mutation_dispatched if owner.draft_mutation else evidence.draft_preflight_dispatched
         return not dispatched and owner.claimed == 0 and not budget.exhausted
+
+    def _scheduled_budget_can_claim(self, owner: _WireAttempt) -> bool:
+        if not self._scheduled_budget_valid(owner.scope):
+            return False
+        evidence = owner.scope.attempt_evidence
+        budget = owner.scope.attempt_budget
+        assert evidence is not None and budget is not None
+        return not evidence.scheduled_mutation_dispatched and owner.claimed == 0 and not budget.exhausted
 
     def defer_write(self, owner: object, permit: object) -> None:
         owner = self._require_wire_owner(owner)
@@ -2998,16 +3194,7 @@ class TelegramRpcGate(TelegramClient):
         method_affected = owner.method in cast(dict[str, object], self._ensure_safety_ledger()._record["methods"])
         try:
             rejected = await self._guard_identity_result(owner, error, result)
-            if owner.receipt is not None:
-                await asyncio.shield(owner.receipt)
-            else:
-                known = error is None or isinstance(error, RPCError)
-                await self._ensure_safety_ledger().complete(
-                    owner.attempt_id,
-                    known_outcome=known,
-                    method_generation=owner.method_generation,
-                    method_success=error is None and rejected is None,
-                )
+            await self._complete_wire_result(owner, error, rejected)
             owner.terminal = True
             self._note_successful_acquisition(owner, error, rejected)
             return rejected
@@ -3018,10 +3205,28 @@ class TelegramRpcGate(TelegramClient):
             if method_affected:
                 self._notify_rpc_eligibility_changed(owner.method)
 
+    async def _complete_wire_result(
+        self, owner: _WireAttempt, error: BaseException | None, rejected: BaseException | None
+    ) -> None:
+        if owner.receipt is not None:
+            await asyncio.shield(owner.receipt)
+            return
+        known = (
+            error is None
+            or isinstance(error, RPCError)
+            or (isinstance(error, ScheduledWriteRejected) and owner.claimed == 0)
+        )
+        await self._ensure_safety_ledger().complete(
+            owner.attempt_id,
+            known_outcome=known,
+            method_generation=owner.method_generation,
+            method_success=error is None and rejected is None,
+        )
+
     def _note_successful_acquisition(
         self, owner: _WireAttempt, error: BaseException | None, rejected: BaseException | None
     ) -> None:
-        if owner.draft_mutation:
+        if owner.draft_mutation or owner.scheduled_mutation:
             return
         if (
             error is None
@@ -3802,7 +4007,9 @@ class TelegramRpcGate(TelegramClient):
         task = asyncio.current_task()
         connection_owned = task is self._connect_owner or task in self._connection_rpc_tasks
         try:
-            return await self._call_classified_difference(request, ordered=ordered)
+            result = await self._call_classified_difference(request, ordered=ordered)
+            await self._recover_scheduled_difference_gap(request, result)
+            return result
         except (TelegramRpcThrottled, TelegramRpcMethodRecoveryPending) as exc:
             if (
                 task is self._update_loop_owner
@@ -3816,6 +4023,26 @@ class TelegramRpcGate(TelegramClient):
             if not connection_owned and exc.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
                 raise OSError("Telegram update difference admission deadline elapsed") from exc
             raise
+
+    async def _recover_scheduled_difference_gap(self, request: object, result: object) -> None:
+        if self._authentication_mode:
+            return
+        target: int | None = None
+        reason: str | None = None
+        if isinstance(result, types.updates.DifferenceTooLong):
+            reason = "account_difference_too_long"
+        elif isinstance(result, types.updates.ChannelDifferenceTooLong):
+            channel = cast(types.TypeInputChannel | None, getattr(request, "channel", None))
+            try:
+                target = int(cast(int, get_peer_id(channel))) if channel is not None else None
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("Telegram channel difference gap has no canonical peer") from exc
+            reason = "channel_difference_too_long"
+        if reason is not None:
+            callback = self._scheduled_continuity_recovery
+            if callback is None or self._ensure_safety_ledger().verified_account_id is None:
+                raise RuntimeError("scheduled continuity recovery is not bound to a verified account")
+            await callback(target, reason)
 
     async def _call_classified_difference(self, request: object, *, ordered: bool) -> object:
         try:
@@ -3840,10 +4067,28 @@ class TelegramRpcGate(TelegramClient):
         """Run one logical RPC after its root demand context is established."""
         scope = self._require_rpc_scope()
         self._check_draft_application(request, scope)
+        actual = _application_request(request)
+        scheduled_check = self._check_scheduled_application(actual, scope)
         if type(_application_request(request)) is functions.messages.SaveDraftRequest:
             return await self._call_with_source_policy(
                 request, ordered=ordered, scope=scope, connection_owned=connection_owned
             )
+        if scheduled_check is not None:
+            return await self._call_with_source_policy(
+                request, ordered=ordered, scope=scope, connection_owned=connection_owned
+            )
+        return await self._call_with_connection_retries(
+            request, ordered=ordered, scope=scope, connection_owned=connection_owned
+        )
+
+    async def _call_with_connection_retries(
+        self,
+        request: object,
+        *,
+        ordered: bool,
+        scope: TelegramRpcScope,
+        connection_owned: bool,
+    ) -> object:
         retry_delays = self._retry_delays_for_call(connection_owned)
         migration_dc: int | None = None
         delay = 0.0

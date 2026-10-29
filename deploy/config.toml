@@ -74,7 +74,6 @@ reaction_detail_max_pages_per_cycle = 5
 reaction_detail_cycle_seconds = 600
 reaction_detail_unavailable_retry_seconds = 600
 # Local daemon maintenance intervals. Compose environment variables can override these.
-scheduled_reconciliation_seconds = 900
 # Refresh the cached account display identity without delaying MCP sessions.
 self_profile_refresh_seconds = 86400
 read_position_reconciliation_seconds = 900

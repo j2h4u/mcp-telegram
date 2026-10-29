@@ -297,6 +297,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                     "enum": ["sent", "scheduled", "draft", "all"],
                     "description": "Lifecycle selection used by the request: all local states by default, or published history, pending author-only state, or current draft composition.",
                 },
+                "read_scope": {"type": "string", "enum": ["dialog", "all_dialogs"]},
                 "since_utc": {"type": ["string", "null"]},
                 "until_utc": {"type": ["string", "null"]},
             },
@@ -312,6 +313,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                 "unread",
                 "anchor_message_id",
                 "message_state",
+                "read_scope",
                 "since_utc",
                 "until_utc",
             ],
@@ -410,6 +412,8 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
             ],
             "additionalProperties": False,
         },
+        "scheduled_coverage": {"type": ["object", "null"]},
+        "dialog_scheduled_coverage": {"type": ["object", "null"]},
         "messages": {
             "type": "array",
             "items": {
@@ -418,7 +422,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                         "type": "object",
                         "properties": {
                             **cast(dict[str, object], MESSAGE_VIEW_SCHEMA["properties"]),
-                            "message_state": {"type": "string", "enum": ["sent", "scheduled"]},
+                            "message_state": {"type": "string", "enum": ["sent", "scheduled", "unknown_missing"]},
                             "visibility": {
                                 "type": "string",
                                 "description": "author_only before publication, chat_visible after publication.",
@@ -431,7 +435,13 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                             "unseen": {"type": "boolean"},
                             "scheduled_at": {"type": ["integer", "null"]},
                             "published_at": {"type": ["integer", "null"]},
-                            "inclusion_basis": {"type": "array", "items": {"type": "string"}},
+                            "repeat_period": {"type": ["integer", "null"]},
+                            "expected_version": {"type": ["string", "null"]},
+                            "scheduled_coverage": {"type": ["object", "null"]},
+                            "dialog_name": {"type": ["string", "null"]},
+                            "dialog_name_source": {"type": ["string", "null"]},
+                            "dialog_type": {"type": ["string", "null"]},
+                            "inclusion_basis": {"type": ["array", "null"], "items": {"type": "string"}},
                         },
                         "required": [
                             "dialog_id",
@@ -445,6 +455,12 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                             "unseen",
                             "scheduled_at",
                             "published_at",
+                            "repeat_period",
+                            "expected_version",
+                            "scheduled_coverage",
+                            "dialog_name",
+                            "dialog_name_source",
+                            "dialog_type",
                             "inclusion_basis",
                             "reaction_events",
                             "reaction_events_status",
@@ -473,6 +489,8 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
         "read_state",
         "scope",
         "draft_coverage",
+        "scheduled_coverage",
+        "dialog_scheduled_coverage",
         "messages",
         "count",
         "result_count_semantics",
@@ -615,13 +633,16 @@ def _topic_candidate_payload(topic: dict) -> dict[str, object]:
 
 
 def _message_lifecycle_fields(row: Mapping[str, object], *, sent_at: int | None) -> dict[str, object]:
-    is_scheduled = row.get("message_state") == "scheduled"
+    message_state = row.get("message_state", "sent")
+    is_scheduled = message_state in {"scheduled", "unknown_missing"}
     published_at = row.get("published_at")
-    inclusion_basis = row.get("inclusion_basis") or []
+    inclusion_basis = row.get("inclusion_basis")
+    if inclusion_basis is None and not is_scheduled:
+        inclusion_basis = []
     if published_at is None and not is_scheduled:
         published_at = sent_at
     return {
-        "message_state": "scheduled" if is_scheduled else "sent",
+        "message_state": message_state if is_scheduled else "sent",
         "visibility": "author_only" if is_scheduled else "chat_visible",
         "unpublished": is_scheduled,
         "published": not is_scheduled,
@@ -629,6 +650,12 @@ def _message_lifecycle_fields(row: Mapping[str, object], *, sent_at: int | None)
         "scheduled_at": row.get("scheduled_at") if is_scheduled else None,
         "published_at": published_at,
         "inclusion_basis": inclusion_basis.copy() if isinstance(inclusion_basis, list) else inclusion_basis,
+        "repeat_period": row.get("repeat_period"),
+        "expected_version": row.get("expected_version"),
+        "scheduled_coverage": row.get("scheduled_coverage"),
+        "dialog_name": row.get("dialog_name"),
+        "dialog_name_source": row.get("dialog_name_source"),
+        "dialog_type": row.get("dialog_type"),
     }
 
 
@@ -654,6 +681,12 @@ def _list_message_structured_item(
             "unseen": lifecycle["unseen"],
             "scheduled_at": lifecycle["scheduled_at"],
             "published_at": lifecycle["published_at"],
+            "repeat_period": lifecycle["repeat_period"],
+            "expected_version": lifecycle["expected_version"],
+            "scheduled_coverage": lifecycle["scheduled_coverage"],
+            "dialog_name": lifecycle["dialog_name"],
+            "dialog_name_source": lifecycle["dialog_name_source"],
+            "dialog_type": lifecycle["dialog_type"],
             "inclusion_basis": lifecycle["inclusion_basis"],
         }
     )
@@ -665,7 +698,7 @@ def _list_message_render_metadata(
     message: ReadMessage,
     marker_by_message: Mapping[int, ReadMarker],
 ) -> tuple[ReadMarker | None, dict[str, object]]:
-    is_scheduled = row.get("message_state") == "scheduled"
+    is_scheduled = row.get("message_state") in {"scheduled", "unknown_missing"}
     marker_label = None if is_scheduled else marker_by_message.get(message.id)
     return marker_label, _message_lifecycle_fields(row, sent_at=message.sent_at)
 
@@ -685,14 +718,18 @@ def _list_messages_structured_messages(
         return []
     sent_rows = [row for row in rows if row.get("message_state") != "draft"]
     messages = _read_messages_from_rows(sent_rows)
-    reply_map: dict[int, ReadMessage] = {message.id: message for message in messages}
+    reply_map: dict[tuple[int, int], ReadMessage] = {
+        (message.dialog_id, message.id): message
+        for row, message in zip(sent_rows, messages, strict=True)
+        if row.get("message_state", "sent") == "sent"
+    }
     marker_by_message = project_read_markers(messages, read_state=read_state, dialog_type=dialog_type)
 
     structured: list[dict[str, object]] = []
     structured_by_identity: dict[int, dict[str, object]] = {}
     for row, message in zip(sent_rows, messages, strict=True):
         marker_label, lifecycle = _list_message_render_metadata(row, message, marker_by_message)
-        reply_parent = reply_map.get(message.reply_to_msg_id or -1)
+        reply_parent = reply_map.get((message.dialog_id, message.reply_to_msg_id or -1))
         parent_in_page = reply_parent is not None
         structured_by_identity[id(row)] = _list_message_structured_item(
             message,
@@ -709,20 +746,23 @@ def _list_messages_structured_messages(
 
 
 def _chronological_message_rows(rows: list[dict]) -> list[dict]:
+    def message_tie_break(row: dict) -> tuple[int, int | str]:
+        if row.get("message_state") == "draft":
+            return (0, str(row.get("message_key") or ""))
+        return (1, int(row.get("message_id", row.get("msg_id")) or 0))
+
     return sorted(
         rows,
         key=lambda row: (
+            0 if row.get("sent_at", row.get("draft_updated_at")) is None else 1,
             int(row.get("sent_at") or row.get("draft_updated_at") or 0),
-            str(row.get("message_key") or row.get("message_id") or ""),
+            int(row.get("dialog_id") or 0),
+            message_tie_break(row),
         ),
     )
 
 
-def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext) -> dict[str, object]:
-    args = ctx.args
-    data = ctx.data
-    rows = ctx.rows
-    resolved_dialog_id = _list_messages_resolved_dialog_id(data, rows, ctx.dialog_id)
+def _list_messages_structured_read_state(data: dict) -> dict[str, object] | None:
     dialog_type = data.get("dialog_type")
     read_state = data.get("read_state")
     header_lines = _render_read_state_header(
@@ -730,13 +770,35 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
         dialog_type,
         int(datetime.now(tz=UTC).timestamp()),
     )
-    structured_read_state: dict[str, object] | None = None
     if read_state is not None or dialog_type is not None or header_lines:
-        structured_read_state = {
+        return {
             "dialog_type": dialog_type,
             "state": read_state,
             "header_lines": header_lines,
         }
+    return None
+
+
+def _list_messages_directory_coverage(data: dict) -> object:
+    return (
+        data.get("directory_coverage")
+        or (
+            data.get("scheduled_coverage", {}).get("directory_coverage")
+            if isinstance(data.get("scheduled_coverage"), dict)
+            else None
+        )
+        or dict(_DEFAULT_DIRECTORY_COVERAGE)
+    )
+
+
+def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext) -> dict[str, object]:
+    args = ctx.args
+    data = ctx.data
+    rows = ctx.rows
+    global_scheduled = args.read_scope == "all_dialogs"
+    resolved_dialog_id = None if global_scheduled else _list_messages_resolved_dialog_id(data, rows, ctx.dialog_id)
+    dialog_type = data.get("dialog_type")
+    read_state = data.get("read_state")
     ordered_rows = _chronological_message_rows(rows)
     warnings = _list_messages_warnings(data)
     if topic_warning := _empty_exact_topic_warning(args, rows, data.get("selection_state")):
@@ -745,15 +807,15 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
         "dialog_id": resolved_dialog_id,
         "dialog": {
             "id": resolved_dialog_id,
-            "name": _list_messages_dialog_name(data, rows, args.dialog),
-            "display_name_source": data.get("dialog_name_source"),
+            "name": None if global_scheduled else _list_messages_dialog_name(data, rows, args.dialog),
+            "display_name_source": None if global_scheduled else data.get("dialog_name_source"),
             "type": dialog_type,
             "access": data.get("dialog_access"),
             "is_self": data.get("is_self", False),
         },
         "source": data.get("source", "unknown"),
         "coverage": _list_messages_coverage(data),
-        "directory_coverage": data.get("directory_coverage") or dict(_DEFAULT_DIRECTORY_COVERAGE),
+        "directory_coverage": _list_messages_directory_coverage(data),
         "warnings": warnings,
         "filters": {
             "dialog": args.dialog,
@@ -767,6 +829,7 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
             "unread": args.unread,
             "anchor_message_id": args.anchor_message_id,
             "message_state": args.message_state,
+            "read_scope": args.read_scope,
             "since_utc": args.since_utc,
             "until_utc": args.until_utc,
         },
@@ -779,9 +842,11 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
         },
         "navigation": {
             "next_navigation": ctx.next_navigation,
-            "has_more": ctx.next_navigation is not None,
+            "has_more": data.get("has_more", ctx.next_navigation is not None),
             "source_cursor": args.navigation,
-            "direction": _navigation_direction_for_structured(ctx.direction, args.anchor_message_id),
+            "direction": _navigation_direction_for_structured(
+                str(data.get("navigation_direction", ctx.direction)), args.anchor_message_id
+            ),
             "anchor_message_id": args.anchor_message_id,
         },
         "truncation": data.get(
@@ -796,9 +861,11 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
                 "use reply_context_ref.msg_id to link replies to parent rows"
             ),
         },
-        "read_state": structured_read_state,
+        "read_state": _list_messages_structured_read_state(data),
         "scope": str(data.get("scope", "all")),
         "draft_coverage": data.get("draft_coverage"),
+        "scheduled_coverage": data.get("scheduled_coverage"),
+        "dialog_scheduled_coverage": data.get("dialog_scheduled_coverage"),
         "messages": _list_messages_structured_messages(
             ordered_rows,
             read_state=read_state,
@@ -826,7 +893,7 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
                 "dialog_id": {"type": ["integer", "null"]},
                 "global": {"type": "boolean"},
                 "message_state": {"type": "string", "enum": ["sent", "scheduled", "all"]},
-                "ownership": {"type": "string", "enum": ["all", "own_only"]},
+                "ownership": {"type": "string", "enum": ["all", "account"]},
                 "since_utc": {"type": ["string", "null"]},
                 "until_utc": {"type": ["string", "null"]},
             },
@@ -835,6 +902,7 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
         },
         "source": {"type": "string"},
         "coverage": {"type": "object"},
+        "scheduled_coverage": {"type": ["object", "null"]},
         "directory_coverage": {"type": "object"},
         "warnings": {"type": "array", "items": {"type": "object"}},
         "read_state_per_dialog": {"type": "object"},
@@ -884,6 +952,7 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
         "scope",
         "source",
         "coverage",
+        "scheduled_coverage",
         "directory_coverage",
         "warnings",
         "read_state_per_dialog",
@@ -966,7 +1035,7 @@ def _search_scope_payload(ctx: _SearchStructuredContentContext) -> dict[str, obj
         "dialog_id": ctx.dialog_id,
         "global": ctx.global_mode,
         "message_state": ctx.args.message_state,
-        "ownership": "own_only" if ctx.args.message_state == "scheduled" else "all",
+        "ownership": "account" if ctx.args.message_state == "scheduled" else "all",
         "since_utc": ctx.args.since_utc,
         "until_utc": ctx.args.until_utc,
     }
@@ -1047,6 +1116,7 @@ def _search_structured_content(ctx: _SearchStructuredContentContext) -> dict[str
         "scope": _search_scope_payload(ctx),
         "source": source,
         "coverage": _list_messages_coverage(data_with_source),
+        "scheduled_coverage": data.get("scheduled_coverage"),
         "directory_coverage": data.get("directory_coverage") or dict(_DEFAULT_DIRECTORY_COVERAGE),
         "warnings": warnings,
         "read_state_per_dialog": _search_read_state_per_dialog(data),
@@ -1136,25 +1206,24 @@ def _format_search_result_row(row: dict, query: str, *, global_mode: bool) -> st
 
 class ListMessages(ToolArgs):
     """
-    List messages in one dialog.
+    List messages in one dialog or page the local scheduled queue.
 
-    Provide dialog= for fuzzy/name/link resolution or exact_dialog_id= when known.
-    This is not a global latest-across-all-dialogs tool.
+    Select a dialog with dialog= or exact_dialog_id=. Set read_scope="all_dialogs"
+    with message_state="scheduled" for the account queue; global mode rejects
+    dialog and topic selectors.
 
-    Pages are chronological. Omit navigation or use navigation="latest" for the
-    recent tail; use navigation="start" for the beginning. Reuse the exact
-    next_navigation token with the same filters, including message_state and unread.
+    Pages are chronological. Start with navigation="latest" or "start", then
+    reuse next_navigation with the same filters, including message_state and unread.
+    By default, message_state="all" returns the local combined stream. Use
+    message_state="sent" for published history, search-hit anchors and topic
+    resolution. Scheduled rows are author_only and unpublished.
 
-    The default message_state="all" returns the local combined stream. Use
-    message_state="sent" for published history, search-hit anchors, and natural
-    topic resolution. Scheduled rows are author_only and unpublished.
-
-    Use anchor_message_id with exact_dialog_id to read context around a search hit.
+    Use anchor_message_id with exact_dialog_id for context around a search hit.
     Reads use retained local facts in every sync state and never fetch Telegram.
-    Missing anchors are reported as unavailable. Sender, topic and unread filters
-    cannot be combined with anchors; UTC bounds remain supported. Coverage and
-    its observation horizon describe what is known; local page exhaustion does
-    not establish current Telegram completeness. DM rows include read_state.
+    Missing anchors are unavailable. Sender, topic and unread filters cannot
+    accompany anchors; UTC bounds remain supported. Coverage and its horizon
+    describe what is known; page exhaustion does not establish current Telegram
+    completeness. DM rows include read_state.
     """
 
     dialog: str | None = Field(
@@ -1239,11 +1308,35 @@ class ListMessages(ToolArgs):
             "draft returns current local author composition. unread is supported only for sent and all."
         ),
     )
+    read_scope: Literal["dialog", "all_dialogs"] = Field(
+        default="dialog",
+        description='Read one selected dialog by default; "all_dialogs" is available only for scheduled queue reads.',
+    )
 
     @model_validator(mode="after")
     def validate_direct_read_selectors(self) -> ListMessages:
         """Reject missing or conflicting selector combinations."""
-        _validate_dialog_selectors(self)
+        if self.read_scope == "dialog":
+            _validate_dialog_selectors(self)
+        else:
+            if self.message_state != "scheduled":
+                raise ValueError('read_scope="all_dialogs" requires message_state="scheduled".')
+            if (
+                any(
+                    value is not None
+                    for value in (
+                        self.dialog,
+                        self.exact_dialog_id,
+                        self.topic,
+                        self.exact_topic_id,
+                        self.anchor_message_id,
+                    )
+                )
+                or self.unread
+            ):
+                raise ValueError(
+                    "read_scope=all_dialogs cannot be combined with dialog, topic, anchor, or unread filters."
+                )
         _validate_topic_selectors(self)
         _validate_message_state_selector(self)
         _validate_utc_range(self)
@@ -1480,32 +1573,33 @@ def _list_messages_request_context(args: ListMessages) -> _ListMessagesRequestCo
             has_cursor=False,
         )
 
-    selector = required_dialog_selector(exact_id=args.exact_dialog_id, dialog=args.dialog)
-    dialog_id = selector.exact_id
-
-    direction = "oldest" if args.navigation in {"start", "oldest"} else "newest"
+    global_scheduled = args.read_scope == "all_dialogs"
+    selector = None if global_scheduled else required_dialog_selector(exact_id=args.exact_dialog_id, dialog=args.dialog)
+    direction = "oldest" if args.navigation == "start" else "newest"
     daemon_navigation = None if args.navigation in navigation_sentinels else args.navigation
-
-    sender_id: int | None = None
-    sender_name: str | None = None
-    if args.sender is not None:
-        try:
-            sender_id = int(args.sender)
-        except ValueError:
-            sender_name = args.sender
+    sender_id, sender_name = _list_messages_sender_filter(args.sender)
 
     return _ListMessagesRequestContext(
         args=args,
-        dialog_id=dialog_id,
-        dialog_label=selector.label,
+        dialog_id=None if selector is None else selector.exact_id,
+        dialog_label="" if selector is None else selector.label,
         has_filter=has_filter,
         has_cursor=has_cursor,
         direction=direction,
         daemon_navigation=daemon_navigation,
         sender_id=sender_id,
         sender_name=sender_name,
-        unread_flag=True if args.unread else None,
+        unread_flag=True if args.unread and not global_scheduled else None,
     )
+
+
+def _list_messages_sender_filter(sender: str | None) -> tuple[int | None, str | None]:
+    if sender is None:
+        return None, None
+    try:
+        return int(sender), None
+    except ValueError:
+        return None, sender
 
 
 def _list_messages_has_filter(args: ListMessages) -> bool:
@@ -1592,11 +1686,12 @@ async def _request_list_messages(
     request_context: _ListMessagesRequestContext,
     topic_id: int | None,
 ) -> dict:
-    selector_kwargs: dict = (
-        {"dialog_id": request_context.dialog_id}
-        if request_context.dialog_id is not None
-        else {"dialog": request_context.dialog_label}
-    )
+    if args.read_scope == "all_dialogs":
+        selector_kwargs: dict = {}
+    elif request_context.dialog_id is not None:
+        selector_kwargs = {"dialog_id": request_context.dialog_id}
+    else:
+        selector_kwargs = {"dialog": request_context.dialog_label}
     async with daemon_connection() as conn:
         return await conn.list_messages(
             **selector_kwargs,
@@ -1610,6 +1705,7 @@ async def _request_list_messages(
             context_message_id=args.anchor_message_id,
             context_size=args.context_size if args.anchor_message_id else None,
             message_state=args.message_state,
+            read_scope=args.read_scope,
             since_utc=args.since_utc,
             until_utc=args.until_utc,
         )

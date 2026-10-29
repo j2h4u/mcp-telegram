@@ -4,14 +4,12 @@ import asyncio
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from telethon.tl import types
 
 from mcp_telegram.flood import TelegramRpcThrottled
-from mcp_telegram.linked_chat_fact import linked_chat_fact_owner
-from mcp_telegram.own_only import OwnOnlyContext
 from mcp_telegram.scheduled_messages import (
     ScheduledDiscoveryDemandAdapter,
     ScheduledMessageReconciler,
@@ -799,55 +797,34 @@ async def test_account_hold_keeps_coordinator_running_until_shutdown() -> None:
 
 
 @pytest.mark.asyncio
-async def test_suspended_discovery_does_not_spin_coordinator_and_restore_reoffers_due_work() -> None:
-    now = 1_800_000_000
+async def test_linked_chat_wait_does_not_block_finite_scheduled_discovery() -> None:
+    now = int(time.time())
     clock = _Clock(float(now))
-    conn, client, discovery = _suspended_discovery(now)
-    callback_kind = DURABLE_DEMAND_ORDER[0]
-    shutdown = asyncio.Event()
-    initial = _adapters({callback_kind: DemandStatus(release_at=float(now))})
-    adapters: dict[DemandKind, object] = dict(initial)
+    conn, client, discovery = _discovery_with_link_wait(now)
+    adapters: dict[DemandKind, object] = dict(_adapters())
     adapters[DemandKind.SCHEDULED_DISCOVERY] = discovery
-    coordinator = TelegramDemandCoordinator(
-        cast(Mapping[DemandKind, DurableDemandAdapter], adapters), shutdown, clock=clock
-    )
-    callback_adapter = initial[callback_kind]
-    callback_offers: list[bool] = []
-    callback_adapter.on_run = _restore_link_callback(conn, clock, coordinator, shutdown, callback_offers)
+    coordinator = TelegramDemandCoordinator(cast(Mapping[DemandKind, DurableDemandAdapter], adapters), clock=clock)
     try:
+        # One finite seed and the two known peers are independent of linked-chat acquisition.
+        for _ in range(3):
+            coordinator.scan()
+            assert coordinator.ready_kinds == (DemandKind.SCHEDULED_DISCOVERY,)
+            await coordinator._execute_slice(DemandKind.SCHEDULED_DISCOVERY)
+            coordinator._active_kind = None
+        assert len(client.requests) == 2
+        assert conn.execute(
+            "SELECT coverage_state,discovery_due_at FROM scheduled_reconciliation_state"
+        ).fetchall() == [
+            ("complete", None),
+            ("complete", None),
+        ]
+        assert conn.execute("SELECT retry_at FROM linked_chat_fact_state").fetchone() == (now + 86_400,)
         for _ in range(20):
-            coordinator.scan(now=clock.value)
-            assert DemandKind.SCHEDULED_DISCOVERY not in coordinator.ready_kinds
-        assert callback_adapter.run_calls == []
-        assert client.requests == []
-
-        await coordinator.run()
-
-        assert len(callback_adapter.run_calls) == 1
-        assert callback_offers == [True]
-        assert client.requests == []
-        assert DemandKind.SCHEDULED_DISCOVERY not in coordinator.ready_kinds
-
-        await _assert_suspended_discovery_seed_then_due(discovery, clock.value + 1, now)
-        assert client.requests == []
+            coordinator.scan()
+            assert coordinator.ready_kinds == ()
+        assert len(client.requests) == 2
     finally:
         conn.close()
-
-
-async def _assert_suspended_discovery_seed_then_due(
-    discovery: ScheduledDiscoveryDemandAdapter, now: float, due_at: int
-) -> None:
-    seed = discovery.status(now)
-    assert seed is not None and seed.release_at == 0 and seed.selected is not None
-    assert seed.selected.key.target == "unseeded"
-    outcome = await discovery.run_slice(RpcAttemptBudget(limit=16, selected=seed.selected))
-    assert outcome.kind is SliceOutcomeKind.PROGRESSED
-
-    newly_seeded = discovery.status(now)
-    assert newly_seeded is not None and newly_seeded.selected is not None
-    due = discovery.status(now, excluded=frozenset({newly_seeded.selected}))
-    assert due is not None and due.release_at == float(due_at) and due.selected is not None
-    assert due.selected.key.target == "42"
 
 
 class _CoordinatorScheduledClient:
@@ -862,10 +839,10 @@ class _CoordinatorScheduledClient:
 
     async def __call__(self, _request: object, **_kwargs: object) -> object:
         self.requests.append(_request)
-        return SimpleNamespace(scheduled_messages=[])
+        return types.messages.Messages(messages=[], topics=[], chats=[], users=[])
 
 
-def _suspended_discovery(
+def _discovery_with_link_wait(
     now: int,
 ) -> tuple[sqlite3.Connection, _CoordinatorScheduledClient, ScheduledDiscoveryDemandAdapter]:
     conn = sqlite3.connect(":memory:")
@@ -889,30 +866,11 @@ def _suspended_discovery(
         client,
         conn,
         asyncio.Event(),
-        OwnOnlyContext(account_id=42, personal_channel_id=channel_id),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=1),
         writer=inline_writer(conn),
     )
+    reconciler.bind_account_id(42)
     return conn, client, ScheduledDiscoveryDemandAdapter(reconciler, account_id=42)
-
-
-def _restore_link_callback(
-    conn: sqlite3.Connection,
-    clock: _Clock,
-    coordinator: TelegramDemandCoordinator,
-    shutdown: asyncio.Event,
-    offers: list[bool],
-) -> Callable[[], Awaitable[None]]:
-    async def restore_link() -> None:
-        channel_id = -1_000_000_000_900
-        with conn:
-            conn.execute("UPDATE synced_dialogs SET status='synced' WHERE dialog_id=?", (channel_id,))
-            generation = linked_chat_fact_owner.capture_generation(conn, channel_id)
-            assert linked_chat_fact_owner.publish(conn, channel_id, generation, 400, int(clock.value) + 1)
-        offers.append(coordinator.offer(DemandKind.SCHEDULED_DISCOVERY))
-        shutdown.set()
-
-    return restore_link
 
 
 @pytest.mark.asyncio

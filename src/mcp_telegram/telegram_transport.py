@@ -24,6 +24,7 @@ from telethon.tl.functions import PingRequest, ReqDHParamsRequest, ReqPqMultiReq
 from telethon.tl.tlobject import TLRequest  # type: ignore[import-untyped]
 from telethon.tl.types import MsgsAck, MsgsStateInfo  # type: ignore[import-untyped]
 
+from .scheduled_write_fence import ScheduledWriteRejected
 from .telegram_rpc_scheduler import RpcAdmissionExpiredError, RpcAdmissionSaturatedError, TelegramRpcScope
 
 type ProtocolOrigin = Literal["ack", "ping", "state_info", "auth"]
@@ -541,6 +542,11 @@ class GuardedMTProtoSender(MTProtoSender):
         owned = packet.state
         try:
             claimed = self._authority.claim_write(owned.owner, packet.permit)
+        except ScheduledWriteRejected as error:
+            if not owned.state.future.done():
+                owned.state.future.set_exception(error)
+            self.defer_packet(packet)
+            return False
         except Exception as error:  # noqa: BLE001 - reject the popped unclaimed packet and close authority safely.
             self._authority.protect_transport(error)
             if not owned.state.future.done():

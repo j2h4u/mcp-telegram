@@ -40,6 +40,7 @@ from mcp_telegram.tools import (
     ListMessages,
     ListTopics,
     ManageDraft,
+    ManageScheduledMessage,
     MarkDialogForSync,
     SearchMessages,
     SubmitFeedback,
@@ -55,6 +56,7 @@ from mcp_telegram.tools import (
     list_messages,
     list_topics,
     manage_draft,
+    manage_scheduled_message,
     mark_dialog_for_sync,
     search_messages,
     submit_feedback,
@@ -311,6 +313,7 @@ def _canonical_dialog_row(
         "draft_text": None,
         "scheduled_count": 0,
         "next_scheduled_at": None,
+        "unresolved_scheduled_count": 0,
         "inclusion_basis": None,
         "folder_ids": [],
         "folders": [],
@@ -402,6 +405,30 @@ STRUCTURED_TOOL_CASES = {
             "current_is_operation_confirmation": False,
             "current": {"presence": "absent", "uncertain": False, "observed_at": 1700000000},
             "next_action": "Read get_draft.",
+        },
+    ),
+    "manage_scheduled_message": (
+        manage_scheduled_message,
+        ManageScheduledMessage(
+            exact_dialog_id=123,
+            action="create",
+            operation_key="schema-test-scheduled",
+            text="scheduled",
+            schedule_at_utc="2099-01-01T00:00:00Z",
+        ),
+        {
+            "ok": True,
+            "action": "create",
+            "operation_key": "schema-test-scheduled",
+            "account_id": 7,
+            "dialog_id": 123,
+            "scheduled_message_id": 500,
+            "outcome": "acknowledged",
+            "mutation_dispatched": True,
+            "acknowledged": True,
+            "receipt_persisted": True,
+            "current_is_operation_confirmation": True,
+            "schedule_at_utc": "2099-01-01T00:00:00Z",
         },
     ),
     "list_conversation_changes": (
@@ -944,6 +971,7 @@ class _patch_daemon:
     def __enter__(self):
         targets = [
             "mcp_telegram.tools.drafts.daemon_connection",
+            "mcp_telegram.tools.scheduled.daemon_connection",
             "mcp_telegram.tools.discovery.daemon_connection",
             "mcp_telegram.tools.reading.daemon_connection",
             "mcp_telegram.tools.sync.daemon_connection",
@@ -979,6 +1007,7 @@ class _patch_daemon_not_running:
         self._patches = []
         targets = [
             "mcp_telegram.tools.drafts.daemon_connection",
+            "mcp_telegram.tools.scheduled.daemon_connection",
             "mcp_telegram.tools.discovery.daemon_connection",
             "mcp_telegram.tools.reading.daemon_connection",
             "mcp_telegram.tools.sync.daemon_connection",

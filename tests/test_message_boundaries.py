@@ -832,3 +832,15 @@ def test_profile_seek_permission_does_not_allow_message_reads_or_mutation(functi
     gate = _gate()
     source = f"def {function}(conn):\n    conn.execute({sql!r})\n"
     assert gate.violations_for(gate.SOURCE_ROOT / "entity_profile/repository.py", source)
+
+
+def test_list_message_context_extensions_use_canonical_content_presenter() -> None:
+    gate = _gate()
+    source = _search_hit_fixture().replace(
+        "    return project_message_view(message)\n",
+        "    item = project_message_view(message)\n"
+        "    item.update({'dialog_name': 'name', 'dialog_name_source': 'directory', 'dialog_type': 'user', "
+        "'expected_version': 'version', 'repeat_period': None, 'scheduled_coverage': message.coverage})\n"
+        "    return item\n",
+    )
+    assert gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source) == []
