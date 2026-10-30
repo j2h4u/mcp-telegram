@@ -191,10 +191,30 @@ reviews. Source: `src/mcp_telegram/feedback_db.py`,
 
 ## Testing
 
+Use the Justfile for local tests and CI. Do not invoke `uv run pytest` directly.
+
 ```bash
-uv run pytest                              # full suite
-uv run pytest tests/test_daemon_api.py -v  # focused
+just test tests/test_daemon_api.py -v  # focused development check
+just check                            # static gates; no pytest
+just crap-threshold                   # full suite once, with coverage and CRAP
 ```
+
+`just crap-threshold` already runs every test. Never precede or follow it with
+another full pytest run on the same candidate. Its two processes run disjoint
+file lists to bound memory, not two copies of the suite. There is no separate
+`unit` recipe. This cadence supersedes historical plans asking for separate
+full unit and coverage runs.
+
+During development, run affected slices. The final full suite belongs in PR CI;
+do not duplicate it locally when CI will test the same candidate. CI uses the
+same `just check` and `just crap-threshold` recipes. A failed test or metric is
+fixed before a new candidate is checked; never rerun an unchanged failure blindly.
+
+Protected PR CI is the release gate. After merge, reuse that result when the
+merged tree matches the checked PR tree; do not dispatch or wait for another
+full main-branch run. If the tree differs, obtain a fresh successful check.
+`just verify` is a standalone full local release path, not an additional gate
+after successful CI. After CI, use only `just runtime-verify` when runtime changed.
 
 ## Observability
 

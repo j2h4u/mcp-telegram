@@ -539,24 +539,34 @@ by normal synchronization.
 The project uses `uv` and `just`.
 
 ```bash
-just --list
-just check
-just typecheck
-just unit
-just crap-threshold
-just runtime-smoke
-just runtime-verify
-just verify
+just test tests/test_daemon_api.py -q  # affected tests during development
+just check                            # static checks and package smoke
+just crap-threshold                   # full suite once, coverage + CRAP
 ```
 
 `just check` runs Ruff plus the non-test static gates. `just typecheck` runs
-mypy. `just unit` runs pytest. `just crap-threshold` runs pytest with per-function
+mypy. `just crap-threshold` runs pytest with per-function
 coverage and enforces the fixed CRAP limit of 30. `just check` enforces Radon CC
 at or below 10. Coverage informs CRAP only; the project has no aggregate coverage floor.
-`just verify` runs the full local gate, including both metric thresholds and live
-runtime verification. `just runtime-verify` rebuilds the live Docker container,
+
+Local development and CI use these same recipes. Run affected tests locally;
+the final full suite runs in PR CI, not once locally and again in CI. Do not run
+another full pytest before/after `just crap-threshold`: coverage is collected
+during the test run itself. Two disjoint file batches bound memory;
+each test runs once.
+
+Protected main requires the PR check against an up-to-date base. The CI workflow
+does not rerun the same suite after merge or nightly on unchanged code. Reuse
+successful PR evidence for an identical merged tree; a different tree requires
+a fresh check. Manual workflow dispatch remains available for intentional reruns.
+CodeQL runs on PRs and its independent weekly security schedule, not again on merge.
+
+After successful CI, use `just runtime-verify` for runtime-affecting changes;
+it rebuilds the live Docker container,
 waits for it to become healthy, and runs the redacted MCP smoke test through
 `devtools/mcp_client/cli.py`.
+`just verify` is the alternative standalone local release path (static checks,
+one instrumented suite, runtime verification), not a command to run after CI.
 
 Pull requests that change documentation only retain the required `ci` status
 but skip Python tests, CRAP analysis, CodeQL, dependency review, and Docker builds.

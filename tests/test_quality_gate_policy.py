@@ -1,10 +1,14 @@
+import json
 import os
 import re
 import subprocess
+import sys
 import textwrap
 import tomllib
 from pathlib import Path
 from typing import TypedDict, cast
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -95,6 +99,73 @@ def test_import_linter_and_tach_are_both_required_static_gates() -> None:
     assert "module-boundaries" in check_recipe
     assert "uv run lint-imports" in justfile
     assert "uv run tach check --dependencies --interfaces --exact" in justfile
+
+
+def test_full_ci_is_premerge_or_explicit_not_repeated_on_main_or_nightly() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    triggers = workflow.partition("\non:\n")[2].partition("\npermissions:")[0]
+    assert re.search(r"(?m)^  pull_request:", triggers)
+    assert re.search(r"(?m)^  workflow_dispatch:", triggers)
+    assert not re.search(r"(?m)^  (push|schedule):", triggers)
+    assert "run: just package-smoke" not in workflow
+    assert workflow.count("-- just crap-threshold") == 1
+
+    codeql = (ROOT / ".github" / "workflows" / "codeql.yml").read_text(encoding="utf-8")
+    codeql_triggers = codeql.partition("\non:\n")[2].partition("\njobs:")[0]
+    assert not re.search(r"(?m)^  push:", codeql_triggers)
+    assert re.search(r"(?m)^  schedule:", codeql_triggers)
+
+
+def test_full_suite_has_one_recipe_without_compatibility_aliases() -> None:
+    result = subprocess.run(
+        ["just", "--dry-run", "crap-threshold"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert (result.stdout + result.stderr).count("just coverage-data;") == 1
+    justfile = (ROOT / "Justfile").read_text(encoding="utf-8")
+    assert not re.search(r"(?m)^(unit|typecheck-tests):", justfile)
+
+
+@pytest.mark.parametrize("recipe", ["test", "test-parallel"])
+def test_development_recipes_require_an_explicit_slice(recipe: str) -> None:
+    result = subprocess.run(["just", "--dry-run", recipe], cwd=ROOT, capture_output=True, text=True, check=False)
+    assert result.returncode != 0
+    assert "uv run pytest" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("file_count", [4, 5])
+def test_instrumented_batches_execute_each_file_once_through_shared_recipe(tmp_path: Path, file_count: int) -> None:
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    expected_files = [f"tests/test_{index}.py" for index in range(file_count)]
+    for relative_path in expected_files:
+        (tmp_path / relative_path).touch()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    invocation_log = tmp_path / "invocations.jsonl"
+    uv = bin_dir / "uv"
+    uv.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "with open(os.environ['INVOCATION_LOG'], 'a') as log:\n"
+        "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n",
+        encoding="utf-8",
+    )
+    uv.chmod(0o755)
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "INVOCATION_LOG": str(invocation_log)}
+    # Nested just calls must keep the real recipe file and isolated working directory.
+    env.update({"JUST_JUSTFILE": str(ROOT / "Justfile"), "JUST_WORKING_DIRECTORY": str(tmp_path)})
+    subprocess.run(["just", "coverage-data"], cwd=tmp_path, env=env, capture_output=True, text=True, check=True)
+    invocations = [cast(list[str], json.loads(line)) for line in invocation_log.read_text().splitlines()]
+    assert len(invocations) == 2
+    assert all(command[:2] == ["run", "pytest"] for command in invocations)
+    executed_files = [argument for command in invocations for argument in command if argument.startswith("tests/")]
+    assert executed_files == expected_files
+    assert "--cov-append" not in invocations[0]
+    assert "--cov-append" in invocations[1]
 
 
 def test_changed_file_lookup_failure_cannot_skip_heavy_ci(tmp_path: Path) -> None:

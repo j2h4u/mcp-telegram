@@ -1,15 +1,10 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - ".planning/**"
-      - "**/*.md"
+  # Protected main requires this PR check on an up-to-date base. Reuse it after
+  # merge instead of running the same tree again on push or every night.
   pull_request:
     branches: [main]
-  schedule:
-    - cron: "37 21 * * *"
   workflow_dispatch:
 
 permissions:
@@ -118,10 +113,7 @@ jobs:
       - name: Verify selected interpreter
         run: uv run python -c 'import os, sys; expected = tuple(map(int, os.environ["UV_PYTHON"].split("."))); actual = sys.version_info[:len(expected)]; print(sys.version); assert actual == expected, f"expected {expected}, got {actual}"'
 
-      - name: Package smoke
-        run: just package-smoke
-
-      - name: CRAP threshold
+      - name: Tests with coverage and CRAP
         run: python3 scripts/ci_pytest_runner.py run -- just crap-threshold
 
   docker-build:
