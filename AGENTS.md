@@ -219,6 +219,8 @@ same `just check` and `just crap-threshold` recipes. A failed test or metric is
 fixed before a new candidate is checked; never rerun an unchanged failure blindly.
 
 Before final CI, freeze the candidate scope and integrate completed handoffs.
+For public tool registry, schema, or content changes, run the existing `tests/test_server.py`
+and `tests/test_strict_tool_arguments.py` contract modules before CI.
 Check changed contracts, callers and fixtures, including actual integration paths
 and producer formats at ownership or persistence boundaries. Run affected static,
 type and complexity checks; collect independent findings and fix them together.
