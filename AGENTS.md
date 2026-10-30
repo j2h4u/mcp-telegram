@@ -214,11 +214,28 @@ do not duplicate it locally when CI will test the same candidate. CI uses the
 same `just check` and `just crap-threshold` recipes. A failed test or metric is
 fixed before a new candidate is checked; never rerun an unchanged failure blindly.
 
+Before final CI, freeze the candidate scope and integrate completed handoffs.
+Check changed contracts, callers and fixtures, including actual integration paths
+and producer formats at ownership or persistence boundaries. Run affected static,
+type and complexity checks; collect independent findings and fix them together.
+PR CI normally owns the full `just check`; run it locally only for a concrete
+cross-module concern or when CI is unavailable.
+
+On CI failure, diagnose the reported check and run it and relevant neighboring
+tests after the fix, before submitting the next candidate. Track new nonblocking
+work in WorkGraph instead of expanding a frozen release; keep release blockers
+in scope.
+
+After a runtime change, follow runtime verification with a product scenario that
+exercises the changed behavior. Test long timing boundaries with bounded controlled
+clocks; require a production soak only when the behavior needs observation over
+time. Report delivered behavior separately from remaining verification or work.
+
 Protected PR CI is the release gate. After merge, reuse that result when the
 merged tree matches the checked PR tree; do not dispatch or wait for another
 full main-branch run. If the tree differs, obtain a fresh successful check.
 `just verify` is a standalone full local release path, not an additional gate
-after successful CI. After CI, use only `just runtime-verify` when runtime changed.
+after successful CI. Use `just runtime-verify` for runtime rebuild and smoke.
 
 ## Observability
 
