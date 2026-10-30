@@ -480,6 +480,9 @@ def test_ensure_demand_runtime_wires_all_demand_sinks_once(monkeypatch: pytest.M
             events.append(f"{self.name}:{sink!r}")
 
     class _Coordinator:
+        def inspect_work(self, _revision: object) -> dict[str, object]:
+            return {}
+
         def run(self) -> object:
             async def _run() -> None:
                 return None
@@ -497,6 +500,7 @@ def test_ensure_demand_runtime_wires_all_demand_sinks_once(monkeypatch: pytest.M
     api_server = SimpleNamespace(
         _get_entity_info_service=lambda: entity_service,
         bind_demand_sink=lambda sink: events.append(f"api:{sink!r}"),
+        bind_profile_job_inspector=lambda inspector: events.append(f"inspector:{inspector.__self__!r}"),
     )
     handler = _Bindable("handler")
     owner = _Bindable("draft")
@@ -541,6 +545,7 @@ def test_ensure_demand_runtime_wires_all_demand_sinks_once(monkeypatch: pytest.M
     assert build_calls[0] == (ctx, history, directory, startup)
     assert events == [
         "api:coordinator",
+        "inspector:coordinator",
         "handler:coordinator",
         "draft:coordinator",
         "entity:coordinator",

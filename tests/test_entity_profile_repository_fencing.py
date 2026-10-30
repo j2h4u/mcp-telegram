@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -45,39 +46,38 @@ def test_migration_is_additive_and_invents_no_evidence(tmp_path: Path, monkeypat
         old_schema.setattr(sync_db_module, "_CURRENT_SCHEMA_VERSION", 60)
         old_schema.setattr(sync_db_module, "_ENTITY_PROFILE_ACQUISITION_MIGRATION_61", 61)
         ensure_sync_schema(path)
-    conn = sqlite3.connect(path)
-    with write_savepoint(conn):
-        conn.execute("INSERT INTO entities(id, type, name, updated_at) VALUES (42, 'user', 'Old', 1)")
-    with write_savepoint(conn):
-        conn.execute(
-            "INSERT INTO entity_details(entity_id, detail_json, fetched_at) VALUES (42, ?, 90)",
-            ('{"schema":1,"id":42,"type":"user","name":"Old"}',),
-        )
-    with write_savepoint(conn):
-        conn.execute(
-            "INSERT INTO entity_profile_refresh_state(entity_id,status,retry_at,reason,updated_at,next_section,acquisition_cursor) "
-            "VALUES (42,'failed',123,'timeout',90,'common_chats',3)"
-        )
-    conn.commit()
-    ensure_sync_schema(path)
-    row = conn.execute(
-        "SELECT detail_json, fetched_at, profile_revision FROM entity_details WHERE entity_id=42"
-    ).fetchone()
-    assert row == ('{"schema":1,"id":42,"type":"user","name":"Old"}', 90, 0)
-    state = conn.execute(
-        "SELECT status,retry_at,reason,next_section,acquisition_cursor,generation,started_at,pair_eligible "
-        "FROM entity_profile_refresh_state WHERE entity_id=42"
-    ).fetchone()
-    assert state == ("failed", 123, "timeout", "common_chats", 3, 0, None, 0)
-    assert conn.execute(
-        "SELECT COUNT(*) FROM entity_detail_sections WHERE entity_id=42 AND acquisition_generation IS NOT NULL"
-    ).fetchone() == (0,)
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(entity_details)")}
-    assert {"profile_owner_account_id", "profile_observation_scope_json"} <= columns
-    assert conn.execute(
-        "SELECT profile_owner_account_id, profile_observation_scope_json FROM entity_details WHERE entity_id=42"
-    ).fetchone() == (None, None)
-    conn.close()
+    with closing(sqlite3.connect(path)) as conn:
+        with write_savepoint(conn):
+            conn.execute("INSERT INTO entities(id, type, name, updated_at) VALUES (42, 'user', 'Old', 1)")
+        with write_savepoint(conn):
+            conn.execute(
+                "INSERT INTO entity_details(entity_id, detail_json, fetched_at) VALUES (42, ?, 90)",
+                ('{"schema":1,"id":42,"type":"user","name":"Old"}',),
+            )
+        with write_savepoint(conn):
+            conn.execute(
+                "INSERT INTO entity_profile_refresh_state(entity_id,status,retry_at,reason,updated_at,next_section,acquisition_cursor) "
+                "VALUES (42,'failed',123,'timeout',90,'common_chats',3)"
+            )
+        conn.commit()
+        ensure_sync_schema(path)
+        row = conn.execute(
+            "SELECT detail_json, fetched_at, profile_revision FROM entity_details WHERE entity_id=42"
+        ).fetchone()
+        assert row == ('{"schema":1,"id":42,"type":"user","name":"Old"}', 90, 0)
+        state = conn.execute(
+            "SELECT status,retry_at,reason,next_section,acquisition_cursor,generation,started_at,pair_eligible "
+            "FROM entity_profile_refresh_state WHERE entity_id=42"
+        ).fetchone()
+        assert state == ("failed", 123, "timeout", "common_chats", 3, 0, None, 0)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM entity_detail_sections WHERE entity_id=42 AND acquisition_generation IS NOT NULL"
+        ).fetchone() == (0,)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(entity_details)")}
+        assert {"profile_owner_account_id", "profile_observation_scope_json"} <= columns
+        assert conn.execute(
+            "SELECT profile_owner_account_id, profile_observation_scope_json FROM entity_details WHERE entity_id=42"
+        ).fetchone() == (None, None)
 
 
 def test_pair_commit_rolls_back_all_projections_on_failure(tmp_path: Path) -> None:
