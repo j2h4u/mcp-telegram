@@ -41,6 +41,11 @@ directories. Put temporary work in OS temporary directories and remove it when
 no longer needed.
 Use `wgr list-tickets --project TG --state active` to find current work; do not
 infer that the project is absent when automatic Git-context detection is unbound.
+On entering or resuming this project, use
+`wgr list-tickets --project TG --state waiting_for` to inspect next-review dates
+in `resume_condition`. Review due items once per recorded interval using their
+stipulated evidence; record the result and next review date in the same ticket.
+Dates are not an unattended scheduler; do not resume explicitly deferred work.
 
 Complete the ordinary backlog end to end. Prepare incomplete tasks before
 execution; missing preparation is work to do, not permission to skip them.
