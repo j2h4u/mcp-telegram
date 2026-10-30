@@ -223,8 +223,9 @@ Before final CI, freeze the candidate scope and integrate completed handoffs.
 Check changed contracts, callers and fixtures, including actual integration paths
 and producer formats at ownership or persistence boundaries. Run affected static,
 type and complexity checks; collect independent findings and fix them together.
-PR CI normally owns the full `just check`; run it locally only for a concrete
-cross-module concern or when CI is unavailable.
+Run `just check` once locally before full CI for a frozen cross-module candidate
+or one that removes interfaces or changes transaction ownership. Keep small
+development loops targeted; full pytest and coverage remain in PR CI.
 
 On CI failure, diagnose the reported check and run it and relevant neighboring
 tests after the fix, before submitting the next candidate. Track new nonblocking

@@ -1,4 +1,4 @@
-"""Synchronous, explicitly owned SQLite write units for the sync database."""
+"""Synchronous, explicitly owned SQLite transactions for the sync database."""
 
 import logging
 import sqlite3
@@ -217,6 +217,19 @@ def _retire_connection(conn: sqlite3.Connection, primary: BaseException) -> None
     except BaseException as close_error:
         primary.add_note(f"Closing the unsafe SQLite connection failed: {close_error!r}")
         raise primary from close_error
+
+
+@contextmanager
+def read_snapshot(conn: sqlite3.Connection) -> Iterator[None]:
+    """Keep a local read snapshot without taking ownership of a caller transaction."""
+    began = not conn.in_transaction
+    if began:
+        conn.execute("BEGIN")
+    try:
+        yield
+    finally:
+        if began:
+            conn.rollback()
 
 
 @contextmanager

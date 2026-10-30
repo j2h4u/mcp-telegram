@@ -51,6 +51,7 @@ from ..sync_read_model import (
     build_sync_read_model,
     local_history_coverage,
 )
+from ..sync_transactions import read_snapshot
 from ..temporal import parse_utc_boundary
 from .draft_projection import draft_message_key, read_drafts
 from .query_records import read_message_from_row
@@ -3389,14 +3390,8 @@ class ReadingService:
             conn.close()
 
     def _list_dialogs_page_transaction(self, conn: sqlite3.Connection, req: dict) -> dict:
-        began = not conn.in_transaction
-        if began:
-            conn.execute("BEGIN")
-        try:
+        with read_snapshot(conn):
             return self._list_dialogs_page(conn, req)
-        finally:
-            if began:
-                conn.rollback()
 
     def _list_dialogs_page(self, conn: sqlite3.Connection, req: dict) -> dict:
         account = req.get("verified_account_id")
