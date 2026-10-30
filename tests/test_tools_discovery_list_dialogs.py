@@ -42,6 +42,7 @@ def _make_dialog_dict(*, opts: _DialogDictOptions | None = None, **kwargs: objec
         "id": opts.dialog_id,
         "name": opts.name,
         "type": opts.type_,
+        "topic_capability": "unknown",
         "last_message_at": 1700000000,
         "unread_count": 0,
         "members": None,

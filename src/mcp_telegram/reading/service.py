@@ -1395,6 +1395,7 @@ class ReadingService:
             "name": row["name"],
             "display_name_source": row["display_name_source"],
             "type": row["type"],
+            "topic_capability": row["topic_capability"],
             "last_message_at": row["last_message_at"],
             "archived": bool(row["archived"]),
             # Telegram-authoritative dialog fact. NULL means this snapshot has

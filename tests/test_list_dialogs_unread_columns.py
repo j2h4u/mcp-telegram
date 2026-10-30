@@ -190,6 +190,9 @@ def _make_db() -> Iterator[sqlite3.Connection]:
             """
         )
         conn.execute("CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS topic_catalog_state (dialog_id INTEGER PRIMARY KEY, applicable INTEGER)"
+        )
         install_dialog_directory_coverage_schema(conn)
         conn.commit()
         yield conn
@@ -734,6 +737,7 @@ async def test_list_dialogs_structured_output_includes_unread_values_and_channel
         now=1700000000,
     ).to_wire()
     common_row = {
+        "topic_capability": "unknown",
         "access_lost_at": None,
         "members": None,
         "created": None,

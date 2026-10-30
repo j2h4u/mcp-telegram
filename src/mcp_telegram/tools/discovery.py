@@ -71,6 +71,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                         "enum": ["name", "username", "numeric", None],
                     },
                     "type": {"type": ["string", "null"]},
+                    "topic_capability": {"type": "string", "enum": ["supported", "unsupported", "unknown"]},
                     "is_self": {"type": "boolean"},
                     "last_message_at": {"type": ["integer", "string", "null"]},
                     "unread_count": {"type": ["integer", "null"]},
@@ -136,6 +137,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "id",
                     "name",
                     "type",
+                    "topic_capability",
                     "last_message_at",
                     "unread_count",
                     "sync_status",
@@ -313,6 +315,7 @@ class _DialogSurface:
     name: str | None
     display_name_source: str | None
     dialog_type: str | None
+    topic_capability: str
     last_message_at: int | str | None
     unread_count: int | None
     access_lost_at: int | None
@@ -499,12 +502,16 @@ def _strict_dialog(value: object, index: int) -> _DialogSurface:
     context = f"dialogs[{index}]"
     if not isinstance(value, Mapping):
         raise SyncReadModelContractError(f"{context} must be an object")
+    capability = _required(value, "topic_capability", context=context)
+    if capability not in ("supported", "unsupported", "unknown"):
+        raise SyncReadModelContractError(f"{context}.topic_capability is invalid")
     return _DialogSurface(
         model=decode_sync_read_model(value),
         dialog_id=_strict_int(value, "id", context=context),
         name=_strict_optional_string(value, "name", context=context),
         display_name_source=_strict_display_name_source(value, context=context),
         dialog_type=_strict_optional_string(value, "type", context=context),
+        topic_capability=capability,
         last_message_at=_strict_optional_timestamp(value, "last_message_at", context=context),
         unread_count=_strict_optional_int(value, "unread_count", context=context),
         access_lost_at=_strict_optional_int(value, "access_lost_at", context=context),
@@ -702,8 +709,7 @@ class ListDialogs(ToolArgs):
       - 'synced'      — complete historical coverage as of history_complete_at; this does not prove active realtime
       - 'own_only'    — only own-message-related history is stored
       - 'access_lost' — account no longer has access; read-only snapshot
-      - 'fragment'    — no full sync; only point-fetched snippets from targeted
-                        list_messages(anchor_message_id=..., message_state="sent") calls (Phase 999.1)
+      - 'fragment'    — partial retained history; anchored reads use local context only
 
     Call `get_sync_status` and inspect `realtime_history` when active realtime coverage matters.
     """
@@ -864,6 +870,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 "name": dialog.name,
                 "display_name_source": dialog.display_name_source,
                 "type": dialog.dialog_type,
+                "topic_capability": dialog.topic_capability,
                 "last_message_at": dialog.last_message_at,
                 "unread_count": dialog.unread_count,
                 "sync_status": wire["sync_status"],

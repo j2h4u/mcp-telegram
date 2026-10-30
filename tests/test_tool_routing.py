@@ -301,6 +301,7 @@ def _canonical_dialog_row(
         "id": 123,
         "name": "Alice",
         "type": "User",
+        "topic_capability": "unknown",
         "last_message_at": 1700000000,
         "unread_count": 0,
         "access_lost_at": None,
