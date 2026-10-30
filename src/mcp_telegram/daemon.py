@@ -154,7 +154,7 @@ from .sync_transactions import enable_runtime_writes, write_transaction
 from .sync_worker import FullSyncWorker
 from .telegram import create_client, make_rpc_safety_store
 from .telegram_demand import AcquisitionKind, DemandStatus, RpcAttemptBudget, acquisition_context, demand_context
-from .telegram_demand_coordinator import TelegramDemandCoordinator
+from .telegram_demand_coordinator import CoordinatorState, TelegramDemandCoordinator
 from .telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkRevision
 from .telegram_gateway import (
     TelethonChannelProfileGateway,
@@ -2114,6 +2114,24 @@ async def _bind_scheduled_commands(ctx: _SyncMainContext) -> None:
         await runtime.scheduled_reconciler.invalidate_continuity(dialog_id, reason)
         runtime.coordinator.offer(DemandKind.SCHEDULED_DISCOVERY)
 
+    async def prioritize_baseline(selected_account_id: int, dialog_id: int) -> bool:
+        if ctx.shutdown_event.is_set() or runtime.coordinator.state in {
+            CoordinatorState.STOPPING,
+            CoordinatorState.STOPPED,
+        }:
+            return False
+        eligible = await runtime.scheduled_reconciler.prioritize_baseline(selected_account_id, dialog_id)
+        if not eligible:
+            return False
+        if ctx.shutdown_event.is_set() or runtime.coordinator.state in {
+            CoordinatorState.STOPPING,
+            CoordinatorState.STOPPED,
+        }:
+            runtime.scheduled_reconciler.clear_baseline_priority(dialog_id)
+            return False
+        runtime.coordinator.offer(DemandKind.SCHEDULED_DISCOVERY)
+        return True
+
     def interrupted_targets(conn: sqlite3.Connection) -> tuple[int, ...]:
         rows = cast(
             list[tuple[int]],
@@ -2150,6 +2168,7 @@ async def _bind_scheduled_commands(ctx: _SyncMainContext) -> None:
             resolve_peer=resolve_peer,
             account_is_premium=current_premium,
             request_recovery=request_recovery,
+            prioritize_baseline=prioritize_baseline,
         )
     )
 

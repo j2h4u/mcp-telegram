@@ -2,7 +2,7 @@
 
 ## Canon
 
-- Trust source, tests, and live runtime over `.planning/*`.
+- Trust source, tests, and live runtime.
 - Source describes current behavior; the product contract below defines required
   behavior. A contradiction is tracked implementation debt, not permission to
   reinterpret the product as a cloud proxy.
@@ -35,6 +35,10 @@ Track remaining delivery and completed-slice evidence in WorkGraph `TG-91`.
 Use WorkGraph (`wgr`), project `TG`, exclusively for task tracking and project
 management. Never create GitHub Issues for this repository. GitHub remains the
 code, pull-request and CI host, not a task tracker.
+Do not use GSD, `.planning`, or parallel project-management stores for this
+repository. Keep permanent checks and supporting code in normal project
+directories. Put temporary work in OS temporary directories and remove it when
+no longer needed.
 Use `wgr list-tickets --project TG --state active` to find current work; do not
 infer that the project is absent when automatic Git-context detection is unbound.
 

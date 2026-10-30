@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,6 +41,7 @@ from mcp_telegram.scheduled_write_fence import (
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
+from mcp_telegram.tools.scheduled import _scheduled_error_response
 from tests.sqlite_writer_helpers import inline_writer
 
 
@@ -431,6 +433,8 @@ class _OwnerHarness:
         self.client = _OwnerClient(self)
         self.account_is_premium = True
         self.fail_recovery = False
+        self.first_use_requests: list[tuple[int, int]] = []
+        self.first_use_accept = False
         self.owner = self.new_owner(self.client)
 
     def new_owner(self, client: object) -> ScheduledCommandOwner:
@@ -443,7 +447,12 @@ class _OwnerHarness:
             resolve_peer=self.resolve_peer,
             account_is_premium=lambda: self.account_is_premium,
             request_recovery=self.recover,
+            prioritize_baseline=self.first_use_repair,
         )
+
+    async def first_use_repair(self, _account_id: int, _dialog_id: int) -> bool:
+        self.first_use_requests.append((_account_id, _dialog_id))
+        return self.first_use_accept
 
     async def resolve_peer(self, dialog_id: int, topic_id: int | None) -> object:
         assert dialog_id == self.dialog_id
@@ -639,6 +648,91 @@ async def test_newly_unknown_coverage_is_a_typed_pre_dispatch_rejection(tmp_path
         assert harness.client.requests and harness.client.dispatched_count == 0
         receipt = read_scheduled_operation(harness.conn, harness.account_id, "coverage-invalidated")
         assert receipt is not None and receipt.outcome == "rejected"
+    finally:
+        harness.close()
+
+
+async def test_missing_baseline_requests_repair_before_any_receipt_or_write(tmp_path: Path) -> None:
+    harness = _OwnerHarness(tmp_path / "sync.db", schedule_at=int(datetime.now(UTC).timestamp()) + 900)
+    try:
+        with write_transaction(harness.conn):
+            harness.conn.execute("DELETE FROM scheduled_reconciliation_state WHERE dialog_id=?", (harness.dialog_id,))
+        harness.first_use_accept = True
+        request = _owner_create_request(harness, "first-use")
+        first, second = await asyncio.gather(harness.owner.execute(request), harness.owner.execute(request))
+        for result in (first, second):
+            assert result["error"] == "scheduled_state_unknown"
+            assert result["operation_key"] == "first-use"
+            assert result["mutation_dispatched"] is False and result["receipt_persisted"] is False
+        projected = _scheduled_error_response(first)
+        assert projected is not None and projected.is_error and projected.structured_content is not None
+        assert projected.structured_content["details"] == {
+            "operation_key": "first-use",
+            "mutation_dispatched": False,
+            "receipt_persisted": False,
+        }
+        assert harness.first_use_requests == [(100, 200), (100, 200)]
+        assert harness.client.requests == []
+        assert read_scheduled_operation(harness.conn, 100, "first-use") is None
+        with write_transaction(harness.conn):
+            order = allocate_observation_order(harness.conn)
+            harness.conn.execute(
+                "INSERT INTO scheduled_reconciliation_state(dialog_id,updated_at,snapshot_observation_order,coverage_state) "
+                "VALUES(?,?,?,'complete')",
+                (200, harness.schedule_at - 100, order),
+            )
+        completed = await harness.owner.execute(request)
+        assert completed["outcome"] == "acknowledged" and completed["mutation_dispatched"] is True
+        assert await harness.owner.execute(request) == completed
+        assert harness.client.dispatched_count == 1
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize("state", ["inaccessible", "unsupported"])
+async def test_terminal_baseline_does_not_request_first_use_repair(tmp_path: Path, state: str) -> None:
+    harness = _OwnerHarness(tmp_path / "sync.db", schedule_at=int(datetime.now(UTC).timestamp()) + 900)
+    try:
+        with write_transaction(harness.conn):
+            harness.conn.execute("UPDATE scheduled_reconciliation_state SET coverage_state=?", (state,))
+        harness.first_use_accept = True
+        result = await harness.owner.execute(_owner_create_request(harness, "terminal"))
+        assert result["error"] == "scheduled_state_unavailable"
+        assert harness.first_use_requests == [] and harness.client.requests == []
+        assert read_scheduled_operation(harness.conn, 100, "terminal") is None
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize("account", [None, 999])
+async def test_unbound_or_different_account_cannot_prioritize_baseline(tmp_path: Path, account: int | None) -> None:
+    harness = _OwnerHarness(tmp_path / "sync.db", schedule_at=int(datetime.now(UTC).timestamp()) + 900)
+    try:
+        with write_transaction(harness.conn):
+            harness.conn.execute("UPDATE scheduled_sync_state SET account_id=? WHERE key='account'", (account,))
+        harness.first_use_accept = True
+        result = await harness.owner.execute(_owner_create_request(harness, "unbound"))
+        assert result["error"] == "account_state_unknown"
+        assert harness.first_use_requests == [] and harness.client.requests == []
+        assert read_scheduled_operation(harness.conn, 100, "unbound") is None
+    finally:
+        harness.close()
+
+
+async def test_failed_baseline_priority_does_not_claim_it_was_scheduled(tmp_path: Path) -> None:
+    harness = _OwnerHarness(tmp_path / "sync.db", schedule_at=int(datetime.now(UTC).timestamp()) + 900)
+    try:
+        with write_transaction(harness.conn):
+            harness.conn.execute("DELETE FROM scheduled_reconciliation_state WHERE dialog_id=200")
+
+        async def fail_priority(_account_id: int, _dialog_id: int) -> bool:
+            raise sqlite3.OperationalError("injected storage failure")
+
+        harness.owner._prioritize_baseline = fail_priority
+        result = await harness.owner.execute(_owner_create_request(harness, "priority-failure"))
+        assert result["error"] == "preflight_unavailable"
+        assert harness.client.requests == []
+        assert read_scheduled_operation(harness.conn, 100, "priority-failure") is None
     finally:
         harness.close()
 

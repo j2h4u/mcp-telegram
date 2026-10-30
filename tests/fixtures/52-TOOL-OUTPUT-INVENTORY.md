@@ -1,6 +1,6 @@
 # Phase 52 Tool Output Inventory
 
-Canonical test-readable copy for Phase 52 Plan 01. The local GSD artifact is mirrored at `.planning/phases/52-agent-first-structured-tool-output/52-TOOL-OUTPUT-INVENTORY.md`, but `.planning/` is intentionally ignored and must not be required for tests in a clean checkout.
+Canonical test-readable inventory for the Phase 52 baseline.
 
 Inventory source command:
 
