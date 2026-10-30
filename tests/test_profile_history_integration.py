@@ -206,6 +206,83 @@ async def test_min_user_cannot_replace_full_name_or_emit_history(db: sqlite3.Con
     assert db.execute("SELECT name FROM entities WHERE id=42").fetchone()[0] == "Ada Lovelace"
 
 
+@pytest.mark.parametrize("existing", ["missing", "unknown"])
+@pytest.mark.parametrize("bot", [False, True])
+async def test_supplied_user_establishes_exact_missing_type_before_profile_invalidation(
+    db: sqlite3.Connection, existing: str, bot: bool
+) -> None:
+    with write_transaction(db):
+        if existing == "missing":
+            db.execute("DELETE FROM entities WHERE id=42")
+        else:
+            db.execute("UPDATE entities SET type='unknown' WHERE id=42")
+    manager = event_manager(MagicMock(), db, asyncio.Event())
+    manager.set_self_id(7)
+    manager.bind_demand_sink(MagicMock())
+    user = types.User(42, bot=bot, first_name="After", stories_unavailable=True)
+    await manager._persist_profile_pushes(sender=user)
+    assert db.execute("SELECT type FROM entities WHERE id=42").fetchone()[0] == ("bot" if bot else "user")
+    assert (
+        db.execute(
+            "SELECT status FROM entity_detail_sections WHERE entity_id=42 AND section='current_stories'"
+        ).fetchone()
+        is not None
+    )
+    fields = cast(
+        dict[str, object],
+        json.loads(cast(str, one(db, "SELECT fields_json FROM entity_profile_semantic_snapshots")[0])),
+    )
+    assert fields["user.stories_unavailable"] is True
+
+
+@pytest.mark.parametrize(("stored_kind", "bot"), [("channel", False), ("user", True), ("bot", False)])
+async def test_supplied_user_does_not_override_conflicting_known_entity_kind(
+    db: sqlite3.Connection, stored_kind: str, bot: bool
+) -> None:
+    with write_transaction(db):
+        db.execute("UPDATE entities SET type=? WHERE id=42", (stored_kind,))
+    manager = event_manager(MagicMock(), db, asyncio.Event())
+    manager.set_self_id(7)
+    with pytest.raises(ValueError, match="profile entity type conflict"):
+        await manager._persist_profile_pushes(sender=types.User(42, bot=bot, stories_unavailable=True))
+    assert db.execute("SELECT type FROM entities WHERE id=42").fetchone()[0] == stored_kind
+    assert db.execute("SELECT COUNT(*) FROM entity_profile_semantic_snapshots").fetchone()[0] == 0
+
+
+async def test_minimal_user_preserves_retained_bot_kind(db: sqlite3.Connection) -> None:
+    with write_transaction(db):
+        db.execute("UPDATE entities SET type='bot' WHERE id=42")
+    manager = event_manager(MagicMock(), db, asyncio.Event())
+    manager.set_self_id(7)
+    manager.bind_demand_sink(MagicMock())
+    await manager._persist_profile_pushes(sender=types.User(42, min=True, first_name="Bot"))
+    assert db.execute("SELECT type FROM entities WHERE id=42").fetchone()[0] == "bot"
+
+
+async def test_supplied_nonpersonal_user_does_not_create_profile_or_type(db: sqlite3.Connection) -> None:
+    with write_transaction(db):
+        db.execute("DELETE FROM dialogs WHERE dialog_id=42")
+        db.execute("UPDATE entities SET type='unknown' WHERE id=42")
+    manager = event_manager(MagicMock(), db, asyncio.Event())
+    manager.set_self_id(7)
+    manager.bind_demand_sink(MagicMock())
+    await manager._persist_profile_pushes(sender=types.User(42, first_name="Other", stories_unavailable=True))
+    assert db.execute("SELECT type FROM entities WHERE id=42").fetchone()[0] == "unknown"
+    assert db.execute("SELECT COUNT(*) FROM entity_profile_semantic_snapshots").fetchone()[0] == 0
+
+
+async def test_supplied_user_type_and_profile_rollback_on_account_mismatch(db: sqlite3.Connection) -> None:
+    with write_transaction(db):
+        db.execute("UPDATE entities SET type='unknown' WHERE id=42")
+        db.execute("UPDATE entity_details SET profile_owner_account_id=8 WHERE entity_id=42")
+    manager = event_manager(MagicMock(), db, asyncio.Event())
+    manager.set_self_id(7)
+    with pytest.raises(ValueError, match="account"):
+        await manager._persist_profile_pushes(sender=types.User(42, stories_unavailable=True))
+    assert db.execute("SELECT type FROM entities WHERE id=42").fetchone()[0] == "unknown"
+    assert db.execute("SELECT COUNT(*) FROM entity_profile_semantic_snapshots").fetchone()[0] == 0
+
+
 def test_generic_invalidation_replay_cannot_revive_finished_work(db: sqlite3.Connection) -> None:
     repo = EntityProfileRepository(db, section_ttl_seconds=300)
     observation = ProfileFieldObservation(7, 50, 50, "update")
