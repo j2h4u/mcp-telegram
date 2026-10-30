@@ -43,6 +43,7 @@ class StartupIdentityState:
     phase: StartupIdentityPhase = StartupIdentityPhase.PROFILE
     profile: object | None = None
     input_user: object | None = None
+    identity_only: bool = False
     _result: StartupIdentityResult | None = None
     _failure_reason: str | None = None
     _done_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -91,6 +92,15 @@ class StartupIdentityState:
     def complete(self, result: StartupIdentityResult) -> None:
         if self.phase is not StartupIdentityPhase.FULL_USER:
             raise RuntimeError("startup identity completed out of order")
+        self._result = result
+        self.phase = StartupIdentityPhase.READY
+        self._done_event.set()
+
+    def complete_verified(self, result: StartupIdentityResult) -> None:
+        """Publish a verified account without asserting a full-profile observation."""
+        if self.phase is not StartupIdentityPhase.INPUT_USER:
+            raise RuntimeError("startup identity verified out of order")
+        self.identity_only = True
         self._result = result
         self.phase = StartupIdentityPhase.READY
         self._done_event.set()

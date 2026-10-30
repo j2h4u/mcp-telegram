@@ -41,7 +41,12 @@ from ..reactions.contracts import ReactionFreshness
 from ..request_timing import current_timing, timing_phase
 from ..resolver import latinize
 from ..sync_db import open_sync_db_reader
-from ..sync_read_model import SyncReadModelContractError, build_sync_read_model, local_history_coverage
+from ..sync_read_model import (
+    LocalHistoryCoverage,
+    SyncReadModelContractError,
+    build_sync_read_model,
+    local_history_coverage,
+)
 from ..temporal import parse_utc_boundary
 from .draft_projection import draft_message_key, read_drafts
 from .query_records import read_message_from_row
@@ -847,6 +852,9 @@ class ReadingService:
         with timing_phase("local_projection"):
             access_metadata = _build_access_metadata(self._conn, dialog_id, status)
         result["data"].update(access_metadata)
+        result["data"]["interval_coverage"] = local_history_coverage(
+            status, access_metadata["last_synced_at"]
+        ).interval_coverage(request.until_utc)
         result["data"]["selection_state"] = local_history_coverage(
             status, access_metadata["last_synced_at"]
         ).selection_state(
@@ -855,6 +863,8 @@ class ReadingService:
                 request.topic_id is None and request.sender_name is None and request.sender_id is None
             ),
             since_utc=request.since_utc,
+            until_utc=request.until_utc,
+            paginated=anchor_msg_id is not None,
         )
         result["data"]["dialog_type"] = dialog_type
         result["data"]["dialog_name"] = identity.display_name
@@ -2355,6 +2365,31 @@ class ReadingService:
             access_metadata["dialog_name_source"] = identity.display_name_source
         return dialog_type, read_state, access_metadata
 
+    def _all_projection_absence_known(self, state: _AllLocalState) -> bool:
+        scheduled = self._scheduled_dialog_coverage(state.request.dialog_id)
+        draft = state.draft_result["data"]["draft_coverage"] if state.draft_result is not None else {}
+        return (
+            isinstance(state.scheduled_coverage, dict)
+            and state.scheduled_coverage.get("state") in {"complete", "partial"}
+            and scheduled.get("state") == "complete"
+            and scheduled.get("baseline_observed_at") is not None
+            and draft.get("presence") == "absent"
+            and draft.get("freshness") == "current"
+        )
+
+    def _all_selection_state(self, state: _AllLocalState, page: list[dict], coverage: LocalHistoryCoverage) -> str:
+        request = state.request.request
+        selection = coverage.selection_state(
+            present=bool(page),
+            attribution_complete=request.topic_id is None and request.sender_name is None and request.sender_id is None,
+            since_utc=request.since_utc,
+            until_utc=request.until_utc,
+            paginated=state.request.navigation is not None,
+        )
+        if selection == "known_empty" and not request.unread and not self._all_projection_absence_known(state):
+            return "unknown"
+        return selection
+
     def _all_local_response(self, state: _AllLocalState) -> dict:
         dialog_type, read_state, access_metadata = state.metadata
         request = state.request.request
@@ -2367,15 +2402,10 @@ class ReadingService:
                 draft_result is not None and draft_result["data"]["next_navigation"] is not None
             )
             page = combined[: request.limit]
-            selection_state = local_history_coverage(
+            history_coverage = local_history_coverage(
                 state.request.status, cast(int | None, access_metadata.get("last_synced_at"))
-            ).selection_state(
-                present=bool(page),
-                attribution_complete=(
-                    request.topic_id is None and request.sender_name is None and request.sender_id is None
-                ),
-                since_utc=request.since_utc,
             )
+            selection_state = self._all_selection_state(state, page, history_coverage)
             next_nav = self._all_next_navigation(
                 page,
                 has_more,
@@ -2409,6 +2439,7 @@ class ReadingService:
                     "next_navigation": next_nav,
                     "message_state": "all",
                     "selection_state": selection_state,
+                    "interval_coverage": history_coverage.interval_coverage(request.until_utc),
                     "dialog_type": dialog_type,
                     "read_state": read_state,
                     **projection_metadata,

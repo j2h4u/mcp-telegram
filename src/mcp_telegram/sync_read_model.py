@@ -23,15 +23,36 @@ class LocalHistoryCoverage:
     state: Literal["complete_as_of", "partial", "unknown"]
     observation_horizon_at: int | None
 
+    def interval_coverage(self, until_utc: int | None) -> Literal["covered_as_of_horizon", "beyond_horizon", "unknown"]:
+        if self.observation_horizon_at is None:
+            return "unknown"
+        if until_utc is None or until_utc > self.observation_horizon_at:
+            return "beyond_horizon"
+        return "covered_as_of_horizon"
+
     def selection_state(
-        self, *, present: bool, attribution_complete: bool = True, since_utc: int | None = None
+        self,
+        *,
+        present: bool,
+        attribution_complete: bool = True,
+        since_utc: int | None = None,
+        until_utc: int | None = None,
+        paginated: bool = False,
     ) -> Literal["present", "known_empty", "unknown"]:
         if present:
             return "present"
         if (
+            since_utc is not None
+            and self.observation_horizon_at is not None
+            and since_utc > self.observation_horizon_at
+        ):
+            return "unknown"
+        if (
             self.observation_horizon_at is not None
             and attribution_complete
-            and (since_utc is None or since_utc <= self.observation_horizon_at)
+            and not paginated
+            and until_utc is not None
+            and until_utc <= self.observation_horizon_at
         ):
             return "known_empty"
         return "unknown"

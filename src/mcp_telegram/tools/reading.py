@@ -235,6 +235,11 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                 "sync_coverage_pct": {"type": ["integer", "null"]},
                 "archived_message_count": {"type": ["integer", "null"]},
                 "selection_state": {"type": "string", "enum": ["present", "known_empty", "unknown"]},
+                "interval_coverage": {
+                    "type": "string",
+                    "enum": ["covered_as_of_horizon", "beyond_horizon", "unknown"],
+                    "description": "Sent-history interval coverage as of its observation horizon; independent of page, attribution, drafts and scheduled messages.",
+                },
                 "observation_horizon_at": {"type": ["integer", "null"]},
                 "sync_status": {"type": ["string", "null"]},
                 "topic_attribution": {
@@ -543,6 +548,9 @@ def _list_messages_coverage(data: dict) -> dict[str, object]:
     selection_state = data.get("selection_state")
     if selection_state in {"present", "known_empty", "unknown"}:
         coverage["selection_state"] = selection_state
+    interval_coverage = data.get("interval_coverage")
+    if interval_coverage in {"covered_as_of_horizon", "beyond_horizon", "unknown"}:
+        coverage["interval_coverage"] = interval_coverage
     topic_attribution = data.get("topic_attribution")
     if isinstance(topic_attribution, dict):
         coverage["topic_attribution"] = topic_attribution

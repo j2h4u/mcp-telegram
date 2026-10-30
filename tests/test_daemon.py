@@ -197,6 +197,9 @@ class _ClientStub:
     async def maintain_auto_resume(self) -> bool:
         return False
 
+    def automatic_trial_active(self) -> bool:
+        return False
+
     async def finish_startup_auto_resume(self) -> None:
         pass
 
@@ -248,9 +251,17 @@ class _ClientStub:
 async def test_connection_failure_reports_startup_recovery(error: Exception) -> None:
     failed = AsyncMock()
     client = SimpleNamespace(
-        prepare_startup_safety=AsyncMock(), connect=AsyncMock(side_effect=error), fail_startup_recovery=failed
+        prepare_startup_safety=AsyncMock(),
+        connect=AsyncMock(side_effect=error),
+        fail_startup_recovery=failed,
+        retained_auth_scope=lambda: None,
     )
-    assert not await _connect_telegram(_typed_ctx(client=client))
+    shutdown = asyncio.Event()
+    task = asyncio.create_task(_connect_telegram(_typed_ctx(client=client, shutdown_event=shutdown)))
+    while failed.await_count == 0:
+        await asyncio.sleep(0)
+    shutdown.set()
+    assert not await task
     failed.assert_awaited_once()
 
 
@@ -578,6 +589,9 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
     shutdown_event = asyncio.Event()
 
     class _Client:
+        def automatic_trial_active(self) -> bool:
+            return False
+
         def set_auto_resume_stop(self, stopped: Callable[[], bool]) -> None:
             assert stopped == shutdown_event.is_set
             events.append("stop:bound")
@@ -916,6 +930,113 @@ async def test_classified_startup_identity_binds_matching_account(
         assert conn.execute("SELECT account_id FROM dialog_directory_state").fetchone() == (101,)
     finally:
         conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fields, expected_channel",
+    [
+        ('{"full_user.personal_channel_id":9001}', -1000000009001),
+        ('{"full_user.personal_channel_id":null}', None),
+        ("{}", None),
+    ],
+)
+async def test_recovery_startup_publishes_retained_channel_without_full_user(
+    tmp_path: Path, shared_writer: SQLiteWriter, fields: str, expected_channel: int | None
+) -> None:
+    from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
+
+    class RecoveryClient(_StartupIdentityClient):
+        def automatic_trial_active(self) -> bool:
+            return True
+
+        def bind_auto_resume_identity(self) -> None:
+            self.identity_task = asyncio.current_task()
+
+        async def get_me(self) -> object:
+            assert self.identity_task is asyncio.current_task()
+            budget = current_rpc_scope().attempt_budget
+            assert budget is not None and budget.limit == 1
+            budget.debit()
+            return await super().get_me()
+
+        async def get_input_entity(self, _account_id: int) -> object:
+            raise AssertionError("recovery must not resolve another entity")
+
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    shutdown = asyncio.Event()
+    conn = _open_sync_db(db_path)
+    conn.execute("INSERT INTO entities(id, type, name, updated_at) VALUES (101, 'user', 'self', 1)")
+    conn.execute(
+        "INSERT INTO entity_profile_semantic_snapshots"
+        "(owner_account_id,entity_id,normalization_version,fields_json,source) VALUES (101,101,?,?,?)",
+        ("entity-profile-full-user-v2", fields, "rpc"),
+    )
+    conn.commit()
+    ctx = _typed_ctx(
+        db_path=db_path,
+        conn=conn,
+        shutdown_event=shutdown,
+        client=RecoveryClient(101),
+        api_server=_ApiStub(),
+        self_profile_cadence=_CadenceStub(),
+    )
+    directory = CanonicalDialogDirectory(ctx.client, db_path, shutdown, writer=shared_writer)
+    try:
+        startup = await _acquire_startup_identity_before_updates(ctx, directory)
+        assert conn.execute(
+            "SELECT fields_json FROM entity_profile_semantic_snapshots WHERE owner_account_id=101 AND entity_id=101"
+        ).fetchone() == (fields,)
+    finally:
+        conn.close()
+
+    assert startup.identity_only
+    assert startup.result().own_only_context.personal_channel_id == expected_channel
+    assert cast(_UserProfilePort, ctx.user_profile_port).calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", [None, TelegramAuthScope(1, 101, 2, 9)])
+async def test_failed_recovery_identity_keeps_local_service_until_monitor_shutdown(
+    tmp_path: Path, shared_writer: SQLiteWriter, scope: TelegramAuthScope | None
+) -> None:
+    error = OSError("offline")
+
+    class RecoveryClient(_StartupIdentityClient):
+        def automatic_trial_active(self) -> bool:
+            return True
+
+        def bind_auto_resume_identity(self) -> None:
+            pass
+
+        def retained_auth_scope(self) -> TelegramAuthScope | None:
+            return scope
+
+        async def get_me(self) -> object:
+            raise error
+
+    client = RecoveryClient(101)
+    client.fail_startup_recovery = AsyncMock()  # type: ignore[method-assign]
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    shutdown = asyncio.Event()
+    api = _ApiStub()
+    ctx = _typed_ctx(
+        db_path=db_path, shutdown_event=shutdown, client=client, api_server=api, self_profile_cadence=_CadenceStub()
+    )
+    directory = CanonicalDialogDirectory(ctx.client, db_path, shutdown, writer=shared_writer)
+    task = asyncio.create_task(daemon._acquire_identity_or_hold(ctx, directory))
+    while client.fail_startup_recovery.await_count == 0:
+        await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not task.done()
+    client.fail_startup_recovery.assert_awaited_once_with(error)
+    assert api._ready is (scope is not None)
+    if scope is not None:
+        assert api.self_id == 101
+    shutdown.set()
+    assert await task is None
 
 
 @pytest.mark.asyncio

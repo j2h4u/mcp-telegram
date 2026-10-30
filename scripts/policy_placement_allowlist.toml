@@ -92,13 +92,18 @@ rationale = "This is process-global mutable gate state, not an operator-configur
 
 [[entry]]
 category = "policy_assignments"
-key = "src/mcp_telegram/telegram_rpc.py:<module>:_METHOD_BACKOFF_BASE_SECONDS"
-rationale = "Approved central method adaptation starts at the existing 300-second recovery contract; it is not an operator knob or a server-wait cap."
+key = "src/mcp_telegram/telegram_rpc_recovery.py:<module>:_BACKOFF"
+rationale = "The reviewed cause-specific recovery delays are fixed safety policy, not operator tuning."
 
 [[entry]]
-category = "policy_assignments"
-key = "src/mcp_telegram/telegram_rpc.py:<module>:_METHOD_BACKOFF_MAX_SECONDS"
-rationale = "Approved 3600-second ceiling applies only to extra method-local adaptation; the mandatory global Telegram server floor remains uncapped."
+category = "policy_dict_values"
+key = "src/mcp_telegram/tools/reading.py:<module>:interval_coverage"
+rationale = "This is a response schema describing observed coverage, not an operator policy."
+
+[[entry]]
+category = "policy_call_keywords"
+key = "src/mcp_telegram/telegram_rpc.py:TelegramRpcGate._observe_unknown_incident:incident_settled_at_ms"
+rationale = "This is the observed settlement timestamp for incident correlation, not a policy interval."
 
 [[entry]]
 category = "policy_assignments"

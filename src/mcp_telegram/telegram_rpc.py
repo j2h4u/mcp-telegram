@@ -87,7 +87,15 @@ from .telegram_demand import (
     transferred_demand_context,
 )
 from .telegram_demand_progress import WorkRevision
-from .telegram_rpc_consumers import CONNECTION_BOOTSTRAP_MAX_RPC_ATTEMPTS, DemandKind, ExecutionMode, demand_contract
+from .telegram_rpc_consumers import (
+    CONNECTION_BOOTSTRAP_MAX_RPC_ATTEMPTS,
+    DemandKind,
+    ExecutionMode,
+    RpcEffect,
+    demand_contract,
+    rpc_effect,
+)
+from .telegram_rpc_recovery import RecoveryCause, backoff_seconds
 from .telegram_rpc_scheduler import (
     AdmissionObserver,
     RpcAdmission,
@@ -107,7 +115,13 @@ from .telegram_rpc_scheduler import (
     rpc_attempt_budget,
     rpc_scope,
 )
-from .telegram_transport import GuardedConnectionTcpFull, GuardedMTProtoSender, ProtocolOrigin
+from .telegram_transport import (
+    GuardedConnectionTcpFull,
+    GuardedMTProtoSender,
+    ProtocolOrigin,
+    TransportConnectError,
+    TransportWriteError,
+)
 from .telegram_update_admission import GateMessageBox
 from .update_delivery import UpdateDeliveryRepository
 
@@ -116,10 +130,10 @@ _DIAGNOSTIC_REQUESTS_MAX = 8
 _TL_CONSTRUCTOR_HEX_CHARS = 8
 _SCHEDULED_ONLINE_SEND_TIMESTAMP = 0x7FFFFFFE
 _SCHEDULED_MINIMUM_LEAD_SECONDS = 60
+_BACKEND_ERROR_CODE_MIN = 500
+_BACKEND_ERROR_CODE_MAX = 599
 
-_METHOD_BACKOFF_BASE_SECONDS = 300
-_METHOD_BACKOFF_MAX_SECONDS = 3600
-_SAFETY_RECEIPT_VERSION = 2
+_SAFETY_RECEIPT_VERSION = 3
 _CANONICAL_METHOD_MAX_LENGTH = 256
 _TL_CONSTRUCTOR_HEX_WIDTH = 8
 _AUTO_RESUME_DELAYS = (3600, 7200, 14400, 28800, 57600, 86400)
@@ -229,6 +243,8 @@ class _AdmissionAwareSender:
         self._gate._reject_exhausted_attempt_budget(self._scope)
         raw_future = self._gate._main_sender.send_owned(request, self._scope)
         wire_owner = self._gate._require_wire_owner(self._gate._main_sender.application_owner(raw_future))
+        if self._scope.source is TelegramRpcSource.TELETHON_RECONNECT_PROBE:
+            self._gate._reconnect_wire_owner = wire_owner
         started_at = time.monotonic()
         timing = current_timing()
         try:
@@ -441,7 +457,7 @@ def _validate_safety_record(value: object) -> bool:
     }
     if not isinstance(value, dict):
         return False
-    if value.get("version") == _SAFETY_RECEIPT_VERSION:
+    if value.get("version") in {2, _SAFETY_RECEIPT_VERSION}:
         fields.add("methods")
     if set(value) != fields:
         return False
@@ -455,8 +471,11 @@ def _validate_safety_record(value: object) -> bool:
     return all(
         (
             _validate_safety_scope(value["scope"]),
-            isinstance(intents, dict) and all(_valid_safety_intent(key, item) for key, item in intents.items()),
-            _valid_safety_recovery(value["recovery"]),
+            isinstance(intents, dict)
+            and all(
+                _valid_safety_intent(key, item, version=cast(int, value["version"])) for key, item in intents.items()
+            ),
+            _valid_safety_recovery(value["recovery"], version=cast(int, value["version"])),
             _valid_safety_transition(value["transition"]),
             _valid_method_episodes(value.get("methods", {})),
         )
@@ -475,7 +494,7 @@ def _valid_safety_record_identity(value: dict[str, object]) -> bool:
     return all(
         (
             type(value["version"]) is int,
-            value["version"] in {1, _SAFETY_RECEIPT_VERSION},
+            value["version"] in {1, 2, _SAFETY_RECEIPT_VERSION},
             isinstance(value["generation"], str),
             bool(value["generation"]),
         )
@@ -533,16 +552,53 @@ def _valid_method_claim(value: object) -> bool:
     )
 
 
-def _valid_safety_intent(key: object, value: object) -> bool:
+def _valid_safety_intent(key: object, value: object, *, version: int = 3) -> bool:
     return (
         isinstance(key, str)
         and bool(key)
         and isinstance(value, dict)
-        and set(value) == {"method", "run", "phase", "scope"}
-        and isinstance(value["method"], str)
+        and set(value) in ({"method", "run", "phase", "scope"}, {"method", "run", "phase", "scope", "policy_recovery"})
+        and _valid_safety_intent_payload(value, version=version)
+    )
+
+
+def _valid_safety_intent_payload(value: dict[str, object], *, version: int) -> bool:
+    return (
+        isinstance(value["method"], str)
         and isinstance(value["run"], str)
         and value["phase"] in {"prepared", "unknown", "acknowledged_unknown"}
         and _valid_intent_scope(value["scope"])
+        and _valid_policy_recovery(value.get("policy_recovery"), value["scope"])
+        and (version == _SAFETY_RECEIPT_VERSION or "policy_recovery" not in value)
+        and _valid_intent_disposition(value)
+    )
+
+
+def _valid_intent_disposition(value: dict[str, object]) -> bool:
+    return value.get("policy_recovery") is None or (
+        value["phase"] == "unknown" and rpc_effect(cast(str, value["method"])) is RpcEffect.NONMUTATING_READ
+    )
+
+
+def _valid_policy_recovery(value: object, scope: object) -> bool:
+    if value is None:
+        return True
+    return (
+        isinstance(value, dict)
+        and set(value) == {"policy_version", "episode_id", "grant_generation", "scope"}
+        and type(value["policy_version"]) is int
+        and value["policy_version"] == 1
+        and all(isinstance(value[key], str) and bool(value[key]) for key in ("episode_id", "grant_generation"))
+        and value["scope"] == scope
+        and _valid_intent_scope(value["scope"])
+    )
+
+
+def _intent_blocks(item: dict[str, object], scope: dict[str, object]) -> bool:
+    return item["phase"] != "acknowledged_unknown" and not (
+        item["phase"] == "unknown"
+        and item.get("policy_recovery") is not None
+        and item["scope"] == {key: scope[key] for key in ("dc_id", "key_id", "account_id")}
     )
 
 
@@ -557,7 +613,7 @@ def _valid_intent_scope(value: object) -> bool:
     )
 
 
-def _valid_safety_recovery(value: object) -> bool:
+def _valid_safety_recovery(value: object, *, version: int = 3) -> bool:
     if value is None:
         return True
     fields = {"generation", "state", "scope", "consumed_run", "acknowledged_protection"}
@@ -567,8 +623,8 @@ def _valid_safety_recovery(value: object) -> bool:
     states = {"authorized", "consumed", "succeeded", "failed"}
     if automatic is not None:
         fields.add("automatic")
-        states.add("waiting")
-        if not _valid_automatic_recovery(automatic):
+        states.update({"waiting", "fencing", "exhausted"} if version == _SAFETY_RECEIPT_VERSION else {"waiting"})
+        if not _valid_automatic_state(automatic, value.get("state"), version):
             return False
     return set(value) == fields and all(
         (
@@ -581,13 +637,81 @@ def _valid_safety_recovery(value: object) -> bool:
     )
 
 
-def _valid_automatic_recovery(value: object) -> bool:
+def _valid_automatic_state(automatic: object, state: object, version: int) -> bool:
+    if not _valid_automatic_recovery(automatic, version=version):
+        return False
+    return not (
+        version == _SAFETY_RECEIPT_VERSION
+        and state == "waiting"
+        and cast(dict[str, object], automatic)["scheduled_due"] is None
+    )
+
+
+def _valid_automatic_recovery(value: object, *, version: int = 3) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if version < _SAFETY_RECEIPT_VERSION:
+        return (
+            set(value) == {"attempts", "due"}
+            and type(value["attempts"]) is int
+            and 0 <= value["attempts"] <= len(_AUTO_RESUME_DELAYS)
+            and _valid_safety_floor(value["due"])
+        )
+    fields = {
+        "episode_id",
+        "policy_version",
+        "cause",
+        "attempts_total",
+        "attempts_by_policy",
+        "failure_stages",
+        "quiet_anchor",
+        "scheduled_due",
+        "bound_intent_ids",
+        "last_transition_key",
+    }
+    if set(value) != fields:
+        return False
+    return _valid_automatic_counts(value) and _valid_automatic_metadata(value)
+
+
+def _valid_automatic_counts(value: dict[str, object]) -> bool:
+    policies = {"flood_wait", "transient", "read_uncertainty"}
+    attempts, stages = value["attempts_by_policy"], value["failure_stages"]
+    if not all(isinstance(item, dict) and set(item) == policies for item in (attempts, stages)):
+        return False
+    attempts = cast(dict[str, object], attempts)
+    stages = cast(dict[str, object], stages)
+    if not all(type(count) is int and count >= 0 for item in (attempts, stages) for count in item.values()):
+        return False
+    if cast(int, attempts["flood_wait"]) > len(_AUTO_RESUME_DELAYS):
+        return False
+    return type(value["attempts_total"]) is int and value["attempts_total"] == sum(
+        cast(dict[str, int], attempts).values()
+    )
+
+
+def _valid_automatic_metadata(value: dict[str, object]) -> bool:
+    policies = {"flood_wait", "transient", "read_uncertainty"}
+    bound = value["bound_intent_ids"]
+    return all(
+        (
+            isinstance(value["episode_id"], str) and bool(value["episode_id"]),
+            type(value["policy_version"]) is int and value["policy_version"] == 1,
+            isinstance(value["cause"], str) and value["cause"] in policies,
+            value["quiet_anchor"] is None or _valid_safety_floor(value["quiet_anchor"]),
+            value["scheduled_due"] is None or _valid_safety_floor(value["scheduled_due"]),
+            _valid_bound_intents(bound),
+            value["last_transition_key"] is None
+            or (isinstance(value["last_transition_key"], str) and bool(value["last_transition_key"])),
+        )
+    )
+
+
+def _valid_bound_intents(value: object) -> bool:
     return (
-        isinstance(value, dict)
-        and set(value) == {"attempts", "due"}
-        and type(value["attempts"]) is int
-        and 0 <= value["attempts"] <= len(_AUTO_RESUME_DELAYS)
-        and _valid_safety_floor(value["due"])
+        isinstance(value, list)
+        and all(isinstance(item, str) and bool(item) for item in value)
+        and len(value) == len(set(value))
     )
 
 
@@ -722,11 +846,45 @@ class TelegramRpcSafetyLedger:
         if not _validate_safety_record(decoded):
             raise ValueError("invalid Telegram safety receipt")
         self._record = cast(dict[str, object], decoded)
-        if self._record["version"] == 1:
-            self._record.update(version=_SAFETY_RECEIPT_VERSION, methods={})
+        self._migrate_safety_record()
         scope = cast(dict[str, object], self._record["scope"])
         self._startup_hold = self._scope_startup_hold(scope, dc_id, key_id)
         self._restore_startup_protection(scope)
+        self._rebase_safety_record()
+        self._retain_method_bindings(self._record)
+
+    def _migrate_safety_record(self) -> None:
+        version = cast(int, self._record["version"])
+        if version == 1:
+            self._record["methods"] = {}
+        recovery = self._record["recovery"]
+        if (
+            version < _SAFETY_RECEIPT_VERSION
+            and isinstance(recovery, dict)
+            and isinstance(recovery.get("automatic"), dict)
+        ):
+            automatic = recovery["automatic"]
+            attempts = cast(int, automatic["attempts"])
+            recovery["automatic"] = {
+                "episode_id": uuid.uuid4().hex,
+                "policy_version": 1,
+                "cause": "flood_wait",
+                "attempts_total": attempts,
+                "attempts_by_policy": {"flood_wait": attempts, "transient": 0, "read_uncertainty": 0},
+                "failure_stages": {"flood_wait": attempts, "transient": 0, "read_uncertainty": 0},
+                "quiet_anchor": None,
+                "scheduled_due": automatic["due"],
+                "bound_intent_ids": [],
+                "last_transition_key": None,
+            }
+            if recovery["state"] == "failed" and self._record["protection"] == "automatic_resume_exhausted":
+                recovery["state"] = "exhausted"
+        self._auto_resume_rebased = version < _SAFETY_RECEIPT_VERSION
+        self._record["version"] = _SAFETY_RECEIPT_VERSION
+        if not _validate_safety_record(self._record):
+            raise ValueError("invalid migrated Telegram safety receipt")
+
+    def _rebase_safety_record(self) -> None:
         legacy = self._load_legacy_floor()
         floor = cast(dict[str, object], self._record["floor"])
         floor["until_utc"] = max(float(cast(float, floor["until_utc"])), float(legacy or 0))
@@ -735,9 +893,12 @@ class TelegramRpcSafetyLedger:
             self._rebase_floor(cast(dict[str, object], episode["floor"]))
         recovery = self._record["recovery"]
         if isinstance(recovery, dict) and isinstance(recovery.get("automatic"), dict):
-            self._auto_resume_rebased = recovery["automatic"]["due"]["boot_id"] != self._boot_id
-            self._rebase_floor(recovery["automatic"]["due"])
-        self._retain_method_bindings(self._record)
+            automatic = recovery["automatic"]
+            for field in ("scheduled_due", "quiet_anchor"):
+                floor = automatic[field]
+                if isinstance(floor, dict):
+                    self._auto_resume_rebased |= floor["boot_id"] != self._boot_id
+                    self._rebase_floor(floor)
 
     def _initialize_record(self, dc_id: int, key_id: int | None) -> None:
         legacy = self._load_legacy_floor()
@@ -811,7 +972,8 @@ class TelegramRpcSafetyLedger:
 
     def _unresolved(self) -> bool:
         intents = cast(dict[str, dict[str, object]], self._record.get("intents", {}))
-        return any(item["phase"] != "acknowledged_unknown" for item in intents.values())
+        scope = cast(dict[str, object], self._record["scope"])
+        return any(_intent_blocks(item, scope) for item in intents.values())
 
     @property
     def floor_deadline(self) -> float:
@@ -924,8 +1086,8 @@ class TelegramRpcSafetyLedger:
         return {
             "generation": self._record.get("generation"),
             "reason": self.protection_reason,
-            "retry_until_utc": time.time() + max(0.0, self.floor_deadline - time.monotonic())
-            if math.isfinite(self.floor_deadline)
+            "retry_until_utc": time.time() + self.floor_deadline - time.monotonic()
+            if time.monotonic() < self.floor_deadline < math.inf
             else None,
             "unresolved_request_count": len(unresolved),
             "unresolved_requests": [
@@ -1074,26 +1236,37 @@ class TelegramRpcSafetyLedger:
         actual_flood: bool = False,
         method_generation: str | None = None,
         method_success: bool = False,
+        recovery_cause: RecoveryCause | None = None,
     ) -> None:
         def settle(record: dict[str, object]) -> None:
             self._settle_method(record, attempt_id, actual_flood, method_generation, method_success)
             self._settle_intent(record, attempt_id, known_outcome)
             if floor_until_utc is not None:
-                self._extend_floor(record, floor_until_utc)
-                transition = record["transition"]
-                if isinstance(transition, dict) and transition["purpose"] == "authentication":
-                    record["protection"] = "authentication_trial_failed"
-                    record["generation"] = uuid.uuid4().hex
-            if circuit_open:
+                self._settle_restriction(record, floor_until_utc)
+            current_trial = record["recovery"]
+            if circuit_open and not (isinstance(current_trial, dict) and current_trial.get("state") == "exhausted"):
                 record["protection"] = "flood_wait_circuit_open"
                 record["generation"] = uuid.uuid4().hex
-            if not known_outcome or floor_until_utc is not None:
-                self._invalidate_recovery_trial(record, known_flood=known_outcome and floor_until_utc is not None)
+            if (
+                (not known_outcome and attempt_id in self._claimed)
+                or floor_until_utc is not None
+                or recovery_cause is not None
+            ):
+                self._invalidate_recovery_trial(
+                    record, known_flood=known_outcome and floor_until_utc is not None, cause=recovery_cause
+                )
 
         if not known_outcome and attempt_id in self._claimed:
             self._startup_hold = "unresolved_outbound_outcome"
         await self._commit(settle)
         self._claimed.discard(attempt_id)
+
+    def _settle_restriction(self, record: dict[str, object], floor_until_utc: float) -> None:
+        self._extend_floor(record, floor_until_utc)
+        transition = record["transition"]
+        if isinstance(transition, dict) and transition["purpose"] == "authentication":
+            record["protection"] = "authentication_trial_failed"
+            record["generation"] = uuid.uuid4().hex
 
     def _settle_method(
         self,
@@ -1122,7 +1295,7 @@ class TelegramRpcSafetyLedger:
     ) -> None:
         prior_live = previous is not None and previous.get("state", "live") == "live"
         count = (cast(int, previous["consecutive_actual_floods"]) if prior_live and previous is not None else 0) + 1
-        delay = min(_METHOD_BACKOFF_BASE_SECONDS * (1 << min(count - 1, 4)), _METHOD_BACKOFF_MAX_SECONDS)
+        delay = backoff_seconds(RecoveryCause.FLOOD_WAIT, count - 1)
         remaining = float(delay)
         if prior_live:
             assert previous is not None
@@ -1156,18 +1329,19 @@ class TelegramRpcSafetyLedger:
             intents.pop(attempt_id, None)
         elif attempt_id in intents:
             cast(dict[str, object], intents[attempt_id])["phase"] = "unknown"
-            record["protection"] = "unresolved_outbound_outcome"
+            trial = record["recovery"]
+            if not (isinstance(trial, dict) and trial.get("state") == "exhausted"):
+                record["protection"] = "unresolved_outbound_outcome"
             record["generation"] = uuid.uuid4().hex
 
-    def _invalidate_recovery_trial(self, record: dict[str, object], *, known_flood: bool = False) -> None:
+    def _invalidate_recovery_trial(
+        self, record: dict[str, object], *, known_flood: bool = False, cause: RecoveryCause | None = None
+    ) -> None:
         trial = record["recovery"]
         if not isinstance(trial, dict):
             return
         if "automatic" in trial:
-            if known_flood and trial["state"] in {"consumed", "succeeded"}:
-                self._schedule_auto_resume(record)
-            elif not known_flood:
-                trial["state"] = "failed"
+            self._invalidate_automatic_trial(record, trial, known_flood, cause)
             return
         if trial["state"] == "authorized":
             record["generation"] = uuid.uuid4().hex
@@ -1175,6 +1349,16 @@ class TelegramRpcSafetyLedger:
             trial["state"] = "failed"
             record["protection"] = "recovery_trial_failed"
             record["generation"] = uuid.uuid4().hex
+
+    def _invalidate_automatic_trial(
+        self, record: dict[str, object], trial: dict[str, object], known_flood: bool, cause: RecoveryCause | None
+    ) -> None:
+        if trial["state"] in {"consumed", "succeeded"} and trial["consumed_run"] == self._run:
+            self._schedule_auto_resume(
+                record, cause=RecoveryCause.FLOOD_WAIT if known_flood else cause or RecoveryCause.READ_UNCERTAINTY
+            )
+        elif known_flood and trial["state"] in {"fencing", "waiting"}:
+            self._schedule_auto_resume(record, cause=RecoveryCause.FLOOD_WAIT)
 
     def _extend_floor(self, record: dict[str, object], until_utc: float) -> None:
         if not _finite_safety_number(until_utc):
@@ -1191,7 +1375,8 @@ class TelegramRpcSafetyLedger:
     async def record_floor(self, until_utc: float, *, circuit_open: bool = False) -> None:
         def update(record: dict[str, object]) -> None:
             self._extend_floor(record, until_utc)
-            if circuit_open:
+            trial = record["recovery"]
+            if circuit_open and not (isinstance(trial, dict) and trial.get("state") == "exhausted"):
                 record["protection"] = "flood_wait_circuit_open"
                 record["generation"] = uuid.uuid4().hex
             self._invalidate_recovery_trial(record, known_flood=True)
@@ -1532,9 +1717,11 @@ class TelegramRpcSafetyLedger:
             "recovery_trial_incomplete",
             "recovery_trial_failed",
             "flood_wait_circuit_open",
+            "transport_unavailable",
             "invalid_account_identity",
             "authentication_trial_failed",
             "automatic_resume_exhausted",
+            "automatic_resume_budget_spent",
         }:
             raise ValueError("account safety recovery is not available")
         if self.floor_deadline > time.monotonic():
@@ -1603,12 +1790,22 @@ class TelegramRpcSafetyLedger:
         recovery = self._record.get("recovery")
         return recovery if isinstance(recovery, dict) and "automatic" in recovery else None
 
-    def _auto_resume_scope_safe(self, record: dict[str, object]) -> bool:
-        if self._storage_failed or self._startup_hold is not None or self.verified_account_id is None:
+    def _auto_resume_scope_safe(self, record: dict[str, object], *, allow_claimed: bool = False) -> bool:
+        if self._storage_failed or self.verified_account_id is None:
             return False
         scope = cast(dict[str, object], record.get("scope", {}))
+        allowed = {
+            None,
+            "unresolved_outbound_outcome",
+            "recovery_trial_incomplete",
+            "recovery_trial_failed",
+            "flood_wait_circuit_open",
+            "transport_unavailable",
+        }
         return (
-            not self._claimed
+            (allow_claimed or not self._claimed)
+            and self._startup_hold in allowed
+            and record["protection"] in allowed
             and record["transition"] is None
             and all(owner in {None, scope["account_id"]} for owner in self._store.canonical_owners())
             and self._auto_resume_outcomes_settled(record)
@@ -1616,65 +1813,183 @@ class TelegramRpcSafetyLedger:
 
     @staticmethod
     def _auto_resume_outcomes_settled(record: dict[str, object]) -> bool:
+        scope = cast(dict[str, object], record["scope"])
         return all(
-            item["phase"] == "acknowledged_unknown"
+            not _intent_blocks(item, scope)
+            or (
+                item["scope"] == {key: scope[key] for key in ("dc_id", "key_id", "account_id")}
+                and rpc_effect(cast(str, item["method"])) is RpcEffect.NONMUTATING_READ
+            )
             for item in cast(dict[str, dict[str, object]], record["intents"]).values()
-        ) and all(item["claim"] is None for item in cast(dict[str, dict[str, object]], record["methods"]).values())
+        )
 
-    def _schedule_auto_resume(self, record: dict[str, object]) -> None:
+    def _schedule_auto_resume(
+        self,
+        record: dict[str, object],
+        *,
+        cause: RecoveryCause = RecoveryCause.FLOOD_WAIT,
+        observed_flood: bool = True,
+    ) -> None:
         previous = record["recovery"]
         automatic = previous.get("automatic") if isinstance(previous, dict) else None
-        attempts = cast(int, automatic["attempts"]) if isinstance(automatic, dict) else 0
+        if isinstance(previous, dict) and previous.get("state") == "exhausted":
+            return
+        if isinstance(automatic, dict):
+            assert isinstance(previous, dict)
+            if not self._advance_auto_episode(record, previous, automatic, cause):
+                return
+        else:
+            automatic = self._new_auto_episode(cause)
         generation = uuid.uuid4().hex
         record["generation"] = generation
-        if attempts >= len(_AUTO_RESUME_DELAYS):
-            assert isinstance(previous, dict)
-            previous["state"] = "failed"
-            record["protection"] = "automatic_resume_exhausted"
+        if self._exhaust_auto_if_needed(record, previous, automatic, cause, observed_flood):
             return
-        delay = _AUTO_RESUME_DELAYS[attempts]
-        record["protection"] = "flood_wait_circuit_open"
+        record["protection"] = {
+            RecoveryCause.FLOOD_WAIT: "flood_wait_circuit_open",
+            RecoveryCause.TRANSIENT: "transport_unavailable",
+            RecoveryCause.READ_UNCERTAINTY: "unresolved_outbound_outcome",
+        }[cause]
         record["recovery"] = {
             "generation": generation,
-            "state": "waiting",
+            "state": "fencing",
             "scope": dict(cast(dict[str, object], record["scope"])),
             "consumed_run": None,
             "acknowledged_protection": None,
-            "automatic": {
-                "attempts": attempts,
-                "due": {
-                    "boot_id": self._boot_id,
-                    "until_monotonic": time.monotonic() + delay,
-                    "until_utc": time.time() + delay,
-                    "remaining_seconds": delay,
-                },
-            },
+            "automatic": automatic,
         }
 
-    async def maintain_auto_resume(self) -> bool:
-        if not self._auto_resume_enabled or not self._auto_resume_scope_safe(self._record):
+    @staticmethod
+    def _exhaust_auto_if_needed(
+        record: dict[str, object],
+        previous: object,
+        automatic: dict[str, object],
+        cause: RecoveryCause,
+        observed_flood: bool,
+    ) -> bool:
+        counts = cast(dict[str, int], automatic["attempts_by_policy"])
+        if cause is not RecoveryCause.FLOOD_WAIT or counts[cause.value] < len(_AUTO_RESUME_DELAYS):
+            return False
+        assert isinstance(previous, dict)
+        previous["state"] = "exhausted"
+        record["protection"] = "automatic_resume_exhausted" if observed_flood else "automatic_resume_budget_spent"
+        return True
+
+    def _advance_auto_episode(
+        self,
+        record: dict[str, object],
+        previous: dict[str, object],
+        automatic: dict[str, object],
+        cause: RecoveryCause,
+    ) -> bool:
+        if previous["state"] not in {"consumed", "succeeded"}:
+            if cause is RecoveryCause.FLOOD_WAIT:
+                self._strengthen_auto_flood(record, previous, automatic)
+            return False
+        stages = cast(dict[str, int], automatic["failure_stages"])
+        family = cast(str, automatic["cause"])
+        if previous["state"] == "consumed" and self._auto_resume_scope_safe(record, allow_claimed=True):
+            stages[family] += 1
+        automatic.update(cause=cause.value, quiet_anchor=None, bound_intent_ids=[])
+        return True
+
+    def _strengthen_auto_flood(
+        self, record: dict[str, object], trial: dict[str, object], automatic: dict[str, object]
+    ) -> None:
+        cause = RecoveryCause.FLOOD_WAIT
+        automatic["cause"] = cause.value
+        if self._exhaust_auto_if_needed(record, trial, automatic, cause, True):
+            return
+        if trial["state"] == "waiting":
+            due = cast(dict[str, object], automatic["scheduled_due"])
+            stage = cast(dict[str, int], automatic["failure_stages"])[cause.value]
+            delay = max(float(backoff_seconds(cause, stage)), self._floor_release_at(due) - time.monotonic())
+            due.update(
+                boot_id=self._boot_id,
+                until_monotonic=time.monotonic() + delay,
+                until_utc=time.time() + delay,
+                remaining_seconds=delay,
+            )
+
+    @staticmethod
+    def _new_auto_episode(cause: RecoveryCause) -> dict[str, object]:
+        counts = {item.value: 0 for item in RecoveryCause}
+        return {
+            "episode_id": uuid.uuid4().hex,
+            "policy_version": 1,
+            "cause": cause.value,
+            "attempts_total": 0,
+            "attempts_by_policy": dict(counts),
+            "failure_stages": dict(counts),
+            "quiet_anchor": None,
+            "scheduled_due": None,
+            "bound_intent_ids": [],
+            "last_transition_key": None,
+        }
+
+    async def maintain_auto_resume(self, *, cause: RecoveryCause | None = None, quiesced: bool = True) -> bool:
+        if not self._auto_resume_enabled or not self._auto_resume_scope_safe(self._record, allow_claimed=not quiesced):
             return False
         if self._auto_resume_rebased:
             await self._commit(lambda _record: None)
             self._auto_resume_rebased = False
-        if self.protection_reason != "flood_wait_circuit_open":
-            return False
         recovery = self._record["recovery"]
-        if isinstance(recovery, dict) and recovery["state"] in {"authorized", "consumed", "failed"}:
+        if isinstance(recovery, dict) and "automatic" not in recovery and recovery["state"] != "succeeded":
             return False
         if self._automatic_recovery() is None:
-
-            def schedule(record: dict[str, object]) -> None:
-                if (
-                    self._auto_resume_enabled
-                    and self._auto_resume_scope_safe(record)
-                    and record["protection"] == "flood_wait_circuit_open"
-                    and self._automatic_recovery() is None
-                ):
-                    self._schedule_auto_resume(record)
-
-            await self._commit(schedule)
+            await self._commit(lambda record: self._begin_auto_fencing(record, cause, quiesced))
+        await self._advance_interrupted_auto(quiesced)
         return self.auto_resume_due()
+
+    async def _advance_interrupted_auto(self, quiesced: bool) -> None:
+        recovery = self._automatic_recovery()
+        if recovery is not None and recovery["state"] == "consumed" and recovery["consumed_run"] != self._run:
+            automatic = cast(dict[str, object], recovery["automatic"])
+            interrupted_cause = RecoveryCause(cast(str, automatic["cause"]))
+            await self._commit(
+                lambda record: self._schedule_auto_resume(record, cause=interrupted_cause, observed_flood=False)
+            )
+        recovery = self._automatic_recovery()
+        if recovery is not None and recovery["state"] == "fencing" and quiesced:
+            await self._commit(self._settle_auto_fencing)
+
+    def _begin_auto_fencing(self, record: dict[str, object], cause: RecoveryCause | None, quiesced: bool) -> None:
+        if (
+            self._auto_resume_enabled
+            and self._auto_resume_scope_safe(record, allow_claimed=not quiesced)
+            and self._automatic_recovery() is None
+        ):
+            selected = cause or (
+                RecoveryCause.FLOOD_WAIT
+                if self.protection_reason == "flood_wait_circuit_open"
+                else RecoveryCause.READ_UNCERTAINTY
+            )
+            self._schedule_auto_resume(record, cause=selected)
+
+    def _settle_auto_fencing(self, record: dict[str, object]) -> None:
+        trial = cast(dict[str, object], record["recovery"])
+        if trial["state"] != "fencing" or not self._auto_resume_scope_safe(record):
+            return
+        automatic = cast(dict[str, object], trial["automatic"])
+        cause = RecoveryCause(cast(str, automatic["cause"]))
+        stage = cast(dict[str, int], automatic["failure_stages"])[cause.value]
+        delay = float(backoff_seconds(cause, stage))
+        prior = automatic["scheduled_due"]
+        if isinstance(prior, dict):
+            delay = max(delay, self._floor_release_at(prior) - time.monotonic())
+        now_mono, now_utc = time.monotonic(), time.time()
+        automatic["quiet_anchor"] = {
+            "boot_id": self._boot_id,
+            "until_monotonic": now_mono,
+            "until_utc": now_utc,
+            "remaining_seconds": 0.0,
+        }
+        automatic["scheduled_due"] = {
+            "boot_id": self._boot_id,
+            "until_monotonic": now_mono + delay,
+            "until_utc": now_utc + delay,
+            "remaining_seconds": delay,
+        }
+        trial["state"] = "waiting"
 
     def auto_resume_due(self) -> bool:
         recovery = self._automatic_recovery()
@@ -1683,19 +1998,25 @@ class TelegramRpcSafetyLedger:
         if (
             not self._auto_resume_enabled
             or not self._auto_resume_scope_safe(self._record)
-            or self.protection_reason != "flood_wait_circuit_open"
             or recovery["state"] != "waiting"
             or recovery["scope"] != self._record["scope"]
         ):
             return False
         automatic = cast(dict[str, object], recovery["automatic"])
+        counts = cast(dict[str, int], automatic["attempts_by_policy"])
+        if automatic["cause"] == RecoveryCause.FLOOD_WAIT.value and counts[RecoveryCause.FLOOD_WAIT.value] >= len(
+            _AUTO_RESUME_DELAYS
+        ):
+            return False
         return (
-            cast(int, automatic["attempts"]) < len(_AUTO_RESUME_DELAYS)
-            and max(self.floor_deadline, self._floor_release_at(cast(dict[str, object], automatic["due"])))
+            max(self.floor_deadline, self._floor_release_at(cast(dict[str, object], automatic["scheduled_due"])))
             <= time.monotonic()
         )
 
     async def consume_auto_resume(self) -> bool:
+        if self._auto_resume_rebased:
+            await self._commit(lambda _record: None)
+            self._auto_resume_rebased = False
         if not self.auto_resume_due():
             return False
         consumed = False
@@ -1706,13 +2027,33 @@ class TelegramRpcSafetyLedger:
                 return
             recovery = cast(dict[str, object], record["recovery"])
             automatic = cast(dict[str, object], recovery["automatic"])
-            automatic["attempts"] = cast(int, automatic["attempts"]) + 1
+            counts = cast(dict[str, int], automatic["attempts_by_policy"])
+            cause = cast(str, automatic["cause"])
+            counts[cause] += 1
+            automatic["attempts_total"] = cast(int, automatic["attempts_total"]) + 1
+            grant = cast(str, recovery["generation"])
+            bound = []
+            for intent_id, intent in cast(dict[str, dict[str, object]], record["intents"]).items():
+                if _intent_blocks(intent, cast(dict[str, object], record["scope"])):
+                    intent["phase"] = "unknown"
+                    intent["policy_recovery"] = {
+                        "policy_version": 1,
+                        "episode_id": automatic["episode_id"],
+                        "grant_generation": grant,
+                        "scope": dict(cast(dict[str, object], intent["scope"])),
+                    }
+                    bound.append(intent_id)
+            automatic["bound_intent_ids"] = bound
+            for episode in cast(dict[str, dict[str, object]], record["methods"]).values():
+                episode["claim"] = None
             recovery.update(state="consumed", consumed_run=self._run)
             record["generation"] = uuid.uuid4().hex
             record["protection"] = None
             consumed = True
 
         await self._commit(consume)
+        if consumed:
+            self._startup_hold = None
         return consumed
 
     async def reset_auto_resume(self) -> None:
@@ -1734,32 +2075,64 @@ class TelegramRpcSafetyLedger:
     def auto_resume_status(self) -> dict[str, object]:
         recovery = self._automatic_recovery()
         automatic = cast(dict[str, object], recovery["automatic"]) if recovery is not None else None
+        counts = (
+            cast(dict[str, int], automatic["attempts_by_policy"])
+            if automatic
+            else {item.value: 0 for item in RecoveryCause}
+        )
+        state, eligible, phase, reason, due = self._auto_resume_projection(recovery, automatic)
+        return {
+            "enabled": self._auto_resume_enabled,
+            "state": state,
+            "eligible": eligible,
+            "phase": phase,
+            "cause": automatic["cause"] if automatic else None,
+            "block_reason": reason,
+            "attempts_total": automatic["attempts_total"] if automatic else 0,
+            "attempts_by_policy": counts,
+            "attempts": counts[RecoveryCause.FLOOD_WAIT.value],
+            "max_attempts": len(_AUTO_RESUME_DELAYS),
+            "next_attempt_at_utc": due,
+            "next_trial_at_utc": due,
+            "known_restriction_until_utc": time.time() + self.floor_deadline - time.monotonic()
+            if time.monotonic() < self.floor_deadline < math.inf
+            else None,
+        }
+
+    def _auto_resume_projection(
+        self, recovery: dict[str, object] | None, automatic: dict[str, object] | None
+    ) -> tuple[str, bool, str | None, str | None, float | None]:
         state = "manual"
         due = None
+        eligible = self._auto_resume_enabled and self._auto_resume_scope_safe(self._record)
+        phase = cast(str, recovery["state"]) if recovery is not None else None
+        reason = None if eligible else (self.protection_reason or "unsafe_scope_or_outcome")
+        if phase == "exhausted":
+            eligible = False
+            reason = self._auto_resume_exhaustion_reason()
         if not self._auto_resume_enabled:
             state = "disabled"
         elif recovery is not None:
             state = {"waiting": "waiting", "consumed": "trial", "succeeded": "stability"}.get(
                 cast(str, recovery["state"]), "manual"
             )
-            if state == "waiting" and self._auto_resume_scope_safe(self._record):
-                assert automatic is not None
-                deadline = max(self.floor_deadline, self._floor_release_at(cast(dict[str, object], automatic["due"])))
-                due = time.time() + max(0.0, deadline - time.monotonic())
-            elif state == "waiting":
-                state = "manual"
-            if not self._auto_resume_identity_available():
-                state, due = "manual", None
-        return {
-            "enabled": self._auto_resume_enabled,
-            "state": state,
-            "attempts": automatic["attempts"] if automatic is not None else 0,
-            "max_attempts": len(_AUTO_RESUME_DELAYS),
-            "next_attempt_at_utc": due,
-        }
+            if state == "waiting":
+                state, due = self._auto_resume_waiting_projection(eligible, automatic)
+        return state, eligible, phase, reason, due
 
-    def _auto_resume_identity_available(self) -> bool:
-        return self._startup_hold is None and not self._storage_failed
+    def _auto_resume_waiting_projection(
+        self, eligible: bool, automatic: dict[str, object] | None
+    ) -> tuple[str, float | None]:
+        if not eligible:
+            return "manual", None
+        assert automatic is not None
+        deadline = max(self.floor_deadline, self._floor_release_at(cast(dict[str, object], automatic["scheduled_due"])))
+        return "waiting", time.time() + max(0.0, deadline - time.monotonic())
+
+    def _auto_resume_exhaustion_reason(self) -> str:
+        return (
+            "flood_budget_spent" if self._record["protection"] == "automatic_resume_budget_spent" else "flood_exhausted"
+        )
 
     async def finish_recovery(self, account_id: int) -> None:
         def finish(record: dict[str, object]) -> None:
@@ -1831,6 +2204,8 @@ class _WireAttempt:
     scope: TelegramRpcScope
     claimed: int = 0
     dispatch_at: float | None = None
+    incident_claimed_at_ms: int | None = None
+    incident_recorded: bool = False
     admission: RpcAdmission | None = None
     receipt: asyncio.Task[None] | None = None
     terminal: bool = False
@@ -2016,6 +2391,9 @@ class TelegramRpcGate(TelegramClient):
         self._owned_disconnect: asyncio.Task[None] | None = None
         self._scheduler_shutdown: asyncio.Task[None] | None = None
         self._main_disconnect: asyncio.Task[object] | None = None
+        self._reconnect_probe: asyncio.Task[None] | None = None
+        self._reconnect_wire_owner: _WireAttempt | None = None
+        self._reconnect_quiescing = False
         self._authentication_mode = False
         self._logout_mode = False
         self._authentication_token: DemandToken | None = None
@@ -2023,9 +2401,12 @@ class TelegramRpcGate(TelegramClient):
         self._connection_budgets: WeakKeyDictionary[RpcAttemptEvidence, RpcAttemptBudget] = WeakKeyDictionary()
         self._wire_budgets: WeakKeyDictionary[RpcAttemptEvidence, RpcAttemptBudget] = WeakKeyDictionary()
         self._wire_fault: str | None = None
+        self._recovery_cause: RecoveryCause | None = None
         self._auto_resume_stable_since: float | None = None
         self._auto_resume_acquired = False
         self._auto_resume_progress = False
+        self._auto_resume_self_claimed = False
+        self._auto_resume_identity_owner: asyncio.Task[object] | None = None
         self._startup_safety_prepared = False
         self._auto_resume_stopped: Callable[[], bool] = lambda: False
         self._pending_method_receipts: dict[str, int] = {}
@@ -2307,6 +2688,7 @@ class TelegramRpcGate(TelegramClient):
 
     async def close_rpc_scheduler(self) -> None:
         """Join all physical and persistence owners before releasing storage."""
+        self._reconnect_quiescing = True
         if self._scheduler_shutdown is None:
             self._scheduler_shutdown = asyncio.create_task(self._close_rpc_scheduler_owned(), context=Context())
         cancelled = False
@@ -2321,6 +2703,7 @@ class TelegramRpcGate(TelegramClient):
 
     async def _close_rpc_scheduler_owned(self) -> None:
         operations = [
+            self._quiesce_reconnect_probe,
             self._disconnect_main_sender,
             self._admission_scheduler.close,
             self._main_sender.settle_shutdown,
@@ -2919,6 +3302,7 @@ class TelegramRpcGate(TelegramClient):
         if scope.owner_task is not None and (scope.owner_task.done() or scope.owner_task.cancelling()):
             raise asyncio.CancelledError
         self._reject_exhausted_attempt_budget(scope)
+        self._check_auto_trial_prepare(owner)
         await self._prepare_application_intent(owner)
         if owner.admission is not None:
             # A vendor replay starts a new physical admission, retaining the
@@ -2936,6 +3320,13 @@ class TelegramRpcGate(TelegramClient):
         if owner.claimed == 0:
             owner.method_generation = method_generation
         return _WirePermit(owner, admission, generation, method_generation, scheduled_token)
+
+    def _check_auto_trial_prepare(self, owner: _WireAttempt) -> None:
+        if not self._automatic_trial_claim_allowed(owner):
+            raise TelegramRpcAdmissionDeferred(
+                retry_after_seconds=self._scheduler_policy.admission_retry_seconds,
+                detail="Telegram recovery identity is still in progress",
+            )
 
     @staticmethod
     async def _revalidate_scheduled_write(owner: _WireAttempt) -> ScheduledMutationToken | None:
@@ -2999,6 +3390,13 @@ class TelegramRpcGate(TelegramClient):
         self._validate_claim_intent(owner, ledger)
         if not self._admission_scheduler.record_dispatch(permit.admission):
             return False
+        self._record_claim_debit(owner, budget, ledger)
+        self._record_wire_dispatch(owner, permit)
+        return True
+
+    def _record_claim_debit(
+        self, owner: _WireAttempt, budget: RpcAttemptBudget, ledger: TelegramRpcSafetyLedger
+    ) -> None:
         credit = self._retry_credit(budget)
         if credit is not None:
             credit.debit(budget)
@@ -3006,8 +3404,8 @@ class TelegramRpcGate(TelegramClient):
             budget.debit()
         if not owner.scope.transport_control:
             ledger._claimed.add(owner.attempt_id)
-        self._record_wire_dispatch(owner, permit)
-        return True
+        if self.automatic_trial_active() and owner.self_lookup and not owner.scope.transport_bootstrap:
+            self._auto_resume_self_claimed = True
 
     @staticmethod
     def _check_scheduled_claim(owner: _WireAttempt, permit: _WirePermit) -> None:
@@ -3036,6 +3434,11 @@ class TelegramRpcGate(TelegramClient):
     def _record_wire_dispatch(self, owner: _WireAttempt, permit: _WirePermit) -> None:
         owner.claimed += 1
         owner.dispatch_at = time.monotonic()
+        if owner.claimed == 1 and not owner.scope.transport_control:
+            try:
+                owner.incident_claimed_at_ms = int(time.time() * 1000)
+            except Exception:  # noqa: BLE001 - telemetry cannot affect the physical claim
+                pass
         owner.admission = permit.admission
         self._record_draft_dispatch(owner)
         self._record_scheduled_dispatch(owner)
@@ -3091,8 +3494,15 @@ class TelegramRpcGate(TelegramClient):
     def _permit_still_eligible(self, owner: _WireAttempt, permit: _WirePermit) -> bool:
         if owner.revoked:
             return False
+        if self._reconnect_quiescing and owner.scope.source is TelegramRpcSource.TELETHON_RECONNECT_PROBE:
+            return False
+        if not self._automatic_trial_claim_allowed(owner):
+            return False
         if permit.generation != self._wire_token() or self._wire_release_at(owner.scope) > time.monotonic():
             return False
+        return self._permit_method_and_owner_eligible(owner, permit)
+
+    def _permit_method_and_owner_eligible(self, owner: _WireAttempt, permit: _WirePermit) -> bool:
         if not owner.scope.transport_control and not self._ensure_safety_ledger().method_claim_valid(
             owner.method, owner.attempt_id, permit.method_generation
         ):
@@ -3101,6 +3511,34 @@ class TelegramRpcGate(TelegramClient):
         if task is not None and (task.done() or task.cancelling()):
             return False
         return self._budget_can_claim(owner)
+
+    def _automatic_trial_claim_allowed(self, owner: _WireAttempt) -> bool:
+        ledger = self._ensure_safety_ledger()
+        recovery = ledger._automatic_recovery()
+        if recovery is None or recovery["state"] != "consumed" or owner.scope.transport_control:
+            return True
+        if not self.automatic_trial_active() or not ledger._auto_resume_enabled or self._auto_resume_stopped():
+            return False
+        capability = self._connection_capability
+        bootstrap = (
+            owner.scope.transport_bootstrap
+            and capability is not None
+            and owner.scope.attempt_budget is capability.attempt_budget
+        )
+        return bootstrap or self._automatic_trial_identity_claim(owner)
+
+    def _automatic_trial_identity_claim(self, owner: _WireAttempt) -> bool:
+        return (
+            owner.self_lookup
+            and not owner.scope.transport_bootstrap
+            and not self._auto_resume_self_claimed
+            and owner.claimed == 0
+            and owner.scope.demand_kind is DemandKind.SELF_PROFILE_MAINTENANCE
+            and owner.scope.owner_task is self._auto_resume_identity_owner
+            and self._auto_resume_identity_owner is not None
+            and owner.scope.attempt_budget is not None
+            and owner.scope.attempt_budget.limit == 1
+        )
 
     def _budget_can_claim(self, owner: _WireAttempt) -> bool:
         if owner.scope.demand_kind is DemandKind.DRAFT_MUTATION:
@@ -3159,6 +3597,11 @@ class TelegramRpcGate(TelegramClient):
             self._notify_rpc_eligibility_changed()
         elif not isinstance(error, RPCError) and owner.claimed and not owner.scope.transport_control:
             self._wire_fault = "unresolved_outbound_outcome"
+            self._recovery_cause = (
+                RecoveryCause.TRANSIENT
+                if isinstance(error, (ConnectionError, TimeoutError, OSError))
+                else RecoveryCause.READ_UNCERTAINTY
+            )
             self._notify_rpc_eligibility_changed()
 
     def _observe_result_phase(self, owner: _WireAttempt, error: BaseException | None) -> None:
@@ -3216,12 +3659,55 @@ class TelegramRpcGate(TelegramClient):
             or isinstance(error, RPCError)
             or (isinstance(error, ScheduledWriteRejected) and owner.claimed == 0)
         )
-        await self._ensure_safety_ledger().complete(
+        ledger = self._ensure_safety_ledger()
+        await ledger.complete(
             owner.attempt_id,
             known_outcome=known,
             method_generation=owner.method_generation,
             method_success=error is None and rejected is None,
+            recovery_cause=RecoveryCause.TRANSIENT
+            if owner.claimed and self._transient_terminal_error(error) and self.automatic_trial_active()
+            else None,
         )
+        if not known:
+            self._observe_unknown_incident(owner, error, ledger)
+
+    @staticmethod
+    def _transient_terminal_error(error: BaseException | None) -> bool:
+        code = getattr(error, "code", None) if isinstance(error, RPCError) else None
+        return isinstance(error, (ConnectionError, TimeoutError, OSError)) or (
+            type(code) is int and _BACKEND_ERROR_CODE_MIN <= code <= _BACKEND_ERROR_CODE_MAX
+        )
+
+    def _observe_unknown_incident(
+        self, owner: _WireAttempt, error: BaseException | None, ledger: TelegramRpcSafetyLedger
+    ) -> None:
+        if not owner.claimed or owner.incident_recorded:
+            return
+        owner.incident_recorded = True
+        try:
+            observer = self._rpc_request_observer
+            if observer is not None:
+                cause = (
+                    "shutdown"
+                    if self._transport_state is _TransportBoundaryState.DISCONNECTING
+                    else "cancelled"
+                    if isinstance(error, asyncio.CancelledError)
+                    else "transport_lost"
+                    if isinstance(error, (ConnectionError, TimeoutError, OSError))
+                    else "unspecified"
+                )
+                observer(
+                    scope=owner.scope,
+                    phase="incident_unknown",
+                    request_method=owner.method,
+                    incident_run=ledger._run,
+                    incident_claimed_at_ms=owner.incident_claimed_at_ms,
+                    incident_settled_at_ms=int(time.time() * 1000),
+                    incident_cause=cause,
+                )
+        except Exception:  # noqa: BLE001 - observations cannot alter settled safety
+            logger.debug("telegram_rpc_incident_observation_failed")
 
     def _note_successful_acquisition(
         self, owner: _WireAttempt, error: BaseException | None, rejected: BaseException | None
@@ -3292,9 +3778,13 @@ class TelegramRpcGate(TelegramClient):
         return None
 
     def protect_transport(self, error: BaseException) -> None:
-        del error
         self._reset_auto_resume_stability()
-        self._wire_fault = "unresolved_outbound_outcome"
+        if isinstance(error, (TransportConnectError, TransportWriteError)):
+            self._wire_fault = "transport_unavailable"
+            self._recovery_cause = RecoveryCause.TRANSIENT
+        else:
+            self._wire_fault = "transport_integrity_failure"
+            self._recovery_cause = None
         self._notify_rpc_eligibility_changed()
 
     def transport_terminated(self, error: BaseException | None) -> BaseException | None:
@@ -3304,6 +3794,8 @@ class TelegramRpcGate(TelegramClient):
         if not expected:
             self._transport_state = _TransportBoundaryState.FAILED
             self._wire_fault = self._wire_fault or "transport_terminated"
+            if self._wire_fault == "transport_terminated":
+                self._recovery_cause = RecoveryCause.TRANSIENT
             error = error or RuntimeError("Telegram transport terminated unexpectedly")
         self._notify_rpc_eligibility_changed()
         return error
@@ -3326,8 +3818,14 @@ class TelegramRpcGate(TelegramClient):
             return None
         status = ledger.status()
         automatic = ledger.auto_resume_status()
-        if reason != "flood_wait_circuit_open" and automatic["enabled"]:
-            automatic.update(state="manual", next_attempt_at_utc=None)
+        if self._wire_fault == "transport_integrity_failure":
+            automatic.update(
+                eligible=False,
+                block_reason="transport_integrity_failure",
+                state="manual",
+                next_attempt_at_utc=None,
+                next_trial_at_utc=None,
+            )
         return {
             "generation": status["generation"],
             "reason": reason,
@@ -3351,6 +3849,20 @@ class TelegramRpcGate(TelegramClient):
         """Use the daemon's existing stop signal at the physical trial boundary."""
         self._auto_resume_stopped = stopped
 
+    def automatic_trial_active(self) -> bool:
+        """Report only a trial consumed by this lifecycle."""
+        ledger = self._ensure_safety_ledger()
+        recovery = ledger._automatic_recovery()
+        return bool(recovery and recovery["state"] == "consumed" and recovery["consumed_run"] == ledger._run)
+
+    def bind_auto_resume_identity(self) -> None:
+        """Bind the sole identity probe to the startup owner of this trial."""
+        if not self.automatic_trial_active() or self._auto_resume_identity_owner is not None:
+            raise RuntimeError("automatic recovery identity owner is unavailable")
+        self._auto_resume_identity_owner = asyncio.current_task()
+        if self._auto_resume_identity_owner is None:
+            raise RuntimeError("automatic recovery identity has no task")
+
     def _reset_auto_resume_stability(self) -> None:
         self._auto_resume_stable_since = None
         self._auto_resume_acquired = False
@@ -3368,22 +3880,33 @@ class TelegramRpcGate(TelegramClient):
             self._reset_auto_resume_stability()
             return False
         if self.account_safety_status() is not None or self._rpc_circuit_status().open:
-            self._reset_auto_resume_stability()
-            if self._cooldown_save_tasks or self._pending_method_receipts or ledger._operations:
-                return False
-            return await ledger.maintain_auto_resume()
+            return await self._maintain_auto_failure(ledger)
         await self._maintain_auto_resume_stability(ledger)
         return False
+
+    async def _maintain_auto_failure(self, ledger: TelegramRpcSafetyLedger) -> bool:
+        self._reset_auto_resume_stability()
+        if self._cooldown_save_tasks or self._pending_method_receipts or ledger._operations:
+            return False
+        cause = self._recovery_cause
+        if self._wire_fault == "transport_integrity_failure":
+            return False
+        if self._rpc_circuit_status().open or ledger.protection_reason == "flood_wait_circuit_open":
+            cause = RecoveryCause.FLOOD_WAIT
+        await ledger.maintain_auto_resume(cause=cause, quiesced=False)
+        recovery = ledger._automatic_recovery()
+        if recovery is not None and recovery["state"] == "fencing":
+            await self._disconnect_main_sender()
+        return await ledger.maintain_auto_resume(cause=cause, quiesced=True)
 
     def _automatic_lifecycle_available(self) -> bool:
         if self._auto_resume_stopped():
             return False
         return not (
-            self._wire_fault is not None
-            or self._logout_mode
+            self._logout_mode
             or self._authentication_mode
             or self._connect_owner is not None
-            or self._transport_state in {_TransportBoundaryState.FAILED, _TransportBoundaryState.DISCONNECTING}
+            or self._transport_state is _TransportBoundaryState.DISCONNECTING
         )
 
     async def _maintain_auto_resume_stability(self, ledger: TelegramRpcSafetyLedger) -> None:
@@ -3537,12 +4060,45 @@ class TelegramRpcGate(TelegramClient):
         if isinstance(trial, dict) and "automatic" not in trial and trial["state"] == "consumed":
             await ledger.finish_recovery(account_id)
 
-    async def fail_startup_recovery(self) -> None:
+    async def fail_startup_recovery(self, error: BaseException | None = None) -> None:
         ledger = self._ensure_safety_ledger()
         trial = ledger._record.get("recovery")
+        if self._settled_auto_failure(trial, error):
+            return
+        if error is not None:
+            self.protect_transport(error)
+            if not isinstance(error, (TransportConnectError, TransportWriteError)):
+                await ledger._commit(self._protect_startup_integrity)
+                return
         if ledger._storage_failed or not isinstance(trial, dict) or trial["state"] != "consumed":
             return
+        if "automatic" in trial:
+            cause = self._recovery_cause or RecoveryCause(
+                cast(str, cast(dict[str, object], trial["automatic"])["cause"])
+            )
+            await ledger._commit(lambda record: ledger._schedule_auto_resume(record, cause=cause, observed_flood=False))
+            return
         await ledger.fail_recovery()
+
+    @staticmethod
+    def _settled_auto_failure(trial: object, error: BaseException | None) -> bool:
+        return (
+            isinstance(trial, dict)
+            and "automatic" in trial
+            and trial["state"] in {"fencing", "exhausted"}
+            and (error is None or isinstance(error, (TransportConnectError, TransportWriteError)))
+        )
+
+    @staticmethod
+    def _protect_startup_integrity(record: dict[str, object]) -> None:
+        if record["protection"] in {
+            None,
+            "unresolved_outbound_outcome",
+            "transport_unavailable",
+            "flood_wait_circuit_open",
+        }:
+            record["protection"] = "transport_integrity_failure"
+            record["generation"] = uuid.uuid4().hex
 
     async def __call__(
         self, request: object, ordered: bool = False, flood_sleep_threshold: int | None = None
@@ -3612,28 +4168,28 @@ class TelegramRpcGate(TelegramClient):
             raise self._transport_unavailable()
         await self._connect_with_retry_slots()
 
-    def disconnect(self) -> asyncio.Task[None]:
+    def disconnect(self) -> asyncio.Future[None]:
         self._reset_auto_resume_stability()
+        self._reconnect_quiescing = True
         if self._owned_disconnect is None:
             self._owned_disconnect = self.loop.create_task(self._disconnect_owned())
-        return self._owned_disconnect
+            self._owned_disconnect.add_done_callback(lambda task: None if task.cancelled() else task.exception())
+        return asyncio.shield(self._owned_disconnect)
 
     async def _disconnect_owned(self) -> None:
         """Keep vendor teardown, late receipts and Session close owned on failure."""
+        cancelled = await self._quiesce_reconnect_probe()
         teardown = super().disconnect()
         if teardown is None:
+            if cancelled:
+                raise asyncio.CancelledError
             return
-        cancelled = False
         primary: BaseException | None = None
         try:
-            cancelled = await self._join_vendor_disconnect(teardown)
+            cancelled = await self._join_vendor_disconnect(teardown) or cancelled
         except BaseException as error:  # noqa: BLE001 - Session close and receipt drain must still run.
             primary = error
-        try:
-            if self._safety is not None:
-                await self._safety.drain()
-        except BaseException as error:  # noqa: BLE001 - preserve the first failure after all owners settle.
-            primary = primary or error
+        primary = await self._drain_disconnect_safety(primary)
         try:
             self._close_owned_session()
         except Exception as error:  # noqa: BLE001 - preserve the original transport failure.
@@ -3642,6 +4198,14 @@ class TelegramRpcGate(TelegramClient):
             raise primary
         if cancelled:
             raise asyncio.CancelledError
+
+    async def _drain_disconnect_safety(self, primary: BaseException | None) -> BaseException | None:
+        try:
+            if self._safety is not None:
+                await self._safety.drain()
+        except BaseException as error:  # noqa: BLE001 - preserve the first failure after all owners settle.
+            return primary or error
+        return primary
 
     async def _connect_with_retry_slots(
         self,
@@ -3671,11 +4235,15 @@ class TelegramRpcGate(TelegramClient):
             await owner
             release_reservation = True
         except BaseException as bootstrap_error:
-            release_reservation, cancellation_arrived = await self._finish_connection_failure(
-                owner,
-                bootstrap_error,
-                disconnect_transport=not (initially_ready and not self._connection_mutation_started),
-            )
+            try:
+                release_reservation, cancellation_arrived = await self._finish_connection_failure(
+                    owner,
+                    bootstrap_error,
+                    disconnect_transport=not (initially_ready and not self._connection_mutation_started),
+                )
+            finally:
+                if isinstance(bootstrap_error, OSError):
+                    await self.fail_startup_recovery(bootstrap_error)
             if cancellation_arrived:
                 raise asyncio.CancelledError from None
             raise
@@ -4182,10 +4750,8 @@ class TelegramRpcGate(TelegramClient):
 
     async def _disconnect_main_sender(self) -> object:
         """Coalesce every public/internal teardown under one transport owner."""
+        self._reconnect_quiescing = True
         if self._main_disconnect is None:
-            self._transport_state = _TransportBoundaryState.DISCONNECTING
-            self._wire_generation += 1
-            self._admission_scheduler.notify_eligibility_changed()
             self._main_disconnect = asyncio.create_task(self._perform_main_disconnect(), context=Context())
         task = self._main_disconnect
         cancelled = False
@@ -4201,6 +4767,10 @@ class TelegramRpcGate(TelegramClient):
 
     async def _perform_main_disconnect(self) -> object:
         """Stop transport, then durably retain every unresolved written attempt."""
+        await self._quiesce_reconnect_probe()
+        self._transport_state = _TransportBoundaryState.DISCONNECTING
+        self._wire_generation += 1
+        self._admission_scheduler.notify_eligibility_changed()
         primary: BaseException | None = None
         result: object = None
         try:
@@ -4375,19 +4945,10 @@ class TelegramRpcGate(TelegramClient):
     async def _handle_auto_reconnect(self) -> None:
         """Classify and signal Telethon's vendor reconnect probe."""
         self._reset_auto_resume_stability()
+        if self._reconnect_quiescing:
+            return
         if self._authentication_mode:
-            token = self._authentication_token
-            if token is None:
-                raise RuntimeError("authentication reconnect lacks its original owner")
-            try:
-                active = current_demand_token()
-            except UnclassifiedTelegramDemandError:
-                with transferred_demand_context(token):
-                    await super()._handle_auto_reconnect()  # type: ignore[misc]
-            else:
-                if active.kind is not DemandKind.OPERATOR_AUTH or active.attempt_evidence is not token.attempt_evidence:
-                    raise RuntimeError("authentication reconnect inherited another owner")
-                await super()._handle_auto_reconnect()  # type: ignore[misc]
+            await self._handle_authentication_reconnect()
             return
         try:
             current_demand_token()
@@ -4396,18 +4957,61 @@ class TelegramRpcGate(TelegramClient):
         else:
             raise RuntimeError("nested root demand is invalid; use acquisition_context for nested helpers")
         self.reconnect_event.set()
+        if self._reconnect_quiescing:
+            return
 
         async def run_vendor_probe() -> None:
             require_execution_mode(ExecutionMode.PROTOCOL)
             with acquisition_context(AcquisitionKind.ACCOUNT_SELF_PROFILE):
                 await super(TelegramRpcGate, self)._handle_auto_reconnect()  # type: ignore[misc]
 
-        task = create_scoped_rpc_task(
-            run_vendor_probe(),
-            source=TelegramRpcSource.TELETHON_RECONNECT_PROBE,
-            name="telethon_reconnect_probe",
-        )
-        await task
+        task = self._reconnect_probe
+        if task is None:
+            task = create_scoped_rpc_task(
+                run_vendor_probe(),
+                source=TelegramRpcSource.TELETHON_RECONNECT_PROBE,
+                name="telethon_reconnect_probe",
+            )
+            self._reconnect_probe = task
+            task.add_done_callback(self._reconnect_probe_done)
+        await asyncio.shield(task)
+
+    async def _handle_authentication_reconnect(self) -> None:
+        token = self._authentication_token
+        if token is None:
+            raise RuntimeError("authentication reconnect lacks its original owner")
+        try:
+            active = current_demand_token()
+        except UnclassifiedTelegramDemandError:
+            with transferred_demand_context(token):
+                await super()._handle_auto_reconnect()  # type: ignore[misc]
+        else:
+            if active.kind is not DemandKind.OPERATOR_AUTH or active.attempt_evidence is not token.attempt_evidence:
+                raise RuntimeError("authentication reconnect inherited another owner")
+            await super()._handle_auto_reconnect()  # type: ignore[misc]
+
+    def _reconnect_probe_done(self, task: asyncio.Task[None]) -> None:
+        if not task.cancelled():
+            task.exception()
+        if self._reconnect_probe is task:
+            self._reconnect_probe = None
+            self._reconnect_wire_owner = None
+
+    async def _quiesce_reconnect_probe(self) -> bool:
+        self._reconnect_quiescing = True
+        task = self._reconnect_probe
+        if task is None:
+            return False
+        owner = self._reconnect_wire_owner
+        if owner is None or owner.claimed == 0:
+            task.cancel()
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.wait({task})
+            except asyncio.CancelledError:
+                cancelled = True
+        return cancelled
 
     async def _dispatch_update(self, update: object) -> None:
         """Give one ordinary or replayed update its event-owned demand root."""
@@ -4448,6 +5052,14 @@ class TelegramRpcGate(TelegramClient):
         self._raise_if_transport_unavailable(allow_disconnected=True)
         if self._transport_state is not _TransportBoundaryState.DISCONNECTED:
             raise self._transport_unavailable()
+        if self._scheduler_shutdown is not None:
+            raise self._transport_unavailable()
+        for teardown in (self._owned_disconnect, self._main_disconnect):
+            if teardown is not None and (
+                not teardown.done() or teardown.cancelled() or teardown.exception() is not None
+            ):
+                raise self._transport_unavailable()
+        self._reconnect_quiescing = False
         self._owned_disconnect = None
         self._main_disconnect = None
         self._wire_generation += 1

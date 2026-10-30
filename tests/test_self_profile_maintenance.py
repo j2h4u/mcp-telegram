@@ -328,6 +328,43 @@ async def test_startup_accepts_partial_personal_channel_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_recovery_identity_uses_one_probe_without_claiming_full_profile() -> None:
+    startup = StartupIdentityState(100.0, 200.0)
+    profile = SimpleNamespace(id=42)
+    published: list[OwnOnlyContext] = []
+    cadence = _Cadence(DemandStatus(release_at=10_000.0))
+    port = _StartupUserProfilePort(error=AssertionError("full profile must not be acquired"))
+
+    async def get_me() -> object:
+        current_rpc_scope().attempt_budget.debit()  # type: ignore[union-attr]
+        return profile
+
+    async def publish(_profile: object, context: OwnOnlyContext) -> None:
+        published.append(context)
+
+    adapter = SelfProfileMaintenanceDemandAdapter(
+        SelfProfileMaintenanceDependencies(
+            cadence=cadence,
+            get_me=get_me,
+            update_profile=_unused_update_profile,
+            startup=startup,
+            get_input_entity=lambda _account_id: _unused_get_me(),
+            user_profile_port=port,
+            publish_startup_identity=publish,
+            retained_context=lambda account_id: OwnOnlyContext(account_id, 9001),
+        ),
+        account_id=42,
+        clock=lambda: 100.0,
+    )
+
+    await adapter.run_startup(RpcAttemptBudget(1))
+    assert startup.result().own_only_context.personal_channel_id == -1000000009001
+    assert startup.identity_only and cadence.refreshed_at == []
+    assert published[-1].personal_channel_id == -1000000009001
+    assert adapter.status(100.0).release_at == 10_000.0  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
 async def test_permanent_startup_profile_failure_signals_terminal_state() -> None:
     startup = StartupIdentityState(100.0, 200.0)
 

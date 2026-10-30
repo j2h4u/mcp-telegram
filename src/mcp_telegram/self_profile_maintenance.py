@@ -67,6 +67,7 @@ class SelfProfileMaintenanceDependencies:
     get_input_entity: Callable[[int], Awaitable[object]] | None = None
     user_profile_port: UserProfilePort | None = None
     publish_startup_identity: Callable[[object, OwnOnlyContext], Awaitable[None]] | None = None
+    retained_context: Callable[[int], OwnOnlyContext] | None = None
 
     def __post_init__(self) -> None:
         if self.startup is None:
@@ -196,13 +197,23 @@ class SelfProfileMaintenanceDemandAdapter(DurableDemandAdapter):
             reason = f"startup identity {startup.phase.value} failed ({type(exc).__name__})"
             startup.fail(reason)
             raise StartupIdentityUnavailableError(reason) from exc
-        if startup.phase is StartupIdentityPhase.READY:
+        if startup.phase is StartupIdentityPhase.READY and not startup.identity_only:
             return await self._dependencies.cadence.mark_refreshed(self._clock())
         return None
 
     async def _continue_startup(self, startup: StartupIdentityState) -> None:
         if startup.phase is StartupIdentityPhase.PROFILE:
             await self._acquire_startup_profile(startup)
+
+        if startup.phase is StartupIdentityPhase.INPUT_USER and self._dependencies.retained_context is not None:
+            profile = startup.profile
+            assert profile is not None
+            context = self._dependencies.retained_context(int(cast(_MeLike, profile).id))
+            publish = self._dependencies.publish_startup_identity
+            assert publish is not None
+            await publish(profile, context)
+            startup.complete_verified(StartupIdentityResult(profile, context))
+            return
 
         if startup.phase is StartupIdentityPhase.INPUT_USER:
             await self._acquire_startup_input_user(startup)
