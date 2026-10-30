@@ -32,7 +32,9 @@ from mcp_telegram.scheduled_messages import (
 from mcp_telegram.scheduled_write_fence import ScheduledMutationFence
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
+from mcp_telegram.telegram_demand_coordinator import CoordinatorState
 from mcp_telegram.telegram_gateway import ScheduledHistoryClient
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 from tests.sqlite_writer_helpers import inline_writer
 from tests.test_daemon import _typed_ctx
 from tests.test_daemon_api import make_server
@@ -70,6 +72,79 @@ def _seed(conn: sqlite3.Connection) -> None:
             "INSERT INTO scheduled_reconciliation_state(dialog_id,updated_at,snapshot_observation_order,"
             "baseline_observed_at,coverage_state) VALUES(200,1,1,1,'complete')"
         )
+
+
+@pytest.mark.parametrize("mode", ["coalesced", "stopped", "stopping_during_read"])
+async def test_first_use_binding_prioritizes_existing_local_baseline_without_telegram(
+    conn: sqlite3.Connection, mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed(conn)
+    with write_transaction(conn):
+        conn.execute(
+            "INSERT INTO scheduled_reconciliation_state(dialog_id,updated_at,coverage_state,discovery_due_at) "
+            "VALUES(100,1,'unknown',1)"
+        )
+    client = SimpleNamespace(__call__=AsyncMock())
+    server = make_server(conn, client, feedback_conn=conn)
+    server.self_id = 100
+    reconciler = ScheduledMessageReconciler(
+        cast(ScheduledHistoryClient, client),
+        conn,
+        asyncio.Event(),
+        policy=ScheduledReconciliationPolicy(10),
+        writer=inline_writer(conn),
+    )
+    reconciler.bind_account_id(100)
+    offers: list[object] = []
+
+    def coalesced_offer(kind: object) -> bool:
+        offers.append(kind)
+        return False
+
+    coordinator = SimpleNamespace(
+        offer=coalesced_offer, state=CoordinatorState.STOPPED if mode == "stopped" else CoordinatorState.RUNNING
+    )
+    runtime = SimpleNamespace(scheduled_reconciler=reconciler, coordinator=coordinator)
+    if mode == "stopping_during_read":
+        original = reconciler.prioritize_baseline
+
+        async def stop_during_read(account_id: int, dialog_id: int) -> bool:
+            eligible = await original(account_id, dialog_id)
+            coordinator.state = CoordinatorState.STOPPED
+            return eligible
+
+        monkeypatch.setattr(reconciler, "prioritize_baseline", stop_during_read)
+    ctx = _typed_ctx(
+        conn=conn,
+        writer=inline_writer(conn),
+        client=client,
+        api_server=server,
+        demand_runtime=runtime,
+        scheduled_mutation_fence=ScheduledMutationFence(),
+    )
+    await _bind_scheduled_commands(ctx)
+    before = conn.execute("SELECT * FROM scheduled_reconciliation_state WHERE dialog_id=100").fetchone()
+    result = await server._dispatch(
+        {
+            "method": "manage_scheduled_message",
+            "request_id": "abcdef12",
+            "operation_id": "op",
+            "dialog_id": 100,
+            "action": "create",
+            "operation_key": "first-use",
+            "text": "future",
+            "schedule_at_utc": datetime.fromtimestamp(int(time.time()) + 3600, UTC).isoformat(),
+        }
+    )
+    assert result["error"] == "scheduled_state_unknown"
+    assert result["operation_key"] == "first-use" and result["mutation_dispatched"] is False
+    assert result["receipt_persisted"] is False
+    assert reconciler._priority_dialog_id == (100 if mode == "coalesced" else None)
+    assert offers == ([DemandKind.SCHEDULED_DISCOVERY] if mode == "coalesced" else [])
+    assert ("priority was requested" in cast(str, result["message"])) == (mode == "coalesced")
+    assert conn.execute("SELECT * FROM scheduled_reconciliation_state WHERE dialog_id=100").fetchone() == before
+    assert conn.execute("SELECT COUNT(*) FROM scheduled_operation_receipts").fetchone()[0] == 0
+    await server.shutdown()
 
 
 async def test_native_command_binding_routes_and_persists_canonical_response(conn: sqlite3.Connection) -> None:
@@ -508,6 +583,7 @@ async def test_actual_canonical_event_between_owner_prepare_and_wire_claim(  # n
         resolve_peer=resolve_peer,
         account_is_premium=lambda: False,
         request_recovery=AsyncMock(),
+        prioritize_baseline=AsyncMock(return_value=False),
     )
 
     def request(key: str) -> dict[str, object]:

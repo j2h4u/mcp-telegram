@@ -576,6 +576,7 @@ class ScheduledMessageReconciler:
         self._verified_account_id: int | None = None
         self._policy = policy
         self._mutation_fence = mutation_fence
+        self._priority_dialog_id: int | None = None
 
     def bind_account_id(self, account_id: int) -> None:
         if type(account_id) is not int or account_id <= 0:
@@ -583,6 +584,34 @@ class ScheduledMessageReconciler:
         if self._verified_account_id not in (None, account_id):
             raise RuntimeError("scheduled reconciliation account does not match verified startup identity")
         self._verified_account_id = account_id
+
+    async def prioritize_baseline(self, account_id: int, dialog_id: int) -> bool:
+        """Prioritize an existing eligible discovery without changing its durable revision."""
+        if type(account_id) is not int or type(dialog_id) is not int or dialog_id == 0:
+            return False
+        if self._verified_account_id != account_id:
+            return False
+
+        def eligible(conn: sqlite3.Connection) -> bool:
+            row = cast(
+                tuple[object] | None,
+                conn.execute(
+                    "SELECT 1 FROM scheduled_reconciliation_state r JOIN scheduled_sync_state s ON s.key='account' "
+                    "WHERE s.account_id=? AND r.dialog_id=? AND r.coverage_state='unknown' "
+                    "AND r.repair_due_at IS NULL AND r.discovery_due_at IS NOT NULL",
+                    (account_id, dialog_id),
+                ).fetchone(),
+            )
+            return row is not None
+
+        if not await self._writer.run(eligible):
+            return False
+        self._priority_dialog_id = dialog_id
+        return True
+
+    def clear_baseline_priority(self, dialog_id: int) -> None:
+        if self._priority_dialog_id == dialog_id:
+            self._priority_dialog_id = None
 
     def _candidate_ids(self) -> set[int]:
         """Return every known directory peer, plus self and retained queue peers."""
@@ -1051,6 +1080,7 @@ class _ScheduledDemandAdapter(DurableDemandAdapter):
                 f"FROM scheduled_reconciliation_state WHERE {column} IS NOT NULL {repair_precedence} ORDER BY {column},dialog_id"
             ).fetchall(),
         )
+        self._clear_stale_priority(rows)
         candidates: list[DemandStatus] = []
         for dialog_id, generation, snapshot_order, due_at in rows:
             dialog_id, generation, snapshot_order, due_at = (
@@ -1070,10 +1100,30 @@ class _ScheduledDemandAdapter(DurableDemandAdapter):
         seed = self._seed_status(excluded)
         if seed is not None:
             candidates.append(seed)
-        return min(
-            candidates,
-            key=lambda candidate: (candidate.release_at, candidate.freshness_deadline or candidate.release_at),
-            default=None,
+        return min(candidates, key=lambda candidate: self._selection_key(candidate, now), default=None)
+
+    def _clear_stale_priority(self, rows: list[tuple[object, object, object, object]]) -> None:
+        priority = self._reconciler._priority_dialog_id
+        if (
+            self.demand_kind is DemandKind.SCHEDULED_DISCOVERY
+            and priority is not None
+            and not any(_as_int(row[0]) == priority for row in rows)
+        ):
+            self._reconciler._priority_dialog_id = None
+
+    def _selection_key(self, candidate: DemandStatus, now: float) -> tuple[bool, bool, float, float]:
+        selected = candidate.selected
+        prioritized = (
+            self.demand_kind is DemandKind.SCHEDULED_DISCOVERY
+            and selected is not None
+            and selected.key.target == str(self._reconciler._priority_dialog_id)
+            and candidate.release_at <= now
+        )
+        return (
+            candidate.release_at > now,
+            not prioritized,
+            candidate.release_at,
+            candidate.freshness_deadline or candidate.release_at,
         )
 
     def _seed_status(self, excluded: frozenset[WorkRevision]) -> DemandStatus | None:

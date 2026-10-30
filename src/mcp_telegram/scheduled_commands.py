@@ -443,12 +443,7 @@ def _parse_command(request: Mapping[str, object], account_id: int) -> ScheduledC
 def _current_state(
     conn: sqlite3.Connection, account_id: int, dialog_id: int, message_id: int | None
 ) -> tuple[Mapping[str, object] | None, int]:
-    account = cast(
-        tuple[object, ...] | None,
-        conn.execute("SELECT account_id FROM scheduled_sync_state WHERE key='account'").fetchone(),
-    )
-    if account is None or account[0] != account_id:
-        raise ScheduledCommandError("account_state_unknown", "Scheduled queue ownership is not bound to this account.")
+    _require_scheduled_account(conn, account_id)
     coverage = cast(
         tuple[object, ...] | None,
         conn.execute(
@@ -456,10 +451,14 @@ def _current_state(
             (dialog_id,),
         ).fetchone(),
     )
-    if coverage is None or coverage[1] != "complete" or cast(int, coverage[0]) <= 0:
+    if coverage is None or coverage[1] == "unknown":
         raise ScheduledCommandError(
             "scheduled_state_unknown", "This dialog's scheduled queue has no current complete baseline."
         )
+    if coverage[1] != "complete":
+        raise ScheduledCommandError("scheduled_state_unavailable", "This dialog's scheduled queue is unavailable.")
+    if cast(int, coverage[0]) <= 0:
+        raise ScheduledCommandError("scheduled_state_invalid", "This dialog's scheduled baseline is invalid.")
     row: Mapping[str, object] | None = None
     if message_id is not None:
         row = _read_mapping(
@@ -472,6 +471,15 @@ def _current_state(
                 "scheduled_message_unavailable", "That scheduled queue item is no longer active locally."
             )
     return row, cast(int, coverage[0])
+
+
+def _require_scheduled_account(conn: sqlite3.Connection, account_id: int) -> None:
+    account = cast(
+        tuple[object, ...] | None,
+        conn.execute("SELECT account_id FROM scheduled_sync_state WHERE key='account'").fetchone(),
+    )
+    if account is None or account[0] != account_id:
+        raise ScheduledCommandError("account_state_unknown", "Scheduled queue ownership is not bound to this account.")
 
 
 def _read_mapping(conn: sqlite3.Connection, sql: str, values: tuple[object, ...]) -> dict[str, object] | None:
@@ -831,6 +839,7 @@ class ScheduledCommandOwner:
         resolve_peer: Callable[[int, int | None], Awaitable[object | None]],
         account_is_premium: Callable[[], bool | None],
         request_recovery: Callable[[int, str], Awaitable[None]],
+        prioritize_baseline: Callable[[int, int], Awaitable[bool]],
     ) -> None:
         if type(account_id) is not int or account_id <= 0:
             raise ValueError("account_id must be positive")
@@ -842,6 +851,7 @@ class ScheduledCommandOwner:
         self._resolve_peer = resolve_peer
         self._account_is_premium = account_is_premium
         self._request_recovery = request_recovery
+        self._prioritize_baseline = prioritize_baseline
         self._locks: WeakValueDictionary[tuple[int, int], asyncio.Lock] = WeakValueDictionary()
 
     async def execute(self, request: Mapping[str, object]) -> dict[str, object]:
@@ -881,9 +891,27 @@ class ScheduledCommandOwner:
             raise ScheduledCommandError(
                 "peer_unavailable", "Exact retained peer access is unavailable for this dialog."
             )
-        row, coverage_order = await self._writer.run(
-            lambda conn: _current_state(conn, command.account_id, command.dialog_id, command.scheduled_message_id)
-        )
+        try:
+            row, coverage_order = await self._writer.run(
+                lambda conn: _current_state(conn, command.account_id, command.dialog_id, command.scheduled_message_id)
+            )
+        except ScheduledCommandError as error:
+            if error.code != "scheduled_state_unknown":
+                raise
+            requested = await self._prioritize_baseline(command.account_id, command.dialog_id)
+            return {
+                "ok": False,
+                "error": "scheduled_state_unknown",
+                "message": (
+                    "Scheduled queue baseline priority was requested when eligible; no mutation was dispatched."
+                    if requested
+                    else "No priority was added; the scheduled baseline is unavailable and no mutation was dispatched."
+                ),
+                "required_action": "Retry the same command with the same operation key after the baseline is ready.",
+                "operation_key": command.operation_key,
+                "mutation_dispatched": False,
+                "receipt_persisted": False,
+            }
         _validate_current_item(command, row)
         return await self._prepare_dispatch(command, row, coverage_order, peer)
 

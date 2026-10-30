@@ -69,6 +69,138 @@ def _coordinator(
     return TelegramDemandCoordinator(adapters, clock=lambda: now[0], monotonic_clock=lambda: now[0]), reconciler
 
 
+async def test_first_use_hint_prioritizes_same_discovery_revision_without_writes(conn: sqlite3.Connection) -> None:
+    with write_transaction(conn):
+        conn.execute("UPDATE scheduled_reconciliation_state SET repair_due_at=NULL,discovery_due_at=100")
+        conn.executemany(
+            "INSERT INTO scheduled_reconciliation_state(dialog_id,discovery_due_at,updated_at,coverage_state) "
+            "VALUES(?,100,100,'unknown')",
+            ((number,) for number in range(1000, 1850)),
+        )
+    coordinator, reconciler = _coordinator(conn, _ScheduledSnapshotClient(), [100.0])
+    adapter = ScheduledDiscoveryDemandAdapter(reconciler, account_id=42)
+    target = 1849
+    before = conn.execute("SELECT * FROM scheduled_reconciliation_state WHERE dialog_id=?", (target,)).fetchone()
+    assert adapter.status(100).selected.key.target != str(target)  # type: ignore[union-attr]
+    assert await reconciler.prioritize_baseline(42, target)
+    selected = adapter.status(100)
+    assert selected is not None and selected.selected is not None and selected.selected.key.target == str(target)
+    assert await reconciler.prioritize_baseline(42, target)
+    assert adapter.status(100) == selected
+    assert (
+        conn.execute("SELECT * FROM scheduled_reconciliation_state WHERE dialog_id=?", (target,)).fetchone() == before
+    )
+    _, restarted = _coordinator(conn, _ScheduledSnapshotClient(), [100.0])
+    restarted_adapter = ScheduledDiscoveryDemandAdapter(restarted, account_id=42)
+    assert restarted._priority_dialog_id is None and restarted_adapter.status(100) is not None
+    assert (
+        conn.execute("SELECT * FROM scheduled_reconciliation_state WHERE dialog_id=?", (target,)).fetchone() == before
+    )
+    coordinator.offer(DemandKind.SCHEDULED_DISCOVERY)
+    coordinator.scan()
+    assert coordinator.statuses[DemandKind.SCHEDULED_DISCOVERY].selected == selected.selected
+
+
+async def test_first_use_hint_keeps_excluded_revision_parked_and_respects_account_floor(
+    conn: sqlite3.Connection,
+) -> None:
+    with write_transaction(conn):
+        conn.execute("UPDATE scheduled_reconciliation_state SET repair_due_at=NULL,discovery_due_at=100")
+        conn.execute(
+            "INSERT INTO scheduled_reconciliation_state(dialog_id,discovery_due_at,updated_at,coverage_state) "
+            "VALUES(77,100,100,'unknown')"
+        )
+    _, reconciler = _coordinator(conn, _ScheduledSnapshotClient(), [100.0])
+    adapter = ScheduledDiscoveryDemandAdapter(reconciler, account_id=42)
+    assert await reconciler.prioritize_baseline(42, 77)
+    selected = adapter.status(100)
+    assert selected is not None and selected.selected is not None and selected.selected.key.target == "77"
+    other = adapter.status(100, excluded=frozenset({selected.selected}))
+    assert other is not None and other.selected is not None and other.selected.key.target != "77"
+    with write_transaction(conn):
+        conn.execute("UPDATE scheduled_sync_state SET next_retry_at=200 WHERE key='account'")
+    assert adapter.status(100).release_at == 200  # type: ignore[union-attr]
+    assert await reconciler.prioritize_baseline(42, 42)
+    assert adapter.status(100).release_at == 200  # type: ignore[union-attr]
+
+
+async def test_first_use_hint_does_not_invalidate_inflight_discovery_snapshot(conn: sqlite3.Connection) -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class BlockingClient(_ScheduledSnapshotClient):
+        async def __call__(self, request: object, **kwargs: object) -> object:
+            entered.set()
+            await release.wait()
+            return await super().__call__(request, **kwargs)
+
+    with write_transaction(conn):
+        conn.execute("UPDATE scheduled_reconciliation_state SET repair_due_at=NULL,discovery_due_at=100")
+        conn.execute(
+            "UPDATE scheduled_sync_state SET directory_generation=(SELECT generation FROM dialog_directory_publication)"
+        )
+    client = BlockingClient({42: []})
+    coordinator, reconciler = _coordinator(conn, client, [100.0])
+    selected = coordinator.statuses[DemandKind.SCHEDULED_DISCOVERY].selected
+    assert selected is not None and selected.key.target == "42"
+    before = conn.execute("SELECT * FROM scheduled_reconciliation_state WHERE dialog_id=42").fetchone()
+    task = asyncio.create_task(coordinator._execute_slice(DemandKind.SCHEDULED_DISCOVERY))
+    await entered.wait()
+    assert await reconciler.prioritize_baseline(42, 42)
+    assert conn.execute("SELECT * FROM scheduled_reconciliation_state WHERE dialog_id=42").fetchone() == before
+    release.set()
+    await task
+    assert len(client.requests) == 1
+    assert conn.execute("SELECT coverage_state FROM scheduled_reconciliation_state WHERE dialog_id=42").fetchone() == (
+        "complete",
+    )
+    ScheduledDiscoveryDemandAdapter(reconciler, account_id=42).status(100)
+    assert reconciler._priority_dialog_id is None
+
+
+async def test_first_use_hint_never_restarts_a_parked_discovery_budget(conn: sqlite3.Connection) -> None:
+    with write_transaction(conn):
+        conn.execute("UPDATE scheduled_reconciliation_state SET repair_due_at=NULL,discovery_due_at=100")
+        conn.execute(
+            "INSERT INTO scheduled_reconciliation_state(dialog_id,discovery_due_at,updated_at,coverage_state) "
+            "VALUES(77,100,100,'unknown')"
+        )
+        conn.execute(
+            "UPDATE scheduled_sync_state SET directory_generation=(SELECT generation FROM dialog_directory_publication)"
+        )
+    client = _RecoveryClient()
+    coordinator, reconciler = _coordinator(conn, client, [100.0])
+    assert await reconciler.prioritize_baseline(42, 42)
+    coordinator.scan()
+    selected = coordinator.statuses[DemandKind.SCHEDULED_DISCOVERY].selected
+    assert selected is not None and selected.key.target == "42"
+    await coordinator._execute_slice(DemandKind.SCHEDULED_DISCOVERY)
+    assert selected in coordinator._excluded
+    budget = coordinator._invocations[selected].budget
+    assert budget.attempts == 1
+    assert await reconciler.prioritize_baseline(42, 42)
+    coordinator._active_kind = None
+    coordinator.offer(DemandKind.SCHEDULED_DISCOVERY)
+    coordinator.scan()
+    assert coordinator._invocations[selected].budget is budget and budget.attempts == 1
+    assert selected in coordinator._excluded
+    assert coordinator.statuses[DemandKind.SCHEDULED_DISCOVERY].selected != selected
+
+
+@pytest.mark.parametrize("mode", ["wrong_account", "unbound", "missing", "complete", "inaccessible", "unsupported"])
+async def test_first_use_hint_rejects_unavailable_or_unowned_target(conn: sqlite3.Connection, mode: str) -> None:
+    with write_transaction(conn):
+        conn.execute("UPDATE scheduled_reconciliation_state SET repair_due_at=NULL,discovery_due_at=100")
+        if mode == "unbound":
+            conn.execute("UPDATE scheduled_sync_state SET account_id=NULL WHERE key='account'")
+        if mode in {"complete", "inaccessible", "unsupported"}:
+            conn.execute("UPDATE scheduled_reconciliation_state SET coverage_state=?", (mode,))
+    _, reconciler = _coordinator(conn, _ScheduledSnapshotClient(), [100.0])
+    account = 99 if mode == "wrong_account" else 42
+    dialog = 99999 if mode == "missing" else 42
+    assert not await reconciler.prioritize_baseline(account, dialog)
+    assert reconciler._priority_dialog_id is None
+
+
 class _RecoveryClient(_ScheduledSnapshotClient):
     def __init__(self) -> None:
         super().__init__({42: []})
