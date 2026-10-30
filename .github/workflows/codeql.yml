@@ -4,8 +4,6 @@ name: CodeQL
 # Complements Dependabot (which only scans dependencies).
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
     paths-ignore:

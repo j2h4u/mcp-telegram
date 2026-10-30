@@ -249,6 +249,39 @@ def _account_protection_error() -> dict[str, object]:
     }
 
 
+def _account_recovery_notice(automatic: object, reason: object) -> tuple[str, str]:
+    context = (
+        "Background Telegram acquisition is blocked because a persisted request has no confirmed response. "
+        "Whether Telegram processed it or applied a rate limit is unknown. "
+        if reason == "unresolved_outbound_outcome"
+        else "Background Telegram acquisition is blocked by account protection. "
+    )
+    context += (
+        "Retained local reads remain available; use this result's source and coverage to assess requested data. "
+        "New incoming data and freshness may be limited. "
+    )
+    if isinstance(automatic, dict) and automatic.get("enabled") is True:
+        state = automatic.get("state")
+        if automatic.get("phase") == "fencing" and automatic.get("eligible") is True:
+            return (
+                "automatic",
+                context + "Automatic recovery is preparing; consult its status for eligibility and blocks.",
+            )
+        if state == "waiting":
+            if automatic.get("next_trial_at_utc") is not None:
+                return (
+                    "automatic",
+                    context + "An automatic trial is scheduled; its time is conditional, not a recovery ETA.",
+                )
+            return "automatic", context + "Automatic recovery is waiting; no next trial time is available."
+        if state in {"trial", "stability"}:
+            return (
+                "automatic",
+                context + "Automatic recovery is in progress; consult its status for eligibility and blocks.",
+            )
+    return "manual", context + "Recovery requires operator action."
+
+
 def _rpc_admission_response(error: RpcAdmissionError) -> dict[str, object] | None:
     """Project typed pre-transport admission rejection."""
     if not isinstance(error, (RpcAdmissionSaturatedError, RpcAdmissionExpiredError)):
@@ -1869,22 +1902,9 @@ class DaemonAPIServer:
             protection["opened_at"] = status.opened_at
         if safety is not None:
             protection.update(safety)
-            automatic = safety.get("automatic_resume")
-            match automatic:
-                case {"enabled": True, "state": "waiting"}:
-                    protection["recovery"] = "automatic"
-                    protection["notice"] = (
-                        "Background Telegram acquisition is paused by account protection. A cautious automatic "
-                        "restart is scheduled after the recovery delay and Telegram restrictions. Retained local "
-                        "reads remain available; new incoming data and freshness may be limited."
-                    )
-            if safety.get("reason") == "unresolved_outbound_outcome":
-                protection["notice"] = (
-                    "Background Telegram acquisition is blocked because a persisted request has no confirmed "
-                    "response. Whether Telegram processed it or applied a rate limit is unknown. Retained local "
-                    "reads remain available; use this result's source and coverage to assess requested data. "
-                    "Recovery requires operator acknowledgement."
-                )
+            protection["recovery"], protection["notice"] = _account_recovery_notice(
+                safety.get("automatic_resume"), safety.get("reason")
+            )
         return {"ok": True, "data": {"account_protection": protection}}
 
     async def _recover_account(self, req: dict[str, object]) -> dict[str, object]:

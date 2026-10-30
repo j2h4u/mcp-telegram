@@ -1041,7 +1041,7 @@ class ReadingService:
         if isinstance(coverage_result, dict):
             return coverage_result
         _, account_coverage = coverage_result
-        if not scheduled_messages_available(self._conn):
+        if account_coverage.get("state") == "unknown" or not scheduled_messages_available(self._conn):
             return {
                 "ok": True,
                 "data": {
@@ -1616,6 +1616,14 @@ class ReadingService:
                     "FROM scheduled_sync_state WHERE key='account'"
                 )
             )
+            if account is None or _row_value(account, "account_id") is None:
+                return account_id, {"state": "unknown", "reason": "scheduled_account_unbound"}
+            if _row_value(account, "account_id") != account_id:
+                return {
+                    "ok": False,
+                    "error": "scheduled_account_mismatch",
+                    "message": "The local scheduled queue account does not match the verified Telegram account.",
+                }
             directory = read_dialog_directory_coverage(source).to_wire()
             state_count_rows = cast(
                 list[tuple[object, object]],
@@ -1652,12 +1660,6 @@ class ReadingService:
                 "ok": False,
                 "error": "scheduled_coverage_unavailable",
                 "message": "Scheduled queue account coverage could not be read safely.",
-            }
-        if account is None or _row_value(account, "account_id") != account_id:
-            return {
-                "ok": False,
-                "error": "scheduled_account_mismatch",
-                "message": "The local scheduled queue account does not match the verified Telegram account.",
             }
         return account_id, self._scheduled_account_coverage_data(
             account_id=account_id,
@@ -1708,6 +1710,13 @@ class ReadingService:
     def _scheduled_dialog_coverage(self, dialog_id: int, conn: sqlite3.Connection | None = None) -> dict[str, object]:
         source = self._conn if conn is None else conn
         try:
+            account = _fetchone_row(source.execute("SELECT account_id FROM scheduled_sync_state WHERE key='account'"))
+            if (
+                type(self._deps.self_id) is not int
+                or account is None
+                or _row_value(account, "account_id") != self._deps.self_id
+            ):
+                return {"state": "unknown", "reason": "scheduled_account_not_bound"}
             row = _fetchone_row(
                 source.execute(
                     "SELECT coverage_state,coverage_reason,baseline_observed_at,directory_generation,"
@@ -1785,7 +1794,7 @@ class ReadingService:
         if isinstance(navigation, dict):
             return navigation
         anchor, direction = navigation
-        raw_rows = self._read_scheduled_queue_rows(request, dialog_id, direction, anchor)
+        raw_rows = self._read_scheduled_queue_rows(request, dialog_id, direction, anchor, coverage)
         with timing_phase("response_shape"):
             has_more = len(raw_rows) > request.limit
             selected = raw_rows[: request.limit]
@@ -1874,8 +1883,9 @@ class ReadingService:
         dialog_id: int | None,
         direction: str,
         anchor: ScheduledQueueNavigationToken | None,
+        coverage: dict[str, object],
     ) -> list[object]:
-        if not scheduled_messages_available(self._conn):
+        if coverage.get("state") == "unknown" or not scheduled_messages_available(self._conn):
             raw_rows: list[object] = []
         else:
             with timing_phase("local_projection"):
@@ -1978,7 +1988,7 @@ class ReadingService:
         account_id, account_coverage = coverage_result
         with timing_phase("local_projection"):
             own_basis: dict[int, tuple[str, ...]] = {}
-            if scheduled_messages_available(self._conn):
+            if account_coverage.get("state") != "unknown" and scheduled_messages_available(self._conn):
                 own_basis = self._own_only_basis_by_dialog()
                 anchor_sent_at = req.anchor_sent_at
                 if req.anchor_msg_id is not None and anchor_sent_at is None:
@@ -3382,7 +3392,11 @@ class ReadingService:
             }
         else:
             _, scheduled_coverage = coverage_result
-            scheduled_summary = scheduled_summary_by_dialog(conn, scheduled_now=int(time.time()))
+            scheduled_summary = (
+                {}
+                if scheduled_coverage.get("state") == "unknown"
+                else scheduled_summary_by_dialog(conn, scheduled_now=int(time.time()))
+            )
         own_basis: dict[int, tuple[str, ...]] = self._own_only_basis_by_dialog(conn)
         sql_rows = self._fetch_list_dialog_rows(conn, request, dialog_filter)
         if not sql_rows:

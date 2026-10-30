@@ -126,6 +126,7 @@ from .messages.sqlite_hydration import (
 from .messages.telegram_adapter import (
     extract_message_row,
 )
+from .models import DialogType
 from .observation_order import delivered_observation_order
 from .reactions.contracts import ReactionAggregate, ReactionAggregateSource, ReactionObservationBoundary
 from .reactions.persistence import allocate_observation_boundary, replace_reaction_aggregates
@@ -2479,6 +2480,7 @@ class EventHandlerManager:
                     continue
                 assert push is not None
                 observation = self._profile_push_observation(conn, source, push)
+                self._ensure_supplied_user_type(conn, source, push, observation)
                 push = self._filter_retained_profile_identity(conn, push, observation)
                 changed = self._apply_profile_push(profiles, push, observation)
                 sections = self._profile_push_sections(source, changed)
@@ -2494,6 +2496,32 @@ class EventHandlerManager:
         for source, observation in annotations:
             mark_push_applied(source, self._profile_push_owner, observation)
         return offered, handled_name, topics_changed
+
+    @staticmethod
+    def _ensure_supplied_user_type(
+        conn: sqlite3.Connection, source: object, push: ProfilePush, observation: ProfileFieldObservation
+    ) -> None:
+        if not isinstance(source, User) or source.id != push.entity_id:
+            return
+        observed = classify_dialog_type(source)
+        row = cast(
+            tuple[str] | None, conn.execute("SELECT type FROM entities WHERE id=?", (push.entity_id,)).fetchone()
+        )
+        current = DialogType.parse(row[0]) if row is not None else DialogType.UNKNOWN
+        if observed not in {DialogType.USER, DialogType.BOT} or current not in {
+            DialogType.UNKNOWN,
+            DialogType.USER,
+            DialogType.BOT,
+        }:
+            raise ValueError("profile entity type conflict")
+        if current is not DialogType.UNKNOWN and current is not observed and not source.min:
+            raise ValueError("profile entity type conflict")
+        if current is DialogType.UNKNOWN:
+            apply_partial_entity_identity(
+                conn,
+                push.entity_id,
+                PartialEntityIdentity(observed_at=observation.observed_at, observed_type=observed.value),
+            )
 
     def _flush_profile_invalidations(
         self,

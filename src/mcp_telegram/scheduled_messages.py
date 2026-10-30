@@ -921,9 +921,9 @@ class ScheduledMessageReconciler:
         self, demand_kind: DemandKind, dialog_id: int, expected_revision: str | None
     ) -> tuple[int, str | None]:
         row = cast(
-            tuple[object, object, object] | None,
+            tuple[object, object, object, object] | None,
             self._conn.execute(
-                "SELECT dialog_id,dirty_generation,discovery_due_at IS NOT NULL "
+                "SELECT dialog_id,dirty_generation,repair_due_at,discovery_due_at "
                 "FROM scheduled_reconciliation_state WHERE dialog_id=?",
                 (dialog_id,),
             ).fetchone(),
@@ -935,37 +935,36 @@ class ScheduledMessageReconciler:
         account_retry = _retry_at(self._conn)
         if account_retry is not None and account_retry > now:
             return 0, None
-        due_row = next(
-            (item for item in self._due_rows(now, demand_kind) if item[0] == dialog_id),
-            None,
-        )
-        if due_row is None:
+        repair_due, discovery_due = row[2], row[3]
+        if demand_kind is DemandKind.SCHEDULED_REPAIR:
+            due = repair_due
+        else:
+            due = discovery_due if repair_due is None else None
+        if due is None or _as_int(due) > now:
             return 0, None
-        if not self._selected_revision_is_current(dialog_id, generation, due_row[1], expected_revision):
+        if not self._selected_revision_is_current(dialog_id, generation, expected_revision):
             return 0, None
         discovery = demand_kind is DemandKind.SCHEDULED_DISCOVERY
         changed, _stopped, receipt = await self._process_due_dialog(dialog_id, generation, discovery, now)
         return changed, receipt
 
-    def _selected_revision_is_current(
-        self, dialog_id: int, generation: int, due_generation: int, expected_revision: str | None
-    ) -> bool:
+    def _selected_revision_is_current(self, dialog_id: int, generation: int, expected_revision: str | None) -> bool:
         if expected_revision is None:
             return True
-        if due_generation != generation:
-            return False
         selected_generation, _, selected_order = expected_revision.split("|", 2)
         current_order = cast(
-            tuple[object] | None,
+            tuple[object, object] | None,
             self._conn.execute(
-                "SELECT COALESCE(snapshot_observation_order,0) FROM scheduled_reconciliation_state WHERE dialog_id=?",
+                "SELECT dirty_generation,COALESCE(snapshot_observation_order,0) "
+                "FROM scheduled_reconciliation_state WHERE dialog_id=?",
                 (dialog_id,),
             ).fetchone(),
         )
         return (
             current_order is not None
+            and _as_int(current_order[0]) == generation
             and str(generation) == selected_generation
-            and str(current_order[0]) == selected_order
+            and str(current_order[1]) == selected_order
         )
 
     async def _process_due_row(

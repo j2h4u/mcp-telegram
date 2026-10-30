@@ -225,8 +225,9 @@ async def test_cancelled_slow_consume_stays_owned_and_crash_cannot_retry(clock: 
 
 
 def _wire_clock(wire: _WireHarness, monkeypatch: pytest.MonkeyPatch) -> Clock:
-    value = Clock(time.time(), time.monotonic())
+    value = Clock(time.time(), 429.31)
     monkeypatch.setattr(telegram_rpc, "time", value)
+    monkeypatch.setattr(telegram_rpc, "_COOLDOWN_DEADLINE", 0.0)
     monkeypatch.setattr(wire[0]._admission_scheduler, "_clock", value.monotonic)
     return value
 
@@ -310,7 +311,7 @@ async def test_real_wire_success_and_canonical_progress_are_both_required_for_re
     gate, sender, connection, sink = wire
     await gate.finish_startup_auto_resume()
     gate.note_canonical_progress()
-    clock.advance(3600)
+    clock.advance(3599)
     assert not await gate.maintain_auto_resume()
     assert gate._ensure_safety_ledger()._automatic_recovery() is not None
     response, packet = await _prepared_packet(wire, clock)
@@ -321,6 +322,14 @@ async def test_real_wire_success_and_canonical_progress_are_both_required_for_re
     assert not await gate.maintain_auto_resume()
     assert gate._ensure_safety_ledger()._automatic_recovery() is not None
     gate.note_canonical_progress()
+    assert gate._auto_resume_acquired and gate._auto_resume_progress
+    assert not await gate.maintain_auto_resume()
+    assert gate._ensure_safety_ledger()._automatic_recovery() is not None
+    clock.advance(1)
+    stable_since = gate._auto_resume_stable_since
+    assert stable_since is not None and stable_since == 4029.31
+    assert clock.monotonic() == stable_since + 3600
+    assert clock.monotonic() - stable_since < 3600
     assert not await gate.maintain_auto_resume()
     assert gate._ensure_safety_ledger()._automatic_recovery() is None
 

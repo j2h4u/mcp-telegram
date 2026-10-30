@@ -8,7 +8,7 @@ default:
     @just --list
 
 # Run all local source checks.
-check: fmt-check lint radon-threshold lock-check typecheck typecheck-pyright typecheck-tests import-contracts module-boundaries semantic-boundaries transaction-boundaries message-boundaries telegram-rpc-boundaries config-imports policy-placement demand-cutover runtime-seams actionlint supply-chain-pins deptry compile deadcode package-smoke
+check: fmt-check lint radon-threshold lock-check typecheck typecheck-pyright import-contracts module-boundaries semantic-boundaries transaction-boundaries message-boundaries telegram-rpc-boundaries config-imports policy-placement demand-cutover runtime-seams actionlint supply-chain-pins deptry compile deadcode package-smoke
 
 # Verify uv.lock is synchronized with pyproject.toml.
 lock-check:
@@ -33,9 +33,6 @@ typecheck:
 # Run basedpyright over the package and deploy helpers.
 typecheck-pyright:
     uv run basedpyright src/mcp_telegram deploy scripts tests --warnings
-
-# Compatibility alias for the combined BasedPyright gate.
-typecheck-tests: typecheck-pyright
 
 # Enforce named architecture contracts that should remain stable across refactors.
 import-contracts:
@@ -101,18 +98,14 @@ compile:
 package-smoke:
     uv run python scripts/check_packaging_smoke.py
 
-# Run pytest. Extra args are forwarded, e.g. `just test tests/test_daemon_api.py -q`.
-test *args:
+# Run an explicit pytest slice. For the full suite use `just crap-threshold`.
+test +args:
     uv run pytest {{args}}
 
 # Run a bounded parallel pytest slice. Avoid `-n auto` on this host: execnet can
 # hit thread limits during worker teardown.
-test-parallel *args:
+test-parallel +args:
     uv run pytest -n 2 {{args}}
-
-# Unit tests.
-unit:
-    uv run pytest
 
 # Dead-code sieve (advisory — vulture has false positives, read with judgment).
 deadcode:
@@ -125,8 +118,8 @@ deadcode:
 coverage-data:
     test_files=(tests/test_*.py); \
     split=$(((${#test_files[@]} + 1) / 2)); \
-    uv run pytest "${test_files[@]:0:split}" --cov=src/mcp_telegram --cov-report=; \
-    uv run pytest "${test_files[@]:split}" --cov=src/mcp_telegram --cov-append --cov-report=
+    just test "${test_files[@]:0:split}" --cov=src/mcp_telegram --cov-report=; \
+    just test "${test_files[@]:split}" --cov=src/mcp_telegram --cov-append --cov-report=
 
 # Enforce the repository-wide CRAP limit of 30 using per-function coverage.
 crap-threshold:

@@ -3920,7 +3920,7 @@ class TelegramRpcGate(TelegramClient):
             self._auto_resume_stable_since = time.monotonic()
         if (
             self._auto_resume_progress
-            and time.monotonic() - self._auto_resume_stable_since >= _AUTO_RESUME_STABILITY_SECONDS
+            and time.monotonic() >= self._auto_resume_stable_since + _AUTO_RESUME_STABILITY_SECONDS
         ):
             await ledger.reset_auto_resume()
             self._reset_auto_resume_stability()
