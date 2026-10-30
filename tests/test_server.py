@@ -64,7 +64,7 @@ def _minimal_schema_value(schema: dict[str, object]) -> object:  # noqa: PLR0911
     if schema_type == "boolean":
         return False
     if schema_type == "integer" or schema_type == "number":
-        return 0
+        return schema.get("minimum", 0)
     if schema_type == "null":
         return None
     return "example"
@@ -783,6 +783,8 @@ def test_list_tools_exposes_snake_case_names_titles_and_annotations() -> None:
         "get_dialog_stats": "Dialog Stats",
         "mark_dialog_for_sync": "Mark Sync",
         "get_sync_status": "Sync Status",
+        "get_message_image": "Get Message Image",
+        "prepare_message_image": "Prepare Message Image",
         "get_my_recent_activity": "Recent Activity",
         "get_inbox": "Inbox",
         "get_entity_info": "Entity Info",
@@ -836,6 +838,13 @@ def test_list_tools_exposes_snake_case_names_titles_and_annotations() -> None:
     assert trace_annotations.destructive_hint is False
     assert trace_annotations.idempotent_hint is True
     assert all(not any(part[:1].isupper() for part in name.split("_")) for name in server.tool_by_name)
+
+
+def test_image_tool_annotations_distinguish_local_read_from_preparation() -> None:
+    get_annotations = server.tool_by_name["get_message_image"].annotations
+    prepare_annotations = server.tool_by_name["prepare_message_image"].annotations
+    assert get_annotations is not None and get_annotations.read_only_hint is True
+    assert prepare_annotations is not None and prepare_annotations.read_only_hint is False
 
 
 def test_phase_52_tool_output_inventory_covers_registered_tools() -> None:
@@ -2665,7 +2674,7 @@ async def test_server_instructions_point_to_workflows_prompt(monkeypatch: pytest
 
 
 @pytest.mark.asyncio
-async def test_server_instructions_describe_structured_only_response_contract(
+async def test_server_instructions_describe_structured_and_native_image_response_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _Conn:
@@ -2682,8 +2691,8 @@ async def test_server_instructions_describe_structured_only_response_contract(
     normalized = instructions.lower()
 
     assert "structuredContent" in instructions
-    assert "structured-only" in normalized
-    assert "content may be empty" in normalized
+    assert "get_message_image may also return an image" in normalized
+    assert "for other successful tools, content is empty" in normalized
     assert "iserror=true" in normalized
     assert "untrusted content" in normalized
 

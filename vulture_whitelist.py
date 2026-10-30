@@ -179,3 +179,6 @@ TopicCatalogRepository.next_pending  # retained repository projection/fencing te
 TopicCatalogRepository.apply_page  # retained pure page projection transaction tests
 TopicCatalogRepository.mark_not_applicable  # account/eligibility fencing tests
 EntityProfileRepository.refresh_state  # repository collection-page fencing assertions
+
+# Pinned Telethon iterator calls this capability cleanup dynamically after FileMigrate.
+_return_exported_sender

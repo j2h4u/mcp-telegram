@@ -514,6 +514,10 @@ class DaemonConnection:
         """Return sync status and message stats for a dialog."""
         return await self.request({"method": "get_sync_status", "dialog_id": dialog_id})
 
+    async def get_profile_job_status(self, *, entity_id: int) -> dict:
+        """Inspect one profile job through the existing daemon status route."""
+        return await self.request({"method": "get_sync_status", "view": "profile_job", "entity_id": entity_id})
+
     async def recover_dialog_directory(self) -> dict:
         """Ask the daemon writer to replace an explicitly latched invalid attempt."""
         return await self.request({"method": "recover_dialog_directory"})

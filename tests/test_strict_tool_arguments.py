@@ -28,6 +28,8 @@ VALID_ARGUMENTS: dict[str, dict[str, object]] = {
     "mark_dialog_for_sync": {"dialog_id": 123},
     "get_sync_status": {"dialog_id": 123},
     "get_draft": {"exact_dialog_id": 123},
+    "get_message_image": {"exact_dialog_id": 123, "message_id": 1},
+    "prepare_message_image": {"exact_dialog_id": 123, "message_id": 1},
     "manage_draft": {"exact_dialog_id": 123, "action": "create", "operation_key": "validation", "text": "draft"},
     "manage_scheduled_message": {
         "exact_dialog_id": 123,
@@ -86,6 +88,16 @@ async def test_all_tools_reject_then_accept_without_executing_invalid_call(
     ("name", "invalid"),
     [("get_sync_status", {"dialog_id": value}) for value in (True, False, 123.0, 1.5, "123")]
     + [("mark_dialog_for_sync", {"enable": value}) for value in (1, 0, "true", "false")]
+    + [
+        (name, {"message_id": value})
+        for name in ("get_message_image", "prepare_message_image")
+        for value in (0, -1, True, "1")
+    ]
+    + [
+        (name, {"exact_dialog_id": value})
+        for name in ("get_message_image", "prepare_message_image")
+        for value in (0, True, "123")
+    ]
     + [
         ("search_messages", {"limit": 0}),
         ("search_messages", {"limit": 201}),

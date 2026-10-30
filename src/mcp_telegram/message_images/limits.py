@@ -1,0 +1,8 @@
+"""Fixed bounds shared by native photo acquisition and durable storage."""
+
+PHOTO_MAX_BYTES = 4 * 1024 * 1024
+PHOTO_CHUNK_BYTES = 512 * 1024
+PHOTO_MAX_ATTEMPTS = 32
+PHOTO_MAX_SETUP_ATTEMPTS = 16
+PHOTO_MAX_SLICE_REQUESTS = 2
+PHOTO_MAX_LEASE_CONTROLS = 32

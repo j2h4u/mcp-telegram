@@ -71,6 +71,11 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "fts.py",
             "history_enrollment.py",
             "hydration_queue.py",
+            "image_authorization.py",  # Connection-bound active-target revocation registry.
+            "message_images/fence.py",  # Writer-owned account/source preflight and durable allowance.
+            "message_images/repository.py",  # Canonical source and image job projection.
+            "message_images/service.py",  # Account-fenced local image status and explicit preparation.
+            "message_images/worker.py",  # Serialized image acquisition and conditional association.
             "messages/sqlite_bundle.py",
             "messages/sqlite_hydration.py",
             "messages/sqlite_hydration_jobs.py",
@@ -139,6 +144,8 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "telegram_access.py",
             "telegram_auth.py",  # Verified User type returned by the shared authentication owner.
             "telegram_transport.py",  # Owned physical transport and vendor framing adapter.
+            "telegram_image_download.py",  # Bounded vendor iterator behind the guarded dispatch port.
+            "message_images/worker.py",  # Classifies selected vendor RPC errors without transport access.
             "telegram_gateway.py",
             "telegram_rpc.py",
             "telegram_update_admission.py",  # Gate-owned vendor gap bookkeeping; no network dispatch.

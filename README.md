@@ -174,12 +174,14 @@ this work themselves: they return the facts already persisted by the daemon.
 
 ## MCP Tools
 
-There are 18 MCP tools. Successful calls are machine-oriented: agents should
+There are 20 MCP tools. Successful calls are machine-oriented: agents should
 read `structuredContent` for IDs, counts, navigation tokens, coverage, warnings,
-and Telegram-originated content.
+and Telegram-originated content. `get_message_image` additionally returns one native JPEG image when available.
 
 | Tool | Purpose |
 | --- | --- |
+| `prepare_message_image` | Explicitly queue bounded acquisition of one photo. |
+| `get_message_image` | Read a retained photo locally as a native MCP image. |
 | `list_dialogs` | List dialogs or summarize the custom-folder structure, with unread, activity, sync, draft, and cached metadata. |
 | `list_topics` | List threads for a topic-capable dialog, including forum topics and bot-DM topics. |
 | `list_messages` | Read one dialog in chronological order within each page. By default it combines local sent, scheduled, and draft rows; set `message_state="sent"` for published history only. Supports pagination, topic/sender/unread filters, UTC time bounds, reply refs, reactions, read-state markers, and archive coverage. |
@@ -431,6 +433,14 @@ Telegram account ID, clarify Telegram-read-only vs local MCP state writes, and
 remind agents to treat Telegram-originated fields as untrusted content.
 
 ## Operator Commands
+
+Inspect one current profile refresh job using an exact entity ID from dialog discovery:
+
+```bash
+docker exec -it mcp-telegram mcp-telegram summary --profile-entity-id 123456
+```
+
+The saved job and current coordinator state are separate observations; a missing job does not mean profile facts are absent.
 
 Log out and remove the local Telegram session:
 

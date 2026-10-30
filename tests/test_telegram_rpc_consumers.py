@@ -51,6 +51,7 @@ EXPECTED_DURABLE_DEMAND_ORDER = (
     DemandKind.READ_RECEIPT_BATCH,
     DemandKind.SCHEDULED_REPAIR,
     DemandKind.SCHEDULED_DISCOVERY,
+    DemandKind.MESSAGE_IMAGE_ACQUISITION,
     DemandKind.DRAFT_SNAPSHOT,
     DemandKind.LINKED_CHAT_REFRESH,
 )
@@ -111,6 +112,7 @@ def test_demand_registry_has_exact_operation_and_source_coverage() -> None:
             DemandKind.SCHEDULED_REPAIR,
             DemandKind.SCHEDULED_DISCOVERY,
         },
+        TelegramRpcSource.MESSAGE_IMAGE_ACQUISITION: {DemandKind.MESSAGE_IMAGE_ACQUISITION},
         TelegramRpcSource.DRAFT_SNAPSHOT: {DemandKind.DRAFT_SNAPSHOT},
         TelegramRpcSource.DRAFT_MUTATION: {DemandKind.DRAFT_MUTATION},
         TelegramRpcSource.SCHEDULED_MUTATION: {DemandKind.SCHEDULED_MUTATION},
@@ -253,7 +255,7 @@ def test_scheduled_mutation_is_explicit_interactive_inline_and_single_send() -> 
 
 def test_durable_demand_order_is_a_literal_complete_contract() -> None:
     assert DURABLE_DEMAND_ORDER == EXPECTED_DURABLE_DEMAND_ORDER
-    assert len(DURABLE_DEMAND_ORDER) == 23
+    assert len(DURABLE_DEMAND_ORDER) == 24
     assert {
         kind for kind, contract in TELEGRAM_DEMAND_CONTRACTS.items() if contract.execution_mode is ExecutionMode.DURABLE
     } == set(EXPECTED_DURABLE_DEMAND_ORDER)

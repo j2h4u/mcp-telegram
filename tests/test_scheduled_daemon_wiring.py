@@ -345,7 +345,9 @@ def test_schema92_preserves_legacy_rows_and_isolates_receipts(tmp_path: Path, mo
             "VALUES(200,7,'legacy',1,1)"
         )
     conn.close()
-    ensure_sync_schema(path)
+    with monkeypatch.context() as patch:
+        patch.setattr(sync_db, "_CURRENT_SCHEMA_VERSION", 92)
+        ensure_sync_schema(path)
     conn = _open_sync_db(path)
     try:
         assert conn.execute(

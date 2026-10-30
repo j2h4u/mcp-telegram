@@ -1,10 +1,12 @@
 {
   "steps": [
     {
-      "_comment": "All 18 tools registered with output schemas",
+      "_comment": "All 20 tools registered with output schemas",
       "action": "list_tools",
       "expect": {
         "tool_names_include": [
+          "prepare_message_image",
+          "get_message_image",
           "get_dialog_stats",
           "get_entity_info",
           "get_inbox",
@@ -25,6 +27,8 @@
           "manage_scheduled_message"
         ],
         "tool_expectations": {
+          "get_message_image": {"outputSchema.type": "object"},
+          "prepare_message_image": {"outputSchema.type": "object"},
           "get_dialog_stats": {
             "outputSchema.type": "object"
           },

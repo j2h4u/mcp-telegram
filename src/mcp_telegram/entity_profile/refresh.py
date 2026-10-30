@@ -88,6 +88,7 @@ class DurableRefreshSliceResult:
     entity_id: int
     terminal: DurableRefreshTerminal | None = None
     outcome: SliceOutcome | None = None
+    retryable_failure: bool = False
 
 
 class DurableRefreshTerminal(StrEnum):
@@ -159,8 +160,7 @@ class EntityRefreshCoordinator:
             return None
         timeout_seconds = self._limits.per_rpc_seconds
         with rpc_scope(TelegramRpcSource.ENTITY_INFO_REFRESH, timeout_seconds=timeout_seconds):
-            async with asyncio.timeout(self._limits.whole_refresh_seconds):
-                return await self._durable_slice_callback(budget)
+            return await self._durable_slice_callback(budget)
 
     def signal_terminal(self, result: DurableRefreshSliceResult) -> None:
         """Release coalesced waiters after durable success or persisted failure."""

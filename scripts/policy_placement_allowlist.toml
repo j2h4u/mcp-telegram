@@ -641,3 +641,38 @@ rationale = "Native scheduled idempotency-key input and storage contract shared 
 category = "policy_assignments"
 key = "src/mcp_telegram/reading/service.py:ReadingService._bound_scheduled_queue_rows:budget_truncated"
 rationale = "Derived output reports actual response truncation using the already-injected presentation budget; not a configurable budget or acquisition policy."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon_entity_info.py:_ProfileRefreshWriteReceipt:retryable_failure"
+rationale = "False initializes per-slice owner receipt state; it does not select retry timing, allowance or operator policy. Only an accepted classified failure can set this flag."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon_entity_info.py:DaemonEntityInfoService._handle_profile_slice_deadline:receipt.retryable_failure"
+rationale = "True records an accepted exact-revision failure after the existing profile-owner deadline has expired and writer ownership has drained. Retry timing and attempt authorization remain with the central coordinator."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon_entity_info.py:DaemonEntityInfoService._note_retryable_profile_failure:receipt.retryable_failure"
+rationale = "True records a classified Telegram-read failure only after accepted failure persistence and current-scope verification; this outcome marker does not define retry delays or budgets."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/entity_profile/refresh.py:DurableRefreshSliceResult:retryable_failure"
+rationale = "False is the default value of the immutable slice-result failure marker passed to the existing central demand owner, not a retry scheduling default or an operator knob."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/telegram_demand_coordinator.py:TelegramDemandCoordinator._resume_gate_wait:invocation.deadline"
+rationale = "Computed monotonic deadline from the existing demand-contract duration after an actual gate wait releases; only the same invocation's unspent allowance resumes, without resetting attempts or increasing its limit."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/telegram_demand_coordinator.py:TelegramDemandCoordinator._activate_transient_retry:invocation.deadline"
+rationale = "Computed monotonic deadline from the unchanged demand-contract duration for one centrally authorized retry after an accepted failure and existing shared backoff; method credit retains priority and cumulative accounting is preserved."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/telegram_demand_progress.py:SliceOutcomeKind:RETRYABLE_FAILURE"
+rationale = "This fixed semantic outcome tag distinguishes an accepted retryable owner failure from deferred, stale and no-progress results; the tag itself specifies no retry policy value."

@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import math
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Coroutine, Iterator
-from contextlib import AbstractContextManager
-from contextvars import Context
-from dataclasses import dataclass, replace
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
+from contextlib import AbstractContextManager, contextmanager
+from contextvars import Context, ContextVar
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from functools import wraps
@@ -36,6 +37,7 @@ from telethon.client.telegrambaseclient import (  # type: ignore[import-untyped]
 )
 from telethon.crypto import AuthKey  # type: ignore[import-untyped]
 from telethon.errors import (  # type: ignore[import-untyped]
+    FileMigrateError,
     FloodPremiumWaitError,
     FloodTestPhoneWaitError,
     FloodWaitError,
@@ -49,17 +51,19 @@ from telethon.errors import (  # type: ignore[import-untyped]
 )
 from telethon.events import Raw  # type: ignore[import-untyped]
 from telethon.events.common import EventBuilder  # type: ignore[import-untyped]
-from telethon.tl.alltlobjects import tlobjects  # type: ignore[import-untyped]
+from telethon.sessions import Session  # type: ignore[import-untyped]
+from telethon.tl.alltlobjects import LAYER, tlobjects  # type: ignore[import-untyped]
 from telethon.tl.functions.updates import (  # type: ignore[import-untyped]
     GetChannelDifferenceRequest,
     GetDifferenceRequest,
 )
 from telethon.tl.tlobject import TLRequest  # type: ignore[import-untyped]
-from telethon.utils import get_peer_id, is_list_like  # type: ignore[import-untyped]
+from telethon.utils import get_input_channel, get_peer_id, is_list_like  # type: ignore[import-untyped]
 
 from .auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from .delivered_update import DeliveredUpdate, delivered_update_context, fail_delivered_update
 from .flood import FloodWaitObservation, TelegramRpcThrottled, flood_seconds
+from .image_authorization import ScopeCell, ScopeToken
 from .request_timing import DaemonRequestTiming, current_timing
 from .scheduled_write_fence import (
     ScheduledMutationCheck,
@@ -68,6 +72,7 @@ from .scheduled_write_fence import (
     ScheduledWriteRejected,
     current_scheduled_mutation_check,
 )
+from .state import TelegramSessionLease, TelegramSessionLeasePin
 from .telegram_delivery import DeliveryEnvelope, ProtocolSnapshot, load_delivery_envelope, load_protocol_snapshot
 from .telegram_demand import (
     AcquisitionKind,
@@ -87,6 +92,21 @@ from .telegram_demand import (
     transferred_demand_context,
 )
 from .telegram_demand_progress import WorkRevision
+from .telegram_image_download import (
+    PHOTO_CHUNK_BYTES,
+    PHOTO_MAX_LEASE_CONTROLS,
+    PHOTO_MAX_SLICE_REQUESTS,
+    PhotoBudget,
+    PhotoDownloadSession,
+    PhotoLocator,
+    PhotoObservation,
+    PhotoSourceFence,
+    PhotoSourceToken,
+    PhotoTarget,
+    PhotoWork,
+    iter_photo_chunks,
+    photo_locator_from_message,
+)
 from .telegram_rpc_consumers import (
     CONNECTION_BOOTSTRAP_MAX_RPC_ATTEMPTS,
     DemandKind,
@@ -241,8 +261,9 @@ class _AdmissionAwareSender:
         del ordered
         self._gate._raise_if_transport_unavailable()
         self._gate._reject_exhausted_attempt_budget(self._scope)
-        raw_future = self._gate._main_sender.send_owned(request, self._scope)
-        wire_owner = self._gate._require_wire_owner(self._gate._main_sender.application_owner(raw_future))
+        sender = self._selected_sender()
+        raw_future = sender.send_owned(request, self._scope)
+        wire_owner = self._gate._require_wire_owner(sender.application_owner(raw_future))
         if self._scope.source is TelegramRpcSource.TELETHON_RECONNECT_PROBE:
             self._gate._reconnect_wire_owner = wire_owner
         started_at = time.monotonic()
@@ -274,6 +295,15 @@ class _AdmissionAwareSender:
                 timing.add_phase("rpc_admission", (admission_end - started_at) * 1000)
                 if wire_owner.dispatch_at is not None:
                     timing.add_phase("rpc_execution", (ended_at - wire_owner.dispatch_at) * 1000)
+
+    def _selected_sender(self) -> _MainSender:
+        capability = _PHOTO_CAPABILITY.get()
+        if capability is None or not capability.use_auxiliary:
+            return self._gate._main_sender
+        lease = capability.lease
+        if lease is None or lease.sender is None or lease.revoked:
+            raise RuntimeError("photo auxiliary sender is unavailable")
+        return cast(_MainSender, lease.sender)
 
     @staticmethod
     def _raise_if_cancel_pending() -> None:
@@ -357,7 +387,8 @@ class _MainSenderAdapter:
 
     @auth_key.setter
     def auth_key(self, value: object) -> None:
-        self._gate._main_sender.auth_key = value
+        with self._gate._image_identity_change():
+            self._gate._main_sender.auth_key = value
 
     def _transport_connected(self) -> bool:
         return (
@@ -557,7 +588,12 @@ def _valid_safety_intent(key: object, value: object, *, version: int = 3) -> boo
         isinstance(key, str)
         and bool(key)
         and isinstance(value, dict)
-        and set(value) in ({"method", "run", "phase", "scope"}, {"method", "run", "phase", "scope", "policy_recovery"})
+        and set(value)
+        in (
+            {"method", "run", "phase", "scope"},
+            {"method", "run", "phase", "scope", "policy_recovery"},
+            {"method", "run", "phase", "scope", "aux_bootstrap"},
+        )
         and _valid_safety_intent_payload(value, version=version)
     )
 
@@ -570,7 +606,97 @@ def _valid_safety_intent_payload(value: dict[str, object], *, version: int) -> b
         and _valid_intent_scope(value["scope"])
         and _valid_policy_recovery(value.get("policy_recovery"), value["scope"])
         and (version == _SAFETY_RECEIPT_VERSION or "policy_recovery" not in value)
+        and _valid_aux_bootstrap(value, version=version)
         and _valid_intent_disposition(value)
+    )
+
+
+def _valid_aux_bootstrap(intent: dict[str, object], *, version: int) -> bool:
+    aux = intent.get("aux_bootstrap")
+    if aux is None:
+        return "aux_bootstrap" not in intent
+    if version != _SAFETY_RECEIPT_VERSION or not isinstance(aux, dict):
+        return False
+    return _valid_aux_provenance(intent, aux)
+
+
+def _valid_aux_provenance(intent: dict[str, object], aux: dict[str, object]) -> bool:
+    fields = {
+        "purpose",
+        "main_scope",
+        "aux_dc_id",
+        "aux_key_id",
+        "lease_id",
+        "work_id",
+        "attempt_generation",
+        "source_generation",
+        "contained",
+    }
+    if set(aux) not in (fields, fields | {"lock_scope", "lock_owner_id"}):
+        return False
+    if not isinstance(intent["run"], str) or not intent["run"]:
+        return False
+    methods = {
+        "export": "telethon.tl.functions.auth.ExportAuthorizationRequest:e5bfffcd",
+        "import": "telethon.tl.functions.auth.ImportAuthorizationRequest:a57a7dad",
+    }
+    main = aux["main_scope"]
+    purpose = aux["purpose"]
+    if not isinstance(purpose, str) or methods.get(purpose) != intent["method"]:
+        return False
+    if not _valid_intent_scope(main) or not isinstance(main, dict):
+        return False
+    if not _valid_aux_fields(intent, aux, main):
+        return False
+    binding = (
+        main
+        if purpose == "export"
+        else {"dc_id": aux["aux_dc_id"], "key_id": aux["aux_key_id"], "account_id": main["account_id"]}
+    )
+    return intent["scope"] == binding
+
+
+def _valid_aux_fields(intent: dict[str, object], aux: dict[str, object], main: dict[str, object]) -> bool:
+    return all(
+        (
+            main["key_id"] is not None,
+            main["account_id"] is not None,
+            type(aux["aux_dc_id"]) is int and cast(int, aux["aux_dc_id"]) > 0,
+            type(aux["aux_key_id"]) is int,
+            aux["aux_key_id"] != main["key_id"],
+            all(
+                isinstance(aux[key], str) and bool(aux[key])
+                for key in ("lease_id", "work_id", "attempt_generation", "source_generation")
+            ),
+            type(aux["contained"]) is bool,
+            not aux["contained"] or intent["phase"] == "unknown",
+            "lock_scope" not in aux or _valid_aux_lock_scope(aux["lock_scope"]),
+            "lock_owner_id" not in aux or _valid_aux_lock_owner(aux["lock_owner_id"]),
+        )
+    )
+
+
+def _valid_aux_lock_scope(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"version", "device", "inode"}
+        and type(value["version"]) is int
+        and value["version"] == 1
+        and type(value["device"]) is int
+        and value["device"] >= 0
+        and type(value["inode"]) is int
+        and value["inode"] > 0
+    )
+
+
+_AUX_OWNER_HEX_WIDTH = 32
+
+
+def _valid_aux_lock_owner(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == _AUX_OWNER_HEX_WIDTH
+        and all(char in "0123456789abcdef" for char in value)
     )
 
 
@@ -594,7 +720,19 @@ def _valid_policy_recovery(value: object, scope: object) -> bool:
     )
 
 
+def _is_contained_aux(item: dict[str, object]) -> bool:
+    aux = item.get("aux_bootstrap")
+    return isinstance(aux, dict) and aux.get("contained") is True and item["phase"] == "unknown"
+
+
 def _intent_blocks(item: dict[str, object], scope: dict[str, object]) -> bool:
+    aux = item.get("aux_bootstrap")
+    if (
+        _is_contained_aux(item)
+        and isinstance(aux, dict)
+        and aux["main_scope"] == {key: scope[key] for key in ("dc_id", "key_id", "account_id")}
+    ):
+        return False
     return item["phase"] != "acknowledged_unknown" and not (
         item["phase"] == "unknown"
         and item.get("policy_recovery") is not None
@@ -811,13 +949,31 @@ class _MethodReceipt(dict[str, object]):
         self.credits: dict[WorkRevision, _MethodRetryCredit] = {}
 
 
+def _safety_identity_projection(record: dict[str, object]) -> tuple[object, object, object]:
+    protection = record.get("protection")
+    identity_failures = {
+        "safety_auth_scope_mismatch",
+        "safety_canonical_owner_mismatch",
+        "authentication_account_mismatch",
+        "invalid_account_identity",
+    }
+    return record.get("scope"), record.get("transition"), protection if protection in identity_failures else None
+
+
 class TelegramRpcSafetyLedger:
     """Keep prewrite uncertainty durable without binding it to caller cancellation."""
 
     def __init__(
-        self, store: TelegramRpcSafetyStore, *, dc_id: int, key_id: int | None, boot_id: str | None = None
+        self,
+        store: TelegramRpcSafetyStore,
+        *,
+        dc_id: int,
+        key_id: int | None,
+        boot_id: str | None = None,
+        image_scope_cell: ScopeCell | None = None,
     ) -> None:
         self._store = store
+        self._image_scope_cell = image_scope_cell
         self._authentication_authorized = False
         self._boot_id = boot_id if boot_id is not None else _system_boot_id()
         self._run = uuid.uuid4().hex
@@ -1123,12 +1279,21 @@ class TelegramRpcSafetyLedger:
             if not _validate_safety_record(updated):
                 raise ValueError("invalid outbound safety mutation")
             encoded = json.dumps(updated, separators=(",", ":"), sort_keys=True, allow_nan=False)
+            cell = self._image_scope_cell
+            identity_changed = _safety_identity_projection(updated) != _safety_identity_projection(self._record)
+            scope_change = cell.begin_change() if cell is not None and identity_changed else None
             try:
                 await self._store.save_record(self._encoded, encoded)
             except Exception:
                 self._storage_failed = True
+                if cell is not None:
+                    cell.publish(None)
                 raise
-            self._record, self._encoded = updated, encoded
+            else:
+                self._record, self._encoded = updated, encoded
+            finally:
+                if cell is not None and scope_change is not None:
+                    cell.end_change(scope_change)
 
     def _retain_method_bindings(self, updated: dict[str, object]) -> None:
         previous = cast(dict[str, dict[str, object]], self._record["methods"])
@@ -1202,8 +1367,23 @@ class TelegramRpcSafetyLedger:
         *,
         transport_identity: tuple[int, int | None] | None = None,
         auth_only: bool = False,
+        aux_bootstrap: dict[str, object] | None = None,
     ) -> None:
         self.require_writable(auth_only=auth_only)
+
+        def attach_aux(intent: dict[str, object], scope: dict[str, object], provenance: dict[str, object]) -> None:
+            main_scope = {key: scope[key] for key in ("dc_id", "key_id", "account_id")}
+            if scope["stage"] != "verified" or provenance.get("main_scope") != main_scope:
+                raise ValueError("auxiliary bootstrap does not own the verified main scope")
+            if provenance.get("contained") is not False:
+                raise ValueError("auxiliary bootstrap must start uncontained")
+            if not _valid_aux_lock_scope(provenance.get("lock_scope")):
+                raise ValueError("auxiliary bootstrap requires a pinned session lock")
+            if not _valid_aux_lock_owner(provenance.get("lock_owner_id")):
+                raise ValueError("auxiliary bootstrap requires a session lock owner")
+            intent["aux_bootstrap"] = provenance
+            if not _valid_safety_intent(attempt_id, intent):
+                raise ValueError("invalid auxiliary bootstrap provenance")
 
         def add(record: dict[str, object]) -> None:
             if self.protection_reason is not None:
@@ -1214,11 +1394,115 @@ class TelegramRpcSafetyLedger:
             transition = record["transition"]
             previous = cast(dict[str, object], transition["from"]) if isinstance(transition, dict) else scope
             binding = {"dc_id": dc_id, "key_id": key_id, "account_id": previous["account_id"]}
-            intents.setdefault(attempt_id, {"method": method, "run": self._run, "phase": "prepared", "scope": binding})
+            intent: dict[str, object] = {"method": method, "run": self._run, "phase": "prepared", "scope": binding}
+            if aux_bootstrap is not None:
+                provenance = cast(dict[str, object], json.loads(json.dumps(aux_bootstrap)))
+                attach_aux(intent, scope, provenance)
+            existing = intents.get(attempt_id)
+            if aux_bootstrap is not None and existing is not None and existing != intent:
+                raise ValueError("outbound attempt identity changed")
+            intents.setdefault(attempt_id, intent)
             floor = cast(dict[str, object], record["floor"])
             self._rebase_floor(floor)
 
         await self._commit(add)
+
+    async def _contain_aux_unknown(self, attempt_id: str, *, captured_scope: dict[str, object], lease_id: str) -> None:
+        """Record gate-proven retirement without changing the unknown outcome."""
+
+        def contain(record: dict[str, object]) -> None:
+            scope = cast(dict[str, object], record["scope"])
+            intent = cast(dict[str, dict[str, object]], record["intents"]).get(attempt_id)
+            aux = intent.get("aux_bootstrap") if intent else None
+            main = {key: scope[key] for key in ("dc_id", "key_id", "account_id")}
+            if not isinstance(aux, dict) or intent is None:
+                raise ValueError("auxiliary retirement lacks an owned intent")
+            if not all(
+                (
+                    scope["stage"] == "verified",
+                    captured_scope == main,
+                    intent["run"] == self._run,
+                    intent["phase"] == "unknown",
+                    aux["main_scope"] == main,
+                    aux["lease_id"] == lease_id,
+                )
+            ):
+                raise ValueError("auxiliary retirement does not match the owned unknown intent")
+            aux["contained"] = True
+            if record["protection"] == "unresolved_outbound_outcome" and not any(
+                _intent_blocks(item, scope) for item in cast(dict[str, dict[str, object]], record["intents"]).values()
+            ):
+                record["protection"] = None
+            record["generation"] = uuid.uuid4().hex
+
+        await self._commit(contain)
+        if self._startup_hold == "unresolved_outbound_outcome" and not self._unresolved():
+            self._startup_hold = None
+
+    async def _reconcile_aux_after_restart(self, lease: TelegramSessionLease) -> None:
+        """Contain prior auxiliary uncertainty only while the same kernel lease is pinned."""
+        if type(lease) is not TelegramSessionLease or not lease.is_held():
+            raise ValueError("a live Telegram session lease is required")
+        pin = lease._pin()
+        try:
+            lock_scope = pin.identity()
+            owner_id = pin.owner_id()
+            if not any(
+                self._restart_aux_matches(item, self._record, lock_scope, owner_id)
+                for item in cast(dict[str, dict[str, object]], self._record.get("intents", {})).values()
+            ):
+                return
+
+            def reconcile(record: dict[str, object]) -> None:
+                if not lease.is_held() or lease.identity() != lock_scope or lease.owner_id() != owner_id:
+                    raise ValueError("Telegram session lease was revoked")
+                scope = cast(dict[str, object], record["scope"])
+                intents = cast(dict[str, dict[str, object]], record["intents"])
+                for item in intents.values():
+                    if self._restart_aux_matches(item, record, lock_scope, owner_id):
+                        item["phase"] = "unknown"
+                        cast(dict[str, object], item["aux_bootstrap"])["contained"] = True
+                if record["protection"] == "unresolved_outbound_outcome" and not any(
+                    _intent_blocks(item, scope) for item in intents.values()
+                ):
+                    record["protection"] = None
+                record["generation"] = uuid.uuid4().hex
+
+            task = asyncio.create_task(self._commit(reconcile))
+            cancelled = False
+            while not task.done():
+                try:
+                    await asyncio.wait({task})
+                except asyncio.CancelledError:
+                    cancelled = True
+            task.result()
+            if self._startup_hold == "unresolved_outbound_outcome" and not self._unresolved():
+                self._startup_hold = None
+            if cancelled:
+                raise asyncio.CancelledError
+        finally:
+            pin._release()
+
+    def _restart_aux_matches(
+        self, intent: dict[str, object], record: dict[str, object], lock_scope: dict[str, int], owner_id: str
+    ) -> bool:
+        scope = cast(dict[str, object], record["scope"])
+        aux = intent.get("aux_bootstrap")
+        if not self._read_scope_valid or scope["stage"] != "verified" or record["transition"] is not None:
+            return False
+        if not isinstance(aux, dict) or not _valid_aux_bootstrap(intent, version=_SAFETY_RECEIPT_VERSION):
+            return False
+        return all(
+            (
+                intent["run"] != self._run,
+                intent["phase"] in {"prepared", "unknown"},
+                aux["contained"] is False,
+                aux.get("lock_scope") == lock_scope,
+                aux.get("lock_owner_id") is not None and aux["lock_owner_id"] != owner_id,
+                aux["main_scope"] == {key: scope[key] for key in ("dc_id", "key_id", "account_id")},
+                all(owner in {None, scope["account_id"]} for owner in self._store.canonical_owners()),
+            )
+        )
 
     def mark_claimed(self, attempt_id: str, *, auth_only: bool = False) -> None:
         self.require_writable(auth_only=auth_only)
@@ -1323,16 +1607,24 @@ class TelegramRpcSafetyLedger:
         prior = intents.get(attempt_id)
         if isinstance(prior, dict) and prior["run"] != self._run:
             raise ValueError("completion does not own this outbound intent")
+        if isinstance(prior, dict) and _is_contained_aux(prior):
+            return
         if known_outcome or (
             attempt_id not in self._claimed and (not isinstance(prior, dict) or prior["phase"] == "prepared")
         ):
             intents.pop(attempt_id, None)
         elif attempt_id in intents:
-            cast(dict[str, object], intents[attempt_id])["phase"] = "unknown"
-            trial = record["recovery"]
-            if not (isinstance(trial, dict) and trial.get("state") == "exhausted"):
-                record["protection"] = "unresolved_outbound_outcome"
-            record["generation"] = uuid.uuid4().hex
+            self._mark_unknown_intent(record, cast(dict[str, object], intents[attempt_id]))
+
+    @staticmethod
+    def _mark_unknown_intent(record: dict[str, object], intent: dict[str, object]) -> None:
+        intent["phase"] = "unknown"
+        trial = record["recovery"]
+        if record["protection"] in {None, "unresolved_outbound_outcome"} and not (
+            isinstance(trial, dict) and trial.get("state") == "exhausted"
+        ):
+            record["protection"] = "unresolved_outbound_outcome"
+        record["generation"] = uuid.uuid4().hex
 
     def _invalidate_recovery_trial(
         self, record: dict[str, object], *, known_flood: bool = False, cause: RecoveryCause | None = None
@@ -1410,6 +1702,8 @@ class TelegramRpcSafetyLedger:
         verified_same = scope["stage"] == "verified" and scope["account_id"] == account_id
         compatible = all(owner is None or owner == account_id for owner in owners)
         if not compatible or (not verified_same and owners not in {(None, None), (account_id, account_id)}):
+            if self._image_scope_cell is not None:
+                self._image_scope_cell.publish(None)
             self._startup_hold = "safety_canonical_owner_mismatch"
             self.require_writable()
 
@@ -2197,6 +2491,43 @@ class _ActiveDelivery:
 
 
 @dataclass(slots=True, eq=False)
+class _PhotoWireCapability:
+    issuer: object
+    scope: TelegramAuthScope
+    owner_task: asyncio.Task[object]
+    request_body: bytes
+    budget: PhotoBudget
+    source_fence: PhotoSourceFence | None
+    setup: bool
+    revoked: bool = False
+    lease: _AuxPhotoLease | None = None
+    use_auxiliary: bool = False
+    aux_bootstrap: dict[str, object] | None = None
+    wire_owner: _WireAttempt | None = None
+    photo_session: _GuardedPhotoSession | None = None
+
+
+_PHOTO_CAPABILITY: ContextVar[_PhotoWireCapability | None] = ContextVar("telegram_photo_capability", default=None)
+
+
+@dataclass(slots=True, eq=False)
+class _AuxPhotoLease:
+    gate: TelegramRpcGate
+    scope: TelegramAuthScope
+    owner_task: asyncio.Task[object]
+    rpc_scope: TelegramRpcScope
+    budget: PhotoBudget
+    source_fence: PhotoSourceFence
+    dc_id: int
+    lease_id: str
+    work: PhotoWork
+    locator: PhotoLocator
+    sender: GuardedMTProtoSender | None = None
+    revoked: bool = False
+    control_budget: RpcAttemptBudget = field(default_factory=lambda: RpcAttemptBudget(PHOTO_MAX_LEASE_CONTROLS))
+
+
+@dataclass(slots=True, eq=False)
 class _WireAttempt:
     issuer: object
     attempt_id: str
@@ -2220,6 +2551,8 @@ class _WireAttempt:
     draft_mutation: bool = False
     scheduled_check: ScheduledMutationCheck | None = None
     scheduled_mutation: bool = False
+    photo_capability: _PhotoWireCapability | None = None
+    photo_lease: _AuxPhotoLease | None = None
 
 
 def _application_request(request: object) -> TLRequest:
@@ -2274,6 +2607,146 @@ class _WirePermit:
     method_generation: str | None = None
     scheduled_token: ScheduledMutationToken | None = None
     released: bool = False
+    photo_token: PhotoSourceToken | None = None
+    auxiliary_generation: int | None = None
+
+
+class _AuxPhotoAuthority:
+    """Bind the existing physical authority to one gate-owned auxiliary sender."""
+
+    def __init__(self, lease: _AuxPhotoLease) -> None:
+        self._lease = lease
+        self._gate = lease.gate
+
+    def register_application(self, request: object, body: bytes, scope: TelegramRpcScope) -> object:
+        owner = self._gate._require_wire_owner(self._gate.register_application(request, body, scope))
+        owner.photo_lease = self._lease
+        return owner
+
+    def register_protocol(self, request: object, body: bytes, origin: ProtocolOrigin) -> object:
+        return self._gate._register_aux_photo_protocol(self._lease, request, body, origin)
+
+    async def prepare_write(self, owner: object) -> object:
+        return await self._gate.prepare_write(owner)
+
+    def claim_write(self, owner: object, permit: object) -> bool:
+        return self._gate.claim_write(owner, permit)
+
+    def observe_write_return(self, owner: object) -> None:
+        self._gate.observe_write_return(owner)
+
+    def defer_write(self, owner: object, permit: object) -> None:
+        self._gate.defer_write(owner, permit)
+
+    async def observe_result(
+        self, owner: object, error: BaseException | None, result: object = None
+    ) -> BaseException | None:
+        return await self._gate.observe_result(owner, error, result)
+
+    def observe_error_now(self, owner: object, error: BaseException) -> None:
+        self._gate.observe_error_now(owner, error)
+
+    def protect_transport(self, error: BaseException) -> None:
+        self._lease.revoked = True
+        if not isinstance(error, (TransportConnectError, TransportWriteError)):
+            self._gate.protect_transport(error)
+
+    def transport_terminated(self, error: BaseException | None) -> BaseException | None:
+        self._lease.revoked = True
+        return error
+
+
+class _GuardedPhotoSession:
+    """Private, one-owner capability passed only to the pinned photo iterator."""
+
+    def __init__(  # noqa: PLR0913, PLR0917 - the capability binds these separate owner facts.
+        self,
+        gate: TelegramRpcGate,
+        locator: PhotoLocator,
+        scope: TelegramAuthScope,
+        work: PhotoWork,
+        budget: PhotoBudget,
+        source_fence: PhotoSourceFence,
+        owner_task: asyncio.Task[object],
+    ) -> None:
+        self.gate = gate
+        self.locator = locator
+        self.scope = scope
+        self.work = work
+        self.budget = budget
+        self.source_fence = source_fence
+        self.owner_task = owner_task
+        self.dc_id = locator.dc_id
+        self.redirected = False
+        self.closed = False
+        self.slicing = False
+        self._pending_migration: int | None = None
+        self.slice_reservations = 0
+        self.slice_evidence: RpcAttemptEvidence | None = None
+        self._close_task: asyncio.Task[None] | None = None
+
+    def _require_owner(self) -> None:
+        if self.closed or asyncio.current_task() is not self.owner_task or self.gate._photo_session is not self:
+            raise UnclassifiedTelegramRpcError("photo session is no longer owned")
+
+    async def chunks(self, *, offset: int) -> AsyncIterator[bytes]:
+        self._require_owner()
+        if self.slicing:
+            raise RuntimeError("photo slice is already running")
+        self.slicing = True
+        evidence = current_demand_token().attempt_evidence
+        if self.slice_evidence is not evidence:
+            self.slice_reservations = 0
+            self.slice_evidence = evidence
+        try:
+            await self.gate._ensure_photo_transport(self)
+            async for chunk in iter_photo_chunks(self.locator, offset=offset, dispatch=self, log=self.gate._log):
+                yield chunk
+        finally:
+            self._pending_migration = None
+            self.slicing = False
+
+    async def get_file(self, request: functions.upload.GetFileRequest) -> object:
+        self._require_owner()
+        if not self.slicing:
+            raise RuntimeError("photo file dispatch requires an active slice")
+        self._pending_migration = None
+        try:
+            return await self.gate._photo_file_request(self, request)
+        except FileMigrateError as exc:
+            self._pending_migration = exc.new_dc
+            raise
+
+    async def migrate(self, dc_id: int) -> None:
+        self._require_owner()
+        if (
+            not self.slicing
+            or self.redirected
+            or type(dc_id) is not int
+            or dc_id <= 0
+            or self._pending_migration != dc_id
+        ):
+            raise RuntimeError("photo migration is unavailable")
+        self._pending_migration = None
+        await self.budget.reserve_redirect(dc_id)
+        self.redirected = True
+        await self.gate._close_photo_aux_lease()
+        self.dc_id = dc_id
+        await self.gate._ensure_photo_transport(self)
+
+    async def close(self) -> None:
+        if self._close_task is None:
+            self._require_owner()
+            self.closed = True
+            self._close_task = asyncio.create_task(self._close_owned(), context=Context())
+        cancelled = await self.gate._join_vendor_disconnect(self._close_task)
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _close_owned(self) -> None:
+        await self.gate._close_photo_aux_lease()
+        if self.gate._photo_session is self:
+            self.gate._photo_session = None
 
 
 class TelegramRpcGate(TelegramClient):
@@ -2349,6 +2822,7 @@ class TelegramRpcGate(TelegramClient):
             GuardedMTProtoSender(
                 unused_sender.auth_key,
                 authority=self,
+                identity_change=self._image_identity_change,
                 loggers=self._log,
                 retries=self._connection_retries,
                 delay=self._retry_delay,
@@ -2386,6 +2860,14 @@ class TelegramRpcGate(TelegramClient):
         self._safety_store = safety_store
         self._safety: TelegramRpcSafetyLedger | None = None
         self._wire_issuer = object()
+        self._image_scope_cell = ScopeCell()
+        self._photo_issuer = object()
+        self._session_lease: TelegramSessionLease | None = None
+        self._session_pin: TelegramSessionLeasePin | None = None
+        self._photo_aux_lease: _AuxPhotoLease | None = None
+        self._photo_session: _GuardedPhotoSession | None = None
+        self._photo_locators: dict[int, tuple[PhotoLocator, ScopeToken]] = {}
+        self._photo_wire_fault_owner: str | None = None
         self._vendor_call_tasks: set[asyncio.Task[object]] = set()
         self._dc_transition_target: int | None = None
         self._owned_disconnect: asyncio.Task[None] | None = None
@@ -2704,6 +3186,7 @@ class TelegramRpcGate(TelegramClient):
     async def _close_rpc_scheduler_owned(self) -> None:
         operations = [
             self._quiesce_reconnect_probe,
+            self._shutdown_photo_session,
             self._disconnect_main_sender,
             self._admission_scheduler.close,
             self._main_sender.settle_shutdown,
@@ -2724,6 +3207,24 @@ class TelegramRpcGate(TelegramClient):
             primary = primary or error
         if primary is not None:
             raise primary
+        self._release_session_pin()
+
+    def _release_session_pin(self) -> None:
+        if self._photo_aux_lease is not None:
+            raise RuntimeError("photo auxiliary lease remains uncontained")
+        if self._session_pin is not None:
+            self._session_pin._release()
+            self._session_pin = None
+
+    async def _shutdown_photo_session(self) -> None:
+        session = self._photo_session
+        if session is None:
+            await self._close_photo_aux_lease()
+            return
+        session.closed = True
+        if session._close_task is None:
+            session._close_task = asyncio.create_task(session._close_owned(), context=Context())
+        await self._join_vendor_disconnect(session._close_task)
 
     async def _drain_cooldown_saves(self) -> None:
         """Keep durable FloodWait receipts owned until shutdown can close storage."""
@@ -2904,7 +3405,9 @@ class TelegramRpcGate(TelegramClient):
                 assert self.session is not None
                 self.session.set_dc(DEFAULT_DC_ID, DEFAULT_IPV6_IP if self._use_ipv6 else DEFAULT_IPV4_IP, DEFAULT_PORT)
                 dc_id, key_id = self._offline_wire_identity()
-            self._safety = TelegramRpcSafetyLedger(self._safety_store, dc_id=dc_id, key_id=key_id)
+            self._safety = TelegramRpcSafetyLedger(
+                self._safety_store, dc_id=dc_id, key_id=key_id, image_scope_cell=self._image_scope_cell
+            )
             global _COOLDOWN_DEADLINE
             if math.isfinite(self._safety.floor_deadline):
                 _COOLDOWN_DEADLINE = max(_COOLDOWN_DEADLINE, self._safety.floor_deadline)
@@ -2931,6 +3434,7 @@ class TelegramRpcGate(TelegramClient):
     def register_application(self, request: object, body: bytes, scope: TelegramRpcScope) -> object:
         if not isinstance(body, bytes) or scope.deadline is None or not math.isfinite(scope.deadline):
             raise RuntimeError("invalid owned Telegram application scope")
+        capability = self._photo_application_capability(request, scope)
         method = _canonical_wire_method(request)
         self._check_draft_application(request, scope)
         self._check_operator_application(request, scope)
@@ -2951,6 +3455,9 @@ class TelegramRpcGate(TelegramClient):
             transport_auth=self._authentication_mode or self._logout_mode,
         )
         owner = _WireAttempt(self._wire_issuer, attempt_id, method, bound, timing=current_timing())
+        owner.photo_capability = capability
+        if capability is not None:
+            capability.wire_owner = owner
         owner.self_lookup = self._is_self_lookup(actual)
         owner.draft_mutation = type(actual) is functions.messages.SaveDraftRequest
         owner.scheduled_check = scheduled_check
@@ -2958,6 +3465,46 @@ class TelegramRpcGate(TelegramClient):
         if scheduled_check is not None:
             self._require_scheduled_mutation_budget(bound)
         return owner
+
+    def _photo_application_capability(self, request: object, scope: TelegramRpcScope) -> _PhotoWireCapability | None:
+        actual = _application_request(request)
+        capability = _PHOTO_CAPABILITY.get()
+        restricted = type(actual) in (
+            functions.upload.GetFileRequest,
+            functions.auth.ExportAuthorizationRequest,
+            functions.auth.ImportAuthorizationRequest,
+        )
+        if capability is None:
+            if restricted or scope.demand_kind is DemandKind.MESSAGE_IMAGE_ACQUISITION:
+                raise UnclassifiedTelegramRpcError("photo transport requires a gate-owned capability")
+            return None
+        self._validate_photo_capability(capability, actual, scope)
+        return capability
+
+    def _validate_photo_capability(
+        self, capability: _PhotoWireCapability, actual: TLRequest, scope: TelegramRpcScope
+    ) -> None:
+        if self._session_lease is None or not self._session_lease.is_held():
+            raise UnclassifiedTelegramRpcError("photo transport requires the held session lease")
+        if (
+            capability.issuer is not self._photo_issuer
+            or capability.revoked
+            or capability.owner_task is not asyncio.current_task()
+        ):
+            raise UnclassifiedTelegramRpcError("photo transport capability is invalid")
+        self._validate_photo_capability_binding(capability, actual, scope)
+
+    def _validate_photo_capability_binding(
+        self, capability: _PhotoWireCapability, actual: TLRequest, scope: TelegramRpcScope
+    ) -> None:
+        if (
+            scope.demand_kind is not DemandKind.MESSAGE_IMAGE_ACQUISITION
+            or self.retained_auth_scope() != capability.scope
+            or bytes(actual) != capability.request_body
+        ):
+            raise UnclassifiedTelegramRpcError("photo transport capability is invalid")
+        if capability.lease is not None and (self._photo_aux_lease is not capability.lease or capability.lease.revoked):
+            raise UnclassifiedTelegramRpcError("photo auxiliary lease is revoked")
 
     @staticmethod
     def _draft_budget_valid(scope: TelegramRpcScope) -> bool:
@@ -3191,6 +3738,55 @@ class TelegramRpcGate(TelegramClient):
         )
         return _WireAttempt(self._wire_issuer, attempt_id, method, bound)
 
+    def _register_aux_photo_protocol(
+        self, lease: _AuxPhotoLease, request: object, body: bytes, origin: ProtocolOrigin
+    ) -> _WireAttempt:
+        allowed: dict[str, tuple[type[object], ...]] = {
+            "ack": (types.MsgsAck,),
+            "ping": (functions.PingRequest,),
+            "state_info": (types.MsgsStateInfo,),
+            "auth": (functions.ReqPqMultiRequest, functions.ReqDHParamsRequest, functions.SetClientDHParamsRequest),
+        }
+        if (
+            self._photo_aux_lease is not lease
+            or lease.revoked
+            or origin not in allowed
+            or type(request) not in allowed[origin]
+            or not isinstance(body, bytes)
+        ):
+            raise RuntimeError("invalid auxiliary photo protocol request")
+        kind = type(request)
+        constructor = getattr(kind, "CONSTRUCTOR_ID", None)
+        if type(constructor) is not int:
+            raise RuntimeError("invalid auxiliary photo constructor")
+        attempt_id = uuid.uuid4().hex
+        method = f"{kind.__module__}.{kind.__name__}:{constructor:08x}"
+        control = origin != "auth"
+        bound = replace(
+            lease.rpc_scope,
+            request_method=method,
+            owned_attempt_id=attempt_id,
+            attempt_budget=lease.control_budget if control else self._wire_budget(lease.rpc_scope),
+            transport_control=control,
+            transport_bootstrap=not control,
+            transport_auth=False,
+        )
+        owner = _WireAttempt(self._wire_issuer, attempt_id, method, bound)
+        owner.photo_lease = lease
+        if not control:
+            owner.photo_capability = _PhotoWireCapability(
+                self._photo_issuer,
+                lease.scope,
+                lease.owner_task,
+                body,
+                lease.budget,
+                lease.source_fence,
+                True,
+                lease=lease,
+                use_auxiliary=True,
+            )
+        return owner
+
     def _require_wire_owner(self, value: object) -> _WireAttempt:
         if not isinstance(value, _WireAttempt) or value.issuer is not self._wire_issuer:
             raise RuntimeError("unowned Telegram transport attempt")
@@ -3314,12 +3910,41 @@ class TelegramRpcGate(TelegramClient):
         try:
             method_generation = await self._prepare_method_permission(owner)
             scheduled_token = await self._revalidate_scheduled_write(owner)
+            photo_token = await self._prepare_photo_write(owner)
         except BaseException:
             self._admission_scheduler.complete(admission)
             raise
         if owner.claimed == 0:
             owner.method_generation = method_generation
-        return _WirePermit(owner, admission, generation, method_generation, scheduled_token)
+        return _WirePermit(
+            owner,
+            admission,
+            generation,
+            method_generation,
+            scheduled_token,
+            photo_token=photo_token,
+            auxiliary_generation=self._auxiliary_generation(owner),
+        )
+
+    @staticmethod
+    def _auxiliary_generation(owner: _WireAttempt) -> int | None:
+        lease = owner.photo_lease
+        return lease.sender.write_generation if lease is not None and lease.sender is not None else None
+
+    async def _prepare_photo_write(self, owner: _WireAttempt) -> PhotoSourceToken | None:
+        capability = owner.photo_capability
+        if capability is None:
+            return None
+        if capability.revoked or self.retained_auth_scope() != capability.scope:
+            raise UnclassifiedTelegramRpcError("photo capability has been revoked")
+        token = await capability.source_fence.prepare() if capability.source_fence is not None else None
+        session = capability.photo_session
+        if session is not None and not capability.setup:
+            if session.slice_reservations >= PHOTO_MAX_SLICE_REQUESTS:
+                raise RuntimeError("photo slice physical allowance exhausted")
+            session.slice_reservations += 1
+        await capability.budget.reserve(setup=capability.setup)
+        return token
 
     def _check_auto_trial_prepare(self, owner: _WireAttempt) -> None:
         if not self._automatic_trial_claim_allowed(owner):
@@ -3353,15 +3978,28 @@ class TelegramRpcGate(TelegramClient):
         if not scope.transport_control:
             ledger.require_writable(auth_only=scope.transport_auth)
             self._check_method_eligibility(owner)
-            dc_id, key_id = self._offline_wire_identity()
+            lease = owner.photo_lease
+            if lease is None:
+                dc_id, key_id = self._offline_wire_identity()
+            else:
+                dc_id = lease.dc_id
+                key_id = lease.sender.auth_key.key_id if lease.sender is not None and lease.sender.auth_key else None
             recorded_scope = cast(dict[str, object], ledger._record["scope"])
-            if key_id is not None and (
-                recorded_scope["stage"] == "key_pending"
-                or (recorded_scope["dc_id"], recorded_scope["key_id"]) != (dc_id, key_id)
+            if (
+                lease is None
+                and key_id is not None
+                and (
+                    recorded_scope["stage"] == "key_pending"
+                    or (recorded_scope["dc_id"], recorded_scope["key_id"]) != (dc_id, key_id)
+                )
             ):
                 await ledger.bind_key(dc_id, key_id, auth_only=scope.transport_auth)
             await ledger.prepare(
-                owner.attempt_id, owner.method, transport_identity=(dc_id, key_id), auth_only=scope.transport_auth
+                owner.attempt_id,
+                owner.method,
+                transport_identity=(dc_id, key_id),
+                auth_only=scope.transport_auth,
+                aux_bootstrap=owner.photo_capability.aux_bootstrap if owner.photo_capability is not None else None,
             )
             self._check_method_eligibility(owner)
 
@@ -3494,6 +4132,8 @@ class TelegramRpcGate(TelegramClient):
     def _permit_still_eligible(self, owner: _WireAttempt, permit: _WirePermit) -> bool:
         if owner.revoked:
             return False
+        if not self._photo_claim_current(owner, permit):
+            return False
         if self._reconnect_quiescing and owner.scope.source is TelegramRpcSource.TELETHON_RECONNECT_PROBE:
             return False
         if not self._automatic_trial_claim_allowed(owner):
@@ -3501,6 +4141,38 @@ class TelegramRpcGate(TelegramClient):
         if permit.generation != self._wire_token() or self._wire_release_at(owner.scope) > time.monotonic():
             return False
         return self._permit_method_and_owner_eligible(owner, permit)
+
+    def _photo_claim_current(self, owner: _WireAttempt, permit: _WirePermit) -> bool:
+        lease = owner.photo_lease
+        if lease is not None and not self._aux_photo_claim_current(lease, permit):
+            return False
+        capability = owner.photo_capability
+        if capability is None:
+            return True
+        return self._photo_capability_claim_current(capability, permit)
+
+    def _photo_capability_claim_current(self, capability: _PhotoWireCapability, permit: _WirePermit) -> bool:
+        if capability.lease is not None and (self._photo_aux_lease is not capability.lease or capability.lease.revoked):
+            return False
+        return (
+            not capability.revoked
+            and self._session_lease is not None
+            and self._session_lease.is_held()
+            and self.retained_auth_scope() == capability.scope
+            and (permit.photo_token is None or permit.photo_token.is_current())
+        )
+
+    def _aux_photo_claim_current(self, lease: _AuxPhotoLease, permit: _WirePermit) -> bool:
+        sender = lease.sender
+        if self._photo_aux_lease is not lease or lease.revoked or sender is None:
+            return False
+        if sender.write_generation != permit.auxiliary_generation or not sender.physical_connected():
+            return False
+        return (
+            self.retained_auth_scope() == lease.scope
+            and self._session_lease is not None
+            and self._session_lease.is_held()
+        )
 
     def _permit_method_and_owner_eligible(self, owner: _WireAttempt, permit: _WirePermit) -> bool:
         if not owner.scope.transport_control and not self._ensure_safety_ledger().method_claim_valid(
@@ -3596,6 +4268,7 @@ class TelegramRpcGate(TelegramClient):
             owner.receipt = receipt
             self._notify_rpc_eligibility_changed()
         elif not isinstance(error, RPCError) and owner.claimed and not owner.scope.transport_control:
+            self._note_photo_fault_owner(owner)
             self._wire_fault = "unresolved_outbound_outcome"
             self._recovery_cause = (
                 RecoveryCause.TRANSIENT
@@ -3603,6 +4276,12 @@ class TelegramRpcGate(TelegramClient):
                 else RecoveryCause.READ_UNCERTAINTY
             )
             self._notify_rpc_eligibility_changed()
+
+    def _note_photo_fault_owner(self, owner: _WireAttempt) -> None:
+        if self._wire_fault is None and owner.photo_capability is not None and owner.photo_capability.aux_bootstrap:
+            self._photo_wire_fault_owner = owner.attempt_id
+        elif self._photo_wire_fault_owner != owner.attempt_id:
+            self._photo_wire_fault_owner = None
 
     def _observe_result_phase(self, owner: _WireAttempt, error: BaseException | None) -> None:
         if (
@@ -3633,10 +4312,16 @@ class TelegramRpcGate(TelegramClient):
         if owner.terminal:
             if owner.receipt is not None:
                 await asyncio.shield(owner.receipt)
+            if self._retired_photo_export(owner, error):
+                return RuntimeError("retired photo authorization response discarded")
             return None
         method_affected = owner.method in cast(dict[str, object], self._ensure_safety_ledger()._record["methods"])
         try:
-            rejected = await self._guard_identity_result(owner, error, result)
+            rejected = (
+                RuntimeError("retired photo authorization response discarded")
+                if self._retired_photo_export(owner, error)
+                else await self._guard_identity_result(owner, error, result)
+            )
             await self._complete_wire_result(owner, error, rejected)
             owner.terminal = True
             self._note_successful_acquisition(owner, error, rejected)
@@ -3654,11 +4339,7 @@ class TelegramRpcGate(TelegramClient):
         if owner.receipt is not None:
             await asyncio.shield(owner.receipt)
             return
-        known = (
-            error is None
-            or isinstance(error, RPCError)
-            or (isinstance(error, ScheduledWriteRejected) and owner.claimed == 0)
-        )
+        known = self._wire_outcome_known(owner, error)
         ledger = self._ensure_safety_ledger()
         await ledger.complete(
             owner.attempt_id,
@@ -3671,6 +4352,24 @@ class TelegramRpcGate(TelegramClient):
         )
         if not known:
             self._observe_unknown_incident(owner, error, ledger)
+
+    def _wire_outcome_known(self, owner: _WireAttempt, error: BaseException | None) -> bool:
+        return not self._retired_photo_export(owner, error) and (
+            error is None
+            or isinstance(error, RPCError)
+            or (isinstance(error, ScheduledWriteRejected) and owner.claimed == 0)
+        )
+
+    @staticmethod
+    def _retired_photo_export(owner: _WireAttempt, error: BaseException | None) -> bool:
+        capability = owner.photo_capability
+        return (
+            error is None
+            and owner.revoked
+            and capability is not None
+            and isinstance(capability.aux_bootstrap, dict)
+            and capability.aux_bootstrap.get("purpose") == "export"
+        )
 
     @staticmethod
     def _transient_terminal_error(error: BaseException | None) -> bool:
@@ -3779,6 +4478,7 @@ class TelegramRpcGate(TelegramClient):
 
     def protect_transport(self, error: BaseException) -> None:
         self._reset_auto_resume_stability()
+        self._photo_wire_fault_owner = None
         if isinstance(error, (TransportConnectError, TransportWriteError)):
             self._wire_fault = "transport_unavailable"
             self._recovery_cause = RecoveryCause.TRANSIENT
@@ -3792,6 +4492,7 @@ class TelegramRpcGate(TelegramClient):
         expected = self._transport_state is _TransportBoundaryState.DISCONNECTING
         self._wire_generation += 1
         if not expected:
+            self._photo_wire_fault_owner = None
             self._transport_state = _TransportBoundaryState.FAILED
             self._wire_fault = self._wire_fault or "transport_terminated"
             if self._wire_fault == "transport_terminated":
@@ -3844,6 +4545,13 @@ class TelegramRpcGate(TelegramClient):
         )
         if not enabled:
             self._reset_auto_resume_stability()
+
+    def bind_session_lease(self, lease: TelegramSessionLease) -> None:
+        """Bind the actual live session-lock capability before startup admission."""
+        if type(lease) is not TelegramSessionLease or not lease.is_held() or self._session_lease is not None:
+            raise RuntimeError("a held Telegram session lease is required")
+        self._session_pin = lease._pin()
+        self._session_lease = lease
 
     def set_auto_resume_stop(self, stopped: Callable[[], bool]) -> None:
         """Use the daemon's existing stop signal at the physical trial boundary."""
@@ -3971,9 +4679,10 @@ class TelegramRpcGate(TelegramClient):
         )
         if clear_key:
             assert self.session is not None
-            self.session.auth_key = None
-            cast(AuthKey, self._main_sender.auth_key).key = None
-            self.session.save()
+            with self._image_identity_change():
+                self.session.auth_key = None
+                cast(AuthKey, self._main_sender.auth_key).key = None
+                self.session.save()
         self._authentication_token = token
         self._authentication_mode = True
 
@@ -4019,9 +4728,10 @@ class TelegramRpcGate(TelegramClient):
             await ledger.confirm_logout()
             self.close_update_delivery()
             assert self.session is not None
-            self.session.auth_key = None
-            cast(AuthKey, self._main_sender.auth_key).key = None
-            self.session.save()
+            with self._image_identity_change():
+                self.session.auth_key = None
+                cast(AuthKey, self._main_sender.auth_key).key = None
+                self.session.save()
             await ledger.clear_logged_out_key()
         except BaseException:
             if not prepared:
@@ -4040,6 +4750,56 @@ class TelegramRpcGate(TelegramClient):
             return None
         return TelegramAuthScope(AUTH_SCOPE_VERSION, account_id, dc_id, key_id)
 
+    def capture_image_scope(self) -> ScopeToken | None:
+        """Capture a verified scope generation on the daemon event loop."""
+        asyncio.get_running_loop()
+        scope = self._verified_image_scope()
+        if not self._image_scope_cell.publish(scope) or scope is None:
+            return None
+        return self._image_scope_cell.capture()
+
+    def _verified_image_scope(self) -> TelegramAuthScope | None:
+        ledger = self._safety
+        session = self.session
+        lease = self._session_lease
+        if ledger is None or ledger._storage_failed or session is None or lease is None or not lease.is_held():
+            return None
+        return self._scope_from_initialized_identity(ledger, session)
+
+    @staticmethod
+    def _scope_from_initialized_identity(ledger: TelegramRpcSafetyLedger, session: Session) -> TelegramAuthScope | None:
+        key = session.auth_key
+        persisted = ledger._record.get("scope")
+        if ledger._record.get("protection") in {"invalid_account_identity", "authentication_account_mismatch"}:
+            return None
+        if (
+            not isinstance(persisted, dict)
+            or key is None
+            or key.key_id is None
+            or ledger._record.get("transition") is not None
+        ):
+            return None
+        account = ledger.verified_account_id
+        if account is None or (persisted.get("dc_id"), persisted.get("key_id"), persisted.get("account_id")) != (
+            session.dc_id,
+            key.key_id,
+            account,
+        ):
+            return None
+        return TelegramAuthScope(AUTH_SCOPE_VERSION, account, session.dc_id, key.key_id)
+
+    def claim_image_scope(self, token: ScopeToken) -> bool:
+        """Atomically authorize the captured generation without database access."""
+        return self._image_scope_cell.claim(token)
+
+    @contextmanager
+    def _image_identity_change(self) -> Iterator[None]:
+        change = self._image_scope_cell.begin_change()
+        try:
+            yield
+        finally:
+            self._image_scope_cell.end_change(change)
+
     async def authorize_account_recovery(self, expected_generation: str, acknowledged: bool) -> None:
         await self._ensure_safety_ledger().authorize_recovery(expected_generation, acknowledged=acknowledged)
 
@@ -4047,6 +4807,8 @@ class TelegramRpcGate(TelegramClient):
         """Consume an explicit one-use grant before any connection/bootstrap write."""
         ledger = self._ensure_safety_ledger()
         try:
+            if self._session_lease is not None and self._session_lease.is_held():
+                await ledger._reconcile_aux_after_restart(self._session_lease)
             await ledger.consume_auto_resume()
             await ledger.consume_recovery()
             ledger.require_writable()
@@ -4126,6 +4888,407 @@ class TelegramRpcGate(TelegramClient):
         if isinstance(request, (GetDifferenceRequest, GetChannelDifferenceRequest)):
             return await self._call_update_difference(request, ordered=ordered)
         return await self._call_registered(request, ordered=ordered)
+
+    async def _photo_owned_request(  # noqa: PLR0913 - explicit claim inputs bind the photo request.
+        self,
+        request: TLRequest,
+        *,
+        scope: TelegramAuthScope,
+        budget: PhotoBudget,
+        source_fence: PhotoSourceFence | None,
+        setup: bool,
+        photo_session: _GuardedPhotoSession | None = None,
+    ) -> object:
+        task = asyncio.current_task()
+        if task is None or self.retained_auth_scope() != scope:
+            raise UnclassifiedTelegramRpcError("photo account scope is unavailable")
+        root = current_demand_token()
+        if root.kind is not DemandKind.MESSAGE_IMAGE_ACQUISITION:
+            raise UnclassifiedTelegramRpcError("photo acquisition requires its owned demand")
+        if photo_session is None:
+            if type(request) not in (functions.messages.GetMessagesRequest, functions.channels.GetMessagesRequest):
+                raise UnclassifiedTelegramRpcError("photo observation permits only the exact message request")
+        else:
+            self._validate_photo_file_request(photo_session, request)
+        capability = _PhotoWireCapability(self._photo_issuer, scope, task, bytes(request), budget, source_fence, setup)
+        capability.photo_session = photo_session
+        if photo_session is not None and photo_session.dc_id != scope.dc_id:
+            capability.lease = self._photo_aux_lease
+            capability.use_auxiliary = True
+        context = _PHOTO_CAPABILITY.set(capability)
+        try:
+            return await self(request)
+        finally:
+            capability.revoked = True
+            _PHOTO_CAPABILITY.reset(context)
+
+    async def _retire_uncertain_photo_bootstrap(self, capability: _PhotoWireCapability, lease: _AuxPhotoLease) -> None:
+        owner = capability.wire_owner
+        provenance = capability.aux_bootstrap
+        if owner is None or owner.claimed == 0 or not isinstance(provenance, dict):
+            return
+        self._revoke_wire_owner(owner)
+        ledger = self._ensure_safety_ledger()
+        if not await self._photo_unknown_intent_owned(owner, ledger):
+            return
+        if self._wire_fault is None:
+            self._wire_fault = "unresolved_outbound_outcome"
+            self._photo_wire_fault_owner = owner.attempt_id
+        if not owner.terminal:
+            await ledger.complete(owner.attempt_id, known_outcome=False, method_generation=owner.method_generation)
+            owner.terminal = True
+        if provenance["purpose"] == "import":
+            await self._close_photo_aux_lease()
+        await ledger._contain_aux_unknown(
+            owner.attempt_id, captured_scope=cast(dict[str, object], provenance["main_scope"]), lease_id=lease.lease_id
+        )
+        self._release_photo_unknown_wire_fault(owner, ledger)
+
+    @staticmethod
+    async def _photo_unknown_intent_owned(owner: _WireAttempt, ledger: TelegramRpcSafetyLedger) -> bool:
+        if owner.receipt is not None:
+            await asyncio.shield(owner.receipt)
+        prior = cast(dict[str, dict[str, object]], ledger._record["intents"]).get(owner.attempt_id)
+        return prior is not None and (not owner.terminal or prior["phase"] == "unknown")
+
+    def _release_photo_unknown_wire_fault(self, owner: _WireAttempt, ledger: TelegramRpcSafetyLedger) -> None:
+        if (
+            self._photo_wire_fault_owner == owner.attempt_id
+            and self._wire_fault == "unresolved_outbound_outcome"
+            and not ledger._unresolved()
+            and ledger.protection_reason is None
+        ):
+            self._wire_fault = None
+            self._recovery_cause = None
+            self._photo_wire_fault_owner = None
+            self._notify_rpc_eligibility_changed()
+
+    def _validate_photo_file_request(self, session: _GuardedPhotoSession, request: TLRequest) -> None:
+        session._require_owner()
+        if type(request) is not functions.upload.GetFileRequest or not session.slicing:
+            raise UnclassifiedTelegramRpcError("photo download request is not owned")
+        if (
+            bytes(request.location) != bytes(cast(types.InputPhotoFileLocation, session.locator.location))
+            or request.cdn_supported
+            or request.precise
+            or request.limit != PHOTO_CHUNK_BYTES
+        ):
+            raise UnclassifiedTelegramRpcError("photo download request differs from the approved locator")
+        if request.offset < 0 or request.offset % PHOTO_CHUNK_BYTES or request.offset >= session.locator.size:
+            raise UnclassifiedTelegramRpcError("photo download request differs from the approved locator")
+
+    async def _photo_file_request(
+        self, session: _GuardedPhotoSession, request: functions.upload.GetFileRequest
+    ) -> object:
+        return await self._photo_owned_request(
+            request,
+            scope=session.scope,
+            budget=session.budget,
+            source_fence=session.source_fence,
+            setup=False,
+            photo_session=session,
+        )
+
+    async def _ensure_photo_transport(self, session: _GuardedPhotoSession) -> None:
+        session._require_owner()
+        if self.retained_auth_scope() != session.scope:
+            raise UnclassifiedTelegramRpcError("photo account scope changed")
+        if session.dc_id != session.scope.dc_id:
+            await self._open_photo_aux_lease(session)
+
+    async def _close_photo_aux_lease(self) -> None:
+        lease = self._photo_aux_lease
+        if lease is None:
+            return
+        lease.revoked = True
+        sender = lease.sender
+        if sender is not None:
+            await sender.disconnect_for_containment()
+            await sender.settle_shutdown()
+            sender.auth_key.key = None
+        self._photo_aux_lease = None
+
+    async def _open_photo_aux_lease(self, session: _GuardedPhotoSession) -> None:
+        if self._photo_aux_lease is not None:
+            if self._photo_aux_lease.dc_id == session.dc_id and not self._photo_aux_lease.revoked:
+                return
+            raise RuntimeError("another photo auxiliary lease is active")
+        task = asyncio.current_task()
+        if task is None or self._session_pin is None or self.retained_auth_scope() != session.scope:
+            raise RuntimeError("photo auxiliary ownership is unavailable")
+        lease = _AuxPhotoLease(
+            self,
+            session.scope,
+            task,
+            current_rpc_scope(),
+            session.budget,
+            session.source_fence,
+            session.dc_id,
+            uuid.uuid4().hex,
+            session.work,
+            session.locator,
+        )
+        self._photo_aux_lease = lease
+        try:
+            option = await self._photo_dc_option(session, lease)
+            await self._connect_aux_photo_sender(lease, option)
+            await self._authorize_aux_photo_sender(session, lease)
+        except BaseException:
+            cleanup = asyncio.create_task(self._close_photo_aux_lease(), context=Context())
+            await self._join_vendor_disconnect(cleanup)
+            raise
+
+    async def _connect_aux_photo_sender(self, lease: _AuxPhotoLease, option: types.DcOption) -> None:
+        sender = GuardedMTProtoSender(
+            None,
+            authority=_AuxPhotoAuthority(lease),
+            loggers=self._log,
+            retries=0,
+            delay=self._retry_delay,
+            auto_reconnect=False,
+            connect_timeout=self._timeout,
+            auth_key_callback=None,
+            updates_queue=None,
+            auto_reconnect_callback=None,
+        )
+        lease.sender = sender
+        connection = GuardedConnectionTcpFull(
+            option.ip_address,
+            option.port,
+            option.id,
+            loggers=self._log,
+            proxy=self._proxy,
+            local_addr=self._local_addr,
+        )
+        await sender.connect(connection)
+
+    async def _authorize_aux_photo_sender(self, session: _GuardedPhotoSession, lease: _AuxPhotoLease) -> None:
+        exported = await self._photo_bootstrap_request(
+            session,
+            lease,
+            functions.auth.ExportAuthorizationRequest(lease.dc_id),
+            use_auxiliary=False,
+        )
+        if type(exported) is not types.auth.ExportedAuthorization:
+            await self._ensure_safety_ledger().reject_identity_result(mismatched_account=False)
+            raise RuntimeError("invalid exported photo authorization")
+        exported = cast(types.auth.ExportedAuthorization, exported)
+        import_request = functions.auth.ImportAuthorizationRequest(exported.id, exported.bytes)
+        init_request = copy.copy(self._init_request)
+        init_request.query = import_request
+        wrapped = functions.InvokeWithLayerRequest(LAYER, init_request)
+        authorized = await self._photo_bootstrap_request(session, lease, wrapped, use_auxiliary=True)
+        if type(authorized) is not types.auth.Authorization:
+            await self._ensure_safety_ledger().reject_identity_result(mismatched_account=False)
+            raise RuntimeError("invalid auxiliary photo authorization")
+        authorized = cast(types.auth.Authorization, authorized)
+        if type(authorized.user) is not types.User:
+            await self._ensure_safety_ledger().reject_identity_result(mismatched_account=False)
+            raise RuntimeError("invalid auxiliary photo authorization")
+        if authorized.user.id != session.scope.account_id:
+            await self._ensure_safety_ledger().reject_identity_result(mismatched_account=True)
+            raise RuntimeError("auxiliary photo authorization returned a different account")
+
+    async def _photo_dc_option(self, session: _GuardedPhotoSession, lease: _AuxPhotoLease) -> types.DcOption:
+        config = type(self)._config
+        if config is None:
+            config = await self._photo_bootstrap_request(
+                session, lease, functions.help.GetConfigRequest(), use_auxiliary=False
+            )
+        if type(config) is not types.Config:
+            raise RuntimeError("Telegram DC configuration is unavailable")
+        candidates = [option for option in config.dc_options if option.id == lease.dc_id and not option.cdn]
+        if not candidates:
+            raise RuntimeError("photo media DC is unavailable")
+        return next((option for option in candidates if bool(option.ipv6) == self._use_ipv6), candidates[0])
+
+    async def _photo_bootstrap_request(
+        self, session: _GuardedPhotoSession, lease: _AuxPhotoLease, request: TLRequest, *, use_auxiliary: bool
+    ) -> object:
+        session._require_owner()
+        actual = _application_request(request)
+        if type(actual) not in (
+            functions.help.GetConfigRequest,
+            functions.auth.ExportAuthorizationRequest,
+            functions.auth.ImportAuthorizationRequest,
+        ):
+            raise UnclassifiedTelegramRpcError("unsupported photo bootstrap method")
+        if self._photo_aux_lease is not lease or lease.revoked or self.retained_auth_scope() != lease.scope:
+            raise UnclassifiedTelegramRpcError("photo auxiliary lease is unavailable")
+        capability = _PhotoWireCapability(
+            self._photo_issuer,
+            lease.scope,
+            lease.owner_task,
+            bytes(actual),
+            lease.budget,
+            lease.source_fence,
+            True,
+            lease=lease,
+            use_auxiliary=use_auxiliary,
+        )
+        capability.photo_session = session
+        if type(actual) in (functions.auth.ExportAuthorizationRequest, functions.auth.ImportAuthorizationRequest):
+            capability.aux_bootstrap = self._photo_bootstrap_provenance(
+                lease, type(actual) is functions.auth.ExportAuthorizationRequest
+            )
+        context = _PHOTO_CAPABILITY.set(capability)
+        try:
+            return await self(request)
+        except BaseException as error:
+            if (
+                capability.aux_bootstrap is not None
+                and not isinstance(error, RPCError)
+                and not isinstance(error.__cause__, RPCError)
+            ):
+                cleanup = asyncio.create_task(self._retire_uncertain_photo_bootstrap(capability, lease))
+                await self._join_vendor_disconnect(cleanup)
+            raise
+        finally:
+            capability.revoked = True
+            _PHOTO_CAPABILITY.reset(context)
+
+    def _photo_bootstrap_provenance(self, lease: _AuxPhotoLease, export: bool) -> dict[str, object]:
+        sender = lease.sender
+        if sender is None or sender.auth_key is None or sender.auth_key.key_id is None or self._session_pin is None:
+            raise RuntimeError("photo auxiliary key is unavailable")
+        return {
+            "purpose": "export" if export else "import",
+            "main_scope": {
+                "dc_id": lease.scope.dc_id,
+                "key_id": lease.scope.auth_key_id,
+                "account_id": lease.scope.account_id,
+            },
+            "aux_dc_id": lease.dc_id,
+            "aux_key_id": sender.auth_key.key_id,
+            "lease_id": lease.lease_id,
+            "work_id": lease.work.key,
+            "attempt_generation": lease.work.attempt_generation,
+            "source_generation": lease.work.source_generation,
+            "contained": False,
+            "lock_scope": self._session_pin.identity(),
+            "lock_owner_id": self._session_pin.owner_id(),
+        }
+
+    def _photo_message_request(self, target: PhotoTarget) -> TLRequest:
+        if not self._photo_target_valid(target):
+            raise ValueError("invalid photo message target")
+        if self.session is None:
+            raise ValueError("photo dialog identity is unavailable")
+        peer = self.session.get_input_entity(target.dialog_id)
+        if type(peer) is types.InputPeerSelf:
+            scope = self.retained_auth_scope()
+            if scope is None or target.dialog_id != scope.account_id:
+                raise ValueError("photo dialog identity differs from the verified account")
+        elif get_peer_id(peer) != target.dialog_id:
+            raise ValueError("photo dialog identity does not match the requested dialog")
+        ids: list[types.TypeInputMessage] = [types.InputMessageID(target.message_id)]
+        if type(peer) is types.InputPeerChannel:
+            channel = get_input_channel(peer)
+            if channel is None:
+                raise ValueError("photo channel identity is unavailable")
+            return functions.channels.GetMessagesRequest(channel, ids)
+        return functions.messages.GetMessagesRequest(ids)
+
+    @staticmethod
+    def _photo_target_valid(target: PhotoTarget) -> bool:
+        return (
+            type(target.dialog_id) is int
+            and target.dialog_id != 0
+            and type(target.message_id) is int
+            and target.message_id > 0
+        )
+
+    async def resolve_photo(
+        self,
+        target: PhotoTarget,
+        *,
+        scope: TelegramAuthScope,
+        observation_order: int,
+        budget: PhotoBudget,
+        source_fence: PhotoSourceFence,
+    ) -> PhotoObservation:
+        """Resolve one exact photo message through the existing physical gateway."""
+        if type(observation_order) is not int or observation_order < 0 or self.retained_auth_scope() != scope:
+            raise ValueError("photo observation binding is invalid")
+        token = self.capture_image_scope()
+        if token is None or token.scope != scope:
+            raise ValueError("photo observation scope is unavailable")
+        request = self._photo_message_request(target)
+        response = await self._photo_owned_request(
+            request, scope=scope, budget=budget, source_fence=source_fence, setup=True
+        )
+        message = self._photo_message_from_response(response, target)
+        locator = photo_locator_from_message(message)
+        if not self.claim_image_scope(token):
+            raise ValueError("photo observation scope changed")
+        self._photo_locators.clear()
+        self._photo_locators[id(locator)] = (locator, token)
+        return PhotoObservation(message, locator)
+
+    @staticmethod
+    def _photo_message_from_response(response: object, target: PhotoTarget) -> object:
+        messages = getattr(response, "messages", None)
+        if not isinstance(messages, list) or len(messages) != 1:
+            raise ValueError("photo message is unavailable")
+        message = messages[0]
+        peer = cast(object, getattr(message, "peer_id", None))
+        if getattr(message, "id", None) != target.message_id or peer is None or get_peer_id(peer) != target.dialog_id:
+            raise ValueError("photo response does not match the requested message")
+        return cast(object, message)
+
+    async def open_photo_download(
+        self,
+        locator: PhotoLocator,
+        *,
+        scope: TelegramAuthScope,
+        work: PhotoWork,
+        budget: PhotoBudget,
+        source_fence: PhotoSourceFence,
+    ) -> PhotoDownloadSession:
+        """Bind one gate-issued locator to one live photo job owner."""
+        task = asyncio.current_task()
+        issued_token = self._require_issued_photo_locator(locator, scope)
+        if task is None:
+            raise UnclassifiedTelegramRpcError("photo acquisition has no owner")
+        if self._photo_session is not None or self._session_lease is None or not self._session_lease.is_held():
+            raise TelegramRpcAdmissionDeferred(
+                retry_after_seconds=self._scheduler_policy.admission_retry_seconds,
+                detail="photo acquisition owner is unavailable",
+            )
+        if current_demand_token().kind is not DemandKind.MESSAGE_IMAGE_ACQUISITION:
+            raise UnclassifiedTelegramRpcError("photo acquisition requires its owned demand")
+        session = _GuardedPhotoSession(self, locator, scope, work, budget, source_fence, task)
+        self._photo_session = session
+        try:
+            await self._restore_photo_session(session, issued_token)
+            self._photo_locators.pop(id(locator))
+        except BaseException:
+            if self._photo_session is session:
+                self._photo_session = None
+            raise
+        return session
+
+    async def _restore_photo_session(self, session: _GuardedPhotoSession, token: ScopeToken) -> None:
+        redirect_dc = await session.budget.current_redirect()
+        if redirect_dc is not None:
+            if type(redirect_dc) is not int or redirect_dc <= 0:
+                raise RuntimeError("persisted photo migration destination is invalid")
+            session.dc_id = redirect_dc
+            session.redirected = True
+        if (
+            self.retained_auth_scope() != session.scope
+            or not self.claim_image_scope(token)
+            or self._photo_session is not session
+        ):
+            raise UnclassifiedTelegramRpcError("photo session binding changed")
+
+    def _require_issued_photo_locator(self, locator: PhotoLocator, scope: TelegramAuthScope) -> ScopeToken:
+        issued = self._photo_locators.get(id(locator))
+        if issued is None or issued[0] is not locator or issued[1].scope != scope:
+            raise UnclassifiedTelegramRpcError("photo locator is not owned by this account")
+        if not self.claim_image_scope(issued[1]) or self.retained_auth_scope() != scope:
+            raise UnclassifiedTelegramRpcError("photo locator scope changed")
+        return issued[1]
 
     async def _call(
         self,
@@ -4372,16 +5535,17 @@ class TelegramRpcGate(TelegramClient):
         await self._check_connection_admission(scope)
         self._dc_transition_target = dc_id
         try:
-            await super()._switch_dc(dc_id)  # type: ignore[misc]
-            transition = self._ensure_safety_ledger()._record["transition"]
-            if isinstance(transition, dict) and transition["purpose"] == "dc_migration":
-                account_id = transition["validated_account"]
-                if type(account_id) is not int:
-                    profile = cast(object, await self.get_me())
-                    if not isinstance(profile, types.User):
-                        raise RuntimeError("DC transition did not verify the account")
-                    account_id = profile.id
-                await self._ensure_safety_ledger().finish_dc_transition(account_id)
+            with self._image_identity_change():
+                await super()._switch_dc(dc_id)  # type: ignore[misc]
+                transition = self._ensure_safety_ledger()._record["transition"]
+                if isinstance(transition, dict) and transition["purpose"] == "dc_migration":
+                    account_id = transition["validated_account"]
+                    if type(account_id) is not int:
+                        profile = cast(object, await self.get_me())
+                        if not isinstance(profile, types.User):
+                            raise RuntimeError("DC transition did not verify the account")
+                        account_id = profile.id
+                    await self._ensure_safety_ledger().finish_dc_transition(account_id)
         finally:
             self._dc_transition_target = None
 
@@ -4476,7 +5640,8 @@ class TelegramRpcGate(TelegramClient):
                 await self._connect_with_retry_slots(initial_dc=new_dc)
                 return
             raise _ConnectionDcMigrationRequestedError(new_dc)
-        await super()._switch_dc(new_dc)  # type: ignore[misc]
+        with self._image_identity_change():
+            await super()._switch_dc(new_dc)  # type: ignore[misc]
 
     def _capture_connection_capability(self) -> _ConnectionCapability:
         """Coalesce one finite mechanical allowance under the original cause."""

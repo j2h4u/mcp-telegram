@@ -14,6 +14,7 @@ from .. import message_contracts as _message_contracts
 from ..alert_policy import incoming_human_dm_sql
 from ..fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
 from ..hydration_queue import HydrationPriority, HydrationQueueRepository
+from ..image_authorization import invalidate_message_source, invalidate_nonchannel_sources
 from ..media_fact import decode_media_fact, is_transcribable_telegram_media
 from ..observation_order import allocate_observation_order
 from ..own_only_contracts import CHANNEL_PEER_ID_OFFSET, is_channel_peer_id
@@ -117,6 +118,7 @@ def record_nonchannel_deletions(
 ) -> tuple[int, ...]:
     """Retain terminal evidence even before the canonical peer/body is known."""
     ids = _validated_message_ids(message_ids)
+    invalidate_nonchannel_sources(conn, ids)
     conn.executemany(
         "INSERT OR IGNORE INTO nonchannel_message_deletions(message_id,deleted_at) VALUES(?,?)",
         ((message_id, deleted_at) for message_id in ids),
@@ -137,6 +139,8 @@ def record_message_deletions(conn: sqlite3.Connection, dialog_id: int, message_i
         is None
     ]
     if pending:
+        for message_id in pending:
+            invalidate_message_source(conn, dialog_id, message_id)
         observation_order = allocate_observation_order(conn)
         conn.executemany(
             "INSERT INTO message_observations(dialog_id,message_id,observation_order,is_deleted) VALUES(?,?,?,1) ON CONFLICT(dialog_id,message_id) DO UPDATE SET is_deleted=1,observation_order=excluded.observation_order",
@@ -313,6 +317,8 @@ def insert_messages_with_fts(
 ) -> int:
     """Persist accepted bundles and return their unique key count."""
     accepted = _accepted_message_bundles(conn, extracted, reaction_source)
+    for item in accepted:
+        invalidate_message_source(conn, item.message.dialog_id, item.message.message_id)
     fallback_sequence = (
         allocate_observation_order(conn) if any(item.observation_order is None for item in accepted) else 0
     )
@@ -321,6 +327,18 @@ def insert_messages_with_fts(
         conn.execute(
             "INSERT INTO message_observations(dialog_id,message_id,observation_order,source_rank) VALUES(?,?,?,?) ON CONFLICT(dialog_id,message_id) DO UPDATE SET observation_order=excluded.observation_order,source_rank=excluded.source_rank",
             (item.message.dialog_id, item.message.message_id, sequence, ReactionAggregateSource(reaction_source).rank),
+        )
+        conn.execute(
+            "INSERT INTO message_image_sources(dialog_id,message_id,photo_id,observation_order,eligible) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(dialog_id,message_id) DO UPDATE SET photo_id=excluded.photo_id, "
+            "observation_order=excluded.observation_order,eligible=excluded.eligible",
+            (
+                item.message.dialog_id,
+                item.message.message_id,
+                item.private_photo_id,
+                sequence,
+                int(item.private_photo_eligible),
+            ),
         )
     projected = _overlay_message_transcriptions(conn, _preserve_transcribed_texts(conn, accepted))
     _write_message_rows_and_fts(conn, projected, priority=priority)

@@ -6,6 +6,7 @@ import sqlite3
 from typing import cast
 
 from ..hydration_queue import TRANSCRIPTION_HYDRATION_KIND, HydrationJob, HydrationPriority, HydrationQueueRepository
+from ..image_authorization import invalidate_message_source
 from ..media_fact import decode_media_fact, is_transcribable_telegram_media
 from ..observation_order import delivered_observation_order
 from .sqlite_bundle import has_nonchannel_deletion, persist_transcribed_text, read_message_text
@@ -210,13 +211,26 @@ def apply_hydrated_media_fact(  # noqa: PLR0913
     """Apply one media fact only while full-history access remains current."""
     if not hydration_observation_current(conn, dialog_id, message_id, observation_order):
         return False
-    cursor = conn.execute(
-        "UPDATE messages SET media_kind = ?, media_payload = ? WHERE dialog_id = ? AND message_id = ? AND "
+    eligibility = (
+        "dialog_id = ? AND message_id = ? AND "
         + _MEDIA_METADATA_HYDRATION_ELIGIBILITY_SQL.replace("m.", "")
         + " AND EXISTS ("
         + _FACT_HYDRATION_ELIGIBILITY_SQL
-        + ")",
-        (media_kind, media_payload, dialog_id, message_id, dialog_id),
+        + ")"
+    )
+    parameters = (dialog_id, message_id, dialog_id)
+    changed = cast(
+        tuple[int] | None,
+        conn.execute(
+            "SELECT 1 FROM messages WHERE " + eligibility + " AND (media_kind IS NOT ? OR media_payload IS NOT ?)",
+            (*parameters, media_kind, media_payload),
+        ).fetchone(),
+    )
+    if changed is not None:
+        invalidate_message_source(conn, dialog_id, message_id)
+    cursor = conn.execute(
+        "UPDATE messages SET media_kind = ?, media_payload = ? WHERE " + eligibility,
+        (media_kind, media_payload, *parameters),
     )
     return cursor.rowcount > 0
 

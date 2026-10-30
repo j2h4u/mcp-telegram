@@ -135,6 +135,7 @@ class DemandCompositionDependencies:
     publish_startup_identity: Callable[[object, int], Awaitable[None]]
     draft_owner: DraftMessageOwner
     linked_chat_fact_refresh_port: LinkedChatFactRefreshPort
+    image_worker: DurableDemandAdapter
     startup_detail_setter: Callable[[str], None] | None = None
 
 
@@ -197,6 +198,7 @@ def build_durable_adapter_map(
 ) -> Mapping[DemandKind, DurableDemandAdapter]:
     """Build and validate the exhaustive durable adapter map."""
     adapters: dict[DemandKind, DurableDemandAdapter] = {
+        DemandKind.MESSAGE_IMAGE_ACQUISITION: dependencies.image_worker,
         DemandKind.TOPIC_SNAPSHOT: TopicSnapshotDemandAdapter(
             TelethonTelegramTopicGateway(cast(TopicClient, dependencies.client)),
             dependencies.conn,

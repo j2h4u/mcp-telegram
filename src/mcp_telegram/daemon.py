@@ -104,6 +104,7 @@ from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .folders.telegram_adapter import FolderClient, TelethonTelegramFolderGateway
 from .folders.worker import FolderProjectionWorker
 from .hydration_queue import HydrationPriority
+from .image_authorization import ActiveSources, ScopeToken
 from .media_hydration import MediaFactHydrationHandler
 from .message_fact_refresh import (
     MessageFactRefreshDeps,
@@ -114,6 +115,9 @@ from .message_history.telegram_adapter import (
     TelethonFullHistoryPageAdapter,
     TelethonHistoryAccessProbe,
 )
+from .message_images.contracts import ImageScope
+from .message_images.service import MessageImageService
+from .message_images.worker import MessageImageWorker
 from .messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
 from .models import DialogType
 from .reactions import ReactionDetailPolicy, ReactionDetailRefresher
@@ -140,7 +144,7 @@ from .startup_identity import (
     StartupIdentityState,
     StartupIdentityUnavailableError,
 )
-from .state import StatePaths, ensure_private_state_dir, telegram_session_lease
+from .state import StatePaths, TelegramSessionLease, ensure_private_state_dir, telegram_session_lease
 from .sync_db import (
     _open_sync_db,
     ensure_sync_schema,
@@ -163,6 +167,7 @@ from .telegram_gateway import (
     TelethonUserAvatarHistoryGateway,
     TelethonUserProfileGateway,
 )
+from .telegram_image_download import TelegramImageGateway
 from .telegram_read_receipts import TelethonTelegramReadReceiptGateway
 from .telegram_rpc_consumers import DemandKind, demand_contract
 from .telegram_rpc_scheduler import (
@@ -251,6 +256,12 @@ def read_operator_summary_snapshot(
 
 
 class _DaemonClient(Protocol):
+    def bind_session_lease(self, lease: TelegramSessionLease) -> None: ...
+
+    def capture_image_scope(self) -> ScopeToken | None: ...
+
+    def claim_image_scope(self, token: ScopeToken) -> bool: ...
+
     def retained_draft_peer(self, dialog_id: int) -> object | None: ...
 
     async def logout_account(self) -> None: ...
@@ -405,6 +416,10 @@ class _SyncMainContext:
     unix_server: asyncio.AbstractServer | None = None
     handler_manager: EventHandlerManager | None = None
     draft_owner: DraftMessageOwner | None = None
+    image_worker: MessageImageWorker | None = None
+    image_service: MessageImageService | None = None
+    image_sources: ActiveSources | None = None
+    image_sources_bound: bool = False
     scheduled_mutation_fence: ScheduledMutationFence = field(default_factory=ScheduledMutationFence)
     scheduling: SchedulingConfig = field(default_factory=SchedulingConfig)
     background_tasks: set[asyncio.Task[object]] = field(default_factory=set)
@@ -1079,7 +1094,7 @@ async def _build_sync_main_context() -> _SyncMainContext:
     async with AsyncExitStack() as cleanup:
         lease = ExitStack()
         cleanup.enter_context(lease)
-        lease.enter_context(telegram_session_lease(state_paths.state_dir))
+        session_proof = lease.enter_context(telegram_session_lease(state_paths.state_dir))
         bootstrap = asyncio.create_task(
             asyncio.to_thread(_bootstrap_sync_database, db_path, state_paths.state_dir, config)
         )
@@ -1096,7 +1111,9 @@ async def _build_sync_main_context() -> _SyncMainContext:
         cleanup.push_async_callback(writer.aclose)
         conn = open_sync_db_reader(db_path)
         cleanup.callback(conn.close)
-        ctx = await _compose_sync_main_context(config, scheduling, state_paths, writer, conn, cleanup=cleanup)
+        ctx = await _compose_sync_main_context(
+            config, scheduling, state_paths, writer, conn, session_proof=session_proof, cleanup=cleanup
+        )
         ctx.session_lease = lease
         cleanup.pop_all()
         return ctx
@@ -1137,6 +1154,7 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
     writer: SQLiteWriter,
     conn: sqlite3.Connection,
     *,
+    session_proof: TelegramSessionLease,
     cleanup: AsyncExitStack,
 ) -> _SyncMainContext:
     db_path = state_paths.sync_db_path
@@ -1157,6 +1175,7 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
     client = _create_telegram_client(config, conn, writer)
     cleanup.push_async_callback(client.close_rpc_scheduler)
     cleanup.push_async_callback(client.disconnect)
+    client.bind_session_lease(session_proof)
     rpc_scheduler_failure: dict[str, str | None] = {"detail": None}
 
     def health_status() -> DaemonHealthStatus:
@@ -1714,6 +1733,21 @@ def _build_demand_runtime(
     account_id = ctx.api_server.self_id
     if account_id is None:
         raise RuntimeError("demand composition requires the verified startup account")
+    image_directory = ctx.db_path.parent / "message-images"
+    image_sources = ActiveSources()
+    image_scope = ImageScope(ctx.client.capture_image_scope, ctx.client.claim_image_scope, image_sources)
+    image_worker = MessageImageWorker(
+        ctx.conn, ctx.writer, image_directory, image_scope, cast(TelegramImageGateway, ctx.client)
+    )
+
+    def offer_image() -> None:
+        if ctx.coordinator is not None:
+            ctx.coordinator.offer(DemandKind.MESSAGE_IMAGE_ACQUISITION)
+
+    image_service = MessageImageService(ctx.conn, ctx.writer, image_directory, image_scope, offer_image)
+    ctx.image_service = image_service
+    ctx.image_worker = image_worker
+    ctx.image_sources = image_sources
     try:
         dependencies = DemandCompositionDependencies(
             account_id=account_id,
@@ -1745,6 +1779,7 @@ def _build_demand_runtime(
             publish_startup_identity=publish_startup_identity,
             draft_owner=draft_owner,
             linked_chat_fact_refresh_port=ctx.handler_manager,
+            image_worker=image_worker,
             startup_detail_setter=lambda detail: setattr(ctx.api_server, "startup_detail", detail),
         )
         coordinator = build_durable_coordinator(dependencies, observer=ctx.rpc_admission_observer)
@@ -1783,6 +1818,7 @@ def _ensure_demand_runtime(
     ctx.coordinator = demand_runtime.coordinator
     ctx.client.set_scheduled_continuity_recovery(demand_runtime.scheduled_reconciler.invalidate_continuity)
     ctx.api_server.bind_demand_sink(demand_runtime.coordinator)
+    ctx.api_server.bind_profile_job_inspector(demand_runtime.coordinator.inspect_work)
     if ctx.handler_manager is not None:
         ctx.handler_manager.bind_demand_sink(demand_runtime.coordinator)
     if ctx.draft_owner is not None:
@@ -1831,6 +1867,18 @@ async def _cancel_background_tasks(ctx: _SyncMainContext) -> None:
     demand_runtime = cast(_DemandRuntime | None, getattr(ctx, "demand_runtime", None))
     if demand_runtime is not None:
         demand_runtime.message_fact_refresh_deps.conn.close()
+
+
+async def _stop_image_sources(ctx: _SyncMainContext) -> None:
+    image_worker = cast(MessageImageWorker | None, getattr(ctx, "image_worker", None))
+    try:
+        if image_worker is not None:
+            await image_worker.close()
+    finally:
+        if getattr(ctx, "image_sources_bound", False):
+            assert ctx.image_sources is not None
+            await ctx.writer.run(ctx.image_sources.unbind)
+            ctx.image_sources_bound = False
 
 
 async def _close_runtime_connections(ctx: _SyncMainContext) -> None:
@@ -1951,6 +1999,7 @@ async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
     stages: tuple[tuple[str, Callable[[], Awaitable[object]]], ...] = (
         ("daemon_api", lambda: _stop_daemon_api(ctx)),
         ("background_tasks", lambda: _cancel_background_tasks(ctx)),
+        ("image_sources", lambda: _stop_image_sources(ctx)),
         ("telegram_disconnect", lambda: ctx.client.disconnect()),
         ("rpc_scheduler", lambda: ctx.client.close_rpc_scheduler()),
         ("rpc_observer_detach", detach_observer),
@@ -1991,6 +2040,21 @@ async def _release_updates_after_replay(ctx: _SyncMainContext, barrier: UpdatePr
     await ctx.client.start_update_delivery(ctx.api_server.self_id)
     await ctx.client.finish_startup_auto_resume()
     assert ctx.coordinator is not None
+    if ctx.image_worker is None:
+        raise RuntimeError("message image worker is unavailable")
+    if ctx.image_sources is None:
+        raise RuntimeError("message image source registry is unavailable")
+
+    def bind_image_sources(conn: sqlite3.Connection) -> None:
+        assert ctx.image_sources is not None
+        ctx.image_sources.bind(conn)
+        ctx.image_sources_bound = True
+
+    await ctx.writer.run(bind_image_sources)
+    await ctx.image_worker.reconcile_files()
+    if ctx.image_service is None:
+        raise RuntimeError("message image service is unavailable")
+    ctx.api_server.bind_message_image_service(ctx.image_service)
     await _start_self_profile_after_replay(ctx)
     _create_tracked_task(
         ctx,

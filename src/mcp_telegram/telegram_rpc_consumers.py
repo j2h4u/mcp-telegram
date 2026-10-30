@@ -54,6 +54,8 @@ _READ_METHODS = frozenset(
         "telethon.tl.functions.updates.GetChannelDifferenceRequest:03173d78",
         "telethon.tl.functions.contacts.ResolveUsernameRequest:725afbbc",
         "telethon.tl.functions.photos.GetUserPhotosRequest:91cd32a8",
+        "telethon.tl.functions.upload.GetFileRequest:be5335be",
+        "telethon.tl.functions.help.GetConfigRequest:c4f9186b",
         "telethon.tl.functions.payments.GetSavedStarGiftsRequest:a319e569",
         "telethon.tl.functions.stories.GetPeerStoriesRequest:2c4ada50",
         "telethon.tl.functions.stories.GetPinnedStoriesRequest:5821a5dc",
@@ -76,6 +78,7 @@ _AUTH_METHODS = frozenset(
         "telethon.tl.functions.auth.SignUpRequest:aac7b717",
         "telethon.tl.functions.auth.SendCodeRequest:a677244f",
         "telethon.tl.functions.auth.ImportAuthorizationRequest:a57a7dad",
+        "telethon.tl.functions.auth.ExportAuthorizationRequest:e5bfffcd",
     }
 )
 
@@ -127,6 +130,7 @@ class TelegramRpcSource(StrEnum):
     MESSAGE_FACT_REFRESH = "message_fact_refresh"
     READ_RECEIPT_PROBE = "read_receipt_probe"
     SCHEDULED_MESSAGES = "scheduled_messages"
+    MESSAGE_IMAGE_ACQUISITION = "message_image_acquisition"
     SCHEDULED_MUTATION = "scheduled_mutation"
     DRAFT_SNAPSHOT = "draft_snapshot"
     DRAFT_MUTATION = "draft_mutation"
@@ -170,6 +174,7 @@ class DemandKind(StrEnum):
     READ_RECEIPT_BATCH = "read_receipt_batch"
     SCHEDULED_REPAIR = "scheduled_repair"
     SCHEDULED_DISCOVERY = "scheduled_discovery"
+    MESSAGE_IMAGE_ACQUISITION = "message_image_acquisition"
     SCHEDULED_MUTATION = "scheduled_mutation"
     DRAFT_SNAPSHOT = "draft_snapshot"
     DRAFT_MUTATION = "draft_mutation"
@@ -204,10 +209,11 @@ DURABLE_DEMAND_ORDER: tuple[DemandKind, ...] = (
     DemandKind.READ_RECEIPT_BATCH,
     DemandKind.SCHEDULED_REPAIR,
     DemandKind.SCHEDULED_DISCOVERY,
+    DemandKind.MESSAGE_IMAGE_ACQUISITION,
     DemandKind.DRAFT_SNAPSHOT,
     DemandKind.LINKED_CHAT_REFRESH,
 )
-_EXPECTED_DURABLE_DEMAND_COUNT = 23
+_EXPECTED_DURABLE_DEMAND_COUNT = 24
 
 
 class ExecutionMode(StrEnum):
@@ -686,6 +692,17 @@ _REGISTRY: dict[TelegramRpcSource, TelegramRpcConsumerSpec] = {
         demand_bound=DemandBound.PRODUCER_BOUNDED,
         repairs=(TelegramRpcSource.REALTIME_EVENT, TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE),
     ),
+    TelegramRpcSource.MESSAGE_IMAGE_ACQUISITION: _consumer(
+        "Message image acquisition",
+        "Acquire one explicitly requested message photo",
+        _B,
+        TelegramFactDomain.MESSAGE_FACTS,
+        AcquisitionRole.ENRICHMENT,
+        AcquisitionTrigger.DURABLE_BACKLOG,
+        FanoutScope.MESSAGE,
+        _PRODUCER,
+        demand_bound=DemandBound.PRODUCER_BOUNDED,
+    ),
     TelegramRpcSource.MAINTENANCE: _consumer(
         "Maintenance",
         "Refresh account-owned maintenance facts",
@@ -951,6 +968,12 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         TelegramRpcSource.SCHEDULED_MESSAGES,
         _DURABLE,
         max_rpc_attempts_per_slice=16,
+    ),
+    DemandKind.MESSAGE_IMAGE_ACQUISITION: _contract(
+        DemandKind.MESSAGE_IMAGE_ACQUISITION,
+        TelegramRpcSource.MESSAGE_IMAGE_ACQUISITION,
+        _DURABLE,
+        max_rpc_attempts_per_slice=32,
     ),
     DemandKind.DRAFT_SNAPSHOT: _contract(
         DemandKind.DRAFT_SNAPSHOT,

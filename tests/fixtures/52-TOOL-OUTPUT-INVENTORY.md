@@ -9,10 +9,10 @@ uv run python -c "from mcp_telegram import server; print(len(server.tool_by_name
 ```
 
 Historical Phase 52 baseline registry count: 17 tools.
-Current registry count: 18 tools; `manage_scheduled_message` was added after this baseline.
+Current registry count: 20 tools; scheduled-message and image tools were added after this baseline.
 
 Current Phase 52 completion status:
-- The historical Phase 52 baseline recorded 17 registered tools declaring `outputSchema` in the live MCP tool descriptors at that time. The current registry has 18 tools, including the scheduled-message tool added after the baseline.
+- The historical Phase 52 baseline recorded 17 registered tools declaring `outputSchema` in the live MCP tool descriptors at that time. The current registry has 20 tools, including scheduled-message and image tools added after the baseline.
 - Every successful tool path returns `structuredContent`; recoverable error paths may stay text-only.
 - The table below is the Plan 52-01 pre-implementation baseline and lossless migration map. Its
   `Baseline` columns intentionally preserve the state observed before later Phase 52 plans ran.
@@ -35,6 +35,8 @@ Current Phase 52 completion status:
 | `submit_feedback` | Submit Feedback | primary | false | false | no | acknowledgement only; accepted severity/context/model/harness omitted from result; fire-and-forget write semantics; no tracking id by design | `accepted {message,severity,context_present,model,harness}`, `status`, `message`, `tracking_id:null`, `readback_available:false`, `side_effects {feedback_db_write:true}` | none |
 | `trace_account_messages` | Account Trace | primary | false | true | yes | text summary of resolved account, evidence count, coverage_state, gaps count, first five evidence snippets framed as untrusted_content, more-count, gap_summary, next_navigation; coverage_gaps/provenance already structured | `resolved_account`, `groups[]`, `groups[].evidence[] {text,media_description,untrusted_content:true}`, `coverage`, `gaps`, `provenance`, `coverage_gaps`, `next_navigation`, `result_count_semantics`, `is_error_conditions`, `preview {shown_count,hidden_count,gap_summary}` | none |
 
+| `get_message_image` | Get Message Image | primary | true | not in baseline | not in baseline | local retained image and acquisition state | `dialog_id`, `message_id`, `content`, `acquisition` | one native JPEG ImageContent when available |
+| `prepare_message_image` | Prepare Message Image | primary | false | not in baseline | not in baseline | explicitly queue bounded photo acquisition | `dialog_id`, `message_id`, `content`, `acquisition` | local queue mutation |
 | `get_draft` | Get Draft | primary | true | true | yes | local current draft and temporary undo history; unknown distinct from absent | `current`, `history[]`, `selected_history`, `next_action` | none |
 | `manage_draft` | Manage Draft | primary | false | false | yes | explicit native draft create/update/clear/restore, version conflict and uncertain result guidance; never sends | `outcome`, `operation_key`, `mutation_dispatched`, `save_acknowledged`, `backup_history_id`, `current`, `next_action` | native cloud draft mutation |
 | `manage_scheduled_message` | Manage Scheduled Message | primary | false | not in baseline | not in baseline | create/update/cancel one native scheduled queue item; receipt lookup guidance; accepted items may publish automatically later | `ok`, `action`, `operation_key`, `account_id`, `dialog_id`, `scheduled_message_id`, `outcome`, `mutation_dispatched`, `acknowledged`, `receipt_persisted`, `current_is_operation_confirmation`, `schedule_at_utc` | scheduled queue mutation; no immediate-send action |
@@ -69,4 +71,4 @@ Current Phase 52 completion status:
 - Baseline rows are retained as historical evidence; current completion is enforced by registry and smoke tests, not by the baseline status columns.
 - Existing baseline `outputSchema` tools were not accepted as complete; rows above preserve the gaps that later migration plans had to close.
 - Error results may remain text-only per D-05. This inventory is scoped to successful tool calls.
-- Exceptions are `none` for all tools in Plan 52-01; later migration plans must either fill the target fields or update this inventory with a concrete exception and justification.
+- Exceptions were `none` in the Phase 52 baseline. The later `get_message_image` tool returns a native JPEG block when available; other successful tools remain structured-only.

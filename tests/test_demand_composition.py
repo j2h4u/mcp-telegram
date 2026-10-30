@@ -50,6 +50,7 @@ from mcp_telegram.fact_hydration import FactHydrationDemandAdapter
 from mcp_telegram.folders.contracts import FolderRuleObservation
 from mcp_telegram.folders.ports import FolderSnapshotRepository
 from mcp_telegram.folders.worker import FolderProjectionDemandAdapter, FolderProjectionWorker
+from mcp_telegram.image_authorization import ActiveSources
 from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshDemandAdapter,
     MessageFactRefreshDeps,
@@ -57,6 +58,8 @@ from mcp_telegram.message_fact_refresh import (
     ReadReceiptDemandAdapter,
 )
 from mcp_telegram.message_history.contracts import ForwardGapPage
+from mcp_telegram.message_images.contracts import ImageScope
+from mcp_telegram.message_images.worker import MessageImageWorker
 from mcp_telegram.scheduled_messages import (
     ScheduledDiscoveryDemandAdapter,
     ScheduledMessageReconciler,
@@ -79,6 +82,7 @@ from mcp_telegram.telegram_demand import (
 )
 from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator
 from mcp_telegram.telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkRevision
+from mcp_telegram.telegram_image_download import TelegramImageGateway
 from mcp_telegram.telegram_rpc_consumers import (
     DemandKind,
     TelegramRpcSource,
@@ -259,6 +263,13 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
         publish_startup_identity=publish_startup_identity,
         draft_owner=cast(DraftMessageOwner, objects["draft_owner"]),
         linked_chat_fact_refresh_port=cast(object, objects["linked_chat_refresh"]),  # type: ignore[arg-type]
+        image_worker=MessageImageWorker(
+            conn,
+            inline_writer(conn),
+            tmp_path / "images",
+            ImageScope(lambda: None, lambda _: False, ActiveSources()),
+            cast(TelegramImageGateway, MagicMock()),
+        ),
     )
     objects["read_receipt_batch"] = read_receipt_batch
     objects["update_profile"] = update_profile
@@ -276,7 +287,7 @@ def composition_dependencies(
         cast(sqlite3.Connection, objects["conn"]).close()
 
 
-def test_adapter_map_is_exact_against_literal_23_kind_class_map(
+def test_adapter_map_is_exact_against_literal_24_kind_class_map(
     composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
 ) -> None:
     dependencies, objects = composition_dependencies
@@ -284,6 +295,7 @@ def test_adapter_map_is_exact_against_literal_23_kind_class_map(
     adapters = build_durable_adapter_map(dependencies)
 
     expected = {
+        DemandKind.MESSAGE_IMAGE_ACQUISITION: MessageImageWorker,
         DemandKind.ENTITY_PROFILE_REFRESH: EntityProfileDemandAdapter,
         DemandKind.DELTA_GAP_FILL: DeltaGapFillDemandAdapter,
         DemandKind.DM_DELETION_RECONCILIATION: DmDeletionReconciliationDemandAdapter,
@@ -308,7 +320,7 @@ def test_adapter_map_is_exact_against_literal_23_kind_class_map(
         DemandKind.SELF_PROFILE_MAINTENANCE: SelfProfileMaintenanceDemandAdapter,
         DemandKind.LINKED_CHAT_REFRESH: LinkedChatFactDemandAdapter,
     }
-    assert len(expected) == 23
+    assert len(expected) == 24
     assert set(adapters) == set(expected)
     assert {kind: type(adapter) for kind, adapter in adapters.items()} == expected
     assert all(getattr(adapter, "demand_kind", None) is kind for kind, adapter in adapters.items())

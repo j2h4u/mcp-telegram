@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, cast, get_args
 
 type MediaKind = Literal[
@@ -42,6 +42,7 @@ class MediaFact:
 
     kind: MediaKind
     payload: dict[str, object]
+    private_photo_id: int | None = field(default=None, repr=False)
 
 
 def is_transcribable_telegram_media(fact: MediaFact | None) -> bool:

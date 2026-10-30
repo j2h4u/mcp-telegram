@@ -6,6 +6,7 @@ import asyncio
 import io
 import struct
 from collections.abc import Callable, Iterable
+from contextlib import AbstractContextManager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Literal, Never, Protocol, cast
@@ -229,16 +230,26 @@ class GuardedMTProtoSender(MTProtoSender):
 
     _ping: int | None
 
-    def __init__(self, auth_key: object, *, authority: TransportAuthority, **kwargs: object) -> None:
+    def __init__(
+        self,
+        auth_key: object,
+        *,
+        authority: TransportAuthority,
+        identity_change: Callable[[], AbstractContextManager[None]] | None = None,
+        **kwargs: object,
+    ) -> None:
         if version.__version__ != "1.45.0":
             raise RuntimeError("unsupported Telethon transport contract")
         cast(Callable[..., None], super().__init__)(auth_key, **kwargs)
         self._authority = authority
+        self._identity_change = identity_change
         self._owned_states: dict[_RequestState, _OwnedState] = {}
         self._preparing: set[asyncio.Task[None]] = set()
         self._observing: set[asyncio.Task[None]] = set()
         self._settling: asyncio.Task[None] | None = None
         self._terminal_teardown: asyncio.Task[None] | None = None
+        self._terminal_cause: BaseException | None = None
+        self._terminal_cleanup_failure: BaseException | None = None
         self._send_queue = _OwnedPacker(self)
         self._control_origin: ContextVar[tuple[asyncio.Task[object] | None, ProtocolOrigin] | None] = ContextVar(
             "telegram_protocol_origin", default=None
@@ -325,6 +336,7 @@ class GuardedMTProtoSender(MTProtoSender):
                     assert caller is not None
                     caller.add_done_callback(self._terminal_loop_done)
             terminal_error = self._authority.transport_terminated(error) or error
+            self._terminal_cause = terminal_error
             self._terminal_teardown = asyncio.create_task(self._disconnect_terminal_owned(terminal_error))
         task = self._terminal_teardown
         cancelled = False
@@ -347,13 +359,23 @@ class GuardedMTProtoSender(MTProtoSender):
         try:
             await super()._disconnect(error)
         except BaseException as failure:  # noqa: BLE001 - keep terminal ownership through all cleanup.
+            self._terminal_cleanup_failure = failure
             primary = primary or failure
         try:
             await self.settle_shutdown()
         except BaseException as failure:  # noqa: BLE001 - preserve the first terminal failure.
+            self._terminal_cleanup_failure = self._terminal_cleanup_failure or failure
             primary = primary or failure
         if primary is not None:
             raise primary
+
+    async def disconnect_for_containment(self) -> None:
+        """Require successful teardown while retaining the original terminal failure."""
+        try:
+            await self.disconnect()
+        except Exception as failure:
+            if failure is not self._terminal_cause or self._terminal_cleanup_failure is not None:
+                raise
 
     def send(self, request: object, ordered: bool = False) -> asyncio.Future[object]:
         raise RuntimeError("fresh Telegram application state requires gate ownership")
@@ -651,9 +673,10 @@ class GuardedMTProtoSender(MTProtoSender):
     async def _try_gen_auth_key(self, attempt: int) -> bool:
         plain = GuardedMTProtoPlainSender(self)
         try:
-            self.auth_key.key, self._state.time_offset = await authenticator.do_authentication(plain)
-            if self._auth_key_callback is not None:
-                await self._auth_key_callback(self.auth_key)
+            with self._identity_change() if self._identity_change is not None else nullcontext():
+                self.auth_key.key, self._state.time_offset = await authenticator.do_authentication(plain)
+                if self._auth_key_callback is not None:
+                    await self._auth_key_callback(self.auth_key)
             return True
         except SecurityError, AssertionError:
             await asyncio.sleep(self._delay)

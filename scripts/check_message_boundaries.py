@@ -1414,6 +1414,24 @@ def _authorized_profile_peer_sql(relative: str, snippet: _SqlSnippet) -> bool:
     ]
 
 
+_IMAGE_SOURCE_SQL_SHAPES: Mapping[tuple[str, str], str] = {
+    ("message_images/repository.py", "current_source"): (
+        "SELECT s.photo_id,COALESCE(o.observation_order,0),m.media_kind,m.media_payload,s.eligible FROM messages m "
+        "LEFT JOIN message_observations o USING(dialog_id,message_id) "
+        "LEFT JOIN message_image_sources s USING(dialog_id,message_id) "
+        "WHERE m.dialog_id=? AND m.message_id=? AND m.is_deleted=0 AND COALESCE(o.is_deleted,0)=0"
+    ),
+    ("message_images/service.py", "_missing_reason"): (
+        "SELECT is_deleted FROM messages WHERE dialog_id=? AND message_id=?"
+    ),
+}
+
+
+def _authorized_image_source_sql(relative: str, snippet: _SqlSnippet) -> bool:
+    expected = _IMAGE_SOURCE_SQL_SHAPES.get((relative, snippet.function or ""))
+    return expected is not None and " ".join(snippet.text.split()) == " ".join(expected.split())
+
+
 def violations_for(path: Path, source: str) -> list[Finding]:
     relative = _relative(path)
     tree = ast.parse(source, filename=str(path))
@@ -1441,6 +1459,7 @@ def violations_for(path: Path, source: str) -> list[Finding]:
             )
             for snippet in sql_hits
             if not _authorized_profile_peer_sql(relative, snippet)
+            and not _authorized_image_source_sql(relative, snippet)
         )
     entity_dml_hits = [snippet for snippet in _sql_snippets(tree, constants) if _has_entity_table_dml(snippet.text)]
     if entity_dml_hits and relative not in ENTITY_DML_OWNER_PATHS and relative not in ENTITY_DML_SCHEMA_OWNER_PATHS:

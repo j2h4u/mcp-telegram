@@ -378,7 +378,40 @@ def _canonical_get_sync_status_data() -> dict[str, object]:
     }
 
 
+from mcp_telegram.tools.message_images import (
+    GetMessageImage,
+    PrepareMessageImage,
+    get_message_image,
+    prepare_message_image,
+)
+
 STRUCTURED_TOOL_CASES = {
+    "get_message_image": (
+        get_message_image,
+        GetMessageImage(exact_dialog_id=123, message_id=4),
+        {
+            "ok": True,
+            "data": {
+                "dialog_id": 123,
+                "message_id": 4,
+                "content": {"state": "missing"},
+                "acquisition": {"state": "idle"},
+            },
+        },
+    ),
+    "prepare_message_image": (
+        prepare_message_image,
+        PrepareMessageImage(exact_dialog_id=123, message_id=4),
+        {
+            "ok": True,
+            "data": {
+                "dialog_id": 123,
+                "message_id": 4,
+                "content": {"state": "missing"},
+                "acquisition": {"state": "queued"},
+            },
+        },
+    ),
     "get_draft": (
         get_draft,
         GetDraft(exact_dialog_id=123),
@@ -971,6 +1004,7 @@ class _patch_daemon:
 
     def __enter__(self):
         targets = [
+            "mcp_telegram.tools.message_images.daemon_connection",
             "mcp_telegram.tools.drafts.daemon_connection",
             "mcp_telegram.tools.scheduled.daemon_connection",
             "mcp_telegram.tools.discovery.daemon_connection",
@@ -1007,6 +1041,7 @@ class _patch_daemon_not_running:
 
         self._patches = []
         targets = [
+            "mcp_telegram.tools.message_images.daemon_connection",
             "mcp_telegram.tools.drafts.daemon_connection",
             "mcp_telegram.tools.scheduled.daemon_connection",
             "mcp_telegram.tools.discovery.daemon_connection",

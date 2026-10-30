@@ -514,11 +514,11 @@ def extract_message_text(msg: object) -> str | None:
     return rich_text or (text if isinstance(text, str) else None)
 
 
-def _extract_media_fact(msg: object) -> tuple[str | None, str | None]:
+def _extract_media_fact(msg: object) -> tuple[str | None, str | None, int | None]:
     fact = extract_media_fact(_attr(msg, "media", None))
     if fact is None:
-        return None, None
-    return fact.kind, encode_media_payload(fact)
+        return None, None, None
+    return fact.kind, encode_media_payload(fact), fact.private_photo_id
 
 
 def _extract_edit_date(msg: object) -> int | None:
@@ -601,7 +601,7 @@ def extract_message_row(
 
     reply_to_msg_id, forum_topic_id = extract_reply_and_topic(msg)
 
-    media_kind_value, media_payload = _extract_media_fact(msg)
+    media_kind_value, media_payload, private_photo_id = _extract_media_fact(msg)
     formatting_entities, service_action = extract_message_composition(msg)
     stored = _message_contracts.StoredMessage(
         dialog_id=dialog_id,
@@ -631,6 +631,10 @@ def extract_message_row(
     return _message_contracts.ExtractedMessage(
         message=stored,
         reply_count=reply_count,
+        private_photo_id=private_photo_id,
+        private_photo_eligible=(
+            _attr(msg, "ttl_period", None) is None and _attr(_attr(msg, "media", None), "ttl_seconds", None) is None
+        ),
         reactions=reactions,
         entities=entities,
         forward=forward,

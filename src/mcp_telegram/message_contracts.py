@@ -84,6 +84,8 @@ class ExtractedMessage:
     message: StoredMessage
     reply_count: int
     observation_order: int | None = None
+    private_photo_id: int | None = field(default=None, repr=False)
+    private_photo_eligible: bool = True
     reactions_observed: bool = True
     reactions: list[ReactionRecord] = field(default_factory=list)
     entities: list[EntityRecord] = field(default_factory=list)

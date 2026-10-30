@@ -844,3 +844,42 @@ def test_list_message_context_extensions_use_canonical_content_presenter() -> No
         "    return item\n",
     )
     assert gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source) == []
+
+
+@pytest.mark.parametrize(
+    "relative,function",
+    [("message_images/repository.py", "current_source"), ("message_images/service.py", "_missing_reason")],
+)
+def test_image_source_sql_permission_is_exact_and_read_only(relative: str, function: str) -> None:
+    gate = _gate()
+    path = gate.SOURCE_ROOT / relative
+    actual = path.read_text(encoding="utf-8")
+    assert not gate.violations_for(path, actual)
+    sql = gate._IMAGE_SOURCE_SQL_SHAPES[(relative, function)]
+
+    def make_source(name: str, query: str) -> str:
+        return f"def {name}(conn):\n    conn.execute({query!r})\n"
+
+    source = make_source(function, sql)
+    assert not gate.violations_for(path, source)
+    assert gate.violations_for(path, make_source("other", sql))
+    assert gate.violations_for(gate.SOURCE_ROOT / "message_images/other.py", source)
+    for forbidden in (
+        sql.replace("SELECT ", "SELECT text,", 1),
+        sql.replace("?", "1", 1),
+        sql.replace("?", "", 1),
+        "UPDATE messages SET text='x' WHERE dialog_id=? AND message_id=?",
+        "INSERT INTO messages(dialog_id,message_id) VALUES(?,?)",
+        "DELETE FROM messages WHERE dialog_id=? AND message_id=?",
+    ):
+        assert gate.violations_for(path, make_source(function, forbidden))
+
+
+def test_image_source_sql_rejects_changed_deletion_predicate() -> None:
+    gate = _gate()
+    path = gate.SOURCE_ROOT / "message_images/repository.py"
+    sql = gate._IMAGE_SOURCE_SQL_SHAPES[("message_images/repository.py", "current_source")]
+    for replacement in ("m.is_deleted=1", "m.is_deleted>=0", "m.is_deleted!=0"):
+        altered = sql.replace("m.is_deleted=0", replacement)
+        source = f"def current_source(conn):\n    conn.execute({altered!r})\n"
+        assert gate.violations_for(path, source)

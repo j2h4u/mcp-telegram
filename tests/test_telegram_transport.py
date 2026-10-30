@@ -908,6 +908,9 @@ async def test_terminal_disconnect_fences_even_without_pending_requests_and_reta
             with pytest.raises(OSError) as caught:
                 await wire.sender._disconnect(error=terminal_error)
             assert caught.value is (terminal_error or close_error)
+        with pytest.raises(OSError) as caught:
+            await wire.sender.disconnect_for_containment()
+        assert caught.value is (terminal_error or close_error)
         assert calls == 1
         assert wire.authority.terminations == [terminal_error]
     finally:
