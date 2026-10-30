@@ -4,10 +4,11 @@ import logging
 from datetime import UTC, datetime
 from logging import Logger
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from telethon import errors
-from telethon.tl import types
+from telethon.tl import functions, types
 
 from mcp_telegram.telegram_image_download import (
     PHOTO_CHUNK_BYTES,
@@ -65,6 +66,7 @@ class _Dispatch:
         self.destinations: list[int] = []
 
     async def get_file(self, request: object) -> object:
+        assert isinstance(request, functions.upload.GetFileRequest)
         self.requests.append((request.offset, request.limit, request.cdn_supported, bytes(request.location)))
         result = self.outcomes.pop(0)
         if isinstance(result, Exception):
@@ -101,7 +103,9 @@ async def test_real_iterator_bounded_slice_and_resume() -> None:
     assert [len(part) for part in first + second] == [PHOTO_CHUNK_BYTES, PHOTO_CHUNK_BYTES, 3]
     assert [request[0] for request in dispatch.requests] == [0, PHOTO_CHUNK_BYTES, 2 * PHOTO_CHUNK_BYTES]
     assert all(request[1] == PHOTO_CHUNK_BYTES and not request[2] for request in dispatch.requests)
-    assert all(request[3] == bytes(locator.location) for request in dispatch.requests)
+    assert all(
+        request[3] == bytes(cast(types.InputPhotoFileLocation, locator.location)) for request in dispatch.requests
+    )
     assert dispatch.destinations == []
 
 
@@ -140,7 +144,7 @@ async def test_early_eof_and_invalid_locator_fail_closed() -> None:
     with pytest.raises(PhotoUnsupportedError, match="mismatch"):
         _ = [chunk async for chunk in iter_photo_chunks(_locator(100), offset=0, dispatch=dispatch, log=_logs())]
     bad = _locator(100)
-    bad.location.id = 8
+    cast(types.InputPhotoFileLocation, bad.location).id = 8
     with pytest.raises(ValueError, match="locator"):
         _ = [chunk async for chunk in iter_photo_chunks(bad, offset=0, dispatch=dispatch, log=_logs())]
     assert len(dispatch.requests) == 1
@@ -173,6 +177,8 @@ async def test_mutated_location_cannot_dispatch_second_request() -> None:
     class MutatingDispatch(_Dispatch):
         async def get_file(self, request: object) -> object:
             result = await super().get_file(request)
+            assert isinstance(request, functions.upload.GetFileRequest)
+            assert isinstance(request.location, types.InputPhotoFileLocation)
             request.location.id = 999
             return result
 

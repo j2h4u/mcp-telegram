@@ -226,6 +226,29 @@ def test_boundary_allows_gate_type_only_imports(tmp_path: Path) -> None:
     assert gate._violations(path) == []
 
 
+def test_photo_iterator_allows_only_type_checking_client_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = _load_gate()
+    path = tmp_path / "telegram_image_download.py"
+    monkeypatch.setattr(gate, "PHOTO_ITERATOR_PATH", path)
+    import_text = "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from telethon.client.telegramclient import TelegramClient\n"
+    path.write_text(
+        import_text + "def identity(client: TelegramClient) -> TelegramClient:\n    return client\n", encoding="utf-8"
+    )
+    assert gate._violations(path) == []
+    for forbidden in (
+        "from telethon.client.telegramclient import TelegramClient\n",
+        import_text + "TelegramClient()\n",
+        import_text + "TelegramClient.connect(client)\n",
+    ):
+        path.write_text(forbidden, encoding="utf-8")
+        assert gate._violations(path)
+    neighbor = tmp_path / "neighbor.py"
+    neighbor.write_text(import_text, encoding="utf-8")
+    assert gate._violations(neighbor)
+
+
 def test_boundary_allows_gate_construction_only_in_create_client(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -299,7 +322,11 @@ def test_boundary_allows_account_wide_transport_dependencies_in_gate(
 @pytest.mark.parametrize(
     "case",
     [
-        ("telegram_rpc.py", "_AdmissionAwareSender", "_send", "self._gate._main_sender.send_owned(request)"),
+        ("telegram_rpc.py", "_AdmissionAwareSender", "_selected_sender", "self._gate._main_sender.send_owned(request)"),
+        ("telegram_image_download.py", "_PhotoIteratorFacade", "__init__", "self._sender = object()"),
+        ("telegram_image_download.py", "_PhotoIteratorFacade", "_call", "sender = self._sender"),
+        ("telegram_image_download.py", "_PhotoIteratorFacade", "_borrow_exported_sender", "sender = self._sender"),
+        ("telegram_image_download.py", "_PhotoIteratorFacade", "_return_exported_sender", "sender = self._sender"),
         ("telegram_transport.py", "_OwnedPacker", "__init__", "self._sender = sender"),
         ("telegram_transport.py", "_OwnedPacker", "append", "self._sender.require_owned(state)"),
         ("telegram_transport.py", "_AuthConnectionProxy", "__init__", "self._sender = sender"),

@@ -435,7 +435,7 @@ class MessageImageWorker:
             publish_image, self._directory, transfer.scope.scope.account_id, bytes(transfer.data)
         )
 
-        def commit(conn: sqlite3.Connection) -> bool:
+        def associate_artifact(conn: sqlite3.Connection) -> bool:
             with write_transaction(conn):
                 if not self._current(conn, transfer):
                     return False
@@ -479,7 +479,7 @@ class MessageImageWorker:
         receipt = [False]
 
         def commit_with_receipt(conn: sqlite3.Connection) -> bool:
-            committed = commit(conn)
+            committed = associate_artifact(conn)
             receipt[0] = committed
             return committed
 

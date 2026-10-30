@@ -95,12 +95,12 @@ depends_on = ["mcp_telegram.telegram_rpc_consumers"]
 [[modules]]
 path = "mcp_telegram.telegram_demand_coordinator"
 layer = "application"
-depends_on = ["mcp_telegram.flood", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.telegram_demand_progress"]
+depends_on = ["mcp_telegram.telegram_rpc_recovery", "mcp_telegram.flood", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.telegram_demand_progress"]
 
 [[modules]]
 path = "mcp_telegram.daemon_api"
 layer = "application"
-depends_on = ["mcp_telegram.message_images.contracts", "mcp_telegram.chat_export",
+depends_on = ["mcp_telegram.entity_profile.repository", "mcp_telegram.telegram_demand_progress", "mcp_telegram.message_images.contracts", "mcp_telegram.chat_export",
     "mcp_telegram.daemon_account_trace", "mcp_telegram.daemon_activity_stats",
     "mcp_telegram.daemon_dialog_queries", "mcp_telegram.daemon_entity_info", "mcp_telegram.dialog_selector",
     "mcp_telegram.demand_wiring", "mcp_telegram.dialog_directory", "mcp_telegram.dialog_directory_coverage", "mcp_telegram.entity_profile.refresh",

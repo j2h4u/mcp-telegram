@@ -20,6 +20,7 @@ FACTORY_PATH = SOURCE_ROOT / "telegram.py"
 DAEMON_PATH = SOURCE_ROOT / "daemon.py"
 AUTH_PATH = SOURCE_ROOT / "telegram_auth.py"
 TRANSPORT_PATH = SOURCE_ROOT / "telegram_transport.py"
+PHOTO_ITERATOR_PATH = SOURCE_ROOT / "telegram_image_download.py"
 
 # These paths own the concrete Telethon type. The deploy QR helper lives in a
 # separate maintenance surface and is intentionally outside SOURCE_ROOT.
@@ -41,7 +42,11 @@ _LIFECYCLE_ALLOWLIST: dict[Path, dict[str, frozenset[str]]] = {
 
 # Access to an owned sender is distinct from permission to call its raw send.
 _PRIVATE_SENDER_SEAMS: dict[Path, frozenset[tuple[str, str, str]]] = {
-    GATE_PATH: frozenset({("_AdmissionAwareSender", "_send", "self._gate._main_sender")}),
+    GATE_PATH: frozenset({("_AdmissionAwareSender", "_selected_sender", "self._gate._main_sender")}),
+    PHOTO_ITERATOR_PATH: frozenset(
+        ("_PhotoIteratorFacade", method, "self._sender")
+        for method in ("__init__", "_call", "_borrow_exported_sender", "_return_exported_sender")
+    ),
     TRANSPORT_PATH: frozenset(
         {
             ("_OwnedPacker", "__init__", "self._sender"),
@@ -266,7 +271,12 @@ class _BoundaryVisitor(ast.NodeVisitor):
         if imported.name == "TelegramClient":
             alias = imported.asname or imported.name
             self._telegram_client_aliases.add(alias)
-            if not _owner_path(self.path, _CONCRETE_CLIENT_OWNER_PATHS):
+            photo_type_only = (
+                _same_path(self.path, PHOTO_ITERATOR_PATH)
+                and node.module == "telethon.client.telegramclient"
+                and self._type_checking_depth > 0
+            )
+            if not _owner_path(self.path, _CONCRETE_CLIENT_OWNER_PATHS) and not photo_type_only:
                 self._add(node, "concrete TelegramClient import outside transport/factory owner")
         if (
             node.module in {"telethon.errors", "telethon.errors.rpcerrorlist"}

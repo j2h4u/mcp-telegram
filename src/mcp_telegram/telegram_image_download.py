@@ -6,8 +6,8 @@ from logging import Logger
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Protocol, SupportsBytes, cast
 
-from telethon import errors  # type: ignore[import-untyped]
 from telethon.client.downloads import DownloadMethods  # type: ignore[import-untyped]
+from telethon.errors import TimedOutError  # type: ignore[import-untyped]
 from telethon.tl import (
     functions,  # type: ignore[import-untyped]
     types,  # type: ignore[import-untyped]
@@ -178,7 +178,7 @@ class _PhotoIteratorFacade(DownloadMethods):
         self._calls += 1
         try:
             result = await self._dispatch.get_file(request)
-        except errors.TimedOutError as exc:
+        except TimedOutError as exc:
             raise TimeoutError("photo request timed out") from exc
         if type(result) is types.upload.FileCdnRedirect or type(result) is not types.upload.File:
             raise PhotoUnsupportedError("unsupported_photo_redirect")

@@ -54,7 +54,7 @@ async def test_native_image_real_framed_ipc(tmp_path: Path, monkeypatch: pytest.
     socket = tmp_path / "daemon.sock"
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        request = json.loads(await reader.readline())
+        request = cast(dict[str, object], json.loads(await reader.readline()))
         response = await api._dispatch(request)
         await write_response(writer, response)
         writer.close()
@@ -103,7 +103,7 @@ def test_server_rejects_forged_native_content() -> None:
 
     from mcp_telegram.tools import ToolResult
 
-    status = {
+    status: dict[str, object] = {
         "content": {"state": "available", "mime_type": "image/jpeg", "representation": "telegram_photo", "byte_size": 5}
     }
     invalid = [

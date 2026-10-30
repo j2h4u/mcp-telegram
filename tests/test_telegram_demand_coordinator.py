@@ -291,7 +291,7 @@ async def test_plain_throttle_waits_for_finite_floor_without_new_budget(outcome:
     clock = _Clock()
     adapters = _adapters({kind: DemandStatus(0)})
     adapter = adapters[kind]
-    hint = [None]
+    hint: list[TelegramRpcThrottled | None] = [None]
     coordinator = TelegramDemandCoordinator(
         adapters, clock=clock, monotonic_clock=clock, rpc_eligibility=lambda _: hint[0]
     )

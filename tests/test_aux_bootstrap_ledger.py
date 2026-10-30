@@ -192,8 +192,9 @@ async def test_restart_keeps_legacy_and_other_unknowns_blocked(tmp_path: Path) -
         await restarted._reconcile_aux_after_restart(current)
         assert restarted.protection_reason == "unresolved_outbound_outcome"
         assert intents(store)["two"]["phase"] == "unknown"
-    payload = json.loads(cast(str, store.raw))
-    item = payload["intents"]["one"]["aux_bootstrap"]
+    payload = cast(dict[str, object], json.loads(cast(str, store.raw)))
+    items = cast(dict[str, dict[str, object]], payload["intents"])
+    item = cast(dict[str, object], items["one"]["aux_bootstrap"])
     item.pop("lock_scope")
     item.pop("lock_owner_id")
     item["contained"] = False
