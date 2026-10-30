@@ -2,7 +2,7 @@
 
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Literal, TypedDict
+from typing import Literal
 
 ASSESSMENT_TOOLS = frozenset({"get_sync_status", "list_messages", "search_messages"})
 ASSESSMENT_SCHEMA: dict[str, object] = {
@@ -15,12 +15,6 @@ ASSESSMENT_SCHEMA: dict[str, object] = {
     "required": ["local_read", "background_acquisition", "summary"],
     "additionalProperties": False,
 }
-
-
-class _Assessment(TypedDict):
-    local_read: Literal["completed_without_telegram"]
-    background_acquisition: Literal["account_hold", "no_account_hold_observed", "unknown"]
-    summary: str
 
 
 def _acquisition(snapshot: Mapping[str, object]) -> Literal["account_hold", "no_account_hold_observed", "unknown"]:
@@ -159,9 +153,8 @@ def build_sync_assessment(
             "unknown": "Account acquisition protection status is unknown.",
         }[acquisition]
     )
-    assessment: _Assessment = {
+    return {
         "local_read": "completed_without_telegram",
         "background_acquisition": acquisition,
         "summary": " ".join(parts),
     }
-    return dict(assessment)
