@@ -85,6 +85,7 @@ from .drafts.history import interrupt_draft_operations, prune_draft_history, pru
 from .drafts.owner import DraftMessageOwner
 from .drafts.sqlite_projection import SQLiteDraftProjection
 from .entity_profile.ports import UserProfilePort
+from .entity_profile.reader import semantic_profile
 from .entity_profile.refresh import RefreshLimits
 from .event_handlers import EventHandlerManager, UpdateProcessingBarrier
 from .fact_hydration import MessageFactHydrationWorker
@@ -138,6 +139,7 @@ from .sqlite_writer import SQLiteWriter
 from .startup_identity import (
     StartupIdentityResult,
     StartupIdentityState,
+    StartupIdentityUnavailableError,
 )
 from .state import StatePaths, ensure_private_state_dir, telegram_session_lease
 from .sync_db import (
@@ -260,9 +262,13 @@ class _DaemonClient(Protocol):
 
     async def verify_startup_account(self, account_id: int) -> None: ...
 
-    async def fail_startup_recovery(self) -> None: ...
+    async def fail_startup_recovery(self, error: BaseException | None = None) -> None: ...
 
     async def maintain_auto_resume(self) -> bool: ...
+
+    def automatic_trial_active(self) -> bool: ...
+
+    def bind_auto_resume_identity(self) -> None: ...
 
     def set_auto_resume_stop(self, stopped: Callable[[], bool]) -> None: ...
 
@@ -1350,9 +1356,15 @@ async def _connect_telegram(ctx: _SyncMainContext) -> bool:
             return False
         await ctx.client.connect()
     except (TimeoutError, OSError) as exc:
-        await ctx.client.fail_startup_recovery()
+        await ctx.client.fail_startup_recovery(exc)
         ctx.api_server.startup_detail = f"connection failed: {exc}"
         logger.exception("sync-daemon connection failed: %s", exc)
+        retained_scope = ctx.client.retained_auth_scope()
+        if retained_scope is not None:
+            ctx.api_server.self_id = retained_scope.account_id
+            await ctx.api_server._publish_auth_scope(retained_scope)
+            ctx.api_server._ready = True
+        await ctx.shutdown_event.wait()
         return False
     except (TelegramRpcThrottled, RpcAdmissionError) as exc:
         await ctx.client.fail_startup_recovery()
@@ -1377,6 +1389,14 @@ async def _acquire_startup_identity_before_updates(
 ) -> StartupIdentityState:
     """Run the established classified startup identity path while updates wait."""
     startup = StartupIdentityState.begin()
+    recovery_trial = ctx.client.automatic_trial_active()
+
+    def retained_context(account_id: int) -> OwnOnlyContext:
+        semantic = semantic_profile(ctx.conn, account_id, account_id, int(time.time()))
+        fields = semantic.get("fields")
+        value = fields.get("full_user.personal_channel_id") if isinstance(fields, dict) else None
+        channel = value if type(value) is int and value > 0 else None
+        return OwnOnlyContext(account_id, channel)
 
     async def get_self_input_entity(account_id: int) -> object:
         return await ctx.client.get_input_entity(account_id)
@@ -1402,15 +1422,18 @@ async def _acquire_startup_identity_before_updates(
             get_input_entity=get_self_input_entity,
             user_profile_port=ctx.user_profile_port,
             publish_startup_identity=publish,
+            retained_context=retained_context if recovery_trial else None,
         ),
         account_id=None,
     )
     limit = demand_contract(DemandKind.SELF_PROFILE_MAINTENANCE).max_rpc_attempts_per_slice
     if limit is None:
         raise RuntimeError("startup identity has no RPC attempt bound")
-    budget = RpcAttemptBudget(limit)
+    budget = RpcAttemptBudget(1 if recovery_trial else limit)
     deadline = asyncio.get_running_loop().time() + startup.remaining(time.time())
     try:
+        if recovery_trial:
+            ctx.client.bind_auto_resume_identity()
         with demand_context(DemandKind.SELF_PROFILE_MAINTENANCE, deadline=deadline):
             async with asyncio.timeout_at(deadline):
                 while startup.pending:
@@ -1421,6 +1444,28 @@ async def _acquire_startup_identity_before_updates(
         startup.fail("startup identity deadline expired")
     startup.result()
     return startup
+
+
+async def _acquire_identity_or_hold(
+    ctx: _SyncMainContext, directory: CanonicalDialogDirectory
+) -> StartupIdentityState | None:
+    trial = ctx.client.automatic_trial_active()
+    try:
+        return await _acquire_startup_identity_before_updates(ctx, directory)
+    except (StartupIdentityUnavailableError, TelegramRpcThrottled, RpcAdmissionError) as exc:
+        if not trial:
+            raise
+        cause = exc.__cause__ if isinstance(exc.__cause__, (TimeoutError, OSError)) else None
+        await ctx.client.fail_startup_recovery(cause)
+        ctx.api_server.startup_detail = "Telegram identity unavailable during recovery"
+        ctx.api_server._ready = False
+        retained_scope = ctx.client.retained_auth_scope()
+        if retained_scope is not None:
+            ctx.api_server.self_id = retained_scope.account_id
+            await ctx.api_server._publish_auth_scope(retained_scope)
+            ctx.api_server._ready = True
+        await ctx.shutdown_event.wait()
+        return None
 
 
 async def _run_startup_identity_slice(
@@ -1481,7 +1526,7 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     ctx.coordinator.offer(DemandKind.SELF_PROFILE_MAINTENANCE)
     identity = await _wait_for_startup_identity(ctx.demand_runtime.startup_identity, ctx.shutdown_event)
     assert ctx.api_server.self_id is not None
-    assert ctx.own_only_context == identity.own_only_context
+    assert ctx.own_only_context is not None and ctx.own_only_context.account_id == identity.own_only_context.account_id
     # The directory's account fence is durable and must settle before event
     # ownership and API readiness can expose the authenticated account.
     await ctx.demand_runtime.dialog_directory.bind_account_id(ctx.api_server.self_id)
@@ -2163,7 +2208,9 @@ async def sync_main() -> None:  # noqa: PLR0915 - composition root owns startup 
             writer=ctx.writer,
             startup_detail_setter=lambda detail: setattr(ctx.api_server, "startup_detail", detail),
         )
-        startup_identity = await _acquire_startup_identity_before_updates(ctx, dialog_directory)
+        startup_identity = await _acquire_identity_or_hold(ctx, dialog_directory)
+        if startup_identity is None:
+            return
         assert ctx.api_server.self_id is not None
         ctx.handler_manager.set_self_id(ctx.api_server.self_id)
         await _bind_draft_commands(ctx)

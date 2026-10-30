@@ -220,6 +220,18 @@ def _valid_rpc_scope(scope: TelegramRpcScope) -> bool:
     )
 
 
+def _valid_incident_id(value: str | None) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == _OBSERVATION_ID_HEX_LENGTH
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _valid_incident_time(value: int | None) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 @dataclass(slots=True)
 class _MethodAggregate:
     started_at: float
@@ -361,9 +373,18 @@ class RpcAdmissionObservationAggregator:
         replay_ordinal: int | None = None,
         reason: str | None = None,
         attempt_ordinal: int | None = None,
+        incident_run: str | None = None,
+        incident_claimed_at_ms: int | None = None,
+        incident_settled_at_ms: int | None = None,
+        incident_cause: str | None = None,
     ) -> None:
         """Bounded method counters and biased root samples; never admit work."""
         try:
+            if phase == "incident_unknown":
+                self._observe_unknown_incident(
+                    scope, request_method, incident_run, incident_claimed_at_ms, incident_settled_at_ms, incident_cause
+                )
+                return
             if phase not in _RPC_PHASES or not _valid_rpc_scope(scope):
                 return
             method = _observation_method(request_method or scope.request_method, self._method_names)
@@ -385,6 +406,51 @@ class RpcAdmissionObservationAggregator:
                 self._sample_rpc_event(operation_id, payload, wall_ms)
             self.flush_if_due()
         except Exception:  # noqa: BLE001 - neither payloads nor observer failures enter the product path
+            with self._state_lock:
+                self._rpc_lost_rows += 1
+
+    def _observe_unknown_incident(  # noqa: PLR0913, PLR0917 - passive fields from the physical owner
+        self,
+        scope: TelegramRpcScope,
+        method: str | None,
+        run: str | None,
+        claimed_at_ms: int | None,
+        settled_at_ms: int | None,
+        cause: str | None,
+    ) -> None:
+        attempt = scope.owned_attempt_id
+        method = _observation_method(method, self._method_names)
+        if not all(
+            (
+                _valid_rpc_scope(scope),
+                not scope.transport_control,
+                _valid_incident_id(attempt),
+                _valid_incident_id(run),
+                _valid_incident_time(claimed_at_ms),
+                _valid_incident_time(settled_at_ms),
+                method != "unknown",
+            )
+        ):
+            with self._state_lock:
+                self._rpc_lost_rows += 1
+            return
+        payload: dict[str, object] = {
+            "attempt_id": attempt,
+            "run": run,
+            "method": method,
+            "source": scope.source.value,
+            "service_class": scope.service_class.value,
+            "claim_at_ms": claimed_at_ms,
+            "settled_at_ms": settled_at_ms,
+            "termination": cause if cause in {"cancelled", "transport_lost", "shutdown"} else "unspecified",
+        }
+        if scope.demand_kind is not None:
+            payload["demand_kind"] = scope.demand_kind.value
+        if scope.acquisition_kind is not None:
+            payload["acquisition_kind"] = scope.acquisition_kind.value
+        if not self._record_rpc_row(
+            outcome="incident_unknown", payload=payload, observed_at_ms=cast(int, settled_at_ms), operation_id=attempt
+        ):
             with self._state_lock:
                 self._rpc_lost_rows += 1
 

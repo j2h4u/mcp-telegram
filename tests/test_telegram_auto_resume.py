@@ -3,21 +3,27 @@
 import asyncio
 import json
 import time
+from collections.abc import AsyncIterator
 from dataclasses import replace
 from typing import cast
 
 import pytest
+from telethon.network.connection.tcpfull import FullPacketCodec
+from telethon.tl import functions, types
 from telethon.tl.functions.updates import GetStateRequest
 
 from mcp_telegram import telegram_rpc
+from mcp_telegram.config import TelegramRpcSchedulerConfig
 from mcp_telegram.telegram_demand import RpcAttemptBudget, RpcAttemptEvidence
-from mcp_telegram.telegram_rpc import TelegramRpcSafetyLedger, TelegramRpcThrottled
+from mcp_telegram.telegram_rpc import TelegramRpcBudget, TelegramRpcGate, TelegramRpcSafetyLedger, TelegramRpcThrottled
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import RpcServiceClass, TelegramRpcScope, TelegramRpcSource
-from mcp_telegram.telegram_transport import _OwnedPacket
+from mcp_telegram.telegram_transport import GuardedConnectionTcpFull, GuardedMTProtoSender, _OwnedPacket
 from tests.test_telegram_rpc_safety import Clock, Store, generation, intents, record, recovery
 from tests.test_telegram_rpc_safety import clock as clock
-from tests.test_telegram_rpc_wire_integration import _WireHarness
+from tests.test_telegram_rpc_wire_integration import _Circuit, _WireHarness
 from tests.test_telegram_rpc_wire_integration import wire as wire
+from tests.test_telegram_transport import _Writer
 
 
 def _automatic(store: Store) -> dict[str, object]:
@@ -47,7 +53,7 @@ async def test_automatic_wait_honors_later_server_floor_and_does_not_replenish(c
     clock.advance(2)
     assert await restarted.maintain_auto_resume()
     assert await restarted.consume_auto_resume()
-    assert _automatic(store)["attempts"] == 1
+    assert cast(dict[str, int], _automatic(store)["attempts_by_policy"])["flood_wait"] == 1
     assert not await restarted.consume_auto_resume()
 
 
@@ -59,15 +65,16 @@ async def test_automatic_attempts_back_off_and_exhaust_after_six(clock: Clock) -
         assert not await ledger.consume_auto_resume()
         clock.advance(1)
         assert await ledger.consume_auto_resume()
-        assert _automatic(store)["attempts"] == attempt
+        assert cast(dict[str, int], _automatic(store)["attempts_by_policy"])["flood_wait"] == attempt
         await ledger.record_floor(clock.time() + 1, circuit_open=True)
+        await ledger.maintain_auto_resume()
     assert ledger.protection_reason == "automatic_resume_exhausted"
     clock.advance(10_000_000)
     restarted = store.ledger()
     restarted.configure_auto_resume(enabled=True)
     assert not await restarted.maintain_auto_resume()
     assert not await restarted.consume_auto_resume()
-    assert _automatic(store)["attempts"] == 6
+    assert cast(dict[str, int], _automatic(store)["attempts_by_policy"])["flood_wait"] == 6
 
 
 async def test_automatic_wait_rebase_is_persisted_once_per_boot(clock: Clock) -> None:
@@ -78,14 +85,14 @@ async def test_automatic_wait_rebase_is_persisted_once_per_boot(clock: Clock) ->
     rebooted = store.ledger(boot_id="boot-b")
     rebooted.configure_auto_resume(enabled=True)
     assert not await rebooted.maintain_auto_resume()
-    due = cast(dict[str, object], _automatic(store)["due"])
+    due = cast(dict[str, object], _automatic(store)["scheduled_due"])
     assert due["boot_id"] == "boot-b"
     deadline = due["until_monotonic"]
     clock.advance(1800)
     restarted = store.ledger(boot_id="boot-b")
     restarted.configure_auto_resume(enabled=True)
     assert not await restarted.maintain_auto_resume()
-    assert cast(dict[str, object], _automatic(store)["due"])["until_monotonic"] == deadline
+    assert cast(dict[str, object], _automatic(store)["scheduled_due"])["until_monotonic"] == deadline
     clock.advance(1800)
     assert await restarted.maintain_auto_resume()
 
@@ -117,18 +124,18 @@ async def test_disabled_automatic_mode_does_not_arm_or_consume(clock: Clock) -> 
     assert store.raw == before
 
 
-async def test_consumed_trial_crash_is_manual_even_after_wait(clock: Clock) -> None:
+async def test_consumed_trial_crash_waits_for_a_new_trial(clock: Clock) -> None:
     store = Store()
     ledger = await _waiting(store, clock)
     clock.advance(3600)
     assert await ledger.consume_auto_resume()
     restarted = store.ledger()
     restarted.configure_auto_resume(enabled=True)
-    clock.advance(1_000_000)
     assert restarted.protection_reason == "recovery_trial_incomplete"
-    assert restarted.auto_resume_status()["state"] == "manual"
     assert not await restarted.maintain_auto_resume()
     assert not await restarted.consume_auto_resume()
+    clock.advance(7200)
+    assert await restarted.consume_auto_resume()
 
 
 async def test_unknown_intent_is_never_acknowledged_by_automatic_recovery(clock: Clock) -> None:
@@ -194,7 +201,7 @@ async def test_competing_consumers_get_one_durable_trial(clock: Clock) -> None:
     ledger = await _waiting(store, clock)
     clock.advance(3600)
     assert sorted(await asyncio.gather(ledger.consume_auto_resume(), ledger.consume_auto_resume())) == [False, True]
-    assert _automatic(store)["attempts"] == 1
+    assert cast(dict[str, int], _automatic(store)["attempts_by_policy"])["flood_wait"] == 1
 
 
 async def test_cancelled_slow_consume_stays_owned_and_crash_cannot_retry(clock: Clock) -> None:
@@ -224,45 +231,83 @@ def _wire_clock(wire: _WireHarness, monkeypatch: pytest.MonkeyPatch) -> Clock:
     return value
 
 
-async def _wire_trial(wire: _WireHarness, clock: Clock) -> None:
+@pytest.fixture
+async def trial_wire(wire: _WireHarness, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[tuple[_WireHarness, Clock]]:
     gate = wire[0]
+    clock = _wire_clock(wire, monkeypatch)
     gate.configure_auto_resume(enabled=True)
     await gate.prepare_startup_safety()
     await gate._ensure_safety_ledger().record_floor(clock.time() + 1, circuit_open=True)
     assert not await gate.maintain_auto_resume()
     clock.advance(3600)
     assert await gate.maintain_auto_resume()
-    dc_id, key_id = gate._offline_wire_identity()
-    gate._safety = TelegramRpcSafetyLedger(gate._safety_store, dc_id=dc_id, key_id=key_id)
-    gate.configure_auto_resume(enabled=True)
-    await gate.prepare_startup_safety()
-    await gate.verify_startup_account(42)
-    recovery = gate._ensure_safety_ledger()._automatic_recovery()
+    assert not wire[1].physical_connected()
+    fresh = TelegramRpcGate(
+        gate.session,
+        1,
+        "test",
+        rpc_budget=TelegramRpcBudget(30, 60),
+        circuit_status=_Circuit,
+        fallback_wait_seconds=1,
+        cooldown_buffer_seconds=0,
+        transient_retry_delays_seconds=(),
+        scheduler_policy=TelegramRpcSchedulerConfig(),
+        safety_store=gate._safety_store,
+    )
+    monkeypatch.setattr(fresh._admission_scheduler, "_clock", clock.monotonic)
+    sender = cast(GuardedMTProtoSender, fresh._main_sender)
+    connection = GuardedConnectionTcpFull("127.0.0.1", 443, 2, loggers=fresh._log)
+    connection.bind_owner(sender)
+    connection._connected = True
+    sink = _Writer()
+    connection._writer = cast(asyncio.StreamWriter, sink)
+    connection._codec = FullPacketCodec(connection)
+    sender._connection = connection
+    sender._user_connected = True
+    fresh._transport_state = telegram_rpc._TransportBoundaryState.READY
+    fresh.configure_auto_resume(enabled=True)
+    await fresh.prepare_startup_safety()
+    await fresh.verify_startup_account(42)
+    recovery = fresh._ensure_safety_ledger()._automatic_recovery()
     assert recovery is not None and recovery["state"] == "consumed"
+    try:
+        yield (fresh, sender, connection, sink), clock
+    finally:
+        for state in tuple(sender._owned_states):
+            if not state.future.done():
+                state.future.cancel()
+        await asyncio.sleep(0)
+        await asyncio.gather(*sender._observing, return_exceptions=True)
+        await fresh._admission_scheduler.close()
+        await connection.disconnect()
 
 
 async def _prepared_packet(wire: _WireHarness, clock: Clock) -> tuple[asyncio.Future[object], _OwnedPacket]:
-    _, sender, connection, _ = wire
+    gate, sender, connection, _ = wire
+    trial = gate.automatic_trial_active()
+    if trial:
+        gate.bind_auto_resume_identity()
     scope = TelegramRpcScope(
-        TelegramRpcSource.MCP_INTERACTIVE,
-        RpcServiceClass.INTERACTIVE,
+        TelegramRpcSource.MAINTENANCE if trial else TelegramRpcSource.MCP_INTERACTIVE,
+        RpcServiceClass.BACKGROUND if trial else RpcServiceClass.INTERACTIVE,
         clock.monotonic() + 10,
         asyncio.current_task(),
-        attempt_budget=RpcAttemptBudget(2),
+        demand_kind=DemandKind.SELF_PROFILE_MAINTENANCE if trial else None,
+        attempt_budget=RpcAttemptBudget(1 if trial else 2),
         attempt_evidence=RpcAttemptEvidence(),
     )
-    response = sender.send_owned(GetStateRequest(), scope)
+    request = functions.users.GetUsersRequest([types.InputUserSelf()]) if trial else GetStateRequest()
+    response = sender.send_owned(request, scope)
     state = await sender._send_queue.next_state()
     await sender._prepare_state(state)
     return response, connection._send_queue.get_nowait()
 
 
 async def test_real_wire_success_and_canonical_progress_are_both_required_for_reset(
-    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+    trial_wire: tuple[_WireHarness, Clock],
 ) -> None:
-    clock = _wire_clock(wire, monkeypatch)
+    wire, clock = trial_wire
     gate, sender, connection, sink = wire
-    await _wire_trial(wire, clock)
     await gate.finish_startup_auto_resume()
     gate.note_canonical_progress()
     clock.advance(3600)
@@ -281,24 +326,36 @@ async def test_real_wire_success_and_canonical_progress_are_both_required_for_re
 
 
 async def test_disable_revokes_prepared_automatic_trial_packet(
-    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+    trial_wire: tuple[_WireHarness, Clock],
 ) -> None:
-    clock = _wire_clock(wire, monkeypatch)
+    wire, clock = trial_wire
     gate, sender, connection, sink = wire
-    await _wire_trial(wire, clock)
     response, packet = await _prepared_packet(wire, clock)
+    budget = cast(telegram_rpc._WireAttempt, sender.application_owner(response)).scope.attempt_budget
+    assert budget is not None and budget.limit == 1
     gate.configure_auto_resume(enabled=False)
     assert not sender.write_packet(packet, connection._send)
+    assert budget.attempts == 0
     assert sink.frames == []
     response.cancel()
 
 
+async def test_recovery_identity_claim_spends_exactly_one_attempt(trial_wire: tuple[_WireHarness, Clock]) -> None:
+    wire, clock = trial_wire
+    _, sender, connection, sink = wire
+    response, packet = await _prepared_packet(wire, clock)
+    budget = cast(telegram_rpc._WireAttempt, sender.application_owner(response)).scope.attempt_budget
+    assert budget is not None and budget.limit == 1 and budget.attempts == 0
+    assert sender.write_packet(packet, connection._send)
+    assert budget.attempts == 1 and sink.frames
+    response.cancel()
+
+
 async def test_stop_during_blocked_intent_commit_prevents_physical_write(
-    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+    trial_wire: tuple[_WireHarness, Clock],
 ) -> None:
-    clock = _wire_clock(wire, monkeypatch)
+    wire, clock = trial_wire
     gate, _, _, sink = wire
-    await _wire_trial(wire, clock)
     ledger = gate._ensure_safety_ledger()
     entered, released, stopped = asyncio.Event(), asyncio.Event(), asyncio.Event()
     gate.set_auto_resume_stop(stopped.is_set)
@@ -324,16 +381,18 @@ async def test_stop_during_blocked_intent_commit_prevents_physical_write(
 
 
 async def test_stop_revokes_prepared_trial_packet_without_stopping_controls(
-    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+    trial_wire: tuple[_WireHarness, Clock],
 ) -> None:
-    clock = _wire_clock(wire, monkeypatch)
+    wire, clock = trial_wire
     gate, sender, connection, sink = wire
-    await _wire_trial(wire, clock)
     stopped = asyncio.Event()
     gate.set_auto_resume_stop(stopped.is_set)
     response, packet = await _prepared_packet(wire, clock)
+    budget = cast(telegram_rpc._WireAttempt, sender.application_owner(response)).scope.attempt_budget
+    assert budget is not None and budget.limit == 1
     stopped.set()
     assert not sender.write_packet(packet, connection._send)
+    assert budget.attempts == 0
     assert gate._control_scope_valid()
     assert sink.frames == []
     response.cancel()

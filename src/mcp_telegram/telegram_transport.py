@@ -30,6 +30,21 @@ from .telegram_rpc_scheduler import RpcAdmissionExpiredError, RpcAdmissionSatura
 type ProtocolOrigin = Literal["ack", "ping", "state_info", "auth"]
 
 
+class TransportConnectError(ConnectionError):
+    """The owned socket connection could not be established."""
+
+
+class TransportWriteError(ConnectionError):
+    """A physical connection writer failed after the claim boundary."""
+
+
+def _write_frame(write: Callable[[bytes], None], frame: bytes) -> None:
+    try:
+        write(frame)
+    except OSError as error:
+        raise TransportWriteError("Telegram connection writer failed") from error
+
+
 class _RequestState(Protocol):
     request: object
     data: bytes
@@ -151,7 +166,12 @@ class GuardedConnectionTcpFull(ConnectionTcpFull):
     async def connect(self, timeout: float | None = None, ssl: object = None) -> None:
         self._owned_epoch = getattr(self, "_owned_epoch", 0) + 1
         self._owned_putters.clear()
-        await super().connect(timeout=timeout, ssl=ssl)
+        self._last_connect_failed = False
+        try:
+            await super().connect(timeout=timeout, ssl=ssl)
+        except (OSError, TimeoutError) as error:
+            self._last_connect_failed = True
+            raise TransportConnectError("Telegram socket connection failed") from error
 
     async def send(self, data: object) -> None:
         packet = data
@@ -284,6 +304,15 @@ class GuardedMTProtoSender(MTProtoSender):
             self._terminal_teardown = None
         connection.bind_owner(self)
         return await super().connect(connection)
+
+    async def _connect(self) -> None:
+        try:
+            await super()._connect()
+        except ConnectionError as error:
+            connection = self._connection
+            if isinstance(connection, GuardedConnectionTcpFull) and getattr(connection, "_last_connect_failed", False):
+                raise TransportConnectError("Telegram socket retries exhausted") from error
+            raise
 
     async def _disconnect(self, error: BaseException | None = None) -> None:
         if self._terminal_teardown is None:
@@ -564,7 +593,7 @@ class GuardedMTProtoSender(MTProtoSender):
             if not owned.plain_frame_validated or owned.plain_message_id is None:
                 raise RuntimeError("owned authentication frame is missing")
             header = struct.pack("<qqi", 0, owned.plain_message_id(), len(owned.body))
-            write(header + owned.body)
+            _write_frame(write, header + owned.body)
             return
         buffer = io.BytesIO()
         state.msg_id = self._state.write_data_as_message(
@@ -577,7 +606,7 @@ class GuardedMTProtoSender(MTProtoSender):
         encrypted = self._state.encrypt_message_data(buffer.getvalue())
         if isinstance(state.request, TLRequest):
             self._pending_state[state.msg_id] = state
-        write(encrypted)
+        _write_frame(write, encrypted)
         if owned.origin == "ack" and owned.claims == 1:
             # Vendor retention bounds replay of sent acknowledgements. Pending
             # obligations keep their existing queue ownership until first write.

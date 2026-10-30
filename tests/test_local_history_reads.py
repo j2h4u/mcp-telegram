@@ -113,7 +113,7 @@ async def test_empty_history_requires_a_completed_observation(local_reader: Loca
     assert result["ok"] is True
     data = _response_data(result)
     assert data["messages"] == []
-    assert data["selection_state"] == ("known_empty" if status == "synced" else "unknown")
+    assert data["selection_state"] == "unknown"
     assert data["observation_horizon_at"] == (200 if status == "synced" else None)
 
 
@@ -283,6 +283,46 @@ async def test_empty_time_range_after_observation_horizon_is_unknown(local_reade
     _insert_synced_dialog(conn, 42, status="synced", last_synced_at=100)
     result = await _read(local_reader, since_utc="1970-01-01T00:01:41Z")
     assert _response_data(result)["selection_state"] == "unknown"
+
+
+@pytest.mark.parametrize("message_state", ("sent", "all"))
+@pytest.mark.parametrize(
+    ("bounds", "expected"),
+    [
+        ({"until_utc": "1970-01-01T00:01:40Z"}, "known_empty"),
+        ({"since_utc": "1970-01-01T00:00:50Z", "until_utc": "1970-01-01T00:01:40Z"}, "known_empty"),
+        ({"since_utc": "1970-01-01T00:00:50Z"}, "unknown"),
+        ({"since_utc": "1970-01-01T00:00:50Z", "until_utc": "1970-01-01T00:01:41Z"}, "unknown"),
+        ({}, "unknown"),
+    ],
+)
+async def test_empty_selection_requires_full_time_coverage(
+    local_reader: LocalReader, message_state: str, bounds: dict[str, str], expected: str
+) -> None:
+    conn, _ = local_reader
+    _insert_synced_dialog(conn, 42, status="synced", last_synced_at=100)
+    result = await _read(local_reader, message_state=message_state, **bounds)
+    assert _response_data(result)["selection_state"] == (expected if message_state == "sent" else "unknown")
+    assert _response_data(result)["interval_coverage"] == (
+        "covered_as_of_horizon" if expected == "known_empty" else "beyond_horizon"
+    )
+
+
+@pytest.mark.parametrize("message_state", ("sent", "all"))
+async def test_empty_next_page_is_not_empty_history(local_reader: LocalReader, message_state: str) -> None:
+    conn, _ = local_reader
+    _insert_synced_dialog(conn, 42, status="synced", last_synced_at=100)
+    _insert_message(conn, 42, 1, sent_at=50)
+    _insert_message(conn, 42, 2, sent_at=60)
+    first = await _read(local_reader, message_state=message_state, until_utc="1970-01-01T00:01:40Z", limit=1)
+    token = _response_data(first)["next_navigation"]
+    assert isinstance(token, str)
+    conn.execute("DELETE FROM messages WHERE dialog_id=42 AND message_id=1")
+    second = await _read(
+        local_reader, message_state=message_state, until_utc="1970-01-01T00:01:40Z", limit=1, navigation=token
+    )
+    assert _response_messages(second) == []
+    assert _response_data(second)["selection_state"] == "unknown"
 
 
 async def test_context_respects_valid_utc_bounds(local_reader: LocalReader) -> None:

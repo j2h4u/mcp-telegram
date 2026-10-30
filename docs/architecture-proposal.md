@@ -241,16 +241,20 @@ back to a compatible binary. Never rewind the database after new facts have
 been committed or erase protection floors/intents. For a failed rollout, use a
 forward fix or protected current compatible binary first.
 
-Settled FloodWait account protection uses automatic full-lifecycle resumption
-by default (`[flood_wait] auto_resume_enabled = true`). The existing central
-receipt persists six waits of 1/2/4/8/16/24 hours and spent trials; mandatory
-server floors can only extend eligibility. Automatic consumption never
-acknowledges unknown intents or clears method claims. Unknown outcomes,
-consumed-trial crashes, identity/storage faults and exhausted attempts remain
-manual. Disable the mode on a compatible binary to disarm future trials while
-preserving receipt state. Stability requires a continuous verified hour plus
-successful application acquisition and accepted canonical progress; a restart
-does not replenish attempts.
+Automatic full-lifecycle resumption is enabled by default
+(`[flood_wait] auto_resume_enabled = true`). The central receipt retains
+cause-specific recovery state: confirmed FloodWait has six attempts with
+1/2/4/8/16/24-hour waits; transport and retryable server failures use a capped
+30-second to 30-minute backoff; eligible unexplained unknown read outcomes use
+a capped five-minute to one-hour backoff. Applicable server floors and already
+incurred policy waits cannot be shortened. Interrupted trials remain spent.
+Automatic recovery records a scoped policy disposition for eligible unknown
+reads; it does not turn the outcome into a known result or an operator
+acknowledgement. Unknown mutations, unclassified methods, invalid storage or
+account ownership, unresolved authentication and exhausted FloodWait attempts
+remain hard holds. Disable the mode on a compatible binary to disarm future
+trials while preserving receipt state. Stability requires a continuous verified
+hour plus successful application acquisition and accepted canonical progress.
 
 Manual recovery is `mcp-telegram recover-account
 --acknowledge-unknown-outcome`. It reads the active protection generation, then
@@ -262,8 +266,8 @@ outcomes, with operator acknowledgement. A bounded bootstrap and identity trial
 may follow restart only under that authorization. Trial success opens that
 operator authorization but cannot prove an unseen server floor has elapsed.
 Failure, FloodWait or uncertainty returns to hold; retry requires a new explicit
-operator authorization. There is no MCP recovery tool, automatic timer, raw
-state reset or SQL-edit recovery path.
+operator authorization. There is no MCP recovery tool, raw state reset or
+SQL-edit recovery path.
 
 Protocol ACK, Ping and StateInfo controls use exact, bounded central admission
 during an application-write hold. They remain protocol-only: no application

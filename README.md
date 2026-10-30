@@ -110,16 +110,20 @@ Keep the marker on rollback to a compatible binary. Do not restore an older
 database after new facts have been written; use a forward fix or a protected
 current compatible binary first.
 
-Settled FloodWait protection automatically schedules a cautious full restart,
-enabled by `[flood_wait] auto_resume_enabled = true` (the default). Six attempts
-wait 1, 2, 4, 8, 16 and 24 hours after protection or a known failed trial;
-longer Telegram restrictions always extend the wait. Restarting does not reset
-the count. One uninterrupted hour with successful application acquisition and
-committed canonical progress resets the episode. Setting the option to false
-disables future automatic attempts without clearing restrictions or history.
+Automatic recovery is enabled by `[flood_wait] auto_resume_enabled = true` (the
+default). Confirmed FloodWait recovery has six attempts, with waits of 1, 2, 4,
+8, 16 and 24 hours. Transport and retryable server failures use a separate
+30-second to 30-minute backoff; eligible nonmutating reads with an unexplained
+unknown outcome use a five-minute to one-hour backoff. Known Telegram waits and
+already incurred policy waits always apply. An interrupted trial remains spent.
+One uninterrupted hour with successful application acquisition and committed
+canonical progress resets an eligible successful episode. Disabling automatic
+recovery preserves restrictions and history.
 
-Unknown outcomes, interrupted consumed trials, identity/storage failures and
-exhausted attempts require the existing manual recovery path:
+Untrusted storage, account or key mismatch, unresolved authentication,
+unknown mutations or unclassified methods remain hard holds. Exhausted
+FloodWait recovery requires explicit recovery; automatic recovery never issues
+manual acknowledgement. The existing manual recovery path is:
 
 ```bash
 mcp-telegram recover-account --acknowledge-unknown-outcome
@@ -140,7 +144,8 @@ does not restart the service. Deployment verification waits up to 15 minutes;
 if readiness is not observed in that interval, the runtime is left running and
 `just runtime-wait` can continue observation. A caller timeout does not release
 an accepted write or receipt from its owner; forced termination can leave an
-outcome unknown and require the existing manual recovery path.
+outcome unknown; eligibility for automatic recovery depends on the classified
+method and verified account ownership.
 
 Protocol ACK, Ping and StateInfo controls use the same bounded central admission
 path during an application-write hold. They remain protocol-only: no application

@@ -64,7 +64,7 @@ _DRAFT_SOURCE_ORDER_SCHEMA_76 = 76
 
 _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _RPC_SAFETY_RECORD_KEY = "telegram_rpc_safety"
-_RPC_SAFETY_RECORD_VERSION = 2
+_RPC_SAFETY_RECORD_VERSION = 3
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
 _LEGACY_SCHEDULED_QUIET_DISCOVERY_SECONDS = 86_400
 
@@ -1636,14 +1636,14 @@ def _validate_rpc_safety_record(value: str) -> tuple[int | None, float]:
     if (
         not isinstance(record, dict)
         or type(record.get("version")) is not int
-        or record["version"] not in {1, _RPC_SAFETY_RECORD_VERSION}
+        or record["version"] not in {1, 2, _RPC_SAFETY_RECORD_VERSION}
     ):
         raise ValueError("invalid Telegram RPC safety record version")
     account_id, expected_account = _validate_rpc_safety_scope(cast(dict[str, object], record))
     floor_utc = _validate_rpc_safety_floor(record.get("floor"))
     if not record.get("generation") or not isinstance(record.get("generation"), str):
         raise ValueError("invalid Telegram RPC safety record generation")
-    if record["version"] == _RPC_SAFETY_RECORD_VERSION:
+    if record["version"] in {2, _RPC_SAFETY_RECORD_VERSION}:
         _validate_rpc_method_episodes(record.get("methods"))
     scope = cast(dict[str, object], record.get("scope"))
     return (account_id if scope["stage"] == "verified" else expected_account, floor_utc)

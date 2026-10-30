@@ -142,7 +142,7 @@ async def test_bound_credit_wait_retains_gate_horizon_even_after_it_expires(
     gate, _, _, _ = wire
     clock = _clock(wire, monkeypatch)
     method = await _flood(wire, clock)
-    clock.advance(301)
+    clock.advance(3601)
     budget = _selected_budget()
     authorization = gate.prepare_durable_retry(budget, method)
     assert authorization is not None and budget.selected is not None

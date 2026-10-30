@@ -109,7 +109,7 @@ async def test_restart_never_remints_same_live_or_recovered_generation_credit(
     budget = _credit_budget()
     credit = ledger.bind_method_retry(budget, method, 2)
     assert credit is not None
-    method_clock.advance(301)
+    method_clock.advance(3601)
     await ledger.prepare("trial", method)
     generation = await ledger.prepare_method_trial("trial", method)
     credit.debit(budget)
@@ -138,13 +138,13 @@ async def test_binding_capacity_refuses_only_new_extra_credit_and_never_evicts_s
 
 
 @pytest.mark.parametrize("global_first", [False, True])
-async def test_method_flood_delay_doubles_to_hour_cap_without_capping_global_floor(
+async def test_method_flood_delay_doubles_to_day_cap_without_capping_global_floor(
     method_clock: Clock, global_first: bool
 ) -> None:
     store = Store()
     method = method_key()
     global_floor = method_clock.utc + 50_000
-    delays = [300, 600, 1200, 2400, 3600, 3600]
+    delays = [3600, 7200, 14400, 28800, 57600, 86400, 86400]
 
     for index, delay in enumerate(delays):
         prior_count = index + 1
@@ -159,7 +159,7 @@ async def test_method_flood_delay_doubles_to_hour_cap_without_capping_global_flo
         assert method_floor(store, method)["remaining_seconds"] == delay
 
     assert store.ledger().floor_deadline >= 100 + 50_000
-    assert store.ledger().method_release_at(method) - method_clock.monotonic_seconds == 3600
+    assert store.ledger().method_release_at(method) - method_clock.monotonic_seconds == 86400
 
 
 async def test_duplicate_terminal_flood_after_intent_removal_does_not_escalate(method_clock: Clock) -> None:
@@ -182,7 +182,7 @@ async def test_only_one_of_five_contenders_commits_the_durable_method_claim(meth
     store = Store()
     method = method_key()
     await record_flood(store, "seed", method)
-    method_clock.advance(300)
+    method_clock.advance(3600)
     ledger = store.ledger()
     for index in range(5):
         await ledger.prepare(f"candidate-{index}", method)
@@ -206,7 +206,7 @@ async def test_never_written_trial_releases_claim_without_erasing_method_history
     store = Store()
     method = method_key()
     await record_flood(store, "seed", method)
-    method_clock.advance(300)
+    method_clock.advance(3600)
     ledger = store.ledger()
     await ledger.prepare("cancelled", method)
     generation = await ledger.prepare_method_trial("cancelled", method)
@@ -226,7 +226,7 @@ async def test_only_matching_current_trial_success_clears_method_episode(method_
     store = Store()
     method = method_key()
     await record_flood(store, "seed", method)
-    method_clock.advance(300)
+    method_clock.advance(3600)
     ledger = store.ledger()
     await ledger.prepare("unrelated", method)
     await ledger.prepare("current", method)
@@ -250,10 +250,10 @@ async def test_restart_preserves_method_hold_and_unsettled_trial_is_unknown_prot
     await record_flood(store, "seed", method)
     method_clock.advance(100)
     restarted = store.ledger(boot_id="boot-b")
-    assert restarted.method_release_at(method) >= method_clock.monotonic_seconds + 300
+    assert restarted.method_release_at(method) >= method_clock.monotonic_seconds + 3600
     assert restarted.protection_reason is None
 
-    method_clock.advance(301)
+    method_clock.advance(3601)
     await restarted.prepare("trial", method)
     await restarted.prepare_method_trial("trial", method)
     restarted.mark_claimed("trial")
@@ -267,7 +267,7 @@ async def test_method_reservation_save_failure_closes_admission(method_clock: Cl
     store = Store()
     method = method_key()
     await record_flood(store, "seed", method)
-    method_clock.advance(300)
+    method_clock.advance(3600)
     ledger = store.ledger()
     await ledger.prepare("trial", method)
     store.fail_next = True
@@ -300,6 +300,6 @@ async def test_version_one_receipt_migration_preserves_floor_binding_and_unknown
     assert migrated._record["methods"] == {}
     await migrated.record_floor(method_clock.utc + 50_000)
     persisted = safety_record(store)
-    assert persisted.pop("version") == 2 and persisted.pop("methods") == {}
+    assert persisted.pop("version") == 3 and persisted.pop("methods") == {}
     legacy.pop("version")
     assert persisted == legacy

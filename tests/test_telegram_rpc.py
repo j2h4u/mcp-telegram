@@ -3175,6 +3175,132 @@ async def test_internal_reconnect_probe_signals_before_vendor_handler(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_reconnect_callbacks_share_owned_probe_after_waiter_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = _gate()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def vendor_handler(_client: TelegramClient) -> None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(TelegramClient, "_handle_auto_reconnect", vendor_handler)
+    first = asyncio.create_task(gate._handle_auto_reconnect())
+    await started.wait()
+    second = asyncio.create_task(gate._handle_auto_reconnect())
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert calls == 1 and not second.done()
+    release.set()
+    await second
+    await gate._handle_auto_reconnect()
+    assert calls == 2
+    await gate.close_rpc_scheduler()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_close_cancels_unclaimed_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = _gate()
+    started = asyncio.Event()
+
+    async def vendor_handler(_client: TelegramClient) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(TelegramClient, "_handle_auto_reconnect", vendor_handler)
+    callback = asyncio.create_task(gate._handle_auto_reconnect())
+    await started.wait()
+    await gate.close_rpc_scheduler()
+    with pytest.raises(asyncio.CancelledError):
+        await callback
+    await gate._handle_auto_reconnect()
+    assert not json.loads(gate._test_safety_store.raw)["intents"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_clears_prepared_unclaimed_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = _gate()
+    gate._mb_entity_cache = SimpleNamespace(self_id=None, set_self_user=lambda *_args: None)
+    sender = _RawFutureSender()
+    _set_sender(gate, sender)
+    prepared = asyncio.Event()
+
+    async def block_after_prepare(_owner: object) -> str | None:
+        prepared.set()
+        await asyncio.Event().wait()
+        return None
+
+    monkeypatch.setattr(gate, "_prepare_method_permission", block_after_prepare)
+    callback = asyncio.create_task(gate._handle_auto_reconnect())
+    await prepared.wait()
+    assert json.loads(gate._test_safety_store.raw)["intents"]
+    await gate.close_rpc_scheduler()
+    with pytest.raises(asyncio.CancelledError):
+        await callback
+    record = json.loads(gate._test_safety_store.raw)
+    assert sender.calls == 0 and not record["intents"] and record["protection"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_scheduler", [False, True])
+async def test_reconnect_claim_drains_before_disconnect(close_scheduler: bool) -> None:
+    gate = _gate()
+    gate._mb_entity_cache = SimpleNamespace(self_id=None, set_self_user=lambda *_args: None)
+    sender = _RawFutureSender()
+    _set_sender(gate, sender)
+    probe = asyncio.create_task(gate._handle_auto_reconnect())
+    await _wait_for(lambda: sender.calls == 1)
+    deadline = sender.scopes[0].deadline
+    closing = asyncio.create_task(gate.close_rpc_scheduler()) if close_scheduler else gate.disconnect()
+    await _wait_for(lambda: gate._reconnect_quiescing)
+    await gate._handle_auto_reconnect()
+    await asyncio.sleep(0)
+    assert sender.calls == 1 and sender.disconnect_calls == 0
+    assert sender.scopes[0].deadline == deadline
+    sender.futures[0].set_result([types.User(id=1, is_self=True)])
+    await probe
+    await closing
+    assert sender.disconnect_calls == 1
+    record = json.loads(gate._test_safety_store.raw)
+    assert not record["intents"] and record["protection"] is None
+    if not close_scheduler:
+        await gate.close_rpc_scheduler()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_deadline_keeps_unknown_after_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    import mcp_telegram.telegram_rpc as rpc
+
+    gate = _gate()
+    original = rpc.create_scoped_rpc_task
+
+    def short_scoped_task(
+        coro: Coroutine[object, object, None], *, source: TelegramRpcSource, name: str
+    ) -> asyncio.Task[None]:
+        return original(coro, source=source, name=name, deadline=time.monotonic() + 0.2)
+
+    monkeypatch.setattr(rpc, "create_scoped_rpc_task", short_scoped_task)
+    gate._mb_entity_cache = SimpleNamespace(self_id=None, set_self_user=lambda *_args: None)
+    sender = _RawFutureSender()
+    _set_sender(gate, sender)
+    callback = asyncio.create_task(gate._handle_auto_reconnect())
+    await _wait_for(lambda: sender.calls == 1)
+    deadline = sender.scopes[0].deadline
+    closing = gate.disconnect()
+    await closing
+    await callback
+    assert deadline is not None and time.monotonic() >= deadline
+    record = json.loads(gate._test_safety_store.raw)
+    assert record["protection"] is not None or record["intents"]
+    await gate.close_rpc_scheduler()
+
+
+@pytest.mark.asyncio
 async def test_internal_reconnect_probe_runs_vendor_get_users_request_under_scope() -> None:
     assert "get_me" in inspect.getsource(TelegramClient._handle_auto_reconnect)
     gate = _gate()

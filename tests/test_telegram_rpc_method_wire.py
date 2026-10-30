@@ -105,7 +105,7 @@ async def test_five_real_contenders_get_one_durable_trial_and_current_success_cl
     gate, sender, connection, sink = wire
     clock = _clock(wire, monkeypatch)
     method = await _flood(wire, clock)
-    clock.advance(301)
+    clock.advance(3601)
     original = gate._admission_scheduler.admit
     all_admitted = asyncio.Event()
     count = 0
@@ -179,8 +179,8 @@ async def test_new_flood_generation_revokes_a_durable_trial_even_after_both_hold
     assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
     clock.advance(3)
     await _flood(wire, clock)
-    clock.advance(301)
-    scope = replace(_scope(clock, TelegramRpcSource.ENTITY_INFO_REFRESH), deadline=clock.monotonic() + 900)
+    clock.advance(3601)
+    scope = replace(_scope(clock, TelegramRpcSource.ENTITY_INFO_REFRESH), deadline=clock.monotonic() + 9000)
     result = sender.send_owned(request, scope)
     state = await sender._send_queue.next_state()
     await sender._prepare_state(state)
@@ -188,7 +188,7 @@ async def test_new_flood_generation_revokes_a_durable_trial_even_after_both_hold
     old.future.set_exception(FloodWaitError(request, capture=9))
     with pytest.raises(FloodWaitError):
         await late
-    clock.advance(601)
+    clock.advance(7201)
     assert gate._wire_release_at(packet.state.owner.scope) <= clock.monotonic()
     assert not sender.write_packet(packet, connection._send)
     assert len(sink.frames) == 2 and scope.attempt_budget is not None and scope.attempt_budget.attempts == 0
@@ -216,7 +216,7 @@ async def test_credit_is_shared_by_trial_continuation_and_duplicate_budgets(
     assert not gate.prepare_durable_retry(first, method)
     assert not gate.prepare_durable_retry(duplicate, method)
     assert first._retry_candidate is duplicate._retry_candidate
-    clock.advance(301)
+    clock.advance(3601)
     assert gate.prepare_durable_retry(first, method)
     request = functions.users.GetFullUserRequest(types.InputUser(7, 0))
     for index in range(original_limit):
@@ -250,7 +250,7 @@ async def test_credit_authorization_horizon_survives_duplicate_budgets_and_only_
     method = await _flood(wire, clock)
     budget = _selected_budget()
     assert gate.prepare_durable_retry(budget, method) is None
-    clock.advance(301)
+    clock.advance(3601)
     authorization = gate.prepare_durable_retry(budget, method)
     assert authorization is not None
     initial = budget.limit, budget.attempts
@@ -270,7 +270,7 @@ async def test_credit_authorization_horizon_survives_duplicate_budgets_and_only_
     assert (budget.limit, budget.attempts) == (duplicate.limit, duplicate.attempts) == initial
     assert len(sink.frames) == 1
     assert await _flood(wire, clock) == method
-    clock.advance(601)
+    clock.advance(7201)
     renewed = gate.prepare_durable_retry(duplicate, method)
     assert renewed is not None and renewed is not authorization
     assert renewed.deadline > authorization.deadline
@@ -286,7 +286,7 @@ async def test_denied_final_claim_never_spends_credit_or_grows_budget(
     method = await _flood(wire, clock)
     budget = _selected_budget()
     gate.prepare_durable_retry(budget, method)
-    clock.advance(301)
+    clock.advance(3601)
     request = functions.users.GetFullUserRequest(types.InputUser(7, 0))
     result = sender.send_owned(request, replace(_scope(clock), attempt_budget=budget))
     state = await sender._send_queue.next_state()
@@ -348,11 +348,11 @@ async def test_alternating_method_bindings_share_all_six_physical_debits(
     methods = tuple(telegram_rpc._canonical_wire_method(request) for request in requests)
     await _send_result(wire, clock, first, requests[0], flood=True)
     gate.prepare_durable_retry(first, methods[0])
-    clock.advance(301)
+    clock.advance(3601)
     await _send_result(wire, clock, first, requests[1], flood=True)
     duplicate = RpcAttemptBudget(2, attempts=2, selected=selected)
     gate.prepare_durable_retry(duplicate, methods[1])
-    clock.advance(301)
+    clock.advance(3601)
     for budget, index in ((first, 0), (duplicate, 1), (duplicate, 1), (first, 0)):
         assert gate.prepare_durable_retry(budget, methods[index])
         await _send_result(wire, clock, budget, requests[index])
@@ -386,7 +386,7 @@ async def test_authorized_authentication_preserves_protection_but_can_prepare_me
         await ledger.prepare("earlier-flood", method)
         ledger.mark_claimed("earlier-flood")
         await ledger.complete("earlier-flood", known_outcome=True, actual_flood=True)
-        clock.advance(301)
+        clock.advance(3601)
     await ledger.prepare("unknown", method)
     ledger.mark_claimed("unknown")
     await ledger.complete("unknown", known_outcome=False)

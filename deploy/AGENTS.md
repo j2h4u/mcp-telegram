@@ -129,20 +129,21 @@ authorization. Existing uncertain outcomes or manual holds require the
 separate `--acknowledge-unknown-outcome` option, and known server waits still
 apply. Authentication does not authorize normal acquisition past those holds.
 
-For an interrupted daemon attempt, use
-`mcp-telegram recover-account --acknowledge-unknown-outcome` against the running
-protected daemon. It authorizes one conditional restart trial for the same
-verified account after known waits; success is reported only after the real
-startup identity operation completes. A failed or interrupted trial remains
-protected and requires a fresh explicit command.
+Automatic recovery is enabled by default; `[flood_wait] auto_resume_enabled`
+can disable future trials without clearing restrictions or spent attempts.
+Confirmed FloodWait has six waits of 1/2/4/8/16/24 hours; transport and
+retryable server failures use 30-second to 30-minute backoff, and eligible
+unknown read outcomes use five-minute to one-hour backoff. Known server floors
+and previously incurred waits still apply. Interrupted trials remain spent.
+Unknown mutations, unclassified methods, invalid account ownership or storage,
+unresolved authentication and exhausted FloodWait attempts remain hard holds.
+Automatic policy disposition retains unknown outcomes and is not manual
+acknowledgement. Health remains degraded during protection while retained local
+reads stay available.
 
-Settled FloodWait stops resume automatically by default. The typed
-`[flood_wait] auto_resume_enabled` setting can disable future automatic trials
-without clearing known restrictions or spent attempts. The six waits are
-1/2/4/8/16/24 hours, extended by longer Telegram restrictions. Interrupted
-consumed trials and unknown outcomes still require manual recovery. A full
-restart restores pending delivery before normal acquisition; health remains
-degraded during protection while retained local reads stay available.
+The explicit `mcp-telegram recover-account --acknowledge-unknown-outcome`
+command requests one conditional trial for a verified account after known waits.
+Authorization and a scheduled restart do not establish successful recovery.
 
 Automatic episode metadata extends the existing gateway safety receipt;
 older readers reject that extension. Disable on the current compatible binary

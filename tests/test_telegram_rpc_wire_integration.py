@@ -50,7 +50,12 @@ from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcScope,
     TelegramRpcSource,
 )
-from mcp_telegram.telegram_transport import GuardedConnectionTcpFull, GuardedMTProtoSender, _RequestState
+from mcp_telegram.telegram_transport import (
+    GuardedConnectionTcpFull,
+    GuardedMTProtoSender,
+    TransportWriteError,
+    _RequestState,
+)
 from tests.helpers import reset_rpc_process_policy
 from tests.test_rpc_admission_observations import _Recorder
 from tests.test_telegram_transport import _Writer
@@ -668,8 +673,10 @@ async def test_claimed_ack_unknown_write_failure_does_not_restore_fresh_ids(wire
     def fail_write(_data: bytes) -> None:
         raise OSError("indeterminate test write")
 
-    with pytest.raises(OSError, match="indeterminate test write"):
+    with pytest.raises(TransportWriteError, match="Telegram connection writer failed") as failure:
         sender.write_packet(connection._send_queue.get_nowait(), fail_write)
+    assert isinstance(failure.value.__cause__, OSError)
+    assert str(failure.value.__cause__) == "indeterminate test write"
     await asyncio.sleep(0)
     await asyncio.gather(*sender._observing)
     assert owned.claims == 1 and owner.scope.attempt_budget is not None

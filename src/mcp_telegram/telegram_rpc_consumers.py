@@ -15,6 +15,82 @@ CONNECTION_BOOTSTRAP_MAX_RPC_ATTEMPTS = 16
 OPERATOR_AUTH_MAX_RPC_ATTEMPTS = 32
 
 
+class RpcEffect(StrEnum):
+    NONMUTATING_READ = "nonmutating_read"
+    MUTATION = "mutation"
+    AUTH_TRANSITION = "auth_transition"
+    UNCLASSIFIED = "unclassified"
+
+
+# Exact constructor identities: absence from this table never grants recovery.
+_READ_METHODS = frozenset(
+    {
+        "telethon.tl.functions.users.GetUsersRequest:0d91a548",
+        "telethon.tl.functions.users.GetFullUserRequest:b60f5918",
+        "telethon.tl.functions.users.GetSavedMusicRequest:788d7fe3",
+        "telethon.tl.functions.messages.GetFullChatRequest:aeb00b34",
+        "telethon.tl.functions.messages.GetHistoryRequest:4423e6c5",
+        "telethon.tl.functions.messages.GetMessagesRequest:63c66506",
+        "telethon.tl.functions.messages.GetDialogsRequest:a0f4cb4f",
+        "telethon.tl.functions.messages.GetPinnedDialogsRequest:d6b94df2",
+        "telethon.tl.functions.messages.GetPeerDialogsRequest:e470bcfd",
+        "telethon.tl.functions.messages.GetDialogFiltersRequest:efd48c89",
+        "telethon.tl.functions.messages.GetAllDraftsRequest:6a3f8d65",
+        "telethon.tl.functions.messages.GetScheduledHistoryRequest:f516760b",
+        "telethon.tl.functions.messages.GetScheduledMessagesRequest:bdbb0464",
+        "telethon.tl.functions.messages.GetForumTopicsRequest:3ba47bff",
+        "telethon.tl.functions.messages.GetForumTopicsByIDRequest:af0a4a08",
+        "telethon.tl.functions.messages.GetCustomEmojiDocumentsRequest:d9ab0f54",
+        "telethon.tl.functions.messages.GetMessageReactionsListRequest:461b3f48",
+        "telethon.tl.functions.messages.GetOutboxReadDateRequest:8c4bfe5d",
+        "telethon.tl.functions.messages.SearchRequest:29ee847a",
+        "telethon.tl.functions.messages.GetCommonChatsRequest:e40ca104",
+        "telethon.tl.functions.channels.GetFullChannelRequest:08736a09",
+        "telethon.tl.functions.channels.GetParticipantsRequest:77ced9d0",
+        "telethon.tl.functions.channels.GetParticipantRequest:a0ab6cc6",
+        "telethon.tl.functions.channels.GetMessagesRequest:ad8c9a23",
+        "telethon.tl.functions.channels.GetAdminLogRequest:33ddf480",
+        "telethon.tl.functions.updates.GetDifferenceRequest:19c2f763",
+        "telethon.tl.functions.updates.GetChannelDifferenceRequest:03173d78",
+        "telethon.tl.functions.contacts.ResolveUsernameRequest:725afbbc",
+        "telethon.tl.functions.photos.GetUserPhotosRequest:91cd32a8",
+        "telethon.tl.functions.payments.GetSavedStarGiftsRequest:a319e569",
+        "telethon.tl.functions.stories.GetPeerStoriesRequest:2c4ada50",
+        "telethon.tl.functions.stories.GetPinnedStoriesRequest:5821a5dc",
+        "telethon.tl.functions.stories.GetStoriesByIDRequest:5774ca74",
+    }
+)
+_MUTATION_METHODS = frozenset(
+    {
+        "telethon.tl.functions.messages.SaveDraftRequest:ad0fa15c",
+        "telethon.tl.functions.messages.SendMessageRequest:fef48f62",
+        "telethon.tl.functions.messages.EditMessageRequest:b106e66c",
+        "telethon.tl.functions.messages.DeleteScheduledMessagesRequest:59ae2b16",
+        "telethon.tl.functions.messages.TranscribeAudioRequest:269e9a49",
+    }
+)
+_AUTH_METHODS = frozenset(
+    {
+        "telethon.tl.functions.auth.LogOutRequest:3e72ba19",
+        "telethon.tl.functions.auth.SignInRequest:8d52a951",
+        "telethon.tl.functions.auth.SignUpRequest:aac7b717",
+        "telethon.tl.functions.auth.SendCodeRequest:a677244f",
+        "telethon.tl.functions.auth.ImportAuthorizationRequest:a57a7dad",
+    }
+)
+
+
+def rpc_effect(canonical_method: str) -> RpcEffect:
+    """Classify only explicitly reviewed canonical constructor identities."""
+    if canonical_method in _READ_METHODS:
+        return RpcEffect.NONMUTATING_READ
+    if canonical_method in _MUTATION_METHODS:
+        return RpcEffect.MUTATION
+    if canonical_method in _AUTH_METHODS:
+        return RpcEffect.AUTH_TRANSITION
+    return RpcEffect.UNCLASSIFIED
+
+
 class RpcServiceClass(StrEnum):
     """Internal service classes for account-wide Telegram RPC admission."""
 
@@ -1081,12 +1157,14 @@ __all__ = [
     "DemandSpec",
     "ExecutionMode",
     "FanoutScope",
+    "RpcEffect",
     "RpcServiceClass",
     "TelegramFactDomain",
     "TelegramRpcConsumerSpec",
     "TelegramRpcSource",
     "demand_contract",
     "demand_freshness_seconds",
+    "rpc_effect",
     "telegram_rpc_consumer",
     "validate_demand_contracts",
 ]
