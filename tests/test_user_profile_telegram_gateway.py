@@ -70,6 +70,17 @@ async def test_gateway_fetches_one_request_and_returns_both_projections() -> Non
 
 
 @pytest.mark.asyncio
+async def test_gateway_uses_self_target_only_for_matching_owner() -> None:
+    client = _Client(_response())
+    gateway = TelethonUserProfileGateway(client, now_provider=lambda: 100.0)
+    await gateway.fetch_user_profile(42, TargetKind.USER, owner_account_id=42)
+    await gateway.fetch_user_profile(42, TargetKind.USER, owner_account_id=7)
+    assert isinstance(client.requests[0], GetFullUserRequest)
+    assert isinstance(client.requests[0].id, types.InputUserSelf)
+    assert isinstance(client.requests[1], GetFullUserRequest) and client.requests[1].id == 42
+
+
+@pytest.mark.asyncio
 async def test_gateway_accepts_replies_bot_as_service_full_profile() -> None:
     user = types.User(id=42, bot=True, first_name="Replies", username="replies")
     response = SimpleNamespace(

@@ -20,7 +20,13 @@ from typing import cast
 from ..dialog_fact_observations import claim_dialog_fact
 from ..dialog_identity import capture_identity_baseline, publish_dialog_identity
 from ..dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation, ObservedText
-from ..entity_store import EntitySnapshot, ensure_entity_stub, upsert_entity_snapshots
+from ..entity_store import (
+    EntitySnapshot,
+    PartialEntityIdentity,
+    apply_partial_entity_identity,
+    ensure_entity_stub,
+    upsert_entity_snapshots,
+)
 from ..models import DialogType
 from ..resolver import latinize
 from ..sync_transactions import require_write_transaction, write_savepoint
@@ -185,11 +191,15 @@ class EntityProfileRepository:
         return columns
 
     def _profile_sections(self, entity_id: int) -> tuple[str, ...]:
+        if entity_id == bound_profile_account(self._conn):
+            return ("full_profile", "personal_channel")
         kind = str(self._read_entity_stub(entity_id).get("type", "")).lower()
         return PROFILE_SECTIONS if kind in {"user", "bot"} else PROFILE_SECTIONS[:5]
 
     def _next_section(self, cursor: EntityRefreshCursor) -> str | None:
         sections = self._profile_sections(cursor.entity_id)
+        if cursor.next_section not in sections:
+            return None
         index = sections.index(cursor.next_section) + 1
         return sections[index] if index < len(sections) else None
 
@@ -571,7 +581,15 @@ class EntityProfileRepository:
         ).fetchone()
         if previous is not None and previous[0] >= observation.order:
             return False
-        if not self.request_section_refresh(entity_id, sections, now=observation.observed_at, pair_mode=pair_mode):
+        if entity_id == observation.owner_account_id and bound_profile_account(self._conn) == entity_id:
+            queued = (
+                self.request_follow_up(entity_id, now=observation.observed_at)
+                if _pending_refresh_is_active(self._read_pending_refresh_state(entity_id))
+                else self.request_section_refresh(entity_id, sections, now=observation.observed_at, pair_mode=pair_mode)
+            )
+        else:
+            queued = self.request_section_refresh(entity_id, sections, now=observation.observed_at, pair_mode=pair_mode)
+        if not queued:
             return False
         self._conn.execute(
             "INSERT INTO entity_profile_field_observations(entity_id,field,owner_account_id,observation_order,observed_at,source) VALUES (?,?,?,?,?,?) "
@@ -711,6 +729,8 @@ class EntityProfileRepository:
                 "WHERE entity_id=? AND section IN ('full_profile', 'personal_channel')",
                 (cursor.entity_id,),
             )
+            if cursor.entity_id == bound_profile_account(self._conn):
+                return self._finish_section_generation(cursor, now=now, detail_revision=None) == 1
             predicate, parameters = self._cursor_predicate(cursor)
             changed = self._conn.execute(
                 "UPDATE entity_profile_refresh_state SET status='pending', retry_at=NULL, "
@@ -1502,6 +1522,7 @@ class EntityProfileRepository:
                 "next_section": cursor.next_section,
                 "acquisition_cursor": cursor.acquisition_cursor,
                 "profile_revision": cursor.profile_revision,
+                "pair_eligible": cursor.pair_eligible,
                 "page_cursor_json": cursor.page_cursor_json,
             },
             sort_keys=True,
@@ -1566,7 +1587,7 @@ class EntityProfileRepository:
                 return True
             row = self._read_detail_fence(cursor.entity_id)
             if row is None or row[0] == cursor.profile_revision:
-                return True
+                return self._prepare_self_follow_up(cursor, owner_account_id)
             if owner_account_id is None or row[1] != owner_account_id:
                 raise RuntimeError("profile revision ownership unavailable")
             revision = max(cursor.profile_revision, int(row[0])) + 1
@@ -1585,6 +1606,25 @@ class EntityProfileRepository:
             if changed != 1:
                 raise sqlite3.OperationalError("profile revision reconciliation cursor changed")
         return False
+
+    def _prepare_self_follow_up(self, cursor: EntityRefreshCursor, owner_account_id: int | None) -> bool:
+        if (
+            owner_account_id != cursor.entity_id
+            or bound_profile_account(self._conn) != cursor.entity_id
+            or cursor.next_section != "full_profile"
+            or not self._refresh_follow_up_required(cursor)
+        ):
+            return True
+        self._conn.execute(
+            "UPDATE entity_detail_sections SET status='pending',reason='profile_changed' "
+            "WHERE entity_id=? AND section IN ('full_profile','personal_channel')",
+            (cursor.entity_id,),
+        )
+        self._conn.execute(
+            "UPDATE entity_profile_refresh_state SET follow_up_required=0,pair_eligible=1 WHERE entity_id=?",
+            (cursor.entity_id,),
+        )
+        return cursor.pair_eligible
 
     def _read_detail_fence(self, entity_id: int) -> tuple[int, int | None] | None:
         owner_column = "profile_owner_account_id" if self._detail_has("profile_owner_account_id") else "NULL"
@@ -2799,6 +2839,9 @@ class EntityProfileRepository:
 
     def _advance_full_pair_cursor(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
         require_write_transaction(self._conn)
+        if cursor.entity_id == bound_profile_account(self._conn):
+            revision = cursor.profile_revision + 1 if self._refresh_has("profile_revision") else None
+            return self._finish_section_generation(cursor, now=now, detail_revision=revision) == 1
         predicate, parameters = self._cursor_predicate(cursor)
         assignments = (
             "status='pending', retry_at=NULL, reason='refresh_queued', updated_at=?, "
@@ -2888,13 +2931,22 @@ class EntityProfileRepository:
             (
                 now,
                 now,
-                int(self._pair_is_eligible(cursor.entity_id, now=now)),
+                int(
+                    cursor.entity_id == bound_profile_account(self._conn)
+                    or self._pair_is_eligible(cursor.entity_id, now=now)
+                ),
                 PROFILE_SECTIONS[0],
                 *revision_value,
                 *parameters,
             ),
         ).rowcount
         if changed == 1:
+            if cursor.entity_id == bound_profile_account(self._conn):
+                self._conn.execute(
+                    "UPDATE entity_detail_sections SET status='pending',reason='profile_changed' "
+                    "WHERE entity_id=? AND section IN ('full_profile','personal_channel')",
+                    (cursor.entity_id,),
+                )
             self._reset_pair_measurement(cursor.entity_id)
         return changed
 
@@ -3808,6 +3860,32 @@ def admit_profile_peer(
     )
     conn.execute("INSERT INTO daemon_state(key,value) VALUES (?,?)", (_profile_peer_key(owner, peer), str(now)))
     return queued
+
+
+def admit_self_profile(conn: sqlite3.Connection, owner: int, *, kind: DialogType, now: int, pair_mode: str) -> bool:
+    """Queue the verified account's own profile without disturbing retained work."""
+    require_write_transaction(conn)
+    if owner <= 0 or bound_profile_account(conn) != owner or kind not in {DialogType.USER, DialogType.BOT}:
+        raise ValueError("self profile requires the verified bound account")
+    existing = conn.execute("SELECT type FROM entities WHERE id=?", (owner,)).fetchone()
+    if existing is not None and str(existing[0]).lower() not in {"unknown", kind.value}:
+        raise ValueError("self profile conflicts with retained entity type")
+    if existing is None or str(existing[0]).lower() == "unknown":
+        apply_partial_entity_identity(conn, owner, PartialEntityIdentity(observed_at=now, observed_type=kind.value))
+    if _self_profile_retains_acquisition(conn, owner):
+        conn.execute(
+            "UPDATE entity_profile_refresh_state SET next_section='full_profile', acquisition_cursor=0, pair_eligible=1 "
+            "WHERE entity_id=? AND next_section NOT IN ('full_profile','personal_channel')",
+            (owner,),
+        )
+        return False
+    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
+    return repo.request_section_refresh(owner, ("full_profile", "personal_channel"), now=now, pair_mode=pair_mode)
+
+
+def _self_profile_retains_acquisition(conn: sqlite3.Connection, owner: int) -> bool:
+    state = conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=?", (owner,)).fetchone()
+    return state is not None and state[0] in {"pending", "failed"} and _profile_retains_acquisition(conn, owner, owner)
 
 
 def _profile_retains_acquisition(conn: sqlite3.Connection, owner: int, peer: int) -> bool:

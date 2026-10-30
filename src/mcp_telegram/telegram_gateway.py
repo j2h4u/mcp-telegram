@@ -429,7 +429,8 @@ class TelethonUserProfileGateway(UserProfilePort):
         except (TypeError, ValueError) as exc:
             raise ValueError("user target kind must be 'user' or 'bot'") from exc
         started_at = self._now_provider()
-        result = await self._client(GetFullUserRequest(id=cast(TypeInputUser, user_id)))
+        target = types.InputUserSelf() if owner_account_id is not None and user_id == owner_account_id else user_id
+        result = await self._client(GetFullUserRequest(id=cast(TypeInputUser, target)))
         completed_at = self._now_provider()
         observation = normalize_full_user_response(
             result,

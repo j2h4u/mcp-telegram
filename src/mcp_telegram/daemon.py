@@ -85,8 +85,8 @@ from .drafts.history import interrupt_draft_operations, prune_draft_history, pru
 from .drafts.owner import DraftMessageOwner
 from .drafts.sqlite_projection import SQLiteDraftProjection
 from .entity_profile.ports import UserProfilePort
-from .entity_profile.reader import semantic_profile
 from .entity_profile.refresh import RefreshLimits
+from .entity_profile.repository import admit_self_profile
 from .event_handlers import EventHandlerManager, UpdateProcessingBarrier
 from .fact_hydration import MessageFactHydrationWorker
 from .feedback_db import SQLiteFeedbackStore, ensure_feedback_schema
@@ -116,7 +116,6 @@ from .message_history.telegram_adapter import (
 )
 from .messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
 from .models import DialogType
-from .own_only_contracts import OwnOnlyContext
 from .reactions import ReactionDetailPolicy, ReactionDetailRefresher
 from .reactions.telegram_adapter import TelethonTelegramReactionGateway
 from .read_state import apply_read_cursor, apply_reconciled_unread_count
@@ -174,6 +173,7 @@ from .telegram_rpc_scheduler import (
     RpcAdmissionEventKind,
     TelegramRpcAdmissionDeferred,
 )
+from .telethon_dialog import classify_dialog_type
 from .topics.catalog import TopicCatalogRepository
 from .topics.refresh import TopicRefresher
 from .topics.sqlite_repository import SQLiteTopicSnapshotRepository
@@ -406,7 +406,6 @@ class _SyncMainContext:
     handler_manager: EventHandlerManager | None = None
     draft_owner: DraftMessageOwner | None = None
     scheduled_mutation_fence: ScheduledMutationFence = field(default_factory=ScheduledMutationFence)
-    own_only_context: OwnOnlyContext | None = None
     scheduling: SchedulingConfig = field(default_factory=SchedulingConfig)
     background_tasks: set[asyncio.Task[object]] = field(default_factory=set)
     flood_wait_kill_switch_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -1391,19 +1390,9 @@ async def _acquire_startup_identity_before_updates(
     startup = StartupIdentityState.begin()
     recovery_trial = ctx.client.automatic_trial_active()
 
-    def retained_context(account_id: int) -> OwnOnlyContext:
-        semantic = semantic_profile(ctx.conn, account_id, account_id, int(time.time()))
-        fields = semantic.get("fields")
-        value = fields.get("full_user.personal_channel_id") if isinstance(fields, dict) else None
-        channel = value if type(value) is int and value > 0 else None
-        return OwnOnlyContext(account_id, channel)
-
-    async def get_self_input_entity(account_id: int) -> object:
-        return await ctx.client.get_input_entity(account_id)
-
-    async def publish(profile: object, own_only_context: OwnOnlyContext) -> None:
-        await directory.bind_account_id(own_only_context.account_id)
-        await _publish_startup_identity(ctx, profile, own_only_context)
+    async def publish(profile: object, account_id: int) -> None:
+        await directory.bind_account_id(account_id)
+        await _publish_startup_identity(ctx, profile, account_id)
 
     async def get_verified_self() -> object:
         profile = await ctx.client.get_me()
@@ -1419,10 +1408,7 @@ async def _acquire_startup_identity_before_updates(
             get_me=get_verified_self,
             update_profile=lambda profile: _update_self_profile(ctx.api_server, cast(_MeLike, profile)),
             startup=startup,
-            get_input_entity=get_self_input_entity,
-            user_profile_port=ctx.user_profile_port,
             publish_startup_identity=publish,
-            retained_context=retained_context if recovery_trial else None,
         ),
         account_id=None,
     )
@@ -1526,7 +1512,7 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     ctx.coordinator.offer(DemandKind.SELF_PROFILE_MAINTENANCE)
     identity = await _wait_for_startup_identity(ctx.demand_runtime.startup_identity, ctx.shutdown_event)
     assert ctx.api_server.self_id is not None
-    assert ctx.own_only_context is not None and ctx.own_only_context.account_id == identity.own_only_context.account_id
+    assert ctx.api_server.self_id == identity.account_id
     # The directory's account fence is durable and must settle before event
     # ownership and API readiness can expose the authenticated account.
     await ctx.demand_runtime.dialog_directory.bind_account_id(ctx.api_server.self_id)
@@ -1621,10 +1607,11 @@ async def _update_self_profile(api_server: DaemonAPIServer, me: _MeLike) -> None
     await api_server._publish_auth_scope(capture_auth_scope(me, api_server._client))
 
 
-async def _publish_startup_identity(ctx: _SyncMainContext, profile: object, own_only_context: OwnOnlyContext) -> None:
+async def _publish_startup_identity(ctx: _SyncMainContext, profile: object, account_id: int) -> None:
     """Publish all startup identity facts before waking the readiness waiter."""
     await _update_self_profile(ctx.api_server, cast(_MeLike, profile))
-    ctx.own_only_context = own_only_context
+    if ctx.api_server.self_id != account_id:
+        raise RuntimeError("published startup account does not match verified identity")
 
 
 def _build_message_fact_refresh_dependencies(ctx: _SyncMainContext) -> MessageFactRefreshDeps:
@@ -1716,12 +1703,9 @@ def _build_demand_runtime(
             selected=selected,
         )
 
-    async def get_self_input_entity(account_id: int) -> object:
-        return await ctx.client.get_input_entity(account_id)
-
-    async def publish_startup_identity(profile: object, own_only_context: OwnOnlyContext) -> None:
-        await _publish_startup_identity(ctx, profile, own_only_context)
-        scheduled_reconciler.bind_account_id(own_only_context.account_id)
+    async def publish_startup_identity(profile: object, account_id: int) -> None:
+        await _publish_startup_identity(ctx, profile, account_id)
+        scheduled_reconciler.bind_account_id(account_id)
 
     draft_owner = ctx.draft_owner
     if draft_owner is None:
@@ -1758,8 +1742,6 @@ def _build_demand_runtime(
             self_profile_cadence=ctx.self_profile_cadence,
             update_self_profile=lambda me: _update_self_profile(ctx.api_server, cast(_MeLike, me)),
             startup_identity=startup_identity,
-            get_self_input_entity=get_self_input_entity,
-            user_profile_port=ctx.user_profile_port,
             publish_startup_identity=publish_startup_identity,
             draft_owner=draft_owner,
             linked_chat_fact_refresh_port=ctx.handler_manager,
@@ -2009,12 +1991,41 @@ async def _release_updates_after_replay(ctx: _SyncMainContext, barrier: UpdatePr
     await ctx.client.start_update_delivery(ctx.api_server.self_id)
     await ctx.client.finish_startup_auto_resume()
     assert ctx.coordinator is not None
+    await _start_self_profile_after_replay(ctx)
     _create_tracked_task(
         ctx,
         ctx.coordinator.run(),
         name="telegram_demand_coordinator",
         critical=True,
     )
+
+
+async def _start_self_profile_after_replay(ctx: _SyncMainContext) -> None:
+    assert ctx.demand_runtime is not None
+    assert ctx.coordinator is not None
+    identity = ctx.demand_runtime.startup_identity.result()
+    if identity.account_id != ctx.api_server.self_id:
+        raise RuntimeError("startup identity changed before self-profile admission")
+    scope = ctx.api_server._auth_scope
+    if scope is None or scope.account_id != identity.account_id:
+        raise RuntimeError("startup authentication scope is unavailable")
+    kind = classify_dialog_type(identity.profile)
+
+    def queue_self(conn: sqlite3.Connection) -> bool:
+        with write_transaction(conn):
+            if ctx.api_server._auth_scope != scope:
+                raise RuntimeError("authentication scope changed before self-profile admission")
+            return admit_self_profile(
+                conn,
+                identity.account_id,
+                kind=kind,
+                now=int(time.time()),
+                pair_mode="enabled" if ctx.api_server._policy.full_user_pair_enabled else "disabled",
+            )
+
+    await ctx.writer.run(queue_self)
+    await ctx.self_profile_cadence.mark_refreshed(time.time())
+    ctx.coordinator.offer(DemandKind.ENTITY_PROFILE_REFRESH)
 
 
 async def _bind_draft_commands(ctx: _SyncMainContext) -> None:

@@ -1,19 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import pytest
 
-from mcp_telegram.entity_profile.contracts import (
-    ProjectionOutcome,
-    ProjectionStatus,
-    TargetKind,
-    UserProfileObservation,
-    UserReference,
-)
-from mcp_telegram.own_only_contracts import OwnOnlyContext
 from mcp_telegram.self_profile_maintenance import (
     SelfProfileMaintenanceDemandAdapter,
     SelfProfileMaintenanceDependencies,
@@ -39,49 +30,11 @@ async def _unused_get_me() -> object:
     return None
 
 
-class _StartupUserProfilePort:
-    def __init__(
-        self,
-        *,
-        personal_channel_id: int | None = None,
-        personal_channel_status: ProjectionStatus = ProjectionStatus.USABLE,
-        error: BaseException | None = None,
-        observer: Callable[[], None] | None = None,
-    ) -> None:
-        self.personal_channel_id = personal_channel_id
-        self.personal_channel_status = personal_channel_status
-        self.error = error
-        self.observer = observer
-
-    def get_user_reference(self, user_id: int, *, is_self: bool = False) -> UserReference:
-        return UserReference(user_id, 0, is_self=is_self)
-
-    async def fetch_user_profile(
-        self, user_id: int, target_kind: TargetKind, *, owner_account_id: int | None = None
-    ) -> UserProfileObservation:
-        if self.error is not None:
-            raise self.error
-        if self.observer is not None:
-            self.observer()
-        assert user_id == 42
-        assert target_kind is TargetKind.USER
-        scope = current_rpc_scope()
-        assert scope.attempt_budget is not None
-        scope.attempt_budget.debit()
-        outcome = ProjectionOutcome(
-            self.personal_channel_status,
-            {"personal_channel_id": self.personal_channel_id},
-            None,
-            None,
-        )
-        return UserProfileObservation(user_id, target_kind, outcome, outcome)
-
-
 async def _unused_update_profile(me: object) -> None:
     del me
 
 
-async def _unused_publish_startup_identity(_profile: object, _context: OwnOnlyContext) -> None:
+async def _unused_publish_startup_identity(_profile: object, _context: int) -> None:
     pass
 
 
@@ -217,151 +170,36 @@ async def test_run_slice_does_not_apply_profile_when_attempt_budget_is_exhausted
 
 
 @pytest.mark.asyncio
-async def test_startup_bypasses_persisted_cadence_and_resumes_after_budget_split() -> None:  # noqa: PLR0915
+async def test_startup_bypasses_cadence_with_one_identity_probe() -> None:
     cadence = _Cadence(DemandStatus(release_at=10_000.0))
-    startup = StartupIdentityState(100.0, 200.0)
-    profile = SimpleNamespace(id=42, username="account")
-    input_user = object()
-    applied_profiles: list[object] = []
-    applied_contexts: list[OwnOnlyContext] = []
-    observed: list[tuple[DemandKind, AcquisitionKind]] = []
-
-    def observe_scope() -> None:
-        token = current_demand_token()
-        scope = current_rpc_scope()
-        assert token.acquisition_kind is not None
-        assert scope.attempt_budget is not None
-        observed.append((token.kind, token.acquisition_kind))
-
-    async def get_me() -> object:
-        observe_scope()
-        current_rpc_scope().attempt_budget.debit()  # type: ignore[union-attr]
-        return profile
-
-    async def get_input_entity(account_id: int) -> object:
-        observe_scope()
-        assert account_id == 42
-        return input_user
-
-    user_profile_port = _StartupUserProfilePort(personal_channel_id=9001, observer=observe_scope)
-
-    async def publish_startup_identity(applied_profile: object, context: OwnOnlyContext) -> None:
-        applied_profiles.append(applied_profile)
-        applied_contexts.append(context)
-
-    async def update_profile(profile: object) -> None:
-        applied_profiles.append(profile)
-
-    adapter = SelfProfileMaintenanceDemandAdapter(
-        SelfProfileMaintenanceDependencies(
-            cadence=cadence,
-            get_me=get_me,
-            update_profile=update_profile,
-            startup=startup,
-            get_input_entity=get_input_entity,
-            user_profile_port=user_profile_port,
-            publish_startup_identity=publish_startup_identity,
-        ),
-        account_id=42,
-        clock=lambda: 100.0,
-    )
-
-    startup_status = adapter.status(100.0)
-    assert startup_status is not None and startup_status.release_at == 0.0
-    assert startup_status.freshness_deadline == 200.0
-    await _run(adapter)
-    assert startup.phase is StartupIdentityPhase.FULL_USER
-    assert applied_profiles == []
-    outcome = await _run(adapter)
-    assert startup.phase is StartupIdentityPhase.READY
-
-    assert startup.phase is StartupIdentityPhase.READY
-    assert startup.done_event.is_set()
-    assert startup.result().profile is profile
-    assert startup.result().own_only_context.account_id == 42
-    assert startup.result().own_only_context.personal_channel_id == -1000000009001
-    assert applied_profiles == [profile]
-    assert applied_contexts == [startup.result().own_only_context]
-    assert cadence.refreshed_at == [100.0]
-    assert outcome.committed_revision == "1"
-    status = adapter.status(100.0)
-    assert status is not None and status.release_at == 10_000.0
-    assert status.selected is not None and status.selected.revision == "1"
-    assert observed == [(DemandKind.SELF_PROFILE_MAINTENANCE, AcquisitionKind.ACCOUNT_SELF_PROFILE)] * 4
-
-
-@pytest.mark.asyncio
-async def test_startup_accepts_partial_personal_channel_id() -> None:
-    startup = StartupIdentityState(100.0, 200.0)
-    profile = SimpleNamespace(id=42, username="account")
-
-    async def get_me() -> object:
-        current_rpc_scope().attempt_budget.debit()  # type: ignore[union-attr]
-        return profile
-
-    port = _StartupUserProfilePort(
-        personal_channel_id=9001,
-        personal_channel_status=ProjectionStatus.PARTIAL,
-    )
-
-    async def get_input_entity(_account_id: int) -> object:
-        return object()
-
-    adapter = SelfProfileMaintenanceDemandAdapter(
-        SelfProfileMaintenanceDependencies(
-            cadence=_Cadence(DemandStatus(release_at=10_000.0)),
-            get_me=get_me,
-            update_profile=_unused_update_profile,
-            startup=startup,
-            get_input_entity=get_input_entity,
-            user_profile_port=port,
-            publish_startup_identity=_unused_publish_startup_identity,
-        ),
-        account_id=42,
-        clock=lambda: 100.0,
-    )
-
-    await _run(adapter, limit=2)
-
-    assert startup.phase is StartupIdentityPhase.READY
-    assert startup.result().own_only_context.personal_channel_id == -1000000009001
-
-
-@pytest.mark.asyncio
-async def test_recovery_identity_uses_one_probe_without_claiming_full_profile() -> None:
     startup = StartupIdentityState(100.0, 200.0)
     profile = SimpleNamespace(id=42)
-    published: list[OwnOnlyContext] = []
-    cadence = _Cadence(DemandStatus(release_at=10_000.0))
-    port = _StartupUserProfilePort(error=AssertionError("full profile must not be acquired"))
+    observed: list[tuple[DemandKind, AcquisitionKind]] = []
+    published: list[tuple[object, int]] = []
 
     async def get_me() -> object:
-        current_rpc_scope().attempt_budget.debit()  # type: ignore[union-attr]
+        token = current_demand_token()
+        assert token.acquisition_kind is not None
+        observed.append((token.kind, token.acquisition_kind))
+        budget = current_rpc_scope().attempt_budget
+        assert budget is not None
+        budget.debit()
         return profile
 
-    async def publish(_profile: object, context: OwnOnlyContext) -> None:
-        published.append(context)
+    async def publish(value: object, account_id: int) -> None:
+        published.append((value, account_id))
 
     adapter = SelfProfileMaintenanceDemandAdapter(
-        SelfProfileMaintenanceDependencies(
-            cadence=cadence,
-            get_me=get_me,
-            update_profile=_unused_update_profile,
-            startup=startup,
-            get_input_entity=lambda _account_id: _unused_get_me(),
-            user_profile_port=port,
-            publish_startup_identity=publish,
-            retained_context=lambda account_id: OwnOnlyContext(account_id, 9001),
-        ),
+        SelfProfileMaintenanceDependencies(cadence, get_me, _unused_update_profile, startup, publish),
         account_id=42,
         clock=lambda: 100.0,
     )
-
     await adapter.run_startup(RpcAttemptBudget(1))
-    assert startup.result().own_only_context.personal_channel_id == -1000000009001
-    assert startup.identity_only and cadence.refreshed_at == []
-    assert published[-1].personal_channel_id == -1000000009001
-    assert adapter.status(100.0).release_at == 10_000.0  # type: ignore[union-attr]
+    assert startup.phase is StartupIdentityPhase.READY
+    assert startup.result().profile is profile and startup.result().account_id == 42
+    assert published == [(profile, 42)]
+    assert observed == [(DemandKind.SELF_PROFILE_MAINTENANCE, AcquisitionKind.ACCOUNT_SELF_PROFILE)]
+    assert cadence.refreshed_at == []
 
 
 @pytest.mark.asyncio
@@ -377,8 +215,6 @@ async def test_permanent_startup_profile_failure_signals_terminal_state() -> Non
             get_me=get_me,
             update_profile=_unused_update_profile,
             startup=startup,
-            get_input_entity=lambda _account_id: _unused_get_me(),
-            user_profile_port=_StartupUserProfilePort(error=RuntimeError("permanent")),
             publish_startup_identity=_unused_publish_startup_identity,
         ),
         account_id=42,

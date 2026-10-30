@@ -66,7 +66,7 @@ async def test_consumed_trial_runs_real_startup_self_probe_once(  # noqa: PLR091
         assert budget.attempts == 1 and len(sink.frames) == 1
         state.future.set_result([types.User(id=42, is_self=True)])
         result = await asyncio.wait_for(task, 3)
-        assert result.identity_only and result.result().own_only_context.account_id == 42
+        assert result.result().account_id == 42
         assert bound == [42] and api.self_id == 42
         assert gate.automatic_trial_active()
         assert len(sink.frames) == 1

@@ -989,8 +989,10 @@ class DaemonEntityInfoService:
             and entity_type in {DialogType.USER, DialogType.BOT}
         )
 
-    def _stored_entity_type(self, entity_id: int, *, now: int) -> DialogType:
-        stored = self._profiles.read(entity_id, now=now)
+    def _stored_entity_type(
+        self, entity_id: int, *, now: int, profiles: EntityProfileRepository | None = None
+    ) -> DialogType:
+        stored = (profiles if profiles is not None else self._profiles).read(entity_id, now=now)
         raw_type = stored.detail.get("type") if stored is not None else None
         return DialogType.parse(raw_type if isinstance(raw_type, str) else None)
 
@@ -1139,12 +1141,12 @@ class DaemonEntityInfoService:
         actual_attempts = self._rpc_attempt_count() - context.attempt_start
         if context.pair_section and context.eligible_pair and context.pair_mode == "disabled":
             committed, summary = await self._write_profiles(
-                lambda profiles: profiles.commit_section_with_pair_measurement(
+                lambda profiles: self._commit_measured_section_in_scope(
+                    profiles,
                     cursor,
                     result,
+                    context,
                     now=now,
-                    outcome=self._section_commit_outcome(cursor.next_section, result),
-                    actual_attempts=actual_attempts,
                 )
             )
             if summary is not None:
@@ -1174,15 +1176,36 @@ class DaemonEntityInfoService:
         now: int,
     ) -> bool:
         if (
-            cursor.next_section in {"current_stories", "pinned_stories"}
-            and result.collection_page is not None
-            and self._profile_scope_changed_during_acquisition(context.captured_scope)
-        ):
+            cursor.next_section in {"full_profile", "personal_channel"}
+            or (cursor.next_section in {"current_stories", "pinned_stories"} and result.collection_page is not None)
+        ) and self._profile_scope_changed_during_acquisition(context.captured_scope):
             profiles.mark_section_failure(
                 cursor, now=now, reason="auth_scope_changed", retry_at=scope_changed_retry_at(now)
             )
             return False
         return profiles.commit_section(cursor, result, now=now)
+
+    def _commit_measured_section_in_scope(
+        self,
+        profiles: EntityProfileRepository,
+        cursor: EntityRefreshCursor,
+        result: EntitySectionCommit,
+        context: _ProfileSectionContext,
+        *,
+        now: int,
+    ) -> tuple[bool, dict[str, object] | None]:
+        if self._profile_scope_changed_during_acquisition(context.captured_scope):
+            profiles.mark_section_failure(
+                cursor, now=now, reason="auth_scope_changed", retry_at=scope_changed_retry_at(now)
+            )
+            return False, None
+        return profiles.commit_section_with_pair_measurement(
+            cursor,
+            result,
+            now=now,
+            outcome=self._section_commit_outcome(cursor.next_section, result),
+            actual_attempts=self._rpc_attempt_count() - context.attempt_start,
+        )
 
     def _commit_unsupported_contact_overlap(
         self,
@@ -1398,27 +1421,21 @@ class DaemonEntityInfoService:
         full_profile: EntitySectionCommit,
         *,
         now: int,
+        profiles: EntityProfileRepository | None = None,
     ) -> bool:
         if self._deps.full_user_auth_scope is None:
             return False
         current_scope = self._capture_pair_scope()
         expected_identity = full_profile.evidence.identity if full_profile.evidence is not None else None
         expected_identity_for_scope = self._full_user_pair_identity(
-            self._target_kind(self._stored_entity_type(cursor.entity_id, now=now)),
+            self._target_kind(self._stored_entity_type(cursor.entity_id, now=now, profiles=profiles)),
             scope=current_scope,
         )
         return current_scope is None or expected_identity != expected_identity_for_scope
 
     async def _commit_full_user_pair_or_raise(self, request: _PairCommitRequest) -> bool:
         try:
-            return await self._write_profiles(
-                lambda profiles: profiles.commit_full_user_pair(
-                    request.cursor,
-                    request.full_profile,
-                    request.personal_channel,
-                    now=request.now,
-                )
-            )
+            return await self._write_profiles(lambda profiles: self._commit_full_user_pair_in_scope(profiles, request))
         except Exception:
             await self._record_full_user_pair_failure(
                 request.cursor,
@@ -1427,6 +1444,19 @@ class DaemonEntityInfoService:
                 request.reuse_rejection_reason,
             )
             raise
+
+    def _commit_full_user_pair_in_scope(self, profiles: EntityProfileRepository, request: _PairCommitRequest) -> bool:
+        if self._pair_scope_mismatch(request.cursor, request.full_profile, now=request.now, profiles=profiles):
+            profiles.mark_section_failure(
+                request.cursor,
+                now=request.now,
+                reason="auth_scope_changed",
+                retry_at=scope_changed_retry_at(request.now),
+            )
+            return False
+        return profiles.commit_full_user_pair(
+            request.cursor, request.full_profile, request.personal_channel, now=request.now
+        )
 
     async def _record_full_user_pair_commit(self, measurement: _PairMeasurement) -> dict[str, object] | None:
         if not measurement.committed:
@@ -2092,7 +2122,9 @@ class DaemonEntityInfoService:
         if section == "avatar_history":
             return await self._acquire_avatar_history(cursor.entity_id, entity_type)
         if section == "personal_channel":
-            return await self._acquire_personal_channel(cursor.entity_id, entity_type)
+            return await self._acquire_personal_channel(
+                cursor.entity_id, entity_type, scope=context.captured_scope if context else None
+            )
         raise ValueError(f"unsupported entity profile section: {section}")
 
     @staticmethod
@@ -2558,9 +2590,13 @@ class DaemonEntityInfoService:
             raise ValueError("collection user reference unavailable")
         return reference
 
-    async def _acquire_personal_channel(self, entity_id: int, entity_type: DialogType) -> EntitySectionCommit:
+    async def _acquire_personal_channel(
+        self, entity_id: int, entity_type: DialogType, *, scope: TelegramAuthScope | None = None
+    ) -> EntitySectionCommit:
         target_kind = self._target_kind(entity_type)
-        observation = await self._deps.user_profile_port.fetch_user_profile(entity_id, target_kind)
+        observation = await self._deps.user_profile_port.fetch_user_profile(
+            entity_id, target_kind, owner_account_id=scope.account_id if scope else None
+        )
         return self._personal_channel_section_commit(observation.personal_channel)
 
     def _personal_channel_section_commit(self, outcome: ProjectionOutcome) -> EntitySectionCommit:
