@@ -64,7 +64,6 @@ async def test_daemon_runtime_binds_gate_and_verified_account_to_real_local_seed
             ),
             scheduling=scheduling,
             topic_refresher=None,
-            own_only_context=None,
             message_fact_refresh_policy=dependencies.message_fact_refresh_policy,
             folder_projection_worker=dependencies.folder_projection_worker,
             fact_hydration_worker=MessageFactHydrationWorker(
@@ -83,7 +82,6 @@ async def test_daemon_runtime_binds_gate_and_verified_account_to_real_local_seed
                 backfill_debt_limit=scheduling.fact_hydration.backfill_debt_limit,
             ),
             self_profile_cadence=dependencies.self_profile_cadence,
-            user_profile_port=dependencies.user_profile_port,
             draft_owner=dependencies.draft_owner,
         )
         history = _HistorySyncRuntime(
