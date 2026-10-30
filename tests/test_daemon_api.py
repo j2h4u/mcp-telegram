@@ -2182,7 +2182,7 @@ async def test_list_dialogs_includes_orphan_access_lost_archive() -> None:
     assert dialogs[0]["name"] == "84"
     assert dialogs[0]["display_name_source"] == "numeric"
     assert dialogs[0]["type"] == "unknown"
-    assert dialogs[0]["last_message_at"] == 1700000050
+    assert dialogs[0]["last_message_at"] is None
     assert dialogs[0]["sync_status"] == "access_lost"
     assert dialogs[0]["access_lost_at"] == 1700000100
     cast(MagicMock, client.iter_dialogs).assert_not_called()

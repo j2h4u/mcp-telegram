@@ -34,12 +34,12 @@ depends_on = ["mcp_telegram.sqlite_values", "mcp_telegram.chat_export_cli", "mcp
 [[modules]]
 path = "mcp_telegram.server"
 layer = "delivery"
-depends_on = ["mcp_telegram.config", "mcp_telegram.correlation", "mcp_telegram.daemon_client", "mcp_telegram.request_timing", "mcp_telegram.runtime_logging", "mcp_telegram.tools"]
+depends_on = ["mcp_telegram.config", "mcp_telegram.correlation", "mcp_telegram.daemon_client", "mcp_telegram.request_timing", "mcp_telegram.runtime_logging", "mcp_telegram.sync_assessment", "mcp_telegram.tools"]
 
 [[modules]]
 path = "mcp_telegram.tools"
 layer = "delivery"
-depends_on = ["mcp_telegram.entity_profile.read_schema", "mcp_telegram.activity_dialog_kinds", "mcp_telegram.conversation_change_contracts", "mcp_telegram.daemon_client", "mcp_telegram.dialog_selector", "mcp_telegram.drafts.contracts", "mcp_telegram.entity_identity", "mcp_telegram.errors", "mcp_telegram.formatter", "mcp_telegram.models", "mcp_telegram.search_contracts", "mcp_telegram.sync_read_model", "mcp_telegram.temporal", "mcp_telegram.tools.dialog_resolution", "mcp_telegram.tools.message_view", "mcp_telegram.tools.search_hit", "mcp_telegram.tools.structured", "mcp_telegram.inbox_projection", "mcp_telegram.scheduled_contracts"]
+depends_on = ["mcp_telegram.entity_profile.read_schema", "mcp_telegram.activity_dialog_kinds", "mcp_telegram.conversation_change_contracts", "mcp_telegram.daemon_client", "mcp_telegram.dialog_selector", "mcp_telegram.drafts.contracts", "mcp_telegram.entity_identity", "mcp_telegram.errors", "mcp_telegram.formatter", "mcp_telegram.models", "mcp_telegram.search_contracts", "mcp_telegram.sync_read_model", "mcp_telegram.sync_assessment", "mcp_telegram.temporal", "mcp_telegram.tools.dialog_resolution", "mcp_telegram.tools.message_view", "mcp_telegram.tools.search_hit", "mcp_telegram.tools.structured", "mcp_telegram.inbox_projection", "mcp_telegram.scheduled_contracts"]
 cannot_depend_on = [
     "mcp_telegram.daemon", "mcp_telegram.daemon_api", "mcp_telegram.feedback_db",
     "mcp_telegram.folders.sqlite_repository", "mcp_telegram.folders.telegram_adapter",
@@ -211,6 +211,11 @@ cannot_depend_on = [
 path = "mcp_telegram.reading.sqlite_projection"
 layer = "application"
 depends_on = ["mcp_telegram.alert_policy", "mcp_telegram.models", "mcp_telegram.sync_read_model"]
+
+[[modules]]
+path = "mcp_telegram.sync_assessment"
+layer = "foundation"
+depends_on = []
 
 [[modules]]
 path = "mcp_telegram.sync_read_model"
