@@ -797,9 +797,10 @@ async def test_account_hold_keeps_coordinator_running_until_shutdown() -> None:
 
 
 @pytest.mark.asyncio
-async def test_linked_chat_wait_does_not_block_finite_scheduled_discovery() -> None:
+async def test_linked_chat_wait_does_not_block_finite_scheduled_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
     now = int(time.time())
     clock = _Clock(float(now))
+    monkeypatch.setattr(time, "time", clock)
     conn, client, discovery = _discovery_with_link_wait(now)
     adapters: dict[DemandKind, object] = dict(_adapters())
     adapters[DemandKind.SCHEDULED_DISCOVERY] = discovery
