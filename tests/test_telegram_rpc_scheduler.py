@@ -73,6 +73,24 @@ def test_legacy_deadline_only_tightens_contract_and_nested_scope_keeps_root_iden
                 assert token.source is nested.source
 
 
+async def test_response_timeout_is_owner_bound_and_nested_can_only_tighten() -> None:
+    with rpc_scope(TelegramRpcSource.MCP_INTERACTIVE, response_timeout_seconds=8) as outer:
+        assert outer.response_timeout_seconds == 8
+        with rpc_scope(TelegramRpcSource.FULL_SYNC, response_timeout_seconds=12) as nested:
+            assert nested.response_timeout_seconds == 8
+        with rpc_scope(TelegramRpcSource.FULL_SYNC, response_timeout_seconds=3) as nested:
+            assert nested.response_timeout_seconds == 3
+
+        async def child() -> float | None:
+            return current_rpc_scope().response_timeout_seconds
+
+        with pytest.raises(UnclassifiedTelegramRpcError):
+            await asyncio.create_task(child())
+    with pytest.raises(ValueError):
+        with rpc_scope(TelegramRpcSource.MCP_INTERACTIVE, response_timeout_seconds=0):
+            pass
+
+
 class _ControlledLimiter:
     def __init__(self) -> None:
         self._waiters: deque[asyncio.Future[None]] = deque()

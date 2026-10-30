@@ -159,7 +159,7 @@ class EntityRefreshCoordinator:
         if self._durable_slice_callback is None:
             return None
         timeout_seconds = self._limits.per_rpc_seconds
-        with rpc_scope(TelegramRpcSource.ENTITY_INFO_REFRESH, timeout_seconds=timeout_seconds):
+        with rpc_scope(TelegramRpcSource.ENTITY_INFO_REFRESH, response_timeout_seconds=timeout_seconds):
             return await self._durable_slice_callback(budget)
 
     def signal_terminal(self, result: DurableRefreshSliceResult) -> None:

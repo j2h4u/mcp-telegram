@@ -731,20 +731,20 @@ class DaemonEntityInfoService:
         receipt = _ProfileRefreshWriteReceipt(selected, scope=scope)
         token = _PROFILE_REFRESH_WRITES.set(receipt)
         try:
-            deadline = asyncio.timeout(self._deps.refresh_limits.whole_refresh_seconds)
-            try:
-                async with deadline:
-                    await self._write_profiles(lambda profiles: profiles.recover_pair_measurements(now=now))
-                    if not await self._write_profiles(
-                        lambda profiles: self._prepare_refresh_revision(profiles, cursor, scope)
-                    ):
-                        result = DurableRefreshSliceResult(entity_id)
-                    else:
-                        result = await self._run_selected_profile_owner(cursor, now=now)
-            except TimeoutError:
-                if not deadline.expired():
-                    raise
-                result = await self._handle_profile_slice_deadline(selected, cursor, scope, receipt)
+            await self._write_profiles(lambda profiles: profiles.recover_pair_measurements(now=now))
+            if not await self._write_profiles(lambda profiles: self._prepare_refresh_revision(profiles, cursor, scope)):
+                result = DurableRefreshSliceResult(entity_id)
+            else:
+                result = await self._run_selected_profile_owner(cursor, now=now)
+        except asyncio.CancelledError:
+            if receipt.accepted_state is not None and self._refresh is not None:
+                status = receipt.accepted_state[1]
+                if status in {"complete", "rejected"}:
+                    terminal = (
+                        DurableRefreshTerminal.SUCCESS if status == "complete" else DurableRefreshTerminal.FAILURE
+                    )
+                    self._refresh.signal_terminal(DurableRefreshSliceResult(entity_id, terminal))
+            raise
         finally:
             _PROFILE_REFRESH_WRITES.reset(token)
         current_state = self._profiles.refresh_work_state(entity_id, scope.account_id)
@@ -753,39 +753,6 @@ class DaemonEntityInfoService:
             retryable_failure=receipt.retryable_failure,
             outcome=self._profile_refresh_outcome(selected, result, receipt, current_state),
         )
-
-    async def _handle_profile_slice_deadline(
-        self,
-        selected: WorkRevision,
-        cursor: EntityRefreshCursor,
-        scope: TelegramAuthScope,
-        receipt: _ProfileRefreshWriteReceipt,
-    ) -> DurableRefreshSliceResult:
-        result = DurableRefreshSliceResult(cursor.entity_id)
-        if receipt.accepted_state is not None:
-            status = receipt.accepted_state[1]
-            if status == "complete":
-                return DurableRefreshSliceResult(cursor.entity_id, DurableRefreshTerminal.SUCCESS)
-            if status == "rejected":
-                return DurableRefreshSliceResult(cursor.entity_id, DurableRefreshTerminal.FAILURE)
-            return result
-        if receipt.rejected:
-            return result
-        now = int(self._deps.now_provider())
-
-        def persist(profiles: EntityProfileRepository) -> bool:
-            state = profiles.refresh_work_state(cursor.entity_id, scope.account_id)
-            if self._profile_scope_changed_during_acquisition(scope) or state is None or state[0] != selected:
-                return False
-            return profiles.mark_core_failure(
-                cursor, now=now, reason="profile_slice_deadline", retry_at=self._existing_refresh_retry_at(cursor, now)
-            )
-
-        if await self._write_profiles(persist):
-            receipt.retryable_failure = True
-            self._signal_foreground_refresh_failure(cursor.entity_id)
-            return DurableRefreshSliceResult(cursor.entity_id, DurableRefreshTerminal.FAILURE, retryable_failure=True)
-        return result
 
     async def _run_selected_profile_owner(self, cursor: EntityRefreshCursor, *, now: int) -> DurableRefreshSliceResult:
         pair_mode = await self._capture_refresh_pair_mode(cursor)
@@ -882,8 +849,7 @@ class DaemonEntityInfoService:
         """Acquire one legacy group envelope for independent profile projections."""
         context = self._profile_section_context(cursor, DialogType.GROUP)
         try:
-            async with asyncio.timeout(self._deps.refresh_limits.per_rpc_seconds):
-                full_profile, contact_overlap = await self._acquire_group_full_chat_pair(cursor)
+            full_profile, contact_overlap = await self._acquire_group_full_chat_pair(cursor)
         except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending:
             raise
         except RpcAttemptBudgetExhaustedError:
@@ -1107,8 +1073,7 @@ class DaemonEntityInfoService:
                 if entity_type in {DialogType.USER, DialogType.BOT, DialogType.SERVICE}
                 else None
             )
-            async with asyncio.timeout(self._deps.refresh_limits.per_rpc_seconds):
-                result = await self._acquire_profile_section(cursor, entity_type, context=context)
+            result = await self._acquire_profile_section(cursor, entity_type, context=context)
         except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending:
             raise
         except RpcAttemptBudgetExhaustedError:
@@ -1380,8 +1345,7 @@ class DaemonEntityInfoService:
         attempt_start = self._rpc_attempt_count()
         pair_mode = cursor.pair_mode or "enabled"
         try:
-            async with asyncio.timeout(self._deps.refresh_limits.per_rpc_seconds):
-                full_profile, personal_channel = await self._acquire_full_user_pair(cursor)
+            full_profile, personal_channel = await self._acquire_full_user_pair(cursor)
         except (
             TelegramRpcAdmissionDeferred,
             TelegramRpcMethodRecoveryPending,
@@ -2891,8 +2855,7 @@ class DaemonEntityInfoService:
 
     async def _resolve_entity(self, entity_id: int) -> tuple[object | None, dict[str, object] | None]:
         try:
-            async with asyncio.timeout(self._deps.refresh_limits.per_rpc_seconds):
-                entity = await _profile_network_read(self._deps.client.get_entity(entity_id))
+            entity = await _profile_network_read(self._deps.client.get_entity(entity_id))
         except (ValueError, KeyError, *_ENTITY_NOT_FOUND_ERRORS) as exc:
             self._deps.logger.warning(
                 "entity_info entity_not_found entity_id=%r error=%s%s",

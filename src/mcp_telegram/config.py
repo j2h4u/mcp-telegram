@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import tomllib
@@ -20,6 +21,7 @@ ENTITY_PROFILE_DAEMON_TIMEOUT_SECONDS: Final[float] = 30.0
 ENTITY_PROFILE_ENDPOINT_TIMEOUT_CAP_SECONDS: Final[float] = 20.0
 ENTITY_PROFILE_RPC_TIMEOUT_CAP_SECONDS: Final[float] = 8.0
 ENTITY_PROFILE_REFRESH_TIMEOUT_CAP_SECONDS: Final[float] = 25.0
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(RuntimeError):
@@ -68,6 +70,7 @@ class EntityProfileConfig:
     foreground_resolve_seconds: float = 3.0
     foreground_refresh_wait_seconds: float = 15.0
     rpc_timeout_seconds: float = 8.0
+    # Deprecated compatibility input; it does not limit durable acquisition.
     refresh_timeout_seconds: float = 25.0
     max_queued_refreshes: int = 128
 
@@ -966,7 +969,7 @@ def _parse_entity_profile(data: dict[str, object], path: Path) -> EntityProfileC
     )
     defaults = EntityProfileConfig()
     try:
-        return EntityProfileConfig(
+        result = EntityProfileConfig(
             full_user_pair_enabled=_bool(
                 section, "full_user_pair_enabled", "entity_profile", path, defaults.full_user_pair_enabled
             ),
@@ -992,6 +995,12 @@ def _parse_entity_profile(data: dict[str, object], path: Path) -> EntityProfileC
         )
     except ValueError as exc:
         raise ConfigError(f"Invalid entity_profile policy in {path}: {exc}") from exc
+    if "refresh_timeout_seconds" in section:
+        logger.info(
+            "entity_profile.refresh_timeout_seconds is deprecated and does not limit durable acquisition; "
+            "shared admission and the post-dispatch rpc_timeout_seconds apply"
+        )
+    return result
 
 
 def _optional_section(data: dict[str, object], name: str, allowed: set[str], path: Path) -> dict[str, object]:

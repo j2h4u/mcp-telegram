@@ -676,3 +676,8 @@ rationale = "Computed monotonic deadline from the unchanged demand-contract dura
 category = "policy_assignments"
 key = "src/mcp_telegram/telegram_demand_progress.py:SliceOutcomeKind:RETRYABLE_FAILURE"
 rationale = "This fixed semantic outcome tag distinguishes an accepted retryable owner failure from deferred, stale and no-progress results; the tag itself specifies no retry policy value."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/telegram_rpc.py:TelegramRpcGate._arm_response_timeout:deadline"
+rationale = "Computed first-physical-claim response deadline from the existing injected RPC duration, capped by the original caller admission deadline; no new timeout value, replay renewal or operator policy."

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -121,6 +122,18 @@ def test_runtime_observation_row_cap_covers_rpc_summary_retention_budget() -> No
 
 def test_fact_hydration_config_accepts_positive_capacity_values() -> None:
     assert FactHydrationConfig(max_requests_per_cycle=1, max_jobs_per_cycle=1).max_requests_per_cycle == 1
+
+
+def test_legacy_profile_timeout_logs_only_when_explicit(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="mcp_telegram.config")
+    load_config(_write_config(tmp_path, '[state]\ndir = "/state"\n'))
+    assert not caplog.records
+    caplog.clear()
+    load_config(_write_config(tmp_path, '[state]\ndir = "/state"\n[entity_profile]\nrefresh_timeout_seconds = 25\n'))
+    assert len(caplog.records) == 1
+    assert (
+        "deprecated" in caplog.records[0].message and "does not limit durable acquisition" in caplog.records[0].message
+    )
 
 
 def test_load_config_reads_entity_profile_budgets_and_ipc_validation(tmp_path: Path) -> None:

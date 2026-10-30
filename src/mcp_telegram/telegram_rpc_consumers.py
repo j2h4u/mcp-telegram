@@ -187,6 +187,8 @@ class DemandKind(StrEnum):
 # Scheduler order is an independent product contract.  Keep this literal: deriving
 # it from ``DemandKind`` or ``_DEMAND_CONTRACTS`` would let coordinated omissions
 # pass startup validation.
+RETAINED_DEMAND_KINDS = frozenset({DemandKind.ENTITY_PROFILE_REFRESH})
+
 DURABLE_DEMAND_ORDER: tuple[DemandKind, ...] = (
     DemandKind.SELF_PROFILE_MAINTENANCE,
     DemandKind.ENTITY_PROFILE_REFRESH,

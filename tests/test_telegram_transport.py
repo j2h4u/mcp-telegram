@@ -137,6 +137,9 @@ class _Authority:
             self.floor = True
             self.generation += 1
 
+    def observe_response_now(self, owner: object) -> None:
+        del owner
+
     def transport_terminated(self, error: BaseException | None) -> None:
         self.terminations.append(error)
         self.generation += 1

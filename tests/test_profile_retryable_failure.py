@@ -170,33 +170,3 @@ async def test_rejected_failure_cas_is_stale_not_retryable(tmp_path: Path, monke
     finally:
         await service.shutdown()
         conn.close()
-
-
-@pytest.mark.asyncio
-async def test_deadline_expiring_inside_read_is_retryable(tmp_path: Path) -> None:
-    import asyncio
-    from dataclasses import replace
-
-    conn, prior = _prepare(tmp_path / "deadline.sqlite", migrated=True)
-    await prior.shutdown()  # type: ignore[attr-defined]
-
-    class SlowClient(_PairClient):
-        async def fetch_user_profile(
-            self, user_id: int, target_kind: TargetKind, *, owner_account_id: int | None = None
-        ) -> UserProfileObservation:
-            await asyncio.sleep(10)
-            raise AssertionError("read timeout should cancel the pending request")
-
-    service = cast(DaemonEntityInfoService, _pair_service(conn, SlowClient(), enabled=True))
-    service._deps = replace(
-        service._deps,
-        refresh_limits=replace(service._deps.refresh_limits, foreground_resolve_seconds=0.005, per_rpc_seconds=0.01),
-    )
-    coordinator = service.refresh_coordinator
-    assert coordinator is not None
-    try:
-        outcome = await run_ready_slice(EntityProfileDemandAdapter(coordinator), now=100)
-        assert outcome is not None and outcome.kind is SliceOutcomeKind.RETRYABLE_FAILURE
-    finally:
-        await service.shutdown()
-        conn.close()
