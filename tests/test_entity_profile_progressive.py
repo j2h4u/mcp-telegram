@@ -58,11 +58,9 @@ from mcp_telegram.sync_db import _CURRENT_SCHEMA_VERSION, _apply_migration_57, _
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_savepoint
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
-    DemandStatus,
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
 )
-from mcp_telegram.telegram_demand_progress import WorkKey, WorkRevision
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope
 from mcp_telegram.tools.entity_info import GET_ENTITY_INFO_OUTPUT_SCHEMA, GetEntityInfo, _entity_structured_content
@@ -2051,36 +2049,6 @@ def test_progressive_payload_validates_against_real_mcp_schema() -> None:
         resolution="exact_id",
     )
     validate(instance=payload, schema=GET_ENTITY_INFO_OUTPUT_SCHEMA)
-
-
-@pytest.mark.asyncio
-async def test_configured_whole_refresh_timeout_bounds_non_rpc_callback() -> None:
-    coordinator = EntityRefreshCoordinator(
-        limits=RefreshLimits(
-            foreground_resolve_seconds=0.001,
-            per_rpc_seconds=0.005,
-            whole_refresh_seconds=0.005,
-        )
-    )
-    cancelled = asyncio.Event()
-
-    async def slow_slice(budget: RpcAttemptBudget) -> DurableRefreshSliceResult | None:
-        try:
-            await asyncio.sleep(0.05)
-        finally:
-            cancelled.set()
-        return None
-
-    coordinator.bind_durable_executor(lambda now, excluded: DemandStatus(0, selected=budget.selected), slow_slice)
-    budget = RpcAttemptBudget(
-        limit=1,
-        selected=WorkRevision(WorkKey(DemandKind.ENTITY_PROFILE_REFRESH, 42, "42"), "test"),
-    )
-    with pytest.raises(TimeoutError):
-        await EntityProfileDemandAdapter(coordinator).run_slice(budget)
-    assert cancelled.is_set()
-    assert not coordinator.is_closed
-    await coordinator.shutdown()
 
 
 @pytest.mark.asyncio

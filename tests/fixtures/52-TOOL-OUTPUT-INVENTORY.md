@@ -9,10 +9,10 @@ uv run python -c "from mcp_telegram import server; print(len(server.tool_by_name
 ```
 
 Historical Phase 52 baseline registry count: 17 tools.
-Current registry count: 18 tools; `manage_scheduled_message` was added after this baseline.
+Current registry count: 20 tools; `manage_scheduled_message` was added after this baseline.
 
 Current Phase 52 completion status:
-- The historical Phase 52 baseline recorded 17 registered tools declaring `outputSchema` in the live MCP tool descriptors at that time. The current registry has 18 tools, including the scheduled-message tool added after the baseline.
+- The historical Phase 52 baseline recorded 17 registered tools declaring `outputSchema` in the live MCP tool descriptors at that time. The current registry has 20 tools, including the scheduled-message tool added after the baseline.
 - Every successful tool path returns `structuredContent`; recoverable error paths may stay text-only.
 - The table below is the Plan 52-01 pre-implementation baseline and lossless migration map. Its
   `Baseline` columns intentionally preserve the state observed before later Phase 52 plans ran.

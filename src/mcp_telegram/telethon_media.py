@@ -28,6 +28,11 @@ def _positive_integer(value: object) -> int | None:
     return integer if integer is not None and integer > 0 else None
 
 
+def _nonzero_integer(value: object) -> int | None:
+    integer = _integer(value)
+    return integer if integer is not None and integer != 0 else None
+
+
 def _text(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
@@ -59,7 +64,7 @@ def extract_media_fact(media: object | None) -> MediaFact | None:
     if media is None or isinstance(media, tl.MessageMediaEmpty):
         return None
     if isinstance(media, tl.MessageMediaPhoto):
-        return MediaFact("photo", _photo_payload(media))
+        return MediaFact("photo", _photo_payload(media), _nonzero_integer(_attr(_attr(media, "photo"), "id")))
     if isinstance(media, tl.MessageMediaDocument):
         return _extract_document(media)
     fact = _extract_location_or_poll(media)

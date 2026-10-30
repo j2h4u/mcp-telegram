@@ -1,5 +1,6 @@
 import asyncio
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, cast
 
@@ -82,8 +83,16 @@ def _resolve_http_port(port: int | None, *, base: HttpServerConfig | None = None
 @app.command()
 def summary(
     since: Annotated[str, Option("--since", help="Telemetry window: 30m, 24h, or 2d.")] = "24h",
+    profile_entity_id: Annotated[
+        int | None, Option("--profile-entity-id", help="Inspect one current profile job by exact entity id.")
+    ] = None,
 ) -> None:
     """Print one coherent operational report from durable telemetry."""
+    if profile_entity_id is not None:
+        if since != "24h":
+            raise BadParameter("--since does not apply to current profile job inspection.")
+        _print_profile_job(profile_entity_id)
+        return
     from .operator_summary import build_operator_summary, parse_since
 
     try:
@@ -98,6 +107,65 @@ def summary(
     except (ConfigError, OSError, sqlite3.Error, ValueError) as exc:
         raise BadParameter(str(exc)) from exc
     print(report.text)
+
+
+def _print_profile_job(entity_id: int) -> None:
+    import sys
+
+    from .daemon_client import DaemonNotRunningError, daemon_connection
+
+    async def read() -> dict[str, object]:
+        async with daemon_connection() as conn:
+            return cast(dict[str, object], await conn.get_profile_job_status(entity_id=entity_id))
+
+    try:
+        response = asyncio.run(read())
+    except (ConfigError, DaemonNotRunningError, OSError, TimeoutError) as exc:
+        print(f"Profile job unavailable: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    data = response.get("data")
+    if not response.get("ok") or not isinstance(data, dict):
+        print(f"Profile job unavailable: {response.get('message', 'unknown error')}", file=sys.stderr)
+        raise SystemExit(1)
+    durable = cast(dict[str, object], data["durable"])
+    live = cast(dict[str, object], data["live"])
+    print(f"Profile job for entity {entity_id}, observed {_profile_job_time(data['observed_at'])}.")
+    if durable["availability"] == "not_enqueued":
+        print("No saved refresh job was found for this entity.")
+    else:
+        print(
+            f"Saved job: {durable['status']}; next section: {durable['next_section']}; reason: {_profile_job_value(durable['reason'])}."
+        )
+        print(
+            f"Owner retry boundary: {_profile_job_time(durable['retry_at'])}; updated: {_profile_job_time(durable['updated_at'])}."
+        )
+    if live["availability"] == "unavailable":
+        print(f"Coordinator state unavailable: {live['unavailable_reason']}.")
+        return
+    print(
+        f"Coordinator (live, process-local): {live['coordinator_state']}; active for target: {live['active_for_target']}; "
+        f"active revision matches saved job: {_profile_job_value(live['active_revision_matches'])}; excluded: {live['excluded']}."
+    )
+    print(
+        f"Central hold: {live['hold_kind']}; reason: {_profile_job_value(live['reason'])}; retry after seconds: {_profile_job_value(live['retry_after_seconds'])}."
+    )
+    print(
+        f"Selected for kind: {live['selected_for_kind']}; attempts: {_profile_job_value(live['attempts'])}; "
+        f"invocation remaining seconds: {_profile_job_value(live['invocation_remaining_seconds'])}."
+    )
+
+
+def _profile_job_value(value: object) -> object:
+    return "unknown" if value is None else value
+
+
+def _profile_job_time(value: object) -> str:
+    if type(value) is not int:
+        return "unknown"
+    try:
+        return datetime.fromtimestamp(value, UTC).isoformat()
+    except OverflowError, OSError, ValueError:
+        return "unknown"
 
 
 @app.command()

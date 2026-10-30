@@ -309,12 +309,12 @@ async def test_self_scope_change_while_writer_queued_rejects_result(
     original_write = service._write_profiles
     switched = False
 
-    async def queued_write[T](operation: Callable[[EntityProfileRepository], T]) -> T:
+    async def queued_write[T](operation: Callable[[EntityProfileRepository], T], *, track_rejection: bool = True) -> T:
         nonlocal switched
         if client.full_user_calls and not switched:
             switched = True
             current[0] = TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 100)
-        return await original_write(operation)
+        return await original_write(operation, track_rejection=track_rejection)
 
     monkeypatch.setattr(service, "_write_profiles", queued_write)
     coordinator = service.refresh_coordinator
@@ -388,10 +388,10 @@ async def test_self_pair_commits_on_real_sqlite_writer_thread(
     service._deps = replace(service._deps, writer=writer, full_user_auth_scope=lambda: current[0])
     original_write = service._write_profiles
 
-    async def queued_write[T](operation: Callable[[EntityProfileRepository], T]) -> T:
+    async def queued_write[T](operation: Callable[[EntityProfileRepository], T], *, track_rejection: bool = True) -> T:
         if rotate_key and client.full_user_calls:
             current[0] = TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 100)
-        return await original_write(operation)
+        return await original_write(operation, track_rejection=track_rejection)
 
     monkeypatch.setattr(service, "_write_profiles", queued_write)
     coordinator = service.refresh_coordinator

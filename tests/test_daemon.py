@@ -671,6 +671,15 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             events.append("directory:init")
 
+    class _ImageWorker:
+        async def reconcile_files(self) -> None:
+            events.append("image:reconciled")
+
+    class _ImageSources:
+        def bind(self, connection: object) -> None:
+            assert connection is writer_connection and writer_active
+            events.append("image:registry_bound")
+
     ctx = SimpleNamespace(
         coordinator=SimpleNamespace(run=lambda: asyncio.sleep(0)),
         rpc_observation_sink=None,
@@ -687,7 +696,12 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
         api_server=SimpleNamespace(
             self_id=314,
             _policy=SimpleNamespace(full_user_pair_enabled=True, entity_detail_ttl_seconds=300),
+            bind_message_image_service=lambda _service: events.append("image:service_bound"),
         ),
+        image_worker=_ImageWorker(),
+        image_sources=_ImageSources(),
+        image_sources_bound=False,
+        image_service=object(),
         draft_owner=None,
         scheduled_mutation_fence=ScheduledMutationFence(),
         handler_manager=None,
@@ -790,6 +804,11 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
         "barrier:open",
         "delivery:replayed",
         "startup:restored",
+        "writer:run",
+        "image:registry_bound",
+        "writer:done",
+        "image:reconciled",
+        "image:service_bound",
         "task:telegram_demand_coordinator",
         "task:reconnect_catch_up_loop",
         "prime",

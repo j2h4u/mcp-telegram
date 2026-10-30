@@ -17,7 +17,7 @@ from .scheduled_receipts_schema import SCHEDULED_OPERATION_RECEIPT_DDL
 from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 
-_CURRENT_SCHEMA_VERSION = 92
+_CURRENT_SCHEMA_VERSION = 93
 _SCHEDULED_COMMAND_MIGRATION = 92
 _SCHEDULED_FINITE_COVERAGE_MIGRATION = 91
 _DRAFT_HISTORY_MIGRATION = 90
@@ -5086,9 +5086,24 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     current = _apply_migration_59(conn, current)
     current = _apply_migration_60(conn, current)
     current = _apply_late_migrations(conn, current)
-    _apply_migrations_85_to_92(conn, current)
+    current = _apply_migrations_85_to_92(conn, current)
+    _apply_migration_93(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
+
+
+def _apply_migration_93(conn: sqlite3.Connection, current: int) -> int:
+    """Create private image identity, finite jobs, and durable associations."""
+    return _apply_migration(
+        conn,
+        current,
+        93,
+        [
+            "CREATE TABLE IF NOT EXISTS message_image_sources (dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL, photo_id INTEGER, observation_order INTEGER NOT NULL, eligible INTEGER NOT NULL CHECK(eligible IN (0,1)), PRIMARY KEY(dialog_id,message_id)) WITHOUT ROWID",
+            "CREATE TABLE IF NOT EXISTS message_image_jobs (account_id INTEGER NOT NULL, dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL, state TEXT NOT NULL, attempt_generation INTEGER NOT NULL, source_generation INTEGER NOT NULL, photo_id INTEGER, remaining INTEGER NOT NULL, setup_remaining INTEGER NOT NULL, offset INTEGER NOT NULL DEFAULT 0, reference_refreshes INTEGER NOT NULL DEFAULT 0, redirect_dc INTEGER, reason TEXT, PRIMARY KEY(account_id,dialog_id,message_id)) WITHOUT ROWID",
+            "CREATE TABLE IF NOT EXISTS message_image_artifacts (account_id INTEGER NOT NULL, dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL, photo_id INTEGER NOT NULL, source_generation INTEGER NOT NULL, filename TEXT NOT NULL, sha256 TEXT NOT NULL, byte_size INTEGER NOT NULL, width INTEGER, height INTEGER, PRIMARY KEY(account_id,dialog_id,message_id)) WITHOUT ROWID",
+        ],
+    )
 
 
 def _apply_migrations_85_to_92(conn: sqlite3.Connection, current: int) -> int:

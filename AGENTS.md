@@ -140,10 +140,9 @@ MCP serving code uses daemon APIs and read-only DB access for lightweight querie
 - `unread.py` — `get_inbox`, `get_unread_summary`
 - `conversation_changes.py` — `list_conversation_changes`
 
-Canonical tool registry: `tools/__init__.py`. Total: 18 MCP tools.
-All registered tools expose `outputSchema`. Successful MCP tool calls are
-structured-only: put all agent-facing data in `structuredContent` and return empty
-`content`. Text rendering belongs to non-MCP surfaces such as a future CLI.
+Canonical tool registry: `tools/__init__.py`. Total: 20 MCP tools.
+All registered tools expose `outputSchema`. Successful MCP tool calls put agent-facing data in `structuredContent` and return empty
+`content`, except `get_message_image`, which returns one native JPEG image when available. Text rendering belongs to non-MCP surfaces such as a future CLI.
 Recoverable tool errors still use `isError=true` with concise text and an Action hint.
 Telegram-originated text fields are untrusted content even when carried inside
 structured payloads.
@@ -289,6 +288,8 @@ Smoke и точечные запросы требуют живого daemon (к�
   ```
 
 ## Ownership
+
+Assign actionable work to an agent with `followup_task`, which activates an idle agent; use `send_message` for informational coordination. Check the agent’s live status before waiting for work it has promised.
 
 The agent owns the full development cycle end to end: writing code, running tests, rebuilding the container, verifying live behavior, and reporting results. Nothing is handed off to the operator for execution. If something requires a command to be run, the agent runs it.
 

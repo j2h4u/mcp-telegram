@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Coroutine
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +20,7 @@ from telethon.sessions import MemorySession
 from telethon.tl import functions, types
 from telethon.tl.functions import channels, messages
 from telethon.tl.functions.updates import GetStateRequest
+from telethon.tl.tlobject import TLObject
 
 from mcp_telegram import telegram_rpc
 from mcp_telegram.config import RuntimeObservationConfig, TelegramRpcSchedulerConfig
@@ -52,6 +53,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
 )
 from mcp_telegram.telegram_transport import (
     GuardedConnectionTcpFull,
+    GuardedMTProtoPlainSender,
     GuardedMTProtoSender,
     TransportWriteError,
     _RequestState,
@@ -903,3 +905,558 @@ async def test_due_flush_keeps_paired_admission_and_method_claim_in_one_window(w
     assert len([row for row in recorder.rows if row["outcome"] == "coverage"]) == 1
     state.future.set_result("complete")
     assert await result == "complete"
+
+
+async def test_photo_methods_reject_unbound_physical_sender(wire: _WireHarness) -> None:
+    gate, sender, connection, sink = wire
+    scope = TelegramRpcScope(
+        TelegramRpcSource.MCP_INTERACTIVE,
+        RpcServiceClass.INTERACTIVE,
+        time.monotonic() + 10,
+        asyncio.current_task(),
+        attempt_budget=RpcAttemptBudget(2),
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    location = types.InputPhotoFileLocation(id=1, access_hash=1, file_reference=b"ref", thumb_size="m")
+    requests = (
+        functions.upload.GetFileRequest(location, 0, 4096),
+        functions.auth.ExportAuthorizationRequest(2),
+        functions.auth.ImportAuthorizationRequest(id=12, bytes=b"private"),
+    )
+    for request in requests:
+        with pytest.raises(RuntimeError, match="gate-owned capability"):
+            sender.send_owned(request, scope)
+    assert not sink.frames
+    assert connection._send_queue.empty()
+    assert scope.attempt_budget is not None and scope.attempt_budget.attempts == 0
+    assert gate._ensure_safety_ledger()._record["intents"] == {}
+
+
+@pytest.fixture
+async def image_wire(wire: _WireHarness, tmp_path: Path) -> AsyncIterator[_WireHarness]:
+    from mcp_telegram.state import telegram_session_lease
+
+    gate = wire[0]
+    with telegram_session_lease(tmp_path) as lease:
+        gate.bind_session_lease(lease)
+        try:
+            yield wire
+        finally:
+            await gate.close_rpc_scheduler()
+
+
+class _PhotoBudget:
+    def __init__(self, debits: list[bool] | None = None) -> None:
+        self.debits = debits
+
+    async def reserve(self, *, setup: bool) -> None:
+        if self.debits is not None:
+            self.debits.append(setup)
+
+    async def current_redirect(self) -> int | None:
+        return None
+
+    async def reserve_redirect(self, dc_id: int) -> None:
+        del dc_id
+
+
+class _PhotoFence:
+    async def prepare(self) -> _PhotoFence:
+        return self
+
+    def is_current(self) -> bool:
+        return True
+
+
+def _photo_lease(gate: TelegramRpcGate, budget: _PhotoBudget, attempts: int) -> telegram_rpc._AuxPhotoLease:
+    from mcp_telegram.telegram_image_download import PhotoLocator, PhotoWork
+
+    binding = gate.retained_auth_scope()
+    task = asyncio.current_task()
+    assert binding is not None and task is not None
+    scope = TelegramRpcScope(
+        TelegramRpcSource.MESSAGE_IMAGE_ACQUISITION,
+        RpcServiceClass.BACKGROUND,
+        time.monotonic() + 10,
+        task,
+        demand_kind=DemandKind.MESSAGE_IMAGE_ACQUISITION,
+        attempt_budget=RpcAttemptBudget(attempts),
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    location = types.InputPhotoFileLocation(id=5, access_hash=3, file_reference=b"ref", thumb_size="m")
+    lease = telegram_rpc._AuxPhotoLease(
+        gate,
+        binding,
+        task,
+        scope,
+        budget,
+        _PhotoFence(),
+        3,
+        "lease",
+        PhotoWork("w", "a", "s"),
+        PhotoLocator(5, "m", 3, 50, 8, 8, location),
+    )
+    gate._photo_aux_lease = lease
+    return lease
+
+
+def _connected_photo_sender(
+    gate: TelegramRpcGate, lease: telegram_rpc._AuxPhotoLease
+) -> tuple[GuardedMTProtoSender, GuardedConnectionTcpFull, _Writer]:
+    sender = GuardedMTProtoSender(
+        AuthKey(bytes(reversed(range(256)))), authority=telegram_rpc._AuxPhotoAuthority(lease), loggers=gate._log
+    )
+    lease.sender = sender
+    connection = GuardedConnectionTcpFull("127.0.0.1", 443, 3, loggers=gate._log)
+    connection.bind_owner(sender)
+    connection._connected = True
+    sink = _Writer()
+    connection._writer = cast(asyncio.StreamWriter, sink)
+    connection._codec = FullPacketCodec(connection)
+    sender._connection = connection
+    sender._user_connected = True
+    return sender, connection, sink
+
+
+async def _prepare_photo_request(
+    sender: GuardedMTProtoSender,
+    lease: telegram_rpc._AuxPhotoLease,
+    request: TLObject,
+    *,
+    setup: bool,
+    auxiliary: bool,
+) -> tuple[telegram_rpc._PhotoWireCapability, asyncio.Future[object], _RequestState]:
+    cap = telegram_rpc._PhotoWireCapability(
+        lease.gate._photo_issuer,
+        lease.scope,
+        lease.owner_task,
+        bytes(request),
+        lease.budget,
+        lease.source_fence,
+        setup,
+        lease=lease,
+        use_auxiliary=auxiliary,
+    )
+    if setup:
+        cap.aux_bootstrap = lease.gate._photo_bootstrap_provenance(lease, not auxiliary)
+    context = telegram_rpc._PHOTO_CAPABILITY.set(cap)
+    try:
+        future = sender.send_owned(request, lease.rpc_scope)
+    finally:
+        telegram_rpc._PHOTO_CAPABILITY.reset(context)
+    state = await sender._send_queue.next_state()
+    await sender._prepare_state(state)
+    return cap, future, state
+
+
+async def test_photo_permit_reserves_before_physical_claim_and_checks_source(image_wire: _WireHarness) -> None:
+    gate, sender, connection, sink = image_wire
+    binding = gate.retained_auth_scope()
+    assert binding is not None
+    reserved: list[bool] = []
+
+    class Token:
+        current = True
+
+        def is_current(self) -> bool:
+            return self.current
+
+    class Fence:
+        def __init__(self) -> None:
+            self.token = Token()
+
+        async def prepare(self) -> Token:
+            return self.token
+
+    fence = Fence()
+    task = asyncio.current_task()
+    assert task is not None
+    request = functions.upload.GetFileRequest(
+        types.InputPhotoFileLocation(id=1, access_hash=1, file_reference=b"ref", thumb_size="m"), 0, 4096
+    )
+    capability = telegram_rpc._PhotoWireCapability(
+        gate._photo_issuer, binding, task, bytes(request), _PhotoBudget(reserved), fence, False
+    )
+    scope = TelegramRpcScope(
+        TelegramRpcSource.MESSAGE_IMAGE_ACQUISITION,
+        RpcServiceClass.BACKGROUND,
+        time.monotonic() + 10,
+        task,
+        demand_kind=DemandKind.MESSAGE_IMAGE_ACQUISITION,
+        attempt_budget=RpcAttemptBudget(2),
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    context = telegram_rpc._PHOTO_CAPABILITY.set(capability)
+    try:
+        future = sender.send_owned(request, scope)
+    finally:
+        telegram_rpc._PHOTO_CAPABILITY.reset(context)
+    state = await sender._send_queue.next_state()
+    await sender._prepare_state(state)
+    packet = connection._send_queue.get_nowait()
+    assert reserved == [False]
+    fence.token.current = False
+    assert not sender.write_packet(packet, connection._send)
+    assert not sink.frames
+    assert scope.attempt_budget is not None and scope.attempt_budget.attempts == 0
+    future.cancel()
+
+
+async def test_exact_photo_resolution_uses_guarded_wire_and_durable_budget(
+    image_wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mcp_telegram.telegram_demand import durable_demand_context
+    from mcp_telegram.telegram_image_download import PhotoObservation, PhotoTarget
+
+    gate, sender, connection, sink = image_wire
+    binding = gate.retained_auth_scope()
+    assert binding is not None and gate.session is not None
+    monkeypatch.setattr(gate.session, "get_input_entity", lambda _dialog_id: types.InputPeerUser(100, 9))
+    debits: list[bool] = []
+
+    async def acquire() -> PhotoObservation:
+        with durable_demand_context(DemandKind.MESSAGE_IMAGE_ACQUISITION):
+            return await gate.resolve_photo(
+                PhotoTarget(100, 7),
+                scope=binding,
+                observation_order=1,
+                budget=_PhotoBudget(debits),
+                source_fence=_PhotoFence(),
+            )
+
+    task = asyncio.create_task(acquire())
+    state = await asyncio.wait_for(sender._send_queue.next_state(), timeout=2)
+    await sender._prepare_state(state)
+    packet = connection._send_queue.get_nowait()
+    assert debits == [True]
+    assert sender.write_packet(packet, connection._send)
+    assert len(sink.frames) == 1
+    photo = types.Photo(
+        id=5, access_hash=3, file_reference=b"ref", date=None, dc_id=2, sizes=[types.PhotoSize("m", 8, 8, 50)]
+    )
+    message = types.Message(
+        id=7, peer_id=types.PeerUser(100), date=None, message="", media=types.MessageMediaPhoto(photo=photo)
+    )
+    state.future.set_result(types.messages.Messages(messages=[message], chats=[], users=[], topics=[]))
+    result = await asyncio.wait_for(task, timeout=2)
+    assert result.locator.photo_id == 5
+
+
+async def test_same_dc_photo_iterator_uses_guarded_physical_file_request(
+    image_wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mcp_telegram.telegram_demand import durable_demand_context
+    from mcp_telegram.telegram_image_download import PhotoTarget, PhotoWork
+
+    gate, sender, connection, sink = image_wire
+    binding = gate.retained_auth_scope()
+    assert binding is not None and gate.session is not None
+    monkeypatch.setattr(gate.session, "get_input_entity", lambda _dialog_id: types.InputPeerUser(100, 9))
+    debits: list[bool] = []
+
+    async def acquire() -> list[bytes]:
+        with durable_demand_context(DemandKind.MESSAGE_IMAGE_ACQUISITION):
+            budget = _PhotoBudget(debits)
+            observation = await gate.resolve_photo(
+                PhotoTarget(100, 7), scope=binding, observation_order=1, budget=budget, source_fence=_PhotoFence()
+            )
+            session = await gate.open_photo_download(
+                observation.locator,
+                scope=binding,
+                work=PhotoWork("work", "attempt", "source"),
+                budget=budget,
+                source_fence=_PhotoFence(),
+            )
+            try:
+                return [chunk async for chunk in session.chunks(offset=0)]
+            finally:
+                await session.close()
+
+    task = asyncio.create_task(acquire())
+    state = await asyncio.wait_for(sender._send_queue.next_state(), timeout=2)
+    await sender._prepare_state(state)
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    photo = types.Photo(
+        id=5, access_hash=3, file_reference=b"ref", date=None, dc_id=2, sizes=[types.PhotoSize("m", 8, 8, 50)]
+    )
+    message = types.Message(
+        id=7, peer_id=types.PeerUser(100), date=None, message="", media=types.MessageMediaPhoto(photo=photo)
+    )
+    state.future.set_result(types.messages.Messages(messages=[message], chats=[], users=[], topics=[]))
+    state = await asyncio.wait_for(sender._send_queue.next_state(), timeout=2)
+    await sender._prepare_state(state)
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    state.future.set_result(types.upload.File(type=types.storage.FileJpeg(), mtime=0, bytes=b"x" * 50))
+    assert await asyncio.wait_for(task, timeout=2) == [b"x" * 50]
+    assert debits == [True, False]
+    assert len(sink.frames) == 2
+
+
+async def test_auxiliary_owned_file_claim_uses_auxiliary_identity_and_shared_gate(image_wire: _WireHarness) -> None:
+    gate, main_sink = image_wire[0], image_wire[3]
+    debits: list[bool] = []
+    lease = _photo_lease(gate, _PhotoBudget(debits), 2)
+    sender, connection, sink = _connected_photo_sender(gate, lease)
+    request = functions.upload.GetFileRequest(cast(types.InputPhotoFileLocation, lease.locator.location), 0, 524288)
+    cap, future, state = await _prepare_photo_request(sender, lease, request, setup=False, auxiliary=True)
+    raw = gate._safety_store.load_record()
+    assert raw is not None
+    intent = next(iter(cast(dict[str, dict[str, object]], json.loads(raw)["intents"]).values()))
+    assert intent["scope"] == {"dc_id": 3, "key_id": sender.auth_key.key_id, "account_id": 42}
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    state.future.set_result(types.upload.File(type=types.storage.FileJpeg(), mtime=0, bytes=b"x" * 50))
+    await future
+    assert debits == [False] and len(sink.frames) == 1 and not main_sink.frames
+    await gate._close_photo_aux_lease()
+
+
+async def _drive_foreign_photo_exchange(
+    image_wire: _WireHarness,
+    aux_sink: _Writer,
+    connected: asyncio.Event,
+    debits: list[bool],
+    acquire: Callable[[], Coroutine[object, object, list[bytes]]],
+) -> None:
+    gate, main, main_conn, main_sink = image_wire
+    task = asyncio.create_task(acquire())
+    state = await asyncio.wait_for(main._send_queue.next_state(), 2)
+    await main._prepare_state(state)
+    assert main.write_packet(main_conn._send_queue.get_nowait(), main_conn._send)
+    photo = types.Photo(
+        id=5, access_hash=3, file_reference=b"ref", date=None, dc_id=3, sizes=[types.PhotoSize("m", 8, 8, 50)]
+    )
+    message = types.Message(
+        id=7, peer_id=types.PeerUser(100), date=None, message="", media=types.MessageMediaPhoto(photo=photo)
+    )
+    state.future.set_result(types.messages.Messages(messages=[message], chats=[], users=[], topics=[]))
+    await asyncio.wait_for(connected.wait(), 2)
+    state = await asyncio.wait_for(main._send_queue.next_state(), 2)
+    await main._prepare_state(state)
+    assert main.write_packet(main_conn._send_queue.get_nowait(), main_conn._send)
+    state.future.set_result(types.auth.ExportedAuthorization(id=12, bytes=b"secret"))
+    lease = gate._photo_aux_lease
+    assert lease is not None and lease.sender is not None
+    aux = lease.sender
+    assert aux._retries == 0 and aux._auto_reconnect is False
+    aux_conn = cast(GuardedConnectionTcpFull, aux._connection)
+    state = await asyncio.wait_for(aux._send_queue.next_state(), 2)
+    await aux._prepare_state(state)
+    assert aux.write_packet(aux_conn._send_queue.get_nowait(), aux_conn._send)
+    state.future.set_result(types.auth.Authorization(user=types.User(id=42)))
+    state = await asyncio.wait_for(aux._send_queue.next_state(), 2)
+    await aux._prepare_state(state)
+    assert aux.write_packet(aux_conn._send_queue.get_nowait(), aux_conn._send)
+    state.future.set_result(types.upload.File(type=types.storage.FileJpeg(), mtime=0, bytes=b"x" * 50))
+    assert await asyncio.wait_for(task, 2) == [b"x" * 50]
+    assert debits == [True, True, True, False]
+    assert len(main_sink.frames) == 2 and len(aux_sink.frames) == 2
+    assert gate._photo_aux_lease is None and main.physical_connected()
+
+
+async def test_foreign_dc_photo_bootstrap_and_download_use_guarded_senders(
+    image_wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mcp_telegram.telegram_demand import durable_demand_context
+    from mcp_telegram.telegram_image_download import PhotoTarget, PhotoWork
+
+    gate, main, main_conn, main_sink = image_wire
+    scope = gate.retained_auth_scope()
+    assert scope is not None and gate.session is not None
+    monkeypatch.setattr(gate.session, "get_input_entity", lambda _dialog_id: types.InputPeerUser(100, 9))
+    aux_sink = _Writer()
+    connected = asyncio.Event()
+    debits: list[bool] = []
+
+    async def fake_dc(_session: object, _lease: object) -> object:
+        return SimpleNamespace(ip_address="127.0.0.1", port=443, id=3)
+
+    async def fake_connect(sender: GuardedMTProtoSender, connection: GuardedConnectionTcpFull) -> bool:
+        connection.bind_owner(sender)
+        connection._connected = True
+        connection._writer = cast(asyncio.StreamWriter, aux_sink)
+        connection._codec = FullPacketCodec(connection)
+        sender._connection = connection
+        sender._user_connected = True
+        sender.auth_key.key = bytes(reversed(range(256)))
+        connected.set()
+        return True
+
+    monkeypatch.setattr(gate, "_photo_dc_option", fake_dc)
+    monkeypatch.setattr(GuardedMTProtoSender, "connect", fake_connect)
+
+    async def acquire() -> list[bytes]:
+        with durable_demand_context(DemandKind.MESSAGE_IMAGE_ACQUISITION):
+            budget = _PhotoBudget(debits)
+            observation = await gate.resolve_photo(
+                PhotoTarget(100, 7), scope=scope, observation_order=1, budget=budget, source_fence=_PhotoFence()
+            )
+            session = await gate.open_photo_download(
+                observation.locator,
+                scope=scope,
+                work=PhotoWork("work", "attempt", "source"),
+                budget=budget,
+                source_fence=_PhotoFence(),
+            )
+            try:
+                return [chunk async for chunk in session.chunks(offset=0)]
+            finally:
+                await session.close()
+
+    await _drive_foreign_photo_exchange(image_wire, aux_sink, connected, debits, acquire)
+
+
+async def test_image_scope_claim_rejects_identity_transition_aba(image_wire: _WireHarness) -> None:
+    gate = image_wire[0]
+    token = gate.capture_image_scope()
+    assert token is not None and gate.claim_image_scope(token)
+    with gate._image_identity_change():
+        assert not gate.claim_image_scope(token)
+        assert gate.capture_image_scope() is None
+    replacement = gate.capture_image_scope()
+    assert replacement is not None and gate.claim_image_scope(replacement)
+    assert not gate.claim_image_scope(token)
+
+
+@pytest.mark.parametrize("late_flood", [False, True])
+async def test_unknown_photo_export_is_retired_without_replay_or_late_credentials(
+    image_wire: _WireHarness, late_flood: bool
+) -> None:
+    gate, main, connection, sink = image_wire
+    lease = _photo_lease(gate, _PhotoBudget(), 2)
+    aux = GuardedMTProtoSender(
+        AuthKey(bytes(reversed(range(256)))), authority=telegram_rpc._AuxPhotoAuthority(lease), loggers=gate._log
+    )
+    lease.sender = aux
+    request = functions.auth.ExportAuthorizationRequest(3)
+    cap, future, state = await _prepare_photo_request(main, lease, request, setup=True, auxiliary=False)
+    assert main.write_packet(connection._send_queue.get_nowait(), connection._send)
+    owner = cap.wire_owner
+    assert owner is not None and owner.claimed == 1
+    await gate._retire_uncertain_photo_bootstrap(cap, lease)
+    intent = cast(dict[str, dict[str, object]], gate._ensure_safety_ledger()._record["intents"])[owner.attempt_id]
+    assert intent["phase"] == "unknown"
+    assert cast(dict[str, object], intent["aux_bootstrap"])["contained"] is True
+    assert gate._wire_fault is None and main.physical_connected()
+    with pytest.raises(asyncio.CancelledError):
+        await main._prepare_state(state)
+    if late_flood:
+        state.future.set_exception(FloodWaitError(request, capture=7))
+        with pytest.raises(FloodWaitError):
+            await future
+        assert gate._ensure_safety_ledger().floor_deadline > time.monotonic()
+    else:
+        state.future.set_result(types.auth.ExportedAuthorization(id=12, bytes=b"private"))
+        with pytest.raises(RuntimeError, match="discarded"):
+            await future
+    assert len(sink.frames) == 1
+    aux.auth_key.key = None
+    gate._photo_aux_lease = None
+
+
+async def test_actual_aux_sender_connect_authenticates_through_guarded_plain_frames(
+    image_wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import struct
+
+    from telethon.network import authenticator
+
+    gate, main, _main_conn, main_sink = image_wire
+    debits: list[bool] = []
+    lease = _photo_lease(gate, _PhotoBudget(debits), 16)
+    scope = lease.rpc_scope
+    sender = GuardedMTProtoSender(
+        None,
+        authority=telegram_rpc._AuxPhotoAuthority(lease),
+        loggers=gate._log,
+        retries=0,
+        delay=0,
+        auto_reconnect=False,
+    )
+    lease.sender = sender
+    connection = GuardedConnectionTcpFull("127.0.0.1", 443, 3, loggers=gate._log)
+    sink = _Writer()
+
+    async def socket_connect(*_args: object, **_kwargs: object) -> None:
+        connection._owned_epoch += 1
+        connection._connected = True
+        connection._writer = cast(asyncio.StreamWriter, sink)
+        connection._codec = FullPacketCodec(connection)
+        connection._send_task = asyncio.create_task(connection._send_loop())
+
+    async def scripted_auth(plain: object) -> tuple[AuthKey, int]:
+        result = await cast(GuardedMTProtoPlainSender, plain).send(functions.ReqPqMultiRequest(1))
+        assert isinstance(result, types.ResPQ)
+        return AuthKey(bytes(reversed(range(256)))), 0
+
+    monkeypatch.setattr(connection, "connect", socket_connect)
+    monkeypatch.setattr(authenticator, "do_authentication", scripted_auth)
+    connecting = asyncio.create_task(sender.connect(connection))
+    frame = await asyncio.wait_for(sink.written.get(), 2)
+    assert frame and debits == [True]
+    response = bytes(types.ResPQ(1, 2, b"pq", []))
+    connection._recv_queue.put_nowait((struct.pack("<qqi", 0, 4, len(response)) + response, None))
+    assert await asyncio.wait_for(connecting, 2)
+    assert sender.auth_key and sender._auto_reconnect is False
+    assert scope.attempt_budget is not None and scope.attempt_budget.attempts == 1
+    assert not main_sink.frames and main.physical_connected()
+    await gate._close_photo_aux_lease()
+
+
+@pytest.mark.parametrize("transport_failure", [False, True])
+async def test_unknown_aux_import_requires_teardown_and_key_discard(
+    image_wire: _WireHarness, transport_failure: bool
+) -> None:
+    gate, main, main_sink = image_wire[0], image_wire[1], image_wire[3]
+    lease = _photo_lease(gate, _PhotoBudget(), 2)
+    aux, connection, _sink = _connected_photo_sender(gate, lease)
+    request = functions.auth.ImportAuthorizationRequest(id=12, bytes=b"private")
+    cap, future, state = await _prepare_photo_request(aux, lease, request, setup=True, auxiliary=True)
+    assert aux.write_packet(connection._send_queue.get_nowait(), connection._send)
+    owner = cap.wire_owner
+    assert owner is not None and owner.claimed == 1
+    if transport_failure:
+        error = ConnectionError("auxiliary receive failed")
+        with pytest.raises(ConnectionError, match="auxiliary receive failed"):
+            await aux._disconnect(error)
+    await gate._retire_uncertain_photo_bootstrap(cap, lease)
+    with pytest.raises((asyncio.CancelledError, ConnectionError)):
+        await future
+    intent = cast(dict[str, dict[str, object]], gate._ensure_safety_ledger()._record["intents"])[owner.attempt_id]
+    assert intent["phase"] == "unknown" and cast(dict[str, object], intent["aux_bootstrap"])["contained"] is True
+    assert aux.auth_key.key is None and gate._photo_aux_lease is None
+    assert gate._wire_fault is None and main.physical_connected() and not main_sink.frames
+
+
+async def test_failed_gate_teardown_keeps_session_flock_pinned(
+    wire: _WireHarness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mcp_telegram.state import telegram_session_lease
+
+    gate, sender, connection, _sink = wire
+    with telegram_session_lease(tmp_path) as lease:
+        gate.bind_session_lease(lease)
+
+        async def failed_disconnect() -> None:
+            raise RuntimeError("test teardown failure")
+
+        monkeypatch.setattr(sender, "disconnect", failed_disconnect)
+        with pytest.raises(RuntimeError, match="test teardown failure"):
+            await gate.close_rpc_scheduler()
+    with pytest.raises(RuntimeError, match="already owned"), telegram_session_lease(tmp_path):
+        pass
+    await connection.disconnect()
+    pin = gate._session_pin
+    assert pin is not None
+    pin._release()
+    gate._session_pin = None
+    with telegram_session_lease(tmp_path) as replacement:
+        assert replacement.is_held()
+
+
+async def test_invalid_account_identity_revokes_image_scope(image_wire: _WireHarness) -> None:
+    gate = image_wire[0]
+    token = gate.capture_image_scope()
+    assert token is not None and gate.claim_image_scope(token)
+    await gate._ensure_safety_ledger().reject_identity_result(mismatched_account=False)
+    assert not gate.claim_image_scope(token)
+    assert gate.capture_image_scope() is None

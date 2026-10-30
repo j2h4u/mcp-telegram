@@ -49,6 +49,7 @@ class SliceOutcomeKind(StrEnum):
     PROGRESSED = "progressed"
     TERMINAL = "terminal"
     DEFERRED = "deferred"
+    RETRYABLE_FAILURE = "retryable_failure"
     STALE = "stale"
     NO_PROGRESS = "no_progress"
 

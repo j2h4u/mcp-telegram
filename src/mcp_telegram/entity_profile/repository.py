@@ -12,6 +12,7 @@ updates. Older test fixtures retain a compatibility blob fallback.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -29,7 +30,7 @@ from ..entity_store import (
 )
 from ..models import DialogType
 from ..resolver import latinize
-from ..sync_transactions import require_write_transaction, write_savepoint
+from ..sync_transactions import read_snapshot, require_write_transaction, write_savepoint
 from ..telegram_demand_progress import WorkKey, WorkRevision
 from ..telegram_rpc_consumers import DemandKind
 from .collection_repository import (
@@ -1577,6 +1578,77 @@ class EntityProfileRepository:
         status = str(values["status"])
         terminal_status = status if status in {"complete", "rejected"} else None
         return self.refresh_work_revision(cursor, account_id, terminal_status=terminal_status), status
+
+    def inspect_refresh_job(self, entity_id: int, account_id: int) -> tuple[dict[str, object], WorkRevision | None]:
+        """Read one exact job and its private revision under the verified account."""
+        with read_snapshot(self._conn):
+            if bound_profile_account(self._conn) != account_id:
+                raise PermissionError("profile account is not verified")
+            columns = [
+                "entity_id",
+                "status",
+                "generation",
+                "next_section",
+                "reason",
+                "retry_at",
+                "started_at",
+                "updated_at",
+                "acquisition_cursor",
+                "pair_eligible",
+                "profile_revision",
+                "pair_mode",
+                "page_cursor_json",
+            ]
+            row = self._conn.execute(
+                f"SELECT {', '.join(columns)} FROM entity_profile_refresh_state WHERE entity_id=?", (entity_id,)
+            ).fetchone()
+            if row is None:
+                return {"availability": "not_enqueued"}, None
+            values = dict(zip(columns, row, strict=True))
+            return self._inspect_refresh_row(values, account_id)
+
+    def _inspect_refresh_row(
+        self, values: dict[str, object], account_id: int
+    ) -> tuple[dict[str, object], WorkRevision]:
+        self._validate_inspected_refresh(values)
+        status = values["status"]
+        reason = values["reason"]
+        reason = self._safe_refresh_reason(reason)
+        cursor = self._refresh_cursor_from_row(tuple(values.values()), list(values))
+        terminal = cast(str, status) if status in {"complete", "rejected"} else None
+        durable = {
+            key: values[key] for key in ("status", "generation", "next_section", "retry_at", "started_at", "updated_at")
+        }
+        return {"availability": "present", **durable, "reason": reason}, self.refresh_work_revision(
+            cursor, account_id, terminal_status=terminal
+        )
+
+    @staticmethod
+    def _safe_refresh_reason(reason: object) -> str | None:
+        if reason is None:
+            return None
+        if not isinstance(reason, str):
+            return "unknown"
+        if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason):
+            return reason
+        if re.fullmatch(r"story_validation:[a-z_]+(?::[a-z_]+=[0-9]+)*", reason):
+            return "story_validation"
+        if re.fullmatch(r"[a-z][a-z0-9_]{0,63}:[0-9]{3}:[A-Z0-9_]{1,64}", reason):
+            return "rpc_error"
+        return "unknown"
+
+    @staticmethod
+    def _validate_inspected_refresh(values: dict[str, object]) -> None:
+        if values["status"] not in {"pending", "failed", "rejected", "complete"}:
+            raise ValueError("invalid profile job status")
+        if values["next_section"] not in PROFILE_SECTIONS or type(values["entity_id"]) is not int:
+            raise ValueError("invalid profile job identity")
+        for key in ("generation", "updated_at", "acquisition_cursor", "profile_revision"):
+            if type(values[key]) is not int or cast(int, values[key]) < 0:
+                raise ValueError("invalid profile job value")
+        for key in ("retry_at", "started_at"):
+            if values[key] is not None and type(values[key]) is not int:
+                raise ValueError("invalid profile job timestamp")
 
     def prepare_refresh_revision(self, cursor: EntityRefreshCursor, *, owner_account_id: int | None) -> bool:
         """Return whether this captured cursor is ready; repair owned divergence then yield."""

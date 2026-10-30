@@ -58,6 +58,7 @@ async def test_daemon_runtime_binds_gate_and_verified_account_to_real_local_seed
             shutdown_event=dependencies.shutdown_event,
             api_server=SimpleNamespace(
                 self_id=77,
+                bind_message_image_service=MagicMock(),
                 _get_entity_info_service=lambda: SimpleNamespace(
                     refresh_coordinator=dependencies.entity_refresh_coordinator,
                 ),

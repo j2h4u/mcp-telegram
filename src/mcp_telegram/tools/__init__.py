@@ -24,6 +24,7 @@ from .discovery import ListDialogs, ListTopics, list_dialogs, list_topics
 from .drafts import GetDraft, ManageDraft, get_draft, manage_draft
 from .entity_info import GetEntityInfo, get_entity_info
 from .feedback import SubmitFeedback, submit_feedback
+from .message_images import MessageImage, get_message_image, prepare_message_image
 from .reading import ListMessages, SearchMessages, list_messages, search_messages
 from .scheduled import ManageScheduledMessage, manage_scheduled_message
 from .stats import GetDialogStats, GetUsageStats, get_dialog_stats, get_usage_stats
@@ -53,6 +54,7 @@ __all__ = [
     "ManageDraft",
     "ManageScheduledMessage",
     "MarkDialogForSync",
+    "MessageImage",
     "SearchMessages",
     "SubmitFeedback",
     "ToolArgs",
@@ -63,6 +65,7 @@ __all__ = [
     "get_draft",
     "get_entity_info",
     "get_inbox",
+    "get_message_image",
     "get_my_recent_activity",
     "get_sync_status",
     "get_unread_summary",
@@ -77,6 +80,7 @@ __all__ = [
     "mcp_tool",
     "normalize_output_schema",
     "omit_none_mapping_values",
+    "prepare_message_image",
     "search_messages",
     "submit_feedback",
     "tool_args",

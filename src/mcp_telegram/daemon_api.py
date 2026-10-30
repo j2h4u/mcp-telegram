@@ -36,6 +36,7 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
 import dataclasses
 import json
@@ -83,10 +84,12 @@ from .entity_profile.ports import (
     UserProfilePort,
 )
 from .entity_profile.refresh import RefreshLimits
+from .entity_profile.repository import EntityProfileRepository
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
 from .folders.read_model import dialog_placement, folder_snapshot, folder_summaries, folders_by_dialog
 from .history_enrollment import EnrollmentOutcome, disable_history, enable_history, read_intent
+from .message_images.contracts import ImageReadResult
 from .models import ReadMessage
 from .reading import ReadingDeps, ReadingService
 from .request_timing import (
@@ -115,6 +118,7 @@ from .sync_read_model import (
 )
 from .sync_transactions import write_transaction
 from .telegram_demand import AcquisitionKind, demand_context
+from .telegram_demand_progress import WorkRevision
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
     RpcAdmissionError,
@@ -716,6 +720,33 @@ def _parse_inbox_projection_options(req: dict[str, object]) -> object:
     return cast(InboxProjectionOptions, options)
 
 
+class MessageImageServicePort(Protocol):
+    async def prepare(self, dialog_id: int, message_id: int) -> dict[str, object]: ...
+    async def read(self, dialog_id: int, message_id: int) -> ImageReadResult: ...
+
+
+def _image_response(result: ImageReadResult) -> dict[str, object]:
+    response: dict[str, object] = {"ok": True, "data": result.status}
+    image = result.image_bytes
+    if image is None:
+        return response
+    content = result.status.get("content")
+    if result.mime_type != "image/jpeg" or not 0 < len(image) <= 4 * 1024 * 1024 or not isinstance(content, dict):
+        return {"ok": False, "error": "invalid_image_response"}
+    if (image[:3], image[-2:]) != (b"\xff\xd8\xff", b"\xff\xd9"):
+        return {"ok": False, "error": "invalid_image_response"}
+    expected = {
+        "state": "available",
+        "mime_type": "image/jpeg",
+        "representation": "telegram_photo",
+        "byte_size": len(image),
+    }
+    if any(content.get(key) != value for key, value in expected.items()):
+        return {"ok": False, "error": "invalid_image_response"}
+    response["image_base64"] = base64.b64encode(image).decode("ascii")
+    return response
+
+
 class DaemonAPIServer:
     """Unix socket server that dispatches JSON requests to Telegram/sync.db.
 
@@ -782,6 +813,7 @@ class DaemonAPIServer:
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
         self._entity_info_service: DaemonEntityInfoService | None = None
         self._demand_sink: DemandOfferSink | None = None
+        self._profile_job_inspector: Callable[[WorkRevision], dict[str, object]] | None = None
         self._profile_observer: ProfilePairObservationHook | None = None
         self._conversation_changes_token_codec = ConversationChangesTokenCodec()
         self._runtime_observation_sink: RuntimeObservationSink | None = None
@@ -789,6 +821,11 @@ class DaemonAPIServer:
         self._client_handlers: dict[asyncio.Task[object], asyncio.StreamWriter] = {}
         self._draft_commands: DraftCommands | None = None
         self._scheduled_commands: DraftCommands | None = None
+        self._message_image_service: MessageImageServicePort | None = None
+
+    def bind_message_image_service(self, service: MessageImageServicePort) -> None:
+        """Attach the account-fenced image service after daemon composition."""
+        self._message_image_service = service
 
     def bind_draft_commands(self, commands: DraftCommands) -> None:
         """Attach draft writes only after the authenticated account is bound."""
@@ -807,6 +844,10 @@ class DaemonAPIServer:
         self._demand_sink = sink
         if self._entity_info_service is not None:
             self._entity_info_service.bind_demand_sink(sink)
+
+    def bind_profile_job_inspector(self, inspector: Callable[[WorkRevision], dict[str, object]]) -> None:
+        """Bind the coordinator's read-only exact-work snapshot."""
+        self._profile_job_inspector = inspector
 
     def bind_profile_observer(self, observer: ProfilePairObservationHook) -> None:
         """Attach the process-wide profile telemetry observer after startup composition."""
@@ -1292,6 +1333,8 @@ class DaemonAPIServer:
             "export_chat": self._export_chat,
             "list_messages": self._list_messages,
             "get_draft": self._get_draft,
+            "get_message_image": self._get_message_image,
+            "prepare_message_image": self._prepare_message_image,
             "manage_draft": self._manage_draft,
             "manage_scheduled_message": self._manage_scheduled_message,
             "search_messages": self._search_messages,
@@ -2029,13 +2072,90 @@ class DaemonAPIServer:
     # get_sync_status
     # ------------------------------------------------------------------
 
-    async def _get_sync_status(self, req: dict[str, object]) -> dict:  # noqa: PLR0914
-        """Return sync status and message statistics for a dialog.
+    @staticmethod
+    def _profile_job_error(code: str, message: str) -> dict[str, object]:
+        return {
+            "ok": False,
+            "error": code,
+            "message": f"{message} Action: check the exact entity and verified account.",
+        }
 
-        delete_detection is derived from dialog_id sign:
-        - Negative → channel/supergroup → "reliable (channel)"
-        - Positive → DM/small group → weekly or paused deletion verification
-        """
+    def _profile_job_status(self, req: dict[str, object]) -> dict[str, object]:
+        entity_id = self._get_entity_info_service().extract_profile_job_entity_id(req)
+        if isinstance(entity_id, dict):
+            return entity_id
+        scope = self._auth_scope
+        if scope is None or self.self_id != scope.account_id:
+            return self._profile_job_error("account_unverified", "The current account is not verified.")
+        try:
+            repository = EntityProfileRepository(self._conn, section_ttl_seconds=self._policy.entity_detail_ttl_seconds)
+            durable, revision = repository.inspect_refresh_job(entity_id, scope.account_id)
+        except PermissionError:
+            return self._profile_job_error("account_unverified", "The persisted account does not match.")
+        except sqlite3.Error, ValueError, TypeError, KeyError:
+            return self._profile_job_error("profile_job_unavailable", "The profile job could not be read.")
+        if self._auth_scope != scope or self.self_id != scope.account_id:
+            return self._profile_job_error("account_unverified", "The current account changed during the read.")
+        live = self._profile_job_live(revision)
+        return {
+            "ok": True,
+            "data": {
+                "view": "profile_job",
+                "entity_id": entity_id,
+                "observed_at": int(time.time()),
+                "consistency": "live",
+                "durable": durable,
+                "live": live,
+            },
+        }
+
+    def _profile_job_live(self, revision: WorkRevision | None) -> dict[str, object]:
+        if revision is None:
+            return {
+                "availability": "unavailable",
+                "persistence": "process",
+                "unavailable_reason": "no_current_revision",
+            }
+        if self._profile_job_inspector is None:
+            return {
+                "availability": "unavailable",
+                "persistence": "process",
+                "unavailable_reason": "coordinator_unavailable",
+            }
+        try:
+            snapshot = self._profile_job_inspector(revision)
+            keys = (
+                "coordinator_state",
+                "active_for_target",
+                "active_revision_matches",
+                "selected_for_kind",
+                "excluded",
+                "hold_kind",
+                "reason",
+                "retry_after_seconds",
+                "attempts",
+                "invocation_remaining_seconds",
+            )
+            return {"availability": "available", "persistence": "process", **{key: snapshot[key] for key in keys}}
+        except KeyError, RuntimeError, ValueError, TypeError:
+            return {
+                "availability": "unavailable",
+                "persistence": "process",
+                "unavailable_reason": "coordinator_unavailable",
+            }
+
+    async def _get_sync_status(self, req: dict[str, object]) -> dict:
+        """Return local dialog status or the private exact profile job view."""
+        if req.get("view") is not None:
+            if req.get("view") != "profile_job" or "dialog_id" in req:
+                return self._profile_job_error("invalid_arguments", "Use only an exact profile entity id.")
+            return self._profile_job_status(req)
+        if "entity_id" in req:
+            return self._profile_job_error("invalid_arguments", "Use the profile job view with an entity id.")
+        return self._get_history_sync_status(req)
+
+    def _get_history_sync_status(self, req: dict[str, object]) -> dict:  # noqa: PLR0914
+        """Return local sync status and message statistics for a dialog."""
         dialog_id = _coerce_int(req.get("dialog_id", 0), 0)
         row = cast(tuple[object, ...] | None, self._conn.execute(_GET_SYNC_STATUS_SQL, (dialog_id,)).fetchone())
 
@@ -2286,6 +2406,24 @@ class DaemonAPIServer:
             "dialog_id": int(resolved),
             "account_id": self.self_id,
         }
+
+    async def _image_request(self, req: dict[str, object], *, prepare: bool) -> dict[str, object]:
+        dialog_id, message_id = req.get("dialog_id"), req.get("message_id")
+        if type(dialog_id) is not int or dialog_id == 0 or type(message_id) is not int or message_id <= 0:
+            return {"ok": False, "error": "invalid_arguments", "message": "Expected exact dialog and message ids."}
+        service = self._message_image_service
+        if service is None:
+            return {"ok": False, "error": "daemon_not_ready", "message": "Image service is not ready."}
+        if prepare:
+            return {"ok": True, "data": await service.prepare(dialog_id, message_id)}
+        result = await service.read(dialog_id, message_id)
+        return _image_response(result)
+
+    async def _get_message_image(self, req: dict[str, object]) -> dict[str, object]:
+        return await self._image_request(req, prepare=False)
+
+    async def _prepare_message_image(self, req: dict[str, object]) -> dict[str, object]:
+        return await self._image_request(req, prepare=True)
 
     async def _get_draft(self, req: dict[str, object]) -> dict[str, object]:
         resolved = await self._draft_request(req)

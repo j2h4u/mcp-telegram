@@ -57,6 +57,354 @@ async def _noop() -> None:
     return None
 
 
+async def test_retryable_failure_uses_bounded_cumulative_windows_and_backoff() -> None:
+    kind = DemandKind.ENTITY_PROFILE_REFRESH
+    clock = _Clock()
+    adapters = _adapters({kind: DemandStatus(0)})
+    adapter = adapters[kind]
+    adapter.outcome_kind = SliceOutcomeKind.RETRYABLE_FAILURE
+    coordinator = TelegramDemandCoordinator(adapters, clock=clock, monotonic_clock=clock)
+    progress: list[bool] = []
+    coordinator.bind_canonical_progress(lambda: progress.append(True))
+
+    async def acquire() -> None:
+        adapter.run_calls[-1].debit()
+
+    adapter.on_run = acquire
+    await coordinator._execute_slice(kind)
+    budget = adapter.run_calls[0]
+    accounting = budget._accounting
+    coordinator._active_kind = None
+    coordinator.eligibility_changed(None)
+    coordinator.eligibility_changed("some.method")
+    clock.value = 129
+    coordinator.scan()
+    assert kind not in coordinator.ready_kinds
+    assert budget.attempts == 1
+    clock.value = 130
+    coordinator.scan()
+    assert kind in coordinator.ready_kinds
+    await coordinator._execute_slice(kind)
+    assert adapter.run_calls[-1] is budget
+    assert budget._accounting is accounting
+    assert budget.attempts == 2
+    assert progress == []
+    coordinator._active_kind = None
+    clock.value = 189
+    coordinator.scan()
+    assert kind not in coordinator.ready_kinds
+    clock.value = 190
+    coordinator.scan()
+    adapter.outcome_kind = SliceOutcomeKind.PROGRESSED
+    await coordinator._execute_slice(kind)
+    assert budget.attempts == 3
+    assert progress == [True]
+    assert adapter.selected not in coordinator._transient_stages
+
+
+async def test_retryable_failure_waits_for_gate_without_extra_window() -> None:
+    kind = DemandKind.ENTITY_PROFILE_REFRESH
+    clock = _Clock()
+    held = [False]
+    adapters = _adapters({kind: DemandStatus(0, request_method="users.getFullUser")})
+    adapter = adapters[kind]
+    adapter.outcome_kind = SliceOutcomeKind.RETRYABLE_FAILURE
+    coordinator = TelegramDemandCoordinator(
+        adapters,
+        clock=clock,
+        monotonic_clock=clock,
+        rpc_eligibility=lambda _: TelegramRpcThrottled(latched=True) if held[0] else None,
+    )
+    await coordinator._execute_slice(kind)
+    budget = adapter.run_calls[0]
+    coordinator._active_kind = None
+    held[0] = True
+    clock.value = 130
+    coordinator.scan()
+    assert kind not in coordinator.ready_kinds
+    assert len(adapter.run_calls) == 1
+    clock.value = 3699
+    coordinator.eligibility_changed(None)
+    coordinator.scan()
+    assert kind not in coordinator.ready_kinds
+    clock.value = 3700
+    held[0] = False
+    coordinator.eligibility_changed("users.getFullUser")
+    coordinator.scan()
+    assert kind in coordinator.ready_kinds
+    adapter.outcome_kind = SliceOutcomeKind.NO_PROGRESS
+    await coordinator._execute_slice(kind)
+    coordinator._active_kind = None
+    for _ in range(3):
+        coordinator.offer(kind)
+        coordinator.scan()
+    assert len(adapter.run_calls) == 2
+    assert budget.attempts == 0
+    assert kind not in coordinator.ready_kinds
+
+
+async def test_retryable_failure_leaves_sibling_ready() -> None:
+    kind = DemandKind.ENTITY_PROFILE_REFRESH
+    sibling = DemandKind.DELTA_GAP_FILL
+    clock = _Clock()
+    adapters = _adapters({kind: DemandStatus(0), sibling: DemandStatus(0)})
+    adapters[kind].outcome_kind = SliceOutcomeKind.RETRYABLE_FAILURE
+    coordinator = TelegramDemandCoordinator(adapters, clock=clock, monotonic_clock=clock)
+    await coordinator._execute_slice(kind)
+    coordinator._active_kind = None
+    coordinator.scan()
+    assert sibling in coordinator.ready_kinds
+    assert kind not in coordinator.ready_kinds
+    await coordinator._execute_slice(sibling)
+    assert len(adapters[sibling].run_calls) == 1
+
+
+async def test_retryable_failure_prefers_existing_method_credit() -> None:
+    kind = DemandKind.ENTITY_PROFILE_REFRESH
+    clock = _Clock()
+    adapters = _adapters({kind: DemandStatus(0, request_method="users.getFullUser")})
+    adapter = adapters[kind]
+    adapter.outcome_kind = SliceOutcomeKind.RETRYABLE_FAILURE
+    credit = object()
+
+    def authorize(budget: RpcAttemptBudget, method: str | None) -> RpcRetryAuthorization:
+        assert method == "users.getFullUser"
+        budget._retry_candidate = credit
+        return RpcRetryAuthorization(500)
+
+    coordinator = TelegramDemandCoordinator(
+        adapters, clock=clock, monotonic_clock=clock, prepare_durable_retry=authorize
+    )
+
+    async def first_attempt() -> None:
+        adapter.run_calls[-1].debit()
+
+    adapter.on_run = first_attempt
+    await coordinator._execute_slice(kind)
+    budget = adapter.run_calls[0]
+    coordinator._active_kind = None
+    clock.value = 130
+    coordinator.scan()
+    adapter.outcome_kind = SliceOutcomeKind.NO_PROGRESS
+
+    async def check_credit() -> None:
+        assert budget.limit == budget.attempts == 1
+        assert budget._retry_candidate is credit
+
+    adapter.on_run = check_credit
+    await coordinator._execute_slice(kind)
+    assert budget.attempts == 1
+
+
+async def test_inspect_work_is_read_only_and_reports_active_and_waiting() -> None:
+    kind = DemandKind.ENTITY_PROFILE_REFRESH
+    clock = _Clock()
+    adapters = _adapters({kind: DemandStatus(0)})
+    adapter = adapters[kind]
+    adapter.outcome_kind = SliceOutcomeKind.RETRYABLE_FAILURE
+    coordinator = TelegramDemandCoordinator(adapters, clock=clock, monotonic_clock=clock)
+
+    async def inspect_active() -> None:
+        snapshot = coordinator.inspect_work(adapter.selected)
+        assert snapshot["active_for_target"] is True
+        assert snapshot["active_revision_matches"] is True
+
+    adapter.on_run = inspect_active
+    await coordinator._execute_slice(kind)
+    snapshot = coordinator.inspect_work(adapter.selected)
+    assert snapshot["active_for_target"] is False
+    assert snapshot["hold_kind"] == "transient_backoff"
+    assert snapshot["reason"] == "retryable_failure"
+    assert snapshot["retry_after_seconds"] == 30
+    assert snapshot["attempts"] == 0
+    assert coordinator.inspect_work(adapter.selected) == snapshot
+
+
+async def test_inspect_work_clears_active_after_cancellation() -> None:
+    kind = DemandKind.ENTITY_PROFILE_REFRESH
+    adapters = _adapters({kind: DemandStatus(0)})
+    adapter = adapters[kind]
+    started = asyncio.Event()
+    coordinator = TelegramDemandCoordinator(adapters)
+
+    async def wait_for_cancel() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    adapter.on_run = wait_for_cancel
+    task = asyncio.create_task(coordinator._execute_slice(kind))
+    await started.wait()
+    assert coordinator.inspect_work(adapter.selected)["active_for_target"] is True
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert coordinator.inspect_work(adapter.selected)["active_for_target"] is False
+
+
+async def test_inspect_work_distinguishes_exact_revision_and_deadline_reason() -> None:
+    kind = DemandKind.ENTITY_PROFILE_REFRESH
+    adapters = _adapters({kind: DemandStatus(0)})
+    adapter = adapters[kind]
+    coordinator = TelegramDemandCoordinator(adapters)
+    old = WorkRevision(adapter.selected.key, "old")
+    unrelated = WorkRevision(WorkKey(kind, 1, "other"), "r1")
+
+    async def fail() -> None:
+        assert coordinator.inspect_work(old)["active_revision_matches"] is False
+        assert coordinator.inspect_work(unrelated)["active_for_target"] is False
+        raise TimeoutError
+
+    adapter.on_run = fail
+    await coordinator._execute_slice(kind)
+    snapshot = coordinator.inspect_work(adapter.selected)
+    assert snapshot["hold_kind"] == "excluded"
+    assert snapshot["reason"] == "deadline_exceeded"
+
+
+def test_inspect_work_reports_gate_wait_and_clears_reason_on_release() -> None:
+    kind = DemandKind.ENTITY_PROFILE_REFRESH
+    clock = _Clock()
+    held = [True]
+    adapters = _adapters({kind: DemandStatus(0, request_method="users.getFullUser")})
+    coordinator = TelegramDemandCoordinator(
+        adapters,
+        clock=clock,
+        monotonic_clock=clock,
+        rpc_eligibility=lambda _: TelegramRpcAdmissionDeferred(50, eligible_at=150) if held[0] else None,
+    )
+    selected = adapters[kind].selected
+    snapshot = coordinator.inspect_work(selected)
+    assert snapshot["hold_kind"] == "gate_wait"
+    assert snapshot["reason"] == "admission_deferred"
+    assert snapshot["retry_after_seconds"] == 50
+    held[0] = False
+    clock.value = 150
+    coordinator.eligibility_changed(None)
+    snapshot = coordinator.inspect_work(selected)
+    assert snapshot["hold_kind"] == "none"
+    assert snapshot["reason"] is None
+
+
+@pytest.mark.parametrize("outcome", ["exception", "hint"])
+async def test_plain_throttle_waits_for_finite_floor_without_new_budget(outcome: str) -> None:
+    kind = DemandKind.ENTITY_PROFILE_REFRESH
+    clock = _Clock()
+    adapters = _adapters({kind: DemandStatus(0)})
+    adapter = adapters[kind]
+    hint = [None]
+    coordinator = TelegramDemandCoordinator(
+        adapters, clock=clock, monotonic_clock=clock, rpc_eligibility=lambda _: hint[0]
+    )
+    if outcome == "exception":
+        adapter.run_error = TelegramRpcThrottled(3600)
+    else:
+        adapter.outcome_kind = SliceOutcomeKind.DEFERRED
+
+        async def set_hint() -> None:
+            hint[0] = TelegramRpcThrottled(3600)
+
+        adapter.on_run = set_hint
+    await coordinator._execute_slice(kind)
+    budget = adapter.run_calls[0]
+    coordinator._active_kind = None
+    hint[0] = None
+    clock.value = 3699
+    coordinator.eligibility_changed(None)
+    coordinator.scan()
+    assert kind not in coordinator.ready_kinds
+    clock.value = 3700
+    coordinator.scan()
+    assert kind in coordinator.ready_kinds
+    assert adapter.run_calls == [budget]
+    assert budget.attempts == 0
+    adapter.run_error = None
+    adapter.outcome_kind = SliceOutcomeKind.NO_PROGRESS
+
+    async def acquire() -> None:
+        adapter.run_calls[-1].debit()
+
+    adapter.on_run = acquire
+    await coordinator._execute_slice(kind)
+    assert adapter.run_calls == [budget, budget]
+    assert budget.attempts == budget.limit == 1
+
+
+async def test_released_gate_wait_does_not_renew_exhausted_budget() -> None:
+    kind = DemandKind.ENTITY_PROFILE_REFRESH
+    clock = _Clock()
+    adapters = _adapters({kind: DemandStatus(0)})
+    adapter = adapters[kind]
+    adapter.run_error = TelegramRpcThrottled(3600)
+
+    async def acquire() -> None:
+        adapter.run_calls[-1].debit()
+
+    adapter.on_run = acquire
+    coordinator = TelegramDemandCoordinator(adapters, clock=clock, monotonic_clock=clock)
+    await coordinator._execute_slice(kind)
+    budget = adapter.run_calls[0]
+    coordinator._active_kind = None
+    clock.value = 3700
+    coordinator.scan()
+    await coordinator._execute_slice(kind)
+    assert adapter.run_calls == [budget]
+    assert budget.attempts == budget.limit == 1
+
+
+async def test_expired_bare_invocation_is_not_revived_by_gate_notifications() -> None:
+    kind = DemandKind.ENTITY_PROFILE_REFRESH
+    clock = _Clock()
+    adapters = _adapters({kind: DemandStatus(0, request_method="users.getFullUser")})
+    adapter = adapters[kind]
+    adapter.actual_method = "users.getFullUser"
+    adapter.outcome_kind = SliceOutcomeKind.NO_PROGRESS
+    coordinator = TelegramDemandCoordinator(adapters, clock=clock, monotonic_clock=clock)
+    await coordinator._execute_slice(kind)
+    budget = adapter.run_calls[0]
+    coordinator._active_kind = None
+    clock.value = 5000
+    coordinator.eligibility_changed("users.getFullUser")
+    coordinator.scan()
+    await coordinator._execute_slice(kind)
+    assert coordinator.inspect_work(adapter.selected)["reason"] == "retry_not_authorized"
+    for _ in range(3):
+        coordinator.eligibility_changed(None)
+        coordinator.eligibility_changed("users.getFullUser")
+        coordinator.scan()
+        if kind in coordinator.ready_kinds:
+            await coordinator._execute_slice(kind)
+    assert adapter.run_calls == [budget]
+    assert budget.attempts == 0
+
+
+async def test_latched_hint_dominates_finite_throttle_exception() -> None:
+    kind = DemandKind.ENTITY_PROFILE_REFRESH
+    clock = _Clock()
+    adapters = _adapters({kind: DemandStatus(0)})
+    adapter = adapters[kind]
+    adapter.run_error = TelegramRpcThrottled(5)
+    coordinator = TelegramDemandCoordinator(adapters, clock=clock, monotonic_clock=clock)
+    coordinator._rpc_eligibility = lambda _: TelegramRpcThrottled(latched=True)
+    await coordinator._execute_slice(kind)
+    assert coordinator.inspect_work(adapter.selected)["retry_after_seconds"] is None
+    clock.value += 3600
+    coordinator.eligibility_changed(None)
+    coordinator.scan()
+    assert kind not in coordinator.ready_kinds
+
+
+async def test_throttle_exception_preserves_later_floor_than_gate_hint() -> None:
+    kind = DemandKind.ENTITY_PROFILE_REFRESH
+    clock = _Clock()
+    adapters = _adapters({kind: DemandStatus(0)})
+    adapter = adapters[kind]
+    adapter.run_error = TelegramRpcThrottled(3600)
+    coordinator = TelegramDemandCoordinator(adapters, clock=clock, monotonic_clock=clock)
+    coordinator._rpc_eligibility = lambda _: TelegramRpcAdmissionDeferred(5, eligible_at=105)
+    await coordinator._execute_slice(kind)
+    assert coordinator.inspect_work(adapter.selected)["retry_after_seconds"] == 3600
+
+
 async def test_capacity_notification_is_snapshotted_again_before_each_slice() -> None:
     kind = DemandKind.DELTA_GAP_FILL
     adapters = _adapters({kind: DemandStatus(0)})
