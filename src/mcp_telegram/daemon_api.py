@@ -1711,6 +1711,8 @@ class DaemonAPIServer:
     async def _list_dialogs(self, req: dict[str, object]) -> dict:
         """Delegate list_dialogs reads to the reading service."""
         await self._reproject_due_folder_memberships()
+        if self._directory_audit_requested(req):
+            return await self._list_dialogs_audit(req)
         result = await self._get_reading_service().list_dialogs(cast(dict[str, object], req))
         if not result.get("ok"):
             return result
@@ -1732,6 +1734,39 @@ class DaemonAPIServer:
             stale_after_seconds=self._policy.folder_snapshot_stale_after_seconds,
         )
         return result
+
+    @staticmethod
+    def _directory_audit_requested(req: dict[str, object]) -> bool:
+        return (
+            req.get("navigation") is not None
+            or req.get("dialog_type") is not None
+            or (req.get("exclude_self") is not None and req.get("exclude_self") is not False)
+            or req.get("last_message_since_utc") is not None
+            or req.get("last_message_until_utc") is not None
+        )
+
+    async def _list_dialogs_audit(self, req: dict[str, object]) -> dict:
+        scope = self._auth_scope
+        if scope is None or self.self_id != scope.account_id:
+            return self._directory_account_unverified("The current account is not verified.")
+        trusted_req = {
+            **req,
+            "verified_account_id": scope.account_id,
+            "folder_snapshot_stale_after_seconds": self._policy.folder_snapshot_stale_after_seconds,
+        }
+        result = await self._get_reading_service().list_dialogs(trusted_req)
+        if self._auth_scope != scope or self.self_id != scope.account_id:
+            return self._directory_account_unverified("The verified account changed during the read.")
+        return result
+
+    @staticmethod
+    def _directory_account_unverified(message: str) -> dict[str, object]:
+        return {
+            "ok": False,
+            "error": "account_unverified",
+            "message": message,
+            "required_action": "Verify the current account and restart the directory traversal.",
+        }
 
     def _project_archived_dialogs(
         self,

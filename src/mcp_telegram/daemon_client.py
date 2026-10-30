@@ -442,6 +442,11 @@ class DaemonConnection:
         scope: str = "all",
         folder_id: int | None = None,
         limit: int | None = None,
+        dialog_type: str | None = None,
+        exclude_self: bool = False,
+        last_message_since_utc: int | None = None,
+        last_message_until_utc: int | None = None,
+        navigation: str | None = None,
     ) -> dict:
         """List dialogs with optional archive/pin/name filtering."""
         payload: dict = {
@@ -457,6 +462,20 @@ class DaemonConnection:
             payload["folder_id"] = folder_id
         if limit is not None:
             payload["limit"] = limit
+        payload.update(
+            {
+                key: value
+                for key, value in (
+                    ("dialog_type", dialog_type),
+                    ("last_message_since_utc", last_message_since_utc),
+                    ("last_message_until_utc", last_message_until_utc),
+                    ("navigation", navigation),
+                )
+                if value is not None
+            }
+        )
+        if exclude_self:
+            payload["exclude_self"] = True
         return await self.request(payload)
 
     async def list_folders(self) -> dict:

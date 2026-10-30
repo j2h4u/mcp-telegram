@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
+from collections.abc import Sequence
 from typing import Protocol, cast, overload
 
 
@@ -18,7 +20,7 @@ class FolderReadConnection(Protocol):
     def execute(self, sql: str, /) -> FolderReadCursor: ...
 
     @overload
-    def execute(self, sql: str, _: tuple[int, ...], /) -> FolderReadCursor: ...
+    def execute(self, sql: str, _: tuple[object, ...], /) -> FolderReadCursor: ...
 
 
 def _missing_table(exc: sqlite3.OperationalError) -> bool:
@@ -142,7 +144,9 @@ def folder_summaries(conn: FolderReadConnection) -> list[dict[str, object]]:
     ]
 
 
-def folders_by_dialog(conn: FolderReadConnection) -> dict[int, list[dict[str, object]]]:
+def folders_by_dialog(
+    conn: FolderReadConnection, dialog_ids: Sequence[int] | None = None
+) -> dict[int, list[dict[str, object]]]:
     result: dict[int, list[dict[str, object]]] = {}
     try:
         rows = cast(
@@ -153,7 +157,9 @@ def folders_by_dialog(conn: FolderReadConnection) -> dict[int, list[dict[str, ob
                    JOIN telegram_folder_local_members AS m ON m.namespace=f.namespace AND m.folder_id=f.folder_id
                    JOIN dialogs AS d ON d.dialog_id=m.dialog_id AND d.hidden=0
                    WHERE m.state='present'
-                   ORDER BY f.source_position, m.pin_position IS NULL, m.pin_position, m.dialog_id"""
+                   AND (? IS NULL OR m.dialog_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?)))
+                   ORDER BY f.source_position, m.pin_position IS NULL, m.pin_position, m.dialog_id""",
+                (json.dumps(dialog_ids) if dialog_ids is not None else None,) * 2,
             ).fetchall(),
         )
     except sqlite3.OperationalError as exc:

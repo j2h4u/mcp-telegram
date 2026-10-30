@@ -358,3 +358,86 @@ async def test_list_dialogs_never_returns_draft_text_with_quotes() -> None:
     dialog = cast(dict[str, object], cast(list[dict[str, object]], structured["dialogs"])[0])
     assert "draft_text" not in dialog
     assert "draft_content" not in dialog
+
+
+@pytest.mark.asyncio
+async def test_audit_cursor_and_utc_bounds_pass_unchanged_to_daemon() -> None:
+    from jsonschema import validate
+
+    from mcp_telegram.tools import TOOL_REGISTRY
+    from mcp_telegram.tools._base import omit_none_mapping_values
+
+    response = _canonical_catalog(dialogs=[_make_dialog_dict()])
+    data = cast(dict[str, object], response["data"])
+    data["navigation"] = {
+        "has_more": True,
+        "order": "dialog_id_asc",
+        "consistency": "live",
+        "next_navigation": "opaque.token",
+    }
+    conn = MagicMock()
+    mock_list = AsyncMock(return_value=response)
+    conn.list_dialogs = mock_list
+
+    @asynccontextmanager
+    async def cm():
+        yield conn
+
+    args = ListDialogs(
+        dialog_type="user", exclude_self=True, last_message_since_utc="2026-01-01T00:00:00Z", navigation="opaque.token"
+    )
+    with patch("mcp_telegram.tools.discovery.daemon_connection", side_effect=cm):
+        result = await list_dialogs(args)
+    mock_list.assert_awaited_once_with(
+        exclude_archived=False,
+        ignore_pinned=False,
+        filter=None,
+        message_state="all",
+        scope="all",
+        folder_id=None,
+        limit=None,
+        dialog_type="user",
+        exclude_self=True,
+        last_message_since_utc=1767225600,
+        last_message_until_utc=None,
+        navigation="opaque.token",
+    )
+    payload = cast(dict[str, object], result.structured_content)
+    assert cast(dict[str, object], payload["navigation"])["next_navigation"] == "opaque.token"
+    schema = TOOL_REGISTRY["list_dialogs"].output_schema
+    assert schema is not None
+    validate(omit_none_mapping_values(payload), schema)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"view": "folders", "navigation": "start"},
+        {"view": "folders", "dialog_type": "user"},
+        {"last_message_since_utc": "2026-01-01T00:00:00+01:00"},
+        {"last_message_since_utc": "2026-01-02T00:00:00Z", "last_message_until_utc": "2026-01-01T00:00:00Z"},
+        {"dialog_type": "User"},
+    ],
+)
+def test_directory_audit_rejects_invalid_filters(kwargs: dict[str, object]) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ListDialogs.model_validate(kwargs)
+
+
+def test_directory_fractional_bounds_normalize_exactly_before_epoch() -> None:
+    from mcp_telegram.tools.discovery import _directory_boundary_seconds
+
+    assert _directory_boundary_seconds("1969-12-31T23:59:59.5Z", "time") == 0
+    assert _directory_boundary_seconds("1969-12-31T23:59:59Z", "time") == -1
+    with pytest.raises(ValueError):
+        ListDialogs(last_message_since_utc="1970-01-01T00:00:00.9Z", last_message_until_utc="1970-01-01T00:00:00.1Z")
+
+
+@pytest.mark.asyncio
+async def test_audit_requires_valid_navigation_receipt() -> None:
+    with _patched_daemon(_canonical_catalog()):
+        result = await list_dialogs(ListDialogs(navigation="start"))
+    assert result.is_error is True
+    assert "navigation is missing" in _error_text(result)

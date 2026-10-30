@@ -18,6 +18,8 @@ NavigationKind = Literal["history", "search"]
 AccountTraceGroupBy = Literal["timeline", "dialog"]
 AccountTraceView = Literal["dialogs", "messages"]
 _MAX_SCOPE_DIALOG_IDS = 2
+_DIRECTORY_TOKEN_MAX_SIZE = 2048
+_SHA256_HEX_LENGTH = 64
 
 
 class HistoryDirection(StrEnum):
@@ -752,3 +754,70 @@ def decode_profile_navigation(value: str, *, account: int, entity: int, section:
     if (payload["account"], payload["entity"], payload["section"]) != (account, entity, section):
         raise ValueError("Profile navigation belongs to another account, entity, or section")
     return ProfileNavigationToken(**cast(dict, payload))
+
+
+@dataclass(frozen=True, slots=True)
+class DialogDirectoryNavigationToken:
+    """Account and selector bound live directory traversal."""
+
+    account_id: int
+    fingerprint: str
+    last_dialog_id: int
+    upper_dialog_id: int
+
+
+def encode_dialog_directory_navigation(token: DialogDirectoryNavigationToken) -> str:
+    _validate_dialog_directory_navigation(token)
+    return _encode_payload(
+        {
+            "kind": "dialog_directory",
+            "version": 1,
+            "order": "dialog_id_asc",
+            "account_id": token.account_id,
+            "fingerprint": token.fingerprint,
+            "last_dialog_id": token.last_dialog_id,
+            "upper_dialog_id": token.upper_dialog_id,
+        }
+    )
+
+
+def decode_dialog_directory_navigation(token: str) -> DialogDirectoryNavigationToken:
+    if not isinstance(token, str) or len(token) > _DIRECTORY_TOKEN_MAX_SIZE:
+        raise ValueError("Invalid directory navigation token")
+    data = _decode_payload(token)
+    if set(data) != {"kind", "version", "order", "account_id", "fingerprint", "last_dialog_id", "upper_dialog_id"}:
+        raise ValueError("Invalid directory navigation fields")
+    if (
+        data["kind"] != "dialog_directory"
+        or data["version"] != 1
+        or type(data["version"]) is not int
+        or data["order"] != "dialog_id_asc"
+    ):
+        raise ValueError("Invalid directory navigation kind or version")
+    result = DialogDirectoryNavigationToken(
+        account_id=cast(int, data["account_id"]),
+        fingerprint=cast(str, data["fingerprint"]),
+        last_dialog_id=cast(int, data["last_dialog_id"]),
+        upper_dialog_id=cast(int, data["upper_dialog_id"]),
+    )
+    _validate_dialog_directory_navigation(result)
+    return result
+
+
+def _validate_dialog_directory_navigation(token: DialogDirectoryNavigationToken) -> None:
+    if type(token.account_id) is not int or token.account_id <= 0:
+        raise ValueError("Invalid directory navigation account")
+    if not _valid_directory_fingerprint(token.fingerprint):
+        raise ValueError("Invalid directory navigation fingerprint")
+    if (
+        type(token.last_dialog_id) is not int
+        or type(token.upper_dialog_id) is not int
+        or token.last_dialog_id > token.upper_dialog_id
+    ):
+        raise ValueError("Invalid directory navigation anchor")
+    if not -(2**63) <= token.last_dialog_id < 2**63 or not -(2**63) <= token.upper_dialog_id < 2**63:
+        raise ValueError("Invalid directory navigation anchor")
+
+
+def _valid_directory_fingerprint(value: object) -> bool:
+    return isinstance(value, str) and len(value) == _SHA256_HEX_LENGTH and all(c in "0123456789abcdef" for c in value)

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Protocol, cast
 
 from ..daemon_message import project_read_message_content
@@ -383,7 +384,7 @@ def _row_value(row: object, key: str) -> object | None:
 
 
 def scheduled_summary_by_dialog(
-    conn: sqlite3.Connection, *, scheduled_now: int
+    conn: sqlite3.Connection, *, scheduled_now: int, dialog_ids: Sequence[int] | None = None
 ) -> dict[int, tuple[int, int | None, int]]:
     """Summarize future rows separately from due or unresolved pending rows."""
     if conn.execute(SCHEDULED_MESSAGES_TABLE_SQL).fetchone() is None:
@@ -400,9 +401,10 @@ def scheduled_summary_by_dialog(
                     THEN 1 ELSE 0 END)
             FROM scheduled_messages
             WHERE message_state IN ('scheduled','unknown_missing')
+              AND (:dialog_ids IS NULL OR dialog_id IN (SELECT CAST(value AS INTEGER) FROM json_each(:dialog_ids)))
             GROUP BY dialog_id
             """,
-            {"scheduled_now": scheduled_now},
+            {"scheduled_now": scheduled_now, "dialog_ids": json.dumps(dialog_ids) if dialog_ids is not None else None},
         ).fetchall(),
     )
     return {

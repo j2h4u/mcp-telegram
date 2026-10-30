@@ -9406,3 +9406,33 @@ async def test_client_eof_keeps_dispatched_raw_rpc_lease_and_prevents_followup()
     assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
     writer.write.assert_not_called()
     await gate.close_rpc_scheduler()
+
+
+@pytest.mark.asyncio
+async def test_directory_audit_fences_scope_change_and_overwrites_private_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = make_server()
+    scope = TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99)
+    server.self_id = 42
+    await server._publish_auth_scope(scope)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    seen: list[dict[str, object]] = []
+
+    async def read(req: dict[str, object]) -> dict[str, object]:
+        seen.append(req)
+        entered.set()
+        await release.wait()
+        return {"ok": True, "data": {"dialogs": []}}
+
+    service = server._get_reading_service()
+    monkeypatch.setattr(service, "list_dialogs", read)
+    task = asyncio.create_task(server._list_dialogs({"navigation": "start", "verified_account_id": 7}))
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    await server._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 100))
+    release.set()
+    result = await task
+    assert seen[0]["verified_account_id"] == 42
+    assert result["error"] == "account_unverified"
+    assert "data" not in result
