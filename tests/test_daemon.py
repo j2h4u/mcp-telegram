@@ -43,7 +43,6 @@ from mcp_telegram.entity_profile.contracts import (
 from mcp_telegram.feedback_db import SQLiteFeedbackStore, ensure_feedback_schema
 from mcp_telegram.feedback_service import FeedbackApplicationService
 from mcp_telegram.flood import FloodWaitKillSwitchStatus, TelegramRpcThrottled
-from mcp_telegram.own_only_contracts import OwnOnlyContext
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.runtime_observations import RuntimeObservationSink
 from mcp_telegram.scheduled_write_fence import ScheduledMutationFence
@@ -751,6 +750,8 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
     monkeypatch.setattr(daemon, "_prime_runtime", prime)
     monkeypatch.setattr(daemon, "_bind_draft_commands", bind_draft_commands)
     monkeypatch.setattr(daemon, "_bind_scheduled_commands", AsyncMock())
+    self_profile_start = AsyncMock()
+    monkeypatch.setattr(daemon, "_start_self_profile_after_replay", self_profile_start)
     monkeypatch.setattr(daemon, "_offer_startup_demands", lambda _ctx: events.append("offers"))
     monkeypatch.setattr(daemon, "_run_daemon_lifetime", lifetime)
     monkeypatch.setattr(daemon, "_shutdown_sync_main_context", shutdown)
@@ -762,6 +763,7 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
         with pytest.raises(expected_error, match="synthetic startup failure"):
             await daemon.sync_main()
 
+    assert self_profile_start.await_count == (1 if failure_stage is None else 0)
     expected = [
         "context",
         "stop:bound",
@@ -826,11 +828,9 @@ async def test_prime_runtime_waits_for_coordinator_profile_and_offers_folder() -
     api.self_id = 42
     api.self_profile = {"id": 42}
     conn = sqlite3.connect(":memory:")
-    own_only_context = OwnOnlyContext(account_id=42)
     startup_identity = StartupIdentityState(100.0, 200.0)
     startup_identity.advance_profile(SimpleNamespace(id=42))
-    startup_identity.advance_input_user(object())
-    startup_identity.complete(StartupIdentityResult(SimpleNamespace(id=42), own_only_context))
+    startup_identity.complete(StartupIdentityResult(SimpleNamespace(id=42), 42))
     bound_account_ids: list[int] = []
 
     async def bind_account_id(account_id: int) -> None:
@@ -847,7 +847,6 @@ async def test_prime_runtime_waits_for_coordinator_profile_and_offers_folder() -
         conn=conn,
         client=_ClientStub(),
         socket_path=Path("/tmp/mcp-telegram-test.sock"),
-        own_only_context=own_only_context,
         self_profile_cadence=None,
     )
 
@@ -858,7 +857,6 @@ async def test_prime_runtime_waits_for_coordinator_profile_and_offers_folder() -
 
     assert handler.self_ids == [42]
     assert bound_account_ids == [42]
-    assert ctx.own_only_context == OwnOnlyContext(account_id=42)
     assert coordinator.offered == [DemandKind.SELF_PROFILE_MAINTENANCE, DemandKind.FOLDER_SNAPSHOT]
     assert api._ready is True
 
@@ -923,7 +921,7 @@ async def test_classified_startup_identity_binds_matching_account(
     startup = await _acquire_startup_identity_before_updates(ctx, directory)
 
     assert not startup.pending
-    assert cast(_UserProfilePort, ctx.user_profile_port).calls == [(101, TargetKind.USER)]
+    assert cast(_UserProfilePort, ctx.user_profile_port).calls == []
     assert ctx.api_server.self_id == 101
     conn = _open_sync_db(db_path)
     try:
@@ -934,15 +932,11 @@ async def test_classified_startup_identity_binds_matching_account(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "fields, expected_channel",
-    [
-        ('{"full_user.personal_channel_id":9001}', -1000000009001),
-        ('{"full_user.personal_channel_id":null}', None),
-        ("{}", None),
-    ],
+    "fields",
+    ['{"full_user.personal_channel_id":9001}', '{"full_user.personal_channel_id":null}', "{}"],
 )
 async def test_recovery_startup_publishes_retained_channel_without_full_user(
-    tmp_path: Path, shared_writer: SQLiteWriter, fields: str, expected_channel: int | None
+    tmp_path: Path, shared_writer: SQLiteWriter, fields: str
 ) -> None:
     from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 
@@ -991,8 +985,7 @@ async def test_recovery_startup_publishes_retained_channel_without_full_user(
     finally:
         conn.close()
 
-    assert startup.identity_only
-    assert startup.result().own_only_context.personal_channel_id == expected_channel
+    assert startup.result().account_id == 101
     assert cast(_UserProfilePort, ctx.user_profile_port).calls == []
 
 

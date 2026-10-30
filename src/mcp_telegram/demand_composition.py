@@ -32,7 +32,6 @@ from mcp_telegram.dialog_sync import (
     DialogReconciliationWorker,
 )
 from mcp_telegram.drafts.owner import DraftMessageOwner
-from mcp_telegram.entity_profile.ports import UserProfilePort
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, EntityRefreshCoordinator
 from mcp_telegram.fact_hydration import FactHydrationDemandAdapter, MessageFactHydrationWorker
 from mcp_telegram.folders.worker import FolderProjectionDemandAdapter, FolderProjectionWorker
@@ -44,7 +43,6 @@ from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshPolicy,
     ReadReceiptDemandAdapter,
 )
-from mcp_telegram.own_only_contracts import OwnOnlyContext
 from mcp_telegram.scheduled_messages import (
     ScheduledDiscoveryDemandAdapter,
     ScheduledMessageReconciler,
@@ -134,9 +132,7 @@ class DemandCompositionDependencies:
     self_profile_cadence: SelfProfileCadenceState
     update_self_profile: Callable[[object], Awaitable[None]]
     startup_identity: StartupIdentityState
-    get_self_input_entity: Callable[[int], Awaitable[object]]
-    user_profile_port: UserProfilePort
-    publish_startup_identity: Callable[[object, OwnOnlyContext], Awaitable[None]]
+    publish_startup_identity: Callable[[object, int], Awaitable[None]]
     draft_owner: DraftMessageOwner
     linked_chat_fact_refresh_port: LinkedChatFactRefreshPort
     startup_detail_setter: Callable[[str], None] | None = None
@@ -309,8 +305,6 @@ def build_durable_adapter_map(
                 get_me=dependencies.client.get_me,
                 update_profile=dependencies.update_self_profile,
                 startup=dependencies.startup_identity,
-                get_input_entity=dependencies.get_self_input_entity,
-                user_profile_port=dependencies.user_profile_port,
                 publish_startup_identity=dependencies.publish_startup_identity,
             ),
             account_id=dependencies.account_id,

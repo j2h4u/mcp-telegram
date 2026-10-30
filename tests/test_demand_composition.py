@@ -57,7 +57,6 @@ from mcp_telegram.message_fact_refresh import (
     ReadReceiptDemandAdapter,
 )
 from mcp_telegram.message_history.contracts import ForwardGapPage
-from mcp_telegram.own_only_contracts import OwnOnlyContext
 from mcp_telegram.scheduled_messages import (
     ScheduledDiscoveryDemandAdapter,
     ScheduledMessageReconciler,
@@ -87,7 +86,7 @@ from mcp_telegram.telegram_rpc_consumers import (
 )
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcScope, current_rpc_scope, rpc_scope
 from mcp_telegram.topics.demand import TopicSnapshotDemandAdapter
-from tests.helpers import LoudUserProfilePort, build_mock_message
+from tests.helpers import build_mock_message
 from tests.sqlite_writer_helpers import inline_writer
 
 
@@ -228,11 +227,8 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
     async def read_receipt_batch(_selected: WorkRevision) -> SliceOutcome:
         raise AssertionError("read receipt batch is not called by adapter-map tests")
 
-    async def get_self_input_entity(_account_id: int) -> object:
-        return object()
-
     update_profile: Callable[[object], Awaitable[None]] = AsyncMock()
-    publish_startup_identity: Callable[[object, OwnOnlyContext], Awaitable[None]] = AsyncMock()
+    publish_startup_identity: Callable[[object, int], Awaitable[None]] = AsyncMock()
     dependencies = DemandCompositionDependencies(
         client=cast(DemandCompositionClient, objects["client"]),
         conn=cast(sqlite3.Connection, objects["conn"]),
@@ -260,8 +256,6 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
         self_profile_cadence=cast(SelfProfileCadenceState, objects["cadence"]),
         update_self_profile=update_profile,
         startup_identity=StartupIdentityState.begin(now=100.0),
-        get_self_input_entity=get_self_input_entity,
-        user_profile_port=LoudUserProfilePort(),
         publish_startup_identity=publish_startup_identity,
         draft_owner=cast(DraftMessageOwner, objects["draft_owner"]),
         linked_chat_fact_refresh_port=cast(object, objects["linked_chat_refresh"]),  # type: ignore[arg-type]

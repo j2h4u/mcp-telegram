@@ -295,6 +295,31 @@ async def test_generic_user_change_requests_targeted_acquisition_without_rpc(dat
 
 
 @pytest.mark.asyncio
+async def test_self_updates_preserve_pending_retry_and_coalesce(database: sqlite3.Connection) -> None:
+    from mcp_telegram.entity_profile.repository import admit_self_profile
+    from mcp_telegram.models import DialogType
+
+    with write_transaction(database):
+        database.execute("UPDATE dialog_directory_state SET account_id=7 WHERE singleton=1")
+        assert admit_self_profile(database, 7, kind=DialogType.USER, now=100, pair_mode="enabled")
+        database.execute("UPDATE entity_profile_refresh_state SET status='failed',retry_at=500 WHERE entity_id=7")
+    manager, client = _manager(database)
+    first = types.UpdateUser(7)
+    await manager.on_raw_identity_or_notify(first)
+    await manager.on_raw_identity_or_notify(first)
+    await manager.on_raw_identity_or_notify(types.UpdateUser(7))
+    state = database.execute(
+        "SELECT generation,retry_at,follow_up_required FROM entity_profile_refresh_state WHERE entity_id=7"
+    ).fetchone()
+    assert tuple(state) == (1, 500, 1)
+    sections = database.execute(
+        "SELECT section FROM entity_detail_sections WHERE entity_id=7 ORDER BY section"
+    ).fetchall()
+    assert [row[0] for row in sections] == ["full_profile", "personal_channel"]
+    assert client.mock_calls == []
+
+
+@pytest.mark.asyncio
 async def test_repeated_unchanged_photo_does_not_restart_pending_acquisition(database: sqlite3.Connection) -> None:
     manager, _ = _manager(database)
     update = types.UpdateUserStatus(42, types.UserStatusRecently())

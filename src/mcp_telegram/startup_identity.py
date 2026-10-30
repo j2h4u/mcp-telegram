@@ -8,7 +8,6 @@ import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from mcp_telegram.own_only_contracts import OwnOnlyContext
 from mcp_telegram.telegram_rpc_consumers import DemandKind, demand_contract
 
 
@@ -16,8 +15,7 @@ class StartupIdentityPhase(StrEnum):
     """Restart-local continuation point for mandatory account identity."""
 
     PROFILE = "profile"
-    INPUT_USER = "input_user"
-    FULL_USER = "full_user"
+    PUBLISH = "publish"
     READY = "ready"
     FAILED = "failed"
 
@@ -31,7 +29,7 @@ class StartupIdentityResult:
     """Identity facts published atomically before daemon readiness."""
 
     profile: object
-    own_only_context: OwnOnlyContext
+    account_id: int
 
 
 @dataclass(slots=True)
@@ -42,8 +40,6 @@ class StartupIdentityState:
     deadline_at: float
     phase: StartupIdentityPhase = StartupIdentityPhase.PROFILE
     profile: object | None = None
-    input_user: object | None = None
-    identity_only: bool = False
     _result: StartupIdentityResult | None = None
     _failure_reason: str | None = None
     _done_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -81,26 +77,11 @@ class StartupIdentityState:
         if self.phase is not StartupIdentityPhase.PROFILE:
             raise RuntimeError("startup identity profile arrived out of order")
         self.profile = profile
-        self.phase = StartupIdentityPhase.INPUT_USER
-
-    def advance_input_user(self, input_user: object) -> None:
-        if self.phase is not StartupIdentityPhase.INPUT_USER:
-            raise RuntimeError("startup identity input user arrived out of order")
-        self.input_user = input_user
-        self.phase = StartupIdentityPhase.FULL_USER
+        self.phase = StartupIdentityPhase.PUBLISH
 
     def complete(self, result: StartupIdentityResult) -> None:
-        if self.phase is not StartupIdentityPhase.FULL_USER:
+        if self.phase is not StartupIdentityPhase.PUBLISH:
             raise RuntimeError("startup identity completed out of order")
-        self._result = result
-        self.phase = StartupIdentityPhase.READY
-        self._done_event.set()
-
-    def complete_verified(self, result: StartupIdentityResult) -> None:
-        """Publish a verified account without asserting a full-profile observation."""
-        if self.phase is not StartupIdentityPhase.INPUT_USER:
-            raise RuntimeError("startup identity verified out of order")
-        self.identity_only = True
         self._result = result
         self.phase = StartupIdentityPhase.READY
         self._done_event.set()

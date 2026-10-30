@@ -1,6 +1,7 @@
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Literal, cast
 
 from pydantic import Field, StrictInt, model_validator
@@ -21,6 +22,7 @@ from ..sync_read_model import (
     SyncStatus,
     decode_sync_read_model,
 )
+from ..temporal import parse_utc_boundary
 from ._base import (
     DaemonConnection,
     DaemonNotRunningError,
@@ -71,6 +73,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                         "enum": ["name", "username", "numeric", None],
                     },
                     "type": {"type": ["string", "null"]},
+                    "topic_capability": {"type": "string", "enum": ["supported", "unsupported", "unknown"]},
                     "is_self": {"type": "boolean"},
                     "last_message_at": {"type": ["integer", "string", "null"]},
                     "unread_count": {"type": ["integer", "null"]},
@@ -136,6 +139,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "id",
                     "name",
                     "type",
+                    "topic_capability",
                     "last_message_at",
                     "unread_count",
                     "sync_status",
@@ -196,6 +200,23 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
             },
         },
         "count": {"type": "integer"},
+        "navigation": {
+            "type": "object",
+            "properties": {
+                "has_more": {
+                    "type": "boolean",
+                    "description": "Unexamined local candidates remain; a short or empty page may still have a continuation.",
+                },
+                "order": {"const": "dialog_id_asc"},
+                "consistency": {
+                    "const": "live",
+                    "description": "Each page sees current local state; restart for a fresh traversal.",
+                },
+                "next_navigation": {"type": ["string", "null"]},
+            },
+            "required": ["has_more", "order", "consistency"],
+            "additionalProperties": False,
+        },
         "filters": {
             "type": "object",
             "properties": {
@@ -211,6 +232,14 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                 "folder_id": {"type": ["integer", "null"]},
                 "limit": {"type": ["integer", "null"]},
                 "view": {"type": "string", "enum": ["dialogs", "folders"]},
+                "dialog_type": {
+                    "type": ["string", "null"],
+                    "enum": ["user", "bot", "service", "channel", "supergroup", "forum", "group", "unknown", None],
+                },
+                "exclude_self": {"type": "boolean"},
+                "last_message_since_utc": {"type": ["string", "null"]},
+                "last_message_until_utc": {"type": ["string", "null"]},
+                "navigation": {"type": ["string", "null"]},
             },
             "required": [
                 "exclude_archived",
@@ -313,6 +342,7 @@ class _DialogSurface:
     name: str | None
     display_name_source: str | None
     dialog_type: str | None
+    topic_capability: str
     last_message_at: int | str | None
     unread_count: int | None
     access_lost_at: int | None
@@ -354,6 +384,7 @@ class _ListDialogsSurface:
     directory_coverage: dict[str, object]
     scheduled_coverage: dict[str, object]
     folder_membership_unknown_count: int
+    navigation: dict[str, object] | None
 
 
 def _list_dialogs_contract_error(detail: str) -> ToolResult:
@@ -499,12 +530,16 @@ def _strict_dialog(value: object, index: int) -> _DialogSurface:
     context = f"dialogs[{index}]"
     if not isinstance(value, Mapping):
         raise SyncReadModelContractError(f"{context} must be an object")
+    capability = _required(value, "topic_capability", context=context)
+    if capability not in ("supported", "unsupported", "unknown"):
+        raise SyncReadModelContractError(f"{context}.topic_capability is invalid")
     return _DialogSurface(
         model=decode_sync_read_model(value),
         dialog_id=_strict_int(value, "id", context=context),
         name=_strict_optional_string(value, "name", context=context),
         display_name_source=_strict_display_name_source(value, context=context),
         dialog_type=_strict_optional_string(value, "type", context=context),
+        topic_capability=capability,
         last_message_at=_strict_optional_timestamp(value, "last_message_at", context=context),
         unread_count=_strict_optional_int(value, "unread_count", context=context),
         access_lost_at=_strict_optional_int(value, "access_lost_at", context=context),
@@ -526,6 +561,26 @@ def _strict_dialog(value: object, index: int) -> _DialogSurface:
         archived=_strict_bool(value, "archived", context=context),
         is_self=_strict_bool(value, "is_self", context=context),
     )
+
+
+def _strict_directory_navigation(value: object) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise SyncReadModelContractError("navigation must be an object")
+    has_more = value.get("has_more")
+    cursor = value.get("next_navigation")
+    if not isinstance(has_more, bool) or value.get("order") != "dialog_id_asc" or value.get("consistency") != "live":
+        raise SyncReadModelContractError("invalid directory navigation")
+    if not _valid_directory_cursor(has_more, cursor):
+        raise SyncReadModelContractError("invalid directory navigation")
+    return {"has_more": has_more, "order": "dialog_id_asc", "consistency": "live", "next_navigation": cursor}
+
+
+def _valid_directory_cursor(has_more: bool, cursor: object) -> bool:
+    if has_more:
+        return isinstance(cursor, str) and bool(cursor)
+    return cursor is None
 
 
 def _strict_list_dialogs_data(
@@ -572,6 +627,7 @@ def _strict_list_dialogs_data(
             if "folder_membership_unknown_count" in raw_data
             else 0
         ),
+        navigation=_strict_directory_navigation(raw_data.get("navigation")),
     )
 
 
@@ -696,14 +752,18 @@ class ListDialogs(ToolArgs):
     return only dialogs with future or unresolved pending queue facts; "all" is the default.
     Use scope="own_only" to return only dialogs accepted by the own-message classifier.
 
+    A new type, self-exclusion or message-time filter, or navigation="start", selects
+    bounded live pages (default limit 100). has_more means unexamined local candidates
+    remain: a short or empty page may still have next_navigation. Repeat the same
+    selectors when continuing, and start again for a fresh traversal.
+
     sync_status values:
       - 'not_synced'  — no bulk fetch attempted
       - 'syncing'     — bulk fetch in progress
       - 'synced'      — complete historical coverage as of history_complete_at; this does not prove active realtime
       - 'own_only'    — only own-message-related history is stored
       - 'access_lost' — account no longer has access; read-only snapshot
-      - 'fragment'    — no full sync; only point-fetched snippets from targeted
-                        list_messages(anchor_message_id=..., message_state="sent") calls (Phase 999.1)
+      - 'fragment'    — partial retained history; anchored reads use local context only
 
     Call `get_sync_status` and inspect `realtime_history` when active realtime coverage matters.
     """
@@ -715,6 +775,21 @@ class ListDialogs(ToolArgs):
     message_state: Literal["sent", "scheduled", "all"] = "all"
     scope: Literal["all", "own_only"] = "all"
     folder_id: int | None = Field(default=None, ge=0)
+    dialog_type: Literal["user", "bot", "service", "channel", "supergroup", "forum", "group", "unknown"] | None = None
+    exclude_self: bool = False
+    last_message_since_utc: str | None = Field(
+        default=None,
+        description="Inclusive UTC bound on the latest observed message creation time; unknown times are excluded.",
+    )
+    last_message_until_utc: str | None = Field(
+        default=None,
+        description="Exclusive UTC bound on the latest observed message creation time; unknown times are excluded.",
+    )
+    navigation: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Start a live bounded directory traversal with 'start', or continue with its opaque token.",
+    )
     limit: int | None = Field(
         default=None,
         ge=1,
@@ -733,15 +808,24 @@ class ListDialogs(ToolArgs):
                 self.scope != "all",
                 self.folder_id is not None,
                 self.limit is not None,
+                self.dialog_type is not None,
+                self.exclude_self,
+                self.last_message_since_utc is not None,
+                self.last_message_until_utc is not None,
+                self.navigation is not None,
             )
         )
         if self.view == "folders" and uses_dialog_filters:
             raise ValueError("Dialog filters are only available with view='dialogs'.")
+        since = _directory_boundary(self.last_message_since_utc, "last_message_since_utc")
+        until = _directory_boundary(self.last_message_until_utc, "last_message_until_utc")
+        if since is not None and until is not None and since >= until:
+            raise ValueError("last_message_since_utc must be earlier than last_message_until_utc.")
         return self
 
 
 def _list_dialogs_filters(args: ListDialogs) -> dict[str, object]:
-    return {
+    filters: dict[str, object] = {
         "exclude_archived": args.exclude_archived,
         "ignore_pinned": args.ignore_pinned,
         "filter": args.filter,
@@ -751,6 +835,84 @@ def _list_dialogs_filters(args: ListDialogs) -> dict[str, object]:
         "limit": args.limit,
         "view": args.view,
     }
+    if _directory_audit_requested(args):
+        filters.update(
+            dialog_type=args.dialog_type,
+            exclude_self=args.exclude_self,
+            last_message_since_utc=args.last_message_since_utc,
+            last_message_until_utc=args.last_message_until_utc,
+            navigation=args.navigation,
+        )
+    return filters
+
+
+def _directory_audit_requested(args: ListDialogs) -> bool:
+    return any(
+        (
+            args.dialog_type is not None,
+            args.exclude_self,
+            args.last_message_since_utc is not None,
+            args.last_message_until_utc is not None,
+            args.navigation is not None,
+        )
+    )
+
+
+def _directory_boundary(value: str | None, field: str) -> datetime | None:
+    parse_utc_boundary(value, field=field)
+    return datetime.fromisoformat(value) if value is not None else None
+
+
+def _directory_boundary_seconds(value: str | None, field: str) -> int | None:
+    boundary = _directory_boundary(value, field)
+    if boundary is None:
+        return None
+    delta = boundary - datetime(1970, 1, 1, tzinfo=UTC)
+    return delta.days * 86400 + delta.seconds + int(delta.microseconds != 0)
+
+
+async def _fetch_directory_audit(conn: DaemonConnection, args: ListDialogs) -> dict:
+    return await conn.list_dialogs(
+        exclude_archived=args.exclude_archived,
+        ignore_pinned=args.ignore_pinned,
+        filter=args.filter,
+        message_state=args.message_state,
+        scope=args.scope,
+        folder_id=args.folder_id,
+        limit=args.limit,
+        dialog_type=args.dialog_type,
+        exclude_self=args.exclude_self,
+        last_message_since_utc=_directory_boundary_seconds(args.last_message_since_utc, "last_message_since_utc"),
+        last_message_until_utc=_directory_boundary_seconds(args.last_message_until_utc, "last_message_until_utc"),
+        navigation=args.navigation,
+    )
+
+
+async def _fetch_directory(conn: DaemonConnection, args: ListDialogs) -> dict:
+    if args.view == "folders":
+        return await conn.list_folders()
+    if _directory_audit_requested(args):
+        return await _fetch_directory_audit(conn, args)
+    return await conn.list_dialogs(
+        exclude_archived=args.exclude_archived,
+        ignore_pinned=args.ignore_pinned,
+        filter=args.filter,
+        message_state=args.message_state,
+        scope=args.scope,
+        folder_id=args.folder_id,
+        limit=args.limit,
+    )
+
+
+def _directory_surface(response: Mapping[str, object], args: ListDialogs) -> _ListDialogsSurface:
+    surface = _strict_list_dialogs_data(response)
+    if _directory_audit_requested(args) and surface.navigation is None:
+        raise SyncReadModelContractError("directory navigation is missing")
+    return surface
+
+
+def _directory_navigation_output(surface: _ListDialogsSurface) -> dict[str, object]:
+    return {} if surface.navigation is None else {"navigation": surface.navigation}
 
 
 def _folder_view_result(args: ListDialogs, response: Mapping[str, object]) -> ToolResult:
@@ -821,18 +983,7 @@ def _folder_view_result(args: ListDialogs, response: Mapping[str, object]) -> To
 async def list_dialogs(args: ListDialogs) -> ToolResult:
     try:
         async with daemon_connection() as conn:
-            if args.view == "folders":
-                response = await conn.list_folders()
-            else:
-                response = await conn.list_dialogs(
-                    exclude_archived=args.exclude_archived,
-                    ignore_pinned=args.ignore_pinned,
-                    filter=args.filter,
-                    message_state=args.message_state,
-                    scope=args.scope,
-                    folder_id=args.folder_id,
-                    limit=args.limit,
-                )
+            response = await _fetch_directory(conn, args)
     except DaemonNotRunningError as exc:
         return error_result(_daemon_not_running_text(exc))
 
@@ -842,7 +993,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
         return _folder_view_result(args, response)
 
     try:
-        surface = _strict_list_dialogs_data(response)
+        surface = _directory_surface(response, args)
     except SyncReadModelContractError as exc:
         return _list_dialogs_contract_error(str(exc))
     warnings: list[StructuredWarning] = []
@@ -864,6 +1015,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 "name": dialog.name,
                 "display_name_source": dialog.display_name_source,
                 "type": dialog.dialog_type,
+                "topic_capability": dialog.topic_capability,
                 "last_message_at": dialog.last_message_at,
                 "unread_count": dialog.unread_count,
                 "sync_status": wire["sync_status"],
@@ -913,6 +1065,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
         "scheduled_coverage": surface.scheduled_coverage,
         "folder_membership_unknown_count": surface.folder_membership_unknown_count,
         "warnings": warnings,
+        **_directory_navigation_output(surface),
     }
 
     if not surface.dialogs:

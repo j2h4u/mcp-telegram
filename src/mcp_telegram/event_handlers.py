@@ -90,7 +90,12 @@ from .dialog_identity import capture_identity_baseline, publish_dialog_identity
 from .dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation, ObservedText
 from .dialog_pin_observations import claim_pin_delta, claim_pin_snapshot, ordered_pin_overlay
 from .entity_profile.contracts import ProfileFieldObservation, SuppliedProfileUser
-from .entity_profile.repository import EntityProfileRepository, admit_profile_peer, personal_profile_peer
+from .entity_profile.repository import (
+    EntityProfileRepository,
+    admit_profile_peer,
+    bound_profile_account,
+    personal_profile_peer,
+)
 from .entity_profile.updates import (
     ProfilePush,
     bundled_profile_users,
@@ -2483,7 +2488,7 @@ class EventHandlerManager:
                 self._ensure_supplied_user_type(conn, source, push, observation)
                 push = self._filter_retained_profile_identity(conn, push, observation)
                 changed = self._apply_profile_push(profiles, push, observation)
-                sections = self._profile_push_sections(source, changed)
+                sections = self._owned_profile_push_sections(owner, push.entity_id, source, changed)
                 if sections:
                     self._coalesce_profile_invalidation(
                         invalidations, push.entity_id, sections, observation, isinstance(source, UpdateUser)
@@ -2576,7 +2581,10 @@ class EventHandlerManager:
         return (
             push is not None
             and self._self_id is not None
-            and personal_profile_peer(conn, self._self_id, push.entity_id)
+            and (
+                personal_profile_peer(conn, self._self_id, push.entity_id)
+                or (push.entity_id == self._self_id and bound_profile_account(conn) == self._self_id)
+            )
         )
 
     def _profile_push_observation(
@@ -2612,6 +2620,14 @@ class EventHandlerManager:
         if changed & {"stories_max_id", "stories_unavailable"}:
             sections.add("current_stories")
         return tuple(sorted(sections))
+
+    def _owned_profile_push_sections(
+        self, owner: int, entity_id: int, source: object, changed: frozenset[str]
+    ) -> tuple[str, ...]:
+        sections = self._profile_push_sections(source, changed)
+        if entity_id == owner:
+            return tuple(section for section in sections if section in {"full_profile", "personal_channel"})
+        return sections
 
     async def _persist_profile_pushes(self, *, update: object = None, sender: object = None) -> bool:
         users: Sequence[object] = (sender,) if sender is not None else bundled_profile_users(update)

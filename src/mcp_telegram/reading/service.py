@@ -24,15 +24,19 @@ from ..dialog_directory_coverage import DialogDirectoryCoverage, read_dialog_dir
 from ..dialog_identity import read_dialog_identities
 from ..dialog_identity_contracts import DialogIdentity
 from ..dialog_selector import DialogSelector, DialogSelectorError, optional_dialog_selector, required_dialog_selector
+from ..folders.read_repository import folder_snapshot, folders_by_dialog
 from ..fts import stem_query
 from ..models import DialogType, DraftReadRecord, ReadMessage, ReadState
 from ..own_only import own_only_basis_by_dialog
 from ..pagination import (
+    DialogDirectoryNavigationToken,
     HistoryDirection,
     NavigationToken,
     ScheduledQueueNavigationToken,
+    decode_dialog_directory_navigation,
     decode_navigation_token,
     decode_scheduled_queue_navigation,
+    encode_dialog_directory_navigation,
     encode_history_navigation,
     encode_scheduled_queue_navigation,
     encode_search_navigation,
@@ -47,6 +51,7 @@ from ..sync_read_model import (
     build_sync_read_model,
     local_history_coverage,
 )
+from ..sync_transactions import read_snapshot
 from ..temporal import parse_utc_boundary
 from .draft_projection import draft_message_key, read_drafts
 from .query_records import read_message_from_row
@@ -63,6 +68,9 @@ from .sqlite_projection import (
     _COLLECT_UNREAD_DIALOG_CANDIDATES_SQL,
     _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL,
     _COUNT_READ_POSITION_PENDING_SQL,
+    _DIALOG_DIRECTORY_FIRST_PAGE_SQL,
+    _DIALOG_DIRECTORY_PAGE_SQL,
+    _DIALOG_DIRECTORY_UPPER_SQL,
     _FETCH_UNREAD_MESSAGES_SQL,
     _GET_READ_POSITION_SQL,
     _LIST_DIALOG_MESSAGE_AGGREGATES_SQL,
@@ -366,6 +374,9 @@ class _SearchMessagesRequest:
     message_state: str
     since_utc: int | None = None
     until_utc: int | None = None
+
+
+_DIRECTORY_PAGE_LIMIT = 500
 
 
 @dataclass(frozen=True)
@@ -1282,6 +1293,7 @@ class ReadingService:
         own_basis: Mapping[int, tuple[str, ...]],
         identities: Mapping[int, DialogIdentity],
         conn: sqlite3.Connection,
+        scheduled_coverages: Mapping[int, dict[str, object]] | None = None,
     ) -> list[tuple[Mapping[str, object], tuple[int, int | None, int], tuple[str, ...] | None]]:
         selected_rows: list[tuple[Mapping[str, object], tuple[int, int | None, int], tuple[str, ...] | None]] = []
         for row in sql_rows:
@@ -1301,7 +1313,11 @@ class ReadingService:
                         "name": identity.display_name,
                         "type": identity.dialog_type.value,
                         "display_name_source": identity.display_name_source,
-                        "scheduled_coverage": self._scheduled_dialog_coverage(dialog_id, conn),
+                        "scheduled_coverage": (
+                            self._scheduled_dialog_coverage(dialog_id, conn)
+                            if scheduled_coverages is None
+                            else scheduled_coverages.get(dialog_id)
+                        ),
                     },
                     summary,
                     own_basis.get(dialog_id),
@@ -1395,6 +1411,7 @@ class ReadingService:
             "name": row["name"],
             "display_name_source": row["display_name_source"],
             "type": row["type"],
+            "topic_capability": row["topic_capability"],
             "last_message_at": row["last_message_at"],
             "archived": bool(row["archived"]),
             # Telegram-authoritative dialog fact. NULL means this snapshot has
@@ -1598,11 +1615,11 @@ class ReadingService:
         return own_only_basis_by_dialog(source)
 
     def _scheduled_account_coverage(
-        self, conn: sqlite3.Connection | None = None
+        self, conn: sqlite3.Connection | None = None, *, account_id: int | None = None
     ) -> tuple[int, dict[str, object]] | dict[str, object]:
         """Read scheduled account and baseline coverage without acquiring or mutating facts."""
         source = self._conn if conn is None else conn
-        account_id = self._deps.self_id
+        account_id = self._deps.self_id if account_id is None else account_id
         if type(account_id) is not int or account_id <= 0:
             return {
                 "ok": False,
@@ -3372,8 +3389,442 @@ class ReadingService:
         finally:
             conn.close()
 
+    def _list_dialogs_page_transaction(self, conn: sqlite3.Connection, req: dict) -> dict:
+        with read_snapshot(conn):
+            return self._list_dialogs_page(conn, req)
+
+    def _list_dialogs_page(self, conn: sqlite3.Connection, req: dict) -> dict:
+        account = req.get("verified_account_id")
+        if type(account) is not int or account <= 0:
+            return {
+                "ok": False,
+                "error": "account_unverified",
+                "message": "Verified account unavailable.",
+                "required_action": "Retry after account verification.",
+            }
+        owner = cast(
+            tuple[object] | None,
+            conn.execute("SELECT account_id FROM dialog_directory_state WHERE singleton=1").fetchone(),
+        )
+        if owner is None or owner[0] != account:
+            return {
+                "ok": False,
+                "error": "account_unverified",
+                "message": "Local account ownership is unavailable or changed.",
+                "required_action": "Verify the account.",
+            }
+        input_error = self._directory_request_error(req)
+        if input_error is not None:
+            return input_error
+        request = self._parse_list_dialogs_request(req)
+        error = self._list_dialogs_request_error(request)
+        if error is not None:
+            return error
+        try:
+            return self._build_dialogs_page(conn, req, request, account)
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "error": "invalid_navigation",
+                "message": str(exc),
+                "required_action": "Restart navigation.",
+            }
+
+    @staticmethod
+    def _directory_request_error(req: dict) -> dict | None:
+        return (
+            ReadingService._directory_selector_error(req)
+            or ReadingService._directory_bounds_error(req)
+            or ReadingService._directory_navigation_error(req)
+        )
+
+    @staticmethod
+    def _directory_selector_error(req: dict) -> dict | None:
+        valid = {item.value for item in DialogType}
+        if req.get("dialog_type") is not None and (
+            not isinstance(req["dialog_type"], str) or req["dialog_type"] not in valid
+        ):
+            return {"ok": False, "error": "invalid_input", "message": "Unknown dialog type."}
+        for key in ("exclude_self", "exclude_archived", "ignore_pinned"):
+            if key in req and type(req[key]) is not bool:
+                return {"ok": False, "error": "invalid_input", "message": f"{key} must be a boolean."}
+        if req.get("filter") is not None and not isinstance(req["filter"], str):
+            return {"ok": False, "error": "invalid_input", "message": "filter must be a string."}
+        return None
+
+    @staticmethod
+    def _directory_bounds_error(req: dict) -> dict | None:
+        error = ReadingService._directory_integer_error(req)
+        if error is not None:
+            return error
+        if req.get("limit") is not None and not 1 <= req["limit"] <= _DIRECTORY_PAGE_LIMIT:
+            return {"ok": False, "error": "invalid_input", "message": "limit must be between 1 and 500."}
+        lower, upper = req.get("last_message_since_utc"), req.get("last_message_until_utc")
+        if lower is not None and upper is not None and lower > upper:
+            return {"ok": False, "error": "invalid_input", "message": "Time bounds must not be reversed."}
+        if req.get("folder_id") is not None and req["folder_id"] < 0:
+            return {"ok": False, "error": "invalid_input", "message": "folder_id must be nonnegative."}
+        return None
+
+    @staticmethod
+    def _directory_integer_error(req: dict) -> dict | None:
+        for key in ("folder_id", "last_message_since_utc", "last_message_until_utc", "limit"):
+            if req.get(key) is not None and type(req[key]) is not int:
+                return {"ok": False, "error": "invalid_input", "message": f"{key} must be an integer."}
+        return None
+
+    @staticmethod
+    def _directory_navigation_error(req: dict) -> dict | None:
+        navigation = req.get("navigation")
+        if navigation is not None and (not isinstance(navigation, str) or not navigation):
+            return {
+                "ok": False,
+                "error": "invalid_navigation",
+                "message": "Invalid navigation.",
+                "required_action": "Restart navigation.",
+            }
+        return None
+
+    def _build_dialogs_page(
+        self, conn: sqlite3.Connection, req: dict, request: _ListDialogsRequest, account: int
+    ) -> dict:
+        dialog_filter = self._prepare_list_dialogs_filter(request.filter_raw)
+        fingerprint = self._directory_fingerprint(req, request, dialog_filter)
+        rows, upper = self._directory_candidate_rows(conn, req, request, account, fingerprint)
+        candidates = [cast(Mapping[str, object], row) for row in rows[:500]]
+        directory_coverage = read_dialog_directory_coverage(conn).to_wire()
+        scheduled_coverage = self._directory_account_coverage(conn, account, directory_coverage)
+        selected, examined = self._directory_select_candidates(
+            conn, req, request, account, dialog_filter, candidates, scheduled_coverage
+        )
+        has_more = examined is not None and (
+            len(rows) > len(candidates) or examined != _object_to_int(candidates[-1]["dialog_id"])
+        )
+        return self._finish_dialogs_page(
+            conn,
+            req,
+            request,
+            account,
+            fingerprint,
+            upper,
+            examined,
+            has_more,
+            selected,
+            scheduled_coverage,
+            directory_coverage,
+        )
+
+    @staticmethod
+    def _directory_fingerprint(req: dict, request: _ListDialogsRequest, dialog_filter: _ListDialogsFilter) -> str:
+        payload = [
+            request.exclude_archived,
+            request.ignore_pinned,
+            dialog_filter.normalized,
+            dialog_filter.raw_lower,
+            request.message_state,
+            request.scope,
+            req.get("folder_id"),
+            req.get("dialog_type"),
+            req.get("exclude_self", False),
+            req.get("last_message_since_utc"),
+            req.get("last_message_until_utc"),
+        ]
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
+    @staticmethod
+    def _directory_candidate_rows(
+        conn: sqlite3.Connection, req: dict, request: _ListDialogsRequest, account: int, fingerprint: str
+    ) -> tuple[list[object], int | None]:
+        params = {
+            "archived_filter": 0 if request.exclude_archived else None,
+            "pinned_filter": 0 if request.ignore_pinned else None,
+        }
+        navigation = req.get("navigation")
+        upper: int | None
+        after: int | None
+        if navigation not in (None, "start"):
+            cursor = decode_dialog_directory_navigation(navigation)
+            if cursor.account_id != account or cursor.fingerprint != fingerprint:
+                raise ValueError("Navigation token belongs to a different account or selection")
+            upper, after = cursor.upper_dialog_id, cursor.last_dialog_id
+        else:
+            result = cast(tuple[int | None], conn.execute(_DIALOG_DIRECTORY_UPPER_SQL, params).fetchone())
+            upper, after = result[0], None
+        if upper is None:
+            return [], None
+        return _fetchall_rows(
+            conn.execute(
+                _DIALOG_DIRECTORY_FIRST_PAGE_SQL if after is None else _DIALOG_DIRECTORY_PAGE_SQL,
+                {**params, "after_id": after, "upper_id": upper},
+            )
+        ), upper
+
+    def _directory_account_coverage(self, conn: sqlite3.Connection, account: int, directory: dict) -> dict[str, object]:
+        result = self._scheduled_account_coverage(conn, account_id=account)
+        if not isinstance(result, dict):
+            return result[1]
+        return {
+            "state": "unknown",
+            "account_id": account,
+            "directory_generation": directory.get("publication_generation"),
+            "reason": result.get("error"),
+            "directory_coverage": directory,
+        }
+
+    def _directory_select_candidates(  # noqa: PLR0913, PLR0917
+        self,
+        conn: sqlite3.Connection,
+        req: dict,
+        request: _ListDialogsRequest,
+        account: int,
+        dialog_filter: _ListDialogsFilter,
+        candidates: list[Mapping[str, object]],
+        scheduled_coverage: dict[str, object],
+    ) -> tuple[list, int | None]:
+        ids = [_object_to_int(row["dialog_id"]) for row in candidates]
+        identities = read_dialog_identities(conn, ids)
+        summaries = (
+            scheduled_summary_by_dialog(conn, scheduled_now=int(time.time()), dialog_ids=ids)
+            if request.message_state == "scheduled" and scheduled_coverage.get("state") != "unknown"
+            else {}
+        )
+        own = own_only_basis_by_dialog(conn, ids) if request.scope == "own_only" else {}
+        folders = folders_by_dialog(conn, ids) if req.get("folder_id") not in (None, 1) else {}
+        archived = self._directory_archived_facts(conn, ids) if req.get("folder_id") == 1 else {}
+        selectable = self._select_list_dialog_rows(
+            candidates, request, dialog_filter, summaries, own, identities, conn, {}
+        )
+        selected_by_id = {_object_to_int(item[0]["dialog_id"]): item for item in selectable}
+        return self._directory_take_candidates(req, candidates, identities, folders, archived, account, selected_by_id)
+
+    @staticmethod
+    def _directory_take_candidates(  # noqa: PLR0913, PLR0917
+        req: dict,
+        candidates: list[Mapping[str, object]],
+        identities: Mapping[int, DialogIdentity],
+        folders: Mapping[int, list[dict[str, object]]],
+        archived: Mapping[int, bool | None],
+        account: int,
+        selected_by_id: dict,
+    ) -> tuple[list, int | None]:
+        limit = req.get("limit") or 100
+        if type(limit) is not int or not 1 <= limit <= _DIRECTORY_PAGE_LIMIT:
+            raise ValueError("Invalid page limit")
+        selected = []
+        examined = None
+        for row in candidates:
+            dialog_id = _object_to_int(row["dialog_id"])
+            examined = dialog_id
+            item = selected_by_id.get(dialog_id)
+            if item is None or not ReadingService._directory_page_matches(
+                req, row, identities[dialog_id], folders, archived, account
+            ):
+                continue
+            selected.append(item)
+            if len(selected) == limit:
+                break
+        return selected, examined
+
+    @staticmethod
+    def _directory_archived_facts(conn: sqlite3.Connection, ids: Sequence[int]) -> dict[int, bool | None]:
+        if not ids:
+            return {}
+        rows = cast(
+            list[tuple[int, object]],
+            conn.execute(
+                "SELECT d.dialog_id, COALESCE(f.archived,d.archived) FROM dialogs d LEFT JOIN dialog_directory_facts f USING(dialog_id) WHERE d.hidden=0 AND d.dialog_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))",
+                (json.dumps(ids),),
+            ).fetchall(),
+        )
+        return {int(row[0]): None if row[1] is None else bool(row[1]) for row in rows}
+
+    @staticmethod
+    def _directory_page_matches(  # noqa: PLR0913, PLR0917
+        req: dict,
+        row: Mapping[str, object],
+        identity: DialogIdentity,
+        folders: Mapping[int, list[dict[str, object]]],
+        archived: Mapping[int, bool | None],
+        account: int,
+    ) -> bool:
+        dialog_id = _object_to_int(row["dialog_id"])
+        if req.get("dialog_type") is not None and identity.dialog_type.value != req["dialog_type"]:
+            return False
+        if req.get("exclude_self") and dialog_id == account:
+            return False
+        if not ReadingService._directory_time_matches(req, row):
+            return False
+        return ReadingService._directory_folder_matches(req, dialog_id, folders, archived)
+
+    @staticmethod
+    def _directory_time_matches(req: dict, row: Mapping[str, object]) -> bool:
+        value = _object_to_int_or_none(row["last_message_at"])
+        lower, upper = req.get("last_message_since_utc"), req.get("last_message_until_utc")
+        return not (
+            (lower is not None and (value is None or value < lower))
+            or (upper is not None and (value is None or value >= upper))
+        )
+
+    @staticmethod
+    def _directory_folder_matches(
+        req: dict, dialog_id: int, folders: Mapping[int, list[dict[str, object]]], archived: Mapping[int, bool | None]
+    ) -> bool:
+        folder_id = req.get("folder_id")
+        if folder_id == 1:
+            return archived.get(dialog_id) is True
+        if folder_id is not None:
+            return any(item["id"] == folder_id for item in folders.get(dialog_id, []))
+        return True
+
+    def _finish_dialogs_page(  # noqa: PLR0913, PLR0917
+        self,
+        conn: sqlite3.Connection,
+        req: dict,
+        request: _ListDialogsRequest,
+        account: int,
+        fingerprint: str,
+        upper: int | None,
+        examined: int | None,
+        has_more: bool,
+        selected: list,
+        scheduled_coverage: dict[str, object],
+        directory_coverage: dict,
+    ) -> dict:
+        ids = [_object_to_int(item[0]["dialog_id"]) for item in selected]
+        summaries = (
+            scheduled_summary_by_dialog(conn, scheduled_now=int(time.time()), dialog_ids=ids)
+            if scheduled_coverage.get("state") != "unknown"
+            else {}
+        )
+        own = own_only_basis_by_dialog(conn, ids)
+        coverage = self._directory_scheduled_coverages(conn, ids, account)
+        selected = [
+            (
+                {**row, "scheduled_coverage": coverage[dialog_id]},
+                summaries.get(dialog_id, (0, None, 0)),
+                own.get(dialog_id),
+            )
+            for row, _, _ in selected
+            for dialog_id in [_object_to_int(row["dialog_id"])]
+        ]
+        result = self._project_list_dialog_rows(conn, selected, request, directory_coverage, scheduled_coverage)
+        data = result["data"]
+        self._directory_add_page_metadata(conn, req, account, fingerprint, upper, examined, has_more, ids, data)
+        return result
+
+    def _directory_add_page_metadata(  # noqa: PLR0913, PLR0917
+        self,
+        conn: sqlite3.Connection,
+        req: dict,
+        account: int,
+        fingerprint: str,
+        upper: int | None,
+        examined: int | None,
+        has_more: bool,
+        ids: list[int],
+        data: dict,
+    ) -> None:
+        folder_id = req.get("folder_id")
+        folders = folders_by_dialog(conn, ids) if folder_id != 1 else {}
+        for dialog in data["dialogs"]:
+            dialog_id = dialog["id"]
+            placements = [{"id": 1, "title": "Archived"}] if folder_id == 1 else folders.get(dialog_id, [])
+            dialog.update(
+                folder_ids=[item["id"] for item in placements], folders=placements, is_self=dialog_id == account
+            )
+        data["folder_snapshot"] = folder_snapshot(
+            conn, stale_after_seconds=req.get("folder_snapshot_stale_after_seconds", 900)
+        )
+        data["folder_membership_unknown_count"] = self._directory_folder_unknown_count(conn, folder_id)
+        data["navigation"] = {
+            "has_more": has_more,
+            "order": "dialog_id_asc",
+            "consistency": "live",
+            "next_navigation": encode_dialog_directory_navigation(
+                DialogDirectoryNavigationToken(account, fingerprint, examined, upper)
+            )
+            if has_more and examined is not None and upper is not None
+            else None,
+        }
+        if not ids and upper is None:
+            data["bootstrap_pending"] = count_dialog_rows(conn) == 0
+
+    @staticmethod
+    def _directory_folder_unknown_count(conn: sqlite3.Connection, folder_id: int | None) -> int:
+        if folder_id is None:
+            return 0
+        if folder_id == 1:
+            return cast(
+                tuple[int],
+                conn.execute(
+                    "SELECT COUNT(*) FROM dialogs d LEFT JOIN dialog_directory_facts f USING(dialog_id) WHERE d.hidden=0 AND COALESCE(f.archived,d.archived) IS NULL"
+                ).fetchone(),
+            )[0]
+        namespace = "default" if folder_id == 0 else "filter"
+        return cast(
+            tuple[int],
+            conn.execute(
+                "SELECT COUNT(*) FROM telegram_folder_local_members WHERE namespace=? AND folder_id=? AND state='unknown'",
+                (namespace, folder_id),
+            ).fetchone(),
+        )[0]
+
+    @staticmethod
+    def _directory_scheduled_coverages(
+        conn: sqlite3.Connection, ids: Sequence[int], account: int
+    ) -> dict[int, dict[str, object]]:
+        if not ids:
+            return {}
+        try:
+            bound = cast(
+                tuple[object] | None,
+                conn.execute("SELECT account_id FROM scheduled_sync_state WHERE key='account'").fetchone(),
+            )
+            if bound is None or bound[0] != account:
+                return {dialog_id: {"state": "unknown", "reason": "scheduled_account_not_bound"} for dialog_id in ids}
+            rows = cast(
+                list[tuple[int, object, object, object, object, object, object]],
+                conn.execute(
+                    "SELECT dialog_id,coverage_state,coverage_reason,baseline_observed_at,directory_generation,repair_due_at,discovery_due_at FROM scheduled_reconciliation_state WHERE dialog_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))",
+                    (json.dumps(ids),),
+                ).fetchall(),
+            )
+        except sqlite3.Error:
+            rows = []
+        result: dict[int, dict[str, object]] = {
+            dialog_id: {
+                "state": "unknown",
+                "reason": "baseline_missing",
+                "baseline_observed_at": None,
+                "directory_generation": None,
+                "acquisition_pending": False,
+            }
+            for dialog_id in ids
+        }
+        for row in rows:
+            result[int(row[0])] = {
+                "state": row[1],
+                "reason": row[2],
+                "baseline_observed_at": row[3],
+                "directory_generation": row[4],
+                "acquisition_pending": row[5] is not None or row[6] is not None,
+            }
+        return result
+
+    @staticmethod
+    def _is_dialogs_page(req: dict) -> bool:
+        return (
+            any(
+                req.get(key) is not None
+                for key in ("navigation", "dialog_type", "last_message_since_utc", "last_message_until_utc")
+            )
+            or req.get("exclude_self", False) is not False
+        )
+
     def _list_dialogs_sync(self, conn: sqlite3.Connection, req: dict) -> dict:
         """Return dialog list from the local dialogs snapshot (pure SQL)."""
+        if self._is_dialogs_page(req):
+            return self._list_dialogs_page_transaction(conn, req)
         directory_coverage = read_dialog_directory_coverage(conn).to_wire()
         request = self._parse_list_dialogs_request(req)
         request_error = self._list_dialogs_request_error(request)

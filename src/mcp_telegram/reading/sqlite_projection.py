@@ -149,6 +149,7 @@ WITH agent_visible_dialogs AS (
         d.unread_mentions_count,
         d.unread_reactions_count,
         d.unread_count,
+        tc.applicable AS topic_applicable,
         sd.status AS sync_status,
         sd.total_messages,
         sd.last_synced_at,
@@ -157,6 +158,7 @@ WITH agent_visible_dialogs AS (
         sd.access_lost_at
     FROM dialogs d
     LEFT JOIN synced_dialogs sd USING(dialog_id)
+    LEFT JOIN topic_catalog_state tc ON tc.dialog_id = d.dialog_id
     WHERE d.hidden = 0 OR sd.status = 'access_lost'
 
     UNION ALL
@@ -172,6 +174,7 @@ WITH agent_visible_dialogs AS (
         0 AS unread_mentions_count,
         0 AS unread_reactions_count,
         NULL AS unread_count,
+        tc.applicable AS topic_applicable,
         sd.status AS sync_status,
         sd.total_messages,
         sd.last_synced_at,
@@ -180,17 +183,62 @@ WITH agent_visible_dialogs AS (
         sd.access_lost_at
     FROM synced_dialogs sd
     LEFT JOIN dialogs d USING(dialog_id)
+    LEFT JOIN topic_catalog_state tc ON tc.dialog_id = sd.dialog_id
     WHERE sd.status = 'access_lost' AND d.dialog_id IS NULL
 )
 SELECT
     dialog_id, archived, pinned,
     members, created, last_message_at, snapshot_at,
     unread_mentions_count, unread_reactions_count, unread_count,
+    CASE topic_applicable WHEN 1 THEN 'supported' WHEN 0 THEN 'unsupported' ELSE 'unknown' END AS topic_capability,
     sync_status, total_messages, last_synced_at, last_event_at, last_delta_checked_at, access_lost_at
 FROM agent_visible_dialogs
 WHERE (:archived_filter IS NULL OR archived = :archived_filter)
 AND (:pinned_filter IS NULL OR pinned = :pinned_filter)
 ORDER BY pinned DESC, last_message_at DESC, dialog_id ASC
+"""
+
+
+# Both branches remain keyset-bounded and SQLite merges their primary-key order.
+_DIALOG_DIRECTORY_PAGE_SQL = """
+SELECT d.dialog_id AS dialog_id, d.archived, d.pinned, d.members, d.created, d.last_message_at, d.snapshot_at,
+       d.unread_mentions_count, d.unread_reactions_count, d.unread_count,
+       CASE tc.applicable WHEN 1 THEN 'supported' WHEN 0 THEN 'unsupported' ELSE 'unknown' END AS topic_capability,
+       sd.status AS sync_status, sd.total_messages, sd.last_synced_at, sd.last_event_at,
+       sd.last_delta_checked_at, sd.access_lost_at
+FROM dialogs d LEFT JOIN synced_dialogs sd USING(dialog_id)
+LEFT JOIN topic_catalog_state tc ON tc.dialog_id=d.dialog_id
+WHERE (d.hidden=0 OR sd.status='access_lost')
+  AND d.dialog_id > :after_id AND d.dialog_id <= :upper_id
+  AND (:archived_filter IS NULL OR d.archived=:archived_filter)
+  AND (:pinned_filter IS NULL OR d.pinned=:pinned_filter)
+UNION ALL
+SELECT sd.dialog_id AS dialog_id, 0 AS archived, 0 AS pinned, NULL AS members, NULL AS created,
+       NULL AS last_message_at, NULL AS snapshot_at, 0 AS unread_mentions_count,
+       0 AS unread_reactions_count, NULL AS unread_count,
+       CASE tc.applicable WHEN 1 THEN 'supported' WHEN 0 THEN 'unsupported' ELSE 'unknown' END AS topic_capability,
+       sd.status AS sync_status, sd.total_messages, sd.last_synced_at, sd.last_event_at,
+       sd.last_delta_checked_at, sd.access_lost_at
+FROM synced_dialogs sd LEFT JOIN dialogs d USING(dialog_id)
+LEFT JOIN topic_catalog_state tc ON tc.dialog_id=sd.dialog_id
+WHERE sd.status='access_lost' AND d.dialog_id IS NULL
+  AND sd.dialog_id > :after_id AND sd.dialog_id <= :upper_id
+ORDER BY dialog_id ASC LIMIT 501
+"""
+_DIALOG_DIRECTORY_FIRST_PAGE_SQL = _DIALOG_DIRECTORY_PAGE_SQL.replace("sd.dialog_id > :after_id AND ", "").replace(
+    "d.dialog_id > :after_id AND ", ""
+)
+
+_DIALOG_DIRECTORY_UPPER_SQL = """
+SELECT MAX(bound) FROM (
+  SELECT MAX(d.dialog_id) AS bound FROM dialogs d LEFT JOIN synced_dialogs sd USING(dialog_id)
+  WHERE (d.hidden=0 OR sd.status='access_lost')
+    AND (:archived_filter IS NULL OR d.archived=:archived_filter)
+    AND (:pinned_filter IS NULL OR d.pinned=:pinned_filter)
+  UNION ALL
+  SELECT MAX(sd.dialog_id) AS bound FROM synced_dialogs sd LEFT JOIN dialogs d USING(dialog_id)
+  WHERE sd.status='access_lost' AND d.dialog_id IS NULL
+)
 """
 
 _LIST_DIALOG_MESSAGE_AGGREGATES_SQL = """
