@@ -1429,9 +1429,7 @@ _IMAGE_SOURCE_SQL_SHAPES: Mapping[tuple[str, str], str] = {
 
 def _authorized_image_source_sql(relative: str, snippet: _SqlSnippet) -> bool:
     expected = _IMAGE_SOURCE_SQL_SHAPES.get((relative, snippet.function or ""))
-    return expected is not None and [token.casefold() for token in _sql_tokens(snippet.text)] == [
-        token.casefold() for token in _sql_tokens(expected)
-    ]
+    return expected is not None and " ".join(snippet.text.split()) == " ".join(expected.split())
 
 
 def violations_for(path: Path, source: str) -> list[Finding]:
