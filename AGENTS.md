@@ -213,7 +213,11 @@ file lists to bound memory, not two copies of the suite. There is no separate
 `unit` recipe. This cadence supersedes historical plans asking for separate
 full unit and coverage runs.
 
-During development, run affected slices. The final full suite belongs in PR CI;
+During development, run affected slices. For new complex logic subject to CRAP,
+run the targeted slice with coverage in that same pass and inspect the changed
+functions' coverage and CRAP using the existing `devtools.crap_threshold` metric
+before CI; keep targeted coverage data in temporary files. Do not first run the
+same slice without coverage. The final full suite belongs in PR CI;
 do not duplicate it locally when CI will test the same candidate. CI uses the
 same `just check` and `just crap-threshold` recipes. A failed test or metric is
 fixed before a new candidate is checked; never rerun an unchanged failure blindly.

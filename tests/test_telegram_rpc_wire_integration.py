@@ -1000,6 +1000,132 @@ def _photo_lease(gate: TelegramRpcGate, budget: _PhotoBudget, attempts: int) -> 
     return lease
 
 
+def _photo_config(options: list[types.DcOption]) -> types.Config:
+    return types.Config(
+        date=None,
+        expires=None,
+        test_mode=False,
+        this_dc=2,
+        dc_options=options,
+        dc_txt_domain_name="test",
+        chat_size_max=1,
+        megagroup_size_max=1,
+        forwarded_count_max=1,
+        online_update_period_ms=1,
+        offline_blur_timeout_ms=1,
+        offline_idle_timeout_ms=1,
+        online_cloud_timeout_ms=1,
+        notify_cloud_delay_ms=1,
+        notify_default_delay_ms=1,
+        push_chat_period_ms=1,
+        push_chat_limit=1,
+        edit_time_limit=1,
+        revoke_time_limit=1,
+        revoke_pm_time_limit=1,
+        rating_e_decay=1,
+        stickers_recent_limit=1,
+        channels_read_media_period=1,
+        call_receive_timeout_ms=1,
+        call_ring_timeout_ms=1,
+        call_connect_timeout_ms=1,
+        call_packet_timeout_ms=1,
+        me_url_prefix="test",
+        caption_length_max=1,
+        message_length_max=1,
+        webfile_dc_id=2,
+    )
+
+
+def _dc_option_session(
+    gate: TelegramRpcGate, budget: _PhotoBudget
+) -> tuple[telegram_rpc._GuardedPhotoSession, telegram_rpc._AuxPhotoLease]:
+    lease = _photo_lease(gate, budget, 4)
+    session = telegram_rpc._GuardedPhotoSession(
+        gate, lease.locator, lease.scope, lease.work, budget, lease.source_fence, lease.owner_task
+    )
+    gate._photo_session = session
+    return session, lease
+
+
+@pytest.mark.parametrize("prefer_ipv6", [False, True])
+async def test_photo_dc_selection_prefers_ip_family_and_skips_wrong_dc_and_cdn(
+    image_wire: _WireHarness, monkeypatch: pytest.MonkeyPatch, prefer_ipv6: bool
+) -> None:
+    gate, _sender, _connection, sink = image_wire
+    ipv4 = types.DcOption(id=3, ip_address="192.0.2.3", port=443)
+    ipv6 = types.DcOption(id=3, ip_address="2001:db8::3", port=443, ipv6=True)
+    options = [
+        types.DcOption(id=4, ip_address="192.0.2.4", port=443),
+        types.DcOption(id=3, ip_address="192.0.2.5", port=443, cdn=True),
+        ipv4,
+        ipv6,
+    ]
+    monkeypatch.setattr(type(gate), "_config", _photo_config(options))
+    monkeypatch.setattr(gate, "_use_ipv6", prefer_ipv6)
+    session, lease = _dc_option_session(gate, _PhotoBudget())
+    assert await gate._photo_dc_option(session, lease) is (ipv6 if prefer_ipv6 else ipv4)
+    assert not sink.frames
+
+
+async def test_photo_dc_selection_falls_back_to_first_available_family(
+    image_wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = image_wire[0]
+    first = types.DcOption(id=3, ip_address="2001:db8::1", port=443, ipv6=True, media_only=True)
+    second = types.DcOption(id=3, ip_address="2001:db8::2", port=80, ipv6=True)
+    monkeypatch.setattr(type(gate), "_config", _photo_config([first, second]))
+    monkeypatch.setattr(gate, "_use_ipv6", False)
+    session, lease = _dc_option_session(gate, _PhotoBudget())
+    assert await gate._photo_dc_option(session, lease) is first
+
+
+@pytest.mark.parametrize("invalid_config", [False, True])
+async def test_photo_dc_selection_rejects_no_eligible_or_non_config(
+    image_wire: _WireHarness, monkeypatch: pytest.MonkeyPatch, invalid_config: bool
+) -> None:
+    gate = image_wire[0]
+    config: object = _photo_config(
+        [
+            types.DcOption(id=3, ip_address="192.0.2.3", port=443, cdn=True),
+            types.DcOption(id=4, ip_address="192.0.2.4", port=443),
+        ]
+    )
+    if invalid_config:
+        config = object()
+    monkeypatch.setattr(type(gate), "_config", config)
+    session, lease = _dc_option_session(gate, _PhotoBudget())
+    with pytest.raises(
+        RuntimeError, match="configuration is unavailable" if invalid_config else "media DC is unavailable"
+    ):
+        await gate._photo_dc_option(session, lease)
+
+
+async def test_photo_dc_selection_fetches_uncached_config_through_guarded_main_sender(
+    image_wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mcp_telegram.telegram_demand import durable_demand_context
+
+    gate, sender, connection, sink = image_wire
+    monkeypatch.setattr(type(gate), "_config", None)
+    debits: list[bool] = []
+    option = types.DcOption(id=3, ip_address="192.0.2.3", port=443)
+
+    async def select() -> types.DcOption:
+        with durable_demand_context(DemandKind.MESSAGE_IMAGE_ACQUISITION):
+            session, lease = _dc_option_session(gate, _PhotoBudget(debits))
+            return await gate._photo_dc_option(session, lease)
+
+    task = asyncio.create_task(select())
+    state = await asyncio.wait_for(sender._send_queue.next_state(), 2)
+    assert type(state.request) is functions.help.GetConfigRequest
+    await sender._prepare_state(state)
+    assert debits == [True]
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    state.future.set_result(_photo_config([option]))
+    assert await asyncio.wait_for(task, 2) is option
+    assert len(sink.frames) == 1
+
+
 def _connected_photo_sender(
     gate: TelegramRpcGate, lease: telegram_rpc._AuxPhotoLease
 ) -> tuple[GuardedMTProtoSender, GuardedConnectionTcpFull, _Writer]:
