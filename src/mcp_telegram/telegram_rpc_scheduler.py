@@ -152,6 +152,7 @@ class TelegramRpcScope:
     transport_control: bool = False
     transport_bootstrap: bool = False
     transport_auth: bool = False
+    response_timeout_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +162,9 @@ class _DeadlineOverride:
 
 
 _RPC_DEADLINE: ContextVar[_DeadlineOverride | None] = ContextVar("telegram_rpc_deadline", default=None)
+_RPC_RESPONSE_TIMEOUT: ContextVar[tuple[asyncio.Task[object] | None, float] | None] = ContextVar(
+    "telegram_rpc_response_timeout", default=None
+)
 _RPC_ATTEMPT_BUDGET: ContextVar[RpcAttemptBudget | None] = ContextVar("telegram_rpc_attempt_budget", default=None)
 _LEGACY_DEMAND_TOKEN: ContextVar[DemandToken | None] = ContextVar("telegram_legacy_demand_token", default=None)
 
@@ -232,6 +236,7 @@ def rpc_scope(
     *,
     deadline: float | None = None,
     timeout_seconds: float | None = None,
+    response_timeout_seconds: float | None = None,
     acquisition_kind: AcquisitionKind | None = None,
 ) -> Iterator[TelegramRpcScope]:
     """Bridge one legacy source scope to a registered demand context.
@@ -245,6 +250,7 @@ def rpc_scope(
         raise ValueError("provide deadline or timeout_seconds, not both")
     _validate_deadline(deadline)
     _validate_timeout(timeout_seconds)
+    _validate_timeout(response_timeout_seconds)
     if acquisition_kind is not None and not isinstance(acquisition_kind, AcquisitionKind):
         raise TypeError("acquisition_kind must be an AcquisitionKind")
     caller_deadline = time.monotonic() + float(timeout_seconds) if timeout_seconds is not None else deadline
@@ -255,18 +261,18 @@ def rpc_scope(
         inherited = _LEGACY_DEMAND_TOKEN.get()
         if inherited is not None and inherited.source is source:
             with transferred_demand_context(inherited):
-                with _rpc_scope_details(caller_deadline, acquisition_kind):
+                with _rpc_scope_details(caller_deadline, acquisition_kind, response_timeout_seconds):
                     yield current_rpc_scope()
         else:
             with demand_context(LEGACY_DEMAND_KIND_BY_SOURCE[source], deadline=caller_deadline) as token:
                 legacy_token = _LEGACY_DEMAND_TOKEN.set(token)
                 try:
-                    with _rpc_scope_details(caller_deadline, acquisition_kind):
+                    with _rpc_scope_details(caller_deadline, acquisition_kind, response_timeout_seconds):
                         yield current_rpc_scope()
                 finally:
                     _LEGACY_DEMAND_TOKEN.reset(legacy_token)
     else:
-        with _rpc_scope_details(caller_deadline, acquisition_kind):
+        with _rpc_scope_details(caller_deadline, acquisition_kind, response_timeout_seconds):
             yield current_rpc_scope()
 
 
@@ -274,12 +280,22 @@ def rpc_scope(
 def _rpc_scope_details(
     caller_deadline: float | None,
     acquisition_kind: AcquisitionKind | None,
+    response_timeout_seconds: float | None,
 ) -> Iterator[None]:
     root = current_demand_token()
     resolved_deadline = root.admission_deadline
     if caller_deadline is not None:
         resolved_deadline = min(resolved_deadline, float(caller_deadline))
     deadline_token = _RPC_DEADLINE.set(_DeadlineOverride(resolved_deadline, _current_task()))
+    previous_response = _RPC_RESPONSE_TIMEOUT.get()
+    owner = _current_task()
+    inherited_response = (
+        previous_response[1] if previous_response is not None and previous_response[0] is owner else None
+    )
+    response = response_timeout_seconds if inherited_response is None else inherited_response
+    if inherited_response is not None and response_timeout_seconds is not None:
+        response = min(inherited_response, response_timeout_seconds)
+    response_token = _RPC_RESPONSE_TIMEOUT.set(None if response is None else (owner, response))
     try:
         if acquisition_kind is None:
             yield
@@ -287,6 +303,7 @@ def _rpc_scope_details(
             with acquisition_context(acquisition_kind):
                 yield
     finally:
+        _RPC_RESPONSE_TIMEOUT.reset(response_token)
         _RPC_DEADLINE.reset(deadline_token)
 
 
@@ -298,6 +315,7 @@ def current_rpc_scope() -> TelegramRpcScope:
     if override is not None and override.owner_task is _current_task():
         deadline = min(deadline, override.deadline)
     contract = demand_contract(token.kind)
+    response_override = _RPC_RESPONSE_TIMEOUT.get()
     return TelegramRpcScope(
         source=token.source,
         service_class=token.service_class,
@@ -308,6 +326,9 @@ def current_rpc_scope() -> TelegramRpcScope:
         source_outstanding_limit=contract.source_outstanding_limit,
         attempt_budget=_RPC_ATTEMPT_BUDGET.get(),
         attempt_evidence=token.attempt_evidence,
+        response_timeout_seconds=(
+            response_override[1] if response_override is not None and response_override[0] is _current_task() else None
+        ),
     )
 
 
@@ -396,7 +417,7 @@ def create_scoped_rpc_task[T](  # noqa: PLR0913 - compatibility task factory car
             with rpc_scope(source, deadline=deadline):
                 return await awaitable
         with transferred_demand_context(demand_token):
-            with _rpc_scope_details(deadline, None):
+            with _rpc_scope_details(deadline, None, None):
                 return await awaitable
 
     async def run_scoped() -> T:

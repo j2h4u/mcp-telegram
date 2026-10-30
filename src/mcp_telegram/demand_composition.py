@@ -72,6 +72,7 @@ from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator, 
 from mcp_telegram.telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkKey, WorkRevision
 from mcp_telegram.telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 from mcp_telegram.telegram_rpc_scheduler import (
+    TelegramRpcAdmissionDeferred,
     TelegramRpcMethodRecoveryPending,
     TelegramRpcThrottled,
     rpc_attempt_budget,
@@ -90,6 +91,8 @@ class DemandCompositionClient(ActivityClient, Protocol):
     def prepare_durable_retry(
         self, budget: RpcAttemptBudget, method_key: str | None
     ) -> RpcRetryAuthorization | None: ...
+
+    def admission_expired_deferral(self, method_key: str | None) -> TelegramRpcAdmissionDeferred: ...
 
     def set_rpc_eligibility_observer(self, observer: Callable[[str | None], None] | None) -> None: ...
 
@@ -336,6 +339,7 @@ def build_durable_coordinator(
         observer=observer,
         rpc_eligibility=dependencies.client.rpc_eligibility,
         prepare_durable_retry=dependencies.client.prepare_durable_retry,
+        admission_expired_deferral=dependencies.client.admission_expired_deferral,
     )
     dependencies.client.set_rpc_eligibility_observer(coordinator.eligibility_changed)
     return coordinator

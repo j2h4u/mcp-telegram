@@ -1263,7 +1263,15 @@ async def test_entity_profile_adapter_sets_bounded_rpc_scope() -> None:
             scope.attempt_budget.debit()
             assert scope.demand_kind is not None
             assert scope.acquisition_kind is not None
-            observed.append((scope.source, scope.deadline, scope.owner_task, scope.demand_kind, scope.acquisition_kind))
+            observed.append(
+                (
+                    scope.source,
+                    scope.response_timeout_seconds,
+                    scope.owner_task,
+                    scope.demand_kind,
+                    scope.acquisition_kind,
+                )
+            )
             return SimpleNamespace(
                 full_user=SimpleNamespace(about="fresh", blocked=False, folder_id=None), users=[], chats=[]
             )
@@ -1277,9 +1285,9 @@ async def test_entity_profile_adapter_sets_bounded_rpc_scope() -> None:
     assert coordinator is not None
     await EntityProfileDemandAdapter(coordinator).run_slice(_select_profile_budget(service, RpcAttemptBudget(limit=1)))
 
-    source, deadline, owner_task, demand_kind, acquisition_kind = observed[0]
+    source, response_timeout, owner_task, demand_kind, acquisition_kind = observed[0]
     assert source is TelegramRpcSource.ENTITY_INFO_REFRESH
-    assert deadline is not None
+    assert response_timeout == limits.per_rpc_seconds
     assert owner_task is asyncio.current_task()
     assert demand_kind is DemandKind.ENTITY_PROFILE_REFRESH
     assert acquisition_kind is AcquisitionKind.ENTITY_LOOKUP
@@ -1738,7 +1746,7 @@ async def test_durable_unknown_core_timeout_retains_cursor_and_retry_resolves_id
         async def get_entity(self, entity_id: int) -> object:
             self.calls += 1
             if self.calls == 1:
-                await asyncio.sleep(1)
+                raise TimeoutError("wire response timeout")
             return User(id=entity_id, first_name="Known", username="known")
 
     conn = sqlite3.connect(":memory:")
@@ -2066,12 +2074,10 @@ async def test_entity_acquisition_timeout_persists_retry_and_keeps_cursor(known:
 
     class SlowClient(_UnusedClient):
         async def get_entity(self, entity_id: int) -> object:
-            await asyncio.sleep(0.05)
-            return User(id=42, first_name="Slow")
+            raise TimeoutError("wire response timeout")
 
         async def __call__(self, request: object) -> object:
-            await asyncio.sleep(0.05)
-            return SimpleNamespace(full_user=SimpleNamespace(about="late"), users=[], chats=[])
+            raise TimeoutError("wire response timeout")
 
     service._deps = replace(service._deps, client=SlowClient(), user_profile_port=_UserProfilePort(SlowClient()))
     if known:

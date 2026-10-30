@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Literal, Never, Protocol, cast
 
 from telethon import version  # type: ignore[import-untyped]
-from telethon.errors import SecurityError  # type: ignore[import-untyped]
+from telethon.errors import RPCError, SecurityError  # type: ignore[import-untyped]
 from telethon.extensions.messagepacker import MessagePacker  # type: ignore[import-untyped]
 from telethon.network import authenticator  # type: ignore[import-untyped]
 from telethon.network.connection.tcpfull import ConnectionTcpFull  # type: ignore[import-untyped]
@@ -80,6 +80,8 @@ class TransportAuthority(Protocol):
 
     def observe_error_now(self, owner: object, error: BaseException) -> None: ...
 
+    def observe_response_now(self, owner: object) -> None: ...
+
 
 class _OwnedFuture(asyncio.Future[object]):
     """Observe terminal errors before scheduled callbacks can allow another write."""
@@ -93,7 +95,14 @@ class _OwnedFuture(asyncio.Future[object]):
         if not self.done():
             error = exception() if isinstance(exception, type) else exception
             self._authority.observe_error_now(self._owner, error)
+            if isinstance(error, RPCError):
+                self._authority.observe_response_now(self._owner)
         super().set_exception(exception)
+
+    def set_result(self, result: object) -> None:
+        if not self.done():
+            self._authority.observe_response_now(self._owner)
+        super().set_result(result)
 
     def cancel(self, msg: object = None) -> bool:
         if not self.done():

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import AsyncIterator, Callable, Coroutine
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -255,6 +255,190 @@ async def test_cancelled_logical_owner_cannot_revive_after_task_uncancel(wire: _
     finally:
         release.set()
         await task
+
+
+@pytest.mark.parametrize("cancel_caller", [False, True])
+async def test_response_timeout_starts_at_claim_and_stops_before_receipt(
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch, cancel_caller: bool
+) -> None:
+    gate, sender, connection, _sink = wire
+    started, release = asyncio.Event(), asyncio.Event()
+    ledger = gate._ensure_safety_ledger()
+    original = cast(Callable[..., Awaitable[object]], ledger.complete)
+
+    async def held_complete(*args: object, **kwargs: object) -> object:
+        started.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(ledger, "complete", held_complete)
+    budget = RpcAttemptBudget(2)
+
+    async def call() -> object:
+        scope = TelegramRpcScope(
+            TelegramRpcSource.MCP_INTERACTIVE,
+            RpcServiceClass.INTERACTIVE,
+            time.monotonic() + 5,
+            asyncio.current_task(),
+            attempt_budget=budget,
+            attempt_evidence=RpcAttemptEvidence(),
+            response_timeout_seconds=0.06,
+        )
+        return await _AdmissionAwareSender(gate, scope).send(GetStateRequest())
+
+    task = asyncio.create_task(call())
+    state = await sender._send_queue.next_state()
+    try:
+        await asyncio.sleep(0.09)
+        assert not task.done() and budget.attempts == 0
+        await sender._prepare_state(state)
+        assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+        state.future.set_result("complete")
+        await asyncio.wait_for(started.wait(), 2)
+        await asyncio.sleep(0.09)
+        assert not task.done() and budget.attempts == 1
+        if cancel_caller:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        release.set()
+        if cancel_caller:
+            await asyncio.gather(*sender._observing)
+            assert ledger._record["intents"] == {}
+        else:
+            assert await task == "complete"
+    finally:
+        release.set()
+
+
+async def test_response_timeout_after_first_claim_does_not_renew_on_replay(wire: _WireHarness) -> None:
+    gate, sender, connection, sink = wire
+    budget = RpcAttemptBudget(2)
+
+    async def call() -> object:
+        scope = TelegramRpcScope(
+            TelegramRpcSource.MCP_INTERACTIVE,
+            RpcServiceClass.INTERACTIVE,
+            time.monotonic() + 5,
+            asyncio.current_task(),
+            attempt_budget=budget,
+            attempt_evidence=RpcAttemptEvidence(),
+            response_timeout_seconds=0.12,
+        )
+        return await _AdmissionAwareSender(gate, scope).send(GetStateRequest())
+
+    task = asyncio.create_task(call())
+    state = await sender._send_queue.next_state()
+    await sender._prepare_state(state)
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    await asyncio.sleep(0.07)
+    gate._admission_scheduler._next_write_at = 0.0
+    await sender._prepare_state(state)
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(task, 0.1)
+    assert len(sink.frames) == 2 and budget.attempts == 2
+    state.future.set_result("late")
+    await asyncio.gather(*sender._observing)
+
+
+async def test_response_timeout_does_not_run_during_durable_intent_preparation(
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate, sender, connection, _sink = wire
+    prepared, release = asyncio.Event(), asyncio.Event()
+    ledger = gate._ensure_safety_ledger()
+    original = cast(Callable[..., Awaitable[object]], ledger.prepare)
+
+    async def held_prepare(*args: object, **kwargs: object) -> object:
+        result = await original(*args, **kwargs)
+        prepared.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(ledger, "prepare", held_prepare)
+    budget = RpcAttemptBudget(1)
+
+    async def call() -> object:
+        scope = TelegramRpcScope(
+            TelegramRpcSource.MCP_INTERACTIVE,
+            RpcServiceClass.INTERACTIVE,
+            time.monotonic() + 5,
+            asyncio.current_task(),
+            attempt_budget=budget,
+            attempt_evidence=RpcAttemptEvidence(),
+            response_timeout_seconds=0.06,
+        )
+        return await _AdmissionAwareSender(gate, scope).send(GetStateRequest())
+
+    task = asyncio.create_task(call())
+    state = await sender._send_queue.next_state()
+    preparing = asyncio.create_task(sender._prepare_state(state))
+    try:
+        await asyncio.wait_for(prepared.wait(), 2)
+        await asyncio.sleep(0.09)
+        assert not task.done() and budget.attempts == 0
+        release.set()
+        await preparing
+        assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+        state.future.set_result("complete")
+        assert await task == "complete"
+    finally:
+        release.set()
+
+
+async def test_admission_expired_deferral_uses_scheduler_retry_policy(wire: _WireHarness) -> None:
+    gate = wire[0]
+    before = time.monotonic()
+    result = gate.admission_expired_deferral("test.method")
+    assert result.method_key == "test.method" and result.reason == "admission_expired"
+    assert result.retry_after_seconds == gate._scheduler_policy.admission_retry_seconds
+    delay = result.retry_after_seconds
+    assert delay is not None and result.eligible_at is not None and result.eligible_at >= before + delay
+
+
+async def test_expired_scheduler_outcome_uses_shared_deferral(wire: _WireHarness) -> None:
+    gate = wire[0]
+    scope = TelegramRpcScope(
+        TelegramRpcSource.MCP_INTERACTIVE,
+        RpcServiceClass.INTERACTIVE,
+        time.monotonic() + 1,
+        asyncio.current_task(),
+        request_method="test.method",
+    )
+    from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred
+
+    with pytest.raises(TelegramRpcAdmissionDeferred) as caught:
+        await gate._handle_admission_deferral(
+            scope, RpcAdmissionExpiredError(scope, "expired"), request=GetStateRequest(), connection_owned=False
+        )
+    assert caught.value.reason == "admission_expired" and caught.value.method_key == "test.method"
+    assert caught.value.eligible_at is not None
+
+
+async def test_parent_deadline_before_claim_is_admission_expiry(wire: _WireHarness) -> None:
+    gate, sender, _connection, sink = wire
+    budget = RpcAttemptBudget(1)
+
+    async def call() -> object:
+        scope = TelegramRpcScope(
+            TelegramRpcSource.MCP_INTERACTIVE,
+            RpcServiceClass.INTERACTIVE,
+            time.monotonic() + 0.05,
+            asyncio.current_task(),
+            attempt_budget=budget,
+            attempt_evidence=RpcAttemptEvidence(),
+            response_timeout_seconds=0.01,
+        )
+        return await _AdmissionAwareSender(gate, scope).send(GetStateRequest())
+
+    task = asyncio.create_task(call())
+    state = await sender._send_queue.next_state()
+    with pytest.raises(RpcAdmissionExpiredError):
+        await task
+    assert not sink.frames and budget.attempts == 0 and gate._wire_fault is None
+    with pytest.raises(asyncio.CancelledError):
+        await sender._prepare_state(state)
 
 
 async def test_pregranted_shared_budget_exhaustion_does_not_drop_transport(

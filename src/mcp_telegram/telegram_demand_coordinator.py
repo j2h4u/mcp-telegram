@@ -9,6 +9,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
@@ -26,6 +27,7 @@ from mcp_telegram.telegram_demand import (
 from mcp_telegram.telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkRevision
 from mcp_telegram.telegram_rpc_consumers import (
     DURABLE_DEMAND_ORDER,
+    RETAINED_DEMAND_KINDS,
     TELEGRAM_DEMAND_CONTRACTS,
     DemandContract,
     DemandKind,
@@ -45,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SAFETY_SCAN_SECONDS = 60.0
 MIN_WAIT_SECONDS = 0.001
+_SLICE_GENERATION: ContextVar[int] = ContextVar("demand_slice_generation", default=0)
 _DEFERRED_ERRORS = (
     TelegramRpcAdmissionDeferred,
     TelegramRpcMethodRecoveryPending,
@@ -133,6 +136,7 @@ class TelegramDemandCoordinator:
         rpc_eligibility: Callable[[str | None], TelegramRpcThrottled | TelegramRpcMethodRecoveryPending | None]
         | None = None,
         prepare_durable_retry: Callable[[RpcAttemptBudget, str | None], RpcRetryAuthorization | None] | None = None,
+        admission_expired_deferral: Callable[[str | None], TelegramRpcAdmissionDeferred] | None = None,
     ) -> None:
         validate_durable_adapters(adapters)
         if not math.isfinite(safety_scan_seconds) or safety_scan_seconds <= 0:
@@ -143,6 +147,7 @@ class TelegramDemandCoordinator:
         self._monotonic_clock = monotonic_clock
         self._rpc_eligibility = rpc_eligibility or (lambda _method: None)
         self._prepare_durable_retry = prepare_durable_retry or (lambda _budget, _method: None)
+        self._admission_expired_deferral = admission_expired_deferral
         self._safety_scan_seconds = float(safety_scan_seconds)
         self._observer = observer
         self._canonical_progress: Callable[[], None] | None = None
@@ -156,6 +161,8 @@ class TelegramDemandCoordinator:
         self._offered: set[DemandKind] = set()
         self._active_kind: DemandKind | None = None
         self._active_revision: WorkRevision | None = None
+        self._retained_revision: WorkRevision | None = None
+        self._retained_task: asyncio.Task[None] | None = None
         self._next_release_at: float | None = None
         self._status_failed_until: dict[DemandKind, float] = {}
         self._invocations: dict[WorkRevision, _Invocation] = {}
@@ -167,7 +174,6 @@ class TelegramDemandCoordinator:
         self._transient_stages: dict[WorkRevision, int] = {}
         self._revision_methods: dict[WorkRevision, str] = {}
         self._eligibility_generation = 0
-        self._slice_eligibility_generation = 0
         self.scan()
 
     def bind_canonical_progress(self, callback: Callable[[], None]) -> None:
@@ -196,7 +202,7 @@ class TelegramDemandCoordinator:
 
     def inspect_work(self, selected: WorkRevision) -> dict[str, object]:
         """Snapshot exact-work coordinator state without changing admission."""
-        active = self._active_revision
+        active = self._inspect_active(selected.key.demand_kind)
         status = self._statuses.get(selected.key.demand_kind)
         invocation = self._invocations.get(selected)
         now = self._monotonic_clock()
@@ -219,6 +225,12 @@ class TelegramDemandCoordinator:
                 else None
             ),
         }
+
+    def _inspect_active(self, kind: DemandKind) -> WorkRevision | None:
+        if not self._retained_kind(kind):
+            return self._active_revision
+        task = self._retained_task
+        return self._retained_revision if task is not None and not task.done() else None
 
     def _inspect_hold(self, selected: WorkRevision, now: float) -> tuple[str, float | None]:
         transient = self._transient_waits.get(selected)
@@ -293,7 +305,7 @@ class TelegramDemandCoordinator:
         self._validate_durable_kind(kind)
         if self._state in {CoordinatorState.STOPPING, CoordinatorState.STOPPED}:
             return False
-        if kind in self._offered or kind in self._queued or kind is self._active_kind:
+        if kind in self._offered or kind in self._queued or kind is self._active_kind or self._retained_kind(kind):
             return False
         self._offered.add(kind)
         self._wake.set()
@@ -324,24 +336,30 @@ class TelegramDemandCoordinator:
                 self._release_gate_wait(revision)
 
     def _scan_kind(self, kind: DemandKind, observed_at: float) -> None:
+        if self._retained_kind(kind):
+            self._remove_queued(kind)
+            return
         if observed_at < self._status_failed_until.get(kind, -math.inf):
             return
         try:
-            while True:
-                excluded = frozenset(self._excluded)
-                status = self._adapters[kind].status(observed_at, excluded=excluded)
-                if status is not None and not isinstance(status, DemandStatus):
-                    raise TypeError("adapter returned an invalid status")
-                if status is None:
-                    self._apply_status(kind, None, observed_at)
-                    break
-                self._apply_status(kind, status, observed_at)
-                if status.selected is None or status.selected not in self._excluded or status.selected in excluded:
-                    break
+            self._scan_available_kind(kind, observed_at)
         except Exception as exc:  # noqa: BLE001 - one bad domain cannot stop the pump
             self._record_status_failure(kind, observed_at, exc)
             return
         self._status_failed_until.pop(kind, None)
+
+    def _scan_available_kind(self, kind: DemandKind, observed_at: float) -> None:
+        while True:
+            excluded = frozenset(self._excluded)
+            status = self._adapters[kind].status(observed_at, excluded=excluded)
+            if status is not None and not isinstance(status, DemandStatus):
+                raise TypeError("adapter returned an invalid status")
+            if status is None:
+                self._apply_status(kind, None, observed_at)
+                break
+            self._apply_status(kind, status, observed_at)
+            if status.selected is None or status.selected not in self._excluded or status.selected in excluded:
+                break
 
     def _record_status_failure(self, kind: DemandKind, observed_at: float, exc: Exception) -> None:
         self._status_failed_until[kind] = observed_at + self._safety_scan_seconds
@@ -473,6 +491,7 @@ class TelegramDemandCoordinator:
         try:
             while not self._shutdown_event.is_set():
                 self._wake.clear()
+                self._harvest_retained()
                 now = self._now()
                 self.scan(now=now)
                 if self._shutdown_event.is_set():
@@ -480,6 +499,9 @@ class TelegramDemandCoordinator:
                 kind = self._pop_ready(now=now)
                 if kind is None:
                     await self._wait_for_wakeup(self._wait_delay(now))
+                    continue
+                if kind in RETAINED_DEMAND_KINDS:
+                    self._start_retained(kind)
                     continue
                 try:
                     await self._execute_slice(kind)
@@ -492,17 +514,52 @@ class TelegramDemandCoordinator:
             raise
         finally:
             self._state = CoordinatorState.STOPPING
+            await self._stop_retained()
             self._active_kind = None
             self._state = CoordinatorState.STOPPED
 
-    async def _execute_slice(self, kind: DemandKind) -> None:
+    def _retained_kind(self, kind: DemandKind) -> bool:
+        return self._retained_revision is not None and self._retained_revision.key.demand_kind is kind
+
+    def _start_retained(self, kind: DemandKind) -> None:
+        status = self._statuses[kind]
+        if status.selected is None or self._retained_task is not None:
+            raise RuntimeError("retained demand requires one selected revision")
+        self._retained_revision = status.selected
+        task = asyncio.create_task(self._execute_slice(kind, retained_status=status))
+        self._retained_task = task
+        task.add_done_callback(lambda _: self._wake.set())
+
+    def _harvest_retained(self) -> None:
+        task = self._retained_task
+        if task is None or not task.done():
+            return
+        self._retained_task = None
+        self._retained_revision = None
+        task.result()
+
+    async def _stop_retained(self) -> None:
+        task = self._retained_task
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._retained_task = None
+            self._retained_revision = None
+
+    async def _execute_slice(self, kind: DemandKind, *, retained_status: DemandStatus | None = None) -> None:
         contract = demand_contract(kind)
         limit = contract.max_rpc_attempts_per_slice
         if limit is None:
             raise RuntimeError(f"durable demand {kind.value} has no slice budget")
         selected_at = self._now()
         queued_at = self._queued_since.pop(kind, selected_at)
-        status = self._statuses.get(kind)
+        status = retained_status if retained_status is not None else self._statuses.get(kind)
         if status is None or status.selected is None:
             raise RuntimeError(f"durable demand {kind.value} did not select an exact work revision")
         invocation = self._invocations.get(status.selected)
@@ -589,16 +646,13 @@ class TelegramDemandCoordinator:
         if selected is None:
             return
         budget = invocation.budget
-        self._slice_eligibility_generation = self._eligibility_generation
-        self._active_kind = kind
-        self._active_revision = selected
+        generation_token = _SLICE_GENERATION.set(self._eligibility_generation)
+        retained = asyncio.current_task() is self._retained_task
+        self._set_inline_active(kind, selected, retained=retained)
         self._observe("selected", kind, queue_age_seconds=max(0.0, selected_at - queued_at), status=status)
         assert invocation.deadline is not None
         try:
-            remaining = max(0.0, invocation.deadline - self._monotonic_clock())
-            with demand_context(kind, deadline=invocation.deadline):
-                async with asyncio.timeout(remaining):
-                    outcome = await self._run_adapter(kind, budget, selected)
+            outcome = await self._run_scoped_adapter(kind, status, budget, invocation.deadline)
         except asyncio.CancelledError:
             raise
         except RpcAdmissionClosedError:
@@ -614,7 +668,43 @@ class TelegramDemandCoordinator:
         else:
             self._handle_outcome(kind, status, budget, outcome)
         finally:
+            self._clear_inline_active(retained=retained)
+            _SLICE_GENERATION.reset(generation_token)
+
+    def _set_inline_active(self, kind: DemandKind, selected: WorkRevision, *, retained: bool) -> None:
+        if not retained:
+            self._active_kind = kind
+            self._active_revision = selected
+
+    def _clear_inline_active(self, *, retained: bool) -> None:
+        if not retained:
             self._active_revision = None
+
+    async def _run_scoped_adapter(
+        self, kind: DemandKind, status: DemandStatus, budget: RpcAttemptBudget, deadline: float
+    ) -> SliceOutcome:
+        selected = status.selected
+        assert selected is not None
+        remaining = max(0.0, deadline - self._monotonic_clock())
+        timer = asyncio.timeout(remaining)
+        with demand_context(kind, deadline=deadline) as token:
+            try:
+                async with timer:
+                    return await self._run_adapter(kind, budget, selected)
+            except TimeoutError:
+                if self._is_admission_expiry(timer, token):
+                    assert self._admission_expired_deferral is not None
+                    method = self._method_for_work(selected, budget, status.request_method)
+                    raise self._admission_expired_deferral(method) from None
+                raise
+
+    def _is_admission_expiry(self, timer: asyncio.Timeout, token: DemandToken) -> bool:
+        return (
+            asyncio.current_task() is self._retained_task
+            and timer.expired()
+            and token.attempt_evidence.actual_attempts == 0
+            and self._admission_expired_deferral is not None
+        )
 
     async def _run_adapter(self, kind: DemandKind, budget: RpcAttemptBudget, selected: WorkRevision) -> SliceOutcome:
         attempts_before = budget.attempts
@@ -776,7 +866,7 @@ class TelegramDemandCoordinator:
             self._excluded.add(budget.selected)
             self._exclusion_reasons[budget.selected] = "admission_saturated"
             self._eligibility_waits[budget.selected] = None
-            if self._slice_eligibility_generation != self._eligibility_generation:
+            if _SLICE_GENERATION.get() != self._eligibility_generation:
                 self._release_ready_gate_waits()
         self._observe("deferred", kind, actual_attempts=budget.attempts, reason="admission_saturated")
 

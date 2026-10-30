@@ -269,12 +269,15 @@ class _AdmissionAwareSender:
         started_at = time.monotonic()
         timing = current_timing()
         try:
-            async with asyncio.timeout_at(self._scope.deadline):
+            async with asyncio.timeout_at(self._scope.deadline) as timeout:
+                wire_owner.response_timer = timeout
                 await asyncio.wait({raw_future})
             return raw_future.result()
         except TimeoutError:
             self._gate._revoke_wire_owner(wire_owner)
             raw_future.add_done_callback(self._consume_late_result, context=Context())
+            if wire_owner.claimed == 0:
+                raise RpcAdmissionExpiredError(self._scope, "Telegram RPC admission deadline elapsed") from None
             if self._gate._wire_fault is not None:
                 raise TelegramRpcThrottled(
                     retry_after_seconds=None, latched=True, detail="Telegram outbound outcome is uncertain"
@@ -288,6 +291,7 @@ class _AdmissionAwareSender:
             raw_future.add_done_callback(self._consume_late_result, context=Context())
             raise
         finally:
+            wire_owner.response_timer = None
             self._dispatch_started = wire_owner.claimed > 0
             if timing is not None:
                 ended_at = time.monotonic()
@@ -2547,6 +2551,7 @@ class _WireAttempt:
     method_generation: str | None = None
     observed_write_returns: int = 0
     observed_result: bool = False
+    response_timer: asyncio.Timeout | None = None
     observation_ordinal: int | None = None
     draft_mutation: bool = False
     scheduled_check: ScheduledMutationCheck | None = None
@@ -2645,6 +2650,9 @@ class _AuxPhotoAuthority:
 
     def observe_error_now(self, owner: object, error: BaseException) -> None:
         self._gate.observe_error_now(owner, error)
+
+    def observe_response_now(self, owner: object) -> None:
+        self._gate.observe_response_now(owner)
 
     def protect_transport(self, error: BaseException) -> None:
         self._lease.revoked = True
@@ -3143,6 +3151,7 @@ class TelegramRpcGate(TelegramClient):
         *,
         deadline: float | None = None,
         timeout_seconds: float | None = None,
+        response_timeout_seconds: float | None = None,
         acquisition_kind: AcquisitionKind | None = None,
     ) -> AbstractContextManager[TelegramRpcScope]:
         """Return a source scope for application helpers using this client."""
@@ -3150,6 +3159,7 @@ class TelegramRpcGate(TelegramClient):
             source,
             deadline=deadline,
             timeout_seconds=timeout_seconds,
+            response_timeout_seconds=response_timeout_seconds,
             acquisition_kind=acquisition_kind,
         )
 
@@ -4072,6 +4082,7 @@ class TelegramRpcGate(TelegramClient):
     def _record_wire_dispatch(self, owner: _WireAttempt, permit: _WirePermit) -> None:
         owner.claimed += 1
         owner.dispatch_at = time.monotonic()
+        self._arm_response_timeout(owner)
         if owner.claimed == 1 and not owner.scope.transport_control:
             try:
                 owner.incident_claimed_at_ms = int(time.time() * 1000)
@@ -4093,6 +4104,15 @@ class TelegramRpcGate(TelegramClient):
             reason="replay" if owner.claimed > 1 else None,
             attempt_ordinal=owner.observation_ordinal,
         )
+
+    @staticmethod
+    def _arm_response_timeout(owner: _WireAttempt) -> None:
+        if owner.claimed == 1 and owner.response_timer is not None and owner.scope.response_timeout_seconds is not None:
+            assert owner.dispatch_at is not None
+            deadline = owner.dispatch_at + owner.scope.response_timeout_seconds
+            if owner.scope.deadline is not None:
+                deadline = min(deadline, owner.scope.deadline)
+            owner.response_timer.reschedule(deadline)
 
     @staticmethod
     def _record_draft_dispatch(owner: _WireAttempt) -> None:
@@ -4276,6 +4296,12 @@ class TelegramRpcGate(TelegramClient):
                 else RecoveryCause.READ_UNCERTAINTY
             )
             self._notify_rpc_eligibility_changed()
+
+    def observe_response_now(self, owner: object) -> None:
+        owner = self._require_wire_owner(owner)
+        timer = owner.response_timer
+        if owner.claimed and timer is not None and not timer.expired():
+            timer.reschedule(owner.scope.deadline)
 
     def _note_photo_fault_owner(self, owner: _WireAttempt) -> None:
         if self._wire_fault is None and owner.photo_capability is not None and owner.photo_capability.aux_bootstrap:
@@ -5969,6 +5995,8 @@ class TelegramRpcGate(TelegramClient):
                 raise exc
             await self._retry_update_source(scope, request=request, reason=type(exc).__name__)
             return
+        if isinstance(exc, RpcAdmissionExpiredError):
+            raise self.admission_expired_deferral(scope.request_method) from None
         retry_seconds = self._scheduler_policy.admission_retry_seconds
         raise TelegramRpcAdmissionDeferred(
             retry_after_seconds=retry_seconds,
@@ -5977,6 +6005,18 @@ class TelegramRpcGate(TelegramClient):
             method_key=scope.request_method,
             reason="capacity" if isinstance(exc, RpcAdmissionSaturatedError) else None,
         ) from None
+
+    def admission_expired_deferral(self, method_key: str | None) -> TelegramRpcAdmissionDeferred:
+        """Translate expired local admission using the scheduler's existing retry policy."""
+        retry_seconds = self._scheduler_policy.admission_retry_seconds
+        return TelegramRpcAdmissionDeferred(
+            retry_after_seconds=retry_seconds,
+            latched=False,
+            detail=f"Telegram is temporarily busy; retry in {retry_seconds:g}s",
+            method_key=method_key,
+            eligible_at=time.monotonic() + retry_seconds,
+            reason="admission_expired",
+        )
 
     async def _retry_update_source(self, scope: TelegramRpcScope, *, request: object, reason: str) -> None:
         self._record_rpc_retry(scope, request, reason=reason)

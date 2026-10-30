@@ -597,7 +597,7 @@ async def test_scan_preserves_fifo_positions_and_tail_rotates_after_slice() -> N
     coordinator = TelegramDemandCoordinator(adapters, shutdown, clock=clock)
     assert coordinator.ready_kinds == (first, second)
     await coordinator.run()
-    assert coordinator.ready_kinds == (second,)
+    assert len(adapters[second].run_calls) == 1
 
 
 @pytest.mark.asyncio
