@@ -19,6 +19,7 @@ from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.feedback_db import SQLiteFeedbackStore, ensure_feedback_schema
 from mcp_telegram.feedback_service import FeedbackApplicationService
 from mcp_telegram.flood import FloodWaitKillSwitchStatus
+from mcp_telegram.fts import backfill_fts_index
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_rpc import TelegramRpcGate
 from tests.daemon_api_policy import make_daemon_api_policy
@@ -197,6 +198,150 @@ async def test_registered_local_tool_uses_real_ipc_protection_snapshot(
     }
     assert status_reads == 1
     validate(payload, cast(dict[str, object], mcp_server.tool_by_name["get_sync_status"].output_schema))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hold", "event_at", "since", "until", "expect_results", "interval"),
+    [
+        (True, None, "2023-11-14T22:12:00Z", "2023-11-14T22:14:00Z", True, "covered_as_of_horizon"),
+        (False, 1_700_000_200, "2023-11-14T22:12:00Z", "2023-11-14T22:20:00Z", True, "beyond_horizon"),
+        (False, None, "2023-11-14T22:12:00Z", "2023-11-14T22:14:00Z", True, "covered_as_of_horizon"),
+        (True, None, "2023-11-14T22:16:00Z", "2023-11-14T22:20:00Z", False, "beyond_horizon"),
+    ],
+)
+async def test_registered_assessments_follow_local_results_and_protection(  # noqa: PLR0913, PLR0914, PLR0915
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hold: bool,
+    event_at: int | None,
+    since: str,
+    until: str,
+    expect_results: bool,
+    interval: str,
+) -> None:
+    monkeypatch.setattr(mcp_server, "_schedule_telemetry", lambda _event: None)
+    gate, sender, client = _protection_gate_client()
+    daemon, sync_conn, feedback_conn, _ = _local_daemon(tmp_path, client)
+    _seed_topic_dialog(sync_conn, 123, "Project", message="needle retained")
+    sync_conn.execute(
+        "UPDATE synced_dialogs SET last_synced_at=?,last_event_at=? WHERE dialog_id=123",
+        (1_700_000_100, event_at),
+    )
+    sync_conn.commit()
+    backfill_fts_index(sync_conn)
+    if hold:
+        daemon._health_status = _active_status
+    status_reads = 0
+    original_status = daemon._get_account_protection
+
+    def count_status(req: dict[str, object]) -> dict[str, object]:
+        nonlocal status_reads
+        status_reads += 1
+        return original_status(req)
+
+    daemon._get_account_protection = count_status  # type: ignore[method-assign]
+    socket_path = tmp_path / "daemon.sock"
+    _install_daemon_socket(monkeypatch, socket_path)
+    try:
+        async with await asyncio.start_unix_server(daemon.handle_client, path=socket_path):
+            status = await mcp_server.call_tool("get_sync_status", {"dialog_id": 123})
+            messages = await mcp_server.call_tool(
+                "list_messages",
+                {"exact_dialog_id": 123, "message_state": "sent", "since_utc": since, "until_utc": until},
+            )
+            search = await mcp_server.call_tool(
+                "search_messages", {"dialog": "123", "query": "needle", "since_utc": since, "until_utc": until}
+            )
+            extra = []
+            if not hold and event_at is None:
+                extra = [
+                    await mcp_server.call_tool("list_messages", {"exact_dialog_id": 123, "message_state": "all"}),
+                    await mcp_server.call_tool("search_messages", {"query": "needle"}),
+                ]
+    finally:
+        sync_conn.close()
+        feedback_conn.close()
+        await gate.close_rpc_scheduler()
+
+    assert status_reads == 3 + len(extra) and sender.calls == 0
+    for result in extra:
+        assert result.is_error is False
+        payload = cast(dict[str, object], result.structured_content)
+        summary = cast(str, cast(dict[str, object], payload["assessment"])["summary"])
+        assert "Aggregate coverage is unverified" in summary
+    expected_protection = "account_hold" if hold else "no_account_hold_observed"
+    for name, result in (("get_sync_status", status), ("list_messages", messages), ("search_messages", search)):
+        assert result.is_error is False and result.content == []
+        payload = cast(dict[str, object], result.structured_content)
+        assessment = cast(dict[str, object], payload["assessment"])
+        assert assessment["local_read"] == "completed_without_telegram"
+        assert assessment["background_acquisition"] == expected_protection
+        validate(payload, cast(dict[str, object], mcp_server.tool_by_name[name].output_schema))
+    status_payload = cast(dict[str, object], status.structured_content)
+    assert status_payload["history_complete_at"] == "2023-11-14T22:15:00+00:00"
+    summary = cast(str, cast(dict[str, object], status_payload["assessment"])["summary"])
+    assert ("event was observed after" in summary) is (event_at is not None)
+    if event_at is None:
+        assert "silence alone does not indicate a fault" in summary
+    for result, key in ((messages, "messages"), (search, "results")):
+        payload = cast(dict[str, object], result.structured_content)
+        assert bool(payload[key]) is expect_results
+        coverage = cast(dict[str, object], payload["coverage"])
+        read_summary = cast(str, cast(dict[str, object], payload["assessment"])["summary"])
+        if key == "messages":
+            assert coverage["interval_coverage"] == interval
+            assert ("extends beyond" in read_summary) is (interval == "beyond_horizon")
+        else:
+            assert "interval_coverage" not in coverage
+            assert "interval coverage is unknown" in read_summary
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", [False, True])
+async def test_assessment_reports_unavailable_protection_without_losing_local_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, malformed: bool
+) -> None:
+    monkeypatch.setattr(mcp_server, "_schedule_telemetry", lambda _event: None)
+    gate, sender, client = _protection_gate_client()
+    daemon, sync_conn, feedback_conn, _ = _local_daemon(tmp_path, client)
+    _seed_topic_dialog(sync_conn, 123, "Project", message="retained")
+    calls = 0
+
+    def unavailable(_req: dict[str, object]) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"ok": True, "data": {"account_protection": {"status": "active"}}} if malformed else {"ok": False}
+
+    daemon._get_account_protection = unavailable  # type: ignore[method-assign]
+    socket_path = tmp_path / "daemon.sock"
+    _install_daemon_socket(monkeypatch, socket_path)
+    try:
+        async with await asyncio.start_unix_server(daemon.handle_client, path=socket_path):
+            result = await mcp_server.call_tool("get_sync_status", {"dialog_id": 123})
+    finally:
+        sync_conn.close()
+        feedback_conn.close()
+        await gate.close_rpc_scheduler()
+    payload = cast(dict[str, object], result.structured_content)
+    assert result.is_error is False and payload["saved_message_count"] == 1
+    assert cast(dict[str, object], payload["assessment"])["background_acquisition"] == "unknown"
+    assert cast(dict[str, object], payload["account_protection"])["status"] == "unavailable"
+    assert calls == 1 and sender.calls == 0
+    validate(payload, cast(dict[str, object], mcp_server.tool_by_name["get_sync_status"].output_schema))
+
+
+def test_assessment_schema_only_on_three_registered_tools() -> None:
+    expected = {"get_sync_status", "list_messages", "search_messages"}
+    for name, tool in mcp_server.tool_by_name.items():
+        schema = cast(dict[str, object], tool.output_schema)
+        properties = cast(dict[str, object], schema["properties"])
+        assert ("assessment" in properties) is (name in expected)
+        if name in expected:
+            assessment = cast(dict[str, object], properties["assessment"])
+            assert assessment["required"] == ["local_read", "background_acquisition", "summary"]
+            assert assessment["additionalProperties"] is False
+            assert "assessment" not in cast(list[str], cast(dict[str, object], schema["else"])["required"])
 
 
 @pytest.mark.asyncio
@@ -620,6 +765,7 @@ async def test_registered_list_messages_unobserved_topic_catalog_is_explicit_und
     assert result.content
     payload = cast(dict[str, object], result.structured_content)
     error = cast(dict[str, object], payload["error"])
+    assert "assessment" not in payload
     details = cast(dict[str, object], error["details"])
     assert error["code"] == "topic_catalog_incomplete"
     assert "mark_dialog_for_sync" in cast(str, error["action"])

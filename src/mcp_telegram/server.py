@@ -49,6 +49,7 @@ from .correlation import correlation_context, current_correlation_ids
 from .daemon_client import AccountProtectionError, daemon_connection
 from .request_timing import standalone_operation_id
 from .runtime_logging import install_telethon_log_filter
+from .sync_assessment import ASSESSMENT_TOOLS, build_sync_assessment
 from .tools._base import ACTIVE_ACCOUNT_PROTECTION_SCHEMA, _send_telemetry_event, safe_error_code
 
 logger = logging.getLogger(__name__)
@@ -93,7 +94,7 @@ Workflows:
 - PERSON OR ENTITY: Use get_entity_info for a user, bot, group, supergroup, or channel profile. Read dialog_placement.folders to see folder membership for that entity.
 - FIND DIALOGS: Prefer a name, @username, or Telegram link when the caller has not already obtained an id from mcp-telegram. Use list_dialogs to discover exact ids before direct reads. Never treat identifiers from another API as mcp-telegram dialog ids.
 - TOPICS: Use list_topics for forum/topic-capable dialogs, then pass exact_topic_id to scoped reads when needed.
-- SYNC STATE: Use get_sync_status when a result looks stale, incomplete, or surprising. Full synced history means complete as of history_complete_at; ongoing freshness is local_knowledge_at.
+- SYNC STATE: Use get_sync_status when a result looks stale, incomplete, or surprising. history_complete_at is the recorded history/reconciliation boundary; local_knowledge_at is the latest local observation, not proof of ongoing freshness.
 - ENROLL SYNC: Use mark_dialog_for_sync to request authorized background history/topic sync; enabled personal-dialog sync also maintains counterpart profiles. Reads never enroll or fetch. This mutates local MCP sync scope, not Telegram.
 - ACCOUNT TRACE: Use trace_account_messages when you need observable messages authored by one account. Treat best_effort_visible as bounded visible sampling, not completeness.
 - FEEDBACK: Use submit_feedback when a tool response is wrong, confusing, or missing a useful capability.
@@ -392,11 +393,13 @@ def _account_protection_unavailable() -> dict[str, object]:
     }
 
 
-def _attach_account_protection(result: CallToolResult, status: dict[str, object]) -> CallToolResult:
+def _attach_account_protection(name: str, result: CallToolResult, status: dict[str, object]) -> CallToolResult:
     structured_content: dict[str, object] = {}
     result_content = t.cast(dict[str, object] | None, result.structured_content)
     if result_content is not None:
         structured_content.update(result_content)
+        if not result.is_error and name in ASSESSMENT_TOOLS:
+            structured_content["assessment"] = build_sync_assessment(name, result_content, status)
     structured_content.update(status)
     return CallToolResult(
         content=result.content,
@@ -720,7 +723,7 @@ async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:
                 except TimeoutError:
                     pass
             protection_elapsed = time.monotonic() - protection_started
-            final_result = _attach_account_protection(result, status)
+            final_result = _attach_account_protection(name, result, status)
             _log_tool_result(
                 name,
                 tools.ToolResult(

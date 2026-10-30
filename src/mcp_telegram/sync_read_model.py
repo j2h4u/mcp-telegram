@@ -312,7 +312,7 @@ _STATUS_PROFILES: Mapping[SyncStatus, _StatusProfile] = MappingProxyType(
             HistoryScope.FULL,
             HistoryDepthState.COMPLETE,
             HistorySyncState.COMPLETE_AS_OF_LAST_SYNC,
-            "Full history was fetched as of last_synced_at; ongoing freshness is represented by local_knowledge_at.",
+            "Completed history is recorded as of last_synced_at; local_knowledge_at is the latest local observation.",
         ),
         SyncStatus.SYNCING: _StatusProfile(
             HistoryScope.FULL,

@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..daemon_client import DaemonConnection, DaemonNotRunningError, daemon_connection
 from ..errors import action_text
+from ..sync_assessment import ASSESSMENT_SCHEMA, ASSESSMENT_TOOLS
 from ..temporal import (
     normalize_temporal_output_schema,
     project_temporal_response,
@@ -314,6 +315,9 @@ def _registered_output_schema(name: str, schema: dict[str, object] | None) -> di
                 properties[key] = deepcopy(original[key])
         if "$defs" in temporal:
             normalized["$defs"] = deepcopy(temporal["$defs"])
+    if name in ASSESSMENT_TOOLS and normalized is not None:
+        properties = t.cast(dict[str, object], normalized["properties"])
+        properties["assessment"] = deepcopy(ASSESSMENT_SCHEMA)
     return _protection_output_schema(normalized)
 
 
