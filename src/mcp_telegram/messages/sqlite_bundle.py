@@ -13,14 +13,25 @@ from mcp_telegram.delivered_update import current_delivered_update
 from .. import message_contracts as _message_contracts
 from ..alert_policy import incoming_human_dm_sql
 from ..fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
-from ..hydration_queue import HydrationPriority, HydrationQueueRepository
+from ..hydration_queue import (
+    HYDRATION_QUEUE_TABLE,
+    MEDIA_METADATA_KIND,
+    TRANSCRIPTION_HYDRATION_KIND,
+    HydrationPriority,
+    HydrationQueueRepository,
+)
 from ..image_authorization import invalidate_message_source, invalidate_nonchannel_sources
 from ..media_fact import decode_media_fact, is_transcribable_telegram_media
 from ..observation_order import allocate_observation_order
 from ..own_only_contracts import CHANNEL_PEER_ID_OFFSET, is_channel_peer_id
 from ..reactions.contracts import ReactionAggregate, ReactionAggregateSource
 from ..reactions.persistence import replace_reaction_aggregates
-from .sqlite_hydration_jobs import _FACT_HYDRATION_EMPTY_KINDS, _is_canonical_media_pair, reconcile_fact_hydration_job
+from .sqlite_hydration_jobs import (
+    _FACT_HYDRATION_EMPTY_KINDS,
+    HydrationJobEvidence,
+    _is_canonical_media_pair,
+    reconcile_fact_hydration_job,
+)
 
 
 def _insert_sql(table: str, dataclass_type: type) -> str:
@@ -40,9 +51,6 @@ _SELECT_MESSAGE_OUT_SQL = "SELECT out FROM messages WHERE dialog_id = ? AND mess
 _NEXT_VERSION_SQL = "SELECT COALESCE(MAX(version), 0) + 1 FROM message_versions WHERE dialog_id = ? AND message_id = ?"
 _INSERT_VERSION_SQL = "INSERT INTO message_versions (dialog_id, message_id, version, old_text, edit_date, origin) VALUES (?, ?, ?, ?, ?, ?)"
 _UPDATE_MESSAGE_TEXT_SQL = "UPDATE messages SET text = ? WHERE dialog_id = ? AND message_id = ?"
-_SELECT_MESSAGE_TRANSCRIPTION_SQL = (
-    "SELECT text, transcription_id FROM message_transcriptions WHERE dialog_id = ? AND message_id = ?"
-)
 _MARK_DELETED_SQL = (
     "UPDATE messages SET is_deleted = 1, deleted_at = ? WHERE dialog_id = ? AND message_id = ? AND is_deleted = 0"
 )
@@ -74,6 +82,84 @@ class MessageTextLookup:
 class MessageOutLookup:
     found: bool
     outgoing: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _StoredPageFact:
+    exists: bool
+    text: str | None
+    indexed_text: str | None
+    index_matches_key: bool
+    transcription: tuple[str, int] | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PageEvidence:
+    facts: dict[tuple[int, int], _StoredPageFact]
+    jobs: dict[tuple[int, int], frozenset[str]]
+    queue: HydrationQueueRepository | None
+
+
+def _page_facts(conn: sqlite3.Connection, extracted: Sequence[_message_contracts.ExtractedMessage]) -> _PageEvidence:
+    """Read current text, index, transcription and queue keys in bounded pages."""
+    facts: dict[tuple[int, int], _StoredPageFact] = {}
+    jobs: dict[tuple[int, int], frozenset[str]] = {}
+    queue = HydrationQueueRepository(conn)
+    queue_available = queue.is_available()
+    keys = [(item.message.dialog_id, item.message.message_id) for item in extracted]
+    for offset in range(0, len(keys), 400):
+        batch = keys[offset : offset + 400]
+        values = ",".join("(?,?)" for _ in batch)
+        params = tuple(value for key in batch for value in key)
+        prefix = f"WITH wanted(dialog_id,message_id) AS (VALUES {values}) "
+        facts.update(_read_stored_page(conn, prefix, params))
+        if queue_available:
+            jobs.update(_read_page_jobs(conn, prefix, params))
+    return _PageEvidence(facts, jobs, queue if queue_available else None)
+
+
+def _read_stored_page(
+    conn: sqlite3.Connection, prefix: str, params: tuple[int, ...]
+) -> dict[tuple[int, int], _StoredPageFact]:
+    rows = cast(
+        list[tuple[int, int, int | None, str | None, str | None, int | None, int | None, str | None, int | None]],
+        conn.execute(
+            prefix + "SELECT w.dialog_id,w.message_id,m.message_id,m.text,f.stemmed_text,"
+            "f.dialog_id,f.message_id,t.text,t.transcription_id "
+            "FROM wanted w LEFT JOIN messages m USING(dialog_id,message_id) "
+            "LEFT JOIN message_fts_keys k ON k.dialog_id=w.dialog_id AND k.message_id=w.message_id "
+            "LEFT JOIN messages_fts f ON f.rowid=k.id "
+            "LEFT JOIN message_transcriptions t ON t.dialog_id=w.dialog_id AND t.message_id=w.message_id",
+            params,
+        ).fetchall(),
+    )
+    return {
+        (dialog_id, message_id): _StoredPageFact(
+            present is not None,
+            text,
+            indexed,
+            (fts_dialog, fts_message) == (dialog_id, message_id),
+            None if transcript_id is None else (cast(str, transcript), transcript_id),
+        )
+        for dialog_id, message_id, present, text, indexed, fts_dialog, fts_message, transcript, transcript_id in rows
+    }
+
+
+def _read_page_jobs(
+    conn: sqlite3.Connection, prefix: str, params: tuple[int, ...]
+) -> dict[tuple[int, int], frozenset[str]]:
+    rows = cast(
+        list[tuple[int, int, str]],
+        conn.execute(
+            prefix + f"SELECT q.dialog_id,q.message_id,q.kind FROM wanted w CROSS JOIN {HYDRATION_QUEUE_TABLE} q "
+            "ON q.dialog_id=w.dialog_id AND q.message_id=w.message_id WHERE q.kind IN (?,?)",
+            (*params, MEDIA_METADATA_KIND, TRANSCRIPTION_HYDRATION_KIND),
+        ).fetchall(),
+    )
+    jobs: dict[tuple[int, int], set[str]] = {}
+    for dialog_id, message_id, kind in rows:
+        jobs.setdefault((dialog_id, message_id), set()).add(kind)
+    return {key: frozenset(kinds) for key, kinds in jobs.items()}
 
 
 def message_exists(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
@@ -317,6 +403,9 @@ def insert_messages_with_fts(
 ) -> int:
     """Persist accepted bundles and return their unique key count."""
     accepted = _accepted_message_bundles(conn, extracted, reaction_source)
+    if not accepted:
+        return 0
+    evidence = _page_facts(conn, accepted)
     for item in accepted:
         invalidate_message_source(conn, item.message.dialog_id, item.message.message_id)
     fallback_sequence = (
@@ -340,8 +429,10 @@ def insert_messages_with_fts(
                 int(item.private_photo_eligible),
             ),
         )
-    projected = _overlay_message_transcriptions(conn, _preserve_transcribed_texts(conn, accepted))
-    _write_message_rows_and_fts(conn, projected, priority=priority)
+    projected = _overlay_message_transcriptions(
+        conn, _preserve_transcribed_texts(accepted, evidence.facts), evidence.facts
+    )
+    _write_message_rows_and_fts(conn, projected, evidence, priority=priority)
     _delete_entity_and_forward_projections(conn, projected)
     _replace_reaction_projections(conn, projected, source=reaction_source, observed_at=reaction_observed_at)
     _insert_entity_and_forward_projections(conn, projected)
@@ -351,6 +442,7 @@ def insert_messages_with_fts(
 def _write_message_rows_and_fts(
     conn: sqlite3.Connection,
     extracted: Sequence[_message_contracts.ExtractedMessage],
+    evidence: _PageEvidence,
     *,
     priority: HydrationPriority = HydrationPriority.BACKFILL,
 ) -> None:
@@ -358,21 +450,44 @@ def _write_message_rows_and_fts(
     conn.executemany(
         _INSERT_MESSAGE_SQL, [{**asdict(item.message), "reply_count": item.reply_count} for item in extracted]
     )
-    conn.executemany(DELETE_FTS_SQL, ((item.dialog_id, item.message_id) for item in messages))
-    conn.executemany(INSERT_FTS_SQL, ((item.dialog_id, item.message_id, stem_text(item.text)) for item in messages))
+    changed = []
     for message in messages:
-        reconcile_fact_hydration_job(conn, message, due_at=int(time.time()), priority=priority)
+        key = (message.dialog_id, message.message_id)
+        fact = evidence.facts[key]
+        stemmed = stem_text(message.text)
+        if _fts_refresh_needed(fact, message.text, stemmed):
+            changed.append((*key, stemmed))
+    conn.executemany(DELETE_FTS_SQL, ((dialog, message) for dialog, message, _ in changed))
+    conn.executemany(INSERT_FTS_SQL, changed)
+    if evidence.queue is not None:
+        now = int(time.time())
+        for message in messages:
+            key = (message.dialog_id, message.message_id)
+            reconcile_fact_hydration_job(
+                conn,
+                message,
+                due_at=now,
+                priority=priority,
+                evidence=HydrationJobEvidence(
+                    evidence.queue, evidence.jobs.get(key, frozenset()), evidence.facts[key].transcription is not None
+                ),
+            )
+
+
+def _fts_refresh_needed(fact: _StoredPageFact, text: str | None, stemmed: str) -> bool:
+    return not fact.exists or fact.text != text or not fact.index_matches_key or fact.indexed_text != stemmed
 
 
 def _overlay_message_transcriptions(
-    conn: sqlite3.Connection, extracted: Sequence[_message_contracts.ExtractedMessage]
+    conn: sqlite3.Connection,
+    extracted: Sequence[_message_contracts.ExtractedMessage],
+    facts: dict[tuple[int, int], _StoredPageFact],
 ) -> list[_message_contracts.ExtractedMessage]:
     projected: list[_message_contracts.ExtractedMessage] = []
     for item in extracted:
         dialog_id, message_id = item.message.dialog_id, item.message.message_id
-        row = cast(
-            tuple[str, int] | None, conn.execute(_SELECT_MESSAGE_TRANSCRIPTION_SQL, (dialog_id, message_id)).fetchone()
-        )
+        key = (dialog_id, message_id)
+        row = facts[key].transcription
         if row is None:
             projected.append(item)
             continue
@@ -382,10 +497,13 @@ def _overlay_message_transcriptions(
         ) and is_transcribable_telegram_media(fact):
             projected.append(replace(item, message=replace(item.message, text=row[0])))
             continue
-        if _is_canonical_media_pair(item.message.media_kind, item.message.media_payload, fact=fact):
+        if (item.message.media_kind, item.message.media_payload) == (None, None) or _is_canonical_media_pair(
+            item.message.media_kind, item.message.media_payload, fact=fact
+        ):
             conn.execute(
                 "DELETE FROM message_transcriptions WHERE dialog_id = ? AND message_id = ?", (dialog_id, message_id)
             )
+            facts[key] = replace(facts[key], transcription=None)
         projected.append(item)
     return projected
 
@@ -437,7 +555,7 @@ def _insert_entity_and_forward_projections(
 
 
 def _preserve_transcribed_texts(
-    conn: sqlite3.Connection, extracted: Sequence[_message_contracts.ExtractedMessage]
+    extracted: Sequence[_message_contracts.ExtractedMessage], facts: dict[tuple[int, int], _StoredPageFact]
 ) -> list[_message_contracts.ExtractedMessage]:
     preserved_texts: dict[tuple[int, int], str] = {}
     for item in extracted:
@@ -445,12 +563,10 @@ def _preserve_transcribed_texts(
             continue
         if item.message.media_kind not in _FACT_HYDRATION_EMPTY_KINDS and item.message.media_kind != "voice":
             continue
-        row = cast(
-            tuple[str | None] | None,
-            conn.execute(_SELECT_MESSAGE_TEXT_SQL, (item.message.dialog_id, item.message.message_id)).fetchone(),
-        )
-        if row is not None and row[0]:
-            preserved_texts[(item.message.dialog_id, item.message.message_id)] = row[0]
+        key = (item.message.dialog_id, item.message.message_id)
+        text = facts[key].text
+        if text:
+            preserved_texts[key] = text
     if not preserved_texts:
         return list(extracted)
     return [

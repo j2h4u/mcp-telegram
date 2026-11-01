@@ -57,6 +57,15 @@ class TranscriptionHydrationRepair:
 
 
 @dataclass(frozen=True, slots=True)
+class HydrationJobEvidence:
+    """Queue and transcription facts captured for one message in this transaction."""
+
+    queue: HydrationQueueRepository
+    existing_kinds: frozenset[str] | None = None
+    transcription_exists: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class MediaMetadataHydrationRepair:
     """Bounded result of repairing missing media metadata jobs."""
 
@@ -272,17 +281,31 @@ def reconcile_fact_hydration_job(
     *,
     due_at: int,
     priority: HydrationPriority = HydrationPriority.FOREGROUND,
+    evidence: HydrationJobEvidence | None = None,
 ) -> None:
     """Reconcile one persisted message and its queue row in caller's transaction."""
-    queue = HydrationQueueRepository(conn)
-    if not queue.is_available():
-        return
-    _reconcile_media_hydration_job(conn, queue, message, due_at=due_at)
-    _reconcile_transcription_hydration_job(conn, queue, message, due_at=due_at, priority=priority)
+    if evidence is None:
+        queue = HydrationQueueRepository(conn)
+        if not queue.is_available():
+            return
+        evidence = HydrationJobEvidence(queue)
+    _reconcile_media_hydration_job(conn, evidence.queue, message, due_at=due_at, existing_kinds=evidence.existing_kinds)
+    _reconcile_transcription_hydration_job(
+        conn,
+        message,
+        due_at=due_at,
+        priority=priority,
+        evidence=evidence,
+    )
 
 
 def _reconcile_media_hydration_job(
-    conn: sqlite3.Connection, queue: HydrationQueueRepository, message: _message_contracts.StoredMessage, *, due_at: int
+    conn: sqlite3.Connection,
+    queue: HydrationQueueRepository,
+    message: _message_contracts.StoredMessage,
+    *,
+    due_at: int,
+    existing_kinds: frozenset[str] | None,
 ) -> None:
     job = HydrationJob(
         MEDIA_METADATA_KIND,
@@ -296,40 +319,41 @@ def _reconcile_media_hydration_job(
     unresolved = message.media_kind in _FACT_HYDRATION_EMPTY_KINDS and message.media_payload == _EMPTY_MEDIA_PAYLOAD
     if unresolved and media_fact_hydration_eligible(conn, message.dialog_id, message.message_id):
         queue.enqueue(job)
-    elif unresolved:
+    elif unresolved and (existing_kinds is None or MEDIA_METADATA_KIND in existing_kinds):
         queue.remove_active(job)
-    else:
+    elif not unresolved and (existing_kinds is None or MEDIA_METADATA_KIND in existing_kinds):
         queue.remove(job)
 
 
 def _reconcile_transcription_hydration_job(
     conn: sqlite3.Connection,
-    queue: HydrationQueueRepository,
     message: _message_contracts.StoredMessage,
     *,
     due_at: int,
     priority: HydrationPriority,
+    evidence: HydrationJobEvidence,
 ) -> None:
+    queue = evidence.queue
+    existing_kinds = evidence.existing_kinds
+    transcription_exists = evidence.transcription_exists
     job = HydrationJob(
         TRANSCRIPTION_HYDRATION_KIND, message.dialog_id, message.message_id, due_at, 0, message.sent_at, priority
     )
-    transcription_row = cast(
-        tuple[int] | None,
-        conn.execute(
-            "SELECT 1 FROM message_transcriptions WHERE dialog_id = ? AND message_id = ?",
-            (message.dialog_id, message.message_id),
-        ).fetchone(),
-    )
+    if transcription_exists is None:
+        transcription_exists = (
+            conn.execute(
+                "SELECT 1 FROM message_transcriptions WHERE dialog_id = ? AND message_id = ?",
+                (message.dialog_id, message.message_id),
+            ).fetchone()
+            is not None
+        )
     transcribable = _is_transcribable_media_pair(message.media_kind, message.media_payload)
-    if (
-        transcribable
-        and transcription_row is None
-        and transcription_hydration_eligible(conn, message.dialog_id, message.message_id)
-    ):
-        queue.enqueue(job)
-    elif transcribable and transcription_row is None:
-        queue.remove_active(job)
-    else:
+    if transcribable and not transcription_exists:
+        if transcription_hydration_eligible(conn, message.dialog_id, message.message_id):
+            queue.enqueue(job)
+        elif existing_kinds is None or TRANSCRIPTION_HYDRATION_KIND in existing_kinds:
+            queue.remove_active(job)
+    elif existing_kinds is None or TRANSCRIPTION_HYDRATION_KIND in existing_kinds:
         queue.remove(job)
 
 

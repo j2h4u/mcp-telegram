@@ -904,6 +904,94 @@ async def test_missing_channel_entities_fails_closed_and_min_hash_never_replaces
         await writer.aclose()
 
 
+async def test_channel_checkpoint_batch_checks_real_session_and_survives_reopen(tmp_path: Path) -> None:
+    writer = await SQLiteWriter.open(_database(tmp_path))
+    client = _client(tmp_path / "session", writer)
+    session = cast(SQLiteSession, client.session)
+    try:
+        await client.start_update_delivery(99)
+        snapshot = client._capture_delivery_snapshot([])
+        ids = range(1000, 1275)
+        snapshot = snapshot.model_copy(
+            update={"channels": dict.fromkeys(ids, 20), "channel_hashes": {i: i + 1 for i in ids}}
+        )
+        client._ensure_delivery_channel_entities(snapshot)
+        session.save()
+        statements: list[str] = []
+        assert session._conn is not None
+        session._conn.set_trace_callback(statements.append)
+        client._ensure_delivery_channel_entities(snapshot)
+        assert len([sql for sql in statements if sql.lstrip().upper().startswith("SELECT")]) == 1
+        session._conn.set_trace_callback(None)
+
+        changed = snapshot.model_copy(update={"channel_hashes": {**snapshot.channel_hashes, 1000: 9876}})
+        client._ensure_delivery_channel_entities(changed)
+        session.save()
+        session.close()
+        reopened = SQLiteSession(session.filename)
+        try:
+            peer = reopened.get_input_entity(types.PeerChannel(1000))
+            assert isinstance(peer, types.InputPeerChannel) and peer.access_hash == 9876
+        finally:
+            reopened.close()
+        missing = snapshot.model_copy(update={"channels": {9999: 20}, "channel_hashes": {}})
+        with pytest.raises(ValueError, match="Could not find"):
+            client._ensure_delivery_channel_entities(missing)
+    finally:
+        session.close()
+        await writer.aclose()
+
+
+async def test_empty_delivery_saves_session_before_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    writer = await SQLiteWriter.open(_database(tmp_path))
+    client = _client(tmp_path / "session", writer)
+    session = cast(SQLiteSession, client.session)
+    try:
+        await client.start_update_delivery(99)
+        repository = client._delivery_repository
+        assert repository is not None
+        saved: list[str] = []
+        original_save = session.save
+        original_complete = repository.complete
+
+        def save() -> None:
+            saved.append("session")
+            original_save()
+
+        async def complete(snapshot: str) -> None:
+            assert saved == ["session"]
+            await original_complete(snapshot)
+
+        monkeypatch.setattr(session, "save", save)
+        monkeypatch.setattr(repository, "complete", complete)
+        await client._preprocess_updates([], [], [])
+        assert saved == ["session"]
+    finally:
+        session.close()
+        await writer.aclose()
+
+
+async def test_session_save_failure_keeps_delivery_pending(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = _database(tmp_path)
+    writer = await SQLiteWriter.open(path)
+    client = _client(tmp_path / "session", writer)
+    session = cast(SQLiteSession, client.session)
+    try:
+        await client.start_update_delivery(99)
+
+        def fail_save() -> None:
+            raise OSError("session save failed")
+
+        monkeypatch.setattr(session, "save", fail_save)
+        with pytest.raises(OSError, match="session save failed"):
+            await client._preprocess_updates([], [], [])
+        assert _pending(path) is not None
+        assert client._delivery_failure.is_set()
+    finally:
+        session.close()
+        await writer.aclose()
+
+
 async def test_daemon_shutdown_closes_delivery_before_unregister_and_background_await(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

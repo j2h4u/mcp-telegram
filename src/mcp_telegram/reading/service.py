@@ -92,6 +92,7 @@ from .sqlite_projection import (
     read_context_anchor,
     read_daemon_state_int,
     read_daemon_state_value,
+    read_states_for_dialogs,
 )
 
 # These thresholds are part of reading's local fuzzy dialog projection.  They
@@ -782,16 +783,13 @@ class ReadingService:
             return project_cached_message_facts_by_dialog(self._conn, messages)
 
     def _read_state_per_dialog(self, messages: list[ReadMessage]) -> dict[int, ReadState]:
-        read_state_per_dialog: dict[int, ReadState] = {}
         with timing_phase("local_projection"):
             dialog_ids = {m.dialog_id for m in messages if m.dialog_id}
             identities = read_dialog_identities(self._conn, dialog_ids)
-            for dialog_id in dialog_ids:
-                dialog_type = identities[dialog_id].dialog_type.value
-                read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
-                if read_state is not None:
-                    read_state_per_dialog[dialog_id] = read_state
-        return read_state_per_dialog
+            return read_states_for_dialogs(
+                self._conn,
+                [dialog_id for dialog_id in dialog_ids if identities[dialog_id].dialog_type is DialogType.USER],
+            )
 
     async def _list_messages_context_result(
         self,
@@ -3825,29 +3823,20 @@ class ReadingService:
         """Return dialog list from the local dialogs snapshot (pure SQL)."""
         if self._is_dialogs_page(req):
             return self._list_dialogs_page_transaction(conn, req)
+        with read_snapshot(conn):
+            result = self._list_legacy_dialogs(conn, req)
+            if result.get("ok"):
+                self._decorate_legacy_dialogs(conn, req, result["data"])
+            return result
+
+    def _list_legacy_dialogs(self, conn: sqlite3.Connection, req: dict) -> dict:
         directory_coverage = read_dialog_directory_coverage(conn).to_wire()
         request = self._parse_list_dialogs_request(req)
         request_error = self._list_dialogs_request_error(request)
         if request_error is not None:
             return request_error
         dialog_filter = self._prepare_list_dialogs_filter(request.filter_raw)
-        coverage_result = self._scheduled_account_coverage(conn)
-        if isinstance(coverage_result, dict):
-            scheduled_summary: dict[int, tuple[int, int | None, int]] = {}
-            scheduled_coverage = {
-                "state": "unknown",
-                "account_id": self._deps.self_id,
-                "directory_generation": directory_coverage.get("publication_generation"),
-                "reason": coverage_result.get("error"),
-                "directory_coverage": directory_coverage,
-            }
-        else:
-            _, scheduled_coverage = coverage_result
-            scheduled_summary = (
-                {}
-                if scheduled_coverage.get("state") == "unknown"
-                else scheduled_summary_by_dialog(conn, scheduled_now=int(time.time()))
-            )
+        scheduled_summary, scheduled_coverage = self._legacy_scheduled_coverage(conn, directory_coverage)
         own_basis: dict[int, tuple[str, ...]] = self._own_only_basis_by_dialog(conn)
         sql_rows = self._fetch_list_dialog_rows(conn, request, dialog_filter)
         if not sql_rows:
@@ -3867,6 +3856,7 @@ class ReadingService:
             own_basis,
             identities,
             conn,
+            {},
         )
         if not selected_rows:
             return self._empty_list_dialogs_response(
@@ -3875,4 +3865,82 @@ class ReadingService:
                 scheduled_coverage,
                 bootstrap_pending=False,
             )
-        return self._project_list_dialog_rows(conn, selected_rows, request, directory_coverage, scheduled_coverage)
+        return self._project_legacy_dialog_page(
+            conn, req, request, selected_rows, directory_coverage, scheduled_coverage
+        )
+
+    def _legacy_scheduled_coverage(self, conn: sqlite3.Connection, directory_coverage: dict) -> tuple[dict, dict]:
+        coverage_result = self._scheduled_account_coverage(conn)
+        if isinstance(coverage_result, dict):
+            return {}, {
+                "state": "unknown",
+                "account_id": self._deps.self_id,
+                "directory_generation": directory_coverage.get("publication_generation"),
+                "reason": coverage_result.get("error"),
+                "directory_coverage": directory_coverage,
+            }
+        _, scheduled_coverage = coverage_result
+        summary = (
+            {}
+            if scheduled_coverage.get("state") == "unknown"
+            else scheduled_summary_by_dialog(conn, scheduled_now=int(time.time()))
+        )
+        return summary, scheduled_coverage
+
+    def _project_legacy_dialog_page(  # noqa: PLR0913, PLR0917 - explicit read-model inputs
+        self,
+        conn: sqlite3.Connection,
+        req: dict,
+        request: _ListDialogsRequest,
+        selected_rows: list,
+        directory_coverage: dict,
+        scheduled_coverage: dict,
+    ) -> dict:
+        snapshot_times = [
+            value
+            for row, _, _ in selected_rows
+            if (value := _object_to_int_or_none(row.get("snapshot_at"))) is not None
+        ]
+        selected_rows = self._select_legacy_folder_page(conn, req, selected_rows)
+        ids = [_object_to_int(row["dialog_id"]) for row, _, _ in selected_rows]
+        account = self._deps.self_id
+        coverages = self._directory_scheduled_coverages(conn, ids, account if type(account) is int else 0)
+        selected_rows = [
+            ({**row, "scheduled_coverage": coverages[dialog_id]}, summary, basis)
+            for row, summary, basis in selected_rows
+            for dialog_id in [_object_to_int(row["dialog_id"])]
+        ]
+        result = self._project_list_dialog_rows(conn, selected_rows, request, directory_coverage, scheduled_coverage)
+        result["data"]["snapshot_age_h"] = _compute_snapshot_age_h(max(snapshot_times) if snapshot_times else None)
+        return result
+
+    def _select_legacy_folder_page(self, conn: sqlite3.Connection, req: dict, selected: list) -> list:
+        folder = req.get("folder_id")
+        folder_id = None if folder is None else int(folder)
+        ids = [_object_to_int(row["dialog_id"]) for row, _, _ in selected]
+        folders = folders_by_dialog(conn, ids) if folder_id not in (None, 1) else {}
+        archived = self._directory_archived_facts(conn, ids) if folder_id == 1 else {}
+        selected = [
+            item
+            for item in selected
+            if self._directory_folder_matches(
+                {"folder_id": folder_id}, _object_to_int(item[0]["dialog_id"]), folders, archived
+            )
+        ]
+        raw_limit = req.get("limit")
+        return selected if raw_limit is None else selected[: _clamp(_coerce_int(raw_limit, 100), 1, 500)]
+
+    def _decorate_legacy_dialogs(self, conn: sqlite3.Connection, req: dict, data: dict) -> None:
+        folder = req.get("folder_id")
+        folder_id = None if folder is None else int(folder)
+        ids = [dialog["id"] for dialog in data["dialogs"]]
+        folders = folders_by_dialog(conn, ids) if folder_id != 1 else {}
+        for dialog in data["dialogs"]:
+            placements = [{"id": 1, "title": "Archived"}] if folder_id == 1 else folders.get(dialog["id"], [])
+            dialog["folder_ids"] = [item["id"] for item in placements]
+            dialog["folders"] = placements
+            dialog["is_self"] = dialog["id"] == self._deps.self_id
+        data["folder_snapshot"] = folder_snapshot(
+            conn, stale_after_seconds=req.get("folder_snapshot_stale_after_seconds", 900)
+        )
+        data["folder_membership_unknown_count"] = self._directory_folder_unknown_count(conn, folder_id)

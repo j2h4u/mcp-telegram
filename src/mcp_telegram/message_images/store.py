@@ -40,6 +40,16 @@ def _is_unpublished_artifact(path: Path, referenced: frozenset[str]) -> bool:
     )
 
 
+def retire_image(directory: Path, account_id: int, filename: str) -> None:
+    """Remove one unreferenced owned artifact after publication commits."""
+    account_dir = directory / str(account_id)
+    if directory.is_symlink() or account_dir.is_symlink() or Path(filename).name != filename:
+        return
+    path = account_dir / filename
+    if path.suffix == ".jpg" and _is_unpublished_artifact(path, frozenset()):
+        path.unlink(missing_ok=True)
+
+
 def _fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:

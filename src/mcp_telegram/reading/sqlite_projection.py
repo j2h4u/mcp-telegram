@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import time
@@ -709,6 +710,10 @@ def _read_state_for_dialog(conn: sqlite3.Connection, dialog_id: int, dialog_type
         tuple[object, object, object, object, object, object] | None,
         conn.execute(_READ_STATE_SQL, {"dialog_id": dialog_id}).fetchone(),
     )
+    return _read_state_from_row(row)
+
+
+def _read_state_from_row(row: tuple[object, object, object, object, object, object] | None) -> ReadState:
     values = _read_state_values(row)
     rs: ReadState = {
         "inbox_unread_count": values.inbox_count,
@@ -718,6 +723,28 @@ def _read_state_for_dialog(conn: sqlite3.Connection, dialog_id: int, dialog_type
     }
     _add_read_state_positions(rs, values)
     return rs
+
+
+def read_states_for_dialogs(conn: sqlite3.Connection, dialog_ids: list[int]) -> dict[int, ReadState]:
+    """Compute direct-message states in one query for the selected dialogs."""
+    if not dialog_ids:
+        return {}
+    rows = cast(
+        list[tuple[int, object, object, object, object, object, object]],
+        conn.execute(
+            "WITH ids AS MATERIALIZED (SELECT CAST(value AS INTEGER) AS id FROM json_each(?)) "
+            "SELECT ids.id,sd.read_inbox_max_id,sd.read_outbox_max_id, "
+            "SUM(CASE WHEN m.out=0 AND m.message_id>COALESCE(sd.read_inbox_max_id,-1) THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN m.out=1 AND m.message_id>COALESCE(sd.read_outbox_max_id,-1) THEN 1 ELSE 0 END), "
+            "MIN(CASE WHEN m.out=0 AND m.message_id>COALESCE(sd.read_inbox_max_id,-1) THEN m.sent_at END), "
+            "MIN(CASE WHEN m.out=1 AND m.message_id>COALESCE(sd.read_outbox_max_id,-1) THEN m.sent_at END) "
+            "FROM ids LEFT JOIN synced_dialogs sd ON sd.dialog_id=ids.id "
+            "LEFT JOIN messages m ON m.dialog_id=ids.id AND m.is_deleted=0 AND m.is_service=0 "
+            "GROUP BY ids.id",
+            (json.dumps(dialog_ids),),
+        ).fetchall(),
+    )
+    return {int(row[0]): _read_state_from_row((row[1], row[2], row[3], row[4], row[5], row[6])) for row in rows}
 
 
 def _read_state_values(

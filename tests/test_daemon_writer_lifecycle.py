@@ -7,6 +7,7 @@ from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -79,7 +80,7 @@ async def test_shutdown_preserves_finalizer_commit_loss_boundary_and_final_marke
         SimpleNamespace(
             conn=reader,
             writer=writer,
-            feedback_conn=feedback_conn,
+            feedback_owner=SimpleNamespace(aclose=AsyncMock()),
             shutdown_event=asyncio.Event(),
             client=Client(),
             api_server=Api(),
@@ -127,3 +128,40 @@ async def test_shutdown_preserves_finalizer_commit_loss_boundary_and_final_marke
         await writer.aclose()
         reader.close()
         feedback_conn.close()
+
+
+async def test_cancelled_feedback_close_still_releases_sync_resources() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def close_feedback() -> None:
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+            raise
+
+    writer_close = AsyncMock()
+    writer = SimpleNamespace(run=AsyncMock(), aclose=writer_close)
+    reader = SimpleNamespace(close=AsyncMock())
+    lease_closed = []
+    lease = SimpleNamespace(close=lambda: lease_closed.append(True))
+    ctx = cast(
+        daemon._SyncMainContext,
+        SimpleNamespace(
+            feedback_owner=SimpleNamespace(aclose=close_feedback), writer=writer, conn=reader, session_lease=lease
+        ),
+    )
+    # A real sqlite connection has a synchronous close.
+    reader.close = lambda: lease_closed.append("reader")
+    task = asyncio.create_task(
+        daemon._run_shutdown_stage("runtime_connections", lambda: daemon._close_runtime_connections(ctx), None)
+    )
+    await entered.wait()
+    task.cancel()
+    release.set()
+    assert isinstance(await task, asyncio.CancelledError)
+    writer_close.assert_awaited_once()
+    assert lease_closed == ["reader", True]
+    assert ctx.session_lease is None

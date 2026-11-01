@@ -63,17 +63,23 @@ class CollectionProgress:
 
 
 def collection_progress(
-    page: ProfileCollectionPage, state: dict[str, object], summary: dict[str, object], previous: object
+    conn: sqlite3.Connection,
+    page: ProfileCollectionPage,
+    state: dict[str, object],
+    summary: dict[str, object],
+    previous: object,
 ) -> CollectionProgress:
     legacy = _retained_legacy_evidence(state)
     summary.update(legacy)
     first_count = state.get("first_count", page.reported_count)
     summary["changed_during_scan"] = bool(state.get("changed_count")) or first_count != page.reported_count
     summary["diagnostics"] = tuple(cast(list[str], state.get("diagnostics", []))) + page.diagnostics
-    seen = cast(list[str], state.get("seen", []))
     request_key = encode(state.get("request", {}))
-    stalled = page.next_cursor is not None and encode(page.next_cursor) in [*seen, request_key]
+    seen = cast(list[str], state.get("seen", []))
+    stalled = _cursor_stalled(page.next_cursor, seen, request_key)
     complete = _collection_complete(page, summary, stalled)
+    if complete:
+        summary.update(_collection_digests(conn, page, summary))
     baseline = _published_baseline(state, previous)
     _page_summary(page, state, summary, complete, baseline)
     if complete or page.reason:
@@ -109,6 +115,10 @@ def collection_progress(
 
 def _retained_legacy_evidence(state: Mapping[str, object]) -> dict[str, object]:
     return {"legacy_evidence": state["legacy_evidence"]} if "legacy_evidence" in state else {}
+
+
+def _cursor_stalled(next_cursor: Mapping[str, object] | None, seen: list[str], request_key: str) -> bool:
+    return next_cursor is not None and encode(next_cursor) in [*seen, request_key]
 
 
 def _collection_complete(page: ProfileCollectionPage, summary: Mapping[str, object], stalled: bool) -> bool:
@@ -670,24 +680,39 @@ def _has_later_delivered_leaf(paths: Mapping[str, object], order: int) -> bool:
 def _collection_summary(
     conn: sqlite3.Connection, page: ProfileCollectionPage, owner: int, generation: int, scan: int
 ) -> dict[str, object]:
-    rows = conn.execute(
-        "SELECT m.item_key,m.identity_kind,m.detail_complete,f.fields_json FROM entity_profile_collection_membership m "
+    row = conn.execute(
+        "SELECT COUNT(*),COALESCE(SUM(m.identity_kind='remote'),0),"
+        "COALESCE(MIN(m.detail_complete),1) FROM entity_profile_collection_membership m "
         "JOIN entity_profile_collection_facts f USING(owner_account_id,entity_id,section,item_key) "
-        "WHERE m.owner_account_id=? AND m.entity_id=? AND m.section=? AND m.generation=? AND m.scan=? ORDER BY m.item_key",
+        "WHERE m.owner_account_id=? AND m.entity_id=? AND m.section=? AND m.generation=? AND m.scan=?",
         (owner, page.entity_id, page.section, generation, scan),
-    ).fetchall()
-    digest = hashlib.sha256(encode([(r[0], r[3]) for r in rows]).encode()).hexdigest()
+    ).fetchone()
+    assert row is not None
+    count, unique_count, details_complete = row
     return {
         "owner_account_id": owner,
         "reported_count": page.reported_count,
-        "retained_count": len(rows),
-        "retained_unique_count": sum(r[1] == "remote" for r in rows),
-        "details_complete": all(r[2] for r in rows),
-        "membership_digest": hashlib.sha256(encode([r[0] for r in rows]).encode()).hexdigest(),
-        "content_digest": digest,
-        "identifiable": all(r[1] == "remote" for r in rows),
+        "retained_count": count,
+        "retained_unique_count": unique_count,
+        "details_complete": bool(details_complete),
+        "identifiable": unique_count == count,
         "generation": generation,
         "scan": scan,
+    }
+
+
+def _collection_digests(
+    conn: sqlite3.Connection, page: ProfileCollectionPage, summary: Mapping[str, object]
+) -> dict[str, str]:
+    rows = conn.execute(
+        "SELECT m.item_key,f.fields_json FROM entity_profile_collection_membership m "
+        "JOIN entity_profile_collection_facts f USING(owner_account_id,entity_id,section,item_key) "
+        "WHERE m.owner_account_id=? AND m.entity_id=? AND m.section=? AND m.generation=? AND m.scan=? ORDER BY m.item_key",
+        (summary["owner_account_id"], page.entity_id, page.section, summary["generation"], summary["scan"]),
+    ).fetchall()
+    return {
+        "membership_digest": hashlib.sha256(encode([r[0] for r in rows]).encode()).hexdigest(),
+        "content_digest": hashlib.sha256(encode([(r[0], r[1]) for r in rows]).encode()).hexdigest(),
     }
 
 

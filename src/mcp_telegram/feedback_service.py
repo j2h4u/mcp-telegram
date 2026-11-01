@@ -83,9 +83,9 @@ class FeedbackStore(Protocol):
 class FeedbackService(Protocol):
     """Application boundary consumed by the daemon API dispatcher."""
 
-    def submit_feedback(self, req: Mapping[str, object]) -> dict[str, object]: ...
+    async def submit_feedback(self, req: Mapping[str, object]) -> dict[str, object]: ...
 
-    def update_feedback_status(self, req: Mapping[str, object]) -> dict[str, object]: ...
+    async def update_feedback_status(self, req: Mapping[str, object]) -> dict[str, object]: ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -140,7 +140,10 @@ class FeedbackApplicationService:
     def __init__(self, store: FeedbackStore) -> None:
         self._store = store
 
-    def submit_feedback(self, req: Mapping[str, object]) -> dict[str, object]:
+    async def submit_feedback(self, req: Mapping[str, object]) -> dict[str, object]:
+        return self.submit_feedback_sync(req)
+
+    def submit_feedback_sync(self, req: Mapping[str, object]) -> dict[str, object]:
         try:
             request = _SubmitFeedbackRequest.parse(req)
         except ValueError as exc:
@@ -160,7 +163,10 @@ class FeedbackApplicationService:
             logger.exception("submit_feedback failed")
             return {"ok": False, "error": "internal", "message": "internal error"}
 
-    def update_feedback_status(self, req: Mapping[str, object]) -> dict[str, object]:
+    async def update_feedback_status(self, req: Mapping[str, object]) -> dict[str, object]:
+        return self.update_feedback_status_sync(req)
+
+    def update_feedback_status_sync(self, req: Mapping[str, object]) -> dict[str, object]:
         try:
             request = _UpdateFeedbackStatusRequest.parse(req)
         except ValueError as exc:

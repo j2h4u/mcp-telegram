@@ -101,25 +101,47 @@ class MessageImageService:
         )
         if job is not None and _job_matches_source(job, source):
             status["acquisition"] = _acquisition_status((job[0], job[1]))
-        artifact = cast(
-            tuple[str, str, int, int | None, int | None] | None,
-            self._conn.execute(
-                "SELECT filename,sha256,byte_size,width,height FROM message_image_artifacts "
-                "WHERE account_id=? AND dialog_id=? AND message_id=? AND photo_id=?",
-                (account, dialog_id, message_id, source.photo_id),
-            ).fetchone(),
-        )
-        if artifact is None:
-            return ImageReadResult(status)
-        filename, digest, size, width, height = artifact
-        image = await asyncio.to_thread(self._read_file, account, filename, digest, size)
-        if self._account(self._conn, captured) != account:
-            raise RuntimeError("verified account unavailable")
-        if current_source(self._conn, dialog_id, message_id) != source:
-            return ImageReadResult({**status, "content": {"state": "missing"}})
-        if image is None:
-            status["content"] = {"state": "unavailable", "reason": "missing_or_corrupt"}
-            return ImageReadResult(status)
+        assert captured is not None
+        return await self._read_artifact(dialog_id, message_id, captured, source, status)
+
+    async def _read_artifact(
+        self,
+        dialog_id: int,
+        message_id: int,
+        captured: ScopeToken,
+        source: ImageSource,
+        status: dict[str, object],
+    ) -> ImageReadResult:
+        account = captured.scope.account_id
+        while True:
+            artifact = cast(
+                tuple[str, str, int, int | None, int | None] | None,
+                self._conn.execute(
+                    "SELECT filename,sha256,byte_size,width,height FROM message_image_artifacts "
+                    "WHERE account_id=? AND dialog_id=? AND message_id=? AND photo_id=?",
+                    (account, dialog_id, message_id, source.photo_id),
+                ).fetchone(),
+            )
+            if artifact is None:
+                return ImageReadResult(status)
+            filename, digest, size, width, height = artifact
+            image = await asyncio.to_thread(self._read_file, account, filename, digest, size)
+            if self._account(self._conn, captured) != account:
+                raise RuntimeError("verified account unavailable")
+            if current_source(self._conn, dialog_id, message_id) != source:
+                return ImageReadResult({**status, "content": {"state": "missing"}})
+            if image is not None:
+                break
+            current = cast(
+                tuple[str] | None,
+                self._conn.execute(
+                    "SELECT filename FROM message_image_artifacts WHERE account_id=? AND dialog_id=? AND message_id=?",
+                    (account, dialog_id, message_id),
+                ).fetchone(),
+            )
+            if current is None or current[0] == filename:
+                status["content"] = {"state": "unavailable", "reason": "missing_or_corrupt"}
+                return ImageReadResult(status)
         status["content"] = _available_content(size, width, height)
         return ImageReadResult(status, image, "image/jpeg")
 

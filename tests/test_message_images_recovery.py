@@ -117,7 +117,7 @@ async def test_transport_failure_preserves_attempt_and_retained_image(tmp_path: 
         assert job is not None and job[1] == 1
         assert (await service.read(7, 8)).image_bytes == image
         if failure == "unchanged":
-            assert outcome.kind is SliceOutcomeKind.TERMINAL
+            assert outcome.kind is SliceOutcomeKind.TERMINAL and (image_dir / "42" / stored.filename).is_file()
             assert job == ("failed", 1, 1, 31, 15, "acquisition_failed")
             assert worker.status(100) is None
         else:
@@ -125,7 +125,11 @@ async def test_transport_failure_preserves_attempt_and_retained_image(tmp_path: 
             assert job == ("queued", 1, 10, 30 if failure == "transferring" else 31, 15, None)
             result = await run_ready_slice(worker, limit=32, now=100)
             assert result is not None and result.kind is SliceOutcomeKind.TERMINAL
-            assert (await service.read(7, 8)).image_bytes == image
+            assert (
+                (await service.read(7, 8)).image_bytes == image
+                and len([p for p in (image_dir / "42").glob("*.jpg") if p.name != stored.filename]) == 1
+                and not (image_dir / "42" / stored.filename).exists()
+            )
             assert conn.execute(
                 "SELECT attempt_generation,remaining,setup_remaining FROM message_image_jobs"
             ).fetchone() == (1, 28 if failure == "transferring" else 29, 14)
