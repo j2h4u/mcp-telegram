@@ -32,7 +32,6 @@ from .dialog_identity import ensure_dialog_identity_baseline, publish_dialog_ide
 from .entity_store import EntitySnapshot, upsert_entity_stub
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .history_enrollment import (
-    automatic_group_probe_allowed,
     ensure_automatic_dm_enrollment,
     full_history_enabled,
     read_intent,
@@ -79,7 +78,6 @@ from .telegram_rpc_scheduler import (
 logger = logging.getLogger(__name__)
 
 _BATCH_SIZE = MESSAGE_HISTORY_PAGE_SIZE
-_AUTOMATIC_GROUP_UNDECIDED_SQL = "(fhe.dialog_id IS NULL OR (fhe.source='migration' AND fhe.enabled=0))"
 _DM_ENROLLMENT_KEY_LAST_PUBLICATION_GENERATION = "full_sync_dm_enrollment_last_publication_generation"
 _TOTAL_MESSAGES_REPAIR_GATE_STATE_KEY = "full_sync_total_messages_repair_retry_at"
 _TOTAL_MESSAGES_REPAIR_FAILURE_DELAY_S = 60
@@ -547,7 +545,7 @@ class FullSyncWorker:
                 "SELECT d.dialog_id FROM dialogs d "
                 "LEFT JOIN full_history_enrollment fhe ON fhe.dialog_id=d.dialog_id "
                 "LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id "
-                f"WHERE {_AUTOMATIC_GROUP_UNDECIDED_SQL} AND d.hidden=0 AND d.type IN ('group','supergroup','forum') "
+                "WHERE fhe.dialog_id IS NULL AND d.hidden=0 AND d.type IN ('group','supergroup','forum') "
                 "AND d.members BETWEEN 1 AND ? AND d.created >= ? "
                 "AND (sd.status IS NULL OR sd.status NOT IN ('access_lost', 'synced')) "
                 "AND NOT EXISTS (SELECT 1 FROM daemon_state ds WHERE ds.key='automatic_group_history_retry:' || d.dialog_id AND CAST(ds.value AS INTEGER) > ?) "
@@ -565,7 +563,7 @@ class FullSyncWorker:
             conn.execute(
                 "SELECT 1 FROM dialogs d LEFT JOIN full_history_enrollment fhe ON fhe.dialog_id=d.dialog_id "
                 "LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id "
-                f"WHERE d.dialog_id=? AND {_AUTOMATIC_GROUP_UNDECIDED_SQL} AND d.hidden=0 "
+                "WHERE d.dialog_id=? AND fhe.dialog_id IS NULL AND d.hidden=0 "
                 "AND d.type IN ('group','supergroup','forum') AND d.members BETWEEN 1 AND ? AND d.created >= ? "
                 "AND (sd.status IS NULL OR sd.status NOT IN ('access_lost', 'synced'))",
                 (dialog_id, policy.max_members, cutoff),
@@ -612,7 +610,7 @@ class FullSyncWorker:
         assert self._automatic_group_history is not None
         with write_transaction(conn):
             intent = read_intent(conn, dialog_id)
-            if not automatic_group_probe_allowed(intent):
+            if intent.enabled is not None:
                 conn.execute("DELETE FROM daemon_state WHERE key=?", (f"automatic_group_history_retry:{dialog_id}",))
                 if intent.enabled:
                     conn.execute(
@@ -985,7 +983,7 @@ class FullSyncDemandAdapter:
                 "LEFT JOIN full_history_enrollment fhe ON fhe.dialog_id=d.dialog_id "
                 "LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id "
                 "LEFT JOIN daemon_state ds ON ds.key='automatic_group_history_retry:' || d.dialog_id "
-                f"WHERE {_AUTOMATIC_GROUP_UNDECIDED_SQL} AND d.hidden=0 AND d.type IN ('group','supergroup','forum') "
+                "WHERE fhe.dialog_id IS NULL AND d.hidden=0 AND d.type IN ('group','supergroup','forum') "
                 "AND d.members BETWEEN 1 AND ? AND d.created >= ? "
                 "AND (sd.status IS NULL OR sd.status NOT IN ('access_lost','synced')) ORDER BY d.dialog_id",
                 (policy.max_members, cutoff),

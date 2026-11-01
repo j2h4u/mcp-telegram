@@ -4,30 +4,24 @@ from dataclasses import replace
 
 import pytest
 
+from mcp_telegram.daemon_api import _automatic_group_type
 from mcp_telegram.dialog_identity import read_automatic_group_metadata
 from mcp_telegram.sync_read_model import AutomaticGroupFacts, SyncReadModelContractError, automatic_group_status
 from mcp_telegram.tools.sync import _decode_automatic_group_status
 
 
 @pytest.mark.parametrize(
-    ("enabled", "source", "interpretation", "eligibility", "reason"),
+    ("enabled", "eligibility", "reason"),
     [
-        (False, "migration", "migration_unknown", "eligible_for_probe", "eligible"),
-        (None, None, "undecided", "eligible_for_probe", "eligible"),
-        (False, "explicit", "explicit_disabled", "blocked", "enrollment_decided"),
-        (False, "automatic", "automatic_rejected", "blocked", "enrollment_decided"),
-        (True, "explicit", "enabled", "blocked", "already_enabled"),
+        (None, "eligible_for_probe", "eligible"),
+        (False, "blocked", "disabled"),
+        (True, "blocked", "already_enabled"),
     ],
 )
-def test_automatic_group_status_interprets_existing_intent(
-    enabled: bool | None, source: str | None, interpretation: str, eligibility: str, reason: str
-) -> None:
-    facts = AutomaticGroupFacts(
-        enabled, source, source is None or source == "migration", "group", 12, 1000, False, "own_only", None
-    )
+def test_automatic_group_status_interprets_existing_intent(enabled: bool | None, eligibility: str, reason: str) -> None:
+    facts = AutomaticGroupFacts(enabled, True, 12, 1000, False, "own_only", None)
     result = automatic_group_status(facts, now=1000, max_members=100, recent_days=365)
     assert result == {
-        "enrollment_interpretation": interpretation,
         "eligibility": eligibility,
         "reason": reason,
         "fresh_telegram_total": "unknown",
@@ -44,12 +38,12 @@ def test_automatic_group_status_interprets_existing_intent(
         ({"hidden": True}, "hidden"),
         ({"coverage_status": "access_lost"}, "access_lost"),
         ({"coverage_status": "synced"}, "already_synced"),
-        ({"dialog_type": "user"}, "not_a_group"),
+        ({"is_group": False}, "not_a_group"),
         ({"retry_at": 40_000_001}, "retry_wait"),
     ],
 )
 def test_automatic_group_status_reports_local_blocker(changes: dict, reason: str) -> None:
-    facts = AutomaticGroupFacts(False, "migration", True, "group", 12, 40_000_000, False, "own_only", None)
+    facts = AutomaticGroupFacts(None, True, 12, 40_000_000, False, "own_only", None)
     result = automatic_group_status(replace(facts, **changes), now=40_000_000, max_members=100, recent_days=365)
     assert result["eligibility"] == ("unknown" if reason == "group_metadata_unknown" else "blocked")
     assert result["reason"] == reason
@@ -58,11 +52,10 @@ def test_automatic_group_status_reports_local_blocker(changes: dict, reason: str
         assert result["retry_at"] == 40_000_001
 
 
-@pytest.mark.parametrize("field", ["eligibility", "enrollment_interpretation"])
+@pytest.mark.parametrize("field", ["eligibility", "reason"])
 def test_malformed_group_status_fails_closed(field: str) -> None:
     value: dict[str, object] = {
         "eligibility": "blocked",
-        "enrollment_interpretation": "enabled",
         "reason": "already_enabled",
         "fresh_telegram_total": "unknown",
     }
@@ -71,11 +64,10 @@ def test_malformed_group_status_fails_closed(field: str) -> None:
         _decode_automatic_group_status(value)
 
 
-def test_explicit_decision_does_not_report_obsolete_retry() -> None:
-    facts = AutomaticGroupFacts(False, "explicit", False, "group", 12, 1000, False, "own_only", 2000)
+def test_disabled_decision_does_not_report_obsolete_retry() -> None:
+    facts = AutomaticGroupFacts(False, True, 12, 1000, False, "own_only", 2000)
     result = automatic_group_status(facts, now=1000, max_members=100, recent_days=365)
-    assert result["enrollment_interpretation"] == "explicit_disabled"
-    assert result["reason"] == "enrollment_decided" and "retry_at" not in result
+    assert result["reason"] == "disabled" and "retry_at" not in result
 
 
 def test_group_metadata_uses_raw_directory_facts_and_preserves_absence() -> None:
@@ -88,3 +80,8 @@ def test_group_metadata_uses_raw_directory_facts_and_preserves_absence() -> None
         conn.execute("INSERT INTO entities VALUES (42,'group')")
         assert read_automatic_group_metadata(conn, 42) == (None, 12, 1000, 0)
         assert read_automatic_group_metadata(conn, 99) is None
+
+
+@pytest.mark.parametrize("value", [None, "unknown", "unrecognized"])
+def test_unknown_group_type_stays_unknown(value: object) -> None:
+    assert _automatic_group_type(value) is None

@@ -93,9 +93,9 @@ async def test_automatic_probe_retries_at_durable_floor_without_restart(failure:
                 timer.set()
                 await asyncio.wait_for(settled.wait(), 3)
                 assert port.calls == 2
-                assert conn.execute(
-                    "SELECT enabled,source FROM full_history_enrollment WHERE dialog_id=501"
-                ).fetchone() == (1, "automatic")
+                assert conn.execute("SELECT enabled FROM full_history_enrollment WHERE dialog_id=501").fetchone() == (
+                    1,
+                )
                 stop.set()
                 timer.set()
                 await asyncio.wait_for(task, 3)
@@ -139,17 +139,12 @@ def test_future_enrolled_head_does_not_hide_ready_group_or_peer() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("total", "expected"), [(5000, (1, "automatic")), (5001, (0, "automatic")), (None, (0, "migration"))]
-)
-async def test_migration_disabled_group_requires_fresh_bounded_probe(
-    total: int | None, expected: tuple[int, str]
-) -> None:
+@pytest.mark.parametrize(("total", "expected"), [(5000, (1,)), (5001, (0,)), (None, None)])
+async def test_undecided_group_requires_fresh_bounded_probe(total: int | None, expected: tuple[int] | None) -> None:
     conn = _hydration_db()
     try:
         conn.execute("INSERT INTO dialogs(dialog_id,type,members,created) VALUES (501,'group',3,1)")
         conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (501,'own_only')")
-        seed_full_history_enrollment(conn, 501, enabled=False, source="migration")
         conn.commit()
 
         class Port:
@@ -169,10 +164,7 @@ async def test_migration_disabled_group_requires_fresh_bounded_probe(
             selected = adapter.status(1000)
             assert selected is not None and selected.selected is not None
             await adapter.run_slice(RpcAttemptBudget(limit=1, selected=selected.selected))
-        assert (
-            conn.execute("SELECT enabled,source FROM full_history_enrollment WHERE dialog_id=501").fetchone()
-            == expected
-        )
+        assert conn.execute("SELECT enabled FROM full_history_enrollment WHERE dialog_id=501").fetchone() == expected
         if total is None:
             assert conn.execute(
                 "SELECT value FROM daemon_state WHERE key='automatic_group_history_retry:501'"
@@ -284,14 +276,13 @@ async def test_existing_history_recovers_from_transient_without_new_revision(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enabled", [False, True])
-async def test_explicit_decision_wins_during_migration_probe(enabled: bool) -> None:
+async def test_explicit_decision_wins_during_probe(enabled: bool) -> None:
     from mcp_telegram.history_enrollment import disable_history, enable_history
 
     conn = _hydration_db()
     try:
         conn.execute("INSERT INTO dialogs(dialog_id,type,members,created) VALUES (501,'group',3,1)")
         conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (501,'own_only')")
-        seed_full_history_enrollment(conn, 501, enabled=False, source="migration")
         conn.commit()
 
         class Port:
@@ -314,9 +305,8 @@ async def test_explicit_decision_wins_during_migration_probe(enabled: bool) -> N
             status = adapter.status(1000)
             assert status is not None and status.selected is not None
             await adapter.run_slice(RpcAttemptBudget(limit=1, selected=status.selected))
-        assert conn.execute("SELECT enabled,source FROM full_history_enrollment WHERE dialog_id=501").fetchone() == (
+        assert conn.execute("SELECT enabled FROM full_history_enrollment WHERE dialog_id=501").fetchone() == (
             int(enabled),
-            "explicit",
         )
     finally:
         conn.close()
@@ -347,5 +337,27 @@ def test_ready_automatic_probe_precedes_ready_total_repair() -> None:
             selected = adapter.status(1061)
             assert selected is not None and selected.selected is not None
             assert selected.selected.key.target == "total:502"
+    finally:
+        conn.close()
+
+
+def test_disabled_group_is_not_selected_for_automatic_probe() -> None:
+    conn = _hydration_db()
+    try:
+        conn.execute("INSERT INTO dialogs(dialog_id,type,members,created) VALUES (501,'group',3,1)")
+        conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (501,'own_only')")
+        seed_full_history_enrollment(conn, 501, enabled=False)
+        conn.commit()
+        worker = FullSyncWorker(
+            UnusedPort(),
+            conn,
+            asyncio.Event(),
+            automatic_group_history=AutomaticGroupHistoryConfig(),
+            writer=inline_writer(conn),
+        )
+        adapter = FullSyncDemandAdapter(worker, account_id=1)
+        with patch("mcp_telegram.sync_worker.time.time", return_value=1000):
+            assert adapter.status(1000) is None
+        assert conn.execute("SELECT enabled FROM full_history_enrollment WHERE dialog_id=501").fetchone() == (0,)
     finally:
         conn.close()

@@ -11,37 +11,23 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from dataclasses import dataclass
-from enum import StrEnum
+from dataclasses import dataclass, replace
 from typing import cast
 
 from .hydration_queue import HydrationQueueRepository
 from .sync_transactions import require_write_transaction, write_savepoint
 
 
-class EnrollmentSource(StrEnum):
-    EXPLICIT = "explicit"
-    AUTOMATIC = "automatic"
-    MIGRATION = "migration"
-
-
 @dataclass(frozen=True, slots=True)
 class EnrollmentIntent:
     dialog_id: int
     enabled: bool | None
-    source: EnrollmentSource | None
-
-
-def automatic_group_probe_allowed(intent: EnrollmentIntent) -> bool:
-    """Reconsider migration's inferred disable while preserving real decisions."""
-    return intent.source is None or (intent.source is EnrollmentSource.MIGRATION and intent.enabled is False)
 
 
 @dataclass(frozen=True, slots=True)
 class EnrollmentOutcome:
     dialog_id: int
     enabled: bool
-    source: EnrollmentSource
     coverage_status: str | None
     action: str
     blocked_reason: str | None
@@ -57,9 +43,6 @@ class _TransitionDecision:
 
 
 _COVERAGE_STATUSES = frozenset({"not_synced", "own_only", "fragment", "syncing", "synced", "access_lost"})
-_ENROLLMENT_SOURCES = frozenset(
-    (EnrollmentSource.EXPLICIT.value, EnrollmentSource.AUTOMATIC.value, EnrollmentSource.MIGRATION.value)
-)
 
 
 def request_delta_refresh(conn: sqlite3.Connection, dialog_id: int, now: int) -> None:
@@ -85,18 +68,10 @@ def reset_read_position_retry(conn: sqlite3.Connection, dialog_id: int) -> int:
 
 def read_intent(conn: sqlite3.Connection, dialog_id: int) -> EnrollmentIntent:
     row = cast(
-        tuple[int, str] | None,
-        conn.execute(
-            "SELECT enabled, source FROM full_history_enrollment WHERE dialog_id = ?",
-            (dialog_id,),
-        ).fetchone(),
+        tuple[int] | None,
+        conn.execute("SELECT enabled FROM full_history_enrollment WHERE dialog_id = ?", (dialog_id,)).fetchone(),
     )
-    if row is None:
-        return EnrollmentIntent(dialog_id, None, None)
-    source = row[1]
-    if source not in _ENROLLMENT_SOURCES:
-        raise ValueError(f"invalid history enrollment source: {source!r}")
-    return EnrollmentIntent(dialog_id, bool(row[0]), EnrollmentSource(source))
+    return EnrollmentIntent(dialog_id, None if row is None else bool(row[0]))
 
 
 def full_history_enabled(conn: sqlite3.Connection, dialog_id: int) -> bool:
@@ -128,17 +103,15 @@ def _store_intent(
     conn: sqlite3.Connection,
     dialog_id: int,
     enabled: bool,
-    source: EnrollmentSource,
     now: int,
 ) -> None:
     conn.execute(
-        """INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at)
-           VALUES (?, ?, ?, ?)
+        """INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at)
+           VALUES (?, ?, ?)
            ON CONFLICT(dialog_id) DO UPDATE SET
              enabled = excluded.enabled,
-             source = excluded.source,
              updated_at = excluded.updated_at""",
-        (dialog_id, int(enabled), source.value, now),
+        (dialog_id, int(enabled), now),
     )
 
 
@@ -146,7 +119,6 @@ def _outcome(  # noqa: PLR0913
     dialog_id: int,
     *,
     enabled: bool,
-    source: EnrollmentSource,
     coverage_status: str | None,
     action: str,
     blocked_reason: str | None = None,
@@ -155,7 +127,6 @@ def _outcome(  # noqa: PLR0913
     return EnrollmentOutcome(
         dialog_id=dialog_id,
         enabled=enabled,
-        source=source,
         coverage_status=coverage_status,
         action=action,
         blocked_reason=blocked_reason,
@@ -167,11 +138,11 @@ def _outcome(  # noqa: PLR0913
     )
 
 
-def _decide_transition(coverage: str | None, *, enabled: bool, automatic: bool = False) -> _TransitionDecision:  # noqa: PLR0911
+def _decide_transition(coverage: str | None, *, enabled: bool) -> _TransitionDecision:  # noqa: PLR0911
     if not enabled:
         return _TransitionDecision("disabled_history", "not_synced" if coverage == "syncing" else coverage, None, False)
     if coverage is None:
-        return _TransitionDecision("queue_full_history", "syncing" if automatic else "not_synced", None, True)
+        return _TransitionDecision("queue_full_history", "not_synced", None, True)
     if coverage in {"not_synced", "own_only", "fragment"}:
         return _TransitionDecision("queue_full_history", "syncing", None, True)
     if coverage == "syncing":
@@ -187,35 +158,15 @@ def enable_history(
     conn: sqlite3.Connection,
     dialog_id: int,
     *,
-    source: EnrollmentSource = EnrollmentSource.EXPLICIT,
     now: int | None = None,
 ) -> EnrollmentOutcome:
     """Persist an enabled intent and queue work according to factual coverage."""
     timestamp = int(time.time()) if now is None else now
     with write_savepoint(conn):
-        previous = read_intent(conn, dialog_id)
         coverage = _coverage_status(conn, dialog_id)
-        if source is EnrollmentSource.AUTOMATIC and previous.source is EnrollmentSource.EXPLICIT:
-            if previous.enabled is False:
-                return _outcome(
-                    dialog_id,
-                    enabled=False,
-                    source=previous.source,
-                    coverage_status=coverage,
-                    action="blocked_explicit_disable",
-                    blocked_reason="explicit_disable",
-                )
-            return _outcome(
-                dialog_id,
-                enabled=True,
-                source=previous.source,
-                coverage_status=coverage,
-                action="preserved_explicit_enable",
-            )
-
-        _store_intent(conn, dialog_id, True, source, timestamp)
+        _store_intent(conn, dialog_id, True, timestamp)
         reset_read_position_retry(conn, dialog_id)
-        decision = _decide_transition(coverage, enabled=True, automatic=source is EnrollmentSource.AUTOMATIC)
+        decision = _decide_transition(coverage, enabled=True)
         if coverage is None:
             conn.execute(
                 "INSERT INTO synced_dialogs(dialog_id, status) VALUES (?, ?)",
@@ -233,7 +184,6 @@ def enable_history(
         return _outcome(
             dialog_id,
             enabled=True,
-            source=source,
             coverage_status=coverage,
             action=decision.action,
             blocked_reason=decision.blocked_reason,
@@ -251,7 +201,7 @@ def disable_history(
     timestamp = int(time.time()) if now is None else now
     with write_savepoint(conn):
         coverage = _coverage_status(conn, dialog_id)
-        _store_intent(conn, dialog_id, False, EnrollmentSource.EXPLICIT, timestamp)
+        _store_intent(conn, dialog_id, False, timestamp)
         reset_read_position_retry(conn, dialog_id)
         HydrationQueueRepository(conn).remove_active_for_dialog(dialog_id)
         if coverage == "syncing":
@@ -265,7 +215,6 @@ def disable_history(
         return _outcome(
             dialog_id,
             enabled=False,
-            source=EnrollmentSource.EXPLICIT,
             coverage_status=coverage,
             action="disabled_history" if coverage is not None else "disabled_history_tombstone",
         )
@@ -277,26 +226,22 @@ def ensure_automatic_dm_enrollment(
     *,
     now: int | None = None,
 ) -> EnrollmentOutcome:
-    """Enroll a first-seen private dialog unless an explicit decision exists."""
-    intent = read_intent(conn, dialog_id)
-    if intent.source is EnrollmentSource.EXPLICIT:
-        return _outcome(
-            dialog_id,
-            enabled=bool(intent.enabled),
-            source=intent.source,
-            coverage_status=_coverage_status(conn, dialog_id),
-            action="preserved_explicit_decision",
-            blocked_reason="explicit_disable" if intent.enabled is False else None,
-        )
-    if intent.enabled is True:
-        return _outcome(
-            dialog_id,
-            enabled=True,
-            source=cast(EnrollmentSource, intent.source),
-            coverage_status=_coverage_status(conn, dialog_id),
-            action="preserved_enabled_intent",
-        )
-    return enable_history(conn, dialog_id, source=EnrollmentSource.AUTOMATIC, now=now)
+    """Enroll a first-seen private dialog unless a decision already exists."""
+    with write_savepoint(conn):
+        intent = read_intent(conn, dialog_id)
+        if intent.enabled is not None:
+            return _outcome(
+                dialog_id,
+                enabled=intent.enabled,
+                coverage_status=_coverage_status(conn, dialog_id),
+                action="preserved_enabled_intent" if intent.enabled else "preserved_disabled_intent",
+                blocked_reason=None if intent.enabled else "disabled",
+            )
+        outcome = enable_history(conn, dialog_id, now=now)
+        if outcome.coverage_status == "not_synced":
+            conn.execute("UPDATE synced_dialogs SET status='syncing' WHERE dialog_id=?", (dialog_id,))
+            return replace(outcome, coverage_status="syncing")
+        return outcome
 
 
 def record_automatic_group_decision(
@@ -307,13 +252,13 @@ def record_automatic_group_decision(
     total_messages: int | None = None,
     now: int | None = None,
 ) -> EnrollmentIntent:
-    """Persist a first-page group decision while preserving explicit intent."""
+    """Persist a first-page group decision while preserving an existing decision."""
     timestamp = int(time.time()) if now is None else now
     with write_savepoint(conn):
         previous = read_intent(conn, dialog_id)
-        if not automatic_group_probe_allowed(previous):
+        if previous.enabled is not None:
             return previous
-        _store_intent(conn, dialog_id, enabled, EnrollmentSource.AUTOMATIC, timestamp)
+        _store_intent(conn, dialog_id, enabled, timestamp)
         if enabled:
             reset_read_position_retry(conn, dialog_id)
             if _coverage_status(conn, dialog_id) is None:
@@ -342,8 +287,6 @@ def restore_access_status(conn: sqlite3.Connection, dialog_id: int) -> bool:
 __all__ = [
     "EnrollmentIntent",
     "EnrollmentOutcome",
-    "EnrollmentSource",
-    "automatic_group_probe_allowed",
     "disable_history",
     "enable_history",
     "ensure_automatic_dm_enrollment",

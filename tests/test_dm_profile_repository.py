@@ -42,7 +42,7 @@ def _peer(conn: sqlite3.Connection, entity_id: int, *, kind: str = "user", enabl
         )
         conn.execute("INSERT INTO dialogs(dialog_id,type,name) VALUES (?,?,?)", (entity_id, kind, f"Peer {entity_id}"))
         conn.execute(
-            "INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (?,?,'explicit',1)",
+            "INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (?,?,1)",
             (entity_id, int(enabled)),
         )
 

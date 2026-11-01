@@ -51,7 +51,7 @@ def _db(tmp_path: Path) -> sqlite3.Connection:
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
     conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (1,'synced')")
-    conn.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (1,1,'explicit',1)")
+    conn.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (1,1,1)")
     conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (1,2,1)")
     conn.commit()
     return conn

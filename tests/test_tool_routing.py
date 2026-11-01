@@ -367,13 +367,11 @@ def _canonical_get_sync_status_data() -> dict[str, object]:
     return {
         "dialog_id": 123,
         "automatic_group_sync": {
-            "enrollment_interpretation": "enabled",
             "eligibility": "blocked",
             "reason": "already_enabled",
             "fresh_telegram_total": "unknown",
         },
         "latest_retained_message": None,
-        "enrollment_source": "explicit",
         "sync_progress": None,
         "sync_progress_message_id": None,
         "delta_refresh_requested_at": None,
@@ -595,13 +593,11 @@ STRUCTURED_TOOL_CASES = {
             "data": {
                 "dialog_id": 123,
                 "automatic_group_sync": {
-                    "enrollment_interpretation": "enabled",
                     "eligibility": "blocked",
                     "reason": "already_enabled",
                     "fresh_telegram_total": "unknown",
                 },
                 "latest_retained_message": None,
-                "enrollment_source": "explicit",
                 "delta_refresh_requested_at": None,
                 "sync_progress": None,
                 "sync_progress_message_id": None,
@@ -619,7 +615,6 @@ STRUCTURED_TOOL_CASES = {
         {
             "ok": True,
             "data": {
-                "enrollment_source": "explicit",
                 "coverage_status": "not_synced",
                 "action": "queue_full_history",
                 "blocked_reason": None,
@@ -2457,7 +2452,6 @@ async def test_mark_dialog_for_sync_via_daemon():
         {
             "ok": True,
             "data": {
-                "enrollment_source": "explicit",
                 "coverage_status": "not_synced",
                 "action": "queue_full_history",
                 "blocked_reason": None,
@@ -2471,7 +2465,6 @@ async def test_mark_dialog_for_sync_via_daemon():
     assert result.structured_content == {
         "dialog_id": 42,
         "enabled": True,
-        "enrollment_source": "explicit",
         "coverage_status": "not_synced",
         "action": "queue_full_history",
         "blocked_reason": None,
@@ -2487,7 +2480,6 @@ async def test_mark_dialog_for_sync_synced_dialog_reports_delta_refresh():
             "ok": True,
             "data": {
                 "action": "request_delta_refresh",
-                "enrollment_source": "explicit",
                 "coverage_status": "synced",
                 "blocked_reason": None,
                 "full_history_will_be_fetched": False,
@@ -2500,7 +2492,6 @@ async def test_mark_dialog_for_sync_synced_dialog_reports_delta_refresh():
     assert result.structured_content == {
         "dialog_id": 42,
         "enabled": True,
-        "enrollment_source": "explicit",
         "coverage_status": "synced",
         "action": "request_delta_refresh",
         "blocked_reason": None,
@@ -2515,7 +2506,6 @@ async def test_mark_dialog_for_sync_disable():
         {
             "ok": True,
             "data": {
-                "enrollment_source": "explicit",
                 "coverage_status": "synced",
                 "action": "disabled_history",
                 "blocked_reason": None,
@@ -2529,7 +2519,6 @@ async def test_mark_dialog_for_sync_disable():
     assert result.structured_content == {
         "dialog_id": 42,
         "enabled": False,
-        "enrollment_source": "explicit",
         "coverage_status": "synced",
         "action": "disabled_history",
         "blocked_reason": None,
@@ -2556,13 +2545,11 @@ async def test_get_sync_status_via_daemon():
     data = {
         "dialog_id": -1001234567890,
         "automatic_group_sync": {
-            "enrollment_interpretation": "enabled",
             "eligibility": "blocked",
             "reason": "already_enabled",
             "fresh_telegram_total": "unknown",
         },
         "latest_retained_message": None,
-        "enrollment_source": "explicit",
         "sync_progress": 100,
         "sync_progress_message_id": 100,
         "delete_detection": "reliable (channel)",
@@ -2584,14 +2571,12 @@ async def test_get_sync_status_via_daemon():
     assert result.structured_content == {
         "dialog_id": -1001234567890,
         "automatic_group_sync": {
-            "enrollment_interpretation": "enabled",
             "eligibility": "blocked",
             "reason": "already_enabled",
             "fresh_telegram_total": "unknown",
         },
         "coverage_status": "synced",
         "enrollment_enabled": True,
-        "enrollment_source": "explicit",
         "realtime_history": "full",
         "message_retention_policy": "all_authorized",
         "latest_retained_message": None,
@@ -2674,19 +2659,6 @@ async def test_get_sync_status_projects_retention_policy(status: str, policy: st
     assert result.is_error is False
     assert result.structured_content is not None
     assert result.structured_content["message_retention_policy"] == policy
-
-
-async def test_get_sync_status_rejects_missing_enrollment_source() -> None:
-    data = _canonical_get_sync_status_data()
-    del data["enrollment_source"]
-    conn = _make_daemon_conn({"ok": True, "data": data})
-
-    with _patch_daemon(conn):
-        result = await get_sync_status(GetSyncStatus(dialog_id=123))
-
-    assert result.is_error is True
-    assert result.structured_content is None
-    assert "daemon_protocol_error" in _result_text(result)
 
 
 async def test_get_sync_status_rejects_mismatched_daemon_dialog_id() -> None:

@@ -35,7 +35,7 @@ from tests.test_fact_demand_adapters import _HydrationHandler
 def _seed(conn: sqlite3.Connection) -> None:
     with write_transaction(conn):
         conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (1,'synced')")
-        conn.execute("INSERT INTO full_history_enrollment VALUES (1,1,'explicit',1)")
+        conn.execute("INSERT INTO full_history_enrollment VALUES (1,1,1)")
         conn.execute("INSERT INTO entities(id,type,name,updated_at) VALUES (1,'user','peer',1)")
         conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at,out) VALUES (1,2,1,1)")
         conn.execute("INSERT INTO hydration_jobs(kind,dialog_id,message_id,due_at,priority) VALUES ('test',1,2,1,1)")

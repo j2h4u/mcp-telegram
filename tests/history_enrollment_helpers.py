@@ -11,12 +11,11 @@ def seed_full_history_enrollment(
     dialog_id: int,
     *,
     enabled: bool,
-    source: str = "explicit",
     updated_at: int = 0,
 ) -> None:
     """Seed one operator intent; production never derives this from coverage."""
     conn.execute(
-        """INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at)
-           VALUES (?, ?, ?, ?)""",
-        (dialog_id, int(enabled), source, updated_at),
+        """INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at)
+           VALUES (?, ?, ?)""",
+        (dialog_id, int(enabled), updated_at),
     )

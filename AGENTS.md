@@ -15,6 +15,12 @@ delivered updates populate and update canonical local facts. Ordinary reads
 project persisted authorized data; they must not execute or wait for Telegram
 acquisition. Missing information is reported alongside useful retained data.
 
+Maintain one current software, schema, and MCP contract for this service and its
+single consumer. Normalize old data once in a forward migration; do not retain
+runtime branches or tests for removed record origins and obsolete formats.
+Preserve current enabled/disabled settings. This rule does not remove actual
+Telegram message, profile, or draft history.
+
 Keep fact availability, coverage/completeness, observation age, field access,
 known sync gaps and acquisition progress separate. A reuse TTL does not remove
 knowledge or authorize read-time network access. Failed acquisition does not

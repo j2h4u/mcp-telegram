@@ -54,7 +54,7 @@ def _make_db(path: str | Path = ":memory:") -> sqlite3.Connection:
         CREATE TABLE full_history_enrollment (
             dialog_id INTEGER PRIMARY KEY,
             enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
-            source TEXT NOT NULL CHECK(source IN ('explicit', 'automatic', 'migration')),
+
             updated_at INTEGER NOT NULL
         ) WITHOUT ROWID;
         CREATE TABLE entities (

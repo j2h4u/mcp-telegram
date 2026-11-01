@@ -6,7 +6,6 @@ import sqlite3
 import pytest
 
 from mcp_telegram.history_enrollment import (
-    EnrollmentSource,
     disable_history,
     enable_history,
     ensure_automatic_dm_enrollment,
@@ -32,7 +31,6 @@ def conn() -> sqlite3.Connection:
         CREATE TABLE full_history_enrollment (
             dialog_id INTEGER PRIMARY KEY,
             enabled INTEGER NOT NULL,
-            source TEXT NOT NULL,
             updated_at INTEGER NOT NULL
         ) WITHOUT ROWID;
         """
@@ -65,8 +63,8 @@ def test_enable_disable_matrix(conn: sqlite3.Connection, status: str | None) -> 
 def test_automatic_dm_does_not_resurrect_explicit_disable(conn: sqlite3.Connection) -> None:
     disable_history(conn, 1, now=10)
     outcome = ensure_automatic_dm_enrollment(conn, 1, now=11)
-    assert outcome.blocked_reason == "explicit_disable"
-    assert read_intent(conn, 1) == read_intent(conn, 1).__class__(1, False, EnrollmentSource.EXPLICIT)
+    assert outcome.blocked_reason == "disabled"
+    assert read_intent(conn, 1) == read_intent(conn, 1).__class__(1, False)
 
 
 def test_enrollment_transitions_clear_read_position_retry(conn: sqlite3.Connection) -> None:
@@ -92,12 +90,12 @@ def test_enrollment_transitions_clear_read_position_retry(conn: sqlite3.Connecti
     ).fetchone() == (None, 0)
 
 
-def test_weak_migration_disable_can_be_promoted_for_automatic_dm(conn: sqlite3.Connection) -> None:
-    conn.execute("INSERT INTO full_history_enrollment VALUES (2, 0, 'migration', 1)")
+def test_automatic_dm_preserves_existing_disabled_decision(conn: sqlite3.Connection) -> None:
+    conn.execute("INSERT INTO full_history_enrollment VALUES (2, 0, 1)")
     conn.commit()
     outcome = ensure_automatic_dm_enrollment(conn, 2, now=2)
-    assert outcome.enabled is True
-    assert read_intent(conn, 2).source is EnrollmentSource.AUTOMATIC
+    assert outcome.enabled is False
+    assert read_intent(conn, 2).enabled is False
 
 
 def test_enable_unknown_coverage_fails_closed(conn: sqlite3.Connection) -> None:

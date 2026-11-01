@@ -414,7 +414,7 @@ async def test_invalid_dm_checkpoint_does_not_block_forward_delta_coordinator(
         (dialog_id, delta_cursor),
     )
     dependencies.conn.execute(
-        "INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (?,1,'explicit',0)",
+        "INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (?,1,0)",
         (dialog_id,),
     )
     dependencies.conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (?,1,1)", (dialog_id,))
@@ -464,7 +464,7 @@ async def test_claim_write_failure_preserves_demand_for_reclaim_before_scanner(
     dialog_id = 7199
     dependencies.conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?,'synced')", (dialog_id,))
     dependencies.conn.execute(
-        "INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (?,1,'explicit',0)",
+        "INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (?,1,0)",
         (dialog_id,),
     )
     dependencies.conn.execute("INSERT INTO entities(id,type,updated_at) VALUES (?,'user',1)", (dialog_id,))
@@ -692,7 +692,7 @@ async def test_malformed_dm_checkpoint_does_not_block_realtime_receive_only_inge
     dependencies.conn.execute("INSERT INTO daemon_state(key,value) VALUES ('delta_dm_gap_scan_state', NULL)")
     dependencies.conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?,'synced')", (dialog_id,))
     dependencies.conn.execute(
-        "INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (?,1,'explicit',0)",
+        "INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (?,1,0)",
         (dialog_id,),
     )
     dependencies.conn.commit()

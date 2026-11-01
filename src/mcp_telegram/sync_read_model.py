@@ -19,9 +19,7 @@ class SyncReadModelContractError(ValueError):
 @dataclass(frozen=True, slots=True)
 class AutomaticGroupFacts:
     enrollment_enabled: bool | None
-    enrollment_source: str | None
-    probe_allowed: bool
-    dialog_type: str | None
+    is_group: bool | None
     members: int | None
     created: int | None
     hidden: bool | None
@@ -33,19 +31,8 @@ def automatic_group_status(
     facts: AutomaticGroupFacts, *, now: int, max_members: int | None, recent_days: int | None
 ) -> dict[str, object]:
     """Describe current local eligibility; a fresh Telegram total is not known here."""
-    if facts.enrollment_enabled is True:
-        interpretation = "enabled"
-    elif facts.enrollment_source == "migration":
-        interpretation = "migration_unknown"
-    elif facts.enrollment_source == "explicit":
-        interpretation = "explicit_disabled"
-    elif facts.enrollment_source == "automatic":
-        interpretation = "automatic_rejected"
-    else:
-        interpretation = "undecided"
     reason = _automatic_group_blocker(facts, now=now, max_members=max_members, recent_days=recent_days)
     result: dict[str, object] = {
-        "enrollment_interpretation": interpretation,
         "eligibility": (
             "eligible_for_probe"
             if reason == "eligible"
@@ -66,8 +53,8 @@ def _automatic_group_blocker(
 ) -> str:
     if facts.enrollment_enabled is True:
         return "already_enabled"
-    if not facts.probe_allowed:
-        return "enrollment_decided"
+    if facts.enrollment_enabled is False:
+        return "disabled"
     if max_members is None or recent_days is None:
         return "policy_unavailable"
     return _automatic_group_metadata_blocker(facts, now=now, max_members=max_members, recent_days=recent_days)
@@ -76,9 +63,9 @@ def _automatic_group_blocker(
 def _automatic_group_metadata_blocker(
     facts: AutomaticGroupFacts, *, now: int, max_members: int, recent_days: int
 ) -> str:
-    if facts.dialog_type is None or facts.hidden is None:
+    if facts.is_group is None or facts.hidden is None:
         return "dialog_metadata_unknown"
-    if facts.dialog_type not in {"group", "supergroup", "forum"}:
+    if not facts.is_group:
         return "not_a_group"
     if facts.hidden:
         return "hidden"

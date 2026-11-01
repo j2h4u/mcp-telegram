@@ -247,9 +247,7 @@ async def test_pending_transcription_resumes_after_due_with_same_coordinator(  #
 ) -> None:
     conn = _hydration_db()
     conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
-    conn.execute(
-        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
-    )
+    conn.execute("INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (1, 1, 1)")
     conn.execute(
         "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
         "VALUES (1, 1, 1, 'voice', '{}')"
@@ -380,9 +378,7 @@ async def test_pending_transcription_resumes_after_due_with_same_coordinator(  #
 async def test_transcription_cancellation_preserves_message_and_propagates() -> None:
     conn = _hydration_db()
     conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
-    conn.execute(
-        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
-    )
+    conn.execute("INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (1, 1, 1)")
     conn.execute(
         "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) VALUES (1, 1, 1, 'voice', '{}')"
     )
@@ -725,9 +721,7 @@ def test_backfill_status_uses_repair_deadline_without_candidate_scans(tmp_path: 
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
     conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
-    conn.execute(
-        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
-    )
+    conn.execute("INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (1, 1, 1)")
     conn.execute(
         "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
         "VALUES (1, 1, 1, 'other', '{}')"
@@ -754,9 +748,7 @@ async def test_backfill_slice_seeds_and_processes_repair_candidates(tmp_path: Pa
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
     conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
-    conn.execute(
-        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
-    )
+    conn.execute("INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (1, 1, 1)")
     conn.execute(
         "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
         "VALUES (1, 1, 1, 'other', '{}')"
@@ -781,9 +773,7 @@ async def test_backfill_queued_work_runs_during_repair_cooldown(tmp_path: Path) 
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
     conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
-    conn.execute(
-        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
-    )
+    conn.execute("INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (1, 1, 1)")
     conn.executemany(
         "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
         "VALUES (1, ?, ?, 'other', '{}')",
@@ -823,9 +813,7 @@ async def test_backfill_more_repair_candidates_keep_repair_due(tmp_path: Path) -
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
     conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
-    conn.execute(
-        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
-    )
+    conn.execute("INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (1, 1, 1)")
     conn.executemany(
         "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
         "VALUES (1, ?, ?, 'other', '{}')",
@@ -851,9 +839,7 @@ async def test_backfill_raw_pages_advance_past_existing_jobs_without_erasing_bac
     conn = _open_sync_db(db_path)
     try:
         conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
-        conn.execute(
-            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
-        )
+        conn.execute("INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (1, 1, 1)")
         conn.executemany(
             "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) VALUES (1, ?, ?, ?, '{}')",
             [(1, 10, "other"), (2, 9, "video"), (3, 8, "contact")],
@@ -1001,9 +987,7 @@ def test_backfill_repair_rolls_back_all_producers_and_retries_same_page(
     try:
         assert conn.execute("PRAGMA journal_mode").fetchone() == ("wal",)
         conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
-        conn.execute(
-            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
-        )
+        conn.execute("INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (1, 1, 1)")
         conn.execute(
             "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
             "VALUES (1, 1, 1, 'voice', '{}')"
@@ -1060,9 +1044,7 @@ def test_backfill_repair_owns_wal_writer_before_candidate_reads(
     writer = sqlite3.connect(db_path, timeout=0)
     try:
         conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
-        conn.execute(
-            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
-        )
+        conn.execute("INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (1, 1, 1)")
         conn.execute(
             "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
             "VALUES (1, 1, 1, 'other', '{}')"

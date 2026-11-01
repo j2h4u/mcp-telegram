@@ -156,9 +156,7 @@ def test_hydrated_media_revokes_only_accepted_change_before_commit(tmp_path: Pat
     try:
         with write_transaction(conn):
             conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (42,'synced')")
-            conn.execute(
-                "INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (42,1,'explicit',1)"
-            )
+            conn.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (42,1,1)")
             insert_messages_with_fts(
                 conn, [replace(_message(8, text=None, media_kind="other", media_payload="{}"), observation_order=20)]
             )

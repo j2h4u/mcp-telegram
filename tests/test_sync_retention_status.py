@@ -68,6 +68,14 @@ def test_latest_query_uses_index_on_migrated_database(tmp_path: Path) -> None:
     assert any("idx_messages_dialog_sent" in str(row[3]) for row in plan)
 
 
+def test_group_status_propagates_database_read_failure() -> None:
+    conn = _make_db_with_dialogs()
+    daemon = make_server(conn)
+    conn.execute("DROP TABLE daemon_state")
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        daemon._automatic_group_rows(123)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("empty", [False, True])
 @pytest.mark.parametrize("unavailable", [False, True])
@@ -147,13 +155,11 @@ async def test_registered_sync_status_projects_local_rows_and_unknown_delivery(
 
 
 @pytest.mark.asyncio
-async def test_registered_status_reports_migration_retry_without_acquisition(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_registered_status_reports_retry_without_acquisition(monkeypatch: pytest.MonkeyPatch) -> None:
     conn = _make_db_with_dialogs()
     _seed_dialog_row(conn, 123, type_="group", members=12, created=1_700_000_000)
     _insert_synced_dialog(conn, 123, status="own_only")
-    conn.execute(
-        "INSERT OR REPLACE INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (123,0,'migration',1)"
-    )
+    conn.execute("DELETE FROM full_history_enrollment WHERE dialog_id=123")
     conn.execute("INSERT INTO daemon_state(key,value) VALUES ('automatic_group_history_retry:123','1700000100')")
     conn.commit()
     daemon = make_server(conn)
@@ -177,9 +183,8 @@ async def test_registered_status_reports_migration_retry_without_acquisition(mon
     assert result.is_error is False
     payload = cast(dict[str, object], result.structured_content)
     group = cast(dict[str, object], payload["automatic_group_sync"])
-    assert group["enrollment_interpretation"] == "migration_unknown"
     assert group["eligibility"] == "blocked" and group["reason"] == "retry_wait"
     assert group["fresh_telegram_total"] == "unknown" and "retry_at" in group
-    assert payload["enrollment_source"] == "migration" and payload["coverage_status"] == "own_only"
+    assert payload["enrollment_enabled"] is None and payload["coverage_status"] == "own_only"
     validate(payload, cast(dict[str, object], server.tool_by_name["get_sync_status"].output_schema))
     assert all(not statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE")) for statement in statements)

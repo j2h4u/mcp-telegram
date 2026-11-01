@@ -94,16 +94,13 @@ from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
 from .folders.read_model import dialog_placement, folder_snapshot, folder_summaries
 from .history_enrollment import (
-    EnrollmentIntent,
     EnrollmentOutcome,
-    EnrollmentSource,
-    automatic_group_probe_allowed,
     disable_history,
     enable_history,
     read_intent,
 )
 from .message_images.contracts import ImageReadResult
-from .models import ReadMessage
+from .models import DialogType, ReadMessage
 from .reading import ReadingDeps, ReadingService
 from .request_timing import (
     TIMING_KIND,
@@ -436,6 +433,16 @@ def _attr(obj: object, name: str, default: object | None = None) -> object | Non
         return cast(object | None, object.__getattribute__(obj, name))
     except AttributeError:
         return default
+
+
+def _automatic_group_type(value: object) -> bool | None:
+    if not isinstance(value, str) or value == DialogType.UNKNOWN.value:
+        return None
+    if value in {DialogType.GROUP.value, DialogType.SUPERGROUP.value, DialogType.FORUM.value}:
+        return True
+    if value in {item.value for item in DialogType}:
+        return False
+    return None
 
 
 def _coerce_int(value: object, default: int) -> int:
@@ -2000,7 +2007,6 @@ class DaemonAPIServer:
             if outcome.action in {
                 "queue_full_history",
                 "already_syncing",
-                "preserved_explicit_enable",
             }:
                 offer_durable_demand(self._require_demand_sink(), DemandKind.FULL_SYNC_PAGE)
             elif outcome.action == "request_delta_refresh":
@@ -2017,7 +2023,6 @@ class DaemonAPIServer:
             "data": {
                 "dialog_id": dialog_id,
                 "enabled": outcome.enabled,
-                "enrollment_source": outcome.source.value,
                 "coverage_status": outcome.coverage_status,
                 "action": outcome.action,
                 "blocked_reason": outcome.blocked_reason,
@@ -2127,7 +2132,6 @@ class DaemonAPIServer:
             delta_refresh_requested_at = cast(int | None, row[7])
             access_revalidation = (cast(int | None, row[8]), cast(int | None, row[9]))
             enrollment_enabled = bool(row[10]) if row[10] is not None else None
-            enrollment_source = cast(str | None, row[11])
         else:
             persisted_status = None
             last_synced_at = None
@@ -2140,7 +2144,6 @@ class DaemonAPIServer:
             access_revalidation = (None, None)
             intent = read_intent(self._conn, dialog_id)
             enrollment_enabled = intent.enabled
-            enrollment_source = intent.source.value if intent.source else None
 
         count_row = cast(tuple[object] | None, self._conn.execute(_COUNT_SYNCED_MESSAGES_SQL, (dialog_id,)).fetchone())
         message_count = int(cast(int | str, count_row[0])) if count_row is not None else 0
@@ -2173,9 +2176,8 @@ class DaemonAPIServer:
             "access_lost_at": access_lost_at,
             "access_last_revalidated_at": access_revalidation[0],
             "access_next_revalidate_at": access_revalidation[1],
-            "enrollment_source": enrollment_source,
             "automatic_group_sync": self._automatic_group_status(
-                dialog_id, enrollment_enabled, enrollment_source, persisted_status, observed_now
+                dialog_id, enrollment_enabled, persisted_status, observed_now
             ),
             **sync_read_model.to_wire(),
         }
@@ -2184,16 +2186,13 @@ class DaemonAPIServer:
         return {"ok": True, "data": data}
 
     def _automatic_group_status(
-        self, dialog_id: int, enabled: bool | None, source: str | None, coverage: str | None, now: int
+        self, dialog_id: int, enabled: bool | None, coverage: str | None, now: int
     ) -> dict[str, object]:
         row, retry_row = self._automatic_group_rows(dialog_id)
-        intent = EnrollmentIntent(dialog_id, enabled, EnrollmentSource(source) if source is not None else None)
         policy = self._policy.automatic_group_history
         facts = AutomaticGroupFacts(
-            enrollment_enabled=intent.enabled,
-            enrollment_source=source,
-            probe_allowed=automatic_group_probe_allowed(intent),
-            dialog_type=None if row is None else cast(str | None, row[0]),
+            enrollment_enabled=enabled,
+            is_group=None if row is None else _automatic_group_type(row[0]),
             members=None if row is None else cast(int | None, row[1]),
             created=None if row is None else cast(int | None, row[2]),
             hidden=None if row is None or row[3] is None else bool(row[3]),
@@ -2210,18 +2209,13 @@ class DaemonAPIServer:
     def _automatic_group_rows(
         self, dialog_id: int
     ) -> tuple[tuple[object, object, object, object] | None, tuple[object] | None]:
-        try:
-            row = read_automatic_group_metadata(self._conn, dialog_id)
-            retry_row = cast(
-                tuple[object] | None,
-                self._conn.execute(
-                    "SELECT value FROM daemon_state WHERE key=?", (f"automatic_group_history_retry:{dialog_id}",)
-                ).fetchone(),
-            )
-        except sqlite3.OperationalError as exc:
-            if "no such table" not in str(exc).lower():
-                raise
-            row, retry_row = None, None
+        row = read_automatic_group_metadata(self._conn, dialog_id)
+        retry_row = cast(
+            tuple[object] | None,
+            self._conn.execute(
+                "SELECT value FROM daemon_state WHERE key=?", (f"automatic_group_history_retry:{dialog_id}",)
+            ).fetchone(),
+        )
         return row, retry_row
 
     async def _recover_dialog_directory(self, req: dict[str, object]) -> dict[str, object]:

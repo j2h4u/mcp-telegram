@@ -214,7 +214,7 @@ async def test_background_reconciliation_survives_restart_beyond_waiter_capacity
             ((entity_id,) for entity_id in range(1000, 1129)),
         )
         conn.executemany(
-            "INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (?,1,'automatic',100)",
+            "INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (?,1,100)",
             ((entity_id,) for entity_id in range(1000, 1129)),
         )
 

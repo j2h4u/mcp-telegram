@@ -18,7 +18,6 @@ from jsonschema import validate
 from telethon.errors import PeerIdInvalidError  # type: ignore[import-untyped]
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
-from helpers import remove_v80_schema_for_historical_fixture
 from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.daemon_entity_info import (
     _SQLITE_INT64_MAX,
@@ -2018,8 +2017,6 @@ def test_progressive_projection_schema_upgrades_from_v56(tmp_path: Path, request
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
     request.addfinalizer(conn.close)
-    remove_v80_schema_for_historical_fixture(conn)
-    conn.commit()
     with write_savepoint(conn):
         conn.execute("DROP TABLE entity_detail_sections")
     with write_savepoint(conn):
@@ -2027,7 +2024,6 @@ def test_progressive_projection_schema_upgrades_from_v56(tmp_path: Path, request
     conn.commit()
     _apply_migration_57(conn, 56)
     conn.commit()
-    _apply_migrations(conn)
     assert conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_detail_sections'"
     ).fetchone() == (1,)

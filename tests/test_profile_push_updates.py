@@ -32,9 +32,7 @@ def database(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     with write_transaction(conn):
         conn.execute("INSERT INTO entities(id,type,name,updated_at) VALUES (42,'user','Before',1)")
         conn.execute("INSERT INTO dialogs(dialog_id,type,name) VALUES (42,'user','Before')")
-        conn.execute(
-            "INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (42,1,'explicit',1)"
-        )
+        conn.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (42,1,1)")
         conn.execute(
             "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_owner_account_id) VALUES (42,?,1,7)",
             (json.dumps({"schema": 1, "id": 42, "type": "user", "name": "Before", "about": "Retained"}),),
