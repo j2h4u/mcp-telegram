@@ -395,9 +395,12 @@ def interrupt_draft_operations(conn: sqlite3.Connection, account_id: int, *, now
     )
     for operation_key, encoded in rows:
         result = cast(object, json.loads(encoded))
-        verification = result.get("verification") if isinstance(result, dict) else None
+        if not isinstance(result, dict):
+            continue
+        verification = result.get("verification")
         if isinstance(verification, dict) and verification.get("reason") == "verification_in_progress":
             verification["reason"] = "interrupted"
+            result["next_action"] = "The retained state may predate this write. Do not repeat it; await reconciliation."
             conn.execute(
                 "UPDATE draft_operation_receipts SET result_json=?,updated_at=? WHERE account_id=? AND operation_key=?",
                 (
