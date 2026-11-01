@@ -691,3 +691,8 @@ rationale = "This fixed domain event tag marks an owned terminal failure for the
 category = "policy_assignments"
 key = "src/mcp_telegram/telegram_rpc_recovery.py:RecoveryReason:FLOOD_BUDGET_SPENT"
 rationale = "This fixed decision-reason tag reports exhaustion of the existing FloodWait trial budget; the tag defines neither the budget limit nor a retry policy value."
+
+[[entry]]
+category = "policy_dict_values"
+key = "src/mcp_telegram/tools/sync.py:<module>:message_retention_policy"
+rationale = "This is the MCP response schema for derived retention-policy vocabulary, not an operator policy value or retention decision."

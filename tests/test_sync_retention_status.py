@@ -61,7 +61,10 @@ def test_latest_query_uses_index_on_migrated_database(tmp_path: Path) -> None:
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     with closing(sqlite3.connect(path)) as conn:
-        plan = conn.execute("EXPLAIN QUERY PLAN " + _LATEST_RETAINED_MESSAGE_SQL, (123,)).fetchall()
+        plan = cast(
+            list[tuple[int, int, int, str]],
+            conn.execute("EXPLAIN QUERY PLAN " + _LATEST_RETAINED_MESSAGE_SQL, (123,)).fetchall(),
+        )
     assert any("idx_messages_dialog_sent" in str(row[3]) for row in plan)
 
 
@@ -73,7 +76,10 @@ async def test_registered_sync_status_projects_local_rows_and_unknown_delivery(
 ) -> None:
     conn = _make_db_with_dialogs()
     dialog_id = 123
-    plan = conn.execute("EXPLAIN QUERY PLAN " + _LATEST_RETAINED_MESSAGE_SQL, (dialog_id,)).fetchall()
+    plan = cast(
+        list[tuple[int, int, int, str]],
+        conn.execute("EXPLAIN QUERY PLAN " + _LATEST_RETAINED_MESSAGE_SQL, (dialog_id,)).fetchall(),
+    )
     assert any("idx_messages_dialog_sent" in str(row[3]) for row in plan)
     _insert_synced_dialog(
         conn,
