@@ -31,6 +31,7 @@ from mcp_telegram.drafts.history import (
     prune_draft_operation_receipts,
     read_current_draft,
     read_draft_operation,
+    refine_draft_verification,
 )
 from mcp_telegram.drafts.snapshot import decode_restore_snapshot
 from mcp_telegram.drafts.sqlite_projection import SQLiteDraftProjection
@@ -337,3 +338,33 @@ def test_migration_90_keeps_legacy_fact_without_inventing_restore_payload(
     )
     assert row == ("old local knowledge", None, None)
     assert conn.execute("SELECT COUNT(*) FROM draft_versions").fetchone()[0] == 0
+
+
+def test_ack_verification_refines_once_and_restart_preserves_ack(
+    store: tuple[sqlite3.Connection, SQLiteDraftProjection],
+) -> None:
+    conn, projection = store
+    _full_snapshot(projection, 100)
+    initial = {
+        "outcome": "acknowledged",
+        "save_acknowledged": True,
+        "mutation_dispatched": True,
+        "backup_history_id": None,
+        "verification": {"status": "unverified", "basis": "none", "reason": "verification_in_progress"},
+        "current": {"presence": "absent"},
+    }
+    with write_transaction(conn):
+        prepare_draft_operation(conn, _SCOPE, "one", "fingerprint", _version(conn), backup=False)
+        finish_draft_operation(conn, 100, "one", "acknowledged", initial)
+        final = {**initial, "verification": {"status": "verified", "basis": "post_write_snapshot"}}
+        refine_draft_verification(conn, 100, "one", "fingerprint", final)
+        with pytest.raises(DraftOperationConflictError):
+            refine_draft_verification(conn, 100, "one", "fingerprint", final)
+        prepare_draft_operation(conn, _SCOPE, "two", "fingerprint2", _version(conn), backup=False)
+        finish_draft_operation(conn, 100, "two", "acknowledged", initial)
+        assert interrupt_draft_operations(conn, 100) == 1
+    first = read_draft_operation(conn, 100, "one")
+    second = read_draft_operation(conn, 100, "two")
+    assert first is not None and first.result == final
+    assert second is not None and second.outcome == "acknowledged"
+    assert cast(dict[str, object], second.result["verification"])["reason"] == "interrupted"

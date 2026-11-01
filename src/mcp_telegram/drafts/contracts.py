@@ -7,6 +7,7 @@ arrival has a globally meaningful order.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -15,6 +16,16 @@ MAX_DRAFT_ENTITY_COUNT = 1_024
 MAX_DRAFT_TEXT_LENGTH = 65_536
 MAX_DRAFT_ENTITIES_JSON_BYTES = 65_536
 MAX_REFERENCE_KIND_LENGTH = 80
+
+
+def project_draft_result(result: Mapping[str, object]) -> dict[str, object]:
+    """Add honest verification evidence to retained pre-verification receipts."""
+    projected = dict(result)
+    if "verification" not in projected and "outcome" in projected:
+        projected["verification"] = {"status": "unverified", "basis": "none", "reason": "legacy_receipt"}
+        if "current_is_operation_confirmation" in projected:
+            projected["current_is_operation_confirmation"] = False
+    return projected
 
 
 class DraftDisposition(StrEnum):

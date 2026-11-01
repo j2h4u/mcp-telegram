@@ -12,6 +12,7 @@ from ..dialog_selector import (
     DialogSelectorError,
     required_dialog_selector,
 )
+from ..drafts.contracts import project_draft_result
 from ._base import (
     DaemonNotRunningError,
     ToolArgs,
@@ -61,7 +62,9 @@ class ManageDraft(GetDraft):
     restore. Observed replaced states are retained temporarily for undo; an
     unseen simultaneous edit from another device cannot be protected by Telegram
     version checks. Reuse the same operation_key when checking an interrupted
-    operation; never blindly repeat an uncertain write with a new key.
+    operation; never blindly repeat an uncertain write with a new key. Successful
+    changes are checked against an authoritative snapshot before returning when
+    possible; verification reports whether the observed state matches.
     """
 
     action: Literal["create", "update", "clear", "restore"]
@@ -146,7 +149,18 @@ MANAGE_DRAFT_OUTPUT_SCHEMA = {
         },
         "current_is_operation_confirmation": {
             "type": "boolean",
-            "description": "Whether current confirms this operation; false for acknowledged/unknown because current is a retained observation that may predate the write.",
+            "description": "Whether current confirms a verified acknowledged or unchanged operation.",
+        },
+        "verification": {
+            "type": "object",
+            "properties": {
+                "status": {"enum": ["verified", "conflict", "unverified"]},
+                "basis": {"enum": ["post_write_snapshot", "preflight", "none"]},
+                "reason": {"type": "string", "maxLength": 128},
+            },
+            "required": ["status", "basis"],
+            "additionalProperties": False,
+            "description": "Whether the canonical observation confirms the requested state; unverified current may predate the write.",
         },
         "save_acknowledged": {"type": "boolean"},
         "backup_history_id": {"type": "integer"},
@@ -159,6 +173,7 @@ MANAGE_DRAFT_OUTPUT_SCHEMA = {
         "operation_key",
         "result_persisted",
         "current_is_operation_confirmation",
+        "verification",
         "current",
         "next_action",
     ],
@@ -184,6 +199,7 @@ def _draft_error_response(response: Mapping[str, object]) -> ToolResult | None:
         "backup_history_id",
         "current",
         "current_is_operation_confirmation",
+        "verification",
     ):
         if field in response:
             details[field] = response[field]
@@ -243,6 +259,8 @@ async def manage_draft(args: ManageDraft) -> ToolResult:
             error_code="draft_completion_unconfirmed",
             details={"outcome": "unknown", "operation_key": args.operation_key, "failure_kind": exc.kind},
         )
+    if response.get("ok") is True or response.get("result_persisted") is True:
+        response = project_draft_result(response)
     if err := _draft_error_response(response):
         return err
     response.pop("request_id", None)

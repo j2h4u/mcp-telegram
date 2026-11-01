@@ -438,6 +438,7 @@ STRUCTURED_TOOL_CASES = {
             "save_acknowledged": True,
             "result_persisted": True,
             "current_is_operation_confirmation": False,
+            "verification": {"status": "unverified", "basis": "none", "reason": "legacy_receipt"},
             "current": {"presence": "absent", "uncertain": False, "observed_at": 1700000000},
             "next_action": "Read get_draft.",
         },

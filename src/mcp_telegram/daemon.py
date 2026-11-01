@@ -2138,6 +2138,7 @@ async def _bind_draft_commands(ctx: _SyncMainContext) -> None:
             resolve_peer=resolve_peer,
             preflight=owner.refresh_for_mutation,
             request_recovery=owner.request_recovery,
+            postflight=owner.refresh_after_mutation,
         )
     )
 

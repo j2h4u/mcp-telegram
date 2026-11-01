@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
@@ -567,3 +568,72 @@ async def test_real_snapshot_owner_and_adapter_share_command_budgets(harness: _H
     assert harness.conn.execute("SELECT status FROM draft_sync_state WHERE account_id=100").fetchone() == (
         "recovery_needed",
     )
+
+
+async def test_cancel_after_ack_checkpoint_finalizes_interrupted_receipt(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    saved, release = asyncio.Event(), asyncio.Event()
+    original = harness.owner._finish
+
+    async def held_finish(command: object, result: dict[str, object]) -> None:
+        await original(command, result)  # type: ignore[arg-type]
+        saved.set()
+        await release.wait()
+
+    monkeypatch.setattr(harness.owner, "_finish", held_finish)
+    request = harness.command("create", "cancel-ack", text="test")
+    task = asyncio.create_task(harness.owner.execute(request))
+    await saved.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    receipt = read_draft_operation(harness.conn, 100, "cancel-ack")
+    assert receipt is not None and receipt.outcome == "acknowledged"
+    assert receipt.result["verification"] == {"status": "unverified", "basis": "none", "reason": "interrupted"}
+    assert harness.recoveries == ["draft_mutation"]
+    assert await harness.owner.execute(request) == receipt.result
+
+
+async def test_legacy_unchanged_receipt_replay_does_not_claim_verification(harness: _Harness) -> None:
+    request = harness.command("clear", "legacy-noop")
+    saved = await harness.owner.execute(request)
+    legacy = dict(saved)
+    del legacy["verification"]
+    legacy["current_is_operation_confirmation"] = True
+    with harness.conn:
+        harness.conn.execute(
+            "UPDATE draft_operation_receipts SET result_json=? WHERE operation_key=?",
+            (json.dumps(legacy), "legacy-noop"),
+        )
+    calls = harness.preflights
+    replay = await harness.owner.execute(request)
+    assert harness.preflights == calls and harness.requests == []
+    assert replay["current"] == legacy["current"]
+    assert replay["current_is_operation_confirmation"] is False
+    assert replay["verification"] == {"status": "unverified", "basis": "none", "reason": "legacy_receipt"}
+    receipt = read_draft_operation(harness.conn, 100, "legacy-noop")
+    assert receipt is not None and receipt.result == legacy
+
+
+async def test_noop_does_not_confirm_newer_state_after_prepare(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = harness.owner._prepare
+
+    async def changed_after_prepare(*args: object, **kwargs: object) -> object:
+        receipt = await original(*args, **kwargs)  # type: ignore[arg-type]
+        harness.set_remote("concurrent change")
+        harness.publish()
+        return receipt
+
+    monkeypatch.setattr(harness.owner, "_prepare", changed_after_prepare)
+    result = await harness.owner.execute(harness.command("clear", "noop-race"))
+    assert result["outcome"] == "unchanged"
+    assert result["current_is_operation_confirmation"] is False
+    assert cast(dict[str, object], result["verification"])["status"] == "unverified"
+    assert cast(dict[str, object], result["current"])["text"] == "concurrent change"
+    assert harness.requests == []

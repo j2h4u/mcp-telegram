@@ -742,7 +742,7 @@ _REGISTRY: dict[TelegramRpcSource, TelegramRpcConsumerSpec] = {
     ),
     TelegramRpcSource.DRAFT_MUTATION: _consumer(
         "Draft mutation",
-        "Check native drafts once and save or clear one explicitly requested draft",
+        "Check native drafts, save or clear one requested draft, and verify the result",
         _I,
         TelegramFactDomain.DRAFTS,
         AcquisitionRole.MUTATION,
@@ -987,7 +987,7 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         DemandKind.DRAFT_MUTATION,
         TelegramRpcSource.DRAFT_MUTATION,
         _INLINE,
-        max_rpc_attempts_per_slice=2,
+        max_rpc_attempts_per_slice=3,
     ),
     DemandKind.SCHEDULED_MUTATION: _contract(
         DemandKind.SCHEDULED_MUTATION,

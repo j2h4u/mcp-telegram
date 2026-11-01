@@ -100,7 +100,8 @@ async def test_draft_commands_bind_and_respect_exact_retained_target(
         if error is None:
             assert result["ok"] is True
             assert result["outcome"] == "acknowledged"
-            assert len(calls) == 2
+            assert len(calls) == 3
+            assert result["verification"] == {"status": "conflict", "basis": "post_write_snapshot"}
         else:
             assert result["ok"] is False
             assert result["error"] == error
