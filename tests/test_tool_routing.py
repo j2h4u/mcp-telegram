@@ -366,6 +366,12 @@ def _canonical_list_dialogs_data(dialogs: list[dict[str, object]]) -> dict[str, 
 def _canonical_get_sync_status_data() -> dict[str, object]:
     return {
         "dialog_id": 123,
+        "automatic_group_sync": {
+            "enrollment_interpretation": "enabled",
+            "eligibility": "blocked",
+            "reason": "already_enabled",
+            "fresh_telegram_total": "unknown",
+        },
         "latest_retained_message": None,
         "enrollment_source": "explicit",
         "sync_progress": None,
@@ -588,6 +594,12 @@ STRUCTURED_TOOL_CASES = {
             "ok": True,
             "data": {
                 "dialog_id": 123,
+                "automatic_group_sync": {
+                    "enrollment_interpretation": "enabled",
+                    "eligibility": "blocked",
+                    "reason": "already_enabled",
+                    "fresh_telegram_total": "unknown",
+                },
                 "latest_retained_message": None,
                 "enrollment_source": "explicit",
                 "delta_refresh_requested_at": None,
@@ -2543,6 +2555,12 @@ async def test_get_sync_status_via_daemon():
     """GetSyncStatus routes through daemon and formats key=value output."""
     data = {
         "dialog_id": -1001234567890,
+        "automatic_group_sync": {
+            "enrollment_interpretation": "enabled",
+            "eligibility": "blocked",
+            "reason": "already_enabled",
+            "fresh_telegram_total": "unknown",
+        },
         "latest_retained_message": None,
         "enrollment_source": "explicit",
         "sync_progress": 100,
@@ -2565,6 +2583,12 @@ async def test_get_sync_status_via_daemon():
     assert result.content == ()
     assert result.structured_content == {
         "dialog_id": -1001234567890,
+        "automatic_group_sync": {
+            "enrollment_interpretation": "enabled",
+            "eligibility": "blocked",
+            "reason": "already_enabled",
+            "fresh_telegram_total": "unknown",
+        },
         "coverage_status": "synced",
         "enrollment_enabled": True,
         "enrollment_source": "explicit",

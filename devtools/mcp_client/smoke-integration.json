@@ -57,6 +57,7 @@
           "structuredContent.current.uncertain",
           "structuredContent.acquisition_status",
           "structuredContent.coverage_status",
+          "structuredContent.automatic_group_sync",
           "structuredContent.history",
           "structuredContent.next_action"
         ],

@@ -32,6 +32,11 @@ class EnrollmentIntent:
     source: EnrollmentSource | None
 
 
+def automatic_group_probe_allowed(intent: EnrollmentIntent) -> bool:
+    """Reconsider migration's inferred disable while preserving real decisions."""
+    return intent.source is None or (intent.source is EnrollmentSource.MIGRATION and intent.enabled is False)
+
+
 @dataclass(frozen=True, slots=True)
 class EnrollmentOutcome:
     dialog_id: int
@@ -306,7 +311,7 @@ def record_automatic_group_decision(
     timestamp = int(time.time()) if now is None else now
     with write_savepoint(conn):
         previous = read_intent(conn, dialog_id)
-        if previous.source is not None:
+        if not automatic_group_probe_allowed(previous):
             return previous
         _store_intent(conn, dialog_id, enabled, EnrollmentSource.AUTOMATIC, timestamp)
         if enabled:
@@ -338,6 +343,7 @@ __all__ = [
     "EnrollmentIntent",
     "EnrollmentOutcome",
     "EnrollmentSource",
+    "automatic_group_probe_allowed",
     "disable_history",
     "enable_history",
     "ensure_automatic_dm_enrollment",

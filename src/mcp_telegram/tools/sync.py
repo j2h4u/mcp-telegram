@@ -67,6 +67,21 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
         },
         "enrollment_enabled": {"type": ["boolean", "null"]},
         "enrollment_source": {"type": ["string", "null"]},
+        "automatic_group_sync": {
+            "type": "object",
+            "description": "Current local automatic group eligibility; a fresh Telegram total requires a background probe.",
+            "properties": {
+                "enrollment_interpretation": {
+                    "enum": ["migration_unknown", "explicit_disabled", "automatic_rejected", "enabled", "undecided"]
+                },
+                "eligibility": {"enum": ["eligible_for_probe", "blocked", "unknown"]},
+                "reason": {"type": "string"},
+                "fresh_telegram_total": {"const": "unknown"},
+                "retry_at": {"type": "integer"},
+            },
+            "required": ["enrollment_interpretation", "eligibility", "reason", "fresh_telegram_total"],
+            "additionalProperties": False,
+        },
         "realtime_history": {
             "type": "string",
             "enum": [item.value for item in RealtimeHistory],
@@ -142,6 +157,7 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
         "coverage_status",
         "enrollment_enabled",
         "enrollment_source",
+        "automatic_group_sync",
         "realtime_history",
         "message_retention_policy",
         "latest_retained_message",
@@ -179,6 +195,7 @@ class _GetSyncStatusSurface:
     model: SyncReadModel
     dialog_id: int
     enrollment_source: str | None
+    automatic_group_sync: dict[str, object]
     delta_refresh_requested_at: int | None
     sync_progress: int | None
     sync_progress_message_id: int | None
@@ -239,6 +256,7 @@ def _decode_get_sync_status_surface(
         model=decode_sync_read_model(data),
         dialog_id=dialog_id,
         enrollment_source=_surface_optional_string(data, "enrollment_source"),
+        automatic_group_sync=_decode_automatic_group_status(_surface_required(data, "automatic_group_sync")),
         delta_refresh_requested_at=_surface_optional_int(data, "delta_refresh_requested_at"),
         sync_progress=_surface_optional_int(data, "sync_progress"),
         sync_progress_message_id=_surface_optional_int(data, "sync_progress_message_id"),
@@ -248,6 +266,44 @@ def _decode_get_sync_status_surface(
         access_next_revalidate_at=_surface_optional_int(data, "access_next_revalidate_at"),
         latest_retained_message=decode_latest_retained_message(_surface_required(data, "latest_retained_message")),
     )
+
+
+def _decode_automatic_group_status(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise SyncReadModelContractError("automatic_group_sync must be an object")
+    interpretation = value.get("enrollment_interpretation")
+    if not _is_known_value(
+        interpretation,
+        {
+            "migration_unknown",
+            "explicit_disabled",
+            "automatic_rejected",
+            "enabled",
+            "undecided",
+        },
+    ):
+        raise SyncReadModelContractError("invalid automatic group enrollment interpretation")
+    eligibility = value.get("eligibility")
+    if (
+        not _is_known_value(eligibility, {"eligible_for_probe", "blocked", "unknown"})
+        or value.get("fresh_telegram_total") != "unknown"
+    ):
+        raise SyncReadModelContractError("invalid automatic group eligibility")
+    if not isinstance(value.get("reason"), str) or set(value) - {
+        "enrollment_interpretation",
+        "eligibility",
+        "reason",
+        "fresh_telegram_total",
+        "retry_at",
+    }:
+        raise SyncReadModelContractError("invalid automatic group status")
+    if "retry_at" in value and type(value["retry_at"]) is not int:
+        raise SyncReadModelContractError("invalid automatic group retry time")
+    return dict(value)
+
+
+def _is_known_value(value: object, allowed: set[str]) -> bool:
+    return isinstance(value, str) and value in allowed
 
 
 class MarkDialogForSync(ToolArgs):
@@ -305,6 +361,7 @@ class GetSyncStatus(ToolArgs):
     sync_progress is the raw message_id offset cursor, not a row count. Works for any dialog —
     non-synced dialogs return status='not_synced' with zero counts.
     Retention policy says which delivered messages may be saved; it does not verify delivery.
+    Automatic group eligibility describes local facts; a fresh Telegram total requires a background probe.
     The latest retained message is ordered by Telegram sent time, not local arrival."""
 
     dialog_id: int = Field(description="Numeric dialog ID from ListDialogs")
@@ -346,6 +403,7 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
         "coverage_status": wire["sync_status"],
         "enrollment_enabled": wire["enrollment_enabled"],
         "enrollment_source": surface.enrollment_source,
+        "automatic_group_sync": surface.automatic_group_sync,
         "realtime_history": wire["realtime_history"],
         "message_retention_policy": {
             RealtimeHistory.FULL: "all_authorized",

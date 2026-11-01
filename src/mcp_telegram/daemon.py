@@ -1323,6 +1323,7 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
                 max_queued_refreshes=config.entity_profile.max_queued_refreshes,
             ),
             full_user_pair_enabled=config.entity_profile.full_user_pair_enabled,
+            automatic_group_history=config.scheduling.automatic_group_history,
         ),
         health_status=health_status,
         account_safety_status=client.account_safety_status,

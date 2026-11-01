@@ -75,7 +75,7 @@ from .dialog_directory_coverage import (
     classify_directory_coverage,
     read_dialog_directory_coverage,
 )
-from .dialog_identity import read_local_dialog_identities
+from .dialog_identity import read_automatic_group_metadata, read_local_dialog_identities
 from .dialog_selector import SELF_DIALOG_ALIASES, DialogSelector, DialogSelectorError, required_dialog_selector
 from .drafts.read_service import read_draft_request
 from .entity_profile.ports import (
@@ -93,7 +93,15 @@ from .entity_profile.repository import EntityProfileRepository
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
 from .folders.read_model import dialog_placement, folder_snapshot, folder_summaries
-from .history_enrollment import EnrollmentOutcome, disable_history, enable_history, read_intent
+from .history_enrollment import (
+    EnrollmentIntent,
+    EnrollmentOutcome,
+    EnrollmentSource,
+    automatic_group_probe_allowed,
+    disable_history,
+    enable_history,
+    read_intent,
+)
 from .message_images.contracts import ImageReadResult
 from .models import ReadMessage
 from .reading import ReadingDeps, ReadingService
@@ -115,8 +123,10 @@ from .runtime_observations import (
 from .sqlite_writer import SQLiteWriter
 from .sync_read_model import (
     DM_DELETION_RECONCILIATION_STATE_KEY,
+    AutomaticGroupFacts,
     InvalidDmDeletionCheckpointError,
     SyncStatus,
+    automatic_group_status,
     build_sync_read_model,
     decode_dm_deletion_checkpoint,
     dm_deletion_reconciliation_is_blocked,
@@ -394,6 +404,14 @@ class TelemetryPolicy(Protocol):
     def runtime_observations(self) -> RuntimeObservationPolicy: ...
 
 
+class AutomaticGroupPolicy(Protocol):
+    @property
+    def max_members(self) -> int: ...
+
+    @property
+    def recent_days(self) -> int: ...
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class DaemonApiPolicy:
     """Operator-controlled cache and retention policy supplied by the daemon root."""
@@ -410,6 +428,7 @@ class DaemonApiPolicy:
     draft_response_budget_bytes: int
     entity_profile: RefreshLimits
     full_user_pair_enabled: bool = False
+    automatic_group_history: AutomaticGroupPolicy | None = None
 
 
 def _attr(obj: object, name: str, default: object | None = None) -> object | None:
@@ -2126,6 +2145,7 @@ class DaemonAPIServer:
         count_row = cast(tuple[object] | None, self._conn.execute(_COUNT_SYNCED_MESSAGES_SQL, (dialog_id,)).fetchone())
         message_count = int(cast(int | str, count_row[0])) if count_row is not None else 0
         latest = cast(tuple[int, int] | None, self._conn.execute(_LATEST_RETAINED_MESSAGE_SQL, (dialog_id,)).fetchone())
+        observed_now = int(time.time())
         sync_read_model = build_sync_read_model(
             persisted_status=persisted_status,
             enrollment_enabled=enrollment_enabled,
@@ -2134,7 +2154,7 @@ class DaemonAPIServer:
             last_delta_checked_at=last_delta_checked_at,
             saved_message_count=message_count,
             total_messages=total_messages,
-            now=int(time.time()),
+            now=observed_now,
         )
 
         data: dict = {
@@ -2154,11 +2174,55 @@ class DaemonAPIServer:
             "access_last_revalidated_at": access_revalidation[0],
             "access_next_revalidate_at": access_revalidation[1],
             "enrollment_source": enrollment_source,
+            "automatic_group_sync": self._automatic_group_status(
+                dialog_id, enrollment_enabled, enrollment_source, persisted_status, observed_now
+            ),
             **sync_read_model.to_wire(),
         }
         if sync_read_model.sync_status is SyncStatus.ACCESS_LOST and total_messages is None:
             data["archived_message_count"] = message_count
         return {"ok": True, "data": data}
+
+    def _automatic_group_status(
+        self, dialog_id: int, enabled: bool | None, source: str | None, coverage: str | None, now: int
+    ) -> dict[str, object]:
+        row, retry_row = self._automatic_group_rows(dialog_id)
+        intent = EnrollmentIntent(dialog_id, enabled, EnrollmentSource(source) if source is not None else None)
+        policy = self._policy.automatic_group_history
+        facts = AutomaticGroupFacts(
+            enrollment_enabled=intent.enabled,
+            enrollment_source=source,
+            probe_allowed=automatic_group_probe_allowed(intent),
+            dialog_type=None if row is None else cast(str | None, row[0]),
+            members=None if row is None else cast(int | None, row[1]),
+            created=None if row is None else cast(int | None, row[2]),
+            hidden=None if row is None or row[3] is None else bool(row[3]),
+            coverage_status=coverage,
+            retry_at=None if retry_row is None else _coerce_int(retry_row[0], 0),
+        )
+        return automatic_group_status(
+            facts,
+            now=now,
+            max_members=None if policy is None else policy.max_members,
+            recent_days=None if policy is None else policy.recent_days,
+        )
+
+    def _automatic_group_rows(
+        self, dialog_id: int
+    ) -> tuple[tuple[object, object, object, object] | None, tuple[object] | None]:
+        try:
+            row = read_automatic_group_metadata(self._conn, dialog_id)
+            retry_row = cast(
+                tuple[object] | None,
+                self._conn.execute(
+                    "SELECT value FROM daemon_state WHERE key=?", (f"automatic_group_history_retry:{dialog_id}",)
+                ).fetchone(),
+            )
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            row, retry_row = None, None
+        return row, retry_row
 
     async def _recover_dialog_directory(self, req: dict[str, object]) -> dict[str, object]:
         """Start a new unpublished attempt only after a semantic-invalid latch."""
