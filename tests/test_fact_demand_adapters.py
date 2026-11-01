@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import patch
 
 import pytest
 
@@ -21,7 +22,12 @@ from mcp_telegram.fact_hydration import (
     MessageFactHydrationWorker,
 )
 from mcp_telegram.flood import TelegramRpcThrottled
-from mcp_telegram.hydration_queue import HydrationJob, HydrationPriority, HydrationQueueRepository
+from mcp_telegram.hydration_queue import (
+    TRANSCRIPTION_HYDRATION_KIND,
+    HydrationJob,
+    HydrationPriority,
+    HydrationQueueRepository,
+)
 from mcp_telegram.media_hydration import MediaFactHydrationHandler
 from mcp_telegram.message_fact_refresh import (
     ReadReceiptDemandAdapter,
@@ -48,6 +54,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     current_rpc_scope,
     rpc_scope,
 )
+from mcp_telegram.transcription_hydration import TranscriptionHydrationHandler
 from tests.sqlite_writer_helpers import inline_writer
 
 
@@ -231,6 +238,182 @@ def _hydration_worker(
         backfill_debt_limit=1,
         clock=clock,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("pending_count", "restart"), [(1, False), (2, False), (3, False), (1, True)])
+async def test_pending_transcription_resumes_after_due_with_same_coordinator(  # noqa: PLR0915, PLR0914
+    pending_count: int, restart: bool
+) -> None:
+    conn = _hydration_db()
+    conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
+    conn.execute(
+        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
+    )
+    conn.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
+        "VALUES (1, 1, 1, 'voice', '{}')"
+    )
+    conn.execute(
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, priority) VALUES (?, 1, 1, 1, 1)",
+        (TRANSCRIPTION_HYDRATION_KIND,),
+    )
+    conn.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
+        "VALUES (1, 2, 1, 'voice', '{}')"
+    )
+    conn.execute(
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, priority) VALUES (?, 1, 2, 120, 1)",
+        (TRANSCRIPTION_HYDRATION_KIND,),
+    )
+    clock = [100.0]
+    handler = TranscriptionHydrationHandler(recheck_delay_seconds=30)
+    worker = _hydration_worker(conn, cast(_HydrationHandler, handler), clock=lambda: clock[0])
+    adapter = FactHydrationDemandAdapter(worker, HydrationPriority.FOREGROUND, account_id=1)
+    adapters: dict[DemandKind, DurableDemandAdapter] = {
+        kind: cast(DurableDemandAdapter, _IdleDemandAdapter()) for kind in DURABLE_DEMAND_ORDER
+    }
+    adapters[DemandKind.LIVE_HYDRATION_BATCH] = adapter
+    pending: asyncio.Queue[None] = asyncio.Queue()
+    completed: asyncio.Queue[None] = asyncio.Queue()
+    timer = asyncio.Event()
+    shutdown = asyncio.Event()
+
+    class Observer:
+        def observe_demand(self, **event: object) -> None:
+            if event.get("reason") in {"retryable_failure", "no_progress"}:
+                pending.put_nowait(None)
+            if event.get("outcome") == "completed":
+                completed.put_nowait(None)
+
+    coordinator = TelegramDemandCoordinator(
+        adapters, shutdown, clock=lambda: clock[0], monotonic_clock=lambda: clock[0], observer=Observer()
+    )
+
+    async def wait_for_clock(_delay: float) -> None:
+        await timer.wait()
+        timer.clear()
+
+    selected = adapter.status(clock[0])
+    assert selected is not None
+
+    task: asyncio.Task[None] | None = None
+    try:
+        with (
+            patch.object(coordinator, "_wait_for_wakeup", side_effect=wait_for_clock),
+            patch.object(
+                worker,
+                "_request_batch",
+                side_effect=[
+                    SimpleNamespace(pending=True),
+                    SimpleNamespace(pending=False, text="independent transcription", transcription_id=5),
+                    *[SimpleNamespace(pending=True) for _ in range(pending_count - 1)],
+                    SimpleNamespace(pending=False, text="completed transcription", transcription_id=4),
+                ],
+            ) as request,
+        ):
+            task = asyncio.create_task(coordinator.run())
+            for attempt in range(1, pending_count + 1):
+                await asyncio.wait_for(pending.get(), 3)
+                row = cast(
+                    tuple[int, int, int, str],
+                    conn.execute(
+                        "SELECT due_at, attempts, terminal, last_outcome FROM hydration_jobs WHERE message_id=1"
+                    ).fetchone(),
+                )
+                if attempt == 3:
+                    assert row[1:] == (3, 1, "exhausted")
+                    clock[0] += 3600
+                    assert adapter.status(clock[0]) is None
+                    assert request.call_count == 4
+                    shutdown.set()
+                    timer.set()
+                    await asyncio.wait_for(task, 3)
+                    return
+                assert row == (int(clock[0]) + 30, attempt, 0, "telegram_pending")
+                clock[0] = row[0] - 1
+                if attempt == 1:
+                    other = adapter.status(clock[0])
+                    assert other is not None and other.selected != selected.selected
+                    timer.set()
+                    await asyncio.wait_for(completed.get(), 3)
+                else:
+                    assert adapter.status(clock[0]) is None
+                assert request.call_count == attempt + 1
+                clock[0] = row[0]
+                current = adapter.status(clock[0])
+                assert current is not None and current.selected == selected.selected
+                # The existing central backoff may be longer than the persisted due time.
+                clock[0] += 60
+                if restart:
+                    shutdown.set()
+                    timer.set()
+                    await asyncio.wait_for(task, 3)
+                    shutdown = asyncio.Event()
+                    coordinator = TelegramDemandCoordinator(
+                        adapters,
+                        shutdown,
+                        clock=lambda: clock[0],
+                        monotonic_clock=lambda: clock[0],
+                        observer=Observer(),
+                    )
+                    task = asyncio.create_task(coordinator.run())
+                else:
+                    timer.set()
+            await asyncio.wait_for(completed.get(), 3)
+            assert request.call_count == pending_count + 2
+            assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+            shutdown.set()
+            if restart:
+                coordinator.offer(DemandKind.LIVE_HYDRATION_BATCH)
+            else:
+                timer.set()
+            await asyncio.wait_for(task, 3)
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_transcription_cancellation_preserves_message_and_propagates() -> None:
+    conn = _hydration_db()
+    conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
+    conn.execute(
+        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
+    )
+    conn.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) VALUES (1, 1, 1, 'voice', '{}')"
+    )
+    conn.execute(
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, priority) VALUES (?, 1, 1, 1, 1)",
+        (TRANSCRIPTION_HYDRATION_KIND,),
+    )
+    worker = _hydration_worker(conn, cast(_HydrationHandler, TranscriptionHydrationHandler(recheck_delay_seconds=30)))
+    adapter = FactHydrationDemandAdapter(worker, HydrationPriority.FOREGROUND, account_id=1)
+    status = adapter.status(100)
+    assert status is not None
+    started = asyncio.Event()
+
+    async def blocked_request(*_args: object, **_kwargs: object) -> object:
+        started.set()
+        await asyncio.Event().wait()
+        return object()
+
+    try:
+        with patch.object(worker, "_request_batch", side_effect=blocked_request):
+            task = asyncio.create_task(adapter.run_slice(RpcAttemptBudget(limit=2, selected=status.selected)))
+            await asyncio.wait_for(started.wait(), 3)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert conn.execute("SELECT media_kind FROM messages WHERE dialog_id=1 AND message_id=1").fetchone() == (
+            "voice",
+        )
+        assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (1,)
+    finally:
+        conn.close()
 
 
 @pytest.mark.asyncio

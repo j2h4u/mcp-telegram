@@ -92,7 +92,7 @@ from .entity_profile.refresh import RefreshLimits
 from .entity_profile.repository import EntityProfileRepository
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
-from .folders.read_model import dialog_placement, folder_snapshot, folder_summaries, folders_by_dialog
+from .folders.read_model import dialog_placement, folder_snapshot, folder_summaries
 from .history_enrollment import EnrollmentOutcome, disable_history, enable_history, read_intent
 from .message_images.contracts import ImageReadResult
 from .models import ReadMessage
@@ -1768,27 +1768,9 @@ class DaemonAPIServer:
         await self._reproject_due_folder_memberships()
         if self._directory_audit_requested(req):
             return await self._list_dialogs_audit(req)
-        result = await self._get_reading_service().list_dialogs(cast(dict[str, object], req))
-        if not result.get("ok"):
-            return result
-        requested_folder = req.get("folder_id")
-        folder_id = None if requested_folder is None else int(cast(int | str, requested_folder))
-        raw_limit = req.get("limit")
-        limit = None if raw_limit is None else _clamp(_coerce_int(raw_limit, 100), 1, 500)
-        data = cast(dict[str, object], result.get("data", {}))
-        dialogs = cast(list[dict[str, object]], data.get("dialogs", []))
-        if folder_id == 1:
-            self._project_archived_dialogs(data, dialogs, limit)
-        else:
-            self._project_regular_folder_dialogs(data, dialogs, folder_id, limit)
-        for dialog in cast(list[dict[str, object]], data.get("dialogs", [])):
-            dialog_id = dialog.get("id")
-            dialog["is_self"] = isinstance(dialog_id, int) and dialog_id == self.self_id
-        data["folder_snapshot"] = folder_snapshot(
-            self._conn,
-            stale_after_seconds=self._policy.folder_snapshot_stale_after_seconds,
+        return await self._get_reading_service().list_dialogs(
+            {**req, "folder_snapshot_stale_after_seconds": self._policy.folder_snapshot_stale_after_seconds}
         )
-        return result
 
     @staticmethod
     def _directory_audit_requested(req: dict[str, object]) -> bool:
@@ -1822,62 +1804,6 @@ class DaemonAPIServer:
             "message": message,
             "required_action": "Verify the current account and restart the directory traversal.",
         }
-
-    def _project_archived_dialogs(
-        self,
-        data: dict[str, object],
-        dialogs: list[dict[str, object]],
-        limit: int | None,
-    ) -> None:
-        archive_rows = cast(
-            list[tuple[object, object]],
-            self._conn.execute(
-                "SELECT d.dialog_id,COALESCE(f.archived,d.archived) FROM dialogs d "
-                "LEFT JOIN dialog_directory_facts f ON f.dialog_id=d.dialog_id WHERE d.hidden=0"
-            ).fetchall(),
-        )
-        archived_ids = {_coerce_int(dialog_id, 0) for dialog_id, archived in archive_rows if archived == 1}
-        unknown_archived = sum(archived is None for _, archived in archive_rows)
-        enriched = [dialog for dialog in dialogs if int(cast(int | str, dialog["id"])) in archived_ids]
-        for dialog in enriched:
-            dialog["folder_ids"] = [1]
-            dialog["folders"] = [{"id": 1, "title": "Archived"}]
-        data["dialogs"] = enriched[:limit] if limit is not None else enriched
-        data["folder_membership_unknown_count"] = unknown_archived
-
-    def _project_regular_folder_dialogs(
-        self,
-        data: dict[str, object],
-        dialogs: list[dict[str, object]],
-        folder_id: int | None,
-        limit: int | None,
-    ) -> None:
-        memberships = folders_by_dialog(self._conn)
-        enriched = []
-        for dialog in dialogs:
-            folders = memberships.get(int(cast(int | str, dialog["id"])), [])
-            ids = [int(cast(int | str, folder["id"])) for folder in folders]
-            dialog["folder_ids"] = ids
-            dialog["folders"] = folders
-            if folder_id is None or folder_id in ids:
-                enriched.append(dialog)
-                if limit is not None and len(enriched) >= limit:
-                    break
-        data["dialogs"] = enriched
-        data["folder_membership_unknown_count"] = self._folder_membership_unknown_count(folder_id)
-
-    def _folder_membership_unknown_count(self, folder_id: int | None) -> int:
-        if folder_id is None:
-            return 0
-        folder_namespace = "default" if folder_id == 0 else "filter"
-        unknown_row = cast(
-            tuple[object] | None,
-            self._conn.execute(
-                "SELECT COUNT(*) FROM telegram_folder_local_members WHERE namespace=? AND folder_id=? AND state='unknown'",
-                (folder_namespace, folder_id),
-            ).fetchone(),
-        )
-        return _coerce_int(unknown_row[0], 0) if unknown_row is not None else 0
 
     async def _get_unread_summary(self, req: dict[str, object]) -> dict:
         """Delegate the Dialog-projection unread overview to the read service."""
@@ -2469,7 +2395,7 @@ class DaemonAPIServer:
         """Delegate feedback submission to the daemon-wired application service."""
         if self._feedback_service is None:
             return {"ok": False, "error": "internal", "message": "feedback database not initialised"}
-        return self._feedback_service.submit_feedback(req)
+        return await self._feedback_service.submit_feedback(req)
 
     # ------------------------------------------------------------------
     # update_feedback_status
@@ -2479,7 +2405,7 @@ class DaemonAPIServer:
         """Delegate feedback status changes to the daemon-wired application service."""
         if self._feedback_service is None:
             return {"ok": False, "error": "internal", "message": "feedback database not initialised"}
-        return self._feedback_service.update_feedback_status(req)
+        return await self._feedback_service.update_feedback_status(req)
 
     # ------------------------------------------------------------------
     # get_usage_stats

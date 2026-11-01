@@ -103,7 +103,7 @@ def _ctx(**overrides: object) -> SimpleNamespace:
         "fact_hydration_worker": SimpleNamespace(),
         "socket_path": Path("/tmp/mcp-telegram-test.sock"),
         "unix_server": None,
-        "feedback_conn": MagicMock(),
+        "feedback_owner": SimpleNamespace(aclose=AsyncMock()),
         "rpc_admission_observer": None,
         "rpc_observation_sink": None,
         "session_lease": None,

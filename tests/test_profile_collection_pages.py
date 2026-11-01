@@ -4,6 +4,7 @@ from __future__ import annotations
 
 # pyright: reportAny=false
 import asyncio
+import hashlib
 import json
 import sqlite3
 import threading
@@ -102,9 +103,55 @@ def test_more_than_100_pages_reopen_and_exact_count(database: Database) -> None:
     assert summary["comparable_membership"] is False
 
 
+def test_collection_digests_only_after_complete_reopened_scan(database: Database) -> None:
+    path, conn, repo = database
+    with write_transaction(conn):
+        conn.execute("UPDATE entity_profile_refresh_state SET next_section='pinned_stories'")
+        assert _commit(repo, replace(_page(_item("old"), count=1, terminal=True), section="pinned_stories"))
+    baseline = _summary(repo, "pinned_stories")["published"]
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    with write_transaction(conn):
+        assert repo.request_section_refresh(42, ("pinned_stories",), now=200, pair_mode="disabled")
+        assert _commit(repo, replace(_page(_item("a"), count=3, cursor={"offset": 1}), section="pinned_stories"), 201)
+    first = _summary(repo, "pinned_stories")
+    assert first["retained_count"] == 1 and first["published"] == baseline and not first["complete"]
+    assert not any("SELECT m.item_key,f.fields_json" in sql for sql in statements)
+    conn.set_trace_callback(None)
+
+    reopened = sqlite3.connect(path)
+    try:
+        reopened.set_trace_callback(statements.append)
+        resumed = EntityProfileRepository(reopened, section_ttl_seconds=300)
+        with write_transaction(reopened):
+            assert _commit(
+                resumed, replace(_page(_item("b"), count=3, cursor={"offset": 2}), section="pinned_stories"), 202
+            )
+        second = _summary(resumed, "pinned_stories")
+        assert second["retained_count"] == 2 and second["published"] == baseline and not second["complete"]
+        assert not any("SELECT m.item_key,f.fields_json" in sql for sql in statements)
+        with write_transaction(reopened):
+            assert _commit(resumed, replace(_page(_item("c"), count=3, terminal=True), section="pinned_stories"), 203)
+        final = _summary(resumed, "pinned_stories")
+        assert final["complete"] and final["retained_count"] == 3
+        assert sum("SELECT m.item_key,f.fields_json" in sql for sql in statements) == 1
+        expected_members = json.dumps(["a", "b", "c"], separators=(",", ":"))
+        expected_content = json.dumps(
+            [[key, json.dumps({"id": key}, separators=(",", ":"))] for key in ("a", "b", "c")],
+            separators=(",", ":"),
+        )
+        published = cast(dict[str, object], final["published"])
+        assert published["membership_digest"] == hashlib.sha256(expected_members.encode()).hexdigest()
+        assert published["content_digest"] == hashlib.sha256(expected_content.encode()).hexdigest()
+    finally:
+        reopened.close()
+
+
 @pytest.mark.parametrize("case", ["same_cursor", "cycle", "changed_count", "count_gap", "malformed"])
 def test_partial_never_becomes_complete(database: Database, case: str) -> None:
     _path, conn, repo = database
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
     with write_transaction(conn):
         assert _commit(repo, _page(_item("1"), count=2, cursor={"offset": 1}))
     page = _page(_item("2"), count=2, terminal=True)
@@ -121,6 +168,7 @@ def test_partial_never_becomes_complete(database: Database, case: str) -> None:
     with write_transaction(conn):
         assert _commit(repo, page, 101)
     assert _summary(repo, "avatar_history")["complete"] is False
+    assert not any("SELECT m.item_key,f.fields_json" in sql for sql in statements)
     row = conn.execute("SELECT status,retry_at FROM entity_profile_refresh_state").fetchone()
     assert row == ("failed", 161)
     assert conn.execute("SELECT count(*) FROM entity_profile_collection_facts").fetchone()[0] >= 1

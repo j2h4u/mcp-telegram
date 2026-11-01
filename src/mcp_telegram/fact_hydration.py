@@ -314,20 +314,20 @@ class FactHydrationDemandAdapter(DurableDemandAdapter):
 
     @staticmethod
     def _slice_outcome(selected: WorkRevision, outcome: _BatchOutcome | None) -> SliceOutcome:
-        if outcome is not None and outcome.stopped:
+        if outcome is None:
+            return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
+        if outcome.stopped:
             if outcome.deferred_error is not None:
                 raise outcome.deferred_error
             return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
-        if outcome is not None and outcome.terminal_revision is not None:
+        if outcome.terminal_revision is not None:
             return SliceOutcome(selected, SliceOutcomeKind.TERMINAL, outcome.terminal_revision)
-        if (
-            outcome is not None
-            and outcome.committed_revision is not None
-            and outcome.committed_revision != selected.revision
-        ):
-            if outcome.completed:
-                return SliceOutcome(selected, SliceOutcomeKind.TERMINAL, outcome.committed_revision)
-            return SliceOutcome(selected, SliceOutcomeKind.PROGRESSED, outcome.committed_revision)
+        if outcome.pending:
+            # The accepted pending result needs a timed retry, not canonical progress.
+            return SliceOutcome(selected, SliceOutcomeKind.RETRYABLE_FAILURE)
+        if outcome.committed_revision is not None and outcome.committed_revision != selected.revision:
+            kind = SliceOutcomeKind.TERMINAL if outcome.completed else SliceOutcomeKind.PROGRESSED
+            return SliceOutcome(selected, kind, outcome.committed_revision)
         return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
 
     def _selected_job(self, selected: WorkRevision) -> HydrationJob | None:

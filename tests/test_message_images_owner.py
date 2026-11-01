@@ -535,3 +535,64 @@ async def test_source_claim_is_revoked_before_canonical_update_commit(tmp_path: 
         await writer.run(image_scope.sources.unbind)
         await writer.aclose()
         conn.close()
+
+
+@pytest.mark.asyncio
+async def test_read_retries_when_artifact_is_retired_before_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    import threading
+
+    db_path = tmp_path / "replacement.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    with write_transaction(conn):
+        conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+        conn.execute(
+            "INSERT INTO messages(dialog_id,message_id,sent_at,media_kind,media_payload) VALUES(7,8,1,'photo','{}')"
+        )
+        conn.execute("INSERT INTO message_observations(dialog_id,message_id,observation_order) VALUES(7,8,1)")
+        conn.execute("INSERT INTO message_image_sources VALUES(7,8,99,1,1)")
+    writer = await SQLiteWriter.open(db_path)
+    scope, _ = _image_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 100))
+    directory = tmp_path / "images"
+    service = MessageImageService(conn, writer, directory, scope, lambda: None)
+    old = publish_image(directory, 42, b"\xff\xd8\xffold\xff\xd9")
+    new_bytes = b"\xff\xd8\xffnew\xff\xd9"
+    new = publish_image(directory, 42, new_bytes)
+    with write_transaction(conn):
+        conn.execute(
+            "INSERT INTO message_image_artifacts VALUES(42,7,8,99,1,?,?,?,?,?)",
+            (old.filename, old.sha256, old.byte_size, 10, 20),
+        )
+    started, proceed = threading.Event(), threading.Event()
+    original = service._read_file
+
+    def delayed(account: int, filename: str, digest: str, size: int) -> bytes | None:
+        if filename == old.filename:
+            started.set()
+            assert proceed.wait(timeout=5)
+        return original(account, filename, digest, size)
+
+    monkeypatch.setattr(service, "_read_file", delayed)
+    task = asyncio.create_task(service.read(7, 8))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+
+        def replace_artifact(db: sqlite3.Connection) -> None:
+            with write_transaction(db):
+                db.execute(
+                    "UPDATE message_image_artifacts SET filename=?,sha256=?,byte_size=?",
+                    (new.filename, new.sha256, new.byte_size),
+                )
+            (directory / "42" / old.filename).unlink()
+
+        await writer.run(replace_artifact)
+        proceed.set()
+        assert (await task).image_bytes == new_bytes
+    finally:
+        proceed.set()
+        await task
+        await writer.aclose()
+        conn.close()

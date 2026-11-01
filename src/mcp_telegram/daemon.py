@@ -40,6 +40,7 @@ import os
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack, ExitStack
 from contextvars import Context
 from dataclasses import dataclass, field
@@ -392,12 +393,79 @@ _SELECT_READ_POSITION_WORK_SQL = (
 )
 
 
+class FeedbackThreadOwner:
+    """Own feedback SQLite and its application service on one worker thread."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="feedback-db")
+        self._closed = False
+        self._conn: sqlite3.Connection | None = None
+
+    @classmethod
+    async def open(cls, path: Path) -> FeedbackThreadOwner:
+        owner = cls(path)
+        try:
+            await owner._run(owner._open)
+        except BaseException:
+            await owner.aclose()
+            raise
+        return owner
+
+    def _open(self) -> None:
+        self._conn = ensure_feedback_schema(self._path)
+
+    def _service(self) -> FeedbackApplicationService:
+        assert self._conn is not None
+        return FeedbackApplicationService(SQLiteFeedbackStore(self._conn))
+
+    async def _run[T](self, callback: Callable[[], T]) -> T:
+        future = asyncio.wrap_future(self._executor.submit(callback))
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            while not future.done():
+                try:
+                    await asyncio.wait({future})
+                except asyncio.CancelledError:
+                    continue
+            future.exception()
+            raise
+
+    async def submit_feedback(self, req: Mapping[str, object]) -> dict[str, object]:
+        if self._closed:
+            raise RuntimeError("feedback owner is closed")
+        return await self._run(lambda: self._service().submit_feedback_sync(req))
+
+    async def update_feedback_status(self, req: Mapping[str, object]) -> dict[str, object]:
+        if self._closed:
+            raise RuntimeError("feedback owner is closed")
+        return await self._run(lambda: self._service().update_feedback_status_sync(req))
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._run(self._close)
+        finally:
+            self._executor.shutdown(wait=False)
+
+    def _close(self) -> None:
+        if self._conn is not None:
+            try:
+                checkpoint_sqlite_connection(self._conn)
+            finally:
+                self._conn.close()
+                self._conn = None
+
+
 @dataclass(slots=True)
 class _SyncMainContext:
     db_path: Path
     conn: sqlite3.Connection
     writer: SQLiteWriter
-    feedback_conn: sqlite3.Connection
+    feedback_owner: FeedbackThreadOwner
     shutdown_event: asyncio.Event
     client: _DaemonClient
     message_fact_refresh_policy: MessageFactRefreshPolicy
@@ -1159,11 +1227,11 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
 ) -> _SyncMainContext:
     db_path = state_paths.sync_db_path
 
-    # feedback.db remains a separate loop-owned store, closed during orderly shutdown.
+    # feedback.db has its own thread-owned connection and drains before shutdown.
     feedback_db_path = state_paths.feedback_db_path
-    feedback_conn = ensure_feedback_schema(feedback_db_path)
-    cleanup.callback(feedback_conn.close)
-    feedback_service = FeedbackApplicationService(SQLiteFeedbackStore(feedback_conn))
+    feedback_owner = await FeedbackThreadOwner.open(feedback_db_path)
+    cleanup.push_async_callback(feedback_owner.aclose)
+    feedback_service = feedback_owner
     logger.info("feedback.db ready at %s", feedback_db_path)
 
     shutdown_event = daemon_shutdown.register_shutdown_handler(
@@ -1296,7 +1364,7 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
         db_path=db_path,
         conn=conn,
         writer=writer,
-        feedback_conn=feedback_conn,
+        feedback_owner=feedback_owner,
         shutdown_event=shutdown_event,
         client=client,
         message_fact_refresh_policy=_message_fact_refresh_policy_from_config(config, scheduling=scheduling),
@@ -1883,26 +1951,26 @@ async def _stop_image_sources(ctx: _SyncMainContext) -> None:
 
 async def _close_runtime_connections(ctx: _SyncMainContext) -> None:
     try:
-        checkpoint_sqlite_connection(ctx.feedback_conn)
-    except Exception:
-        logger.debug("feedback_conn checkpoint error", exc_info=True)
-    try:
-        ctx.feedback_conn.close()
-    except Exception:
-        logger.debug("feedback_conn close error", exc_info=True)
-    try:
-        await ctx.writer.run(lambda conn: _record_stopped(conn))
-    except Exception:
-        logger.exception("runtime_event_record_failed kind=runtime.stopped")
-    try:
-        await ctx.writer.aclose()
+        try:
+            await ctx.feedback_owner.aclose()
+        except Exception:
+            logger.warning("feedback owner shutdown failed", exc_info=True)
     finally:
         try:
-            ctx.conn.close()
+            try:
+                await ctx.writer.run(lambda conn: _record_stopped(conn))
+            except Exception:
+                logger.exception("runtime_event_record_failed kind=runtime.stopped")
         finally:
-            if ctx.session_lease is not None:
-                ctx.session_lease.close()
-                ctx.session_lease = None
+            try:
+                await ctx.writer.aclose()
+            finally:
+                try:
+                    ctx.conn.close()
+                finally:
+                    if ctx.session_lease is not None:
+                        ctx.session_lease.close()
+                        ctx.session_lease = None
 
 
 def _record_stopped(conn: sqlite3.Connection) -> None:

@@ -70,6 +70,57 @@ class InvalidReadDateWitnessError(ValueError):
     """A Telegram age witness cannot be used for a future local message date."""
 
 
+def reaction_event_projection_by_message(
+    conn: sqlite3.Connection, keys: str
+) -> tuple[dict[tuple[int, int], tuple[ReadReactionEvent, ...]], dict[tuple[int, int], str]]:
+    """Read reaction facts for composite message keys without merging dialogs."""
+    selected = (
+        "WITH keys AS MATERIALIZED (SELECT json_extract(value,'$[0]') AS dialog_id, "
+        "json_extract(value,'$[1]') AS message_id FROM json_each(?)) "
+    )
+    try:
+        event_rows = cast(
+            list[tuple[int, int, int | None, str, int | None]],
+            conn.execute(
+                selected + "SELECT e.dialog_id,e.message_id,e.reactor_id,e.emoji,e.reacted_at "
+                "FROM keys k CROSS JOIN message_reaction_events e JOIN message_reaction_event_status s "
+                "ON s.dialog_id=e.dialog_id AND s.message_id=e.message_id "
+                "LEFT JOIN message_reaction_aggregate_state a "
+                "ON a.dialog_id=e.dialog_id AND a.message_id=e.message_id "
+                "WHERE e.dialog_id=k.dialog_id AND e.message_id=k.message_id "
+                "AND e.display_generation=s.display_generation AND e.display_generation>0 "
+                "AND a.can_see_list IS NOT 0 ORDER BY e.message_id,e.event_id",
+                (keys,),
+            ).fetchall(),
+        )
+        status_rows = cast(
+            list[tuple[int, int, str]],
+            conn.execute(
+                selected
+                + "SELECT s.dialog_id,s.message_id,s.status FROM keys k CROSS JOIN message_reaction_event_status s "
+                "WHERE s.dialog_id=k.dialog_id AND s.message_id=k.message_id",
+                (keys,),
+            ).fetchall(),
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
+        return {}, {}
+    grouped: dict[tuple[int, int], list[ReadReactionEvent]] = {}
+    for dialog_id, message_id, reactor_id, emoji, reacted_at in event_rows:
+        grouped.setdefault((int(dialog_id), int(message_id)), []).append(
+            ReadReactionEvent(
+                reactor_id=None if reactor_id is None else int(reactor_id),
+                emoji=str(emoji),
+                reacted_at=None if reacted_at is None else int(reacted_at),
+            )
+        )
+    return (
+        {key: tuple(values) for key, values in grouped.items()},
+        {(int(dialog_id), int(message_id)): str(status) for dialog_id, message_id, status in status_rows},
+    )
+
+
 def reaction_event_projection(
     conn: sqlite3.Connection,
     dialog_id: int,

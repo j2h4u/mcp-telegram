@@ -139,11 +139,11 @@ class SQLiteFeedbackStore:
         model: object | None,
         harness: object | None,
     ) -> int | None:
-        cur = self._conn.execute(
-            "INSERT INTO feedback (submitted_at, message, severity, context, model, harness) VALUES (?, ?, ?, ?, ?, ?)",
-            (submitted_at, message, severity, context, model, harness),
-        )
-        self._conn.commit()
+        with self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO feedback (submitted_at, message, severity, context, model, harness) VALUES (?, ?, ?, ?, ?, ?)",
+                (submitted_at, message, severity, context, model, harness),
+            )
         return cast(int | None, cur.lastrowid)
 
     def update_feedback_status(
@@ -154,11 +154,9 @@ class SQLiteFeedbackStore:
         status_changed_at: int,
         reason: str | None,
     ) -> bool:
-        cur = self._conn.execute(
-            "UPDATE feedback SET status = ?, status_changed_at = ?, status_comment = ? WHERE id = ?",
-            (status, status_changed_at, reason, feedback_id),
-        )
-        if cur.rowcount == 0:
-            return False
-        self._conn.commit()
-        return True
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE feedback SET status = ?, status_changed_at = ?, status_comment = ? WHERE id = ?",
+                (status, status_changed_at, reason, feedback_id),
+            )
+        return cur.rowcount != 0

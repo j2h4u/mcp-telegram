@@ -1634,6 +1634,28 @@ async def test_search_messages_global_searches_all_dialogs() -> None:
 
 
 @pytest.mark.asyncio
+async def test_global_search_batches_facts_for_twenty_dialogs() -> None:
+    conn = _make_db(with_fts=True, with_entities=True)
+    for dialog_id in range(1, 21):
+        _insert_synced_dialog(conn, dialog_id)
+        _insert_message(conn, dialog_id, 7, text="searchterm")
+        _insert_entity(conn, dialog_id, name=f"Dialog {dialog_id}")
+        conn.execute(
+            "INSERT INTO messages_fts(dialog_id,message_id,stemmed_text) VALUES (?,?,?)",
+            (dialog_id, 7, stem_text("searchterm")),
+        )
+    conn.commit()
+    queries: list[str] = []
+    conn.set_trace_callback(queries.append)
+    result = await make_server(conn)._search_messages({"query": "searchterm", "limit": 20})
+    conn.set_trace_callback(None)
+    assert result["ok"] is True
+    assert {item["dialog_id"] for item in _response_messages(result)} == set(range(1, 21))
+    assert sum("WITH keys AS MATERIALIZED" in query for query in queries) <= 5
+    assert sum("WITH ids AS MATERIALIZED" in query for query in queries) <= 1
+
+
+@pytest.mark.asyncio
 async def test_search_messages_global_dialog_name_fallback() -> None:
     """Global search falls back to string dialog_id when entity has no name."""
     conn = _make_db(with_fts=True, with_entities=True)
@@ -1791,6 +1813,52 @@ async def test_list_dialogs_respects_limit_after_projection() -> None:
     dialogs = result["data"]["dialogs"]
     assert len(dialogs) == 1
     assert dialogs[0]["id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_limits_expensive_projection_after_folder_and_name_filter(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _register_sqlite_connection(sqlite3.connect(db_path))
+    for dialog_id in range(1, 21):
+        _seed_dialog_row(conn, dialog_id, name=f"Example {dialog_id}", type_="User", last_message_at=1000 - dialog_id)
+    replace_folder_snapshot(conn, [(3, "Work")], [(3, 19), (3, 20)])
+    server = make_server(conn)
+    queries: list[str] = []
+    conn.set_trace_callback(queries.append)
+    result = server._get_reading_service()._list_dialogs_sync(conn, {"folder_id": 3, "filter": "Example", "limit": 1})
+    conn.set_trace_callback(None)
+    dialogs = cast(list[dict[str, object]], _response_data(result)["dialogs"])
+    assert [item["id"] for item in dialogs] == [19]
+    aggregate = [query for query in queries if "message_aggregates AS" in query]
+    assert len(aggregate) == 1 and "[19]" in aggregate[0]
+    assert sum("FROM scheduled_reconciliation_state WHERE dialog_id=" in query for query in queries) == 0
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_keeps_reader_folder_snapshot_after_concurrent_change(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _register_sqlite_connection(sqlite3.connect(db_path))
+    _seed_dialog_row(conn, 1, name="First", type_="User", last_message_at=20)
+    _seed_dialog_row(conn, 2, name="Second", type_="User", last_message_at=10)
+    replace_folder_snapshot(conn, [(3, "Work")], [(3, 1), (3, 2)])
+    conn.commit()
+    server = make_server(conn)
+    service = server._get_reading_service()
+    original = service.list_dialogs
+
+    async def list_then_change(req: dict[str, object]) -> dict:
+        result = await original(req)
+        replace_folder_snapshot(conn, [(3, "Work")], [(3, 2)])
+        conn.commit()
+        return result
+
+    service.list_dialogs = list_then_change  # type: ignore[method-assign]
+    result = await server._list_dialogs({"folder_id": 3, "limit": 1})
+    dialogs = cast(list[dict[str, object]], _response_data(result)["dialogs"])
+    assert [item["id"] for item in dialogs] == [1]
+    assert dialogs[0]["folder_ids"] == [3]
 
 
 @pytest.mark.asyncio

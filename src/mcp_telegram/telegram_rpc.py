@@ -51,7 +51,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
 )
 from telethon.events import Raw  # type: ignore[import-untyped]
 from telethon.events.common import EventBuilder  # type: ignore[import-untyped]
-from telethon.sessions import Session  # type: ignore[import-untyped]
+from telethon.sessions import Session, SQLiteSession  # type: ignore[import-untyped]
 from telethon.tl.alltlobjects import LAYER, tlobjects  # type: ignore[import-untyped]
 from telethon.tl.functions.updates import (  # type: ignore[import-untyped]
     GetChannelDifferenceRequest,
@@ -3055,6 +3055,33 @@ class _GuardedPhotoSession:
             self.gate._photo_session = None
 
 
+def _delivery_session_hashes(session: Session, channel_ids: set[int]) -> dict[int, int]:
+    """Read recoverable channel identities from the owning session."""
+    if type(session) is SQLiteSession:
+        # Use the owned session connection; do not move it to another thread.
+        marked = {get_peer_id(types.PeerChannel(channel_id)): channel_id for channel_id in channel_ids}
+        cursor = session._cursor()
+        try:
+            rows = cast(
+                list[tuple[int, int]],
+                cursor.execute(
+                    "SELECT id, hash FROM entities WHERE id IN (SELECT value FROM json_each(?))",
+                    (json.dumps(list(marked)),),
+                ).fetchall(),
+            )
+        finally:
+            cursor.close()
+        return {marked[row[0]]: row[1] for row in rows}
+    saved = {}
+    for channel_id in channel_ids:
+        try:
+            peer = session.get_input_entity(types.PeerChannel(channel_id))
+        except ValueError:
+            continue
+        saved[channel_id] = peer.access_hash
+    return saved
+
+
 class TelegramRpcGate(TelegramClient):
     """A Telethon client with account-global admission and transient retry.
 
@@ -3399,20 +3426,7 @@ class TelegramRpcGate(TelegramClient):
                 self._delivery_failure.set()
                 return
             snapshot = active.envelope.checkpoint_after
-            for channel_id, access_hash in snapshot.channel_hashes.items():
-                try:
-                    peer = self.session.get_input_entity(types.PeerChannel(channel_id))
-                except ValueError:
-                    peer = None
-                if getattr(peer, "access_hash", None) == access_hash:
-                    continue
-                self.session.process_entities(
-                    types.contacts.ResolvedPeer(
-                        types.PeerChannel(channel_id), [types.ChannelForbidden(channel_id, access_hash, "")], []
-                    )
-                )
-            for channel_id in snapshot.channels:
-                self.session.get_input_entity(types.PeerChannel(channel_id))
+            self._ensure_delivery_channel_entities(snapshot)
             # Entity/access-hash durability precedes authoritative completion across the two databases.
             self.session.save()
             await repository.complete(snapshot.model_dump_json())
@@ -3423,6 +3437,24 @@ class TelegramRpcGate(TelegramClient):
             raise
         finally:
             active.done.set()
+
+    def _ensure_delivery_channel_entities(self, snapshot: ProtocolSnapshot) -> None:
+        """Ensure the session can recover every channel before checkpoint publication."""
+        assert self.session is not None
+        session = self.session
+        channel_ids = snapshot.channels.keys() | snapshot.channel_hashes.keys()
+        saved = _delivery_session_hashes(session, channel_ids)
+        for channel_id, access_hash in snapshot.channel_hashes.items():
+            if saved.get(channel_id) == access_hash:
+                continue
+            session.process_entities(
+                types.contacts.ResolvedPeer(
+                    types.PeerChannel(channel_id), [types.ChannelForbidden(channel_id, access_hash, "")], []
+                )
+            )
+        for channel_id in snapshot.channels:
+            if channel_id not in saved and channel_id not in snapshot.channel_hashes:
+                raise ValueError("Could not find input entity for delivery channel")
 
     async def _save_states_and_entities(self) -> None:
         if self._authentication_mode or self._logout_mode:

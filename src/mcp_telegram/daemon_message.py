@@ -1,6 +1,7 @@
 """Message serialization helpers for daemon API responses."""
 
 import dataclasses
+import json
 import sqlite3
 from collections.abc import Sequence
 from typing import cast
@@ -9,7 +10,7 @@ from .formatter import format_reaction_counts
 from .message_content import project_message_text
 from .models import ContentKind, ReadMessage
 from .reactions.contracts import ReactionFreshness
-from .telegram_fact_queries import enrich_reaction_events, read_at_map
+from .telegram_fact_queries import enrich_reaction_events, reaction_event_projection_by_message, read_at_map
 from .telegram_message_projection import MessageLike as _MessageLike
 from .telegram_message_projection import message_to_dict
 
@@ -147,14 +148,65 @@ def project_cached_message_facts_by_dialog(
     messages: Sequence[ReadMessage],
 ) -> list[ReadMessage]:
     """Attach cached facts to a cross-dialog message list while preserving order."""
-    grouped: dict[int, list[tuple[int, ReadMessage]]] = {}
-    for index, message in enumerate(messages):
-        grouped.setdefault(message.dialog_id, []).append((index, message))
+    if not messages:
+        return []
+    keys = json.dumps(list({(message.dialog_id, message.message_id) for message in messages}))
+    reactions = _batch_message_facts(conn, keys, "message_reactions", "emoji, count", "ORDER BY count DESC, emoji")
+    links = _batch_message_facts(
+        conn,
+        keys,
+        "message_entities",
+        "offset, length, value",
+        "AND type='text_url' AND value IS NOT NULL ORDER BY t.message_id, offset",
+        optional=True,
+    )
+    dates = _batch_message_facts(conn, keys, "message_read_facts", "read_at", "")
+    events, statuses = reaction_event_projection_by_message(conn, keys)
+    result = []
+    for message in messages:
+        key = (message.dialog_id, message.message_id)
+        projected = _project_cached_message(
+            message,
+            text_links=[
+                (int(cast(int | str, row[0])), int(cast(int | str, row[1])), str(row[2])) for row in links.get(key, [])
+            ],
+            reactions_display=format_reaction_counts(
+                [(str(row[0]), int(cast(int | str, row[1]))) for row in reactions.get(key, [])]
+            ),
+        )
+        date_rows = dates.get(key, [])
+        read_at = None if not date_rows or date_rows[0][0] is None else int(cast(int | str, date_rows[0][0]))
+        result.append(
+            dataclasses.replace(
+                projected,
+                reaction_events=events.get(key, ()),
+                reaction_events_status=statuses.get(key, "unavailable"),
+                read_at=read_at,
+            )
+        )
+    return result
 
-    enriched: dict[int, ReadMessage] = {}
-    for dialog_id, indexed_messages in grouped.items():
-        dialog_messages = [message for _, message in indexed_messages]
-        facts = project_cached_message_facts(conn, dialog_id, dialog_messages)
-        for (index, _), message in zip(indexed_messages, facts, strict=True):
-            enriched[index] = message
-    return [enriched[index] for index in range(len(messages))]
+
+def _batch_message_facts(  # noqa: PLR0913 - query parts describe one bounded fact lookup
+    conn: sqlite3.Connection, keys: str, table: str, fields: str, suffix: str, *, optional: bool = False
+) -> dict[tuple[int, int], list[tuple[object, ...]]]:
+    try:
+        rows = cast(
+            list[tuple[int, int, *tuple[object, ...]]],
+            conn.execute(
+                "WITH keys AS MATERIALIZED (SELECT json_extract(value,'$[0]') AS dialog_id, "
+                "json_extract(value,'$[1]') AS message_id FROM json_each(?)) "
+                f"SELECT t.dialog_id, t.message_id, {fields} FROM keys k CROSS JOIN {table} t "
+                "WHERE t.dialog_id=k.dialog_id AND t.message_id=k.message_id "
+                f"{suffix}",
+                (keys,),
+            ).fetchall(),
+        )
+    except sqlite3.OperationalError as exc:
+        if not optional or "no such table" not in str(exc).lower():
+            raise
+        return {}
+    result: dict[tuple[int, int], list[tuple[object, ...]]] = {}
+    for dialog_id, message_id, *values in rows:
+        result.setdefault((int(dialog_id), int(message_id)), []).append(tuple(values))
+    return result

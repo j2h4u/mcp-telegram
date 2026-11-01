@@ -32,7 +32,7 @@ from .contracts import ImageScope
 from .fence import DurableBudget, SourceFence
 from .limits import PHOTO_MAX_BYTES
 from .repository import ImageSource, current_source
-from .store import cleanup_unpublished, publish_image
+from .store import cleanup_unpublished, publish_image, retire_image
 
 
 @dataclass(slots=True)
@@ -435,6 +435,8 @@ class MessageImageWorker:
             publish_image, self._directory, transfer.scope.scope.account_id, bytes(transfer.data)
         )
 
+        retired: list[str] = []
+
         def associate_artifact(conn: sqlite3.Connection) -> bool:
             with write_transaction(conn):
                 if not self._current(conn, transfer):
@@ -459,6 +461,13 @@ class MessageImageWorker:
                 ).rowcount
                 if changed != 1:
                     return False
+                previous = cast(
+                    tuple[str] | None,
+                    conn.execute(
+                        "SELECT filename FROM message_image_artifacts WHERE account_id=? AND dialog_id=? AND message_id=?",
+                        (transfer.scope.scope.account_id, transfer.target.dialog_id, transfer.target.message_id),
+                    ).fetchone(),
+                )
                 conn.execute(
                     "INSERT OR REPLACE INTO message_image_artifacts VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (
@@ -474,6 +483,8 @@ class MessageImageWorker:
                         transfer.locator.height,
                     ),
                 )
+                if previous is not None:
+                    retired.append(previous[0])
                 return True
 
         receipt = [False]
@@ -481,6 +492,18 @@ class MessageImageWorker:
         def commit_with_receipt(conn: sqlite3.Connection) -> bool:
             committed = associate_artifact(conn)
             receipt[0] = committed
+            if (
+                committed
+                and retired
+                and not conn.execute(
+                    "SELECT 1 FROM message_image_artifacts WHERE account_id=? AND filename=? LIMIT 1",
+                    (transfer.scope.scope.account_id, retired[0]),
+                ).fetchone()
+            ):
+                try:
+                    retire_image(self._directory, transfer.scope.scope.account_id, retired[0])
+                except OSError:
+                    pass  # Startup reconciliation retries failed retirement.
             return committed
 
         try:

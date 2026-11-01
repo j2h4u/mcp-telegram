@@ -245,6 +245,46 @@ def test_cross_dialog_folder_projection_preserves_media_and_hidden_links() -> No
         conn.close()
 
 
+def test_cross_dialog_facts_batch_composite_keys_and_visibility() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript("""
+            CREATE TABLE message_entities(dialog_id INTEGER,message_id INTEGER,offset INTEGER,length INTEGER,type TEXT,value TEXT);
+            CREATE TABLE message_reactions(dialog_id INTEGER,message_id INTEGER,emoji TEXT,count INTEGER);
+            CREATE TABLE message_read_facts(dialog_id INTEGER,message_id INTEGER,read_at INTEGER);
+            CREATE TABLE message_reaction_event_status(dialog_id INTEGER,message_id INTEGER,status TEXT,display_generation INTEGER);
+            CREATE TABLE message_reaction_events(dialog_id INTEGER,message_id INTEGER,reactor_id INTEGER,emoji TEXT,reacted_at INTEGER,display_generation INTEGER,event_id INTEGER);
+            CREATE TABLE message_reaction_aggregate_state(dialog_id INTEGER,message_id INTEGER,can_see_list INTEGER);
+        """)
+        for dialog_id in range(1, 21):
+            conn.execute(
+                "INSERT INTO message_entities VALUES (?,?,0,4,'text_url',?)",
+                (dialog_id, 7, f"https://example.com/{dialog_id}"),
+            )
+            conn.execute("INSERT INTO message_reactions VALUES (?,?,?,?)", (dialog_id, 7, "👍", dialog_id))
+            conn.execute("INSERT INTO message_read_facts VALUES (?,?,?)", (dialog_id, 7, dialog_id * 10))
+            conn.execute("INSERT INTO message_reaction_event_status VALUES (?,?,'complete',1)", (dialog_id, 7))
+            conn.execute(
+                "INSERT INTO message_reaction_events VALUES (?,?,?,'👍',100,1,1)", (dialog_id, 7, dialog_id + 100)
+            )
+            conn.execute("INSERT INTO message_reaction_aggregate_state VALUES (?,?,?)", (dialog_id, 7, dialog_id % 2))
+        queries: list[str] = []
+        conn.set_trace_callback(queries.append)
+        messages = [ReadMessage(dialog_id=i, message_id=7, sent_at=1, text="link") for i in range(20, 0, -1)]
+        result = project_cached_message_facts_by_dialog(conn, messages)
+        conn.set_trace_callback(None)
+        assert len(queries) == 5
+        assert [message.dialog_id for message in result] == list(range(20, 0, -1))
+        for message in result:
+            assert message.text == f"[link](https://example.com/{message.dialog_id})"
+            assert message.read_at == message.dialog_id * 10
+            assert len(message.reaction_events) == message.dialog_id % 2
+            if message.reaction_events:
+                assert message.reaction_events[0].reactor_id == message.dialog_id + 100
+    finally:
+        conn.close()
+
+
 def test_uncached_telegram_projection_renders_hidden_link() -> None:
     message = SimpleNamespace(
         id=20,

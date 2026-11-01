@@ -1289,3 +1289,102 @@ async def test_newer_background_transcription_uses_acquisition_order_against_ret
         acquired_order,
     )
     assert conn.execute("SELECT text FROM messages WHERE message_id=905").fetchone() == ("background speech",)
+
+
+def test_plain_text_page_batches_hydration_lookups(conn: sqlite3.Connection) -> None:
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        with write_transaction(conn):
+            assert insert_messages_with_fts(conn, [_message(i, text="plain") for i in range(1, 101)]) == 100
+    finally:
+        conn.set_trace_callback(None)
+    queue_reads = [sql for sql in statements if "sqlite_master" in sql and "hydration_jobs" in sql]
+    queue_deletes = [sql for sql in statements if sql.lstrip().upper().startswith("DELETE FROM HYDRATION_JOBS")]
+    transcription_reads = [sql for sql in statements if "message_transcriptions" in sql and "SELECT" in sql.upper()]
+    assert len(queue_reads) == 1
+    assert len(queue_deletes) == 0
+    assert len(transcription_reads) == 1
+    queue_query = next(sql for sql in statements if "CROSS JOIN hydration_jobs" in sql)
+    plan = cast(list[tuple[int, int, int, str]], conn.execute("EXPLAIN QUERY PLAN " + queue_query).fetchall())
+    assert any("SEARCH q USING PRIMARY KEY" in str(row[3]) for row in plan)
+
+
+def test_replayed_text_skips_fts_write_but_repairs_corrupt_index(conn: sqlite3.Connection) -> None:
+    message = _message(940, text="same message")
+    with write_transaction(conn):
+        insert_messages_with_fts(conn, [message])
+    trace: list[str] = []
+    conn.set_trace_callback(trace.append)
+    try:
+        with write_transaction(conn):
+            changed = replace(message, message=replace(message.message, reply_to_msg_id=17))
+            insert_messages_with_fts(conn, [changed])
+    finally:
+        conn.set_trace_callback(None)
+    assert conn.execute("SELECT reply_to_msg_id FROM messages WHERE dialog_id=42 AND message_id=940").fetchone() == (
+        17,
+    )
+    assert not any(sql.startswith(("DELETE FROM messages_fts", "INSERT INTO messages_fts")) for sql in trace)
+    with write_transaction(conn):
+        conn.execute("UPDATE messages_fts SET stemmed_text='wrong' WHERE dialog_id=42 AND message_id=940")
+        insert_messages_with_fts(conn, [changed])
+    assert conn.execute("SELECT stemmed_text FROM messages_fts WHERE dialog_id=42 AND message_id=940").fetchone() == (
+        stem_text("same message"),
+    )
+    with write_transaction(conn):
+        conn.execute("UPDATE messages_fts SET dialog_id=99 WHERE dialog_id=42 AND message_id=940")
+        insert_messages_with_fts(conn, [changed])
+    assert conn.execute("SELECT stemmed_text FROM messages_fts WHERE dialog_id=42 AND message_id=940").fetchone() == (
+        stem_text("same message"),
+    )
+    with write_transaction(conn):
+        conn.execute("DELETE FROM messages_fts WHERE dialog_id=42 AND message_id=940")
+        insert_messages_with_fts(conn, [changed])
+    assert conn.execute("SELECT stemmed_text FROM messages_fts WHERE dialog_id=42 AND message_id=940").fetchone() == (
+        stem_text("same message"),
+    )
+
+
+def test_page_uses_exact_dialog_and_message_for_transcriptions_and_jobs(conn: sqlite3.Connection) -> None:
+    _make_hydration_eligible(conn)
+    voice = _message(941, text=None, media_kind="voice", media_payload="{}")
+    other = _message(941, text="other dialog")
+    other = replace(other, message=replace(other.message, dialog_id=43))
+    with write_transaction(conn):
+        insert_messages_with_fts(conn, [voice])
+        assert upsert_message_transcription(
+            conn, 42, 941, transcribed_text="voice text", transcription_id=4, received_at=1
+        )
+        insert_messages_with_fts(conn, [voice, other])
+    assert conn.execute("SELECT dialog_id,text FROM messages WHERE message_id=941 ORDER BY dialog_id").fetchall() == [
+        (42, "voice text"),
+        (43, "other dialog"),
+    ]
+
+
+def test_voice_to_plain_removes_old_transcription_without_resurrection(conn: sqlite3.Connection) -> None:
+    _make_hydration_eligible(conn)
+    voice = _message(942, text=None, media_kind="voice", media_payload="{}")
+    plain = _message(942, text="plain text")
+    with write_transaction(conn):
+        insert_messages_with_fts(conn, [voice])
+        assert upsert_message_transcription(
+            conn, 42, 942, transcribed_text="old speech", transcription_id=5, received_at=1
+        )
+        insert_messages_with_fts(conn, [voice])
+    with pytest.raises(RuntimeError, match="rollback"):
+        with write_transaction(conn):
+            insert_messages_with_fts(conn, [plain])
+            raise RuntimeError("rollback")
+    assert conn.execute("SELECT text FROM message_transcriptions WHERE dialog_id=42 AND message_id=942").fetchone() == (
+        "old speech",
+    )
+    with write_transaction(conn):
+        insert_messages_with_fts(conn, [plain])
+    assert conn.execute("SELECT 1 FROM message_transcriptions WHERE dialog_id=42 AND message_id=942").fetchone() is None
+    assert conn.execute("SELECT 1 FROM hydration_jobs WHERE dialog_id=42 AND message_id=942").fetchone() is None
+    with write_transaction(conn):
+        insert_messages_with_fts(conn, [voice])
+    assert read_message_text(conn, 42, 942).text != "old speech"
+    assert conn.execute("SELECT 1 FROM message_transcriptions WHERE dialog_id=42 AND message_id=942").fetchone() is None

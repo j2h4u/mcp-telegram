@@ -2169,7 +2169,7 @@ class EntityProfileRepository:
         previous = self.read_section_payload(cursor.entity_id, cursor.next_section)
         if isinstance(previous, dict) and isinstance(previous.get("legacy_evidence"), dict):
             state = {**state, "legacy_evidence": previous["legacy_evidence"]}
-        progress = collection_progress(page, state, summary, previous)
+        progress = collection_progress(self._conn, page, state, summary, previous)
         self._journal_collection(cursor, page, progress.payload)
         self._write_section(
             cursor.entity_id,
@@ -2229,7 +2229,7 @@ class EntityProfileRepository:
         reconciled = reconcile_embedded_stories(self._conn, page, observation, merge)
         assert reconciled is not None
         summary["history_order"] = observation.order
-        progress = collection_progress(page, state, summary, previous)
+        progress = collection_progress(self._conn, page, state, summary, previous)
         payload = {**progress.payload, "supplied_cursor": progress.cursor, "supplied_generation": generation}
         self._journal_collection(
             EntityRefreshCursor(page.entity_id, page.section, 0, None, generation=generation), page, payload
