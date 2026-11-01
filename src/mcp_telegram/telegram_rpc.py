@@ -115,7 +115,20 @@ from .telegram_rpc_consumers import (
     demand_contract,
     rpc_effect,
 )
-from .telegram_rpc_recovery import RecoveryCause, backoff_seconds
+from .telegram_rpc_recovery import (
+    RecoveryCause,
+    RecoveryCommand,
+    RecoveryDecision,
+    RecoveryEvent,
+    RecoveryFloor,
+    RecoveryMode,
+    RecoveryPhase,
+    RecoveryRun,
+    RecoverySnapshot,
+    backoff_seconds,
+    decide_auto_recovery,
+    recovery_floor_release_at,
+)
 from .telegram_rpc_scheduler import (
     AdmissionObserver,
     RpcAdmission,
@@ -964,6 +977,14 @@ def _safety_identity_projection(record: dict[str, object]) -> tuple[object, obje
     return record.get("scope"), record.get("transition"), protection if protection in identity_failures else None
 
 
+@dataclass(frozen=True, slots=True)
+class _RecoveryIdentity:
+    mode: RecoveryMode
+    phase: RecoveryPhase
+    run: RecoveryRun
+    enabled: bool
+
+
 class TelegramRpcSafetyLedger:
     """Keep prewrite uncertainty durable without binding it to caller cancellation."""
 
@@ -1007,7 +1028,7 @@ class TelegramRpcSafetyLedger:
             raise ValueError("invalid Telegram safety receipt")
         self._record = cast(dict[str, object], decoded)
         self._migrate_safety_record()
-        scope = cast(dict[str, object], self._record["scope"])
+        scope = cast(dict[str, object], self._record.get("scope", {}))
         self._startup_hold = self._scope_startup_hold(scope, dc_id, key_id)
         self._restore_startup_protection(scope)
         self._rebase_safety_record()
@@ -1142,10 +1163,17 @@ class TelegramRpcSafetyLedger:
         return self._floor_release_at(cast(dict[str, object], self._record["floor"]))
 
     def _floor_release_at(self, floor: dict[str, object]) -> float:
-        utc_remaining = max(0.0, float(cast(float, floor["until_utc"])) - time.time())
-        if floor["boot_id"] == self._boot_id:
-            return max(float(cast(float, floor["until_monotonic"])), time.monotonic() + utc_remaining)
-        return time.monotonic() + max(utc_remaining, float(cast(float, floor["remaining_seconds"])))
+        return recovery_floor_release_at(
+            self._recovery_floor(floor), now_monotonic=time.monotonic(), now_utc=time.time()
+        )
+
+    def _recovery_floor(self, floor: dict[str, object]) -> RecoveryFloor:
+        return RecoveryFloor(
+            until_monotonic=float(cast(float, floor["until_monotonic"])),
+            until_utc=float(cast(float, floor["until_utc"])),
+            remaining_seconds=float(cast(float, floor["remaining_seconds"])),
+            same_boot=floor["boot_id"] == self._boot_id,
+        )
 
     def method_release_at(self, method: str | None, attempt_id: str | None = None) -> float:
         if self._storage_failed:
@@ -1243,6 +1271,9 @@ class TelegramRpcSafetyLedger:
             for item in cast(dict[str, dict[str, object]], self._record.get("intents", {})).values()
             if item["phase"] != "acknowledged_unknown"
         ]
+        scope = cast(dict[str, object], self._record.get("scope", {}))
+        blocking = sum(_intent_blocks(item, scope) for item in unresolved)
+        historical = sum(item["phase"] == "unknown" and not _intent_blocks(item, scope) for item in unresolved)
         return {
             "generation": self._record.get("generation"),
             "reason": self.protection_reason,
@@ -1250,8 +1281,14 @@ class TelegramRpcSafetyLedger:
             if time.monotonic() < self.floor_deadline < math.inf
             else None,
             "unresolved_request_count": len(unresolved),
+            "blocking_request_count": blocking,
+            "historical_unknown_request_count": historical,
             "unresolved_requests": [
-                {"method": _safe_diagnostic_method(cast(str, item["method"])), "phase": item["phase"]}
+                {
+                    "method": _safe_diagnostic_method(cast(str, item["method"])),
+                    "phase": item["phase"],
+                    "blocks_acquisition": _intent_blocks(item, scope),
+                }
                 for item in unresolved[:_DIAGNOSTIC_REQUESTS_MAX]
             ],
             "unresolved_requests_truncated": len(unresolved) > _DIAGNOSTIC_REQUESTS_MAX,
@@ -1267,15 +1304,17 @@ class TelegramRpcSafetyLedger:
                 retry_after_seconds=None, latched=True, detail="Telegram outbound safety protection is active"
             )
 
-    async def _commit(self, change: Callable[[dict[str, object]], None]) -> None:
+    async def _commit(self, change: Callable[[dict[str, object]], None], *, settled_attempt: str | None = None) -> None:
         if self._storage_failed:
             self.require_writable()
-        task = asyncio.create_task(self._commit_owned(change))
+        task = asyncio.create_task(self._commit_owned(change, settled_attempt=settled_attempt))
         self._operations.add(task)
         task.add_done_callback(self._operation_done)
         await asyncio.shield(task)
 
-    async def _commit_owned(self, change: Callable[[dict[str, object]], None]) -> None:
+    async def _commit_owned(
+        self, change: Callable[[dict[str, object]], None], *, settled_attempt: str | None = None
+    ) -> None:
         async with self._lock:
             updated = cast(dict[str, object], json.loads(json.dumps(self._record)))
             self._retain_method_bindings(updated)
@@ -1295,6 +1334,8 @@ class TelegramRpcSafetyLedger:
                 raise
             else:
                 self._record, self._encoded = updated, encoded
+                if settled_attempt is not None:
+                    self._claimed.discard(settled_attempt)
             finally:
                 if cell is not None and scope_change is not None:
                     cell.end_change(scope_change)
@@ -1526,6 +1567,18 @@ class TelegramRpcSafetyLedger:
         method_success: bool = False,
         recovery_cause: RecoveryCause | None = None,
     ) -> None:
+        def settle_recovery(record: dict[str, object]) -> None:
+            trial = record["recovery"]
+            known_flood = known_outcome and floor_until_utc is not None
+            if self._ordinary_method_floor_only(trial, known_flood, circuit_open, recovery_cause):
+                return
+            if (
+                (not known_outcome and attempt_id in self._claimed)
+                or floor_until_utc is not None
+                or recovery_cause is not None
+            ):
+                self._invalidate_recovery_trial(record, known_flood=known_flood, cause=recovery_cause)
+
         def settle(record: dict[str, object]) -> None:
             self._settle_method(record, attempt_id, actual_flood, method_generation, method_success)
             self._settle_intent(record, attempt_id, known_outcome)
@@ -1535,19 +1588,19 @@ class TelegramRpcSafetyLedger:
             if circuit_open and not (isinstance(current_trial, dict) and current_trial.get("state") == "exhausted"):
                 record["protection"] = "flood_wait_circuit_open"
                 record["generation"] = uuid.uuid4().hex
-            if (
-                (not known_outcome and attempt_id in self._claimed)
-                or floor_until_utc is not None
-                or recovery_cause is not None
-            ):
-                self._invalidate_recovery_trial(
-                    record, known_flood=known_outcome and floor_until_utc is not None, cause=recovery_cause
-                )
+            settle_recovery(record)
 
         if not known_outcome and attempt_id in self._claimed:
             self._startup_hold = "unresolved_outbound_outcome"
-        await self._commit(settle)
-        self._claimed.discard(attempt_id)
+        await self._commit(settle, settled_attempt=attempt_id)
+
+    @staticmethod
+    def _ordinary_method_floor_only(
+        trial: object, known_flood: bool, circuit_open: bool, cause: RecoveryCause | None
+    ) -> bool:
+        if not known_flood or circuit_open or cause is not None:
+            return False
+        return trial is None or (isinstance(trial, dict) and "automatic" not in trial and trial["state"] == "succeeded")
 
     def _settle_restriction(self, record: dict[str, object], floor_until_utc: float) -> None:
         self._extend_floor(record, floor_until_utc)
@@ -1634,10 +1687,11 @@ class TelegramRpcSafetyLedger:
         self, record: dict[str, object], *, known_flood: bool = False, cause: RecoveryCause | None = None
     ) -> None:
         trial = record["recovery"]
-        if not isinstance(trial, dict):
-            return
-        if "automatic" in trial:
-            self._invalidate_automatic_trial(record, trial, known_flood, cause)
+        if not isinstance(trial, dict) or "automatic" in trial or trial["state"] == "succeeded":
+            selected = RecoveryCause.FLOOD_WAIT if known_flood else cause or RecoveryCause.READ_UNCERTAINTY
+            event = RecoveryEvent.FAILURE_SETTLED
+            decision = self._decide_auto_transition(record, event, cause=selected)
+            self._apply_auto_transition(record, decision, event, cause=selected, observed_flood=known_flood)
             return
         if trial["state"] == "authorized":
             record["generation"] = uuid.uuid4().hex
@@ -1645,18 +1699,6 @@ class TelegramRpcSafetyLedger:
             trial["state"] = "failed"
             record["protection"] = "recovery_trial_failed"
             record["generation"] = uuid.uuid4().hex
-
-    def _invalidate_automatic_trial(
-        self, record: dict[str, object], trial: dict[str, object], known_flood: bool, cause: RecoveryCause | None
-    ) -> None:
-        if trial["state"] == "succeeded" and not self._auto_resume_scope_safe(record, allow_claimed=True):
-            return
-        if trial["state"] == "succeeded" or (trial["state"] == "consumed" and trial["consumed_run"] == self._run):
-            self._schedule_auto_resume(
-                record, cause=RecoveryCause.FLOOD_WAIT if known_flood else cause or RecoveryCause.READ_UNCERTAINTY
-            )
-        elif known_flood and trial["state"] in {"fencing", "waiting"}:
-            self._schedule_auto_resume(record, cause=RecoveryCause.FLOOD_WAIT)
 
     def _extend_floor(self, record: dict[str, object], until_utc: float) -> None:
         if not _finite_safety_number(until_utc):
@@ -1677,7 +1719,8 @@ class TelegramRpcSafetyLedger:
             if circuit_open and not (isinstance(trial, dict) and trial.get("state") == "exhausted"):
                 record["protection"] = "flood_wait_circuit_open"
                 record["generation"] = uuid.uuid4().hex
-            self._invalidate_recovery_trial(record, known_flood=True)
+            if not self._ordinary_method_floor_only(trial, True, circuit_open, None):
+                self._invalidate_recovery_trial(record, known_flood=True)
 
         await self._commit(update)
 
@@ -2091,6 +2134,199 @@ class TelegramRpcSafetyLedger:
         recovery = self._record.get("recovery")
         return recovery if isinstance(recovery, dict) and "automatic" in recovery else None
 
+    def _decide_auto_transition(  # noqa: PLR0913 - normalized guards belong to one atomic decision.
+        self,
+        record: dict[str, object],
+        event: RecoveryEvent,
+        *,
+        cause: RecoveryCause | None = None,
+        quiesced: bool = False,
+        stability_confirmed: bool = False,
+        lifecycle_available: bool = True,
+    ) -> RecoveryDecision:
+        snapshot = self._auto_recovery_snapshot(
+            record,
+            event,
+            cause=cause,
+            quiesced=quiesced,
+            stability_confirmed=stability_confirmed,
+            lifecycle_available=lifecycle_available,
+        )
+        return decide_auto_recovery(snapshot, event)
+
+    def recovery_identity(self) -> _RecoveryIdentity:
+        """Expose only in-memory trial identity at physical claim boundaries."""
+        _trial, _automatic, mode, phase, run = self._auto_recovery_identity(self._record)
+        return _RecoveryIdentity(mode, phase, run, self._auto_resume_enabled)
+
+    def _auto_recovery_snapshot(  # noqa: PLR0913 - normalized guards belong to one atomic decision.
+        self,
+        record: dict[str, object],
+        event: RecoveryEvent,
+        *,
+        cause: RecoveryCause | None = None,
+        quiesced: bool = False,
+        stability_confirmed: bool = False,
+        lifecycle_available: bool = True,
+    ) -> RecoverySnapshot:
+        trial, automatic, mode, phase, run = self._auto_recovery_identity(record)
+        actual_cause = self._auto_transition_cause(record, event, cause)
+        counts = cast(dict[str, int], automatic["attempts_by_policy"]) if isinstance(automatic, dict) else {}
+        pending = self._auto_owner_pending(record)
+        now_mono, now_utc = time.monotonic(), time.time()
+        due = self._auto_record_due(record, trial, automatic, now_mono, now_utc)
+        safe = self._auto_transition_safe(record, event, now_mono, now_utc)
+        return RecoverySnapshot(
+            phase=phase,
+            mode=mode,
+            run=run,
+            cause=actual_cause,
+            safe=safe,
+            owner_pending=pending,
+            quiesced=quiesced,
+            due=due,
+            flood_budget_available=counts.get(RecoveryCause.FLOOD_WAIT.value, 0) < len(_AUTO_RESUME_DELAYS),
+            stability_confirmed=stability_confirmed,
+            enabled=self._auto_resume_enabled,
+            lifecycle_available=lifecycle_available,
+        )
+
+    def _auto_recovery_identity(
+        self, record: dict[str, object]
+    ) -> tuple[dict[str, object] | None, object, RecoveryMode, RecoveryPhase, RecoveryRun]:
+        recovery = record.get("recovery")
+        trial = recovery if isinstance(recovery, dict) else None
+        automatic = trial.get("automatic") if trial is not None else None
+        mode = RecoveryMode.AUTO if isinstance(automatic, dict) else RecoveryMode.MANUAL if trial else RecoveryMode.NONE
+        phase = RecoveryPhase(cast(str, trial["state"])) if trial else RecoveryPhase.NONE
+        consumed_run = trial.get("consumed_run") if trial else None
+        run = (
+            RecoveryRun.ABSENT
+            if consumed_run is None
+            else RecoveryRun.CURRENT
+            if consumed_run == self._run
+            else RecoveryRun.OTHER
+        )
+        return trial, automatic, mode, phase, run
+
+    def _auto_owner_pending(self, record: dict[str, object]) -> bool:
+        if self._claimed:
+            return True
+        intents = cast(dict[str, dict[str, object]], record.get("intents", {}))
+        if any(item["phase"] == "prepared" and item["run"] == self._run for item in intents.values()):
+            return True
+        if not self._operations:
+            return False
+        current = asyncio.current_task()
+        return any(not task.done() and task is not current for task in self._operations)
+
+    def _auto_transition_safe(
+        self, record: dict[str, object], event: RecoveryEvent, now_mono: float, now_utc: float
+    ) -> bool:
+        safe = self._auto_resume_scope_safe(record, allow_claimed=True)
+        if not safe or event is not RecoveryEvent.STABILITY_CONFIRMED:
+            return safe
+        floor = self._recovery_floor(cast(dict[str, object], record["floor"]))
+        return (
+            self.protection_reason is None
+            and recovery_floor_release_at(floor, now_monotonic=now_mono, now_utc=now_utc) <= now_mono
+        )
+
+    def _auto_transition_cause(
+        self,
+        record: dict[str, object],
+        event: RecoveryEvent,
+        cause: RecoveryCause | None,
+    ) -> RecoveryCause | None:
+        trial = record.get("recovery")
+        automatic = trial.get("automatic") if isinstance(trial, dict) else None
+        interrupted = isinstance(trial, dict) and trial["state"] == "consumed" and trial["consumed_run"] != self._run
+        if event is RecoveryEvent.DUE or (event is RecoveryEvent.STARTUP_RECONCILE and interrupted):
+            return (
+                RecoveryCause(cast(str, cast(dict[str, object], automatic)["cause"]))
+                if isinstance(automatic, dict)
+                else None
+            )
+        return self._auto_observed_cause(record, cause)
+
+    def _auto_observed_cause(self, record: dict[str, object], cause: RecoveryCause | None) -> RecoveryCause | None:
+        if cause is not None:
+            return cause
+        if record.get("protection") == "flood_wait_circuit_open":
+            return RecoveryCause.FLOOD_WAIT
+        if record.get("protection") == "transport_unavailable":
+            return RecoveryCause.TRANSIENT
+        scope = cast(dict[str, object], record.get("scope", {}))
+        blocked = any(
+            _intent_blocks(item, scope) and (item["phase"] == "unknown" or item["run"] != self._run)
+            for item in cast(dict[str, dict[str, object]], record.get("intents", {})).values()
+        )
+        return (
+            RecoveryCause.READ_UNCERTAINTY if blocked or self._startup_hold == "unresolved_outbound_outcome" else None
+        )
+
+    def _auto_record_due(
+        self, record: dict[str, object], trial: object, automatic: object, now_mono: float, now_utc: float
+    ) -> bool:
+        if not isinstance(trial, dict) or trial.get("state") != "waiting" or not isinstance(automatic, dict):
+            return False
+        due = automatic.get("scheduled_due")
+        if not isinstance(due, dict) or trial.get("scope") != record.get("scope"):
+            return False
+        floor = self._recovery_floor(cast(dict[str, object], record["floor"]))
+        scheduled = self._recovery_floor(due)
+        return (
+            max(
+                recovery_floor_release_at(floor, now_monotonic=now_mono, now_utc=now_utc),
+                recovery_floor_release_at(scheduled, now_monotonic=now_mono, now_utc=now_utc),
+            )
+            <= now_mono
+        )
+
+    def _apply_auto_transition(
+        self,
+        record: dict[str, object],
+        decision: RecoveryDecision,
+        event: RecoveryEvent,
+        *,
+        cause: RecoveryCause | None = None,
+        observed_flood: bool = False,
+    ) -> None:
+        if decision.command in {RecoveryCommand.ARM_FENCE, RecoveryCommand.STRENGTHEN_FLOOD}:
+            self._apply_auto_fence(record, event, cause, observed_flood)
+        elif decision.command is RecoveryCommand.SET_WAIT:
+            self._settle_auto_fencing(record)
+        elif decision.command is RecoveryCommand.CONSUME:
+            self._consume_auto_record(record)
+        elif decision.command is RecoveryCommand.MARK_SUCCESS:
+            cast(dict[str, object], record["recovery"])["state"] = "succeeded"
+            record["protection"] = None
+        elif decision.command is RecoveryCommand.RESET:
+            record["recovery"] = None
+        self._assert_auto_transition_phase(record, decision)
+
+    def _apply_auto_fence(
+        self, record: dict[str, object], event: RecoveryEvent, cause: RecoveryCause | None, observed_flood: bool
+    ) -> None:
+        trial = record.get("recovery")
+        automatic = trial.get("automatic") if isinstance(trial, dict) else None
+        cause = self._auto_transition_cause(record, event, cause)
+        fallback = (
+            RecoveryCause(cast(str, automatic["cause"]))
+            if isinstance(automatic, dict)
+            else RecoveryCause.READ_UNCERTAINTY
+        )
+        self._schedule_auto_resume(record, cause=cause or fallback, observed_flood=observed_flood)
+
+    @staticmethod
+    def _assert_auto_transition_phase(record: dict[str, object], decision: RecoveryDecision) -> None:
+        if decision.command in {RecoveryCommand.NOOP, RecoveryCommand.WAIT, RecoveryCommand.REJECT}:
+            return
+        current = record.get("recovery")
+        phase = RecoveryPhase(cast(str, current["state"])) if isinstance(current, dict) else RecoveryPhase.NONE
+        if phase is not decision.next_phase:
+            raise RuntimeError("automatic recovery transition disagrees with its decision")
+
     def _auto_resume_scope_safe(self, record: dict[str, object], *, allow_claimed: bool = False) -> bool:
         if self._storage_failed or self.verified_account_id is None:
             return False
@@ -2203,11 +2439,13 @@ class TelegramRpcSafetyLedger:
         if trial["state"] == "waiting":
             due = cast(dict[str, object], automatic["scheduled_due"])
             stage = cast(dict[str, int], automatic["failure_stages"])[cause.value]
-            delay = max(float(backoff_seconds(cause, stage)), self._floor_release_at(due) - time.monotonic())
+            now_mono, now_utc = time.monotonic(), time.time()
+            deadline = recovery_floor_release_at(self._recovery_floor(due), now_monotonic=now_mono, now_utc=now_utc)
+            delay = max(float(backoff_seconds(cause, stage)), deadline - now_mono)
             due.update(
                 boot_id=self._boot_id,
-                until_monotonic=time.monotonic() + delay,
-                until_utc=time.time() + delay,
+                until_monotonic=now_mono + delay,
+                until_utc=now_utc + delay,
                 remaining_seconds=delay,
             )
 
@@ -2227,61 +2465,53 @@ class TelegramRpcSafetyLedger:
             "last_transition_key": None,
         }
 
-    async def maintain_auto_resume(self, *, cause: RecoveryCause | None = None, quiesced: bool = True) -> bool:
-        if not self._auto_resume_enabled or not self._auto_resume_scope_safe(self._record, allow_claimed=not quiesced):
+    async def maintain_auto_resume(
+        self, *, cause: RecoveryCause | None = None, quiesced: bool = True, startup: bool = False
+    ) -> bool:
+        if not await self._persist_auto_rebase():
             return False
-        if self._auto_resume_rebased:
-            await self._commit(lambda _record: None)
-            self._auto_resume_rebased = False
-        recovery = self._record["recovery"]
-        if isinstance(recovery, dict) and "automatic" not in recovery and recovery["state"] != "succeeded":
-            return False
-        if self._auto_resume_needs_fencing(self._record, cause):
-            await self._commit(lambda record: self._begin_auto_fencing(record, cause, quiesced))
-        await self._advance_interrupted_auto(quiesced)
+        event = self._auto_maintenance_event(startup)
+        decision = self._decide_auto_transition(self._record, event, cause=cause, quiesced=quiesced)
+        if decision.command in {RecoveryCommand.ARM_FENCE, RecoveryCommand.STRENGTHEN_FLOOD}:
+            await self._commit(
+                lambda record: self._transition_auto_owned(record, event, cause=cause, quiesced=quiesced)
+            )
+        await self._auto_quiesce_if_ready(quiesced)
         return self.auto_resume_due()
 
-    async def _advance_interrupted_auto(self, quiesced: bool) -> None:
-        recovery = self._automatic_recovery()
-        if recovery is not None and recovery["state"] == "consumed" and recovery["consumed_run"] != self._run:
-            automatic = cast(dict[str, object], recovery["automatic"])
-            interrupted_cause = RecoveryCause(cast(str, automatic["cause"]))
-            await self._commit(
-                lambda record: self._schedule_auto_resume(record, cause=interrupted_cause, observed_flood=False)
-            )
-        recovery = self._automatic_recovery()
-        if recovery is not None and recovery["state"] == "fencing" and quiesced:
-            await self._commit(self._settle_auto_fencing)
-
-    @staticmethod
-    def _auto_resume_needs_fencing(record: dict[str, object], cause: RecoveryCause | None) -> bool:
-        recovery = record["recovery"]
-        if recovery is None:
+    async def _persist_auto_rebase(self) -> bool:
+        if not self._auto_resume_rebased:
             return True
-        if not isinstance(recovery, dict) or recovery["state"] != "succeeded":
+        if not self._auto_resume_enabled or not self._auto_resume_scope_safe(self._record, allow_claimed=True):
             return False
-        scope = cast(dict[str, object], record["scope"])
-        return (
-            cause is not None
-            or record["protection"] is not None
-            or any(
-                _intent_blocks(intent, scope)
-                for intent in cast(dict[str, dict[str, object]], record["intents"]).values()
-            )
-        )
+        await self._commit(lambda _record: None)
+        self._auto_resume_rebased = False
+        return True
 
-    def _begin_auto_fencing(self, record: dict[str, object], cause: RecoveryCause | None, quiesced: bool) -> None:
-        if (
-            self._auto_resume_enabled
-            and self._auto_resume_scope_safe(record, allow_claimed=not quiesced)
-            and self._auto_resume_needs_fencing(record, cause)
-        ):
-            selected = cause or (
-                RecoveryCause.FLOOD_WAIT
-                if self.protection_reason == "flood_wait_circuit_open"
-                else RecoveryCause.READ_UNCERTAINTY
-            )
-            self._schedule_auto_resume(record, cause=selected)
+    def _auto_maintenance_event(self, startup: bool) -> RecoveryEvent:
+        _trial, _automatic, mode, phase, run = self._auto_recovery_identity(self._record)
+        interrupted = mode is RecoveryMode.AUTO and phase is RecoveryPhase.CONSUMED and run is RecoveryRun.OTHER
+        return RecoveryEvent.STARTUP_RECONCILE if startup or interrupted else RecoveryEvent.FAILURE_OBSERVED
+
+    async def _auto_quiesce_if_ready(self, quiesced: bool) -> None:
+        if not quiesced:
+            return
+        event = RecoveryEvent.QUIESCED
+        decision = self._decide_auto_transition(self._record, event, quiesced=True)
+        if decision.command is RecoveryCommand.SET_WAIT:
+            await self._commit(lambda record: self._transition_auto_owned(record, event, quiesced=True))
+
+    def _transition_auto_owned(
+        self,
+        record: dict[str, object],
+        event: RecoveryEvent,
+        *,
+        cause: RecoveryCause | None = None,
+        quiesced: bool = False,
+        observed_flood: bool = False,
+    ) -> None:
+        decision = self._decide_auto_transition(record, event, cause=cause, quiesced=quiesced)
+        self._apply_auto_transition(record, decision, event, cause=cause, observed_flood=observed_flood)
 
     def _settle_auto_fencing(self, record: dict[str, object]) -> None:
         trial = cast(dict[str, object], record["recovery"])
@@ -2291,10 +2521,14 @@ class TelegramRpcSafetyLedger:
         cause = RecoveryCause(cast(str, automatic["cause"]))
         stage = cast(dict[str, int], automatic["failure_stages"])[cause.value]
         delay = float(backoff_seconds(cause, stage))
+        now_mono, now_utc = time.monotonic(), time.time()
         prior = automatic["scheduled_due"]
         if isinstance(prior, dict):
-            delay = max(delay, self._floor_release_at(prior) - time.monotonic())
-        now_mono, now_utc = time.monotonic(), time.time()
+            delay = max(
+                delay,
+                recovery_floor_release_at(self._recovery_floor(prior), now_monotonic=now_mono, now_utc=now_utc)
+                - now_mono,
+            )
         automatic["quiet_anchor"] = {
             "boot_id": self._boot_id,
             "until_monotonic": now_mono,
@@ -2309,64 +2543,29 @@ class TelegramRpcSafetyLedger:
         }
         trial["state"] = "waiting"
 
-    def auto_resume_due(self) -> bool:
-        recovery = self._automatic_recovery()
-        if recovery is None:
-            return False
-        if (
-            not self._auto_resume_enabled
-            or not self._auto_resume_scope_safe(self._record)
-            or recovery["state"] != "waiting"
-            or recovery["scope"] != self._record["scope"]
-        ):
-            return False
-        automatic = cast(dict[str, object], recovery["automatic"])
-        counts = cast(dict[str, int], automatic["attempts_by_policy"])
-        if automatic["cause"] == RecoveryCause.FLOOD_WAIT.value and counts[RecoveryCause.FLOOD_WAIT.value] >= len(
-            _AUTO_RESUME_DELAYS
-        ):
-            return False
+    def auto_resume_due(self, *, lifecycle_available: bool = True) -> bool:
         return (
-            max(self.floor_deadline, self._floor_release_at(cast(dict[str, object], automatic["scheduled_due"])))
-            <= time.monotonic()
+            self._decide_auto_transition(
+                self._record, RecoveryEvent.DUE, lifecycle_available=lifecycle_available
+            ).command
+            is RecoveryCommand.CONSUME
         )
 
-    async def consume_auto_resume(self) -> bool:
+    async def consume_auto_resume(self, *, lifecycle_available: Callable[[], bool] = lambda: True) -> bool:
         if self._auto_resume_rebased:
             await self._commit(lambda _record: None)
             self._auto_resume_rebased = False
-        if not self.auto_resume_due():
+        if not self.auto_resume_due(lifecycle_available=lifecycle_available()):
             return False
         consumed = False
 
         def consume(record: dict[str, object]) -> None:
             nonlocal consumed
-            if not self.auto_resume_due():
+            event = RecoveryEvent.DUE
+            decision = self._decide_auto_transition(record, event, lifecycle_available=lifecycle_available())
+            if decision.command is not RecoveryCommand.CONSUME:
                 return
-            recovery = cast(dict[str, object], record["recovery"])
-            automatic = cast(dict[str, object], recovery["automatic"])
-            counts = cast(dict[str, int], automatic["attempts_by_policy"])
-            cause = cast(str, automatic["cause"])
-            counts[cause] += 1
-            automatic["attempts_total"] = cast(int, automatic["attempts_total"]) + 1
-            grant = cast(str, recovery["generation"])
-            bound = []
-            for intent_id, intent in cast(dict[str, dict[str, object]], record["intents"]).items():
-                if _intent_blocks(intent, cast(dict[str, object], record["scope"])):
-                    intent["phase"] = "unknown"
-                    intent["policy_recovery"] = {
-                        "policy_version": 1,
-                        "episode_id": automatic["episode_id"],
-                        "grant_generation": grant,
-                        "scope": dict(cast(dict[str, object], intent["scope"])),
-                    }
-                    bound.append(intent_id)
-            automatic["bound_intent_ids"] = bound
-            for episode in cast(dict[str, dict[str, object]], record["methods"]).values():
-                episode["claim"] = None
-            recovery.update(state="consumed", consumed_run=self._run)
-            record["generation"] = uuid.uuid4().hex
-            record["protection"] = None
+            self._apply_auto_transition(record, decision, event)
             consumed = True
 
         await self._commit(consume)
@@ -2374,19 +2573,37 @@ class TelegramRpcSafetyLedger:
             self._startup_hold = None
         return consumed
 
+    def _consume_auto_record(self, record: dict[str, object]) -> None:
+        recovery = cast(dict[str, object], record["recovery"])
+        automatic = cast(dict[str, object], recovery["automatic"])
+        counts = cast(dict[str, int], automatic["attempts_by_policy"])
+        cause = cast(str, automatic["cause"])
+        counts[cause] += 1
+        automatic["attempts_total"] = cast(int, automatic["attempts_total"]) + 1
+        grant = cast(str, recovery["generation"])
+        bound = []
+        for intent_id, intent in cast(dict[str, dict[str, object]], record["intents"]).items():
+            if _intent_blocks(intent, cast(dict[str, object], record["scope"])):
+                intent["phase"] = "unknown"
+                intent["policy_recovery"] = {
+                    "policy_version": 1,
+                    "episode_id": automatic["episode_id"],
+                    "grant_generation": grant,
+                    "scope": dict(cast(dict[str, object], intent["scope"])),
+                }
+                bound.append(intent_id)
+        automatic["bound_intent_ids"] = bound
+        for episode in cast(dict[str, dict[str, object]], record["methods"]).values():
+            episode["claim"] = None
+        recovery.update(state="consumed", consumed_run=self._run)
+        record["generation"] = uuid.uuid4().hex
+        record["protection"] = None
+
     async def reset_auto_resume(self) -> None:
         def reset(record: dict[str, object]) -> None:
-            recovery = self._automatic_recovery()
-            if recovery is None:
-                return
-            if (
-                self._auto_resume_enabled
-                and recovery["state"] == "succeeded"
-                and self._auto_resume_scope_safe(record)
-                and self.protection_reason is None
-                and self.floor_deadline <= time.monotonic()
-            ):
-                record["recovery"] = None
+            event = RecoveryEvent.STABILITY_CONFIRMED
+            decision = self._decide_auto_transition(record, event, stability_confirmed=True)
+            self._apply_auto_transition(record, decision, event)
 
         await self._commit(reset)
 
@@ -2422,9 +2639,12 @@ class TelegramRpcSafetyLedger:
     ) -> tuple[str, bool, str | None, str | None, float | None]:
         state = "manual"
         due = None
-        eligible = self._auto_resume_enabled and self._auto_resume_scope_safe(self._record)
+        eligible = self._auto_resume_enabled and self._auto_resume_scope_safe(self._record, allow_claimed=True)
         phase = cast(str, recovery["state"]) if recovery is not None else None
         reason = None if eligible else (self.protection_reason or "unsafe_scope_or_outcome")
+        special = self._auto_special_projection(phase, reason)
+        if special is not None:
+            return special
         if phase == "exhausted":
             eligible = False
             reason = self._auto_resume_exhaustion_reason()
@@ -2438,14 +2658,34 @@ class TelegramRpcSafetyLedger:
                 state, due = self._auto_resume_waiting_projection(eligible, automatic)
         return state, eligible, phase, reason, due
 
+    def _auto_special_projection(
+        self, phase: str | None, reason: str | None
+    ) -> tuple[str, bool, str | None, str | None, float | None] | None:
+        if phase in {"authorized", "failed"}:
+            return "manual", False, None, self.protection_reason or "unsupported_recovery_state", None
+        if phase != "succeeded":
+            return None
+        decision = self._decide_auto_transition(self._record, RecoveryEvent.FAILURE_OBSERVED)
+        if decision.command is RecoveryCommand.ARM_FENCE:
+            return "reconciling", False, None, "recovery_reconciliation_pending", None
+        if self._auto_resume_enabled and not self._auto_resume_scope_safe(self._record, allow_claimed=True):
+            return "manual", False, None, reason, None
+        return None
+
     def _auto_resume_waiting_projection(
         self, eligible: bool, automatic: dict[str, object] | None
     ) -> tuple[str, float | None]:
         if not eligible:
             return "manual", None
         assert automatic is not None
-        deadline = max(self.floor_deadline, self._floor_release_at(cast(dict[str, object], automatic["scheduled_due"])))
-        return "waiting", time.time() + max(0.0, deadline - time.monotonic())
+        now_mono, now_utc = time.monotonic(), time.time()
+        floor = self._recovery_floor(cast(dict[str, object], self._record["floor"]))
+        due = self._recovery_floor(cast(dict[str, object], automatic["scheduled_due"]))
+        deadline = max(
+            recovery_floor_release_at(floor, now_monotonic=now_mono, now_utc=now_utc),
+            recovery_floor_release_at(due, now_monotonic=now_mono, now_utc=now_utc),
+        )
+        return "waiting", now_utc + max(0.0, deadline - now_mono)
 
     def _auto_resume_exhaustion_reason(self) -> str:
         return (
@@ -2465,8 +2705,15 @@ class TelegramRpcSafetyLedger:
                 or scope["account_id"] != account_id
             ):
                 raise ValueError("recovery trial identity is not current")
-            trial["state"] = "succeeded"
-            record["protection"] = None
+            if "automatic" in trial:
+                event = RecoveryEvent.TRIAL_SUCCESS
+                decision = self._decide_auto_transition(record, event)
+                if decision.command is not RecoveryCommand.MARK_SUCCESS:
+                    raise ValueError("recovery trial identity is not current")
+                self._apply_auto_transition(record, decision, event)
+            else:
+                trial["state"] = "succeeded"
+                record["protection"] = None
 
         await self._commit(finish)
 
@@ -2479,6 +2726,30 @@ class TelegramRpcSafetyLedger:
                 record["generation"] = uuid.uuid4().hex
 
         await self._commit(fail)
+
+    async def fail_automatic_recovery(self, cause: RecoveryCause | None) -> None:
+        def fail(record: dict[str, object]) -> None:
+            trial = record.get("recovery")
+            automatic = trial.get("automatic") if isinstance(trial, dict) else None
+            if not isinstance(automatic, dict):
+                return
+            selected = cause or RecoveryCause(cast(str, automatic["cause"]))
+            self._transition_auto_owned(record, RecoveryEvent.FAILURE_SETTLED, cause=selected)
+
+        await self._commit(fail)
+
+    async def mark_startup_integrity_failure(self) -> None:
+        def protect(record: dict[str, object]) -> None:
+            if record["protection"] in {
+                None,
+                "unresolved_outbound_outcome",
+                "transport_unavailable",
+                "flood_wait_circuit_open",
+            }:
+                record["protection"] = "transport_integrity_failure"
+                record["generation"] = uuid.uuid4().hex
+
+        await self._commit(protect)
 
 
 _COOLDOWN_DEADLINE = 0.0
@@ -3871,11 +4142,11 @@ class TelegramRpcGate(TelegramClient):
 
     def _automatic_trial_blocked(self) -> bool:
         assert self._safety is not None
-        recovery = self._safety._automatic_recovery()
+        snapshot = self._safety.recovery_identity()
         return (
-            recovery is not None
-            and recovery["state"] == "consumed"
-            and (not self._safety._auto_resume_enabled or self._auto_resume_stopped())
+            snapshot.mode is RecoveryMode.AUTO
+            and snapshot.phase is RecoveryPhase.CONSUMED
+            and (not snapshot.enabled or self._auto_resume_stopped())
         )
 
     def _connection_write_ready(self, scope: TelegramRpcScope) -> bool:
@@ -4226,10 +4497,14 @@ class TelegramRpcGate(TelegramClient):
 
     def _automatic_trial_claim_allowed(self, owner: _WireAttempt) -> bool:
         ledger = self._ensure_safety_ledger()
-        recovery = ledger._automatic_recovery()
-        if recovery is None or recovery["state"] != "consumed" or owner.scope.transport_control:
+        snapshot = ledger.recovery_identity()
+        if (
+            snapshot.mode is not RecoveryMode.AUTO
+            or snapshot.phase is not RecoveryPhase.CONSUMED
+            or owner.scope.transport_control
+        ):
             return True
-        if not self.automatic_trial_active() or not ledger._auto_resume_enabled or self._auto_resume_stopped():
+        if not self.automatic_trial_active() or not snapshot.enabled or self._auto_resume_stopped():
             return False
         capability = self._connection_capability
         bootstrap = (
@@ -4450,9 +4725,41 @@ class TelegramRpcGate(TelegramClient):
                     incident_claimed_at_ms=owner.incident_claimed_at_ms,
                     incident_settled_at_ms=int(time.time() * 1000),
                     incident_cause=cause,
+                    incident_terminal_stage="terminal_settlement",
+                    incident_error_type=self._incident_error_type(error),
+                    incident_terminal_reason=self._incident_terminal_reason(error),
+                    incident_owner_attempt=owner.attempt_id,
                 )
         except Exception:  # noqa: BLE001 - observations cannot alter settled safety
             logger.debug("telegram_rpc_incident_observation_failed")
+
+    @staticmethod
+    def _incident_error_type(error: BaseException | None) -> str:
+        if error is None:
+            return "no_exception"
+        for kind, label in (
+            (asyncio.CancelledError, "cancelled"),
+            (RpcAdmissionExpiredError, "admission_expired"),
+            (RpcAdmissionSaturatedError, "admission_saturated"),
+            (RpcAttemptBudgetExhaustedError, "attempt_budget_exhausted"),
+            (TimeoutError, "timeout"),
+            (ConnectionError, "connection"),
+            (OSError, "os_error"),
+            (RPCError, "rpc_error"),
+        ):
+            if isinstance(error, kind):
+                return label
+        return "other_exception"
+
+    @staticmethod
+    def _incident_terminal_reason(error: BaseException | None) -> str | None:
+        if isinstance(error, RpcAttemptBudgetExhaustedError):
+            return "attempt_budget_exhausted"
+        if isinstance(error, RpcAdmissionExpiredError):
+            return "admission_expired"
+        if isinstance(error, RpcAdmissionSaturatedError):
+            return "admission_saturated"
+        return None
 
     def _note_successful_acquisition(
         self, owner: _WireAttempt, error: BaseException | None, rejected: BaseException | None
@@ -4578,6 +4885,8 @@ class TelegramRpcGate(TelegramClient):
             "reason": reason,
             "known_retry_until_utc": status["retry_until_utc"],
             "unresolved_request_count": status["unresolved_request_count"],
+            "blocking_request_count": status["blocking_request_count"],
+            "historical_unknown_request_count": status["historical_unknown_request_count"],
             "unresolved_requests": status["unresolved_requests"],
             "unresolved_requests_truncated": status["unresolved_requests_truncated"],
             "automatic_resume": automatic,
@@ -4606,8 +4915,12 @@ class TelegramRpcGate(TelegramClient):
     def automatic_trial_active(self) -> bool:
         """Report only a trial consumed by this lifecycle."""
         ledger = self._ensure_safety_ledger()
-        recovery = ledger._automatic_recovery()
-        return bool(recovery and recovery["state"] == "consumed" and recovery["consumed_run"] == ledger._run)
+        snapshot = ledger.recovery_identity()
+        return (
+            snapshot.mode is RecoveryMode.AUTO
+            and snapshot.phase is RecoveryPhase.CONSUMED
+            and snapshot.run is RecoveryRun.CURRENT
+        )
 
     def bind_auto_resume_identity(self) -> None:
         """Bind the sole identity probe to the startup owner of this trial."""
@@ -4648,8 +4961,8 @@ class TelegramRpcGate(TelegramClient):
         if self._rpc_circuit_status().open or ledger.protection_reason == "flood_wait_circuit_open":
             cause = RecoveryCause.FLOOD_WAIT
         await ledger.maintain_auto_resume(cause=cause, quiesced=False)
-        recovery = ledger._automatic_recovery()
-        if recovery is not None and recovery["state"] == "fencing":
+        snapshot = ledger.recovery_identity()
+        if snapshot.mode is RecoveryMode.AUTO and snapshot.phase is RecoveryPhase.FENCING:
             await self._disconnect_main_sender()
         return await ledger.maintain_auto_resume(cause=cause, quiesced=True)
 
@@ -4664,8 +4977,12 @@ class TelegramRpcGate(TelegramClient):
         )
 
     async def _maintain_auto_resume_stability(self, ledger: TelegramRpcSafetyLedger) -> None:
-        recovery = ledger._automatic_recovery()
-        if recovery is None or recovery["state"] != "succeeded" or not ledger._auto_resume_enabled:
+        snapshot = ledger.recovery_identity()
+        if (
+            snapshot.mode is not RecoveryMode.AUTO
+            or snapshot.phase is not RecoveryPhase.SUCCEEDED
+            or not snapshot.enabled
+        ):
             return
         if not self.is_connected() or self.rpc_eligibility() is not None:
             self._reset_auto_resume_stability()
@@ -4682,13 +4999,13 @@ class TelegramRpcGate(TelegramClient):
     async def finish_startup_auto_resume(self) -> None:
         """Confirm replay restoration before beginning the observed stability interval."""
         ledger = self._ensure_safety_ledger()
-        recovery = ledger._automatic_recovery()
-        if recovery is not None and recovery["state"] == "consumed":
+        snapshot = ledger.recovery_identity()
+        if snapshot.mode is RecoveryMode.AUTO and snapshot.phase is RecoveryPhase.CONSUMED:
             account_id = ledger.verified_account_id
             if account_id is None:
                 raise RuntimeError("automatic recovery lacks verified identity")
             await ledger.finish_recovery(account_id)
-        if recovery is not None and recovery["state"] in {"consumed", "succeeded"}:
+        if snapshot.mode is RecoveryMode.AUTO and snapshot.phase in {RecoveryPhase.CONSUMED, RecoveryPhase.SUCCEEDED}:
             self._reset_auto_resume_stability()
             self._auto_resume_stable_since = time.monotonic()
 
@@ -4855,7 +5172,15 @@ class TelegramRpcGate(TelegramClient):
         try:
             if self._session_lease is not None and self._session_lease.is_held():
                 await ledger._reconcile_aux_after_restart(self._session_lease)
-            await ledger.consume_auto_resume()
+            snapshot = ledger.recovery_identity()
+            interrupted = (
+                snapshot.mode is RecoveryMode.AUTO
+                and snapshot.phase is RecoveryPhase.CONSUMED
+                and snapshot.run is RecoveryRun.OTHER
+            )
+            if self._automatic_lifecycle_available() and (ledger.protection_reason is not None or interrupted):
+                await ledger.maintain_auto_resume(cause=self._recovery_cause, quiesced=True, startup=True)
+            await ledger.consume_auto_resume(lifecycle_available=self._automatic_lifecycle_available)
             await ledger.consume_recovery()
             ledger.require_writable()
         finally:
@@ -4864,49 +5189,34 @@ class TelegramRpcGate(TelegramClient):
     async def verify_startup_account(self, account_id: int) -> None:
         ledger = self._ensure_safety_ledger()
         await ledger.verify_account(account_id)
-        trial = ledger._record["recovery"]
-        if isinstance(trial, dict) and "automatic" not in trial and trial["state"] == "consumed":
+        snapshot = ledger.recovery_identity()
+        if snapshot.mode is RecoveryMode.MANUAL and snapshot.phase is RecoveryPhase.CONSUMED:
             await ledger.finish_recovery(account_id)
 
     async def fail_startup_recovery(self, error: BaseException | None = None) -> None:
         ledger = self._ensure_safety_ledger()
-        trial = ledger._record.get("recovery")
-        if self._settled_auto_failure(trial, error):
+        snapshot = ledger.recovery_identity()
+        if self._settled_auto_failure(snapshot, error):
             return
         if error is not None:
             self.protect_transport(error)
             if not isinstance(error, (TransportConnectError, TransportWriteError)):
-                await ledger._commit(self._protect_startup_integrity)
+                await ledger.mark_startup_integrity_failure()
                 return
-        if ledger._storage_failed or not isinstance(trial, dict) or trial["state"] != "consumed":
+        if ledger._storage_failed or snapshot.phase is not RecoveryPhase.CONSUMED:
             return
-        if "automatic" in trial:
-            cause = self._recovery_cause or RecoveryCause(
-                cast(str, cast(dict[str, object], trial["automatic"])["cause"])
-            )
-            await ledger._commit(lambda record: ledger._schedule_auto_resume(record, cause=cause, observed_flood=False))
+        if snapshot.mode is RecoveryMode.AUTO:
+            await ledger.fail_automatic_recovery(self._recovery_cause)
             return
         await ledger.fail_recovery()
 
     @staticmethod
-    def _settled_auto_failure(trial: object, error: BaseException | None) -> bool:
+    def _settled_auto_failure(snapshot: _RecoveryIdentity, error: BaseException | None) -> bool:
         return (
-            isinstance(trial, dict)
-            and "automatic" in trial
-            and trial["state"] in {"fencing", "exhausted"}
+            snapshot.mode is RecoveryMode.AUTO
+            and snapshot.phase in {RecoveryPhase.FENCING, RecoveryPhase.EXHAUSTED}
             and (error is None or isinstance(error, (TransportConnectError, TransportWriteError)))
         )
-
-    @staticmethod
-    def _protect_startup_integrity(record: dict[str, object]) -> None:
-        if record["protection"] in {
-            None,
-            "unresolved_outbound_outcome",
-            "transport_unavailable",
-            "flood_wait_circuit_open",
-        }:
-            record["protection"] = "transport_integrity_failure"
-            record["generation"] = uuid.uuid4().hex
 
     async def __call__(
         self, request: object, ordered: bool = False, flood_sleep_threshold: int | None = None

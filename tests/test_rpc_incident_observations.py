@@ -17,7 +17,12 @@ from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggre
 from mcp_telegram.runtime_observations import RuntimeObservationSink, _ObservationJob
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import ensure_sync_schema, load_rpc_safety_record
-from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget, RpcAttemptEvidence
+from mcp_telegram.telegram_demand import (
+    AcquisitionKind,
+    RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
+    RpcAttemptEvidence,
+)
 from mcp_telegram.telegram_rpc import TelegramRpcGate, _TransportBoundaryState
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import RpcServiceClass, TelegramRpcScope, TelegramRpcSource
@@ -123,6 +128,50 @@ def test_incident_rejection_and_invalid_legacy_metadata_report_loss() -> None:
     assert not any(row["outcome"] == "incident_unknown" for row in recorder.rows)
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        (
+            "terminal_settlement",
+            "admission_expired",
+            "admission_expired",
+            "terminal_settlement",
+            "admission_expired",
+            "admission_expired",
+        ),
+        ("secret stage", "private exception body", "private reason", "unknown", "other_exception", None),
+    ],
+)
+def test_incident_terminal_fields_are_allowlisted(case: tuple[str, str, str, str, str, str | None]) -> None:
+    stage, error_type, reason, expected_stage, expected_error, expected_reason = case
+    recorder = Recorder()
+    observer = RpcAdmissionObservationAggregator(
+        recorder, policy=RuntimeObservationConfig(), method_names=frozenset({METHOD})
+    )
+    scope = TelegramRpcScope(
+        TelegramRpcSource.MCP_INTERACTIVE, RpcServiceClass.INTERACTIVE, None, None, owned_attempt_id="a" * 32
+    )
+    observer.observe_rpc_event(
+        scope=scope,
+        phase="incident_unknown",
+        request_method=METHOD,
+        incident_run="b" * 32,
+        incident_claimed_at_ms=1,
+        incident_settled_at_ms=2,
+        incident_terminal_stage=stage,
+        incident_error_type=error_type,
+        incident_terminal_reason=reason,
+        incident_owner_attempt="a" * 32,
+    )
+    observer.flush()
+    row = next(row for row in recorder.rows if row["outcome"] == "incident_unknown")
+    payload = cast(dict[str, object], row["payload"])
+    assert payload["terminal_stage"] == expected_stage and payload["error_type"] == expected_error
+    assert payload["owner_attempt_id"] == "a" * 32
+    assert payload.get("terminal_reason") == expected_reason
+    assert "private" not in repr(payload) and "secret" not in repr(payload)
+
+
 async def test_claimed_unknown_is_recorded_once_with_owner_identity(wire: _WireHarness) -> None:  # noqa: F811
     gate, sender, connection, _ = wire
     recorder = Recorder()
@@ -155,9 +204,46 @@ async def test_claimed_unknown_is_recorded_once_with_owner_identity(wire: _WireH
     assert len(incidents) == 1
     payload = cast(dict[str, object], incidents[0]["payload"])
     assert payload["attempt_id"] == owner.attempt_id
+    assert payload["owner_attempt_id"] == owner.attempt_id
+    assert payload["terminal_stage"] == "terminal_settlement"
+    assert payload["error_type"] == "cancelled"
     assert payload["run"] == gate._ensure_safety_ledger()._run
     assert payload["claim_at_ms"] == owner.incident_claimed_at_ms
     assert cast(int, payload["settled_at_ms"]) >= cast(int, payload["claim_at_ms"])
+
+
+async def test_claimed_owner_reports_typed_budget_failure_without_exception_text(wire: _WireHarness) -> None:  # noqa: F811
+    gate, sender, connection, _ = wire
+    recorder = Recorder()
+    observer = RpcAdmissionObservationAggregator(
+        recorder, policy=RuntimeObservationConfig(), method_names=TelegramRpcGate.rpc_observation_methods()
+    )
+    gate.set_rpc_request_observer(observer.observe_rpc_event)
+    scope = TelegramRpcScope(
+        TelegramRpcSource.MCP_INTERACTIVE,
+        RpcServiceClass.INTERACTIVE,
+        time.monotonic() + 10,
+        asyncio.current_task(),
+        attempt_budget=RpcAttemptBudget(2),
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    result = sender.send_owned(GetStateRequest(), scope)
+    state = await sender._send_queue.next_state()
+    await sender._prepare_state(state)
+    packet = connection._send_queue.get_nowait()
+    owner = gate._require_wire_owner(packet.state.owner)
+    assert sender.write_packet(packet, connection._send)
+    state.future.set_exception(RpcAttemptBudgetExhaustedError("private exception text"))
+    with pytest.raises(RpcAttemptBudgetExhaustedError):
+        await result
+    await asyncio.gather(*sender._observing)
+    incidents = [row for row in recorder.rows if row["outcome"] == "incident_unknown"]
+    assert len(incidents) == 1
+    payload = cast(dict[str, object], incidents[0]["payload"])
+    assert payload["owner_attempt_id"] == owner.attempt_id
+    assert payload["terminal_stage"] == "terminal_settlement"
+    assert payload["error_type"] == payload["terminal_reason"] == "attempt_budget_exhausted"
+    assert "private" not in repr(payload) and "replay" not in repr(payload)
 
 
 async def test_unsampled_late_shutdown_incident_survives_sink_drain_and_reopen(  # noqa: PLR0914, PLR0915

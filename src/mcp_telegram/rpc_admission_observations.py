@@ -377,12 +377,25 @@ class RpcAdmissionObservationAggregator:
         incident_claimed_at_ms: int | None = None,
         incident_settled_at_ms: int | None = None,
         incident_cause: str | None = None,
+        incident_terminal_stage: str | None = None,
+        incident_error_type: str | None = None,
+        incident_terminal_reason: str | None = None,
+        incident_owner_attempt: str | None = None,
     ) -> None:
         """Bounded method counters and biased root samples; never admit work."""
         try:
             if phase == "incident_unknown":
                 self._observe_unknown_incident(
-                    scope, request_method, incident_run, incident_claimed_at_ms, incident_settled_at_ms, incident_cause
+                    scope,
+                    request_method,
+                    incident_run,
+                    incident_claimed_at_ms,
+                    incident_settled_at_ms,
+                    incident_cause,
+                    incident_terminal_stage,
+                    incident_error_type,
+                    incident_terminal_reason,
+                    incident_owner_attempt,
                 )
                 return
             if phase not in _RPC_PHASES or not _valid_rpc_scope(scope):
@@ -417,6 +430,10 @@ class RpcAdmissionObservationAggregator:
         claimed_at_ms: int | None,
         settled_at_ms: int | None,
         cause: str | None,
+        terminal_stage: str | None,
+        error_type: str | None,
+        terminal_reason: str | None,
+        owner_attempt: str | None,
     ) -> None:
         attempt = scope.owned_attempt_id
         method = _observation_method(method, self._method_names)
@@ -444,6 +461,7 @@ class RpcAdmissionObservationAggregator:
             "settled_at_ms": settled_at_ms,
             "termination": cause if cause in {"cancelled", "transport_lost", "shutdown"} else "unspecified",
         }
+        self._add_incident_terminal_fields(payload, attempt, terminal_stage, error_type, terminal_reason, owner_attempt)
         if scope.demand_kind is not None:
             payload["demand_kind"] = scope.demand_kind.value
         if scope.acquisition_kind is not None:
@@ -453,6 +471,36 @@ class RpcAdmissionObservationAggregator:
         ):
             with self._state_lock:
                 self._rpc_lost_rows += 1
+
+    @staticmethod
+    def _add_incident_terminal_fields(  # noqa: PLR0913, PLR0917 - bounded producer fields.
+        payload: dict[str, object],
+        attempt: str | None,
+        terminal_stage: str | None,
+        error_type: str | None,
+        terminal_reason: str | None,
+        owner_attempt: str | None,
+    ) -> None:
+        if terminal_stage is not None:
+            payload["terminal_stage"] = terminal_stage if terminal_stage == "terminal_settlement" else "unknown"
+        if error_type is not None:
+            allowed = {
+                "no_exception",
+                "cancelled",
+                "admission_expired",
+                "admission_saturated",
+                "attempt_budget_exhausted",
+                "timeout",
+                "connection",
+                "os_error",
+                "rpc_error",
+                "other_exception",
+            }
+            payload["error_type"] = error_type if error_type in allowed else "other_exception"
+        if owner_attempt == attempt:
+            payload["owner_attempt_id"] = owner_attempt
+        if terminal_reason in {"admission_expired", "admission_saturated", "attempt_budget_exhausted"}:
+            payload["terminal_reason"] = terminal_reason
 
     def _rpc_identity(self, scope: TelegramRpcScope) -> tuple[str | None, str | None]:
         selected = None if scope.attempt_budget is None else scope.attempt_budget.selected

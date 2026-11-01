@@ -2888,7 +2888,8 @@ def test_get_account_protection_reports_only_process_local_status() -> None:
 
 
 @pytest.mark.parametrize(
-    "automatic_state,mode", [("waiting", "automatic"), ("manual", "manual"), ("disabled", "manual")]
+    "automatic_state,mode",
+    [("waiting", "automatic"), ("reconciling", "automatic"), ("manual", "manual"), ("disabled", "manual")],
 )
 def test_account_protection_exposes_automatic_wait_without_changing_local_data(automatic_state: str, mode: str) -> None:
     from jsonschema import validate
@@ -2919,6 +2920,122 @@ def test_account_protection_exposes_automatic_wait_without_changing_local_data(a
     projected = cast(dict[str, object], bounded["automatic_resume"])
     assert ("next_attempt_at_utc" in projected) == (automatic_state == "waiting")
     validate(bounded, ACTIVE_ACCOUNT_PROTECTION_SCHEMA)
+
+
+def test_account_protection_reconciling_exposes_blockers_and_history_without_stale_trial() -> None:
+    from jsonschema import validate
+
+    from mcp_telegram.server import _bounded_account_protection, _is_valid_active_account_protection
+    from mcp_telegram.tools._base import ACTIVE_ACCOUNT_PROTECTION_SCHEMA
+
+    server = make_server()
+    server._account_safety_status = lambda: {
+        "reason": "unresolved_outbound_outcome",
+        "unresolved_request_count": 2,
+        "blocking_request_count": 1,
+        "historical_unknown_request_count": 1,
+        "unresolved_requests": [
+            {"method": "messages.GetHistoryRequest", "phase": "unknown", "blocks_acquisition": True},
+            {"method": "users.GetUsersRequest", "phase": "unknown", "blocks_acquisition": False},
+        ],
+        "automatic_resume": {
+            "enabled": True,
+            "eligible": False,
+            "state": "reconciling",
+            "attempts": 1,
+            "max_attempts": 6,
+            "block_reason": "recovery_reconciliation_pending",
+        },
+    }
+    response = server._get_account_protection({})
+    status = cast(dict[str, object], cast(dict[str, object], response["data"])["account_protection"])
+    assert status["recovery"] == "automatic"
+    assert "reconciling" in cast(str, status["notice"])
+    assert "Historical unknown outcomes" in cast(str, status["notice"])
+    assert _is_valid_active_account_protection(status)
+    bounded = _bounded_account_protection(status)
+    assert "Automatic recovery is reconciling" in cast(str, bounded["notice"])
+    assert "Historical unknown outcomes" in cast(str, bounded["notice"])
+    assert len(cast(str, bounded["notice"])) <= 400
+    validate(bounded, ACTIVE_ACCOUNT_PROTECTION_SCHEMA)
+
+
+def test_bounded_manual_protection_preserves_operator_action_with_history() -> None:
+    from mcp_telegram.server import _bounded_account_protection
+
+    server = make_server()
+    server._account_safety_status = lambda: {
+        "reason": "unresolved_outbound_outcome",
+        "historical_unknown_request_count": 100,
+        "automatic_resume": {"enabled": True, "eligible": False, "state": "manual", "attempts": 0, "max_attempts": 6},
+    }
+    response = server._get_account_protection({})
+    protection = cast(dict[str, object], cast(dict[str, object], response["data"])["account_protection"])
+    bounded = _bounded_account_protection(protection)
+    assert "Historical unknown outcomes" in cast(str, bounded["notice"])
+    assert "Recovery requires operator action" in cast(str, bounded["notice"])
+    assert len(cast(str, bounded["notice"])) <= 400
+
+
+@pytest.mark.parametrize(
+    ("state", "phase", "eligible", "due", "action"),
+    [
+        ("reconciling", None, False, None, "Automatic recovery is reconciling the current protection."),
+        (
+            "waiting",
+            "waiting",
+            True,
+            12345,
+            "An automatic trial is scheduled; its time is conditional, not a recovery ETA.",
+        ),
+        (
+            "manual",
+            "fencing",
+            True,
+            None,
+            "Automatic recovery is preparing; consult its status for eligibility and blocks.",
+        ),
+        (
+            "trial",
+            "consumed",
+            True,
+            None,
+            "Automatic recovery is in progress; consult its status for eligibility and blocks.",
+        ),
+        (
+            "stability",
+            "succeeded",
+            True,
+            None,
+            "Automatic recovery is in progress; consult its status for eligibility and blocks.",
+        ),
+        ("manual", None, False, None, "Recovery requires operator action."),
+    ],
+)
+def test_bounded_protection_notice_preserves_whole_action(
+    state: str, phase: str | None, eligible: bool, due: int | None, action: str
+) -> None:
+    from mcp_telegram.server import _bounded_account_protection
+
+    server = make_server()
+    server._account_safety_status = lambda: {
+        "reason": "unresolved_outbound_outcome",
+        "historical_unknown_request_count": 1,
+        "automatic_resume": {
+            "enabled": True,
+            "eligible": eligible,
+            "state": state,
+            "phase": phase,
+            "next_trial_at_utc": due,
+            "attempts": 1,
+            "max_attempts": 6,
+        },
+    }
+    response = server._get_account_protection({})
+    protection = cast(dict[str, object], cast(dict[str, object], response["data"])["account_protection"])
+    notice = cast(str, _bounded_account_protection(protection)["notice"])
+    assert "Historical unknown outcomes" in notice and action in notice
+    assert len(notice) <= 400
 
 
 @pytest.mark.asyncio

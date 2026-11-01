@@ -136,7 +136,7 @@ async def test_protection_diagnostics_are_bounded_safe_and_read_only(clock: Cloc
     assert status["unresolved_request_count"] == 10
     rows = cast(list[dict[str, object]], status["unresolved_requests"])
     assert len(rows) == 8 and status["unresolved_requests_truncated"] is True
-    assert all(set(row) == {"method", "phase"} and row["method"] == method for row in rows)
+    assert all(set(row) == {"method", "phase", "blocks_acquisition"} and row["method"] == method for row in rows)
     assert {row["phase"] for row in rows} == {"prepared", "unknown"}
     assert store.raw == before and len(store.writes) == writes
     await ledger.authorize_recovery(generation(ledger), acknowledged=True)
@@ -151,7 +151,9 @@ async def test_protection_diagnostics_never_disclose_unrecognized_method_values(
     ledger = store.ledger()
     await ledger.prepare("private-attempt", "private payload:01234567")
     before = store.raw
-    assert ledger.status()["unresolved_requests"] == [{"method": "unrecognized", "phase": "prepared"}]
+    assert ledger.status()["unresolved_requests"] == [
+        {"method": "unrecognized", "phase": "prepared", "blocks_acquisition": True}
+    ]
     assert store.raw == before
 
 
