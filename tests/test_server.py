@@ -57,6 +57,8 @@ def _minimal_schema_value(schema: dict[str, object]) -> object:  # noqa: PLR0911
     if isinstance(enum, list):
         return enum[0]
     schema_type = schema.get("type")
+    if isinstance(schema_type, list) and "null" in schema_type:
+        return None
     if schema_type == "object":
         properties = cast(dict[str, dict[str, object]], schema.get("properties", {}))
         return {

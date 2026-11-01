@@ -13,6 +13,7 @@ from ..sync_read_model import (
     SyncReadModel,
     SyncReadModelContractError,
     SyncStatus,
+    decode_latest_retained_message,
     decode_sync_read_model,
 )
 from ._base import (
@@ -59,10 +60,41 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
         "dialog_id": {"type": "integer"},
-        "coverage_status": {"type": "string", "enum": [item.value for item in SyncStatus]},
+        "coverage_status": {
+            "type": "string",
+            "enum": [item.value for item in SyncStatus],
+            "description": "Persisted history sync state, not current delivery or uninterrupted coverage.",
+        },
         "enrollment_enabled": {"type": ["boolean", "null"]},
         "enrollment_source": {"type": ["string", "null"]},
-        "realtime_history": {"type": "string", "enum": [item.value for item in RealtimeHistory]},
+        "realtime_history": {
+            "type": "string",
+            "enum": [item.value for item in RealtimeHistory],
+            "description": "Legacy retention policy, not evidence that messages are arriving.",
+        },
+        "message_retention_policy": {
+            "type": "string",
+            "enum": ["all_authorized", "own_only", "none"],
+            "description": "Which delivered messages may be retained; this does not establish complete delivery.",
+        },
+        "latest_retained_message": {
+            "type": ["object", "null"],
+            "description": "Newest retained nondeleted message by Telegram sent time, including incoming, outgoing and service messages; not latest local arrival or delivery completeness.",
+            "properties": {"message_id": {"type": "integer"}, "sent_at": {"type": "integer"}},
+            "required": ["message_id", "sent_at"],
+            "additionalProperties": False,
+        },
+        "message_delivery": {
+            "type": "object",
+            "properties": {
+                "state": {"const": "unverified"},
+                "lag_seconds": {"type": "null"},
+                "gap_status": {"const": "unknown"},
+                "reason": {"const": "no_authoritative_delivery_diagnostics"},
+            },
+            "required": ["state", "lag_seconds", "gap_status", "reason"],
+            "additionalProperties": False,
+        },
         "is_syncing": {"type": "boolean"},
         "last_synced_at": {"type": ["integer", "null"]},
         "last_event_at": {
@@ -111,6 +143,9 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
         "enrollment_enabled",
         "enrollment_source",
         "realtime_history",
+        "message_retention_policy",
+        "latest_retained_message",
+        "message_delivery",
         "is_syncing",
         "last_synced_at",
         "last_event_at",
@@ -151,6 +186,7 @@ class _GetSyncStatusSurface:
     access_lost_at: int | None
     access_last_revalidated_at: int | None
     access_next_revalidate_at: int | None
+    latest_retained_message: dict[str, int] | None
 
 
 def _surface_required(data: Mapping[str, object], name: str) -> object:
@@ -210,6 +246,7 @@ def _decode_get_sync_status_surface(
         access_lost_at=_surface_optional_int(data, "access_lost_at"),
         access_last_revalidated_at=_surface_optional_int(data, "access_last_revalidated_at"),
         access_next_revalidate_at=_surface_optional_int(data, "access_next_revalidate_at"),
+        latest_retained_message=decode_latest_retained_message(_surface_required(data, "latest_retained_message")),
     )
 
 
@@ -266,7 +303,9 @@ class GetSyncStatus(ToolArgs):
     (real-time MTProto events), 'best-effort weekly (DM)' while periodic DM verification is active,
     or a paused/stale notice when that maintenance has been suspended.
     sync_progress is the raw message_id offset cursor, not a row count. Works for any dialog —
-    non-synced dialogs return status='not_synced' with zero counts."""
+    non-synced dialogs return status='not_synced' with zero counts.
+    Retention policy says which delivered messages may be saved; it does not verify delivery.
+    The latest retained message is ordered by Telegram sent time, not local arrival."""
 
     dialog_id: int = Field(description="Numeric dialog ID from ListDialogs")
 
@@ -308,6 +347,18 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
         "enrollment_enabled": wire["enrollment_enabled"],
         "enrollment_source": surface.enrollment_source,
         "realtime_history": wire["realtime_history"],
+        "message_retention_policy": {
+            RealtimeHistory.FULL: "all_authorized",
+            RealtimeHistory.OWN_ONLY: "own_only",
+            RealtimeHistory.NONE: "none",
+        }[surface.model.realtime_history],
+        "latest_retained_message": surface.latest_retained_message,
+        "message_delivery": {
+            "state": "unverified",
+            "lag_seconds": None,
+            "gap_status": "unknown",
+            "reason": "no_authoritative_delivery_diagnostics",
+        },
         "is_syncing": wire["is_syncing"],
         "last_synced_at": wire["last_synced_at"],
         "last_event_at": wire["last_event_at"],

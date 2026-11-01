@@ -9,6 +9,10 @@ _GET_SYNC_STATUS_SQL = (
     "FROM synced_dialogs sd LEFT JOIN full_history_enrollment fhe USING(dialog_id) WHERE sd.dialog_id = ?"
 )
 _COUNT_SYNCED_MESSAGES_SQL = "SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND is_deleted = 0"
+_LATEST_RETAINED_MESSAGE_SQL = (
+    "SELECT message_id, sent_at FROM messages INDEXED BY idx_messages_dialog_sent WHERE dialog_id = ? AND is_deleted = 0 "
+    "ORDER BY sent_at DESC, message_id DESC LIMIT 1"
+)
 
 # list_topics - read from topic_metadata snapshot.
 _LIST_TOPICS_SQL = (

@@ -366,6 +366,7 @@ def _canonical_list_dialogs_data(dialogs: list[dict[str, object]]) -> dict[str, 
 def _canonical_get_sync_status_data() -> dict[str, object]:
     return {
         "dialog_id": 123,
+        "latest_retained_message": None,
         "enrollment_source": "explicit",
         "sync_progress": None,
         "sync_progress_message_id": None,
@@ -586,6 +587,7 @@ STRUCTURED_TOOL_CASES = {
             "ok": True,
             "data": {
                 "dialog_id": 123,
+                "latest_retained_message": None,
                 "enrollment_source": "explicit",
                 "delta_refresh_requested_at": None,
                 "sync_progress": None,
@@ -855,7 +857,16 @@ async def test_registered_tool_outputs_match_their_null_free_schemas(tool_name: 
         result = await server.call_tool(tool_name, args.model_dump(mode="json", exclude_none=True))
 
     payload = assert_structured_success_payload(result)
-    _assert_null_free(payload)
+    if tool_name == "get_sync_status":
+        assert payload["latest_retained_message"] is None
+        delivery = cast(dict[str, object], payload["message_delivery"])
+        assert delivery["lag_seconds"] is None
+        remainder = dict(payload)
+        remainder.pop("latest_retained_message")
+        remainder["message_delivery"] = {k: v for k, v in delivery.items() if k != "lag_seconds"}
+        _assert_null_free(remainder)
+    else:
+        _assert_null_free(payload)
     validate(payload, output_schema)
 
 
@@ -2531,6 +2542,7 @@ async def test_get_sync_status_via_daemon():
     """GetSyncStatus routes through daemon and formats key=value output."""
     data = {
         "dialog_id": -1001234567890,
+        "latest_retained_message": None,
         "enrollment_source": "explicit",
         "sync_progress": 100,
         "sync_progress_message_id": 100,
@@ -2556,6 +2568,14 @@ async def test_get_sync_status_via_daemon():
         "enrollment_enabled": True,
         "enrollment_source": "explicit",
         "realtime_history": "full",
+        "message_retention_policy": "all_authorized",
+        "latest_retained_message": None,
+        "message_delivery": {
+            "state": "unverified",
+            "lag_seconds": None,
+            "gap_status": "unknown",
+            "reason": "no_authoritative_delivery_diagnostics",
+        },
         "is_syncing": False,
         "last_synced_at": "2023-11-14T22:13:20+00:00",
         "last_event_at": "2023-11-14T22:30:00+00:00",
@@ -2601,6 +2621,34 @@ async def test_get_sync_status_rejects_malformed_required_surface_field() -> Non
     assert result.is_error is True
     assert result.structured_content is None
     assert "daemon_protocol_error" in _result_text(result)
+
+
+@pytest.mark.parametrize("value", ["missing", {"message_id": True, "sent_at": 1}, {"message_id": 1}, "bad"])
+async def test_get_sync_status_rejects_missing_or_malformed_latest_message(value: object) -> None:
+    data = _canonical_get_sync_status_data()
+    if value == "missing":
+        del data["latest_retained_message"]
+    else:
+        data["latest_retained_message"] = value
+    conn = _make_daemon_conn({"ok": True, "data": data})
+    with _patch_daemon(conn):
+        result = await get_sync_status(GetSyncStatus(dialog_id=123))
+    assert result.is_error is True
+    assert "daemon_protocol_error" in _result_text(result)
+
+
+@pytest.mark.parametrize(
+    ("status", "policy"), [("synced", "all_authorized"), ("own_only", "own_only"), ("fragment", "none")]
+)
+async def test_get_sync_status_projects_retention_policy(status: str, policy: str) -> None:
+    data = _canonical_get_sync_status_data()
+    data.update(_sync_read_model_payload(status=status))
+    conn = _make_daemon_conn({"ok": True, "data": data})
+    with _patch_daemon(conn):
+        result = await get_sync_status(GetSyncStatus(dialog_id=123))
+    assert result.is_error is False
+    assert result.structured_content is not None
+    assert result.structured_content["message_retention_policy"] == policy
 
 
 async def test_get_sync_status_rejects_missing_enrollment_source() -> None:

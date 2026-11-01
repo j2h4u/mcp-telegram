@@ -63,6 +63,7 @@ from .daemon_account_trace import (
 from .daemon_dialog_queries import (
     _COUNT_SYNCED_MESSAGES_SQL,
     _GET_SYNC_STATUS_SQL,
+    _LATEST_RETAINED_MESSAGE_SQL,
     _LIST_TOPICS_SQL,
 )
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
@@ -2198,6 +2199,7 @@ class DaemonAPIServer:
 
         count_row = cast(tuple[object] | None, self._conn.execute(_COUNT_SYNCED_MESSAGES_SQL, (dialog_id,)).fetchone())
         message_count = int(cast(int | str, count_row[0])) if count_row is not None else 0
+        latest = cast(tuple[int, int] | None, self._conn.execute(_LATEST_RETAINED_MESSAGE_SQL, (dialog_id,)).fetchone())
         sync_read_model = build_sync_read_model(
             persisted_status=persisted_status,
             enrollment_enabled=enrollment_enabled,
@@ -2211,6 +2213,7 @@ class DaemonAPIServer:
 
         data: dict = {
             "dialog_id": dialog_id,
+            "latest_retained_message": None if latest is None else {"message_id": latest[0], "sent_at": latest[1]},
             "delta_refresh_requested_at": delta_refresh_requested_at,
             "sync_progress": sync_progress,
             "sync_progress_message_id": sync_progress,

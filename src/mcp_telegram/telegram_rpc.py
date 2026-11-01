@@ -155,7 +155,7 @@ from .telegram_transport import (
     TransportConnectError,
     TransportWriteError,
 )
-from .telegram_update_admission import GateMessageBox
+from .telegram_update_admission import GateMessageBox, UpdateIntakeQueue
 from .update_delivery import UpdateDeliveryRepository
 
 logger = logging.getLogger(__name__)
@@ -3115,6 +3115,10 @@ class TelegramRpcGate(TelegramClient):
                 wait=self._wait_for_scheduler_transport,
             ),
         )
+        box = cast(GateMessageBox, self._message_box)
+        queue = UpdateIntakeQueue(box.wakeup, self._admission_scheduler.notify_eligibility_changed)
+        box.intake_queue = queue
+        self._updates_queue = queue
         unused_sender = cast(_MainSender, object.__getattribute__(self, "_sender"))
         self._main_sender = cast(
             _MainSender,
@@ -4113,14 +4117,22 @@ class TelegramRpcGate(TelegramClient):
     def _difference_admission_deferral(
         self, scope: TelegramRpcScope
     ) -> TelegramRpcThrottled | TelegramRpcMethodRecoveryPending | None:
-        if scope.source is not TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE or scope.transport_bootstrap:
-            return None
-        if scope.owner_task is not self._update_loop_owner:
+        if not self._is_update_difference_scope(scope):
             return None
         global_hold = self.rpc_eligibility()
         if global_hold is not None or scope.request_method is None:
             return global_hold
-        return self._ensure_safety_ledger().method_deferral(scope.request_method, scope.owned_attempt_id)
+        ledger = self._ensure_safety_ledger()
+        method_hold = ledger.method_deferral(scope.request_method, scope.owned_attempt_id)
+        if method_hold is not None:
+            return method_hold
+        if scope.owned_attempt_id not in ledger._claimed and self._message_box.intake_due():
+            return TelegramRpcAdmissionDeferred(
+                self._scheduler_policy.admission_retry_seconds,
+                detail="Local update intake turn",
+                method_key=scope.request_method,
+            )
+        return None
 
     def _application_holds(self, scope: TelegramRpcScope) -> bool:
         assert self._safety is not None
@@ -4330,8 +4342,22 @@ class TelegramRpcGate(TelegramClient):
         if not self._admission_scheduler.record_dispatch(permit.admission):
             return False
         self._record_claim_debit(owner, budget, ledger)
+        if not owner.claimed and self._is_update_difference_owner(owner):
+            self._message_box.difference_claimed()
         self._record_wire_dispatch(owner, permit)
         return True
+
+    def _is_update_difference_owner(self, owner: _WireAttempt) -> bool:
+        return self._is_update_difference_scope(owner.scope)
+
+    def _is_update_difference_scope(self, scope: TelegramRpcScope) -> bool:
+        return (
+            scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE
+            and not scope.transport_bootstrap
+            and not scope.transport_control
+            and self._update_loop_owner is not None
+            and scope.owner_task is self._update_loop_owner
+        )
 
     def _record_claim_debit(
         self, owner: _WireAttempt, budget: RpcAttemptBudget, ledger: TelegramRpcSafetyLedger
@@ -4441,7 +4467,7 @@ class TelegramRpcGate(TelegramClient):
             logger.debug("telegram_rpc_write_observation_failed")
 
     def _permit_still_eligible(self, owner: _WireAttempt, permit: _WirePermit) -> bool:
-        if owner.revoked:
+        if owner.revoked or self._update_intake_blocks_owner(owner):
             return False
         if not self._photo_claim_current(owner, permit):
             return False
@@ -4452,6 +4478,9 @@ class TelegramRpcGate(TelegramClient):
         if permit.generation != self._wire_token() or self._wire_release_at(owner.scope) > time.monotonic():
             return False
         return self._permit_method_and_owner_eligible(owner, permit)
+
+    def _update_intake_blocks_owner(self, owner: _WireAttempt) -> bool:
+        return not owner.claimed and self._is_update_difference_owner(owner) and self._message_box.intake_due()
 
     def _photo_claim_current(self, owner: _WireAttempt, permit: _WirePermit) -> bool:
         lease = owner.photo_lease
