@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import Protocol, cast
 
@@ -32,6 +33,8 @@ from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcMethodRecoveryPending,
     rpc_attempt_budget,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class _DraftEventClient(Protocol):
@@ -105,6 +108,7 @@ class DraftMessageOwner:
         self._snapshot_gateway: DraftSnapshotGateway | None = None
         self._demand_sink: DemandOfferSink | None = None
         self._registered = False
+        self._snapshot_lock = asyncio.Lock()
 
     def register(self) -> None:
         """Register the barrier-gated raw callback before the client connects."""
@@ -151,12 +155,41 @@ class DraftMessageOwner:
 
     async def refresh_for_mutation(self) -> bool:
         """Publish one explicit preflight through the existing snapshot owner."""
+        if self._snapshot_lock.locked():
+            raise DraftPreflightBusyError("draft reconciliation is already in progress; retry after it completes")
+        async with self._snapshot_lock:
+            try:
+                return await self._refresh_mutation_snapshot()
+            finally:
+                self._offer_pending()
+
+    async def refresh_after_mutation(self, deadline: float) -> bool:
+        """Wait within the original command deadline, then acquire a fresh snapshot."""
+        async with asyncio.timeout_at(deadline):
+            await self._snapshot_lock.acquire()
+        try:
+            due_at = self._repository.recovery_due_at()
+            if due_at is not None:
+                remaining = max(0.0, due_at - time.time())
+                if remaining:
+                    async with asyncio.timeout_at(deadline):
+                        await asyncio.sleep(remaining)
+            return await self._refresh_mutation_snapshot()
+        finally:
+            self._snapshot_lock.release()
+            self._offer_pending()
+
+    def _offer_pending(self) -> None:
+        if self._demand_sink is not None:
+            offer_durable_demand(self._demand_sink, self.demand_kind)
+
+    async def _refresh_mutation_snapshot(self) -> bool:
         gateway = self._snapshot_gateway
         if gateway is None or self._shutdown_event.is_set():
             raise RuntimeError("draft synchronization is not ready")
         now = time.time()
-        claim = await self._writer.run(
-            lambda conn: self._repository.for_connection(conn).claim_mutation_preflight(now=now)
+        claim = await self._claim_with_custody(
+            self._writer.run(lambda conn: self._repository.for_connection(conn).claim_mutation_preflight(now=now)), now
         )
         if claim is None:
             raise DraftPreflightBusyError("draft reconciliation is already in progress; retry after it completes")
@@ -165,7 +198,7 @@ class DraftMessageOwner:
             result = await self._publish_snapshot(coverage, observations, claim, now)
             return result.accepted
         except BaseException:
-            await self._release_claim(claim, now)
+            await self._release_claim_owned(claim, now)
             raise
 
     async def on_raw_draft_update(self, update: object) -> None:
@@ -244,6 +277,11 @@ class DraftMessageOwner:
 
     def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
         """Expose only a durable repository request to the coordinator."""
+        if self._snapshot_lock.locked():
+            return None
+        return self._durable_status(now, excluded=excluded)
+
+    def _durable_status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
         if self._account_id is None:
             return None
         due_at = self._repository.recovery_due_at()
@@ -261,6 +299,15 @@ class DraftMessageOwner:
         selected = budget.selected
         if selected is None:
             raise ValueError("draft demand requires a selected revision")
+        if self._snapshot_lock.locked():
+            return SliceOutcome(selected, SliceOutcomeKind.RETRYABLE_FAILURE)
+        async with self._snapshot_lock:
+            try:
+                return await self._run_snapshot_slice(budget, selected)
+            finally:
+                self._offer_pending()
+
+    async def _run_snapshot_slice(self, budget: RpcAttemptBudget, selected: WorkRevision) -> SliceOutcome:
         current = self._slice_status(selected, budget)
         if isinstance(current, SliceOutcome):
             return current
@@ -275,7 +322,7 @@ class DraftMessageOwner:
         try:
             result = await self._publish_snapshot(coverage, observations, claim_token, current.release_at)
         except BaseException:
-            await self._release_claim(claim_token, current.release_at)
+            await self._release_claim_owned(claim_token, current.release_at)
             raise
         if not result.accepted:
             return SliceOutcome(selected, SliceOutcomeKind.STALE)
@@ -284,7 +331,7 @@ class DraftMessageOwner:
         return SliceOutcome(selected, SliceOutcomeKind.PROGRESSED, result.work_revision)
 
     def _slice_status(self, selected: WorkRevision, budget: RpcAttemptBudget) -> DemandStatus | SliceOutcome:
-        current = self.status(time.time())
+        current = self._durable_status(time.time())
         if current is None or current.selected != selected:
             return SliceOutcome(selected, SliceOutcomeKind.STALE)
         if not current.is_ready(time.time()) or (budget.exhausted and not budget.can_prepare_retry):
@@ -304,13 +351,13 @@ class DraftMessageOwner:
                 with rpc_attempt_budget(budget):
                     return await gateway.fetch_all_drafts()
         except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending:
-            await self._release_claim(claim_token, due_at)
+            await self._release_claim_owned(claim_token, due_at)
             raise
         except RpcAttemptBudgetExhaustedError:
-            await self._release_claim(claim_token, due_at)
+            await self._release_claim_owned(claim_token, due_at)
             return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
         except BaseException:
-            await self._release_claim(claim_token, due_at)
+            await self._release_claim_owned(claim_token, due_at)
             raise
 
     async def _prepare_snapshot_run(
@@ -322,13 +369,56 @@ class DraftMessageOwner:
         now = time.time()
         if account_id is None or gateway is None or (budget.exhausted and not budget.can_prepare_retry):
             return None
-        status = self.status(now)
+        status = self._durable_status(now)
         if status is None or not status.is_ready(now):
             return None
-        claim_token = await self._writer.run(lambda conn: self._repository.for_connection(conn).claim_recovery(now=now))
+        claim_token = await self._claim_with_custody(
+            self._writer.run(lambda conn: self._repository.for_connection(conn).claim_recovery(now=now)), now
+        )
         if claim_token is None:
             return None
         return gateway, claim_token
+
+    async def _claim_with_custody(self, claim: Awaitable[int | None], due_at: float) -> int | None:
+        task = asyncio.ensure_future(claim)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:  # noqa: BLE001 - inspect the finished storage task below
+                    break
+            try:
+                token = task.result()
+            except Exception as error:  # noqa: BLE001 - cancellation remains authoritative after storage drain
+                logger.error("draft_claim_drain_failed error_type=%s", type(error).__name__)
+                raise asyncio.CancelledError from None
+            if token is not None:
+                await self._release_claim_owned(token, due_at)
+            raise
+
+    async def _release_claim_owned(self, claim_token: int, due_at: float) -> None:
+        task = asyncio.create_task(self._release_claim(claim_token, due_at))
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+                continue
+            except Exception:  # noqa: BLE001 - inspect the finished storage task below
+                break
+        try:
+            task.result()
+        except Exception as error:
+            if not cancelled:
+                raise
+            logger.error("draft_release_drain_failed error_type=%s", type(error).__name__)
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def _publish_snapshot(
         self,
@@ -339,16 +429,33 @@ class DraftMessageOwner:
     ) -> DraftApplyResult:
         if not coverage.authoritative:
             reason = _snapshot_recovery_reason(coverage)
-            await self._release_claim(claim_token, due_at)
+            await self._release_claim_owned(claim_token, due_at)
             self._record("draft.recovery", "deferred", reason)
             return DraftApplyResult(accepted=False, decision=reason)
-        result = await self._writer.run(
-            lambda conn: self._repository.for_connection(conn).apply_snapshot(
-                observations, coverage, claim_token=claim_token
+        publication = asyncio.create_task(
+            self._writer.run(
+                lambda conn: self._repository.for_connection(conn).apply_snapshot(
+                    observations, coverage, claim_token=claim_token
+                )
             )
         )
+        try:
+            result = await asyncio.shield(publication)
+        except asyncio.CancelledError:
+            while not publication.done():
+                try:
+                    await asyncio.shield(publication)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:  # noqa: BLE001 - inspect the finished storage task below
+                    break
+            try:
+                publication.result()
+            except Exception as error:  # noqa: BLE001 - cancellation remains authoritative after storage drain
+                logger.error("draft_publication_drain_failed error_type=%s", type(error).__name__)
+            raise
         if result.ambiguous or not result.accepted:
-            await self._release_claim(claim_token, due_at)
+            await self._release_claim_owned(claim_token, due_at)
         self._record("draft.recovery", "applied" if result.accepted else "ignored", result.decision)
         return result
 

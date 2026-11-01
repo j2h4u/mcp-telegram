@@ -381,10 +381,62 @@ def interrupt_draft_operations(conn: sqlite3.Connection, account_id: int, *, now
     """At startup, expose interrupted commands as unknown without replaying or scope locks."""
     require_write_transaction(conn)
     _require_account(conn, account_id)
-    return conn.execute(
+    count = conn.execute(
         "UPDATE draft_operation_receipts SET outcome='unknown',updated_at=? WHERE account_id=? AND outcome='pending'",
         (_now(now), account_id),
     ).rowcount
+    rows = cast(
+        list[tuple[str, str]],
+        conn.execute(
+            "SELECT operation_key,result_json FROM draft_operation_receipts "
+            "WHERE account_id=? AND outcome='acknowledged'",
+            (account_id,),
+        ).fetchall(),
+    )
+    for operation_key, encoded in rows:
+        result = cast(object, json.loads(encoded))
+        if not isinstance(result, dict):
+            continue
+        verification = result.get("verification")
+        if isinstance(verification, dict) and verification.get("reason") == "verification_in_progress":
+            verification["reason"] = "interrupted"
+            result["next_action"] = "The retained state may predate this write. Do not repeat it; await reconciliation."
+            conn.execute(
+                "UPDATE draft_operation_receipts SET result_json=?,updated_at=? WHERE account_id=? AND operation_key=?",
+                (
+                    json.dumps(result, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True),
+                    _now(now),
+                    account_id,
+                    operation_key,
+                ),
+            )
+            count += 1
+    return count
+
+
+def refine_draft_verification(
+    conn: sqlite3.Connection, account_id: int, operation_key: str, fingerprint: str, result: Mapping[str, object]
+) -> None:
+    """Finalize exactly one acknowledged, still-in-progress verification."""
+    require_write_transaction(conn)
+    previous = read_draft_operation(conn, account_id, operation_key)
+    if previous is None or previous.request_fingerprint != fingerprint or previous.outcome != "acknowledged":
+        raise DraftOperationConflictError("draft verification receipt identity changed")
+    prior = previous.result
+    if prior.get("verification") != {"status": "unverified", "basis": "none", "reason": "verification_in_progress"}:
+        raise DraftOperationConflictError("draft verification is already final")
+    allowed = {"verification", "current", "current_is_operation_confirmation", "next_action", "result_persisted"}
+    if (prior.keys() - allowed) != (result.keys() - allowed) or any(
+        prior[key] != result[key] for key in prior.keys() - allowed
+    ):
+        raise DraftOperationConflictError("draft verification changed immutable receipt evidence")
+    encoded = json.dumps(dict(result), ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True)
+    if len(encoded.encode()) > _RESULT_MAX_BYTES:
+        raise ValueError("draft operation result exceeds its storage bound")
+    conn.execute(
+        "UPDATE draft_operation_receipts SET result_json=?,updated_at=? WHERE account_id=? AND operation_key=?",
+        (encoded, _now(None), account_id, operation_key),
+    )
 
 
 def _prune_limit(limit: int) -> None:

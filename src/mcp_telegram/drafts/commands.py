@@ -17,7 +17,7 @@ from telethon.tl import types  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import SaveDraftRequest  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
-from mcp_telegram.drafts.contracts import MAX_DRAFT_TEXT_LENGTH, DraftScope
+from mcp_telegram.drafts.contracts import MAX_DRAFT_TEXT_LENGTH, DraftScope, project_draft_result
 from mcp_telegram.drafts.history import (
     DraftOperationConflictError,
     DraftOperationReceipt,
@@ -29,6 +29,7 @@ from mcp_telegram.drafts.history import (
     prepare_draft_operation,
     read_current_draft,
     read_draft_operation,
+    refine_draft_verification,
 )
 from mcp_telegram.drafts.ports import DraftPreflightBusyError
 from mcp_telegram.drafts.snapshot import (
@@ -36,11 +37,12 @@ from mcp_telegram.drafts.snapshot import (
     build_clear_draft_request,
     build_save_draft_request,
     build_text_draft_request,
+    compare_draft_request,
 )
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_transactions import write_transaction
-from mcp_telegram.telegram_demand import RpcAttemptBudget, demand_context, require_execution_mode
+from mcp_telegram.telegram_demand import RpcAttemptBudget, current_demand_token, demand_context, require_execution_mode
 from mcp_telegram.telegram_rpc_consumers import DemandKind, ExecutionMode
 from mcp_telegram.telegram_rpc_error import describe_telegram_rpc_error
 from mcp_telegram.telegram_rpc_scheduler import rpc_attempt_budget
@@ -49,6 +51,7 @@ logger = logging.getLogger(__name__)
 _ACTIONS = frozenset({"create", "update", "clear", "restore"})
 _OPERATION_KEY_LIMIT = 128
 _VERSION_LIMIT = 256
+_UNVERIFIED_ACTION = "The retained state may predate this write. Do not repeat it; await reconciliation."
 _SNAPSHOT_FAILURE_MESSAGES = {
     "draft_formatting_conflict": "Changing this text invalidates its formatting; set drop_formatting=true to replace it with plain text.",
     "rich_text_update_unsupported": "This draft contains rich text blocks; edit that composition in Telegram.",
@@ -195,6 +198,7 @@ class DraftCommandOwner:
         resolve_peer: Callable[[DraftScope], Awaitable[object | None]],
         preflight: Callable[[], Awaitable[bool]],
         request_recovery: Callable[[str], Awaitable[None]],
+        postflight: Callable[[float], Awaitable[bool]] | None = None,
     ) -> None:
         if type(account_id) is not int or account_id <= 0:
             raise ValueError("account_id must be positive")
@@ -205,6 +209,7 @@ class DraftCommandOwner:
         self._resolve_peer = resolve_peer
         self._preflight = preflight
         self._request_recovery = request_recovery
+        self._postflight = postflight
         self._locks: WeakValueDictionary[DraftScope, asyncio.Lock] = WeakValueDictionary()
 
     async def execute(self, request: Mapping[str, object]) -> dict[str, object]:  # noqa: PLR0911 - explicit safe error categories
@@ -275,7 +280,7 @@ class DraftCommandOwner:
         if receipt.request_fingerprint != command.fingerprint():
             raise DraftOperationConflictError("operation key has another payload")
         if receipt.result:
-            return dict(receipt.result)
+            return project_draft_result(receipt.result)
         return self._result(command, "unknown", receipt.backup_history_id, dispatched=None, acknowledged=None)
 
     async def _execute_new(self, command: _Command) -> dict[str, object]:
@@ -289,14 +294,22 @@ class DraftCommandOwner:
         current = read_current_draft(self._reader, command.scope)
         self._validate_current(command, current)
         request = self._build_request(command, current, peer)
+        intended_absent = command.action == "clear"
+        if command.action == "restore":
+            assert command.history_id is not None
+            historical = get_draft_history(self._reader, command.scope, command.history_id)
+            intended_absent = historical is not None and historical.presence == "absent"
         receipt = await self._prepare(command, current, backup=request is not None)
         if receipt.outcome != "pending":
-            return dict(receipt.result)
+            return project_draft_result(receipt.result)
         if request is None:
             result = self._result(command, "unchanged", receipt.backup_history_id, dispatched=False, acknowledged=None)
+            if result["current_is_operation_confirmation"]:
+                result["verification"] = {"status": "verified", "basis": "preflight"}
+                result["next_action"] = "The observed draft is unchanged."
             await self._finish(command, result)
             return result
-        return await self._dispatch(command, request, receipt.backup_history_id)
+        return await self._dispatch(command, request, receipt.backup_history_id, intended_absent=intended_absent)
 
     @staticmethod
     def _validate_peer(peer: object | None, scope: DraftScope) -> None:
@@ -374,7 +387,7 @@ class DraftCommandOwner:
         return await self._writer.run(persist)
 
     async def _dispatch(
-        self, command: _Command, request: SaveDraftRequest, backup_history_id: int | None
+        self, command: _Command, request: SaveDraftRequest, backup_history_id: int | None, *, intended_absent: bool
     ) -> dict[str, object]:
         budget = RpcAttemptBudget(1)
         try:
@@ -382,10 +395,13 @@ class DraftCommandOwner:
                 response = await self._client(request)
         except BaseException as exc:
             result = self._dispatch_failure(command, exc, budget, backup_history_id)
-            await self._finish(command, result)
             if not isinstance(exc, Exception):
+                await self._finish(command, result)
                 raise
             await self._recover()
+            if result.get("outcome") == "unknown" and budget.attempts:
+                await self._verify_unknown(command, request, intended_absent, result)
+            await self._finish(command, result)
             return result
         result = self._result(
             command,
@@ -394,9 +410,125 @@ class DraftCommandOwner:
             dispatched=bool(budget.attempts) or response is True,
             acknowledged=True if response is True else None,
         )
-        await self._finish(command, result)
-        await self._recover()
+        if response is True:
+            result["verification"] = {"status": "unverified", "basis": "none", "reason": "verification_in_progress"}
+            await self._checkpoint_ack(command, result)
+            await self._verify_acknowledged(command, request, intended_absent, result)
+        else:
+            await self._recover()
+            if budget.attempts:
+                await self._verify_unknown(command, request, intended_absent, result)
+            await self._finish(command, result)
         return result
+
+    async def _checkpoint_ack(self, command: _Command, result: dict[str, object]) -> None:
+        task = asyncio.create_task(self._finish(command, result))
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+            task.result()
+            result["verification"] = {"status": "unverified", "basis": "none", "reason": "interrupted"}
+            result["next_action"] = _UNVERIFIED_ACTION
+            recovery = asyncio.create_task(self._recover())
+            while not recovery.done():
+                try:
+                    await asyncio.shield(recovery)
+                except asyncio.CancelledError:
+                    continue
+            await self._refine_owned(command, result)
+            raise
+
+    async def _verify_unknown(
+        self, command: _Command, request: SaveDraftRequest, intended_absent: bool, result: dict[str, object]
+    ) -> None:
+        if self._postflight is None:
+            return
+        try:
+            with rpc_attempt_budget(RpcAttemptBudget(1)):
+                accepted = await self._postflight(current_demand_token().admission_deadline)
+            if accepted:
+                self._apply_verification(command, request, intended_absent, result)
+                result["current_is_operation_confirmation"] = False
+                result["next_action"] = "The write outcome is unknown; do not repeat it without review."
+        except Exception:  # noqa: BLE001 - the original unknown write outcome remains authoritative
+            return
+
+    async def _verify_acknowledged(
+        self, command: _Command, request: SaveDraftRequest, intended_absent: bool, result: dict[str, object]
+    ) -> None:
+        try:
+            await self._recover()
+            if self._postflight is None:
+                verified = False
+            else:
+                with rpc_attempt_budget(RpcAttemptBudget(1)):
+                    verified = await self._postflight(current_demand_token().admission_deadline)
+            if verified:
+                self._apply_verification(command, request, intended_absent, result)
+            else:
+                result["verification"] = {"status": "unverified", "basis": "none", "reason": "snapshot_unavailable"}
+        except asyncio.CancelledError:
+            result["verification"] = {"status": "unverified", "basis": "none", "reason": "interrupted"}
+            result["next_action"] = _UNVERIFIED_ACTION
+            await self._refine_owned(command, result)
+            raise
+        except Exception:  # noqa: BLE001 - preserve acknowledged remote outcome across verification failures
+            result["verification"] = {"status": "unverified", "basis": "none", "reason": "snapshot_unavailable"}
+        verification = cast(dict[str, object], result["verification"])
+        if verification["status"] == "unverified":
+            result["next_action"] = _UNVERIFIED_ACTION
+        await self._refine_owned(command, result)
+
+    def _apply_verification(
+        self, command: _Command, request: SaveDraftRequest, intended_absent: bool, result: dict[str, object]
+    ) -> None:
+        state = read_current_draft(self._reader, command.scope)
+        result["current"] = _public_current(state)
+        if state.uncertain or state.expected_version is None or state.presence == "unknown":
+            result["verification"] = {"status": "unverified", "basis": "none", "reason": "state_uncertain"}
+            return
+        if (state.presence == "absent") != intended_absent:
+            match: bool | None = False
+        else:
+            match = compare_draft_request(request, command.scope, state.restore_snapshot, present=not intended_absent)
+        status = "unverified" if match is None else "verified" if match else "conflict"
+        result["verification"] = {"status": status, "basis": "post_write_snapshot"}
+        result["current_is_operation_confirmation"] = status == "verified"
+        result["next_action"] = (
+            "Draft verified; it remains unsent."
+            if status == "verified"
+            else "Review the observed draft before another command."
+        )
+
+    async def _refine_owned(self, command: _Command, result: dict[str, object]) -> None:
+        if result.get("result_persisted") is not True:
+            return
+
+        def persist(conn: sqlite3.Connection) -> None:
+            with write_transaction(conn):
+                refine_draft_verification(conn, self._account_id, command.operation_key, command.fingerprint(), result)
+
+        task = asyncio.create_task(self._writer.run(persist))
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+                continue
+            except Exception:  # noqa: BLE001 - inspect the completed storage task below
+                break
+        try:
+            task.result()
+        except Exception:  # noqa: BLE001 - acknowledged outcome remains known even if refinement fails
+            result["result_persisted"] = False
+        if cancelled:
+            raise asyncio.CancelledError
 
     def _dispatch_failure(
         self, command: _Command, error: BaseException, budget: RpcAttemptBudget, backup_history_id: int | None
@@ -456,6 +588,7 @@ class DraftCommandOwner:
         return result
 
     async def _finish(self, command: _Command, result: dict[str, object]) -> None:
+        result.setdefault("verification", {"status": "unverified", "basis": "none", "reason": "not_verified"})
         result["result_persisted"] = True
 
         def persist(conn: sqlite3.Connection) -> None:
@@ -496,6 +629,7 @@ class DraftCommandOwner:
             "result_persisted": False,
             "backup_history_id": backup_history_id,
             "current": current,
+            "verification": {"status": "unverified", "basis": "none", "reason": "not_verified"},
             "current_is_operation_confirmation": (
                 outcome == "unchanged"
                 and current["presence"] != "unknown"

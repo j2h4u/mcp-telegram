@@ -260,6 +260,21 @@ def build_save_draft_request(peer: object, scope: DraftScope, snapshot: RestoreS
     return _save_request(peer, scope, draft)
 
 
+def compare_draft_request(
+    intended: SaveDraftRequest, scope: DraftScope, snapshot: RestoreSnapshot | None, *, present: bool
+) -> bool | None:
+    """Compare complete writable Telegram compositions without fabricating observations."""
+    if not present:
+        return True
+    if snapshot is None:
+        return None
+    try:
+        observed = build_save_draft_request(intended.peer, scope, snapshot)
+        return bytes(observed) == bytes(intended)
+    except DraftSnapshotError, TypeError, ValueError:
+        return None
+
+
 def _replace_draft_text(draft: types.DraftMessage, text: str, *, drop_formatting: bool) -> None:
     if text != draft.message:
         if draft.rich_message is not None:

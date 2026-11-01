@@ -621,3 +621,109 @@ async def test_delivered_draft_keeps_capture_time_and_failed_raw_payload() -> No
         await owner.on_raw_draft_update(update)
     assert delivered.failed
     assert repository.reasons == ["realtime_persistence_failed"]
+
+
+async def test_postflight_waits_for_old_snapshot_and_acquires_its_own() -> None:
+    started, release = asyncio.Event(), asyncio.Event()
+
+    class HeldGateway(_Gateway):
+        async def fetch_all_drafts(self) -> tuple[SnapshotCoverage, tuple[DraftObservation, ...]]:
+            self.calls += 1
+            if self.calls == 1:
+                started.set()
+                await release.wait()
+            return self.coverage, self.observations
+
+    repository = _Repository()
+    gateway = HeldGateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
+    owner, _client = await _owner(repository, gateway)
+    repository.due_at = 0.0
+    old = asyncio.create_task(owner.run_slice(_selected_budget(owner)))
+    await started.wait()
+    post = asyncio.create_task(owner.refresh_after_mutation(asyncio.get_running_loop().time() + 3))
+    await asyncio.sleep(0)
+    assert gateway.calls == 1 and not post.done() and owner.status(time.time()) is None
+    release.set()
+    await old
+    assert await post
+    assert gateway.calls == 2 and len(repository.snapshot_calls) == 2
+
+
+async def test_selected_background_contending_snapshot_is_retryable_and_revision_retained() -> None:
+    repository = _Repository()
+    gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
+    owner, _client = await _owner(repository, gateway)
+    repository.due_at = 0.0
+    budget = _selected_budget(owner)
+    sink = _DemandSink()
+    owner.bind_demand_sink(sink)
+    await owner._snapshot_lock.acquire()
+    try:
+        result = await owner.run_slice(budget)
+        assert result.kind.value == "retryable_failure" and owner.status(time.time()) is None
+    finally:
+        owner._snapshot_lock.release()
+    owner._offer_pending()
+    assert sink.offered == [DemandKind.DRAFT_SNAPSHOT]
+    status = owner.status(time.time())
+    assert status is not None and status.selected == budget.selected
+    assert (await owner.run_slice(budget)).kind.value == "progressed"
+
+
+async def test_cancelled_claim_keeps_custody_through_second_cancellation() -> None:
+    repository = _Repository()
+    gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
+    owner, _client = await _owner(repository, gateway)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def claim() -> int:
+        started.set()
+        await release.wait()
+        return 123
+
+    task = asyncio.create_task(owner._claim_with_custody(claim(), 99.0))
+    await started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert repository.rearmed == [("claim_released", 99.0)]
+
+
+async def test_postflight_respects_existing_due_within_original_deadline() -> None:
+    repository = _Repository()
+    gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
+    owner, _client = await _owner(repository, gateway)
+    repository.due_at = time.time() + 0.1
+    with pytest.raises(TimeoutError):
+        await owner.refresh_after_mutation(asyncio.get_running_loop().time() + 0.01)
+    assert gateway.calls == 0 and repository.due_at is not None
+    assert await owner.refresh_after_mutation(asyncio.get_running_loop().time() + 2)
+    assert gateway.calls == 1
+
+
+async def test_cancelled_claim_reports_storage_error_without_masking_cancellation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    repository = _Repository()
+    gateway = _Gateway(SnapshotCoverage(42, True, 0, source_order_at=datetime(2026, 1, 1, tzinfo=UTC)), ())
+    owner, _client = await _owner(repository, gateway)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def claim() -> int:
+        started.set()
+        await release.wait()
+        raise RuntimeError("private detail")
+
+    task = asyncio.create_task(owner._claim_with_custody(claim(), 99.0))
+    await started.wait()
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert "draft_claim_drain_failed error_type=RuntimeError" in caplog.text
+    assert "private detail" not in caplog.text

@@ -2822,6 +2822,12 @@ class _AuxPhotoLease:
     control_budget: RpcAttemptBudget = field(default_factory=lambda: RpcAttemptBudget(PHOTO_MAX_LEASE_CONTROLS))
 
 
+class _DraftWirePhase(StrEnum):
+    PREFLIGHT = "preflight"
+    MUTATION = "mutation"
+    POSTFLIGHT = "postflight"
+
+
 @dataclass(slots=True, eq=False)
 class _WireAttempt:
     issuer: object
@@ -2845,6 +2851,7 @@ class _WireAttempt:
     response_timer: asyncio.Timeout | None = None
     observation_ordinal: int | None = None
     draft_mutation: bool = False
+    draft_phase: _DraftWirePhase | None = None
     scheduled_check: ScheduledMutationCheck | None = None
     scheduled_mutation: bool = False
     photo_capability: _PhotoWireCapability | None = None
@@ -3765,11 +3772,22 @@ class TelegramRpcGate(TelegramClient):
             capability.wire_owner = owner
         owner.self_lookup = self._is_self_lookup(actual)
         owner.draft_mutation = type(actual) is functions.messages.SaveDraftRequest
+        owner.draft_phase = self._draft_phase_at_registration(owner)
         owner.scheduled_check = scheduled_check
         owner.scheduled_mutation = scheduled_check is not None
         if scheduled_check is not None:
             self._require_scheduled_mutation_budget(bound)
         return owner
+
+    @staticmethod
+    def _draft_phase_at_registration(owner: _WireAttempt) -> _DraftWirePhase | None:
+        if owner.scope.demand_kind is not DemandKind.DRAFT_MUTATION:
+            return None
+        evidence = owner.scope.attempt_evidence
+        assert evidence is not None
+        if owner.draft_mutation:
+            return _DraftWirePhase.MUTATION
+        return _DraftWirePhase.POSTFLIGHT if evidence.draft_mutation_dispatched else _DraftWirePhase.PREFLIGHT
 
     def _photo_application_capability(self, request: object, scope: TelegramRpcScope) -> _PhotoWireCapability | None:
         actual = _application_request(request)
@@ -4437,10 +4455,12 @@ class TelegramRpcGate(TelegramClient):
             return
         evidence = owner.scope.attempt_evidence
         assert evidence is not None
-        if owner.draft_mutation:
+        if owner.draft_phase is _DraftWirePhase.MUTATION:
             evidence.draft_mutation_dispatched = True
-        else:
+        elif owner.draft_phase is _DraftWirePhase.PREFLIGHT:
             evidence.draft_preflight_dispatched = True
+        elif owner.draft_phase is _DraftWirePhase.POSTFLIGHT:
+            evidence.draft_postflight_dispatched = True
 
     @staticmethod
     def _record_scheduled_dispatch(owner: _WireAttempt) -> None:
@@ -4579,8 +4599,19 @@ class TelegramRpcGate(TelegramClient):
         budget = owner.scope.attempt_budget
         evidence = owner.scope.attempt_evidence
         assert budget is not None and evidence is not None
-        dispatched = evidence.draft_mutation_dispatched if owner.draft_mutation else evidence.draft_preflight_dispatched
-        return not dispatched and owner.claimed == 0 and not budget.exhausted
+        allowed: dict[_DraftWirePhase | None, bool] = {
+            _DraftWirePhase.PREFLIGHT: not evidence.draft_preflight_dispatched
+            and not evidence.draft_mutation_dispatched,
+            _DraftWirePhase.MUTATION: not evidence.draft_mutation_dispatched,
+            _DraftWirePhase.POSTFLIGHT: evidence.draft_mutation_dispatched and not evidence.draft_postflight_dispatched,
+        }
+        return (
+            owner.scope.deadline is not None
+            and time.monotonic() < owner.scope.deadline
+            and allowed.get(owner.draft_phase, False)
+            and owner.claimed == 0
+            and not budget.exhausted
+        )
 
     def _scheduled_budget_can_claim(self, owner: _WireAttempt) -> bool:
         if not self._scheduled_budget_valid(owner.scope):

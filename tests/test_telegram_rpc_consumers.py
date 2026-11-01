@@ -196,7 +196,7 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
         DemandKind.TELETHON_CONNECTION_BOOTSTRAP: 16,
         DemandKind.OPERATOR_AUTH: 32,
         DemandKind.OPERATOR_LOGOUT: 1,
-        DemandKind.DRAFT_MUTATION: 2,
+        DemandKind.DRAFT_MUTATION: 3,
         DemandKind.SCHEDULED_MUTATION: 1,
     }
     for contract in TELEGRAM_DEMAND_CONTRACTS.values():
@@ -235,7 +235,7 @@ def test_draft_mutation_is_explicit_interactive_inline_and_bounded() -> None:
     assert consumer.demand.owner is DemandPolicyOwner.CALLER
     assert contract.service_class is RpcServiceClass.INTERACTIVE
     assert contract.execution_mode is ExecutionMode.INLINE
-    assert contract.max_rpc_attempts_per_slice == 2
+    assert contract.max_rpc_attempts_per_slice == 3
     assert DemandKind.DRAFT_MUTATION not in DURABLE_DEMAND_ORDER
 
 

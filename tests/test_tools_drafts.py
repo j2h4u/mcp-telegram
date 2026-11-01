@@ -102,6 +102,102 @@ async def test_successful_draft_tools_validate_schema_without_ipc_metadata(
     normalized_schema = normalize_output_schema(schema)
     assert normalized_schema is not None
     validate(result.structured_content, normalized_schema)
+    if mutation:
+        assert result.structured_content is not None
+        assert result.structured_content["verification"] == {
+            "status": "unverified",
+            "basis": "none",
+            "reason": "legacy_receipt",
+        }
+
+
+@pytest.mark.parametrize(
+    "status,basis", [("verified", "post_write_snapshot"), ("conflict", "post_write_snapshot"), ("unverified", "none")]
+)
+async def test_mutation_verification_is_preserved_at_tool_boundary(
+    monkeypatch: pytest.MonkeyPatch, status: str, basis: str
+) -> None:
+    verification = {"status": status, "basis": basis}
+
+    class Connection:
+        async def request(self, _payload: dict[str, object]) -> dict[str, object]:
+            return {
+                "ok": True,
+                "outcome": "acknowledged",
+                "operation_key": "key",
+                "result_persisted": True,
+                "current_is_operation_confirmation": status == "verified",
+                "verification": verification,
+                "current": {"presence": "present", "uncertain": False, "expected_version": "v1"},
+                "next_action": "Review the verification result.",
+            }
+
+    @asynccontextmanager
+    async def connection() -> AsyncIterator[Connection]:
+        yield Connection()
+
+    monkeypatch.setattr(drafts, "daemon_connection", connection)
+    result = await drafts.manage_draft(
+        drafts.ManageDraft(exact_dialog_id=42, action="create", operation_key="key", text="draft")
+    )
+    assert result.structured_content is not None
+    assert result.structured_content["verification"] == verification
+    schema = normalize_output_schema(drafts.MANAGE_DRAFT_OUTPUT_SCHEMA)
+    assert schema is not None
+    validate(result.structured_content, schema)
+
+
+def test_mutation_error_preserves_verification_details() -> None:
+    verification = {"status": "unverified", "basis": "none", "reason": "interrupted"}
+    result = drafts._draft_error_response({"ok": False, "error": "draft_failed", "verification": verification})
+    assert result is not None and result.structured_content is not None
+    assert result.structured_content["details"] == {"verification": verification}
+
+
+async def test_legacy_unchanged_receipt_is_projected_without_changing_stored_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current = {"presence": "present", "uncertain": False, "expected_version": "saved-version", "text": "saved"}
+    receipt: dict[str, object] = {
+        "ok": True,
+        "outcome": "unchanged",
+        "operation_key": "old-key",
+        "result_persisted": True,
+        "current_is_operation_confirmation": True,
+        "backup_history_id": 19,
+        "current": current,
+        "next_action": "Review in Telegram.",
+    }
+    original = {**receipt, "current": dict(current)}
+    calls = 0
+
+    class Connection:
+        async def request(self, _payload: dict[str, object]) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            return receipt
+
+    @asynccontextmanager
+    async def connection() -> AsyncIterator[Connection]:
+        yield Connection()
+
+    monkeypatch.setattr(drafts, "daemon_connection", connection)
+    result = await drafts.manage_draft(
+        drafts.ManageDraft(
+            exact_dialog_id=42, action="clear", operation_key="old-key", expected_version="saved-version"
+        )
+    )
+    assert calls == 1
+    assert receipt == original
+    assert result.structured_content is not None
+    assert result.structured_content["verification"] == {
+        "status": "unverified",
+        "basis": "none",
+        "reason": "legacy_receipt",
+    }
+    assert result.structured_content["current_is_operation_confirmation"] is False
+    for field in ("outcome", "current", "backup_history_id"):
+        assert result.structured_content[field] == original[field]
 
 
 @pytest.mark.parametrize("prepared", [False, True])

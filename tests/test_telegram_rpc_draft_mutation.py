@@ -249,3 +249,89 @@ async def test_retained_draft_peer_uses_only_session_cache(wire: _WireHarness, m
 async def test_retained_draft_peer_rejects_invalid_identifiers(wire: _WireHarness, value: object) -> None:
     with pytest.raises(ValueError, match="nonzero integer"):
         wire[0].retained_draft_peer(cast(int, value))
+
+
+async def test_three_physical_phases_share_root_and_reject_fourth(
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _clock(wire, monkeypatch)
+    _, sender, connection, sink = wire
+    with demand_context(DemandKind.DRAFT_MUTATION) as root:
+        deadline = root.admission_deadline
+        with rpc_attempt_budget(RpcAttemptBudget(1)) as first:
+            with acquisition_context(AcquisitionKind.DRAFT_SNAPSHOT):
+                await _complete(wire, functions.messages.GetAllDraftsRequest())
+        clock.advance(2)
+        with rpc_attempt_budget(RpcAttemptBudget(1)) as save:
+            await _complete(wire, _save())
+        clock.advance(2)
+        with rpc_attempt_budget(RpcAttemptBudget(1)) as last:
+            with acquisition_context(AcquisitionKind.DRAFT_SNAPSHOT):
+                assert current_rpc_scope().deadline == deadline
+                await _complete(wire, functions.messages.GetAllDraftsRequest())
+        assert (first.attempts, save.attempts, last.attempts) == (1, 1, 1)
+        assert root.attempt_evidence.actual_attempts == 3
+        assert root.attempt_evidence.draft_preflight_dispatched
+        assert root.attempt_evidence.draft_mutation_dispatched
+        assert root.attempt_evidence.draft_postflight_dispatched
+        clock.advance(2)
+        with rpc_attempt_budget(RpcAttemptBudget(1)) as duplicate:
+            with acquisition_context(AcquisitionKind.DRAFT_SNAPSHOT):
+                response, packet = await _prepare(wire, functions.messages.GetAllDraftsRequest(), current_rpc_scope())
+                assert not sender.write_packet(packet, connection._send)
+                assert duplicate.attempts == 0
+                response.cancel()
+    assert len(sink.frames) == 3
+
+
+async def test_delayed_preflight_cannot_become_postflight(wire: _WireHarness, monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = _clock(wire, monkeypatch)
+    _, sender, connection, sink = wire
+    with demand_context(DemandKind.DRAFT_MUTATION) as root:
+        with rpc_attempt_budget(RpcAttemptBudget(1)) as delayed:
+            with acquisition_context(AcquisitionKind.DRAFT_SNAPSHOT):
+                response = sender.send_owned(functions.messages.GetAllDraftsRequest(), current_rpc_scope())
+                state = await sender._send_queue.next_state()
+        with rpc_attempt_budget(RpcAttemptBudget(1)):
+            await _complete(wire, _save())
+        clock.advance(2)
+        await sender._prepare_state(state)
+        assert not sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+        assert delayed.attempts == 0 and not root.attempt_evidence.draft_postflight_dispatched
+        response.cancel()
+    assert len(sink.frames) == 1
+
+
+async def test_retained_postflight_cannot_claim_at_original_deadline(
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _clock(wire, monkeypatch)
+    _, sender, connection, sink = wire
+    with demand_context(DemandKind.DRAFT_MUTATION) as root:
+        with rpc_attempt_budget(RpcAttemptBudget(1)):
+            await _complete(wire, _save())
+        clock.advance(2)
+        with rpc_attempt_budget(RpcAttemptBudget(1)) as budget:
+            with acquisition_context(AcquisitionKind.DRAFT_SNAPSHOT):
+                response, packet = await _prepare(wire, functions.messages.GetAllDraftsRequest(), current_rpc_scope())
+                clock.monotonic_seconds = root.admission_deadline
+                assert not sender.write_packet(packet, connection._send)
+                assert budget.attempts == 0 and not root.attempt_evidence.draft_postflight_dispatched
+                response.cancel()
+    assert len(sink.frames) == 1
+
+
+async def test_prepared_preflight_retains_phase_after_save(wire: _WireHarness, monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = _clock(wire, monkeypatch)
+    _, sender, connection, sink = wire
+    with demand_context(DemandKind.DRAFT_MUTATION) as root:
+        with rpc_attempt_budget(RpcAttemptBudget(1)) as preflight:
+            with acquisition_context(AcquisitionKind.DRAFT_SNAPSHOT):
+                response, packet = await _prepare(wire, functions.messages.GetAllDraftsRequest(), current_rpc_scope())
+        with rpc_attempt_budget(RpcAttemptBudget(1)):
+            await _complete(wire, _save())
+        clock.advance(2)
+        assert not sender.write_packet(packet, connection._send)
+        assert preflight.attempts == 0 and not root.attempt_evidence.draft_postflight_dispatched
+        response.cancel()
+    assert len(sink.frames) == 1
