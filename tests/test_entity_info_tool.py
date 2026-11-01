@@ -19,6 +19,7 @@ from mcp_telegram.tools.entity_info import (
     GET_ENTITY_INFO_OUTPUT_SCHEMA,
     GetEntityInfo,
     _entity_structured_content,
+    _local_entity_miss,
     _numeric_entity_lookup,
     _resolve_entity_lookup,
     get_entity_info,
@@ -62,6 +63,54 @@ def _patch_daemon(resolve_response: dict[str, object], get_entity_info_response:
 
 def _dict(value: object) -> dict[str, object]:
     return cast(dict[str, object], value)
+
+
+@pytest.mark.parametrize(
+    ("status", "complete", "fresh", "diagnosis"),
+    [
+        ("never", True, True, "incomplete"),
+        ("in_progress", True, True, "incomplete"),
+        ("complete", False, False, "incomplete"),
+        ("stale", True, True, "stale"),
+        ("complete", True, False, "stale"),
+        ("complete", True, True, "complete"),
+    ],
+)
+def test_local_entity_miss_preserves_directory_receipt_and_limits(
+    status: str, complete: bool, fresh: bool, diagnosis: str
+) -> None:
+    receipt = {
+        "status": status,
+        "publication_generation": 3,
+        "observation_started_at": 100,
+        "age_seconds": 901,
+        "refresh_status": "incomplete",
+        "reason": "test_reason",
+        "lookup_complete": complete,
+        "lookup_fresh": fresh,
+    }
+    result = _local_entity_miss({"directory_coverage": receipt, "directory_diagnostic": diagnosis}, exact=True)
+    details = cast(dict[str, object], cast(dict[str, object], result.structured_content)["details"])
+    assert details["directory_coverage"] == receipt and details["directory_diagnostic"] == diagnosis
+    assert "No local observations exist" in cast(_TextContent, result.content[0]).text
+    assert "\nAction:" in cast(_TextContent, result.content[0]).text
+
+
+def test_local_entity_miss_treats_invalid_or_legacy_evidence_as_unknown() -> None:
+    incomplete = {
+        "status": "never",
+        "publication_generation": None,
+        "observation_started_at": None,
+        "age_seconds": None,
+        "refresh_status": "pending",
+        "reason": None,
+        "lookup_complete": True,
+        "lookup_fresh": True,
+    }
+    for evidence in ({}, {"directory_coverage": incomplete, "directory_diagnostic": "invalid"}):
+        result = _local_entity_miss(evidence, exact=False)
+        details = cast(dict[str, object], cast(dict[str, object], result.structured_content)["details"])
+        assert details == {"lookup_scope": "local_entity_observations", "directory_diagnostic": "unknown"}
 
 
 def _dict_at(value: object, *keys: str) -> dict[str, object]:
@@ -502,7 +551,7 @@ async def test_get_entity_info_resolver_not_found() -> None:
     with patch("mcp_telegram.tools.entity_info.daemon_connection", fake_dc):
         result = await get_entity_info(GetEntityInfo(entity="Nobody"))
     text = cast(_TextContent, result.content[0]).text
-    assert "No local entity matches this query" in text
+    assert "No local observations match this query" in text
     assert "list_dialogs" in text
 
 
@@ -811,7 +860,7 @@ async def test_resolve_entity_lookup_not_found_returns_error_result() -> None:
 
     assert isinstance(result, ToolResult)
     assert result.is_error is True
-    assert "No local entity matches this query" in cast(_TextContent, result.content[0]).text
+    assert "No local observations match this query" in cast(_TextContent, result.content[0]).text
 
 
 @pytest.mark.asyncio

@@ -5,26 +5,31 @@ import inspect
 import json
 import logging
 import re
+import sqlite3
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from functools import partial
 from pathlib import Path
 from typing import Protocol, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import urlparse
 
 import pytest
-from jsonschema import ValidationError, validate
+from jsonschema import ValidationError, validate, validators
 from mcp.types import CallToolResult, Prompt, TextContent, Tool
 
 from mcp_telegram import server
-from mcp_telegram.daemon_client import AccountProtectionError
+from mcp_telegram.daemon_client import AccountProtectionError, DaemonConnection, DaemonNotRunningError
 from mcp_telegram.request_timing import is_valid_operation_id
+from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.tools._base import ToolRegistryEntry, ToolResult, error_result, tool_description
 from mcp_telegram.tools.discovery import ListDialogs
+from tests.test_daemon_api import make_server
 
 INVENTORY_PATH = Path(__file__).parent / "fixtures" / "52-TOOL-OUTPUT-INVENTORY.md"
+type _TestJson = str | int | float | bool | list[_TestJson] | dict[str, _TestJson] | None
 
 
 def _tool_input_schema(tool: Tool) -> dict[str, object]:
@@ -52,6 +57,8 @@ def _minimal_schema_value(schema: dict[str, object]) -> object:  # noqa: PLR0911
     if isinstance(enum, list):
         return enum[0]
     schema_type = schema.get("type")
+    if isinstance(schema_type, list) and "null" in schema_type:
+        return None
     if schema_type == "object":
         properties = cast(dict[str, dict[str, object]], schema.get("properties", {}))
         return {
@@ -137,6 +144,111 @@ def _call_tool_result(result: object) -> CallToolResult:
     assert hasattr(result, "content")
     assert hasattr(result, "is_error")
     return cast(CallToolResult, result)
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        ({"entity": "NoSuchPerson"}, "never", "inactive"),
+        ({"exact_entity_id": 987654321}, "never", "inactive"),
+        ({"entity": "@NoSuchHandle"}, "complete", "inactive"),
+        ({"entity": "https://t.me/NoSuchHandle"}, "never", "manual"),
+        ({"entity": "987654321"}, "never", "inactive"),
+        ({"entity": "NoSuchPerson"}, "stale", "inactive"),
+        ({"exact_entity_id": 987654321}, "never", "unavailable"),
+    ],
+)
+async def test_registered_entity_miss_preserves_real_local_coverage_without_acquisition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    scenario: tuple[dict[str, object], str, str],
+) -> None:
+    arguments, publication, protection = scenario
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    request.addfinalizer(conn.close)
+    if publication != "never":
+        conn.execute(
+            "UPDATE dialog_directory_publication SET generation=1, observation_started_at=? WHERE singleton=1",
+            (int(time.time()) - (901 if publication == "stale" else 0),),
+        )
+        conn.commit()
+    client = MagicMock()
+    feedback_conn = sqlite3.connect(":memory:")
+    request.addfinalizer(feedback_conn.close)
+    api = make_server(conn=conn, client=client, feedback_conn=feedback_conn)
+    api._runtime_observation_sink = None
+    sink = MagicMock()
+    api.bind_demand_sink(sink)
+    status_reads = 0
+    if protection == "manual":
+
+        def account_safety_status() -> dict[str, object]:
+            nonlocal status_reads
+            status_reads += 1
+            return {
+                "generation": "g",
+                "reason": "unresolved_outbound_outcome",
+                "unresolved_request_count": 1,
+                "unresolved_requests": [],
+                "unresolved_requests_truncated": False,
+            }
+
+        api._account_safety_status = account_safety_status
+    socket = tmp_path / "daemon.sock"
+
+    @asynccontextmanager
+    async def connection(*_args: object, **_kwargs: object) -> AsyncIterator[DaemonConnection]:
+        reader, writer = await asyncio.open_unix_connection(str(socket))
+        try:
+            yield DaemonConnection(reader, writer)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    monkeypatch.setattr("mcp_telegram.tools.entity_info.daemon_connection", connection)
+
+    @asynccontextmanager
+    async def unavailable(*_args: object, **_kwargs: object) -> AsyncIterator[DaemonConnection]:
+        raise DaemonNotRunningError("status unavailable")
+        yield
+
+    monkeypatch.setattr(server, "daemon_connection", unavailable if protection == "unavailable" else connection)
+    monkeypatch.setattr(server, "_schedule_telemetry", lambda _event: None)
+    before = conn.total_changes
+    async with await asyncio.start_unix_server(api.handle_client, path=socket):
+        result = _call_tool_result(await server.call_tool("get_entity_info", arguments))
+    _assert_registered_entity_miss(result, publication=publication, protection=protection)
+    assert status_reads == (1 if protection == "manual" else 0)
+    assert conn.total_changes == before
+    assert not client.mock_calls and not sink.mock_calls
+    await api.shutdown_clients()
+
+
+def _assert_registered_entity_miss(result: CallToolResult, *, publication: str, protection: str) -> None:
+    assert result.is_error is True
+    payload = cast(dict[str, object], result.structured_content)
+    schema = cast(dict[str, object], server.tool_by_name["get_entity_info"].output_schema)
+    validators.validator_for(schema)(schema).validate(cast(_TestJson, payload))
+    error = cast(dict[str, object], payload["error"])
+    details = cast(dict[str, object], error["details"])
+    coverage = cast(dict[str, object], details["directory_coverage"])
+    assert error["code"] == "entity_not_observed" and details["lookup_scope"] == "local_entity_observations"
+    assert details["directory_diagnostic"] == ("incomplete" if publication == "never" else publication)
+    assert coverage["status"] == publication
+    assert "cannot confirm absence from Telegram" in cast(str, error["message"])
+    if publication == "stale":
+        assert cast(int, coverage["age_seconds"]) >= 901
+    assert "Action:" in _call_tool_text(result) and "list_dialogs" in cast(str, error["action"])
+    if protection == "inactive":
+        assert "account_protection" not in payload
+    else:
+        state = cast(dict[str, object], payload["account_protection"])
+        assert state["status"] == ("active" if protection == "manual" else "unavailable")
+        if protection == "manual":
+            assert state["recovery"] == "manual" and "operator action" in cast(str, state["notice"])
 
 
 def _tool(name: str) -> Tool:

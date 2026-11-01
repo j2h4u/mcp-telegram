@@ -83,7 +83,7 @@ def test_mixed_null_enum_is_optional_but_keeps_non_null_values() -> None:
 
 
 def test_registered_output_schemas_do_not_advertise_null() -> None:
-    """Canonical profile clears are the sole mapping-null wire exception."""
+    """Only explicitly defined profile and sync-status facts retain nulls."""
     for name, entry in tools.TOOL_REGISTRY.items():
         schema = entry.output_schema
         assert schema is not None, name
@@ -107,7 +107,11 @@ def _assert_registered_null_boundary(name: str, schema: dict[str, object]) -> No
             name == "get_entity_info"
             and (path[:1] == ("$defs",) or path in {("properties", "semantic"), ("properties", "page")})
         )
-        assert nullable or not _schema_has_null(node), (name, path)
+        sync_null = name == "get_sync_status" and path in {
+            ("properties", "latest_retained_message"),
+            ("properties", "message_delivery", "properties", "lag_seconds"),
+        }
+        assert nullable or sync_null or not _schema_has_null(node), (name, path)
         properties, required = node.get("properties"), node.get("required")
         if isinstance(properties, dict) and isinstance(required, list):
             assert set(required) <= set(properties), (name, path)
@@ -130,6 +134,8 @@ def _assert_registered_null_boundary(name: str, schema: dict[str, object]) -> No
         ("get_entity_info", {"type": ["object", "null"]}),
         ("get_entity_info", {"properties": {"legacy": {"type": ["string", "null"]}}}),
         ("list_dialogs", {"properties": {"semantic": {"type": ["string", "null"]}}}),
+        ("get_sync_status", {"properties": {"other": {"type": ["string", "null"]}}}),
+        ("list_dialogs", {"properties": {"latest_retained_message": {"type": ["object", "null"]}}}),
         (
             "get_entity_info",
             {"properties": {"legacy": {"$ref": "#/$defs/shared"}}, "$defs": {"shared": {"type": ["string", "null"]}}},

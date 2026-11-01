@@ -160,6 +160,9 @@
         "path_exists": [
           "structuredContent.dialog_id",
           "structuredContent.coverage_status",
+          "structuredContent.message_retention_policy",
+          "structuredContent.latest_retained_message",
+          "structuredContent.message_delivery",
           "structuredContent.delete_detection"
         ],
         "path_nonempty": [

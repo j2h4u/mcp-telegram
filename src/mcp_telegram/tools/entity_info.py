@@ -710,6 +710,69 @@ def _numeric_entity_lookup(entity: str) -> _EntityLookup | None:
     return _EntityLookup(entity_id=entity_id, display_name=entity, resolution="numeric_id")
 
 
+def _local_entity_miss(evidence: dict[str, object], *, exact: bool) -> ToolResult:
+    raw = evidence.get("directory_coverage")
+    diagnosis = evidence.get("directory_diagnostic")
+    details: dict[str, object] = {"lookup_scope": "local_entity_observations", "directory_diagnostic": "unknown"}
+    if (
+        isinstance(raw, dict)
+        and isinstance(diagnosis, str)
+        and diagnosis in {"incomplete", "stale", "complete"}
+        and _valid_directory_receipt(raw)
+    ):
+        details["directory_coverage"] = dict(raw)
+        details["directory_diagnostic"] = diagnosis
+    else:
+        diagnosis = "unknown"
+    opening = "No local observations exist for this entity." if exact else "No local observations match this query."
+    if diagnosis == "complete":
+        context = (
+            "The retained dialog directory is complete for its observation, not for every Telegram entity; "
+            "it cannot confirm absence from Telegram."
+        )
+    elif diagnosis == "stale":
+        context = (
+            "The retained dialog directory or its identity lookup is stale; it cannot confirm absence from Telegram."
+        )
+    else:
+        context = (
+            "The local dialog directory is incomplete or has unknown coverage; it cannot confirm absence from Telegram."
+        )
+    return error_result(
+        f"{opening} {context}\n"
+        "Action: Use list_dialogs for retained local dialogs, or retry get_entity_info after directory acquisition progresses. "
+        "Inspect account_protection for an acquisition block. No explicit entity-refresh MCP tool is available.",
+        error_code="entity_not_observed",
+        details=details,
+    )
+
+
+def _valid_directory_receipt(value: dict[str, object]) -> bool:
+    if set(value) != {
+        "status",
+        "publication_generation",
+        "observation_started_at",
+        "age_seconds",
+        "refresh_status",
+        "reason",
+        "lookup_complete",
+        "lookup_fresh",
+    }:
+        return False
+    if not isinstance(value["status"], str) or value["status"] not in {"never", "in_progress", "stale", "complete"}:
+        return False
+    if type(value["lookup_complete"]) is not bool or type(value["lookup_fresh"]) is not bool:
+        return False
+    return _valid_directory_receipt_fields(value)
+
+
+def _valid_directory_receipt_fields(value: dict[str, object]) -> bool:
+    numbers = (value[key] for key in ("publication_generation", "observation_started_at", "age_seconds"))
+    return all(item is None or (type(item) is int and cast(int, item) >= 0) for item in numbers) and all(
+        value[key] is None or isinstance(value[key], str) for key in ("refresh_status", "reason")
+    )
+
+
 async def _resolve_entity_lookup(entity: str) -> ToolResult | _EntityLookup:
     # Two daemon connections: daemon handles one request per connection.
     # Accepted race: entity_id obtained from resolve_entity could theoretically
@@ -731,10 +794,7 @@ async def _resolve_entity_lookup(entity: str) -> ToolResult | _EntityLookup:
     resolve_status = resolve_data.get("result", "not_found")
 
     if resolve_status == "not_found":
-        return error_result(
-            "No local entity matches this query. Action: use list_dialogs to select a known local entity.",
-            error_code="entity_not_observed",
-        )
+        return _local_entity_miss(resolve_data, exact=False)
 
     if resolve_status == "candidates":
         matches = resolve_data.get("matches", [])
@@ -767,6 +827,8 @@ def _entity_info_fetch_error(args: GetEntityInfo, response: dict) -> ToolResult 
 
     entity = args.entity if args.entity is not None else str(args.exact_entity_id)
     error_code = response.get("error", "")
+    if error_code == "entity_not_observed":
+        return _local_entity_miss(response, exact=True)
     if error_code == "entity_not_found":
         return error_result(entity_not_found_text(entity, retry_tool="GetEntityInfo"), error_code="entity_not_found")
 

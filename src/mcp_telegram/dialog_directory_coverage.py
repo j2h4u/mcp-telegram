@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Literal, cast
 
 DirectoryCoverageStatus = Literal["never", "in_progress", "stale", "complete"]
+DirectoryDiagnostic = Literal["incomplete", "stale", "complete"]
 _STALE_AFTER_SECONDS = 900
 
 
@@ -35,6 +36,15 @@ class DialogDirectoryCoverage:
             "lookup_complete": self.lookup_complete,
             "lookup_fresh": self.lookup_fresh,
         }
+
+
+def classify_directory_coverage(coverage: DialogDirectoryCoverage) -> DirectoryDiagnostic:
+    """Classify retained directory evidence with the existing selector precedence."""
+    if coverage.status in {"never", "in_progress"} or not coverage.lookup_complete:
+        return "incomplete"
+    if coverage.status == "stale" or not coverage.lookup_fresh:
+        return "stale"
+    return "complete"
 
 
 def _int_or_none(value: object) -> int | None:

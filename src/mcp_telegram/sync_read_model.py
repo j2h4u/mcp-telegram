@@ -16,6 +16,18 @@ class SyncReadModelContractError(ValueError):
     """Raised when canonical sync facts cannot be built or decoded safely."""
 
 
+def decode_latest_retained_message(value: object) -> dict[str, int] | None:
+    """Validate the daemon's optional retained message identity and source time."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {"message_id", "sent_at"}:
+        raise SyncReadModelContractError("latest_retained_message must be null or a message identity")
+    message_id, sent_at = value["message_id"], value["sent_at"]
+    if type(message_id) is not int or message_id <= 0 or type(sent_at) is not int or sent_at < 0:
+        raise SyncReadModelContractError("latest_retained_message has invalid message_id or sent_at")
+    return {"message_id": message_id, "sent_at": sent_at}
+
+
 @dataclass(frozen=True, slots=True)
 class LocalHistoryCoverage:
     """History evidence is independent of retained rows and current access."""

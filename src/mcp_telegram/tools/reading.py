@@ -241,7 +241,10 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                     "description": "Sent-history interval coverage as of its observation horizon; independent of page, attribution, drafts and scheduled messages.",
                 },
                 "observation_horizon_at": {"type": ["integer", "null"]},
-                "sync_status": {"type": ["string", "null"]},
+                "sync_status": {
+                    "type": ["string", "null"],
+                    "description": "Persisted history sync state, not uninterrupted delivery.",
+                },
                 "topic_attribution": {
                     "type": "object",
                     "properties": {

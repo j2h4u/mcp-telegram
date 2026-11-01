@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 import time
 from collections.abc import Callable
@@ -17,6 +18,28 @@ from .flood import TelegramRpcThrottled
 from .telegram_rpc_scheduler import TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending
 
 type Eligibility = TelegramRpcThrottled | TelegramRpcMethodRecoveryPending | None
+
+
+class UpdateIntakeQueue(asyncio.Queue[object]):
+    """Count real vendor envelopes without counting local eligibility wakeups."""
+
+    def __init__(self, wakeup: object, notify: Callable[[], None]) -> None:
+        super().__init__()
+        self._wakeup = wakeup
+        self._notify = notify
+        self.real_count = 0
+
+    def put_nowait(self, item: object) -> None:
+        super().put_nowait(item)
+        if item is not self._wakeup:
+            self.real_count += 1
+            self._notify()
+
+    def get_nowait(self) -> object:
+        item = super().get_nowait()
+        if item is not self._wakeup:
+            self.real_count -= 1
+        return item
 
 
 class GateMessageBox(MessageBox):
@@ -40,11 +63,23 @@ class GateMessageBox(MessageBox):
         self._preserved_ends: set[int | None] = set()
         self.wakeup = object()
         self.wakeup_queued = False
+        self.intake_queue: UpdateIntakeQueue | None = None
+        self.difference_credit = False
+
+    def intake_due(self) -> bool:
+        return self.intake_queue is not None and self.intake_queue.real_count > 0 and not self.difference_credit
+
+    def difference_claimed(self) -> None:
+        self.difference_credit = False
 
     def get_difference(self) -> GetDifferenceRequest | None:
+        if self.intake_due():
+            return None
         return self._eligible_request(super().get_difference())
 
     def get_channel_difference(self, chat_hashes: object) -> GetChannelDifferenceRequest | None:
+        if self.intake_due():
+            return None
         return self._eligible_request(super().get_channel_difference(chat_hashes))
 
     def _eligible_request[T](self, request: T | None) -> T | None:
@@ -83,6 +118,8 @@ class GateMessageBox(MessageBox):
 
     def check_deadlines(self) -> float:
         deadline = cast(float, super().check_deadlines())
+        if self.intake_due():
+            return math.inf
         if deadline > time.monotonic() or not self._blocked:
             return deadline
         boundaries = [
@@ -101,7 +138,13 @@ class GateMessageBox(MessageBox):
         preserve_account = bool(self.getting_diff_for & {ENTRY_ACCOUNT, ENTRY_SECRET})
         seq, date = self.seq, self.date
         try:
-            return cast(tuple[list[object], list[object]], super().process_updates(updates, chat_hashes, result))
+            try:
+                outcome = cast(tuple[list[object], list[object]], super().process_updates(updates, chat_hashes, result))
+            except GapError:
+                self.difference_credit = True
+                raise
+            self.difference_credit = True
+            return outcome
         finally:
             if preserve_account:
                 self.seq, self.date = seq, date

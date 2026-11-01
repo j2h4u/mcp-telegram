@@ -77,8 +77,15 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "is_self": {"type": "boolean"},
                     "last_message_at": {"type": ["integer", "string", "null"]},
                     "unread_count": {"type": ["integer", "null"]},
-                    "sync_status": {"type": "string", "enum": [item.value for item in SyncStatus]},
-                    "synced": {"type": "boolean"},
+                    "sync_status": {
+                        "type": "string",
+                        "enum": [item.value for item in SyncStatus],
+                        "description": "Persisted history sync state, not current delivery.",
+                    },
+                    "synced": {
+                        "type": "boolean",
+                        "description": "Persisted history completion status, not uninterrupted delivery.",
+                    },
                     "sync_coverage_pct": {"type": ["integer", "null"]},
                     "saved_message_count": {"type": "integer"},
                     "history_scope": {"type": "string", "enum": [item.value for item in HistoryScope]},
@@ -765,7 +772,7 @@ class ListDialogs(ToolArgs):
       - 'access_lost' — account no longer has access; read-only snapshot
       - 'fragment'    — partial retained history; anchored reads use local context only
 
-    Call `get_sync_status` and inspect `realtime_history` when active realtime coverage matters.
+    Call `get_sync_status` for retention policy, history boundary and separate delivery diagnostics.
     """
 
     view: Literal["dialogs", "folders"] = "dialogs"

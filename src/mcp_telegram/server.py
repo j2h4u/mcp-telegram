@@ -531,6 +531,7 @@ def _project_tool_result(name: str, tool_result: object, telemetry: _CallTelemet
         else None
     )
     _restore_profile_nulls(name, tool_result, structured_content)
+    _restore_sync_status_nulls(name, tool_result, structured_content)
     content: list[ContentBlock] = []
     if tool_result.is_error:
         structured_content = _canonical_tool_error(tool_result.error_code, tool_result.content, structured_content)
@@ -568,6 +569,16 @@ def _restore_profile_nulls(
     if name == "get_entity_info" and not tool_result.is_error and structured_content is not None:
         original = tool_result.structured_content or {}
         for key in ("semantic", "page"):
+            if key in original:
+                structured_content[key] = deepcopy(original[key])
+
+
+def _restore_sync_status_nulls(
+    name: str, tool_result: tools.ToolResult, structured_content: dict[str, object] | None
+) -> None:
+    if name == "get_sync_status" and not tool_result.is_error and structured_content is not None:
+        original = tool_result.structured_content or {}
+        for key in ("latest_retained_message", "message_delivery"):
             if key in original:
                 structured_content[key] = deepcopy(original[key])
 

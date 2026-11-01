@@ -74,6 +74,9 @@ def _status_summary(payload: Mapping[str, object]) -> list[str]:
     else:
         parts = ["The local status read completed; the retained message count is unknown."]
     parts.append(_history_summary(payload))
+    parts.append(
+        "The message retention policy does not assure delivery; current lag and missing-message continuity are unverified."
+    )
     if payload.get("last_delta_checked_at") is not None:
         parts.append("A reconciliation was recorded.")
     if payload.get("delta_refresh_requested_at") is not None:

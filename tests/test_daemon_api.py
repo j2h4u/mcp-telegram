@@ -777,6 +777,7 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
         ) WITHOUT ROWID
         """
     )
+    conn.execute("CREATE INDEX idx_messages_dialog_sent ON messages(dialog_id, sent_at DESC)")
     conn.execute(
         """
         CREATE TABLE message_read_facts (

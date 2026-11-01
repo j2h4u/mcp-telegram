@@ -7,8 +7,34 @@ from pathlib import Path
 
 import pytest
 
-from mcp_telegram.dialog_directory_coverage import read_dialog_directory_coverage
+from mcp_telegram.dialog_directory_coverage import (
+    DialogDirectoryCoverage,
+    classify_directory_coverage,
+    read_dialog_directory_coverage,
+)
 from mcp_telegram.sync_db import ensure_sync_schema
+
+
+@pytest.mark.parametrize(
+    ("status", "complete", "fresh", "expected"),
+    [
+        ("never", True, True, "incomplete"),
+        ("in_progress", True, True, "incomplete"),
+        ("stale", False, False, "incomplete"),
+        ("stale", True, True, "stale"),
+        ("complete", True, False, "stale"),
+        ("complete", True, True, "complete"),
+    ],
+)
+def test_directory_diagnostic_keeps_publication_and_identity_precedence(
+    status: str, complete: bool, fresh: bool, expected: str
+) -> None:
+    from typing import cast
+
+    from mcp_telegram.dialog_directory_coverage import DirectoryCoverageStatus
+
+    coverage = DialogDirectoryCoverage(cast(DirectoryCoverageStatus, status), 1, 100, 10, "incomplete", complete, fresh)
+    assert classify_directory_coverage(coverage) == expected
 
 
 def test_coverage_schema_fault_propagates(tmp_path: Path) -> None:

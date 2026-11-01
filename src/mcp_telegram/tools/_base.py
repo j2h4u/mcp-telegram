@@ -321,10 +321,25 @@ def _registered_output_schema(name: str, schema: dict[str, object] | None) -> di
                 properties[key] = deepcopy(original[key])
         if "$defs" in temporal:
             normalized["$defs"] = deepcopy(temporal["$defs"])
+    _restore_sync_status_schema(name, normalized, temporal)
     if name in ASSESSMENT_TOOLS and normalized is not None:
         properties = t.cast(dict[str, object], normalized["properties"])
         properties["assessment"] = deepcopy(ASSESSMENT_SCHEMA)
     return _protection_output_schema(normalized)
+
+
+def _restore_sync_status_schema(
+    name: str, normalized: dict[str, object] | None, temporal: dict[str, object] | None
+) -> None:
+    if name != "get_sync_status" or normalized is None or temporal is None:
+        return
+    properties = t.cast(dict[str, object], normalized["properties"])
+    original = t.cast(dict[str, object], temporal["properties"])
+    for key in ("latest_retained_message", "message_delivery"):
+        properties[key] = deepcopy(original[key])
+    required = t.cast(list[str], normalized["required"])
+    if "latest_retained_message" not in required:
+        required.append("latest_retained_message")
 
 
 def _protection_output_schema(schema: dict[str, object] | None) -> dict[str, object] | None:
