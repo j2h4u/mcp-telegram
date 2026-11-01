@@ -1649,7 +1649,9 @@ class TelegramRpcSafetyLedger:
     def _invalidate_automatic_trial(
         self, record: dict[str, object], trial: dict[str, object], known_flood: bool, cause: RecoveryCause | None
     ) -> None:
-        if trial["state"] in {"consumed", "succeeded"} and trial["consumed_run"] == self._run:
+        if trial["state"] == "succeeded" and not self._auto_resume_scope_safe(record, allow_claimed=True):
+            return
+        if trial["state"] == "succeeded" or (trial["state"] == "consumed" and trial["consumed_run"] == self._run):
             self._schedule_auto_resume(
                 record, cause=RecoveryCause.FLOOD_WAIT if known_flood else cause or RecoveryCause.READ_UNCERTAINTY
             )
@@ -2072,7 +2074,8 @@ class TelegramRpcSafetyLedger:
             trial.update(state="consumed", consumed_run=self._run)
             record["generation"] = uuid.uuid4().hex
             for intent in cast(dict[str, dict[str, object]], record["intents"]).values():
-                intent["phase"] = "acknowledged_unknown"
+                if _intent_blocks(intent, cast(dict[str, object], record["scope"])):
+                    intent["phase"] = "acknowledged_unknown"
             for episode in cast(dict[str, dict[str, object]], record["methods"]).values():
                 episode["claim"] = None
             record["protection"] = None
@@ -2233,7 +2236,7 @@ class TelegramRpcSafetyLedger:
         recovery = self._record["recovery"]
         if isinstance(recovery, dict) and "automatic" not in recovery and recovery["state"] != "succeeded":
             return False
-        if self._automatic_recovery() is None:
+        if self._auto_resume_needs_fencing(self._record, cause):
             await self._commit(lambda record: self._begin_auto_fencing(record, cause, quiesced))
         await self._advance_interrupted_auto(quiesced)
         return self.auto_resume_due()
@@ -2250,11 +2253,28 @@ class TelegramRpcSafetyLedger:
         if recovery is not None and recovery["state"] == "fencing" and quiesced:
             await self._commit(self._settle_auto_fencing)
 
+    @staticmethod
+    def _auto_resume_needs_fencing(record: dict[str, object], cause: RecoveryCause | None) -> bool:
+        recovery = record["recovery"]
+        if recovery is None:
+            return True
+        if not isinstance(recovery, dict) or recovery["state"] != "succeeded":
+            return False
+        scope = cast(dict[str, object], record["scope"])
+        return (
+            cause is not None
+            or record["protection"] is not None
+            or any(
+                _intent_blocks(intent, scope)
+                for intent in cast(dict[str, dict[str, object]], record["intents"]).values()
+            )
+        )
+
     def _begin_auto_fencing(self, record: dict[str, object], cause: RecoveryCause | None, quiesced: bool) -> None:
         if (
             self._auto_resume_enabled
             and self._auto_resume_scope_safe(record, allow_claimed=not quiesced)
-            and self._automatic_recovery() is None
+            and self._auto_resume_needs_fencing(record, cause)
         ):
             selected = cause or (
                 RecoveryCause.FLOOD_WAIT
