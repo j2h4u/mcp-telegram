@@ -177,13 +177,17 @@ async def test_get_entity_info_serves_old_profile_locally_without_refetch() -> N
 
 
 @pytest.mark.asyncio
-async def test_get_entity_info_exact_ttl_age_stays_local() -> None:
+async def test_get_entity_info_exact_ttl_age_stays_local(monkeypatch: pytest.MonkeyPatch) -> None:
     conn = _make_db()
     client = AsyncMock()
     server = make_server(conn=conn, client=client, about="at cutoff")
     service = server._get_entity_info_service()
     await acquire_entity_profile(service, 43, {"id": 43, "type": "user", "name": "Cache", "about": "at cutoff"})
     service._deps = replace(service._deps, now_provider=lambda: 2_000_000)
+    monkeypatch.setattr(
+        "mcp_telegram.daemon_api.read_dialog_directory_coverage",
+        lambda _conn: pytest.fail("successful identity must not read miss coverage"),
+    )
     before = conn.total_changes
     calls_before_read = client.await_count
 

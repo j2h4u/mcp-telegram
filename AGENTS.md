@@ -245,6 +245,14 @@ do not duplicate it locally when CI will test the same candidate. CI uses the
 same `just check` and `just crap-threshold` recipes. A failed test or metric is
 fixed before a new candidate is checked; never rerun an unchanged failure blindly.
 
+Before opening a release candidate, inventory ordinary ready work and tasks
+needing preparation in WorkGraph. Group compatible authorized changes in one
+candidate and PR, with parallel workers owning disjoint changes. Respect deferred
+and externally waiting work; do not delay an urgent fix for an unbounded batch.
+Use targeted checks, including coverage for changed complex logic, during the
+work; search related contract fixtures before freezing. Run one full PR CI on
+the integrated candidate rather than a full run or separate PR for each ticket.
+
 Before final CI, freeze the candidate scope and integrate completed handoffs.
 For public tool registry, schema, or content changes, run the existing `tests/test_server.py`
 and `tests/test_strict_tool_arguments.py` contract modules before CI.

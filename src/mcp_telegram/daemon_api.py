@@ -69,7 +69,11 @@ from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from .daemon_ipc import write_response
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_directory import recover_invalid_generation_in_transaction
-from .dialog_directory_coverage import DialogDirectoryCoverage, read_dialog_directory_coverage
+from .dialog_directory_coverage import (
+    DialogDirectoryCoverage,
+    classify_directory_coverage,
+    read_dialog_directory_coverage,
+)
 from .dialog_identity import read_local_dialog_identities
 from .dialog_selector import SELF_DIALOG_ALIASES, DialogSelector, DialogSelectorError, required_dialog_selector
 from .drafts.read_service import read_draft_request
@@ -1577,7 +1581,8 @@ class DaemonAPIServer:
         coverage: DialogDirectoryCoverage,
     ) -> dict[str, object]:
         coverage_wire = coverage.to_wire()
-        if coverage.status in {"never", "in_progress"} or not coverage.lookup_complete:
+        diagnosis = classify_directory_coverage(coverage)
+        if diagnosis == "incomplete":
             return {
                 "ok": False,
                 "error": "dialog_directory_incomplete",
@@ -1585,7 +1590,7 @@ class DaemonAPIServer:
                 "directory_coverage": coverage_wire,
                 "required_action": "Use an exact dialog id or @username when known, or retry after a future directory refresh.",
             }
-        if coverage.status == "stale" or not coverage.lookup_fresh:
+        if diagnosis == "stale":
             return {
                 "ok": False,
                 "error": "stale_local_directory",
@@ -2290,6 +2295,8 @@ class DaemonAPIServer:
         fetched_at = time.perf_counter()
         if result.get("error") == "entity_info_pending" and self._health_status().open:
             return _account_protection_error()
+        if result.get("error") == "entity_not_observed":
+            result.update(self._entity_miss_coverage())
         if result.get("ok"):
             data = cast(dict[str, object], result.get("data", {}))
             entity_id = data.get("id")
@@ -2574,7 +2581,7 @@ class DaemonAPIServer:
                         "display_name": row[1] or f"@{username_query}",
                     },
                 }
-            return {"ok": True, "data": {"result": "not_found", "query": query}}
+            return {"ok": True, "data": {"result": "not_found", "query": query, **self._entity_miss_coverage()}}
 
         display_name_map = dict(
             cast(
@@ -2613,4 +2620,8 @@ class DaemonAPIServer:
                 "ok": True,
                 "data": {"result": "candidates", "matches": result.matches},
             }
-        return {"ok": True, "data": {"result": "not_found", "query": query}}
+        return {"ok": True, "data": {"result": "not_found", "query": query, **self._entity_miss_coverage()}}
+
+    def _entity_miss_coverage(self) -> dict[str, object]:
+        coverage = read_dialog_directory_coverage(self._conn)
+        return {"directory_coverage": coverage.to_wire(), "directory_diagnostic": classify_directory_coverage(coverage)}
