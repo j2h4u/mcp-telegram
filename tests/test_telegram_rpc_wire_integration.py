@@ -588,11 +588,14 @@ async def test_account_safety_status_reports_protection_without_session_material
         "reason",
         "known_retry_until_utc",
         "unresolved_request_count",
+        "blocking_request_count",
+        "historical_unknown_request_count",
         "unresolved_requests",
         "unresolved_requests_truncated",
         "automatic_resume",
     }
     assert status["unresolved_request_count"] == 0 and status["unresolved_requests"] == []
+    assert status["blocking_request_count"] == 0 and status["historical_unknown_request_count"] == 0
     assert status["reason"] == "unresolved_outbound_outcome"
     gate._wire_fault = "storage_failure"
     status = gate.account_safety_status()

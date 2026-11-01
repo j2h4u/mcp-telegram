@@ -1483,6 +1483,27 @@ def test_all_registered_output_schemas_validate_success_and_canonical_error_exam
                 "status": "unavailable",
                 "notice": "Account protection status is unavailable.",
             },
+            {
+                "status": "active",
+                "outbound_acquisition": "blocked",
+                "recovery": "automatic",
+                "notice": "Recovery is reconciling.",
+                "unresolved_request_count": 2,
+                "blocking_request_count": 1,
+                "historical_unknown_request_count": 1,
+                "unresolved_requests": [
+                    {"method": "messages.GetHistoryRequest", "phase": "unknown", "blocks_acquisition": True},
+                    {"method": "users.GetUsersRequest", "phase": "unknown", "blocks_acquisition": False},
+                ],
+                "automatic_resume": {
+                    "enabled": True,
+                    "eligible": False,
+                    "state": "reconciling",
+                    "attempts": 1,
+                    "max_attempts": 6,
+                    "block_reason": "recovery_reconciliation_pending",
+                },
+            },
         ):
             validate(instance={**success, "account_protection": protection}, schema=schema)
         error = {"error": {"code": "tool_error", "message": "failed", "action": "inspect"}}

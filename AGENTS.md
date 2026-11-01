@@ -53,6 +53,29 @@ Respect explicit WorkGraph suspension decisions such as `deferred`. Backlog
 membership or wording such as "later" in a title is not a suspension, and agents
 must not defer authorized work on their own to avoid completing it.
 
+## Stratified Design
+
+Apply `$stratified-design` to all new code and changed paths in existing code.
+Assess the applicable design layers in each task plan and review, at the scope
+of the change. Use a clear semantic language and one level of detail in each
+operation. Build real abstraction barriers and minimal interfaces from the
+problem; do not require a fixed layer count, a wrapper for each helper, or an
+unrelated rewrite.
+
+Distinguish data, pure calculations, and actions. A database or clock callback
+does not make a calculation pure: pass observed time values to pure timing
+calculations. A higher-level operation may accept a semantic fact such as
+`due` when a lower pure boundary owns the timing calculation. Preserve error
+handling, conditional read order, stale-data checks, compare-and-swap,
+durability, cancellation, and resource ownership when moving behavior.
+
+Test required behavior through stable interfaces and independent expected
+results. Use actual storage and protocol boundaries, composition, and end-to-end
+paths where they matter; do not test every private helper separately. For
+meaningful changed logic, consider one business-rule change and one stored
+representation change, and review the affected callers and tests. Apply these
+principles incrementally; untouched legacy code needs no unrelated refactor.
+
 ## Architecture
 
 Default Docker runtime is one container with two worker processes:

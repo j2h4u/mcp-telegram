@@ -253,19 +253,25 @@ def _account_protection_error() -> dict[str, object]:
     }
 
 
-def _account_recovery_notice(automatic: object, reason: object) -> tuple[str, str]:
+def _account_recovery_context(reason: object, history_count: object) -> str:
     context = (
-        "Background Telegram acquisition is blocked because a persisted request has no confirmed response. "
-        "Whether Telegram processed it or applied a rate limit is unknown. "
+        "A Telegram request has no confirmed response; its effects and any rate limit are unknown. "
+        "Background acquisition is blocked. "
         if reason == "unresolved_outbound_outcome"
         else "Background Telegram acquisition is blocked by account protection. "
     )
-    context += (
-        "Retained local reads remain available; use this result's source and coverage to assess requested data. "
-        "New incoming data and freshness may be limited. "
-    )
+    context += "Local reads remain available; check source and coverage. New data may be limited. "
+    if type(history_count) is int and history_count > 0:
+        context += "Historical unknown outcomes remain recorded and do not themselves block acquisition. "
+    return context
+
+
+def _account_recovery_notice(automatic: object, reason: object, history_count: object = None) -> tuple[str, str]:
+    context = _account_recovery_context(reason, history_count)
     if isinstance(automatic, dict) and automatic.get("enabled") is True:
         state = automatic.get("state")
+        if state == "reconciling":
+            return "automatic", context + "Automatic recovery is reconciling the current protection."
         if automatic.get("phase") == "fencing" and automatic.get("eligible") is True:
             return (
                 "automatic",
@@ -1981,7 +1987,7 @@ class DaemonAPIServer:
         if safety is not None:
             protection.update(safety)
             protection["recovery"], protection["notice"] = _account_recovery_notice(
-                safety.get("automatic_resume"), safety.get("reason")
+                safety.get("automatic_resume"), safety.get("reason"), safety.get("historical_unknown_request_count")
             )
         return {"ok": True, "data": {"account_protection": protection}}
 

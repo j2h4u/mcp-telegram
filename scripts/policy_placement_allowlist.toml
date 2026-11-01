@@ -681,3 +681,13 @@ rationale = "This fixed semantic outcome tag distinguishes an accepted retryable
 category = "policy_assignments"
 key = "src/mcp_telegram/telegram_rpc.py:TelegramRpcGate._arm_response_timeout:deadline"
 rationale = "Computed first-physical-claim response deadline from the existing injected RPC duration, capped by the original caller admission deadline; no new timeout value, replay renewal or operator policy."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/telegram_rpc_recovery.py:RecoveryEvent:FAILURE_SETTLED"
+rationale = "This fixed domain event tag marks an owned terminal failure for the recovery transition matrix; it defines no TTL, delay, retry allowance or operator-configured value."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/telegram_rpc_recovery.py:RecoveryReason:FLOOD_BUDGET_SPENT"
+rationale = "This fixed decision-reason tag reports exhaustion of the existing FloodWait trial budget; the tag defines neither the budget limit nor a retry policy value."

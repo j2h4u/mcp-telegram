@@ -72,11 +72,14 @@ ACTIVE_ACCOUNT_PROTECTION_SCHEMA: dict[str, object] = {
             "type": "object",
             "properties": {
                 "enabled": {"type": "boolean"},
-                "eligible": {"type": "boolean", "description": "Whether an automatic trial is currently eligible."},
+                "eligible": {
+                    "type": "boolean",
+                    "description": "Policy eligibility; dispatch still requires the due trial and admission checks.",
+                },
                 "phase": {"enum": ["fencing", "waiting", "consumed", "succeeded", "exhausted"]},
                 "cause": {"enum": ["flood_wait", "transient", "read_uncertainty"]},
                 "block_reason": {"type": "string"},
-                "state": {"enum": ["waiting", "trial", "stability", "manual", "disabled"]},
+                "state": {"enum": ["reconciling", "waiting", "trial", "stability", "manual", "disabled"]},
                 "attempts": {
                     "type": "integer",
                     "minimum": 0,
@@ -111,6 +114,8 @@ ACTIVE_ACCOUNT_PROTECTION_SCHEMA: dict[str, object] = {
         "opened_at": {"type": "integer"},
         "known_retry_until_utc": {"type": "number", "minimum": 0},
         "unresolved_request_count": {"type": "integer", "minimum": 0},
+        "blocking_request_count": {"type": "integer", "minimum": 0},
+        "historical_unknown_request_count": {"type": "integer", "minimum": 0},
         "unresolved_requests": {
             "type": "array",
             "maxItems": 8,
@@ -119,6 +124,7 @@ ACTIVE_ACCOUNT_PROTECTION_SCHEMA: dict[str, object] = {
                 "properties": {
                     "method": {"type": "string", "maxLength": 256},
                     "phase": {"enum": ["prepared", "unknown"]},
+                    "blocks_acquisition": {"type": "boolean"},
                 },
                 "required": ["method", "phase"],
                 "additionalProperties": False,

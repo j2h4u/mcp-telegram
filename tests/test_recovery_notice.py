@@ -5,6 +5,7 @@ from jsonschema import validate
 
 from mcp_telegram.server import _bounded_account_protection, _is_valid_active_account_protection
 from mcp_telegram.tools._base import ACTIVE_ACCOUNT_PROTECTION_SCHEMA
+from tests.test_daemon_api import _close_tracked_sqlite_connections as _close_tracked_sqlite_connections
 from tests.test_daemon_api import make_server
 
 
@@ -45,7 +46,7 @@ def test_protection_notice_follows_automatic_snapshot(  # noqa: PLR0913
     assert protection["automatic_resume"] == automatic
     notice = cast(str, protection["notice"])
     assert notice_fragment in notice
-    assert "Retained local reads remain available" in notice
+    assert "Local reads remain available; check source and coverage" in notice
     assert "no confirmed response" in notice
     assert ("operator action" in notice) == (mode == "manual")
     assert _is_valid_active_account_protection(protection)
