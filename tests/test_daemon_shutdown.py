@@ -7,6 +7,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from mcp_telegram.daemon_shutdown import register_shutdown_handler
 from mcp_telegram.sqlite_checkpoint import checkpoint_sqlite_connection
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
@@ -45,19 +47,61 @@ def test_checkpoint_rolls_back_pending_work_and_preserves_integrity(tmp_path: Pa
 
 def test_signal_requests_shutdown_without_touching_sqlite() -> None:
     loop = _LoopStub()
-    shutdown_event = register_shutdown_handler(cast(asyncio.AbstractEventLoop, loop))
-    assert not shutdown_event.is_set()
+    shutdown = register_shutdown_handler(cast(asyncio.AbstractEventLoop, loop))
+    assert not shutdown.event.is_set()
     assert loop.call_args is not None
     assert loop.call_args[0] == signal.SIGTERM
     cast(Callable[[], None], loop.call_args[1])()
-    assert shutdown_event.is_set()
+    assert shutdown.event.is_set()
 
 
 def test_repeated_shutdown_signal_is_idempotent() -> None:
     loop = _LoopStub()
-    shutdown_event = register_shutdown_handler(cast(asyncio.AbstractEventLoop, loop))
+    shutdown = register_shutdown_handler(cast(asyncio.AbstractEventLoop, loop))
     assert loop.call_args is not None
     callback = cast(Callable[[], None], loop.call_args[1])
     callback()
     callback()
-    assert shutdown_event.is_set()
+    assert shutdown.event.is_set()
+
+
+def test_first_observed_cause_wins() -> None:
+    loop = _LoopStub()
+    shutdown = register_shutdown_handler(cast(asyncio.AbstractEventLoop, loop))
+    shutdown.request("critical_task_failed")
+    assert loop.call_args is not None
+    cast(Callable[[], None], loop.call_args[1])()
+    assert shutdown.reason_code == "critical_task_failed"
+
+
+async def test_signal_during_bootstrap_waits_and_skips_telegram(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import AsyncMock
+
+    from mcp_telegram import daemon
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    shutdown = AsyncMock()
+    start = AsyncMock()
+    loop = asyncio.get_running_loop()
+    callbacks: dict[int, Callable[[], None]] = {}
+    monkeypatch.setattr(loop, "add_signal_handler", lambda sig, cb: callbacks.update({sig: cb}))
+    monkeypatch.setattr(loop, "remove_signal_handler", lambda _sig: True)
+
+    async def build(_request: object) -> object:
+        entered.set()
+        await release.wait()
+        return object()
+
+    monkeypatch.setattr(daemon, "_build_sync_main_context", build)
+    monkeypatch.setattr(daemon, "_shutdown_sync_main_context", shutdown)
+    monkeypatch.setattr(daemon, "_connect_telegram", start)
+    task = asyncio.create_task(daemon.sync_main())
+    await entered.wait()
+    callbacks[signal.SIGTERM]()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    await task
+    shutdown.assert_awaited_once()
+    start.assert_not_awaited()

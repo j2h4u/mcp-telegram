@@ -90,7 +90,7 @@ def _make_server(
     server = DaemonAPIServer(
         conn,
         cast(DaemonClientLike, client),
-        asyncio.Event(),
+        lambda _reason: asyncio.Event().set(),
         writer=inline_writer(conn),
         channel_profile_port=channel_profile_port,
         group_profile_port=LoudGroupProfilePort(),

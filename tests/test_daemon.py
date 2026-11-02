@@ -109,6 +109,9 @@ def _ctx(**overrides: object) -> SimpleNamespace:
         "session_lease": None,
     }
     values.update(overrides)
+    request = daemon.daemon_shutdown.ShutdownRequest()
+    request.event = cast(asyncio.Event, values["shutdown_event"])
+    values["shutdown_request"] = request
     return SimpleNamespace(**values)
 
 
@@ -712,7 +715,7 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
         handler_manager=None,
     )
 
-    async def build_context() -> object:
+    async def build_context(_request: object) -> object:
         events.append("context")
         return ctx
 
@@ -1151,7 +1154,7 @@ async def test_latched_coordinator_stop_keeps_local_daemon_socket_available(  # 
     api = DaemonAPIServer(
         conn,
         cast(DaemonClientLike, client),
-        shutdown,
+        lambda _reason: shutdown.set(),
         FeedbackApplicationService(SQLiteFeedbackStore(feedback_conn)),
         writer=inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
@@ -1272,7 +1275,7 @@ async def test_protective_monitor_cancels_active_coordinator_without_closing_loc
     api = DaemonAPIServer(
         conn,
         cast(DaemonClientLike, client),
-        shutdown,
+        lambda _reason: shutdown.set(),
         writer=inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
@@ -1632,6 +1635,43 @@ async def test_shutdown_cancels_disconnects_and_detaches_before_flushing_telemet
     assert stages.index("flood_detach") < stages.index("flush")
     assert stages.index("flush") < stages.index("sink_close")
     assert stages.index("sink_close") < stages.index("connections_close")
+
+
+async def test_shutdown_waits_for_disconnect_before_scheduler_and_connection_close() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    stages: list[str] = []
+
+    class Client(_ClientStub):
+        async def disconnect(self) -> None:
+            entered.set()
+            await release.wait()
+            stages.append("disconnect")
+
+        async def close_rpc_scheduler(self) -> None:
+            stages.append("scheduler")
+
+    class Connection(_ConnectionStub):
+        def close(self) -> None:
+            stages.append("connection")
+
+    ctx = _typed_ctx(client=Client(), conn=Connection())
+    task = asyncio.create_task(_shutdown_sync_main_context(ctx))
+    try:
+        await entered.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert stages == []
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert stages == ["disconnect", "scheduler", "connection"]
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def _append_async(stages: list[str], stage: str) -> None:

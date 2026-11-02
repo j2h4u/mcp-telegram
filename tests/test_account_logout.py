@@ -6,6 +6,7 @@ import sqlite3
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from typing import cast
+from unittest.mock import Mock
 
 import pytest
 
@@ -26,6 +27,10 @@ from tests.helpers import (
 from tests.sqlite_writer_helpers import inline_writer
 
 
+class _TestDaemonAPIServer(DaemonAPIServer):
+    _shutdown_event: asyncio.Event
+
+
 @pytest.fixture
 def conn() -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(":memory:")
@@ -35,11 +40,14 @@ def conn() -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
-async def _server(conn: sqlite3.Connection, callback: Callable[[], Awaitable[None]] | None = None) -> DaemonAPIServer:
-    server = DaemonAPIServer(
+async def _server(
+    conn: sqlite3.Connection, callback: Callable[[], Awaitable[None]] | None = None
+) -> _TestDaemonAPIServer:
+    shutdown_event = asyncio.Event()
+    server = _TestDaemonAPIServer(
         conn,
         cast(DaemonClientLike, object()),
-        asyncio.Event(),
+        lambda _reason: shutdown_event.set(),
         writer=inline_writer(conn),
         account_logout=callback,
         channel_profile_port=LoudChannelProfilePort(),
@@ -50,6 +58,7 @@ async def _server(conn: sqlite3.Connection, callback: Callable[[], Awaitable[Non
         chat_avatar_history_port=LoudChatAvatarHistoryPort(),
         policy=make_daemon_api_policy(),
     )
+    server._shutdown_event = shutdown_event
     server._ready = True
     server.self_id = 42
     server.self_profile = {"id": 42, "first_name": "Retained identity"}
@@ -98,7 +107,7 @@ def _response(writer: _Writer) -> dict[str, object]:
     return cast(dict[str, object], json.loads(b"".join(writer.written)))
 
 
-def _assert_identity_retained(server: DaemonAPIServer, *, ready: bool = True) -> None:
+def _assert_identity_retained(server: _TestDaemonAPIServer, *, ready: bool = True) -> None:
     assert server._ready is ready
     assert server.self_id == 42
     assert server.self_profile == {"id": 42, "first_name": "Retained identity"}
@@ -165,6 +174,8 @@ async def test_confirmed_logout_clears_identity_before_reply_and_shutdown(
         await confirmed.wait()
 
     server = await _server(conn, logout)
+    request_shutdown = Mock(wraps=server._request_shutdown)
+    server._request_shutdown = request_shutdown
     server._ready = ready
     writer = _Writer(server._shutdown_event, release_drain=flushed)
     task = asyncio.create_task(server.handle_client(_reader(eof=False), cast(asyncio.StreamWriter, writer)))
@@ -186,6 +197,7 @@ async def test_confirmed_logout_clears_identity_before_reply_and_shutdown(
         flushed.set()
         await asyncio.wait_for(task, 1)
         assert server._shutdown_event.is_set()
+        request_shutdown.assert_called_once_with("logout_account")
         assert writer.closed
     finally:
         task.cancel()

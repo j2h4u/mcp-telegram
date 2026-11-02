@@ -83,7 +83,7 @@ def trace_server(tmp_path: Path) -> Iterator[tuple[DaemonAPIServer, sqlite3.Conn
     server = DaemonAPIServer(
         conn,
         client,
-        asyncio.Event(),
+        lambda _reason: asyncio.Event().set(),
         writer=inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),

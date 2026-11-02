@@ -204,7 +204,7 @@ def _make_server(
     server = DaemonAPIServer(
         conn,
         cast(DaemonClientLike, client),
-        shutdown_event,
+        lambda _reason: shutdown_event.set(),
         writer=inline_writer(conn),
         channel_profile_port=channel_profile_port,
         group_profile_port=LoudGroupProfilePort(),

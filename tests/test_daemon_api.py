@@ -349,13 +349,17 @@ def _activity_data(resp: dict[str, object]) -> dict[str, object]:
     return cast(dict[str, object], resp["data"])
 
 
+class _TestDaemonAPIServer(DaemonAPIServer):
+    _shutdown_event: asyncio.Event
+
+
 def make_server(
     conn: sqlite3.Connection | None = None,
     client: object | None = None,
     feedback_conn: sqlite3.Connection | None = None,
     hydration_requester: Callable[[sqlite3.Connection, int, int], None] | None = None,
     writer: SQLiteWriter | None = None,
-) -> DaemonAPIServer:
+) -> _TestDaemonAPIServer:
     """Return a DaemonAPIServer wired to in-memory DB and mock client."""
     if conn is None:
         conn = _make_db()
@@ -370,10 +374,10 @@ def make_server(
             "message TEXT NOT NULL, severity TEXT, context TEXT, model TEXT, harness TEXT)"
         )
     shutdown_event = asyncio.Event()
-    server = DaemonAPIServer(
+    server = _TestDaemonAPIServer(
         conn,
         cast(DaemonClientLike, client),
-        shutdown_event,
+        lambda _reason: shutdown_event.set(),
         FeedbackApplicationService(SQLiteFeedbackStore(feedback_conn)),
         writer=writer if writer is not None else inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
@@ -385,6 +389,7 @@ def make_server(
         chat_avatar_history_port=LoudChatAvatarHistoryPort(),
         policy=make_daemon_api_policy(),
     )
+    server._shutdown_event = shutdown_event
     server._ready = True
 
     sink = MagicMock()
@@ -529,7 +534,7 @@ def test_daemon_api_server_uses_explicit_sync_db_path(tmp_path: Path) -> None:
     server = DaemonAPIServer(
         conn,
         cast(DaemonClientLike, client),
-        asyncio.Event(),
+        lambda _reason: asyncio.Event().set(),
         sync_db_path=sync_db_path,
         writer=inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
@@ -2851,6 +2856,8 @@ async def test_recovery_authorization_reply_precedes_orderly_shutdown() -> None:
         calls.append((generation, acknowledged))
 
     server._account_recovery = authorize
+    request_shutdown = MagicMock(wraps=server._request_shutdown)
+    server._request_shutdown = request_shutdown
     reader = asyncio.StreamReader()
     reader.feed_data(
         b'{"method":"recover_account","expected_generation":"current","acknowledge_unknown_outcome":true}\n'
@@ -2868,6 +2875,7 @@ async def test_recovery_authorization_reply_precedes_orderly_shutdown() -> None:
     await server.handle_client(reader, writer)
     assert calls == [("current", True)]
     assert server._shutdown_event.is_set()
+    request_shutdown.assert_called_once_with("recover_account")
 
 
 async def test_recovery_without_acknowledgement_does_not_call_write_owner() -> None:

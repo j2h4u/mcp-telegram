@@ -795,7 +795,7 @@ class DaemonAPIServer:
         self,
         conn: sqlite3.Connection,
         client: DaemonClientLike,
-        shutdown_event: asyncio.Event,
+        request_shutdown: Callable[[str], None],
         feedback_service: FeedbackService | None = None,
         sync_db_path: Path | None = None,
         *,
@@ -820,7 +820,7 @@ class DaemonAPIServer:
         self._sync_db_path = _resolve_sync_db_path(conn, sync_db_path)
         self._feedback_service = feedback_service
         self._client = client
-        self._shutdown_event = shutdown_event
+        self._request_shutdown = request_shutdown
         # Phase 39.1: cached authenticated user id, populated once by
         # sync_main() after client.connect() completes (see daemon.py).
         # Query-build paths (Plan 39.1-02) read this as a bound SQL parameter
@@ -1339,7 +1339,7 @@ class DaemonAPIServer:
         finally:
             await self._finish_client_connection(handler, writer, method, (pending_read, request_task))
             if restart_authorized:
-                self._shutdown_event.set()
+                self._request_shutdown(method)
 
     async def _finish_client_connection(
         self,

@@ -38,7 +38,7 @@ async def test_cancelled_bootstrap_retains_lease_until_its_thread_stops(monkeypa
     open_writer = AsyncMock(side_effect=AssertionError("cancelled startup must not create a writer"))
     monkeypatch.setattr(daemon, "_bootstrap_sync_database", bootstrap)
     monkeypatch.setattr(daemon.SQLiteWriter, "open", open_writer)
-    build = asyncio.create_task(daemon._build_sync_main_context())
+    build = asyncio.create_task(daemon._build_sync_main_context(daemon.daemon_shutdown.ShutdownRequest()))
     try:
         await asyncio.wait_for(entered.wait(), timeout=5)
         build.cancel()
@@ -153,11 +153,10 @@ async def test_composition_failure_closes_client_before_releasing_session_lease(
 
     monkeypatch.setattr(daemon, "_bootstrap_sync_database", bootstrap)
     monkeypatch.setattr(daemon, "_create_telegram_client", lambda *_args: client)
-    monkeypatch.setattr(daemon.daemon_shutdown, "register_shutdown_handler", lambda _loop: asyncio.Event())
     monkeypatch.setattr(daemon, "_install_flood_wait_kill_switch", lambda *_args: None)
     monkeypatch.setattr(daemon, "TopicRefresher", fail_topic_constructor)
     with pytest.raises(RuntimeError, match="synthetic (composition|lease binding) failure"):
-        await daemon._build_sync_main_context()
+        await daemon._build_sync_main_context(daemon.daemon_shutdown.ShutdownRequest())
     assert events == ["disconnect", "scheduler"]
     with telegram_session_lease(state_dir):
         pass

@@ -1,7 +1,10 @@
 import asyncio
 import signal
+import sqlite3
 import subprocess
 import sys
+import tempfile
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -20,7 +23,7 @@ async def _check_worker_exit_stops_sibling(monkeypatch: pytest.MonkeyPatch, exit
         return worker
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
-    assert await service_processes.run_service(host="127.0.0.1", port=3100, shutdown_seconds=0.1) == 1
+    assert await service_processes.run_service(host="127.0.0.1", port=3100) == 1
     assert len(workers) == 2
     assert all(worker.returncode is not None for worker in workers)
 
@@ -38,7 +41,7 @@ async def _check_partial_start_failure_stops_first_worker(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
     with pytest.raises(OSError, match="second worker"):
-        await service_processes.run_service(host="127.0.0.1", port=3100, shutdown_seconds=0.1)
+        await service_processes.run_service(host="127.0.0.1", port=3100)
     assert workers[0].returncode is not None
 
 
@@ -68,21 +71,38 @@ async def _check_operator_stop_drains_http_before_daemon(monkeypatch: pytest.Mon
     monkeypatch.setattr(loop, "remove_signal_handler", lambda sig: True)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
     monkeypatch.setattr(service_processes, "_signal_worker", observe_signal)
-    assert await service_processes.run_service(host="127.0.0.1", port=3100, shutdown_seconds=0.2) == 0
+    assert await service_processes.run_service(host="127.0.0.1", port=3100) == 0
     assert signals[:2] == [workers[1].pid, workers[0].pid]
     assert all(worker.returncode is not None for worker in workers)
 
 
-async def _check_stopped_worker_is_killed_after_grace() -> None:
-    worker = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(60)")
-    worker.send_signal(signal.SIGSTOP)
-    try:
-        await service_processes._stop_workers([worker], orderly=False, shutdown_seconds=0.03, http_drain_seconds=0.01)
-        assert worker.returncode == -signal.SIGKILL
-    finally:
-        if worker.returncode is None:
-            worker.kill()
-        await worker.wait()
+async def _check_slow_worker_is_allowed_to_finish(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def expired_wait(_workers: object, _timeout: float) -> None:
+        return None
+
+    monkeypatch.setattr(service_processes, "_wait_workers", expired_wait)
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "result.sqlite"
+        code = (
+            "import signal,sqlite3,sys,time\n"
+            "def stop(*_):\n"
+            " time.sleep(.15)\n"
+            " conn=sqlite3.connect(sys.argv[1]); conn.execute('create table receipt (value text)'); "
+            "conn.execute(\"insert into receipt values ('committed')\"); conn.commit(); conn.close(); exit(0)\n"
+            "signal.signal(signal.SIGTERM, stop); print('ready', flush=True); time.sleep(60)"
+        )
+        worker = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", code, str(path), stdout=asyncio.subprocess.PIPE
+        )
+        assert worker.stdout is not None
+        await worker.stdout.readline()
+        stop = asyncio.create_task(service_processes._stop_workers([worker], orderly=False, http_drain_seconds=0.01))
+        await asyncio.sleep(0.05)
+        assert not stop.done()
+        await stop
+        assert worker.returncode == 0
+        with closing(sqlite3.connect(path)) as conn:
+            assert conn.execute("select value from receipt").fetchone() == ("committed",)
 
 
 async def _run_scenario(scenario: str) -> None:
@@ -94,7 +114,7 @@ async def _run_scenario(scenario: str) -> None:
         elif scenario == "stop":
             await _check_operator_stop_drains_http_before_daemon(monkeypatch)
         else:
-            await _check_stopped_worker_is_killed_after_grace()
+            await _check_slow_worker_is_allowed_to_finish(monkeypatch)
 
 
 @pytest.mark.parametrize("scenario", ["sync", "http", "partial", "stop", "kill"])

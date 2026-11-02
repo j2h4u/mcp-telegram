@@ -100,13 +100,30 @@ def test_summary_is_one_coherent_content_free_report(tmp_path: Path) -> None:
     report = build_operator_summary(db_path, since_seconds=15 * 3600, now=now)
 
     assert report.window_complete is True
-    assert "Runtime: starts=1, clean stops=0, task failures=0" in report.text
+    assert "Runtime: recorded starts=1, recorded stops=0, task failures=0" in report.text
     assert "Dialog state: access_lost=1, synced=2" in report.text
     assert "MCP: calls=2, errors=1 (tool_error=1)" in report.text
     assert "Slow MCP calls: get_entity_info=1.5s, attribution=unavailable" in report.text
     assert "scheduled_messages: dispatched=12, worst wait=9.0s, max queue=2" in report.text
     assert "sync.read_reconciliation applied=1" in report.text
     assert "get_entity_info: tool_error" in report.text
+
+
+def test_summary_reports_prior_stop_reasons_with_a_newer_start(tmp_path: Path) -> None:
+    now = 2_000_000_000.0
+    db_path = tmp_path / "sync.db"
+    _database(db_path, now_ms=int(now * 1000))
+    with closing(sqlite3.connect(db_path)) as conn, conn:
+        conn.executemany(
+            "INSERT INTO runtime_observations(observed_at_ms,kind,runtime_instance_id,reason_code) VALUES (?,?,?,?)",
+            [
+                (int(now * 1000) - 20_000, "runtime.stopped", "old1", "sigterm"),
+                (int(now * 1000) - 15_000, "runtime.stopped", "old2", None),
+            ],
+        )
+    report = build_operator_summary(db_path, since_seconds=3600, now=now)
+    assert "Recorded stop reasons: sigterm=1, unknown=1" in report.text
+    assert "stop recorded=no" in report.text
 
 
 def test_rpc_admission_summary_explains_full_buckets_selected_by_end_time(tmp_path: Path) -> None:

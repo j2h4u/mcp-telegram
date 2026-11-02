@@ -8,9 +8,7 @@ import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
-SHUTDOWN_SECONDS = 40.0
 HTTP_DRAIN_SECONDS = 30.0
-KILL_REAP_SECONDS = 1.0
 WORKER_COUNT = 2
 
 
@@ -31,26 +29,16 @@ async def _wait_workers(workers: list[asyncio.subprocess.Process], timeout: floa
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def _stop_workers(
-    workers: list[asyncio.subprocess.Process], *, orderly: bool, shutdown_seconds: float, http_drain_seconds: float
-) -> None:
-    deadline = asyncio.get_running_loop().time() + shutdown_seconds
+async def _stop_workers(workers: list[asyncio.subprocess.Process], *, orderly: bool, http_drain_seconds: float) -> None:
     if orderly and len(workers) == WORKER_COUNT:
         _signal_worker(workers[1], signal.SIGTERM)
-        await _wait_workers([workers[1]], min(http_drain_seconds, shutdown_seconds))
+        await _wait_workers([workers[1]], http_drain_seconds)
     for worker in workers:
         _signal_worker(worker, signal.SIGTERM)
-    await _wait_workers(workers, deadline - asyncio.get_running_loop().time())
-    for worker in workers:
-        _signal_worker(worker, signal.SIGKILL)
-    # A worker in kernel disk sleep may not exit even after SIGKILL. Never
-    # respawn it here or wait indefinitely; Docker owns the whole-container restart.
-    await _wait_workers(workers, KILL_REAP_SECONDS)
+    await asyncio.gather(*(worker.wait() for worker in workers))
 
 
-async def run_service(
-    *, host: str, port: int, shutdown_seconds: float = SHUTDOWN_SECONDS, http_drain_seconds: float = HTTP_DRAIN_SECONDS
-) -> int:
+async def run_service(*, host: str, port: int, http_drain_seconds: float = HTTP_DRAIN_SECONDS) -> int:
     """Start once, stop both on a worker exit, and leave restart to Docker."""
     executable = Path(sys.executable).with_name("mcp-telegram")
     workers: list[asyncio.subprocess.Process] = []
@@ -75,9 +63,7 @@ async def run_service(
                 logger.error("Service worker %s exited with status %s; stopping service", index, task.result())
         return 1
     finally:
-        await _stop_workers(
-            workers, orderly=orderly, shutdown_seconds=shutdown_seconds, http_drain_seconds=http_drain_seconds
-        )
+        await _stop_workers(workers, orderly=orderly, http_drain_seconds=http_drain_seconds)
         for task in [*waits, stop_task]:
             task.cancel()
         await asyncio.gather(*waits, stop_task, return_exceptions=True)

@@ -131,7 +131,7 @@ crap-threshold:
 
 # Rebuild and restart the live Docker container.
 runtime-build:
-    docker compose -f {{compose_file}} up -d --build {{container}}
+    docker compose -f {{compose_file}} up -d --build --timeout -1 {{container}}
 
 # Wait until the live Docker container reports healthy.
 runtime-wait:

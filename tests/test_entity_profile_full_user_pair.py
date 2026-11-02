@@ -324,7 +324,7 @@ async def test_protective_disconnect_serves_valid_partial_profile_from_local_cac
     api = DaemonAPIServer(
         conn,
         cast(DaemonClientLike, client),
-        asyncio.Event(),
+        lambda _reason: asyncio.Event().set(),
         writer=inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),

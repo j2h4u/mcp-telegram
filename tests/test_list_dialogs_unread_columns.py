@@ -251,7 +251,7 @@ def _make_server(conn: sqlite3.Connection, client: object) -> DaemonAPIServer:
     server = DaemonAPIServer(
         conn,
         cast(DaemonClientLike, client),
-        asyncio.Event(),
+        lambda _reason: asyncio.Event().set(),
         writer=inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),

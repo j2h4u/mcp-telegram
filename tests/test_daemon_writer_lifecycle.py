@@ -82,6 +82,7 @@ async def test_shutdown_preserves_finalizer_commit_loss_boundary_and_final_marke
             writer=writer,
             feedback_owner=SimpleNamespace(aclose=AsyncMock()),
             shutdown_event=asyncio.Event(),
+            shutdown_request=daemon.daemon_shutdown.ShutdownRequest(),
             client=Client(),
             api_server=Api(),
             socket_path=tmp_path / "daemon.sock",
@@ -96,6 +97,7 @@ async def test_shutdown_preserves_finalizer_commit_loss_boundary_and_final_marke
             session_lease=None,
         ),
     )
+    ctx.shutdown_request.request("sigterm")
     try:
         await daemon._shutdown_sync_main_context(ctx)
         assert ctx.shutdown_event.is_set()
@@ -115,6 +117,12 @@ async def test_shutdown_preserves_finalizer_commit_loss_boundary_and_final_marke
                 "runtime.telemetry_loss",
                 "runtime.stopped",
             ]
+            assert (
+                check.execute("SELECT reason_code FROM runtime_observations WHERE kind = 'runtime.stopped'").fetchone()[
+                    0
+                ]
+                == "sigterm"
+            )
             loss_payload = cast(dict[str, object], json.loads(rows[-2][1]))
             assert loss_payload["queue_full_drops"] == 1
             assert (
@@ -150,7 +158,11 @@ async def test_cancelled_feedback_close_still_releases_sync_resources() -> None:
     ctx = cast(
         daemon._SyncMainContext,
         SimpleNamespace(
-            feedback_owner=SimpleNamespace(aclose=close_feedback), writer=writer, conn=reader, session_lease=lease
+            feedback_owner=SimpleNamespace(aclose=close_feedback),
+            writer=writer,
+            conn=reader,
+            session_lease=lease,
+            shutdown_request=daemon.daemon_shutdown.ShutdownRequest(),
         ),
     )
     # A real sqlite connection has a synchronous close.

@@ -110,7 +110,7 @@ def _local_daemon(
     daemon = DaemonAPIServer(
         sync_conn,
         cast(DaemonClientLike, client),
-        asyncio.Event(),
+        lambda _reason: asyncio.Event().set(),
         FeedbackApplicationService(SQLiteFeedbackStore(feedback_conn)),
         writer=inline_writer(sync_conn),
         channel_profile_port=LoudChannelProfilePort(),
