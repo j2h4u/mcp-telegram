@@ -16,6 +16,7 @@ from mcp_telegram.daemon import (
     _monitor_sqlite_writer,
     _SyncMainContext,
 )
+from mcp_telegram.daemon_shutdown import ShutdownRequest
 from mcp_telegram.folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import ensure_sync_schema, open_sync_db_reader
@@ -32,13 +33,14 @@ async def test_retired_owner_clears_readiness_and_requests_shutdown(tmp_path: Pa
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     writer = await SQLiteWriter.open(path)
-    shutdown = asyncio.Event()
+    shutdown = ShutdownRequest()
     api = _ReadyAPI()
     ctx = cast(
         _SyncMainContext,
         SimpleNamespace(
             writer=writer,
-            shutdown_event=shutdown,
+            shutdown_event=shutdown.event,
+            shutdown_request=shutdown,
             api_server=api,
             rpc_observation_sink=None,
             background_tasks=set(),
@@ -50,7 +52,8 @@ async def test_retired_owner_clears_readiness_and_requests_shutdown(tmp_path: Pa
             await writer.run(lambda conn: conn.close())
         with pytest.raises(RuntimeError, match="SQLite write owner failed"):
             await monitor
-        await asyncio.wait_for(shutdown.wait(), timeout=1)
+        await asyncio.wait_for(shutdown.event.wait(), timeout=1)
+        assert shutdown.reason_code == "critical_task_failed"
         assert not api._ready
         assert "sqlite_write_owner" in api.startup_detail
     finally:
