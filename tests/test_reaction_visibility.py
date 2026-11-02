@@ -40,7 +40,7 @@ def conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     ensure_sync_schema(path)
     connection = sqlite3.connect(path)
     connection.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (1,'synced')")
-    connection.execute("INSERT INTO full_history_enrollment VALUES (1,1,'explicit',1)")
+    connection.execute("INSERT INTO full_history_enrollment VALUES (1,1,1)")
     connection.execute("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (1,2,1)")
     connection.commit()
     yield connection

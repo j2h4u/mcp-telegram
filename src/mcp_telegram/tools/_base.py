@@ -335,11 +335,12 @@ def _restore_sync_status_schema(
         return
     properties = t.cast(dict[str, object], normalized["properties"])
     original = t.cast(dict[str, object], temporal["properties"])
-    for key in ("latest_retained_message", "message_delivery"):
+    for key in ("enrollment_enabled", "latest_retained_message", "message_delivery"):
         properties[key] = deepcopy(original[key])
     required = t.cast(list[str], normalized["required"])
-    if "latest_retained_message" not in required:
-        required.append("latest_retained_message")
+    for key in ("enrollment_enabled", "latest_retained_message"):
+        if key not in required:
+            required.append(key)
 
 
 def _protection_output_schema(schema: dict[str, object] | None) -> dict[str, object] | None:

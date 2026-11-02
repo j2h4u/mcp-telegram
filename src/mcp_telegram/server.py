@@ -578,7 +578,7 @@ def _restore_sync_status_nulls(
 ) -> None:
     if name == "get_sync_status" and not tool_result.is_error and structured_content is not None:
         original = tool_result.structured_content or {}
-        for key in ("latest_retained_message", "message_delivery"):
+        for key in ("enrollment_enabled", "latest_retained_message", "message_delivery"):
             if key in original:
                 structured_content[key] = deepcopy(original[key])
 

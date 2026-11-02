@@ -270,11 +270,11 @@ async def test_dm_enrollment_consumes_completed_publication_locally_and_idempote
         [(111, "user", "Alice", 17, None), (112, "bot", "Helper", None, 23), (113, "group", "Group", 99, 99)],
     )
     conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (114,'access_lost')")
-    seed_full_history_enrollment(conn, 114, enabled=True, source="automatic")
+    seed_full_history_enrollment(conn, 114, enabled=True)
     conn.execute(
         "INSERT INTO dialogs(dialog_id,type,name,read_inbox_max_id,read_outbox_max_id,identity_complete) VALUES (114,'user','Lost',31,41,1)"
     )
-    seed_full_history_enrollment(conn, 112, enabled=False, source="explicit")
+    seed_full_history_enrollment(conn, 112, enabled=False)
     conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (112,'not_synced')")
     conn.execute(
         "INSERT INTO entities(id,type,name,username,name_normalized,updated_at) VALUES (111,'user','Richer','richer','richer',100)"

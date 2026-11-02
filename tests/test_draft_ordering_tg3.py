@@ -12,7 +12,6 @@ from typing import cast
 import pytest
 from telethon.tl import types  # type: ignore[import-untyped]
 
-from helpers import remove_v80_schema_for_historical_fixture
 from mcp_telegram.config import DraftRecoveryConfig
 from mcp_telegram.drafts.contracts import (
     DraftComposition,
@@ -24,7 +23,7 @@ from mcp_telegram.drafts.contracts import (
 )
 from mcp_telegram.drafts.sqlite_projection import SQLiteDraftProjection
 from mcp_telegram.drafts.telethon_adapter import normalize_update_draft
-from mcp_telegram.sync_db import _CURRENT_SCHEMA_VERSION, ensure_sync_schema
+from mcp_telegram.sync_db import _apply_migration_76, ensure_sync_schema
 
 
 @pytest.fixture()
@@ -270,13 +269,10 @@ def test_migrated_v75_null_order_rows_are_fenced_until_authoritative_bootstrap(
     ensure_sync_schema(database)
     conn = sqlite3.connect(database)
     request.addfinalizer(conn.close)
-    remove_v80_schema_for_historical_fixture(conn)
-    conn.commit()
     conn.execute("ALTER TABLE draft_current DROP COLUMN source_order_at")
     conn.execute("ALTER TABLE draft_sync_state DROP COLUMN source_order_floor")
     conn.execute("DROP TABLE draft_order_uncertainty")
-    conn.execute("DELETE FROM schema_version WHERE version>=76")
-    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (75,)
+    conn.execute("DELETE FROM schema_version WHERE version=76")
     current_columns = cast(list[tuple[int, str]], conn.execute("PRAGMA table_info(draft_current)").fetchall())
     state_columns = cast(list[tuple[int, str]], conn.execute("PRAGMA table_info(draft_sync_state)").fetchall())
     assert "source_order_at" not in {row[1] for row in current_columns}
@@ -292,11 +288,7 @@ def test_migrated_v75_null_order_rows_are_fenced_until_authoritative_bootstrap(
         "VALUES (100,402,'empty',1,'realtime_empty',1,1,1,2,1)"
     )
     conn.commit()
-    conn.close()
-    ensure_sync_schema(database)
-    conn = sqlite3.connect(database)
-    request.addfinalizer(conn.close)
-    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (_CURRENT_SCHEMA_VERSION,)
+    assert _apply_migration_76(conn, 75) == 76
     assert conn.execute(
         "SELECT dialog_id,state,text,source_order_at FROM draft_current ORDER BY dialog_id"
     ).fetchall() == [(401, "present", "legacy", None), (402, "empty", None, None)]

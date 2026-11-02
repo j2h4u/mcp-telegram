@@ -190,9 +190,7 @@ def test_transcription_creates_neither_version_nor_change_alert(conn: sqlite3.Co
 def _make_hydration_eligible(conn: sqlite3.Connection, status: str = "synced") -> None:
     with write_transaction(conn):
         conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (42, ?)", (status,))
-        conn.execute(
-            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (42, 1, 'explicit', 1)"
-        )
+        conn.execute("INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (42, 1, 1)")
 
 
 @pytest.mark.parametrize("media_kind", ["contact", "other"])
@@ -629,9 +627,7 @@ def test_transcription_repair_excludes_ineligible_and_queued_messages(conn: sqli
     _make_hydration_eligible(conn)
     with write_transaction(conn):
         conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (43, 'access_lost')")
-        conn.execute(
-            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (43, 1, 'explicit', 1)"
-        )
+        conn.execute("INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (43, 1, 1)")
         conn.executemany(
             "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload, is_deleted, out) "
             "VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",

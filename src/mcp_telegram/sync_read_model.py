@@ -16,6 +16,76 @@ class SyncReadModelContractError(ValueError):
     """Raised when canonical sync facts cannot be built or decoded safely."""
 
 
+@dataclass(frozen=True, slots=True)
+class AutomaticGroupFacts:
+    enrollment_enabled: bool | None
+    is_group: bool | None
+    members: int | None
+    created: int | None
+    hidden: bool | None
+    coverage_status: str | None
+    retry_at: int | None
+
+
+def automatic_group_status(
+    facts: AutomaticGroupFacts, *, now: int, max_members: int | None, recent_days: int | None
+) -> dict[str, object]:
+    """Describe current local eligibility; a fresh Telegram total is not known here."""
+    reason = _automatic_group_blocker(facts, now=now, max_members=max_members, recent_days=recent_days)
+    result: dict[str, object] = {
+        "eligibility": (
+            "eligible_for_probe"
+            if reason == "eligible"
+            else "unknown"
+            if reason in {"policy_unavailable", "dialog_metadata_unknown", "group_metadata_unknown"}
+            else "blocked"
+        ),
+        "reason": reason,
+        "fresh_telegram_total": "unknown",
+    }
+    if reason == "retry_wait" and facts.retry_at is not None:
+        result["retry_at"] = facts.retry_at
+    return result
+
+
+def _automatic_group_blocker(
+    facts: AutomaticGroupFacts, *, now: int, max_members: int | None, recent_days: int | None
+) -> str:
+    if facts.enrollment_enabled is True:
+        return "already_enabled"
+    if facts.enrollment_enabled is False:
+        return "disabled"
+    if max_members is None or recent_days is None:
+        return "policy_unavailable"
+    return _automatic_group_metadata_blocker(facts, now=now, max_members=max_members, recent_days=recent_days)
+
+
+def _automatic_group_metadata_blocker(
+    facts: AutomaticGroupFacts, *, now: int, max_members: int, recent_days: int
+) -> str:
+    if facts.is_group is None or facts.hidden is None:
+        return "dialog_metadata_unknown"
+    if not facts.is_group:
+        return "not_a_group"
+    if facts.hidden:
+        return "hidden"
+    if facts.coverage_status in {"access_lost", "synced"}:
+        return "access_lost" if facts.coverage_status == "access_lost" else "already_synced"
+    return _automatic_group_limits_blocker(facts, now=now, max_members=max_members, recent_days=recent_days)
+
+
+def _automatic_group_limits_blocker(facts: AutomaticGroupFacts, *, now: int, max_members: int, recent_days: int) -> str:
+    if facts.members is None or facts.created is None:
+        return "group_metadata_unknown"
+    if not 1 <= facts.members <= max_members:
+        return "member_limit"
+    if facts.created < now - recent_days * 86400:
+        return "outside_recent_window"
+    if facts.retry_at is not None and facts.retry_at > now:
+        return "retry_wait"
+    return "eligible"
+
+
 def decode_latest_retained_message(value: object) -> dict[str, int] | None:
     """Validate the daemon's optional retained message identity and source time."""
     if value is None:

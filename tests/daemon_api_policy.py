@@ -18,6 +18,7 @@ def make_daemon_api_policy() -> DaemonApiPolicy:
         resolver_enrichment_ttl_seconds=freshness.entities.resolver_enrichment_ttl_seconds,
         folder_snapshot_stale_after_seconds=scheduling.folder_projection.stale_threshold_seconds,
         telemetry=TelemetryConfig(),
+        automatic_group_history=scheduling.automatic_group_history,
         slow_request_seconds=LoggingConfig().daemon_api_slow_request_seconds,
         draft_response_budget_bytes=256 * 1024,
         entity_profile=RefreshLimits(

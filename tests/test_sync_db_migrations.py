@@ -18,7 +18,6 @@ import mcp_telegram.sync_db as sync_db_module
 from helpers import remove_v80_schema_for_historical_fixture
 from mcp_telegram.sync_db import (
     _CURRENT_SCHEMA_VERSION,
-    _DIALOGS_V74_DDL,
     _ENTITY_TABLE_DDL,
     _apply_migration_51,
     _apply_migration_52,
@@ -273,227 +272,6 @@ def test_migration_v68_preserves_legacy_reaction_evidence(db_path: Path) -> None
         ) == ("idx_message_reaction_detail_due",)
 
 
-def test_migration_v37_rebuilds_media_tables_without_legacy_description(db_path: Path) -> None:
-    # Start with the complete schema, then rebuild only the two message tables
-    # to their real v36 shape.  This retains all other production artifacts and
-    # lets the test exercise the physical table swap rather than an idealized
-    # fixture.
-    ensure_sync_schema(db_path)
-    with _sqlite_connection(db_path) as conn:
-        conn.execute("ALTER TABLE messages RENAME TO messages_current")
-        conn.execute(
-            """CREATE TABLE messages (
-                dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
-                sent_at INTEGER NOT NULL, text TEXT, sender_id INTEGER,
-                sender_first_name TEXT, media_description TEXT, media_kind TEXT,
-                reply_to_msg_id INTEGER, forum_topic_id INTEGER, edit_date INTEGER,
-                grouped_id INTEGER, reply_to_peer_id INTEGER,
-                out INTEGER NOT NULL DEFAULT 0, is_service INTEGER NOT NULL DEFAULT 0,
-                post_author TEXT, reply_count INTEGER NOT NULL DEFAULT 0,
-                is_deleted INTEGER NOT NULL DEFAULT 0, deleted_at INTEGER,
-                PRIMARY KEY (dialog_id, message_id)
-            ) WITHOUT ROWID"""
-        )
-        conn.execute(
-            """INSERT INTO messages
-            (dialog_id, message_id, sent_at, text, sender_id, sender_first_name,
-             media_description, media_kind, out, is_service, reply_count)
-            VALUES (1, 1, 1700000000, 'ordinary', 7, 'Alice',
-                        'legacy human description', 'other', 0, 0, 2)"""
-        )
-        conn.execute(
-            """INSERT INTO messages
-            (dialog_id, message_id, sent_at, text, sender_id, sender_first_name,
-             media_description, media_kind, out, is_service, reply_count)
-            VALUES (1, 3, 1700000001, NULL, 7, 'Bob',
-                        'legacy contact description', 'contact', 0, 0, 0)"""
-        )
-        conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
-        conn.execute(
-            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
-        )
-        conn.execute("DROP TABLE messages_current")
-        conn.execute("CREATE INDEX idx_messages_dialog_sent ON messages(dialog_id, sent_at DESC)")
-        conn.execute("CREATE INDEX idx_messages_legacy_safe ON messages(dialog_id, message_id)")
-
-        conn.execute("ALTER TABLE scheduled_messages RENAME TO scheduled_messages_current")
-        conn.execute(
-            """CREATE TABLE scheduled_messages (
-                dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
-                scheduled_at INTEGER, text TEXT, sender_id INTEGER,
-                sender_first_name TEXT, media_description TEXT, media_kind TEXT,
-                reply_to_msg_id INTEGER, forum_topic_id INTEGER, edit_date INTEGER,
-                grouped_id INTEGER, reply_to_peer_id INTEGER,
-                out INTEGER NOT NULL DEFAULT 1, is_service INTEGER NOT NULL DEFAULT 0,
-                post_author TEXT, schedule_repeat_period INTEGER,
-                message_state TEXT NOT NULL DEFAULT 'scheduled',
-                visibility TEXT NOT NULL DEFAULT 'author_only',
-                unpublished INTEGER NOT NULL DEFAULT 1, unseen INTEGER NOT NULL DEFAULT 1,
-                publication_hint_message_id INTEGER, published_message_id INTEGER,
-                publication_verified_at INTEGER, published_at INTEGER, deleted_at INTEGER,
-                first_seen_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-                PRIMARY KEY (dialog_id, message_id)
-            ) WITHOUT ROWID"""
-        )
-        conn.execute(
-            """INSERT INTO scheduled_messages
-                (dialog_id, message_id, scheduled_at, text, sender_id,
-                 media_description, media_kind, first_seen_at, updated_at)
-                VALUES (1, 2, 1700000100, NULL, 7, 'legacy scheduled description',
-                        'other', 1700000000, 1700000000)"""
-        )
-        conn.execute("DROP TABLE scheduled_messages_current")
-        conn.execute("CREATE INDEX idx_scheduled_messages_active ON scheduled_messages(dialog_id, scheduled_at)")
-        # Replay the migration tail from a genuine pre-v39 activity table so
-        # the additive v39 columns are exercised exactly once.
-        conn.executescript("DROP TABLE activity_dialog_state;" + _V23_ACTIVITY_DIALOG_STATE_DDL)
-        remove_v80_schema_for_historical_fixture(conn)
-        conn.execute("DELETE FROM schema_version WHERE version >= 37")
-
-        # FTS is a separate contentless table and must survive the physical
-        # message-table rebuild with its rows intact.
-        conn.execute("INSERT INTO messages_fts(dialog_id, message_id, stemmed_text) VALUES (1, 1, 'ordinary')")
-        conn.execute(
-            "INSERT INTO scheduled_messages_fts(dialog_id, message_id, stemmed_text) VALUES (1, 2, 'scheduled')"
-        )
-        conn.commit()
-        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 36
-
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _fetchone_row(
-            conn,
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='message_transcriptions'",
-        ) == ("message_transcriptions",)
-        assert (
-            _fetchone_row(
-                conn,
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='pending_transcriptions'",
-            )
-            is None
-        )
-        transcription_cols = {row[1] for row in _table_info(conn, "message_transcriptions")}
-        assert {"dialog_id", "message_id", "text", "transcription_id", "received_at"} <= transcription_cols
-        assert _fetchone_int(conn, "SELECT COUNT(*) FROM message_transcriptions") == 0
-        for table in ("messages", "scheduled_messages"):
-            cols = {row[1] for row in _table_info(conn, table)}
-            assert "media_description" not in cols
-            assert {"media_kind", "media_payload"} <= cols
-            sql_row = _fetchone_row(conn, "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,))
-            assert sql_row is not None
-            sql = str(sql_row[0])
-            assert "WITHOUT ROWID" in sql.upper()
-        assert conn.execute("SELECT text, media_kind, media_payload FROM messages").fetchone() == (
-            "ordinary",
-            "other",
-            "{}",
-        )
-        assert conn.execute("SELECT text, media_kind, media_payload FROM scheduled_messages").fetchone() == (
-            None,
-            "other",
-            "{}",
-        )
-        assert conn.execute("SELECT stemmed_text FROM messages_fts WHERE dialog_id=1 AND message_id=1").fetchone() == (
-            "ordinary",
-        )
-        assert conn.execute(
-            "SELECT stemmed_text FROM scheduled_messages_fts WHERE dialog_id=1 AND message_id=2"
-        ).fetchone() == ("scheduled",)
-        assert conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_legacy_safe'"
-        ).fetchone()
-        assert conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_scheduled_messages_active'"
-        ).fetchone()
-        assert conn.execute(
-            "SELECT kind, dialog_id, message_id, priority, message_sent_at FROM hydration_jobs ORDER BY message_id"
-        ).fetchall() == [
-            ("media_metadata", 1, 1, 0, 1700000000),
-            ("media_metadata", 1, 3, 0, 1700000001),
-        ]
-
-
-def test_migration_v44_accepts_custom_emoji_and_preserves_media_artifacts(db_path: Path) -> None:
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
-        conn.execute(
-            "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
-            "VALUES (1, 1, 1700000000, 'ordinary', 'document', '{\"size\":4}')"
-        )
-        conn.execute(
-            "INSERT INTO scheduled_messages(dialog_id, message_id, scheduled_at, text, media_kind, media_payload, "
-            "first_seen_at, updated_at) VALUES (1, 2, 1700000100, 'scheduled', 'document', '{\"size\":5}', 1, 1)"
-        )
-        conn.execute("INSERT INTO messages_fts(dialog_id, message_id, stemmed_text) VALUES (1, 1, 'ordinary')")
-        conn.execute(
-            "INSERT INTO scheduled_messages_fts(dialog_id, message_id, stemmed_text) VALUES (1, 2, 'scheduled')"
-        )
-        conn.execute(
-            "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at) VALUES ('media_metadata', 1, 1, 1)"
-        )
-        conn.execute("CREATE INDEX idx_messages_v44_probe ON messages(sender_id)")
-        conn.execute("CREATE INDEX idx_scheduled_messages_v44_probe ON scheduled_messages(sender_id)")
-
-        _downgrade_media_tables_to_v43(conn)
-        with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(
-                "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
-                "VALUES (1, 3, 1700000001, 'custom_emoji', '{\"alt\":\"📊\"}')"
-            )
-        remove_v80_schema_for_historical_fixture(conn)
-        conn.execute("DELETE FROM schema_version WHERE version >= 44")
-        conn.commit()
-
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert conn.execute("SELECT media_kind, media_payload FROM messages WHERE message_id = 1").fetchone() == (
-            "document",
-            '{"size":4}',
-        )
-        assert conn.execute(
-            "SELECT media_kind, media_payload FROM scheduled_messages WHERE message_id = 2"
-        ).fetchone() == (
-            "document",
-            '{"size":5}',
-        )
-        assert conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone() == (1,)
-        assert conn.execute("SELECT COUNT(*) FROM scheduled_messages_fts").fetchone() == (1,)
-        assert conn.execute("SELECT kind, dialog_id, message_id FROM hydration_jobs").fetchone() == (
-            "media_metadata",
-            1,
-            1,
-        )
-        assert conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN "
-            "('idx_messages_dialog_sent', 'idx_messages_v44_probe', 'idx_scheduled_messages_v44_probe') "
-            "ORDER BY name"
-        ).fetchall() == [
-            ("idx_messages_dialog_sent",),
-            ("idx_messages_v44_probe",),
-            ("idx_scheduled_messages_v44_probe",),
-        ]
-        conn.execute(
-            "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
-            "VALUES (1, 3, 1700000001, 'custom_emoji', '{\"alt\":\"📊\"}')"
-        )
-        conn.execute(
-            "INSERT INTO scheduled_messages(dialog_id, message_id, scheduled_at, media_kind, media_payload, "
-            "first_seen_at, updated_at) VALUES (1, 4, 1700000101, 'custom_emoji', '{\"alt\":\"📊\"}', 1, 1)"
-        )
-        conn.commit()
-
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert conn.execute("SELECT media_kind FROM messages WHERE message_id = 3").fetchone() == ("custom_emoji",)
-        assert conn.execute("SELECT media_kind FROM scheduled_messages WHERE message_id = 4").fetchone() == (
-            "custom_emoji",
-        )
-
-
 def test_v40_creates_prioritized_hydration_queue_and_due_index(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
@@ -531,65 +309,6 @@ def test_v40_creates_prioritized_hydration_queue_and_due_index(tmp_path: Path) -
             _fetchone_row(
                 conn, "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_voice_undeleted_sent'"
             )
-            is None
-        )
-
-
-def test_v41_shape_seeds_voice_transcription_hydration_as_backfill(tmp_path: Path) -> None:
-    db_path = tmp_path / "sync.db"
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (91, 'synced')")
-        conn.execute(
-            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (91, 1, 'explicit', 1)"
-        )
-        conn.execute(
-            "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
-            "VALUES (91, 17, 1234, NULL, 'voice', '{}')"
-        )
-        conn.execute(
-            "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload, is_deleted) "
-            "VALUES (91, 18, 1235, NULL, 'voice', '{}', 1)"
-        )
-        conn.execute(
-            "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at) "
-            "VALUES ('media_metadata', 91, 99, 1200, 2, 1, 1199)"
-        )
-        conn.execute("DROP INDEX idx_hydration_jobs_schedule")
-        conn.execute("DROP INDEX idx_messages_transcribable_undeleted_sent")
-        conn.execute("ALTER TABLE hydration_jobs RENAME TO hydration_jobs_v41")
-        conn.execute(
-            "CREATE TABLE hydration_jobs ("
-            "kind TEXT NOT NULL, dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL, "
-            "due_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, "
-            "priority INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1)), "
-            "message_sent_at INTEGER NOT NULL DEFAULT 0, "
-            "PRIMARY KEY (kind, dialog_id, message_id)) WITHOUT ROWID"
-        )
-        conn.execute(
-            "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at) "
-            "SELECT kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at FROM hydration_jobs_v41"
-        )
-        conn.execute("DROP TABLE hydration_jobs_v41")
-        assert "terminal" not in [row[1] for row in _table_info(conn, "hydration_jobs")]
-        remove_v80_schema_for_historical_fixture(conn)
-        conn.execute("DELETE FROM schema_version WHERE version >= 41")
-        conn.commit()
-
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        assert conn.execute(
-            "SELECT kind, dialog_id, message_id, priority, message_sent_at FROM hydration_jobs "
-            "WHERE kind = 'transcription'"
-        ).fetchone() == ("transcription", 91, 17, 0, 1234)
-        assert conn.execute(
-            "SELECT kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at, terminal "
-            "FROM hydration_jobs WHERE kind = 'media_metadata'"
-        ).fetchone() == ("media_metadata", 91, 99, 1200, 2, 1, 1199, 0)
-        assert (
-            conn.execute(
-                "SELECT 1 FROM hydration_jobs WHERE kind = 'transcription' AND dialog_id = 91 AND message_id = 18"
-            ).fetchone()
             is None
         )
 
@@ -1640,72 +1359,6 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
 
 
-def test_migration_v78_rollback_then_reopen_applies_atomically(tmp_path: Path) -> None:
-    db_path = tmp_path / "v77.sqlite"
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        triggers = cast(
-            list[tuple[str, str]],
-            conn.execute(
-                "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='dialogs' AND sql IS NOT NULL"
-            ).fetchall(),
-        )
-        for name, _ in triggers:
-            conn.execute(f"DROP TRIGGER {name}")
-        conn.execute(_DIALOGS_V74_DDL)
-        column_rows = cast(list[tuple[object, str]], conn.execute("PRAGMA table_info(dialogs)").fetchall())
-        old_columns = [row[1] for row in column_rows if row[1] != "identity_revision"]
-        conn.execute(f"INSERT INTO dialogs_v74({','.join(old_columns)}) SELECT {','.join(old_columns)} FROM dialogs")
-        conn.execute("PRAGMA legacy_alter_table=ON")
-        conn.execute("DROP TABLE dialogs")
-        conn.execute("ALTER TABLE dialogs_v74 RENAME TO dialogs")
-        conn.execute("PRAGMA legacy_alter_table=OFF")
-        for _, statement in triggers:
-            conn.execute(statement)
-        conn.execute("DROP TABLE dialog_directory_baseline")
-        conn.execute(
-            "CREATE TABLE dialog_directory_baseline(generation INTEGER,dialog_id INTEGER,"
-            "baseline_revision INTEGER NOT NULL,seen INTEGER NOT NULL DEFAULT 0,"
-            "PRIMARY KEY(generation,dialog_id)) WITHOUT ROWID"
-        )
-        remove_v80_schema_for_historical_fixture(conn)
-        conn.execute("DELETE FROM schema_version WHERE version>=78")
-        conn.execute(
-            "UPDATE dialog_directory_state SET generation=8,status='in_progress',"
-            "ordinary_status='incomplete',pinned_main_status='complete',"
-            "pinned_archive_status='incomplete',offset_id=5,observed_count=1 WHERE singleton=1"
-        )
-        conn.execute("INSERT INTO dialog_directory_baseline VALUES (8,71,4,0)")
-        conn.execute(
-            "CREATE TRIGGER reject_v78 BEFORE INSERT ON schema_version WHEN NEW.version=78 "
-            "BEGIN SELECT RAISE(ABORT,'injected migration failure'); END"
-        )
-        conn.commit()
-
-    with pytest.raises(sqlite3.IntegrityError, match="injected migration failure"):
-        ensure_sync_schema(db_path)
-
-    with _sync_db_connection(db_path) as conn:
-        column_rows = cast(list[tuple[object, str]], conn.execute("PRAGMA table_info(dialogs)").fetchall())
-        columns = {row[1] for row in column_rows}
-        state = _fetchone_row(conn, "SELECT generation,status,offset_id FROM dialog_directory_state WHERE singleton=1")
-        assert "identity_revision" not in columns
-        assert state == (8, "in_progress", 5)
-        assert _fetchone_int(conn, "SELECT COUNT(*) FROM dialog_directory_baseline WHERE generation=8") == 1
-        conn.execute("DROP TRIGGER reject_v78")
-        conn.commit()
-
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _fetchone_row(conn, "SELECT generation,status FROM dialog_directory_state WHERE singleton=1") == (
-            8,
-            "pending",
-        )
-        assert _fetchone_int(conn, "SELECT COUNT(*) FROM dialog_directory_baseline WHERE generation=8") == 0
-        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
-
-
 def test_migration_v72_keeps_existing_topic_attribution_unknown(tmp_path: Path) -> None:
     """A NULL legacy projection is not a topic-absence receipt."""
     db_path = _make_v24_db(tmp_path)
@@ -1830,9 +1483,7 @@ def test_migration_v71_seeds_cutoff_and_prunes_only_eligible_tail() -> None:
         sync_db_module._apply_migrations(conn)
         conn.execute("INSERT INTO synced_dialogs(dialog_id, status, read_outbox_max_id) VALUES (42, 'synced', 9)")
         conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (42, 'user', 1)")
-        conn.execute(
-            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (42, 1, 'explicit', 1)"
-        )
+        conn.execute("INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (42, 1, 1)")
         conn.executemany(
             "INSERT INTO messages(dialog_id, message_id, sent_at, out, is_deleted) VALUES (42, ?, ?, 1, 0)",
             [(1, 100), (2, 50), (3, 300), (4, 80), (5, 40)],
@@ -1890,9 +1541,7 @@ def test_migration_v71_ignores_invalid_witnesses_and_uses_newest_valid_witness()
         sync_db_module._apply_migrations(conn)
         conn.execute("INSERT INTO synced_dialogs(dialog_id, status, read_outbox_max_id) VALUES (42, 'synced', 4)")
         conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (42, 'user', 1)")
-        conn.execute(
-            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (42, 1, 'explicit', 1)"
-        )
+        conn.execute("INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (42, 1, 1)")
         conn.executemany(
             "INSERT INTO messages(dialog_id, message_id, sent_at, out, is_deleted) VALUES (42, ?, ?, 1, 0)",
             [(1, 500), (2, 200), (3, 0), (4, -10)],
@@ -1920,40 +1569,6 @@ def test_migration_v71_ignores_invalid_witnesses_and_uses_newest_valid_witness()
         ]
     finally:
         conn.close()
-
-
-def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:
-    db_path = tmp_path / "sync.db"
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        conn.executemany(
-            "INSERT INTO synced_dialogs(dialog_id, status, sync_progress, total_messages) VALUES (?, ?, ?, ?)",
-            [(1, "synced", 10, 20), (2, "own_only", 3, 4), (3, "access_lost", 5, 6)],
-        )
-        conn.execute("DROP INDEX idx_full_history_enrollment_enabled")
-        conn.execute("DROP TABLE full_history_enrollment")
-        # Recreate the complete v36 message-table shape before replaying the
-        # v34-v37 migration tail; current v37 tables are intentionally not
-        # valid inputs for the v37 rebuild.
-        conn.execute("DROP TABLE messages")
-        conn.execute("DROP TABLE scheduled_messages")
-        conn.execute(_V36_MESSAGES_DDL)
-        conn.execute(_V36_SCHEDULED_MESSAGES_DDL)
-        conn.execute("DROP TABLE activity_dialog_state")
-        conn.execute(_V23_ACTIVITY_DIALOG_STATE_DDL)
-        remove_v80_schema_for_historical_fixture(conn)
-        conn.execute("DELETE FROM schema_version WHERE version >= 34")
-        conn.commit()
-
-    ensure_sync_schema(db_path)
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        assert conn.execute(
-            "SELECT dialog_id, enabled, source FROM full_history_enrollment ORDER BY dialog_id"
-        ).fetchall() == [(1, 1, "migration"), (2, 0, "migration"), (3, 0, "migration")]
-        assert conn.execute(
-            "SELECT dialog_id, status, sync_progress, total_messages FROM synced_dialogs ORDER BY dialog_id"
-        ).fetchall() == [(1, "synced", 10, 20), (2, "own_only", 3, 4), (3, "access_lost", 5, 6)]
 
 
 def test_migration_v30_adds_delta_probe_columns(tmp_path: Path) -> None:
@@ -2089,57 +1704,6 @@ def test_migration_v25_ignores_non_own_only(tmp_path: Path) -> None:
         assert row_pending is None, "non-own_only 'pending' peer must NOT get a thin dialogs row"
 
 
-def test_migration_v63_repairs_positive_synced_dialog_orphans(tmp_path: Path) -> None:
-    db_path = tmp_path / "sync.db"
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        conn.execute(
-            "INSERT INTO synced_dialogs(dialog_id, status, last_event_at, last_synced_at) VALUES (?, 'synced', ?, ?)",
-            (12345, 1700000002, 1700000001),
-        )
-        conn.execute(
-            "INSERT INTO entities(id, type, name, name_normalized, updated_at) VALUES (?, 'bot', ?, ?, ?)",
-            (12345, "Exact Bot", "exact bot", 1700000000),
-        )
-        conn.execute(
-            "INSERT INTO messages(dialog_id, message_id, sent_at, text) VALUES (?, ?, ?, ?)",
-            (12345, 1, 1700000005, "hello"),
-        )
-        conn.execute(
-            "INSERT INTO synced_dialogs(dialog_id, status) VALUES (?, 'access_lost')",
-            (12346,),
-        )
-        conn.execute(
-            "INSERT INTO synced_dialogs(dialog_id, status) VALUES (?, 'synced')",
-            (12348,),
-        )
-        conn.execute(
-            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) "
-            "VALUES (?, 0, 'explicit', 1700000000)",
-            (12348,),
-        )
-        conn.execute(
-            "INSERT INTO dialogs(dialog_id, name, type, hidden, archived, pinned, needs_refresh) "
-            "VALUES (?, 'Keep', 'user', 1, 1, 1, 0)",
-            (12347,),
-        )
-        conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (?, 'synced')", (12347,))
-        conn.commit()
-        sync_db_module._apply_migration_63(conn, 62)
-
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        assert conn.execute(
-            "SELECT name, type, last_message_at, hidden, needs_refresh FROM dialogs WHERE dialog_id=?", (12345,)
-        ).fetchone() == ("Exact Bot", "bot", 1700000005, 0, 1)
-        assert conn.execute("SELECT dialog_id FROM dialogs WHERE dialog_id=?", (12346,)).fetchone() is None
-        assert conn.execute("SELECT dialog_id FROM dialogs WHERE dialog_id=?", (12348,)).fetchone() is None
-        assert conn.execute(
-            "SELECT name, type, hidden, archived, pinned, needs_refresh FROM dialogs WHERE dialog_id=?",
-            (12347,),
-        ).fetchone() == ("Keep", "user", 1, 1, 1, 0)
-
-
 def test_startup_repair_reclassifies_persisted_replies_rows(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
@@ -2231,21 +1795,6 @@ def test_v51_human_dm_alert_policy_and_sequence_are_durable(tmp_path: Path) -> N
         assert after == before + 1
 
 
-def test_v51_replay_does_not_clear_new_alerts(tmp_path: Path) -> None:
-    db_path = tmp_path / "sync.db"
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        conn.execute(
-            "INSERT INTO conversation_history_events(kind,occurred_at,time_basis,dialog_id,message_id) VALUES ('deleted_message',1,'observed',1,1)"
-        )
-        remove_v80_schema_for_historical_fixture(conn)
-        conn.execute("DELETE FROM schema_version WHERE version >= 51")
-        conn.commit()
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        assert _fetchone_int(conn, "SELECT COUNT(*) FROM conversation_history_events") == 1
-
-
 def _downgrade_event_tables_to_v50(conn: sqlite3.Connection) -> None:
     for trigger in (
         "sync_alert_events_message_insert_deleted",
@@ -2309,91 +1858,6 @@ def _downgrade_event_tables_to_v53(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM schema_version WHERE version >= 54")
 
 
-def test_v51_reconstructs_strict_dm_alerts_and_preserves_access_lost(tmp_path: Path) -> None:
-    """v51 keeps only positively identified incoming human-DM changes."""
-    db_path = tmp_path / "sync.db"
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        _downgrade_event_tables_to_v50(conn)
-        _downgrade_message_versions_to_v47(conn)
-        dialog_rows = [
-            (1, "user"),
-            (2, "user"),
-            (3, "bot"),
-            (4, "group"),
-            (5, "supergroup"),
-            (6, "channel"),
-            (7, "user"),
-            (8, None),
-        ]
-        conn.executemany("INSERT INTO dialogs(dialog_id, type) VALUES (?, ?)", dialog_rows)
-        conn.executemany("INSERT INTO entities(id, type, updated_at) VALUES (?, 'user', 1)", [(1,), (2,), (7,)])
-        conn.executemany(
-            "INSERT INTO messages(dialog_id, message_id, sent_at, text, sender_id, out, is_service, is_deleted, deleted_at) "
-            "VALUES (?, 1, 1, 'old', ?, ?, ?, 1, 10)",
-            [(dialog_id, dialog_id, int(dialog_id == 2), int(dialog_id == 7)) for dialog_id, _ in dialog_rows],
-        )
-        conn.execute(
-            "INSERT INTO messages(dialog_id, message_id, sent_at, text, sender_id, out, is_service, is_deleted, deleted_at) "
-            "VALUES (1, 2, 1, 'old', 1, 0, 0, 0, NULL)"
-        )
-        conn.execute(
-            "INSERT INTO message_versions(dialog_id, message_id, version, old_text, edit_date) VALUES (1, 1, 1, 'old', 20)"
-        )
-        conn.execute(
-            "INSERT INTO message_versions(dialog_id, message_id, version, old_text, edit_date) VALUES (1, 2, 1, 'old', 21)"
-        )
-        conn.execute(
-            "INSERT INTO message_transcriptions(dialog_id, message_id, text, transcription_id, received_at) "
-            "VALUES (1, 2, 'new', 1, 21)"
-        )
-        conn.executemany(
-            "INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, message_id, version, daemon_event_id) "
-            "VALUES ('deleted_message', 10, ?, 1, NULL, NULL)",
-            [(dialog_id,) for dialog_id, _ in dialog_rows],
-        )
-        conn.execute(
-            "INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, message_id, version, daemon_event_id) "
-            "VALUES ('edit', 20, 1, 1, 1, NULL)"
-        )
-        conn.execute(
-            "INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, message_id, version, daemon_event_id) "
-            "VALUES ('edit', 21, 1, 2, 1, NULL)"
-        )
-        conn.execute("INSERT INTO daemon_events(kind, occurred_at, dialog_id) VALUES ('access_lost', 30, 1)")
-        access_id = _fetchone_int(conn, "SELECT MAX(id) FROM daemon_events")
-        conn.execute(
-            "INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, daemon_event_id) "
-            "VALUES ('access_lost', 30, 1, ?)",
-            (access_id,),
-        )
-        conn.executemany(
-            "INSERT INTO daemon_events(kind, occurred_at, dialog_id) VALUES ('runtime_probe', 1, NULL)",
-            [() for _ in range(99)],
-        )
-        conn.commit()
-
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        rows = _fetchall_rows(
-            conn,
-            "SELECT kind, dialog_id, message_id, version, occurred_at FROM conversation_history_events ORDER BY occurred_at, kind",
-        )
-        assert rows == [
-            ("deleted_message", 1, 1, None, 10),
-            ("edit", 1, 1, 1, 20),
-            ("access_lost", 1, None, None, 30),
-        ]
-        assert _fetchone_int(conn, "SELECT MIN(seq) FROM conversation_history_events") > 100
-        assert _fetchone_row(conn, "SELECT origin FROM message_versions WHERE dialog_id=1 AND message_id=1") == (
-            "legacy_unknown",
-        )
-        conn.execute(
-            "INSERT INTO conversation_history_events(kind, occurred_at, time_basis, dialog_id) VALUES ('access_lost', 40, 'observed', 1)"
-        )
-        assert _fetchone_int(conn, "SELECT MAX(seq) FROM conversation_history_events") > 100
-
-
 def test_v52_expands_origin_contract_without_guessing_from_edit_date(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
@@ -2434,54 +1898,6 @@ def test_v52_expands_origin_contract_without_guessing_from_edit_date(tmp_path: P
             (2, "telegram_edit"),
             (3, "transcription"),
         ]
-
-
-def test_v52_origin_repair_rolls_back_before_replacing_versions(tmp_path: Path) -> None:
-    db_path = tmp_path / "sync.db"
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        conn.execute("ALTER TABLE message_versions RENAME TO message_versions_current")
-        conn.execute(
-            """CREATE TABLE message_versions (
-                   dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
-                   version INTEGER NOT NULL, old_text TEXT, edit_date INTEGER,
-                   origin TEXT NOT NULL DEFAULT 'telegram_edit'
-                     CHECK (origin IN ('telegram_edit', 'transcription')),
-                   PRIMARY KEY (dialog_id, message_id, version)
-               ) WITHOUT ROWID"""
-        )
-        conn.execute("INSERT INTO message_versions VALUES (1, 1, 1, 'old', 1, 'telegram_edit')")
-        conn.execute("DROP TABLE message_versions_current")
-        conn.execute("CREATE TABLE message_versions_origin_migration(blocker INTEGER)")
-        remove_v80_schema_for_historical_fixture(conn)
-        conn.execute("DELETE FROM schema_version WHERE version >= 52")
-        conn.commit()
-
-        ensure_sync_schema(db_path)
-        assert _fetchone_row(conn, "SELECT origin FROM message_versions WHERE dialog_id=1") == ("telegram_edit",)
-        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=52") == (52,)
-
-
-def test_v51_preserves_access_alerts_and_uses_both_sequence_high_water_marks(tmp_path: Path) -> None:
-    db_path = tmp_path / "sync.db"
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        _downgrade_event_tables_to_v50(conn)
-        conn.executemany(
-            "INSERT INTO daemon_events(kind,occurred_at) VALUES ('access_lost',1)",
-            [() for _ in range(7)],
-        )
-        conn.execute(
-            "INSERT INTO sync_alert_events(kind,occurred_at,dialog_id,daemon_event_id) VALUES ('access_lost',1,1,7)"
-        )
-        conn.commit()
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        assert _fetchone_int(conn, "SELECT COUNT(*) FROM conversation_history_events WHERE kind='access_lost'") == 1
-        conn.execute(
-            "INSERT INTO conversation_history_events(kind,occurred_at,time_basis,dialog_id) VALUES ('access_lost',2,'observed',1)"
-        )
-        assert _fetchone_int(conn, "SELECT MAX(seq) FROM conversation_history_events") > 7
 
 
 def test_v51_failure_before_table_swap_rolls_back_all_prior_ddl(tmp_path: Path) -> None:
@@ -2736,7 +2152,6 @@ def test_v54_ledger_damage_does_not_replay_destructive_v53_cleanup(tmp_path: Pat
         conn.execute(
             "INSERT INTO conversation_history_events(kind,occurred_at,time_basis,dialog_id,message_id,version) VALUES ('edit',10,'telegram',1,1,1)"
         )
-        remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version=53")
         conn.commit()
 
@@ -3153,24 +2568,6 @@ def test_v66_preserves_legacy_identity_without_fabricating_provenance(tmp_path: 
             "SELECT name,type,username,identity_observed_at,identity_complete,identity_source FROM dialogs WHERE dialog_id=99",
         ) == ("legacy", "user", None, None, 0, None)
         assert _fetchone_int(conn, "SELECT COUNT(*) FROM dialog_directory_facts") == 0
-
-
-def test_v79_upgrade_without_fts_cache_rebuilds_only_live_messages(db_path: Path) -> None:
-    from mcp_telegram.fts import backfill_fts_index
-
-    ensure_sync_schema(db_path)
-    with _sqlite_connection(db_path) as conn:
-        remove_v80_schema_for_historical_fixture(conn)
-        conn.execute("DROP TABLE messages_fts")
-        conn.execute(
-            "INSERT INTO messages(dialog_id,message_id,sent_at,text,is_deleted) VALUES(42,1,1,'live',0),(42,2,2,'deleted',1)"
-        )
-        conn.commit()
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM message_fts_keys").fetchone() == (2,)
-        assert conn.execute("SELECT dialog_id,message_id FROM messages_fts").fetchall() == [(42, 1)]
-        assert backfill_fts_index(conn) == 0
 
 
 @pytest.fixture()

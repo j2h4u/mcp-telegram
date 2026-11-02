@@ -272,7 +272,7 @@ def test_reserved_topic_event_order_rejects_older_event(db: sqlite3.Connection) 
 
 @pytest.mark.asyncio
 async def test_supplied_bot_capability_change_reopens_catalog_without_rpc(db: sqlite3.Connection) -> None:
-    seed_full_history_enrollment(db, 42, enabled=True, source="automatic")
+    seed_full_history_enrollment(db, 42, enabled=True)
     db.commit()
     client = MagicMock()
     manager = event_manager(client, db, asyncio.Event())

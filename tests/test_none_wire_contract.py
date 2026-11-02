@@ -108,6 +108,7 @@ def _assert_registered_null_boundary(name: str, schema: dict[str, object]) -> No
             and (path[:1] == ("$defs",) or path in {("properties", "semantic"), ("properties", "page")})
         )
         sync_null = name == "get_sync_status" and path in {
+            ("properties", "enrollment_enabled"),
             ("properties", "latest_retained_message"),
             ("properties", "message_delivery", "properties", "lag_seconds"),
         }

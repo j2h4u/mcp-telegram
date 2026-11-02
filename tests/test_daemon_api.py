@@ -746,7 +746,7 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
         CREATE TABLE full_history_enrollment (
             dialog_id INTEGER PRIMARY KEY,
             enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
-            source TEXT NOT NULL CHECK(source IN ('explicit', 'automatic', 'migration')),
+
             updated_at INTEGER NOT NULL
         ) WITHOUT ROWID
         """
@@ -889,6 +889,7 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             name        TEXT,
             type        TEXT,
             members     INTEGER,
+            created     INTEGER,
             hidden      INTEGER NOT NULL DEFAULT 0,
             username    TEXT,
             identity_observed_at INTEGER,
@@ -3300,9 +3301,9 @@ async def test_mark_dialog_for_sync_disable() -> None:
     )
     assert row is not None
     assert row[0] == "synced"
-    enrollment = conn.execute("SELECT enabled, source FROM full_history_enrollment WHERE dialog_id = 42").fetchone()
+    enrollment = conn.execute("SELECT enabled FROM full_history_enrollment WHERE dialog_id = 42").fetchone()
     assert enrollment is not None
-    assert tuple(enrollment) == (0, "explicit")
+    assert tuple(enrollment) == (0,)
 
 
 # ---------------------------------------------------------------------------
@@ -8878,7 +8879,7 @@ def _make_trace_db() -> sqlite3.Connection:
         CREATE TABLE full_history_enrollment (
             dialog_id INTEGER PRIMARY KEY,
             enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
-            source TEXT NOT NULL CHECK(source IN ('explicit', 'automatic', 'migration')),
+
             updated_at INTEGER NOT NULL
         ) WITHOUT ROWID;
         CREATE TABLE messages (

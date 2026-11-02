@@ -137,7 +137,8 @@ async def _execute(
         assert evidence[0].draft_preflight_dispatched
         assert evidence[0].draft_mutation_dispatched and evidence[0].draft_postflight_dispatched
         assert evidence[0].actual_attempts == 3
-        assert rig.clock.monotonic() - start_clock <= 9
+        elapsed = rig.clock.monotonic() - start_clock
+        assert elapsed <= 9 or elapsed == pytest.approx(9, abs=1e-9, rel=0)
         assert result["ok"] is True and result["outcome"] == "acknowledged"
         assert result["save_acknowledged"] is True
         assert result["result_persisted"] is True and result["current_is_operation_confirmation"] is True

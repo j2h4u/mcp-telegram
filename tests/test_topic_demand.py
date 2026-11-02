@@ -41,9 +41,7 @@ def db(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     path = tmp_path / "topics.sqlite"
     ensure_sync_schema(path)
     with closing(sqlite3.connect(path)) as conn:
-        conn.execute(
-            "INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (42,1,'explicit',100)"
-        )
+        conn.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (42,1,100)")
         conn.commit()
         yield conn
 
@@ -146,7 +144,7 @@ async def test_all_nested_rpc_attempts_count_and_successive_slices_advance(db: s
 
 @pytest.mark.asyncio
 async def test_selected_topic_sibling_progresses_and_stale_revision_is_rejected(db: sqlite3.Connection) -> None:
-    db.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (43,1,'explicit',100)")
+    db.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (43,1,100)")
     db.commit()
 
     class SiblingClient(_CountingClient):

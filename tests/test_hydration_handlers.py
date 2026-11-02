@@ -58,7 +58,7 @@ def db(tmp_path: Path) -> Iterator[sqlite3.Connection]:
 def _seed_dialog(conn: sqlite3.Connection, dialog_id: int = 1, *, status: str = "synced") -> None:
     conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (?, ?)", (dialog_id, status))
     conn.execute(
-        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (?, 1, 'explicit', 1)",
+        "INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (?, 1, 1)",
         (dialog_id,),
     )
 

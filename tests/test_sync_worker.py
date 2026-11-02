@@ -315,10 +315,7 @@ async def test_full_sync_adapter_runs_one_automatic_first_page_under_budget(
     assert observed_scopes and observed_scopes[0].attempt_budget is budget  # type: ignore[union-attr]
     client.get_messages.assert_awaited_once()
     assert len(client.raw_history_requests) == 1
-    assert sync_db.execute("SELECT enabled,source FROM full_history_enrollment WHERE dialog_id=504").fetchone() == (
-        1,
-        "automatic",
-    )
+    assert sync_db.execute("SELECT enabled FROM full_history_enrollment WHERE dialog_id=504").fetchone() == (1,)
 
 
 @pytest.mark.asyncio
@@ -504,8 +501,8 @@ async def test_automatic_group_acceptance_resumes_partial_history_and_counts_top
     )
 
     assert sync_db.execute(
-        "SELECT enabled,source FROM full_history_enrollment WHERE dialog_id=?", (dialog_id,)
-    ).fetchone() == (1, "automatic")
+        "SELECT enabled FROM full_history_enrollment WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (1,)
     assert sync_db.execute(
         "SELECT status,total_messages,sync_progress,topic_attribution_state,topic_attribution_no_topic_count "
         "FROM synced_dialogs WHERE dialog_id=?",
@@ -647,7 +644,7 @@ async def test_hidden_previously_synced_dm_is_neither_reenrolled_nor_scheduled(s
     publish_local_dialogs(sync_db, [(102, "user", "Absent", None, None)])
     sync_db.execute("UPDATE dialogs SET hidden=1 WHERE dialog_id=102")
     sync_db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (102,'syncing')")
-    sync_db.execute("INSERT INTO full_history_enrollment VALUES (102,1,'automatic',1)")
+    sync_db.execute("INSERT INTO full_history_enrollment VALUES (102,1,1)")
     sync_db.commit()
     worker = make_worker(MagicMock(), sync_db, asyncio.Event())
 
@@ -663,7 +660,7 @@ async def test_full_sync_disable_race_discards_fetched_body_and_checkpoint(tmp_p
     first = cast(sqlite3.Connection, _open_sync_db(db_path))
     second = cast(sqlite3.Connection, _open_sync_db(db_path))
     first.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (77, 'syncing')")
-    first.execute("INSERT INTO full_history_enrollment VALUES (77, 1, 'explicit', 1)")
+    first.execute("INSERT INTO full_history_enrollment VALUES (77, 1, 1)")
     first.commit()
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -695,7 +692,7 @@ async def test_full_sync_adapter_reports_stale_when_selected_cursor_loses_cas(tm
     first = cast(sqlite3.Connection, _open_sync_db(db_path))
     second = cast(sqlite3.Connection, _open_sync_db(db_path))
     first.execute("INSERT INTO synced_dialogs(dialog_id, status, sync_progress) VALUES (78, 'syncing', 0)")
-    first.execute("INSERT INTO full_history_enrollment VALUES (78, 1, 'explicit', 1)")
+    first.execute("INSERT INTO full_history_enrollment VALUES (78, 1, 1)")
     first.commit()
 
     async def fetch_page(_dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
@@ -725,7 +722,7 @@ async def test_full_sync_stale_access_error_records_lost_for_tracked_dialog(tmp_
     first = cast(sqlite3.Connection, _open_sync_db(db_path))
     second = cast(sqlite3.Connection, _open_sync_db(db_path))
     first.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (79, 'syncing')")
-    first.execute("INSERT INTO full_history_enrollment VALUES (79, 1, 'explicit', 1)")
+    first.execute("INSERT INTO full_history_enrollment VALUES (79, 1, 1)")
     first.commit()
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -1170,7 +1167,7 @@ async def test_admission_rejection_defers_without_checkpoint_or_transport_attemp
     sync_db.execute(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', ?)", (dialog_id, 77)
     )
-    sync_db.execute("INSERT INTO full_history_enrollment VALUES (?, 1, 'explicit', 1)", (dialog_id,))
+    sync_db.execute("INSERT INTO full_history_enrollment VALUES (?, 1, 1)", (dialog_id,))
     sync_db.commit()
 
     async def reject(**_kwargs: object) -> MockTotalList:
@@ -1193,7 +1190,7 @@ async def test_scheduler_closure_propagates_from_full_sync(
 ) -> None:
     dialog_id = 60002
     sync_db.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'syncing')", (dialog_id,))
-    sync_db.execute("INSERT INTO full_history_enrollment VALUES (?, 1, 'explicit', 1)", (dialog_id,))
+    sync_db.execute("INSERT INTO full_history_enrollment VALUES (?, 1, 1)", (dialog_id,))
     sync_db.commit()
 
     async def close(**_kwargs: object) -> MockTotalList:

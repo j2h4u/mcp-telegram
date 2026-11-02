@@ -37,7 +37,6 @@ MARK_DIALOG_FOR_SYNC_OUTPUT_SCHEMA = {
     "properties": {
         "dialog_id": {"type": "integer"},
         "enabled": {"type": "boolean"},
-        "enrollment_source": {"type": "string"},
         "coverage_status": {"type": ["string", "null"]},
         "action": {"type": "string"},
         "blocked_reason": {"type": ["string", "null"]},
@@ -46,7 +45,6 @@ MARK_DIALOG_FOR_SYNC_OUTPUT_SCHEMA = {
     "required": [
         "dialog_id",
         "enabled",
-        "enrollment_source",
         "coverage_status",
         "action",
         "blocked_reason",
@@ -66,7 +64,18 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
             "description": "Persisted history sync state, not current delivery or uninterrupted coverage.",
         },
         "enrollment_enabled": {"type": ["boolean", "null"]},
-        "enrollment_source": {"type": ["string", "null"]},
+        "automatic_group_sync": {
+            "type": "object",
+            "description": "Current local automatic group eligibility; a fresh Telegram total requires a background probe.",
+            "properties": {
+                "eligibility": {"enum": ["eligible_for_probe", "blocked", "unknown"]},
+                "reason": {"type": "string"},
+                "fresh_telegram_total": {"const": "unknown"},
+                "retry_at": {"type": "integer"},
+            },
+            "required": ["eligibility", "reason", "fresh_telegram_total"],
+            "additionalProperties": False,
+        },
         "realtime_history": {
             "type": "string",
             "enum": [item.value for item in RealtimeHistory],
@@ -141,7 +150,7 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
         "dialog_id",
         "coverage_status",
         "enrollment_enabled",
-        "enrollment_source",
+        "automatic_group_sync",
         "realtime_history",
         "message_retention_policy",
         "latest_retained_message",
@@ -178,7 +187,7 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
 class _GetSyncStatusSurface:
     model: SyncReadModel
     dialog_id: int
-    enrollment_source: str | None
+    automatic_group_sync: dict[str, object]
     delta_refresh_requested_at: int | None
     sync_progress: int | None
     sync_progress_message_id: int | None
@@ -211,13 +220,6 @@ def _surface_int(data: Mapping[str, object], name: str) -> int:
     return value
 
 
-def _surface_optional_string(data: Mapping[str, object], name: str) -> str | None:
-    value = _surface_required(data, name)
-    if value is None or isinstance(value, str):
-        return value
-    raise SyncReadModelContractError(f"{name} must be a string or null")
-
-
 def _surface_string(data: Mapping[str, object], name: str) -> str:
     value = _surface_required(data, name)
     if not isinstance(value, str):
@@ -238,7 +240,7 @@ def _decode_get_sync_status_surface(
     return _GetSyncStatusSurface(
         model=decode_sync_read_model(data),
         dialog_id=dialog_id,
-        enrollment_source=_surface_optional_string(data, "enrollment_source"),
+        automatic_group_sync=_decode_automatic_group_status(_surface_required(data, "automatic_group_sync")),
         delta_refresh_requested_at=_surface_optional_int(data, "delta_refresh_requested_at"),
         sync_progress=_surface_optional_int(data, "sync_progress"),
         sync_progress_message_id=_surface_optional_int(data, "sync_progress_message_id"),
@@ -248,6 +250,31 @@ def _decode_get_sync_status_surface(
         access_next_revalidate_at=_surface_optional_int(data, "access_next_revalidate_at"),
         latest_retained_message=decode_latest_retained_message(_surface_required(data, "latest_retained_message")),
     )
+
+
+def _decode_automatic_group_status(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise SyncReadModelContractError("automatic_group_sync must be an object")
+    eligibility = value.get("eligibility")
+    if (
+        not _is_known_value(eligibility, {"eligible_for_probe", "blocked", "unknown"})
+        or value.get("fresh_telegram_total") != "unknown"
+    ):
+        raise SyncReadModelContractError("invalid automatic group eligibility")
+    if not isinstance(value.get("reason"), str) or set(value) - {
+        "eligibility",
+        "reason",
+        "fresh_telegram_total",
+        "retry_at",
+    }:
+        raise SyncReadModelContractError("invalid automatic group status")
+    if "retry_at" in value and type(value["retry_at"]) is not int:
+        raise SyncReadModelContractError("invalid automatic group retry time")
+    return dict(value)
+
+
+def _is_known_value(value: object, allowed: set[str]) -> bool:
+    return isinstance(value, str) and value in allowed
 
 
 class MarkDialogForSync(ToolArgs):
@@ -288,7 +315,6 @@ async def mark_dialog_for_sync(args: MarkDialogForSync) -> ToolResult:
     structured_content = {
         "dialog_id": args.dialog_id,
         "enabled": args.enable,
-        "enrollment_source": data["enrollment_source"],
         "coverage_status": data["coverage_status"],
         "action": data["action"],
         "blocked_reason": data["blocked_reason"],
@@ -305,6 +331,7 @@ class GetSyncStatus(ToolArgs):
     sync_progress is the raw message_id offset cursor, not a row count. Works for any dialog —
     non-synced dialogs return status='not_synced' with zero counts.
     Retention policy says which delivered messages may be saved; it does not verify delivery.
+    Automatic group eligibility describes local facts; a fresh Telegram total requires a background probe.
     The latest retained message is ordered by Telegram sent time, not local arrival."""
 
     dialog_id: int = Field(description="Numeric dialog ID from ListDialogs")
@@ -345,7 +372,7 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
         "dialog_id": surface.dialog_id,
         "coverage_status": wire["sync_status"],
         "enrollment_enabled": wire["enrollment_enabled"],
-        "enrollment_source": surface.enrollment_source,
+        "automatic_group_sync": surface.automatic_group_sync,
         "realtime_history": wire["realtime_history"],
         "message_retention_policy": {
             RealtimeHistory.FULL: "all_authorized",

@@ -17,7 +17,8 @@ from .scheduled_receipts_schema import SCHEDULED_OPERATION_RECEIPT_DDL
 from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 
-_CURRENT_SCHEMA_VERSION = 93
+_CURRENT_SCHEMA_VERSION = 94
+_HISTORY_ENROLLMENT_SIMPLIFICATION_MIGRATION = 94
 _MESSAGE_IMAGE_MIGRATION = 93
 _SCHEDULED_COMMAND_MIGRATION = 92
 _SCHEDULED_FINITE_COVERAGE_MIGRATION = 91
@@ -539,17 +540,6 @@ CREATE TABLE IF NOT EXISTS daemon_state (
     key   TEXT PRIMARY KEY,
     value TEXT
 )
-"""
-
-# v34: durable authorization for full-history work.  Coverage/work status
-# remains in synced_dialogs; absence here means no operator decision.
-_FULL_HISTORY_ENROLLMENT_DDL = """
-CREATE TABLE IF NOT EXISTS full_history_enrollment (
-    dialog_id  INTEGER PRIMARY KEY,
-    enabled    INTEGER NOT NULL CHECK (enabled IN (0, 1)),
-    source     TEXT NOT NULL CHECK (source IN ('explicit', 'automatic', 'migration')),
-    updated_at INTEGER NOT NULL
-) WITHOUT ROWID
 """
 
 _FULL_HISTORY_ENROLLMENT_ENABLED_INDEX_DDL = """
@@ -2515,7 +2505,12 @@ def _apply_migration_34(conn: sqlite3.Connection, current: int) -> int:
         current,
         34,
         [
-            _FULL_HISTORY_ENROLLMENT_DDL,
+            """CREATE TABLE IF NOT EXISTS full_history_enrollment (
+                   dialog_id INTEGER PRIMARY KEY,
+                   enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                   source TEXT NOT NULL CHECK (source IN ('explicit', 'automatic', 'migration')),
+                   updated_at INTEGER NOT NULL
+               ) WITHOUT ROWID""",
             _FULL_HISTORY_ENROLLMENT_ENABLED_INDEX_DDL,
             """INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at)
                SELECT dialog_id,
@@ -5089,9 +5084,24 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     current = _apply_late_migrations(conn, current)
     current = _apply_migrations_85_to_92(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _MESSAGE_IMAGE_MIGRATION:
-        _apply_migration_93(conn, current)
+        current = _apply_migration_93(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _HISTORY_ENROLLMENT_SIMPLIFICATION_MIGRATION:
+        _apply_migration_94(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
+
+
+def _apply_migration_94(conn: sqlite3.Connection, current: int) -> int:
+    """Remove inferred disabled rows and retain the remaining enrollment decisions."""
+    return _apply_migration(
+        conn,
+        current,
+        _HISTORY_ENROLLMENT_SIMPLIFICATION_MIGRATION,
+        [
+            "DELETE FROM full_history_enrollment WHERE enabled=0 AND source='migration'",
+            "ALTER TABLE full_history_enrollment DROP COLUMN source",
+        ],
+    )
 
 
 def _apply_migration_93(conn: sqlite3.Connection, current: int) -> int:

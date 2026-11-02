@@ -58,7 +58,7 @@ def _open_seeded_db(
     # This is the v34 durable authorization relation, deliberately seeded as
     # enabled rather than inferred from synced_dialogs.status.
     handler_conn.execute(
-        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (?, 1, 'explicit', 1)",
+        "INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (?, 1, 1)",
         (dialog_id,),
     )
     handler_conn.execute("INSERT INTO dialogs(dialog_id, type) VALUES (?, 'user')", (dialog_id,))

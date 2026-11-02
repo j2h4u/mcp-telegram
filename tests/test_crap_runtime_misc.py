@@ -256,9 +256,7 @@ def _message(message_id: int, *, text: str | None, media_kind: str = "voice") ->
 def _enable_history(conn: sqlite3.Connection) -> None:
     with write_transaction(conn):
         conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (42, 'synced')")
-        conn.execute(
-            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (42, 1, 'explicit', 1)"
-        )
+        conn.execute("INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (42, 1, 1)")
 
 
 def test_transcription_worker_result_is_idempotent_and_race_aware(sync_conn: sqlite3.Connection) -> None:

@@ -60,7 +60,7 @@ def _open_seeded_db(path: Path, dialog_id: int, message_id: int) -> tuple[_SQLit
     disable_conn = _open_sync_db(path)
     handler_conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (?, 'synced')", (dialog_id,))
     handler_conn.execute(
-        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (?, 1, 'explicit', 1)",
+        "INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (?, 1, 1)",
         (dialog_id,),
     )
     handler_conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (?, 'user', 1)", (dialog_id,))

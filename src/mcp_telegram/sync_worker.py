@@ -260,6 +260,7 @@ class FullSyncWorker:
         self._last_total_repair_error: BaseException | None = None
         self._last_page_accepted = False
         self._last_page_stale = False
+        self._last_automatic_pending = False
         self._last_total_accepted = False
         self._last_total_stale = False
         self._last_page_committed_revision: str | None = None
@@ -513,31 +514,6 @@ class FullSyncWorker:
         cutoff = int(time.time()) - self._automatic_group_history.recent_days * 86_400
         return self._eligible_automatic_group(cutoff=cutoff)
 
-    def _automatic_group_earliest_retry(self) -> float | None:
-        candidate = self._automatic_group_retry_candidate()
-        return None if candidate is None else candidate[1]
-
-    def _automatic_group_retry_candidate(self) -> tuple[int, float] | None:
-        policy = self._automatic_group_history
-        if policy is None:
-            return None
-        now = int(time.time())
-        row = cast(
-            tuple[int, int] | None,
-            self._conn.execute(
-                "SELECT d.dialog_id,CAST(ds.value AS INTEGER) FROM daemon_state ds JOIN dialogs d "
-                "ON ds.key='automatic_group_history_retry:' || d.dialog_id "
-                "LEFT JOIN full_history_enrollment fhe ON fhe.dialog_id=d.dialog_id "
-                "LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id "
-                "WHERE fhe.dialog_id IS NULL AND d.hidden=0 AND d.type IN ('group','supergroup','forum') "
-                "AND d.members BETWEEN 1 AND ? AND d.created >= ? "
-                "AND (sd.status IS NULL OR sd.status NOT IN ('access_lost','synced')) "
-                "AND CAST(ds.value AS INTEGER) > ? ORDER BY CAST(ds.value AS INTEGER),d.dialog_id LIMIT 1",
-                (policy.max_members, now - policy.recent_days * 86_400, now),
-            ).fetchone(),
-        )
-        return None if row is None else (int(row[0]), float(row[1]))
-
     def _set_automatic_group_retry(self, conn: sqlite3.Connection, dialog_id: int) -> None:
         require_write_transaction(conn)
         assert self._automatic_group_history is not None
@@ -548,6 +524,16 @@ class FullSyncWorker:
                 str(int(time.time()) + self._automatic_group_history.probe_retry_seconds),
             ),
         )
+
+    def _automatic_group_retry_at(self, dialog_id: int) -> int:
+        row = cast(
+            tuple[int] | None,
+            self._conn.execute(
+                "SELECT CAST(value AS INTEGER) FROM daemon_state WHERE key=?",
+                (f"automatic_group_history_retry:{dialog_id}",),
+            ).fetchone(),
+        )
+        return 0 if row is None else int(row[0])
 
     def _eligible_automatic_group(self, *, cutoff: int) -> int | None:
         policy = self._automatic_group_history
@@ -588,11 +574,16 @@ class FullSyncWorker:
     async def _process_one_automatic_group(self, expected_dialog_id: int | None = None) -> bool:
         self._last_page_accepted = False
         self._last_page_stale = False
+        self._last_automatic_pending = False
+        self._last_page_error = None
         self._last_page_committed_revision = None
         if self._automatic_group_history is None:
             return False
         dialog_id = expected_dialog_id if expected_dialog_id is not None else self._next_automatic_group()
         if dialog_id is None:
+            return False
+        if self._automatic_group_retry_at(dialog_id) > time.time():
+            self._last_automatic_pending = True
             return False
         if not self._is_eligible_automatic_group(
             self._conn, dialog_id, cutoff=int(time.time()) - self._automatic_group_history.recent_days * 86_400
@@ -609,13 +600,9 @@ class FullSyncWorker:
         except Exception:
             await self._writer.run(persist_probe_retry)
             raise
-        if page.retry is not None:
+        if page.retry is not None or page.total_messages is None:
             await self._writer.run(persist_probe_retry)
-            if isinstance(self._last_page_error, MessageHistoryUnavailableError):
-                self._last_page_error = None
-            return True
-        if page.total_messages is None:
-            await self._writer.run(persist_probe_retry)
+            self._last_automatic_pending = True
             return True
         return await self._writer.run(lambda conn: self._finalize_automatic_group_page(conn, dialog_id, page))
 
@@ -623,7 +610,7 @@ class FullSyncWorker:
         assert self._automatic_group_history is not None
         with write_transaction(conn):
             intent = read_intent(conn, dialog_id)
-            if intent.source is not None:
+            if intent.enabled is not None:
                 conn.execute("DELETE FROM daemon_state WHERE key=?", (f"automatic_group_history_retry:{dialog_id}",))
                 if intent.enabled:
                     conn.execute(
@@ -676,15 +663,6 @@ class FullSyncWorker:
         )
         retry_at = _total_messages_repair_retry_at(self._conn)
         return eligible is not None and (retry_at is None or retry_at <= int(time.time()))
-
-    def _total_messages_repair_release_at(self, now: float) -> float | None:
-        row = cast(tuple[int] | None, self._conn.execute(_NEXT_TOTAL_MESSAGES_REPAIR_SQL, (time.time(),)).fetchone())
-        if row is None:
-            return None
-        retry_at = _total_messages_repair_retry_at(self._conn)
-        if retry_at is None or retry_at <= now:
-            return 0.0
-        return float(retry_at)
 
     def _deferred_batch_page(self, dialog_id: int, sync_progress: int, exc: Exception) -> _FetchedBatchPage:
         if isinstance(exc, TelegramRpcAdmissionDeferred):
@@ -951,17 +929,22 @@ class FullSyncDemandAdapter:
 
     def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
         """Report pending history without changing local or Telegram state."""
-        pending = self._pending_dialog_status(excluded)
-        if pending is not None:
+        pending = self._pending_dialog_status(now, excluded)
+        if pending is not None and pending.release_at <= now:
             return pending
         statuses = [
             status
             for status in (self._automatic_group_status(excluded), self._total_repair_status(now, excluded))
             if status is not None
         ]
+        for status in statuses:
+            if status.release_at <= now:
+                return status
+        if pending is not None:
+            statuses.append(pending)
         return min(statuses, key=lambda status: status.release_at) if statuses else None
 
-    def _pending_dialog_status(self, excluded: frozenset[WorkRevision]) -> DemandStatus | None:
+    def _pending_dialog_status(self, now: float, excluded: frozenset[WorkRevision]) -> DemandStatus | None:
         rows = cast(
             list[tuple[int, int | None, int | None, str]],
             self._worker._conn.execute(
@@ -972,6 +955,7 @@ class FullSyncDemandAdapter:
                 "ORDER BY CASE WHEN sd.dialog_id>COALESCE((SELECT CAST(value AS INTEGER) FROM daemon_state WHERE key='full_sync_peer_cursor'),0) THEN 0 ELSE 1 END,sd.dialog_id"
             ).fetchall(),
         )
+        future: DemandStatus | None = None
         for dialog_id_value, cursor_value, retry_at, dialog_status in rows:
             dialog_id, cursor = int(dialog_id_value), int(cursor_value or 0)
             selected = self._revision(
@@ -979,8 +963,12 @@ class FullSyncDemandAdapter:
                 f"{cursor}:{int(full_history_enabled(self._worker._conn, dialog_id))}:{dialog_status}",
             )
             if selected not in excluded:
-                return DemandStatus(release_at=float(retry_at or 0), selected=selected)
-        return None
+                status = DemandStatus(release_at=float(retry_at or 0), selected=selected)
+                if status.release_at <= now:
+                    return status
+                if future is None or status.release_at < future.release_at:
+                    future = status
+        return future
 
     def _automatic_group_status(self, excluded: frozenset[WorkRevision]) -> DemandStatus | None:
         policy = self._worker._automatic_group_history
@@ -1013,38 +1001,26 @@ class FullSyncDemandAdapter:
 
     def _total_repair_status(self, now: float, excluded: frozenset[WorkRevision]) -> DemandStatus | None:
         retry_at = _total_messages_repair_retry_at(self._worker._conn)
-        if retry_at is not None and retry_at > int(now):
-            return None
         rows = cast(
-            list[tuple[int]],
+            list[tuple[int, int | None]],
             self._worker._conn.execute(
-                _NEXT_TOTAL_MESSAGES_REPAIR_SQL.replace(" LIMIT 1", ""), (time.time(),)
+                _NEXT_TOTAL_MESSAGES_REPAIR_SQL.replace(
+                    "SELECT sd.dialog_id", "SELECT sd.dialog_id,sd.full_sync_retry_at"
+                )
+                .replace("AND COALESCE(sd.full_sync_retry_at,0) <= ? ", "")
+                .replace(" LIMIT 1", "")
             ).fetchall(),
         )
-        for (repair,) in rows:
+        future: DemandStatus | None = None
+        for repair, peer_retry in rows:
             selected = self._revision(f"total:{repair}", f"missing:{repair}")
             if selected not in excluded:
-                releases = self._repair_release_candidates(now)
-                return DemandStatus(release_at=min(releases) if releases else 0.0, selected=selected)
-        return None
-
-    def _repair_release_candidates(self, now: float) -> list[float]:
-        candidates = [
-            self._worker._automatic_group_earliest_retry(),
-            self._worker._total_messages_repair_release_at(now),
-        ]
-        retry_row = cast(
-            tuple[int | None] | None,
-            self._worker._conn.execute(
-                "SELECT MIN(sd.full_sync_retry_at) FROM synced_dialogs sd "
-                "JOIN full_history_enrollment fhe ON fhe.dialog_id=sd.dialog_id AND fhe.enabled=1 "
-                "WHERE (sd.status IN ('syncing','not_synced') OR (sd.total_messages IS NULL AND sd.status != 'access_lost')) "
-                "AND NOT EXISTS (SELECT 1 FROM dialogs d WHERE d.dialog_id=sd.dialog_id AND d.hidden=1)"
-            ).fetchone(),
-        )
-        if retry_row is not None:
-            candidates.append(retry_row[0])
-        return [float(candidate) for candidate in candidates if candidate is not None]
+                status = DemandStatus(release_at=float(max(peer_retry or 0, retry_at or 0)), selected=selected)
+                if status.release_at <= now:
+                    return status
+                if future is None or status.release_at < future.release_at:
+                    future = status
+        return future
 
     async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
         """Fetch at most one history page under the transport attempt budget."""
@@ -1089,7 +1065,7 @@ class FullSyncDemandAdapter:
         if revision != selected.revision:
             return SliceOutcome(selected, SliceOutcomeKind.STALE)
         if float(row[1] or 0) > now:
-            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+            return SliceOutcome(selected, SliceOutcomeKind.RETRYABLE_FAILURE)
         return None
 
     def _validate_automatic_group(self, selected: WorkRevision, now: float) -> SliceOutcome | None:
@@ -1102,7 +1078,11 @@ class FullSyncDemandAdapter:
                 self._worker._conn, dialog_id, cutoff=int(now) - policy.recent_days * 86_400
             )
         )
-        return None if eligible else SliceOutcome(selected, SliceOutcomeKind.STALE)
+        if not eligible:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        if self._worker._automatic_group_retry_at(dialog_id) > now:
+            return SliceOutcome(selected, SliceOutcomeKind.RETRYABLE_FAILURE)
+        return None
 
     def _validate_total_repair(self, selected: WorkRevision, now: float) -> SliceOutcome | None:
         dialog_id = int(selected.key.target.split(":", 1)[1])
@@ -1115,7 +1095,7 @@ class FullSyncDemandAdapter:
         if row is None or row[0] is not None or selected.revision != f"missing:{dialog_id}":
             return SliceOutcome(selected, SliceOutcomeKind.STALE)
         if float(row[1] or 0) > now:
-            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+            return SliceOutcome(selected, SliceOutcomeKind.RETRYABLE_FAILURE)
         return None
 
     async def _dispatch_selected(self, selected: WorkRevision, budget: RpcAttemptBudget) -> bool:
@@ -1168,6 +1148,8 @@ class FullSyncDemandAdapter:
             selected.key.target.startswith("total:") and self._worker._last_total_stale
         ):
             return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        if selected.key.target.startswith("automatic-group:") and self._worker._last_automatic_pending:
+            return SliceOutcome(selected, SliceOutcomeKind.RETRYABLE_FAILURE)
         return self._accepted_outcome(selected)
 
     @staticmethod
@@ -1176,7 +1158,11 @@ class FullSyncDemandAdapter:
             error,
             (TelegramRpcThrottled, TelegramRpcAdmissionDeferred, RpcAdmissionSaturatedError, RpcAdmissionExpiredError),
         )
-        return SliceOutcome(selected, SliceOutcomeKind.DEFERRED if deferred else SliceOutcomeKind.NO_PROGRESS)
+        if deferred:
+            return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        if isinstance(error, (MessageHistoryUnavailableError, TimeoutError)):
+            return SliceOutcome(selected, SliceOutcomeKind.RETRYABLE_FAILURE)
+        return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
 
     def _accepted_outcome(self, selected: WorkRevision) -> SliceOutcome:
         if selected.key.target.startswith("dialog:") and self._worker._last_page_accepted:

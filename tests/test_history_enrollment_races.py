@@ -36,7 +36,7 @@ async def test_new_message_disable_between_permission_checks_discards_body(tmp_p
     second = sqlite3.connect(path)
     _apply_migrations(first)
     first.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (5, 'synced')")
-    first.execute("INSERT INTO full_history_enrollment VALUES (5, 1, 'explicit', 1)")
+    first.execute("INSERT INTO full_history_enrollment VALUES (5, 1, 1)")
     first.commit()
     manager = make_manager(MagicMock(), first, asyncio.Event())
     original = manager._realtime_coverage
@@ -72,7 +72,7 @@ async def test_read_cursor_disable_before_apply_discards_positions(tmp_path) -> 
     second = sqlite3.connect(path)
     _apply_migrations(first)
     first.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (3,'synced')")
-    first.execute("INSERT INTO full_history_enrollment VALUES (3,1,'explicit',1)")
+    first.execute("INSERT INTO full_history_enrollment VALUES (3,1,1)")
     first.commit()
     adapter = ReadReceiptDemandAdapter(first, lambda _selected: None, account_id=1)  # type: ignore[arg-type]
     status = adapter.status(0.0)

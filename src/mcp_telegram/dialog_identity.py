@@ -133,6 +133,18 @@ def capture_identity_baseline(conn: sqlite3.Connection, dialog_id: int) -> int |
     return None if row is None else int(row[0])
 
 
+def read_automatic_group_metadata(
+    conn: sqlite3.Connection, dialog_id: int
+) -> tuple[str | None, int | None, int | None, int | None] | None:
+    """Read the raw directory facts used by automatic group selection."""
+    return cast(
+        tuple[str | None, int | None, int | None, int | None] | None,
+        conn.execute(
+            "SELECT type,members,created,hidden FROM dialogs WHERE dialog_id=?", (_dialog_id(dialog_id),)
+        ).fetchone(),
+    )
+
+
 def ensure_dialog_identity_baseline(conn: sqlite3.Connection, dialog_id: int) -> int:
     """Enroll a thin refreshable identity row before an asynchronous acquisition."""
     dialog_id = _dialog_id(dialog_id)

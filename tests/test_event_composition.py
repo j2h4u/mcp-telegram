@@ -32,7 +32,7 @@ async def test_formatting_only_edit_persists_without_lookup_or_history(tmp_path:
         conn.execute("INSERT INTO entities(id,type,updated_at) VALUES(42,'user',1)")
         conn.execute("INSERT INTO synced_dialogs(dialog_id,status,last_event_at) VALUES(42,'synced',17)")
         conn.execute(
-            "INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES(42,?,'explicit',1)",
+            "INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES(42,?,1)",
             (int(enabled),),
         )
         conn.execute(

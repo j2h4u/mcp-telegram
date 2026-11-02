@@ -10,9 +10,8 @@ from typing import cast
 
 import pytest
 
-from helpers import remove_v87_schema_for_historical_fixture
 from mcp_telegram.observation_order import allocate_observation_order
-from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.sync_db import _apply_migration_84, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.topics.catalog import TopicCatalogRepository, TopicScan
 from mcp_telegram.topics.contracts import TopicCursor, TopicFact, TopicPage, TopicSourceUnavailableError
@@ -29,7 +28,7 @@ def db(tmp_path: Path) -> Iterator[sqlite3.Connection]:
 
 def _enroll(conn: sqlite3.Connection, dialog_id: int = 42) -> TopicCatalogRepository:
     conn.execute(
-        "INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (?,1,'explicit',100)",
+        "INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (?,1,100)",
         (dialog_id,),
     )
     conn.commit()
@@ -376,14 +375,13 @@ def test_topic_catalog_migration_preserves_legacy_rows_without_receipts(tmp_path
     with closing(sqlite3.connect(path)) as conn, conn:
         _seed(conn, 7, "Legacy title")
         conn.execute("UPDATE topic_metadata SET pinned=1,hidden=1,icon_emoji_id=77,icon_emoji='🧭'")
-        # Remove later physical additions before reproducing the historical v83 ledger.
-        remove_v87_schema_for_historical_fixture(conn)
+        # Reproduce the topic state before migration 84 without rewinding unrelated schemas.
         conn.execute("DROP TRIGGER topic_catalog_identity_changed")
         conn.execute("DROP TABLE topic_catalog_state")
         conn.execute("ALTER TABLE topic_metadata DROP COLUMN catalog_present")
         conn.execute("ALTER TABLE topic_metadata DROP COLUMN seen_generation")
-        conn.execute("DELETE FROM schema_version WHERE version>=84")
-    ensure_sync_schema(path)
+        conn.execute("DELETE FROM schema_version WHERE version=84")
+        assert _apply_migration_84(conn, 83) == 84
 
     with closing(sqlite3.connect(path)) as migrated:
         assert _row(
@@ -394,13 +392,9 @@ def test_topic_catalog_migration_preserves_legacy_rows_without_receipts(tmp_path
         assert TopicCatalogRepository(migrated).coverage(42)["coverage"] == "partial"
 
 
-@pytest.mark.parametrize("source", ["explicit", "automatic"])
-def test_bootstrap_reuses_enabled_enrollment_without_creating_new_scope(db: sqlite3.Connection, source: str) -> None:
-    db.execute(
-        "INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (42,1,?,100)",
-        (source,),
-    )
-    db.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (43,0,'explicit',100)")
+def test_bootstrap_reuses_enabled_enrollment_without_creating_new_scope(db: sqlite3.Connection) -> None:
+    db.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (42,1,100)")
+    db.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (43,0,100)")
     db.commit()
     repository = TopicCatalogRepository(db)
 
