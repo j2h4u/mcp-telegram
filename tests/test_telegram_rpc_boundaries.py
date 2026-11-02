@@ -9,6 +9,7 @@ import pytest
 
 
 class _BoundaryChecker(Protocol):
+    DAEMON_PATH: Path
     GATE_PATH: Path
     SOURCE_ROOT: Path
     _PRIVATE_SENDER_SEAMS: dict[Path, frozenset[tuple[str, str, str]]]
