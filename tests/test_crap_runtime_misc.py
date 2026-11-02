@@ -21,6 +21,7 @@ from mcp_telegram.daemon import (
     _SyncMainContext,
 )
 from mcp_telegram.daemon_api import DaemonAPIServer
+from mcp_telegram.daemon_shutdown import ShutdownRequest
 from mcp_telegram.linked_chat_fact import LinkedChatFact, LinkedChatState
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
 from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
@@ -76,6 +77,7 @@ async def test_tracked_task_failure_records_noncritical_and_critical_outcomes(sy
         raise RuntimeError("boom")
 
     api = cast(DaemonAPIServer, SimpleNamespace(_ready=True, startup_detail=""))
+    shutdown = ShutdownRequest()
     ctx = cast(
         _SyncMainContext,
         SimpleNamespace(
@@ -83,7 +85,8 @@ async def test_tracked_task_failure_records_noncritical_and_critical_outcomes(sy
             writer=inline_writer(sync_conn),
             rpc_observation_sink=inline_observation_sink(sync_conn),
             background_tasks=set(),
-            shutdown_event=asyncio.Event(),
+            shutdown_event=shutdown.event,
+            shutdown_request=shutdown,
             api_server=api,
         ),
     )
@@ -100,6 +103,7 @@ async def test_tracked_task_failure_records_noncritical_and_critical_outcomes(sy
     await asyncio.sleep(0)
     assert api._ready is False
     assert ctx.shutdown_event.is_set()
+    assert shutdown.reason_code == "critical_task_failed"
     assert sync_conn.execute("SELECT COUNT(*) FROM runtime_observations").fetchone() == (2,)
 
 

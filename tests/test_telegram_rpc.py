@@ -48,7 +48,7 @@ from mcp_telegram.config import (
     TelegramRpcConfig,
     TelegramRpcSchedulerConfig,
 )
-from mcp_telegram.daemon import _connect_telegram, _SyncMainContext
+from mcp_telegram.daemon import _connect_telegram, _DaemonClient, _disconnect_telegram, _SyncMainContext
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.delta_sync import (
     DeltaGapFillDemandAdapter,
@@ -2289,7 +2289,7 @@ async def test_daemon_unobserved_topic_catalog_does_not_cross_latched_gate(tmp_p
     server = DaemonAPIServer(
         conn,
         cast(DaemonClientLike, GateClient()),
-        asyncio.Event(),
+        lambda _reason: asyncio.Event().set(),
         writer=inline_writer(conn),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
@@ -4305,6 +4305,37 @@ async def test_overlapping_owned_disconnects_share_one_teardown_and_settle_unkno
             await gate.close_rpc_scheduler()
     else:
         await gate.close_rpc_scheduler()
+
+
+@pytest.mark.asyncio
+async def test_daemon_disconnect_settles_owned_gate_after_repeated_cancellation() -> None:
+    gate = _gate()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockedSender(_RawFutureSender):
+        async def disconnect(self) -> None:
+            entered.set()
+            await release.wait()
+
+    _set_sender(gate, BlockedSender())
+    task = asyncio.create_task(_disconnect_telegram(cast(_DaemonClient, gate)))
+    try:
+        await entered.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert gate._owned_disconnect is not None and not gate._owned_disconnect.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert gate._owned_disconnect.done()
+        await gate.close_rpc_scheduler()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

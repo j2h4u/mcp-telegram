@@ -1053,11 +1053,20 @@ async def test_closed_admission_propagates_until_shutdown_then_exits() -> None:
     )
     closed = RpcAdmissionClosedError(scope, "scheduler closed")
     adapters[target].run_error = closed
-    coordinator = TelegramDemandCoordinator(adapters, asyncio.Event(), clock=_Clock())
+    shutdown = asyncio.Event()
+    reasons: list[str] = []
+
+    def request_shutdown() -> None:
+        reasons.append("rpc_admission_closed")
+        shutdown.set()
+
+    coordinator = TelegramDemandCoordinator(adapters, shutdown, clock=_Clock(), request_shutdown=request_shutdown)
 
     with pytest.raises(RpcAdmissionClosedError):
         await coordinator.run()
     assert coordinator.state is CoordinatorState.STOPPED
+    assert reasons == ["rpc_admission_closed"]
+    assert shutdown.is_set()
 
     shutdown = asyncio.Event()
     adapters = _adapters({target: DemandStatus(0)})

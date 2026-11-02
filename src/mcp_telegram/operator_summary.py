@@ -316,16 +316,29 @@ def _runtime_lines(observations: list[Observation]) -> list[str]:
     starts = [row for row in observations if row["kind"] == "runtime.started"]
     stops = [row for row in observations if row["kind"] == "runtime.stopped"]
     failures = [row for row in observations if row["kind"] in _RUNTIME_FAILURE_KINDS]
-    lines = [f"Runtime: starts={len(starts)}, clean stops={len(stops)}, task failures={len(failures)}"]
+    lines = [f"Runtime: recorded starts={len(starts)}, recorded stops={len(stops)}, task failures={len(failures)}"]
+    lines.extend(_recorded_stop_reasons(stops))
     if not starts:
         return lines
-    latest = starts[-1]
+    lines.append(_latest_runtime_line(starts[-1], stops))
+    return lines
+
+
+def _latest_runtime_line(latest: Observation, stops: list[Observation]) -> str:
     stopped = any(row["runtime_instance_id"] == latest["runtime_instance_id"] for row in stops)
-    lines.append(
+    return (
         f"Current recorded instance: started {_utc(_as_int(latest['observed_at_ms']) / 1000)}; "
         f"stop recorded={'yes' if stopped else 'no'}"
     )
-    return lines
+
+
+def _recorded_stop_reasons(stops: list[Observation]) -> list[str]:
+    if not stops:
+        return []
+    reasons: dict[str, int] = defaultdict(int)
+    for row in stops:
+        reasons[str(row["reason_code"] or "unknown")] += 1
+    return ["Recorded stop reasons: " + ", ".join(f"{reason}={count}" for reason, count in sorted(reasons.items()))]
 
 
 def _mcp_lines(summary: McpSummary) -> list[str]:

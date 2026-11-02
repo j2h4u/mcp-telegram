@@ -9,6 +9,7 @@ import pytest
 
 
 class _BoundaryChecker(Protocol):
+    DAEMON_PATH: Path
     GATE_PATH: Path
     SOURCE_ROOT: Path
     _PRIVATE_SENDER_SEAMS: dict[Path, frozenset[tuple[str, str, str]]]
@@ -172,24 +173,18 @@ def test_boundary_allows_documented_daemon_lifecycle_helpers(tmp_path: Path, mon
     daemon.write_text(
         "async def _connect_telegram(ctx):\n"
         "    await ctx.client.connect()\n"
-        "async def _shutdown_sync_main_context(ctx):\n"
-        "    await ctx.client.disconnect()\n",
+        "async def _disconnect_telegram(client):\n"
+        "    await client.disconnect()\n",
         encoding="utf-8",
     )
     gate = _load_gate()
+    lifecycle = gate._LIFECYCLE_ALLOWLIST[gate.DAEMON_PATH]
     monkeypatch.setattr(gate, "DAEMON_PATH", daemon)
-    monkeypatch.setattr(
-        gate,
-        "_LIFECYCLE_ALLOWLIST",
-        {
-            daemon: {
-                "_connect_telegram": frozenset({"connect"}),
-                "_shutdown_sync_main_context": frozenset({"disconnect"}),
-            }
-        },
-    )
+    monkeypatch.setattr(gate, "_LIFECYCLE_ALLOWLIST", {daemon: lifecycle})
 
     assert gate._violations(daemon) == []
+    daemon.write_text("async def other(client):\n    await client.disconnect()\n", encoding="utf-8")
+    assert any("lifecycle call disconnect outside approved owner" in str(item) for item in gate._violations(daemon))
 
 
 @pytest.mark.parametrize(

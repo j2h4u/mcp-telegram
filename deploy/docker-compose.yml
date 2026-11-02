@@ -6,7 +6,7 @@ services:
     container_name: mcp-telegram
     restart: unless-stopped
     init: true
-    stop_grace_period: 45s
+    stop_grace_period: -1s
     mem_limit: 4g
     logging:
       driver: journald

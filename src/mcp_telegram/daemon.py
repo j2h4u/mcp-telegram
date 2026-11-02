@@ -37,6 +37,7 @@ import asyncio
 import logging
 import math
 import os
+import signal
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
@@ -467,6 +468,7 @@ class _SyncMainContext:
     writer: SQLiteWriter
     feedback_owner: FeedbackThreadOwner
     shutdown_event: asyncio.Event
+    shutdown_request: daemon_shutdown.ShutdownRequest
     client: _DaemonClient
     message_fact_refresh_policy: MessageFactRefreshPolicy
     api_server: DaemonAPIServer
@@ -1006,7 +1008,7 @@ def _handle_tracked_task_completion(ctx: _SyncMainContext, task: asyncio.Task[ob
     if critical:
         ctx.api_server._ready = False
         ctx.api_server.startup_detail = f"critical background task failed: {task.get_name()}"
-        ctx.shutdown_event.set()
+        ctx.shutdown_request.request("critical_task_failed")
         logger.critical("critical_background_task_failed name=%s error=%s", task.get_name(), exc, exc_info=exc)
     else:
         logger.error("background_task_failed name=%s error=%s", task.get_name(), exc, exc_info=exc)
@@ -1060,7 +1062,7 @@ def _mark_rpc_scheduler_failed(
     failure_state["detail"] = detail
     ctx.api_server._ready = False
     ctx.api_server.startup_detail = detail
-    ctx.shutdown_event.set()
+    ctx.shutdown_request.request("rpc_scheduler_failed")
     logger.critical(
         "telegram_rpc_scheduler_failed_closed reason=%s source=%s service_class=%s",
         event.reason,
@@ -1094,7 +1096,7 @@ async def _monitor_auto_resume(ctx: _SyncMainContext) -> None:
             return
         if restart_due:
             logger.info("automatic_sync_resume_restarting")
-            ctx.shutdown_event.set()
+            ctx.shutdown_request.request("auto_resume_restart")
             return
         await sleep_through_flood(ctx.shutdown_event, 60)
 
@@ -1154,7 +1156,7 @@ def _create_telegram_client(
     return client
 
 
-async def _build_sync_main_context() -> _SyncMainContext:
+async def _build_sync_main_context(shutdown_request: daemon_shutdown.ShutdownRequest) -> _SyncMainContext:
     config = load_config()
     scheduling = resolve_scheduling_config(config.scheduling)
     state_paths = StatePaths.from_state_dir(ensure_private_state_dir(config.state.dir))
@@ -1180,7 +1182,14 @@ async def _build_sync_main_context() -> _SyncMainContext:
         conn = open_sync_db_reader(db_path)
         cleanup.callback(conn.close)
         ctx = await _compose_sync_main_context(
-            config, scheduling, state_paths, writer, conn, session_proof=session_proof, cleanup=cleanup
+            config,
+            scheduling,
+            state_paths,
+            writer,
+            conn,
+            session_proof=session_proof,
+            cleanup=cleanup,
+            shutdown_request=shutdown_request,
         )
         ctx.session_lease = lease
         cleanup.pop_all()
@@ -1224,6 +1233,7 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
     *,
     session_proof: TelegramSessionLease,
     cleanup: AsyncExitStack,
+    shutdown_request: daemon_shutdown.ShutdownRequest,
 ) -> _SyncMainContext:
     db_path = state_paths.sync_db_path
 
@@ -1234,15 +1244,13 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
     feedback_service = feedback_owner
     logger.info("feedback.db ready at %s", feedback_db_path)
 
-    shutdown_event = daemon_shutdown.register_shutdown_handler(
-        asyncio.get_running_loop(),
-    )
+    shutdown_event = shutdown_request.event
     flood_wait_kill_switch_event = asyncio.Event()
     _install_flood_wait_kill_switch(config, flood_wait_kill_switch_event)
 
     client = _create_telegram_client(config, conn, writer)
     cleanup.push_async_callback(client.close_rpc_scheduler)
-    cleanup.push_async_callback(client.disconnect)
+    cleanup.push_async_callback(_disconnect_telegram, client)
     client.bind_session_lease(session_proof)
     rpc_scheduler_failure: dict[str, str | None] = {"detail": None}
 
@@ -1287,7 +1295,7 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
     api_server = DaemonAPIServer(
         conn,
         cast(DaemonClientLike, client),
-        shutdown_event,
+        shutdown_request.request,
         feedback_service,
         db_path,
         writer=writer,
@@ -1367,6 +1375,7 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
         writer=writer,
         feedback_owner=feedback_owner,
         shutdown_event=shutdown_event,
+        shutdown_request=shutdown_request,
         client=client,
         message_fact_refresh_policy=_message_fact_refresh_policy_from_config(config, scheduling=scheduling),
         api_server=api_server,
@@ -1851,7 +1860,11 @@ def _build_demand_runtime(
             image_worker=image_worker,
             startup_detail_setter=lambda detail: setattr(ctx.api_server, "startup_detail", detail),
         )
-        coordinator = build_durable_coordinator(dependencies, observer=ctx.rpc_admission_observer)
+        coordinator = build_durable_coordinator(
+            dependencies,
+            observer=ctx.rpc_admission_observer,
+            request_shutdown=partial(ctx.shutdown_request.request, "rpc_admission_closed"),
+        )
         coordinator.bind_canonical_progress(ctx.client.note_canonical_progress)
     except BaseException:
         message_fact_refresh_deps.conn.close()
@@ -1959,7 +1972,7 @@ async def _close_runtime_connections(ctx: _SyncMainContext) -> None:
     finally:
         try:
             try:
-                await ctx.writer.run(lambda conn: _record_stopped(conn))
+                await ctx.writer.run(lambda conn: _record_stopped(conn, ctx.shutdown_request.reason_code))
             except Exception:
                 logger.exception("runtime_event_record_failed kind=runtime.stopped")
         finally:
@@ -1974,9 +1987,9 @@ async def _close_runtime_connections(ctx: _SyncMainContext) -> None:
                         ctx.session_lease = None
 
 
-def _record_stopped(conn: sqlite3.Connection) -> None:
+def _record_stopped(conn: sqlite3.Connection, reason_code: str | None) -> None:
     with write_transaction(conn):
-        record_runtime_observation(conn, kind="runtime.stopped", outcome="observed")
+        record_runtime_observation(conn, kind="runtime.stopped", outcome="observed", reason_code=reason_code)
 
 
 async def _persist_runtime_observation_loss(ctx: _SyncMainContext) -> None:
@@ -2042,6 +2055,23 @@ async def _run_shutdown_stage(
     return primary
 
 
+async def _disconnect_telegram(client: _DaemonClient) -> None:
+    disconnect = asyncio.ensure_future(client.disconnect())
+    cancelled = False
+    while not disconnect.done():
+        try:
+            await asyncio.wait({disconnect})
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        try:
+            disconnect.result()
+        except BaseException:
+            logger.exception("telegram_disconnect_failed_after_cancellation")
+        raise asyncio.CancelledError
+    disconnect.result()
+
+
 async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
     shutdown_event = cast(asyncio.Event | None, getattr(ctx, "shutdown_event", None))
     if shutdown_event is not None:
@@ -2069,7 +2099,7 @@ async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
         ("daemon_api", lambda: _stop_daemon_api(ctx)),
         ("background_tasks", lambda: _cancel_background_tasks(ctx)),
         ("image_sources", lambda: _stop_image_sources(ctx)),
-        ("telegram_disconnect", lambda: ctx.client.disconnect()),
+        ("telegram_disconnect", lambda: _disconnect_telegram(ctx.client)),
         ("rpc_scheduler", lambda: ctx.client.close_rpc_scheduler()),
         ("rpc_observer_detach", detach_observer),
         ("telemetry", drain_telemetry),
@@ -2333,8 +2363,15 @@ async def sync_main() -> None:  # noqa: PLR0915 - composition root owns startup 
     Orchestrates: DB init → FTS backfill → Telegram connect → wire services →
     sync loop → cleanup.
     """
-    ctx = await _build_sync_main_context()
+    shutdown_request = daemon_shutdown.register_shutdown_handler(asyncio.get_running_loop())
     try:
+        ctx = await _build_sync_main_context(shutdown_request)
+    except BaseException:
+        asyncio.get_running_loop().remove_signal_handler(signal.SIGTERM)
+        raise
+    try:
+        if shutdown_request.event.is_set():
+            return
         _start_runtime_monitors(ctx)
 
         update_barrier = UpdateProcessingBarrier(closed=True)
@@ -2433,10 +2470,14 @@ async def sync_main() -> None:  # noqa: PLR0915 - composition root owns startup 
         _offer_startup_demands(ctx)
         await _run_daemon_lifetime(ctx)
     except BaseException as exc:
+        shutdown_request.request(f"top_level_{type(exc).__name__}")
         await _run_shutdown_stage("startup_recovery", ctx.client.fail_startup_recovery, exc)
         raise
     finally:
-        await _shutdown_sync_main_context(ctx)
+        try:
+            await _shutdown_sync_main_context(ctx)
+        finally:
+            asyncio.get_running_loop().remove_signal_handler(signal.SIGTERM)
 
 
 _SYNC_MAIN = sync_main

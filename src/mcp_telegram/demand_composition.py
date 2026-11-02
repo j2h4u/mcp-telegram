@@ -331,11 +331,13 @@ def build_durable_coordinator(
     dependencies: DemandCompositionDependencies,
     *,
     observer: DemandCompositionObserver | None = None,
+    request_shutdown: Callable[[], None] | None = None,
 ) -> TelegramDemandCoordinator:
     """Construct the sole durable executor over the exhaustive adapter map."""
     coordinator = TelegramDemandCoordinator(
         build_durable_adapter_map(dependencies, observer=observer),
         dependencies.shutdown_event,
+        request_shutdown=request_shutdown,
         observer=observer,
         rpc_eligibility=dependencies.client.rpc_eligibility,
         prepare_durable_retry=dependencies.client.prepare_durable_retry,

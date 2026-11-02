@@ -129,6 +129,7 @@ class TelegramDemandCoordinator:
         adapters: Mapping[DemandKind, DurableDemandAdapter],
         shutdown_event: asyncio.Event | None = None,
         *,
+        request_shutdown: Callable[[], None] | None = None,
         clock: Callable[[], float] = time.time,
         safety_scan_seconds: float = DEFAULT_SAFETY_SCAN_SECONDS,
         observer: object | None = None,
@@ -143,6 +144,7 @@ class TelegramDemandCoordinator:
             raise ValueError("safety_scan_seconds must be finite and positive")
         self._adapters: Mapping[DemandKind, DurableDemandAdapter] = MappingProxyType(dict(adapters))
         self._shutdown_event = shutdown_event or asyncio.Event()
+        self._request_shutdown = request_shutdown or self._shutdown_event.set
         self._clock = clock
         self._monotonic_clock = monotonic_clock
         self._rpc_eligibility = rpc_eligibility or (lambda _method: None)
@@ -771,7 +773,7 @@ class TelegramDemandCoordinator:
         if self._shutdown_event.is_set():
             self._observe("deferred", kind, actual_attempts=budget.attempts, reason="shutdown")
             return True
-        self._shutdown_event.set()
+        self._request_shutdown()
         self._wake.set()
         return False
 

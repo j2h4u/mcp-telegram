@@ -36,7 +36,7 @@ _LIFECYCLE_ALLOWLIST: dict[Path, dict[str, frozenset[str]]] = {
     DAEMON_PATH: {
         "_connect_telegram": frozenset({"connect"}),
         "_monitor_flood_wait_kill_switch": frozenset({"disconnect"}),
-        "_shutdown_sync_main_context": frozenset({"disconnect"}),
+        "_disconnect_telegram": frozenset({"disconnect"}),
     },
 }
 
