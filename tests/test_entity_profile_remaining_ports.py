@@ -122,6 +122,16 @@ async def test_client_collection_fixture_uses_canonical_chat_identities() -> Non
 
 
 @pytest.mark.asyncio
+async def test_client_collection_fixture_keeps_unknown_constructor_incomplete() -> None:
+    from tests.helpers import client_profile_collection_page
+
+    client = _Client(SimpleNamespace(chats=[SimpleNamespace(id=7, title="Shared")]))
+    page = await client_profile_collection_page(client, UserReference(7, 8), "common_chats")
+    assert page.terminal and page.reported_count is None
+    assert len(page.items) == 1 and page.items[0].detail_complete is False
+
+
+@pytest.mark.asyncio
 async def test_user_empty_matches_target() -> None:
     photos = _Client(types.photos.Photos([_photo(2)], [types.UserEmpty(id=7)]))
     result = await TelethonUserAvatarHistoryGateway(photos).fetch_user_avatar_history(UserReference(7, 8))

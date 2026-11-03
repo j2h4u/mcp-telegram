@@ -503,7 +503,7 @@ async def test_get_entity_info_user_field_surface_preserved() -> None:
     assert _dict_at(d, "semantic", "fields")["full_user.about"] is None
     about = field_coverage["full_user.about"]
     assert about["state"] == "cleared" and about["authoritative"] is True
-    assert _dict_at(d, "collections", "common_chats")["reported_count"] == 0
+    assert _dict_at(d, "collections", "common_chats")["reported_count"] is None
 
 
 @pytest.mark.asyncio

@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 from jsonschema import validate
 from telethon.errors import PeerIdInvalidError  # type: ignore[import-untyped]
+from telethon.tl import types
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
@@ -1033,7 +1034,7 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt(re
                     chats=[],
                 )
             if kind == "common_chats":
-                return SimpleNamespace(chats=[SimpleNamespace(id=7, title="Shared")])
+                return types.messages.Chats([types.Chat(7, "Shared", types.ChatPhotoEmpty(), 0, None, 1)])
             raise AssertionError(f"unexpected request: {kind}")
 
         async def get_entity(self, _entity_id: int) -> object:
@@ -1102,9 +1103,17 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt(re
 
     assert second_budget.attempts == 1
     assert client.calls == ["full_user", "common_chats"]
-    assert conn.execute(
-        "SELECT next_section, acquisition_cursor FROM entity_profile_refresh_state WHERE entity_id=42"
-    ).fetchone() == ("contact_overlap", 0)
+    progress = cast(
+        tuple[str, int] | None,
+        conn.execute(
+            "SELECT next_section, acquisition_cursor FROM entity_profile_refresh_state WHERE entity_id=42"
+        ).fetchone(),
+    )
+    assert progress == ("contact_overlap", 0), conn.execute(
+        "SELECT status, reason, json_extract(payload_json, '$.diagnostics'), "
+        "json_extract(payload_json, '$.details_complete'), json_extract(payload_json, '$.identifiable') "
+        "FROM entity_detail_sections WHERE entity_id=42 AND section='common_chats'"
+    ).fetchone()
     local_budget = RpcAttemptBudget(limit=1)
     await restarted_adapter.run_slice(_select_profile_budget(restarted, local_budget))
     assert local_budget.attempts == 0

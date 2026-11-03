@@ -14,6 +14,7 @@ from .dialog_classification import (
     is_bot_dialog_type,
     is_reserved_replies_username,
 )
+from .models import DialogType
 from .scheduled_receipts_schema import SCHEDULED_OPERATION_RECEIPT_DDL
 from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
@@ -5243,14 +5244,14 @@ def _retained_common_chat(value: object) -> tuple[str, dict[str, object]] | None
         return None
     if kind == "group" and -_CHANNEL_ID_MARKER < dialog_id < 0:
         family, raw = "chat", -dialog_id
-    elif kind in {"channel", "supergroup"} and dialog_id < -_CHANNEL_ID_MARKER:
+    elif kind in {DialogType.CHANNEL, DialogType.SUPERGROUP} and dialog_id < -_CHANNEL_ID_MARKER:
         family, raw = "channel", -dialog_id - _CHANNEL_ID_MARKER
     else:
         return None
     fields: dict[str, object] = {"peer_kind": family, "id": raw}
     if isinstance(value.get("name"), str):
         fields["title"] = value["name"]
-    if kind == "supergroup":
+    if kind == DialogType.SUPERGROUP:
         fields["megagroup"] = True
     return f"{family}:{raw}", fields
 

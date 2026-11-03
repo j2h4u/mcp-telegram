@@ -620,12 +620,12 @@ depends_on = ["mcp_telegram.access_predicates", "mcp_telegram.dialog_identity", 
 [[modules]]
 path = "mcp_telegram.entity_profile.collection_repository"
 layer = "persistence"
-depends_on = ["mcp_telegram.entity_profile.field_manifest", "mcp_telegram.entity_profile.contracts", "mcp_telegram.sync_transactions"]
+depends_on = ["mcp_telegram.entity_profile.output_schema", "mcp_telegram.entity_profile.field_manifest", "mcp_telegram.entity_profile.contracts", "mcp_telegram.sync_transactions"]
 
 [[modules]]
 path = "mcp_telegram.sync_db"
 layer = "persistence"
-depends_on = ["mcp_telegram.sqlite_values", "mcp_telegram.alert_policy", "mcp_telegram.dialog_classification", "mcp_telegram.fts", "mcp_telegram.sync_transactions", "mcp_telegram.scheduled_receipts_schema"]
+depends_on = ["mcp_telegram.models", "mcp_telegram.sqlite_values", "mcp_telegram.alert_policy", "mcp_telegram.dialog_classification", "mcp_telegram.fts", "mcp_telegram.sync_transactions", "mcp_telegram.scheduled_receipts_schema"]
 
 [[modules]]
 path = "mcp_telegram.runtime_observations"
@@ -1120,7 +1120,7 @@ depends_on = ["mcp_telegram.pagination", "mcp_telegram.entity_profile.contracts"
 [[modules]]
 path = "mcp_telegram.entity_profile.output_schema"
 layer = "foundation"
-depends_on = ["mcp_telegram.structured", "mcp_telegram.entity_profile.contracts", "mcp_telegram.entity_profile.field_manifest"]
+depends_on = ["mcp_telegram.models", "mcp_telegram.structured", "mcp_telegram.entity_profile.contracts", "mcp_telegram.entity_profile.field_manifest"]
 
 [[modules]]
 path = "mcp_telegram.entity_profile.read_schema"

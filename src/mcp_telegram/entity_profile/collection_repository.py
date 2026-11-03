@@ -26,6 +26,7 @@ from .contracts import (
     profile_value_paths,
 )
 from .field_manifest import PROFILE_FIELD_MANIFEST
+from .output_schema import common_chat_constructor_family
 
 
 def encode(value: object) -> str:
@@ -757,10 +758,8 @@ def _same_partial_peer(old: Mapping[str, object], new: Mapping[str, object]) -> 
         "constructor" not in old
         and type(old.get("id")) is int
         and old.get("id") == new.get("id")
-        and (
-            (family == "chat" and constructor in {"Chat", "ChatEmpty", "ChatForbidden"})
-            or (family == "channel" and constructor in {"Channel", "ChannelForbidden"})
-        )
+        and family in ("chat", "channel")
+        and family == common_chat_constructor_family(constructor)
     )
 
 

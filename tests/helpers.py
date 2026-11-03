@@ -268,7 +268,8 @@ async def client_profile_collection_page(
         result = await client(("common_chats", {"user_id": reference.user_id, "limit": 100}))  # type: ignore[operator]
         chats = getattr(result, "chats", ()) or ()
         items = tuple(_common_chat_fixture_item(chat) for chat in chats)
-        count = len(items)
+        reported = getattr(result, "count", None)
+        count = reported if type(reported) is int else None
     elif section == "avatar_history":
         observation = await ClientUserAvatarHistoryPort(client).fetch_user_avatar_history(reference)
         items = tuple(

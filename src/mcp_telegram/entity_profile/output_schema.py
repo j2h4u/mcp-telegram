@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import cast
 
+from ..models import DialogType
 from ..structured import TELEGRAM_CONTENT_OUTPUT_SCHEMA, TelegramContentKind, telegram_content
 from .contracts import ProfileFieldClass
 from .field_manifest import PROFILE_FIELD_MANIFEST, ProfileFieldRule
@@ -172,6 +173,18 @@ COLLECTION_CONSTRUCTORS: dict[str, tuple[str, ...]] = {
     "current_stories": ("StoryItem", "StoryItemSkipped", "StoryItemDeleted"),
     "pinned_stories": ("StoryItem", "StoryItemSkipped", "StoryItemDeleted"),
 }
+
+
+def common_chat_constructor_family(constructor: object) -> str | None:
+    """Classify only supported Telegram chat constructors by peer family."""
+    if not isinstance(constructor, str) or constructor not in COLLECTION_CONSTRUCTORS["common_chats"]:
+        return None
+    kind = DialogType.parse(constructor.removesuffix("Forbidden").removesuffix("Empty"))
+    if kind is DialogType.GROUP:
+        return "chat"
+    if kind is DialogType.CHANNEL:
+        return "channel"
+    return None
 
 
 def collection_item_schema(section: str) -> dict[str, object]:

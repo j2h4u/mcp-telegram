@@ -10,6 +10,7 @@ from typing import cast
 from ..pagination import ProfileNavigationToken, decode_profile_navigation, encode_profile_navigation
 from .contracts import PROFILE_COLLECTION_SECTIONS, profile_value_paths
 from .output_schema import (
+    common_chat_constructor_family,
     project_collection_item,
     project_history_value,
     project_legacy_collection_item,
@@ -481,9 +482,10 @@ def common_chat_dialog_id(item: Mapping[str, object]) -> int | None:
         return -identifier
     if value.get("peer_kind") == "channel":
         return -1_000_000_000_000 - identifier
-    if constructor in {"Chat", "ChatForbidden", "ChatEmpty"}:
+    family = common_chat_constructor_family(constructor)
+    if family == "chat":
         return -identifier
-    if constructor in {"Channel", "ChannelForbidden"}:
+    if family == "channel":
         return -1_000_000_000_000 - identifier
     return None
 
