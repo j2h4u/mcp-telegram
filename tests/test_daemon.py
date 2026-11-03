@@ -43,6 +43,7 @@ from mcp_telegram.entity_profile.contracts import (
 from mcp_telegram.feedback_db import SQLiteFeedbackStore, ensure_feedback_schema
 from mcp_telegram.feedback_service import FeedbackApplicationService
 from mcp_telegram.flood import FloodWaitKillSwitchStatus, TelegramRpcThrottled
+from mcp_telegram.peer_access import PeerAccess
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.runtime_observations import RuntimeObservationSink
 from mcp_telegram.scheduled_write_fence import ScheduledMutationFence
@@ -92,6 +93,8 @@ def _ctx(**overrides: object) -> SimpleNamespace:
         "shutdown_event": asyncio.Event(),
         "coordinator": None,
         "demand_runtime": None,
+        "peer_access": None,
+        "peer_access_bound": False,
         "scheduled_mutation_fence": ScheduledMutationFence(),
         "handler_manager": _HandlerStub(),
         "api_server": _ApiStub(),
@@ -430,6 +433,19 @@ class _StartupIdentityClient(_ClientStub):
     def __init__(self, account_id: int) -> None:
         super().__init__()
         self._account_id = account_id
+        self._verified_scope: TelegramAuthScope | None = None
+        self.peer_access: PeerAccess | None = None
+
+    async def verify_startup_account(self, account_id: int) -> None:
+        assert account_id == self._account_id
+        self._verified_scope = TelegramAuthScope(1, account_id, 2, 9)
+
+    def retained_auth_scope(self) -> TelegramAuthScope | None:
+        return self._verified_scope
+
+    def bind_peer_access(self, access: PeerAccess) -> None:
+        assert access.scope == self._verified_scope
+        self.peer_access = access
 
     async def get_me(self) -> object:
         return SimpleNamespace(id=self._account_id)
@@ -439,6 +455,21 @@ class _StartupIdentityClient(_ClientStub):
 
     async def __call__(self, _request: object) -> object:
         return SimpleNamespace(full_user=SimpleNamespace(personal_channel_id=None))
+
+
+async def _unbind_test_peer_access(ctx: _SyncMainContext, writer: SQLiteWriter) -> None:
+    if ctx.peer_access is not None and ctx.peer_access_bound:
+        await writer.run(ctx.peer_access.unbind)
+
+
+@pytest.mark.asyncio
+async def test_startup_peer_access_rejects_unverified_account(shared_writer: SQLiteWriter) -> None:
+    client = _StartupIdentityClient(101)
+    ctx = _typed_ctx(client=client, writer=shared_writer)
+    with pytest.raises(RuntimeError, match="peer access requires a verified account"):
+        await daemon._bind_peer_access(ctx)
+    assert ctx.peer_access is None
+    assert client.peer_access is None
 
 
 class _CadenceStub:
@@ -906,6 +937,7 @@ async def test_classified_startup_identity_mismatch_preserves_directory_rows(
     shutdown = asyncio.Event()
     ctx = _typed_ctx(
         db_path=db_path,
+        writer=shared_writer,
         shutdown_event=shutdown,
         client=_StartupIdentityClient(101),
         api_server=_ApiStub(),
@@ -913,8 +945,11 @@ async def test_classified_startup_identity_mismatch_preserves_directory_rows(
     )
     directory = CanonicalDialogDirectory(ctx.client, db_path, shutdown, writer=shared_writer)
 
-    with pytest.raises(StartupIdentityUnavailableError, match="startup identity"):
-        await _acquire_startup_identity_before_updates(ctx, directory)
+    try:
+        with pytest.raises(StartupIdentityUnavailableError, match="startup identity"):
+            await _acquire_startup_identity_before_updates(ctx, directory)
+    finally:
+        await _unbind_test_peer_access(ctx, shared_writer)
 
     conn = _open_sync_db(db_path)
     try:
@@ -927,12 +962,8 @@ async def test_classified_startup_identity_mismatch_preserves_directory_rows(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("retained_account", [False, True])
 async def test_classified_startup_identity_binds_matching_account(
-    tmp_path: Path, shared_writer: SQLiteWriter, retained_account: bool, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, shared_writer: SQLiteWriter, retained_account: bool
 ) -> None:
-    async def bind_peer_access(_ctx: object) -> None:
-        return
-
-    monkeypatch.setattr(daemon, "_bind_peer_access", bind_peer_access)
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     if retained_account:
@@ -942,6 +973,7 @@ async def test_classified_startup_identity_binds_matching_account(
     shutdown = asyncio.Event()
     ctx = _typed_ctx(
         db_path=db_path,
+        writer=shared_writer,
         shutdown_event=shutdown,
         client=_StartupIdentityClient(101),
         api_server=_ApiStub(),
@@ -949,7 +981,11 @@ async def test_classified_startup_identity_binds_matching_account(
     )
     directory = CanonicalDialogDirectory(ctx.client, db_path, shutdown, writer=shared_writer)
 
-    startup = await _acquire_startup_identity_before_updates(ctx, directory)
+    try:
+        startup = await _acquire_startup_identity_before_updates(ctx, directory)
+        assert ctx.peer_access is cast(_StartupIdentityClient, ctx.client).peer_access
+    finally:
+        await _unbind_test_peer_access(ctx, shared_writer)
 
     assert not startup.pending
     assert cast(_UserProfilePort, ctx.user_profile_port).calls == []
@@ -1002,6 +1038,7 @@ async def test_recovery_startup_publishes_retained_channel_without_full_user(
     ctx = _typed_ctx(
         db_path=db_path,
         conn=conn,
+        writer=shared_writer,
         shutdown_event=shutdown,
         client=RecoveryClient(101),
         api_server=_ApiStub(),
@@ -1014,6 +1051,7 @@ async def test_recovery_startup_publishes_retained_channel_without_full_user(
             "SELECT fields_json FROM entity_profile_semantic_snapshots WHERE owner_account_id=101 AND entity_id=101"
         ).fetchone() == (fields,)
     finally:
+        await _unbind_test_peer_access(ctx, shared_writer)
         conn.close()
 
     assert startup.result().account_id == 101
@@ -1705,6 +1743,7 @@ async def test_preidentity_startup_retains_one_budget_and_deadline_across_gate_d
     shutdown = asyncio.Event()
     ctx = _typed_ctx(
         db_path=db_path,
+        writer=shared_writer,
         shutdown_event=shutdown,
         client=DeferredClient(101),
         api_server=_ApiStub(),
@@ -1712,7 +1751,10 @@ async def test_preidentity_startup_retains_one_budget_and_deadline_across_gate_d
     )
     directory = CanonicalDialogDirectory(ctx.client, db_path, shutdown, writer=shared_writer)
     monkeypatch.setattr(daemon, "sleep_through_flood", AsyncMock(return_value=False))
-    startup = await _acquire_startup_identity_before_updates(ctx, directory)
+    try:
+        startup = await _acquire_startup_identity_before_updates(ctx, directory)
+    finally:
+        await _unbind_test_peer_access(ctx, shared_writer)
     assert not startup.pending and ctx.api_server.self_id == 101
     assert len(seen) == 2 and seen[0][0] is seen[1][0] and seen[0][1] == seen[1][1]
     assert seen[1][0] is not None and seen[1][0].attempts == 1

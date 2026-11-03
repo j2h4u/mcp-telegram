@@ -87,6 +87,12 @@ class PeerAccess:
                 if cell is not None:
                     cell.publish(None)
 
+    def invalidate_scope(self) -> None:
+        """Revoke queued attempts before a transport identity transition."""
+        with self._lock:
+            for cell in (*self._cells.values(), *self._probe_cells.values()):
+                cell.publish(None)
+
     def reconcile(self, conn: sqlite3.Connection) -> None:
         with self._lock:
             dirty = tuple(self._dirty)

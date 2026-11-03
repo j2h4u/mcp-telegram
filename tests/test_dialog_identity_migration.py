@@ -5,6 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
+from unittest.mock import patch
 
 import pytest
 from telethon.tl import functions, types  # type: ignore[import-untyped]
@@ -24,7 +25,8 @@ from mcp_telegram.sync_db import (
 
 
 def _create_paused_v77_database(db_path: Path) -> None:
-    ensure_sync_schema(db_path)
+    with patch("mcp_telegram.sync_db._CURRENT_SCHEMA_VERSION", 79):
+        ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
     try:
         triggers = cast(
@@ -241,6 +243,7 @@ async def test_v77_incomplete_generation_restarts_from_fresh_full_crawl_and_publ
     db_path = tmp_path / "paused-v77.sqlite"
     _create_paused_v77_database(db_path)
     _migrate_and_assert_fresh_directory_generation(db_path)
+    ensure_sync_schema(db_path)
 
     client = _PublicationClient()
     writer = await SQLiteWriter.open(db_path)

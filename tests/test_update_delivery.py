@@ -38,6 +38,7 @@ from mcp_telegram.delivered_update import (
     fail_delivered_update,
 )
 from mcp_telegram.observation_order import delivered_observation_order
+from mcp_telegram.peer_access import PeerAccess
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
@@ -267,6 +268,7 @@ async def _close_migration_delivery(
     writer: SQLiteWriter,
     dispatches: list[asyncio.Task[None]],
     probe: _MigrationLoopProbe,
+    access: PeerAccess,
 ) -> None:
     probe.release.set()
     for task in (client._updates_handle, client._keepalive_handle):
@@ -281,16 +283,23 @@ async def _close_migration_delivery(
     await asyncio.gather(*dispatches, *list(client._event_handler_tasks), return_exceptions=True)
     await client._disconnect_main_sender()
     cast(SQLiteSession, client.session).close()
+    await writer.run(access.unbind)
     await writer.aclose()
     await client.close_rpc_scheduler()
 
 
-async def test_callback_migration_replacement_vendor_loop_restores_latest_whole_safe_snapshot(
+async def test_callback_migration_replacement_vendor_loop_restores_latest_whole_safe_snapshot(  # noqa: PLR0915 - complete delivery and migration lifecycle
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = _database(tmp_path)
     writer = await SQLiteWriter.open(path)
     client = _client(tmp_path / "session", writer)
+    await client.verify_startup_account(99)
+    scope = client.retained_auth_scope()
+    assert scope is not None
+    access = PeerAccess(scope)
+    await writer.run(access.bind)
+    client.bind_peer_access(access)
     _prepare_migration_transport(client, monkeypatch)
     probe = _observe_migration_delivery(client)
     dispatches: list[asyncio.Task[None]] = []
@@ -337,7 +346,7 @@ async def test_callback_migration_replacement_vendor_loop_restores_latest_whole_
         assert _saved(client)[123][0] == 20
         assert _pending(path) is None and not client._delivery_failure.is_set()
     finally:
-        await _close_migration_delivery(client, writer, dispatches, probe)
+        await _close_migration_delivery(client, writer, dispatches, probe, access)
 
 
 @pytest.mark.parametrize("stage", ["queued", "committed"])

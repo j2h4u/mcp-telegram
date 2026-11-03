@@ -123,6 +123,7 @@ from tests.helpers import (
     reset_rpc_process_policy,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.peer_access_helpers import bind_test_peer_access
 from tests.test_rpc_admission_observations import _Recorder
 
 
@@ -608,6 +609,7 @@ def _gate(  # noqa: PLR0915
         safety_store=safety_store or safety.api(),
         flood_observer=lambda **_kwargs: None,
     )
+    bind_test_peer_access(gate)
     limiter = _FastFiniteLimiter()
     gate._limiter = limiter
     gate._admission_scheduler._limiter = limiter
@@ -3149,6 +3151,33 @@ def test_gate_factory_invariants_without_connecting() -> None:
     assert gate.flood_sleep_threshold == 0
     assert gate._raise_last_call_error is True
     assert gate._auto_reconnect is True
+
+
+@pytest.mark.asyncio
+async def test_identity_transition_revokes_queued_peers_without_erasing_denials() -> None:
+    gate = _gate()
+    access = gate._peer_access
+    scope = gate.retained_auth_scope()
+    assert access is not None and scope is not None
+    old = access.capture(scope, (11,), None)
+    access.revoke(12)
+    with gate._image_identity_change():
+        assert not access.claim(old)
+    assert not access.claim(old)
+    assert access.claim(access.capture(scope, (11,), None))
+    assert not access.claim(access.capture(scope, (12,), None))
+    await gate.close_rpc_scheduler()
+
+
+@pytest.mark.asyncio
+async def test_unverified_scope_rejects_ordinary_config_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mcp_telegram.peer_access import PeerAccessRejectedError
+
+    gate = _gate()
+    monkeypatch.setattr(gate, "retained_auth_scope", lambda: None)
+    with pytest.raises(PeerAccessRejectedError, match="peer_access_scope_changed"):
+        await _call(gate, _TestRequest("ordinary"))
+    await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio

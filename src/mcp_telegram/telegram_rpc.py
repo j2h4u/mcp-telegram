@@ -3962,12 +3962,27 @@ class TelegramRpcGate(TelegramClient):
             if not (owner.scope.transport_bootstrap or owner.scope.transport_auth or startup):
                 raise PeerAccessRejectedError("peer_access_unbound")
             return
+        retained_scope = self.retained_auth_scope()
+        if self._is_peerless_identity_bootstrap(owner, request, capability, retained_scope):
+            return
         targets = _request_peers(request, access.scope.account_id, capability)
-        owner.peer_tokens = access.capture(
-            self.retained_auth_scope(), targets, _probe_target(owner, access.scope, targets)
-        )
+        owner.peer_tokens = access.capture(retained_scope, targets, _probe_target(owner, access.scope, targets))
         if any(token is None for token in owner.peer_tokens):
             raise PeerAccessRejectedError("peer_access_lost")
+
+    def _is_peerless_identity_bootstrap(
+        self,
+        owner: _WireAttempt,
+        request: TLRequest,
+        capability: _PhotoWireCapability | None,
+        scope: TelegramAuthScope | None,
+    ) -> bool:
+        return (
+            scope is None
+            and capability is None
+            and owner.scope.transport_bootstrap
+            and (self._is_self_lookup(request) or type(request) is functions.help.GetConfigRequest)
+        )
 
     @staticmethod
     def _draft_phase_at_registration(owner: _WireAttempt) -> _DraftWirePhase | None:
@@ -5417,6 +5432,9 @@ class TelegramRpcGate(TelegramClient):
 
     @contextmanager
     def _image_identity_change(self) -> Iterator[None]:
+        access = self._peer_access
+        if access is not None:
+            access.invalidate_scope()
         change = self._image_scope_cell.begin_change()
         try:
             yield
