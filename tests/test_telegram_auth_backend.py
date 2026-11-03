@@ -1,6 +1,7 @@
 """Stopped authentication preserves retained state and rejects foreign identities."""
 
 import asyncio
+import sqlite3
 import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -16,6 +17,10 @@ from telethon.sessions import SQLiteSession
 from telethon.tl import functions, types
 
 from mcp_telegram.config import TelegramRpcSchedulerConfig
+from mcp_telegram.peer_access import PeerAccess
+from mcp_telegram.sqlite_writer import SQLiteWriter
+from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_demand import RpcAttemptBudget, RpcAttemptEvidence, demand_context
 from mcp_telegram.telegram_rpc import TelegramRpcBudget, TelegramRpcGate
 from mcp_telegram.telegram_rpc_consumers import DemandKind
@@ -50,12 +55,29 @@ async def auth_backend(tmp_path: Path) -> AsyncIterator[tuple[TelegramRpcGate, S
         safety_store=store.api(),
     )
     await gate.verify_startup_account(42)
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    writer = await SQLiteWriter.open(path)
+
+    def retain_lost_dialog(conn: sqlite3.Connection) -> None:
+        with write_transaction(conn):
+            conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (999,'access_lost')")
+
+    await writer.run(retain_lost_dialog)
+    scope = gate.retained_auth_scope()
+    assert scope is not None
+    access = PeerAccess(scope)
+    await writer.run(access.bind)
+    assert access.capture(scope, (999,), None) == (None,)
+    gate.bind_peer_access(access)
     store.owners = (42, 42)
     try:
         yield gate, store, session
     finally:
         await gate.disconnect()
         await gate.close_rpc_scheduler()
+        await writer.run(access.unbind)
+        await writer.aclose()
         reset_rpc_process_policy()
 
 

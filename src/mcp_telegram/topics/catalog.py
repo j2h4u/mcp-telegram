@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import cast
 
+from ..access_predicates import not_access_lost_sql
 from ..observation_order import allocate_observation_order
 from ..sync_transactions import write_savepoint
 from .contracts import TopicCursor, TopicPage, TopicSourceUnavailableError
@@ -55,6 +56,12 @@ class TopicCatalogRepository:
                 "SELECT 1 FROM full_history_enrollment WHERE dialog_id=? AND enabled=1", (dialog_id,)
             ).fetchone()
             is not None
+        )
+
+    def acquisition_allowed(self, dialog_id: int) -> bool:
+        return (
+            self._enabled(dialog_id)
+            and self._conn.execute("SELECT " + not_access_lost_sql("?"), (dialog_id,)).fetchone()[0] == 1
         )
 
     def request(self, dialog_id: int, reason: str) -> None:
@@ -121,8 +128,9 @@ class TopicCatalogRepository:
                 """SELECT e.dialog_id,COALESCE(s.retry_at,0) FROM full_history_enrollment e
             LEFT JOIN topic_catalog_state s ON s.dialog_id=e.dialog_id
             WHERE e.enabled=1 AND (s.dialog_id IS NULL OR s.pending=1)
-            AND COALESCE(s.reason,'')<>'source_access_unavailable'
-            ORDER BY COALESCE(s.retry_at,0),e.dialog_id LIMIT 1"""
+            AND COALESCE(s.reason,'')<>'source_access_unavailable' AND """
+                + not_access_lost_sql("e.dialog_id")
+                + " ORDER BY COALESCE(s.retry_at,0),e.dialog_id LIMIT 1"
             ).fetchone(),
         )
 
@@ -133,14 +141,15 @@ class TopicCatalogRepository:
                 """SELECT e.dialog_id,COALESCE(s.retry_at,0) FROM full_history_enrollment e
                 LEFT JOIN topic_catalog_state s ON s.dialog_id=e.dialog_id
                 WHERE e.enabled=1 AND (s.dialog_id IS NULL OR s.pending=1)
-                AND COALESCE(s.reason,'')<>'source_access_unavailable'
-                ORDER BY COALESCE(s.retry_at,0),e.dialog_id""",
+                AND COALESCE(s.reason,'')<>'source_access_unavailable' AND """
+                + not_access_lost_sql("e.dialog_id")
+                + " ORDER BY COALESCE(s.retry_at,0),e.dialog_id",
             ).fetchall(),
         )
 
     def begin_page(self, dialog_id: int) -> TopicScan | None:
         with write_savepoint(self._conn):
-            if not self._enabled(dialog_id):
+            if not self.acquisition_allowed(dialog_id):
                 return None
             self.bootstrap()
             row = cast(
@@ -177,7 +186,7 @@ class TopicCatalogRepository:
     def apply_page_outcome(self, scan: TopicScan, page: TopicPage) -> tuple[bool, bool, str | None]:
         """Return acceptance, terminal state and its revision from the write transaction."""
         with write_savepoint(self._conn):
-            if not self._enabled(scan.dialog_id):
+            if not self.acquisition_allowed(scan.dialog_id):
                 return False, False, None
             state = cast(
                 _PageState | None,
@@ -306,6 +315,8 @@ class TopicCatalogRepository:
 
     def fail(self, scan: TopicScan, reason: str, retry_at: int | None) -> None:
         with write_savepoint(self._conn):
+            if not self.acquisition_allowed(scan.dialog_id):
+                return
             if reason == "source_access_unavailable":
                 self._conn.execute(
                     "UPDATE topic_catalog_state SET reason=?,retry_at=NULL,capability_observation_order=? "
@@ -333,7 +344,7 @@ class TopicCatalogRepository:
 
     def mark_not_applicable_outcome(self, scan: TopicScan) -> tuple[bool, str | None]:
         with write_savepoint(self._conn):
-            if not self._enabled(scan.dialog_id):
+            if not self.acquisition_allowed(scan.dialog_id):
                 return False, None
             changed = self._conn.execute(
                 "UPDATE topic_catalog_state SET applicable=0,pending=0,reason='not_topic_capable',retry_at=NULL "

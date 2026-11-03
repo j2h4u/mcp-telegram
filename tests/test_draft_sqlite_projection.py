@@ -171,6 +171,23 @@ def test_authoritative_absence_creates_bodyless_cleared_tombstone(
     assert (state, text, source_kind, entities) == ("cleared", None, "snapshot_absence", None)
 
 
+def test_snapshot_absence_preserves_inaccessible_draft_and_realtime_clear_applies(
+    projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
+) -> None:
+    conn, repository = projection
+    lost, readable = DraftScope(100, 200), DraftScope(100, 201)
+    for scope in (lost, readable):
+        repository.apply_realtime(_present(scope, 1, "body", source=DraftObservationSource.REALTIME))
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (200,'access_lost')")
+    conn.commit()
+    claim = _claim(repository, 2)
+    assert repository.apply_snapshot([], _coverage(0), claim_token=claim).accepted
+    assert _current(conn, lost)[:2] == ("present", "body")
+    assert _current(conn, readable)[:2] == ("cleared", None)
+    assert repository.apply_realtime(_empty(lost, 11, source=DraftObservationSource.REALTIME)).accepted
+    assert _current(conn, lost)[:2] == ("empty", None)
+
+
 def test_authoritative_absence_is_revision_idempotent(
     projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
 ) -> None:

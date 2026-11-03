@@ -1395,7 +1395,161 @@ async def test_access_loss_marks_scheduled_coverage_inaccessible(conn: sqlite3.C
         "SELECT coverage_state,coverage_reason,repair_due_at,discovery_due_at "
         "FROM scheduled_reconciliation_state WHERE dialog_id=?",
         (dialog_id,),
-    ).fetchone() == ("inaccessible", "ChannelPrivateError", None, None)
+    ).fetchone() == ("unknown", None, None, 0)
     assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
         "access_lost",
     )
+
+
+def test_permission_block_persists_and_only_changed_rights_rearm(tmp_path: Path) -> None:
+    from mcp_telegram.scheduled_state import apply_scheduled_permission
+
+    path = tmp_path / "permissions.db"
+    ensure_sync_schema(path)
+    connection = _open_sync_db(path)
+    with write_transaction(connection):
+        apply_scheduled_permission(connection, 123, "1:0:0:0", 10)
+    connection.close()
+    ensure_sync_schema(path)
+    connection = _open_sync_db(path)
+    assert connection.execute(
+        "SELECT acquisition_block,dirty_generation FROM scheduled_reconciliation_state WHERE dialog_id=123"
+    ).fetchone() == ("permission_denied", 0)
+    with write_transaction(connection):
+        apply_scheduled_permission(connection, 123, "1:0:0:0", 11)
+    assert connection.execute(
+        "SELECT acquisition_block,dirty_generation FROM scheduled_reconciliation_state WHERE dialog_id=123"
+    ).fetchone() == ("permission_denied", 0)
+    with write_transaction(connection):
+        apply_scheduled_permission(connection, 123, "1:0:1:1", 12)
+    assert connection.execute(
+        "SELECT acquisition_block,dirty_generation FROM scheduled_reconciliation_state WHERE dialog_id=123"
+    ).fetchone() == (None, 1)
+    connection.close()
+
+
+@pytest.mark.asyncio
+async def test_admin_denial_blocks_only_selected_peer_and_survives_restart(conn: sqlite3.Connection) -> None:
+    from telethon.errors import ChatAdminRequiredError
+
+    from mcp_telegram.scheduled_messages import ScheduledDiscoveryDemandAdapter
+
+    conn.executemany("INSERT INTO dialogs(dialog_id,type) VALUES (?,'channel')", [(100,), (101,)])
+    conn.executemany(
+        "INSERT INTO scheduled_reconciliation_state(dialog_id,discovery_due_at,updated_at) VALUES (?,0,0)",
+        [(100,), (101,)],
+    )
+    conn.commit()
+    client = _ScheduledSnapshotClient(call_error=ChatAdminRequiredError(request=None))
+    worker = ScheduledMessageReconciler(
+        client,
+        conn,
+        asyncio.Event(),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
+        writer=inline_writer(conn),
+    )
+    adapter = ScheduledDiscoveryDemandAdapter(worker, account_id=42)
+    result = await worker._run_demand_slice_with_receipt(DemandKind.SCHEDULED_DISCOVERY, 100)
+    assert result[1] is not None
+    assert conn.execute(
+        "SELECT acquisition_block,discovery_due_at FROM scheduled_reconciliation_state WHERE dialog_id=100"
+    ).fetchone() == ("admin_required", 0)
+    status = adapter.status(1)
+    assert status is not None and status.selected is not None
+    assert status.selected.key.target == "101"
+    assert await worker._apply_snapshot(100, 0, [], discovery=True, now=1, observation_order=1) is None
+
+
+def test_access_loss_invalidates_only_bound_account_permits(conn: sqlite3.Connection) -> None:
+    from mcp_telegram.scheduled_state import invalidate_scheduled_access_loss
+    from mcp_telegram.scheduled_write_fence import ScheduledMutationFence
+
+    fence = ScheduledMutationFence()
+    local = fence.watch(42, 123, None)
+    other = fence.watch(43, 123, None)
+    with write_transaction(conn):
+        invalidate_scheduled_access_loss(conn, 123, 10)
+    assert local.invalidated.is_set()
+    assert not other.invalidated.is_set()
+
+
+def test_permission_schema_upgrades_existing_v94(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import mcp_telegram.sync_db as sync_db
+
+    path = tmp_path / "upgrade.db"
+    monkeypatch.setattr(sync_db, "_CURRENT_SCHEMA_VERSION", 94)
+    ensure_sync_schema(path)
+    connection = _open_sync_db(path)
+    connection.execute(
+        "INSERT INTO scheduled_reconciliation_state(dialog_id,discovery_due_at,updated_at) VALUES(123,1,1)"
+    )
+    connection.commit()
+    connection.close()
+    monkeypatch.setattr(sync_db, "_CURRENT_SCHEMA_VERSION", 95)
+    ensure_sync_schema(path)
+    connection = _open_sync_db(path)
+    assert connection.execute(
+        "SELECT acquisition_block,permission_signature,authorization_pending FROM scheduled_reconciliation_state WHERE dialog_id=123"
+    ).fetchone() == (None, None, 0)
+    connection.close()
+
+
+def test_loss_preserves_complete_coverage_but_requires_new_baseline(conn: sqlite3.Connection) -> None:
+    from mcp_telegram.scheduled_commands import ScheduledCommandError, _current_state
+    from mcp_telegram.scheduled_state import invalidate_scheduled_access_loss
+
+    conn.execute(
+        "INSERT INTO scheduled_reconciliation_state(dialog_id,updated_at,coverage_state,snapshot_observation_order) "
+        "VALUES (123,1,'complete',5)"
+    )
+    conn.commit()
+    with write_transaction(conn):
+        invalidate_scheduled_access_loss(conn, 123, 10)
+    assert conn.execute(
+        "SELECT coverage_state,authorization_pending,discovery_due_at FROM scheduled_reconciliation_state WHERE dialog_id=123"
+    ).fetchone() == ("complete", 1, 10)
+    with pytest.raises(ScheduledCommandError, match="baseline"):
+        _current_state(conn, 42, 123, None)
+
+
+def test_v94_lost_complete_baseline_requires_refresh_after_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mcp_telegram.sync_db as sync_db
+    from mcp_telegram.access_lifecycle import restore_access_after_revalidation
+    from mcp_telegram.scheduled_commands import ScheduledCommandError, _current_state
+
+    path = tmp_path / "lost-upgrade.db"
+    monkeypatch.setattr(sync_db, "_CURRENT_SCHEMA_VERSION", 94)
+    ensure_sync_schema(path)
+    connection = _open_sync_db(path)
+    try:
+        with write_transaction(connection):
+            connection.execute("UPDATE scheduled_sync_state SET account_id=42 WHERE key='account'")
+            connection.execute(
+                "INSERT INTO synced_dialogs(dialog_id,status,access_lost_at) VALUES(123,'access_lost',20)"
+            )
+            upsert_scheduled_message(connection, 123, _message(11, "retained", scheduled_at=1_900_000_001), now=10)
+            connection.execute(
+                "UPDATE scheduled_reconciliation_state SET coverage_state='complete',coverage_reason=NULL,"
+                "repair_due_at=NULL,discovery_due_at=NULL,dirty_since=NULL,dirty_generation=3,"
+                "snapshot_observation_order=5 WHERE dialog_id=123"
+            )
+    finally:
+        connection.close()
+    monkeypatch.setattr(sync_db, "_CURRENT_SCHEMA_VERSION", 95)
+    ensure_sync_schema(path)
+    connection = _open_sync_db(path)
+    try:
+        assert connection.execute(
+            "SELECT coverage_state,authorization_pending,dirty_generation,discovery_due_at "
+            "FROM scheduled_reconciliation_state WHERE dialog_id=123"
+        ).fetchone() == ("complete", 1, 4, 0)
+        assert connection.execute(
+            "SELECT text FROM scheduled_messages WHERE dialog_id=123 AND message_id=11"
+        ).fetchone() == ("retained",)
+        assert restore_access_after_revalidation(connection, 123, 30)
+        with pytest.raises(ScheduledCommandError, match="baseline"):
+            _current_state(connection, 42, 123, None)
+    finally:
+        connection.close()

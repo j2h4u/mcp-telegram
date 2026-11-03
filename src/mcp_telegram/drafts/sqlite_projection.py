@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import cast
 
+from mcp_telegram.access_predicates import not_access_lost_sql
 from mcp_telegram.drafts.contracts import (
     DraftApplyResult,
     DraftComposition,
@@ -247,7 +248,10 @@ class SQLiteDraftProjection:
         row = cast(
             tuple[object] | None,
             self._conn.execute(
-                "SELECT 1 FROM draft_order_uncertainty WHERE account_id=? LIMIT 1", (account_id,)
+                "SELECT 1 FROM draft_order_uncertainty WHERE account_id=? AND "
+                + not_access_lost_sql("draft_order_uncertainty.dialog_id")
+                + " LIMIT 1",
+                (account_id,),
             ).fetchone(),
         )
         return row is not None
@@ -349,7 +353,8 @@ class SQLiteDraftProjection:
         known = cast(
             list[tuple[int, int, int, int]],
             self._conn.execute(
-                "SELECT dialog_id,top_message_id,subdialog_peer_id,projection_revision FROM draft_current WHERE account_id=?",
+                "SELECT dialog_id,top_message_id,subdialog_peer_id,projection_revision FROM draft_current WHERE account_id=? AND "
+                + not_access_lost_sql("draft_current.dialog_id"),
                 (account_id,),
             ).fetchall(),
         )
@@ -373,7 +378,7 @@ class SQLiteDraftProjection:
             list[tuple[int, int, int, int]],
             self._conn.execute(
                 "SELECT dialog_id,top_message_id,subdialog_peer_id,account_id FROM draft_order_uncertainty "
-                "WHERE account_id=?",
+                "WHERE account_id=? AND " + not_access_lost_sql("draft_order_uncertainty.dialog_id"),
                 (account_id,),
             ).fetchall(),
         )

@@ -53,6 +53,7 @@ def _fenced_schema(conn: sqlite3.Connection, *, semantic: bool = True) -> None:
             id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT,
             name_normalized TEXT, updated_at INTEGER NOT NULL
         );
+        CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL);
         CREATE TABLE dialogs (
             dialog_id INTEGER PRIMARY KEY, name TEXT, type TEXT, username TEXT,
             created INTEGER, hidden INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0,

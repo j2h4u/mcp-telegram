@@ -136,6 +136,10 @@ def _unobserved_scope_state(conn: sqlite3.Connection, scope: DraftScope, *, unce
     coverage = _one(conn, "SELECT * FROM draft_sync_state WHERE account_id=?", (scope.account_id,))
     known = (
         not uncertain
+        and conn.execute(
+            "SELECT 1 FROM synced_dialogs WHERE dialog_id=? AND status='access_lost'", (scope.dialog_id,)
+        ).fetchone()
+        is None
         and coverage is not None
         and coverage["coverage_status"] == "complete"
         and coverage["status"] == "ready"

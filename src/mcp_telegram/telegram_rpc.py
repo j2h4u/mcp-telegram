@@ -64,6 +64,7 @@ from .auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from .delivered_update import DeliveredUpdate, delivered_update_context, fail_delivered_update
 from .flood import FloodWaitObservation, TelegramRpcThrottled, flood_seconds
 from .image_authorization import ScopeCell, ScopeToken
+from .peer_access import PeerAccess, PeerAccessRejectedError, current_peer_target
 from .request_timing import DaemonRequestTiming, current_timing
 from .scheduled_write_fence import (
     ScheduledMutationCheck,
@@ -2800,6 +2801,7 @@ class _PhotoWireCapability:
     aux_bootstrap: dict[str, object] | None = None
     wire_owner: _WireAttempt | None = None
     photo_session: _GuardedPhotoSession | None = None
+    dialog_id: int | None = None
 
 
 _PHOTO_CAPABILITY: ContextVar[_PhotoWireCapability | None] = ContextVar("telegram_photo_capability", default=None)
@@ -2856,6 +2858,7 @@ class _WireAttempt:
     scheduled_mutation: bool = False
     photo_capability: _PhotoWireCapability | None = None
     photo_lease: _AuxPhotoLease | None = None
+    peer_tokens: tuple[ScopeToken | None, ...] = ()
 
 
 def _application_request(request: object) -> TLRequest:
@@ -2887,6 +2890,136 @@ def _canonical_wire_method(request: object) -> str:
     actual = _application_request(request)
     kind = type(actual)
     return f"{kind.__module__}.{kind.__name__}:{actual.CONSTRUCTOR_ID:08x}"
+
+
+class _PeerRequest(Protocol):
+    peer: object
+
+
+class _ChannelRequest(Protocol):
+    channel: object
+
+
+class _UserRequest(Protocol):
+    user_id: object
+
+
+class _PeerVectorRequest(Protocol):
+    peers: list[object]
+
+
+def _request_peers(request: TLRequest, account_id: int, photo: _PhotoWireCapability | None) -> tuple[int, ...]:
+    """Freeze typed peer identities from the request, never from message IDs."""
+    if photo is not None:
+        if photo.dialog_id is None:
+            raise PeerAccessRejectedError("peer_target_unavailable")
+        return (photo.dialog_id,)
+    if type(request) is functions.messages.GetMessagesRequest:
+        target = current_peer_target()
+        if target is None:
+            raise PeerAccessRejectedError("peer_target_unavailable")
+        return (target,)
+    targets = (_input_peer_id(value, account_id) for value in _request_peer_values(request))
+    return tuple(sorted({target for target in targets if target is not None}))
+
+
+def _request_peer_values(request: TLRequest) -> list[object]:
+    kind = type(request)
+    peer_methods = (
+        functions.messages.GetHistoryRequest,
+        functions.messages.GetScheduledHistoryRequest,
+        functions.messages.GetScheduledMessagesRequest,
+        functions.messages.GetForumTopicsRequest,
+        functions.messages.GetForumTopicsByIDRequest,
+        functions.messages.GetMessageReactionsListRequest,
+        functions.messages.GetOutboxReadDateRequest,
+        functions.messages.SearchRequest,
+        functions.messages.SaveDraftRequest,
+        functions.messages.SendMessageRequest,
+        functions.messages.EditMessageRequest,
+        functions.messages.DeleteScheduledMessagesRequest,
+        functions.messages.TranscribeAudioRequest,
+        functions.payments.GetSavedStarGiftsRequest,
+        functions.stories.GetPeerStoriesRequest,
+        functions.stories.GetPinnedStoriesRequest,
+        functions.stories.GetStoriesByIDRequest,
+    )
+    channel_methods = (
+        functions.channels.GetFullChannelRequest,
+        functions.channels.GetParticipantsRequest,
+        functions.channels.GetParticipantRequest,
+        functions.channels.GetMessagesRequest,
+        functions.channels.GetAdminLogRequest,
+        functions.updates.GetChannelDifferenceRequest,
+    )
+    values: list[object] = []
+    if kind in peer_methods:
+        values.append(cast(_PeerRequest, request).peer)
+    elif kind in channel_methods:
+        values.append(cast(_ChannelRequest, request).channel)
+    elif kind in (functions.messages.GetCommonChatsRequest, functions.photos.GetUserPhotosRequest):
+        values.append(cast(_UserRequest, request).user_id)
+    elif kind is functions.messages.GetPeerDialogsRequest:
+        values.extend(cast(_PeerVectorRequest, request).peers)
+    else:
+        values.extend(_request_peer_ids(request))
+    return values
+
+
+def _request_peer_ids(request: TLRequest) -> list[object]:
+    if isinstance(
+        request,
+        (functions.users.GetUsersRequest, functions.users.GetFullUserRequest, functions.users.GetSavedMusicRequest),
+    ):
+        value = request.id
+        return list(value) if isinstance(value, list) else [value]
+    if isinstance(request, functions.channels.GetChannelsRequest):
+        return list(request.id)
+    if isinstance(request, functions.messages.GetChatsRequest):
+        return [types.PeerChat(chat_id) for chat_id in request.id]
+    if isinstance(request, functions.messages.GetFullChatRequest):
+        return [types.PeerChat(request.chat_id)]
+    if _unknown_peer_target(request):
+        raise PeerAccessRejectedError("peer_target_unclassified")
+    return []
+
+
+def _unknown_peer_target(request: TLRequest) -> bool:
+    value = getattr(request, "id", None)
+    values = value if isinstance(value, list) else [value]
+    peer_types = (types.InputUser, types.InputChannel, types.InputPeerUser, types.InputPeerChannel, types.InputPeerChat)
+    return any(isinstance(item, peer_types) for item in values) or any(
+        hasattr(request, name) for name in ("peer", "channel", "user_id", "peers", "chat_id")
+    )
+
+
+def _input_peer_id(value: object, account_id: int) -> int | None:
+    if isinstance(value, types.InputDialogPeer):
+        value = value.peer
+    if isinstance(value, (types.InputPeerSelf, types.InputUserSelf)):
+        return account_id
+    if isinstance(value, types.InputPeerEmpty):
+        return None
+    try:
+        return int(get_peer_id(value))
+    except (TypeError, ValueError) as error:
+        raise PeerAccessRejectedError("peer_target_unavailable") from error
+
+
+def _probe_target(owner: _WireAttempt, scope: TelegramAuthScope, targets: tuple[int, ...]) -> int | None:
+    budget = owner.scope.attempt_budget
+    selected = None if budget is None else budget.selected
+    if (
+        owner.scope.demand_kind is not DemandKind.DELTA_ACCESS_PROBE
+        or selected is None
+        or selected.key.demand_kind is not DemandKind.DELTA_ACCESS_PROBE
+        or selected.key.account_id != scope.account_id
+        or rpc_effect(owner.method) is not RpcEffect.NONMUTATING_READ
+    ):
+        return None
+    if len(targets) != 1:
+        return None
+    return targets[0] if selected.key.target in (f"probe:{targets[0]}", f"recovery:{targets[0]}") else None
 
 
 def _safe_diagnostic_method(method: str) -> str:
@@ -2977,6 +3110,7 @@ class _GuardedPhotoSession:
     ) -> None:
         self.gate = gate
         self.locator = locator
+        self.dialog_id: int | None = None
         self.scope = scope
         self.work = work
         self.budget = budget
@@ -3083,6 +3217,7 @@ def _delivery_session_hashes(session: Session, channel_ids: set[int]) -> dict[in
 
 
 class TelegramRpcGate(TelegramClient):
+    _peer_access: PeerAccess | None
     """A Telethon client with account-global admission and transient retry.
 
     Every admitted attempt consumes one limiter acquisition. Flood errors
@@ -3192,18 +3327,24 @@ class TelegramRpcGate(TelegramClient):
         """Bind the durable owner for Telegram's explicit DifferenceTooLong result."""
         self._scheduled_continuity_recovery = callback
 
+    def bind_peer_access(self, access: PeerAccess) -> None:
+        if self._peer_access is not None:
+            raise RuntimeError("peer access already configured")
+        self._peer_access = access
+
     def _initialize_wire_authority(self, safety_store: TelegramRpcSafetyStore) -> None:
         """Initialize one account-owned physical-attempt authority."""
         self._safety_store = safety_store
         self._safety: TelegramRpcSafetyLedger | None = None
         self._wire_issuer = object()
         self._image_scope_cell = ScopeCell()
+        self._peer_access = None
         self._photo_issuer = object()
         self._session_lease: TelegramSessionLease | None = None
         self._session_pin: TelegramSessionLeasePin | None = None
         self._photo_aux_lease: _AuxPhotoLease | None = None
         self._photo_session: _GuardedPhotoSession | None = None
-        self._photo_locators: dict[int, tuple[PhotoLocator, ScopeToken]] = {}
+        self._photo_locators: dict[int, tuple[PhotoLocator, ScopeToken, int]] = {}
         self._photo_wire_fault_owner: str | None = None
         self._vendor_call_tasks: set[asyncio.Task[object]] = set()
         self._dc_transition_target: int | None = None
@@ -3799,6 +3940,7 @@ class TelegramRpcGate(TelegramClient):
             transport_auth=self._authentication_mode or self._logout_mode,
         )
         owner = _WireAttempt(self._wire_issuer, attempt_id, method, bound, timing=current_timing())
+        self._capture_peer_access(owner, actual, capability)
         owner.photo_capability = capability
         if capability is not None:
             capability.wire_owner = owner
@@ -3810,6 +3952,22 @@ class TelegramRpcGate(TelegramClient):
         if scheduled_check is not None:
             self._require_scheduled_mutation_budget(bound)
         return owner
+
+    def _capture_peer_access(
+        self, owner: _WireAttempt, request: TLRequest, capability: _PhotoWireCapability | None
+    ) -> None:
+        access = self._peer_access
+        if access is None:
+            startup = owner.scope.demand_kind is DemandKind.SELF_PROFILE_MAINTENANCE and self._is_self_lookup(request)
+            if not (owner.scope.transport_bootstrap or owner.scope.transport_auth or startup):
+                raise PeerAccessRejectedError("peer_access_unbound")
+            return
+        targets = _request_peers(request, access.scope.account_id, capability)
+        owner.peer_tokens = access.capture(
+            self.retained_auth_scope(), targets, _probe_target(owner, access.scope, targets)
+        )
+        if any(token is None for token in owner.peer_tokens):
+            raise PeerAccessRejectedError("peer_access_lost")
 
     @staticmethod
     def _draft_phase_at_registration(owner: _WireAttempt) -> _DraftWirePhase | None:
@@ -4381,6 +4539,7 @@ class TelegramRpcGate(TelegramClient):
         owner = self._require_wire_owner(owner)
         if not isinstance(permit, _WirePermit) or permit.owner is not owner or permit.released:
             raise RuntimeError("unowned Telegram write permission")
+        self._claim_peer_access(owner)
         self._check_scheduled_claim(owner, permit)
         if not self._permit_still_eligible(owner, permit):
             return False
@@ -4396,6 +4555,15 @@ class TelegramRpcGate(TelegramClient):
             self._message_box.difference_claimed()
         self._record_wire_dispatch(owner, permit)
         return True
+
+    def _claim_peer_access(self, owner: _WireAttempt) -> None:
+        access = self._peer_access
+        if (
+            access is not None
+            and owner.peer_tokens
+            and (self.retained_auth_scope() != access.scope or not access.claim(owner.peer_tokens))
+        ):
+            raise PeerAccessRejectedError("peer_access_lost")
 
     def _is_update_difference_owner(self, owner: _WireAttempt) -> bool:
         return self._is_update_difference_scope(owner.scope)
@@ -4770,7 +4938,7 @@ class TelegramRpcGate(TelegramClient):
         return not self._retired_photo_export(owner, error) and (
             error is None
             or isinstance(error, RPCError)
-            or (isinstance(error, ScheduledWriteRejected) and owner.claimed == 0)
+            or (isinstance(error, (ScheduledWriteRejected, PeerAccessRejectedError)) and owner.claimed == 0)
         )
 
     @staticmethod
@@ -5346,6 +5514,7 @@ class TelegramRpcGate(TelegramClient):
         source_fence: PhotoSourceFence | None,
         setup: bool,
         photo_session: _GuardedPhotoSession | None = None,
+        dialog_id: int | None = None,
     ) -> object:
         task = asyncio.current_task()
         if task is None or self.retained_auth_scope() != scope:
@@ -5359,6 +5528,7 @@ class TelegramRpcGate(TelegramClient):
         else:
             self._validate_photo_file_request(photo_session, request)
         capability = _PhotoWireCapability(self._photo_issuer, scope, task, bytes(request), budget, source_fence, setup)
+        capability.dialog_id = dialog_id
         capability.photo_session = photo_session
         if photo_session is not None and photo_session.dc_id != scope.dc_id:
             capability.lease = self._photo_aux_lease
@@ -5435,6 +5605,7 @@ class TelegramRpcGate(TelegramClient):
             source_fence=session.source_fence,
             setup=False,
             photo_session=session,
+            dialog_id=session.dialog_id,
         )
 
     async def _ensure_photo_transport(self, session: _GuardedPhotoSession) -> None:
@@ -5575,6 +5746,7 @@ class TelegramRpcGate(TelegramClient):
             use_auxiliary=use_auxiliary,
         )
         capability.photo_session = session
+        capability.dialog_id = session.dialog_id
         if type(actual) in (functions.auth.ExportAuthorizationRequest, functions.auth.ImportAuthorizationRequest):
             capability.aux_bootstrap = self._photo_bootstrap_provenance(
                 lease, type(actual) is functions.auth.ExportAuthorizationRequest
@@ -5663,14 +5835,14 @@ class TelegramRpcGate(TelegramClient):
             raise ValueError("photo observation scope is unavailable")
         request = self._photo_message_request(target)
         response = await self._photo_owned_request(
-            request, scope=scope, budget=budget, source_fence=source_fence, setup=True
+            request, scope=scope, budget=budget, source_fence=source_fence, setup=True, dialog_id=target.dialog_id
         )
         message = self._photo_message_from_response(response, target)
         locator = photo_locator_from_message(message)
         if not self.claim_image_scope(token):
             raise ValueError("photo observation scope changed")
         self._photo_locators.clear()
-        self._photo_locators[id(locator)] = (locator, token)
+        self._photo_locators[id(locator)] = (locator, token, target.dialog_id)
         return PhotoObservation(message, locator)
 
     @staticmethod
@@ -5706,6 +5878,7 @@ class TelegramRpcGate(TelegramClient):
         if current_demand_token().kind is not DemandKind.MESSAGE_IMAGE_ACQUISITION:
             raise UnclassifiedTelegramRpcError("photo acquisition requires its owned demand")
         session = _GuardedPhotoSession(self, locator, scope, work, budget, source_fence, task)
+        session.dialog_id = self._photo_locators[id(locator)][2]
         self._photo_session = session
         try:
             await self._restore_photo_session(session, issued_token)

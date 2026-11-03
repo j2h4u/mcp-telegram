@@ -547,6 +547,17 @@ def _dialog_filter_matches_fuzzy(filter_normalized: str, name_normalized: str) -
     return _fuzz.partial_ratio(filter_normalized, name_normalized) >= _TRACE_FUZZY_SCORE_MIN
 
 
+def _scheduled_acquisition_projection(
+    block: object, access_lost: object, repair_due: object, discovery_due: object
+) -> dict[str, object]:
+    return {
+        "acquisition_block": "access_lost" if access_lost else block,
+        "acquisition_pending": not access_lost
+        and block is None
+        and (repair_due is not None or discovery_due is not None),
+    }
+
+
 class ReadingService:
     """Domain service for list/search/list_dialogs and helper operations."""
 
@@ -1666,7 +1677,8 @@ class ReadingService:
                     tuple[object],
                     source.execute(
                         "SELECT COUNT(*) FROM scheduled_reconciliation_state "
-                        "WHERE repair_due_at IS NOT NULL OR discovery_due_at IS NOT NULL"
+                        "WHERE acquisition_block IS NULL AND (repair_due_at IS NOT NULL OR discovery_due_at IS NOT NULL) "
+                        "AND NOT EXISTS (SELECT 1 FROM synced_dialogs d WHERE d.dialog_id=scheduled_reconciliation_state.dialog_id AND d.status='access_lost')"
                     ).fetchone(),
                 )[0]
             )
@@ -1676,7 +1688,7 @@ class ReadingService:
                 "error": "scheduled_coverage_unavailable",
                 "message": "Scheduled queue account coverage could not be read safely.",
             }
-        return account_id, self._scheduled_account_coverage_data(
+        data = self._scheduled_account_coverage_data(
             account_id=account_id,
             account=account,
             directory=directory,
@@ -1684,6 +1696,11 @@ class ReadingService:
             baseline_missing_count=baseline_missing_count,
             acquisition_due=acquisition_due,
         )
+        data["acquisition_blocked_dialog_count"] = source.execute(
+            "SELECT COUNT(*) FROM scheduled_reconciliation_state s WHERE s.acquisition_block IS NOT NULL "
+            "OR EXISTS (SELECT 1 FROM synced_dialogs d WHERE d.dialog_id=s.dialog_id AND d.status='access_lost')"
+        ).fetchone()[0]
+        return account_id, data
 
     @staticmethod
     def _scheduled_account_coverage_data(  # noqa: PLR0913
@@ -1735,7 +1752,9 @@ class ReadingService:
             row = _fetchone_row(
                 source.execute(
                     "SELECT coverage_state,coverage_reason,baseline_observed_at,directory_generation,"
-                    "repair_due_at,discovery_due_at FROM scheduled_reconciliation_state WHERE dialog_id=?",
+                    "repair_due_at,discovery_due_at,acquisition_block, "
+                    "EXISTS (SELECT 1 FROM synced_dialogs d WHERE d.dialog_id=scheduled_reconciliation_state.dialog_id AND d.status='access_lost') AS access_lost "
+                    "FROM scheduled_reconciliation_state WHERE dialog_id=?",
                     (dialog_id,),
                 )
             )
@@ -1754,8 +1773,11 @@ class ReadingService:
             "reason": _row_value(row, "coverage_reason"),
             "baseline_observed_at": _object_to_int_or_none(_row_value(row, "baseline_observed_at")),
             "directory_generation": _object_to_int_or_none(_row_value(row, "directory_generation")),
-            "acquisition_pending": (
-                _row_value(row, "repair_due_at") is not None or _row_value(row, "discovery_due_at") is not None
+            **_scheduled_acquisition_projection(
+                _row_value(row, "acquisition_block"),
+                _row_value(row, "access_lost"),
+                _row_value(row, "repair_due_at"),
+                _row_value(row, "discovery_due_at"),
             ),
         }
 
@@ -3781,9 +3803,9 @@ class ReadingService:
             if bound is None or bound[0] != account:
                 return {dialog_id: {"state": "unknown", "reason": "scheduled_account_not_bound"} for dialog_id in ids}
             rows = cast(
-                list[tuple[int, object, object, object, object, object, object]],
+                list[tuple[int, object, object, object, object, object, object, object, object]],
                 conn.execute(
-                    "SELECT dialog_id,coverage_state,coverage_reason,baseline_observed_at,directory_generation,repair_due_at,discovery_due_at FROM scheduled_reconciliation_state WHERE dialog_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))",
+                    "SELECT dialog_id,coverage_state,coverage_reason,baseline_observed_at,directory_generation,repair_due_at,discovery_due_at,acquisition_block,EXISTS (SELECT 1 FROM synced_dialogs d WHERE d.dialog_id=scheduled_reconciliation_state.dialog_id AND d.status='access_lost') FROM scheduled_reconciliation_state WHERE dialog_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))",
                     (json.dumps(ids),),
                 ).fetchall(),
             )
@@ -3805,7 +3827,7 @@ class ReadingService:
                 "reason": row[2],
                 "baseline_observed_at": row[3],
                 "directory_generation": row[4],
-                "acquisition_pending": row[5] is not None or row[6] is not None,
+                **_scheduled_acquisition_projection(row[7], row[8], row[5], row[6]),
             }
         return result
 

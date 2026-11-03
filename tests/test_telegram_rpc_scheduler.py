@@ -834,3 +834,125 @@ def test_only_optional_forward_budget_rejection_is_debug(
     assert events == [event]
     assert len(caplog.records) == 1
     assert caplog.records[0].levelname == level
+
+
+async def test_pressure_episode_reports_progress_only_after_source_drains(caplog: pytest.LogCaptureFixture) -> None:
+    clock = [10.0]
+    events: list[RpcAdmissionEvent] = []
+    limiter = _ControlledLimiter()
+    scheduler = _scheduler(
+        policy=TelegramRpcSchedulerConfig(), limiter=limiter, observer=events.append, clock=lambda: clock[0]
+    )
+    scope = replace(_scope(TelegramRpcSource.FULL_SYNC), deadline=1000.0)
+    first = asyncio.create_task(scheduler.admit(scope))
+    second = asyncio.create_task(scheduler.admit(scope))
+    with caplog.at_level("DEBUG", logger="mcp_telegram.telegram_rpc_scheduler"):
+        await _wait_until(lambda: scheduler.source_queue_depths()[scope.source] == 2)
+        scheduler.record_expired_before_dispatch(scope, wait_seconds=2)
+        scheduler.record_expired_before_dispatch(scope, wait_seconds=3)
+        clock[0] = 71.0
+        scheduler.record_expired_before_dispatch(scope, wait_seconds=4)
+        scheduler._emit_for_scope(RpcAdmissionEventKind.REJECTED, scope, reason="source_outstanding_saturated")
+        await limiter.allow_one()
+        admission = await first
+        assert scheduler.record_dispatch(admission)
+        scheduler.complete(admission)
+        assert "status=drained_after_dispatch" not in caplog.text
+        second.cancel()
+        await asyncio.gather(second, return_exceptions=True)
+        assert "status=drained_after_dispatch" in caplog.text
+        await scheduler.close()
+    warnings = [record.message for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 4
+    assert "status=ongoing" in warnings[1] and "count=3" in warnings[1]
+    assert "max_wait_seconds=4.000" in warnings[1]
+    assert "source_outstanding_saturated" in warnings[2]
+    assert "count=4" in warnings[3]
+    assert sum(event.kind is RpcAdmissionEventKind.EXPIRED for event in events) == 3
+    assert sum(event.kind is RpcAdmissionEventKind.REJECTED for event in events) == 1
+    assert len(events) == 8
+    assert all(event.observation_method == "tests.Request" for event in events)
+
+
+async def test_pressure_shutdown_unknown_and_observer_failure_remain_visible(caplog: pytest.LogCaptureFixture) -> None:
+    def broken(_event: RpcAdmissionEvent) -> None:
+        raise RuntimeError("observer failed")
+
+    scheduler = _scheduler(policy=TelegramRpcSchedulerConfig(), limiter=_ImmediateLimiter(), observer=broken)
+    scope = _scope(TelegramRpcSource.FULL_SYNC)
+    with caplog.at_level("DEBUG", logger="mcp_telegram.telegram_rpc_scheduler"):
+        scheduler.record_expired_before_dispatch(scope, wait_seconds=1)
+        scheduler.record_expired_before_dispatch(scope, wait_seconds=2)
+        scheduler._emit_for_scope(RpcAdmissionEventKind.REJECTED, scope, reason="unknown")
+        scheduler.record_unclassified()
+        await scheduler.close()
+    assert caplog.text.count("telegram_rpc_admission_observer_failed") == 4
+    assert "reason=unknown" in caplog.text
+    assert "event=unclassified" in caplog.text
+    assert "status=shutdown" in caplog.text
+    assert "status=drained_after_dispatch" not in caplog.text
+
+
+def test_admission_observer_method_defaults_to_scope_and_explicit_override_wins() -> None:
+    events: list[RpcAdmissionEvent] = []
+    scheduler = _scheduler(policy=TelegramRpcSchedulerConfig(), limiter=_ImmediateLimiter(), observer=events.append)
+    scope = _scope(TelegramRpcSource.FULL_SYNC)
+    scheduler.record_expired_before_dispatch(scope, wait_seconds=1)
+    scheduler.record_retry(scope, reason="retry", request_method="tests.OtherRequest")
+    assert [event.observation_method for event in events] == ["tests.Request", "tests.OtherRequest"]
+
+
+async def test_new_pressure_requires_a_new_physical_dispatch(caplog: pytest.LogCaptureFixture) -> None:
+    scheduler = _scheduler(policy=TelegramRpcSchedulerConfig(), limiter=_ImmediateLimiter())
+    scope = _scope(TelegramRpcSource.FULL_SYNC)
+    with caplog.at_level("WARNING", logger="mcp_telegram.telegram_rpc_scheduler"):
+        scheduler.record_expired_before_dispatch(scope, wait_seconds=1)
+        admission = await scheduler.admit(scope)
+        assert scheduler.record_dispatch(admission)
+        scheduler.record_expired_before_dispatch(scope, wait_seconds=2)
+        scheduler.complete(admission)
+        assert "status=drained_after_dispatch" not in caplog.text
+        await scheduler.close()
+    assert "status=shutdown" in caplog.text
+
+
+async def test_pressure_distinguishes_method_and_acquisition_and_requires_matching_dispatch(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    events: list[RpcAdmissionEvent] = []
+    scheduler = _scheduler(policy=TelegramRpcSchedulerConfig(), limiter=_ImmediateLimiter(), observer=events.append)
+    scope = _scope(TelegramRpcSource.FULL_SYNC)
+    other_method = replace(scope, request_method="tests.OtherRequest")
+    other_acquisition = replace(scope, acquisition_kind=AcquisitionKind.ENTITY_LOOKUP)
+    with caplog.at_level("WARNING", logger="mcp_telegram.telegram_rpc_scheduler"):
+        for item in (scope, other_method, other_acquisition):
+            scheduler.record_expired_before_dispatch(item, wait_seconds=1)
+        assert len(caplog.records) == 3
+        admission = await scheduler.admit(other_method)
+        assert scheduler.record_dispatch(admission)
+        scheduler.complete(admission)
+        summaries = [r.message for r in caplog.records if "status=drained_after_dispatch" in r.message]
+        assert len(summaries) == 1 and "method=tests.OtherRequest" in summaries[0]
+        await scheduler.close()
+    shutdown = [r.message for r in caplog.records if "status=shutdown" in r.message]
+    assert len(shutdown) == 2
+    assert any("acquisition=entity_lookup" in message for message in shutdown)
+    assert len(events) == 5
+
+
+async def test_pressure_eviction_and_shutdown_preserve_counts(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("mcp_telegram.telegram_rpc_scheduler._PRESSURE_MAX_EPISODES", 2)
+    events: list[RpcAdmissionEvent] = []
+    scheduler = _scheduler(policy=TelegramRpcSchedulerConfig(), limiter=_ImmediateLimiter(), observer=events.append)
+    scope = _scope(TelegramRpcSource.FULL_SYNC)
+    with caplog.at_level("WARNING", logger="mcp_telegram.telegram_rpc_scheduler"):
+        for method in ("A", "A", "B", "C"):
+            scheduler.record_expired_before_dispatch(replace(scope, request_method=method), wait_seconds=1)
+        await scheduler.close()
+    summaries = [r.message for r in caplog.records if "telegram_rpc_admission_pressure" in r.message]
+    assert len(summaries) == 3
+    assert "method=A status=evicted" in summaries[0] and "count=2" in summaries[0]
+    assert all("status=shutdown" in message and "count=1" in message for message in summaries[1:])
+    assert len(events) == 4

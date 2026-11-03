@@ -410,7 +410,7 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, 
 # ---------------------------------------------------------------------------
 
 
-async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:  # noqa: PLR0914 - bounded page state
+async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
     """Search for self-authored messages in a single peer and persist them.
 
     Direction-agnostic: takes explicit offset_id + min_id, reports both
@@ -439,10 +439,17 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:  # no
         return _access_skip_result(rpc_calls=rpc_calls)
 
     # Step 2: issue per-peer self-search with concrete peer (not InputPeerEmpty)
-    rpc_calls += 1  # SearchRequest is a governed Telegram call attempt.
-    identity_revision, observation_order = await request.writer.run(
-        lambda db: _prepare_sweep_observation(db, request.dialog_id)
+    observation = await request.writer.run(
+        lambda db: (
+            _prepare_sweep_observation(db, request.dialog_id)
+            if request.accept_page is None or request.accept_page(db)
+            else None
+        )
     )
+    if observation is None:
+        return SweepResult([], 0, None, None, completed=False, accepted=False)
+    identity_revision, observation_order = observation
+    rpc_calls += 1  # SearchRequest is a governed Telegram call attempt.
     search = await _search_self_messages(request, peer, rpc_calls=rpc_calls)
     if search.early_result is not None:
         return search.early_result
@@ -460,7 +467,18 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:  # no
     if isinstance(page_rows, SweepResult):
         return page_rows
     extracted, genuinely_new_keys = page_rows
+    return _sweep_page_result(request, batch, extracted, genuinely_new_keys, rpc_duration_s, rpc_calls)
 
+
+def _sweep_page_result(  # noqa: PLR0913, PLR0917 - page outcome context
+    request: PeerSweepRequest,
+    batch: Sequence[_SweepMessageLike],
+    extracted: list[ExtractedMessage],
+    genuinely_new_keys: frozenset[tuple[int, int]],
+    rpc_duration_s: float,
+    rpc_calls: int,
+) -> SweepResult:
+    """Describe the persisted page, distinguishing a reachable history floor."""
     # Step 5: genuinely empty batch from a reachable peer → history floor
     if not batch:
         logger.debug(

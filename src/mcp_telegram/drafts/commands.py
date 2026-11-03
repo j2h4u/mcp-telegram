@@ -284,6 +284,7 @@ class DraftCommandOwner:
         return self._result(command, "unknown", receipt.backup_history_id, dispatched=None, acknowledged=None)
 
     async def _execute_new(self, command: _Command) -> dict[str, object]:
+        self._require_read_access(command.scope)
         peer = await self._resolve_peer(command.scope)
         self._validate_peer(peer, command.scope)
         with rpc_attempt_budget(RpcAttemptBudget(1)):
@@ -292,6 +293,7 @@ class DraftCommandOwner:
                     "draft_state_unknown", "Telegram did not provide a complete current draft snapshot."
                 )
         current = read_current_draft(self._reader, command.scope)
+        self._require_read_access(command.scope)
         self._validate_current(command, current)
         request = self._build_request(command, current, peer)
         intended_absent = command.action == "clear"
@@ -310,6 +312,15 @@ class DraftCommandOwner:
             await self._finish(command, result)
             return result
         return await self._dispatch(command, request, receipt.backup_history_id, intended_absent=intended_absent)
+
+    def _require_read_access(self, scope: DraftScope) -> None:
+        if (
+            self._reader.execute(
+                "SELECT 1 FROM synced_dialogs WHERE dialog_id=? AND status='access_lost'", (scope.dialog_id,)
+            ).fetchone()
+            is not None
+        ):
+            raise DraftCommandError("access_lost", "Dialog access is unavailable; no draft change was dispatched.")
 
     @staticmethod
     def _validate_peer(peer: object | None, scope: DraftScope) -> None:

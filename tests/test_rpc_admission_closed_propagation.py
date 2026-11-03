@@ -107,7 +107,7 @@ async def test_scheduled_snapshot_propagates_scheduler_close(close_on_resolution
             writer=inline_writer(conn),
         )
         with pytest.raises(RpcAdmissionClosedError, match="scheduler closed") as raised:
-            await worker._fetch_snapshot_or_stop(42, discovery=True, now=100)
+            await worker._fetch_snapshot_or_stop(42, discovery=True, now=100, generation=0)
         assert raised.value is closed
 
 

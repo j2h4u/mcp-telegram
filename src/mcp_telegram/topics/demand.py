@@ -91,6 +91,8 @@ class TopicSnapshotDemandAdapter:
         scan = await self._writer.run(lambda conn: TopicCatalogRepository(conn).begin_page(pending[0]))
         if scan is None:
             return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        if not TopicCatalogRepository(self._conn).acquisition_allowed(scan.dialog_id):
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
         return await self._run_selected_scan(selected, scan, budget)
 
     def _slice_preflight(self, selected: WorkRevision, budget: RpcAttemptBudget) -> SliceOutcome | None:
@@ -130,6 +132,8 @@ class TopicSnapshotDemandAdapter:
             rpc_attempt_budget(budget),
         ):
             entity = await self._gateway.fetch_entity(scan.dialog_id)
+            if not TopicCatalogRepository(self._conn).acquisition_allowed(scan.dialog_id):
+                return False, None
             if not is_topic_capable(entity):
                 return await self._writer.run(
                     lambda conn: TopicCatalogRepository(conn).mark_not_applicable_outcome(scan)

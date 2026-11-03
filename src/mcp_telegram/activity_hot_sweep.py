@@ -105,7 +105,9 @@ def _hot_state_matches(conn: sqlite3.Connection, state: _HotWindowState) -> bool
         tuple[int, int | None, int | None, int | None, int | None, int | None] | None,
         conn.execute(
             "SELECT COALESCE(hot_cursor,0),hot_page_offset_id,hot_window_max_id,hot_window_had_new,hot_last_sync_at,hot_empty_streak "
-            "FROM activity_dialog_state WHERE dialog_id=?",
+            "FROM activity_dialog_state WHERE dialog_id=? AND NOT EXISTS "
+            "(SELECT 1 FROM synced_dialogs WHERE synced_dialogs.dialog_id=activity_dialog_state.dialog_id "
+            "AND synced_dialogs.status='access_lost')",
             (state.dialog_id,),
         ).fetchone(),
     )
@@ -192,7 +194,9 @@ def _begin_hot_window(conn: sqlite3.Connection, dialog_id: int) -> _HotWindowSta
             tuple[int | None, int | None, int | None, int, int | None, int] | None,
             conn.execute(
                 "SELECT hot_cursor, hot_page_offset_id, hot_window_max_id, hot_window_had_new, hot_last_sync_at, hot_empty_streak "
-                "FROM activity_dialog_state WHERE dialog_id = ?",
+                "FROM activity_dialog_state WHERE dialog_id = ? AND NOT EXISTS "
+                "(SELECT 1 FROM synced_dialogs WHERE synced_dialogs.dialog_id=activity_dialog_state.dialog_id "
+                "AND synced_dialogs.status='access_lost')",
                 (dialog_id,),
             ).fetchone(),
         )

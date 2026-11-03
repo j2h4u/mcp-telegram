@@ -18,6 +18,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import cast
 
+from ..access_predicates import not_access_lost_sql
 from ..dialog_fact_observations import claim_dialog_fact
 from ..dialog_identity import capture_identity_baseline, publish_dialog_identity
 from ..dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation, ObservedText
@@ -1427,12 +1428,16 @@ class EntityProfileRepository:
             return self._legacy_section_status(detail, section, payload, observed_at, now=now) == "pending"
         return _profile_section_missing(row)
 
+    def access_available(self, entity_id: int) -> bool:
+        return bool(self._conn.execute("SELECT " + not_access_lost_sql("?"), (entity_id,)).fetchone()[0])
+
     def next_refresh_release_at(self, *, after: int | None = None) -> float | None:
         """Return the earliest durable pending or retryable refresh release."""
         try:
             query = (
                 "SELECT MIN(COALESCE(retry_at, 0)) FROM entity_profile_refresh_state "
-                "WHERE status IN ('pending', 'failed')"
+                "WHERE status IN ('pending', 'failed') AND "
+                + not_access_lost_sql("entity_profile_refresh_state.entity_id")
             )
             parameters: tuple[object, ...] = ()
             if after is not None:
@@ -1468,7 +1473,9 @@ class EntityProfileRepository:
                 )
                 if column in columns
             )
-            predicate = "status IN ('pending', 'failed') AND (retry_at IS NULL OR retry_at <= ?)"
+            predicate = "status IN ('pending', 'failed') AND (retry_at IS NULL OR retry_at <= ?) AND " + (
+                not_access_lost_sql("entity_profile_refresh_state.entity_id")
+            )
             parameters: tuple[object, ...] = (now,)
             if entity_id is not None:
                 predicate += " AND entity_id=?"
@@ -3088,6 +3095,7 @@ class EntityProfileRepository:
     def _cursor_predicate(self, cursor: EntityRefreshCursor) -> tuple[str, tuple[object, ...]]:
         clauses = [
             "entity_id=?",
+            not_access_lost_sql("entity_profile_refresh_state.entity_id"),
             "status IN ('pending', 'failed')",
             "next_section=?",
             "acquisition_cursor=?",

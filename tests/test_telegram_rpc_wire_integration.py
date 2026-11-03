@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from dataclasses import dataclass, replace
@@ -24,6 +25,7 @@ from telethon.tl.tlobject import TLObject
 
 from mcp_telegram import telegram_rpc
 from mcp_telegram.config import RuntimeObservationConfig, TelegramRpcSchedulerConfig
+from mcp_telegram.peer_access import PeerAccess
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import (
@@ -35,6 +37,7 @@ from mcp_telegram.sync_db import (
     save_rpc_safety_record,
 )
 from mcp_telegram.telegram_demand import RpcAttemptBudget, RpcAttemptBudgetExhaustedError, RpcAttemptEvidence
+from mcp_telegram.telegram_demand_progress import WorkKey, WorkRevision
 from mcp_telegram.telegram_rpc import (
     TelegramRpcBudget,
     TelegramRpcGate,
@@ -119,6 +122,11 @@ async def wire(
         safety_store=store,
     )
     await gate.verify_startup_account(42)
+    auth = gate.retained_auth_scope()
+    assert auth is not None
+    access = PeerAccess(auth)
+    await writer.run(access.bind)
+    gate.bind_peer_access(access)
     sender = cast(GuardedMTProtoSender, gate._main_sender)
     connection = GuardedConnectionTcpFull("127.0.0.1", 443, 2, loggers=gate._log)
     connection.bind_owner(sender)
@@ -139,6 +147,7 @@ async def wire(
         await asyncio.gather(*sender._observing, return_exceptions=True)
         await gate._admission_scheduler.close()
         await connection.disconnect()
+        await writer.run(access.unbind)
         await writer.aclose()
         reader.close()
         reset_rpc_process_policy()
@@ -171,6 +180,86 @@ async def test_actual_write_has_durable_intent_before_bytes_and_settles_after_re
     settled = gate._safety_store.load_record()
     assert settled is not None
     assert cast(dict[str, object], json.loads(settled))["intents"] == {}
+
+
+async def test_queued_peer_loss_rejects_physical_write_and_restoration_does_not_revive_token(
+    wire: _WireHarness,
+) -> None:
+    from mcp_telegram.peer_access import PeerAccessRejectedError
+
+    gate, sender, connection, sink = wire
+    auth = gate.retained_auth_scope()
+    assert auth is not None
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE synced_dialogs (dialog_id INTEGER, status TEXT)")
+    access = gate._peer_access
+    assert access is not None
+    budget = RpcAttemptBudget(2)
+    scope = TelegramRpcScope(
+        TelegramRpcSource.MCP_INTERACTIVE,
+        RpcServiceClass.INTERACTIVE,
+        time.monotonic() + 10,
+        asyncio.current_task(),
+        attempt_budget=budget,
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    request = messages.GetHistoryRequest(types.InputPeerUser(11, 1), 0, None, 0, 1, 0, 0, 0)
+    future = sender.send_owned(request, scope)
+    state = await sender._send_queue.next_state()
+    await sender._prepare_state(state)
+    packet = connection._send_queue.get_nowait()
+    access.revoke(11)
+    conn.execute("INSERT INTO synced_dialogs VALUES (11, 'access_lost')")
+    conn.commit()
+    access.reconcile(conn)
+    access.revoke(11)
+    conn.execute("UPDATE synced_dialogs SET status='active' WHERE dialog_id=11")
+    conn.commit()
+    access.reconcile(conn)
+    assert not sender.write_packet(packet, connection._send)
+    with pytest.raises(PeerAccessRejectedError):
+        await future
+    assert sink.frames == [] and budget.attempts == 0
+    assert access.claim(access.capture(auth, (11,), None))
+    conn.close()
+
+
+async def test_only_selected_access_probe_can_write_to_lost_peer(wire: _WireHarness) -> None:
+    from mcp_telegram.peer_access import PeerAccessRejectedError
+
+    gate, sender, connection, sink = wire
+    access = gate._peer_access
+    assert access is not None
+    access.revoke(11)
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE synced_dialogs(dialog_id INTEGER, status TEXT)")
+    conn.execute("INSERT INTO synced_dialogs VALUES (11, 'access_lost')")
+    access.reconcile(conn)
+    selected = WorkRevision(WorkKey(DemandKind.DELTA_ACCESS_PROBE, 42, "probe:11"), "1")
+    budget = RpcAttemptBudget(1, selected=selected)
+    scope = TelegramRpcScope(
+        TelegramRpcSource.DELTA_SYNC,
+        demand_contract(DemandKind.DELTA_ACCESS_PROBE).service_class,
+        time.monotonic() + 10,
+        asyncio.current_task(),
+        demand_kind=DemandKind.DELTA_ACCESS_PROBE,
+        attempt_budget=budget,
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    request = messages.GetHistoryRequest(types.InputPeerUser(11, 1), 0, None, 0, 1, 0, 0, 0)
+    wrong = replace(scope, demand_kind=DemandKind.DELTA_GAP_FILL)
+    with pytest.raises(PeerAccessRejectedError):
+        sender.send_owned(request, wrong)
+    future = sender.send_owned(request, scope)
+    state = await sender._send_queue.next_state()
+    await sender._prepare_state(state)
+    packet = connection._send_queue.get_nowait()
+    assert sender.write_packet(packet, connection._send)
+    access.revoke(11)
+    state.future.set_result(True)
+    assert await future is True
+    assert len(sink.frames) == 1 and budget.attempts == 1
+    conn.close()
 
 
 def test_canonical_method_identity_distinguishes_namespaces() -> None:
@@ -1347,6 +1436,7 @@ def _dc_option_session(
     session = telegram_rpc._GuardedPhotoSession(
         gate, lease.locator, lease.scope, lease.work, budget, lease.source_fence, lease.owner_task
     )
+    session.dialog_id = 11
     gate._photo_session = session
     return session, lease
 
@@ -1467,6 +1557,7 @@ async def _prepare_photo_request(
         lease=lease,
         use_auxiliary=auxiliary,
     )
+    cap.dialog_id = 11
     if setup:
         cap.aux_bootstrap = lease.gate._photo_bootstrap_provenance(lease, not auxiliary)
     context = telegram_rpc._PHOTO_CAPABILITY.set(cap)
@@ -1507,6 +1598,7 @@ async def test_photo_permit_reserves_before_physical_claim_and_checks_source(ima
     capability = telegram_rpc._PhotoWireCapability(
         gate._photo_issuer, binding, task, bytes(request), _PhotoBudget(reserved), fence, False
     )
+    capability.dialog_id = 11
     scope = TelegramRpcScope(
         TelegramRpcSource.MESSAGE_IMAGE_ACQUISITION,
         RpcServiceClass.BACKGROUND,

@@ -413,7 +413,9 @@ def _cold_claim_matches(conn: sqlite3.Connection, dialog_id: int, offset_id: int
     row = cast(
         tuple[int, str | None, int | None] | None,
         conn.execute(
-            "SELECT COALESCE(cold_offset_id,0),cold_status,cold_next_retry_at FROM activity_dialog_state WHERE dialog_id=?",
+            "SELECT COALESCE(cold_offset_id,0),cold_status,cold_next_retry_at FROM activity_dialog_state WHERE dialog_id=? "
+            "AND NOT EXISTS (SELECT 1 FROM synced_dialogs WHERE synced_dialogs.dialog_id=activity_dialog_state.dialog_id "
+            "AND synced_dialogs.status='access_lost')",
             (dialog_id,),
         ).fetchone(),
     )

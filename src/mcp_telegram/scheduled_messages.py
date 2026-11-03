@@ -17,11 +17,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, cast
 
-from telethon.errors import RPCError  # type: ignore[import-untyped]
+from telethon.errors import ChatAdminRequiredError, RPCError  # type: ignore[import-untyped]
 from telethon.tl.types import Message as TelegramMessage  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
-from .access_lifecycle import set_access_lost
+from .access_lifecycle import not_access_lost_sql, set_access_lost
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .fts import stem_text
 from .message_contracts import ExtractedMessage
@@ -107,13 +107,17 @@ def _mark_scheduled_dialog_dirty(
     )
 
 
+def _scheduled_available_sql(alias: str) -> str:
+    return f"{alias}.acquisition_block IS NULL AND " + not_access_lost_sql(f"{alias}.dialog_id")
+
+
 def scheduled_dialog_has_due_work(conn: sqlite3.Connection, dialog_id: int) -> bool:
     """Whether accepted scheduled evidence still needs bounded acquisition."""
     row = cast(
         tuple[object] | None,
         conn.execute(
             "SELECT 1 FROM scheduled_reconciliation_state WHERE dialog_id=? "
-            "AND (repair_due_at IS NOT NULL OR discovery_due_at IS NOT NULL)",
+            f"AND (repair_due_at IS NOT NULL OR discovery_due_at IS NOT NULL) AND {_scheduled_available_sql('scheduled_reconciliation_state')}",
             (dialog_id,),
         ).fetchone(),
     )
@@ -597,8 +601,8 @@ class ScheduledMessageReconciler:
                 tuple[object] | None,
                 conn.execute(
                     "SELECT 1 FROM scheduled_reconciliation_state r JOIN scheduled_sync_state s ON s.key='account' "
-                    "WHERE s.account_id=? AND r.dialog_id=? AND r.coverage_state='unknown' "
-                    "AND r.repair_due_at IS NULL AND r.discovery_due_at IS NOT NULL",
+                    f"WHERE s.account_id=? AND r.dialog_id=? AND (r.coverage_state='unknown' OR r.authorization_pending=1) "
+                    f"AND r.repair_due_at IS NULL AND r.discovery_due_at IS NOT NULL AND {_scheduled_available_sql('r')}",
                     (account_id, dialog_id),
                 ).fetchone(),
             )
@@ -731,7 +735,7 @@ class ScheduledMessageReconciler:
                 f"""
                 SELECT dialog_id, dirty_generation, {discovery_expression}
                 FROM scheduled_reconciliation_state
-                WHERE {due_predicate}
+                WHERE ({due_predicate}) AND {_scheduled_available_sql("scheduled_reconciliation_state")}
                 ORDER BY CASE WHEN dirty_since IS NULL THEN 1 ELSE 0 END,
                          CASE
                              WHEN dirty_since IS NULL
@@ -766,7 +770,7 @@ class ScheduledMessageReconciler:
                     tuple[int, int] | None,
                     conn.execute(
                         "SELECT dirty_generation,COALESCE(snapshot_observation_order,0) "
-                        "FROM scheduled_reconciliation_state WHERE dialog_id=?",
+                        f"FROM scheduled_reconciliation_state WHERE dialog_id=? AND {_scheduled_available_sql('scheduled_reconciliation_state')}",
                         (dialog_id,),
                     ).fetchone(),
                 )
@@ -787,7 +791,7 @@ class ScheduledMessageReconciler:
                         dirty_since=NULL,
                         updated_at=?,
                         snapshot_observation_order=?,
-                        baseline_observed_at=?,coverage_state='complete',coverage_reason=NULL,
+                        baseline_observed_at=?,coverage_state='complete',coverage_reason=NULL,authorization_pending=0,
                         directory_generation=(SELECT generation FROM dialog_directory_publication WHERE singleton=1)
                     WHERE dialog_id=? AND dirty_generation=?
                     """,
@@ -835,11 +839,11 @@ class ScheduledMessageReconciler:
         return None
 
     async def _fetch_snapshot_or_stop(
-        self, dialog_id: int, discovery: bool, now: int
-    ) -> tuple[list[object] | None, bool]:
-        del discovery, now
+        self, dialog_id: int, discovery: bool, now: int, generation: int
+    ) -> tuple[list[object] | None, bool, str | None]:
+        del discovery
         try:
-            return await self._fetch_scheduled_snapshot(dialog_id), False
+            return await self._fetch_scheduled_snapshot(dialog_id), False, None
         except TelegramRpcAdmissionDeferred:
             raise
         except TelegramRpcThrottled as exc:
@@ -849,36 +853,61 @@ class ScheduledMessageReconciler:
                 dialog_id,
             )
             raise
+        except ChatAdminRequiredError:
+            blocked = await self._block_admin_required(dialog_id, generation, now)
+            return None, False, f"blocked:{generation + 1}" if blocked else None
         except RPCError as exc:
             logger.warning("scheduled_reconcile_rpc_error dialog_id=%d error_type=%s", dialog_id, type(exc).__name__)
             if isinstance(exc, ACCESS_LOST_ERRORS):
-                await self._mark_inaccessible(dialog_id, now=int(time.time()), reason=type(exc).__name__)
-            return None, False
+                await self._mark_inaccessible(
+                    dialog_id, generation=generation, now=int(time.time()), reason=type(exc).__name__
+                )
+            return None, False, None
         except ValueError as exc:
             logger.warning("scheduled_reconcile_incomplete_snapshot dialog_id=%d error=%s", dialog_id, exc)
-            return None, False
+            return None, False, None
 
-    async def _record_snapshot_failure(self, dialog_id: int, now: int, reason: str) -> None:
+    async def _block_admin_required(self, dialog_id: int, generation: int, now: int) -> bool:
+        def persist(conn: sqlite3.Connection) -> bool:
+            with write_transaction(conn):
+                cursor = conn.execute(
+                    f"UPDATE scheduled_reconciliation_state SET acquisition_block='admin_required', "
+                    f"dirty_generation=dirty_generation+1,updated_at=? WHERE dialog_id=? AND dirty_generation=? "
+                    f"AND {_scheduled_available_sql('scheduled_reconciliation_state')}",
+                    (now, dialog_id, generation),
+                )
+                if cursor.rowcount:
+                    _invalidate_scheduled_target(self._mutation_fence, self._verified_account_id, dialog_id)
+                return cursor.rowcount > 0
+
+        return await self._writer.run(persist)
+
+    async def _record_snapshot_failure(self, dialog_id: int, generation: int, now: int, reason: str) -> None:
         def persist(conn: sqlite3.Connection) -> None:
             with write_transaction(conn):
                 conn.execute(
                     "UPDATE scheduled_reconciliation_state SET coverage_reason=?,updated_at=? "
-                    "WHERE dialog_id=? AND coverage_state NOT IN ('inaccessible','unsupported')",
-                    (reason, now, dialog_id),
+                    f"WHERE dialog_id=? AND dirty_generation=? AND {_scheduled_available_sql('scheduled_reconciliation_state')} "
+                    "AND coverage_state NOT IN ('inaccessible','unsupported')",
+                    (reason, now, dialog_id, generation),
                 )
 
         await self._writer.run(persist)
 
-    async def _mark_inaccessible(self, dialog_id: int, *, now: int, reason: str) -> None:
+    async def _mark_inaccessible(self, dialog_id: int, *, generation: int, now: int, reason: str) -> None:
         def persist(conn: sqlite3.Connection) -> None:
             with write_transaction(conn):
+                current = cast(
+                    tuple[object] | None,
+                    conn.execute(
+                        f"SELECT 1 FROM scheduled_reconciliation_state WHERE dialog_id=? AND dirty_generation=? AND {_scheduled_available_sql('scheduled_reconciliation_state')}",
+                        (dialog_id, generation),
+                    ).fetchone(),
+                )
+                if current is None:
+                    return
                 _invalidate_scheduled_target(self._mutation_fence, self._verified_account_id, dialog_id)
                 set_access_lost(conn, dialog_id, now, reason=reason)
-                conn.execute(
-                    "UPDATE scheduled_reconciliation_state SET repair_due_at=NULL,discovery_due_at=NULL,"
-                    "coverage_state='inaccessible',coverage_reason=?,updated_at=? WHERE dialog_id=?",
-                    (reason, now, dialog_id),
-                )
 
         await self._writer.run(persist)
 
@@ -923,11 +952,21 @@ class ScheduledMessageReconciler:
             outcome = await self._prepare_discovery(dialog_id, now)
             if outcome is not None:
                 return outcome[0], outcome[1], None
+        current = cast(
+            tuple[object] | None,
+            self._conn.execute(
+                f"SELECT 1 FROM scheduled_reconciliation_state WHERE dialog_id=? AND dirty_generation=? AND {_scheduled_available_sql('scheduled_reconciliation_state')}",
+                (dialog_id, generation),
+            ).fetchone(),
+        )
+        if current is None:
+            return 0, False, None
         observation_order = await self._writer.run(allocate_observation_order)
-        snapshot, stopped = await self._fetch_snapshot_or_stop(dialog_id, discovery, now)
+        snapshot, stopped, failure_receipt = await self._fetch_snapshot_or_stop(dialog_id, discovery, now, generation)
         if snapshot is None:
-            await self._record_snapshot_failure(dialog_id, now, "rpc_error")
-            return 0, stopped, None
+            if failure_receipt is None:
+                await self._record_snapshot_failure(dialog_id, generation, now, "rpc_error")
+            return 0, stopped, failure_receipt
         receipt = await self._apply_snapshot(
             dialog_id, generation, snapshot, discovery=discovery, now=now, observation_order=observation_order
         )
@@ -953,7 +992,7 @@ class ScheduledMessageReconciler:
             tuple[object, object, object, object] | None,
             self._conn.execute(
                 "SELECT dialog_id,dirty_generation,repair_due_at,discovery_due_at "
-                "FROM scheduled_reconciliation_state WHERE dialog_id=?",
+                f"FROM scheduled_reconciliation_state WHERE dialog_id=? AND {_scheduled_available_sql('scheduled_reconciliation_state')}",
                 (dialog_id,),
             ).fetchone(),
         )
@@ -1077,7 +1116,7 @@ class _ScheduledDemandAdapter(DurableDemandAdapter):
             list[tuple[object, object, object, object]],
             self._reconciler._conn.execute(
                 f"SELECT dialog_id,dirty_generation,COALESCE(snapshot_observation_order,0),{column} "
-                f"FROM scheduled_reconciliation_state WHERE {column} IS NOT NULL {repair_precedence} ORDER BY {column},dialog_id"
+                f"FROM scheduled_reconciliation_state WHERE {column} IS NOT NULL {repair_precedence} AND {_scheduled_available_sql('scheduled_reconciliation_state')} ORDER BY {column},dialog_id"
             ).fetchall(),
         )
         self._clear_stale_priority(rows)
@@ -1209,7 +1248,7 @@ class _ScheduledDemandAdapter(DurableDemandAdapter):
             tuple[object, object, object] | None,
             self._reconciler._conn.execute(
                 f"SELECT dirty_generation,COALESCE(snapshot_observation_order,0),{column} "
-                f"FROM scheduled_reconciliation_state WHERE dialog_id=? {repair_precedence}",
+                f"FROM scheduled_reconciliation_state WHERE dialog_id=? {repair_precedence} AND {_scheduled_available_sql('scheduled_reconciliation_state')}",
                 (dialog_id,),
             ).fetchone(),
         )

@@ -14,11 +14,19 @@ from pathlib import Path
 from typing import cast
 
 from .delivered_update import isolate_delivered_update
+from .peer_access import reconcile_peers
 from .sync_db import open_runtime_sync_db
 
 _STOP = None
 _SLOW_QUEUE_SECONDS = 1.0
 logger = logging.getLogger(__name__)
+
+
+def _reconcile_peer_access(conn: sqlite3.Connection) -> None:
+    try:
+        reconcile_peers(conn)
+    except Exception as error:  # noqa: BLE001 - preserve the already-settled database operation.
+        logger.warning("peer_access_reconcile_failed error_type=%s", type(error).__name__)
 
 
 class SQLiteWriterContractError(RuntimeError):
@@ -199,10 +207,13 @@ class SQLiteWriter:
             if isinstance(value, (sqlite3.Connection, sqlite3.Cursor)):
                 raise SQLiteWriterContractError("SQLite writer callback returned a thread-bound value")
             self._check_idle(conn)
+            _reconcile_peer_access(conn)
             result.set_result(value)
             return False
         except BaseException as error:  # noqa: BLE001 - rollback callback failures before returning them.
             fatal = self._recover(conn, error)
+            if not fatal:
+                _reconcile_peer_access(conn)
             result.set_exception(error)
             if fatal:
                 self._retire(error)

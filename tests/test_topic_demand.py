@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
@@ -118,6 +118,78 @@ def _selected_budget(adapter: TopicSnapshotDemandAdapter, limit: int) -> RpcAtte
 
 async def _run_selected(adapter: TopicSnapshotDemandAdapter, limit: int) -> object:
     return await adapter.run_slice(_selected_budget(adapter, limit))
+
+
+@pytest.mark.asyncio
+async def test_access_loss_rejects_selected_topic_and_retains_pending(db: sqlite3.Connection) -> None:
+    db.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (43,1,100)")
+    db.commit()
+    client = _CountingClient()
+    adapter = _adapter(db, client)
+    budget = _selected_budget(adapter, 4)
+    db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(42,'access_lost')")
+    db.commit()
+    assert (await adapter.run_slice(budget)).kind is SliceOutcomeKind.STALE
+    assert client.attempts == []
+    assert TopicCatalogRepository(db).next_pending() == (43, 0)
+    assert TopicCatalogRepository(db).coverage(42)["pending"] is False  # no catalog row yet
+    db.execute("UPDATE synced_dialogs SET status='synced' WHERE dialog_id=42")
+    db.commit()
+    assert TopicCatalogRepository(db).next_pending() == (42, 0)
+
+
+@pytest.mark.asyncio
+async def test_access_loss_during_topic_page_preserves_catalog(db: sqlite3.Connection) -> None:
+    class LostDuringPage(_CountingClient):
+        async def __call__(self, request: object) -> object:
+            page = await super().__call__(request)
+            db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(42,'access_lost')")
+            db.commit()
+            return page
+
+    client = LostDuringPage()
+    adapter = _adapter(db, client)
+    outcome = await adapter.run_slice(_selected_budget(adapter, 4))
+    assert outcome.kind is SliceOutcomeKind.STALE
+    assert db.execute("SELECT COUNT(*) FROM topic_metadata WHERE dialog_id=42").fetchone() == (0,)
+    assert db.execute("SELECT pending FROM topic_catalog_state WHERE dialog_id=42").fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+async def test_access_loss_during_entity_lookup_stops_topic_page(db: sqlite3.Connection) -> None:
+    class LostDuringLookup(_CountingClient):
+        async def get_entity(self, entity: object) -> object:
+            result = await super().get_entity(entity)
+            db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(42,'access_lost')")
+            db.commit()
+            return result
+
+    client = LostDuringLookup()
+    adapter = _adapter(db, client)
+    outcome = await adapter.run_slice(_selected_budget(adapter, 4))
+    assert outcome.kind is SliceOutcomeKind.STALE
+    assert client.attempts == ["cold_identity_lookup", "entity_lookup"]
+    assert db.execute("SELECT pending FROM topic_catalog_state WHERE dialog_id=42").fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+async def test_access_loss_after_topic_page_selection_stops_rpc(db: sqlite3.Connection) -> None:
+    client = _CountingClient()
+    adapter = _adapter(db, client)
+    budget = _selected_budget(adapter, 4)
+    original_run = adapter._writer.run
+
+    async def lose_access_after_begin[T](operation: Callable[[sqlite3.Connection], T]) -> T:
+        result = await original_run(operation)
+        db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(42,'access_lost')")
+        db.commit()
+        return result
+
+    adapter._writer.run = lose_access_after_begin  # type: ignore[method-assign]
+    outcome = await adapter.run_slice(budget)
+    assert outcome.kind is SliceOutcomeKind.STALE
+    assert client.attempts == []
+    assert db.execute("SELECT pending FROM topic_catalog_state WHERE dialog_id=42").fetchone() == (1,)
 
 
 @pytest.mark.asyncio

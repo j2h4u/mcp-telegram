@@ -101,12 +101,18 @@ class ScheduledMutationToken:
         )
 
 
+_FENCES: weakref.WeakSet[ScheduledMutationFence] = weakref.WeakSet()
+_FENCES_LOCK = threading.Lock()
+
+
 class ScheduledMutationFence:
     """Weak registry of permits invalidated by accepted canonical queue writes."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._tokens: dict[tuple[int, int, int | None], weakref.WeakSet[ScheduledMutationToken]] = {}
+        with _FENCES_LOCK:
+            _FENCES.add(self)
 
     def watch(self, account_id: int, dialog_id: int, scheduled_message_id: int | None) -> ScheduledMutationToken:
         token = ScheduledMutationToken(account_id, dialog_id, scheduled_message_id)
@@ -146,6 +152,14 @@ class ScheduledMutationFence:
         for key, tokens in tuple(self._tokens.items()):
             if not tokens:
                 del self._tokens[key]
+
+
+def invalidate_scheduled_dialog_permits(account_id: int, dialog_id: int) -> None:
+    """Revoke every live permit for a dialog when canonical access is lost."""
+    with _FENCES_LOCK:
+        fences = tuple(_FENCES)
+    for fence in fences:
+        fence.invalidate_dialog(account_id, dialog_id)
 
 
 @dataclass(frozen=True, slots=True)

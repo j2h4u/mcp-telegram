@@ -927,8 +927,12 @@ async def test_classified_startup_identity_mismatch_preserves_directory_rows(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("retained_account", [False, True])
 async def test_classified_startup_identity_binds_matching_account(
-    tmp_path: Path, shared_writer: SQLiteWriter, retained_account: bool
+    tmp_path: Path, shared_writer: SQLiteWriter, retained_account: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    async def bind_peer_access(_ctx: object) -> None:
+        return
+
+    monkeypatch.setattr(daemon, "_bind_peer_access", bind_peer_access)
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     if retained_account:

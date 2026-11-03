@@ -28,6 +28,7 @@ from mcp_telegram.media_hydration import MediaFactHydrationHandler
 from mcp_telegram.messages.sqlite_bundle import mark_message_deleted
 from mcp_telegram.messages.sqlite_hydration import apply_message_transcription
 from mcp_telegram.observation_order import allocate_observation_order
+from mcp_telegram.peer_access import current_peer_target
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_demand import RpcAttemptBudget
@@ -91,6 +92,23 @@ def _enqueue(
     with write_transaction(conn):
         HydrationQueueRepository(conn).enqueue(job)
     return job
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dialog_id", [42, -42, -1000000000042])
+async def test_media_request_carries_dialog_target_not_message_id(dialog_id: int) -> None:
+    class Client:
+        async def get_messages(self, *, entity: int, ids: list[int]) -> object:
+            assert entity == dialog_id
+            assert ids == [999, 1000]
+            assert current_peer_target() == dialog_id
+            return []
+
+    jobs = [
+        HydrationJob(MEDIA_METADATA_KIND, dialog_id, message_id, due_at=1, attempts=0) for message_id in (999, 1000)
+    ]
+    assert await MediaFactHydrationHandler(batch_size=2).request(Client(), jobs) == []
+    assert current_peer_target() is None
 
 
 @pytest.mark.asyncio

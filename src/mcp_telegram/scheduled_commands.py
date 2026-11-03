@@ -24,6 +24,7 @@ from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
+from .access_lifecycle import not_access_lost_sql
 from .message_composition import decode_formatting_entities
 from .observation_order import delivered_observation_order
 from .scheduled_contracts import SCHEDULED_OPERATION_KEY_LIMIT, scheduled_message_version
@@ -447,11 +448,15 @@ def _current_state(
     coverage = cast(
         tuple[object, ...] | None,
         conn.execute(
-            "SELECT COALESCE(snapshot_observation_order,0),coverage_state FROM scheduled_reconciliation_state WHERE dialog_id=?",
+            f"SELECT COALESCE(snapshot_observation_order,0),coverage_state,acquisition_block,authorization_pending FROM scheduled_reconciliation_state WHERE dialog_id=? AND {not_access_lost_sql('scheduled_reconciliation_state.dialog_id')}",
             (dialog_id,),
         ).fetchone(),
     )
-    if coverage is None or coverage[1] == "unknown":
+    if coverage is not None and coverage[2] is not None:
+        raise ScheduledCommandError(
+            "scheduled_state_unavailable", "Scheduled acquisition is blocked pending renewed permission evidence."
+        )
+    if coverage is None or coverage[1] == "unknown" or coverage[3]:
         raise ScheduledCommandError(
             "scheduled_state_unknown", "This dialog's scheduled queue has no current complete baseline."
         )
@@ -459,18 +464,22 @@ def _current_state(
         raise ScheduledCommandError("scheduled_state_unavailable", "This dialog's scheduled queue is unavailable.")
     if cast(int, coverage[0]) <= 0:
         raise ScheduledCommandError("scheduled_state_invalid", "This dialog's scheduled baseline is invalid.")
-    row: Mapping[str, object] | None = None
-    if message_id is not None:
-        row = _read_mapping(
-            conn,
-            "SELECT * FROM scheduled_messages WHERE dialog_id=? AND message_id=?",
-            (dialog_id, message_id),
+    return _current_scheduled_item(conn, dialog_id, message_id), cast(int, coverage[0])
+
+
+def _current_scheduled_item(
+    conn: sqlite3.Connection, dialog_id: int, message_id: int | None
+) -> Mapping[str, object] | None:
+    if message_id is None:
+        return None
+    row = _read_mapping(
+        conn, "SELECT * FROM scheduled_messages WHERE dialog_id=? AND message_id=?", (dialog_id, message_id)
+    )
+    if row is None or row["message_state"] != "scheduled" or row["observation_order"] is None:
+        raise ScheduledCommandError(
+            "scheduled_message_unavailable", "That scheduled queue item is no longer active locally."
         )
-        if row is None or row["message_state"] != "scheduled" or row["observation_order"] is None:
-            raise ScheduledCommandError(
-                "scheduled_message_unavailable", "That scheduled queue item is no longer active locally."
-            )
-    return row, cast(int, coverage[0])
+    return row
 
 
 def _require_scheduled_account(conn: sqlite3.Connection, account_id: int) -> None:
@@ -886,6 +895,24 @@ class ScheduledCommandOwner:
         duplicate = read_scheduled_operation(self._reader, command.account_id, command.operation_key)
         if duplicate is not None:
             return self._duplicate(command, duplicate)
+        access = cast(
+            tuple[object] | None,
+            self._reader.execute(f"SELECT {not_access_lost_sql('?')}", (command.dialog_id,)).fetchone(),
+        )
+        if access is None or not access[0]:
+            raise ScheduledCommandError("scheduled_state_unavailable", "Dialog access is unavailable.")
+
+        def rearm(conn: sqlite3.Connection) -> None:
+            with write_transaction(conn):
+                conn.execute(
+                    f"UPDATE scheduled_reconciliation_state SET acquisition_block=NULL,authorization_pending=1, "
+                    f"coverage_reason='explicit_command',discovery_due_at=COALESCE(discovery_due_at,?), "
+                    f"dirty_generation=dirty_generation+1,updated_at=? WHERE dialog_id=? AND acquisition_block IS NOT NULL "
+                    f"AND {not_access_lost_sql('scheduled_reconciliation_state.dialog_id')}",
+                    (int(time.time()), int(time.time()), command.dialog_id),
+                )
+
+        await self._writer.run(rearm)
         peer = await self._resolve_peer(command.dialog_id, command.topic_id)
         if not _peer_matches(peer, command.dialog_id, command.account_id):
             raise ScheduledCommandError(

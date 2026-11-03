@@ -411,7 +411,7 @@ def _make_scheduled_server(conn: sqlite3.Connection | None = None, client: objec
     source.execute(
         "CREATE TABLE IF NOT EXISTS scheduled_reconciliation_state (dialog_id INTEGER PRIMARY KEY, "
         "coverage_state TEXT, coverage_reason TEXT, baseline_observed_at INTEGER, directory_generation INTEGER, "
-        "repair_due_at INTEGER, discovery_due_at INTEGER)"
+        "repair_due_at INTEGER, discovery_due_at INTEGER, acquisition_block TEXT)"
     )
     source.commit()
     return server
@@ -1604,3 +1604,23 @@ async def test_search_all_pages_chronological_prefix_before_merge(global_mode: b
     assert seen == expected
     sent = await server._search_messages({"query": "needle", "dialog_id": 1, "message_state": "sent", "limit": 1})
     assert sent["data"]["messages"][0]["message_id"] == 1
+
+
+def test_scheduled_coverage_reports_blocked_obligation_without_runnable_work() -> None:
+    server = _make_scheduled_server()
+    conn = server._conn
+    try:
+        conn.execute(
+            "INSERT INTO scheduled_reconciliation_state(dialog_id,coverage_state,discovery_due_at,acquisition_block) "
+            "VALUES (1,'complete',1,'admin_required')"
+        )
+        reading = server._get_reading_service()
+        coverage = reading._scheduled_dialog_coverage(1)
+        assert coverage["state"] == "complete"
+        assert coverage["acquisition_block"] == "admin_required"
+        assert coverage["acquisition_pending"] is False
+        projected = reading._directory_scheduled_coverages(conn, [1], 7)[1]
+        assert projected["acquisition_block"] == "admin_required"
+        assert projected["acquisition_pending"] is False
+    finally:
+        conn.close()

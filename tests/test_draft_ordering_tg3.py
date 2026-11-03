@@ -511,6 +511,44 @@ def test_authoritative_snapshot_clears_scope_uncertainty_and_allows_newer_realti
     )
 
 
+def test_lost_uncertain_scope_does_not_repeat_snapshot_and_rearms_on_restore(
+    projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
+) -> None:
+    from mcp_telegram.access_lifecycle import restore_access_after_revalidation
+    from mcp_telegram.drafts.history import read_current_draft
+
+    conn, repository = projection
+    lost, readable = DraftScope(100, 215), DraftScope(100, 216)
+    repository.apply_realtime(_empty(lost, 10))
+    repository.apply_realtime(
+        DraftObservation(
+            scope=lost,
+            disposition=DraftDisposition.TOMBSTONE,
+            source=DraftObservationSource.REALTIME,
+            observed_at=_at(20),
+        )
+    )
+    repository.apply_realtime(_present(readable, 10, "readable"))
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (215,'access_lost')")
+    conn.commit()
+    repository.bind_account(100)
+    assert repository.recovery_due_at() is None
+    claim = _claim(repository, 30)
+    assert repository.apply_snapshot([], _coverage(0, second=30), claim_token=claim).accepted
+    assert repository.recovery_due_at() is None
+    assert read_current_draft(conn, lost).uncertain
+    assert read_current_draft(conn, readable).presence == "absent"
+    assert read_current_draft(conn, DraftScope(100, 215, top_message_id=3)).presence == "unknown"
+    restore_access_after_revalidation(conn, 215, int(_at(31).timestamp()))
+    assert repository.recovery_due_at() is not None
+    assert read_current_draft(conn, lost).uncertain
+    claim = repository.claim_recovery(now=_at(31).timestamp())
+    assert claim is not None
+    assert repository.apply_snapshot([], _coverage(0, second=31), claim_token=claim).accepted
+    assert not read_current_draft(conn, lost).uncertain
+    assert repository.recovery_due_at() is None
+
+
 def test_authoritative_confirmation_advances_scope_order_without_revision(
     projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
 ) -> None:

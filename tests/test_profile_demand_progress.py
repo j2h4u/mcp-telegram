@@ -10,7 +10,9 @@ from typing import cast
 
 import pytest
 
+from mcp_telegram.auth_scope import TelegramAuthScope
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
+from mcp_telegram.entity_profile.contracts import ProfileFieldObservation
 from mcp_telegram.entity_profile.refresh import DurableRefreshSliceResult, EntityProfileDemandAdapter
 from mcp_telegram.entity_profile.repository import EntityRefreshCursor
 from mcp_telegram.sync_transactions import write_transaction
@@ -29,6 +31,106 @@ def _add_pending(conn: sqlite3.Connection, entity_id: int, now: int = 100) -> No
             "VALUES(?,'pending',?,'avatar_history',1)",
             (entity_id, now),
         )
+
+
+@pytest.mark.asyncio
+async def test_access_lost_preserves_profile_work_and_rejects_selected_slice(tmp_path: Path) -> None:
+    conn, repo = _repository(tmp_path / "access.sqlite")
+    _peer(conn, 42)
+    repo.mark_pending(42, now=100)
+    _add_pending(conn, 77, now=101)
+    client = _PairClient(channel_id=None)
+    service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=False))
+    status = service._durable_refresh_status(100)
+    assert status is not None and status.selected is not None
+    with conn:
+        conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(42,'access_lost')")
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    try:
+        outcome = await EntityProfileDemandAdapter(coordinator).run_slice(
+            RpcAttemptBudget(limit=1, selected=status.selected)
+        )
+        assert outcome.kind is SliceOutcomeKind.STALE
+        assert client.full_user_calls == 0
+        assert repo.next_due_refresh(now=101).entity_id == 77  # type: ignore[union-attr]
+        assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
+            "pending",
+        )
+        with conn:
+            conn.execute("UPDATE synced_dialogs SET status='synced' WHERE dialog_id=42")
+        assert repo.next_due_refresh(now=101).entity_id == 42  # type: ignore[union-attr]
+    finally:
+        await service.shutdown()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_access_loss_during_profile_request_keeps_pending_facts(tmp_path: Path) -> None:
+    conn, repo = _repository(tmp_path / "inflight.sqlite")
+    _peer(conn, 42)
+    repo.mark_pending(42, now=100)
+
+    class LostDuringRequest(_PairClient):
+        async def fetch_user_profile(self, user_id: int, target_kind: object, *, owner_account_id: int | None = None):
+            result = await super().fetch_user_profile(user_id, target_kind, owner_account_id=owner_account_id)  # type: ignore[arg-type]
+            with conn:
+                conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(42,'access_lost')")
+            return result
+
+    client = LostDuringRequest(channel_id=None)
+    service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=False))
+    status = service._durable_refresh_status(100)
+    assert status is not None and status.selected is not None
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    try:
+        outcome = await EntityProfileDemandAdapter(coordinator).run_slice(
+            RpcAttemptBudget(limit=1, selected=status.selected)
+        )
+        assert outcome.kind is SliceOutcomeKind.STALE
+        assert client.full_user_calls == 1
+        assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
+            "pending",
+        )
+        assert conn.execute("SELECT COUNT(*) FROM entity_details WHERE entity_id=42").fetchone() == (0,)
+    finally:
+        await service.shutdown()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_access_loss_during_profile_preparation_stops_rpc(tmp_path: Path) -> None:
+    conn, repo = _repository(tmp_path / "preparation.sqlite")
+    _peer(conn, 42)
+    repo.mark_pending(42, now=100)
+    client = _PairClient(channel_id=None)
+    service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=False))
+    status = service._durable_refresh_status(100)
+    assert status is not None and status.selected is not None
+    reserve = service._reserve_profile_observation
+
+    async def lose_access(scope: TelegramAuthScope | None) -> ProfileFieldObservation | None:
+        result = await reserve(scope)
+        with conn:
+            conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(42,'access_lost')")
+        return result
+
+    service._reserve_profile_observation = lose_access  # type: ignore[method-assign]
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    try:
+        outcome = await EntityProfileDemandAdapter(coordinator).run_slice(
+            RpcAttemptBudget(limit=1, selected=status.selected)
+        )
+        assert outcome.kind is SliceOutcomeKind.STALE
+        assert client.full_user_calls == 0
+        assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
+            "pending",
+        )
+    finally:
+        await service.shutdown()
+        conn.close()
 
 
 def test_five_siblings_and_retry_timestamp_do_not_change_work_revision(tmp_path: Path) -> None:

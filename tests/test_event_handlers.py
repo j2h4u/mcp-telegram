@@ -1403,6 +1403,34 @@ async def test_gap_scan_marks_deleted(
 
 
 @pytest.mark.asyncio
+async def test_gap_scan_rejected_peer_keeps_message_and_clears_context(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    from mcp_telegram.peer_access import PeerAccessRejectedError, current_peer_target
+
+    dialog_id = 2001
+    insert_synced_dialog(sync_db, dialog_id)
+    insert_message(sync_db, dialog_id, message_id=20, text="retained")
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+
+    async def reject(entity: int, *, ids: list[int]) -> object:
+        assert entity == dialog_id
+        assert ids == [20]
+        assert current_peer_target() == dialog_id
+        raise PeerAccessRejectedError("peer_access_lost")
+
+    mock_client.get_messages = AsyncMock(side_effect=reject)
+    with pytest.raises(PeerAccessRejectedError):
+        await manager.run_dm_gap_scan_page(dialog_id, [20])
+    assert current_peer_target() is None
+    assert sync_db.execute(
+        "SELECT is_deleted FROM messages WHERE dialog_id=? AND message_id=?", (dialog_id, 20)
+    ).fetchone() == (0,)
+
+
+@pytest.mark.asyncio
 async def test_gap_scan_skips_unsynced_messages(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
