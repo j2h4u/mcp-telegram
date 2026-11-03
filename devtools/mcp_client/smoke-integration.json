@@ -209,8 +209,12 @@
           "structuredContent.top_forwards": [],
           "structuredContent.coverage": "unknown"
         },
-        "path_exists": ["structuredContent.coverage"],
-        "path_not_exists": ["structuredContent.observation_horizon_at"]
+        "path_exists": [
+          "structuredContent.coverage"
+        ],
+        "path_not_exists": [
+          "structuredContent.observation_horizon_at"
+        ]
       }
     },
     {
@@ -232,6 +236,27 @@
           "structuredContent.scan_status",
           "structuredContent.comments",
           "structuredContent.count"
+        ],
+        "path_nonempty": [
+          "structuredContent"
+        ]
+      }
+    },
+    {
+      "_comment": "get_folder — local retained catalog read, including unknown coverage",
+      "action": "call_tool",
+      "name": "get_folder",
+      "arguments": {
+        "folder_id": 2147483647
+      },
+      "expect": {
+        "is_error": false,
+        "path_equals": {
+          "content": []
+        },
+        "path_exists": [
+          "structuredContent.account_id",
+          "structuredContent.presence"
         ],
         "path_nonempty": [
           "structuredContent"

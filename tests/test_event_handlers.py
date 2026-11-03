@@ -25,6 +25,7 @@ import pytest
 from telethon.tl import types  # type: ignore[import-untyped]
 
 from helpers import build_mock_message
+from mcp_telegram.auth_scope import TelegramAuthScope
 from mcp_telegram.delivered_update import DeliveredUpdate, current_delivered_update, delivered_update_context
 from mcp_telegram.demand_composition import LinkedChatFactDemandAdapter
 from mcp_telegram.dialog_identity import capture_identity_baseline, publish_dialog_identity
@@ -37,6 +38,7 @@ from mcp_telegram.event_handlers import (
     _NewMessageEvent,
 )
 from mcp_telegram.history_enrollment import disable_history
+from mcp_telegram.image_authorization import ScopeCell
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
@@ -2284,8 +2286,15 @@ async def test_retained_dm_enrollment_preserves_newer_identity_and_materializes_
             get_sender=get_sender,
         ),
     )
-    with delivered_update_context(DeliveredUpdate(2, 100, 2)):
+    scope = TelegramAuthScope(1, 99, 2, 123)
+    scope_cell = ScopeCell()
+    assert scope_cell.publish(scope)
+    mock_client.retained_auth_scope.return_value = scope
+    mock_client.claim_image_scope.side_effect = scope_cell.claim
+    delivered = DeliveredUpdate(2, 100, 2, auth_scope=scope, scope_token=scope_cell.capture())
+    with delivered_update_context(delivered):
         await manager.on_new_message(event)
+    assert not delivered.failed
     assert sync_db.execute("SELECT name,username FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
         "New",
         "new",
@@ -2312,3 +2321,184 @@ async def test_retained_dm_enrollment_preserves_newer_identity_and_materializes_
     ).fetchone() == (99, 2)
     get_sender.assert_not_called()
     mock_client.get_entity.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recorded_scope", [None, TelegramAuthScope(1, 99, 2, 124)])
+async def test_unattributed_retained_dm_keeps_identity_and_materializes_message(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+    recorded_scope: TelegramAuthScope | None,
+) -> None:
+    dialog_id = 101
+    sync_db.execute(
+        "INSERT INTO dialogs(dialog_id,name,username,type) VALUES (?,'Retained','retained','user')", (dialog_id,)
+    )
+    sync_db.execute(
+        "INSERT INTO entities(id,type,name,username,updated_at) VALUES (?,'user','Retained','retained',200)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.set_self_id(99)
+    scope = TelegramAuthScope(1, 99, 2, 123)
+    scope_cell = ScopeCell()
+    assert scope_cell.publish(scope)
+    mock_client.retained_auth_scope.return_value = scope
+    mock_client.claim_image_scope.side_effect = scope_cell.claim
+    sender = types.User(id=dialog_id, first_name="Unattributed", username="unattributed", premium=True)
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(
+            chat_id=dialog_id,
+            message=build_mock_message(id=1001, text="retained message"),
+            is_private=True,
+            sender=sender,
+        ),
+    )
+    delivered = DeliveredUpdate(2, 100, 2, auth_scope=recorded_scope, scope_token=scope_cell.capture())
+    with delivered_update_context(delivered):
+        await manager.on_new_message(event)
+    assert not delivered.failed
+    assert sync_db.execute("SELECT name,username FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        "Retained",
+        "retained",
+    )
+    assert sync_db.execute("SELECT name,username FROM entities WHERE id=?", (dialog_id,)).fetchone() == (
+        "Retained",
+        "retained",
+    )
+    assert sync_db.execute(
+        "SELECT text FROM messages WHERE dialog_id=? AND message_id=1001", (dialog_id,)
+    ).fetchone() == ("retained message",)
+    assert sync_db.execute(
+        "SELECT status FROM entity_profile_refresh_state WHERE entity_id=?", (dialog_id,)
+    ).fetchone() == ("pending",)
+    assert (
+        sync_db.execute(
+            "SELECT 1 FROM entity_profile_field_observations WHERE entity_id=? AND field='premium'", (dialog_id,)
+        ).fetchone()
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_dm_enrollment_keeps_delivery_pending_when_authorization_changes_between_writes(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 101
+    sync_db.execute("INSERT INTO dialogs(dialog_id,name,type) VALUES (?,'Retained','user')", (dialog_id,))
+    sync_db.execute("INSERT INTO entities(id,type,name,updated_at) VALUES (?,'user','Retained',200)", (dialog_id,))
+    sync_db.commit()
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.set_self_id(99)
+    scope = TelegramAuthScope(1, 99, 2, 123)
+    cell = ScopeCell()
+    assert cell.publish(scope)
+    mock_client.retained_auth_scope.return_value = scope
+    claims = 0
+
+    def revoke_on_entity(token: object) -> bool:
+        nonlocal claims
+        claims += 1
+        if claims == 3:
+            cell.begin_change()
+        return cell.claim(token)  # type: ignore[arg-type]
+
+    mock_client.claim_image_scope.side_effect = revoke_on_entity
+    sender = types.User(id=dialog_id, first_name="Name", premium=True)
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(
+            chat_id=dialog_id, message=build_mock_message(id=1001, text="message"), is_private=True, sender=sender
+        ),
+    )
+    delivered = DeliveredUpdate(2, 100, 2, auth_scope=scope, scope_token=cell.capture())
+    with delivered_update_context(delivered):
+        await manager.on_new_message(event)
+    assert claims == 3
+    assert delivered.failed
+    assert sync_db.execute(
+        "SELECT text FROM messages WHERE dialog_id=? AND message_id=1001", (dialog_id,)
+    ).fetchone() == ("message",)
+
+
+@pytest.mark.asyncio
+async def test_dm_authorization_change_replays_with_fresh_token_and_retained_order(  # noqa: PLR0915 - complete delivery replay lifecycle
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from telethon.sessions import SQLiteSession
+
+    from mcp_telegram import daemon, daemon_shutdown
+    from mcp_telegram.sqlite_writer import SQLiteWriter
+    from mcp_telegram.sync_db import open_sync_db_reader
+    from tests.test_update_delivery import DATE, _client, _database, _message, _pending
+    from tests.test_update_delivery_handlers import _manager
+
+    path = _database(tmp_path)
+    writer = await SQLiteWriter.open(path)
+    reader = open_sync_db_reader(path)
+    client = _client(tmp_path / "session", writer, channel=False)
+    manager = _manager(client, reader, writer)
+    reopened = None
+    try:
+        await client.start_update_delivery(99)
+        update = types.UpdateNewMessage(_message(11), 11, 1)
+        admitted: list[object] = []
+        client._message_box.process_updates(types.UpdateShort(update, DATE), client._mb_entity_cache, admitted)
+        user = types.User(55, first_name="Fixture", premium=True, access_hash=555)
+        await client._preprocess_updates(admitted, [user], [])
+        original = manager._persist_dm_entity
+
+        def revoke_before_entity(conn: sqlite3.Connection, *args: object) -> None:
+            change = client._image_scope_cell.begin_change()
+            try:
+                original(conn, *args)  # type: ignore[arg-type]
+            finally:
+                client._image_scope_cell.end_change(change)
+
+        monkeypatch.setattr(manager, "_persist_dm_entity", revoke_before_entity)
+        shutdown = daemon_shutdown.ShutdownRequest()
+        monitor_context = SimpleNamespace(
+            background_tasks=set(),
+            api_server=SimpleNamespace(_ready=True, startup_detail=""),
+            shutdown_request=shutdown,
+            rpc_observation_sink=None,
+        )
+        monitor = daemon._create_tracked_task(
+            monitor_context, client.wait_update_delivery_failure(), name="update_delivery", critical=True
+        )
+        await client._dispatch_update(admitted[0])
+        with pytest.raises(RuntimeError, match="retained package needs recovery"):
+            await monitor
+        await asyncio.sleep(0)
+        assert shutdown.event.is_set() and shutdown.reason_code == "critical_task_failed"
+        assert not monitor_context.api_server._ready
+        assert _pending(path) is not None
+        assert reader.execute("SELECT text FROM messages WHERE dialog_id=55 AND message_id=11").fetchone() == (
+            "fixture",
+        )
+        tokens = [tuple(row) for row in reader.execute("SELECT * FROM update_delivery_tokens")]
+        assert tokens
+        cast(SQLiteSession, client.session).close()
+        reopened = _client(tmp_path / "session", writer, channel=False)
+        _manager(reopened, reader, writer)
+        await reopened.start_update_delivery(99)
+        assert _pending(path) is None
+        assert reader.execute("SELECT 1 FROM update_delivery_tokens").fetchone() is None
+        assert reader.execute("SELECT text FROM messages WHERE dialog_id=55 AND message_id=11").fetchone() == (
+            "fixture",
+        )
+        assert reader.execute(
+            "SELECT owner_account_id,observation_order FROM entity_profile_field_observations WHERE entity_id=55 AND field='premium'"
+        ).fetchone() == (99, tokens[0][1])
+    finally:
+        if reopened is not None:
+            cast(SQLiteSession, reopened.session).close()
+        else:
+            cast(SQLiteSession, client.session).close()
+        reader.close()
+        await writer.aclose()

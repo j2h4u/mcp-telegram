@@ -193,6 +193,10 @@ from .unread_state import apply_unread_facts
 logger = logging.getLogger(__name__)
 
 
+class _DeliveredAuthorizationChangedError(RuntimeError):
+    """The admitted delivery no longer has its current account authority."""
+
+
 def _rpc_scope[**P, R](
     source: TelegramRpcSource,
 ) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
@@ -980,7 +984,7 @@ class EventHandlerManager:
                     observed_at,
                 ),
             )
-            if identity is not None:
+            if identity is not None and self._delivery_auth_available():
                 self._publish_dm_identity(
                     conn,
                     identity,
@@ -1034,6 +1038,8 @@ class EventHandlerManager:
     ) -> None:
         try:
             with write_transaction(conn):
+                if not self._delivery_auth_available():
+                    return
                 retained = current_delivered_update()
                 newer_fields = (
                     frozenset()
@@ -1052,6 +1058,8 @@ class EventHandlerManager:
                         username=identity.username,
                     ),
                 )
+        except _DeliveredAuthorizationChangedError:
+            raise
         except Exception:
             # Entity enrichment is optional after the mandatory dialog snapshot
             # has committed; the next refresh can fill a failed cache write.
@@ -1119,6 +1127,8 @@ class EventHandlerManager:
             return
         try:
             await self._persist_profile_pushes(sender=sender)
+        except _DeliveredAuthorizationChangedError:
+            raise
         except Exception:
             logger.exception("dm_auto_enroll_profile_failed dialog_id=%d", dialog_id)
 
@@ -2743,16 +2753,16 @@ class EventHandlerManager:
         scope_reader = getattr(self._client, "retained_auth_scope", None)
         current = scope_reader() if callable(scope_reader) else None
         if not isinstance(current, TelegramAuthScope) or current.account_id != self._self_id:
-            raise RuntimeError("delivered update authorization changed before publication")
+            raise _DeliveredAuthorizationChangedError("delivered update authorization changed before publication")
         self._claim_delivery_scope(delivery)
         if delivery.auth_scope is not None and delivery.auth_scope.account_id != self._self_id:
-            raise RuntimeError("delivered update account mismatch")
+            raise _DeliveredAuthorizationChangedError("delivered update account mismatch")
         return delivery.auth_scope is not None and delivery.auth_scope == current
 
     def _claim_delivery_scope(self, delivery: DeliveredUpdate) -> None:
         token_claim = getattr(self._client, "claim_image_scope", None)
         if not callable(token_claim) or delivery.scope_token is None or not token_claim(delivery.scope_token):
-            raise RuntimeError("delivered update authorization changed before publication")
+            raise _DeliveredAuthorizationChangedError("delivered update authorization changed before publication")
 
     def _request_unattributed_profile_refresh(
         self, conn: sqlite3.Connection, update: object, users: Sequence[object], topic_entities: Sequence[object]
