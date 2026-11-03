@@ -45,6 +45,7 @@ ALLOWED_KINDS = frozenset(
         "telegram.demand",
         "daemon.request_timing",
         "entity_profile.pair",
+        "entity_profile.membership",
         "sync.delta_gap_fill",
         "message_fact.read_at",
         "reaction.aggregate",

@@ -41,6 +41,7 @@ from .dialog_directory_coverage import DialogDirectoryCoverage, read_dialog_dire
 from .dialog_identity import read_dialog_identities
 from .dialog_identity_contracts import DialogIdentity
 from .dialog_selector import DialogSelector, DialogSelectorError, optional_dialog_selector
+from .entity_profile.membership import MembershipSignalCounts
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
@@ -48,7 +49,7 @@ from .linked_chat_fact import LinkedChatState
 from .linked_chat_fact import read_fact as read_linked_chat_fact
 from .message_content import MessageSnapshot, project_message_content
 from .message_contracts import ExtractedMessage
-from .messages.sqlite_bundle import insert_messages_with_fts
+from .messages.sqlite_bundle import MessageWriteResult, insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
 from .models import DialogType
 from .observation_order import allocate_observation_order
@@ -119,6 +120,8 @@ class DaemonAccountTraceDeps:
     self_id: int | None
     logger: _LoggerLike
     rid: Callable[[], str]
+    offer_profile_refresh: Callable[[], None] | None = None
+    observe_membership: Callable[[Mapping[str, int]], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -739,13 +742,18 @@ class DaemonAccountTraceService:
         unique_messages, duplicate_count = _dedupe_trace_messages(fetched)
         result["duplicates_skipped"] += duplicate_count
 
-        def persist(conn: sqlite3.Connection) -> tuple[int, int, str]:
+        def persist(conn: sqlite3.Connection) -> tuple[int, int, str, MembershipSignalCounts]:
             with write_transaction(conn):
                 changed, persisted_duplicate_count = _split_trace_duplicate_messages(
                     conn=conn,
                     messages=unique_messages,
                 )
-                persisted = _persist_trace_messages(conn, changed) if changed else 0
+                write_result = (
+                    _persist_trace_messages(conn, changed, self._deps.self_id)
+                    if changed
+                    else MessageWriteResult(0, MembershipSignalCounts())
+                )
+                persisted = write_result.accepted_count
 
                 status = _trace_candidate_status_after_fetch(
                     fetched_count=len(fetched),
@@ -765,9 +773,16 @@ class DaemonAccountTraceService:
                         now=now,
                     )
                 )
-                return persisted, persisted_duplicate_count, status
+                return persisted, persisted_duplicate_count, status, write_result.membership_counts
 
-        persisted, duplicates, persisted_status = await self._deps.writer.run(persist)
+        persisted, duplicates, persisted_status, membership_counts = await self._deps.writer.run(persist)
+        if self._deps.observe_membership is not None:
+            try:
+                self._deps.observe_membership(membership_counts.as_observation())
+            except Exception:  # noqa: BLE001 - telemetry cannot affect the committed trace.
+                self._deps.logger.debug("membership_observation_failed")
+        if (membership_counts.queued or membership_counts.coalesced) and self._deps.offer_profile_refresh is not None:
+            self._deps.offer_profile_refresh()
         result["messages_persisted"] = persisted
         result["duplicates_skipped"] += duplicates
         result["status"] = persisted_status
@@ -894,6 +909,7 @@ class DaemonAccountTraceService:
                         conn=conn,
                         target_user_id=target_user_id,
                         observed_rows=selected_rows,
+                        owner_account_id=self._deps.self_id,
                         exact_dialog_id=scope.exact_dialog_id,
                         exact_topic_id=scope.exact_topic_id,
                         linked_chat_map=scope.linked_chat_map,
@@ -932,6 +948,14 @@ class DaemonAccountTraceService:
             )
         )
         coverage["observed_message_count"] = query_result.observed_message_count
+        if request.coverage_goal == "observed":
+            from .entity_profile.reader import unobserved_common_chats
+
+            coverage["known_common_chats"] = (
+                _known_common_chats(self._deps.conn, self._deps.self_id, target_user_id, int(time.time()))
+                if self._deps.self_id is not None
+                else unobserved_common_chats()
+            )
         gaps = _build_trace_gaps(
             _TraceGapBuildRequest(
                 conn=self._deps.conn,
@@ -959,6 +983,17 @@ class DaemonAccountTraceService:
                 directory_coverage=scope.directory_coverage,
             )
         )
+
+
+def _known_common_chats(conn: sqlite3.Connection, owner: int, target: int, now: int) -> dict[str, object]:
+    from .entity_profile.reader import common_chat_dialog_id, read_common_chats
+
+    page = read_common_chats(conn, owner, target, now)
+    for item in cast(list[dict[str, object]], page["items"]):
+        dialog_id = common_chat_dialog_id(item)
+        item["dialog_id"] = dialog_id
+        item["local_state"] = dialog_presence_metadata(conn, dialog_id) if dialog_id is not None else None
+    return page
 
 
 def _apply_trace_unknown_link_coverage(
@@ -1680,9 +1715,11 @@ def _split_trace_duplicate_messages(
     return changed, duplicates
 
 
-def _persist_trace_messages(conn: sqlite3.Connection, messages: list[ExtractedMessage]) -> int:
+def _persist_trace_messages(
+    conn: sqlite3.Connection, messages: list[ExtractedMessage], owner: int | None
+) -> MessageWriteResult:
     require_write_transaction(conn)
-    return insert_messages_with_fts(conn, messages, priority=HydrationPriority.BACKFILL)
+    return insert_messages_with_fts(conn, messages, priority=HydrationPriority.BACKFILL, profile_owner_account_id=owner)
 
 
 _TRACE_FRAGMENT_STATUSES = {
@@ -1763,6 +1800,7 @@ class _TraceCandidateBuildRequest:
     conn: sqlite3.Connection
     target_user_id: int
     observed_rows: list[Mapping[str, object]] | list[dict[str, object]]
+    owner_account_id: int | None = None
     exact_dialog_id: int | None = None
     exact_topic_id: int | None = None
     max_dialogs: int = _TRACE_ENRICHMENT_MAX_DIALOGS
@@ -2329,7 +2367,7 @@ def _trace_candidate_dialogs(
     now = int(time.time())
     identity_ids = {_row_int(row, "dialog_id") for row in request.observed_rows}
     identity_ids.update(retry_fragment_dialog_ids(request.conn, target_user_id=request.target_user_id, now=now))
-    identity_ids.update(common_chat_ids(request.conn, request.target_user_id))
+    identity_ids.update(common_chat_ids(request.conn, request.owner_account_id, request.target_user_id, now))
     identity_ids.update(visible_synced_dialog_ids(request.conn))
     identity_ids.update(request.linked_chat_map or {})
     identity_ids.update((request.linked_chat_map or {}).values())
@@ -2468,7 +2506,7 @@ def _add_trace_candidate_common_chats(
     state: _TraceCandidateBuildState,
 ) -> None:
     request = state.request
-    for dialog_id in common_chat_ids(request.conn, request.target_user_id):
+    for dialog_id in common_chat_ids(request.conn, request.owner_account_id, request.target_user_id, int(time.time())):
         _add_trace_candidate_dialog(
             state=state,
             dialog_id=dialog_id,

@@ -224,8 +224,15 @@ def conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
 @pytest.mark.asyncio
 async def test_archive_backfill_adapter_commits_one_page_with_precise_scope(conn: sqlite3.Connection) -> None:
     client = _FakeClient([FakeSearchResult(messages=[_msg(100, 42, 1_700_000_100)]), FakeSearchResult(messages=[])])
+    observed = []
     adapter = ArchiveBackfillDemandAdapter(
-        client, conn, asyncio.Event(), _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
+        client,
+        conn,
+        asyncio.Event(),
+        _TEST_TIMEOUT_S,
+        writer=inline_writer(conn),
+        account_id=123,
+        membership_observer=lambda counts: observed.append((counts, conn.in_transaction)),
     )
 
     assert adapter.status(1_700_000_000.0) is not None
@@ -234,6 +241,8 @@ async def test_archive_backfill_adapter_commits_one_page_with_precise_scope(conn
     state = dict(
         cast(list[tuple[str, str | None]], conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
     )
+    assert len(observed) == 1 and observed[0][1] is False
+    assert observed[0][0].received == 0
     assert state["backfill_offset_id"] == "100"
     assert state["backfill_complete"] == "0"
     assert client.scopes[0].demand_kind is DemandKind.ARCHIVE_BACKFILL
@@ -430,13 +439,21 @@ async def test_archive_page_failure_rolls_back_messages_and_checkpoint(conn: sql
 
     enable_runtime_writes(conn)
     client = _FakeClient([FakeSearchResult(messages=[_msg(100, 42, 1_700_000_100)])])
+    observed = []
     adapter = ArchiveBackfillDemandAdapter(
-        client, conn, asyncio.Event(), timeout_s=_TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
+        client,
+        conn,
+        asyncio.Event(),
+        timeout_s=_TEST_TIMEOUT_S,
+        writer=inline_writer(conn),
+        account_id=123,
+        membership_observer=observed.append,
     )
     with patch.object(activity_sync, "_upsert_entities_from_search", side_effect=RuntimeError("identity write failed")):
         with pytest.raises(RuntimeError, match="identity write failed"):
             await adapter.run_slice(_selected_budget(adapter))
 
+    assert observed == []
     assert conn.execute("SELECT message_id FROM messages").fetchall() == []
     assert conn.execute("SELECT value FROM activity_sync_state WHERE key='backfill_offset_id'").fetchone() == ("0",)
     assert not conn.in_transaction
@@ -598,3 +615,28 @@ async def test_incremental_shutdown_keeps_window(conn: sqlite3.Connection) -> No
     )
     await adapter.run_slice(_selected_budget(adapter))
     assert activity_sync._load_state(conn) == before
+
+
+@pytest.mark.asyncio
+async def test_archive_membership_observation_follows_committed_service_message(conn: sqlite3.Connection) -> None:
+    from telethon.tl.types import MessageActionChatAddUser, MessageService, PeerChat
+
+    message = MessageService(
+        id=100, peer_id=PeerChat(42), date=datetime.now(UTC), action=MessageActionChatAddUser([12])
+    )
+    observed = []
+    client = _FakeClient([FakeSearchResult(messages=[cast(FakeMessage, message)])])
+    adapter = ArchiveBackfillDemandAdapter(
+        client,
+        conn,
+        asyncio.Event(),
+        _TEST_TIMEOUT_S,
+        writer=inline_writer(conn),
+        account_id=123,
+        membership_observer=observed.append,
+    )
+    await adapter.run_slice(_selected_budget(adapter))
+    assert conn.execute("SELECT is_service FROM messages WHERE message_id=100").fetchone() == (1,)
+    assert len(observed) == 1
+    assert observed[0].received == 1
+    assert observed[0].ignored_account_mismatch == 1

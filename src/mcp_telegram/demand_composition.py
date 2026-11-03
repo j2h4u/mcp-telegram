@@ -32,6 +32,7 @@ from mcp_telegram.dialog_sync import (
     DialogReconciliationWorker,
 )
 from mcp_telegram.drafts.owner import DraftMessageOwner
+from mcp_telegram.entity_profile.membership import MembershipSignalCounts
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, EntityRefreshCoordinator
 from mcp_telegram.fact_hydration import FactHydrationDemandAdapter, MessageFactHydrationWorker
 from mcp_telegram.folders.worker import FolderProjectionDemandAdapter, FolderProjectionWorker
@@ -200,6 +201,12 @@ def build_durable_adapter_map(
     observer: DeltaGapFillObservationHook | None = None,
 ) -> Mapping[DemandKind, DurableDemandAdapter]:
     """Build and validate the exhaustive durable adapter map."""
+    observe_membership = getattr(observer, "observe_membership", None)
+
+    def membership_observer(counts: MembershipSignalCounts) -> None:
+        if callable(observe_membership):
+            observe_membership(counts.as_observation(), source="message_membership")
+
     adapters: dict[DemandKind, DurableDemandAdapter] = {
         DemandKind.MESSAGE_IMAGE_ACQUISITION: dependencies.image_worker,
         DemandKind.TOPIC_SNAPSHOT: TopicSnapshotDemandAdapter(
@@ -210,7 +217,10 @@ def build_durable_adapter_map(
         ),
         DemandKind.ENTITY_PROFILE_REFRESH: EntityProfileDemandAdapter(dependencies.entity_refresh_coordinator),
         DemandKind.DELTA_GAP_FILL: DeltaGapFillDemandAdapter(
-            dependencies.delta_sync_worker, account_id=dependencies.account_id, observer=observer
+            dependencies.delta_sync_worker,
+            account_id=dependencies.account_id,
+            observer=observer,
+            membership_observer=membership_observer,
         ),
         DemandKind.DM_DELETION_RECONCILIATION: DmDeletionReconciliationDemandAdapter(
             dependencies.conn,
@@ -224,6 +234,7 @@ def build_durable_adapter_map(
             dependencies.access_probe,
             account_id=dependencies.account_id,
             observer=observer,
+            membership_observer=membership_observer,
         ),
         DemandKind.HOT_ACTIVITY_PAGE: HotActivityDemandAdapter(
             dependencies.client,
@@ -233,6 +244,7 @@ def build_durable_adapter_map(
             dependencies.activity_rpc_timeout_seconds,
             account_id=dependencies.account_id,
             writer=dependencies.writer,
+            membership_observer=membership_observer,
         ),
         DemandKind.LIVE_HYDRATION_BATCH: FactHydrationDemandAdapter(
             dependencies.fact_hydration_worker,
@@ -243,7 +255,7 @@ def build_durable_adapter_map(
             dependencies.full_sync_worker, account_id=dependencies.account_id
         ),
         DemandKind.FULL_SYNC_PAGE: FullSyncDemandAdapter(
-            dependencies.full_sync_worker, account_id=dependencies.account_id
+            dependencies.full_sync_worker, account_id=dependencies.account_id, membership_observer=membership_observer
         ),
         DemandKind.DIALOG_BOOTSTRAP: CanonicalDialogDirectoryDemandAdapter(
             dependencies.dialog_directory,
@@ -259,6 +271,7 @@ def build_durable_adapter_map(
             dependencies.activity_rpc_timeout_seconds,
             account_id=dependencies.account_id,
             writer=dependencies.writer,
+            membership_observer=membership_observer,
         ),
         DemandKind.ARCHIVE_INCREMENTAL: ArchiveIncrementalDemandAdapter(
             dependencies.client,
@@ -268,6 +281,7 @@ def build_durable_adapter_map(
             dependencies.activity_rpc_timeout_seconds,
             account_id=dependencies.account_id,
             writer=dependencies.writer,
+            membership_observer=membership_observer,
         ),
         DemandKind.COLD_PEER_PAGE: ColdPeerPageDemandAdapter(
             dependencies.client,
@@ -277,6 +291,7 @@ def build_durable_adapter_map(
             dependencies.activity_rpc_timeout_seconds,
             account_id=dependencies.account_id,
             writer=dependencies.writer,
+            membership_observer=membership_observer,
         ),
         DemandKind.BACKFILL_HYDRATION_BATCH: FactHydrationDemandAdapter(
             dependencies.fact_hydration_worker,

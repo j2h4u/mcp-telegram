@@ -1394,6 +1394,47 @@ async def test_trace_zero_hit_resolved_account_returns_observed_zero_gap(
 
 
 @pytest.mark.asyncio
+async def test_observed_zero_authored_hits_exposes_retained_candidates_without_rpc(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
+    from telethon.tl import types
+
+    from tests.test_profile_read_integration import _publish
+
+    _server, conn, client = trace_server
+    _forbid_trace_acquisition(client)
+    seed_entity(conn, entity_id=42, name="Target")
+    conn.execute(
+        "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_owner_account_id) VALUES(42,?,1,101)",
+        ('{"common_chats":[{"id":-999}]}',),
+    )
+    conn.commit()
+    _publish(conn, "common_chats", [types.ChatEmpty(7), types.ChannelForbidden(7, 1, "Channel")], owner=101)
+    before = conn.total_changes
+    result = _dict(await trace_service._trace_account_messages({"exact_account_id": 42, "coverage_goal": "observed"}))
+    coverage = _dict(_dict(result["data"])["coverage"])
+    page = _dict(coverage["known_common_chats"])
+    assert coverage["dialogs_considered"] == 0 and coverage["observed_message_count"] == 0
+    assert [item["dialog_id"] for item in cast(list[dict], page["items"])] == [-7, -1000000000007]
+    assert page["returned_count"] == 2 and not page["has_more"]
+    assert all(item["local_state"]["status"] == "not_synced" for item in cast(list[dict], page["items"]))
+    assert conn.total_changes == before and client.mock_calls == []
+    schema = TOOL_REGISTRY["trace_account_messages"].output_schema
+    assert schema is not None
+    from jsonschema import Draft202012Validator
+
+    from mcp_telegram import server
+
+    wire = server._project_tool_result(
+        "trace_account_messages",
+        structured_result(_trace_structured_content(_dict(result["data"]), TraceAccountMessages(exact_account_id=42))),
+        server._CallTelemetry(),
+    )
+    Draft202012Validator(schema).validate(cast(object, wire.structured_content))
+
+
+@pytest.mark.asyncio
 async def test_explicit_trace_defers_unknown_channel_scope_before_pagination(
     trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
     trace_service: DaemonAccountTraceService,

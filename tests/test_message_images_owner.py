@@ -170,7 +170,7 @@ async def test_local_image_read_and_budget_use_real_writer(tmp_path: Path) -> No
     "race",
     ["none", "delete", "replace", "key", "reference", "multi", "unsupported", "same_photo", "same_photo_resolve"],
 )
-async def test_worker_drains_explicit_legacy_photo_to_canonical_local_read(tmp_path: Path, race: str) -> None:
+async def test_worker_drains_explicit_legacy_photo_to_canonical_local_read(tmp_path: Path, race: str) -> None:  # noqa: PLR0915
     db_path = tmp_path / "worker.db"
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
@@ -264,7 +264,10 @@ async def test_worker_drains_explicit_legacy_photo_to_canonical_local_read(tmp_p
         image_scope,
         lambda: None,
     )
-    worker = MessageImageWorker(conn, writer, tmp_path / "images", image_scope, Gateway())
+    observed = []
+    worker = MessageImageWorker(
+        conn, writer, tmp_path / "images", image_scope, Gateway(), membership_observer=observed.append
+    )
     try:
         await service.prepare(7, 8)
         await run_ready_slice(worker, limit=32, now=100)
@@ -279,6 +282,8 @@ async def test_worker_drains_explicit_legacy_photo_to_canonical_local_read(tmp_p
         if race == "multi":
             await run_ready_slice(worker, limit=32, now=100)
             await run_ready_slice(worker, limit=32, now=100)
+        if race == "none":
+            assert len(observed) == 1 and observed[0].received == 0
         await _assert_worker_result(service, conn, tmp_path, race, (opens, slices))
     finally:
         await worker.close()
@@ -305,9 +310,9 @@ def test_normal_message_ingestion_keeps_photo_id_private_and_orders_same_second_
 
     try:
         with write_transaction(conn):
-            assert insert_messages_with_fts(conn, [observed(99, 2)]) == 1
-            assert insert_messages_with_fts(conn, [observed(photo_id, 3)]) == 1
-            assert insert_messages_with_fts(conn, [observed(101, 1)]) == 0
+            assert insert_messages_with_fts(conn, [observed(99, 2)]).accepted_count == 1
+            assert insert_messages_with_fts(conn, [observed(photo_id, 3)]).accepted_count == 1
+            assert insert_messages_with_fts(conn, [observed(101, 1)]).accepted_count == 0
         source = current_source(conn, 7, 8)
         assert source is not None and (source.photo_id, source.generation) == (photo_id, 3)
         payload = cast(

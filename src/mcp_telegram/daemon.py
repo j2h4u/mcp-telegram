@@ -1868,8 +1868,18 @@ def _build_demand_runtime(
     image_directory = ctx.db_path.parent / "message-images"
     image_sources = ActiveSources()
     image_scope = ImageScope(ctx.client.capture_image_scope, ctx.client.claim_image_scope, image_sources)
+    membership_observer = ctx.rpc_admission_observer
     image_worker = MessageImageWorker(
-        ctx.conn, ctx.writer, image_directory, image_scope, cast(TelegramImageGateway, ctx.client)
+        ctx.conn,
+        ctx.writer,
+        image_directory,
+        image_scope,
+        cast(TelegramImageGateway, ctx.client),
+        membership_observer=(
+            lambda counts: membership_observer.observe_membership(counts.as_observation(), source="message_membership")
+        )
+        if membership_observer is not None
+        else None,
     )
 
     def offer_image() -> None:
@@ -2470,6 +2480,13 @@ async def sync_main() -> None:  # noqa: PLR0915 - composition root owns startup 
         )
         if ctx.rpc_observation_sink is not None:
             ctx.handler_manager.bind_observation_sink(ctx.rpc_observation_sink)
+        membership_observer = ctx.rpc_admission_observer
+        if membership_observer is not None:
+            ctx.handler_manager.bind_membership_observer(
+                lambda counts: membership_observer.observe_membership(
+                    counts.as_observation(), source="message_membership"
+                )
+            )
         ctx.handler_manager.register()
         logger.info("event handlers registered behind startup account barrier")
 

@@ -23,12 +23,14 @@ import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from functools import wraps
 from typing import Protocol, cast
 
 from .access_lifecycle import set_access_lost
 from .dialog_identity import ensure_dialog_identity_baseline, publish_dialog_identity
+from .entity_profile.membership import MembershipSignalCounts
 from .entity_store import EntitySnapshot, upsert_entity_stub
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .history_enrollment import (
@@ -224,6 +226,23 @@ def _set_total_messages_repair_retry(conn: sqlite3.Connection, retry_at: int | N
 # ---------------------------------------------------------------------------
 
 
+_FULL_MEMBERSHIP_OBSERVER: ContextVar[Callable[[MembershipSignalCounts], None] | None] = ContextVar(
+    "full_membership_observer", default=None
+)
+
+
+def _report_membership(
+    observer: Callable[[MembershipSignalCounts], None] | None, counts: list[MembershipSignalCounts]
+) -> None:
+    if observer is None:
+        return
+    for item in counts:
+        try:
+            observer(item)
+        except Exception:  # noqa: BLE001 - observability must not affect committed work
+            logger.debug("membership_observation_failed")
+
+
 class FullSyncWorker:
     """Core bulk-fetch engine for the v1.5 sync daemon.
 
@@ -350,7 +369,11 @@ class FullSyncWorker:
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def process_one_batch(
-        self, *, expected_dialog: int | None = None, expected_cursor: int | None = None
+        self,
+        *,
+        expected_dialog: int | None = None,
+        expected_cursor: int | None = None,
+        profile_owner_account_id: int | None = None,
     ) -> bool:
         """Fetch one batch of messages for the next pending dialog.
 
@@ -384,7 +407,7 @@ class FullSyncWorker:
             self._last_page_stale = True
             return False
         if pending is None:
-            return not await self._process_one_automatic_group()
+            return not await self._process_one_automatic_group(profile_owner_account_id=profile_owner_account_id)
 
         dialog_id, sync_progress = pending
 
@@ -393,7 +416,9 @@ class FullSyncWorker:
                 _set_dm_enrollment_state(conn, "full_sync_peer_cursor", str(dialog_id))
 
         await self._writer.run(persist_peer_cursor)
-        _, is_done = await self._fetch_batch(dialog_id, sync_progress)
+        _, is_done = await self._fetch_batch(
+            dialog_id, sync_progress, profile_owner_account_id=profile_owner_account_id
+        )
 
         if not is_done:
             return False  # more batches needed for this dialog
@@ -574,7 +599,9 @@ class FullSyncWorker:
             is not None
         )
 
-    async def _process_one_automatic_group(self, expected_dialog_id: int | None = None) -> bool:
+    async def _process_one_automatic_group(
+        self, expected_dialog_id: int | None = None, *, profile_owner_account_id: int | None = None
+    ) -> bool:
         self._last_page_accepted = False
         self._last_page_stale = False
         self._last_automatic_pending = False
@@ -607,9 +634,22 @@ class FullSyncWorker:
             await self._writer.run(persist_probe_retry)
             self._last_automatic_pending = True
             return True
-        return await self._writer.run(lambda conn: self._finalize_automatic_group_page(conn, dialog_id, page))
+        staged: list[MembershipSignalCounts] = []
+        observer = _FULL_MEMBERSHIP_OBSERVER.get()
+        result = await self._writer.run(
+            lambda conn: self._finalize_automatic_group_page(conn, dialog_id, page, profile_owner_account_id, staged)
+        )
+        _report_membership(observer, staged)
+        return result
 
-    def _finalize_automatic_group_page(self, conn: sqlite3.Connection, dialog_id: int, page: _FetchedBatchPage) -> bool:
+    def _finalize_automatic_group_page(
+        self,
+        conn: sqlite3.Connection,
+        dialog_id: int,
+        page: _FetchedBatchPage,
+        profile_owner_account_id: int | None = None,
+        membership_staged: list[MembershipSignalCounts] | None = None,
+    ) -> bool:
         assert self._automatic_group_history is not None
         with write_transaction(conn):
             intent = read_intent(conn, dialog_id)
@@ -620,7 +660,7 @@ class FullSyncWorker:
                         "UPDATE synced_dialogs SET status='syncing',sync_progress=0 WHERE dialog_id=? AND status IN ('own_only', 'fragment')",
                         (dialog_id,),
                     )
-                    self._store_batch_page_locked(conn, dialog_id, 0, page)
+                    self._store_batch_page_locked(conn, dialog_id, 0, page, profile_owner_account_id, membership_staged)
                 return True
             if not self._is_eligible_automatic_group(
                 conn,
@@ -640,7 +680,7 @@ class FullSyncWorker:
                     "UPDATE synced_dialogs SET status='syncing',sync_progress=0 WHERE dialog_id=? AND status IN ('own_only', 'fragment')",
                     (dialog_id,),
                 )
-                self._store_batch_page_locked(conn, dialog_id, 0, page)
+                self._store_batch_page_locked(conn, dialog_id, 0, page, profile_owner_account_id, membership_staged)
         return True
 
     def _next_total_messages_repair_dialog(self) -> int | None:
@@ -756,7 +796,9 @@ class FullSyncWorker:
         )
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
-    async def _fetch_batch(self, dialog_id: int, sync_progress: int) -> tuple[int, bool]:
+    async def _fetch_batch(
+        self, dialog_id: int, sync_progress: int, *, profile_owner_account_id: int | None = None
+    ) -> tuple[int, bool]:
         """Fetch up to 100 messages for dialog_id older than sync_progress.
 
         Uses offset_id=sync_progress (exclusive) so each batch fetches
@@ -782,6 +824,7 @@ class FullSyncWorker:
             dialog_id,
             sync_progress,
             page,
+            profile_owner_account_id=profile_owner_account_id,
         )
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
@@ -790,21 +833,32 @@ class FullSyncWorker:
         dialog_id: int,
         sync_progress: int,
         page: _FetchedBatchPage,
+        *,
+        profile_owner_account_id: int | None = None,
     ) -> tuple[int, bool]:
         """Persist one fetched batch and update sync progress."""
 
+        staged: list[MembershipSignalCounts] = []
+        observer = _FULL_MEMBERSHIP_OBSERVER.get()
+
         def persist_page(conn: sqlite3.Connection) -> tuple[int, bool]:
             with write_transaction(conn):
-                return self._store_batch_page_locked(conn, dialog_id, sync_progress, page)
+                return self._store_batch_page_locked(
+                    conn, dialog_id, sync_progress, page, profile_owner_account_id, staged
+                )
 
-        return await self._writer.run(persist_page)
+        result = await self._writer.run(persist_page)
+        _report_membership(observer, staged)
+        return result
 
-    def _store_batch_page_locked(
+    def _store_batch_page_locked(  # noqa: PLR0913, PLR0917
         self,
         conn: sqlite3.Connection,
         dialog_id: int,
         sync_progress: int,
         page: _FetchedBatchPage,
+        profile_owner_account_id: int | None = None,
+        membership_staged: list[MembershipSignalCounts] | None = None,
     ) -> tuple[int, bool]:
         require_write_transaction(conn)
         if sync_progress == 0 and full_history_enabled(conn, dialog_id):
@@ -814,7 +868,9 @@ class FullSyncWorker:
             )
         if page.next_before_message_id is None:
             return self._store_terminal_page_locked(conn, dialog_id, sync_progress, page)
-        return self._store_continuation_page_locked(conn, dialog_id, sync_progress, page)
+        return self._store_continuation_page_locked(
+            conn, dialog_id, sync_progress, page, profile_owner_account_id, membership_staged
+        )
 
     def _store_terminal_page_locked(
         self, conn: sqlite3.Connection, dialog_id: int, sync_progress: int, page: _FetchedBatchPage
@@ -837,8 +893,14 @@ class FullSyncWorker:
         logger.info("sync_done dialog_id=%d status=synced (empty batch)", dialog_id)
         return sync_progress, True
 
-    def _store_continuation_page_locked(
-        self, conn: sqlite3.Connection, dialog_id: int, sync_progress: int, page: _FetchedBatchPage
+    def _store_continuation_page_locked(  # noqa: PLR0913, PLR0917
+        self,
+        conn: sqlite3.Connection,
+        dialog_id: int,
+        sync_progress: int,
+        page: _FetchedBatchPage,
+        profile_owner_account_id: int | None = None,
+        membership_staged: list[MembershipSignalCounts] | None = None,
     ) -> tuple[int, bool]:
         assert page.next_before_message_id is not None
         rows = list(page.batch)
@@ -857,9 +919,15 @@ class FullSyncWorker:
             self._last_page_stale = True
             return sync_progress, False
         self._begin_topic_attribution_pass(conn, dialog_id, sync_progress, now)
-        insert_messages_with_fts(
-            conn, rows, priority=HydrationPriority.BACKFILL, reaction_observed_at=page.reaction_observed_at
+        result = insert_messages_with_fts(
+            conn,
+            rows,
+            priority=HydrationPriority.BACKFILL,
+            reaction_observed_at=page.reaction_observed_at,
+            profile_owner_account_id=profile_owner_account_id,
         )
+        if membership_staged is not None:
+            membership_staged.append(result.membership_counts)
         self._record_no_topic_attribution(conn, dialog_id, rows)
         self._capture_committed_page_revision(conn, dialog_id)
         logger.debug(
@@ -923,7 +991,14 @@ class FullSyncDemandAdapter:
 
     demand_kind = DemandKind.FULL_SYNC_PAGE
 
-    def __init__(self, worker: FullSyncWorker, *, account_id: int) -> None:
+    def __init__(
+        self,
+        worker: FullSyncWorker,
+        *,
+        account_id: int,
+        membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
+    ) -> None:
+        self._membership_observer = membership_observer
         self._worker = worker
         self._account_id = account_id
 
@@ -1035,7 +1110,11 @@ class FullSyncDemandAdapter:
         validation = self._validate_selected(selected, time.time())
         if validation is not None:
             return validation
-        stale = await self._dispatch_selected(selected, budget)
+        token = _FULL_MEMBERSHIP_OBSERVER.set(self._membership_observer)
+        try:
+            stale = await self._dispatch_selected(selected, budget)
+        finally:
+            _FULL_MEMBERSHIP_OBSERVER.reset(token)
         if stale:
             return SliceOutcome(selected, SliceOutcomeKind.STALE)
         return self._outcome_for_selected(selected)
@@ -1114,14 +1193,16 @@ class FullSyncDemandAdapter:
 
     async def _dispatch_automatic_group(self, selected: WorkRevision) -> bool:
         dialog_id = int(selected.key.target.split(":", 1)[1])
-        await self._worker._process_one_automatic_group(dialog_id)
+        await self._worker._process_one_automatic_group(dialog_id, profile_owner_account_id=self._account_id)
         self._raise_unexpected_page_error()
         return self._worker._last_page_stale
 
     async def _dispatch_dialog(self, selected: WorkRevision) -> bool:
         dialog_id = int(selected.key.target.split(":", 1)[1])
         cursor = int(selected.revision.split(":", 1)[0])
-        await self._worker.process_one_batch(expected_dialog=dialog_id, expected_cursor=cursor)
+        await self._worker.process_one_batch(
+            expected_dialog=dialog_id, expected_cursor=cursor, profile_owner_account_id=self._account_id
+        )
         self._raise_unexpected_page_error()
         return self._worker._last_page_stale
 

@@ -35,6 +35,7 @@ from .activity_peer_resolve import resolve_input_peer, resolve_linked_chat_id
 from .activity_substrate import ActivityClient, call_with_timeout
 from .dialog_identity import ensure_dialog_identity_baseline, publish_dialog_identity
 from .dialog_identity_contracts import DialogIdentityObservation
+from .entity_profile.membership import MembershipSignalCounts
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
 from .linked_chat_fact import LinkedChatFact, LinkedChatState
@@ -156,6 +157,8 @@ class PeerSweepRequest:
     writer: SQLiteWriter = field(kw_only=True)
     hydration_priority: HydrationPriority = HydrationPriority.BACKFILL
     accept_page: Callable[[sqlite3.Connection], bool] | None = None
+    profile_owner_account_id: int | None = None
+    membership_observer: Callable[[MembershipSignalCounts], None] | None = None
 
 
 _LEGACY_PEER_SWEEP_POSITIONAL_ARGS = 3
@@ -230,6 +233,7 @@ def _extract_and_persist_sweep_messages(  # noqa: PLR0913, PLR0917 - atomic page
     observation_order: int,
     identity: DialogIdentityObservation | None,
     identity_revision: int,
+    membership_counts: list[MembershipSignalCounts],
 ) -> tuple[list[ExtractedMessage], frozenset[tuple[int, int]]] | SweepResult:
     """Return page rows or an explicit non-completion processing error."""
     try:
@@ -242,11 +246,13 @@ def _extract_and_persist_sweep_messages(  # noqa: PLR0913, PLR0917 - atomic page
                 logger.warning("sweep_peer_once_extraction_error dialog_id=%r", request.dialog_id, exc_info=True)
                 return _access_skip_result(rpc_calls=2, pages_fetched=1)
             if extracted:
-                insert_messages_with_fts(
+                result = insert_messages_with_fts(
                     conn,
                     [replace(row, observation_order=observation_order) for row in extracted],
                     priority=request.hydration_priority,
+                    profile_owner_account_id=request.profile_owner_account_id,
                 )
+                membership_counts.append(result.membership_counts)
             if identity is not None:
                 publish_dialog_identity(conn, request.dialog_id, identity, identity_revision)
     except Exception:
@@ -281,6 +287,8 @@ def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequ
         kwargs.pop("hydration_priority", HydrationPriority.BACKFILL),
     )
     accept_page = cast(Callable[[sqlite3.Connection], bool] | None, kwargs.pop("accept_page", None))
+    profile_owner_account_id = cast(int | None, kwargs.pop("profile_owner_account_id", None))
+    membership_observer = cast(Callable[[MembershipSignalCounts], None] | None, kwargs.pop("membership_observer", None))
     if kwargs:
         raise TypeError(f"sweep_peer_once: unexpected keyword arguments {sorted(kwargs)!r}")
 
@@ -295,6 +303,8 @@ def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequ
         writer=writer,
         hydration_priority=hydration_priority,
         accept_page=accept_page,
+        profile_owner_account_id=profile_owner_account_id,
+        membership_observer=membership_observer,
     )
 
 
@@ -459,11 +469,18 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
     identity = observe_response_dialog_identity(
         search.result, request.dialog_id, source="profile", observed_at=int(time.time())
     )
+    membership_counts: list[MembershipSignalCounts] = []
     page_rows = await request.writer.run(
         lambda db: _extract_and_persist_sweep_messages(
-            db, request, batch, observation_order, identity, identity_revision
+            db, request, batch, observation_order, identity, identity_revision, membership_counts
         )
     )
+    if not isinstance(page_rows, SweepResult) and request.membership_observer is not None:
+        for counts in membership_counts:
+            try:
+                request.membership_observer(counts)
+            except Exception:  # noqa: BLE001
+                logger.debug("membership_observer_failed")
     if isinstance(page_rows, SweepResult):
         return page_rows
     extracted, genuinely_new_keys = page_rows

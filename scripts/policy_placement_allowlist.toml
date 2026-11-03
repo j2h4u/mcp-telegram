@@ -569,6 +569,11 @@ rationale = "This queue-only repository adapter checks stored presence/status an
 
 [[entry]]
 category = "policy_call_keywords"
+key = "src/mcp_telegram/entity_profile/repository.py:request_membership_refreshes:section_ttl_seconds"
+rationale = "Membership invalidation only checks retained section state and queues refreshes; it does not evaluate receipt reuse or TTL. The constructor requires this otherwise inert argument."
+
+[[entry]]
+category = "policy_call_keywords"
 key = "src/mcp_telegram/entity_profile/repository.py:admit_self_profile:section_ttl_seconds"
 rationale = "This first self-profile admission queues sections without evaluating receipt reuse or TTL; the repository constructor requires an otherwise inert argument."
 

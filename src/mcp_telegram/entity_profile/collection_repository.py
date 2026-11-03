@@ -149,6 +149,7 @@ def _comparable_membership(complete: bool, summary: Mapping[str, object], baseli
         complete
         and summary["identifiable"]
         and isinstance(baseline, dict)
+        and baseline.get("complete") is True
         and baseline.get("identifiable")
         and baseline.get("owner_account_id") == summary["owner_account_id"]
     )
@@ -637,6 +638,12 @@ def _store_item(  # noqa: PLR0913 - persisted composite identity
     previous_coverage = json.loads(old[3]) if old else {}
     authority = _MergeAuthority(previous_coverage, observations=prior_paths, order=order)
     merged = merge_semantic_fields(previous_fields, dict(fields), coverage, "item", authority)
+    if (
+        isinstance(merged, dict)
+        and fields.get("constructor") == merged.get("constructor")
+        and "item" not in authority.rejected
+    ):
+        merged.pop("peer_kind", None)
     provenance = dict(prior_paths)
     _retain_path_provenance(provenance, previous_fields, merged, "item")
     retained_provenance = dict(provenance)
@@ -717,6 +724,8 @@ def _collection_digests(
 
 
 def _same_node(old: Mapping[str, object], new: Mapping[str, object]) -> bool:
+    if _same_partial_peer(old, new):
+        return True
     if old.get("constructor") == new.get("constructor"):
         return _identity(old) == _identity(new)
     old_id, new_id = old.get("id"), new.get("id")
@@ -727,6 +736,20 @@ def _same_node(old: Mapping[str, object], new: Mapping[str, object]) -> bool:
         and old_id > 0
         and type(new_id) is int
         and new_id == old_id
+    )
+
+
+def _same_partial_peer(old: Mapping[str, object], new: Mapping[str, object]) -> bool:
+    family = old.get("peer_kind")
+    constructor = new.get("constructor")
+    return bool(
+        "constructor" not in old
+        and type(old.get("id")) is int
+        and old.get("id") == new.get("id")
+        and (
+            (family == "chat" and constructor in {"Chat", "ChatEmpty", "ChatForbidden"})
+            or (family == "channel" and constructor in {"Channel", "ChannelForbidden"})
+        )
     )
 
 
@@ -904,7 +927,19 @@ def _page_summary(
     summary["published"] = (
         {
             key: summary[key]
-            for key in ("owner_account_id", "generation", "scan", "identifiable", "membership_digest", "content_digest")
+            for key in (
+                "owner_account_id",
+                "complete",
+                "generation",
+                "scan",
+                "identifiable",
+                "membership_digest",
+                "content_digest",
+                "observation_started_at",
+                "observation_completed_at",
+                "reported_count",
+                "retained_unique_count",
+            )
         }
         if complete
         else baseline

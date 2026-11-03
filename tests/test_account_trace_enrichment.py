@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sqlite3
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
@@ -36,6 +35,7 @@ from mcp_telegram.daemon_account_trace import (
     _upsert_trace_coverage_fragment,
 )
 from mcp_telegram.daemon_api import DaemonAPIServer
+from mcp_telegram.entity_profile.membership import MembershipSignalCounts
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.message_contracts import (
     EntityRecord,
@@ -44,7 +44,7 @@ from mcp_telegram.message_contracts import (
     ReactionRecord,
     StoredMessage,
 )
-from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
+from mcp_telegram.messages.sqlite_bundle import MessageWriteResult, insert_messages_with_fts
 from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
 from tests.daemon_api_policy import make_daemon_api_policy
@@ -392,9 +392,27 @@ def test_trace_candidate_dialogs_include_cached_common_chats(
     seed_entity(conn, entity_id=101, name="Alice", username="alice")
     seed_dialog(conn, dialog_id=-5001, name="Common", dialog_type="Group")
     seed_synced_dialog(conn, dialog_id=-5001)
+    from telethon.tl import types
+
+    from tests.test_profile_read_integration import _publish
+
+    seed_entity(conn, entity_id=42, name="Fixture", username="fixture")
     conn.execute(
-        "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) VALUES (?, ?, ?)",
-        (101, json.dumps({"common_chats": [{"id": -5001}]}), 1_700_000_000),
+        "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at, profile_owner_account_id) VALUES (42, '{}', 1, 77)"
+    )
+    conn.commit()
+    _publish(conn, "common_chats", [types.ChatEmpty(5001)])
+    conn.execute(
+        "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at, profile_owner_account_id) VALUES (101, '{}', 1, 77)"
+    )
+    conn.execute(
+        "INSERT INTO entity_profile_collection_facts SELECT owner_account_id,101,section,item_key,fields_json,coverage_json,provenance_json,observation_order,observed_at FROM entity_profile_collection_facts WHERE entity_id=42"
+    )
+    conn.execute(
+        "INSERT INTO entity_profile_collection_membership SELECT owner_account_id,101,section,generation,scan,item_key,identity_kind,page_key,ordinal,detail_complete FROM entity_profile_collection_membership WHERE entity_id=42"
+    )
+    conn.execute(
+        "INSERT INTO entity_detail_sections (entity_id,section,status,observed_at,payload_json) SELECT 101,section,status,observed_at,payload_json FROM entity_detail_sections WHERE entity_id=42 AND section='common_chats'"
     )
     conn.commit()
 
@@ -403,6 +421,7 @@ def test_trace_candidate_dialogs_include_cached_common_chats(
             conn=conn,
             target_user_id=101,
             observed_rows=[],
+            owner_account_id=77,
             max_dialogs=10,
         )
     )
@@ -509,7 +528,10 @@ async def test_trace_enrichment_uses_canonical_insert_for_new_messages(
     seed_synced_dialog(conn, dialog_id=222)
     conn.commit()
 
-    with patch("mcp_telegram.daemon_account_trace.insert_messages_with_fts", return_value=1) as insert_mock:
+    with patch(
+        "mcp_telegram.daemon_account_trace.insert_messages_with_fts",
+        return_value=MessageWriteResult(1, MembershipSignalCounts()),
+    ) as insert_mock:
         result = await trace_service._trace_enrich_visible_dialogs(
             101,
             [{"dialog_id": 222, "strategy": "dialog_scan", "topic_id": None}],
@@ -530,7 +552,10 @@ async def test_trace_enrichment_skips_unchanged_duplicates(
     seed_existing_message_bundle(conn)
     client.messages_by_dialog = {222: [fake_message(message_id=1, text="same")]}
 
-    with patch("mcp_telegram.daemon_account_trace.insert_messages_with_fts", return_value=1) as insert_mock:
+    with patch(
+        "mcp_telegram.daemon_account_trace.insert_messages_with_fts",
+        return_value=MessageWriteResult(1, MembershipSignalCounts()),
+    ) as insert_mock:
         result = await trace_service._trace_enrich_visible_dialogs(
             101,
             [{"dialog_id": 222, "strategy": "dialog_scan", "topic_id": None}],
@@ -551,7 +576,10 @@ async def test_trace_enrichment_changed_existing_uses_canonical_insert(
     seed_existing_message_bundle(conn, text="old")
     client.messages_by_dialog = {222: [fake_message(message_id=1, text="new")]}
 
-    with patch("mcp_telegram.daemon_account_trace.insert_messages_with_fts", return_value=1) as insert_mock:
+    with patch(
+        "mcp_telegram.daemon_account_trace.insert_messages_with_fts",
+        return_value=MessageWriteResult(1, MembershipSignalCounts()),
+    ) as insert_mock:
         result = await trace_service._trace_enrich_visible_dialogs(
             101,
             [{"dialog_id": 222, "strategy": "dialog_scan", "topic_id": None}],
@@ -827,3 +855,56 @@ async def test_trace_page_rolls_back_messages_when_coverage_write_fails(
     assert conn.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=222").fetchone()[0] == 0
     assert not conn.in_transaction
     assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+
+
+def test_trace_preserves_membership_correction_and_suppresses_replay(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+) -> None:
+    from dataclasses import replace
+
+    from mcp_telegram.daemon_account_trace import _persist_trace_messages, _split_trace_duplicate_messages
+
+    _server, conn, _client = trace_enrichment_server
+    with write_transaction(conn):
+        conn.execute("UPDATE dialog_directory_state SET account_id=77 WHERE singleton=1")
+        for target in (12, 13):
+            conn.execute("INSERT INTO entities(id,type,updated_at) VALUES (?, 'user', 1)", (target,))
+            conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (?, 'user')", (target,))
+            conn.execute(
+                "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_owner_account_id) VALUES (?,'{}',1,77)",
+                (target,),
+            )
+            conn.execute(
+                "INSERT INTO entity_detail_sections(entity_id,section,status,payload_json) VALUES (?,'common_chats','fresh',?)",
+                (target, '{"published":{"owner_account_id":77,"observation_started_at":200}}'),
+            )
+    base = candidate_message()
+    join = '{"_":"MessageActionChatAddUser","users":[12]}'
+    leave = '{"_":"MessageActionChatDeleteUser","user_id":13}'
+    first = replace(base, message=replace(base.message, dialog_id=-5, is_service=1, service_action=join))
+    corrected = replace(first, message=replace(first.message, service_action=leave))
+    with write_transaction(conn):
+        changed, duplicates = _split_trace_duplicate_messages(conn=conn, messages=[first])
+        assert duplicates == 0
+        assert _persist_trace_messages(conn, changed, 77).membership_counts.queued == 1
+    with write_transaction(conn):
+        changed, duplicates = _split_trace_duplicate_messages(conn=conn, messages=[corrected])
+        assert changed == [corrected] and duplicates == 0
+        result = _persist_trace_messages(conn, changed, 77)
+        assert result.membership_counts.queued == 1 and result.membership_counts.coalesced == 1
+    assert (
+        conn.execute("SELECT service_action FROM messages WHERE dialog_id=-5 AND message_id=1").fetchone()[0] == leave
+    )
+    generations = conn.execute(
+        "SELECT entity_id,generation FROM entity_profile_refresh_state WHERE entity_id IN (12,13) ORDER BY entity_id"
+    ).fetchall()
+    assert len(generations) == 2
+    with write_transaction(conn):
+        changed, duplicates = _split_trace_duplicate_messages(conn=conn, messages=[corrected])
+        assert changed == [] and duplicates == 1
+    assert (
+        conn.execute(
+            "SELECT entity_id,generation FROM entity_profile_refresh_state WHERE entity_id IN (12,13) ORDER BY entity_id"
+        ).fetchall()
+        == generations
+    )

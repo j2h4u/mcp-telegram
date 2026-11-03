@@ -78,7 +78,7 @@ def test_real_canonical_hooks_are_connection_scoped_and_ignore_rejected_edits(tm
         stale = sources.register(42, 42, 5, 1)
         old = replace(original, message=replace(original.message, edit_date=9))
         with write_transaction(conn):
-            assert insert_messages_with_fts(conn, [old]) == 0
+            assert insert_messages_with_fts(conn, [old]).accepted_count == 0
         assert stale.is_current()
         with write_transaction(other):
             record_message_deletions(other, 42, [7])

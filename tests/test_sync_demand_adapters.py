@@ -1478,9 +1478,20 @@ async def test_access_probe_adapter_persists_probe_to_gap_fill_handoff(conn: sql
     original_gap_slice = worker.fetch_delta_slice_for_dialog
     recovery_root: list[tuple[DemandKind, float, DemandKind, float]] = []
 
-    async def observe_recovery_root(dialog_id: int, *, expected_completion_generation: int | None = None) -> int:
+    async def observe_recovery_root(
+        dialog_id: int,
+        *,
+        expected_completion_generation: int | None = None,
+        profile_owner_account_id: int | None = None,
+        membership_observer=None,
+    ) -> int:
         before = current_demand_token()
-        result = await original_gap_slice(dialog_id, expected_completion_generation=expected_completion_generation)
+        result = await original_gap_slice(
+            dialog_id,
+            expected_completion_generation=expected_completion_generation,
+            profile_owner_account_id=profile_owner_account_id,
+            membership_observer=membership_observer,
+        )
         after = current_demand_token()
         recovery_root.append((before.kind, before.admission_deadline, after.kind, after.admission_deadline))
         return result

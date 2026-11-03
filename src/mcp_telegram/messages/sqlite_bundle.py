@@ -12,6 +12,8 @@ from mcp_telegram.delivered_update import current_delivered_update
 
 from .. import message_contracts as _message_contracts
 from ..alert_policy import incoming_human_dm_sql
+from ..entity_profile.membership import MembershipChange, MembershipFact, MembershipSignalCounts, changed_members
+from ..entity_profile.repository import request_membership_refreshes
 from ..fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
 from ..hydration_queue import (
     HYDRATION_QUEUE_TABLE,
@@ -85,12 +87,33 @@ class MessageOutLookup:
 
 
 @dataclass(frozen=True, slots=True)
+class MessageWriteResult:
+    accepted_count: int
+    membership_counts: MembershipSignalCounts
+
+    @property
+    def profile_refresh_queued(self) -> bool:
+        return bool(self.membership_counts.queued or self.membership_counts.coalesced)
+
+
+@dataclass(frozen=True, slots=True)
+class EditedMessageWriteResult:
+    version: int | None
+    membership_counts: MembershipSignalCounts
+
+    @property
+    def profile_refresh_queued(self) -> bool:
+        return bool(self.membership_counts.queued or self.membership_counts.coalesced)
+
+
+@dataclass(frozen=True, slots=True)
 class _StoredPageFact:
     exists: bool
     text: str | None
     indexed_text: str | None
     index_matches_key: bool
     transcription: tuple[str, int] | None
+    membership: MembershipFact | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,10 +145,27 @@ def _read_stored_page(
     conn: sqlite3.Connection, prefix: str, params: tuple[int, ...]
 ) -> dict[tuple[int, int], _StoredPageFact]:
     rows = cast(
-        list[tuple[int, int, int | None, str | None, str | None, int | None, int | None, str | None, int | None]],
+        list[
+            tuple[
+                int,
+                int,
+                int | None,
+                str | None,
+                str | None,
+                int | None,
+                int | None,
+                str | None,
+                int | None,
+                int | None,
+                str | None,
+                int | None,
+                int | None,
+                int | None,
+            ]
+        ],
         conn.execute(
             prefix + "SELECT w.dialog_id,w.message_id,m.message_id,m.text,f.stemmed_text,"
-            "f.dialog_id,f.message_id,t.text,t.transcription_id "
+            "f.dialog_id,f.message_id,t.text,t.transcription_id,m.is_service,m.service_action,m.sender_id,m.sent_at,m.edit_date "
             "FROM wanted w LEFT JOIN messages m USING(dialog_id,message_id) "
             "LEFT JOIN message_fts_keys k ON k.dialog_id=w.dialog_id AND k.message_id=w.message_id "
             "LEFT JOIN messages_fts f ON f.rowid=k.id "
@@ -140,8 +180,9 @@ def _read_stored_page(
             indexed,
             (fts_dialog, fts_message) == (dialog_id, message_id),
             None if transcript_id is None else (cast(str, transcript), transcript_id),
+            None if present is None else MembershipFact(service or 0, action, sender, sent, edit),
         )
-        for dialog_id, message_id, present, text, indexed, fts_dialog, fts_message, transcript, transcript_id in rows
+        for dialog_id, message_id, present, text, indexed, fts_dialog, fts_message, transcript, transcript_id, service, action, sender, sent, edit in rows
     }
 
 
@@ -286,37 +327,53 @@ def persist_edited_message(  # noqa: PLR0913
     edit_date: int,
     priority: HydrationPriority = HydrationPriority.FOREGROUND,
     reaction_source: ReactionAggregateSource | str = ReactionAggregateSource.MESSAGE_EDIT,
-) -> int | None:
+    profile_owner_account_id: int | None = None,
+) -> EditedMessageWriteResult:
     """Version and persist a changed message in the caller's transaction."""
     dialog_id, message_id = extracted.message.dialog_id, extracted.message.message_id
     if not _is_current_observation(conn, extracted, reaction_source):
-        return None
+        return EditedMessageWriteResult(None, MembershipSignalCounts())
     current = read_message_text(conn, dialog_id, message_id)
     if not current.found:
-        return None
+        return EditedMessageWriteResult(None, MembershipSignalCounts())
     if current.text == extracted.message.text:
-        insert_messages_with_fts(
-            conn, [extracted], priority=priority, reaction_source=reaction_source, reaction_observed_at=edit_date
+        result = insert_messages_with_fts(
+            conn,
+            [extracted],
+            priority=priority,
+            reaction_source=reaction_source,
+            reaction_observed_at=edit_date,
+            profile_owner_account_id=profile_owner_account_id,
         )
-        return None
+        return EditedMessageWriteResult(None, result.membership_counts)
     old_text = current.text
     keep_history = conn.execute(_SELECT_HUMAN_DM_MESSAGE_SQL, (dialog_id, message_id)).fetchone() is not None
     if not keep_history:
-        insert_messages_with_fts(
-            conn, [extracted], priority=priority, reaction_source=reaction_source, reaction_observed_at=edit_date
+        result = insert_messages_with_fts(
+            conn,
+            [extracted],
+            priority=priority,
+            reaction_source=reaction_source,
+            reaction_observed_at=edit_date,
+            profile_owner_account_id=profile_owner_account_id,
         )
-        return None
+        return EditedMessageWriteResult(None, result.membership_counts)
     version_row = cast(tuple[int], conn.execute(_NEXT_VERSION_SQL, (dialog_id, message_id)).fetchone())
     next_version = int(version_row[0])
     conn.execute(_INSERT_VERSION_SQL, (dialog_id, message_id, next_version, old_text, edit_date, "telegram_edit"))
-    insert_messages_with_fts(
-        conn, [extracted], priority=priority, reaction_source=reaction_source, reaction_observed_at=edit_date
+    result = insert_messages_with_fts(
+        conn,
+        [extracted],
+        priority=priority,
+        reaction_source=reaction_source,
+        reaction_observed_at=edit_date,
+        profile_owner_account_id=profile_owner_account_id,
     )
     conn.execute(
         _INSERT_HUMAN_DM_EDIT_ALERT_SQL,
         (edit_date, dialog_id, message_id, next_version, dialog_id, message_id),
     )
-    return next_version
+    return EditedMessageWriteResult(next_version, result.membership_counts)
 
 
 def persist_transcribed_text(
@@ -393,18 +450,19 @@ def _accepted_message_bundles(
     return list(accepted_by_key.values())
 
 
-def insert_messages_with_fts(
+def insert_messages_with_fts(  # noqa: PLR0913
     conn: sqlite3.Connection,
     extracted: Sequence[_message_contracts.ExtractedMessage],
     *,
     priority: HydrationPriority = HydrationPriority.FOREGROUND,
     reaction_source: ReactionAggregateSource | str = ReactionAggregateSource.HISTORY,
     reaction_observed_at: int | None = None,
-) -> int:
+    profile_owner_account_id: int | None = None,
+) -> MessageWriteResult:
     """Persist accepted bundles and return their unique key count."""
     accepted = _accepted_message_bundles(conn, extracted, reaction_source)
     if not accepted:
-        return 0
+        return MessageWriteResult(0, MembershipSignalCounts())
     evidence = _page_facts(conn, accepted)
     for item in accepted:
         invalidate_message_source(conn, item.message.dialog_id, item.message.message_id)
@@ -436,7 +494,30 @@ def insert_messages_with_fts(
     _delete_entity_and_forward_projections(conn, projected)
     _replace_reaction_projections(conn, projected, source=reaction_source, observed_at=reaction_observed_at)
     _insert_entity_and_forward_projections(conn, projected)
-    return len(projected)
+    changes = _membership_changes(projected, evidence.facts)
+    counts = (
+        request_membership_refreshes(conn, profile_owner_account_id, changes, now=int(time.time()))
+        if changes and profile_owner_account_id is not None
+        else MembershipSignalCounts(received=len(changes), ignored=len(changes), ignored_account_mismatch=len(changes))
+    )
+    return MessageWriteResult(len(projected), counts)
+
+
+def _membership_changes(
+    extracted: Sequence[_message_contracts.ExtractedMessage], facts: dict[tuple[int, int], _StoredPageFact]
+) -> list[MembershipChange]:
+    changes = []
+    for item in extracted:
+        message = item.message
+        before = facts[(message.dialog_id, message.message_id)].membership
+        after = MembershipFact(
+            message.is_service, message.service_action, message.sender_id, message.sent_at, message.edit_date
+        )
+        subjects = changed_members(before, after)
+        if subjects:
+            revision = message.edit_date if before is not None else (message.edit_date or message.sent_at)
+            changes.append(MembershipChange(message.dialog_id, subjects, revision))
+    return changes
 
 
 def _write_message_rows_and_fts(

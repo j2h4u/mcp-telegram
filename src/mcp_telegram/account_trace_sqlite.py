@@ -6,13 +6,13 @@ projection, or coverage interpretation.  Its callers retain those policies.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TypedDict, cast
 
 from .dialog_identity import read_dialog_identities
+from .entity_profile.reader import common_chat_dialog_id, read_common_chats
 
 _ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, name_normalized FROM entities WHERE username = ? COLLATE NOCASE"
 _TRACE_ACCOUNT_BY_ID_SQL = "SELECT id, name, username, name_normalized FROM entities WHERE id = ?"
@@ -49,6 +49,7 @@ TRACE_MESSAGE_COMPARE_FIELDS = (
     "reply_to_peer_id",
     "out",
     "is_service",
+    "service_action",
     "post_author",
     "is_deleted",
 )
@@ -375,24 +376,15 @@ def apply_trace_dialog_identities(
     return cast(list[Mapping[str, object]], projected)
 
 
-def common_chat_ids(conn: sqlite3.Connection, target_user_id: int) -> list[int]:
-    row = _one(conn.execute("SELECT detail_json FROM entity_details WHERE entity_id = ?", (target_user_id,)))
-    if row is None:
+def common_chat_ids(conn: sqlite3.Connection, owner: int | None, target_user_id: int, now: int) -> list[int]:
+    if owner is None:
         return []
-    try:
-        items = cast(dict[str, object], json.loads(str(_sequence(row)[0]))).get("common_chats", [])
-    except TypeError, json.JSONDecodeError:
-        return []
-    if not isinstance(items, list):
-        return []
-    result: list[int] = []
-    for item in items:
-        if isinstance(item, dict) and item.get("id") is not None:
-            try:
-                result.append(_int(item["id"]))
-            except TypeError, ValueError:
-                pass
-    return result
+    page = read_common_chats(conn, owner, target_user_id, now, limit=100)
+    return [
+        dialog_id
+        for item in cast(list[dict[str, object]], page["items"])
+        if (dialog_id := common_chat_dialog_id(item)) is not None
+    ]
 
 
 def retry_fragment_dialog_ids(conn: sqlite3.Connection, *, target_user_id: int, now: int) -> list[int]:

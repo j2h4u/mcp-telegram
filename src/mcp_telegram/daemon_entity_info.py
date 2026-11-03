@@ -59,6 +59,7 @@ from .entity_profile.contracts import (
     completeness,
     reconcile_chat_avatar_history,
 )
+from .entity_profile.membership import MembershipSignalCounts
 from .entity_profile.ports import (
     ChannelProfilePort,
     ChannelReferenceProvider,
@@ -97,7 +98,7 @@ from .telegram_demand import (
     RpcAttemptBudgetExhaustedError,
     UnclassifiedTelegramDemandError,
 )
-from .telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkRevision
+from .telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkKey, WorkRevision
 from .telegram_rpc import raise_if_flood_wait_error
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_error import describe_telegram_rpc_error
@@ -473,6 +474,13 @@ class _PersonalChannelCard:
     local_reason: str | None
 
 
+def _uses_profile_collection(section: str, entity_type: DialogType) -> bool:
+    return section in PROFILE_COLLECTION_SECTIONS and (
+        entity_type in {DialogType.USER, DialogType.BOT}
+        or (section == "common_chats" and entity_type is DialogType.SERVICE)
+    )
+
+
 class DaemonEntityInfoService:
     """Entity-info extraction service used by ``DaemonAPIServer._get_entity_info``."""
 
@@ -609,18 +617,13 @@ class DaemonEntityInfoService:
         now: int,
         req: Mapping[str, object],
     ) -> dict[str, object]:
-        from .entity_profile.reader import read_profile
+        from .entity_profile.reader import read_common_chats, read_profile
 
         result = await self._progressive_result(entity_id, detail, sections, now=now)
-        scope = self._capture_pair_scope()
-        owner = self._deps.self_id or (scope.account_id if scope is not None else None)
-        modern = cast(
-            tuple[object, ...] | None,
-            self._deps.conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE name='entity_profile_semantic_snapshots'"
-            ).fetchone(),
-        )
-        if owner is None or modern is None or entity_id <= 0:
+        if isinstance(result.get("data"), dict):
+            cast(dict[str, object], result["data"])["common_chats"] = []
+        owner = self._local_profile_owner(entity_id)
+        if owner is None:
             if req.get("cursor") is not None or req.get("section") is not None:
                 return self._error(
                     "profile_selection_unavailable", "Account-bound local profile paging is unavailable."
@@ -635,7 +638,23 @@ class DaemonEntityInfoService:
         data = result.get("data")
         if isinstance(data, dict):
             data.update(projection)
+            common = read_common_chats(self._deps.conn, owner, entity_id, now)
+            data["common_chats"] = [
+                item["value"] for item in cast(list[dict[str, object]], common["items"]) if item["state"] == "retained"
+            ]
+            data["common_chats_page"] = common
         return result
+
+    def _local_profile_owner(self, entity_id: int) -> int | None:
+        scope = self._capture_pair_scope()
+        owner = self._deps.self_id or (scope.account_id if scope is not None else None)
+        modern = cast(
+            tuple[object, ...] | None,
+            self._deps.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='entity_profile_semantic_snapshots'"
+            ).fetchone(),
+        )
+        return owner if modern is not None and entity_id > 0 else None
 
     def _profile_owner_matches(self, owner_account_id: int) -> bool:
         scope = self._capture_pair_scope()
@@ -700,6 +719,13 @@ class DaemonEntityInfoService:
         if cursor is not None:
             selected = self._profiles.refresh_work_revision(cursor, scope.account_id)
             return DemandStatus(release_at=float(cursor.retry_at or 0), selected=selected)
+        repair = self._profiles.membership_repair_revision(scope.account_id)
+        if repair is not None:
+            selected = WorkRevision(
+                WorkKey(DemandKind.ENTITY_PROFILE_REFRESH, scope.account_id, "membership-reconcile"), repair
+            )
+            if selected not in excluded:
+                return DemandStatus(release_at=0, selected=selected)
         release_at = self._profiles.next_refresh_release_at(after=now_epoch)
         return DemandStatus(release_at=release_at) if release_at is not None else None
 
@@ -712,6 +738,8 @@ class DaemonEntityInfoService:
             raise RuntimeError("entity profile slice requires an owner-selected revision")
         if selected.key.demand_kind is not DemandKind.ENTITY_PROFILE_REFRESH:
             return DurableRefreshSliceResult(0, outcome=SliceOutcome(selected, SliceOutcomeKind.STALE))
+        if selected.key.target == "membership-reconcile":
+            return await self._run_membership_repair_slice(selected)
         entity_id = _selected_profile_target(selected)
         if entity_id is None:
             return DurableRefreshSliceResult(0, outcome=SliceOutcome(selected, SliceOutcomeKind.STALE))
@@ -723,6 +751,27 @@ class DaemonEntityInfoService:
         if cursor is None or self._profiles.refresh_work_revision(cursor, scope.account_id) != selected:
             return DurableRefreshSliceResult(entity_id, outcome=SliceOutcome(selected, SliceOutcomeKind.STALE))
         return await self._execute_selected_profile_slice(selected, cursor, scope, entity_id, now)
+
+    async def _run_membership_repair_slice(self, selected: WorkRevision) -> DurableRefreshSliceResult:
+        scope = self._capture_pair_scope()
+        if scope is None or scope.account_id != selected.key.account_id:
+            return DurableRefreshSliceResult(0, outcome=SliceOutcome(selected, SliceOutcomeKind.STALE))
+
+        def advance(profiles: EntityProfileRepository) -> tuple[str | None, MembershipSignalCounts]:
+            if self._profile_scope_changed_during_acquisition(scope):
+                return None, MembershipSignalCounts()
+            return profiles.advance_membership_repair(
+                scope.account_id, selected.revision, now=int(self._deps.now_provider()), limit=32
+            )
+
+        revision, counts = await self._write_profiles(advance)
+        self._observe_membership(counts.as_observation(), source="retained_repair")
+        if revision is None:
+            outcome = SliceOutcome(selected, SliceOutcomeKind.STALE)
+        else:
+            kind = SliceOutcomeKind.TERMINAL if revision == "complete" else SliceOutcomeKind.PROGRESSED
+            outcome = SliceOutcome(selected, kind, revision)
+        return DurableRefreshSliceResult(0, outcome=outcome)
 
     async def _execute_selected_profile_slice(
         self,
@@ -1182,6 +1231,8 @@ class DaemonEntityInfoService:
         failed = await self._write_profiles(
             lambda profiles: self._persist_profile_section_failure(profiles, failure, guard_scope=guard_scope)
         )
+        if failed and failure.cursor.next_section == "common_chats":
+            self._observe_membership({"failed": 1}, source="common_chats_refresh")
         actual_attempts = self._rpc_attempt_count() - failure.context.attempt_start
         if failure.context.pair_section and failure.context.eligible_pair and failure.context.pair_mode == "disabled":
             await self._write_profiles(
@@ -1249,6 +1300,8 @@ class DaemonEntityInfoService:
         committed = await self._write_profiles(
             lambda profiles: self._commit_profile_section_in_scope(profiles, cursor, result, context, now=now)
         )
+        if committed and cursor.next_section == "common_chats" and result.collection_page is not None:
+            self._observe_common_chats_publication(cursor, result)
         await self._publish_profile_linked_chat_fact(cursor, entity_type, context, committed, now=now)
         self._observe_profile_section_commit(
             cursor,
@@ -1258,6 +1311,33 @@ class DaemonEntityInfoService:
             actual_attempts=actual_attempts,
         )
         return committed
+
+    def _observe_membership(self, counts: Mapping[str, int], *, source: str) -> None:
+        observer = self._deps.profile_observer
+        callback = cast(Callable[..., None] | None, getattr(observer, "observe_membership", None))
+        if callback is None:
+            return
+        try:
+            callback(counts, source=source)
+        except Exception:  # noqa: BLE001 - diagnostics cannot alter committed profile state.
+            self._deps.logger.debug("membership_observation_failed")
+
+    def _observe_common_chats_publication(self, cursor: EntityRefreshCursor, result: EntitySectionCommit) -> None:
+        try:
+            payload = self._profiles.read_section_payload(cursor.entity_id, "common_chats")
+            published = payload.get("published") if isinstance(payload, dict) else None
+            state = cast(dict[str, object], json.loads(cursor.page_cursor_json)) if cursor.page_cursor_json else {}
+            scan = state.get("scan", 0)
+            if (
+                isinstance(published, dict)
+                and result.field_observation is not None
+                and published.get("owner_account_id") == result.field_observation.owner_account_id
+                and published.get("generation") == cursor.generation
+                and published.get("scan") == scan
+            ):
+                self._observe_membership({"published": 1}, source="common_chats_refresh")
+        except Exception:  # noqa: BLE001 - diagnostic reads cannot alter committed state.
+            self._deps.logger.debug("membership_observation_failed")
 
     def _commit_profile_section_in_scope(
         self,
@@ -2207,7 +2287,7 @@ class DaemonEntityInfoService:
         context: _ProfileSectionContext | None = None,
     ) -> EntitySectionCommit:
         section = cursor.next_section
-        if section in PROFILE_COLLECTION_SECTIONS and entity_type in {DialogType.USER, DialogType.BOT}:
+        if _uses_profile_collection(section, entity_type):
             reference = self._collection_user_reference(cursor.entity_id, section)
             state = json.loads(cursor.page_cursor_json) if cursor.page_cursor_json else {}
             page = await _profile_network_read(
@@ -2218,8 +2298,6 @@ class DaemonEntityInfoService:
             return EntitySectionCommit({}, collection_page=page)
         if section == "full_profile":
             return await self._acquire_full_profile(cursor.entity_id, entity_type, context=context)
-        if section == "common_chats":
-            return await self._acquire_common_chats(cursor.entity_id)
         if section == "contact_overlap":
             return await self._acquire_contact_overlap(cursor, entity_type)
         if section == "avatar_history":
@@ -2252,7 +2330,7 @@ class DaemonEntityInfoService:
     @staticmethod
     def _not_applicable_section_patch(section: str) -> Mapping[str, object]:
         if section == "common_chats":
-            return {"common_chats": []}
+            return {}
         if section == "contact_overlap":
             return {
                 "contacts_subscribed": None,
@@ -2510,18 +2588,6 @@ class DaemonEntityInfoService:
             observation_completed_at=completed_at,
             identity=identity,
         )
-
-    async def _acquire_common_chats(self, entity_id: int) -> EntitySectionCommit:
-        reference = self._user_reference(entity_id)
-        if reference is None:
-            return EntitySectionCommit({}, status="unavailable", reason="user_reference_unavailable")
-        observation = await _profile_network_read(self._deps.common_chats_port.fetch_common_chats(reference))
-        if observation.user_id != entity_id:
-            raise ValueError("common chats observation target does not match")
-        chats = [{"id": item.chat_id, "name": item.name, "type": item.kind} for item in observation.chats]
-        if observation.status is ProjectionStatus.UNAVAILABLE:
-            return EntitySectionCommit({}, status="unavailable", reason=observation.reason, payload=None)
-        return EntitySectionCommit({"common_chats": chats}, payload=chats)
 
     async def _acquire_contact_overlap(
         self,

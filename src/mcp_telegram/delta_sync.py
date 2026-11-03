@@ -29,6 +29,7 @@ from .access_lifecycle import (
     stamp_access_revalidation,
 )
 from .dialog_identity import ensure_dialog_identity_baseline, publish_dialog_identity
+from .entity_profile.membership import MembershipSignalCounts
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .history_enrollment import full_history_enabled, request_delta_refresh
 from .hydration_queue import HydrationPriority
@@ -456,7 +457,12 @@ class DeltaSyncWorker:
 
     @_delta_rpc_scope(DemandKind.DELTA_GAP_FILL, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def fetch_delta_slice_for_dialog(
-        self, dialog_id: int, *, expected_completion_generation: int | None = None
+        self,
+        dialog_id: int,
+        *,
+        expected_completion_generation: int | None = None,
+        profile_owner_account_id: int | None = None,
+        membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
     ) -> int:
         """Fetch and commit one resumable forward-history page."""
         self._reset_delta_slice_state()
@@ -473,7 +479,15 @@ class DeltaSyncWorker:
         outcome = await self._collect_delta_slice(dialog_id, cursor, generation)
         if outcome.result is not None:
             return outcome.result
-        return await self._commit_delta_slice(dialog_id, outcome, generation, cursor, expected_completion_generation)
+        return await self._commit_delta_slice(
+            dialog_id,
+            outcome,
+            generation,
+            cursor,
+            expected_completion_generation,
+            profile_owner_account_id,
+            membership_observer,
+        )
 
     def _reset_delta_slice_state(self) -> None:
         self._last_delta_slice_completed = False
@@ -553,16 +567,19 @@ class DeltaSyncWorker:
         with write_transaction(conn):
             set_access_lost(conn, dialog_id, int(time.time()), reason=reason, refresh_generation=generation)
 
-    async def _commit_delta_slice(
+    async def _commit_delta_slice(  # noqa: PLR0913, PLR0917
         self,
         dialog_id: int,
         outcome: _DeltaFetchOutcome,
         generation: int,
         expected_cursor: int,
         expected_completion_generation: int | None,
+        profile_owner_account_id: int | None = None,
+        membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
     ) -> int:
         continuation_required = not outcome.completed or len(outcome.rows) == _DELTA_SLICE_MESSAGE_LIMIT
         now = int(time.time())
+        staged: list[MembershipSignalCounts] = []
         unique_message_ids, existing_ids, committed_new_count, committed_revision = await self._writer.run(
             lambda conn: self._commit_delta_transaction(
                 conn,
@@ -573,8 +590,16 @@ class DeltaSyncWorker:
                 generation,
                 expected_cursor,
                 expected_completion_generation,
+                profile_owner_account_id,
+                staged,
             )
         )
+        if membership_observer is not None:
+            for counts in staged:
+                try:
+                    membership_observer(counts)
+                except Exception:  # noqa: BLE001 - observability must not affect committed work
+                    logger.debug("membership_observation_failed")
         self._record_uncommitted_delta_counts(unique_message_ids, existing_ids)
         if committed_new_count is None:
             self._last_delta_slice_stale = True
@@ -599,6 +624,8 @@ class DeltaSyncWorker:
         generation: int,
         expected_cursor: int,
         expected_completion_generation: int | None,
+        profile_owner_account_id: int | None = None,
+        membership_staged: list[MembershipSignalCounts] | None = None,
     ) -> tuple[list[int], set[int], int | None, str | None]:
         with write_transaction(conn):
             if not _delta_selection_is_current(
@@ -609,7 +636,14 @@ class DeltaSyncWorker:
             if not full_history_enabled(conn, dialog_id):
                 return unique_message_ids, existing_ids, None, None
             committed_new_count = self._insert_delta_messages(
-                conn, dialog_id, outcome, unique_message_ids, existing_ids, now
+                conn,
+                dialog_id,
+                outcome,
+                unique_message_ids,
+                existing_ids,
+                now,
+                profile_owner_account_id,
+                membership_staged,
             )
             next_cursor = max((row.message.message_id for row in outcome.rows), default=0)
             conn.execute(
@@ -686,17 +720,22 @@ class DeltaSyncWorker:
         unique_message_ids: Sequence[int],
         existing_ids: set[int],
         now: int,
+        profile_owner_account_id: int | None = None,
+        membership_staged: list[MembershipSignalCounts] | None = None,
     ) -> int:
         require_write_transaction(conn)
         if not outcome.rows:
             return 0
-        insert_messages_with_fts(
+        result = insert_messages_with_fts(
             conn,
             outcome.rows,
             priority=HydrationPriority.BACKFILL,
             reaction_source=ReactionAggregateSource.DELTA,
             reaction_observed_at=outcome.reaction_observed_at or now,
+            profile_owner_account_id=profile_owner_account_id,
         )
+        if membership_staged is not None:
+            membership_staged.append(result.membership_counts)
         if not self._delta_gap_fill_observation_enabled:
             return 0
         # INSERT OR REPLACE publishes every unique fetched key; only absent keys count.
@@ -749,7 +788,9 @@ class DeltaGapFillDemandAdapter:
         *,
         account_id: int,
         observer: DeltaGapFillObservationHook | None = None,
+        membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
     ) -> None:
+        self._membership_observer = membership_observer
         self._worker = worker
         self._account_id = account_id
         self._observer = observer
@@ -778,7 +819,10 @@ class DeltaGapFillDemandAdapter:
         outcome, reason = "completed", "completed"
         try:
             await self._worker.fetch_delta_slice_for_dialog(
-                dialog_id, expected_completion_generation=expected_completion_generation
+                dialog_id,
+                expected_completion_generation=expected_completion_generation,
+                profile_owner_account_id=self._account_id,
+                membership_observer=self._membership_observer,
             )
             if self._worker._last_delta_slice_error is not None:
                 raise self._worker._last_delta_slice_error
@@ -1241,7 +1285,7 @@ class DeltaAccessProbeDemandAdapter:
 
     demand_kind = DemandKind.DELTA_ACCESS_PROBE
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         worker: DeltaSyncWorker,
         policy: AccessProbePolicy,
@@ -1249,7 +1293,9 @@ class DeltaAccessProbeDemandAdapter:
         *,
         account_id: int,
         observer: DeltaGapFillObservationHook | None = None,
+        membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
     ) -> None:
+        self._membership_observer = membership_observer
         self._worker = worker
         self._policy = policy
         self._probe = probe
@@ -1512,7 +1558,9 @@ class DeltaAccessProbeDemandAdapter:
             await self._worker._writer.run(lambda conn: _finish_durable_access_recovery(conn, recovery))
             self._worker._last_delta_slice_skipped = True
             return True, None
-        await self._worker.fetch_delta_slice_for_dialog(recovery.dialog_id)
+        await self._worker.fetch_delta_slice_for_dialog(
+            recovery.dialog_id, profile_owner_account_id=self._account_id, membership_observer=self._membership_observer
+        )
         if self._worker._last_delta_slice_completed:
             await self._worker._writer.run(lambda conn: _finish_durable_access_recovery(conn, recovery))
             return True, None

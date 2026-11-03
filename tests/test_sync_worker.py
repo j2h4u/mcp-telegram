@@ -2902,3 +2902,83 @@ async def test_cancelled_full_page_rotates_peer_and_resumes_checkpoint(sync_db: 
         _selected_budget(FullSyncDemandAdapter(worker, account_id=123))
     )
     assert calls == [(1, 12), (2, 12), (1, 12)]
+
+
+@pytest.mark.asyncio
+async def test_full_sync_old_page_cannot_refresh_new_account_profile(sync_db: _SQLiteConnection) -> None:
+    """A page retains its selected account even if a new adapter appears during RPC."""
+    from dataclasses import replace
+
+    conn = cast(sqlite3.Connection, sync_db)
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (-5,'syncing',0)")
+    seed_full_history_enrollment(conn, -5, enabled=True)
+    conn.execute("UPDATE dialog_directory_state SET account_id=77 WHERE singleton=1")
+    conn.execute("INSERT INTO entities(id,type,updated_at) VALUES (12,'user',1)")
+    conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (12,'user')")
+    conn.execute(
+        "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_owner_account_id) VALUES (12,'{}',1,88)"
+    )
+    conn.execute(
+        "INSERT INTO entity_detail_sections(entity_id,section,status,payload_json) VALUES (12,'common_chats','fresh',?)",
+        ('{"published":{"owner_account_id":88,"observation_started_at":200}}',),
+    )
+    conn.commit()
+    entered, release = asyncio.Event(), asyncio.Event()
+    extracted = extract_message_row(-5, build_mock_message(id=3, text=""))
+    extracted = replace(
+        extracted,
+        message=replace(
+            extracted.message,
+            is_service=1,
+            service_action='{"_":"MessageActionChatAddUser","users":[12]}',
+            sent_at=300,
+        ),
+    )
+
+    class Port:
+        async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            assert dialog_id == -5 and before_message_id == 0
+            entered.set()
+            await release.wait()
+            return FullHistoryPage((extracted,), 1, 3)
+
+    worker = FullSyncWorker(Port(), conn, asyncio.Event(), writer=inline_writer(conn))
+    observations = []
+    old_adapter = FullSyncDemandAdapter(worker, account_id=77, membership_observer=observations.append)
+    task = asyncio.create_task(old_adapter.run_slice(_selected_budget(old_adapter)))
+    await entered.wait()
+    conn.execute("UPDATE dialog_directory_state SET account_id=88 WHERE singleton=1")
+    conn.commit()
+    FullSyncDemandAdapter(worker, account_id=88)
+    release.set()
+    await task
+
+    assert conn.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=-5 AND message_id=3").fetchone() == (1,)
+    assert conn.execute(
+        "SELECT status,reason FROM entity_detail_sections WHERE entity_id=12 AND section='common_chats'"
+    ).fetchone() == ("fresh", None)
+    assert conn.execute("SELECT COUNT(*) FROM entity_profile_refresh_state WHERE entity_id=12").fetchone() == (0,)
+    assert len(observations) == 1
+    assert observations[0].ignored_account_mismatch == 1
+
+
+@pytest.mark.asyncio
+async def test_full_sync_rollback_does_not_report_membership(sync_db: _SQLiteConnection) -> None:
+    """A message write rolled back after extraction never emits a committed receipt."""
+    conn = cast(sqlite3.Connection, sync_db)
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (601,'syncing',0)")
+    seed_full_history_enrollment(conn, 601, enabled=True)
+    conn.commit()
+
+    class Port:
+        async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            return FullHistoryPage((extract_message_row(dialog_id, build_mock_message(id=9, text="one")),), 1, 9)
+
+    worker = FullSyncWorker(Port(), conn, asyncio.Event(), writer=inline_writer(conn))
+    observations = []
+    adapter = FullSyncDemandAdapter(worker, account_id=123, membership_observer=observations.append)
+    with patch.object(worker, "_record_no_topic_attribution", side_effect=RuntimeError("abort transaction")):
+        with pytest.raises(RuntimeError, match="abort transaction"):
+            await adapter.run_slice(_selected_budget(adapter))
+    assert not observations
+    assert conn.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=601").fetchone() == (0,)

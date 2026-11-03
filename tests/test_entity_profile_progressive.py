@@ -31,7 +31,6 @@ from mcp_telegram.entity_profile.contracts import (
     ChannelProfileObservation,
     ChannelReference,
     ChatAvatarHistoryObservation,
-    CommonChatsObservation,
     GroupReference,
     ObservationBoundary,
     ProfileCollectionPage,
@@ -480,10 +479,6 @@ def _select_profile_budget(service: DaemonEntityInfoService, budget: RpcAttemptB
 
 @pytest.mark.asyncio
 async def test_unavailable_common_and_avatar_commits_preserve_existing_projection() -> None:
-    class DeniedCommonChatsPort:
-        async def fetch_common_chats(self, _reference: object) -> CommonChatsObservation:
-            return CommonChatsObservation(42, (), 0, ProjectionStatus.UNAVAILABLE, "not_an_admin", 100, 100)
-
     class DeniedUserAvatarPort:
         async def fetch_user_avatar_history(self, _reference: object) -> UserAvatarHistoryObservation:
             return UserAvatarHistoryObservation(42, (), 0, ProjectionStatus.UNAVAILABLE, "access_lost", 100, 100)
@@ -500,16 +495,12 @@ async def test_unavailable_common_and_avatar_commits_preserve_existing_projectio
     service = _test_service(conn, limits=RefreshLimits())
     service._deps = replace(
         service._deps,
-        common_chats_port=DeniedCommonChatsPort(),
         user_avatar_history_port=DeniedUserAvatarPort(),
         chat_avatar_history_port=MissingChatAvatarPort(),
     )
     try:
-        common = await service._acquire_common_chats(42)
         user_avatar = await service._acquire_user_avatar_history(42)
         chat_avatar = await service._acquire_chat_avatar_history(-123)
-        assert common.detail_patch == {} and common.payload is None
-        assert common.status == "unavailable" and common.reason == "not_an_admin"
         assert user_avatar.detail_patch == {} and user_avatar.payload is None
         assert user_avatar.status == "unavailable" and user_avatar.reason == "access_lost"
         assert chat_avatar.detail_patch == {} and chat_avatar.payload is None

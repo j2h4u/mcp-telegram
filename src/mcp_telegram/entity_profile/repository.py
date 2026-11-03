@@ -30,6 +30,7 @@ from ..entity_store import (
     upsert_entity_snapshots,
 )
 from ..models import DialogType
+from ..own_only_contracts import CHANNEL_PEER_ID_OFFSET
 from ..resolver import latinize
 from ..sync_transactions import read_snapshot, require_write_transaction, write_savepoint
 from ..telegram_demand_progress import WorkKey, WorkRevision
@@ -64,6 +65,7 @@ from .contracts import (
     ProfileSemanticSnapshot,
     SuppliedProfileUser,
 )
+from .membership import MembershipChange, MembershipSignalCounts, membership_signal
 from .profile_history import (
     CollectionHistoryMerge,
     HistoryObservation,
@@ -511,6 +513,26 @@ class EntityProfileRepository:
             for table in ("full_history_enrollment", "dialogs", "entity_details", "entity_detail_sections")
         ) and self._refresh_has("generation")
 
+    def membership_repair_revision(self, owner: int) -> str | None:
+        """Return the finite retained-message repair cursor for this account."""
+        if bound_profile_account(self._conn) != owner or not self._history_profile_schema_available():
+            return None
+        state = _read_profile_admission_state(self._conn, owner)
+        repair = state.get("membership_repair_v1")
+        if isinstance(repair, dict) and repair.get("completed"):
+            return None
+        return json.dumps(repair, sort_keys=True, separators=(",", ":")) if repair is not None else "uninitialized"
+
+    def advance_membership_repair(
+        self, owner: int, revision: str, *, now: int, limit: int
+    ) -> tuple[str | None, MembershipSignalCounts]:
+        """Advance one selected bounded repair page in the caller's transaction."""
+        with write_savepoint(self._conn):
+            if self.membership_repair_revision(owner) != revision:
+                return None, MembershipSignalCounts()
+            _, counts = _repair_retained_memberships(self._conn, owner, now=now, limit=limit)
+            return self.membership_repair_revision(owner) or "complete", counts
+
     def _missing_profile_sections(self, entity_id: int) -> tuple[str, ...]:
         stored = self._read_stored_sections(entity_id)
         missing = []
@@ -522,11 +544,19 @@ class EntityProfileRepository:
             missing.insert(0, "full_profile")
         return tuple(missing)
 
-    def request_section_refresh(self, entity_id: int, sections: tuple[str, ...], *, now: int, pair_mode: str) -> bool:
+    def request_section_refresh(
+        self,
+        entity_id: int,
+        sections: tuple[str, ...],
+        *,
+        now: int,
+        pair_mode: str | None,
+        reason: str = "profile_changed",
+    ) -> bool:
         """Invalidate only requested sections and fence an older in-flight result."""
         if any(section not in self._profile_sections(entity_id) for section in sections):
             raise ValueError("unknown profile section")
-        if pair_mode not in {"enabled", "disabled"}:
+        if pair_mode not in {None, "enabled", "disabled"}:
             raise ValueError("invalid profile pair mode")
         if not sections or not self._refresh_has("generation"):
             return False
@@ -539,11 +569,11 @@ class EntityProfileRepository:
                 "SELECT next_section FROM entity_profile_refresh_state WHERE entity_id=? AND status IN ('pending','failed')",
                 (entity_id,),
             ).fetchone()
-            self._upsert_pending_refresh(entity_id, now=now, reason="profile_changed", pair_mode_override=pair_mode)
+            self._upsert_pending_refresh(entity_id, now=now, reason=reason, pair_mode_override=pair_mode)
             self._conn.executemany(
-                "INSERT INTO entity_detail_sections(entity_id,section,status,reason) VALUES (?,?,'pending','profile_changed') "
-                "ON CONFLICT(entity_id,section) DO UPDATE SET status='pending',reason='profile_changed'",
-                ((entity_id, section) for section in set(sections)),
+                "INSERT INTO entity_detail_sections(entity_id,section,status,reason) VALUES (?,?,'pending',?) "
+                "ON CONFLICT(entity_id,section) DO UPDATE SET status='pending',reason=excluded.reason",
+                ((entity_id, section, reason) for section in set(sections)),
             )
             first = _first_dirty_section(sections, previous)
             self._conn.execute(
@@ -3860,6 +3890,64 @@ _PROFILE_ADMISSION_TYPES = ("user", "bot", "User", "Bot")
 _PROFILE_EXCLUDED_PEERS = frozenset({777000, 1271266957})
 
 
+def _repair_retained_memberships(
+    conn: sqlite3.Connection, owner: int, *, now: int, limit: int
+) -> tuple[int, MembershipSignalCounts]:
+    """Checkpoint a finite prefix of canonical messages and queue retained changes once."""
+    require_write_transaction(conn)
+    state = _read_profile_admission_state(conn, owner)
+    repair = state.get("membership_repair_v1")
+    if not isinstance(repair, dict):
+        repair = _new_membership_repair(conn)
+        state["membership_repair_v1"] = repair
+        _save_profile_admission_state(conn, state)
+    if repair.get("completed"):
+        return 0, MembershipSignalCounts()
+    terminal = cast(list[int], repair["terminal"])
+    cursor = cast(list[int] | None, repair.get("cursor"))
+    lower_bound = " AND (dialog_id,message_id) > (?,?)" if cursor is not None else ""
+    parameters = (*terminal, *(cursor or ()), min(limit, 32))
+    rows = cast(
+        list[tuple[int, int, int, str | None, int | None, int, int | None, int]],
+        conn.execute(
+            "SELECT dialog_id,message_id,is_service,service_action,sender_id,sent_at,edit_date,is_deleted FROM messages "
+            "WHERE (dialog_id,message_id) <= (?,?)" + lower_bound + " ORDER BY dialog_id,message_id LIMIT ?",
+            parameters,
+        ).fetchall(),
+    )
+    changes = _retained_membership_changes(rows)
+    counts = (
+        request_membership_refreshes(conn, owner, changes, now=now, retained_repair=True)
+        if changes
+        else MembershipSignalCounts()
+    )
+    if rows:
+        repair["cursor"] = list(rows[-1][:2])
+    if not rows or repair["cursor"] == terminal:
+        repair["completed"] = True
+    state["membership_repair_v1"] = repair
+    _save_profile_admission_state(conn, state)
+    return len(rows), counts
+
+
+def _new_membership_repair(conn: sqlite3.Connection) -> dict[str, object]:
+    last = conn.execute(
+        "SELECT dialog_id,message_id FROM messages ORDER BY dialog_id DESC,message_id DESC LIMIT 1"
+    ).fetchone()
+    return {"terminal": list(last) if last else None, "cursor": None, "completed": last is None}
+
+
+def _retained_membership_changes(
+    rows: list[tuple[int, int, int, str | None, int | None, int, int | None, int]],
+) -> list[MembershipChange]:
+    changes = []
+    for dialog, _, service, action, sender, sent, edited, deleted in rows:
+        subjects = frozenset(user for _, user in membership_signal(service and not deleted, action, sender))
+        if subjects:
+            changes.append(MembershipChange(dialog, subjects, edited or sent))
+    return changes
+
+
 def _read_profile_admission_state(conn: sqlite3.Connection, owner: int) -> dict[str, object]:
     row = cast(
         tuple[object, ...] | None,
@@ -3867,7 +3955,7 @@ def _read_profile_admission_state(conn: sqlite3.Connection, owner: int) -> dict[
     )
     state = cast(dict[str, object], json.loads(cast(str, row[0]))) if row else {}
     if state.get("account") != owner or state.get("version") != NORMALIZATION_VERSION:
-        return {
+        reset: dict[str, object] = {
             "account": owner,
             "version": NORMALIZATION_VERSION,
             "phase": 0,
@@ -3876,6 +3964,9 @@ def _read_profile_admission_state(conn: sqlite3.Connection, owner: int) -> dict[
             "directory_generation": 0,
             "pending_directory_generation": 0,
         }
+        if state.get("account") == owner and "membership_repair_v1" in state:
+            reset["membership_repair_v1"] = state["membership_repair_v1"]
+        return reset
     return state
 
 
@@ -3894,6 +3985,116 @@ def profile_peer_managed(conn: sqlite3.Connection, owner: int, peer: int) -> boo
     return (
         conn.execute("SELECT 1 FROM daemon_state WHERE key=?", (_profile_peer_key(owner, peer),)).fetchone() is not None
     )
+
+
+def request_membership_refreshes(
+    conn: sqlite3.Connection, owner: int, changes: list[MembershipChange], *, now: int, retained_repair: bool = False
+) -> MembershipSignalCounts:
+    """Queue affected account-bound personal profiles within the caller's transaction."""
+    require_write_transaction(conn)
+    if bound_profile_account(conn) != owner:
+        return MembershipSignalCounts(
+            received=len(changes), ignored=len(changes), ignored_account_mismatch=len(changes)
+        )
+    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
+    candidates: dict[int, list[int | None]] = {}
+    for change in changes:
+        peers = set(change.subjects) - {owner}
+        if owner in change.subjects:
+            peers.update(_published_common_chat_peers(conn, owner, change.dialog_id))
+        for peer in peers:
+            candidates.setdefault(peer, []).append(change.revision_at)
+    counts: dict[str, int] = dict.fromkeys(
+        (
+            "queued",
+            "coalesced",
+            "ignored_account_mismatch",
+            "ignored_ineligible",
+            "ignored_snapshot_newer",
+            "ignored_already_pending",
+            "ignored_request_rejected",
+        ),
+        0,
+    )
+    for peer, revisions in candidates.items():
+        outcome = _request_membership_target(conn, repo, owner, peer, revisions, now, retained_repair)
+        counts[outcome] += 1
+    ignored = sum(value for key, value in counts.items() if key.startswith("ignored_"))
+    return MembershipSignalCounts(received=len(changes), ignored=ignored, **counts)
+
+
+def _request_membership_target(  # noqa: PLR0913, PLR0917
+    conn: sqlite3.Connection,
+    repo: EntityProfileRepository,
+    owner: int,
+    peer: int,
+    revisions: list[int | None],
+    now: int,
+    retained_repair: bool,
+) -> str:
+    reason = _membership_ignore_reason(conn, repo, owner, peer, revisions)
+    if reason:
+        return reason
+    if retained_repair and _membership_repair_already_pending(conn, peer, revisions):
+        return "ignored_already_pending"
+    active = repo._read_pending_refresh_state(peer)
+    if not repo.request_section_refresh(peer, ("common_chats",), now=now, pair_mode=None, reason="membership_changed"):
+        return "ignored_request_rejected"
+    return "coalesced" if _pending_refresh_is_active(active) else "queued"
+
+
+def _membership_repair_already_pending(conn: sqlite3.Connection, peer: int, revisions: list[int | None]) -> bool:
+    row = conn.execute(
+        "SELECT started_at FROM entity_profile_refresh_state WHERE entity_id=? AND status IN ('pending','failed') "
+        "AND reason='membership_changed'",
+        (peer,),
+    ).fetchone()
+    return bool(
+        row and type(row[0]) is int and all(type(revision) is int and revision <= row[0] for revision in revisions)
+    )
+
+
+def _published_common_chat_peers(conn: sqlite3.Connection, owner: int, dialog_id: int) -> set[int]:
+    if dialog_id >= 0:
+        return set()
+    key = (
+        f"channel:{-CHANNEL_PEER_ID_OFFSET - dialog_id}"
+        if dialog_id < -CHANNEL_PEER_ID_OFFSET
+        else f"chat:{-dialog_id}"
+    )
+    return {
+        int(row[0])
+        for row in conn.execute(
+            "SELECT m.entity_id FROM entity_profile_collection_membership m "
+            "JOIN entity_detail_sections s ON s.entity_id=m.entity_id AND s.section=m.section "
+            "JOIN entity_details d ON d.entity_id=m.entity_id AND d.profile_owner_account_id=m.owner_account_id "
+            "WHERE m.owner_account_id=? AND m.section='common_chats' AND m.item_key=? "
+            "AND json_extract(s.payload_json,'$.published.owner_account_id')=m.owner_account_id "
+            "AND json_extract(s.payload_json,'$.published.generation')=m.generation "
+            "AND json_extract(s.payload_json,'$.published.scan')=m.scan",
+            (owner, key),
+        )
+    }
+
+
+def _membership_ignore_reason(
+    conn: sqlite3.Connection, repo: EntityProfileRepository, owner: int, peer: int, revisions: list[int | None]
+) -> str | None:
+    if not personal_profile_peer(conn, owner, peer):
+        return "ignored_ineligible"
+    row = conn.execute("SELECT profile_owner_account_id FROM entity_details WHERE entity_id=?", (peer,)).fetchone()
+    if row is None or row[0] != owner:
+        return "ignored_account_mismatch"
+    payload = repo.read_section_payload(peer, "common_chats")
+    published = payload.get("published") if isinstance(payload, dict) else None
+    if not isinstance(published, dict) or published.get("owner_account_id") != owner:
+        return None
+    start = published.get("observation_started_at")
+    return "ignored_snapshot_newer" if _revisions_precede_snapshot(revisions, start) else None
+
+
+def _revisions_precede_snapshot(revisions: list[int | None], start: object) -> bool:
+    return type(start) is int and all(type(revision) is int and revision < start for revision in revisions)
 
 
 def personal_profile_peer(conn: sqlite3.Connection, owner: int, peer: int) -> bool:

@@ -1,13 +1,16 @@
 """Finite image acquisition under the existing durable demand coordinator."""
 
 import asyncio
+import logging
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
 from telethon.errors import FileReferenceExpiredError, FilerefUpgradeNeededError, RPCError
 
+from ..entity_profile.membership import MembershipSignalCounts
 from ..entity_profile.repository import bound_profile_account
 from ..flood import TelegramRpcThrottled
 from ..image_authorization import ScopeToken
@@ -33,6 +36,8 @@ from .fence import DurableBudget, SourceFence
 from .limits import PHOTO_MAX_BYTES
 from .repository import ImageSource, current_source
 from .store import cleanup_unpublished, publish_image, retire_image
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -76,19 +81,22 @@ class MessageImageWorker:
 
     demand_kind = DemandKind.MESSAGE_IMAGE_ACQUISITION
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         conn: sqlite3.Connection,
         writer: SQLiteWriter,
         directory: Path,
         scope: ImageScope,
         gateway: TelegramImageGateway,
+        *,
+        membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
     ) -> None:
         self._conn = conn
         self._writer = writer
         self._directory = directory
         self._scope = scope
         self._gateway = gateway
+        self._membership_observer = membership_observer
         self._active: _Transfer | None = None
         self._resume: _Transfer | None = None
         self._opening: tuple[int, int, int, int] | None = None
@@ -329,11 +337,15 @@ class MessageImageWorker:
         if extracted.message.message_id != target.message_id or extracted.private_photo_id != locator.photo_id:
             raise ValueError("photo identity mismatch")
 
+        membership_counts: list[MembershipSignalCounts] = []
+
         def apply(conn: sqlite3.Connection) -> ImageSource | None:
             with write_transaction(conn):
                 if not self._source_is_current(conn, scope, target, source):
                     return None
-                if insert_messages_with_fts(conn, [extracted]) != 1:
+                result = insert_messages_with_fts(conn, [extracted], profile_owner_account_id=scope.scope.account_id)
+                membership_counts.append(result.membership_counts)
+                if result.accepted_count != 1:
                     return None
                 updated = current_source(conn, target.dialog_id, target.message_id)
                 if not _matches_resolved_photo(source, updated, locator):
@@ -355,6 +367,7 @@ class MessageImageWorker:
                 return updated if count == 1 else None
 
         updated = await self._writer.run(apply)
+        _observe_membership(self._membership_observer, membership_counts)
         if updated is None:
             self._revoke_opening()
             return None
@@ -582,3 +595,14 @@ class MessageImageWorker:
             )
         except OSError:
             raise RuntimeError("image storage unavailable") from None
+
+
+def _observe_membership(
+    observer: Callable[[MembershipSignalCounts], None] | None, counts: list[MembershipSignalCounts]
+) -> None:
+    if observer is not None:
+        for count in counts:
+            try:
+                observer(count)
+            except Exception:  # noqa: BLE001
+                logger.debug("membership_observer_failed")

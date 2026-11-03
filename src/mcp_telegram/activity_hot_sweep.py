@@ -14,7 +14,7 @@ import logging
 import math
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Protocol, cast
@@ -29,6 +29,7 @@ from .activity_peer_sweep import (
     working_set_enrollment_release_at,
 )
 from .activity_substrate import ActivityClient
+from .entity_profile.membership import MembershipSignalCounts
 from .hydration_queue import HydrationPriority
 from .sqlite_writer import SQLiteWriter
 from .sync_transactions import write_transaction
@@ -250,6 +251,7 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
     timeout_s: float
     writer: SQLiteWriter = field(kw_only=True)
     account_id: int = field(kw_only=True)
+    membership_observer: Callable[[MembershipSignalCounts], None] | None = field(default=None, kw_only=True)
     demand_kind = DemandKind.HOT_ACTIVITY_PAGE
 
     def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
@@ -301,6 +303,8 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
                                 writer=self.writer,
                                 hydration_priority=HydrationPriority.FOREGROUND,
                                 accept_page=lambda db: _hot_state_matches(db, state),
+                                profile_owner_account_id=self.account_id,
+                                membership_observer=self.membership_observer,
                             )
                         except RpcAttemptBudgetExhaustedError:
                             return None

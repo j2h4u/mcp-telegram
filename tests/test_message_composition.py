@@ -105,7 +105,7 @@ def test_identical_text_edit_updates_formatting_and_action_without_text_version(
         )
         with write_transaction(conn):
             insert_messages_with_fts(conn, [before])
-            assert persist_edited_message(conn, after, old_text="😀code", edit_date=20) is None
+            assert persist_edited_message(conn, after, old_text="😀code", edit_date=20).version is None
         row = cast(
             tuple[str | None, str | None],
             conn.execute(

@@ -83,8 +83,15 @@ def conn(make_synced_db: Callable[[], sqlite3.Connection]) -> sqlite3.Connection
     return conn
 
 
-def _publish(
-    conn: sqlite3.Connection, section: str, values: list[object], *, generation: int = 1, complete: bool = True
+def _publish(  # noqa: PLR0913
+    conn: sqlite3.Connection,
+    section: str,
+    values: list[object],
+    *,
+    generation: int = 1,
+    complete: bool = True,
+    owner: int = 77,
+    entity: int = 42,
 ) -> None:
     with write_savepoint(conn):
         for index, value in enumerate(values):
@@ -92,8 +99,8 @@ def _publish(
             conn.execute(
                 "INSERT OR REPLACE INTO entity_profile_collection_facts VALUES (?,?,?,?,?,?,?,?,?)",
                 (
-                    77,
-                    42,
+                    owner,
+                    entity,
                     section,
                     str(index),
                     json.dumps(fields),
@@ -105,7 +112,7 @@ def _publish(
             )
             conn.execute(
                 "INSERT INTO entity_profile_collection_membership VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (77, 42, section, generation, 0, str(index), "remote", "page", index, 1),
+                (owner, entity, section, generation, 0, str(index), "remote", "page", index, 1),
             )
         payload = {
             "generation": generation,
@@ -115,11 +122,11 @@ def _publish(
             "retained_count": len(values),
         }
         if complete:
-            payload["published"] = {"owner_account_id": 77, "generation": generation, "scan": 0}
+            payload["published"] = {"owner_account_id": owner, "generation": generation, "scan": 0, "complete": True}
         conn.execute(
-            "INSERT INTO entity_detail_sections(entity_id,section,status,observed_at,payload_json) VALUES (42,?,'fresh',100,?) "
+            "INSERT INTO entity_detail_sections(entity_id,section,status,observed_at,payload_json) VALUES (?,?,'fresh',100,?) "
             "ON CONFLICT(entity_id,section) DO UPDATE SET payload_json=excluded.payload_json",
-            (section, json.dumps(payload)),
+            (entity, section, json.dumps(payload)),
         )
 
 
@@ -288,7 +295,7 @@ def test_actual_wire_preserves_only_new_typed_subtree_nulls() -> None:
     assert "user.phone" not in other["semantic"]["fields"]
 
 
-@pytest.mark.parametrize("section", ["avatar_history", "common_chats"])
+@pytest.mark.parametrize("section", ["avatar_history"])
 def test_real_legacy_receipt_survives_partial_page_failure_and_retry(conn: sqlite3.Connection, section: str) -> None:
     from mcp_telegram.entity_profile.contracts import ProfileCollectionItem, ProfileCollectionPage
     from mcp_telegram.entity_profile.repository import EntitySectionCommit
@@ -564,3 +571,651 @@ def test_real_collection_page_exposes_flat_provenance_and_retains_unknown_covera
     ) == (10, 10, 11, "rpc", 190)
     assert value["state"] == "present" and value["authoritative"] is True
     assert page_result["items"][0]["acquisition"] == {"availability": "unknown"}
+
+
+async def test_common_chats_overview_pages_and_trace_share_published_baseline(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, registered_validator: Draft202012Validator
+) -> None:
+    from mcp_telegram.account_trace_sqlite import common_chat_ids
+    from mcp_telegram.daemon_account_trace import _known_common_chats
+
+    _publish(conn, "common_chats", [types.ChatEmpty(7), types.ChannelForbidden(7, 1, "Channel")])
+    conn.execute(
+        "UPDATE entity_details SET detail_json=json_set(detail_json, '$.common_chats', json('[{\"id\":999}]'))"
+    )
+    section = cast(
+        dict,
+        json.loads(
+            cast(
+                str,
+                conn.execute(
+                    "SELECT payload_json FROM entity_detail_sections WHERE entity_id=42 AND section='common_chats'"
+                ).fetchone()[0],
+            )
+        ),
+    )
+    section["published"].update(
+        observation_started_at=90, observation_completed_at=100, reported_count=2, retained_unique_count=2
+    )
+    section.update(generation=2, complete=False, observation_started_at=190, observation_completed_at=195)
+    conn.execute(
+        "UPDATE entity_detail_sections SET payload_json=? WHERE entity_id=42 AND section='common_chats'",
+        (json.dumps(section),),
+    )
+    first = cast(dict, read_profile(conn, 77, 42, 200, {"section": "common_chats", "limit": 1})["page"])
+    second = cast(
+        dict,
+        read_profile(conn, 77, 42, 200, {"section": "common_chats", "limit": 1, "cursor": first["next_cursor"]})[
+            "page"
+        ],
+    )
+    assert first["source"] == "published" and first["age_seconds"] == 100
+    assert first["reported_count"] == 2 and first["retained_unique_count"] == 2
+    assert first["has_more"] and not second["has_more"]
+    assert common_chat_ids(conn, 77, 42, 200) == [-7, -1000000000007]
+    assert common_chat_ids(conn, 78, 42, 200) == []
+    diagnostic = _known_common_chats(conn, 77, 42, 200)
+    assert [item["dialog_id"] for item in cast(list[dict], diagnostic["items"])] == [-7, -1000000000007]
+    assert all(item["local_state"]["status"] == "not_synced" for item in cast(list[dict], diagnostic["items"]))
+    conn.commit()
+    service = _test_service(conn, limits=RefreshLimits(), account_id=77)
+    monkeypatch.setattr(service.refresh_coordinator, "enqueue", MagicMock(side_effect=AssertionError("read enrolled")))
+
+    @asynccontextmanager
+    async def connection():
+        async def get_entity_info(**kwargs: object):
+            return await service.get_entity_info(kwargs)
+
+        yield SimpleNamespace(get_entity_info=get_entity_info)
+
+    monkeypatch.setattr(entity_info, "_bounded_daemon_connection", connection)
+    tool = await entity_info.get_entity_info(entity_info.GetEntityInfo(exact_entity_id=42))
+    result = cast(
+        dict, server._project_tool_result("get_entity_info", tool, server._CallTelemetry()).structured_content
+    )
+    registered_validator.validate(result)
+    assert len(result["relationships"]["common_chats"]) == 2
+    assert result["relationships"]["common_chats"] == result["type_specific"]["common_chats"]
+    assert result["common_chats_page"]["returned_count"] == 2
+    await service.shutdown()
+
+
+def test_migration_normalizes_owner_bound_common_chats_without_inventing_coverage(conn: sqlite3.Connection) -> None:
+    from mcp_telegram.sync_db import _apply_migration_96
+
+    detail = {
+        "common_chats": [
+            {"id": -7, "type": "group", "name": "Group"},
+            {"id": -1000000000007, "type": "channel", "name": "Channel"},
+        ]
+    }
+    conn.execute("UPDATE entity_details SET detail_json=? WHERE entity_id=42", (json.dumps(detail),))
+    conn.execute(
+        "INSERT INTO entity_detail_sections(entity_id,section,status,observed_at,payload_json) VALUES(42,'common_chats','fresh',100,?)",
+        (json.dumps(detail["common_chats"]),),
+    )
+    conn.execute("DELETE FROM schema_version WHERE version=96")
+    conn.commit()
+    assert _apply_migration_96(conn, 95) == 96
+    page = cast(dict, read_profile(conn, 77, 42, 200, {"section": "common_chats"})["page"])
+    assert page["coverage"] == "retained_partial" and page["age_seconds"] is None
+    assert page["reported_count"] is None and page["retained_unique_count"] == 2
+    assert [source["source"] for source in page["available_sources"]] == ["published"]
+    assert [item["item_key"] for item in page["items"]] == ["channel:7", "chat:7"]
+    assert all(item["observed_at"] is None and item["age_seconds"] is None for item in page["items"])
+    assert all("constructor" not in item["value"] and not item["detail_complete"] for item in page["items"])
+    assert [item["value"]["peer_kind"] for item in page["items"]] == ["channel", "chat"]
+    schema = TOOL_REGISTRY["get_entity_info"].output_schema
+    assert schema is not None
+    wire = server._project_tool_result("get_entity_info", structured_result({"page": page}), server._CallTelemetry())
+    page_schema = {**cast(dict, schema["properties"])["page"], "$defs": schema["$defs"]}
+    Draft202012Validator(page_schema).validate(cast(dict, wire.structured_content)["page"])
+    assert (
+        conn.execute(
+            "SELECT observed_at FROM entity_detail_sections WHERE entity_id=42 AND section='common_chats'"
+        ).fetchone()[0]
+        == 100
+    )
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert _apply_migration_96(conn, 96) == 96
+
+
+def test_migration_keeps_unknown_owner_and_retains_valid_siblings(conn: sqlite3.Connection) -> None:
+    from mcp_telegram.sync_db import _apply_migration_96
+
+    mixed = {"common_chats": [{"id": -7, "type": "group", "name": "Group"}, {"id": 8, "type": ["unknown"]}]}
+    conn.execute("UPDATE entity_details SET detail_json=? WHERE entity_id=42", (json.dumps(mixed),))
+    conn.execute("INSERT INTO entities(id,type,name,updated_at) VALUES(43,'user','Unknown owner',1)")
+    encoded = json.dumps({"common_chats": [{"id": -9, "type": "group", "name": "Private"}]})
+    conn.execute("INSERT INTO entity_details(entity_id,detail_json,fetched_at) VALUES(43,?,1)", (encoded,))
+    conn.execute("DELETE FROM schema_version WHERE version=96")
+    conn.commit()
+    _apply_migration_96(conn, 95)
+    page = cast(dict, read_profile(conn, 77, 42, 200, {"section": "common_chats"})["page"])
+    assert page["returned_count"] == 1 and page["coverage"] == "retained_partial"
+    assert (
+        cast(
+            dict,
+            json.loads(
+                cast(str, conn.execute("SELECT detail_json FROM entity_details WHERE entity_id=42").fetchone()[0])
+            ),
+        )
+        == mixed
+    )
+    assert conn.execute("SELECT detail_json FROM entity_details WHERE entity_id=43").fetchone()[0] == encoded
+    assert (
+        conn.execute("SELECT count(*) FROM entity_profile_collection_membership WHERE entity_id=43").fetchone()[0] == 0
+    )
+
+
+def test_migration_preserves_existing_publication_and_rolls_back_atomically(conn: sqlite3.Connection) -> None:
+    from mcp_telegram.sync_db import _apply_migration_96
+
+    _publish(conn, "common_chats", [types.ChatEmpty(7)])
+    detail = {"common_chats": [{"id": -9, "type": "group", "name": "Old"}]}
+    conn.execute("UPDATE entity_details SET detail_json=? WHERE entity_id=42", (json.dumps(detail),))
+    conn.execute("DELETE FROM schema_version WHERE version=96")
+    conn.execute("DROP INDEX idx_profile_membership_lookup")
+    conn.execute("CREATE INDEX idx_profile_membership_lookup ON entities(id)")
+    conn.commit()
+    with pytest.raises(sqlite3.OperationalError, match="already exists"):
+        _apply_migration_96(conn, 95)
+    assert conn.execute("SELECT count(*) FROM entity_profile_collection_facts").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM schema_version WHERE version=96").fetchone()[0] == 0
+    conn.execute("DROP INDEX idx_profile_membership_lookup")
+    conn.commit()
+    _apply_migration_96(conn, 95)
+    page = cast(dict, read_profile(conn, 77, 42, 200, {"section": "common_chats"})["page"])
+    assert page["coverage"] == "published_traversal"
+    assert [item["value"]["id"] for item in page["items"]] == [7]
+    assert (
+        cast(
+            dict,
+            json.loads(
+                cast(str, conn.execute("SELECT detail_json FROM entity_details WHERE entity_id=42").fetchone()[0])
+            ),
+        )
+        == detail
+    )
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_migrated_partial_baseline_survives_refresh_and_real_acquisition(conn: sqlite3.Connection) -> None:
+    from mcp_telegram.entity_profile.contracts import ProfileCollectionItem, ProfileCollectionPage
+    from mcp_telegram.entity_profile.repository import EntitySectionCommit
+    from mcp_telegram.sync_db import _apply_migration_96
+
+    detail = {"common_chats": [{"id": -7, "type": "group", "name": "Old"}]}
+    conn.execute("UPDATE entity_details SET detail_json=? WHERE entity_id=42", (json.dumps(detail),))
+    conn.execute("DELETE FROM schema_version WHERE version=96")
+    conn.commit()
+    _apply_migration_96(conn, 95)
+    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
+    with write_savepoint(conn):
+        assert repo.request_section_refresh(42, ("common_chats",), now=105, pair_mode="enabled")
+        cursor = repo.next_due_refresh(now=105)
+        assert cursor is not None
+        fields, coverage, _ = normalize_collection_item(types.ChatEmpty(7))
+        page = ProfileCollectionPage(
+            42,
+            "common_chats",
+            (ProfileCollectionItem("chat:7", fields, coverage),),
+            ObservationBoundary(105, 106),
+            2,
+            {"max_id": 7},
+        )
+        assert repo.commit_section(
+            cursor,
+            EntitySectionCommit({}, collection_page=page, field_observation=ProfileFieldObservation(77, 4, 106, "rpc")),
+            now=106,
+        )
+        cursor = repo.next_due_refresh(now=106)
+        assert cursor is not None
+        assert repo.mark_section_failure(cursor, now=110, reason="acquisition_failed", retry_at=170)
+    retained = cast(dict, read_profile(conn, 77, 42, 120, {"section": "common_chats"})["page"])
+    assert retained["coverage"] == "retained_partial" and retained["source"] == "published"
+    assert retained["items"][0]["value"]["id"] == 7
+    assert retained["items"][0]["observed_at"] == 106
+    persisted = cast(
+        dict,
+        json.loads(
+            cast(
+                str,
+                conn.execute(
+                    "SELECT fields_json FROM entity_profile_collection_facts WHERE entity_id=42 AND section='common_chats' AND item_key='chat:7'"
+                ).fetchone()[0],
+            )
+        ),
+    )
+    assert persisted["title"] == "Old" and "peer_kind" not in persisted
+    with write_savepoint(conn):
+        assert repo.request_section_refresh(42, ("common_chats",), now=201, pair_mode="enabled")
+        cursor = repo.next_due_refresh(now=201)
+        assert cursor is not None
+        fields, coverage, _ = normalize_collection_item(types.ChatEmpty(7))
+        page = ProfileCollectionPage(
+            42,
+            "common_chats",
+            (ProfileCollectionItem("chat:7", fields, coverage),),
+            ObservationBoundary(201, 202),
+            1,
+            terminal=True,
+        )
+        assert repo.commit_section(
+            cursor,
+            EntitySectionCommit({}, collection_page=page, field_observation=ProfileFieldObservation(77, 5, 202, "rpc")),
+            now=202,
+        )
+    published = cast(dict, read_profile(conn, 77, 42, 210, {"section": "common_chats"})["page"])
+    assert published["coverage"] == "published_traversal" and published["age_seconds"] == 8
+    assert published["reported_count"] == 1
+    assert published["items"][0]["observed_at"] == 202
+    summary = cast(dict, read_profile(conn, 77, 42, 210, {})["collections"])["common_chats"]
+    assert not summary["comparable_membership"]
+
+
+def test_migration_preserves_baseline_alongside_active_scan(conn: sqlite3.Connection) -> None:
+    from mcp_telegram.sync_db import _apply_migration_96
+
+    _publish(conn, "common_chats", [types.ChatEmpty(7)], generation=2, complete=False)
+    conn.execute("DELETE FROM entity_profile_collection_membership WHERE entity_id=42 AND section='common_chats'")
+    conn.execute(
+        "UPDATE entity_profile_collection_facts SET item_key='chat:7' WHERE entity_id=42 AND section='common_chats'"
+    )
+    conn.execute(
+        "INSERT INTO entity_profile_collection_membership VALUES(77,42,'common_chats',2,0,'chat:7','remote','page',0,1)"
+    )
+    detail = {"common_chats": [{"id": -7, "type": "group", "name": "A"}, {"id": -8, "type": "group", "name": "B"}]}
+    conn.execute(
+        "INSERT INTO entity_profile_refresh_state(entity_id,status,updated_at,next_section,page_cursor_json) VALUES(42,'pending',1,'common_chats',?)",
+        (json.dumps({"baseline": None, "scan": 0}),),
+    )
+    conn.execute("UPDATE entity_details SET detail_json=? WHERE entity_id=42", (json.dumps(detail),))
+    conn.execute("DELETE FROM schema_version WHERE version=96")
+    conn.commit()
+    _apply_migration_96(conn, 95)
+    page = cast(dict, read_profile(conn, 77, 42, 200, {"section": "common_chats"})["page"])
+    assert page["source"] == "published" and page["coverage"] == "retained_partial"
+    state = cast(
+        dict,
+        json.loads(
+            cast(
+                str,
+                conn.execute("SELECT page_cursor_json FROM entity_profile_refresh_state WHERE entity_id=42").fetchone()[
+                    0
+                ],
+            )
+        ),
+    )
+    assert state["baseline"]["complete"] is False and state["baseline"]["retained_unique_count"] == 2
+    assert [item["value"]["id"] for item in page["items"]] == [7, 8]
+    assert page["items"][0]["value"]["constructor"] == "ChatEmpty"
+    assert page["items"][1]["value"]["peer_kind"] == "chat"
+    active = next(source["cursor"] for source in page["available_sources"] if source["source"] == "active")
+    active_page = cast(dict, read_profile(conn, 77, 42, 200, {"section": "common_chats", "cursor": active})["page"])
+    assert active_page["returned_count"] == 1 and active_page["items"][0]["value"]["id"] == 7
+
+
+async def test_service_common_chats_uses_canonical_collection_page(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+
+    from mcp_telegram.entity_profile.contracts import ProfileCollectionPage
+    from mcp_telegram.entity_profile.repository import EntityRefreshCursor
+    from mcp_telegram.models import DialogType
+
+    service = _test_service(conn, limits=RefreshLimits(), account_id=77)
+    page = ProfileCollectionPage(42, "common_chats", (), ObservationBoundary(100, 101), 0, terminal=True)
+    fetch_page = AsyncMock(return_value=page)
+    gateway = SimpleNamespace(fetch_profile_collection_page=fetch_page)
+    service._deps = replace(service._deps, user_profile_port=gateway)
+    monkeypatch.setattr(service, "_collection_user_reference", lambda *_args: object())
+    cursor = EntityRefreshCursor(42, "common_chats", 0, None)
+    commit = await service._acquire_profile_section(cursor, DialogType.SERVICE)
+    assert commit.collection_page is page and commit.detail_patch == {}
+    fetch_page.assert_awaited_once()
+    assert service._not_applicable_section_patch("common_chats") == {}
+    await service.shutdown()
+
+
+@pytest.mark.parametrize("section", ["common_chats", "avatar_history"])
+def test_old_cursor_never_borrows_new_collection_receipt(conn: sqlite3.Connection, section: str) -> None:
+    values: list[object] = (
+        [types.ChatEmpty(1), types.ChatEmpty(2)]
+        if section == "common_chats"
+        else [types.PhotoEmpty(1), types.PhotoEmpty(2)]
+    )
+    _publish(conn, section, values)
+    payload = cast(
+        dict,
+        json.loads(
+            cast(
+                str,
+                conn.execute(
+                    "SELECT payload_json FROM entity_detail_sections WHERE entity_id=42 AND section=?", (section,)
+                ).fetchone()[0],
+            )
+        ),
+    )
+    payload.update(observation_started_at=90, observation_completed_at=100, retained_unique_count=2)
+    payload["published"].update(
+        observation_started_at=90, observation_completed_at=100, retained_unique_count=2, reported_count=2
+    )
+    if section == "common_chats":
+        payload["complete"] = False
+        payload["published"]["complete"] = False
+    conn.execute(
+        "UPDATE entity_detail_sections SET payload_json=? WHERE entity_id=42 AND section=?",
+        (json.dumps(payload), section),
+    )
+    first = cast(dict, read_profile(conn, 77, 42, 150, {"section": section, "limit": 1})["page"])
+    old = payload["published"]
+    payload.update(
+        generation=2,
+        scan=0,
+        complete=True,
+        observation_started_at=190,
+        observation_completed_at=200,
+        reported_count=9,
+        retained_unique_count=9,
+        published={
+            "owner_account_id": 77,
+            "generation": 2,
+            "scan": 0,
+            "complete": True,
+            "observation_started_at": 190,
+            "observation_completed_at": 200,
+            "reported_count": 9,
+            "retained_unique_count": 9,
+        },
+        previous_published=old,
+    )
+    conn.execute(
+        "UPDATE entity_detail_sections SET payload_json=? WHERE entity_id=42 AND section=?",
+        (json.dumps(payload), section),
+    )
+    second = cast(
+        dict, read_profile(conn, 77, 42, 210, {"section": section, "limit": 1, "cursor": first["next_cursor"]})["page"]
+    )
+    assert second["coverage"] == ("retained_partial" if section == "common_chats" else "published_traversal")
+    assert second["age_seconds"] == 110 and second["reported_count"] == 2 and second["retained_unique_count"] == 2
+    payload.pop("previous_published")
+    conn.execute(
+        "UPDATE entity_detail_sections SET payload_json=? WHERE entity_id=42 AND section=?",
+        (json.dumps(payload), section),
+    )
+    unknown = cast(
+        dict, read_profile(conn, 77, 42, 210, {"section": section, "limit": 1, "cursor": first["next_cursor"]})["page"]
+    )
+    assert unknown["coverage"] == "observation_unknown"
+    assert (
+        unknown["age_seconds"] is None
+        and unknown["reported_count"] is None
+        and unknown["retained_unique_count"] is None
+    )
+
+
+def test_partial_peer_identity_merges_only_same_family() -> None:
+    from mcp_telegram.entity_profile.collection_repository import merge_semantic_fields
+
+    partial = {"peer_kind": "chat", "id": 7, "title": "Known"}
+    same = cast(dict, merge_semantic_fields(partial, {"constructor": "ChatEmpty", "id": 7}, {}))
+    different = cast(dict, merge_semantic_fields(partial, {"constructor": "ChannelForbidden", "id": 7}, {}))
+    assert same["title"] == "Known"
+    assert "title" not in different
+
+
+def test_migration_normalizes_inflight_published_receipts_for_other_collections(conn: sqlite3.Connection) -> None:
+    from mcp_telegram.entity_profile.contracts import ProfileCollectionItem, ProfileCollectionPage
+    from mcp_telegram.entity_profile.repository import EntitySectionCommit
+    from mcp_telegram.sync_db import _apply_migration_96
+
+    _publish(conn, "avatar_history", [types.PhotoEmpty(7), types.PhotoEmpty(8)], generation=100)
+    payload = cast(
+        dict,
+        json.loads(
+            cast(
+                str,
+                conn.execute(
+                    "SELECT payload_json FROM entity_detail_sections WHERE entity_id=42 AND section='avatar_history'"
+                ).fetchone()[0],
+            )
+        ),
+    )
+    payload["published"]["identifiable"] = True
+    conn.execute(
+        "UPDATE entity_detail_sections SET payload_json=? WHERE entity_id=42 AND section='avatar_history'",
+        (json.dumps(payload),),
+    )
+    conn.commit()
+    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
+    with write_savepoint(conn):
+        assert repo.request_section_refresh(42, ("avatar_history",), now=105, pair_mode="enabled")
+        cursor = repo.next_due_refresh(now=105)
+        assert cursor is not None
+        fields, coverage, _ = normalize_collection_item(types.PhotoEmpty(7))
+        page = ProfileCollectionPage(
+            42,
+            "avatar_history",
+            (ProfileCollectionItem("7", fields, coverage),),
+            ObservationBoundary(105, 106),
+            2,
+            {"offset": 1},
+        )
+        assert repo.commit_section(
+            cursor,
+            EntitySectionCommit({}, collection_page=page, field_observation=ProfileFieldObservation(77, 4, 106, "rpc")),
+            now=106,
+        )
+    state = cast(
+        dict,
+        json.loads(
+            cast(
+                str,
+                conn.execute("SELECT page_cursor_json FROM entity_profile_refresh_state WHERE entity_id=42").fetchone()[
+                    0
+                ],
+            )
+        ),
+    )
+    state["baseline"].pop("complete")
+    conn.execute("UPDATE entity_profile_refresh_state SET page_cursor_json=? WHERE entity_id=42", (json.dumps(state),))
+    payload = cast(
+        dict,
+        json.loads(
+            cast(
+                str,
+                conn.execute(
+                    "SELECT payload_json FROM entity_detail_sections WHERE entity_id=42 AND section='avatar_history'"
+                ).fetchone()[0],
+            )
+        ),
+    )
+    payload["published"].pop("complete")
+    payload["previous_published"].pop("complete")
+    conn.execute(
+        "UPDATE entity_detail_sections SET payload_json=? WHERE entity_id=42 AND section='avatar_history'",
+        (json.dumps(payload),),
+    )
+    conn.execute("DELETE FROM schema_version WHERE version=96")
+    conn.commit()
+    _apply_migration_96(conn, 95)
+    state = cast(
+        dict,
+        json.loads(
+            cast(
+                str,
+                conn.execute("SELECT page_cursor_json FROM entity_profile_refresh_state WHERE entity_id=42").fetchone()[
+                    0
+                ],
+            )
+        ),
+    )
+    payload = cast(
+        dict,
+        json.loads(
+            cast(
+                str,
+                conn.execute(
+                    "SELECT payload_json FROM entity_detail_sections WHERE entity_id=42 AND section='avatar_history'"
+                ).fetchone()[0],
+            )
+        ),
+    )
+    assert state["baseline"]["complete"] is True
+    assert payload["published"]["complete"] is True and payload["previous_published"]["complete"] is True
+    assert "observation_completed_at" not in state["baseline"]
+    with write_savepoint(conn):
+        cursor = repo.next_due_refresh(now=107)
+        assert cursor is not None
+        fields, coverage, _ = normalize_collection_item(types.PhotoEmpty(8))
+        page = ProfileCollectionPage(
+            42,
+            "avatar_history",
+            (ProfileCollectionItem("8", fields, coverage),),
+            ObservationBoundary(107, 108),
+            2,
+            terminal=True,
+        )
+        assert repo.commit_section(
+            cursor,
+            EntitySectionCommit({}, collection_page=page, field_observation=ProfileFieldObservation(77, 5, 108, "rpc")),
+            now=108,
+        )
+    summary = cast(dict, read_profile(conn, 77, 42, 200, {})["collections"])["avatar_history"]
+    assert summary["comparable_membership"] is True, json.dumps(summary)
+
+
+def test_migration_preserves_matching_published_bounds_across_refresh(conn: sqlite3.Connection) -> None:
+    from mcp_telegram.entity_profile.contracts import ProfileCollectionItem, ProfileCollectionPage
+    from mcp_telegram.entity_profile.repository import EntitySectionCommit
+    from mcp_telegram.sync_db import _apply_migration_96
+
+    _publish(conn, "avatar_history", [types.PhotoEmpty(7), types.PhotoEmpty(8)], generation=100)
+    payload = cast(
+        dict,
+        json.loads(
+            cast(
+                str,
+                conn.execute(
+                    "SELECT payload_json FROM entity_detail_sections WHERE entity_id=42 AND section='avatar_history'"
+                ).fetchone()[0],
+            )
+        ),
+    )
+    payload.update(
+        owner_account_id=77, observation_started_at=90, observation_completed_at=100, retained_unique_count=2
+    )
+    payload["published"].pop("complete")
+    conn.execute(
+        "UPDATE entity_detail_sections SET payload_json=? WHERE entity_id=42 AND section='avatar_history'",
+        (json.dumps(payload),),
+    )
+    conn.execute("DELETE FROM schema_version WHERE version=96")
+    conn.commit()
+    _apply_migration_96(conn, 95)
+    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
+    with write_savepoint(conn):
+        assert repo.request_section_refresh(42, ("avatar_history",), now=105, pair_mode="enabled")
+        cursor = repo.next_due_refresh(now=105)
+        assert cursor is not None
+        fields, coverage, _ = normalize_collection_item(types.PhotoEmpty(7))
+        page = ProfileCollectionPage(
+            42,
+            "avatar_history",
+            (ProfileCollectionItem("7", fields, coverage),),
+            ObservationBoundary(105, 106),
+            2,
+            {"offset": 1},
+        )
+        assert repo.commit_section(
+            cursor,
+            EntitySectionCommit({}, collection_page=page, field_observation=ProfileFieldObservation(77, 4, 106, "rpc")),
+            now=106,
+        )
+    retained = cast(dict, read_profile(conn, 77, 42, 200, {"section": "avatar_history"})["page"])
+    assert retained["source"] == "published" and retained["age_seconds"] == 100
+    assert retained["observation_started_at"] == 90 and retained["observation_completed_at"] == 100
+    assert retained["reported_count"] == 2 and retained["retained_unique_count"] == 2
+
+
+async def test_common_chat_observer_reports_only_accepted_publications_and_failures(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+
+    from mcp_telegram.daemon_entity_info import _ProfileSectionContext, _ProfileSectionFailure
+    from mcp_telegram.entity_profile.contracts import ProfileCollectionItem, ProfileCollectionPage
+    from mcp_telegram.entity_profile.repository import EntitySectionCommit
+    from mcp_telegram.models import DialogType
+
+    service = _test_service(conn, limits=RefreshLimits(), account_id=77)
+    monkeypatch.setattr(service, "_rpc_attempt_count", lambda: 0)
+    seen: list[dict[str, int]] = []
+
+    class Observer:
+        broken = False
+
+        def observe_membership(self, counts: dict[str, int], *, source: str) -> None:
+            assert source == "common_chats_refresh" and not conn.in_transaction
+            seen.append(counts)
+            if self.broken:
+                raise RuntimeError("observer failed")
+
+    observer = Observer()
+    service._deps = replace(service._deps, profile_observer=observer)
+    repo = service._profiles
+    context = _ProfileSectionContext(None, 0, False, "disabled", False)
+    with write_savepoint(conn):
+        assert repo.request_section_refresh(42, ("common_chats",), now=105, pair_mode="enabled")
+    cursor = repo.next_due_refresh(now=105)
+    assert cursor is not None
+    fields, coverage, _ = normalize_collection_item(types.ChatEmpty(7))
+    page = ProfileCollectionPage(
+        42,
+        "common_chats",
+        (ProfileCollectionItem("chat:7", fields, coverage),),
+        ObservationBoundary(105, 106),
+        2,
+        {"max_id": 7},
+    )
+    assert await service._commit_profile_section_result(
+        cursor,
+        DialogType.USER,
+        EntitySectionCommit({}, collection_page=page, field_observation=ProfileFieldObservation(77, 4, 106, "rpc")),
+        context,
+        now=106,
+    )
+    assert seen == []
+    cursor = repo.next_due_refresh(now=106)
+    assert cursor is not None
+    fields, coverage, _ = normalize_collection_item(types.ChatEmpty(8))
+    page = ProfileCollectionPage(
+        42,
+        "common_chats",
+        (ProfileCollectionItem("chat:8", fields, coverage),),
+        ObservationBoundary(107, 108),
+        2,
+        terminal=True,
+    )
+    commit = EntitySectionCommit({}, collection_page=page, field_observation=ProfileFieldObservation(77, 5, 108, "rpc"))
+    assert await service._commit_profile_section_result(cursor, DialogType.USER, commit, context, now=108)
+    assert seen == [{"published": 1}]
+    assert not await service._commit_profile_section_result(cursor, DialogType.USER, commit, context, now=108)
+    assert seen == [{"published": 1}]
+    with write_savepoint(conn):
+        assert repo.request_section_refresh(42, ("common_chats",), now=200, pair_mode="enabled")
+    failure_cursor = repo.next_due_refresh(now=200)
+    assert failure_cursor is not None
+    failure = _ProfileSectionFailure(failure_cursor, DialogType.USER, context, 200, "acquisition_failed", 250)
+    observer.broken = True
+    assert await service._handle_profile_section_failure(failure) is not None
+    assert seen == [{"published": 1}, {"failed": 1}]
+    stale = _ProfileSectionFailure(cursor, DialogType.USER, context, 201, "acquisition_failed", 250)
+    assert await service._handle_profile_section_failure(stale) is None
+    assert seen == [{"published": 1}, {"failed": 1}]
+    assert conn.execute(
+        "SELECT status FROM entity_detail_sections WHERE entity_id=42 AND section='common_chats'"
+    ).fetchone()[0] in {"stale", "unavailable"}
+    await service.shutdown()

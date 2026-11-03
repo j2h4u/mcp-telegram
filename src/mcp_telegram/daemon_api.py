@@ -48,6 +48,7 @@ import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, SupportsIndex, cast
 
@@ -1674,6 +1675,7 @@ class DaemonAPIServer:
         return response
 
     def _trace_service(self) -> DaemonAccountTraceService:
+        observe = cast(Callable[..., None] | None, getattr(self._profile_observer, "observe_membership", None))
         return DaemonAccountTraceService(
             DaemonAccountTraceDeps(
                 conn=self._conn,
@@ -1683,6 +1685,10 @@ class DaemonAPIServer:
                 self_id=self.self_id,
                 logger=cast(AccountTraceLoggerLike, logger),
                 rid=_rid,
+                offer_profile_refresh=lambda: offer_durable_demand(
+                    self._require_demand_sink(), DemandKind.ENTITY_PROFILE_REFRESH
+                ),
+                observe_membership=partial(observe, source="message_membership") if observe is not None else None,
             )
         )
 

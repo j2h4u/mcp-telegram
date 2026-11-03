@@ -751,6 +751,7 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
     ctx = SimpleNamespace(
         coordinator=SimpleNamespace(run=lambda: asyncio.sleep(0)),
         rpc_observation_sink=None,
+        rpc_admission_observer=None,
         writer=_Writer(),
         client=_Client(),
         conn=writer_connection,

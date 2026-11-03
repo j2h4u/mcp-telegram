@@ -32,8 +32,10 @@ from mcp_telegram.activity_peer_sweep import (
     sweep_peer_once,
     working_set_enrollment_release_at,
 )
+from mcp_telegram.entity_profile.membership import MembershipSignalCounts
 from mcp_telegram.linked_chat_fact import LinkedChatState, linked_chat_fact_owner
 from mcp_telegram.message_contracts import ExtractedMessage
+from mcp_telegram.messages.sqlite_bundle import MessageWriteResult
 from mcp_telegram.messages.telegram_adapter import extract_message_row
 from mcp_telegram.sync_db import _apply_migrations
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource
@@ -534,8 +536,9 @@ def test_sweep_peer_once_success_invokes_pacing_sleep(
 
         def fake_insert_messages_with_fts(
             conn: sqlite3.Connection, rows: list[ExtractedMessage], **_kwargs: object
-        ) -> None:
-            del conn, rows
+        ) -> MessageWriteResult:
+            del conn
+            return MessageWriteResult(len(rows), MembershipSignalCounts())
 
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
@@ -831,10 +834,11 @@ def test_sweep_peer_once_persists_only_extractable_messages(monkeypatch: pytest.
 
         def fake_insert_messages_with_fts(
             conn: sqlite3.Connection, rows: list[ExtractedMessage], **_kwargs: object
-        ) -> None:
+        ) -> MessageWriteResult:
             del conn
             assert all(row.observation_order is not None for row in rows)
             inserted.append([(row.message.dialog_id, row.message.text or "") for row in rows])
+            return MessageWriteResult(len(rows), MembershipSignalCounts())
 
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
@@ -896,10 +900,11 @@ def test_sweep_peer_once_counts_unique_genuinely_new_keys_before_replacement(
 
         def fake_insert_messages_with_fts(
             conn: sqlite3.Connection, rows: list[ExtractedMessage], **_kwargs: object
-        ) -> None:
+        ) -> MessageWriteResult:
             del conn
             assert all(row.observation_order is not None for row in rows)
             inserted.append([(row.message.dialog_id, row.message.text or "") for row in rows])
+            return MessageWriteResult(len(rows), MembershipSignalCounts())
 
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
@@ -1150,3 +1155,42 @@ def test_enroll_does_not_clobber_resolved_dialog():
         assert row[0] == "Resolved Chat", f"name must not be clobbered, got {row[0]!r}"
         assert row[1] == "user", f"type must not be clobbered, got {row[1]!r}"
         assert row[2] == 0, f"needs_refresh must stay 0 (not reset to 1), got {row[2]!r}"
+
+
+def test_sweep_membership_observation_follows_real_commit(monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import UTC, datetime
+
+    from telethon.tl.types import MessageActionChatAddUser, MessageService, PeerChat
+
+    with closing(_make_db()) as conn:
+        message = MessageService(
+            id=8, peer_id=PeerChat(101), date=datetime.now(UTC), action=MessageActionChatAddUser([12])
+        )
+
+        async def resolve(client: object, dialog_id: int) -> object:
+            return object()
+
+        async def search(client: object, request: object, *, timeout_s: float) -> _FakeSweepResult:
+            return _FakeSweepResult(messages=[cast(_FakeSweepMessage, message)])
+
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", resolve)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", search)
+        observed = []
+        result = asyncio.run(
+            sweep_peer_once(
+                client=_FakeClient(),
+                conn=conn,
+                dialog_id=101,
+                offset_id=0,
+                min_id=0,
+                limit=30,
+                timeout_s=_TEST_TIMEOUT_S,
+                writer=inline_writer(conn),
+                profile_owner_account_id=123,
+                membership_observer=observed.append,
+            )
+        )
+        assert result.persisted == 1
+        assert conn.execute("SELECT is_service FROM messages WHERE message_id=8").fetchone() == (1,)
+        assert len(observed) == 1 and observed[0].received == 1
+        assert observed[0].ignored_account_mismatch == 1
