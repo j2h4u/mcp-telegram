@@ -63,11 +63,9 @@ from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope
 from mcp_telegram.tools.entity_info import GET_ENTITY_INFO_OUTPUT_SCHEMA, GetEntityInfo, _entity_structured_content
 from tests.helpers import (
-    ClientCommonChatsPort,
     FakeChannelProfilePort,
     LoudChannelProfilePort,
     LoudChatAvatarHistoryPort,
-    LoudCommonChatsPort,
     LoudGroupProfilePort,
     LoudUserAvatarHistoryPort,
 )
@@ -425,7 +423,6 @@ def _test_service(
             group_profile_port=LoudGroupProfilePort(),
             channel_profile_port=LoudChannelProfilePort(),
             channel_reference_provider=LoudChannelProfilePort(),
-            common_chats_port=LoudCommonChatsPort(),
             user_avatar_history_port=LoudUserAvatarHistoryPort(),
             chat_avatar_history_port=LoudChatAvatarHistoryPort(),
             refresh_limits=limits,
@@ -1072,7 +1069,6 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt(re
         client=cast(object, client),
         get_peer_id=lambda value: int(value.id),
         user_profile_port=_UserProfilePort(client),
-        common_chats_port=ClientCommonChatsPort(client),
     )
     coordinator = service.refresh_coordinator
     assert coordinator is not None
@@ -1097,7 +1093,6 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt(re
         client=cast(object, client),
         get_peer_id=lambda value: int(value.id),
         user_profile_port=_UserProfilePort(client),
-        common_chats_port=ClientCommonChatsPort(client),
     )
     restarted_coordinator = restarted.refresh_coordinator
     assert restarted_coordinator is not None

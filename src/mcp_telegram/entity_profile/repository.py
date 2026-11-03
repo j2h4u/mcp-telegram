@@ -31,6 +31,7 @@ from ..entity_store import (
 )
 from ..models import DialogType
 from ..own_only_contracts import CHANNEL_PEER_ID_OFFSET
+from ..reading.sqlite_projection import last_retained_message_key, read_retained_message_action_page
 from ..resolver import latinize
 from ..sync_transactions import read_snapshot, require_write_transaction, write_savepoint
 from ..telegram_demand_progress import WorkKey, WorkRevision
@@ -3893,27 +3894,35 @@ _PROFILE_EXCLUDED_PEERS = frozenset({777000, 1271266957})
 def _repair_retained_memberships(
     conn: sqlite3.Connection, owner: int, *, now: int, limit: int
 ) -> tuple[int, MembershipSignalCounts]:
-    """Checkpoint a finite prefix of canonical messages and queue retained changes once."""
+    """Advance one finite retained-message or access-loss page atomically."""
     require_write_transaction(conn)
+    if isinstance(limit, bool) or limit < 1:
+        raise ValueError("membership repair limit must be positive")
+    limit = min(limit, 32)
     state = _read_profile_admission_state(conn, owner)
     repair = state.get("membership_repair_v1")
     if not isinstance(repair, dict):
         repair = _new_membership_repair(conn)
         state["membership_repair_v1"] = repair
         _save_profile_admission_state(conn, state)
-    if repair.get("completed"):
+    if repair["completed"]:
         return 0, MembershipSignalCounts()
+    if repair["phase"] == "dialogs":
+        examined, counts = _repair_retained_access_loss(conn, owner, repair, now=now, limit=limit)
+    else:
+        examined, counts = _repair_retained_message_page(conn, owner, repair, now=now, limit=limit)
+    state["membership_repair_v1"] = repair
+    _save_profile_admission_state(conn, state)
+    return examined, counts
+
+
+def _repair_retained_message_page(
+    conn: sqlite3.Connection, owner: int, repair: dict[str, object], *, now: int, limit: int
+) -> tuple[int, MembershipSignalCounts]:
     terminal = cast(list[int], repair["terminal"])
-    cursor = cast(list[int] | None, repair.get("cursor"))
-    lower_bound = " AND (dialog_id,message_id) > (?,?)" if cursor is not None else ""
-    parameters = (*terminal, *(cursor or ()), min(limit, 32))
-    rows = cast(
-        list[tuple[int, int, int, str | None, int | None, int, int | None, int]],
-        conn.execute(
-            "SELECT dialog_id,message_id,is_service,service_action,sender_id,sent_at,edit_date,is_deleted FROM messages "
-            "WHERE (dialog_id,message_id) <= (?,?)" + lower_bound + " ORDER BY dialog_id,message_id LIMIT ?",
-            parameters,
-        ).fetchall(),
+    cursor = cast(list[int] | None, repair["cursor"])
+    rows = read_retained_message_action_page(
+        conn, after=None if cursor is None else (cursor[0], cursor[1]), through=(terminal[0], terminal[1]), limit=limit
     )
     changes = _retained_membership_changes(rows)
     counts = (
@@ -3925,16 +3934,63 @@ def _repair_retained_memberships(
         repair["cursor"] = list(rows[-1][:2])
     if not rows or repair["cursor"] == terminal:
         repair["completed"] = True
-    state["membership_repair_v1"] = repair
-    _save_profile_admission_state(conn, state)
+    return len(rows), counts
+
+
+def _repair_retained_access_loss(
+    conn: sqlite3.Connection, owner: int, repair: dict[str, object], *, now: int, limit: int
+) -> tuple[int, MembershipSignalCounts]:
+    terminal = cast(int, repair["dialog_terminal"])
+    cursor = cast(int | None, repair["dialog_cursor"])
+    if cursor is None:
+        rows = conn.execute(
+            "SELECT dialog_id,status,access_lost_at FROM synced_dialogs WHERE dialog_id<=? ORDER BY dialog_id LIMIT ?",
+            (terminal, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT dialog_id,status,access_lost_at FROM synced_dialogs "
+            "WHERE dialog_id>? AND dialog_id<=? ORDER BY dialog_id LIMIT ?",
+            (cursor, terminal, limit),
+        ).fetchall()
+    changes = [
+        MembershipChange(int(dialog), frozenset({owner}), int(lost_at) if lost_at is not None else None)
+        for dialog, status, lost_at in rows
+        if status == "access_lost"
+    ]
+    counts = (
+        request_membership_refreshes(conn, owner, changes, now=now, retained_repair=True)
+        if changes
+        else MembershipSignalCounts()
+    )
+    if rows:
+        repair["dialog_cursor"] = int(rows[-1][0])
+    if not rows or repair["dialog_cursor"] == terminal:
+        _begin_retained_message_repair(conn, repair)
     return len(rows), counts
 
 
 def _new_membership_repair(conn: sqlite3.Connection) -> dict[str, object]:
-    last = conn.execute(
-        "SELECT dialog_id,message_id FROM messages ORDER BY dialog_id DESC,message_id DESC LIMIT 1"
-    ).fetchone()
-    return {"terminal": list(last) if last else None, "cursor": None, "completed": last is None}
+    row = conn.execute("SELECT MAX(dialog_id) FROM synced_dialogs").fetchone()
+    last_dialog = None if row is None or row[0] is None else int(row[0])
+    repair: dict[str, object] = {
+        "terminal": None,
+        "cursor": None,
+        "dialog_terminal": last_dialog,
+        "dialog_cursor": None,
+        "phase": "dialogs",
+        "completed": False,
+    }
+    if last_dialog is None:
+        _begin_retained_message_repair(conn, repair)
+    return repair
+
+
+def _begin_retained_message_repair(conn: sqlite3.Connection, repair: dict[str, object]) -> None:
+    last = last_retained_message_key(conn)
+    repair["terminal"] = list(last) if last else None
+    repair["phase"] = "messages"
+    repair["completed"] = last is None
 
 
 def _retained_membership_changes(

@@ -36,6 +36,7 @@ async def prepared_db(tmp_path: Path, kind: str) -> AsyncIterator[tuple[Path, sq
     path = tmp_path / "prepared.db"
     ensure_sync_schema(path)
     with closing(sqlite3.connect(path)) as setup:
+        setup.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
         setup.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(1,'not_synced')")
         setup.executemany(
             "INSERT OR REPLACE INTO activity_sync_state(key,value) VALUES(?,?)",
@@ -72,7 +73,7 @@ def _operation(
         return lambda: full._fetch_batch_page(1, 0)
     if kind == "delta":
         delta = DeltaSyncWorker(cast(ForwardGapPagePort, port), reader, asyncio.Event(), writer=writer)
-        return lambda: delta._collect_delta_slice(1, 0, 0)
+        return lambda: delta._collect_delta_slice(1, 0, 0, 1, None)
     client = cast(ActivityClient, object())
     if kind == "peer":
         # Peer resolution precedes the preparation being consolidated; data acquisition does not.
@@ -349,7 +350,7 @@ async def test_reaction_anchor_is_after_prep_but_before_commit(
         result = await FullSyncWorker(FullPort(), reader, asyncio.Event(), writer=writer)._fetch_batch_page(1, 0)
     else:
         result = await DeltaSyncWorker(DeltaPort(), reader, asyncio.Event(), writer=writer)._collect_delta_slice(
-            1, 0, 0
+            1, 0, 0, 1, None
         )
     assert result.reaction_observed_at == 200
 

@@ -66,7 +66,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
-from .access_lifecycle import AccessLossEvidence, set_access_lost, unhide_after_realtime_presence
+from .access_lifecycle import AccessLossEvidence, AccessLossResult, set_access_lost, unhide_after_realtime_presence
 from .channel_full_siblings import (
     ChannelFullSiblingsToken,
     capture_channel_full_siblings_token,
@@ -133,7 +133,7 @@ from .messages.telegram_adapter import (
     extract_message_row,
 )
 from .models import DialogType
-from .observation_order import delivered_observation_order
+from .observation_order import allocate_observation_order, delivered_observation_order
 from .peer_access import peer_target
 from .reactions.contracts import ReactionAggregate, ReactionAggregateSource, ReactionObservationBoundary
 from .reactions.persistence import allocate_observation_boundary, replace_reaction_aggregates
@@ -717,6 +717,7 @@ class EventHandlerManager:
         self._demand_sink: DemandOfferSink | None = None
         self._observation_sink: RuntimeObservationSink | None = None
         self._membership_observer: Callable[[MembershipSignalCounts], None] | None = None
+        self._access_loss_observer: Callable[[MembershipSignalCounts], None] | None = None
         self._profile_pair_mode = profile_pair_mode
         self._profile_detail_ttl_seconds = profile_detail_ttl_seconds
         self._profile_push_owner = object()
@@ -727,6 +728,17 @@ class EventHandlerManager:
 
     def bind_membership_observer(self, observer: Callable[[MembershipSignalCounts], None]) -> None:
         self._membership_observer = observer
+
+    def bind_access_loss_observer(self, observer: Callable[[MembershipSignalCounts], None]) -> None:
+        self._access_loss_observer = observer
+
+    def _observe_access_loss(self, counts: MembershipSignalCounts) -> None:
+        if self._access_loss_observer is None:
+            return
+        try:
+            self._access_loss_observer(counts)
+        except Exception:  # noqa: BLE001 - diagnostics cannot affect committed state.
+            logger.debug("access_loss_observation_failed")
 
     def _observe_membership(self, counts: MembershipSignalCounts | None) -> None:
         if counts is None or self._membership_observer is None:
@@ -2796,19 +2808,27 @@ class EventHandlerManager:
             if cause is None:
                 return
             dialog_id = self._participant_dialog_id(update)
-            occurred_at = int(update.date.timestamp()) if update.date is not None else delivered_observed_at()
+            observed_at = delivered_observed_at()
+            occurred_at = int(update.date.timestamp()) if update.date is not None else None
 
-            def _persist_event_0(conn: sqlite3.Connection) -> bool:
+            def _persist_event_0(conn: sqlite3.Connection) -> AccessLossResult:
                 with write_transaction(conn):
                     return set_access_lost(
                         conn,
                         dialog_id,
-                        occurred_at,
+                        observed_at,
                         evidence=AccessLossEvidence("UpdateChannelParticipant", cause, update.actor_id),
+                        profile_owner_account_id=self_id,
+                        observation_order=delivered_observation_order(conn),
+                        membership_revision_at=occurred_at,
+                        processing_at=int(time.time()),
                     )
 
-            changed = await self._writer.run(_persist_event_0)
-            if changed:
+            result = await self._writer.run(_persist_event_0)
+            self._observe_access_loss(result.membership_counts)
+            if result.membership_counts.queued or result.membership_counts.coalesced:
+                self._offer(DemandKind.ENTITY_PROFILE_REFRESH)
+            if result.changed:
                 self._synced_dialog_ids.discard(dialog_id)
                 self._offer(DemandKind.DELTA_ACCESS_PROBE)
         except RpcAdmissionClosedError:
@@ -2921,7 +2941,11 @@ class EventHandlerManager:
             logger.debug("linked_chat_refresh_no_input_peer dialog_id=%d", channel_id)
             return None
 
-        full_result = await self._request_linked_chat_full(work, input_channel, now)
+        profile_owner_account_id = self._self_id
+        observation_order = await self._writer.run(allocate_observation_order)
+        full_result = await self._request_linked_chat_full(
+            work, input_channel, profile_owner_account_id, observation_order
+        )
         if full_result is None:
             return None
         return await self._publish_linked_chat_observation(work, generation, siblings_token, full_result, now)
@@ -2930,7 +2954,8 @@ class EventHandlerManager:
         self,
         work: LinkedChatWork,
         input_channel: TypeInputChannel,
-        now: int,
+        profile_owner_account_id: int | None,
+        observation_order: int,
     ) -> object | None:
         """Acquire one full-channel result and persist recoverable failure state."""
         channel_id = work.channel_id
@@ -2944,7 +2969,9 @@ class EventHandlerManager:
         ):
             raise
         except ACCESS_LOST_ERRORS as exc:
-            await self._mark_linked_chat_access_lost(channel_id, now, exc)
+            await self._mark_linked_chat_access_lost(
+                work, int(time.time()), exc, profile_owner_account_id, observation_order
+            )
             return None
         except Exception:
             logger.debug("linked_chat_refresh_failed dialog_id=%d", channel_id, exc_info=True)
@@ -3015,14 +3042,35 @@ class EventHandlerManager:
             )
             linked_chat_fact_owner.defer(conn, work, retry_at)
 
-    async def _mark_linked_chat_access_lost(self, channel_id: int, now: int, error: Exception) -> None:
-        def _persist_event_0(conn: sqlite3.Connection) -> bool:
+    async def _mark_linked_chat_access_lost(
+        self,
+        work: LinkedChatWork,
+        now: int,
+        error: Exception,
+        profile_owner_account_id: int | None,
+        observation_order: int,
+    ) -> None:
+        def _persist_event_0(conn: sqlite3.Connection) -> AccessLossResult:
             with write_transaction(conn):
-                return set_access_lost(conn, channel_id, now, reason=type(error).__name__)
+                if linked_chat_fact_owner.capture_generation(conn, work.channel_id) != work.generation:
+                    return AccessLossResult(False, MembershipSignalCounts())
+                return set_access_lost(
+                    conn,
+                    work.channel_id,
+                    now,
+                    reason=type(error).__name__,
+                    profile_owner_account_id=profile_owner_account_id,
+                    observation_order=observation_order,
+                    membership_revision_at=now,
+                    processing_at=int(time.time()),
+                )
 
-        changed = await self._writer.run(_persist_event_0)
-        if changed:
-            self._synced_dialog_ids.discard(channel_id)
+        result = await self._writer.run(_persist_event_0)
+        self._observe_access_loss(result.membership_counts)
+        if result.membership_counts.queued or result.membership_counts.coalesced:
+            self._offer(DemandKind.ENTITY_PROFILE_REFRESH)
+        if result.changed:
+            self._synced_dialog_ids.discard(work.channel_id)
             self._offer(DemandKind.DELTA_ACCESS_PROBE)
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)

@@ -9,13 +9,11 @@ from ..message_composition import decode_service_action
 
 @dataclass(frozen=True, slots=True)
 class MembershipFact:
-    """Service-message membership semantics and Telegram revision time."""
+    """Service-message membership semantics."""
 
     is_service: int
     action_json: str | None
     sender_id: int | None
-    occurred_at: int | None
-    edited_at: int | None
 
 
 @dataclass(frozen=True, slots=True)

@@ -120,6 +120,7 @@ class ColdPeerPageDemandAdapter(DurableDemandAdapter):
     writer: SQLiteWriter = field(kw_only=True)
     account_id: int = field(kw_only=True)
     membership_observer: Callable[[MembershipSignalCounts], None] | None = field(default=None, kw_only=True)
+    access_loss_observer: Callable[[MembershipSignalCounts], None] | None = field(default=None, kw_only=True)
     demand_kind = DemandKind.COLD_PEER_PAGE
 
     def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
@@ -265,6 +266,7 @@ class ColdPeerPageDemandAdapter(DurableDemandAdapter):
                     expected_offset=int(selected.revision),
                     profile_owner_account_id=self.account_id,
                     membership_observer=self.membership_observer,
+                    access_loss_observer=self.access_loss_observer,
                 )
         return self._cold_result(selected, result)
 
@@ -526,6 +528,7 @@ async def run_cold_backfill_pass(  # noqa: PLR0913 - explicit worker dependencie
     expected_offset: int | None = None,
     profile_owner_account_id: int | None = None,
     membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
+    access_loss_observer: Callable[[MembershipSignalCounts], None] | None = None,
 ) -> ColdPassResult:
     """Run one cold peer-page operation under its precise durable root."""
     with _cold_demand_scope():
@@ -540,6 +543,7 @@ async def run_cold_backfill_pass(  # noqa: PLR0913 - explicit worker dependencie
             expected_offset=expected_offset,
             profile_owner_account_id=profile_owner_account_id,
             membership_observer=membership_observer,
+            access_loss_observer=access_loss_observer,
         )
 
 
@@ -555,6 +559,7 @@ async def _run_cold_backfill_pass(  # noqa: PLR0913 - explicit worker dependenci
     expected_offset: int | None = None,
     profile_owner_account_id: int | None = None,
     membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
+    access_loss_observer: Callable[[MembershipSignalCounts], None] | None = None,
 ) -> ColdPassResult:
     """Run one Tier-B ColdBackfill pass.
 
@@ -617,6 +622,7 @@ async def _run_cold_backfill_pass(  # noqa: PLR0913 - explicit worker dependenci
                 accept_page=lambda db: _cold_claim_matches(db, dialog_id, offset_id, claim_until),
                 profile_owner_account_id=profile_owner_account_id,
                 membership_observer=membership_observer,
+                access_loss_observer=access_loss_observer,
             )
     except RpcAttemptBudgetExhaustedError:
         # A slice bound is not an access failure. Release the short claim so

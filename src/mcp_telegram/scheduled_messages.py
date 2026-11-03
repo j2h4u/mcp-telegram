@@ -12,7 +12,7 @@ import asyncio
 import logging
 import sqlite3
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, cast
@@ -22,6 +22,7 @@ from telethon.tl.types import Message as TelegramMessage  # type: ignore[import-
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .access_lifecycle import not_access_lost_sql, set_access_lost
+from .entity_profile.membership import MembershipSignalCounts
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .fts import stem_text
 from .message_contracts import ExtractedMessage
@@ -572,6 +573,7 @@ class ScheduledMessageReconciler:
         policy: ScheduledReconciliationPolicy,
         writer: SQLiteWriter,
         mutation_fence: ScheduledMutationFence | None = None,
+        access_loss_observer: Callable[[MembershipSignalCounts], None] | None = None,
     ) -> None:
         self._client = client
         self._conn = conn
@@ -580,6 +582,7 @@ class ScheduledMessageReconciler:
         self._verified_account_id: int | None = None
         self._policy = policy
         self._mutation_fence = mutation_fence
+        self._access_loss_observer = access_loss_observer
         self._priority_dialog_id: int | None = None
 
     def bind_account_id(self, account_id: int) -> None:
@@ -838,8 +841,14 @@ class ScheduledMessageReconciler:
             return 0, False
         return None
 
-    async def _fetch_snapshot_or_stop(
-        self, dialog_id: int, discovery: bool, now: int, generation: int
+    async def _fetch_snapshot_or_stop(  # noqa: PLR0913, PLR0917
+        self,
+        dialog_id: int,
+        discovery: bool,
+        now: int,
+        generation: int,
+        observation_order: int | None = None,
+        owner: int | None = None,
     ) -> tuple[list[object] | None, bool, str | None]:
         del discovery
         try:
@@ -860,7 +869,12 @@ class ScheduledMessageReconciler:
             logger.warning("scheduled_reconcile_rpc_error dialog_id=%d error_type=%s", dialog_id, type(exc).__name__)
             if isinstance(exc, ACCESS_LOST_ERRORS):
                 await self._mark_inaccessible(
-                    dialog_id, generation=generation, now=int(time.time()), reason=type(exc).__name__
+                    dialog_id,
+                    generation=generation,
+                    now=int(time.time()),
+                    reason=type(exc).__name__,
+                    observation_order=observation_order,
+                    owner=owner,
                 )
             return None, False, None
         except ValueError as exc:
@@ -894,8 +908,17 @@ class ScheduledMessageReconciler:
 
         await self._writer.run(persist)
 
-    async def _mark_inaccessible(self, dialog_id: int, *, generation: int, now: int, reason: str) -> None:
-        def persist(conn: sqlite3.Connection) -> None:
+    async def _mark_inaccessible(  # noqa: PLR0913
+        self,
+        dialog_id: int,
+        *,
+        generation: int,
+        now: int,
+        reason: str,
+        observation_order: int | None,
+        owner: int | None,
+    ) -> None:
+        def persist(conn: sqlite3.Connection) -> MembershipSignalCounts | None:
             with write_transaction(conn):
                 current = cast(
                     tuple[object] | None,
@@ -905,11 +928,27 @@ class ScheduledMessageReconciler:
                     ).fetchone(),
                 )
                 if current is None:
-                    return
-                _invalidate_scheduled_target(self._mutation_fence, self._verified_account_id, dialog_id)
-                set_access_lost(conn, dialog_id, now, reason=reason)
+                    return None
+                result = set_access_lost(
+                    conn,
+                    dialog_id,
+                    now,
+                    reason=reason,
+                    profile_owner_account_id=owner,
+                    observation_order=observation_order,
+                    membership_revision_at=now,
+                    processing_at=int(time.time()),
+                )
+                if result.changed:
+                    _invalidate_scheduled_target(self._mutation_fence, owner, dialog_id)
+                return result.membership_counts
 
-        await self._writer.run(persist)
+        counts = await self._writer.run(persist)
+        if counts is not None and self._access_loss_observer is not None:
+            try:
+                self._access_loss_observer(counts)
+            except Exception:  # noqa: BLE001
+                logger.debug("access_loss_observer_failed")
 
     async def invalidate_continuity(self, dialog_id: int | None, reason: str = "difference_too_long") -> None:
         """Schedule bounded snapshots only after Telegram reports an unrecoverable update gap."""
@@ -962,7 +1001,10 @@ class ScheduledMessageReconciler:
         if current is None:
             return 0, False, None
         observation_order = await self._writer.run(allocate_observation_order)
-        snapshot, stopped, failure_receipt = await self._fetch_snapshot_or_stop(dialog_id, discovery, now, generation)
+        owner = self._verified_account_id
+        snapshot, stopped, failure_receipt = await self._fetch_snapshot_or_stop(
+            dialog_id, discovery, now, generation, observation_order, owner
+        )
         if snapshot is None:
             if failure_receipt is None:
                 await self._record_snapshot_failure(dialog_id, generation, now, "rpc_error")

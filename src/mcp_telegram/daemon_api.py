@@ -83,7 +83,6 @@ from .entity_profile.ports import (
     ChannelProfilePort,
     ChannelReferenceProvider,
     ChatAvatarHistoryPort,
-    CommonChatsPort,
     GroupProfilePort,
     ProfilePairObservationHook,
     UserAvatarHistoryPort,
@@ -811,7 +810,6 @@ class DaemonAPIServer:
         account_safety_status: Callable[[], dict[str, object] | None] | None = None,
         account_recovery: Callable[[str, bool], Awaitable[None]] | None = None,
         account_logout: Callable[[], Awaitable[None]] | None = None,
-        common_chats_port: CommonChatsPort,
         user_avatar_history_port: UserAvatarHistoryPort,
         chat_avatar_history_port: ChatAvatarHistoryPort,
     ) -> None:
@@ -839,7 +837,6 @@ class DaemonAPIServer:
         self._group_profile_port = group_profile_port
         self._user_profile_port = user_profile_port
         self._channel_profile_port = channel_profile_port
-        self._common_chats_port = common_chats_port
         self._user_avatar_history_port = user_avatar_history_port
         self._chat_avatar_history_port = chat_avatar_history_port
         self._hydration_requester = hydration_requester
@@ -2267,7 +2264,6 @@ class DaemonAPIServer:
                     user_profile_port=self._user_profile_port,
                     channel_profile_port=self._channel_profile_port,
                     channel_reference_provider=cast(ChannelReferenceProvider, self._channel_profile_port),
-                    common_chats_port=self._common_chats_port,
                     user_avatar_history_port=self._user_avatar_history_port,
                     chat_avatar_history_port=self._chat_avatar_history_port,
                     get_dialog_placement=lambda entity_id: dialog_placement(self._conn, entity_id),

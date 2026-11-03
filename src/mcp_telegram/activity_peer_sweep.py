@@ -159,6 +159,7 @@ class PeerSweepRequest:
     accept_page: Callable[[sqlite3.Connection], bool] | None = None
     profile_owner_account_id: int | None = None
     membership_observer: Callable[[MembershipSignalCounts], None] | None = None
+    access_loss_observer: Callable[[MembershipSignalCounts], None] | None = None
 
 
 _LEGACY_PEER_SWEEP_POSITIONAL_ARGS = 3
@@ -289,6 +290,9 @@ def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequ
     accept_page = cast(Callable[[sqlite3.Connection], bool] | None, kwargs.pop("accept_page", None))
     profile_owner_account_id = cast(int | None, kwargs.pop("profile_owner_account_id", None))
     membership_observer = cast(Callable[[MembershipSignalCounts], None] | None, kwargs.pop("membership_observer", None))
+    access_loss_observer = cast(
+        Callable[[MembershipSignalCounts], None] | None, kwargs.pop("access_loss_observer", None)
+    )
     if kwargs:
         raise TypeError(f"sweep_peer_once: unexpected keyword arguments {sorted(kwargs)!r}")
 
@@ -305,6 +309,7 @@ def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequ
         accept_page=accept_page,
         profile_owner_account_id=profile_owner_account_id,
         membership_observer=membership_observer,
+        access_loss_observer=access_loss_observer,
     )
 
 
@@ -332,7 +337,9 @@ def _flood_wait_result(seconds: int, *, rpc_calls: int = 0) -> SweepResult:
     )
 
 
-async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, *, rpc_calls: int) -> _SearchOutcome:
+async def _search_self_messages(
+    request: PeerSweepRequest, peer: TypeInputPeer, *, rpc_calls: int, observation_order: int, owner: int | None
+) -> _SearchOutcome:
     from telethon.tl.functions.messages import SearchRequest
     from telethon.tl.types import InputMessagesFilterEmpty, InputPeerSelf
 
@@ -391,8 +398,7 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, 
             early_result=_access_skip_result(rpc_calls=rpc_calls),
         )
     except ACCESS_LOST_ERRORS as exc:
-        reason = type(exc).__name__
-        await request.writer.run(lambda db: _record_access_lost(db, request.dialog_id, reason))
+        await _observe_search_access_loss(request, exc, observation_order, owner)
         return _SearchOutcome(
             result=None,
             rpc_duration_s=_elapsed_s(search_started_at),
@@ -413,6 +419,21 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, 
         )
 
     return _SearchOutcome(result=cast(_SweepResultLike, result), rpc_duration_s=_elapsed_s(search_started_at))
+
+
+async def _observe_search_access_loss(
+    request: PeerSweepRequest, exc: Exception, observation_order: int, owner: int | None
+) -> None:
+    reason = type(exc).__name__
+    observed_at = int(time.time())
+    counts = await request.writer.run(
+        lambda db: _record_access_lost(db, request, reason, observation_order, observed_at, owner)
+    )
+    if counts is not None and request.access_loss_observer is not None:
+        try:
+            request.access_loss_observer(counts)
+        except Exception:  # noqa: BLE001
+            logger.debug("access_loss_observer_failed")
 
 
 # ---------------------------------------------------------------------------
@@ -459,8 +480,11 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
     if observation is None:
         return SweepResult([], 0, None, None, completed=False, accepted=False)
     identity_revision, observation_order = observation
+    owner = request.profile_owner_account_id
     rpc_calls += 1  # SearchRequest is a governed Telegram call attempt.
-    search = await _search_self_messages(request, peer, rpc_calls=rpc_calls)
+    search = await _search_self_messages(
+        request, peer, rpc_calls=rpc_calls, observation_order=observation_order, owner=owner
+    )
     if search.early_result is not None:
         return search.early_result
 
@@ -569,9 +593,27 @@ def _prepare_sweep_observation(conn: sqlite3.Connection, dialog_id: int) -> tupl
         return identity_revision, allocate_observation_order(conn)
 
 
-def _record_access_lost(conn: sqlite3.Connection, dialog_id: int, reason: str) -> None:
+def _record_access_lost(  # noqa: PLR0913, PLR0917
+    conn: sqlite3.Connection,
+    request: PeerSweepRequest,
+    reason: str,
+    observation_order: int,
+    observed_at: int,
+    owner: int | None,
+) -> MembershipSignalCounts | None:
     with write_transaction(conn):
-        set_access_lost(conn, dialog_id, int(time.time()), reason=reason)
+        if request.accept_page is not None and not request.accept_page(conn):
+            return None
+        return set_access_lost(
+            conn,
+            request.dialog_id,
+            observed_at,
+            reason=reason,
+            profile_owner_account_id=owner,
+            observation_order=observation_order,
+            membership_revision_at=observed_at,
+            processing_at=int(time.time()),
+        ).membership_counts
 
 
 def enroll_activity_dialog(

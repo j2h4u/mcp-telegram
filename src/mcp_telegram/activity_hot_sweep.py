@@ -252,6 +252,7 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
     writer: SQLiteWriter = field(kw_only=True)
     account_id: int = field(kw_only=True)
     membership_observer: Callable[[MembershipSignalCounts], None] | None = field(default=None, kw_only=True)
+    access_loss_observer: Callable[[MembershipSignalCounts], None] | None = field(default=None, kw_only=True)
     demand_kind = DemandKind.HOT_ACTIVITY_PAGE
 
     def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
@@ -305,6 +306,7 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
                                 accept_page=lambda db: _hot_state_matches(db, state),
                                 profile_owner_account_id=self.account_id,
                                 membership_observer=self.membership_observer,
+                                access_loss_observer=self.access_loss_observer,
                             )
                         except RpcAttemptBudgetExhaustedError:
                             return None

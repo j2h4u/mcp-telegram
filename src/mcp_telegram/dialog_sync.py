@@ -20,6 +20,7 @@ from .access_lifecycle import set_access_lost
 from .dialog_fact_observations import claim_dialog_fact
 from .dialog_identity import capture_identity_baseline, publish_dialog_identity
 from .dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
+from .entity_profile.membership import MembershipSignalCounts
 from .flood import TelegramRpcThrottled
 from .maintenance_logging import log_maintenance_cycle
 from .observation_order import allocate_observation_order
@@ -118,7 +119,7 @@ def _extract_entity_fields(entity: _EntityLike) -> _EntityFields:
 class DialogReconciliationWorker:
     """Refresh dirty dialog entities and optional forum topics."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         client: object,
         conn: sqlite3.Connection,
@@ -126,10 +127,14 @@ class DialogReconciliationWorker:
         topic_refresher: TopicRefresher | None = None,
         *,
         writer: SQLiteWriter,
+        profile_owner_account_id: int | None = None,
+        access_loss_observer: Callable[[MembershipSignalCounts], None] | None = None,
     ) -> None:
         self._client = cast(_DialogSyncClient, client)
         self._conn = conn
         self._writer = writer
+        self._profile_owner_account_id = profile_owner_account_id
+        self._access_loss_observer = access_loss_observer
         self._shutdown_event = shutdown_event
         self._topic_refresher = topic_refresher
 
@@ -190,6 +195,7 @@ class DialogReconciliationWorker:
         dialog_revision, identity_revision = revision
         if expected_revision is not None and revision != expected_revision:
             return False, None
+        owner = self._profile_owner_account_id
         observation_order = await self._writer.run(allocate_observation_order)
         try:
             entity = await self._client.get_entity(dialog_id)
@@ -199,6 +205,7 @@ class DialogReconciliationWorker:
                 )
             )
             if refresh_topics and self._topic_refresher is not None and is_topic_capable(entity):
+                observation_order = await self._writer.run(allocate_observation_order)
                 topic_count = await self._refresh_forum_topics(dialog_id, entity)
                 logger.debug(
                     "recon_light_pass_forum_topics dialog_id=%d count=%d",
@@ -214,11 +221,13 @@ class DialogReconciliationWorker:
             RPCError,
             *ACCESS_LOST_ERRORS,
         ) as exc:
-            if await self._handle_light_error(exc, dialog_id):
+            if await self._handle_light_error(exc, dialog_id, observation_order, owner):
                 return None, None
         return False, None
 
-    async def _handle_light_error(self, exc: Exception, dialog_id: int) -> bool:
+    async def _handle_light_error(
+        self, exc: Exception, dialog_id: int, observation_order: int, owner: int | None
+    ) -> bool:
         if isinstance(exc, TelegramRpcThrottled):
             return await self._handle_light_throttling(exc, dialog_id)
         if isinstance(exc, (RpcAdmissionSaturatedError, RpcAdmissionExpiredError)):
@@ -230,7 +239,15 @@ class DialogReconciliationWorker:
             return False
         if isinstance(exc, ACCESS_LOST_ERRORS):
             reason = type(exc).__name__
-            await self._writer.run(lambda db: _record_access_lost(db, dialog_id, reason))
+            observed_at = int(time.time())
+            counts = await self._writer.run(
+                lambda db: _record_access_lost(db, dialog_id, reason, owner, observation_order, observed_at)
+            )
+            if self._access_loss_observer is not None:
+                try:
+                    self._access_loss_observer(counts)
+                except Exception:  # noqa: BLE001
+                    logger.debug("access_loss_observer_failed")
             return False
         if isinstance(exc, PeerIdInvalidError):
             logger.warning(
@@ -293,9 +310,20 @@ class DialogReconciliationWorker:
         return count
 
 
-def _record_access_lost(conn: sqlite3.Connection, dialog_id: int, reason: str) -> None:
+def _record_access_lost(  # noqa: PLR0913, PLR0917
+    conn: sqlite3.Connection, dialog_id: int, reason: str, owner: int | None, order: int, observed_at: int
+) -> MembershipSignalCounts:
     with write_transaction(conn):
-        set_access_lost(conn, dialog_id, int(time.time()), reason=reason)
+        return set_access_lost(
+            conn,
+            dialog_id,
+            observed_at,
+            reason=reason,
+            profile_owner_account_id=owner,
+            observation_order=order,
+            membership_revision_at=observed_at,
+            processing_at=int(time.time()),
+        ).membership_counts
 
 
 def _publish_light_identity(

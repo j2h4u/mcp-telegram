@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from typing import Protocol, cast
 
 from .access_lifecycle import set_access_lost
+from .entity_profile.membership import MembershipSignalCounts
 from .flood import TelegramRpcThrottled
 from .hydration_queue import (
     MEDIA_METADATA_KIND,
@@ -374,11 +375,15 @@ class MessageFactHydrationWorker:
         pause_between_requests_seconds: float,
         backfill_debt_limit: int,
         clock: Callable[[], float] = time.time,
+        profile_owner_account_id: int | None = None,
+        access_loss_observer: Callable[[MembershipSignalCounts], None] | None = None,
     ) -> None:
         del circuit_retry_seconds, retry_delay_seconds
         self._client = client
         self._conn = conn
         self._writer = writer
+        self._profile_owner_account_id = profile_owner_account_id
+        self._access_loss_observer = access_loss_observer
         self._shutdown_event = shutdown_event
         self._handlers: dict[str, HydrationHandler] = {}
         for handler in handlers:
@@ -401,6 +406,13 @@ class MessageFactHydrationWorker:
         if backfill_debt_limit <= 0:
             raise ValueError("fact hydration backfill_debt_limit must be positive")
         self._queue = HydrationQueueRepository(conn)
+
+    def bind_account_id(self, account_id: int) -> None:
+        if type(account_id) is not int or account_id <= 0:
+            raise ValueError("account_id must be a positive integer")
+        if self._profile_owner_account_id not in (None, account_id):
+            raise RuntimeError("fact hydration account does not match verified startup identity")
+        self._profile_owner_account_id = account_id
 
     async def run_priority_slice(
         self, priority: HydrationPriority, budget: RpcAttemptBudget, *, selected_job: HydrationJob | None = None
@@ -530,6 +542,7 @@ class MessageFactHydrationWorker:
         if not started:
             self._log_drops(batch, preflight_observations)
             return _BatchOutcome(dropped=len(preflight_observations))
+        owner = self._profile_owner_account_id
         attempts_before_request = None if attempt_budget is None else attempt_budget.attempts
         assert observation_order is not None
         failure: Exception | None = None
@@ -549,7 +562,8 @@ class MessageFactHydrationWorker:
 
         await self._writer.run(requeue_stale)
         if failure is not None:
-            return await self._writer.run(
+            membership_counts: list[MembershipSignalCounts] = []
+            outcome = await self._writer.run(
                 lambda conn: self._handle_batch_error(
                     conn,
                     handler,
@@ -561,8 +575,17 @@ class MessageFactHydrationWorker:
                     observation_order=observation_order,
                     attempt_budget=attempt_budget,
                     attempts_before_request=attempts_before_request,
+                    owner=owner,
+                    membership_counts=membership_counts,
                 )
             )
+            if self._access_loss_observer is not None:
+                for counts in membership_counts:
+                    try:
+                        self._access_loss_observer(counts)
+                    except Exception:  # noqa: BLE001
+                        logger.debug("access_loss_observer_failed")
+            return outcome
         return await self._writer.run(
             lambda conn: self._apply_batch_result(
                 conn, handler, batch, started, preflight_observations, result, effective_now, observation_order
@@ -582,6 +605,8 @@ class MessageFactHydrationWorker:
         observation_order: int,
         attempt_budget: RpcAttemptBudget | None,
         attempts_before_request: int | None,
+        owner: int | None,
+        membership_counts: list[MembershipSignalCounts],
     ) -> _BatchOutcome:
         if isinstance(
             exc,
@@ -635,6 +660,8 @@ class MessageFactHydrationWorker:
                 exc,
                 effective_now,
                 observation_order=observation_order,
+                owner=owner,
+                membership_counts=membership_counts,
             )
         return self._handle_request_error(
             conn,
@@ -924,6 +951,8 @@ class MessageFactHydrationWorker:
         effective_now: int,
         *,
         observation_order: int | None = None,
+        owner: int | None = None,
+        membership_counts: list[MembershipSignalCounts] | None = None,
     ) -> _BatchOutcome:
         descriptor = describe_telegram_rpc_error(exc)
         self._log_drops(batch, preflight_observations)
@@ -937,7 +966,18 @@ class MessageFactHydrationWorker:
                 for summary in HydrationQueueRepository(conn).summarize_for_dialog(dialog_id)
             )
             for dialog_id in dialog_ids:
-                set_access_lost(conn, dialog_id, effective_now, reason=descriptor.error_type)
+                counts = set_access_lost(
+                    conn,
+                    dialog_id,
+                    effective_now,
+                    reason=descriptor.error_type,
+                    profile_owner_account_id=owner,
+                    observation_order=observation_order,
+                    membership_revision_at=effective_now,
+                    processing_at=int(self._clock()),
+                ).membership_counts
+                if membership_counts is not None:
+                    membership_counts.append(counts)
         self._log_summaries(summaries, descriptor)
         drop_counts: dict[str, int] = defaultdict(int)
         for summary in summaries:

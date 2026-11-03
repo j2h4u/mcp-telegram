@@ -30,7 +30,6 @@ from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     ClientChatAvatarHistoryPort,
     FakeChannelProfilePort,
-    LoudCommonChatsPort,
     LoudGroupProfilePort,
     LoudUserAvatarHistoryPort,
     LoudUserProfilePort,
@@ -98,7 +97,6 @@ def make_server(
         channel_profile_port=channel_profile_port,
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
-        common_chats_port=LoudCommonChatsPort(),
         user_avatar_history_port=LoudUserAvatarHistoryPort(),
         chat_avatar_history_port=ClientChatAvatarHistoryPort(client),
         policy=make_daemon_api_policy(),

@@ -45,7 +45,7 @@ _MEMBERSHIP_COUNTERS = frozenset(
 
 def _valid_membership_counts(counts: Mapping[str, int], source: str, reason: str) -> bool:
     return bool(
-        source in {"message_membership", "retained_repair", "common_chats_refresh"}
+        source in {"message_membership", "retained_repair", "common_chats_refresh", "access_loss"}
         and reason in {"unspecified", "ineligible", "not_visible", "no_owner", "unchanged", "error"}
         and counts
         and counts.keys() <= _MEMBERSHIP_COUNTERS

@@ -5154,6 +5154,7 @@ def _apply_migration_96(conn: sqlite3.Connection, current: int) -> int:
         )
         _normalize_published_collection_receipts(conn)
         _normalize_retained_common_chats(conn)
+        _normalize_access_recovery_witnesses(conn)
         conn.execute("INSERT INTO schema_version VALUES (96, strftime('%s', 'now'))")
         if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise sqlite3.IntegrityError("profile collection migration foreign key check failed")
@@ -5162,6 +5163,26 @@ def _apply_migration_96(conn: sqlite3.Connection, current: int) -> int:
         conn.rollback()
         raise
     return _COMMON_CHAT_NORMALIZATION_MIGRATION
+
+
+def _normalize_access_recovery_witnesses(conn: sqlite3.Connection) -> None:
+    """Discard recovery work without a matching observed access fence."""
+    invalid = (
+        "NOT EXISTS (SELECT 1 FROM dialog_fact_observations access "
+        "JOIN dialog_fact_observations witness ON witness.dialog_id=access.dialog_id "
+        "WHERE access.dialog_id=recovery.dialog_id AND access.field='access_state' "
+        "AND witness.field='access_recovery_witness' AND access.observation_order>0 "
+        "AND witness.observation_order=access.observation_order)"
+    )
+    conn.execute(
+        "UPDATE synced_dialogs SET access_next_revalidate_at=(SELECT recovery.retry_at "
+        "FROM delta_access_recovery_state recovery WHERE recovery.dialog_id=synced_dialogs.dialog_id) "
+        "WHERE status='access_lost' AND EXISTS (SELECT 1 FROM delta_access_recovery_state recovery "
+        "WHERE recovery.dialog_id=synced_dialogs.dialog_id AND recovery.retry_at IS NOT NULL "
+        "AND (synced_dialogs.access_next_revalidate_at IS NULL "
+        "OR recovery.retry_at>synced_dialogs.access_next_revalidate_at) AND " + invalid + ")"
+    )
+    conn.execute("DELETE FROM delta_access_recovery_state AS recovery WHERE " + invalid)
 
 
 def _normalize_published_collection_receipts(conn: sqlite3.Connection) -> None:

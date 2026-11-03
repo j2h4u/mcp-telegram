@@ -84,6 +84,32 @@ def read_context_anchor(conn: sqlite3.Connection, dialog_id: int, message_id: in
     )
 
 
+def last_retained_message_key(conn: sqlite3.Connection) -> tuple[int, int] | None:
+    """Capture the upper key of the currently retained message archive."""
+    return cast(
+        tuple[int, int] | None,
+        conn.execute(
+            "SELECT dialog_id,message_id FROM messages ORDER BY dialog_id DESC,message_id DESC LIMIT 1"
+        ).fetchone(),
+    )
+
+
+def read_retained_message_action_page(
+    conn: sqlite3.Connection, *, after: tuple[int, int] | None, through: tuple[int, int], limit: int
+) -> list[tuple[int, int, int, str | None, int | None, int, int | None, int]]:
+    """Read one bounded keyset page, including nonservice and deleted records."""
+    lower_bound = " AND (dialog_id,message_id) > (?,?)" if after is not None else ""
+    parameters = (*through, *(after or ()), min(limit, 32))
+    return cast(
+        list[tuple[int, int, int, str | None, int | None, int, int | None, int]],
+        conn.execute(
+            "SELECT dialog_id,message_id,is_service,service_action,sender_id,sent_at,edit_date,is_deleted FROM messages "
+            "WHERE (dialog_id,message_id) <= (?,?)" + lower_bound + " ORDER BY dialog_id,message_id LIMIT ?",
+            parameters,
+        ).fetchall(),
+    )
+
+
 def _build_access_metadata(
     conn: sqlite3.Connection,
     dialog_id: int,

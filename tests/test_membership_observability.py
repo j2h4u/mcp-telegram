@@ -2,16 +2,17 @@
 
 import asyncio
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
 
 from helpers import build_mock_message
-from mcp_telegram import event_handlers
+from mcp_telegram import daemon, event_handlers
 from mcp_telegram.config import RuntimeObservationConfig
 from mcp_telegram.entity_profile.membership import MembershipSignalCounts
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
@@ -42,12 +43,13 @@ def test_membership_summary_is_bounded_and_retries_rejected_flush() -> None:
     observer.observe_membership({"received": 1}, source="private-source")
     observer.observe_membership({"received": 0}, source="retained_repair")
     observer.observe_membership({"received": -1}, source="message_membership")
+    observer.observe_membership({"received": 1, "queued": 1}, source="access_loss")
     recorder.reject = True
     observer.flush()
     assert recorder.rows == []
     recorder.reject = False
     observer.flush()
-    assert len(recorder.rows) == 1
+    assert len(recorder.rows) == 2
     payload = recorder.rows[0]["payload"]
     assert payload == {
         "received": 100,
@@ -59,6 +61,7 @@ def test_membership_summary_is_bounded_and_retries_rejected_flush() -> None:
     }
     assert len(encode_payload(cast(Mapping[str, object], payload)).encode()) <= MAX_PAYLOAD_BYTES
     assert "private" not in json.dumps(payload)
+    assert recorder.rows[1]["payload"] == {"received": 1, "queued": 1, "source": "access_loss", "reason": "unspecified"}
 
 
 def test_membership_observer_survives_recorder_errors_and_caps_counts() -> None:
@@ -72,6 +75,36 @@ def test_membership_observer_survives_recorder_errors_and_caps_counts() -> None:
     observer.observe_membership({"received": 10**20}, source="retained_repair")
     observer.flush()
     assert observer._membership_counts == {("retained_repair", "unspecified"): {"received": 2147483647}}
+
+
+def test_composition_binds_distinct_membership_and_access_loss_sources() -> None:
+    recorder = Recorder()
+    observer = RpcAdmissionObservationAggregator(recorder, policy=RuntimeObservationConfig(), clock=lambda: 0.0)
+
+    class Handler:
+        membership: Callable[[MembershipSignalCounts], None]
+        access: Callable[[MembershipSignalCounts], None]
+
+        def bind_membership_observer(self, callback: Callable[[MembershipSignalCounts], None]) -> None:
+            self.membership = callback
+
+        def bind_access_loss_observer(self, callback: Callable[[MembershipSignalCounts], None]) -> None:
+            self.access = callback
+
+    handler = Handler()
+    ctx = cast(
+        daemon._SyncMainContext,
+        SimpleNamespace(handler_manager=handler, rpc_observation_sink=None, rpc_admission_observer=observer),
+    )
+    daemon._bind_event_observers(ctx)
+    counts = MembershipSignalCounts(received=1, queued=1)
+    handler.membership(counts)
+    handler.access(counts)
+    observer.flush()
+    assert {cast(dict[str, object], row["payload"])["source"] for row in recorder.rows} == {
+        "message_membership",
+        "access_loss",
+    }
 
 
 @pytest.mark.asyncio

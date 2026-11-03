@@ -1503,7 +1503,7 @@ def test_self_join_refreshes_only_published_matching_dialog_kind(conn: sqlite3.C
                 service_action='{"_":"MessageActionChatJoinedByLink","inviter_id":99}',
             ),
         )
-        assert insert_messages_with_fts(conn, [joined], profile_owner_account_id=77).profile_refresh_queued
+        assert insert_messages_with_fts(conn, [joined], profile_owner_account_id=77).membership_counts.queued == 1
     assert conn.execute("SELECT entity_id FROM entity_profile_refresh_state WHERE status='pending'").fetchall() == [
         (12,)
     ]

@@ -23,13 +23,16 @@ from functools import wraps
 from typing import Protocol, cast
 
 from .access_lifecycle import (
+    AccessLossResult,
     complete_access_revalidation,
+    record_access_recovery_observation,
     restore_access_after_revalidation,
     set_access_lost,
     stamp_access_revalidation,
 )
 from .dialog_identity import ensure_dialog_identity_baseline, publish_dialog_identity
 from .entity_profile.membership import MembershipSignalCounts
+from .entity_profile.repository import bound_profile_account
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .history_enrollment import full_history_enabled, request_delta_refresh
 from .hydration_queue import HydrationPriority
@@ -385,6 +388,7 @@ class _DeltaFetchOutcome:
     result: int | None = None
     completed: bool = True
     reaction_observed_at: int | None = None
+    observation_order: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,6 +439,7 @@ class DeltaSyncWorker:
         self._writer = writer
         self._shutdown_event = shutdown_event
         self._last_delta_slice_completed = False
+        self._last_delta_slice_observation_order: int | None = None
         self._last_delta_slice_succeeded = False
         self._last_delta_slice_stale = False
         self._last_delta_slice_committed_revision: str | None = None
@@ -456,13 +461,15 @@ class DeltaSyncWorker:
             conn.execute("INSERT OR REPLACE INTO daemon_state(key,value) VALUES(?,?)", (key, str(completed + 1)))
 
     @_delta_rpc_scope(DemandKind.DELTA_GAP_FILL, AcquisitionKind.MESSAGE_HISTORY_PAGE)
-    async def fetch_delta_slice_for_dialog(
+    async def fetch_delta_slice_for_dialog(  # noqa: PLR0913
         self,
         dialog_id: int,
         *,
         expected_completion_generation: int | None = None,
         profile_owner_account_id: int | None = None,
         membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
+        access_loss_observer: Callable[[MembershipSignalCounts], None] | None = None,
+        recovery: _DurableAccessRecovery | None = None,
     ) -> int:
         """Fetch and commit one resumable forward-history page."""
         self._reset_delta_slice_state()
@@ -476,7 +483,9 @@ class DeltaSyncWorker:
             ).fetchone(),
         )
         generation = generation_row[0]
-        outcome = await self._collect_delta_slice(dialog_id, cursor, generation)
+        outcome = await self._collect_delta_slice(
+            dialog_id, cursor, generation, profile_owner_account_id, access_loss_observer
+        )
         if outcome.result is not None:
             return outcome.result
         return await self._commit_delta_slice(
@@ -487,10 +496,12 @@ class DeltaSyncWorker:
             expected_completion_generation,
             profile_owner_account_id,
             membership_observer,
+            recovery,
         )
 
     def _reset_delta_slice_state(self) -> None:
         self._last_delta_slice_completed = False
+        self._last_delta_slice_observation_order = None
         self._last_delta_slice_succeeded = False
         self._last_delta_slice_stale = False
         self._last_delta_slice_committed_revision = None
@@ -506,7 +517,14 @@ class DeltaSyncWorker:
         )
         return row_first_int(row)
 
-    async def _collect_delta_slice(self, dialog_id: int, max_known_id: int, generation: int) -> _DeltaFetchOutcome:
+    async def _collect_delta_slice(
+        self,
+        dialog_id: int,
+        max_known_id: int,
+        generation: int,
+        owner: int | None,
+        observer: Callable[[MembershipSignalCounts], None] | None,
+    ) -> _DeltaFetchOutcome:
         def prepare_observation(conn: sqlite3.Connection) -> tuple[int, int, int]:
             with write_transaction(conn):
                 identity_revision = ensure_dialog_identity_baseline(conn, dialog_id)
@@ -531,11 +549,7 @@ class DeltaSyncWorker:
             self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
         except MessageHistoryAccessLostError as exc:
-            access_error = exc
-            await self._writer.run(
-                lambda conn: self._persist_access_loss(conn, dialog_id, access_error.reason_code, generation)
-            )
-            self._last_delta_slice_access_lost = True
+            await self._handle_delta_access_loss(dialog_id, exc, generation, owner, observation_order, observer)
             return _DeltaFetchOutcome([], 0)
         except (MessageHistoryUnavailableError, TimeoutError) as exc:
             logger.warning("delta_slice_rpc_error dialog_id=%d error=%s", dialog_id, exc)
@@ -561,11 +575,58 @@ class DeltaSyncWorker:
                 "new_key_count": 0,
                 "uncommitted_unique_count": len(unique_keys),
             }
-        return _DeltaFetchOutcome(rows, completed=page.complete, reaction_observed_at=reaction_observed_at)
+        return _DeltaFetchOutcome(
+            rows,
+            completed=page.complete,
+            reaction_observed_at=reaction_observed_at,
+            observation_order=observation_order,
+        )
 
-    def _persist_access_loss(self, conn: sqlite3.Connection, dialog_id: int, reason: str, generation: int) -> None:
+    async def _handle_delta_access_loss(  # noqa: PLR0913, PLR0917
+        self,
+        dialog_id: int,
+        error: MessageHistoryAccessLostError,
+        generation: int,
+        owner: int | None,
+        observation_order: int,
+        observer: Callable[[MembershipSignalCounts], None] | None,
+    ) -> None:
+        observed_at = int(time.time())
+        result = await self._writer.run(
+            lambda conn: self._persist_access_loss(
+                conn, dialog_id, error.reason_code, generation, owner, observation_order, observed_at
+            )
+        )
+        if observer is not None:
+            try:
+                observer(result.membership_counts)
+            except Exception:  # noqa: BLE001
+                logger.debug("membership_observation_failed")
+        self._last_delta_slice_access_lost = result.changed
+        self._last_delta_slice_stale = not result.changed
+
+    def _persist_access_loss(  # noqa: PLR0913, PLR0917
+        self,
+        conn: sqlite3.Connection,
+        dialog_id: int,
+        reason: str,
+        generation: int,
+        owner: int | None,
+        order: int,
+        observed_at: int,
+    ) -> AccessLossResult:
         with write_transaction(conn):
-            set_access_lost(conn, dialog_id, int(time.time()), reason=reason, refresh_generation=generation)
+            return set_access_lost(
+                conn,
+                dialog_id,
+                observed_at,
+                reason=reason,
+                refresh_generation=generation,
+                profile_owner_account_id=owner,
+                observation_order=order,
+                membership_revision_at=observed_at,
+                processing_at=int(time.time()),
+            )
 
     async def _commit_delta_slice(  # noqa: PLR0913, PLR0917
         self,
@@ -576,6 +637,7 @@ class DeltaSyncWorker:
         expected_completion_generation: int | None,
         profile_owner_account_id: int | None = None,
         membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
+        recovery: _DurableAccessRecovery | None = None,
     ) -> int:
         continuation_required = not outcome.completed or len(outcome.rows) == _DELTA_SLICE_MESSAGE_LIMIT
         now = int(time.time())
@@ -592,6 +654,7 @@ class DeltaSyncWorker:
                 expected_completion_generation,
                 profile_owner_account_id,
                 staged,
+                recovery,
             )
         )
         if membership_observer is not None:
@@ -604,6 +667,7 @@ class DeltaSyncWorker:
         if committed_new_count is None:
             self._last_delta_slice_stale = True
             return 0
+        self._last_delta_slice_observation_order = outcome.observation_order
         self._last_delta_slice_completed = not continuation_required
         self._last_delta_slice_succeeded = True
         self._last_delta_slice_committed_revision = committed_revision
@@ -626,15 +690,20 @@ class DeltaSyncWorker:
         expected_completion_generation: int | None,
         profile_owner_account_id: int | None = None,
         membership_staged: list[MembershipSignalCounts] | None = None,
+        recovery: _DurableAccessRecovery | None = None,
     ) -> tuple[list[int], set[int], int | None, str | None]:
         with write_transaction(conn):
             if not _delta_selection_is_current(
                 conn, dialog_id, expected_cursor, generation, expected_completion_generation
             ):
                 return [], set(), None, None
-            unique_message_ids, existing_ids = self._existing_delta_message_ids(conn, dialog_id, outcome.rows)
             if not full_history_enabled(conn, dialog_id):
-                return unique_message_ids, existing_ids, None, None
+                return [], set(), None, None
+            if recovery is not None and not self._record_current_recovery(
+                conn, dialog_id, recovery, outcome.observation_order, profile_owner_account_id
+            ):
+                return [], set(), None, None
+            unique_message_ids, existing_ids = self._existing_delta_message_ids(conn, dialog_id, outcome.rows)
             committed_new_count = self._insert_delta_messages(
                 conn,
                 dialog_id,
@@ -665,6 +734,21 @@ class DeltaSyncWorker:
                 else None
             )
         return unique_message_ids, existing_ids, committed_new_count, revision
+
+    @staticmethod
+    def _record_current_recovery(
+        conn: sqlite3.Connection,
+        dialog_id: int,
+        recovery: _DurableAccessRecovery,
+        observation_order: int | None,
+        profile_owner_account_id: int | None,
+    ) -> bool:
+        return (
+            _recovery_is_current(conn, recovery)
+            and observation_order is not None
+            and bound_profile_account(conn) == profile_owner_account_id
+            and record_access_recovery_observation(conn, dialog_id, observation_order)
+        )
 
     def _persist_delta_continuation(
         self, conn: sqlite3.Connection, dialog_id: int, continuation_required: bool, now: int, generation: int
@@ -789,7 +873,9 @@ class DeltaGapFillDemandAdapter:
         account_id: int,
         observer: DeltaGapFillObservationHook | None = None,
         membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
+        access_loss_observer: Callable[[MembershipSignalCounts], None] | None = None,
     ) -> None:
+        self._access_loss_observer = access_loss_observer
         self._membership_observer = membership_observer
         self._worker = worker
         self._account_id = account_id
@@ -823,6 +909,7 @@ class DeltaGapFillDemandAdapter:
                 expected_completion_generation=expected_completion_generation,
                 profile_owner_account_id=self._account_id,
                 membership_observer=self._membership_observer,
+                access_loss_observer=self._access_loss_observer,
             )
             if self._worker._last_delta_slice_error is not None:
                 raise self._worker._last_delta_slice_error
@@ -1227,10 +1314,13 @@ def _restore_revalidated_access(
     dialog_id: int,
     *,
     total_messages: int | None,
+    observation_order: int,
 ) -> int:
     """Persist one verified restoration and return its counter contribution."""
     require_write_transaction(conn)
-    changed = restore_access_after_revalidation(conn, dialog_id, int(time.time()), total_messages=total_messages)
+    changed = restore_access_after_revalidation(
+        conn, dialog_id, int(time.time()), total_messages=total_messages, expected_observation_order=observation_order
+    )
     return int(changed)
 
 
@@ -1240,12 +1330,29 @@ class _DurableAccessRecovery:
     total_messages: int | None
     retry_at: int | None
     probe_succeeded_at: int
+    observation_order: int
+
+
+def _recovery_is_current(conn: sqlite3.Connection, recovery: _DurableAccessRecovery) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM delta_access_recovery_state r JOIN dialog_fact_observations f ON f.dialog_id=r.dialog_id "
+            "WHERE r.dialog_id=? AND r.probe_succeeded_at=? AND r.total_messages IS ? "
+            "AND f.field='access_recovery_witness' AND f.observation_order=? "
+            "AND EXISTS(SELECT 1 FROM dialog_fact_observations a WHERE a.dialog_id=r.dialog_id "
+            "AND a.field='access_state' AND a.observation_order=f.observation_order)",
+            (recovery.dialog_id, recovery.probe_succeeded_at, recovery.total_messages, recovery.observation_order),
+        ).fetchone()
+        is not None
+    )
 
 
 def _set_access_recovery_retry(
-    conn: sqlite3.Connection, recovery: _DurableAccessRecovery, retry_at: int | None
+    conn: sqlite3.Connection, recovery: _DurableAccessRecovery, retry_at: int | None, account_id: int
 ) -> str | None:
     with write_transaction(conn):
+        if bound_profile_account(conn) != account_id or not _recovery_is_current(conn, recovery):
+            return None
         conn.execute(
             "UPDATE delta_access_recovery_state SET retry_at=?, updated_at=? WHERE dialog_id=?",
             (retry_at, int(time.time()), recovery.dialog_id),
@@ -1268,16 +1375,22 @@ def _set_access_recovery_retry(
 def _finish_durable_access_recovery(
     conn: sqlite3.Connection,
     recovery: _DurableAccessRecovery,
-) -> None:
+    account_id: int,
+) -> bool:
     now = int(time.time())
     with write_transaction(conn):
-        restore_access_after_revalidation(
+        if bound_profile_account(conn) != account_id or not _recovery_is_current(conn, recovery):
+            return False
+        changed = restore_access_after_revalidation(
             conn,
             recovery.dialog_id,
             now,
             total_messages=recovery.total_messages,
+            expected_observation_order=recovery.observation_order,
         )
-        conn.execute("DELETE FROM delta_access_recovery_state WHERE dialog_id=?", (recovery.dialog_id,))
+        if changed:
+            conn.execute("DELETE FROM delta_access_recovery_state WHERE dialog_id=?", (recovery.dialog_id,))
+        return changed
 
 
 class DeltaAccessProbeDemandAdapter:
@@ -1294,7 +1407,9 @@ class DeltaAccessProbeDemandAdapter:
         account_id: int,
         observer: DeltaGapFillObservationHook | None = None,
         membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
+        access_loss_observer: Callable[[MembershipSignalCounts], None] | None = None,
     ) -> None:
+        self._access_loss_observer = access_loss_observer
         self._membership_observer = membership_observer
         self._worker = worker
         self._policy = policy
@@ -1311,36 +1426,30 @@ class DeltaAccessProbeDemandAdapter:
         if not self._policy.enabled:
             return None
         rows = cast(
-            list[tuple[int, int, int | None, int | None, int | None, int, int]],
+            list[tuple[int, int, int | None, int | None, int | None, int, int, int, int]],
             self._worker._conn.execute(
                 "SELECT recovery.dialog_id,1,recovery.total_messages,recovery.probe_succeeded_at,recovery.retry_at,"
-                "COALESCE(synced.delta_message_id,0),COALESCE(synced.delta_refresh_generation,0) "
+                "COALESCE(synced.delta_message_id,0),COALESCE(synced.delta_refresh_generation,0),0,0 "
                 "FROM delta_access_recovery_state recovery JOIN synced_dialogs synced ON synced.dialog_id=recovery.dialog_id "
                 "WHERE synced.status='access_lost' "
-                "UNION ALL SELECT synced.dialog_id,0,NULL,NULL,COALESCE(synced.access_next_revalidate_at, "
+                "UNION ALL SELECT synced.dialog_id,0,NULL,NULL,MAX(COALESCE(synced.access_next_revalidate_at,0), "
                 "COALESCE(synced.access_lost_at,0)+?),COALESCE(synced.delta_message_id,0),"
-                "COALESCE(synced.delta_refresh_generation,0) FROM synced_dialogs synced WHERE synced.status='access_lost' "
+                "COALESCE(synced.delta_refresh_generation,0),COALESCE(synced.access_lost_at,0),"
+                "COALESCE((SELECT f.observation_order FROM dialog_fact_observations f "
+                "WHERE f.dialog_id=synced.dialog_id AND f.field='access_state'),0) "
+                "FROM synced_dialogs synced WHERE synced.status='access_lost' "
                 "AND NOT EXISTS (SELECT 1 FROM delta_access_recovery_state recovery WHERE recovery.dialog_id=synced.dialog_id)",
                 (self._policy.cooldown_seconds,),
             ).fetchall(),
         )
         candidates: list[tuple[float, int, WorkRevision]] = []
-        for dialog_id, is_recovery, total, probe_succeeded, release, delta_cursor, generation in rows:
+        for dialog_id, is_recovery, total, probe_succeeded, release, delta_cursor, generation, lost_at, order in rows:
             target = f"recovery:{int(dialog_id)}" if is_recovery else f"probe:{int(dialog_id)}"
             revision = WorkRevision(
                 WorkKey(self.demand_kind, self._account_id, target),
                 repr((total, probe_succeeded, f"{int(delta_cursor or 0)}:{int(generation or 0)}"))
                 if is_recovery
-                else str(
-                    int(
-                        cast(
-                            tuple[int],
-                            self._worker._conn.execute(
-                                "SELECT COALESCE(access_lost_at,0) FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
-                            ).fetchone(),
-                        )[0]
-                    )
-                ),
+                else repr((lost_at, order)),
             )
             if revision not in excluded:
                 candidates.append((float(release or 0), int(dialog_id), revision))
@@ -1348,6 +1457,19 @@ class DeltaAccessProbeDemandAdapter:
             return None
         release_at, _, selected = min(candidates, key=lambda item: (item[0] > now, item[0], item[1]))
         return DemandStatus(release_at=release_at, selected=selected)
+
+    @staticmethod
+    def _probe_revision(conn: sqlite3.Connection, dialog_id: int) -> str:
+        row = cast(
+            tuple[int, int] | None,
+            conn.execute(
+                "SELECT COALESCE(s.access_lost_at,0), COALESCE((SELECT f.observation_order "
+                "FROM dialog_fact_observations f WHERE f.dialog_id=s.dialog_id AND f.field='access_state'),0) "
+                "FROM synced_dialogs s WHERE s.dialog_id=?",
+                (dialog_id,),
+            ).fetchone(),
+        )
+        return repr(row)
 
     async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
         """Commit probe success before a later slice performs gap fill."""
@@ -1364,18 +1486,25 @@ class DeltaAccessProbeDemandAdapter:
         with durable_demand_context(DemandKind.DELTA_ACCESS_PROBE):
             with rpc_attempt_budget(budget):
                 if selected.key.target.startswith("recovery:"):
-                    dialog_id = int(selected.key.target.split(":", 1)[1])
-                    persisted = self._selected_persisted_work(selected, now)
-                    recovery = persisted[2] if persisted is not None and persisted[1] == selected.revision else None
-                    if recovery is None or recovery.dialog_id != dialog_id:
+                    recovery = self._selected_recovery(selected, now)
+                    if recovery is None:
                         return SliceOutcome(selected, SliceOutcomeKind.STALE)
                     successor = await self._run_observed_recovery_slice(budget, recovery)
                 else:
                     dialog_id = int(selected.key.target.split(":", 1)[1])
-                    successor = await self._probe_dialog_for_recovery(dialog_id, now)
+                    probe_result = await self._probe_dialog_for_recovery(dialog_id, now, selected)
+                    if isinstance(probe_result, SliceOutcome):
+                        return probe_result
+                    successor = probe_result
         if successor is None:
             return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
         return SliceOutcome(selected, SliceOutcomeKind.PROGRESSED, successor)
+
+    def _selected_recovery(self, selected: WorkRevision, now: int) -> _DurableAccessRecovery | None:
+        dialog_id = int(selected.key.target.split(":", 1)[1])
+        persisted = self._selected_persisted_work(selected, now)
+        recovery = persisted[2] if persisted is not None and persisted[1] == selected.revision else None
+        return recovery if recovery is not None and recovery.dialog_id == dialog_id else None
 
     def _validate_selected(self, selected: WorkRevision, now: float) -> SliceOutcome | None:
         if selected.key.account_id != self._account_id or selected.key.demand_kind is not self.demand_kind:
@@ -1394,32 +1523,34 @@ class DeltaAccessProbeDemandAdapter:
         return None
 
     def _selected_persisted_work(
-        self, selected: WorkRevision, now: int
+        self, selected: WorkRevision, now: int, *, conn: sqlite3.Connection | None = None
     ) -> tuple[float, str, _DurableAccessRecovery | None] | None:
         """Read one selected peer's local status without reselecting another peer."""
+        connection = self._worker._conn if conn is None else conn
         target_kind, _, raw_dialog_id = selected.key.target.partition(":")
         dialog_id = int(raw_dialog_id)
         if target_kind == "recovery":
             row = cast(
-                tuple[int | None, int, int | None, int, int] | None,
-                self._worker._conn.execute(
+                tuple[int | None, int, int | None, int, int, int | None] | None,
+                connection.execute(
                     "SELECT recovery.total_messages,recovery.probe_succeeded_at,recovery.retry_at,"
-                    "COALESCE(synced.delta_message_id,0),COALESCE(synced.delta_refresh_generation,0) "
+                    "COALESCE(synced.delta_message_id,0),COALESCE(synced.delta_refresh_generation,0),"
+                    "(SELECT observation_order FROM dialog_fact_observations WHERE dialog_id=recovery.dialog_id AND field='access_recovery_witness') "
                     "FROM delta_access_recovery_state recovery "
                     "JOIN synced_dialogs synced ON synced.dialog_id=recovery.dialog_id "
                     "WHERE recovery.dialog_id=? AND synced.status='access_lost'",
                     (dialog_id,),
                 ).fetchone(),
             )
-            if row is None:
+            if row is None or row[5] is None:
                 return None
-            recovery = _DurableAccessRecovery(dialog_id, row[0], row[2], row[1])
+            recovery = _DurableAccessRecovery(dialog_id, row[0], row[2], row[1], row[5])
             revision = repr((row[0], row[1], f"{row[3]}:{row[4]}"))
             return float(row[2] or 0), revision, recovery
 
         probe_row = cast(
             tuple[int, int | None, int, int, int] | None,
-            self._worker._conn.execute(
+            connection.execute(
                 "SELECT COALESCE(synced.access_lost_at,0),synced.access_next_revalidate_at,"
                 "COALESCE(synced.delta_message_id,0),COALESCE(synced.delta_refresh_generation,0),"
                 "EXISTS(SELECT 1 FROM delta_access_recovery_state recovery WHERE recovery.dialog_id=synced.dialog_id) "
@@ -1429,8 +1560,8 @@ class DeltaAccessProbeDemandAdapter:
         )
         if probe_row is None or probe_row[4]:
             return None
-        release = float(probe_row[1] if probe_row[1] is not None else probe_row[0] + self._policy.cooldown_seconds)
-        return release, str(probe_row[0]), None
+        release = float(max(probe_row[1] or 0, probe_row[0] + self._policy.cooldown_seconds))
+        return release, self._probe_revision(connection, dialog_id), None
 
     async def _run_observed_recovery_slice(
         self, budget: RpcAttemptBudget, recovery: _DurableAccessRecovery
@@ -1471,28 +1602,47 @@ class DeltaAccessProbeDemandAdapter:
             with rpc_scope(TelegramRpcSource.DELTA_SYNC):
                 return await self._probe.probe_total_messages(dialog_id)
 
-    async def _probe_dialog_for_recovery(self, dialog_id: int, now: int) -> str | None:
+    async def _probe_dialog_for_recovery(
+        self, dialog_id: int, now: int, selected: WorkRevision
+    ) -> str | SliceOutcome | None:
+        def prepare(conn: sqlite3.Connection) -> int | SliceOutcome:
+            with write_transaction(conn):
+                current_time = int(time.time())
+                if bound_profile_account(conn) != self._account_id:
+                    return SliceOutcome(selected, SliceOutcomeKind.STALE)
+                persisted = self._selected_persisted_work(selected, current_time, conn=conn)
+                if persisted is None or persisted[1] != selected.revision:
+                    return SliceOutcome(selected, SliceOutcomeKind.STALE)
+                if persisted[0] > current_time:
+                    return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+                return allocate_observation_order(conn)
+
+        order = await self._worker._writer.run(prepare)
+        if isinstance(order, SliceOutcome):
+            return order
         try:
             result = await self._request_probe(dialog_id)
         except (
             TelegramRpcAdmissionDeferred,
             TelegramRpcThrottled,
+            MessageHistoryAccessLostError,
+            MessageHistoryUnavailableError,
+            TimeoutError,
         ) as exc:
-            admission_error = exc
-            await self._worker._writer.run(lambda conn: self._handle_probe_error(conn, dialog_id, now, admission_error))
-            return None
-        except MessageHistoryAccessLostError as exc:
-            access_error = exc
-            await self._worker._writer.run(lambda conn: self._handle_probe_error(conn, dialog_id, now, access_error))
-            return None
-        except MessageHistoryUnavailableError as exc:
-            remote_error = exc
-            await self._worker._writer.run(lambda conn: self._handle_probe_error(conn, dialog_id, now, remote_error))
+            observed_at = int(time.time())
+            error = exc
+            await self._worker._writer.run(
+                lambda conn: self._handle_probe_error(conn, dialog_id, observed_at, order, error)
+            )
             return None
 
-        return await self._worker._writer.run(lambda conn: self._persist_probe_success(conn, dialog_id, now, result))
+        return await self._worker._writer.run(
+            lambda conn: self._persist_probe_success(conn, dialog_id, now, result, order)
+        )
 
-    def _handle_probe_error(self, conn: sqlite3.Connection, dialog_id: int, now: int, exc: BaseException) -> None:
+    def _handle_probe_error(
+        self, conn: sqlite3.Connection, dialog_id: int, now: int, order: int, exc: BaseException
+    ) -> None:
         if isinstance(exc, TelegramRpcAdmissionDeferred):
             logger.info(
                 "access_probe admission_deferred dialog_id=%d error_type=%s — preserving revalidation budget",
@@ -1500,33 +1650,49 @@ class DeltaAccessProbeDemandAdapter:
                 type(exc).__name__,
             )
             retry = max(1, int(exc.retry_after_seconds or 1))
-            with write_transaction(conn):
-                stamp_access_revalidation(conn, dialog_id, now, retry)
-            return
-        if isinstance(exc, MessageHistoryAccessLostError):
+        elif isinstance(exc, MessageHistoryAccessLostError):
             logger.debug("access_still_lost dialog_id=%d", dialog_id)
-            with write_transaction(conn):
-                stamp_access_revalidation(conn, dialog_id, now, self._policy.cooldown_seconds)
-            return
-        if isinstance(exc, TelegramRpcThrottled):
+            retry = self._policy.cooldown_seconds
+        elif isinstance(exc, TelegramRpcThrottled):
             _raise_if_latched(exc)
             retry = max(self._policy.cooldown_seconds, exc.retry_after_seconds or self._policy.cooldown_seconds)
-            with write_transaction(conn):
-                stamp_access_revalidation(conn, dialog_id, now, retry)
-            return
-        logger.warning("probe_rpc_error dialog_id=%d error=%s", dialog_id, exc)
+        else:
+            logger.warning("probe_rpc_error dialog_id=%d error=%s", dialog_id, exc)
+            retry = self._policy.cooldown_seconds
         with write_transaction(conn):
-            stamp_access_revalidation(conn, dialog_id, now, self._policy.cooldown_seconds)
+            if bound_profile_account(conn) != self._account_id:
+                return
+            current = cast(
+                tuple[int] | None,
+                conn.execute(
+                    "SELECT 1 FROM synced_dialogs s WHERE s.dialog_id=? AND s.status='access_lost' "
+                    "AND NOT EXISTS (SELECT 1 FROM dialog_fact_observations f WHERE f.dialog_id=s.dialog_id "
+                    "AND f.field='access_state' AND f.observation_order>=?)",
+                    (dialog_id, order),
+                ).fetchone(),
+            )
+            if current is not None:
+                stamp_access_revalidation(conn, dialog_id, now, retry)
 
     def _persist_probe_success(
-        self, conn: sqlite3.Connection, dialog_id: int, now: int, total_messages: int | None
+        self, conn: sqlite3.Connection, dialog_id: int, now: int, total_messages: int | None, order: int
     ) -> str | None:
         with write_transaction(conn):
+            if (
+                bound_profile_account(conn) != self._account_id
+                or conn.execute(
+                    "SELECT 1 FROM synced_dialogs WHERE dialog_id=? AND status='access_lost'", (dialog_id,)
+                ).fetchone()
+                is None
+                or not record_access_recovery_observation(conn, dialog_id, order)
+            ):
+                return None
             if not full_history_enabled(conn, dialog_id):
                 _restore_revalidated_access(
                     conn,
                     dialog_id,
                     total_messages=total_messages,
+                    observation_order=order,
                 )
                 return None
             conn.execute(
@@ -1555,20 +1721,36 @@ class DeltaAccessProbeDemandAdapter:
     async def _run_gap_fill_slice(self, recovery: _DurableAccessRecovery) -> tuple[bool, str | None]:
         if not full_history_enabled(self._worker._conn, recovery.dialog_id):
             self._worker._reset_delta_slice_state()
-            await self._worker._writer.run(lambda conn: _finish_durable_access_recovery(conn, recovery))
-            self._worker._last_delta_slice_skipped = True
-            return True, None
+            finished = await self._worker._writer.run(
+                lambda conn: _finish_durable_access_recovery(conn, recovery, self._account_id)
+            )
+            self._worker._last_delta_slice_skipped = finished
+            return finished, None
         await self._worker.fetch_delta_slice_for_dialog(
-            recovery.dialog_id, profile_owner_account_id=self._account_id, membership_observer=self._membership_observer
+            recovery.dialog_id,
+            profile_owner_account_id=self._account_id,
+            membership_observer=self._membership_observer,
+            access_loss_observer=self._access_loss_observer,
+            recovery=recovery,
         )
-        if self._worker._last_delta_slice_completed:
-            await self._worker._writer.run(lambda conn: _finish_durable_access_recovery(conn, recovery))
-            return True, None
         if self._worker._last_delta_slice_succeeded:
-            successor = await self._worker._writer.run(lambda conn: _set_access_recovery_retry(conn, recovery, None))
+            order = self._worker._last_delta_slice_observation_order
+            assert order is not None
+            recovery = replace(recovery, observation_order=order)
+        if self._worker._last_delta_slice_completed:
+            finished = await self._worker._writer.run(
+                lambda conn: _finish_durable_access_recovery(conn, recovery, self._account_id)
+            )
+            return finished, None
+        if self._worker._last_delta_slice_succeeded:
+            successor = await self._worker._writer.run(
+                lambda conn: _set_access_recovery_retry(conn, recovery, None, self._account_id)
+            )
             return False, successor
         await self._worker._writer.run(
-            lambda conn: _set_access_recovery_retry(conn, recovery, int(time.time()) + self._policy.cooldown_seconds)
+            lambda conn: _set_access_recovery_retry(
+                conn, recovery, int(time.time()) + self._policy.cooldown_seconds, self._account_id
+            )
         )
         return False, None
 

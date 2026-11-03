@@ -1194,3 +1194,151 @@ def test_sweep_membership_observation_follows_real_commit(monkeypatch: pytest.Mo
         assert conn.execute("SELECT is_service FROM messages WHERE message_id=8").fetchone() == (1,)
         assert len(observed) == 1 and observed[0].received == 1
         assert observed[0].ignored_account_mismatch == 1
+
+
+@pytest.mark.asyncio
+async def test_access_loss_uses_account_captured_before_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    from telethon.errors import ChannelPrivateError
+
+    with closing(_make_db()) as conn:
+        dialog_id = -100789000002
+        enroll_activity_dialog(conn, dialog_id, "supergroup", last_activity_at=int(time.time()))
+        conn.execute("UPDATE dialog_directory_state SET account_id=77 WHERE singleton=1")
+        conn.commit()
+        observed = []
+
+        async def resolve(client: object, dialog_id: int) -> object:
+            return object()
+
+        async def fail_after_account_change(client: object, request: object, *, timeout_s: float) -> object:
+            conn.execute("UPDATE dialog_directory_state SET account_id=88 WHERE singleton=1")
+            conn.commit()
+            raise ChannelPrivateError(request=None)
+
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", resolve)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fail_after_account_change)
+        await sweep_peer_once(
+            client=_FakeClient(),
+            conn=conn,
+            dialog_id=dialog_id,
+            offset_id=0,
+            min_id=0,
+            limit=10,
+            timeout_s=_TEST_TIMEOUT_S,
+            writer=inline_writer(conn),
+            profile_owner_account_id=77,
+            access_loss_observer=observed.append,
+        )
+        assert (
+            conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
+            != "access_lost"
+        )
+        assert len(observed) == 1 and observed[0].queued == 0
+
+
+@pytest.mark.asyncio
+async def test_access_loss_rolls_back_before_observer_on_membership_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    from telethon.errors import ChannelPrivateError
+
+    with closing(_make_db()) as conn:
+        dialog_id = -100789000003
+        enroll_activity_dialog(conn, dialog_id, "supergroup", last_activity_at=int(time.time()))
+        conn.execute("UPDATE dialog_directory_state SET account_id=77 WHERE singleton=1")
+        conn.commit()
+        observed = []
+
+        async def resolve(client: object, dialog_id: int) -> object:
+            return object()
+
+        async def fail_search(client: object, request: object, *, timeout_s: float) -> object:
+            raise ChannelPrivateError(request=None)
+
+        def fail_membership(*args: object, **kwargs: object) -> object:
+            raise RuntimeError("membership failure")
+
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", resolve)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fail_search)
+        monkeypatch.setattr("mcp_telegram.access_lifecycle.request_membership_refreshes", fail_membership)
+        with pytest.raises(RuntimeError, match="membership failure"):
+            await sweep_peer_once(
+                client=_FakeClient(),
+                conn=conn,
+                dialog_id=dialog_id,
+                offset_id=0,
+                min_id=0,
+                limit=10,
+                timeout_s=_TEST_TIMEOUT_S,
+                writer=inline_writer(conn),
+                profile_owner_account_id=77,
+                access_loss_observer=observed.append,
+            )
+        assert (
+            conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
+            != "access_lost"
+        )
+        assert observed == []
+
+
+@pytest.mark.asyncio
+async def test_access_loss_preserves_observation_time_when_writer_is_delayed(monkeypatch: pytest.MonkeyPatch) -> None:
+    from collections.abc import Callable
+    from types import SimpleNamespace
+
+    from telethon.errors import ChannelPrivateError
+
+    from mcp_telegram.entity_profile.membership import MembershipChange, MembershipSignalCounts
+    from mcp_telegram.sqlite_writer import SQLiteWriter
+
+    with closing(_make_db()) as conn:
+        dialog_id = -100789000004
+        enroll_activity_dialog(conn, dialog_id, "supergroup", last_activity_at=100)
+        conn.execute("UPDATE dialog_directory_state SET account_id=77 WHERE singleton=1")
+        conn.commit()
+        clock = [100]
+        captured: list[tuple[int, int | None]] = []
+
+        class DelayedWriter:
+            calls = 0
+
+            async def run[T](self, operation: Callable[[sqlite3.Connection], T]) -> T:
+                self.calls += 1
+                if self.calls == 2:
+                    clock[0] = 200
+                return operation(conn)
+
+        async def resolve(client: object, dialog_id: int) -> object:
+            return object()
+
+        async def fail_search(client: object, request: object, *, timeout_s: float) -> object:
+            raise ChannelPrivateError(request=None)
+
+        def capture_refresh(
+            db: sqlite3.Connection, owner: int, changes: list[MembershipChange], *, now: int
+        ) -> MembershipSignalCounts:
+            captured.append((now, changes[0].revision_at))
+            return MembershipSignalCounts()
+
+        monkeypatch.setattr(
+            "mcp_telegram.activity_peer_sweep.time", SimpleNamespace(time=lambda: clock[0], monotonic=time.monotonic)
+        )
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", resolve)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fail_search)
+        monkeypatch.setattr("mcp_telegram.access_lifecycle.request_membership_refreshes", capture_refresh)
+        await sweep_peer_once(
+            client=_FakeClient(),
+            conn=conn,
+            dialog_id=dialog_id,
+            offset_id=0,
+            min_id=0,
+            limit=10,
+            timeout_s=_TEST_TIMEOUT_S,
+            writer=cast(SQLiteWriter, DelayedWriter()),
+            profile_owner_account_id=77,
+        )
+        assert captured == [(200, 100)]
+        assert conn.execute("SELECT access_lost_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+            100,
+        )
+        assert conn.execute(
+            "SELECT occurred_at FROM conversation_history_events WHERE dialog_id=? AND kind='access_lost'", (dialog_id,)
+        ).fetchone() == (100,)

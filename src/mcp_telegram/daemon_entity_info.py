@@ -64,7 +64,6 @@ from .entity_profile.ports import (
     ChannelProfilePort,
     ChannelReferenceProvider,
     ChatAvatarHistoryPort,
-    CommonChatsPort,
     GroupProfilePort,
     ProfileCollectionPort,
     ProfilePairObservationHook,
@@ -388,7 +387,6 @@ class EntityInfoDeps:
     user_profile_port: UserProfilePort
     channel_profile_port: ChannelProfilePort
     channel_reference_provider: ChannelReferenceProvider
-    common_chats_port: CommonChatsPort
     user_avatar_history_port: UserAvatarHistoryPort
     chat_avatar_history_port: ChatAvatarHistoryPort
     get_dialog_placement: Callable[[int], dict[str, object]] | None = None

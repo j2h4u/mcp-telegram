@@ -4,7 +4,7 @@ import asyncio
 import json
 import sqlite3
 import time
-from collections.abc import Awaitable, Callable, Generator, Sequence
+from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,6 +44,7 @@ from mcp_telegram.dialog_sync import (
     DialogLightReconciliationDemandAdapter,
 )
 from mcp_telegram.drafts.owner import DraftMessageOwner
+from mcp_telegram.entity_profile.membership import MembershipSignalCounts
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, EntityRefreshCoordinator
 from mcp_telegram.event_handlers import UpdateProcessingBarrier
 from mcp_telegram.fact_hydration import FactHydrationDemandAdapter
@@ -285,6 +286,34 @@ def composition_dependencies(
         yield dependencies, objects
     finally:
         cast(sqlite3.Connection, objects["conn"]).close()
+
+
+def test_access_loss_observer_reaches_each_durable_producer(
+    composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
+) -> None:
+    class Observer:
+        def __init__(self) -> None:
+            self.sources: list[str] = []
+
+        def observe_delta_gap_fill(self, metrics: Mapping[str, int], *, reason: str) -> None:
+            del metrics, reason
+
+        def observe_membership(self, _counts: Mapping[str, int], *, source: str) -> None:
+            self.sources.append(source)
+
+    observer = Observer()
+    adapters = build_durable_adapter_map(composition_dependencies[0], observer=observer)
+    callbacks = (
+        cast(DeltaGapFillDemandAdapter, adapters[DemandKind.DELTA_GAP_FILL])._access_loss_observer,
+        cast(DeltaAccessProbeDemandAdapter, adapters[DemandKind.DELTA_ACCESS_PROBE])._access_loss_observer,
+        cast(FullSyncDemandAdapter, adapters[DemandKind.FULL_SYNC_PAGE])._access_loss_observer,
+        cast(HotActivityDemandAdapter, adapters[DemandKind.HOT_ACTIVITY_PAGE]).access_loss_observer,
+        cast(ColdPeerPageDemandAdapter, adapters[DemandKind.COLD_PEER_PAGE]).access_loss_observer,
+    )
+    for callback in callbacks:
+        assert callback is not None
+        callback(MembershipSignalCounts(received=1, queued=1))
+    assert observer.sources == ["access_loss"] * len(callbacks)
 
 
 def test_adapter_map_is_exact_against_literal_24_kind_class_map(

@@ -183,7 +183,7 @@ def test_access_lifecycle_suspends_and_restores_linked_chat_demand_without_chang
     conn.commit()
 
     assert read_fact(conn, suspended_channel).suspended is False
-    assert set_access_lost(conn, suspended_channel, 150, reason="test")
+    assert set_access_lost(conn, suspended_channel, 150, reason="test").changed
     suspended_fact = read_fact(conn, suspended_channel)
     assert suspended_fact.state is LinkedChatState.UNKNOWN
     assert suspended_fact.refresh_pending

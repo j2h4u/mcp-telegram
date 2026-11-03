@@ -207,6 +207,10 @@ def build_durable_adapter_map(
         if callable(observe_membership):
             observe_membership(counts.as_observation(), source="message_membership")
 
+    def access_loss_observer(counts: MembershipSignalCounts) -> None:
+        if callable(observe_membership):
+            observe_membership(counts.as_observation(), source="access_loss")
+
     adapters: dict[DemandKind, DurableDemandAdapter] = {
         DemandKind.MESSAGE_IMAGE_ACQUISITION: dependencies.image_worker,
         DemandKind.TOPIC_SNAPSHOT: TopicSnapshotDemandAdapter(
@@ -221,6 +225,7 @@ def build_durable_adapter_map(
             account_id=dependencies.account_id,
             observer=observer,
             membership_observer=membership_observer,
+            access_loss_observer=access_loss_observer,
         ),
         DemandKind.DM_DELETION_RECONCILIATION: DmDeletionReconciliationDemandAdapter(
             dependencies.conn,
@@ -235,6 +240,7 @@ def build_durable_adapter_map(
             account_id=dependencies.account_id,
             observer=observer,
             membership_observer=membership_observer,
+            access_loss_observer=access_loss_observer,
         ),
         DemandKind.HOT_ACTIVITY_PAGE: HotActivityDemandAdapter(
             dependencies.client,
@@ -245,6 +251,7 @@ def build_durable_adapter_map(
             account_id=dependencies.account_id,
             writer=dependencies.writer,
             membership_observer=membership_observer,
+            access_loss_observer=access_loss_observer,
         ),
         DemandKind.LIVE_HYDRATION_BATCH: FactHydrationDemandAdapter(
             dependencies.fact_hydration_worker,
@@ -255,7 +262,10 @@ def build_durable_adapter_map(
             dependencies.full_sync_worker, account_id=dependencies.account_id
         ),
         DemandKind.FULL_SYNC_PAGE: FullSyncDemandAdapter(
-            dependencies.full_sync_worker, account_id=dependencies.account_id, membership_observer=membership_observer
+            dependencies.full_sync_worker,
+            account_id=dependencies.account_id,
+            membership_observer=membership_observer,
+            access_loss_observer=access_loss_observer,
         ),
         DemandKind.DIALOG_BOOTSTRAP: CanonicalDialogDirectoryDemandAdapter(
             dependencies.dialog_directory,
@@ -292,6 +302,7 @@ def build_durable_adapter_map(
             account_id=dependencies.account_id,
             writer=dependencies.writer,
             membership_observer=membership_observer,
+            access_loss_observer=access_loss_observer,
         ),
         DemandKind.BACKFILL_HYDRATION_BATCH: FactHydrationDemandAdapter(
             dependencies.fact_hydration_worker,

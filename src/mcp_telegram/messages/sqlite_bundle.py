@@ -91,19 +91,11 @@ class MessageWriteResult:
     accepted_count: int
     membership_counts: MembershipSignalCounts
 
-    @property
-    def profile_refresh_queued(self) -> bool:
-        return bool(self.membership_counts.queued or self.membership_counts.coalesced)
-
 
 @dataclass(frozen=True, slots=True)
 class EditedMessageWriteResult:
     version: int | None
     membership_counts: MembershipSignalCounts
-
-    @property
-    def profile_refresh_queued(self) -> bool:
-        return bool(self.membership_counts.queued or self.membership_counts.coalesced)
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,13 +151,11 @@ def _read_stored_page(
                 int | None,
                 str | None,
                 int | None,
-                int | None,
-                int | None,
             ]
         ],
         conn.execute(
             prefix + "SELECT w.dialog_id,w.message_id,m.message_id,m.text,f.stemmed_text,"
-            "f.dialog_id,f.message_id,t.text,t.transcription_id,m.is_service,m.service_action,m.sender_id,m.sent_at,m.edit_date "
+            "f.dialog_id,f.message_id,t.text,t.transcription_id,m.is_service,m.service_action,m.sender_id "
             "FROM wanted w LEFT JOIN messages m USING(dialog_id,message_id) "
             "LEFT JOIN message_fts_keys k ON k.dialog_id=w.dialog_id AND k.message_id=w.message_id "
             "LEFT JOIN messages_fts f ON f.rowid=k.id "
@@ -180,9 +170,9 @@ def _read_stored_page(
             indexed,
             (fts_dialog, fts_message) == (dialog_id, message_id),
             None if transcript_id is None else (cast(str, transcript), transcript_id),
-            None if present is None else MembershipFact(service or 0, action, sender, sent, edit),
+            None if present is None else MembershipFact(service or 0, action, sender),
         )
-        for dialog_id, message_id, present, text, indexed, fts_dialog, fts_message, transcript, transcript_id, service, action, sender, sent, edit in rows
+        for dialog_id, message_id, present, text, indexed, fts_dialog, fts_message, transcript, transcript_id, service, action, sender in rows
     }
 
 
@@ -510,9 +500,7 @@ def _membership_changes(
     for item in extracted:
         message = item.message
         before = facts[(message.dialog_id, message.message_id)].membership
-        after = MembershipFact(
-            message.is_service, message.service_action, message.sender_id, message.sent_at, message.edit_date
-        )
+        after = MembershipFact(message.is_service, message.service_action, message.sender_id)
         subjects = changed_members(before, after)
         if subjects:
             revision = message.edit_date if before is not None else (message.edit_date or message.sent_at)

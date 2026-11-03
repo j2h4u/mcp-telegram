@@ -44,7 +44,6 @@ from mcp_telegram.sync_transactions import write_transaction
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     ClientChatAvatarHistoryPort,
-    ClientCommonChatsPort,
     ClientUserAvatarHistoryPort,
     FakeUserProfilePort,
     LoudChannelProfilePort,
@@ -114,7 +113,6 @@ def make_server(
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=user_profile_port if user_profile_port is not None else LoudUserProfilePort(),
-        common_chats_port=ClientCommonChatsPort(client),
         user_avatar_history_port=ClientUserAvatarHistoryPort(client),
         chat_avatar_history_port=ClientChatAvatarHistoryPort(client),
         policy=make_daemon_api_policy(),
