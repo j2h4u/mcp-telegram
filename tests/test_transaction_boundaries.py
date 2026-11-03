@@ -371,3 +371,25 @@ class RuntimeObservationSink:
     violations = gate.boundary_violations(root)
     assert len(violations) == 3
     assert not any("in _bootstrap_sync_database" in item for item in violations)
+
+
+def test_schema_migration_exception_does_not_allow_runtime_transactions(tmp_path: Path) -> None:
+    root = _source_tree(
+        tmp_path,
+        {
+            "sync_db.py": """
+def _apply_migration_96(conn):
+    conn.execute('BEGIN IMMEDIATE')
+    conn.commit()
+    conn.rollback()
+
+def _runtime_migration_96(conn):
+    conn.execute('BEGIN IMMEDIATE')
+    conn.commit()
+    conn.rollback()
+"""
+        },
+    )
+    violations = gate.boundary_violations(root)
+    assert len(violations) == 3
+    assert all("in _runtime_migration_96" in item for item in violations)
