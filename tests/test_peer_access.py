@@ -38,9 +38,13 @@ async def test_writer_reconciles_commit_and_rollback(tmp_path: Path) -> None:
     def loss(conn: sqlite3.Connection) -> None:
         with write_transaction(conn):
             revoke_peer(conn, 11)
+            assert not access.confirmed_lost(scope, 11)
             conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (11,'access_lost')")
 
     await writer.run(loss)
+    assert access.confirmed_lost(scope, 11)
+    assert not access.confirmed_lost(None, 11)
+    assert not access.confirmed_lost(TelegramAuthScope(1, 43, 2, 9), 11)
     assert not access.claim(old)
     assert not access.claim(access.capture(scope, (11,), None))
     probe = access.capture(scope, (11,), 11)
@@ -50,11 +54,13 @@ async def test_writer_reconciles_commit_and_rollback(tmp_path: Path) -> None:
     def failed_restore(conn: sqlite3.Connection) -> None:
         with write_transaction(conn):
             revoke_peer(conn, 11)
+            assert not access.confirmed_lost(scope, 11)
             conn.execute("UPDATE synced_dialogs SET status='synced' WHERE dialog_id=11")
             raise ValueError("rollback")
 
     with pytest.raises(ValueError, match="rollback"):
         await writer.run(failed_restore)
+    assert access.confirmed_lost(scope, 11)
     assert not access.claim(probe)
     assert not access.claim(access.capture(scope, (11,), None))
 
@@ -64,6 +70,7 @@ async def test_writer_reconciles_commit_and_rollback(tmp_path: Path) -> None:
             conn.execute("UPDATE synced_dialogs SET status='synced' WHERE dialog_id=11")
 
     await writer.run(restore)
+    assert not access.confirmed_lost(scope, 11)
     assert access.claim(access.capture(scope, (11,), None))
     with pytest.raises(PeerAccessRejectedError):
         access.capture(TelegramAuthScope(1, 43, 2, 9), (11,), None)

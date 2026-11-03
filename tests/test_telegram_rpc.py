@@ -111,6 +111,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcScope,
 )
 from mcp_telegram.telegram_transport import GuardedConnectionTcpFull, GuardedMTProtoSender
+from mcp_telegram.telegram_update_admission import GateMessageBox
 from sqlite_writer_helpers import event_manager, inline_writer
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
@@ -4914,6 +4915,60 @@ async def test_difference_too_long_waits_for_scoped_scheduled_recovery(
 
     assert await gate._call_update_difference(rpc_request, ordered=False) is response
     assert order == ["response", (target, reason)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claimed", [False, True])
+async def test_local_update_denial_only_retires_confirmed_unclaimed_channel(
+    monkeypatch: pytest.MonkeyPatch, claimed: bool
+) -> None:
+    from mcp_telegram.peer_access import PeerAccessRejectedError
+
+    gate = _gate()
+    gate._update_loop_owner = asyncio.current_task()
+    request = functions.updates.GetChannelDifferenceRequest(
+        types.InputChannel(123, 456), types.ChannelMessagesFilterEmpty(), 1, 100
+    )
+
+    async def rejected(_request: object, *, ordered: bool) -> object:
+        del _request, ordered
+        raise PeerAccessRejectedError("peer_access_lost", was_claimed=claimed)
+
+    monkeypatch.setattr(gate, "_call_classified_difference", rejected)
+    monkeypatch.setattr(gate, "_confirmed_channel_access_loss", lambda _request: True)
+    expected = OSError if claimed else ValueError
+    with pytest.raises(expected):
+        await gate._call_update_difference(request, ordered=False)
+    box = cast(GateMessageBox, gate._message_box)
+    assert (123 in box._access_loss_ends) is not claimed
+    await gate.close_rpc_scheduler()
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_update_denial_preserves_vendor_gap_and_nonvendor_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mcp_telegram.peer_access import PeerAccessRejectedError
+
+    gate = _gate()
+    request = functions.updates.GetChannelDifferenceRequest(
+        types.InputChannel(123, 456), types.ChannelMessagesFilterEmpty(), 1, 100
+    )
+
+    async def rejected(_request: object, *, ordered: bool) -> object:
+        del _request, ordered
+        raise PeerAccessRejectedError("peer_access_lost")
+
+    monkeypatch.setattr(gate, "_call_classified_difference", rejected)
+    monkeypatch.setattr(gate, "_confirmed_channel_access_loss", lambda _request: False)
+    gate._update_loop_owner = asyncio.current_task()
+    with pytest.raises(OSError, match="temporarily unavailable"):
+        await gate._call_update_difference(request, ordered=False)
+    assert not cast(GateMessageBox, gate._message_box)._access_loss_ends
+    gate._update_loop_owner = None
+    with pytest.raises(PeerAccessRejectedError):
+        await gate._call_update_difference(request, ordered=False)
+    await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio

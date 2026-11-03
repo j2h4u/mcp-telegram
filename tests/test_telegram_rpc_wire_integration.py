@@ -224,6 +224,38 @@ async def test_queued_peer_loss_rejects_physical_write_and_restoration_does_not_
     conn.close()
 
 
+async def test_peer_loss_after_claim_never_replays_or_erases_uncertain_outcome(wire: _WireHarness) -> None:
+    from mcp_telegram.peer_access import PeerAccessRejectedError
+
+    gate, sender, connection, sink = wire
+    access = gate._peer_access
+    assert access is not None
+    budget = RpcAttemptBudget(2)
+    scope = TelegramRpcScope(
+        TelegramRpcSource.MCP_INTERACTIVE,
+        RpcServiceClass.INTERACTIVE,
+        time.monotonic() + 10,
+        asyncio.current_task(),
+        attempt_budget=budget,
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    request = messages.GetHistoryRequest(types.InputPeerUser(11, 1), 0, None, 0, 1, 0, 0, 0)
+    future = sender.send_owned(request, scope)
+    state = await sender._send_queue.next_state()
+    await sender._prepare_state(state)
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    access.revoke(11)
+    gate._admission_scheduler._next_write_at = 0
+    await sender._prepare_state(state)
+    assert not sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    with pytest.raises(PeerAccessRejectedError) as rejected:
+        await future
+    assert rejected.value.was_claimed
+    assert len(sink.frames) == 1 and budget.attempts == 1
+    status = gate.account_safety_status()
+    assert status is not None and status["unresolved_request_count"] == 1
+
+
 async def test_only_selected_access_probe_can_write_to_lost_peer(wire: _WireHarness) -> None:
     from mcp_telegram.peer_access import PeerAccessRejectedError
 

@@ -4578,7 +4578,7 @@ class TelegramRpcGate(TelegramClient):
             and owner.peer_tokens
             and (self.retained_auth_scope() != access.scope or not access.claim(owner.peer_tokens))
         ):
-            raise PeerAccessRejectedError("peer_access_lost")
+            raise PeerAccessRejectedError("peer_access_lost", was_claimed=owner.claimed > 0)
 
     def _is_update_difference_owner(self, owner: _WireAttempt) -> bool:
         return self._is_update_difference_scope(owner.scope)
@@ -6395,6 +6395,41 @@ class TelegramRpcGate(TelegramClient):
             if not connection_owned and exc.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
                 raise OSError("Telegram update difference admission deadline elapsed") from exc
             raise
+        except PeerAccessRejectedError as exc:
+            self._handle_update_access_rejection(request, exc, task=task, connection_owned=connection_owned)
+
+    def _handle_update_access_rejection(
+        self,
+        request: object,
+        error: PeerAccessRejectedError,
+        *,
+        task: asyncio.Task[object] | None,
+        connection_owned: bool,
+    ) -> Never:
+        if task is not self._update_loop_owner or connection_owned:
+            raise error
+        if (
+            not error.was_claimed
+            and type(request) is GetChannelDifferenceRequest
+            and isinstance(self._message_box, GateMessageBox)
+        ):
+            channel_request = cast(GetChannelDifferenceRequest, request)
+            if self._confirmed_channel_access_loss(channel_request):
+                self._message_box.retire_access_lost(
+                    channel_request, lambda: self._confirmed_channel_access_loss(channel_request)
+                )
+                raise ValueError("Telegram channel access is unavailable") from error
+        raise OSError("Telegram update difference access is temporarily unavailable") from error
+
+    def _confirmed_channel_access_loss(self, request: GetChannelDifferenceRequest) -> bool:
+        access = self._peer_access
+        if access is None:
+            return False
+        try:
+            dialog_id = int(get_peer_id(request.channel))
+        except TypeError, ValueError:
+            return False
+        return access.confirmed_lost(self.retained_auth_scope(), dialog_id)
 
     async def _recover_scheduled_difference_gap(self, request: object, result: object) -> None:
         if self._authentication_mode:

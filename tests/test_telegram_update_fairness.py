@@ -7,13 +7,29 @@ from typing import cast
 
 import pytest
 from telethon import types
-from telethon._updates import GapError, MessageBox, SessionState
+from telethon._updates import GapError, MessageBox, PrematureEndReason, SessionState
 from telethon._updates.messagebox import ENTRY_ACCOUNT
 
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred
 from mcp_telegram.telegram_update_admission import GateMessageBox, UpdateIntakeQueue
 from tests.test_telegram_rpc_wire_integration import _WireHarness
 from tests.test_telegram_rpc_wire_integration import wire as wire
+
+
+@pytest.mark.parametrize("still_lost", [False, True])
+def test_local_access_loss_marker_rechecks_before_channel_retirement(wire: _WireHarness, still_lost: bool) -> None:
+    gate = wire[0]
+    box, _ = setup_gap(wire)
+    box.try_set_channel_state(123, 20)
+    box.try_begin_get_diff(123, "access test")
+    request = types.InputChannel(123, 456)
+    from telethon.tl.functions.updates import GetChannelDifferenceRequest
+
+    difference = GetChannelDifferenceRequest(request, types.ChannelMessagesFilterEmpty(), 20, 10)
+    box.retire_access_lost(difference, lambda: still_lost)
+    box.end_channel_difference(difference, PrematureEndReason.TEMPORARY_SERVER_ISSUES, gate._mb_entity_cache)
+    assert (123 in box.map) is not still_lost
+    assert (123 in box.getting_diff_for) is not still_lost
 
 
 def setup_gap(wire: _WireHarness) -> tuple[GateMessageBox, datetime]:

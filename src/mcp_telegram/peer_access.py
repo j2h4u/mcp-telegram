@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 class PeerAccessRejectedError(RuntimeError):
     """A peer was inaccessible before this physical attempt."""
 
+    def __init__(self, reason: str, *, was_claimed: bool = False) -> None:
+        super().__init__(reason)
+        self.was_claimed = was_claimed
+
 
 class PeerAccess:
     def __init__(self, scope: TelegramAuthScope) -> None:
@@ -76,6 +80,17 @@ class PeerAccess:
             return not self._closed and all(
                 token is not None and token.scope == self.scope and cast(ScopeCell, token._owner).claim(token)
                 for token in tokens
+            )
+
+    def confirmed_lost(self, scope: TelegramAuthScope | None, dialog_id: int) -> bool:
+        """Report committed access loss only for the active account scope."""
+        with self._lock:
+            return (
+                not self._closed
+                and scope is not None
+                and scope == self.scope
+                and dialog_id in self._denied
+                and dialog_id not in self._dirty
             )
 
     def revoke(self, dialog_id: int) -> None:
