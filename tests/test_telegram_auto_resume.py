@@ -238,7 +238,7 @@ def _wire_clock(wire: _WireHarness, monkeypatch: pytest.MonkeyPatch) -> Clock:
 
 @pytest.fixture
 async def trial_wire(  # noqa: PLR0915 - wire setup and teardown share ownership
-    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, request: pytest.FixtureRequest
 ) -> AsyncIterator[tuple[_WireHarness, Clock]]:
     gate = wire[0]
     clock = _wire_clock(wire, monkeypatch)
@@ -275,14 +275,17 @@ async def trial_wire(  # noqa: PLR0915 - wire setup and teardown share ownership
     fresh.configure_auto_resume(enabled=True)
     await fresh.prepare_startup_safety()
     await fresh.verify_startup_account(42)
-    path = tmp_path / "trial-sync.db"
-    ensure_sync_schema(path)
-    writer = await SQLiteWriter.open(path)
-    scope = fresh.retained_auth_scope()
-    assert scope is not None
-    access = PeerAccess(scope)
-    await writer.run(access.bind)
-    fresh.bind_peer_access(access)
+    writer: SQLiteWriter | None = None
+    access: PeerAccess | None = None
+    if getattr(request, "param", "bound") != "startup":
+        path = tmp_path / "trial-sync.db"
+        ensure_sync_schema(path)
+        writer = await SQLiteWriter.open(path)
+        scope = fresh.retained_auth_scope()
+        assert scope is not None
+        access = PeerAccess(scope)
+        await writer.run(access.bind)
+        fresh.bind_peer_access(access)
     recovery = fresh._ensure_safety_ledger()._automatic_recovery()
     assert recovery is not None and recovery["state"] == "consumed"
     try:
@@ -295,8 +298,9 @@ async def trial_wire(  # noqa: PLR0915 - wire setup and teardown share ownership
         await asyncio.gather(*sender._observing, return_exceptions=True)
         await fresh._admission_scheduler.close()
         await connection.disconnect()
-        await writer.run(access.unbind)
-        await writer.aclose()
+        if writer is not None and access is not None:
+            await writer.run(access.unbind)
+            await writer.aclose()
 
 
 async def _prepared_packet(wire: _WireHarness, clock: Clock) -> tuple[asyncio.Future[object], _OwnedPacket]:

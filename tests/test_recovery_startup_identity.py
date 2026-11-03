@@ -10,6 +10,7 @@ from telethon.tl import functions, types
 from mcp_telegram import telegram_demand, telegram_rpc_scheduler
 from mcp_telegram.daemon import _acquire_startup_identity_before_updates
 from mcp_telegram.dialog_directory import CanonicalDialogDirectory
+from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import _open_sync_db
 from mcp_telegram.telegram_demand import RpcAttemptBudget, demand_context
 from mcp_telegram.telegram_rpc import _WireAttempt
@@ -22,6 +23,7 @@ from tests.test_telegram_rpc_wire_integration import _WireHarness
 from tests.test_telegram_rpc_wire_integration import wire as wire
 
 
+@pytest.mark.parametrize("trial_wire", ["startup"], indirect=True)
 async def test_consumed_trial_runs_real_startup_self_probe_once(  # noqa: PLR0914, PLR0915
     trial_wire: tuple[_WireHarness, Clock], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -34,6 +36,7 @@ async def test_consumed_trial_runs_real_startup_self_probe_once(  # noqa: PLR091
     monkeypatch.setattr(telegram_rpc_scheduler, "time", clock)
     gate._admission_scheduler._clock = loop.time
     conn = _open_sync_db(tmp_path / "sync.db")
+    writer = await SQLiteWriter.open(tmp_path / "sync.db")
     bound: list[int] = []
 
     class Directory:
@@ -42,7 +45,7 @@ async def test_consumed_trial_runs_real_startup_self_probe_once(  # noqa: PLR091
 
     api = _ApiStub()
     api._client = gate
-    ctx = _typed_ctx(conn=conn, client=gate, api_server=api, self_profile_cadence=_CadenceStub())
+    ctx = _typed_ctx(conn=conn, client=gate, api_server=api, self_profile_cadence=_CadenceStub(), writer=writer)
     task = asyncio.create_task(
         _acquire_startup_identity_before_updates(ctx, cast(CanonicalDialogDirectory, Directory()))
     )
@@ -67,6 +70,7 @@ async def test_consumed_trial_runs_real_startup_self_probe_once(  # noqa: PLR091
         state.future.set_result([types.User(id=42, is_self=True)])
         result = await asyncio.wait_for(task, 3)
         assert result.result().account_id == 42
+        assert ctx.peer_access_bound and ctx.peer_access is gate._peer_access
         assert bound == [42] and api.self_id == 42
         assert gate.automatic_trial_active()
         assert len(sink.frames) == 1
@@ -92,4 +96,11 @@ async def test_consumed_trial_runs_real_startup_self_probe_once(  # noqa: PLR091
         if not task.done():
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-        conn.close()
+        try:
+            if ctx.peer_access_bound and ctx.peer_access is not None:
+                await writer.run(ctx.peer_access.unbind)
+        finally:
+            try:
+                await writer.aclose()
+            finally:
+                conn.close()

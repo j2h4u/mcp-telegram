@@ -8,6 +8,7 @@ from typing import cast
 import pytest
 from telethon.tl import functions
 
+from mcp_telegram.peer_access import peer_target
 from mcp_telegram.telegram_demand import AcquisitionKind, DemandStatus, DurableDemandAdapter
 from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator, _Invocation
 from mcp_telegram.telegram_demand_progress import SliceOutcomeKind, WorkKey, WorkRevision
@@ -76,7 +77,8 @@ def _capacity_coordinator(
         with rpc_scope(TelegramRpcSource.FACT_HYDRATION_LIVE, acquisition_kind=AcquisitionKind.MESSAGE_LOOKUP):
             with rpc_attempt_budget(adapter.run_calls[-1]):
                 try:
-                    await gate(functions.messages.GetMessagesRequest([]))
+                    with peer_target(42):
+                        await gate(functions.messages.GetMessagesRequest([]))
                 except TelegramRpcAdmissionDeferred as exc:
                     deferrals.append(exc)
                     raise
