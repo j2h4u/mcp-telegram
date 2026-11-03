@@ -81,6 +81,14 @@ class RpcAttemptEvidence:
     draft_mutation_dispatched: bool = False
     draft_postflight_dispatched: bool = False
     scheduled_mutation_dispatched: bool = False
+    folder_preflight_dispatched: bool = False
+    folder_mutation_dispatched: bool = False
+    folder_postflight_dispatched: bool = False
+    note_target: int | None = None
+    note_config_dispatched: bool = False
+    note_preflight_dispatched: bool = False
+    note_mutation_dispatched: bool = False
+    note_postflight_dispatched: bool = False
 
     def record_dispatch(self) -> None:
         """Record one sender dispatch without changing transport behavior."""
@@ -278,11 +286,21 @@ def create_demand_token(
     if not isinstance(kind, DemandKind):
         raise TypeError("kind must be a DemandKind")
     contract = demand_contract(kind)
+    now = time.monotonic()
+    if kind in {DemandKind.FOLDER_COMMAND, DemandKind.NOTE_COMMAND}:
+        _validate_timestamp(now, "now")
+        if deadline is not None:
+            _validate_timestamp(deadline, "caller_deadline")
+            if deadline == 0:
+                raise ValueError("caller_deadline must be a positive monotonic timestamp")
+        command_deadline = now + 25.0 if deadline is None else min(now + 25.0, deadline)
+    else:
+        command_deadline = resolve_admission_deadline(contract, deadline, now=now)
     return DemandToken(
         kind=kind,
         source=contract.source,
         service_class=contract.service_class,
-        admission_deadline=resolve_admission_deadline(contract, deadline, now=time.monotonic()),
+        admission_deadline=command_deadline,
         acquisition_kind=None,
         owner_task=_current_task(),
         attempt_evidence=RpcAttemptEvidence(),

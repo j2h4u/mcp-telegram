@@ -64,6 +64,12 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "event_handlers.py",
             "fact_hydration.py",
             "feedback_db.py",
+            "contact_notes/commands.py",  # Account-fenced note command and receipt coordination.
+            "contact_notes/domain.py",  # Writer-only authority for note physical attempts.
+            "contact_notes/receipts.py",  # Durable note attempt and verification receipts.
+            "contact_notes/state.py",  # Local account-scoped canonical note projection.
+            "folders/command_receipts.py",  # Durable folder attempt and verification receipts.
+            "folders/commands.py",  # Folder command owner and writer-bound preclaim.
             "folders/sqlite_repository.py",
             "folders/refresh.py",  # Typed writer callback for repository CAS and own-transaction receipt.
             "folders/ports.py",  # Transaction-local projection binding to the shared SQLite owner.
@@ -135,6 +141,11 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "drafts/snapshot.py",  # Private native composition codec and request construction.
             "drafts/commands.py",  # Explicit draft mutation owner, using the sole RPC gate.
             "event_handlers.py",
+            "contact_notes/commands.py",  # Native note command through the sole gateway.
+            "contact_notes/composition.py",  # Native note intent construction.
+            "contact_notes/domain.py",  # Native note request verification.
+            "contact_notes/intake.py",  # Native note body and supplied update classification.
+            "folders/commands.py",  # Native folder reconstruction through the sole gateway.
             "folders/telegram_adapter.py",
             "entity_profile/updates.py",  # Normalizes supplied Telegram updates; never acquires remotely.
             "messages/telegram_adapter.py",

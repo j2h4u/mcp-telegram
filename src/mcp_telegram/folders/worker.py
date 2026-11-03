@@ -47,6 +47,11 @@ class FolderAttemptResult(StrEnum):
     UNEXPECTED = "unexpected"
 
 
+class FolderVerification(Protocol):
+    def verification_status(self, now: float, excluded: frozenset[WorkRevision]) -> DemandStatus | None: ...
+    async def verification_slice(self, budget: RpcAttemptBudget) -> SliceOutcome: ...
+
+
 class FolderProjectionWorker:
     def __init__(  # noqa: PLR0913 - explicit lifecycle and writer dependencies
         self,
@@ -96,14 +101,22 @@ class FolderProjectionWorker:
             except TimeoutError:
                 await self._attempt("scheduled")
 
-    async def _attempt(self, reason: str, budget: RpcAttemptBudget | None = None) -> FolderRefreshResult | None:
+    async def force_refresh(self, budget: RpcAttemptBudget | None = None) -> FolderRefreshResult | None:
+        """Start a new observation only when no acquisition is in flight."""
+        if self._attempt_lock.locked():
+            return None
+        return await self._attempt("verification", budget, force=True)
+
+    async def _attempt(
+        self, reason: str, budget: RpcAttemptBudget | None = None, *, force: bool = False
+    ) -> FolderRefreshResult | None:
         del reason
         async with self._attempt_lock:
             now = int(self._clock())
-            if await self._attempt_preflight(now, budget):
+            if not force and await self._attempt_preflight(now, budget):
                 return None
             try:
-                receipt = await self._refresh_once(now, budget)
+                receipt = await self._refresh_once(now, budget, force=force)
             except asyncio.CancelledError:
                 raise
             except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending, TelegramRpcThrottled:
@@ -126,12 +139,13 @@ class FolderProjectionWorker:
             return True
         return budget is not None and budget.exhausted and not budget.can_prepare_retry
 
-    async def _refresh_once(self, now: int, budget: RpcAttemptBudget | None) -> FolderRefreshResult:
+    async def _refresh_once(self, now: int, budget: RpcAttemptBudget | None, *, force: bool) -> FolderRefreshResult:
         if budget is None:
             return await self._refresher.refresh(completed_at=now)
         with rpc_attempt_budget(budget):
             return await self._refresher.refresh(
-                completed_at=now, expected_revision=None if budget.selected is None else budget.selected.revision
+                completed_at=now,
+                expected_revision=None if force or budget.selected is None else budget.selected.revision,
             )
 
     async def _handle_refresh_error(self, exc: Exception) -> bool:
@@ -167,13 +181,25 @@ class FolderProjectionWorker:
 class FolderProjectionDemandAdapter(DurableDemandAdapter):
     demand_kind = DemandKind.FOLDER_SNAPSHOT
 
-    def __init__(self, worker: FolderProjectionWorker, *, account_id: int) -> None:
+    def __init__(
+        self, worker: FolderProjectionWorker, *, account_id: int, verification: FolderVerification | None = None
+    ) -> None:
         self._worker = worker
         if type(account_id) is not int or account_id <= 0:
             raise ValueError("account_id must be a positive integer")
         self._account_id = account_id
+        self._verification = verification
 
     def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
+        snapshot = self._snapshot_status(now, excluded)
+        verification = None if self._verification is None else self._verification.verification_status(now, excluded)
+        if snapshot is None:
+            return verification
+        if verification is None:
+            return snapshot
+        return verification if verification.release_at <= snapshot.release_at else snapshot
+
+    def _snapshot_status(self, now: float, excluded: frozenset[WorkRevision]) -> DemandStatus | None:
         repository = self._worker._repository
         retry = repository.read_next_retry_at()
         outcome = repository.read_last_outcome()
@@ -191,6 +217,9 @@ class FolderProjectionDemandAdapter(DurableDemandAdapter):
         if success is None:
             selected = self._selected(repository)
             return None if selected in excluded else DemandStatus(release_at=now, selected=selected)
+        if not repository.rules_are_fresh(now=int(now)):
+            selected = self._selected(repository)
+            return None if selected in excluded else DemandStatus(release_at=now, selected=selected)
         deadline = success + RULE_TTL_SECONDS
         selected = self._selected(repository)
         return (
@@ -200,7 +229,7 @@ class FolderProjectionDemandAdapter(DurableDemandAdapter):
         )
 
     def _selected(self, repository: FolderSnapshotRepository) -> WorkRevision:
-        revision = repr(repository.read_snapshot_revision())
+        revision = repr((repository.read_snapshot_revision(), repository.read_catalog_identity()))
         return WorkRevision(WorkKey(self.demand_kind, self._account_id, "folder-snapshot"), revision)
 
     async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
@@ -212,6 +241,11 @@ class FolderProjectionDemandAdapter(DurableDemandAdapter):
             return SliceOutcome(selected, SliceOutcomeKind.STALE)
         if budget.exhausted and not budget.can_prepare_retry:
             return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        if selected.key.target.startswith("receipt:"):
+            if self._verification is None:
+                return SliceOutcome(selected, SliceOutcomeKind.STALE)
+            with durable_demand_context(self.demand_kind):
+                return await self._verification.verification_slice(budget)
         with durable_demand_context(self.demand_kind):
             try:
                 result = await self._worker._attempt("demand", budget)

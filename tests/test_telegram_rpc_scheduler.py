@@ -956,3 +956,25 @@ async def test_pressure_eviction_and_shutdown_preserve_counts(
     assert "method=A status=evicted" in summaries[0] and "count=2" in summaries[0]
     assert all("status=shutdown" in message and "count=1" in message for message in summaries[1:])
     assert len(events) == 4
+
+
+@pytest.mark.parametrize("start,expires", [(100.0, 115.0), (120.0, 125.0)])
+async def test_native_admission_expires_before_dispatch_at_attempt_or_common_deadline(
+    start: float, expires: float
+) -> None:
+    clock = [start]
+    limiter = _ControlledLimiter()
+    scheduler = _scheduler(
+        policy=TelegramRpcSchedulerConfig(interactive_deadline_seconds=40), limiter=limiter, clock=lambda: clock[0]
+    )
+    scope = replace(_scope(TelegramRpcSource.NOTE_COMMAND), deadline=125.0)
+    waiting = asyncio.create_task(scheduler.admit(scope))
+    try:
+        await _wait_until(lambda: limiter.acquisitions == 1)
+        clock[0] = expires
+        assert scheduler.expire_due() == 1
+        with pytest.raises(RpcAdmissionExpiredError):
+            await waiting
+        assert scope.attempt_evidence is not None and scope.attempt_evidence.actual_attempts == 0
+    finally:
+        await scheduler.close()

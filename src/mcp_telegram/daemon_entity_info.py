@@ -25,6 +25,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
 )
 
 from .auth_scope import TelegramAuthScope
+from .contact_notes.intake import intake_marker, track_contact_note
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_identity import capture_identity_baseline
 from .entity_profile.contracts import (
@@ -44,6 +45,7 @@ from .entity_profile.contracts import (
     ChannelReference,
     ChatAvatarReference,
     ChatCurrentPhoto,
+    CommandProfileAcquisition,
     GroupProfileObservation,
     GroupReference,
     ProfileAcquisitionEvidence,
@@ -85,6 +87,7 @@ from .entity_profile.repository import (
 )
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .folders.read_model import dialog_placement
+from .image_authorization import ScopeToken
 from .linked_chat_fact import linked_chat_fact_owner
 from .models import DialogType
 from .observation_order import allocate_observation_order
@@ -236,6 +239,18 @@ _ENTITY_NOT_FOUND_ERRORS = (
 def _is_valid_telethon_peer_id(value: int) -> bool:
     """Return whether an exact ID is safe for Telethon's SQLite peer lookup."""
     return value != 0 and _SQLITE_INT64_MIN <= value <= _TELETHON_PEER_ID_MAX
+
+
+@dataclass(frozen=True, slots=True)
+class _NotePublicationGuard:
+    entity_id: int
+    scope: TelegramAuthScope
+    token: ScopeToken
+    intake: tuple[int, int]
+    claim: Callable[[ScopeToken], bool]
+
+
+_NOTE_REFINEMENT_GUARD: ContextVar[_NotePublicationGuard | None] = ContextVar("note_refinement_guard", default=None)
 
 
 class _AuthScopeUnavailableError(RuntimeError):
@@ -408,6 +423,10 @@ class _ProfileSectionContext:
     linked_chat_fact_captured: bool = False
     linked_chat_observation_usable: bool = False
 
+    @property
+    def measures_disabled_pair(self) -> bool:
+        return self.pair_section and self.eligible_pair and self.pair_mode == "disabled"
+
 
 @dataclass(frozen=True, slots=True)
 class _ProjectionCommitContext:
@@ -502,6 +521,29 @@ class DaemonEntityInfoService:
     def extract_profile_job_entity_id(self, req: Mapping[str, object]) -> int | dict[str, object]:
         """Validate the existing profile target without acquiring it."""
         return self._extract_entity_id(req)
+
+    async def request_note_reconciliation(self, entity_id: int) -> bool:
+        """Offer one existing bounded profile refresh after an uncertain note write."""
+        scope = self._capture_pair_scope()
+        capture = getattr(self._deps.client, "capture_image_scope", None)
+        claim = getattr(self._deps.client, "claim_image_scope", None)
+        if scope is None or not callable(capture) or not callable(claim):
+            return False
+        token = capture()
+        if not isinstance(token, ScopeToken) or token.scope != scope:
+            return False
+
+        def request(profiles: EntityProfileRepository) -> bool:
+            if self._capture_pair_scope() != scope or not profiles.access_available(entity_id) or not claim(token):
+                return False
+            return profiles.request_note_reconciliation(
+                entity_id, now=int(self._deps.now_provider()), pair_mode=self._current_pair_mode()
+            )
+
+        requested = await self._write_profiles(request, track_rejection=False)
+        if requested and self._demand_sink is not None:
+            offer_durable_demand(self._demand_sink, DemandKind.ENTITY_PROFILE_REFRESH)
+        return requested
 
     async def reconcile_history_profiles(self) -> int:
         """Recover one bounded batch of locally missing DM profile observations."""
@@ -622,6 +664,8 @@ class DaemonEntityInfoService:
             cast(dict[str, object], result["data"])["common_chats"] = []
         owner = self._local_profile_owner(entity_id)
         if owner is None:
+            if isinstance(result.get("data"), dict):
+                cast(dict[str, object], result["data"])["contact_note"] = {"state": "unknown", "expected_version": None}
             if req.get("cursor") is not None or req.get("section") is not None:
                 return self._error(
                     "profile_selection_unavailable", "Account-bound local profile paging is unavailable."
@@ -646,6 +690,8 @@ class DaemonEntityInfoService:
     def _local_profile_owner(self, entity_id: int) -> int | None:
         scope = self._capture_pair_scope()
         owner = self._deps.self_id or (scope.account_id if scope is not None else None)
+        if scope is not None and owner != scope.account_id:
+            return None
         modern = cast(
             tuple[object, ...] | None,
             self._deps.conn.execute(
@@ -882,6 +928,46 @@ class DaemonEntityInfoService:
         )
 
     async def _run_known_entity_refresh(
+        self,
+        cursor: EntityRefreshCursor,
+        entity_type: DialogType,
+        *,
+        pair_mode: str,
+        now: int,
+    ) -> DurableRefreshSliceResult:
+        scope = self._capture_pair_scope()
+        if not self._needs_note_refinement(cursor, entity_type, scope):
+            return await self._run_known_entity_refresh_inner(cursor, entity_type, pair_mode=pair_mode, now=now)
+        with track_contact_note(cursor.entity_id):
+            guard = self._capture_note_publication_guard(cursor.entity_id, scope)
+            if guard is None:
+                return DurableRefreshSliceResult(cursor.entity_id)
+            token = _NOTE_REFINEMENT_GUARD.set(guard)
+            try:
+                return await self._run_known_entity_refresh_inner(cursor, entity_type, pair_mode=pair_mode, now=now)
+            finally:
+                _NOTE_REFINEMENT_GUARD.reset(token)
+
+    def _needs_note_refinement(
+        self, cursor: EntityRefreshCursor, entity_type: DialogType, scope: TelegramAuthScope | None
+    ) -> bool:
+        if (
+            scope is None
+            or cursor.next_section != "full_profile"
+            or entity_type not in {DialogType.USER, DialogType.BOT}
+        ):
+            return False
+        return (
+            self._deps.conn.execute(
+                "SELECT 1 FROM contact_note_operation_receipts WHERE account_id=? AND entity_id=? "
+                "AND ((outcome='unknown' AND verification!='observed_after_unknown') "
+                "OR (outcome='acknowledged' AND verification IN ('pending','unavailable'))) LIMIT 1",
+                (scope.account_id, cursor.entity_id),
+            ).fetchone()
+            is not None
+        )
+
+    async def _run_known_entity_refresh_inner(
         self,
         cursor: EntityRefreshCursor,
         entity_type: DialogType,
@@ -1232,7 +1318,7 @@ class DaemonEntityInfoService:
         if failed and failure.cursor.next_section == "common_chats":
             self._observe_membership({"failed": 1}, source="common_chats_refresh")
         actual_attempts = self._rpc_attempt_count() - failure.context.attempt_start
-        if failure.context.pair_section and failure.context.eligible_pair and failure.context.pair_mode == "disabled":
+        if failure.context.measures_disabled_pair:
             await self._write_profiles(
                 lambda profiles: profiles.record_pair_attempt(
                     failure.cursor,
@@ -1276,12 +1362,15 @@ class DaemonEntityInfoService:
         *,
         now: int,
     ) -> bool:
+        guard = _NOTE_REFINEMENT_GUARD.get()
+        if guard is not None and cursor.next_section == "full_profile":
+            result = dataclass_replace(result, note_refinement_guard=lambda: self._note_publication_current(guard))
         if cursor.next_section == "contact_overlap" and result.reason == CHANNEL_CONTACT_UNSUPPORTED_REASON:
             return await self._write_profiles(
                 lambda profiles: self._commit_unsupported_contact_overlap(profiles, cursor, result, context, now=now)
             )
         actual_attempts = self._rpc_attempt_count() - context.attempt_start
-        if context.pair_section and context.eligible_pair and context.pair_mode == "disabled":
+        if context.measures_disabled_pair:
             committed, summary = await self._write_profiles(
                 lambda profiles: self._commit_measured_section_in_scope(
                     profiles,
@@ -1627,9 +1716,13 @@ class DaemonEntityInfoService:
                 retry_at=scope_changed_retry_at(request.now),
             )
             return False
-        return profiles.commit_full_user_pair(
-            request.cursor, request.full_profile, request.personal_channel, now=request.now
-        )
+        guard = _NOTE_REFINEMENT_GUARD.get()
+        full_profile = request.full_profile
+        if guard is not None:
+            full_profile = dataclass_replace(
+                full_profile, note_refinement_guard=lambda: self._note_publication_current(guard)
+            )
+        return profiles.commit_full_user_pair(request.cursor, full_profile, request.personal_channel, now=request.now)
 
     async def _record_full_user_pair_commit(self, measurement: _PairMeasurement) -> dict[str, object] | None:
         if not measurement.committed:
@@ -1675,6 +1768,115 @@ class DaemonEntityInfoService:
             "pair_ready": True,
             "pair_readiness_latency_ms": latency,
         }
+
+    def _capture_note_publication_guard(
+        self, entity_id: int, scope: TelegramAuthScope | None
+    ) -> _NotePublicationGuard | None:
+        capture = getattr(self._deps.client, "capture_image_scope", None)
+        claim = getattr(self._deps.client, "claim_image_scope", None)
+        if scope is None or not callable(capture) or not callable(claim):
+            return None
+        token = capture()
+        marker = intake_marker(entity_id)
+        if not isinstance(token, ScopeToken) or token.scope != scope or marker is None:
+            return None
+        return _NotePublicationGuard(entity_id, scope, token, marker, cast(Callable[[ScopeToken], bool], claim))
+
+    async def acquire_command_profile(self, entity_id: int) -> CommandProfileAcquisition:
+        """Acquire a new profile with the current auth and delivery publication fence."""
+        scope = self._capture_pair_scope()
+        if scope is None:
+            raise _AuthScopeUnavailableError("authenticated session scope is unavailable")
+        if entity_id == scope.account_id:
+            return CommandProfileAcquisition(False, False)
+        capture = getattr(self._deps.client, "capture_image_scope", None)
+        claim = getattr(self._deps.client, "claim_image_scope", None)
+        if not callable(capture) or not callable(claim):
+            raise _AuthScopeUnavailableError("authenticated scope fence is unavailable")
+        with track_contact_note(entity_id):
+            token = capture()
+            marker = intake_marker(entity_id)
+            if not isinstance(token, ScopeToken) or token.scope != scope or marker is None:
+                return CommandProfileAcquisition(False, False)
+            guard = _NotePublicationGuard(entity_id, scope, token, marker, cast(Callable[[ScopeToken], bool], claim))
+            return await self._acquire_guarded_command_profile(entity_id, scope, guard)
+
+    def _note_publication_current(self, guard: _NotePublicationGuard) -> bool:
+        before = intake_marker(guard.entity_id)
+        claimed = guard.claim(guard.token)
+        after = intake_marker(guard.entity_id)
+        return before == guard.intake == after and claimed and self._capture_pair_scope() == guard.scope
+
+    async def _acquire_guarded_command_profile(
+        self, entity_id: int, scope: TelegramAuthScope, guard: _NotePublicationGuard
+    ) -> CommandProfileAcquisition:
+        revision = self._profiles._profile_revision(entity_id)
+        identity_baseline = capture_identity_baseline(self._deps.conn, entity_id)
+        kind = (
+            TargetKind.BOT
+            if self._stored_entity_type(entity_id, now=int(self._deps.now_provider())) is DialogType.BOT
+            else TargetKind.USER
+        )
+        field_observation = await self._reserve_profile_observation(scope)
+        self._require_profile_access(entity_id)
+        reference = self._user_reference(entity_id)
+        if reference is None or reference.is_self:
+            raise ValueError("contact reference unavailable")
+        from .entity_profile.ports import CommandUserProfilePort
+
+        port = cast(CommandUserProfilePort, self._deps.user_profile_port)
+        normalized = await _profile_network_read(
+            port.fetch_command_user_profile(reference, kind, owner_account_id=scope.account_id)
+        )
+        self._validate_full_user_acquisition(normalized, scope)
+        full = normalized.full_profile
+        companion = self._personal_channel_section_commit(normalized.personal_channel)
+        commit = EntitySectionCommit(
+            {
+                **dict(full.payload or {}),
+                **companion.detail_patch,
+                **_profile_photo_patch(normalized.current_photo, normalized.semantic_snapshot),
+            },
+            identity_patch=full.identity_patch,
+            observation_owner_account_id=scope.account_id,
+            observation_auth_scope=scope.as_private_mapping(),
+            ownership_observed=True,
+            dialog_identity_observation=full.dialog_identity_observation,
+            dialog_identity_baseline_revision=identity_baseline,
+            field_observation=field_observation,
+            semantic_snapshot=normalized.semantic_snapshot,
+        )
+
+        def publish(profiles: EntityProfileRepository) -> bool:
+            if not self._note_publication_current(guard):
+                return False
+            return profiles.commit_command_profile(
+                entity_id,
+                commit,
+                expected_revision=revision,
+                now=int(self._deps.now_provider()),
+                publication_guard=lambda: self._note_publication_current(guard),
+            )
+
+        accepted = await self._write_profiles(publish, track_rejection=False)
+        if not self._note_publication_current(guard):
+            return CommandProfileAcquisition(False, False)
+        return self._command_profile_result(normalized, accepted, field_observation)
+
+    @staticmethod
+    def _command_profile_result(
+        observation: UserProfileObservation, accepted: bool, field_observation: ProfileFieldObservation | None
+    ) -> CommandProfileAcquisition:
+        snapshot = observation.semantic_snapshot
+        if snapshot is None:
+            return CommandProfileAcquisition(False, False)
+        note = snapshot.coverage.get("full_user.note")
+        contact = snapshot.coverage.get("user.contact")
+        return CommandProfileAcquisition(
+            bool(accepted and note is not None and note.authoritative),
+            bool(contact is not None and contact.authoritative and snapshot.fields.get("user.contact") is True),
+            field_observation.order if field_observation is not None else None,
+        )
 
     async def _acquire_full_user_pair(
         self,

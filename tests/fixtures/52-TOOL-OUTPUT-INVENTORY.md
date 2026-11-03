@@ -40,6 +40,9 @@ Current Phase 52 completion status:
 | `get_draft` | Get Draft | primary | true | true | yes | local current draft and temporary undo history; unknown distinct from absent | `current`, `history[]`, `selected_history`, `next_action` | none |
 | `manage_draft` | Manage Draft | primary | false | false | yes | explicit native draft create/update/clear/restore, verification and uncertain result guidance; never sends | `outcome`, `operation_key`, `mutation_dispatched`, `save_acknowledged`, `backup_history_id`, `current`, `verification`, `next_action` | native cloud draft mutation |
 | `manage_scheduled_message` | Manage Scheduled Message | primary | false | not in baseline | not in baseline | create/update/cancel one native scheduled queue item; receipt lookup guidance; accepted items may publish automatically later | `ok`, `action`, `operation_key`, `account_id`, `dialog_id`, `scheduled_message_id`, `outcome`, `mutation_dispatched`, `acknowledged`, `receipt_persisted`, `current_is_operation_confirmation`, `schedule_at_utc` | scheduled queue mutation; no immediate-send action |
+| `get_folder` | Get Folder | primary | true | not in baseline | not in baseline | locally retained native definition and independent coverage | `account_id`, `presence`, `catalog_version`, `expected_version`, `definition`, `folder_snapshot` | none |
+| `manage_folder` | Manage Folder | primary | false | not in baseline | not in baseline | explicit native folder create/update/delete and membership changes | `operation_key`, `account_id`, `folder_id`, `outcome`, `dispatch`, `acknowledgement`, `verification` | native folder mutation |
+| `manage_contact_note` | Manage Contact Note | primary | false | not in baseline | not in baseline | explicit private contact note create/update/clear | `operation_key`, `account_id`, `outcome`, `verification` | native contact-note mutation |
 
 ## Lossless Signal Checklist
 

@@ -35,7 +35,7 @@ from mcp_telegram.drafts.owner import DraftMessageOwner
 from mcp_telegram.entity_profile.membership import MembershipSignalCounts
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, EntityRefreshCoordinator
 from mcp_telegram.fact_hydration import FactHydrationDemandAdapter, MessageFactHydrationWorker
-from mcp_telegram.folders.worker import FolderProjectionDemandAdapter, FolderProjectionWorker
+from mcp_telegram.folders.worker import FolderProjectionDemandAdapter, FolderProjectionWorker, FolderVerification
 from mcp_telegram.hydration_queue import HydrationPriority
 from mcp_telegram.linked_chat_fact import LinkedChatWork, linked_chat_fact_owner
 from mcp_telegram.message_fact_refresh import (
@@ -141,6 +141,7 @@ class DemandCompositionDependencies:
     linked_chat_fact_refresh_port: LinkedChatFactRefreshPort
     image_worker: DurableDemandAdapter
     startup_detail_setter: Callable[[str], None] | None = None
+    folder_verification: FolderVerification | None = None
 
 
 class LinkedChatFactDemandAdapter(DurableDemandAdapter):
@@ -310,7 +311,9 @@ def build_durable_adapter_map(
             account_id=dependencies.account_id,
         ),
         DemandKind.FOLDER_SNAPSHOT: FolderProjectionDemandAdapter(
-            dependencies.folder_projection_worker, account_id=dependencies.account_id
+            dependencies.folder_projection_worker,
+            account_id=dependencies.account_id,
+            verification=dependencies.folder_verification,
         ),
         DemandKind.MESSAGE_FACT_REFRESH: MessageFactRefreshDemandAdapter(
             dependencies.message_fact_refresh_deps,

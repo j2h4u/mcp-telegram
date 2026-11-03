@@ -19,7 +19,8 @@ from .scheduled_receipts_schema import SCHEDULED_OPERATION_RECEIPT_DDL
 from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 
-_CURRENT_SCHEMA_VERSION = 96
+_CURRENT_SCHEMA_VERSION = 97
+_NATIVE_MANAGEMENT_MIGRATION = 97
 _COMMON_CHAT_NORMALIZATION_MIGRATION = 96
 _CHANNEL_ID_MARKER = 1_000_000_000_000
 _HISTORY_ENROLLMENT_SIMPLIFICATION_MIGRATION = 94
@@ -5114,7 +5115,58 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
 
     if _CURRENT_SCHEMA_VERSION >= _COMMON_CHAT_NORMALIZATION_MIGRATION:
         current = _apply_migration_96(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _NATIVE_MANAGEMENT_MIGRATION:
+        current = _apply_migration_97(conn, current)
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
+
+
+def _apply_migration_97(conn: sqlite3.Connection, current: int) -> int:
+    """Normalize retained folder facts and create native command receipts."""
+    if current >= _NATIVE_MANAGEMENT_MIGRATION:
+        return current
+    from .contact_notes.schema import CONTACT_NOTE_RECEIPT_DDL
+    from .folders.command_schema import FOLDER_COMMAND_SCHEMA
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "ALTER TABLE telegram_folder_projection_state ADD COLUMN catalog_revision INTEGER NOT NULL DEFAULT 0"
+        )
+        rows = cast(
+            list[tuple[str, int, str]],
+            conn.execute("SELECT namespace,folder_id,rule_json FROM telegram_folder_rules").fetchall(),
+        )
+        for namespace, folder_id, raw in rows:
+            conn.execute(
+                "UPDATE telegram_folder_rules SET rule_json=? WHERE namespace=? AND folder_id=?",
+                (_normalize_folder_rule_json(raw), namespace, folder_id),
+            )
+        conn.execute(
+            "UPDATE telegram_folder_projection_state SET coverage_status='unavailable',catalog_revision=catalog_revision+1 "
+            "WHERE singleton=1 AND EXISTS (SELECT 1 FROM telegram_folder_pending_observation)"
+        )
+        conn.execute("DROP TABLE telegram_folder_pending_observation")
+        conn.execute(
+            "UPDATE update_delivery SET pending=CAST(json_set(CAST(pending AS TEXT),'$.auth_scope',NULL) AS BLOB) "
+            "WHERE pending IS NOT NULL AND CASE WHEN json_valid(CAST(pending AS TEXT)) "
+            "THEN json_type(CAST(pending AS TEXT),'$.auth_scope') IS NULL ELSE 0 END"
+        )
+        conn.execute(CONTACT_NOTE_RECEIPT_DDL)
+        conn.execute(FOLDER_COMMAND_SCHEMA)
+        conn.execute("INSERT INTO schema_version VALUES (97, strftime('%s', 'now'))")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return 97
+
+
+def _normalize_folder_rule_json(raw: str) -> str:
+    value = cast(dict[str, object], json.loads(raw))
+    value.update(
+        title_entities=[], title_noanimate=False, emoticon=None, color=None, has_my_invites=False, complete=False
+    )
+    return json.dumps(value, separators=(",", ":"), sort_keys=True)
 
 
 def _apply_migration_96(conn: sqlite3.Connection, current: int) -> int:

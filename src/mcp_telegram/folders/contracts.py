@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Literal
 
 RULE_TTL_SECONDS = 900
 DEFAULT_FOLDER_NAMESPACE = "default"
@@ -62,6 +65,12 @@ class FolderRule:
     exclude_archived: bool = False
     exclude_read: bool = False
     exclude_muted: bool = False
+    title_entities: tuple[dict[str, object], ...] = ()
+    title_noanimate: bool = False
+    emoticon: str | None = None
+    color: int | None = None
+    has_my_invites: bool = False
+    complete: bool = True
 
     @property
     def key(self) -> tuple[str, int]:
@@ -77,6 +86,15 @@ class FolderRuleObservation:
     rules: tuple[FolderRule, ...]
     token: str
     started_at: int
+    complete: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class FolderRuleUpdate:
+    kind: Literal["filter", "order", "invalid"]
+    folder_id: int | None = None
+    rule: FolderRule | None = None
+    order: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,3 +115,30 @@ def _dedupe_first(values: tuple[int, ...]) -> tuple[int, ...]:
         seen.add(value)
         result.append(value)
     return tuple(result)
+
+
+def folder_observation_token(rules: tuple[FolderRule, ...]) -> str:
+    payload = [
+        (
+            rule.namespace,
+            rule.folder_id,
+            rule.title,
+            rule.kind.value,
+            rule.source_position,
+            rule.included_ids,
+            rule.pinned_ids,
+            rule.excluded_ids,
+            sorted(category.value for category in rule.categories),
+            rule.exclude_archived,
+            rule.exclude_read,
+            rule.exclude_muted,
+            rule.title_entities,
+            rule.title_noanimate,
+            rule.emoticon,
+            rule.color,
+            rule.has_my_invites,
+            rule.complete,
+        )
+        for rule in rules
+    ]
+    return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()

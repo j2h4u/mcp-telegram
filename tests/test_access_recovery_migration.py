@@ -118,7 +118,7 @@ def test_migration_rearms_unwitnessed_access_recovery_without_losing_facts(
             cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=cast(SQLiteWriter, object())
         )
         adapter = DeltaAccessProbeDemandAdapter(
-            worker, AccessProbePolicy(60, 1, 100), cast(AccessProbe, object()), account_id=77
+            worker, AccessProbePolicy(enabled=True, cooldown_seconds=100), cast(AccessProbe, object()), account_id=77
         )
         selected = adapter.status(0)
         assert selected is not None and selected.selected is not None

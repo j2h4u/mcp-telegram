@@ -18,6 +18,7 @@ from telethon.tl.types import User  # type: ignore[import-untyped]
 
 import mcp_telegram.daemon as daemon
 from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
+from mcp_telegram.contact_notes.schema import CONTACT_NOTE_RECEIPT_DDL
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from mcp_telegram.entity_profile.contracts import (
@@ -88,6 +89,7 @@ def _fenced_schema(conn: sqlite3.Connection, *, semantic: bool = True) -> None:
         ) WITHOUT ROWID;
         """
     )
+    conn.execute(CONTACT_NOTE_RECEIPT_DDL)
     if not semantic:
         return
     from mcp_telegram.sync_db import _apply_migration_87, _apply_migration_88

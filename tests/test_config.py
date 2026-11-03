@@ -84,6 +84,7 @@ def test_deploy_config_template_loads_with_current_schema() -> None:
 
     assert config.state.dir == Path("/srv/mcp-telegram/database")
     assert config.scheduling.self_profile_refresh_seconds == 86_400.0
+    assert config.telemetry.runtime_observations.row_cap == RuntimeObservationConfig().row_cap
 
 
 def test_auto_resume_can_be_disabled_without_disabling_protection(tmp_path: Path) -> None:
@@ -370,8 +371,7 @@ read_position_reconciliation_failure_cooldown_seconds = 47
 read_position_reconciliation_batch_size = 16
 read_position_reconciliation_batch_pause_seconds = 1.75
 reconciliation_hourly_seconds = 49
-access_probe_interval_seconds = 86401
-access_probe_max_dialogs_per_cycle = 2
+access_probe_enabled = false
 access_probe_cooldown_seconds = 604801
 message_fact_refresh_reaction_max_messages_per_cycle = 6
 message_fact_refresh_read_at_max_messages_per_cycle = 7
@@ -439,8 +439,7 @@ daemon_api_slow_request_seconds = 2.5
         read_position_reconciliation_batch_size=16,
         read_position_reconciliation_batch_pause_seconds=1.75,
         reconciliation_hourly_seconds=49.0,
-        access_probe_interval_seconds=86401.0,
-        access_probe_max_dialogs_per_cycle=2,
+        access_probe_enabled=False,
         access_probe_cooldown_seconds=604801,
         message_fact_refresh_reaction_max_messages_per_cycle=6,
         message_fact_refresh_read_at_max_messages_per_cycle=7,
@@ -508,8 +507,7 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
             "ACTIVITY_COLD_BACKFILL_BATCH_PAUSE": "51",
             "ACTIVITY_COLD_ENROLL_SECONDS": "52",
             "ACTIVITY_COLD_ACCESS_RETRY_SECONDS": "53",
-            "ACCESS_PROBE_INTERVAL_SECONDS": "86402",
-            "ACCESS_PROBE_MAX_DIALOGS_PER_CYCLE": "4",
+            "ACCESS_PROBE_ENABLED": "false",
             "ACCESS_PROBE_COOLDOWN_SECONDS": "604802",
             "FACT_HYDRATION_INTERVAL_SECONDS": "47",
             "FACT_HYDRATION_MAX_REQUESTS_PER_CYCLE": "4",
@@ -538,8 +536,7 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         read_position_reconciliation_batch_size=16,
         read_position_reconciliation_batch_pause_seconds=1.75,
         reconciliation_hourly_seconds=48.0,
-        access_probe_interval_seconds=86402.0,
-        access_probe_max_dialogs_per_cycle=4,
+        access_probe_enabled=False,
         access_probe_cooldown_seconds=604802,
         message_fact_refresh_reaction_max_messages_per_cycle=6,
         reaction_detail_cycle_seconds=601,

@@ -58,6 +58,7 @@ _READ_METHODS = frozenset(
         "telethon.tl.functions.photos.GetUserPhotosRequest:91cd32a8",
         "telethon.tl.functions.upload.GetFileRequest:be5335be",
         "telethon.tl.functions.help.GetConfigRequest:c4f9186b",
+        "telethon.tl.functions.help.GetAppConfigRequest:61e3f854",
         "telethon.tl.functions.payments.GetSavedStarGiftsRequest:a319e569",
         "telethon.tl.functions.stories.GetPeerStoriesRequest:2c4ada50",
         "telethon.tl.functions.stories.GetPinnedStoriesRequest:5821a5dc",
@@ -67,6 +68,8 @@ _READ_METHODS = frozenset(
 _MUTATION_METHODS = frozenset(
     {
         "telethon.tl.functions.messages.SaveDraftRequest:ad0fa15c",
+        "telethon.tl.functions.messages.UpdateDialogFilterRequest:1ad4a04a",
+        "telethon.tl.functions.contacts.UpdateContactNoteRequest:139f63fb",
         "telethon.tl.functions.messages.SendMessageRequest:fef48f62",
         "telethon.tl.functions.messages.EditMessageRequest:b106e66c",
         "telethon.tl.functions.messages.DeleteScheduledMessagesRequest:59ae2b16",
@@ -134,6 +137,8 @@ class TelegramRpcSource(StrEnum):
     SCHEDULED_MESSAGES = "scheduled_messages"
     MESSAGE_IMAGE_ACQUISITION = "message_image_acquisition"
     SCHEDULED_MUTATION = "scheduled_mutation"
+    FOLDER_COMMAND = "folder_command"
+    NOTE_COMMAND = "note_command"
     DRAFT_SNAPSHOT = "draft_snapshot"
     DRAFT_MUTATION = "draft_mutation"
     MAINTENANCE = "maintenance"
@@ -178,6 +183,8 @@ class DemandKind(StrEnum):
     SCHEDULED_DISCOVERY = "scheduled_discovery"
     MESSAGE_IMAGE_ACQUISITION = "message_image_acquisition"
     SCHEDULED_MUTATION = "scheduled_mutation"
+    FOLDER_COMMAND = "folder_command"
+    NOTE_COMMAND = "note_command"
     DRAFT_SNAPSHOT = "draft_snapshot"
     DRAFT_MUTATION = "draft_mutation"
     SELF_PROFILE_MAINTENANCE = "self_profile_maintenance"
@@ -752,6 +759,26 @@ _REGISTRY: dict[TelegramRpcSource, TelegramRpcConsumerSpec] = {
         FanoutScope.ACCOUNT,
         DemandPolicyOwner.CALLER,
     ),
+    TelegramRpcSource.FOLDER_COMMAND: _consumer(
+        "Folder command",
+        "Observe and change one explicitly selected native folder",
+        _I,
+        TelegramFactDomain.FOLDERS,
+        AcquisitionRole.MUTATION,
+        AcquisitionTrigger.REQUEST,
+        FanoutScope.ACCOUNT,
+        DemandPolicyOwner.CALLER,
+    ),
+    TelegramRpcSource.NOTE_COMMAND: _consumer(
+        "Contact note command",
+        "Observe and change one explicitly selected contact note",
+        _I,
+        TelegramFactDomain.ENTITIES,
+        AcquisitionRole.MUTATION,
+        AcquisitionTrigger.REQUEST,
+        FanoutScope.ENTITY,
+        DemandPolicyOwner.CALLER,
+    ),
     TelegramRpcSource.SCHEDULED_MUTATION: _consumer(
         "Scheduled message mutation",
         "Create, edit, or cancel one explicitly selected native scheduled message",
@@ -991,6 +1018,12 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         _INLINE,
         max_rpc_attempts_per_slice=3,
     ),
+    DemandKind.FOLDER_COMMAND: _contract(
+        DemandKind.FOLDER_COMMAND, TelegramRpcSource.FOLDER_COMMAND, _INLINE, max_rpc_attempts_per_slice=3
+    ),
+    DemandKind.NOTE_COMMAND: _contract(
+        DemandKind.NOTE_COMMAND, TelegramRpcSource.NOTE_COMMAND, _INLINE, max_rpc_attempts_per_slice=4
+    ),
     DemandKind.SCHEDULED_MUTATION: _contract(
         DemandKind.SCHEDULED_MUTATION,
         TelegramRpcSource.SCHEDULED_MUTATION,
@@ -1090,6 +1123,8 @@ def _validate_contract_durable_policy(kind: DemandKind, contract: DemandContract
         DemandKind.TELETHON_CONNECTION_BOOTSTRAP,
         DemandKind.DRAFT_MUTATION,
         DemandKind.SCHEDULED_MUTATION,
+        DemandKind.FOLDER_COMMAND,
+        DemandKind.NOTE_COMMAND,
     }:
         _validate_attempt_bound(kind, contract)
         if contract.freshness_target is not None:

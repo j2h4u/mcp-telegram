@@ -12,7 +12,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 from contextlib import AbstractContextManager, asynccontextmanager, contextmanager
 from contextvars import Context, ContextVar
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from functools import wraps
@@ -61,9 +61,21 @@ from telethon.tl.tlobject import TLRequest  # type: ignore[import-untyped]
 from telethon.utils import get_input_channel, get_peer_id, is_list_like  # type: ignore[import-untyped]
 
 from .auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
+from .contact_notes.intake import capture_contact_note_intake, invalidate_contact_note_scope
 from .delivered_update import DeliveredUpdate, delivered_update_context, fail_delivered_update
 from .flood import FloodWaitObservation, TelegramRpcThrottled, flood_seconds
+from .folders.intake import capture_folder_intake, has_folder_updates, invalidate_folder_intake
 from .image_authorization import ScopeCell, ScopeToken
+from .native_write_fence import (
+    FolderWriteRejected,
+    NativeWireOutcome,
+    NativeWriteCheck,
+    NativeWriteDomain,
+    NativeWriteDomainOwner,
+    NativeWriteReceiptBinding,
+    NoteWriteRejected,
+    current_native_write_check,
+)
 from .peer_access import PeerAccess, PeerAccessRejectedError, current_peer_target
 from .request_timing import DaemonRequestTiming, current_timing
 from .scheduled_write_fence import (
@@ -161,7 +173,7 @@ from .telegram_transport import (
     TransportWriteError,
 )
 from .telegram_update_admission import GateMessageBox, UpdateIntakeQueue
-from .update_delivery import UpdateDeliveryRepository
+from .update_delivery import DeliveryState, UpdateDeliveryRepository
 
 logger = logging.getLogger(__name__)
 _DIAGNOSTIC_REQUESTS_MAX = 8
@@ -615,6 +627,7 @@ def _valid_safety_intent(key: object, value: object, *, version: int = 3) -> boo
             {"method", "run", "phase", "scope"},
             {"method", "run", "phase", "scope", "policy_recovery"},
             {"method", "run", "phase", "scope", "aux_bootstrap"},
+            {"method", "run", "phase", "scope", "native_write_receipt_owner"},
         )
         and _valid_safety_intent_payload(value, version=version)
     )
@@ -629,7 +642,42 @@ def _valid_safety_intent_payload(value: dict[str, object], *, version: int) -> b
         and _valid_policy_recovery(value.get("policy_recovery"), value["scope"])
         and (version == _SAFETY_RECEIPT_VERSION or "policy_recovery" not in value)
         and _valid_aux_bootstrap(value, version=version)
+        and _valid_native_receipt_owner(value)
         and _valid_intent_disposition(value)
+    )
+
+
+def _native_binding(value: object) -> NativeWriteReceiptBinding | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        return NativeWriteReceiptBinding(**value)
+    except TypeError, ValueError:
+        return None
+
+
+def _valid_native_receipt_owner(intent: dict[str, object]) -> bool:
+    owner = intent.get("native_write_receipt_owner")
+    if owner is None:
+        return "native_write_receipt_owner" not in intent
+    if not isinstance(owner, dict) or set(owner) != {"binding", "contained"}:
+        return False
+    binding = _native_binding(owner["binding"])
+    scope = intent["scope"]
+    expected = {
+        "folder": functions.messages.UpdateDialogFilterRequest,
+        "contact_note": functions.contacts.UpdateContactNoteRequest,
+    }
+    return (
+        binding is not None
+        and type(owner["contained"]) is bool
+        and isinstance(scope, dict)
+        and intent["method"]
+        == f"{expected[binding.domain].__module__}.{expected[binding.domain].__name__}:"
+        f"{expected[binding.domain].CONSTRUCTOR_ID:08x}"
+        and (binding.dc_id, binding.key_id, binding.account_id)
+        == (scope["dc_id"], scope["key_id"], scope["account_id"])
+        and (not owner["contained"] or intent["phase"] == "unknown")
     )
 
 
@@ -747,7 +795,19 @@ def _is_contained_aux(item: dict[str, object]) -> bool:
     return isinstance(aux, dict) and aux.get("contained") is True and item["phase"] == "unknown"
 
 
+def _is_contained_native(item: dict[str, object], scope: dict[str, object]) -> bool:
+    native = item.get("native_write_receipt_owner")
+    return (
+        item["phase"] == "unknown"
+        and isinstance(native, dict)
+        and native.get("contained") is True
+        and item["scope"] == {key: scope[key] for key in ("dc_id", "key_id", "account_id")}
+    )
+
+
 def _intent_blocks(item: dict[str, object], scope: dict[str, object]) -> bool:
+    if _is_contained_native(item, scope):
+        return False
     aux = item.get("aux_bootstrap")
     if (
         _is_contained_aux(item)
@@ -1034,6 +1094,10 @@ class TelegramRpcSafetyLedger:
             raise ValueError("invalid Telegram safety receipt")
         self._record = cast(dict[str, object], decoded)
         self._migrate_safety_record()
+        for intent in cast(dict[str, dict[str, object]], self._record["intents"]).values():
+            native = intent.get("native_write_receipt_owner")
+            if isinstance(native, dict):
+                native["contained"] = False
         scope = cast(dict[str, object], self._record.get("scope", {}))
         self._startup_hold = self._scope_startup_hold(scope, dc_id, key_id)
         self._restore_startup_protection(scope)
@@ -1520,7 +1584,7 @@ class TelegramRpcSafetyLedger:
         if cancelled:
             raise asyncio.CancelledError
 
-    async def prepare(
+    async def prepare(  # noqa: PLR0913 - provenance is part of the durable attempt.
         self,
         attempt_id: str,
         method: str,
@@ -1528,6 +1592,7 @@ class TelegramRpcSafetyLedger:
         transport_identity: tuple[int, int | None] | None = None,
         auth_only: bool = False,
         aux_bootstrap: dict[str, object] | None = None,
+        native_binding: NativeWriteReceiptBinding | None = None,
     ) -> None:
         self.require_writable(auth_only=auth_only)
 
@@ -1558,14 +1623,111 @@ class TelegramRpcSafetyLedger:
             if aux_bootstrap is not None:
                 provenance = cast(dict[str, object], json.loads(json.dumps(aux_bootstrap)))
                 attach_aux(intent, scope, provenance)
+            if native_binding is not None:
+                intent["native_write_receipt_owner"] = {"binding": asdict(native_binding), "contained": False}
+                if not _valid_safety_intent(attempt_id, intent):
+                    raise ValueError("invalid native receipt provenance")
             existing = intents.get(attempt_id)
-            if aux_bootstrap is not None and existing is not None and existing != intent:
-                raise ValueError("outbound attempt identity changed")
+            self._check_attempt_consistency(existing, intent, aux_bootstrap is not None or native_binding is not None)
             intents.setdefault(attempt_id, intent)
             floor = cast(dict[str, object], record["floor"])
             self._rebase_floor(floor)
 
         await self._commit(add)
+
+    @staticmethod
+    def _check_attempt_consistency(existing: object, intent: dict[str, object], bound: bool) -> None:
+        if bound and existing is not None and existing != intent:
+            raise ValueError("outbound attempt identity changed")
+
+    async def contain_native(self, attempt_id: str, binding: NativeWriteReceiptBinding) -> None:
+        """Contain one unknown only after its exact domain receipt was validated."""
+
+        def contain(record: dict[str, object]) -> None:
+            intent = cast(dict[str, dict[str, object]], record["intents"]).get(attempt_id)
+            native = intent.get("native_write_receipt_owner") if intent else None
+            scope = cast(dict[str, object], record["scope"])
+            if intent is None or not isinstance(native, dict):
+                raise ValueError("native receipt does not own the outbound attempt")
+            if any(
+                (
+                    native.get("binding") != asdict(binding),
+                    intent["phase"] not in {"prepared", "unknown"},
+                    scope["stage"] != "verified",
+                    intent["scope"] != {key: scope[key] for key in ("dc_id", "key_id", "account_id")},
+                    record["transition"] is not None,
+                    any(owner not in {None, scope["account_id"]} for owner in self._store.canonical_owners()),
+                )
+            ):
+                raise ValueError("native receipt does not own the outbound attempt")
+            intent["phase"] = "unknown"
+            native["contained"] = True
+            if record["protection"] == "unresolved_outbound_outcome" and not any(
+                _intent_blocks(item, scope) for item in cast(dict[str, dict[str, object]], record["intents"]).values()
+            ):
+                record["protection"] = None
+            record["generation"] = uuid.uuid4().hex
+
+        await self._commit(contain)
+        if self._startup_hold == "unresolved_outbound_outcome" and not self._unresolved():
+            self._startup_hold = None
+
+    async def complete_native_unknown(
+        self, attempt_id: str, binding: NativeWriteReceiptBinding, method_generation: str | None
+    ) -> None:
+        """Settle a validated unknown without creating a read-recovery episode."""
+
+        def settle(record: dict[str, object]) -> None:
+            intent = cast(dict[str, dict[str, object]], record["intents"]).get(attempt_id)
+            native = self._require_native_settlement(record, intent, attempt_id, binding)
+            assert intent is not None
+            self._settle_method(record, attempt_id, False, method_generation, False)
+            intent["phase"] = "unknown"
+            native["contained"] = True
+            record["generation"] = uuid.uuid4().hex
+
+        await self._commit(settle, settled_attempt=attempt_id)
+
+    def _require_native_settlement(
+        self,
+        record: dict[str, object],
+        intent: dict[str, object] | None,
+        attempt_id: str,
+        binding: NativeWriteReceiptBinding,
+    ) -> dict[str, object]:
+        native = intent.get("native_write_receipt_owner") if intent else None
+        scope = cast(dict[str, object], record["scope"])
+        if intent is None or not isinstance(native, dict):
+            raise ValueError("native outcome does not match the claimed attempt")
+        if not self._native_settlement_matches(intent, native, scope, binding):
+            raise ValueError("native outcome does not match the claimed attempt")
+        if not self._native_settlement_scope_valid(record, scope, attempt_id):
+            raise ValueError("native outcome does not match the claimed attempt")
+        return cast(dict[str, object], native)
+
+    def _native_settlement_matches(
+        self,
+        intent: dict[str, object],
+        native: dict[str, object],
+        scope: dict[str, object],
+        binding: NativeWriteReceiptBinding,
+    ) -> bool:
+        return (
+            intent["run"] == self._run
+            and intent["phase"] == "prepared"
+            and native.get("binding") == asdict(binding)
+            and scope["stage"] == "verified"
+            and intent["scope"] == {key: scope[key] for key in ("dc_id", "key_id", "account_id")}
+        )
+
+    def _native_settlement_scope_valid(
+        self, record: dict[str, object], scope: dict[str, object], attempt_id: str
+    ) -> bool:
+        return (
+            record["transition"] is None
+            and attempt_id in self._claimed
+            and all(owner in {None, scope["account_id"]} for owner in self._store.canonical_owners())
+        )
 
     async def _contain_aux_unknown(self, attempt_id: str, *, captured_scope: dict[str, object], lease_id: str) -> None:
         """Record gate-proven retirement without changing the unknown outcome."""
@@ -1779,7 +1941,7 @@ class TelegramRpcSafetyLedger:
         prior = intents.get(attempt_id)
         if isinstance(prior, dict) and prior["run"] != self._run:
             raise ValueError("completion does not own this outbound intent")
-        if isinstance(prior, dict) and _is_contained_aux(prior):
+        if self._retains_unknown_intent(prior):
             return
         if known_outcome or (
             attempt_id not in self._claimed and (not isinstance(prior, dict) or prior["phase"] == "prepared")
@@ -1787,6 +1949,12 @@ class TelegramRpcSafetyLedger:
             intents.pop(attempt_id, None)
         elif attempt_id in intents:
             self._mark_unknown_intent(record, cast(dict[str, object], intents[attempt_id]))
+
+    @staticmethod
+    def _retains_unknown_intent(prior: object) -> bool:
+        return isinstance(prior, dict) and (
+            _is_contained_aux(prior) or (prior["phase"] == "unknown" and "native_write_receipt_owner" in prior)
+        )
 
     @staticmethod
     def _mark_unknown_intent(record: dict[str, object], intent: dict[str, object]) -> None:
@@ -2998,6 +3166,14 @@ class _WireAttempt:
     photo_capability: _PhotoWireCapability | None = None
     photo_lease: _AuxPhotoLease | None = None
     peer_tokens: tuple[ScopeToken | None, ...] = ()
+    native_check: NativeWriteCheck | None = None
+    native_owner: NativeWriteDomainOwner | None = None
+    native_request: TLRequest | None = None
+    native_body: bytes | None = None
+    native_bound: bool = False
+    native_scope_token: ScopeToken | None = None
+    native_phase: str | None = None
+    native_target: int | None = None
 
 
 def _application_request(request: object) -> TLRequest:
@@ -3062,6 +3238,29 @@ def _request_peers(request: TLRequest, account_id: int, photo: _PhotoWireCapabil
     return tuple(sorted({target for target in targets if target is not None}))
 
 
+def _native_request_peer_values(request: TLRequest) -> list[object] | None:
+    values: list[object]
+    if type(request) is functions.messages.UpdateDialogFilterRequest:
+        folder = cast(functions.messages.UpdateDialogFilterRequest, request).filter
+        if folder is None:
+            return []
+        if type(folder) is not types.DialogFilter:
+            raise PeerAccessRejectedError("peer_target_unclassified")
+        values = [*folder.pinned_peers, *folder.include_peers, *folder.exclude_peers]
+        entities = folder.title.entities
+    elif type(request) is functions.contacts.UpdateContactNoteRequest:
+        note_request = cast(functions.contacts.UpdateContactNoteRequest, request)
+        values = [note_request.id]
+        entities = note_request.note.entities
+    else:
+        return None
+    values.extend(entity.user_id for entity in entities if isinstance(entity, types.InputMessageEntityMentionName))
+    values.extend(
+        types.PeerUser(entity.user_id) for entity in entities if isinstance(entity, types.MessageEntityMentionName)
+    )
+    return values
+
+
 def _request_peer_values(request: TLRequest) -> list[object]:
     kind = type(request)
     peer_methods = (
@@ -3091,6 +3290,9 @@ def _request_peer_values(request: TLRequest) -> list[object]:
         functions.channels.GetAdminLogRequest,
         functions.updates.GetChannelDifferenceRequest,
     )
+    native_values = _native_request_peer_values(request)
+    if native_values is not None:
+        return native_values
     values: list[object] = []
     if kind in peer_methods:
         values.append(cast(_PeerRequest, request).peer)
@@ -3184,6 +3386,8 @@ class _WirePermit:
     released: bool = False
     photo_token: PhotoSourceToken | None = None
     auxiliary_generation: int | None = None
+    native_token: Callable[[], bool] | None = None
+    native_owner_token: Callable[[], bool] | None = None
 
 
 class _AuxPhotoAuthority:
@@ -3471,7 +3675,7 @@ class TelegramRpcGate(TelegramClient):
             raise RuntimeError("peer access already configured")
         self._peer_access = access
 
-    def _initialize_wire_authority(self, safety_store: TelegramRpcSafetyStore) -> None:
+    def _initialize_wire_authority(self, safety_store: TelegramRpcSafetyStore) -> None:  # noqa: PLR0915
         """Initialize one account-owned physical-attempt authority."""
         self._safety_store = safety_store
         self._safety: TelegramRpcSafetyLedger | None = None
@@ -3501,6 +3705,7 @@ class TelegramRpcGate(TelegramClient):
         self._connection_budgets: WeakKeyDictionary[RpcAttemptEvidence, RpcAttemptBudget] = WeakKeyDictionary()
         self._wire_budgets: WeakKeyDictionary[RpcAttemptEvidence, RpcAttemptBudget] = WeakKeyDictionary()
         self._wire_fault: str | None = None
+        self._native_wire_fault_owner: str | None = None
         self._recovery_cause: RecoveryCause | None = None
         self._auto_resume_stable_since: float | None = None
         self._auto_resume_acquired = False
@@ -3508,6 +3713,7 @@ class TelegramRpcGate(TelegramClient):
         self._auto_resume_self_claimed = False
         self._auto_resume_identity_owner: asyncio.Task[object] | None = None
         self._startup_safety_prepared = False
+        self._native_write_domains: dict[NativeWriteDomain, NativeWriteDomainOwner] = {}
         self._auto_resume_stopped: Callable[[], bool] = lambda: False
         self._pending_method_receipts: dict[str, int] = {}
         self._rpc_eligibility_observer: Callable[[str | None], None] | None = None
@@ -3517,6 +3723,18 @@ class TelegramRpcGate(TelegramClient):
         if self._offline_wire_identity()[0] > 0:
             self._ensure_safety_ledger()
         self._cooldown_save_tasks: dict[int, asyncio.Task[None]] = {}
+
+    def register_native_write_domain(self, domain: NativeWriteDomain, owner: NativeWriteDomainOwner) -> None:
+        """Register the authoritative owner before startup admission."""
+        if (
+            domain not in {"folder", "contact_note"}
+            or not isinstance(owner, NativeWriteDomainOwner)
+            or not callable(owner.notify_terminal)
+        ):
+            raise ValueError("invalid native write domain owner")
+        if domain in self._native_write_domains or self._startup_safety_prepared or self.is_connected():
+            raise RuntimeError("native write domain already registered or startup begun")
+        self._native_write_domains[domain] = owner
 
     def configure_update_delivery(self, repository: UpdateDeliveryRepository) -> None:
         """Hold the vendor loop before connect; auth RPC remains available."""
@@ -3594,18 +3812,7 @@ class TelegramRpcGate(TelegramClient):
         self._delivery_account_id = account_id
         self._delivery_safe = load_protocol_snapshot(state.safe_snapshot)
         if state.pending is not None:
-            envelope = load_delivery_envelope(state.pending)
-            updates, users, chats = envelope.unpack()
-            if len(updates) != len(state.orders) or len(state.orders) != len(state.reaction_sequences):
-                raise RuntimeError("retained Telegram update tokens are incomplete")
-            self._install_delivery(envelope, updates, tuple(zip(state.orders, state.reaction_sequences, strict=True)))
-            await super()._preprocess_updates(updates, users, chats)  # type: ignore[misc]
-            if updates:
-                await asyncio.gather(*(self._dispatch_update(update) for update in updates))
-            else:
-                await self._complete_update_delivery()
-            if self._delivery_failure.is_set():
-                raise RuntimeError("retained Telegram update replay failed")
+            await self._replay_pending_delivery(account_id, state)
         self._require_delivery_open()
         assert self._delivery_safe is not None
         self._restore_delivery_message_box(account_id)
@@ -3613,6 +3820,37 @@ class TelegramRpcGate(TelegramClient):
         assert self.session is not None
         self.session.save()
         self._delivery_ready.set()
+
+    async def _replay_pending_delivery(self, account_id: int, state: DeliveryState) -> None:
+        assert state.pending is not None
+        envelope = load_delivery_envelope(state.pending)
+        updates, users, chats = envelope.unpack()
+        recorded = envelope.retained_auth_scope()
+        current = self.retained_auth_scope()
+        if not self._replay_account_matches(current, recorded, account_id):
+            raise RuntimeError("retained update account mismatch")
+        if len(updates) != len(state.orders) or len(state.orders) != len(state.reaction_sequences):
+            raise RuntimeError("retained Telegram update tokens are incomplete")
+        capture_folder_intake(updates)
+        capture_contact_note_intake(updates)
+        self._install_delivery(envelope, updates, tuple(zip(state.orders, state.reaction_sequences, strict=True)))
+        await super()._preprocess_updates(updates, users, chats)  # type: ignore[misc]
+        if updates:
+            await asyncio.gather(*(self._dispatch_update(update) for update in updates))
+        else:
+            await self._complete_update_delivery()
+        if self._delivery_failure.is_set():
+            raise RuntimeError("retained Telegram update replay failed")
+
+    @staticmethod
+    def _replay_account_matches(
+        current: TelegramAuthScope | None, recorded: TelegramAuthScope | None, account_id: int
+    ) -> bool:
+        return (
+            current is not None
+            and current.account_id == account_id
+            and (recorded is None or recorded.account_id == account_id)
+        )
 
     def _restore_delivery_message_box(self, account_id: int) -> None:
         snapshot = self._delivery_safe
@@ -3655,8 +3893,16 @@ class TelegramRpcGate(TelegramClient):
     def _install_delivery(
         self, envelope: DeliveryEnvelope, updates: list[object], tokens: tuple[tuple[int, int], ...]
     ) -> None:
+        scope = self.retained_auth_scope()
+        scope_token = self._image_scope_cell.capture() if self._image_scope_cell.publish(scope) else None
         contexts = {
-            id(update): DeliveredUpdate(order, envelope.captured_at, sequence)
+            id(update): DeliveredUpdate(
+                order,
+                envelope.captured_at,
+                sequence,
+                auth_scope=envelope.retained_auth_scope(),
+                scope_token=scope_token,
+            )
             for update, (order, sequence) in zip(updates, tokens, strict=True)
         }
         self._active_delivery = _ActiveDelivery(envelope, contexts, set(contexts), asyncio.Event())
@@ -3671,7 +3917,13 @@ class TelegramRpcGate(TelegramClient):
             return cast(list[object], await super()._preprocess_updates(updates, users, chats))
         self._require_delivery_open()
         # Capture before either await: the vendor head can change while the prior callbacks finish.
-        envelope = DeliveryEnvelope.capture(self._capture_delivery_snapshot(chats), time.time(), updates, users, chats)
+        scope = self.retained_auth_scope()
+        self._check_delivery_scope(scope, updates, users)
+        envelope = DeliveryEnvelope.capture(
+            self._capture_delivery_snapshot(chats), time.time(), updates, users, chats, auth_scope=scope
+        )
+        capture_folder_intake(updates)
+        capture_contact_note_intake(updates)
         prior = self._active_delivery
         if prior is not None:
             await prior.done.wait()
@@ -3688,6 +3940,20 @@ class TelegramRpcGate(TelegramClient):
         except BaseException:
             self._delivery_failure.set()
             raise
+
+    def _check_delivery_scope(
+        self, scope: TelegramAuthScope | None, updates: list[object], users: list[object]
+    ) -> None:
+        if (
+            scope is not None
+            and self._delivery_account_id is not None
+            and scope.account_id != self._delivery_account_id
+        ):
+            raise RuntimeError("update delivery account mismatch")
+        if (
+            has_folder_updates(updates) or users or any(isinstance(u, types.UpdateUser) for u in updates)
+        ) and scope is None:
+            raise RuntimeError("profile or folder update requires a verified authorization scope")
 
     @staticmethod
     def _authentication_token_updates(updates: list[object]) -> list[object]:
@@ -4091,6 +4357,7 @@ class TelegramRpcGate(TelegramClient):
         )
         self._check_unverified_application(request, bootstrap)
         actual = _application_request(request)
+        native = self._native_application_check(actual, body, scope)
         scheduled_check = self._check_scheduled_application(actual, scope)
         attempt_id = uuid.uuid4().hex
         bound = replace(
@@ -4103,6 +4370,8 @@ class TelegramRpcGate(TelegramClient):
             transport_auth=self._authentication_mode or self._logout_mode,
         )
         owner = _WireAttempt(self._wire_issuer, attempt_id, method, bound, timing=current_timing())
+        owner.native_phase, owner.native_target = self._native_command_phase(actual, bound)
+        self._install_native_owner(owner, native, actual, body)
         self._capture_peer_access(owner, actual, capability)
         owner.photo_capability = capability
         if capability is not None:
@@ -4115,6 +4384,153 @@ class TelegramRpcGate(TelegramClient):
         if scheduled_check is not None:
             self._require_scheduled_mutation_budget(bound)
         return owner
+
+    def _install_native_owner(
+        self,
+        owner: _WireAttempt,
+        native: tuple[NativeWriteCheck, NativeWriteDomainOwner] | None,
+        actual: TLRequest,
+        body: bytes,
+    ) -> None:
+        if native is None:
+            return
+        owner.native_check, owner.native_owner = native
+        owner.native_request = actual
+        owner.native_body = body
+        owner.native_scope_token = self.capture_image_scope()
+        if owner.native_scope_token is None:
+            error = FolderWriteRejected if native[0].binding.domain == "folder" else NoteWriteRejected
+            raise error("native_auth_scope_unavailable")
+
+    def _native_command_phase(self, request: TLRequest, scope: TelegramRpcScope) -> tuple[str | None, int | None]:
+        evidence = scope.attempt_evidence
+        if scope.demand_kind is DemandKind.FOLDER_COMMAND:
+            if evidence is None or scope.source is not TelegramRpcSource.FOLDER_COMMAND:
+                raise FolderWriteRejected("folder_root_invalid")
+            return self._folder_command_phase(request, evidence), None
+        if scope.demand_kind is DemandKind.NOTE_COMMAND:
+            if evidence is None or scope.source is not TelegramRpcSource.NOTE_COMMAND:
+                raise NoteWriteRejected("note_root_invalid")
+            return self._note_command_phase(request, evidence)
+        return None, None
+
+    @staticmethod
+    def _folder_command_phase(request: TLRequest, evidence: RpcAttemptEvidence) -> str:
+        if type(request) is functions.messages.UpdateDialogFilterRequest:
+            return "folder_mutation"
+        if type(request) is functions.messages.GetDialogFiltersRequest:
+            return "folder_postflight" if evidence.folder_mutation_dispatched else "folder_preflight"
+        raise FolderWriteRejected("folder_method_invalid")
+
+    def _note_command_phase(self, request: TLRequest, evidence: RpcAttemptEvidence) -> tuple[str, int | None]:
+        if type(request) is functions.contacts.UpdateContactNoteRequest:
+            return "note_mutation", None
+        if type(request) is functions.help.GetAppConfigRequest:
+            return "note_config", None
+        if type(request) is functions.users.GetFullUserRequest:
+            user = cast(functions.users.GetFullUserRequest, request).id
+            auth = self.retained_auth_scope()
+            if auth is None or type(user) is not types.InputUser or user.user_id == auth.account_id:
+                raise NoteWriteRejected("note_target_invalid")
+            phase = "note_postflight" if evidence.note_mutation_dispatched else "note_preflight"
+            return phase, int(user.user_id)
+        raise NoteWriteRejected("note_method_invalid")
+
+    def _native_application_check(
+        self, request: TLRequest, body: bytes, scope: TelegramRpcScope
+    ) -> tuple[NativeWriteCheck, NativeWriteDomainOwner] | None:
+        domains: dict[type[object], NativeWriteDomain] = {
+            functions.messages.UpdateDialogFilterRequest: "folder",
+            functions.contacts.UpdateContactNoteRequest: "contact_note",
+        }
+        domain = domains.get(type(request))
+        check = current_native_write_check()
+        if domain is None:
+            if check is not None:
+                raise UnclassifiedTelegramRpcError("native write context used for another request")
+            return None
+        error = FolderWriteRejected if domain == "folder" else NoteWriteRejected
+        expected_root = (
+            (DemandKind.FOLDER_COMMAND, TelegramRpcSource.FOLDER_COMMAND)
+            if domain == "folder"
+            else (DemandKind.NOTE_COMMAND, TelegramRpcSource.NOTE_COMMAND)
+        )
+        owner = self._native_write_domains.get(domain)
+        auth = self.retained_auth_scope()
+        if check is None or owner is None or auth is None:
+            raise error("native_write_context_invalid")
+        if not self._native_context_matches(check, domain, scope, expected_root, auth, request, body):
+            raise error("native_write_context_invalid")
+        return check, owner
+
+    @staticmethod
+    def _native_context_matches(  # noqa: PLR0913, PLR0917 - validates one complete physical binding.
+        check: NativeWriteCheck,
+        domain: NativeWriteDomain,
+        scope: TelegramRpcScope,
+        expected_root: tuple[DemandKind, TelegramRpcSource],
+        auth: TelegramAuthScope,
+        request: TLRequest,
+        body: bytes,
+    ) -> bool:
+        return (
+            check.binding.domain == domain
+            and (scope.demand_kind, scope.source) == expected_root
+            and scope.acquisition_kind is None
+            and (check.binding.account_id, check.binding.dc_id, check.binding.key_id)
+            == (auth.account_id, auth.dc_id, auth.auth_key_id)
+            and body == check.body
+            and bytes(request) == check.body
+        )
+
+    async def _prepare_native_write(self, owner: _WireAttempt) -> None:
+        check, domain_owner, request, body = (
+            owner.native_check,
+            owner.native_owner,
+            owner.native_request,
+            owner.native_body,
+        )
+        if check is None:
+            return
+        if domain_owner is None or request is None or body is None or owner.claimed:
+            raise RuntimeError("native write attempt is not available")
+        self._ensure_safety_ledger().require_writable()
+        await self._verify_native_request(check, domain_owner, request, body)
+        cancelled = await self._drain_owned_task(
+            asyncio.ensure_future(domain_owner.bind_attempt(check.binding, owner.attempt_id))
+        )
+        owner.native_bound = True
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _verify_native_request(
+        self, check: NativeWriteCheck, domain_owner: NativeWriteDomainOwner, request: TLRequest, body: bytes
+    ) -> None:
+        error = FolderWriteRejected if check.binding.domain == "folder" else NoteWriteRejected
+        if bytes(request) != body or not await domain_owner.verify_request(check.binding, request):
+            raise error("native_write_request_mismatch")
+        auth = self.retained_auth_scope()
+        if bytes(request) != body or not self._native_auth_matches(auth, check.binding):
+            raise error("native_write_request_changed")
+
+    @staticmethod
+    def _native_auth_matches(auth: TelegramAuthScope | None, binding: NativeWriteReceiptBinding) -> bool:
+        return auth is not None and (auth.account_id, auth.dc_id, auth.auth_key_id) == (
+            binding.account_id,
+            binding.dc_id,
+            binding.key_id,
+        )
+
+    @staticmethod
+    async def _drain_owned_task(task: asyncio.Future[None]) -> bool:
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.wait({task})
+            except asyncio.CancelledError:
+                cancelled = True
+        task.result()
+        return cancelled
 
     def _capture_peer_access(
         self, owner: _WireAttempt, request: TLRequest, capability: _PhotoWireCapability | None
@@ -4598,6 +5014,7 @@ class TelegramRpcGate(TelegramClient):
             raise asyncio.CancelledError
         self._reject_exhausted_attempt_budget(scope)
         self._check_auto_trial_prepare(owner)
+        await self._prepare_native_write(owner)
         await self._prepare_application_intent(owner)
         if owner.admission is not None:
             # A vendor replay starts a new physical admission, retaining the
@@ -4610,6 +5027,7 @@ class TelegramRpcGate(TelegramClient):
             method_generation = await self._prepare_method_permission(owner)
             scheduled_token = await self._revalidate_scheduled_write(owner)
             photo_token = await self._prepare_photo_write(owner)
+            native_token, native_owner_token = await self._native_preclaim_tokens(owner)
         except BaseException:
             self._admission_scheduler.complete(admission)
             raise
@@ -4623,7 +5041,19 @@ class TelegramRpcGate(TelegramClient):
             scheduled_token,
             photo_token=photo_token,
             auxiliary_generation=self._auxiliary_generation(owner),
+            native_token=native_token,
+            native_owner_token=native_owner_token,
         )
+
+    @staticmethod
+    async def _native_preclaim_tokens(
+        owner: _WireAttempt,
+    ) -> tuple[Callable[[], bool] | None, Callable[[], bool] | None]:
+        if owner.native_check is None:
+            return None, None
+        token = await owner.native_check.revalidate()
+        owner_token = await owner.native_owner.preclaim(owner.native_check.binding) if owner.native_owner else None
+        return token, owner_token
 
     @staticmethod
     def _auxiliary_generation(owner: _WireAttempt) -> int | None:
@@ -4683,24 +5113,32 @@ class TelegramRpcGate(TelegramClient):
             else:
                 dc_id = lease.dc_id
                 key_id = lease.sender.auth_key.key_id if lease.sender is not None and lease.sender.auth_key else None
-            recorded_scope = cast(dict[str, object], ledger._record["scope"])
-            if (
-                lease is None
-                and key_id is not None
-                and (
-                    recorded_scope["stage"] == "key_pending"
-                    or (recorded_scope["dc_id"], recorded_scope["key_id"]) != (dc_id, key_id)
-                )
-            ):
-                await ledger.bind_key(dc_id, key_id, auth_only=scope.transport_auth)
+            await self._bind_application_key(owner, ledger, dc_id, key_id)
             await ledger.prepare(
                 owner.attempt_id,
                 owner.method,
                 transport_identity=(dc_id, key_id),
                 auth_only=scope.transport_auth,
                 aux_bootstrap=owner.photo_capability.aux_bootstrap if owner.photo_capability is not None else None,
+                native_binding=owner.native_check.binding if owner.native_check is not None else None,
             )
             self._check_method_eligibility(owner)
+
+    @staticmethod
+    async def _bind_application_key(
+        owner: _WireAttempt, ledger: TelegramRpcSafetyLedger, dc_id: int, key_id: int | None
+    ) -> None:
+        recorded_scope = cast(dict[str, object], ledger._record["scope"])
+        if owner.photo_lease is not None or key_id is None:
+            return
+        if recorded_scope["stage"] != "key_pending" and (recorded_scope["dc_id"], recorded_scope["key_id"]) == (
+            dc_id,
+            key_id,
+        ):
+            return
+        invalidate_folder_intake()
+        invalidate_contact_note_scope()
+        await ledger.bind_key(dc_id, key_id, auth_only=owner.scope.transport_auth)
 
     def _check_method_eligibility(self, owner: _WireAttempt) -> None:
         deferred = self._ensure_safety_ledger().method_deferral(owner.method, owner.attempt_id)
@@ -4717,8 +5155,10 @@ class TelegramRpcGate(TelegramClient):
         owner = self._require_wire_owner(owner)
         if not isinstance(permit, _WirePermit) or permit.owner is not owner or permit.released:
             raise RuntimeError("unowned Telegram write permission")
+        self._check_native_phase(owner)
         self._claim_peer_access(owner)
         self._check_scheduled_claim(owner, permit)
+        self._check_native_claim(owner, permit)
         if not self._permit_still_eligible(owner, permit):
             return False
         budget = owner.scope.attempt_budget
@@ -4733,6 +5173,106 @@ class TelegramRpcGate(TelegramClient):
             self._message_box.difference_claimed()
         self._record_wire_dispatch(owner, permit)
         return True
+
+    @staticmethod
+    def _check_native_phase(owner: _WireAttempt) -> None:
+        phase = owner.native_phase
+        if phase is None:
+            return
+        error = FolderWriteRejected if phase.startswith("folder_") else NoteWriteRejected
+        evidence = owner.scope.attempt_evidence
+        if (
+            evidence is None
+            or owner.claimed
+            or owner.scope.deadline is None
+            or time.monotonic() >= owner.scope.deadline
+        ):
+            raise error("native_command_attempt_invalid")
+        if not TelegramRpcGate._native_phase_allowed(phase, evidence):
+            raise error("native_command_phase_invalid")
+        TelegramRpcGate._check_native_phase_target(owner, phase, evidence)
+
+    @staticmethod
+    def _check_native_phase_target(owner: _WireAttempt, phase: str, evidence: RpcAttemptEvidence) -> None:
+        if phase in {"note_preflight", "note_postflight"} and (
+            owner.native_target is None or evidence.note_target not in {None, owner.native_target}
+        ):
+            raise NoteWriteRejected("note_target_mismatch")
+        if phase == "note_mutation" and (
+            owner.native_check is None or evidence.note_target != owner.native_check.binding.target
+        ):
+            raise NoteWriteRejected("note_target_mismatch")
+
+    @staticmethod
+    def _native_phase_allowed(phase: str, evidence: RpcAttemptEvidence) -> bool:
+        allowed = {
+            "folder_preflight": not evidence.folder_preflight_dispatched and not evidence.folder_mutation_dispatched,
+            "folder_mutation": evidence.folder_preflight_dispatched and not evidence.folder_mutation_dispatched,
+            "folder_postflight": evidence.folder_mutation_dispatched and not evidence.folder_postflight_dispatched,
+            "note_config": not evidence.note_config_dispatched and not evidence.note_preflight_dispatched,
+            "note_preflight": not evidence.note_preflight_dispatched and not evidence.note_mutation_dispatched,
+            "note_mutation": evidence.note_preflight_dispatched and not evidence.note_mutation_dispatched,
+            "note_postflight": evidence.note_mutation_dispatched and not evidence.note_postflight_dispatched,
+        }
+        return allowed.get(phase, False)
+
+    def _check_native_claim(self, owner: _WireAttempt, permit: _WirePermit) -> None:
+        check = owner.native_check
+        if check is None:
+            return
+        error = FolderWriteRejected if check.binding.domain == "folder" else NoteWriteRejected
+        auth = self.retained_auth_scope()
+        evidence = owner.scope.attempt_evidence
+        if (
+            owner.claimed
+            or permit.native_token is None
+            or permit.native_owner_token is None
+            or owner.native_request is None
+        ):
+            raise error("native_write_claim_invalid")
+        if auth is None or evidence is None:
+            raise error("native_write_claim_invalid")
+        self._check_native_scope(owner, error)
+        if not self._native_claim_matches(owner, permit, check, auth, evidence):
+            raise error("native_write_claim_invalid")
+
+    def _check_native_scope(
+        self, owner: _WireAttempt, error: type[FolderWriteRejected] | type[NoteWriteRejected]
+    ) -> None:
+        if (
+            owner.native_scope_token is None
+            or not self.claim_image_scope(owner.native_scope_token)
+            or self._session_lease is None
+            or not self._session_lease.is_held()
+        ):
+            raise error("native_auth_scope_changed")
+
+    @staticmethod
+    def _native_claim_matches(
+        owner: _WireAttempt,
+        permit: _WirePermit,
+        check: NativeWriteCheck,
+        auth: TelegramAuthScope,
+        evidence: RpcAttemptEvidence,
+    ) -> bool:
+        assert (
+            permit.native_token is not None
+            and permit.native_owner_token is not None
+            and owner.native_request is not None
+        )
+        dispatched = (
+            evidence.folder_mutation_dispatched
+            if check.binding.domain == "folder"
+            else evidence.note_mutation_dispatched
+        )
+        return (
+            permit.native_token()
+            and permit.native_owner_token()
+            and bytes(owner.native_request) == owner.native_body
+            and (auth.account_id, auth.dc_id, auth.auth_key_id)
+            == (check.binding.account_id, check.binding.dc_id, check.binding.key_id)
+            and not dispatched
+        )
 
     def _claim_peer_access(self, owner: _WireAttempt) -> None:
         access = self._peer_access
@@ -4804,6 +5344,12 @@ class TelegramRpcGate(TelegramClient):
         owner.admission = permit.admission
         self._record_draft_dispatch(owner)
         self._record_scheduled_dispatch(owner)
+        if owner.native_phase is not None:
+            evidence = owner.scope.attempt_evidence
+            assert evidence is not None
+            setattr(evidence, f"{owner.native_phase}_dispatched", True)
+            if owner.native_phase == "note_preflight":
+                evidence.note_target = owner.native_target
         if owner.scope.attempt_budget is not None:
             owner.scope.attempt_budget.last_method = owner.method
             owner.observation_ordinal = owner.scope.attempt_budget.attempts
@@ -5021,14 +5567,53 @@ class TelegramRpcGate(TelegramClient):
             owner.receipt = receipt
             self._notify_rpc_eligibility_changed()
         elif not isinstance(error, RPCError) and owner.claimed and not owner.scope.transport_control:
-            self._note_photo_fault_owner(owner)
+            self._observe_unknown_wire_error(owner, error)
+
+    def _observe_unknown_wire_error(self, owner: _WireAttempt, error: BaseException) -> None:
+        prior_fault = self._wire_fault
+        prior_native_transport = (
+            self._native_wire_fault_owner is not None and self._recovery_cause is RecoveryCause.TRANSIENT
+        )
+        prior_transport_fault = prior_fault in {
+            "transport_unavailable",
+            "transport_integrity_failure",
+            "transport_terminated",
+        }
+        if self._wire_fault is None and owner.native_check is not None:
+            self._native_wire_fault_owner = owner.attempt_id
+        elif self._native_wire_fault_owner != owner.attempt_id:
+            self._native_wire_fault_owner = None
+        self._note_photo_fault_owner(owner)
+        self._preserve_wire_faults(owner, error, prior_fault, prior_native_transport, prior_transport_fault)
+        self._notify_rpc_eligibility_changed()
+
+    def _preserve_wire_faults(
+        self,
+        owner: _WireAttempt,
+        error: BaseException,
+        prior_fault: str | None,
+        prior_native_transport: bool,
+        prior_transport_fault: bool,
+    ) -> None:
+        if self._native_transport_overlaps(owner, error, prior_fault):
+            self._wire_fault = "transport_unavailable"
+        if prior_fault is None or owner.native_check is None:
             self._wire_fault = "unresolved_outbound_outcome"
             self._recovery_cause = (
                 RecoveryCause.TRANSIENT
                 if isinstance(error, (ConnectionError, TimeoutError, OSError))
                 else RecoveryCause.READ_UNCERTAINTY
             )
-            self._notify_rpc_eligibility_changed()
+            if prior_native_transport or prior_transport_fault:
+                self._wire_fault = prior_fault if prior_transport_fault else "transport_unavailable"
+
+    @staticmethod
+    def _native_transport_overlaps(owner: _WireAttempt, error: BaseException, prior_fault: str | None) -> bool:
+        return (
+            prior_fault == "unresolved_outbound_outcome"
+            and owner.native_check is not None
+            and isinstance(error, (ConnectionError, TimeoutError, OSError))
+        )
 
     def observe_response_now(self, owner: object) -> None:
         owner = self._require_wire_owner(owner)
@@ -5081,7 +5666,7 @@ class TelegramRpcGate(TelegramClient):
                 if self._retired_photo_export(owner, error)
                 else await self._guard_identity_result(owner, error, result)
             )
-            await self._complete_wire_result(owner, error, rejected)
+            await self._complete_wire_result(owner, error, rejected, result)
             owner.terminal = True
             self._note_successful_acquisition(owner, error, rejected)
             return rejected
@@ -5093,10 +5678,21 @@ class TelegramRpcGate(TelegramClient):
                 self._notify_rpc_eligibility_changed(owner.method)
 
     async def _complete_wire_result(
-        self, owner: _WireAttempt, error: BaseException | None, rejected: BaseException | None
+        self, owner: _WireAttempt, error: BaseException | None, rejected: BaseException | None, result: object
     ) -> None:
         if owner.receipt is not None:
-            await asyncio.shield(owner.receipt)
+            cancelled = await self._drain_owned_task(owner.receipt)
+            if owner.native_check is not None:
+                owner.terminal = True
+            if cancelled:
+                raise asyncio.CancelledError
+            return
+        if owner.native_check is not None and owner.native_bound:
+            task = asyncio.create_task(self._settle_native_result(owner, error, result))
+            cancelled = await self._drain_owned_task(task)
+            owner.terminal = True
+            if cancelled:
+                raise asyncio.CancelledError
             return
         known = self._wire_outcome_known(owner, error)
         ledger = self._ensure_safety_ledger()
@@ -5105,18 +5701,95 @@ class TelegramRpcGate(TelegramClient):
             known_outcome=known,
             method_generation=owner.method_generation,
             method_success=error is None and rejected is None,
-            recovery_cause=RecoveryCause.TRANSIENT
-            if owner.claimed and self._transient_terminal_error(error) and self.automatic_trial_active()
-            else None,
+            recovery_cause=self._wire_recovery_cause(owner, error),
         )
         if not known:
             self._observe_unknown_incident(owner, error, ledger)
+
+    def _wire_recovery_cause(self, owner: _WireAttempt, error: BaseException | None) -> RecoveryCause | None:
+        if owner.claimed and self._transient_terminal_error(error) and self.automatic_trial_active():
+            return RecoveryCause.TRANSIENT
+        return None
+
+    async def _settle_native_result(self, owner: _WireAttempt, error: BaseException | None, result: object) -> None:
+        check, domain_owner = owner.native_check, owner.native_owner
+        assert check is not None and domain_owner is not None
+        outcome = self._native_outcome(owner, error, result)
+        if outcome == "unknown" and self._wire_fault is None:
+            self._wire_fault = "unresolved_outbound_outcome"
+            self._native_wire_fault_owner = owner.attempt_id
+            self._recovery_cause = RecoveryCause.READ_UNCERTAINTY
+        try:
+            await domain_owner.record_wire_outcome(check.binding, owner.attempt_id, outcome)
+        except BaseException:
+            self._wire_fault = self._wire_fault or "unresolved_outbound_outcome"
+            raise
+        ledger = self._ensure_safety_ledger()
+        contained = outcome == "unknown" and await domain_owner.validate_binding(check.binding, owner.attempt_id)
+        if contained:
+            await ledger.complete_native_unknown(owner.attempt_id, check.binding, owner.method_generation)
+        else:
+            await ledger.complete(
+                owner.attempt_id,
+                known_outcome=outcome != "unknown",
+                method_generation=owner.method_generation,
+                method_success=outcome == "acknowledged",
+            )
+        if outcome == "unknown":
+            self._observe_unknown_incident(owner, error, ledger)
+            self._release_native_fault(owner, ledger, contained)
+        await self._notify_detached_native_terminal(owner, outcome)
+
+    @staticmethod
+    def _native_outcome(owner: _WireAttempt, error: BaseException | None, result: object) -> NativeWireOutcome:
+        if not owner.claimed or isinstance(error, RPCError) or (error is None and result is False):
+            return "rejected"
+        if error is None and result is True:
+            return "acknowledged"
+        return "unknown"
+
+    def _release_native_fault(self, owner: _WireAttempt, ledger: TelegramRpcSafetyLedger, contained: bool) -> None:
+        if (
+            contained
+            and self._native_wire_fault_owner == owner.attempt_id
+            and self._wire_fault == "unresolved_outbound_outcome"
+            and self._recovery_cause is RecoveryCause.READ_UNCERTAINTY
+            and not ledger._unresolved()
+        ):
+            self._wire_fault = None
+            self._native_wire_fault_owner = None
+            self._recovery_cause = None
+            self._notify_rpc_eligibility_changed()
+
+    @staticmethod
+    async def _notify_detached_native_terminal(owner: _WireAttempt, outcome: NativeWireOutcome) -> None:
+        domain_owner, check = owner.native_owner, owner.native_check
+        if not owner.claimed or outcome not in {"acknowledged", "unknown"}:
+            return
+        if not TelegramRpcGate._native_owner_abandoned(owner):
+            return
+        if domain_owner is None or check is None or domain_owner.notify_terminal is None:
+            return
+        try:
+            await domain_owner.notify_terminal(check.binding, outcome)
+        except (Exception, asyncio.CancelledError) as error:  # noqa: BLE001 - the wire result is already settled.
+            logger.warning("native_terminal_notification_failed error_type=%s", type(error).__name__)
+
+    @staticmethod
+    def _native_owner_abandoned(owner: _WireAttempt) -> bool:
+        task = owner.scope.owner_task
+        return owner.revoked or task is None or task.done() or bool(task.cancelling())
 
     def _wire_outcome_known(self, owner: _WireAttempt, error: BaseException | None) -> bool:
         return not self._retired_photo_export(owner, error) and (
             error is None
             or isinstance(error, RPCError)
-            or (isinstance(error, (ScheduledWriteRejected, PeerAccessRejectedError)) and owner.claimed == 0)
+            or (
+                isinstance(
+                    error, (ScheduledWriteRejected, FolderWriteRejected, NoteWriteRejected, PeerAccessRejectedError)
+                )
+                and owner.claimed == 0
+            )
         )
 
     @staticmethod
@@ -5202,7 +5875,7 @@ class TelegramRpcGate(TelegramClient):
     def _note_successful_acquisition(
         self, owner: _WireAttempt, error: BaseException | None, rejected: BaseException | None
     ) -> None:
-        if owner.draft_mutation or owner.scheduled_mutation:
+        if owner.draft_mutation or owner.scheduled_mutation or owner.native_check is not None:
             return
         if (
             error is None
@@ -5500,6 +6173,8 @@ class TelegramRpcGate(TelegramClient):
                 self.session.auth_key = None
                 cast(AuthKey, self._main_sender.auth_key).key = None
                 self.session.save()
+        invalidate_folder_intake()
+        invalidate_contact_note_scope()
         self._authentication_token = token
         self._authentication_mode = True
 
@@ -5533,6 +6208,8 @@ class TelegramRpcGate(TelegramClient):
             raise ValueError("logout requires the connected owned account")
         ledger = self._ensure_safety_ledger()
         ledger.require_writable()
+        invalidate_folder_intake()
+        invalidate_contact_note_scope()
         self._logout_mode = True
         self._admission_scheduler.notify_eligibility_changed()
         prepared = False
@@ -5627,6 +6304,7 @@ class TelegramRpcGate(TelegramClient):
         """Consume an explicit one-use grant before any connection/bootstrap write."""
         ledger = self._ensure_safety_ledger()
         try:
+            await self._reconcile_native_receipts(ledger)
             if self._session_lease is not None and self._session_lease.is_held():
                 async with ledger.observe_recovery_await(RecoveryAction.STARTUP_RECONCILE):
                     await ledger._reconcile_aux_after_restart(self._session_lease)
@@ -5646,7 +6324,40 @@ class TelegramRpcGate(TelegramClient):
         finally:
             self._startup_safety_prepared = True
 
+    async def _reconcile_native_receipts(self, ledger: TelegramRpcSafetyLedger) -> None:
+        if not ledger._read_scope_valid:
+            return
+        intents = cast(dict[str, dict[str, object]], ledger._record["intents"])
+        for attempt_id, intent in tuple(intents.items()):
+            await self._reconcile_native_receipt(ledger, attempt_id, intent)
+
+    async def _reconcile_native_receipt(
+        self, ledger: TelegramRpcSafetyLedger, attempt_id: str, intent: dict[str, object]
+    ) -> None:
+        native = intent.get("native_write_receipt_owner")
+        if not isinstance(native, dict):
+            return
+        binding = _native_binding(native.get("binding"))
+        owner = self._native_write_domains.get(binding.domain) if binding is not None else None
+        if binding is None or owner is None:
+            return
+        if not self._native_restart_scope_matches(ledger, intent):
+            return
+        if await owner.recover_binding(binding, attempt_id) and await owner.validate_binding(binding, attempt_id):
+            await ledger.contain_native(attempt_id, binding)
+
+    def _native_restart_scope_matches(self, ledger: TelegramRpcSafetyLedger, intent: dict[str, object]) -> bool:
+        scope = cast(dict[str, object], ledger._record["scope"])
+        return not (
+            ledger._record["transition"] is not None
+            or intent["scope"] != {key: scope[key] for key in ("dc_id", "key_id", "account_id")}
+            or (scope["dc_id"], scope["key_id"]) != self._offline_wire_identity()
+            or any(value not in {None, scope["account_id"]} for value in ledger._store.canonical_owners())
+        )
+
     async def verify_startup_account(self, account_id: int) -> None:
+        invalidate_folder_intake()
+        invalidate_contact_note_scope()
         ledger = self._ensure_safety_ledger()
         await ledger.verify_account(account_id)
         snapshot = ledger.recovery_identity()
@@ -7181,15 +7892,7 @@ class TelegramRpcGate(TelegramClient):
         if wire_owner is not None:
             method = wire_owner.method
             self._pending_method_receipts[method] = self._pending_method_receipts.get(method, 0) + 1
-            receipt = asyncio.create_task(
-                self._ensure_safety_ledger().complete(
-                    wire_owner.attempt_id,
-                    known_outcome=True,
-                    floor_until_utc=deadline_utc,
-                    circuit_open=self._rpc_circuit_status().open,
-                    actual_flood=bool(wire_owner.claimed),
-                )
-            )
+            receipt = asyncio.create_task(self._settle_flood_receipt(wire_owner, deadline_utc))
             receipt.add_done_callback(lambda _task: self._method_receipt_finished(wire_owner.method), context=Context())
         else:
             receipt = asyncio.create_task(
@@ -7199,6 +7902,25 @@ class TelegramRpcGate(TelegramClient):
         receipt.add_done_callback(lambda _task: self._cooldown_save_tasks.pop(id(exc), None), context=Context())
         self._observe_flood_event(scope, attempt, seconds)
         return seconds, receipt
+
+    async def _settle_flood_receipt(self, owner: _WireAttempt, deadline_utc: float) -> None:
+        ledger = self._ensure_safety_ledger()
+        circuit_open = self._rpc_circuit_status().open
+        if owner.native_bound and owner.native_check is not None:
+            assert owner.native_owner is not None
+            try:
+                await owner.native_owner.record_wire_outcome(owner.native_check.binding, owner.attempt_id, "rejected")
+            except BaseException:
+                self._wire_fault = self._wire_fault or "unresolved_outbound_outcome"
+                await ledger.record_floor(deadline_utc, circuit_open=circuit_open)
+                raise
+        await ledger.complete(
+            owner.attempt_id,
+            known_outcome=True,
+            floor_until_utc=deadline_utc,
+            circuit_open=circuit_open,
+            actual_flood=bool(owner.claimed),
+        )
 
     def _method_receipt_finished(self, method: str) -> None:
         remaining = self._pending_method_receipts[method] - 1

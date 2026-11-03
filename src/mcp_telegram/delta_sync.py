@@ -145,13 +145,8 @@ def _delta_rpc_scope[**P, R](
 class AccessProbePolicy:
     """Budgeted cold policy for access-lost archive revalidation."""
 
-    interval_seconds: float
-    max_dialogs_per_cycle: int
+    enabled: bool
     cooldown_seconds: int
-
-    @property
-    def enabled(self) -> bool:
-        return self.max_dialogs_per_cycle > 0
 
 
 # Automatic forward-delta fallback cadence, measured from the durable

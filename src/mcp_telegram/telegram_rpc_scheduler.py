@@ -113,6 +113,8 @@ LEGACY_DEMAND_KIND_BY_SOURCE: Mapping[TelegramRpcSource, DemandKind] = MappingPr
         TelegramRpcSource.SCHEDULED_MESSAGES: DemandKind.SCHEDULED_REPAIR,
         TelegramRpcSource.MESSAGE_IMAGE_ACQUISITION: DemandKind.MESSAGE_IMAGE_ACQUISITION,
         TelegramRpcSource.SCHEDULED_MUTATION: DemandKind.SCHEDULED_MUTATION,
+        TelegramRpcSource.FOLDER_COMMAND: DemandKind.FOLDER_COMMAND,
+        TelegramRpcSource.NOTE_COMMAND: DemandKind.NOTE_COMMAND,
         TelegramRpcSource.DRAFT_SNAPSHOT: DemandKind.DRAFT_SNAPSHOT,
         TelegramRpcSource.DRAFT_MUTATION: DemandKind.DRAFT_MUTATION,
         TelegramRpcSource.MAINTENANCE: DemandKind.SELF_PROFILE_MAINTENANCE,
@@ -731,6 +733,8 @@ class TelegramRpcAdmissionScheduler:
         self._bind_loop(loop)
         now = self._clock()
         deadline = scope.deadline or now + self._configured_deadline_seconds(scope.service_class)
+        if scope.demand_kind in {DemandKind.FOLDER_COMMAND, DemandKind.NOTE_COMMAND}:
+            deadline = min(deadline, now + 15.0, now + self._configured_deadline_seconds(scope.service_class))
         if deadline <= now:
             self._emit_for_scope(
                 RpcAdmissionEventKind.EXPIRED,

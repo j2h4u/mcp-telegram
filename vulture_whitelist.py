@@ -182,3 +182,6 @@ EntityProfileRepository.refresh_state  # repository collection-page fencing asse
 
 # Pinned Telethon iterator calls this capability cleanup dynamically after FileMigrate.
 _return_exported_sender
+
+# Pydantic exposes this version precondition through the public create schema.
+FolderCommandArguments.expected_catalog_version

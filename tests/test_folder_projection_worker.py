@@ -14,9 +14,10 @@ from mcp_telegram.folders.refresh import FolderRefresher
 from mcp_telegram.folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from mcp_telegram.folders.worker import FolderAttemptResult, FolderProjectionDemandAdapter, FolderProjectionWorker
 from mcp_telegram.sync_db import ensure_sync_schema
-from mcp_telegram.sync_transactions import enable_runtime_writes
-from mcp_telegram.telegram_demand import RpcAttemptBudget
-from mcp_telegram.telegram_demand_progress import SliceOutcomeKind
+from mcp_telegram.sync_transactions import enable_runtime_writes, write_savepoint
+from mcp_telegram.telegram_demand import DemandStatus, RpcAttemptBudget
+from mcp_telegram.telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkKey, WorkRevision
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred
 from tests.sqlite_writer_helpers import inline_writer
 
@@ -37,10 +38,98 @@ class _Gateway:
         return FolderRuleObservation((FolderRule(1, "One"),), "token", started_at)
 
 
+@pytest.mark.asyncio
+async def test_forced_observation_starts_after_inflight_and_has_new_order(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Gateway:
+        calls = 0
+
+        async def fetch_rules(self, *, started_at: int) -> FolderRuleObservation:
+            self.calls += 1
+            if self.calls == 1:
+                entered.set()
+                await release.wait()
+            return FolderRuleObservation((FolderRule(2, "One"),), "same", started_at)
+
+    try:
+        conn.execute(
+            "UPDATE dialog_directory_publication SET account_id=1,generation=1,observation_started_at=1 WHERE singleton=1"
+        )
+        conn.commit()
+        enable_runtime_writes(conn)
+        repo = SQLiteFolderSnapshotRepository(conn)
+        gateway = Gateway()
+        worker = FolderProjectionWorker(
+            FolderRefresher(gateway, repo, writer=inline_writer(conn)),
+            repo,
+            asyncio.Event(),
+            _Policy(),
+            writer=inline_writer(conn),
+            clock=lambda: 1000,
+        )
+        first = asyncio.create_task(worker._attempt("scheduled"))
+        await entered.wait()
+        second = asyncio.create_task(worker.force_refresh())
+        await asyncio.sleep(0)
+        assert await second is None
+        assert gateway.calls == 1
+        release.set()
+        old = await first
+        fresh = await worker.force_refresh()
+        assert old is not None and fresh is not None and old.observation_order is not None
+        assert (
+            fresh.accepted and fresh.observation_order is not None and fresh.observation_order > old.observation_order
+        )
+        assert gateway.calls == 2
+    finally:
+        conn.close()
+
+
 def _budget(adapter: FolderProjectionDemandAdapter, now: float) -> RpcAttemptBudget:
     status = adapter.status(now)
     assert status is not None and status.selected is not None
     return RpcAttemptBudget(limit=1, selected=status.selected)
+
+
+@pytest.mark.asyncio
+async def test_receipt_verification_shares_folder_demand_adapter(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    selected = WorkRevision(WorkKey(DemandKind.FOLDER_SNAPSHOT, 1, "receipt:operation"), "version")
+
+    class Verification:
+        def verification_status(self, now: float, excluded: frozenset[WorkRevision]) -> DemandStatus | None:
+            return None if selected in excluded else DemandStatus(release_at=now, selected=selected)
+
+        async def verification_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
+            assert budget.selected == selected
+            return SliceOutcome(selected, SliceOutcomeKind.TERMINAL, "completed")
+
+    try:
+        repo = SQLiteFolderSnapshotRepository(conn)
+        writer = inline_writer(conn)
+        worker = FolderProjectionWorker(
+            FolderRefresher(_Gateway(), repo, writer=writer),
+            repo,
+            asyncio.Event(),
+            _Policy(),
+            writer=writer,
+            clock=lambda: 1000,
+        )
+        adapter = FolderProjectionDemandAdapter(worker, account_id=1, verification=Verification())
+        status = adapter.status(1000)
+        assert status is not None and status.selected == selected
+        outcome = await adapter.run_slice(RpcAttemptBudget(limit=1, selected=selected))
+        assert outcome.kind is SliceOutcomeKind.TERMINAL
+        status = adapter.status(1000, excluded=frozenset({selected}))
+        assert status is not None and status.selected != selected
+    finally:
+        conn.close()
 
 
 @pytest.mark.asyncio
@@ -256,7 +345,7 @@ async def test_pending_folder_observation_without_canonical_generation_is_not_pr
         assert gateway.calls == 1
         assert outcome.kind is SliceOutcomeKind.NO_PROGRESS
         assert repository.read_snapshot_revision() == (None, None, None, None)
-        assert conn.execute("SELECT COUNT(*) FROM telegram_folder_pending_observation").fetchone() == (1,)
+        assert conn.execute("SELECT COUNT(*) FROM telegram_folder_rules").fetchone() == (0,)
     finally:
         conn.close()
 
@@ -304,6 +393,106 @@ async def test_folder_refresh_rejects_publication_after_selected_projection_chan
         assert outcome.kind is SliceOutcomeKind.STALE
         assert repository.read_snapshot_revision() == (1, 1, "newer-token", 1001)
         assert conn.execute("SELECT title FROM telegram_folder_rules").fetchall() == [("Newer",)]
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["intake", "account", "auth"])
+async def test_folder_refresh_rejects_stale_intake_or_account(tmp_path: Path, change: str) -> None:
+    from telethon.tl.types import UpdateDialogFilters
+
+    from mcp_telegram.auth_scope import TelegramAuthScope
+    from mcp_telegram.folders.intake import capture_folder_intake
+
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    auth = [TelegramAuthScope(1, 1, 2, 3)]
+    try:
+        conn.execute(
+            "UPDATE dialog_directory_publication SET account_id=1,generation=1,observation_started_at=1 WHERE singleton=1"
+        )
+        conn.commit()
+        enable_runtime_writes(conn)
+        repository = SQLiteFolderSnapshotRepository(conn)
+        repository.project_observation(FolderRuleObservation((FolderRule(2, "Retained"),), "old", 1), completed_at=1)
+
+        class Gateway:
+            async def fetch_rules(self, *, started_at: int) -> FolderRuleObservation:
+                if change == "intake":
+                    capture_folder_intake([UpdateDialogFilters()])
+                elif change == "account":
+                    with write_savepoint(conn):
+                        conn.execute("UPDATE dialog_directory_publication SET account_id=2 WHERE singleton=1")
+                else:
+                    auth[0] = TelegramAuthScope(1, 1, 2, 4)
+                return FolderRuleObservation((FolderRule(3, "Stale"),), "stale", started_at)
+
+        result = await FolderRefresher(
+            Gateway(), repository, writer=inline_writer(conn), auth_scope=lambda: auth[0]
+        ).refresh(completed_at=10)
+        assert not result.accepted
+        assert conn.execute("SELECT title FROM telegram_folder_rules").fetchone() == ("Retained",)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_scope_claim_rejects_authorization_transition_and_post_commit_result(tmp_path: Path) -> None:
+    from mcp_telegram.auth_scope import TelegramAuthScope
+    from mcp_telegram.image_authorization import ScopeCell
+
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "UPDATE dialog_directory_publication SET account_id=1,generation=1,observation_started_at=1 WHERE singleton=1"
+        )
+        conn.commit()
+        enable_runtime_writes(conn)
+        repo = SQLiteFolderSnapshotRepository(conn)
+        repo.project_observation(FolderRuleObservation((FolderRule(2, "Retained"),), "old", 1), completed_at=1)
+        scope = TelegramAuthScope(1, 1, 2, 3)
+        cell = ScopeCell()
+        cell.publish(scope)
+
+        class TransitionGateway:
+            async def fetch_rules(self, *, started_at: int) -> FolderRuleObservation:
+                change = cell.begin_change()
+                cell.end_change(change)
+                cell.publish(scope)
+                return FolderRuleObservation((FolderRule(3, "Stale"),), "stale", started_at)
+
+        refresher = FolderRefresher(
+            TransitionGateway(),
+            repo,
+            writer=inline_writer(conn),
+            auth_scope=lambda: scope,
+            capture_scope=cell.capture,
+            claim_scope=cell.claim,
+        )
+        assert not (await refresher.refresh(completed_at=10)).accepted
+        assert conn.execute("SELECT title FROM telegram_folder_rules").fetchone() == ("Retained",)
+
+        calls = 0
+
+        def claim_then_revoke(token: object) -> bool:
+            nonlocal calls
+            calls += 1
+            return calls == 1
+
+        refresher = FolderRefresher(
+            _Gateway(),
+            repo,
+            writer=inline_writer(conn),
+            auth_scope=lambda: scope,
+            capture_scope=cell.capture,
+            claim_scope=claim_then_revoke,
+        )
+        result = await refresher.refresh(completed_at=11)
+        assert not result.accepted and result.observation_order is None and result.committed_revision is None
     finally:
         conn.close()
 

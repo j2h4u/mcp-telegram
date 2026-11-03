@@ -107,3 +107,15 @@ def test_demand_status_reports_readiness_and_freshness_debt() -> None:
 
     with pytest.raises(FrozenInstanceError):
         status.release_at = 0.0  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("kind", [DemandKind.FOLDER_COMMAND, DemandKind.NOTE_COMMAND])
+def test_native_command_has_one_bounded_common_deadline(kind: DemandKind, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("mcp_telegram.telegram_demand.time.monotonic", lambda: 100.0)
+    with demand_context(kind, deadline=999.0) as root:
+        assert root.admission_deadline == 125.0
+        with acquisition_context(AcquisitionKind.ENTITY_LOOKUP) as nested:
+            assert nested.admission_deadline == 125.0
+            assert nested.attempt_evidence is root.attempt_evidence
+    with demand_context(kind, deadline=112.0) as root:
+        assert root.admission_deadline == 112.0

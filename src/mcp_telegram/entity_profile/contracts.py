@@ -339,6 +339,15 @@ class ProjectionOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class CommandProfileAcquisition:
+    """Accepted note evidence and separately observed contact eligibility."""
+
+    accepted: bool
+    contact_current: bool
+    observation_order: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class UserProfileObservation:
     """Neutral result containing both projections of one FullUser request."""
 

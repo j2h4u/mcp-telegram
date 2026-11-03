@@ -856,6 +856,8 @@ class DaemonAPIServer:
         self._client_handlers: dict[asyncio.Task[object], asyncio.StreamWriter] = {}
         self._draft_commands: DraftCommands | None = None
         self._scheduled_commands: DraftCommands | None = None
+        self._folder_commands: DraftCommands | None = None
+        self._contact_note_commands: DraftCommands | None = None
         self._message_image_service: MessageImageServicePort | None = None
 
     def bind_message_image_service(self, service: MessageImageServicePort) -> None:
@@ -869,6 +871,12 @@ class DaemonAPIServer:
     def bind_scheduled_commands(self, commands: DraftCommands) -> None:
         """Attach native scheduled writes after authenticated account binding."""
         self._scheduled_commands = commands
+
+    def bind_folder_commands(self, commands: DraftCommands) -> None:
+        self._folder_commands = commands
+
+    def bind_contact_note_commands(self, commands: DraftCommands) -> None:
+        self._contact_note_commands = commands
 
     def bind_runtime_observation_sink(self, sink: RuntimeObservationSink) -> None:
         """Attach the bounded asynchronous sink used for daemon timing evidence."""
@@ -1268,6 +1276,8 @@ class DaemonAPIServer:
             "update_feedback_status",
             "manage_draft",
             "manage_scheduled_message",
+            "manage_folder",
+            "manage_contact_note",
         }
         if foreground:
             request_task.cancel()
@@ -1372,6 +1382,9 @@ class DaemonAPIServer:
             "prepare_message_image": self._prepare_message_image,
             "manage_draft": self._manage_draft,
             "manage_scheduled_message": self._manage_scheduled_message,
+            "get_folder": self._get_folder,
+            "manage_folder": self._manage_folder,
+            "manage_contact_note": self._manage_contact_note,
             "search_messages": self._search_messages,
             "trace_account_messages": self._trace_account_messages,
             "list_dialogs": self._list_dialogs,
@@ -1419,7 +1432,7 @@ class DaemonAPIServer:
                 with _preserve_or_rpc_scope(TelegramRpcSource.OPERATOR_LOGOUT):
                     return await self._logout_account(req)
 
-        if method in {"manage_draft", "manage_scheduled_message"}:
+        if method in {"manage_draft", "manage_scheduled_message", "manage_folder", "manage_contact_note"}:
             result = handler(req)
             return result if isinstance(result, dict) else cast(dict[str, object], await result)
 
@@ -1839,10 +1852,20 @@ class DaemonAPIServer:
         return await self._get_reading_service().get_unread_summary(cast(dict[str, object], req))
 
     async def _list_folders(self, _req: dict[str, object]) -> dict:
+        from .folders.commands import folder_catalog_owner, folder_catalog_version
+
+        scope = self._auth_scope
+        if scope is None or self.self_id != scope.account_id:
+            return self._directory_account_unverified("The connected account is not verified.")
+        owner = folder_catalog_owner(self._conn)
+        if owner is not None and owner != scope.account_id:
+            return self._directory_account_unverified("The retained folder catalog belongs to a different account.")
         await self._reproject_due_folder_memberships()
-        return {
+        response = {
             "ok": True,
             "data": {
+                "account_id": scope.account_id,
+                "catalog_version": folder_catalog_version(self._conn, scope.account_id),
                 "folders": folder_summaries(self._conn),
                 "directory_coverage": read_dialog_directory_coverage(self._conn).to_wire(),
                 "folder_snapshot": folder_snapshot(
@@ -1851,6 +1874,9 @@ class DaemonAPIServer:
                 ),
             },
         }
+        if self._auth_scope != scope or self.self_id != scope.account_id:
+            return self._directory_account_unverified("The connected account changed during the read.")
+        return response
 
     # list_topics
     # ------------------------------------------------------------------
@@ -2432,6 +2458,74 @@ class DaemonAPIServer:
         if resolved.get("ok") is False:
             return resolved
         return read_draft_request(self._conn, resolved, account_id=self.self_id)
+
+    async def _get_folder(self, req: dict[str, object]) -> dict[str, object]:
+        from .folders.commands import read_folder
+
+        scope = self._auth_scope
+        folder_id = req.get("folder_id")
+        if scope is None or self.self_id != scope.account_id:
+            return self._directory_account_unverified("The connected account is not verified.")
+        if type(folder_id) is not int:
+            return {"ok": False, "error": "invalid_arguments", "required_action": "Supply an exact folder ID."}
+        data = read_folder(self._conn, scope.account_id, folder_id)
+        if self._auth_scope != scope or self.self_id != scope.account_id:
+            return self._directory_account_unverified("The connected account changed during the read.")
+        return {"ok": True, **data}
+
+    async def _manage_folder(self, req: dict[str, object]) -> dict[str, object]:
+        from pydantic import ValidationError
+
+        from .folders.arguments import FolderCommandArguments
+
+        if self._folder_commands is None:
+            return {"ok": False, "error": "daemon_not_ready", "required_action": "Folder commands are not ready."}
+        scope = self._auth_scope
+        if scope is None or self.self_id != scope.account_id:
+            return self._directory_account_unverified("The connected account is not verified.")
+        payload = {key: value for key, value in req.items() if key not in {"method", "request_id", "timezone"}}
+        try:
+            command = FolderCommandArguments.model_validate(payload, strict=True)
+        except ValidationError:
+            return {
+                "ok": False,
+                "error": "invalid_arguments",
+                "required_action": "Check action-specific folder arguments.",
+            }
+        result = await self._folder_commands.execute(command.model_dump(exclude_unset=True))
+        if self._auth_scope != scope or self.self_id != scope.account_id:
+            return self._directory_account_unverified("The connected account changed during the command.")
+        return result
+
+    async def _manage_contact_note(self, req: dict[str, object]) -> dict[str, object]:
+        if self._contact_note_commands is None:
+            return {"ok": False, "error": "daemon_not_ready", "required_action": "Contact note commands are not ready."}
+        scope = self._auth_scope
+        if scope is None or self.self_id != scope.account_id:
+            return self._directory_account_unverified("The connected account is not verified.")
+        allowed = {
+            "method",
+            "request_id",
+            "timezone",
+            "dialog_id",
+            "action",
+            "expected_version",
+            "operation_key",
+            "text",
+            "drop_formatting",
+        }
+        if set(req) - allowed:
+            return {"ok": False, "error": "invalid_arguments", "required_action": "Check contact note arguments."}
+        result = await self._contact_note_commands.execute(req)
+        if self._auth_scope != scope or self.self_id != scope.account_id:
+            return self._directory_account_unverified("The connected account changed during the command.")
+        if "error" in result:
+            return {
+                "ok": False,
+                "error": result["error"],
+                "required_action": "Read the contact note and check the same operation key.",
+            }
+        return {"ok": True, "account_id": scope.account_id, "operation_key": req.get("operation_key"), **result}
 
     async def _manage_draft(self, req: dict[str, object]) -> dict[str, object]:
         resolved = await self._draft_request(req)

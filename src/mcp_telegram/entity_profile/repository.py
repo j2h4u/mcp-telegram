@@ -14,11 +14,13 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import cast
 
 from ..access_predicates import not_access_lost_sql
+from ..contact_notes.intake import invalidate_contact_note
+from ..contact_notes.receipts import refine_acknowledged_for_observation, refine_unknown_for_observation
 from ..dialog_fact_observations import claim_dialog_fact
 from ..dialog_identity import capture_identity_baseline, publish_dialog_identity
 from ..dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation, ObservedText
@@ -87,6 +89,14 @@ def _is_nonnegative_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+def _invalidate_note_merge(merged: EffectiveProfileMerge) -> None:
+    roots = ("full_user.note", "user.contact")
+    if any(
+        path == root or path.startswith((root + ".", root + "[")) for path in merged.accepted_paths for root in roots
+    ):
+        invalidate_contact_note(merged.snapshot.target_id)
+
+
 class _CoreAcquisitionRejectedError(Exception):
     """Rollback a rejected core CAS without disturbing its caller's write unit."""
 
@@ -131,6 +141,7 @@ class EntitySectionCommit:
     field_observation: ProfileFieldObservation | None = None
     semantic_snapshot: ProfileSemanticSnapshot | None = None
     collection_page: ProfileCollectionPage | None = None
+    note_refinement_guard: Callable[[], bool] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,6 +334,7 @@ class EntityProfileRepository:
                 endpoint="supplied.User",
             )
             merged = store_semantic_patch(self._conn, incoming, observation)
+            _invalidate_note_merge(merged)
             append_effective_history(self._conn, merged, observation, base, legacy_evidence)
             if observation.source != "min":
                 changed |= self._changed_semantic_roots(merged)
@@ -2079,6 +2091,8 @@ class EntityProfileRepository:
         detail, accepted, reset_owner = self._prepare_observed_commit(
             cursor.entity_id, commit.detail_patch, commit.field_observation
         )
+        if commit.note_refinement_guard is not None and not commit.note_refinement_guard():
+            return False
         if not self._write_detail(
             cursor.entity_id,
             detail,
@@ -2148,10 +2162,19 @@ class EntityProfileRepository:
             snapshot.require_account(observation.owner_account_id)
             merged = store_semantic_snapshot(self._conn, snapshot, observation.order)
             if merged is not None:
+                _invalidate_note_merge(merged)
                 self._dirty_summary_sections(merged)
                 if commit.evidence is not None:
                     merged = self._store_supplied_stories(merged, commit.evidence.generation, observation)
                 append_effective_history(self._conn, merged, observation, legacy_before, legacy_evidence)
+                guard = commit.note_refinement_guard
+                if guard is not None and guard():
+                    refine_unknown_for_observation(
+                        self._conn, observation.owner_account_id, snapshot.target_id, observation.order, guard
+                    )
+                    refine_acknowledged_for_observation(
+                        self._conn, observation.owner_account_id, snapshot.target_id, observation.order, guard
+                    )
             return merged
         return None
 
@@ -2671,6 +2694,49 @@ class EntityProfileRepository:
             _encode_bounded_json(evidence.identity),
         )
 
+    def commit_command_profile(
+        self,
+        entity_id: int,
+        commit: EntitySectionCommit,
+        *,
+        expected_revision: int,
+        now: int,
+        publication_guard: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Publish one command acquisition without advancing refresh progress."""
+        observation = commit.field_observation
+        snapshot = commit.semantic_snapshot
+        if observation is None or snapshot is None or snapshot.target_id != entity_id:
+            raise ValueError("command profile requires an account-bound observation")
+        snapshot.require_account(observation.owner_account_id)
+        with write_savepoint(self._conn):
+            history_base, history_evidence = self._owned_history_base(entity_id, observation)
+            detail, accepted, reset_owner = self._prepare_observed_commit(entity_id, commit.detail_patch, observation)
+            if publication_guard is not None and not publication_guard():
+                return False
+            if not self._write_detail(
+                entity_id,
+                detail,
+                now=now,
+                expected_revision=expected_revision,
+                owner_account_id=commit.observation_owner_account_id,
+                observation_scope=commit.observation_auth_scope,
+                ownership_observed=commit.ownership_observed,
+                identity_patch=_accepted_identity_patch(commit, accepted),
+                dialog_identity_observation=commit.dialog_identity_observation,
+                dialog_identity_baseline_revision=commit.dialog_identity_baseline_revision,
+            ):
+                return False
+            self._finish_observed_commit(entity_id, accepted, reset_owner, observation)
+            merged = self._store_semantic_commit(commit, history_base, history_evidence)
+            if self._refresh_has("profile_revision") and self._detail_has("profile_revision"):
+                self._conn.execute(
+                    "UPDATE entity_profile_refresh_state SET profile_revision=? "
+                    "WHERE entity_id=? AND profile_revision=?",
+                    (expected_revision + 1, entity_id, expected_revision),
+                )
+            return merged is not None and "full_user.note" in merged.accepted_paths
+
     def commit_full_user_pair(
         self,
         cursor: EntityRefreshCursor,
@@ -2860,6 +2926,8 @@ class EntityProfileRepository:
         detail, accepted, reset_owner = self._prepare_observed_commit(
             cursor.entity_id, {**full_profile.detail_patch, **personal_channel.detail_patch}, observation
         )
+        if full_profile.note_refinement_guard is not None and not full_profile.note_refinement_guard():
+            return None
         if not self._write_pair_detail(cursor, detail, full_profile, personal_channel, now=now, accepted=accepted):
             return None
         self._finish_observed_commit(cursor.entity_id, accepted, reset_owner, observation)
@@ -2966,6 +3034,21 @@ class EntityProfileRepository:
             (*values, *parameters),
         ).rowcount
         return changed == 1
+
+    def request_note_reconciliation(self, entity_id: int, *, now: int, pair_mode: str) -> bool:
+        """Coalesce uncertain note evidence without restarting active profile work."""
+        active = self._read_pending_refresh_state(entity_id)
+        if _pending_refresh_is_active(active):
+            if active is not None and active.get("follow_up_required"):
+                return True
+            return self.request_follow_up(entity_id, now=now)
+        return self.request_section_refresh(
+            entity_id,
+            ("full_profile", "personal_channel"),
+            now=now,
+            pair_mode=pair_mode,
+            reason="native_note_uncertain",
+        )
 
     def request_follow_up(self, entity_id: int, *, now: int) -> bool:
         """Record a new freshness demand without losing the active generation."""

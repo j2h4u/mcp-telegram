@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Sequence
 from typing import Protocol, cast
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
 from telethon.errors import RPCError  # type: ignore[import-untyped]
+from telethon.tl import types as tl  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import GetDialogFiltersRequest  # type: ignore[import-untyped]
 from telethon.tl.types import DialogFilter, DialogFilterChatlist, DialogFilterDefault  # type: ignore[import-untyped]
 
 from ..flood import TelegramRpcThrottled
+from ..message_composition import normalize_telegram_fact
 from .contracts import (
     DEFAULT_FOLDER_NAMESPACE,
     FILTER_FOLDER_NAMESPACE,
@@ -20,7 +20,11 @@ from .contracts import (
     FolderRule,
     FolderRuleKind,
     FolderRuleObservation,
+    FolderRuleUpdate,
     FolderSourceUnavailableError,
+)
+from .contracts import (
+    folder_observation_token as _observation_token,
 )
 from .ports import TelegramFolderGateway
 
@@ -31,15 +35,8 @@ class FolderClient(Protocol):
 
 def _peer_ids(peers: object) -> tuple[int, ...]:
     if not isinstance(peers, (list, tuple)):
-        return ()
-    result: list[int] = []
-    seen: set[int] = set()
-    for peer in peers:
-        peer_id = int(telethon_utils.get_peer_id(peer))
-        if peer_id not in seen:
-            seen.add(peer_id)
-            result.append(peer_id)
-    return tuple(result)
+        raise TypeError("folder peer list is unavailable")
+    return tuple(int(telethon_utils.get_peer_id(peer)) for peer in peers)
 
 
 def _categories(folder: object) -> frozenset[DialogCategory]:
@@ -73,41 +70,63 @@ def _folder_rule(folder: object, position: int) -> FolderRule | None:
     folder_id = _as_int(getattr(folder, "id", None))
     if folder_id == 1:
         raise ValueError("custom filter id 1 is reserved for the Telegram archive folder")
+    entities, complete = _title_entities(title_value)
+    try:
+        included = _peer_ids(getattr(folder, "include_peers", ()))
+        pinned = _peer_ids(getattr(folder, "pinned_peers", ()))
+        excluded = _peer_ids(getattr(folder, "exclude_peers", ()))
+    except TypeError, ValueError:
+        return None
     return FolderRule(
         folder_id,
         title,
         FILTER_FOLDER_NAMESPACE,
         kind,
         position,
-        _peer_ids(getattr(folder, "include_peers", ())),
-        _peer_ids(getattr(folder, "pinned_peers", ())),
-        _peer_ids(getattr(folder, "exclude_peers", ())),
+        included,
+        pinned,
+        excluded,
         _categories(folder),
         bool(getattr(folder, "exclude_archived", False)),
         bool(getattr(folder, "exclude_read", False)),
         bool(getattr(folder, "exclude_muted", False)),
+        entities,
+        bool(getattr(folder, "title_noanimate", False)),
+        getattr(folder, "emoticon", None),
+        getattr(folder, "color", None),
+        bool(getattr(folder, "has_my_invites", False)),
+        complete,
     )
 
 
-def _observation_token(rules: tuple[FolderRule, ...]) -> str:
-    payload = [
-        (
-            rule.namespace,
-            rule.folder_id,
-            rule.title,
-            rule.kind.value,
-            rule.source_position,
-            rule.included_ids,
-            rule.pinned_ids,
-            rule.excluded_ids,
-            sorted(category.value for category in rule.categories),
-            rule.exclude_archived,
-            rule.exclude_read,
-            rule.exclude_muted,
-        )
-        for rule in rules
-    ]
-    return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
+def folder_update_from_native(update: object) -> FolderRuleUpdate:
+    if isinstance(update, tl.UpdateDialogFilter):
+        rule = None if update.filter is None else _folder_rule(update.filter, 0)
+        if update.filter is not None and (rule is None or not rule.complete or rule.folder_id != update.id):
+            return FolderRuleUpdate("invalid")
+        return FolderRuleUpdate("filter", folder_id=update.id, rule=rule)
+    if isinstance(update, tl.UpdateDialogFilterOrder):
+        return FolderRuleUpdate("order", order=tuple(update.order))
+    return FolderRuleUpdate("invalid")
+
+
+def _title_entities(title: object) -> tuple[tuple[dict[str, object], ...], bool]:
+    result: list[dict[str, object]] = []
+    for entity in cast(Sequence[object], getattr(title, "entities", ())):
+        name = type(entity).__name__
+        if (
+            name == "MessageEntityUnknown"
+            or not name.startswith("MessageEntity")
+            or getattr(tl, name, None) is not type(entity)
+        ):
+            return tuple(result), False
+        value = normalize_telegram_fact(entity)
+        if not isinstance(value, dict) or not str(value.get("_", "")).startswith("MessageEntity"):
+            return tuple(result), False
+        if any(not isinstance(item, (str, int, bool, type(None))) for item in value.values()):
+            return tuple(result), False
+        result.append(value)
+    return tuple(result), True
 
 
 class TelethonTelegramFolderGateway(TelegramFolderGateway):
@@ -127,7 +146,8 @@ class TelethonTelegramFolderGateway(TelegramFolderGateway):
         rules = tuple(
             rule for position, item in enumerate(raw_filters) if (rule := _folder_rule(item, position)) is not None
         )
-        return FolderRuleObservation(rules, _observation_token(rules), started_at)
+        complete = len(rules) == len(raw_filters) and all(rule.complete for rule in rules)
+        return FolderRuleObservation(rules, _observation_token(rules), started_at, complete)
 
 
 def _as_int(value: object) -> int:

@@ -115,7 +115,7 @@ async def test_first_use_hint_keeps_excluded_revision_parked_and_respects_accoun
     assert await reconciler.prioritize_baseline(42, 77)
     selected = adapter.status(100)
     assert selected is not None and selected.selected is not None and selected.selected.key.target == "77"
-    other = adapter.status(100, excluded=frozenset({selected.selected}))
+    other = adapter.status(100, excluded=frozenset({selected.selected}))  # type: ignore[union-attr]
     assert other is not None and other.selected is not None and other.selected.key.target != "77"
     with write_transaction(conn):
         conn.execute("UPDATE scheduled_sync_state SET next_retry_at=200 WHERE key='account'")
@@ -234,7 +234,7 @@ async def test_failed_revision_is_parked_without_timer_or_sibling_budget_and_new
     assert len(client.budgets) == 1 and client.budgets[0].attempts == 1
     assert conn.execute(
         "SELECT repair_due_at,discovery_due_at,coverage_reason FROM scheduled_reconciliation_state"
-    ).fetchone() == (100, 100, "rpc_error")
+    ).fetchone() == (100, 100, "incomplete_snapshot:ValueError")
     assert conn.execute("SELECT last_snapshot_at,last_error FROM scheduled_sync_state").fetchone() == (
         77,
         "prior_failure",
@@ -343,3 +343,191 @@ async def test_future_repair_blocks_direct_and_selected_discovery_of_same_obliga
     result = await discovery.run_slice(RpcAttemptBudget(16, selected=selected))
     assert result.kind is SliceOutcomeKind.STALE and client.budgets == []
     assert reconciler._due_rows(300) == [(42, generation, False)]
+
+
+@pytest.mark.parametrize(
+    ("message", "code", "category", "delay"),
+    [
+        ("PRIVATE_SECRET_TOKEN", 400, "unknown_rpc", 86400),
+        ("PEER_ID_INVALID", 400, "invalid_target", 86400),
+        ("INTERNAL", 500, "server_error", 30),
+    ],
+)
+async def test_rpc_failure_retains_facts_and_persists_target_floor(  # noqa: PLR0913
+    conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    message: str,
+    code: int,
+    category: str,
+    delay: int,
+) -> None:
+    from telethon.errors import RPCError
+
+    from mcp_telegram.telegram_demand_progress import SliceOutcomeKind
+
+    now = [100.0]
+    monkeypatch.setattr("mcp_telegram.scheduled_messages.time.time", lambda: now[0])
+    client = _ScheduledSnapshotClient(call_error=RPCError(request=None, message=message, code=code))
+    _, reconciler = _coordinator(conn, client, now)
+    adapter = ScheduledRepairDemandAdapter(reconciler, account_id=42)
+    selected = adapter.status(100).selected  # type: ignore[union-attr]
+    assert selected is not None
+    result = await adapter.run_slice(RpcAttemptBudget(16, selected=selected))
+    assert result.kind is SliceOutcomeKind.RETRYABLE_FAILURE
+    due, sibling, reason = conn.execute(
+        "SELECT repair_due_at,discovery_due_at,coverage_reason FROM scheduled_reconciliation_state"
+    ).fetchone()
+    assert (due, sibling) == (100 + delay, 100)
+    assert category in reason
+    if message == "PRIVATE_SECRET_TOKEN":
+        assert message not in reason and message not in caplog.text
+    assert conn.execute("SELECT message_id,text FROM scheduled_messages").fetchone() == (11, "draft")
+    assert adapter.status(100).release_at == 100 + delay  # type: ignore[union-attr]
+    assert ScheduledDiscoveryDemandAdapter(reconciler, account_id=42).status(100) is None
+    assert (await adapter.run_slice(RpcAttemptBudget(16, selected=selected))).kind is SliceOutcomeKind.DEFERRED
+    _, restarted = _coordinator(conn, client, now)
+    assert ScheduledRepairDemandAdapter(restarted, account_id=42).status(100).release_at == 100 + delay  # type: ignore[union-attr]
+    assert restarted._due_rows(99 + delay) == []
+    assert len(restarted._due_rows(100 + delay)) == 1
+
+
+@pytest.mark.parametrize("failure", ["unknown", "admin", "access"])
+@pytest.mark.parametrize("newer", ["snapshot", "floor", "account"])
+async def test_late_failure_cannot_overwrite_same_generation_newer_snapshot(
+    conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    newer: str,
+) -> None:
+    from telethon.errors import ChannelPrivateError, ChatAdminRequiredError, RPCError
+
+    from mcp_telegram.telegram_demand_progress import SliceOutcomeKind
+
+    now = [100.0]
+    monkeypatch.setattr("mcp_telegram.scheduled_messages.time.time", lambda: now[0])
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Client(_ScheduledSnapshotClient):
+        async def __call__(self, request: object, **kwargs: object) -> object:
+            entered.set()
+            await release.wait()
+            if failure == "admin":
+                raise ChatAdminRequiredError(request=None)
+            if failure == "access":
+                raise ChannelPrivateError(request=None)
+            raise RPCError(request=None, message="UNKNOWN_REFUSAL", code=400)
+
+    _, reconciler = _coordinator(conn, Client(), now)
+    adapter = ScheduledRepairDemandAdapter(reconciler, account_id=42)
+    selected = adapter.status(100).selected  # type: ignore[union-attr]
+    assert selected is not None
+    pending = asyncio.create_task(adapter.run_slice(RpcAttemptBudget(16, selected=selected)))
+    await entered.wait()
+    if newer == "snapshot":
+        from mcp_telegram.observation_order import allocate_observation_order
+
+        order = allocate_observation_order(conn)
+        generation = conn.execute("SELECT dirty_generation FROM scheduled_reconciliation_state").fetchone()[0]
+        assert await reconciler._apply_snapshot(42, generation, [], discovery=False, now=101, observation_order=order)
+    else:
+        with write_transaction(conn):
+            if newer == "floor":
+                conn.execute("UPDATE scheduled_reconciliation_state SET discovery_due_at=900")
+            else:
+                conn.execute("UPDATE scheduled_sync_state SET account_id=99")
+    before = conn.execute("SELECT * FROM scheduled_reconciliation_state").fetchone()
+    release.set()
+    assert (await pending).kind is SliceOutcomeKind.STALE
+    assert conn.execute("SELECT * FROM scheduled_reconciliation_state").fetchone() == before
+
+
+async def test_repeated_rpc_failures_keep_budget_across_retry_windows(
+    conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from telethon.errors import RPCError
+
+    now = [100.0]
+    monkeypatch.setattr("mcp_telegram.scheduled_messages.time.time", lambda: now[0])
+
+    class Client(_ScheduledSnapshotClient):
+        def __init__(self) -> None:
+            super().__init__({42: []})
+            self.budgets: list[RpcAttemptBudget] = []
+            self.fail = True
+
+        async def __call__(self, request: object, **kwargs: object) -> object:
+            budget = current_rpc_scope().attempt_budget
+            assert budget is not None
+            self.budgets.append(budget)
+            budget.last_method = _METHOD
+            budget.debit()
+            if self.fail:
+                raise RPCError(request=None, message="UNKNOWN_REFUSAL", code=400)
+            return await super().__call__(request, **kwargs)
+
+    client = Client()
+    coordinator, _ = _coordinator(conn, client, now)
+    progress: list[bool] = []
+    coordinator.bind_canonical_progress(lambda: progress.append(True))
+    selected = coordinator.statuses[DemandKind.SCHEDULED_REPAIR].selected
+    assert selected is not None
+    held = [False]
+    coordinator._rpc_eligibility = lambda _: TelegramRpcThrottled(latched=True) if held[0] else None
+    for number in range(1, 35):
+        coordinator.scan()
+        assert coordinator.statuses[DemandKind.SCHEDULED_REPAIR].selected == selected
+        assert DemandKind.SCHEDULED_REPAIR in coordinator.ready_kinds
+        await coordinator._execute_slice(DemandKind.SCHEDULED_REPAIR)
+        assert len(client.budgets) == number and client.budgets[-1] is client.budgets[0]
+        assert client.budgets[0].attempts == number
+        assert progress == []
+        coordinator._active_kind = None
+        now[0] += 86399
+        coordinator.scan()
+        assert DemandKind.SCHEDULED_REPAIR not in coordinator.ready_kinds
+        now[0] += 1
+        if number == 16:
+            held[0] = True
+            coordinator.scan()
+            assert DemandKind.SCHEDULED_REPAIR not in coordinator.ready_kinds
+            assert client.budgets[0].attempts == 16
+            held[0] = False
+            coordinator.eligibility_changed(_METHOD)
+    client.fail = False
+    coordinator.scan()
+    await coordinator._execute_slice(DemandKind.SCHEDULED_REPAIR)
+    assert client.budgets[0].attempts == 35 and progress == [True]
+    assert conn.execute("SELECT coverage_state FROM scheduled_reconciliation_state").fetchone() == ("complete",)
+
+
+async def test_fresh_event_and_changed_permissions_rearm_only_failure_floor(
+    conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from telethon.errors import RPCError
+
+    from mcp_telegram.scheduled_state import apply_scheduled_permission
+
+    now = [100.0]
+    monkeypatch.setattr("mcp_telegram.scheduled_messages.time.time", lambda: now[0])
+    client = _ScheduledSnapshotClient(call_error=RPCError(request=None, message="UNKNOWN_REFUSAL", code=400))
+    _, reconciler = _coordinator(conn, client, now)
+    adapter = ScheduledRepairDemandAdapter(reconciler, account_id=42)
+    selected = adapter.status(100).selected  # type: ignore[union-attr]
+    assert selected is not None
+    await adapter.run_slice(RpcAttemptBudget(16, selected=selected))
+    with write_transaction(conn):
+        conn.execute("UPDATE scheduled_reconciliation_state SET permission_signature='0:0:0:0'")
+        apply_scheduled_permission(conn, 42, "0:0:0:0", 101)
+    assert adapter.status(101).release_at == 86500  # type: ignore[union-attr]
+    with write_transaction(conn):
+        apply_scheduled_permission(conn, 42, "0:0:1:0", 102)
+    assert adapter.status(102).release_at == 102  # type: ignore[union-attr]
+    with write_transaction(conn):
+        conn.execute(
+            "UPDATE scheduled_reconciliation_state SET repair_due_at=86500,coverage_reason='scheduled_failure:unknown_rpc:RPCError:400:-'"
+        )
+        upsert_scheduled_message(conn, 42, _message(11, "fresh event"), now=103)
+    assert adapter.status(103).release_at == 103  # type: ignore[union-attr]

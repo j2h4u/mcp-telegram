@@ -895,6 +895,8 @@ async def test_list_dialogs_folder_view_returns_structural_summary():
                 ],
                 "directory_coverage": _directory_coverage_payload(),
                 "folder_snapshot": _unavailable_folder_snapshot_payload(),
+                "account_id": 42,
+                "catalog_version": None,
             },
         }
     )

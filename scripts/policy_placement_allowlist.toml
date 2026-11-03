@@ -489,7 +489,7 @@ rationale = "This folder-rule freshness contract is local domain behavior, not o
 
 [[entry]]
 category = "policy_assignments"
-key = "src/mcp_telegram/folders/worker.py:FolderProjectionDemandAdapter.status:deadline"
+key = "src/mcp_telegram/folders/worker.py:FolderProjectionDemandAdapter._snapshot_status:deadline"
 rationale = "This is the computed folder projection freshness deadline from the local rule contract."
 
 [[entry]]
@@ -701,3 +701,13 @@ rationale = "This fixed decision-reason tag reports exhaustion of the existing F
 category = "policy_dict_values"
 key = "src/mcp_telegram/tools/sync.py:<module>:message_retention_policy"
 rationale = "This is the MCP response schema for derived retention-policy vocabulary, not an operator policy value or retention decision."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/contact_notes/commands.py:<module>:_DEFAULT_LIMIT"
+rationale = "Telegram protocol fallback when contact_note_length_limit is missing or invalid, not an operator-configured policy."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/contact_notes/commands.py:ContactNoteCommandOwner.__init__:self._limit"
+rationale = "Retains the current scope Telegram app-config value for NotModified responses, initialized to the same protocol fallback."

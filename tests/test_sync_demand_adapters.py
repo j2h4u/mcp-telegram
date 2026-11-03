@@ -19,6 +19,8 @@ from telethon.tl.functions.messages import GetHistoryRequest  # type: ignore[imp
 from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
 from helpers import MockTotalList, build_mock_message
+from mcp_telegram.config import SchedulingConfig, resolve_scheduling_config
+from mcp_telegram.daemon import _access_probe_policy_from_scheduling
 from mcp_telegram.delta_sync import (
     AccessProbe,
     AccessProbePolicy,
@@ -109,8 +111,7 @@ def _seed_history_dialog(  # noqa: PLR0913
 
 def _delta_policy() -> AccessProbePolicy:
     return AccessProbePolicy(
-        interval_seconds=86_400.0,
-        max_dialogs_per_cycle=1,
+        enabled=True,
         cooldown_seconds=100,
     )
 
@@ -1404,6 +1405,28 @@ async def test_full_sync_page_adapter_defers_to_coordinator_without_local_sleep(
     )
     with pytest.raises(TelegramRpcAdmissionDeferred):
         await adapter.run_slice(_selected_budget(adapter))
+
+
+@pytest.mark.parametrize(
+    ("configured", "environ", "enabled"),
+    [
+        (True, {}, True),
+        (False, {}, False),
+        (True, {"ACCESS_PROBE_ENABLED": "false"}, False),
+        (False, {"ACCESS_PROBE_ENABLED": "yes"}, True),
+    ],
+)
+def test_access_probe_configuration_controls_adapter_selection(
+    conn: sqlite3.Connection, configured: bool, environ: dict[str, str], enabled: bool
+) -> None:
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status,access_lost_at) VALUES (987, 'access_lost', 1)")
+    conn.commit()
+    scheduling = resolve_scheduling_config(SchedulingConfig(access_probe_enabled=configured), environ)
+    worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
+    adapter = DeltaAccessProbeDemandAdapter(
+        worker, _access_probe_policy_from_scheduling(scheduling), cast(AccessProbe, object()), account_id=123
+    )
+    assert (adapter.status(0) is not None) is enabled
 
 
 @pytest.mark.asyncio
