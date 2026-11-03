@@ -52,6 +52,19 @@ REQUIRED_POLICY_SINKS = {
 # these keys here makes the detector reject the same spelling everywhere else.
 NON_OPERATOR_POLICY_FINDINGS: frozenset[tuple[str, str]] = frozenset(
     {
+        # Recovery enum values label observations and transitions, not timing policy.
+        ("policy_assignments", "src/mcp_telegram/telegram_rpc_recovery.py:RecoveryObservationEvent:PENDING_COOLDOWN"),
+        ("policy_assignments", "src/mcp_telegram/telegram_rpc_recovery.py:RecoveryAction:FAILURE_SETTLED"),
+        # ACK retry suppression is sender state; the limit is derived from MTProto frame bounds.
+        (
+            "policy_assignments",
+            "src/mcp_telegram/telegram_transport.py:GuardedMTProtoSender.__init__:self._ack_retry_blocked",
+        ),
+        ("policy_assignments", "src/mcp_telegram/telegram_transport.py:GuardedMTProtoSender._snapshot_ack:limit"),
+        (
+            "policy_assignments",
+            "src/mcp_telegram/telegram_transport.py:GuardedMTProtoSender._send_loop:self._ack_retry_blocked",
+        ),
         # Unix wire/assembly invariants shared by both endpoints, never operator tuning.
         ("policy_assignments", "src/mcp_telegram/daemon_ipc.py:<module>:REQUEST_LIMIT"),
         ("policy_assignments", "src/mcp_telegram/daemon_ipc.py:<module>:RESPONSE_FRAME_LIMIT"),

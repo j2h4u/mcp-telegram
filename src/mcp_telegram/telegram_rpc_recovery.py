@@ -138,6 +138,75 @@ class RecoveryDecision:
     reason: RecoveryReason
 
 
+class RecoveryStage(StrEnum):
+    DECISION = "decision"
+    GUARD = "guard"
+    MONITOR = "monitor"
+    AWAIT = "await"
+    COMMIT = "commit"
+
+
+class RecoveryObservationEvent(StrEnum):
+    DECISION = "decision"
+    STARTUP_UNPREPARED = "startup_unprepared"
+    LIFECYCLE_UNAVAILABLE = "lifecycle_unavailable"
+    PENDING_COOLDOWN = "pending_cooldown"
+    PENDING_RECEIPT = "pending_receipt"
+    PENDING_LEDGER = "pending_ledger"
+    TRANSPORT_HOLD = "transport_hold"
+    MONITOR_EVALUATE_START = "monitor_evaluate_start"
+    MONITOR_EVALUATE_RETURN = "monitor_evaluate_return"
+    MONITOR_EVALUATE_FAILED = "monitor_evaluate_failed"
+    MONITOR_EVALUATE_CANCELLED = "monitor_evaluate_cancelled"
+    MONITOR_SLEEP_START = "monitor_sleep_start"
+    MONITOR_SLEEP_RETURN = "monitor_sleep_return"
+    MONITOR_SLEEP_FAILED = "monitor_sleep_failed"
+    MONITOR_SLEEP_CANCELLED = "monitor_sleep_cancelled"
+    MONITOR_RESTART = "monitor_restart"
+    AWAIT_ENTERED = "await_entered"
+    AWAIT_COMPLETED = "await_completed"
+    AWAIT_CANCELLED = "await_cancelled"
+    AWAIT_FAILED = "await_failed"
+    CONSUMED = "consumed"
+    SUCCEEDED = "succeeded"
+    RESET = "reset"
+
+
+class RecoveryAction(StrEnum):
+    FAILURE_SETTLED = "failure_settled"
+    MAINTENANCE = "maintenance"
+    QUIESCE = "quiesce"
+    TRANSITION = "transition"
+    CONSUME = "consume"
+    RESET = "reset"
+    SUCCESS = "success"
+    LEDGER_MAINTAIN = "ledger_maintain"
+    DISCONNECT = "disconnect"
+    STARTUP_RECONCILE = "startup_reconcile"
+    STARTUP_CONSUME = "startup_consume"
+    SAVE = "save"
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryObservation:
+    """Only finite, content-free facts from an actual recovery action."""
+
+    stage: RecoveryStage
+    event: RecoveryObservationEvent
+    observed_at_ms: int
+    action: RecoveryAction | None = None
+    policy_event: RecoveryEvent | None = None
+    elapsed_ms: float | None = None
+    phase: RecoveryPhase | None = None
+    cause: RecoveryCause | None = None
+    command: RecoveryCommand | None = None
+    reason: RecoveryReason | None = None
+    snapshot: RecoverySnapshot | None = None
+    episode_id: str | None = None
+    grant_id: str | None = None
+    attempts_total: int | None = None
+
+
 class _Rule(StrEnum):
     ARM = "arm"
     ACTIVE_FAILURE = "active_failure"

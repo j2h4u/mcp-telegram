@@ -248,6 +248,9 @@ class _ClientStub:
     def set_flood_event_observer(self, observer: object | None) -> None:
         self.flood_event_observer_detached = observer is None
 
+    def set_recovery_observer(self, observer: object | None) -> None:
+        self.recovery_observer_detached = observer is None
+
     async def get_me(self) -> object:
         return SimpleNamespace(id=1)
 
@@ -343,6 +346,32 @@ async def test_auto_resume_checks_locally_at_bounded_interval_and_stop_wins(monk
     await _monitor_auto_resume(_typed_ctx(client=client, shutdown_event=shutdown))
     await _monitor_auto_resume(_typed_ctx(client=client, shutdown_event=shutdown))
     maintenance.assert_awaited_once()
+
+
+async def test_auto_resume_monitor_reports_wait_and_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mcp_telegram.telegram_rpc_recovery import RecoveryObservationEvent
+
+    shutdown = asyncio.Event()
+    observed: list[RecoveryObservationEvent] = []
+    client = SimpleNamespace(
+        maintain_auto_resume=AsyncMock(side_effect=[False, True]),
+        observe_auto_resume=lambda _stage, event, **_kwargs: observed.append(event),
+    )
+
+    async def wait(_stop: asyncio.Event, _seconds: float) -> bool:
+        return False
+
+    monkeypatch.setattr(daemon, "sleep_through_flood", wait)
+    await _monitor_auto_resume(_typed_ctx(client=client, shutdown_event=shutdown))
+    assert observed == [
+        RecoveryObservationEvent.MONITOR_EVALUATE_START,
+        RecoveryObservationEvent.MONITOR_EVALUATE_RETURN,
+        RecoveryObservationEvent.MONITOR_SLEEP_START,
+        RecoveryObservationEvent.MONITOR_SLEEP_RETURN,
+        RecoveryObservationEvent.MONITOR_EVALUATE_START,
+        RecoveryObservationEvent.MONITOR_EVALUATE_RETURN,
+        RecoveryObservationEvent.MONITOR_RESTART,
+    ]
 
 
 @pytest.mark.asyncio
@@ -1637,6 +1666,9 @@ async def test_shutdown_cancels_disconnects_and_detaches_before_flushing_telemet
         def set_flood_event_observer(self, observer: object | None) -> None:
             stages.append("flood_detach")
 
+        def set_recovery_observer(self, observer: object | None) -> None:
+            stages.append("recovery_detach")
+
     class _OrderedConnection(_ConnectionStub):
         def close(self) -> None:
             stages.append("connections_close")
@@ -1675,6 +1707,7 @@ async def test_shutdown_cancels_disconnects_and_detaches_before_flushing_telemet
     assert stages.index("scheduler_close") < stages.index("request_detach")
     assert stages.index("scheduler_close") < stages.index("flood_detach")
     assert stages.index("flood_detach") < stages.index("flush")
+    assert stages.index("recovery_detach") < stages.index("flush")
     assert stages.index("flush") < stages.index("sink_close")
     assert stages.index("sink_close") < stages.index("connections_close")
 

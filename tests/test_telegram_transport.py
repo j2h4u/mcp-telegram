@@ -397,6 +397,66 @@ async def test_ack_progresses_while_application_prepare_is_held(wire: _Harness) 
     assert len(wire.writer.frames) == 1
 
 
+async def test_ack_successor_waits_for_receipt_and_wakes_idle_sender(wire: _Harness) -> None:
+    wire.authority.receipt_ready.clear()
+    wire.sender._pending_ack.add(1)
+    wire.start_writer()
+    sending = asyncio.create_task(wire.sender._send_loop())
+    wire.tasks.append(sending)
+    await asyncio.wait_for(wire.writer.written.get(), 1)
+    await asyncio.wait_for(wire.authority.receipt_started.wait(), 1)
+    first = wire.sender._fresh_ack
+    assert first is not None
+    token = wire.sender._control_origin.set((asyncio.current_task(), "ack"))
+    try:
+        wire.sender._send_queue.append(cast(_RequestState, RequestState(MsgsAck([2, 3]))))
+    finally:
+        wire.sender._control_origin.reset(token)
+    await asyncio.sleep(0)
+    assert wire.sender._fresh_ack is first and len(wire.authority.owners) == 1
+    assert wire.sender._pending_ack == {2, 3}
+    wire.authority.receipt_ready.set()
+    await asyncio.wait_for(wire.writer.written.get(), 1)
+    assert len(wire.authority.owners) == 2
+    assert set(wire.sender._last_acks[-1].request.msg_ids) == {2, 3}
+
+
+async def test_ack_chunks_fit_transport_limit(wire: _Harness) -> None:
+    from telethon.tl.core.messagecontainer import MessageContainer
+    from telethon.tl.core.tlmessage import TLMessage
+
+    count = (MessageContainer.MAXIMUM_SIZE - TLMessage.SIZE_OVERHEAD - 12) // 8 + 1
+    wire.sender._pending_ack.update(range(count))
+    wire.sender._snapshot_ack()
+    first = await wire.sender._send_queue.next_state()
+    assert len(first.data) + TLMessage.SIZE_OVERHEAD <= MessageContainer.MAXIMUM_SIZE
+    assert len(cast(MsgsAck, first.request).msg_ids) == count - 1
+    assert len(wire.sender._pending_ack) == 1
+    await wire.sender._prepare_state(first)
+    assert wire.sender.write_packet(wire.connection._send_queue.get_nowait(), wire.connection._send)
+    await asyncio.gather(*wire.sender._observing)
+    second = await wire.sender._send_queue.next_state()
+    assert set(cast(MsgsAck, first.request).msg_ids) | set(cast(MsgsAck, second.request).msg_ids) == set(range(count))
+
+
+async def test_ack_deferred_for_reconnect_keeps_fresh_owner(wire: _Harness) -> None:
+    wire.sender._pending_ack.add(1)
+    wire.sender._snapshot_ack()
+    first = await wire.sender._send_queue.next_state()
+    owner = wire.sender.require_owned(first)
+    body = first.data
+    await wire.sender._prepare_state(first)
+    wire.sender._reconnecting = True
+    wire.sender._pending_ack.add(2)
+    await wire.connection.disconnect()
+    assert wire.sender._fresh_ack is first and first.data == body
+    assert wire.sender.require_owned(first) is owner and wire.sender._pending_ack == {2}
+    wire.connection._connected = True
+    wire.sender._reconnecting = False
+    assert await wire.sender._send_queue.next_state() is first
+    assert wire.sender.require_owned(first) is owner
+
+
 async def test_vendor_ping_and_state_info_are_classified_protocol(wire: _Harness) -> None:
     wire.sender._keepalive_ping(7)
     ping = await wire.sender._send_queue.next_state()

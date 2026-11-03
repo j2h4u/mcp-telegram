@@ -324,6 +324,7 @@ def test_boundary_allows_account_wide_transport_dependencies_in_gate(
         ("telegram_image_download.py", "_PhotoIteratorFacade", "_return_exported_sender", "sender = self._sender"),
         ("telegram_transport.py", "_OwnedPacker", "__init__", "self._sender = sender"),
         ("telegram_transport.py", "_OwnedPacker", "append", "self._sender.require_owned(state)"),
+        ("telegram_transport.py", "_OwnedPacker", "next_state", "self._sender._snapshot_ack()"),
         ("telegram_transport.py", "_AuthConnectionProxy", "__init__", "self._sender = sender"),
         ("telegram_transport.py", "_AuthConnectionProxy", "send", "self._sender._prepare_state(state)"),
         ("telegram_transport.py", "_AuthConnectionProxy", "recv", "connection = self._sender._connection"),

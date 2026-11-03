@@ -1010,7 +1010,10 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 "snapshot_stale",
                 f"Dialog snapshot may be stale: snapshot_age_h={surface.snapshot_age_h}.",
                 severity="warning",
-                action="Treat list_dialogs as a cached snapshot; call get_sync_status for critical dialogs.",
+                action=(
+                    "list_dialogs shows retained local directory facts; consider their observation age separately "
+                    "from coverage, and call get_sync_status for critical dialogs."
+                ),
             )
         )
     structured_dialogs: list[dict[str, object]] = []

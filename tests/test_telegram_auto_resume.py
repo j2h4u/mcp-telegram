@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sqlite3
 import time
 from collections.abc import AsyncIterator
 from dataclasses import replace
@@ -15,12 +16,25 @@ from telethon.tl.functions.updates import GetStateRequest
 
 from mcp_telegram import telegram_rpc
 from mcp_telegram.config import TelegramRpcSchedulerConfig
+from mcp_telegram.image_authorization import ScopeCell
 from mcp_telegram.peer_access import PeerAccess
 from mcp_telegram.sqlite_writer import SQLiteWriter
-from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.sync_db import ensure_sync_schema, load_rpc_safety_record, save_rpc_safety_record
 from mcp_telegram.telegram_demand import RpcAttemptBudget, RpcAttemptEvidence
-from mcp_telegram.telegram_rpc import TelegramRpcBudget, TelegramRpcGate, TelegramRpcSafetyLedger, TelegramRpcThrottled
+from mcp_telegram.telegram_rpc import (
+    TelegramRpcBudget,
+    TelegramRpcGate,
+    TelegramRpcSafetyLedger,
+    TelegramRpcSafetyStore,
+    TelegramRpcThrottled,
+)
 from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_rpc_recovery import (
+    RecoveryAction,
+    RecoveryObservation,
+    RecoveryObservationEvent,
+    RecoveryStage,
+)
 from mcp_telegram.telegram_rpc_scheduler import RpcServiceClass, TelegramRpcScope, TelegramRpcSource
 from mcp_telegram.telegram_transport import GuardedConnectionTcpFull, GuardedMTProtoSender, _OwnedPacket
 from tests.test_telegram_rpc_safety import Clock, Store, generation, intents, record, recovery
@@ -228,12 +242,266 @@ async def test_cancelled_slow_consume_stays_owned_and_crash_cannot_retry(clock: 
     assert not await restarted.consume_auto_resume()
 
 
+async def test_recovery_decisions_are_action_only_and_observe_actual_guards(clock: Clock) -> None:
+    store = Store()
+    ledger = await _waiting(store, clock)
+    events: list[RecoveryObservation] = []
+    ledger.set_recovery_observer(events.append)
+    ledger.auto_resume_status()
+    assert events == []
+    clock.advance(3600)
+    assert not await ledger.consume_auto_resume(lifecycle_available=lambda: False)
+    event = events[-1]
+    assert event.stage is RecoveryStage.DECISION
+    assert event.snapshot is not None and event.snapshot.due and not event.snapshot.lifecycle_available
+    assert event.reason == "lifecycle_unavailable"
+    assert await ledger.consume_auto_resume()
+    consumed = [item for item in events if item.event is RecoveryObservationEvent.CONSUMED]
+    assert len(consumed) == 1 and consumed[0].attempts_total == 1
+    await ledger.finish_recovery(42)
+    events.clear()
+    ledger.auto_resume_status()
+    assert events == []
+
+
+@pytest.mark.parametrize("observer", ["absent", "record", "throw"])
+async def test_observer_does_not_change_recovery_actions(clock: Clock, observer: str) -> None:
+    store = Store()
+    ledger = await _waiting(store, clock)
+    events: list[RecoveryObservation] = []
+
+    def fail(_event: RecoveryObservation) -> None:
+        raise ValueError("observer failure")
+
+    ledger.set_recovery_observer(None if observer == "absent" else events.append if observer == "record" else fail)
+    clock.advance(3600)
+    assert await ledger.consume_auto_resume()
+    await ledger.finish_recovery(42)
+    await ledger.reset_auto_resume()
+    assert record(store)["recovery"] is None
+    assert ledger.protection_reason is None
+    if observer == "record":
+        assert [item.event for item in events if item.stage is RecoveryStage.COMMIT] == [
+            RecoveryObservationEvent.CONSUMED,
+            RecoveryObservationEvent.SUCCEEDED,
+            RecoveryObservationEvent.RESET,
+        ]
+
+
+async def test_sqlite_consumption_observation_follows_owned_commit_after_caller_cancel(
+    clock: Clock, tmp_path: Path
+) -> None:
+    seed = Store()
+    await _waiting(seed, clock)
+    clock.advance(3600)
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    assert seed.raw is not None
+    save_rpc_safety_record(conn, None, seed.raw)
+    writer = await SQLiteWriter.open(path)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def save(expected: str | None, encoded: str) -> None:
+        entered.set()
+        await release.wait()
+        await writer.run(lambda owned: save_rpc_safety_record(owned, expected, encoded))
+
+    backend = TelegramRpcSafetyStore(lambda: load_rpc_safety_record(conn), save, lambda: None, lambda: (42, 42))
+    ledger = TelegramRpcSafetyLedger(backend, dc_id=2, key_id=99, boot_id="boot-a")
+    ledger.configure_auto_resume(enabled=True)
+    events: list[RecoveryObservation] = []
+
+    def observe(event: RecoveryObservation) -> None:
+        if event.event is RecoveryObservationEvent.CONSUMED:
+            assert json.loads(cast(str, load_rpc_safety_record(conn)))["recovery"]["state"] == "consumed"
+            assert cast(dict[str, object], ledger._record["recovery"])["state"] == "consumed"
+        events.append(event)
+
+    ledger.set_recovery_observer(observe)
+    try:
+        task = asyncio.create_task(ledger.consume_auto_resume())
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not any(event.event is RecoveryObservationEvent.CONSUMED for event in events)
+        assert any(
+            event.action is RecoveryAction.SAVE and event.event is RecoveryObservationEvent.AWAIT_ENTERED
+            for event in events
+        )
+        release.set()
+        await ledger.drain()
+        assert [event.event for event in events if event.action is RecoveryAction.SAVE] == [
+            RecoveryObservationEvent.AWAIT_ENTERED,
+            RecoveryObservationEvent.AWAIT_COMPLETED,
+        ]
+        assert sum(event.event is RecoveryObservationEvent.CONSUMED for event in events) == 1
+        restarted = TelegramRpcSafetyLedger(backend, dc_id=2, key_id=99, boot_id="boot-a")
+        restarted.set_recovery_observer(events.append)
+        assert sum(event.event is RecoveryObservationEvent.CONSUMED for event in events) == 1
+    finally:
+        release.set()
+        await writer.aclose()
+        conn.close()
+
+
+async def test_failed_recovery_save_emits_no_consumed_observation(clock: Clock) -> None:
+    store = Store()
+    ledger = await _waiting(store, clock)
+    clock.advance(3600)
+    events: list[RecoveryObservation] = []
+    ledger.set_recovery_observer(events.append)
+    store.fail_next = True
+    with pytest.raises(sqlite3.OperationalError):
+        await ledger.consume_auto_resume()
+    assert [item.event for item in events if item.action is RecoveryAction.SAVE] == [
+        RecoveryObservationEvent.AWAIT_ENTERED,
+        RecoveryObservationEvent.AWAIT_FAILED,
+    ]
+    assert all(item.event is not RecoveryObservationEvent.CONSUMED for item in events)
+    restarted = store.ledger()
+    restarted.set_recovery_observer(events.append)
+    assert all(item.event is not RecoveryObservationEvent.CONSUMED for item in events)
+
+
+async def test_recovery_observations_keep_episode_across_distinct_grants(clock: Clock) -> None:
+    store = Store()
+    ledger = await _waiting(store, clock)
+    events: list[RecoveryObservation] = []
+    ledger.set_recovery_observer(events.append)
+    clock.advance(3600)
+    assert await ledger.consume_auto_resume()
+    await ledger.record_floor(clock.time() + 1, circuit_open=True)
+    await ledger.maintain_auto_resume()
+    clock.advance(7200)
+    assert await ledger.consume_auto_resume()
+    consumed = [item for item in events if item.event is RecoveryObservationEvent.CONSUMED]
+    assert len(consumed) == 2
+    assert consumed[0].episode_id == consumed[1].episode_id
+    assert consumed[0].grant_id != consumed[1].grant_id
+    assert [item.attempts_total for item in consumed] == [1, 2]
+
+
+async def test_throwing_observer_cannot_interrupt_claim_settlement_or_scope_cleanup(clock: Clock) -> None:
+    store = Store()
+    ledger = await _waiting(store, clock)
+    clock.advance(3600)
+    assert await ledger.consume_auto_resume()
+    cell = ScopeCell()
+    ledger._image_scope_cell = cell
+
+    def fail(_event: RecoveryObservation) -> None:
+        raise RuntimeError("observer failure")
+
+    ledger.set_recovery_observer(fail)
+    await ledger.prepare("attempt", "test.request")
+    ledger.mark_claimed("attempt")
+    await ledger.complete("attempt", known_outcome=False)
+    assert "attempt" not in ledger._claimed
+    assert intents(store)["attempt"]["phase"] == "unknown"
+    assert cell.publish(None)
+
+
+async def test_only_recovery_saves_are_observed_during_stability(clock: Clock) -> None:
+    store = Store()
+    ledger = await _waiting(store, clock)
+    clock.advance(3600)
+    assert await ledger.consume_auto_resume()
+    await ledger.finish_recovery(42)
+    events: list[RecoveryObservation] = []
+    ledger.set_recovery_observer(events.append)
+    await ledger.prepare("normal", "test.request")
+    ledger.mark_claimed("normal")
+    await ledger.complete("normal", known_outcome=True)
+    assert all(item.action is not RecoveryAction.SAVE for item in events)
+    ledger._auto_resume_rebased = True
+    assert not await ledger.maintain_auto_resume()
+    assert [item.event for item in events if item.action is RecoveryAction.SAVE] == [
+        RecoveryObservationEvent.AWAIT_ENTERED,
+        RecoveryObservationEvent.AWAIT_COMPLETED,
+    ]
+
+
 def _wire_clock(wire: _WireHarness, monkeypatch: pytest.MonkeyPatch) -> Clock:
     value = Clock(time.time(), 429.31)
     monkeypatch.setattr(telegram_rpc, "time", value)
     monkeypatch.setattr(telegram_rpc, "_COOLDOWN_DEADLINE", 0.0)
     monkeypatch.setattr(wire[0]._admission_scheduler, "_clock", value.monotonic)
     return value
+
+
+async def test_recovery_gate_reports_actual_local_guards(wire: _WireHarness, monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = wire[0]
+    clock = _wire_clock(wire, monkeypatch)
+    ledger = gate._ensure_safety_ledger()
+    await ledger.record_floor(clock.time() + 1, circuit_open=True)
+    events: list[RecoveryObservation] = []
+    gate.set_recovery_observer(events.append)
+    assert not await gate.maintain_auto_resume()
+    assert events[-1].event is RecoveryObservationEvent.STARTUP_UNPREPARED
+    gate._startup_safety_prepared = True
+    gate._auto_resume_stopped = lambda: True
+    assert not await gate.maintain_auto_resume()
+    assert events[-1].event is RecoveryObservationEvent.LIFECYCLE_UNAVAILABLE
+    gate._auto_resume_stopped = lambda: False
+    gate._pending_method_receipts["private"] = 1
+    assert not await gate.maintain_auto_resume()
+    assert events[-1].event is RecoveryObservationEvent.PENDING_RECEIPT
+    gate._pending_method_receipts.clear()
+
+    async def wait_pending() -> None:
+        await asyncio.Event().wait()
+
+    pending = asyncio.create_task(wait_pending())
+    gate._cooldown_save_tasks[1] = pending
+    assert not await gate.maintain_auto_resume()
+    assert events[-1].event is RecoveryObservationEvent.PENDING_COOLDOWN
+    gate._cooldown_save_tasks.clear()
+    ledger._operations.add(pending)
+    assert not await gate.maintain_auto_resume()
+    assert events[-1].event is RecoveryObservationEvent.PENDING_LEDGER
+    ledger._operations.clear()
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    gate._wire_fault = "transport_integrity_failure"
+    assert not await gate.maintain_auto_resume()
+    assert events[-1].event is RecoveryObservationEvent.TRANSPORT_HOLD
+
+
+async def test_held_disconnect_reports_enter_and_completion(
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = wire[0]
+    clock = _wire_clock(wire, monkeypatch)
+    gate.configure_auto_resume(enabled=True)
+    gate._startup_safety_prepared = True
+    await gate._ensure_safety_ledger().record_floor(clock.time() + 1, circuit_open=True)
+    entered, release = asyncio.Event(), asyncio.Event()
+    events: list[RecoveryObservation] = []
+    gate.set_recovery_observer(events.append)
+
+    async def disconnect() -> None:
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(gate, "_disconnect_main_sender", disconnect)
+    task = asyncio.create_task(gate.maintain_auto_resume())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert [event.event for event in events if event.action is RecoveryAction.DISCONNECT] == [
+            RecoveryObservationEvent.AWAIT_ENTERED
+        ]
+        release.set()
+        assert not await task
+        assert [event.event for event in events if event.action is RecoveryAction.DISCONNECT] == [
+            RecoveryObservationEvent.AWAIT_ENTERED,
+            RecoveryObservationEvent.AWAIT_COMPLETED,
+        ]
+    finally:
+        release.set()
+        await task
 
 
 @pytest.fixture
