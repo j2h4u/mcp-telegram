@@ -2441,6 +2441,17 @@ def _draft_has_topics(conn: sqlite3.Connection, dialog_id: int, kind: DialogType
     return kind is DialogType.FORUM or capability is True
 
 
+def _bind_event_observers(ctx: _SyncMainContext) -> None:
+    assert ctx.handler_manager is not None
+    if ctx.rpc_observation_sink is not None:
+        ctx.handler_manager.bind_observation_sink(ctx.rpc_observation_sink)
+    observer = ctx.rpc_admission_observer
+    if observer is not None:
+        ctx.handler_manager.bind_membership_observer(
+            lambda counts: observer.observe_membership(counts.as_observation(), source="message_membership")
+        )
+
+
 async def sync_main() -> None:  # noqa: PLR0915 - composition root owns startup sequencing
     """Main entry point for the sync daemon process.
 
@@ -2478,15 +2489,7 @@ async def sync_main() -> None:  # noqa: PLR0915 - composition root owns startup 
             profile_pair_mode="enabled" if ctx.api_server._policy.full_user_pair_enabled else "disabled",
             profile_detail_ttl_seconds=ctx.api_server._policy.entity_detail_ttl_seconds,
         )
-        if ctx.rpc_observation_sink is not None:
-            ctx.handler_manager.bind_observation_sink(ctx.rpc_observation_sink)
-        membership_observer = ctx.rpc_admission_observer
-        if membership_observer is not None:
-            ctx.handler_manager.bind_membership_observer(
-                lambda counts: membership_observer.observe_membership(
-                    counts.as_observation(), source="message_membership"
-                )
-            )
+        _bind_event_observers(ctx)
         ctx.handler_manager.register()
         logger.info("event handlers registered behind startup account barrier")
 

@@ -1243,16 +1243,7 @@ class EventHandlerManager:
                 return True, needs_scheduled_work, write_result.membership_counts
 
             accepted, needs_scheduled_work, membership_counts = await self._writer.run(_persist_event_0)
-            self._observe_membership(membership_counts)
-            if not accepted:
-                return
-
-            self._offer_message_ingestion()
-            if membership_counts is not None and (membership_counts.queued or membership_counts.coalesced):
-                self._offer(DemandKind.ENTITY_PROFILE_REFRESH)
-            if bool(getattr(msg, "from_scheduled", False)) and needs_scheduled_work:
-                self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
-            logger.debug("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
+            self._finish_new_message(dialog_id, msg, accepted, needs_scheduled_work, membership_counts)
         except RpcAdmissionClosedError:
             raise
         except Exception as exc:
@@ -1263,6 +1254,19 @@ class EventHandlerManager:
                 getattr(exc, "sqlite_errorcode", None),
                 getattr(exc, "sqlite_errorname", None),
             )
+
+    def _finish_new_message(
+        self, dialog_id: int, msg: _MessageLike, accepted: bool, scheduled: bool, counts: MembershipSignalCounts | None
+    ) -> None:
+        self._observe_membership(counts)
+        if not accepted:
+            return
+        self._offer_message_ingestion()
+        if counts is not None and (counts.queued or counts.coalesced):
+            self._offer(DemandKind.ENTITY_PROFILE_REFRESH)
+        if bool(getattr(msg, "from_scheduled", False)) and scheduled:
+            self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
+        logger.debug("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
 
     async def _new_message_coverage(
         self,

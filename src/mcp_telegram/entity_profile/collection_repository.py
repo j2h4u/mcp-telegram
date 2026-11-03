@@ -637,13 +637,7 @@ def _store_item(  # noqa: PLR0913 - persisted composite identity
     previous_fields = json.loads(old[0]) if old else {}
     previous_coverage = json.loads(old[3]) if old else {}
     authority = _MergeAuthority(previous_coverage, observations=prior_paths, order=order)
-    merged = merge_semantic_fields(previous_fields, dict(fields), coverage, "item", authority)
-    if (
-        isinstance(merged, dict)
-        and fields.get("constructor") == merged.get("constructor")
-        and "item" not in authority.rejected
-    ):
-        merged.pop("peer_kind", None)
+    merged = _merge_collection_item(previous_fields, fields, coverage, authority)
     provenance = dict(prior_paths)
     _retain_path_provenance(provenance, previous_fields, merged, "item")
     retained_provenance = dict(provenance)
@@ -675,6 +669,23 @@ def _store_item(  # noqa: PLR0913 - persisted composite identity
             page.observation.completed_at,
         ),
     )
+
+
+def _merge_collection_item(
+    previous: object,
+    fields: Mapping[str, object],
+    coverage: Mapping[str, ProfileFieldCoverage],
+    authority: _MergeAuthority,
+) -> object:
+    """Merge retained values and replace partial peer identity only when accepted."""
+    merged = merge_semantic_fields(previous, dict(fields), coverage, "item", authority)
+    if (
+        isinstance(merged, dict)
+        and fields.get("constructor") == merged.get("constructor")
+        and "item" not in authority.rejected
+    ):
+        merged.pop("peer_kind", None)
+    return merged
 
 
 def _has_later_delivered_leaf(paths: Mapping[str, object], order: int) -> bool:

@@ -464,6 +464,17 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
     if search.early_result is not None:
         return search.early_result
 
+    return await _persist_searched_page(request, search, observation_order, identity_revision, rpc_calls)
+
+
+async def _persist_searched_page(
+    request: PeerSweepRequest,
+    search: _SearchOutcome,
+    observation_order: int,
+    identity_revision: int,
+    rpc_calls: int,
+) -> SweepResult:
+    """Commit the searched page and report committed membership signals."""
     rpc_duration_s = search.rpc_duration_s
     batch = list(cast(_SweepResultLike, search.result).messages or [])
     identity = observe_response_dialog_identity(

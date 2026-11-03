@@ -858,13 +858,7 @@ class DaemonAccountTraceService:
             return await self._trace_account_messages_impl(req)
 
     async def _trace_account_messages_impl(self, req: dict) -> dict[str, object]:
-        exact_account_error = _validate_exact_account_id(req.get("exact_account_id"))
-        if exact_account_error is not None:
-            return exact_account_error
-        request_error = _validate_trace_account_navigation(req.get("navigation"))
-        if request_error is not None:
-            return request_error
-        request, request_error = _parse_trace_account_messages_request(req)
+        request, request_error = _validated_trace_account_request(req)
         if request_error is not None:
             return request_error
         assert request is not None
@@ -983,6 +977,16 @@ class DaemonAccountTraceService:
                 directory_coverage=scope.directory_coverage,
             )
         )
+
+
+def _validated_trace_account_request(req: dict) -> tuple[_TraceAccountMessagesRequest | None, dict | None]:
+    error = _validate_exact_account_id(req.get("exact_account_id"))
+    if error is not None:
+        return None, error
+    error = _validate_trace_account_navigation(req.get("navigation"))
+    if error is not None:
+        return None, error
+    return _parse_trace_account_messages_request(req)
 
 
 def _known_common_chats(conn: sqlite3.Connection, owner: int, target: int, now: int) -> dict[str, object]:
