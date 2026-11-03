@@ -77,10 +77,24 @@ async def _probe(socket_path: Path) -> _HealthcheckResponse:
         diagnostic_fields = (
             "reason",
             "unresolved_request_count",
+            "blocking_request_count",
+            "historical_unknown_request_count",
             "unresolved_requests",
             "unresolved_requests_truncated",
         )
         detail = {key: protection[key] for key in diagnostic_fields if key in protection}
+        automatic = protection.get("automatic_resume")
+        if isinstance(automatic, dict):
+            recovery_fields = (
+                "state",
+                "phase",
+                "cause",
+                "block_reason",
+                "attempts_total",
+                "attempts_by_policy",
+                "next_trial_at_utc",
+            )
+            detail["automatic_resume"] = {key: automatic[key] for key in recovery_fields if key in automatic}
         return {"ok": False, "error": "account_protection_active", "detail": json.dumps(detail, ensure_ascii=True)}
     return response
 
