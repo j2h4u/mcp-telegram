@@ -23,12 +23,14 @@ import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from functools import wraps
 from typing import Protocol, cast
 
-from .access_lifecycle import set_access_lost
+from .access_lifecycle import AccessLossResult, set_access_lost
 from .dialog_identity import ensure_dialog_identity_baseline, publish_dialog_identity
+from .entity_profile.membership import MembershipSignalCounts
 from .entity_store import EntitySnapshot, upsert_entity_stub
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .history_enrollment import (
@@ -224,6 +226,28 @@ def _set_total_messages_repair_retry(conn: sqlite3.Connection, retry_at: int | N
 # ---------------------------------------------------------------------------
 
 
+_FULL_MEMBERSHIP_OBSERVER: ContextVar[Callable[[MembershipSignalCounts], None] | None] = ContextVar(
+    "full_membership_observer", default=None
+)
+
+
+_FULL_ACCESS_LOSS_OBSERVER: ContextVar[Callable[[MembershipSignalCounts], None] | None] = ContextVar(
+    "full_access_loss_observer", default=None
+)
+
+
+def _report_membership(
+    observer: Callable[[MembershipSignalCounts], None] | None, counts: list[MembershipSignalCounts]
+) -> None:
+    if observer is None:
+        return
+    for item in counts:
+        try:
+            observer(item)
+        except Exception:  # noqa: BLE001 - observability must not affect committed work
+            logger.debug("membership_observation_failed")
+
+
 class FullSyncWorker:
     """Core bulk-fetch engine for the v1.5 sync daemon.
 
@@ -350,7 +374,11 @@ class FullSyncWorker:
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def process_one_batch(
-        self, *, expected_dialog: int | None = None, expected_cursor: int | None = None
+        self,
+        *,
+        expected_dialog: int | None = None,
+        expected_cursor: int | None = None,
+        profile_owner_account_id: int | None = None,
     ) -> bool:
         """Fetch one batch of messages for the next pending dialog.
 
@@ -384,7 +412,7 @@ class FullSyncWorker:
             self._last_page_stale = True
             return False
         if pending is None:
-            return not await self._process_one_automatic_group()
+            return not await self._process_one_automatic_group(profile_owner_account_id=profile_owner_account_id)
 
         dialog_id, sync_progress = pending
 
@@ -393,7 +421,9 @@ class FullSyncWorker:
                 _set_dm_enrollment_state(conn, "full_sync_peer_cursor", str(dialog_id))
 
         await self._writer.run(persist_peer_cursor)
-        _, is_done = await self._fetch_batch(dialog_id, sync_progress)
+        _, is_done = await self._fetch_batch(
+            dialog_id, sync_progress, profile_owner_account_id=profile_owner_account_id
+        )
 
         if not is_done:
             return False  # more batches needed for this dialog
@@ -401,7 +431,9 @@ class FullSyncWorker:
         return self._next_pending_dialog() is None
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_LOOKUP)
-    async def repair_one_total_messages(self, *, expected_dialog_id: int | None = None) -> bool:
+    async def repair_one_total_messages(
+        self, *, expected_dialog_id: int | None = None, profile_owner_account_id: int | None = None
+    ) -> bool:
         """Repair one missing Telegram history total under a single RPC budget."""
         self._last_total_repair_error = None
         self._last_total_accepted = False
@@ -426,7 +458,7 @@ class FullSyncWorker:
         if not self._expected_total_repair_is_ready(dialog_id):
             self._last_total_stale = True
             return True
-        total_messages = await self._probe_total_messages_for_repair(dialog_id)
+        total_messages = await self._probe_total_messages_for_repair(dialog_id, profile_owner_account_id)
         if total_messages is None:
             return False
 
@@ -453,10 +485,18 @@ class FullSyncWorker:
         logger.info("sync_total_repair_complete dialog_id=%d total_messages=%d", dialog_id, total_messages)
         return self._next_total_messages_repair_dialog() is None
 
-    async def _probe_total_messages_for_repair(self, dialog_id: int) -> int | None:
+    async def _probe_total_messages_for_repair(
+        self, dialog_id: int, profile_owner_account_id: int | None
+    ) -> int | None:
         probe = self._total_messages_probe
         if probe is None:
             return None
+
+        def prepare(conn: sqlite3.Connection) -> int:
+            with write_transaction(conn):
+                return allocate_observation_order(conn)
+
+        order = await self._writer.run(prepare)
         try:
             total_messages = await probe.probe_total_messages(dialog_id)
         except RpcAttemptBudgetExhaustedError:
@@ -481,8 +521,14 @@ class FullSyncWorker:
             self._last_total_repair_error = exc
             return None
         except MessageHistoryAccessLostError as exc:
+            observed_at = int(time.time())
             reason = exc.reason_code
-            await self._writer.run(lambda conn: self._persist_access_loss(conn, dialog_id, reason))
+            result = await self._writer.run(
+                lambda conn: self._persist_access_loss(
+                    conn, dialog_id, reason, profile_owner_account_id, order, observed_at
+                )
+            )
+            _report_membership(_FULL_ACCESS_LOSS_OBSERVER.get(), [result.membership_counts])
             return None
         except (MessageHistoryUnavailableError, TimeoutError) as exc:
             logger.warning("sync_total_repair_failed dialog_id=%d error=%s", dialog_id, exc)
@@ -492,9 +538,20 @@ class FullSyncWorker:
             logger.warning("sync_total_repair_missing_total dialog_id=%d", dialog_id)
         return total_messages
 
-    def _persist_access_loss(self, conn: sqlite3.Connection, dialog_id: int, reason: str) -> None:
+    def _persist_access_loss(  # noqa: PLR0913, PLR0917
+        self, conn: sqlite3.Connection, dialog_id: int, reason: str, owner: int | None, order: int, observed_at: int
+    ) -> AccessLossResult:
         with write_transaction(conn):
-            set_access_lost(conn, dialog_id, int(time.time()), reason=reason)
+            return set_access_lost(
+                conn,
+                dialog_id,
+                observed_at,
+                reason=reason,
+                profile_owner_account_id=owner,
+                observation_order=order,
+                membership_revision_at=observed_at,
+                processing_at=int(time.time()),
+            )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -574,7 +631,9 @@ class FullSyncWorker:
             is not None
         )
 
-    async def _process_one_automatic_group(self, expected_dialog_id: int | None = None) -> bool:
+    async def _process_one_automatic_group(
+        self, expected_dialog_id: int | None = None, *, profile_owner_account_id: int | None = None
+    ) -> bool:
         self._last_page_accepted = False
         self._last_page_stale = False
         self._last_automatic_pending = False
@@ -599,7 +658,7 @@ class FullSyncWorker:
                 self._set_automatic_group_retry(conn, dialog_id)
 
         try:
-            page = await self._fetch_batch_page(dialog_id, 0)
+            page = await self._fetch_batch_page(dialog_id, 0, profile_owner_account_id)
         except Exception:
             await self._writer.run(persist_probe_retry)
             raise
@@ -607,9 +666,22 @@ class FullSyncWorker:
             await self._writer.run(persist_probe_retry)
             self._last_automatic_pending = True
             return True
-        return await self._writer.run(lambda conn: self._finalize_automatic_group_page(conn, dialog_id, page))
+        staged: list[MembershipSignalCounts] = []
+        observer = _FULL_MEMBERSHIP_OBSERVER.get()
+        result = await self._writer.run(
+            lambda conn: self._finalize_automatic_group_page(conn, dialog_id, page, profile_owner_account_id, staged)
+        )
+        _report_membership(observer, staged)
+        return result
 
-    def _finalize_automatic_group_page(self, conn: sqlite3.Connection, dialog_id: int, page: _FetchedBatchPage) -> bool:
+    def _finalize_automatic_group_page(
+        self,
+        conn: sqlite3.Connection,
+        dialog_id: int,
+        page: _FetchedBatchPage,
+        profile_owner_account_id: int | None = None,
+        membership_staged: list[MembershipSignalCounts] | None = None,
+    ) -> bool:
         assert self._automatic_group_history is not None
         with write_transaction(conn):
             intent = read_intent(conn, dialog_id)
@@ -620,7 +692,7 @@ class FullSyncWorker:
                         "UPDATE synced_dialogs SET status='syncing',sync_progress=0 WHERE dialog_id=? AND status IN ('own_only', 'fragment')",
                         (dialog_id,),
                     )
-                    self._store_batch_page_locked(conn, dialog_id, 0, page)
+                    self._store_batch_page_locked(conn, dialog_id, 0, page, profile_owner_account_id, membership_staged)
                 return True
             if not self._is_eligible_automatic_group(
                 conn,
@@ -640,7 +712,7 @@ class FullSyncWorker:
                     "UPDATE synced_dialogs SET status='syncing',sync_progress=0 WHERE dialog_id=? AND status IN ('own_only', 'fragment')",
                     (dialog_id,),
                 )
-                self._store_batch_page_locked(conn, dialog_id, 0, page)
+                self._store_batch_page_locked(conn, dialog_id, 0, page, profile_owner_account_id, membership_staged)
         return True
 
     def _next_total_messages_repair_dialog(self) -> int | None:
@@ -683,11 +755,14 @@ class FullSyncWorker:
         self._last_page_error = exc
         return _FetchedBatchPage(None, (), None, (sync_progress, False))
 
-    async def _handle_batch_page_error(
+    async def _handle_batch_page_error(  # noqa: PLR0913, PLR0917
         self,
         dialog_id: int,
         sync_progress: int,
         exc: Exception,
+        profile_owner_account_id: int | None,
+        observation_order: int,
+        observed_at: int,
     ) -> _FetchedBatchPage:
         if isinstance(exc, TelegramRpcAdmissionDeferred):
             return self._deferred_batch_page(dialog_id, sync_progress, exc)
@@ -698,17 +773,20 @@ class FullSyncWorker:
             self._last_page_error = exc
             return _FetchedBatchPage(None, (), None, (sync_progress, False))
         if isinstance(exc, MessageHistoryAccessLostError):
-            now = int(time.time())
-
-            def persist_access_loss(conn: sqlite3.Connection, error: MessageHistoryAccessLostError = exc) -> None:
-                with write_transaction(conn):
-                    set_access_lost(conn, dialog_id, now, reason=error.reason_code)
-
-            await self._writer.run(persist_access_loss)
+            result = await self._writer.run(
+                lambda conn: self._persist_access_loss(
+                    conn, dialog_id, exc.reason_code, profile_owner_account_id, observation_order, observed_at
+                )
+            )
+            _report_membership(_FULL_ACCESS_LOSS_OBSERVER.get(), [result.membership_counts])
+            if not result.changed:
+                self._last_page_stale = True
             return _FetchedBatchPage(None, (), None, (sync_progress, True))
         raise exc
 
-    async def _fetch_batch_page(self, dialog_id: int, sync_progress: int) -> _FetchedBatchPage:
+    async def _fetch_batch_page(
+        self, dialog_id: int, sync_progress: int, profile_owner_account_id: int | None = None
+    ) -> _FetchedBatchPage:
         self._last_page_error = None
 
         def prepare_observation(conn: sqlite3.Connection) -> tuple[int, int, int]:
@@ -721,9 +799,14 @@ class FullSyncWorker:
         try:
             page = await self._history_port.fetch_page(dialog_id, before_message_id=sync_progress)
         except MessageHistoryAccessLostError as exc:
-            return await self._handle_batch_page_error(dialog_id, sync_progress, exc)
+            observed_at = int(time.time())
+            return await self._handle_batch_page_error(
+                dialog_id, sync_progress, exc, profile_owner_account_id, observation_order, observed_at
+            )
         except (TelegramRpcThrottled, RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
-            return await self._handle_batch_page_error(dialog_id, sync_progress, exc)
+            return await self._handle_batch_page_error(
+                dialog_id, sync_progress, exc, profile_owner_account_id, observation_order, reaction_observed_at
+            )
         except (MessageHistoryUnavailableError, TimeoutError) as exc:
             logger.exception(
                 "sync_batch_rpc_error dialog_id=%d error=%s — dialog NOT marked synced, will retry",
@@ -756,7 +839,9 @@ class FullSyncWorker:
         )
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
-    async def _fetch_batch(self, dialog_id: int, sync_progress: int) -> tuple[int, bool]:
+    async def _fetch_batch(
+        self, dialog_id: int, sync_progress: int, *, profile_owner_account_id: int | None = None
+    ) -> tuple[int, bool]:
         """Fetch up to 100 messages for dialog_id older than sync_progress.
 
         Uses offset_id=sync_progress (exclusive) so each batch fetches
@@ -775,13 +860,14 @@ class FullSyncWorker:
             return sync_progress, True
         if sync_progress == 0:
             logger.info("sync_start dialog_id=%d", dialog_id)
-        page = await self._fetch_batch_page(dialog_id, sync_progress)
+        page = await self._fetch_batch_page(dialog_id, sync_progress, profile_owner_account_id)
         if page.retry is not None:
             return page.retry
         return await self._store_batch_page(
             dialog_id,
             sync_progress,
             page,
+            profile_owner_account_id=profile_owner_account_id,
         )
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
@@ -790,21 +876,32 @@ class FullSyncWorker:
         dialog_id: int,
         sync_progress: int,
         page: _FetchedBatchPage,
+        *,
+        profile_owner_account_id: int | None = None,
     ) -> tuple[int, bool]:
         """Persist one fetched batch and update sync progress."""
 
+        staged: list[MembershipSignalCounts] = []
+        observer = _FULL_MEMBERSHIP_OBSERVER.get()
+
         def persist_page(conn: sqlite3.Connection) -> tuple[int, bool]:
             with write_transaction(conn):
-                return self._store_batch_page_locked(conn, dialog_id, sync_progress, page)
+                return self._store_batch_page_locked(
+                    conn, dialog_id, sync_progress, page, profile_owner_account_id, staged
+                )
 
-        return await self._writer.run(persist_page)
+        result = await self._writer.run(persist_page)
+        _report_membership(observer, staged)
+        return result
 
-    def _store_batch_page_locked(
+    def _store_batch_page_locked(  # noqa: PLR0913, PLR0917
         self,
         conn: sqlite3.Connection,
         dialog_id: int,
         sync_progress: int,
         page: _FetchedBatchPage,
+        profile_owner_account_id: int | None = None,
+        membership_staged: list[MembershipSignalCounts] | None = None,
     ) -> tuple[int, bool]:
         require_write_transaction(conn)
         if sync_progress == 0 and full_history_enabled(conn, dialog_id):
@@ -814,7 +911,9 @@ class FullSyncWorker:
             )
         if page.next_before_message_id is None:
             return self._store_terminal_page_locked(conn, dialog_id, sync_progress, page)
-        return self._store_continuation_page_locked(conn, dialog_id, sync_progress, page)
+        return self._store_continuation_page_locked(
+            conn, dialog_id, sync_progress, page, profile_owner_account_id, membership_staged
+        )
 
     def _store_terminal_page_locked(
         self, conn: sqlite3.Connection, dialog_id: int, sync_progress: int, page: _FetchedBatchPage
@@ -837,8 +936,14 @@ class FullSyncWorker:
         logger.info("sync_done dialog_id=%d status=synced (empty batch)", dialog_id)
         return sync_progress, True
 
-    def _store_continuation_page_locked(
-        self, conn: sqlite3.Connection, dialog_id: int, sync_progress: int, page: _FetchedBatchPage
+    def _store_continuation_page_locked(  # noqa: PLR0913, PLR0917
+        self,
+        conn: sqlite3.Connection,
+        dialog_id: int,
+        sync_progress: int,
+        page: _FetchedBatchPage,
+        profile_owner_account_id: int | None = None,
+        membership_staged: list[MembershipSignalCounts] | None = None,
     ) -> tuple[int, bool]:
         assert page.next_before_message_id is not None
         rows = list(page.batch)
@@ -857,9 +962,15 @@ class FullSyncWorker:
             self._last_page_stale = True
             return sync_progress, False
         self._begin_topic_attribution_pass(conn, dialog_id, sync_progress, now)
-        insert_messages_with_fts(
-            conn, rows, priority=HydrationPriority.BACKFILL, reaction_observed_at=page.reaction_observed_at
+        result = insert_messages_with_fts(
+            conn,
+            rows,
+            priority=HydrationPriority.BACKFILL,
+            reaction_observed_at=page.reaction_observed_at,
+            profile_owner_account_id=profile_owner_account_id,
         )
+        if membership_staged is not None:
+            membership_staged.append(result.membership_counts)
         self._record_no_topic_attribution(conn, dialog_id, rows)
         self._capture_committed_page_revision(conn, dialog_id)
         logger.debug(
@@ -923,7 +1034,16 @@ class FullSyncDemandAdapter:
 
     demand_kind = DemandKind.FULL_SYNC_PAGE
 
-    def __init__(self, worker: FullSyncWorker, *, account_id: int) -> None:
+    def __init__(
+        self,
+        worker: FullSyncWorker,
+        *,
+        account_id: int,
+        membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
+        access_loss_observer: Callable[[MembershipSignalCounts], None] | None = None,
+    ) -> None:
+        self._access_loss_observer = access_loss_observer
+        self._membership_observer = membership_observer
         self._worker = worker
         self._account_id = account_id
 
@@ -1035,7 +1155,13 @@ class FullSyncDemandAdapter:
         validation = self._validate_selected(selected, time.time())
         if validation is not None:
             return validation
-        stale = await self._dispatch_selected(selected, budget)
+        token = _FULL_MEMBERSHIP_OBSERVER.set(self._membership_observer)
+        access_token = _FULL_ACCESS_LOSS_OBSERVER.set(self._access_loss_observer)
+        try:
+            stale = await self._dispatch_selected(selected, budget)
+        finally:
+            _FULL_MEMBERSHIP_OBSERVER.reset(token)
+            _FULL_ACCESS_LOSS_OBSERVER.reset(access_token)
         if stale:
             return SliceOutcome(selected, SliceOutcomeKind.STALE)
         return self._outcome_for_selected(selected)
@@ -1114,20 +1240,24 @@ class FullSyncDemandAdapter:
 
     async def _dispatch_automatic_group(self, selected: WorkRevision) -> bool:
         dialog_id = int(selected.key.target.split(":", 1)[1])
-        await self._worker._process_one_automatic_group(dialog_id)
+        await self._worker._process_one_automatic_group(dialog_id, profile_owner_account_id=self._account_id)
         self._raise_unexpected_page_error()
         return self._worker._last_page_stale
 
     async def _dispatch_dialog(self, selected: WorkRevision) -> bool:
         dialog_id = int(selected.key.target.split(":", 1)[1])
         cursor = int(selected.revision.split(":", 1)[0])
-        await self._worker.process_one_batch(expected_dialog=dialog_id, expected_cursor=cursor)
+        await self._worker.process_one_batch(
+            expected_dialog=dialog_id, expected_cursor=cursor, profile_owner_account_id=self._account_id
+        )
         self._raise_unexpected_page_error()
         return self._worker._last_page_stale
 
     async def _dispatch_total_repair(self, selected: WorkRevision) -> bool:
         dialog_id = int(selected.key.target.split(":", 1)[1])
-        await self._worker.repair_one_total_messages(expected_dialog_id=dialog_id)
+        await self._worker.repair_one_total_messages(
+            expected_dialog_id=dialog_id, profile_owner_account_id=self._account_id
+        )
         self._raise_unexpected_total_error()
         return self._worker._last_total_stale
 

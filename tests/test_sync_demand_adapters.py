@@ -20,6 +20,7 @@ from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
 from helpers import MockTotalList, build_mock_message
 from mcp_telegram.delta_sync import (
+    AccessProbe,
     AccessProbePolicy,
     DeltaAccessProbeDemandAdapter,
     DeltaGapFillDemandAdapter,
@@ -31,6 +32,7 @@ from mcp_telegram.delta_sync import (
     prepare_dm_deletion_reconciliation,
 )
 from mcp_telegram.dialog_sync import DialogLightReconciliationDemandAdapter, DialogReconciliationWorker
+from mcp_telegram.entity_profile.membership import MembershipSignalCounts
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.message_history.contracts import (
     MessageHistoryAccessLostError,
@@ -78,6 +80,8 @@ def db_path(tmp_path: Path) -> Path:
 @pytest.fixture()
 def conn(db_path: Path) -> Iterator[sqlite3.Connection]:
     connection = _open_sync_db(db_path)
+    connection.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
+    connection.commit()
     try:
         yield connection
     finally:
@@ -1478,9 +1482,24 @@ async def test_access_probe_adapter_persists_probe_to_gap_fill_handoff(conn: sql
     original_gap_slice = worker.fetch_delta_slice_for_dialog
     recovery_root: list[tuple[DemandKind, float, DemandKind, float]] = []
 
-    async def observe_recovery_root(dialog_id: int, *, expected_completion_generation: int | None = None) -> int:
+    async def observe_recovery_root(  # noqa: PLR0913
+        dialog_id: int,
+        *,
+        expected_completion_generation: int | None = None,
+        profile_owner_account_id: int | None = None,
+        membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
+        access_loss_observer: Callable[[MembershipSignalCounts], None] | None = None,
+        recovery: _DurableAccessRecovery | None = None,
+    ) -> int:
         before = current_demand_token()
-        result = await original_gap_slice(dialog_id, expected_completion_generation=expected_completion_generation)
+        result = await original_gap_slice(
+            dialog_id,
+            expected_completion_generation=expected_completion_generation,
+            profile_owner_account_id=profile_owner_account_id,
+            membership_observer=membership_observer,
+            access_loss_observer=access_loss_observer,
+            recovery=recovery,
+        )
         after = current_demand_token()
         recovery_root.append((before.kind, before.admission_deadline, after.kind, after.admission_deadline))
         return result
@@ -1572,6 +1591,16 @@ async def test_access_recovery_runs_exact_excluded_sibling(conn: sqlite3.Connect
             "VALUES (?, 'gap_fill', 5, 10, NULL, 10)",
             (dialog_id,),
         )
+    conn.executemany(
+        "INSERT INTO dialog_fact_observations(dialog_id,field,observation_order) VALUES (?, ?, 1)",
+        [
+            (row[0], field)
+            for row in cast(
+                list[tuple[int]], conn.execute("SELECT dialog_id FROM delta_access_recovery_state").fetchall()
+            )
+            for field in ("access_state", "access_recovery_witness")
+        ],
+    )
     conn.commit()
     worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
 
@@ -1605,6 +1634,16 @@ async def test_recovery_query_failure_does_not_reuse_prior_slice_metrics(conn: s
     dialog_id = 304
     _seed_history_dialog(conn, dialog_id, status="synced", refresh_requested_at=1)
     conn.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (?, ?, 1)", (dialog_id, 10))
+    conn.executemany(
+        "INSERT INTO dialog_fact_observations(dialog_id,field,observation_order) VALUES (?, ?, 1)",
+        [
+            (row[0], field)
+            for row in cast(
+                list[tuple[int]], conn.execute("SELECT dialog_id FROM delta_access_recovery_state").fetchall()
+            )
+            for field in ("access_state", "access_recovery_witness")
+        ],
+    )
     conn.commit()
 
     async def send_history(_request: GetHistoryRequest) -> object:
@@ -1635,6 +1674,16 @@ async def test_recovery_query_failure_does_not_reuse_prior_slice_metrics(conn: s
         "VALUES (?, 'gap_fill', 20, 1, NULL, 1)",
         (dialog_id,),
     )
+    conn.executemany(
+        "INSERT INTO dialog_fact_observations(dialog_id,field,observation_order) VALUES (?, ?, 1)",
+        [
+            (row[0], field)
+            for row in cast(
+                list[tuple[int]], conn.execute("SELECT dialog_id FROM delta_access_recovery_state").fetchall()
+            )
+            for field in ("access_state", "access_recovery_witness")
+        ],
+    )
     conn.commit()
     adapter = DeltaAccessProbeDemandAdapter(
         worker, _delta_policy(), TelethonHistoryAccessProbe(client), account_id=123, observer=observer
@@ -1661,6 +1710,16 @@ async def test_non_enrolled_recovery_is_observed_as_skipped_not_terminal(conn: s
         "INSERT INTO delta_access_recovery_state(dialog_id,stage,total_messages,probe_succeeded_at,retry_at,updated_at) "
         "VALUES (?, 'gap_fill', 20, 1, NULL, 1)",
         (dialog_id,),
+    )
+    conn.executemany(
+        "INSERT INTO dialog_fact_observations(dialog_id,field,observation_order) VALUES (?, ?, 1)",
+        [
+            (row[0], field)
+            for row in cast(
+                list[tuple[int]], conn.execute("SELECT dialog_id FROM delta_access_recovery_state").fetchall()
+            )
+            for field in ("access_state", "access_recovery_witness")
+        ],
     )
     conn.commit()
 
@@ -1710,6 +1769,16 @@ async def test_access_recovery_retains_local_flood_retry_and_observes_budget_def
         "INSERT INTO delta_access_recovery_state(dialog_id,stage,total_messages,probe_succeeded_at,retry_at,updated_at) "
         "VALUES (?, 'gap_fill', 10, 1, NULL, 1)",
         (dialog_id,),
+    )
+    conn.executemany(
+        "INSERT INTO dialog_fact_observations(dialog_id,field,observation_order) VALUES (?, ?, 1)",
+        [
+            (row[0], field)
+            for row in cast(
+                list[tuple[int]], conn.execute("SELECT dialog_id FROM delta_access_recovery_state").fetchall()
+            )
+            for field in ("access_state", "access_recovery_witness")
+        ],
     )
     conn.commit()
 
@@ -1910,3 +1979,256 @@ async def test_dialog_light_refresh_treats_deleted_row_as_stale(conn: sqlite3.Co
     )
 
     assert await worker._refresh_light_dialog(999999) == (False, None)
+
+
+@pytest.mark.parametrize(("retry_at", "expected"), [(None, 1100), (1050, 1100), (1200, 1200)])
+def test_access_probe_scheduler_preserves_both_retry_floors(
+    conn: sqlite3.Connection, retry_at: int | None, expected: int
+) -> None:
+    conn.execute(
+        "INSERT INTO synced_dialogs(dialog_id,status,access_lost_at,access_next_revalidate_at) "
+        "VALUES (987, 'access_lost', 1000, ?)",
+        (retry_at,),
+    )
+    conn.commit()
+    worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), cast(AccessProbe, object()), account_id=123)
+    status = adapter.status(0)
+    assert status is not None and status.release_at == expected
+
+
+@pytest.mark.asyncio
+async def test_later_access_loss_fences_pending_probe(conn: sqlite3.Connection) -> None:
+    from mcp_telegram.access_lifecycle import set_access_lost
+    from mcp_telegram.observation_order import allocate_observation_order
+    from mcp_telegram.sync_transactions import write_transaction
+
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status,access_lost_at) VALUES (988, 'access_lost', 1)")
+    seed_full_history_enrollment(conn, 988, enabled=False)
+    conn.commit()
+
+    class Probe:
+        async def probe_total_messages(self, dialog_id: int) -> int | None:
+            with write_transaction(conn):
+                order = allocate_observation_order(conn)
+                set_access_lost(conn, dialog_id, 2, profile_owner_account_id=123, observation_order=order)
+            return 10
+
+    worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), Probe(), account_id=123)
+    await adapter.run_slice(_selected_budget(adapter))
+    assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=988").fetchone() == ("access_lost",)
+    assert conn.execute("SELECT 1 FROM delta_access_recovery_state WHERE dialog_id=988").fetchone() is None
+
+
+@pytest.mark.asyncio
+async def test_new_loss_invalidates_persisted_recovery(conn: sqlite3.Connection) -> None:
+    from mcp_telegram.access_lifecycle import set_access_lost
+    from mcp_telegram.observation_order import allocate_observation_order
+    from mcp_telegram.sync_transactions import write_transaction
+
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status,access_lost_at) VALUES (989, 'access_lost', 1)")
+    seed_full_history_enrollment(conn, 989, enabled=True)
+    conn.commit()
+
+    class Probe:
+        async def probe_total_messages(self, dialog_id: int) -> int | None:
+            return 10
+
+    worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), Probe(), account_id=123)
+    await adapter.run_slice(_selected_budget(adapter))
+    assert conn.execute("SELECT 1 FROM delta_access_recovery_state WHERE dialog_id=989").fetchone()
+    with write_transaction(conn):
+        order = allocate_observation_order(conn)
+        set_access_lost(conn, 989, 2, profile_owner_account_id=123, observation_order=order)
+    assert conn.execute("SELECT 1 FROM delta_access_recovery_state WHERE dialog_id=989").fetchone() is None
+    status = adapter.status(1000)
+    assert status is not None and status.selected is not None and status.selected.key.target == "probe:989"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("crossing", ["account", "restored", "new_loss", "retry_floor"])
+@pytest.mark.parametrize("failure", ["timeout", "deferred", "flood"])
+async def test_delayed_probe_error_respects_new_state_and_retry_floor(
+    conn: sqlite3.Connection, crossing: str, failure: str
+) -> None:
+    from mcp_telegram.access_lifecycle import (
+        set_access_lost,
+    )
+    from mcp_telegram.observation_order import allocate_observation_order
+    from mcp_telegram.sync_transactions import write_transaction
+
+    dialog_id = 990
+    conn.execute(
+        "INSERT INTO synced_dialogs(dialog_id,status,access_lost_at) VALUES (?, 'access_lost', 1)", (dialog_id,)
+    )
+    seed_full_history_enrollment(conn, dialog_id, enabled=False)
+    conn.commit()
+    started, release = asyncio.Event(), asyncio.Event()
+
+    class DelayedProbe:
+        async def probe_total_messages(self, dialog_id: int) -> int | None:
+            started.set()
+            await release.wait()
+            if failure == "deferred":
+                raise TelegramRpcAdmissionDeferred(retry_after_seconds=7)
+            if failure == "flood":
+                raise TelegramRpcThrottled(retry_after_seconds=200)
+            raise TimeoutError("late failure")
+
+    worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), DelayedProbe(), account_id=123)
+    observed_time = 1000
+    with patch("mcp_telegram.delta_sync.time.time", side_effect=lambda: observed_time):
+        task = asyncio.create_task(adapter.run_slice(_selected_budget(adapter)))
+        await started.wait()
+        with write_transaction(conn):
+            if crossing == "account":
+                conn.execute("UPDATE dialog_directory_state SET account_id=456 WHERE singleton=1")
+            elif crossing == "new_loss":
+                order = allocate_observation_order(conn)
+                set_access_lost(conn, dialog_id, 1001, profile_owner_account_id=123, observation_order=order)
+            elif crossing == "retry_floor":
+                conn.execute("UPDATE synced_dialogs SET access_next_revalidate_at=2000 WHERE dialog_id=?", (dialog_id,))
+        if crossing == "restored":
+
+            class SuccessfulProbe:
+                async def probe_total_messages(self, dialog_id: int) -> int | None:
+                    return 10
+
+            successful = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), SuccessfulProbe(), account_id=123)
+            await successful.run_slice(_selected_budget(successful))
+        before = cast(
+            tuple[str, int | None, int | None] | None,
+            conn.execute(
+                "SELECT status,access_last_revalidated_at,access_next_revalidate_at FROM synced_dialogs WHERE dialog_id=?",
+                (dialog_id,),
+            ).fetchone(),
+        )
+        facts_before = conn.execute("SELECT * FROM dialog_fact_observations ORDER BY dialog_id,field").fetchall()
+        jobs_before = conn.execute("SELECT * FROM entity_profile_refresh_state ORDER BY entity_id").fetchall()
+        observed_time = 1010
+        release.set()
+        await task
+    after = cast(
+        tuple[str, int | None, int | None] | None,
+        conn.execute(
+            "SELECT status,access_last_revalidated_at,access_next_revalidate_at FROM synced_dialogs WHERE dialog_id=?",
+            (dialog_id,),
+        ).fetchone(),
+    )
+    if crossing == "retry_floor":
+        assert after == ("access_lost", 1010, 2000)
+    else:
+        assert after == before
+    assert conn.execute("SELECT * FROM dialog_fact_observations ORDER BY dialog_id,field").fetchall() == facts_before
+    assert conn.execute("SELECT * FROM entity_profile_refresh_state ORDER BY entity_id").fetchall() == jobs_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("crossing", ["new_loss", "same_second_loss", "retry_floor"])
+async def test_probe_rechecks_selection_after_writer_queue(conn: sqlite3.Connection, crossing: str) -> None:
+    from mcp_telegram.access_lifecycle import set_access_lost
+    from mcp_telegram.observation_order import allocate_observation_order
+    from mcp_telegram.sqlite_writer import SQLiteWriter
+    from mcp_telegram.sync_transactions import write_transaction
+
+    dialog_id = 991
+    conn.execute(
+        "INSERT INTO synced_dialogs(dialog_id,status,access_lost_at) VALUES (?, 'access_lost', 1)", (dialog_id,)
+    )
+    conn.commit()
+    queued, release = asyncio.Event(), asyncio.Event()
+
+    class DelayedWriter:
+        async def run[T](self, operation: Callable[[sqlite3.Connection], T]) -> T:
+            queued.set()
+            await release.wait()
+            return operation(conn)
+
+    class Probe:
+        async def probe_total_messages(self, dialog_id: int) -> int | None:
+            raise AssertionError("stale selection must not call Telegram")
+
+    worker = DeltaSyncWorker(
+        cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=cast(SQLiteWriter, DelayedWriter())
+    )
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), Probe(), account_id=123)
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
+        task = asyncio.create_task(adapter.run_slice(_selected_budget(adapter)))
+        await queued.wait()
+        with write_transaction(conn):
+            if crossing == "retry_floor":
+                conn.execute("UPDATE synced_dialogs SET access_next_revalidate_at=2000 WHERE dialog_id=?", (dialog_id,))
+            else:
+                order = allocate_observation_order(conn)
+                lost_at = 1 if crossing == "same_second_loss" else 1000
+                set_access_lost(conn, dialog_id, lost_at, profile_owner_account_id=123, observation_order=order)
+        release.set()
+        outcome = await task
+    expected = SliceOutcomeKind.DEFERRED if crossing == "retry_floor" else SliceOutcomeKind.STALE
+    assert outcome.kind is expected
+    assert conn.execute(
+        "SELECT access_last_revalidated_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (None,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["full_total", "delta_page"])
+async def test_delayed_access_loss_persists_rpc_error_time(conn: sqlite3.Connection, path: str) -> None:
+    from mcp_telegram.message_history.contracts import MessageHistoryAccessLostError
+    from mcp_telegram.sqlite_writer import SQLiteWriter
+
+    dialog_id = 992
+    _seed_history_dialog(conn, dialog_id, status="synced")
+    queued, release = asyncio.Event(), asyncio.Event()
+    clock = 1000
+
+    class DelayedWriter:
+        calls = 0
+
+        async def run[T](self, operation: Callable[[sqlite3.Connection], T]) -> T:
+            self.calls += 1
+            if self.calls == 2:
+                queued.set()
+                await release.wait()
+            return operation(conn)
+
+    class FailingProbe:
+        async def probe_total_messages(self, dialog_id: int) -> int | None:
+            nonlocal clock
+            clock = 1001
+            raise MessageHistoryAccessLostError("private", reason_code="private")
+
+    class FailingHistory:
+        async def fetch_page(self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]) -> object:
+            nonlocal clock
+            clock = 1001
+            raise MessageHistoryAccessLostError("private", reason_code="private")
+
+    writer = cast(SQLiteWriter, DelayedWriter())
+    if path == "full_total":
+        full = FullSyncWorker(
+            cast(FullHistoryPagePort, object()),
+            conn,
+            asyncio.Event(),
+            writer=writer,
+            total_messages_probe=FailingProbe(),
+        )
+        work = full._probe_total_messages_for_repair(dialog_id, 123)
+    else:
+        delta = DeltaSyncWorker(cast(ForwardGapPagePort, FailingHistory()), conn, asyncio.Event(), writer=writer)
+        work = delta.fetch_delta_slice_for_dialog(dialog_id, profile_owner_account_id=123)
+    with patch("mcp_telegram.delta_sync.time.time", side_effect=lambda: clock):
+        task = asyncio.ensure_future(work)
+        await queued.wait()
+        clock = 2000
+        release.set()
+        await task
+    assert conn.execute("SELECT access_lost_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        1001,
+    )
+    assert conn.execute(
+        "SELECT occurred_at FROM conversation_history_events WHERE dialog_id=? AND kind='access_lost'", (dialog_id,)
+    ).fetchone() == (1001,)

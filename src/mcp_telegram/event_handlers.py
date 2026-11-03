@@ -66,7 +66,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
-from .access_lifecycle import AccessLossEvidence, set_access_lost, unhide_after_realtime_presence
+from .access_lifecycle import AccessLossEvidence, AccessLossResult, set_access_lost, unhide_after_realtime_presence
 from .channel_full_siblings import (
     ChannelFullSiblingsToken,
     capture_channel_full_siblings_token,
@@ -90,6 +90,7 @@ from .dialog_identity import capture_identity_baseline, publish_dialog_identity
 from .dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation, ObservedText
 from .dialog_pin_observations import claim_pin_delta, claim_pin_snapshot, ordered_pin_overlay
 from .entity_profile.contracts import ProfileFieldObservation, SuppliedProfileUser
+from .entity_profile.membership import MembershipSignalCounts
 from .entity_profile.repository import (
     EntityProfileRepository,
     admit_profile_peer,
@@ -132,7 +133,7 @@ from .messages.telegram_adapter import (
     extract_message_row,
 )
 from .models import DialogType
-from .observation_order import delivered_observation_order
+from .observation_order import allocate_observation_order, delivered_observation_order
 from .peer_access import peer_target
 from .reactions.contracts import ReactionAggregate, ReactionAggregateSource, ReactionObservationBoundary
 from .reactions.persistence import allocate_observation_boundary, replace_reaction_aggregates
@@ -715,6 +716,8 @@ class EventHandlerManager:
         self._self_id: int | None = None
         self._demand_sink: DemandOfferSink | None = None
         self._observation_sink: RuntimeObservationSink | None = None
+        self._membership_observer: Callable[[MembershipSignalCounts], None] | None = None
+        self._access_loss_observer: Callable[[MembershipSignalCounts], None] | None = None
         self._profile_pair_mode = profile_pair_mode
         self._profile_detail_ttl_seconds = profile_detail_ttl_seconds
         self._profile_push_owner = object()
@@ -722,6 +725,28 @@ class EventHandlerManager:
 
     def bind_observation_sink(self, sink: RuntimeObservationSink) -> None:
         self._observation_sink = sink
+
+    def bind_membership_observer(self, observer: Callable[[MembershipSignalCounts], None]) -> None:
+        self._membership_observer = observer
+
+    def bind_access_loss_observer(self, observer: Callable[[MembershipSignalCounts], None]) -> None:
+        self._access_loss_observer = observer
+
+    def _observe_access_loss(self, counts: MembershipSignalCounts) -> None:
+        if self._access_loss_observer is None:
+            return
+        try:
+            self._access_loss_observer(counts)
+        except Exception:  # noqa: BLE001 - diagnostics cannot affect committed state.
+            logger.debug("access_loss_observation_failed")
+
+    def _observe_membership(self, counts: MembershipSignalCounts | None) -> None:
+        if counts is None or self._membership_observer is None:
+            return
+        try:
+            self._membership_observer(counts)
+        except Exception:  # noqa: BLE001 - diagnostics cannot affect ingestion or wakeups.
+            logger.debug("membership_observation_failed")
 
     def _record_observation(self, **event: object) -> None:
         try:
@@ -1170,6 +1195,7 @@ class EventHandlerManager:
         dialog_id = event.chat_id
         if dialog_id is None:
             return
+        profile_owner_account_id = self._self_id
         try:
             reaction_observed_at = delivered_observed_at()
             msg = event.message
@@ -1200,19 +1226,20 @@ class EventHandlerManager:
                 return
             now = delivered_observed_at()
 
-            def _persist_event_0(conn: sqlite3.Connection) -> tuple[bool, bool]:
+            def _persist_event_0(conn: sqlite3.Connection) -> tuple[bool, bool, MembershipSignalCounts | None]:
                 with write_transaction(conn):
                     if not allows_new_message(
                         realtime_history_coverage(*_SQLiteRealtimeHistoryStatusReader(conn).read_status(dialog_id)),
                         outgoing=bool(getattr(msg, "out", False)),
                     ):
-                        return False, False
-                    insert_messages_with_fts(
+                        return False, False, None
+                    write_result = insert_messages_with_fts(
                         conn,
                         [extracted],
                         priority=HydrationPriority.FOREGROUND,
                         reaction_source=ReactionAggregateSource.REALTIME_MESSAGE,
                         reaction_observed_at=reaction_observed_at,
+                        profile_owner_account_id=profile_owner_account_id,
                     )
                     # A normal message carrying from_scheduled is the verification
                     # point for the untrusted sent_messages hint retained by the
@@ -1225,16 +1252,10 @@ class EventHandlerManager:
                     self._project_new_message_metadata(conn, dialog_id, msg, now, observation_order=observation_order)
                     self._record_body_event(conn, dialog_id, now)
                     needs_scheduled_work = scheduled_dialog_has_due_work(conn, dialog_id)
-                return True, needs_scheduled_work
+                return True, needs_scheduled_work, write_result.membership_counts
 
-            accepted, needs_scheduled_work = await self._writer.run(_persist_event_0)
-            if not accepted:
-                return
-
-            self._offer_message_ingestion()
-            if bool(getattr(msg, "from_scheduled", False)) and needs_scheduled_work:
-                self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
-            logger.debug("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
+            accepted, needs_scheduled_work, membership_counts = await self._writer.run(_persist_event_0)
+            self._finish_new_message(dialog_id, msg, accepted, needs_scheduled_work, membership_counts)
         except RpcAdmissionClosedError:
             raise
         except Exception as exc:
@@ -1245,6 +1266,19 @@ class EventHandlerManager:
                 getattr(exc, "sqlite_errorcode", None),
                 getattr(exc, "sqlite_errorname", None),
             )
+
+    def _finish_new_message(
+        self, dialog_id: int, msg: _MessageLike, accepted: bool, scheduled: bool, counts: MembershipSignalCounts | None
+    ) -> None:
+        self._observe_membership(counts)
+        if not accepted:
+            return
+        self._offer_message_ingestion()
+        if counts is not None and (counts.queued or counts.coalesced):
+            self._offer(DemandKind.ENTITY_PROFILE_REFRESH)
+        if bool(getattr(msg, "from_scheduled", False)) and scheduled:
+            self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
+        logger.debug("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
 
     async def _new_message_coverage(
         self,
@@ -1527,6 +1561,7 @@ class EventHandlerManager:
         if dialog_id is None:
             return
 
+        profile_owner_account_id = self._self_id
         try:
             observation_order = await self._writer.run(delivered_observation_order)
             msg = event.message
@@ -1544,7 +1579,9 @@ class EventHandlerManager:
             )
 
             if not existing.found:
-                if await self._insert_missing_edited_message(dialog_id, msg, coverage, now, observation_order):
+                if await self._insert_missing_edited_message(
+                    dialog_id, msg, coverage, now, observation_order, profile_owner_account_id
+                ):
                     logger.info(
                         "event_edit_new dialog_id=%d message_id=%d (not in sync.db, inserted)",
                         dialog_id,
@@ -1561,6 +1598,7 @@ class EventHandlerManager:
                 old_text,
                 now,
                 observation_order,
+                profile_owner_account_id,
             )
             if next_ver is None:
                 return
@@ -1577,13 +1615,14 @@ class EventHandlerManager:
             fail_delivered_update()
             logger.exception("event_edit_failed dialog_id=%s", dialog_id)
 
-    async def _insert_missing_edited_message(
+    async def _insert_missing_edited_message(  # noqa: PLR0913, PLR0917 - ingestion keeps its explicit source facts.
         self,
         dialog_id: int,
         msg: _MessageLike,
         coverage: RealtimeHistoryCoverage,
         now: int,
         observation_order: int,
+        profile_owner_account_id: int | None = None,
     ) -> bool:
         outgoing = bool(getattr(msg, "out", False))
         if not allows_missing_body_insert(coverage, RealtimeBodyEvent.EDIT, outgoing=outgoing):
@@ -1596,27 +1635,32 @@ class EventHandlerManager:
         if not allows_missing_body_insert(coverage, RealtimeBodyEvent.EDIT, outgoing=outgoing):
             return False
 
-        def _persist_event_0(conn: sqlite3.Connection) -> bool:
+        def _persist_event_0(conn: sqlite3.Connection) -> tuple[bool, MembershipSignalCounts | None]:
             with write_transaction(conn):
                 if not allows_missing_body_insert(
                     realtime_history_coverage(*_SQLiteRealtimeHistoryStatusReader(conn).read_status(dialog_id)),
                     RealtimeBodyEvent.EDIT,
                     outgoing=outgoing,
                 ):
-                    return False
-                insert_messages_with_fts(
+                    return False, None
+                write_result = insert_messages_with_fts(
                     conn,
                     [extracted],
                     priority=HydrationPriority.FOREGROUND,
                     reaction_source=ReactionAggregateSource.MESSAGE_EDIT,
                     reaction_observed_at=now,
+                    profile_owner_account_id=profile_owner_account_id,
                 )
                 self._record_body_event(conn, dialog_id, now)
-            return True
+            return True, write_result.membership_counts
 
-        if not await self._writer.run(_persist_event_0):
+        accepted, membership_counts = await self._writer.run(_persist_event_0)
+        self._observe_membership(membership_counts)
+        if not accepted:
             return False
         self._offer_message_ingestion()
+        if membership_counts is not None and (membership_counts.queued or membership_counts.coalesced):
+            self._offer(DemandKind.ENTITY_PROFILE_REFRESH)
         return True
 
     async def _persist_changed_edit(  # noqa: PLR0913, PLR0917
@@ -1628,6 +1672,7 @@ class EventHandlerManager:
         old_text: str | None,
         now: int,
         observation_order: int,
+        profile_owner_account_id: int | None = None,
     ) -> int | None:
         edit_date_raw = msg.edit_date
         edit_date_unix = int(edit_date_raw.timestamp()) if edit_date_raw is not None else now
@@ -1644,7 +1689,7 @@ class EventHandlerManager:
             # preserve the canonical outgoing classification of the row.
             extracted = replace(extracted, message=replace(extracted.message, out=1))
 
-        def _persist_event_0(conn: sqlite3.Connection) -> int | None:
+        def _persist_event_0(conn: sqlite3.Connection) -> tuple[int | None, MembershipSignalCounts | None]:
             with write_transaction(conn):
                 outgoing = read_message_out(conn, dialog_id, int(msg.id)).outgoing
                 current_text = read_message_text(conn, dialog_id, int(msg.id)).text
@@ -1653,19 +1698,23 @@ class EventHandlerManager:
                     RealtimeBodyEvent.EDIT,
                     outgoing=outgoing,
                 ):
-                    return None
-                next_ver = persist_edited_message(
+                    return None, None
+                write_result = persist_edited_message(
                     conn,
                     extracted,
                     old_text=current_text,
                     edit_date=edit_date_unix,
                     priority=HydrationPriority.FOREGROUND,
+                    profile_owner_account_id=profile_owner_account_id,
                 )
                 if current_text != extracted.message.text or msg.edit_date is not None or msg.reactions is not None:
                     self._record_body_event(conn, dialog_id, now)
-            return next_ver
+            return write_result.version, write_result.membership_counts
 
-        next_ver = await self._writer.run(_persist_event_0)
+        next_ver, membership_counts = await self._writer.run(_persist_event_0)
+        self._observe_membership(membership_counts)
+        if membership_counts is not None and (membership_counts.queued or membership_counts.coalesced):
+            self._offer(DemandKind.ENTITY_PROFILE_REFRESH)
         if next_ver is None:
             return None
         self._offer_message_ingestion()
@@ -2759,19 +2808,27 @@ class EventHandlerManager:
             if cause is None:
                 return
             dialog_id = self._participant_dialog_id(update)
-            occurred_at = int(update.date.timestamp()) if update.date is not None else delivered_observed_at()
+            observed_at = delivered_observed_at()
+            occurred_at = int(update.date.timestamp()) if update.date is not None else None
 
-            def _persist_event_0(conn: sqlite3.Connection) -> bool:
+            def _persist_event_0(conn: sqlite3.Connection) -> AccessLossResult:
                 with write_transaction(conn):
                     return set_access_lost(
                         conn,
                         dialog_id,
-                        occurred_at,
+                        observed_at,
                         evidence=AccessLossEvidence("UpdateChannelParticipant", cause, update.actor_id),
+                        profile_owner_account_id=self_id,
+                        observation_order=delivered_observation_order(conn),
+                        membership_revision_at=occurred_at,
+                        processing_at=int(time.time()),
                     )
 
-            changed = await self._writer.run(_persist_event_0)
-            if changed:
+            result = await self._writer.run(_persist_event_0)
+            self._observe_access_loss(result.membership_counts)
+            if result.membership_counts.queued or result.membership_counts.coalesced:
+                self._offer(DemandKind.ENTITY_PROFILE_REFRESH)
+            if result.changed:
                 self._synced_dialog_ids.discard(dialog_id)
                 self._offer(DemandKind.DELTA_ACCESS_PROBE)
         except RpcAdmissionClosedError:
@@ -2884,7 +2941,11 @@ class EventHandlerManager:
             logger.debug("linked_chat_refresh_no_input_peer dialog_id=%d", channel_id)
             return None
 
-        full_result = await self._request_linked_chat_full(work, input_channel, now)
+        profile_owner_account_id = self._self_id
+        observation_order = await self._writer.run(allocate_observation_order)
+        full_result = await self._request_linked_chat_full(
+            work, input_channel, profile_owner_account_id, observation_order
+        )
         if full_result is None:
             return None
         return await self._publish_linked_chat_observation(work, generation, siblings_token, full_result, now)
@@ -2893,7 +2954,8 @@ class EventHandlerManager:
         self,
         work: LinkedChatWork,
         input_channel: TypeInputChannel,
-        now: int,
+        profile_owner_account_id: int | None,
+        observation_order: int,
     ) -> object | None:
         """Acquire one full-channel result and persist recoverable failure state."""
         channel_id = work.channel_id
@@ -2907,7 +2969,9 @@ class EventHandlerManager:
         ):
             raise
         except ACCESS_LOST_ERRORS as exc:
-            await self._mark_linked_chat_access_lost(channel_id, now, exc)
+            await self._mark_linked_chat_access_lost(
+                work, int(time.time()), exc, profile_owner_account_id, observation_order
+            )
             return None
         except Exception:
             logger.debug("linked_chat_refresh_failed dialog_id=%d", channel_id, exc_info=True)
@@ -2978,14 +3042,35 @@ class EventHandlerManager:
             )
             linked_chat_fact_owner.defer(conn, work, retry_at)
 
-    async def _mark_linked_chat_access_lost(self, channel_id: int, now: int, error: Exception) -> None:
-        def _persist_event_0(conn: sqlite3.Connection) -> bool:
+    async def _mark_linked_chat_access_lost(
+        self,
+        work: LinkedChatWork,
+        now: int,
+        error: Exception,
+        profile_owner_account_id: int | None,
+        observation_order: int,
+    ) -> None:
+        def _persist_event_0(conn: sqlite3.Connection) -> AccessLossResult:
             with write_transaction(conn):
-                return set_access_lost(conn, channel_id, now, reason=type(error).__name__)
+                if linked_chat_fact_owner.capture_generation(conn, work.channel_id) != work.generation:
+                    return AccessLossResult(False, MembershipSignalCounts())
+                return set_access_lost(
+                    conn,
+                    work.channel_id,
+                    now,
+                    reason=type(error).__name__,
+                    profile_owner_account_id=profile_owner_account_id,
+                    observation_order=observation_order,
+                    membership_revision_at=now,
+                    processing_at=int(time.time()),
+                )
 
-        changed = await self._writer.run(_persist_event_0)
-        if changed:
-            self._synced_dialog_ids.discard(channel_id)
+        result = await self._writer.run(_persist_event_0)
+        self._observe_access_loss(result.membership_counts)
+        if result.membership_counts.queued or result.membership_counts.coalesced:
+            self._offer(DemandKind.ENTITY_PROFILE_REFRESH)
+        if result.changed:
+            self._synced_dialog_ids.discard(work.channel_id)
             self._offer(DemandKind.DELTA_ACCESS_PROBE)
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)

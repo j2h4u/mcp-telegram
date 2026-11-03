@@ -68,7 +68,6 @@ from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     LoudChannelProfilePort,
     LoudChatAvatarHistoryPort,
-    LoudCommonChatsPort,
     LoudGroupProfilePort,
     LoudUserAvatarHistoryPort,
     LoudUserProfilePort,
@@ -729,6 +728,12 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             events.append("handler:init")
 
+        def bind_membership_observer(self, _observer: object) -> None:
+            pass
+
+        def bind_access_loss_observer(self, _observer: object) -> None:
+            pass
+
         def register(self) -> None:
             events.append("handler:register")
 
@@ -751,6 +756,7 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
     ctx = SimpleNamespace(
         coordinator=SimpleNamespace(run=lambda: asyncio.sleep(0)),
         rpc_observation_sink=None,
+        rpc_admission_observer=None,
         writer=_Writer(),
         client=_Client(),
         conn=writer_connection,
@@ -1231,7 +1237,6 @@ async def test_latched_coordinator_stop_keeps_local_daemon_socket_available(  # 
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
-        common_chats_port=LoudCommonChatsPort(),
         user_avatar_history_port=LoudUserAvatarHistoryPort(),
         chat_avatar_history_port=LoudChatAvatarHistoryPort(),
         policy=make_daemon_api_policy(),
@@ -1351,7 +1356,6 @@ async def test_protective_monitor_cancels_active_coordinator_without_closing_loc
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
-        common_chats_port=LoudCommonChatsPort(),
         user_avatar_history_port=LoudUserAvatarHistoryPort(),
         chat_avatar_history_port=LoudChatAvatarHistoryPort(),
         policy=make_daemon_api_policy(),
@@ -1791,3 +1795,47 @@ async def test_preidentity_startup_retains_one_budget_and_deadline_across_gate_d
     assert not startup.pending and ctx.api_server.self_id == 101
     assert len(seen) == 2 and seen[0][0] is seen[1][0] and seen[0][1] == seen[1][1]
     assert seen[1][0] is not None and seen[1][0].attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_default_daemon_composes_current_profile_collection_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shared_writer: SQLiteWriter
+) -> None:
+    from contextlib import AsyncExitStack
+
+    from mcp_telegram.config import resolve_scheduling_config
+    from mcp_telegram.state import StatePaths, TelegramSessionLease
+    from mcp_telegram.telegram_gateway import TelethonUserProfileGateway
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '[state]\ndir = "/state"\n\n[telegram_rpc]\ntransport_contract_version = 1\n', encoding="utf-8"
+    )
+    config = load_config(config_path)
+    paths = StatePaths.from_state_dir(tmp_path)
+    conn = _open_sync_db(paths.sync_db_path)
+    client = MagicMock()
+    client.close_rpc_scheduler = AsyncMock()
+    client.disconnect = AsyncMock()
+    client.rpc_observation_methods = MagicMock(return_value=())
+    client.account_safety_status = MagicMock(return_value=None)
+    monkeypatch.setattr(daemon, "_create_telegram_client", lambda *_args: client)
+    monkeypatch.setattr(daemon, "_install_flood_wait_kill_switch", lambda *_args: None)
+    try:
+        async with AsyncExitStack() as cleanup:
+            context = await daemon._compose_sync_main_context(
+                config,
+                resolve_scheduling_config(config.scheduling),
+                paths,
+                shared_writer,
+                conn,
+                session_proof=cast(TelegramSessionLease, object()),
+                cleanup=cleanup,
+                shutdown_request=daemon.daemon_shutdown.ShutdownRequest(),
+            )
+            assert isinstance(context.user_profile_port, TelethonUserProfileGateway)
+            assert context.api_server._user_profile_port is context.user_profile_port
+            assert not hasattr(context.api_server, "_common_chats_port")
+            assert paths.daemon_socket_path.exists()
+    finally:
+        conn.close()

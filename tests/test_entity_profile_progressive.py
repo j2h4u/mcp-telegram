@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 from jsonschema import validate
 from telethon.errors import PeerIdInvalidError  # type: ignore[import-untyped]
+from telethon.tl import types
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
@@ -31,7 +32,6 @@ from mcp_telegram.entity_profile.contracts import (
     ChannelProfileObservation,
     ChannelReference,
     ChatAvatarHistoryObservation,
-    CommonChatsObservation,
     GroupReference,
     ObservationBoundary,
     ProfileCollectionPage,
@@ -64,11 +64,9 @@ from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope
 from mcp_telegram.tools.entity_info import GET_ENTITY_INFO_OUTPUT_SCHEMA, GetEntityInfo, _entity_structured_content
 from tests.helpers import (
-    ClientCommonChatsPort,
     FakeChannelProfilePort,
     LoudChannelProfilePort,
     LoudChatAvatarHistoryPort,
-    LoudCommonChatsPort,
     LoudGroupProfilePort,
     LoudUserAvatarHistoryPort,
 )
@@ -426,7 +424,6 @@ def _test_service(
             group_profile_port=LoudGroupProfilePort(),
             channel_profile_port=LoudChannelProfilePort(),
             channel_reference_provider=LoudChannelProfilePort(),
-            common_chats_port=LoudCommonChatsPort(),
             user_avatar_history_port=LoudUserAvatarHistoryPort(),
             chat_avatar_history_port=LoudChatAvatarHistoryPort(),
             refresh_limits=limits,
@@ -480,10 +477,6 @@ def _select_profile_budget(service: DaemonEntityInfoService, budget: RpcAttemptB
 
 @pytest.mark.asyncio
 async def test_unavailable_common_and_avatar_commits_preserve_existing_projection() -> None:
-    class DeniedCommonChatsPort:
-        async def fetch_common_chats(self, _reference: object) -> CommonChatsObservation:
-            return CommonChatsObservation(42, (), 0, ProjectionStatus.UNAVAILABLE, "not_an_admin", 100, 100)
-
     class DeniedUserAvatarPort:
         async def fetch_user_avatar_history(self, _reference: object) -> UserAvatarHistoryObservation:
             return UserAvatarHistoryObservation(42, (), 0, ProjectionStatus.UNAVAILABLE, "access_lost", 100, 100)
@@ -500,16 +493,12 @@ async def test_unavailable_common_and_avatar_commits_preserve_existing_projectio
     service = _test_service(conn, limits=RefreshLimits())
     service._deps = replace(
         service._deps,
-        common_chats_port=DeniedCommonChatsPort(),
         user_avatar_history_port=DeniedUserAvatarPort(),
         chat_avatar_history_port=MissingChatAvatarPort(),
     )
     try:
-        common = await service._acquire_common_chats(42)
         user_avatar = await service._acquire_user_avatar_history(42)
         chat_avatar = await service._acquire_chat_avatar_history(-123)
-        assert common.detail_patch == {} and common.payload is None
-        assert common.status == "unavailable" and common.reason == "not_an_admin"
         assert user_avatar.detail_patch == {} and user_avatar.payload is None
         assert user_avatar.status == "unavailable" and user_avatar.reason == "access_lost"
         assert chat_avatar.detail_patch == {} and chat_avatar.payload is None
@@ -1045,7 +1034,7 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt(re
                     chats=[],
                 )
             if kind == "common_chats":
-                return SimpleNamespace(chats=[SimpleNamespace(id=7, title="Shared")])
+                return types.messages.Chats([types.Chat(7, "Shared", types.ChatPhotoEmpty(), 0, None, 1)])
             raise AssertionError(f"unexpected request: {kind}")
 
         async def get_entity(self, _entity_id: int) -> object:
@@ -1081,7 +1070,6 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt(re
         client=cast(object, client),
         get_peer_id=lambda value: int(value.id),
         user_profile_port=_UserProfilePort(client),
-        common_chats_port=ClientCommonChatsPort(client),
     )
     coordinator = service.refresh_coordinator
     assert coordinator is not None
@@ -1106,7 +1094,6 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt(re
         client=cast(object, client),
         get_peer_id=lambda value: int(value.id),
         user_profile_port=_UserProfilePort(client),
-        common_chats_port=ClientCommonChatsPort(client),
     )
     restarted_coordinator = restarted.refresh_coordinator
     assert restarted_coordinator is not None
@@ -1116,9 +1103,17 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt(re
 
     assert second_budget.attempts == 1
     assert client.calls == ["full_user", "common_chats"]
-    assert conn.execute(
-        "SELECT next_section, acquisition_cursor FROM entity_profile_refresh_state WHERE entity_id=42"
-    ).fetchone() == ("contact_overlap", 0)
+    progress = cast(
+        tuple[str, int] | None,
+        conn.execute(
+            "SELECT next_section, acquisition_cursor FROM entity_profile_refresh_state WHERE entity_id=42"
+        ).fetchone(),
+    )
+    assert progress == ("contact_overlap", 0), conn.execute(
+        "SELECT status, reason, json_extract(payload_json, '$.diagnostics'), "
+        "json_extract(payload_json, '$.details_complete'), json_extract(payload_json, '$.identifiable') "
+        "FROM entity_detail_sections WHERE entity_id=42 AND section='common_chats'"
+    ).fetchone()
     local_budget = RpcAttemptBudget(limit=1)
     await restarted_adapter.run_slice(_select_profile_budget(restarted, local_budget))
     assert local_budget.attempts == 0

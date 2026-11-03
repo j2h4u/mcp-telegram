@@ -48,6 +48,7 @@ import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, SupportsIndex, cast
 
@@ -82,7 +83,6 @@ from .entity_profile.ports import (
     ChannelProfilePort,
     ChannelReferenceProvider,
     ChatAvatarHistoryPort,
-    CommonChatsPort,
     GroupProfilePort,
     ProfilePairObservationHook,
     UserAvatarHistoryPort,
@@ -810,7 +810,6 @@ class DaemonAPIServer:
         account_safety_status: Callable[[], dict[str, object] | None] | None = None,
         account_recovery: Callable[[str, bool], Awaitable[None]] | None = None,
         account_logout: Callable[[], Awaitable[None]] | None = None,
-        common_chats_port: CommonChatsPort,
         user_avatar_history_port: UserAvatarHistoryPort,
         chat_avatar_history_port: ChatAvatarHistoryPort,
     ) -> None:
@@ -838,7 +837,6 @@ class DaemonAPIServer:
         self._group_profile_port = group_profile_port
         self._user_profile_port = user_profile_port
         self._channel_profile_port = channel_profile_port
-        self._common_chats_port = common_chats_port
         self._user_avatar_history_port = user_avatar_history_port
         self._chat_avatar_history_port = chat_avatar_history_port
         self._hydration_requester = hydration_requester
@@ -1674,6 +1672,7 @@ class DaemonAPIServer:
         return response
 
     def _trace_service(self) -> DaemonAccountTraceService:
+        observe = cast(Callable[..., None] | None, getattr(self._profile_observer, "observe_membership", None))
         return DaemonAccountTraceService(
             DaemonAccountTraceDeps(
                 conn=self._conn,
@@ -1683,6 +1682,10 @@ class DaemonAPIServer:
                 self_id=self.self_id,
                 logger=cast(AccountTraceLoggerLike, logger),
                 rid=_rid,
+                offer_profile_refresh=lambda: offer_durable_demand(
+                    self._require_demand_sink(), DemandKind.ENTITY_PROFILE_REFRESH
+                ),
+                observe_membership=partial(observe, source="message_membership") if observe is not None else None,
             )
         )
 
@@ -2261,7 +2264,6 @@ class DaemonAPIServer:
                     user_profile_port=self._user_profile_port,
                     channel_profile_port=self._channel_profile_port,
                     channel_reference_provider=cast(ChannelReferenceProvider, self._channel_profile_port),
-                    common_chats_port=self._common_chats_port,
                     user_avatar_history_port=self._user_avatar_history_port,
                     chat_avatar_history_port=self._chat_avatar_history_port,
                     get_dialog_placement=lambda entity_id: dialog_placement(self._conn, entity_id),

@@ -116,9 +116,9 @@ def test_persist_edited_message_versions_sequentially_and_refreshes_fts(conn: sq
         _seed_human_dm(conn)
         insert_messages_with_fts(conn, [_message(10, text="first")])
     with write_transaction(conn):
-        assert persist_edited_message(conn, _message(10, text="second"), old_text="first", edit_date=200) == 1
+        assert persist_edited_message(conn, _message(10, text="second"), old_text="first", edit_date=200).version == 1
     with write_transaction(conn):
-        assert persist_edited_message(conn, _message(10, text="third"), old_text="second", edit_date=300) == 2
+        assert persist_edited_message(conn, _message(10, text="third"), old_text="second", edit_date=300).version == 2
 
     assert conn.execute(
         "SELECT version, old_text FROM message_versions WHERE dialog_id=42 AND message_id=10 ORDER BY version"
@@ -133,7 +133,7 @@ def test_persist_edited_message_unchanged_is_noop(conn: sqlite3.Connection) -> N
     with write_transaction(conn):
         insert_messages_with_fts(conn, [_message(11, text="same")])
     with write_transaction(conn):
-        assert persist_edited_message(conn, _message(11, text="same"), old_text="same", edit_date=200) is None
+        assert persist_edited_message(conn, _message(11, text="same"), old_text="same", edit_date=200).version is None
     assert conn.execute("SELECT COUNT(*) FROM message_versions").fetchone() == (0,)
 
 
@@ -143,8 +143,11 @@ def test_edit_alert_policy_accepts_only_incoming_confirmed_human_dm(conn: sqlite
         conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (42, 'user', 1)")
         insert_messages_with_fts(conn, [_message(20, text="first"), _message(21, text="own", out=1)])
     with write_transaction(conn):
-        assert persist_edited_message(conn, _message(20, text="second"), old_text="first", edit_date=200) == 1
-        assert persist_edited_message(conn, _message(21, text="changed", out=1), old_text="own", edit_date=201) is None
+        assert persist_edited_message(conn, _message(20, text="second"), old_text="first", edit_date=200).version == 1
+        assert (
+            persist_edited_message(conn, _message(21, text="changed", out=1), old_text="own", edit_date=201).version
+            is None
+        )
     assert conn.execute("SELECT message_id FROM message_versions ORDER BY message_id").fetchall() == [(20,)]
     assert conn.execute(
         "SELECT kind,dialog_id,message_id FROM conversation_history_events ORDER BY seq"
@@ -172,7 +175,9 @@ def test_irrelevant_edit_updates_message_without_storing_history(
         if entity_type is not None:
             conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (42, ?, 1)", (entity_type,))
         insert_messages_with_fts(conn, [_message(23, text="before")])
-        assert persist_edited_message(conn, _message(23, text="after"), old_text="before", edit_date=301) is None
+        assert (
+            persist_edited_message(conn, _message(23, text="after"), old_text="before", edit_date=301).version is None
+        )
     assert conn.execute("SELECT text FROM messages WHERE message_id=23").fetchone() == ("after",)
     assert conn.execute("SELECT COUNT(*) FROM message_versions WHERE message_id=23").fetchone() == (0,)
     assert conn.execute("SELECT COUNT(*) FROM conversation_history_events WHERE message_id=23").fetchone() == (0,)
@@ -852,7 +857,9 @@ def test_repository_writes_rollback_with_caller_transaction(conn: sqlite3.Connec
         insert_messages_with_fts(conn, [_message(30, text="before")])
     with pytest.raises(RuntimeError, match="abort"):
         with write_transaction(conn):
-            assert persist_edited_message(conn, _message(30, text="after"), old_text="before", edit_date=700) == 1
+            assert (
+                persist_edited_message(conn, _message(30, text="after"), old_text="before", edit_date=700).version == 1
+            )
             raise RuntimeError("abort")
     assert conn.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=30").fetchone() == ("before",)
     assert conn.execute("SELECT COUNT(*) FROM message_versions WHERE dialog_id=42 AND message_id=30").fetchone() == (0,)
@@ -1004,7 +1011,7 @@ def test_same_caption_edit_persists_full_bundle_without_version(conn: sqlite3.Co
             original,
             message=replace(original.message, edit_date=200, reply_to_msg_id=10, media_payload='{"duration":24}'),
         )
-        assert persist_edited_message(conn, edited, old_text="same", edit_date=200) is None
+        assert persist_edited_message(conn, edited, old_text="same", edit_date=200).version is None
     assert conn.execute(
         "SELECT edit_date,reply_to_msg_id,media_payload FROM messages WHERE message_id=92"
     ).fetchone() == (200, 10, '{"duration":24}')
@@ -1110,8 +1117,8 @@ def test_peerless_deletion_blocks_unknown_nonchannel_body_but_not_channel(
     channel = replace(unknown, message=replace(unknown.message, dialog_id=-1000000000042))
     with write_transaction(conn):
         assert record_nonchannel_deletions(conn, [901, 901, 0, -1, True], 100) == (901,)
-        assert insert_messages_with_fts(conn, [unknown]) == 0
-        assert insert_messages_with_fts(conn, [channel]) == 1
+        assert insert_messages_with_fts(conn, [unknown]).accepted_count == 0
+        assert insert_messages_with_fts(conn, [channel]).accepted_count == 1
         assert not stage_message_transcription(
             conn, dialog_id, 901, transcribed_text="late voice", transcription_id=1, received_at=200
         )
@@ -1135,7 +1142,7 @@ def test_peerless_deletion_is_terminal_after_restart(tmp_path: Path) -> None:
         enable_runtime_writes(second)
         with write_transaction(second):
             record_nonchannel_deletions(second, [902], 200)
-            assert insert_messages_with_fts(second, [_message(902, text="late")]) == 0
+            assert insert_messages_with_fts(second, [_message(902, text="late")]).accepted_count == 0
         assert second.execute("SELECT message_id,deleted_at FROM nonchannel_message_deletions").fetchone() == (902, 100)
     finally:
         second.close()
@@ -1292,7 +1299,9 @@ def test_plain_text_page_batches_hydration_lookups(conn: sqlite3.Connection) -> 
     conn.set_trace_callback(statements.append)
     try:
         with write_transaction(conn):
-            assert insert_messages_with_fts(conn, [_message(i, text="plain") for i in range(1, 101)]) == 100
+            assert (
+                insert_messages_with_fts(conn, [_message(i, text="plain") for i in range(1, 101)]).accepted_count == 100
+            )
     finally:
         conn.set_trace_callback(None)
     queue_reads = [sql for sql in statements if "sqlite_master" in sql and "hydration_jobs" in sql]
@@ -1384,3 +1393,117 @@ def test_voice_to_plain_removes_old_transcription_without_resurrection(conn: sql
         insert_messages_with_fts(conn, [voice])
     assert read_message_text(conn, 42, 942).text != "old speech"
     assert conn.execute("SELECT 1 FROM message_transcriptions WHERE dialog_id=42 AND message_id=942").fetchone() is None
+
+
+def test_membership_changes_queue_only_after_snapshot_and_ignore_replays(conn: sqlite3.Connection) -> None:
+    from mcp_telegram.entity_profile.repository import EntityProfileRepository, _repair_retained_memberships
+
+    with write_transaction(conn):
+        conn.execute("UPDATE dialog_directory_state SET account_id=77 WHERE singleton=1")
+        conn.execute("INSERT INTO entities(id,type,updated_at) VALUES (12,'user',1)")
+        conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (12,'user')")
+        conn.execute(
+            "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_owner_account_id) VALUES (12,'{}',1,77)"
+        )
+        conn.execute(
+            "INSERT INTO entity_detail_sections(entity_id,section,status,payload_json) VALUES (12,'common_chats','fresh',?)",
+            ('{"published":{"owner_account_id":77,"observation_started_at":200}}',),
+        )
+    base = _message(1, text=None)
+
+    def service(message_id: int, action: str, sent: int, edit: int | None = None) -> ExtractedMessage:
+        return replace(
+            base,
+            message=replace(
+                base.message,
+                dialog_id=-5,
+                message_id=message_id,
+                is_service=1,
+                service_action=action,
+                sent_at=sent,
+                edit_date=edit,
+            ),
+        )
+
+    join = '{"_":"MessageActionChatAddUser","users":[12]}'
+    leave = '{"_":"MessageActionChatDeleteUser","user_id":12}'
+    with write_transaction(conn):
+        old = insert_messages_with_fts(conn, [service(1, join, 100)], profile_owner_account_id=77)
+        assert old.membership_counts.ignored_snapshot_newer == 1
+        wrong = insert_messages_with_fts(conn, [service(2, join, 300)], profile_owner_account_id=88)
+        assert wrong.membership_counts.ignored_account_mismatch == 1
+        new = insert_messages_with_fts(conn, [service(3, join, 300)], profile_owner_account_id=77)
+        assert new.membership_counts.queued == 1
+        replay = insert_messages_with_fts(conn, [service(3, join, 300)], profile_owner_account_id=77)
+        assert replay.membership_counts.received == 0
+        corrected = insert_messages_with_fts(conn, [service(3, leave, 300, 301)], profile_owner_account_id=77)
+        assert corrected.membership_counts.coalesced == 1
+    assert (
+        conn.execute(
+            "SELECT reason FROM entity_detail_sections WHERE entity_id=12 AND section='common_chats'"
+        ).fetchone()[0]
+        == "membership_changed"
+    )
+    assert (
+        conn.execute("SELECT service_action FROM messages WHERE dialog_id=-5 AND message_id=3").fetchone()[0] == leave
+    )
+    generation = cast(
+        tuple[int], conn.execute("SELECT generation FROM entity_profile_refresh_state WHERE entity_id=12").fetchone()
+    )[0]
+    with pytest.raises(RuntimeError, match="rollback"), write_transaction(conn):
+        assert _repair_retained_memberships(conn, 77, now=400, limit=2)[0] == 2
+        raise RuntimeError("rollback")
+    assert conn.execute("SELECT value FROM daemon_state WHERE key='profile_admission_v2'").fetchone() is None
+    with write_transaction(conn):
+        assert _repair_retained_memberships(conn, 77, now=400, limit=2)[0] == 2
+        assert _repair_retained_memberships(conn, 77, now=400, limit=2)[0] == 1
+        assert _repair_retained_memberships(conn, 77, now=400, limit=2)[0] == 0
+    assert (
+        conn.execute("SELECT generation FROM entity_profile_refresh_state WHERE entity_id=12").fetchone()[0]
+        == generation
+    )
+    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
+    cursor = repo.next_due_refresh(now=9_999_999_999, account_id=77, entity_id=12)
+    assert cursor is not None and cursor.pair_mode is None
+    with write_transaction(conn):
+        assert repo.capture_pair_mode(cursor, "disabled") == "disabled"
+
+
+def test_self_join_refreshes_only_published_matching_dialog_kind(conn: sqlite3.Connection) -> None:
+    with write_transaction(conn):
+        conn.execute("UPDATE dialog_directory_state SET account_id=77 WHERE singleton=1")
+        for peer, key in ((12, "chat:5"), (13, "channel:5")):
+            conn.execute("INSERT INTO entities(id,type,updated_at) VALUES (?,'user',1)", (peer,))
+            conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (?,'user')", (peer,))
+            conn.execute(
+                "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_owner_account_id) VALUES (?,'{}',1,77)",
+                (peer,),
+            )
+            conn.execute(
+                "INSERT INTO entity_detail_sections(entity_id,section,status,payload_json) VALUES (?,'common_chats','fresh',?)",
+                (peer, '{"published":{"owner_account_id":77,"generation":1,"scan":0,"observation_started_at":100}}'),
+            )
+            conn.execute(
+                "INSERT INTO entity_profile_collection_facts(owner_account_id,entity_id,section,item_key,fields_json,coverage_json,observation_order,observed_at) VALUES (77,?,'common_chats',?,'{}','{}',1,100)",
+                (peer, key),
+            )
+            conn.execute(
+                "INSERT INTO entity_profile_collection_membership(owner_account_id,entity_id,section,generation,scan,item_key,identity_kind,page_key,ordinal,detail_complete) VALUES (77,?,'common_chats',1,0,?,'remote','first',0,1)",
+                (peer, key),
+            )
+        base = _message(10, text=None)
+        joined = replace(
+            base,
+            message=replace(
+                base.message,
+                dialog_id=-5,
+                is_service=1,
+                sender_id=77,
+                sent_at=200,
+                service_action='{"_":"MessageActionChatJoinedByLink","inviter_id":99}',
+            ),
+        )
+        assert insert_messages_with_fts(conn, [joined], profile_owner_account_id=77).membership_counts.queued == 1
+    assert conn.execute("SELECT entity_id FROM entity_profile_refresh_state WHERE status='pending'").fetchall() == [
+        (12,)
+    ]

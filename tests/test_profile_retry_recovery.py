@@ -13,7 +13,6 @@ import pytest
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
 from mcp_telegram.entity_profile.contracts import (
     PROFILE_SECTIONS,
-    CommonChatsObservation,
     ObservationBoundary,
     ProfileCollectionPage,
     ProjectionStatus,
@@ -39,10 +38,6 @@ class _RetryingFacts:
         self.calls += 1
         if self.calls == 1:
             raise TimeoutError("first missing-section acquisition timed out")
-
-    async def fetch_common_chats(self, reference: UserReference) -> CommonChatsObservation:
-        self._attempt()
-        return CommonChatsObservation(reference.user_id, (), 0, ProjectionStatus.USABLE, None, 1000, 1000)
 
     async def fetch_user_avatar_history(self, reference: UserReference) -> UserAvatarHistoryObservation:
         self._attempt()
@@ -71,7 +66,6 @@ async def test_executor_persists_missing_section_failure_for_central_gate(tmp_pa
     service._deps = replace(
         service._deps,
         now_provider=lambda: clock[0],
-        common_chats_port=facts,
         user_avatar_history_port=facts,
     )
     coordinator = service.refresh_coordinator

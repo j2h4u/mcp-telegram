@@ -50,8 +50,6 @@ from .entity_profile.contracts import (
     ChatAvatarReference,
     ChatCurrentPhoto,
     ChatEntityProfileFacts,
-    CommonChatsObservation,
-    CommonChatSummary,
     DialogIdentityObservation,
     GroupProfileObservation,
     GroupReference,
@@ -71,7 +69,6 @@ from .entity_profile.full_user_normalization import normalize_full_user_response
 from .entity_profile.ports import (
     ChannelProfilePort,
     ChatAvatarHistoryPort,
-    CommonChatsPort,
     GroupProfilePort,
     UserAvatarHistoryPort,
     UserProfilePort,
@@ -268,41 +265,6 @@ class TelethonGroupProfileGateway(GroupProfilePort):
             ),
             chat_entity_fields=_group_profile_entity_fields(result, raw_group_id),
             participants_count=_group_profile_participants_count(result, raw_group_id),
-        )
-
-
-class TelethonCommonChatsGateway(CommonChatsPort):
-    """Normalize one bounded ``messages.GetCommonChats`` page."""
-
-    def __init__(self, client: object, *, now_provider: Callable[[], float] | None = None) -> None:
-        self._client = cast(GroupProfileClient, client)
-        self._now_provider = now_provider or time.time
-
-    async def fetch_common_chats(self, reference: UserReference) -> CommonChatsObservation:
-        _validate_user_reference(reference)
-        started_at = self._now_provider()
-        try:
-            result = await self._client(GetCommonChatsRequest(user_id=_input_user(reference), max_id=0, limit=100))
-        except ACCESS_LOST_ERRORS:
-            completed_at = self._now_provider()
-            return CommonChatsObservation(
-                reference.user_id, (), 0, ProjectionStatus.UNAVAILABLE, "access_lost", started_at, completed_at
-            )
-        except ChatAdminRequiredError:
-            completed_at = self._now_provider()
-            return CommonChatsObservation(
-                reference.user_id, (), 0, ProjectionStatus.UNAVAILABLE, "not_an_admin", started_at, completed_at
-            )
-        chats, reported_count, status = _normalize_common_chats(result)
-        completed_at = self._now_provider()
-        return CommonChatsObservation(
-            user_id=reference.user_id,
-            chats=chats,
-            reported_count=reported_count,
-            status=status,
-            reason="bounded_page" if status is ProjectionStatus.PARTIAL else None,
-            observation_started_at=started_at,
-            observation_completed_at=completed_at,
         )
 
 
@@ -1153,59 +1115,6 @@ def _user_reference_from_peer(peer: object | None, user_id: int, *, is_self: boo
     if raw_id != user_id or access_hash is None:
         return None
     return UserReference(user_id, access_hash, is_self=is_self)
-
-
-def _normalize_common_chats(result: object) -> tuple[tuple[CommonChatSummary, ...], int, ProjectionStatus]:
-    if not isinstance(result, (types.messages.Chats, types.messages.ChatsSlice)):
-        raise ValueError("common chats envelope is invalid")
-    raw_chats = getattr(result, "chats", None)
-    if not isinstance(raw_chats, Sequence) or isinstance(raw_chats, str | bytes | bytearray):
-        raise ValueError("common chats rows are invalid")
-    output: list[CommonChatSummary] = []
-    seen: set[int] = set()
-    for chat in raw_chats:
-        summary = _normalize_common_chat(chat, seen)
-        if summary is not None:
-            output.append(summary)
-    reported = _count_or_length(result, len(output))
-    return (
-        tuple(output),
-        max(reported, len(output)),
-        ProjectionStatus.PARTIAL if isinstance(result, types.messages.ChatsSlice) else ProjectionStatus.USABLE,
-    )
-
-
-def _normalize_common_chat(chat: object, seen: set[int]) -> CommonChatSummary | None:
-    identity = _common_chat_identity(chat, seen)
-    if identity is None:
-        return None
-    chat_id, raw_id, kind = identity
-    title = getattr(chat, "title", None)
-    if title is None:
-        title = str(raw_id)
-    elif not isinstance(title, str):
-        raise ValueError("common chat title is invalid")
-    elif not title:
-        title = str(raw_id)
-    return CommonChatSummary(chat_id, title, kind)
-
-
-def _common_chat_identity(chat: object, seen: set[int]) -> tuple[int, int, str] | None:
-    if isinstance(chat, types.ChatEmpty):
-        return None
-    if not isinstance(chat, (types.Chat, types.ChatForbidden, types.Channel, types.ChannelForbidden)):
-        raise ValueError("common chat row is invalid")
-    raw_id = _positive_id(getattr(chat, "id", None))
-    if raw_id is None:
-        raise ValueError("common chat id is invalid")
-    chat_id = -raw_id if isinstance(chat, (types.Chat, types.ChatForbidden)) else _canonical_channel_id(raw_id)
-    if chat_id in seen:
-        return None
-    seen.add(chat_id)
-    kind = "group"
-    if isinstance(chat, (types.Channel, types.ChannelForbidden)):
-        kind = "supergroup" if bool(getattr(chat, "megagroup", False)) else "channel"
-    return chat_id, raw_id, kind
 
 
 def _normalize_user_photos(result: object, user_id: int) -> tuple[tuple[ChatCurrentPhoto, ...], int, ProjectionStatus]:

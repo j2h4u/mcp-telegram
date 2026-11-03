@@ -92,6 +92,9 @@ async def test_daemon_runtime_binds_gate_and_verified_account_to_real_local_seed
         )
         runtime = _build_demand_runtime(ctx, history, dependencies.dialog_directory, dependencies.startup_identity)
         try:
+            assert ctx.fact_hydration_worker._profile_owner_account_id == 77
+            assert runtime.dialog_reconciliation_worker._profile_owner_account_id == 77
+            assert runtime.scheduled_reconciler._verified_account_id == 77
             cast(MagicMock, client.set_rpc_eligibility_observer).assert_called_once_with(
                 runtime.coordinator.eligibility_changed
             )

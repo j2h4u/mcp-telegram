@@ -86,6 +86,7 @@ from .drafts.contracts import DraftScope
 from .drafts.history import interrupt_draft_operations, prune_draft_history, prune_draft_operation_receipts
 from .drafts.owner import DraftMessageOwner
 from .drafts.sqlite_projection import SQLiteDraftProjection
+from .entity_profile.membership import MembershipSignalCounts
 from .entity_profile.ports import UserProfilePort
 from .entity_profile.refresh import RefreshLimits
 from .entity_profile.repository import admit_self_profile
@@ -166,7 +167,6 @@ from .telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkRevisi
 from .telegram_gateway import (
     TelethonChannelProfileGateway,
     TelethonChatAvatarHistoryGateway,
-    TelethonCommonChatsGateway,
     TelethonGroupProfileGateway,
     TelethonUserAvatarHistoryGateway,
     TelethonUserProfileGateway,
@@ -1326,7 +1326,6 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
     group_profile_port = TelethonGroupProfileGateway(client)
     user_profile_port = TelethonUserProfileGateway(client)
     channel_profile_port = TelethonChannelProfileGateway(client)
-    common_chats_port = TelethonCommonChatsGateway(client)
     user_avatar_history_port = TelethonUserAvatarHistoryGateway(client)
     chat_avatar_history_port = TelethonChatAvatarHistoryGateway(client)
 
@@ -1357,7 +1356,6 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
         group_profile_port=group_profile_port,
         user_profile_port=user_profile_port,
         channel_profile_port=channel_profile_port,
-        common_chats_port=common_chats_port,
         user_avatar_history_port=user_avatar_history_port,
         chat_avatar_history_port=chat_avatar_history_port,
         policy=DaemonApiPolicy(
@@ -1441,6 +1439,9 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
             conn,
             shutdown_event,
             writer=writer,
+            access_loss_observer=lambda counts: rpc_admission_observer.observe_membership(
+                counts.as_observation(), source="access_loss"
+            ),
             handlers=(
                 MediaFactHydrationHandler(batch_size=scheduling.fact_hydration.batch_size),
                 TranscriptionHydrationHandler(
@@ -1829,6 +1830,7 @@ def _build_demand_runtime(
             activity_rpc_timeout_seconds=ctx.scheduling.activity_rpc_timeout_seconds,
         ),
         mutation_fence=ctx.scheduled_mutation_fence,
+        access_loss_observer=partial(_observe_access_loss, ctx.rpc_admission_observer),
     )
     if ctx.api_server.self_id is not None:
         scheduled_reconciler.bind_account_id(ctx.api_server.self_id)
@@ -1838,6 +1840,8 @@ def _build_demand_runtime(
         ctx.shutdown_event,
         ctx.topic_refresher,
         writer=ctx.writer,
+        profile_owner_account_id=ctx.api_server.self_id,
+        access_loss_observer=partial(_observe_access_loss, ctx.rpc_admission_observer),
     )
 
     async def read_receipt_batch(selected: WorkRevision) -> SliceOutcome:
@@ -1865,11 +1869,22 @@ def _build_demand_runtime(
     account_id = ctx.api_server.self_id
     if account_id is None:
         raise RuntimeError("demand composition requires the verified startup account")
+    ctx.fact_hydration_worker.bind_account_id(account_id)
     image_directory = ctx.db_path.parent / "message-images"
     image_sources = ActiveSources()
     image_scope = ImageScope(ctx.client.capture_image_scope, ctx.client.claim_image_scope, image_sources)
+    membership_observer = ctx.rpc_admission_observer
     image_worker = MessageImageWorker(
-        ctx.conn, ctx.writer, image_directory, image_scope, cast(TelegramImageGateway, ctx.client)
+        ctx.conn,
+        ctx.writer,
+        image_directory,
+        image_scope,
+        cast(TelegramImageGateway, ctx.client),
+        membership_observer=(
+            lambda counts: membership_observer.observe_membership(counts.as_observation(), source="message_membership")
+        )
+        if membership_observer is not None
+        else None,
     )
 
     def offer_image() -> None:
@@ -2431,6 +2446,23 @@ def _draft_has_topics(conn: sqlite3.Connection, dialog_id: int, kind: DialogType
     return kind is DialogType.FORUM or capability is True
 
 
+def _bind_event_observers(ctx: _SyncMainContext) -> None:
+    assert ctx.handler_manager is not None
+    if ctx.rpc_observation_sink is not None:
+        ctx.handler_manager.bind_observation_sink(ctx.rpc_observation_sink)
+    observer = ctx.rpc_admission_observer
+    if observer is not None:
+        ctx.handler_manager.bind_membership_observer(
+            lambda counts: observer.observe_membership(counts.as_observation(), source="message_membership")
+        )
+        ctx.handler_manager.bind_access_loss_observer(partial(_observe_access_loss, observer))
+
+
+def _observe_access_loss(observer: RpcAdmissionObservationAggregator | None, counts: MembershipSignalCounts) -> None:
+    if observer is not None:
+        observer.observe_membership(counts.as_observation(), source="access_loss")
+
+
 async def sync_main() -> None:  # noqa: PLR0915 - composition root owns startup sequencing
     """Main entry point for the sync daemon process.
 
@@ -2468,8 +2500,7 @@ async def sync_main() -> None:  # noqa: PLR0915 - composition root owns startup 
             profile_pair_mode="enabled" if ctx.api_server._policy.full_user_pair_enabled else "disabled",
             profile_detail_ttl_seconds=ctx.api_server._policy.entity_detail_ttl_seconds,
         )
-        if ctx.rpc_observation_sink is not None:
-            ctx.handler_manager.bind_observation_sink(ctx.rpc_observation_sink)
+        _bind_event_observers(ctx)
         ctx.handler_manager.register()
         logger.info("event handlers registered behind startup account barrier")
 

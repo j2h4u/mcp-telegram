@@ -8,7 +8,6 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
 
 import pytest
 from telethon.errors import ChatAdminRequiredError
@@ -27,8 +26,8 @@ from mcp_telegram.entity_profile.contracts import (
 from mcp_telegram.entity_profile.repository import EntityProfileRepository
 from mcp_telegram.telegram_gateway import (
     TelethonChatAvatarHistoryGateway,
-    TelethonCommonChatsGateway,
     TelethonUserAvatarHistoryGateway,
+    TelethonUserProfileGateway,
 )
 
 
@@ -101,30 +100,39 @@ async def test_common_chats_uses_one_exact_bounded_request_and_normalizes_rows()
             ]
         )
     )
-    observation = await TelethonCommonChatsGateway(client, now_provider=lambda: 10.0).fetch_common_chats(
-        UserReference(7, 8, is_self=False)
+    page = await TelethonUserProfileGateway(client, now_provider=lambda: 10.0).fetch_profile_collection_page(
+        UserReference(7, 8, is_self=False), "common_chats", {}
     )
-
     request = client.requests[0]
     assert isinstance(request, GetCommonChatsRequest)
-    assert request.user_id.user_id == 7
-    assert request.user_id.access_hash == 8
+    assert request.user_id.user_id == 7 and request.user_id.access_hash == 8
     assert (request.max_id, request.limit) == (0, 100)
-    assert observation.status is ProjectionStatus.USABLE
-    assert [item.kind for item in observation.chats] == ["group", "channel", "group", "channel"]
-    assert [item.chat_id for item in observation.chats] == [-3, -1000000000004, -5, -1000000000006]
+    assert page.terminal and page.reported_count is None
+    assert [item.key for item in page.items] == ["chat:3", "channel:4", "chat:5", "channel:6"]
 
 
 @pytest.mark.asyncio
-async def test_common_chat_missing_name_falls_back_to_raw_id_and_user_empty_matches_target() -> None:
-    common = _Client(
-        types.messages.Chats(
-            [types.ChatEmpty(id=8), types.Chat(9, cast(str, None), types.ChatPhotoEmpty(), 0, None, 1)]
-        )
-    )
-    observation = await TelethonCommonChatsGateway(common).fetch_common_chats(UserReference(7, 8))
-    assert observation.chats[0].name == "9"
+async def test_client_collection_fixture_uses_canonical_chat_identities() -> None:
+    from tests.helpers import client_profile_collection_page
 
+    client = _Client(SimpleNamespace(chats=[types.ChatEmpty(7), types.ChannelForbidden(7, 1, "Channel")]))
+    page = await client_profile_collection_page(client, UserReference(7, 8), "common_chats")
+    assert [item.key for item in page.items] == ["chat:7", "channel:7"]
+    assert [item.fields["constructor"] for item in page.items] == ["ChatEmpty", "ChannelForbidden"]
+
+
+@pytest.mark.asyncio
+async def test_client_collection_fixture_keeps_unknown_constructor_incomplete() -> None:
+    from tests.helpers import client_profile_collection_page
+
+    client = _Client(SimpleNamespace(chats=[SimpleNamespace(id=7, title="Shared")]))
+    page = await client_profile_collection_page(client, UserReference(7, 8), "common_chats")
+    assert page.terminal and page.reported_count is None
+    assert len(page.items) == 1 and page.items[0].detail_complete is False
+
+
+@pytest.mark.asyncio
+async def test_user_empty_matches_target() -> None:
     photos = _Client(types.photos.Photos([_photo(2)], [types.UserEmpty(id=7)]))
     result = await TelethonUserAvatarHistoryGateway(photos).fetch_user_avatar_history(UserReference(7, 8))
     assert result.photos == (ChatCurrentPhoto(2),)
@@ -204,14 +212,14 @@ async def test_chat_photos_uses_exact_filter_and_rejects_wrong_envelopes() -> No
 @pytest.mark.asyncio
 async def test_stable_denial_is_unavailable_and_transient_errors_propagate() -> None:
     reference = UserReference(7, 8, False)
-    denied = await TelethonCommonChatsGateway(_Client(ChatAdminRequiredError(request=None))).fetch_common_chats(
-        reference
-    )
-    assert denied.status is ProjectionStatus.UNAVAILABLE
-    assert denied.reason == "not_an_admin"
-
+    denied = await TelethonUserProfileGateway(
+        _Client(ChatAdminRequiredError(request=None))
+    ).fetch_profile_collection_page(reference, "common_chats", {})
+    assert denied.reason == "access_lost" and denied.items == ()
     with pytest.raises(RuntimeError, match="temporary"):
-        await TelethonCommonChatsGateway(_Client(RuntimeError("temporary"))).fetch_common_chats(reference)
+        await TelethonUserProfileGateway(_Client(RuntimeError("temporary"))).fetch_profile_collection_page(
+            reference, "common_chats", {}
+        )
 
 
 def test_reference_lookup_is_sync_session_only() -> None:
@@ -257,7 +265,7 @@ def test_request_factories_and_chat_photo_types_have_one_production_owner() -> N
         assert "InputMessagesFilterChatPhotos" not in source
         assert "MessageActionChatEditPhoto" not in source
     owners = (root / "telegram_gateway.py").read_text()
-    assert owners.count("GetCommonChatsRequest") == 3
+    assert owners.count("GetCommonChatsRequest") == 2
     assert owners.count("GetUserPhotosRequest") == 3
     assert owners.count("InputMessagesFilterChatPhotos") == 1
     assert owners.count("MessageActionChatEditPhoto") == 1

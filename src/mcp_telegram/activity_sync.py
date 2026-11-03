@@ -10,7 +10,7 @@ import logging
 import math
 import sqlite3
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -20,6 +20,7 @@ from telethon.tl.functions.messages import SearchRequest
 from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty, InputPeerSelf
 
 from .activity_substrate import ActivityClient, call_with_timeout
+from .entity_profile.membership import MembershipSignalCounts
 from .entity_profile.repository import admit_profile_peer, bound_profile_account
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
@@ -88,6 +89,7 @@ class ArchiveBackfillDemandAdapter(DurableDemandAdapter):
     timeout_s: float
     writer: SQLiteWriter = field(kw_only=True)
     account_id: int = field(kw_only=True)
+    membership_observer: Callable[[MembershipSignalCounts], None] | None = field(default=None, kw_only=True)
     demand_kind = DemandKind.ARCHIVE_BACKFILL
 
     def _selected(self) -> WorkRevision:
@@ -122,6 +124,8 @@ class ArchiveBackfillDemandAdapter(DurableDemandAdapter):
                     timeout_s=self.timeout_s,
                     writer=self.writer,
                     expected_revision=selected.revision,
+                    profile_owner_account_id=self.account_id,
+                    membership_observer=self.membership_observer,
                 )
         if accepted is None:
             return SliceOutcome(
@@ -146,6 +150,7 @@ class ArchiveIncrementalDemandAdapter(DurableDemandAdapter):
     timeout_s: float
     writer: SQLiteWriter = field(kw_only=True)
     account_id: int = field(kw_only=True)
+    membership_observer: Callable[[MembershipSignalCounts], None] | None = field(default=None, kw_only=True)
     demand_kind = DemandKind.ARCHIVE_INCREMENTAL
 
     def _selected(self) -> WorkRevision | None:
@@ -193,6 +198,8 @@ class ArchiveIncrementalDemandAdapter(DurableDemandAdapter):
                     timeout_s=self.timeout_s,
                     writer=self.writer,
                     expected_revision=selected.revision,
+                    profile_owner_account_id=self.account_id,
+                    membership_observer=self.membership_observer,
                 )
         if accepted is None:
             return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
@@ -443,12 +450,18 @@ def _persist_own_message_rows(
     extracted: list[ExtractedMessage],
     *,
     priority: HydrationPriority,
+    profile_owner_account_id: int | None = None,
+    membership_counts: list[MembershipSignalCounts] | None = None,
 ) -> None:
     """Persist extracted own-message rows and enroll their dialogs."""
     if not extracted:
         return
     require_write_transaction(conn)
-    insert_messages_with_fts(conn, extracted, priority=priority)
+    result = insert_messages_with_fts(
+        conn, extracted, priority=priority, profile_owner_account_id=profile_owner_account_id
+    )
+    if membership_counts is not None:
+        membership_counts.append(result.membership_counts)
     dialog_ids = {em.message.dialog_id for em in extracted}
     account = bound_profile_account(conn)
     for dialog_id in dialog_ids:
@@ -658,6 +671,8 @@ def _commit_incremental_slice_result(  # noqa: PLR0913, PLR0917
     batch_started_at: float,
     observation_order: int,
     expected_revision: str,
+    profile_owner_account_id: int | None = None,
+    membership_counts: list[MembershipSignalCounts] | None = None,
 ) -> str | None:
     """Persist one incremental page and its restart-safe continuation."""
     with write_transaction(conn):
@@ -678,7 +693,13 @@ def _commit_incremental_slice_result(  # noqa: PLR0913, PLR0917
 
         in_window, past_window = _trim_incremental_batch(batch, min_date)
         extracted = [replace(row, observation_order=observation_order) for row in _extract_own_message_rows(in_window)]
-        _persist_own_message_rows(conn, extracted, priority=HydrationPriority.FOREGROUND)
+        _persist_own_message_rows(
+            conn,
+            extracted,
+            priority=HydrationPriority.FOREGROUND,
+            profile_owner_account_id=profile_owner_account_id,
+            membership_counts=membership_counts,
+        )
         _upsert_entities_from_search(conn, search_result)
         next_offset_id = min(message.id for message in batch)
         _log_incremental_batch(
@@ -729,6 +750,8 @@ async def _run_backfill_slice(  # noqa: PLR0913
     timeout_s: float,
     writer: SQLiteWriter,
     expected_revision: str,
+    profile_owner_account_id: int | None = None,
+    membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
 ) -> str | None:
     """Fetch one restart-safe archive-backfill page."""
     stopped = shutdown_event.is_set()
@@ -748,11 +771,20 @@ async def _run_backfill_slice(  # noqa: PLR0913
         return None
     search_result = cast(_SearchResultLike, result)
     batch = list(search_result.messages or [])
+    membership_counts: list[MembershipSignalCounts] = []
     next_checkpoint = await writer.run(
         lambda db: _commit_backfill_slice_result(
-            db, search_result, batch, started_at, observation_order, expected_revision
+            db,
+            search_result,
+            batch,
+            started_at,
+            observation_order,
+            expected_revision,
+            profile_owner_account_id,
+            membership_counts,
         )
     )
+    _observe_membership(membership_observer, membership_counts)
     if next_checkpoint is None:
         return None
     if batch:
@@ -776,6 +808,8 @@ def _commit_backfill_slice_result(  # noqa: PLR0913, PLR0917
     started_at: str,
     observation_order: int,
     expected_revision: str,
+    profile_owner_account_id: int | None = None,
+    membership_counts: list[MembershipSignalCounts] | None = None,
 ) -> str | None:
     with write_transaction(conn):
         state = _load_state(conn)
@@ -789,7 +823,13 @@ def _commit_backfill_slice_result(  # noqa: PLR0913, PLR0917
             state = _load_state(conn)
             return _backfill_revision(state)
         extracted = [replace(row, observation_order=observation_order) for row in _extract_own_message_rows(batch)]
-        _persist_own_message_rows(conn, extracted, priority=HydrationPriority.BACKFILL)
+        _persist_own_message_rows(
+            conn,
+            extracted,
+            priority=HydrationPriority.BACKFILL,
+            profile_owner_account_id=profile_owner_account_id,
+            membership_counts=membership_counts,
+        )
         _upsert_entities_from_search(conn, search_result)
         checkpoint = min(message.id for message in batch)
         _set_state(conn, "backfill_started_at", started_at)
@@ -806,6 +846,8 @@ async def _run_incremental_slice(  # noqa: PLR0913
     timeout_s: float,
     writer: SQLiteWriter,
     expected_revision: str,
+    profile_owner_account_id: int | None = None,
+    membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
 ) -> str | None:
     """Fetch one restart-safe page from the current incremental window."""
     stopped = shutdown_event.is_set()
@@ -825,8 +867,29 @@ async def _run_incremental_slice(  # noqa: PLR0913
     )
     if result is _SEARCH_BATCH_RETRY or result is _SEARCH_BATCH_STOP:
         return None
-    return await writer.run(
+    membership_counts: list[MembershipSignalCounts] = []
+    result_revision = await writer.run(
         lambda db: _commit_incremental_slice_result(
-            db, cast(_SearchResultLike, result), min_date, batch_started_at, observation_order, expected_revision
+            db,
+            cast(_SearchResultLike, result),
+            min_date,
+            batch_started_at,
+            observation_order,
+            expected_revision,
+            profile_owner_account_id,
+            membership_counts,
         )
     )
+    _observe_membership(membership_observer, membership_counts)
+    return result_revision
+
+
+def _observe_membership(
+    observer: Callable[[MembershipSignalCounts], None] | None, counts: list[MembershipSignalCounts]
+) -> None:
+    if observer is not None:
+        for count in counts:
+            try:
+                observer(count)
+            except Exception:  # noqa: BLE001
+                logger.debug("membership_observer_failed")

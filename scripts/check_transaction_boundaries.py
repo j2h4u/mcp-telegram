@@ -68,6 +68,8 @@ _SYNC_DB_BOOTSTRAP_TRANSACTIONS = frozenset(
         "_apply_migration_78",
         "_apply_migration_79",
         "_apply_migration_82",
+        # The bootstrap lock protects the atomic v96 table swap and normalization.
+        "_apply_migration_96",
     }
     | TRANSACTION_EXCEPTIONS[Path("sync_db.py")]
 )

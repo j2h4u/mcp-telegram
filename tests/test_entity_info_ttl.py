@@ -31,7 +31,6 @@ from mcp_telegram.entity_profile.contracts import (
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     ClientChatAvatarHistoryPort,
-    ClientCommonChatsPort,
     ClientUserAvatarHistoryPort,
     LoudChannelProfilePort,
     LoudGroupProfilePort,
@@ -104,7 +103,6 @@ def make_server(
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=_GenericUserProfilePort(),
-        common_chats_port=ClientCommonChatsPort(client),
         user_avatar_history_port=ClientUserAvatarHistoryPort(client),
         chat_avatar_history_port=ClientChatAvatarHistoryPort(client),
         policy=make_daemon_api_policy(),

@@ -44,7 +44,6 @@ from mcp_telegram.sync_transactions import write_transaction
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     ClientChatAvatarHistoryPort,
-    ClientCommonChatsPort,
     ClientUserAvatarHistoryPort,
     FakeUserProfilePort,
     LoudChannelProfilePort,
@@ -114,7 +113,6 @@ def make_server(
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=user_profile_port if user_profile_port is not None else LoudUserProfilePort(),
-        common_chats_port=ClientCommonChatsPort(client),
         user_avatar_history_port=ClientUserAvatarHistoryPort(client),
         chat_avatar_history_port=ClientChatAvatarHistoryPort(client),
         policy=make_daemon_api_policy(),
@@ -505,7 +503,7 @@ async def test_get_entity_info_user_field_surface_preserved() -> None:
     assert _dict_at(d, "semantic", "fields")["full_user.about"] is None
     about = field_coverage["full_user.about"]
     assert about["state"] == "cleared" and about["authoritative"] is True
-    assert _dict_at(d, "collections", "common_chats")["reported_count"] == 0
+    assert _dict_at(d, "collections", "common_chats")["reported_count"] is None
 
 
 @pytest.mark.asyncio

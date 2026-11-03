@@ -4,6 +4,7 @@ import logging
 import math
 import sqlite3
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import cast
 
@@ -13,11 +14,14 @@ from .dialog_classification import (
     is_bot_dialog_type,
     is_reserved_replies_username,
 )
+from .models import DialogType
 from .scheduled_receipts_schema import SCHEDULED_OPERATION_RECEIPT_DDL
 from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 
-_CURRENT_SCHEMA_VERSION = 95
+_CURRENT_SCHEMA_VERSION = 96
+_COMMON_CHAT_NORMALIZATION_MIGRATION = 96
+_CHANNEL_ID_MARKER = 1_000_000_000_000
 _HISTORY_ENROLLMENT_SIMPLIFICATION_MIGRATION = 94
 _SCHEDULED_ACCESS_MIGRATION = 95
 _MESSAGE_IMAGE_MIGRATION = 93
@@ -5108,7 +5112,254 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
             ],
         )
 
+    if _CURRENT_SCHEMA_VERSION >= _COMMON_CHAT_NORMALIZATION_MIGRATION:
+        current = _apply_migration_96(conn, current)
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
+
+
+def _apply_migration_96(conn: sqlite3.Connection, current: int) -> int:
+    """Normalize account-bound retained common chats without inventing observation time."""
+    if current >= _COMMON_CHAT_NORMALIZATION_MIGRATION:
+        return current
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("""CREATE TABLE entity_profile_collection_facts_v96 (
+            owner_account_id INTEGER NOT NULL CHECK(owner_account_id>0),
+            entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+            section TEXT NOT NULL, item_key TEXT NOT NULL, fields_json TEXT NOT NULL,
+            coverage_json TEXT NOT NULL, provenance_json TEXT NOT NULL DEFAULT '{}',
+            observation_order INTEGER NOT NULL CHECK(observation_order>=0), observed_at INTEGER,
+            PRIMARY KEY(owner_account_id,entity_id,section,item_key)) WITHOUT ROWID""")
+        conn.execute("INSERT INTO entity_profile_collection_facts_v96 SELECT * FROM entity_profile_collection_facts")
+        conn.execute("""CREATE TABLE entity_profile_collection_membership_v96 (
+            owner_account_id INTEGER NOT NULL, entity_id INTEGER NOT NULL, section TEXT NOT NULL,
+            generation INTEGER NOT NULL, scan INTEGER NOT NULL DEFAULT 0, item_key TEXT NOT NULL,
+            identity_kind TEXT NOT NULL CHECK(identity_kind IN ('remote','observation')),
+            page_key TEXT NOT NULL, ordinal INTEGER NOT NULL,
+            detail_complete INTEGER NOT NULL CHECK(detail_complete IN (0,1)),
+            PRIMARY KEY(owner_account_id,entity_id,section,generation,scan,item_key),
+            FOREIGN KEY(owner_account_id,entity_id,section,item_key)
+              REFERENCES entity_profile_collection_facts_v96(owner_account_id,entity_id,section,item_key) ON DELETE CASCADE
+        ) WITHOUT ROWID""")
+        conn.execute(
+            "INSERT INTO entity_profile_collection_membership_v96 SELECT * FROM entity_profile_collection_membership"
+        )
+        conn.execute("DROP TABLE entity_profile_collection_membership")
+        conn.execute("DROP TABLE entity_profile_collection_facts")
+        conn.execute("ALTER TABLE entity_profile_collection_facts_v96 RENAME TO entity_profile_collection_facts")
+        conn.execute(
+            "ALTER TABLE entity_profile_collection_membership_v96 RENAME TO entity_profile_collection_membership"
+        )
+        conn.execute(
+            "CREATE INDEX idx_profile_membership_lookup ON entity_profile_collection_membership(owner_account_id,section,item_key,entity_id,generation,scan)"
+        )
+        _normalize_published_collection_receipts(conn)
+        _normalize_retained_common_chats(conn)
+        _normalize_access_recovery_witnesses(conn)
+        conn.execute("INSERT INTO schema_version VALUES (96, strftime('%s', 'now'))")
+        if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise sqlite3.IntegrityError("profile collection migration foreign key check failed")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return _COMMON_CHAT_NORMALIZATION_MIGRATION
+
+
+def _normalize_access_recovery_witnesses(conn: sqlite3.Connection) -> None:
+    """Discard recovery work without a matching observed access fence."""
+    invalid = (
+        "NOT EXISTS (SELECT 1 FROM dialog_fact_observations access "
+        "JOIN dialog_fact_observations witness ON witness.dialog_id=access.dialog_id "
+        "WHERE access.dialog_id=recovery.dialog_id AND access.field='access_state' "
+        "AND witness.field='access_recovery_witness' AND access.observation_order>0 "
+        "AND witness.observation_order=access.observation_order)"
+    )
+    conn.execute(
+        "UPDATE synced_dialogs SET access_next_revalidate_at=(SELECT recovery.retry_at "
+        "FROM delta_access_recovery_state recovery WHERE recovery.dialog_id=synced_dialogs.dialog_id) "
+        "WHERE status='access_lost' AND EXISTS (SELECT 1 FROM delta_access_recovery_state recovery "
+        "WHERE recovery.dialog_id=synced_dialogs.dialog_id AND recovery.retry_at IS NOT NULL "
+        "AND (synced_dialogs.access_next_revalidate_at IS NULL "
+        "OR recovery.retry_at>synced_dialogs.access_next_revalidate_at) AND " + invalid + ")"
+    )
+    conn.execute("DELETE FROM delta_access_recovery_state AS recovery WHERE " + invalid)
+
+
+def _normalize_published_collection_receipts(conn: sqlite3.Connection) -> None:
+    _retain_published_collection_bounds(conn)
+    for key in ("published", "previous_published"):
+        conn.execute(
+            f"UPDATE entity_detail_sections SET payload_json=json_set(payload_json,'$.{key}.complete',json('true')) "
+            f"WHERE section IN ('avatar_history','common_chats','saved_music','saved_gifts','current_stories','pinned_stories') AND json_valid(payload_json) AND json_type(payload_json,'$.{key}')='object' "
+            f"AND json_type(payload_json,'$.{key}.complete') IS NULL"
+        )
+    conn.execute(
+        "UPDATE entity_profile_refresh_state SET page_cursor_json=json_set(page_cursor_json,'$.baseline.complete',json('true')) "
+        "WHERE next_section IN ('avatar_history','common_chats','saved_music','saved_gifts','current_stories','pinned_stories') AND json_valid(page_cursor_json) AND json_type(page_cursor_json,'$.baseline')='object' "
+        "AND json_type(page_cursor_json,'$.baseline.complete') IS NULL"
+    )
+
+
+def _retain_published_collection_bounds(conn: sqlite3.Connection) -> None:
+    for field in ("observation_started_at", "observation_completed_at", "reported_count", "retained_unique_count"):
+        conn.execute(
+            f"UPDATE entity_detail_sections SET payload_json=json_set(payload_json,'$.published.{field}',json_extract(payload_json,'$.{field}')) "
+            "WHERE section IN ('avatar_history','common_chats','saved_music','saved_gifts','current_stories','pinned_stories') AND json_valid(payload_json) AND json_type(payload_json,'$.published')='object' "
+            f"AND json_type(payload_json,'$.published.{field}') IS NULL AND json_type(payload_json,'$.{field}') IS NOT NULL "
+            "AND json_extract(payload_json,'$.owner_account_id')=json_extract(payload_json,'$.published.owner_account_id') "
+            "AND json_extract(payload_json,'$.generation')=json_extract(payload_json,'$.published.generation') "
+            "AND json_extract(payload_json,'$.scan')=json_extract(payload_json,'$.published.scan')"
+        )
+        conn.execute(
+            f"UPDATE entity_detail_sections SET payload_json=json_set(payload_json,'$.previous_published.{field}',json_extract(payload_json,'$.published.{field}')) "
+            "WHERE section IN ('avatar_history','common_chats','saved_music','saved_gifts','current_stories','pinned_stories') AND json_valid(payload_json) AND json_type(payload_json,'$.previous_published')='object' "
+            f"AND json_type(payload_json,'$.previous_published.{field}') IS NULL AND json_type(payload_json,'$.published.{field}') IS NOT NULL "
+            "AND json_extract(payload_json,'$.previous_published.owner_account_id')=json_extract(payload_json,'$.published.owner_account_id') "
+            "AND json_extract(payload_json,'$.previous_published.generation')=json_extract(payload_json,'$.published.generation') "
+            "AND json_extract(payload_json,'$.previous_published.scan')=json_extract(payload_json,'$.published.scan')"
+        )
+        _retain_inflight_collection_bound(conn, field)
+
+
+def _retain_inflight_collection_bound(conn: sqlite3.Connection, field: str) -> None:
+    source = "(SELECT payload_json FROM entity_detail_sections s WHERE s.entity_id=entity_profile_refresh_state.entity_id AND s.section=entity_profile_refresh_state.next_section)"
+    conn.execute(
+        f"UPDATE entity_profile_refresh_state SET page_cursor_json=json_set(page_cursor_json,'$.baseline.{field}',json_extract({source},'$.published.{field}')) "
+        "WHERE next_section IN ('avatar_history','common_chats','saved_music','saved_gifts','current_stories','pinned_stories') AND json_valid(page_cursor_json) AND json_type(page_cursor_json,'$.baseline')='object' "
+        f"AND json_type(page_cursor_json,'$.baseline.{field}') IS NULL AND json_valid({source}) "
+        f"AND json_type({source},'$.published.{field}') IS NOT NULL "
+        f"AND json_extract(page_cursor_json,'$.baseline.owner_account_id')=json_extract({source},'$.published.owner_account_id') "
+        f"AND json_extract(page_cursor_json,'$.baseline.generation')=json_extract({source},'$.published.generation') "
+        f"AND json_extract(page_cursor_json,'$.baseline.scan')=json_extract({source},'$.published.scan')"
+    )
+
+
+def _retained_common_chat(value: object) -> tuple[str, dict[str, object]] | None:
+    if not isinstance(value, dict) or type(value.get("id")) is not int:
+        return None
+    dialog_id = value["id"]
+    kind = value.get("type")
+    if not isinstance(kind, str):
+        return None
+    if kind == "group" and -_CHANNEL_ID_MARKER < dialog_id < 0:
+        family, raw = "chat", -dialog_id
+    elif kind in {DialogType.CHANNEL, DialogType.SUPERGROUP} and dialog_id < -_CHANNEL_ID_MARKER:
+        family, raw = "channel", -dialog_id - _CHANNEL_ID_MARKER
+    else:
+        return None
+    fields: dict[str, object] = {"peer_kind": family, "id": raw}
+    if isinstance(value.get("name"), str):
+        fields["title"] = value["name"]
+    if kind == DialogType.SUPERGROUP:
+        fields["megagroup"] = True
+    return f"{family}:{raw}", fields
+
+
+def _normalize_retained_common_chats(conn: sqlite3.Connection) -> None:
+    rows = cast(
+        Iterator[tuple[int, object, object]],
+        conn.execute("SELECT entity_id,profile_owner_account_id,detail_json FROM entity_details"),
+    )
+    unresolved = sum(_normalize_common_chat_profile(conn, entity, owner, encoded) for entity, owner, encoded in rows)
+    if unresolved:
+        logger.warning("common chat normalization retained %d unresolved profile blobs", unresolved)
+
+
+def _normalize_common_chat_profile(conn: sqlite3.Connection, entity: int, owner: object, encoded: object) -> int:
+    detail = _common_chat_detail(encoded)
+    if detail is None:
+        return 0
+    items = [_retained_common_chat(value) for value in cast(list[object], detail["common_chats"])]
+    incomplete = any(item is None for item in items)
+    if not isinstance(owner, int) or owner <= 0:
+        return 1
+    payload = _common_chat_section_payload(conn, entity)
+    if payload.get("published"):
+        return 0
+    if not _can_retain_common_chat_baseline(items, payload):
+        return 1
+    _store_retained_common_chats(conn, entity, owner, items, payload)
+    if not incomplete:
+        del detail["common_chats"]
+        conn.execute("UPDATE entity_details SET detail_json=? WHERE entity_id=?", (json.dumps(detail), entity))
+    return int(incomplete)
+
+
+def _can_retain_common_chat_baseline(
+    items: list[tuple[str, dict[str, object]] | None], payload: dict[str, object]
+) -> bool:
+    return not (items and not any(items)) and not (payload.get("generation") == 0 and payload.get("scan", 0) == 0)
+
+
+def _common_chat_detail(encoded: object) -> dict[str, object] | None:
+    try:
+        detail = cast(object, json.loads(cast(str, encoded)))
+    except TypeError, json.JSONDecodeError:
+        return None
+    if not isinstance(detail, dict) or not isinstance(detail.get("common_chats"), list):
+        return None
+    return cast(dict[str, object], detail)
+
+
+def _common_chat_section_payload(conn: sqlite3.Connection, entity: int) -> dict[str, object]:
+    section = cast(
+        tuple[str | None] | None,
+        conn.execute(
+            "SELECT payload_json FROM entity_detail_sections WHERE entity_id=? AND section='common_chats'", (entity,)
+        ).fetchone(),
+    )
+    try:
+        payload: object = json.loads(section[0]) if section and section[0] else {}
+    except TypeError, json.JSONDecodeError:
+        return {}
+    return cast(dict[str, object], payload) if isinstance(payload, dict) else {}
+
+
+def _store_retained_common_chats(
+    conn: sqlite3.Connection,
+    entity: int,
+    owner: int,
+    items: list[tuple[str, dict[str, object]] | None],
+    payload: dict[str, object],
+) -> None:
+    for ordinal, item in enumerate(items):
+        if item is None:
+            continue
+        key, fields = item
+        conn.execute(
+            "INSERT OR IGNORE INTO entity_profile_collection_facts VALUES (?,?, 'common_chats', ?, ?, '{}', '{}', 0, NULL)",
+            (owner, entity, key, json.dumps(fields)),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO entity_profile_collection_membership VALUES (?,?,'common_chats',0,0,?,'remote','retained',?,0)",
+            (owner, entity, key, ordinal),
+        )
+    count = cast(
+        tuple[int],
+        conn.execute(
+            "SELECT count(*) FROM entity_profile_collection_membership WHERE owner_account_id=? AND entity_id=? AND section='common_chats' AND generation=0 AND scan=0",
+            (owner, entity),
+        ).fetchone(),
+    )[0]
+    baseline = {
+        "owner_account_id": owner,
+        "generation": 0,
+        "scan": 0,
+        "complete": False,
+        "retained_unique_count": count,
+    }
+    payload["published"] = baseline
+    conn.execute(
+        "INSERT INTO entity_detail_sections(entity_id,section,status,payload_json) VALUES (?,'common_chats','stale',?) ON CONFLICT(entity_id,section) DO UPDATE SET payload_json=excluded.payload_json",
+        (entity, json.dumps(payload)),
+    )
+    conn.execute(
+        "UPDATE entity_profile_refresh_state SET page_cursor_json=json_set(page_cursor_json,'$.baseline',json(?)) "
+        "WHERE entity_id=? AND next_section='common_chats' AND json_valid(page_cursor_json) "
+        "AND json_type(page_cursor_json,'$.baseline') IN ('null')",
+        (json.dumps(baseline), entity),
+    )
 
 
 def _apply_migration_94(conn: sqlite3.Connection, current: int) -> int:

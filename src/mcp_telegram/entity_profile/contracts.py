@@ -373,22 +373,6 @@ class ChatCurrentPhoto:
 
 
 @dataclass(frozen=True, slots=True)
-class CommonChatSummary:
-    """One common-chat row with only transport-neutral fields."""
-
-    chat_id: int
-    name: str | None
-    kind: str
-
-    def __post_init__(self) -> None:
-        _validate_nonzero_id(self.chat_id, field_name="chat_id")
-        if self.name is not None and not isinstance(self.name, str):
-            raise TypeError("name must be a string or None")
-        if not isinstance(self.kind, str) or not self.kind:
-            raise ValueError("kind must be a non-empty string")
-
-
-@dataclass(frozen=True, slots=True)
 class UserAvatarHistoryObservation:
     """One bounded user profile-photo page."""
 
@@ -403,27 +387,6 @@ class UserAvatarHistoryObservation:
     def __post_init__(self) -> None:
         _validate_positive_id(self.user_id, field_name="user_id")
         _validate_photos(self.photos)
-        _validate_count(self.reported_count)
-        _validate_bounded_status(self.status, self.reason)
-        _validate_observation_boundary(self.observation_started_at, self.observation_completed_at)
-
-
-@dataclass(frozen=True, slots=True)
-class CommonChatsObservation:
-    """One bounded common-chat page for a user."""
-
-    user_id: int
-    chats: tuple[CommonChatSummary, ...]
-    reported_count: int
-    status: ProjectionStatus
-    reason: str | None
-    observation_started_at: float
-    observation_completed_at: float
-
-    def __post_init__(self) -> None:
-        _validate_positive_id(self.user_id, field_name="user_id")
-        if not isinstance(self.chats, tuple) or any(not isinstance(item, CommonChatSummary) for item in self.chats):
-            raise TypeError("chats must be a tuple of CommonChatSummary")
         _validate_count(self.reported_count)
         _validate_bounded_status(self.status, self.reason)
         _validate_observation_boundary(self.observation_started_at, self.observation_completed_at)

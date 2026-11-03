@@ -10,6 +10,7 @@ from ..dialog_selector import (
     DialogSelectorError,
     optional_dialog_selector,
 )
+from ..entity_profile.read_schema import common_chat_trace_schema, profile_read_schemas
 from ..models import ContentKind
 from ._base import (
     DaemonNotRunningError,
@@ -152,6 +153,7 @@ TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA = {
                 "dialogs_with_hits": {"type": "integer"},
                 "dialogs_with_gaps": {"type": "integer"},
                 "as_of": {"type": "integer"},
+                "known_common_chats": common_chat_trace_schema(),
             },
             "required": [
                 "state",
@@ -242,6 +244,9 @@ TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA = {
     ],
     "additionalProperties": True,
 }
+
+
+TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA["$defs"] = {"telegram_content": profile_read_schemas()[1]["telegram_content"]}
 
 
 class _TraceDialogSelectorKwargs(TypedDict, total=False):

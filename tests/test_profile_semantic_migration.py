@@ -118,8 +118,8 @@ def test_history_migration_seeds_only_existing_publication_journal_bounds(
             ).fetchone(),
         )
         assert row[0] == retained
-        assert json.loads(row[1])["published"] == {**published, "history_event_id": 0}
-        assert json.loads(row[2])["baseline"] == {**published, "history_event_id": 0}
+        assert json.loads(row[1])["published"] == {**published, "history_event_id": 0, "complete": True}
+        assert json.loads(row[2])["baseline"] == {**published, "history_event_id": 0, "complete": True}
         assert conn.execute("SELECT COUNT(*) FROM entity_profile_change_events").fetchone()[0] == 0
         assert (
             conn.execute("SELECT name FROM sqlite_master WHERE name='entity_profile_invalidation_orders'").fetchone()

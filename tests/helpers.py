@@ -21,8 +21,6 @@ from mcp_telegram.entity_profile.contracts import (
     ChatAvatarHistoryObservation,
     ChatAvatarReference,
     ChatCurrentPhoto,
-    CommonChatsObservation,
-    CommonChatSummary,
     GroupProfileObservation,
     GroupReference,
     ObservationBoundary,
@@ -216,11 +214,6 @@ class LoudGroupProfilePort:
         raise AssertionError(f"unexpected group profile request for {group_id}")
 
 
-class LoudCommonChatsPort:
-    async def fetch_common_chats(self, reference: UserReference) -> CommonChatsObservation:
-        raise AssertionError(f"unexpected common-chat request for {reference.user_id}")
-
-
 class LoudUserAvatarHistoryPort:
     async def fetch_user_avatar_history(self, reference: UserReference) -> UserAvatarHistoryObservation:
         raise AssertionError(f"unexpected user-avatar request for {reference.user_id}")
@@ -232,28 +225,6 @@ class LoudChatAvatarHistoryPort:
 
     async def fetch_chat_avatar_history(self, reference: ChatAvatarReference) -> ChatAvatarHistoryObservation:
         raise AssertionError(f"unexpected chat-avatar request for {reference}")
-
-
-class ClientCommonChatsPort:
-    """Neutral common-chat port backed by a test client's response queue."""
-
-    def __init__(self, client: object) -> None:
-        self.client = client
-
-    async def fetch_common_chats(self, reference: UserReference) -> CommonChatsObservation:
-        result = await self.client(("common_chats", {"user_id": reference.user_id, "limit": 100}))  # type: ignore[operator]
-        chats: list[CommonChatSummary] = []
-        for chat in getattr(result, "chats", ()) or ():
-            chat_id = getattr(chat, "id", None)
-            if not isinstance(chat_id, int) or isinstance(chat_id, bool) or chat_id == 0:
-                raise ValueError("test common-chat id is invalid")
-            kind = "supergroup" if bool(getattr(chat, "megagroup", False)) else "channel"
-            if type(chat).__name__ == "Chat":
-                kind = "group"
-            chats.append(CommonChatSummary(chat_id, getattr(chat, "title", None), kind))
-        return CommonChatsObservation(
-            reference.user_id, tuple(chats), len(chats), ProjectionStatus.USABLE, None, 100.0, 100.0
-        )
 
 
 class ClientUserAvatarHistoryPort:
@@ -279,16 +250,26 @@ class ClientUserAvatarHistoryPort:
         )
 
 
+def _common_chat_fixture_item(chat: object) -> ProfileCollectionItem:
+    from mcp_telegram.entity_profile.semantic_normalization import normalize_collection_item
+
+    identifier = getattr(chat, "id", None)
+    if type(identifier) is not int or identifier <= 0:
+        raise ValueError("test common-chat id is invalid")
+    fields, coverage, diagnostics = normalize_collection_item(chat)
+    family = "channel" if type(chat).__name__.startswith("Channel") else "chat"
+    return ProfileCollectionItem(f"{family}:{identifier}", fields, coverage, detail_complete=not diagnostics)
+
+
 async def client_profile_collection_page(
     client: object, reference: UserReference, section: str
 ) -> ProfileCollectionPage:
     if section == "common_chats":
-        observation = await ClientCommonChatsPort(client).fetch_common_chats(reference)
-        items = tuple(
-            ProfileCollectionItem(str(chat.chat_id), {"id": chat.chat_id, "name": chat.name}, {})
-            for chat in observation.chats
-        )
-        count = observation.reported_count
+        result = await client(("common_chats", {"user_id": reference.user_id, "limit": 100}))  # type: ignore[operator]
+        chats = getattr(result, "chats", ()) or ()
+        items = tuple(_common_chat_fixture_item(chat) for chat in chats)
+        reported = getattr(result, "count", None)
+        count = reported if type(reported) is int else None
     elif section == "avatar_history":
         observation = await ClientUserAvatarHistoryPort(client).fetch_user_avatar_history(reference)
         items = tuple(

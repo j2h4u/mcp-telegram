@@ -177,12 +177,13 @@ def _dialogs_count(conn: _SQLiteConnection) -> int:
     ("actor_id", "expected_cause"),
     [(42, "self_left"), (99, "removed_by_admin")],
 )
-async def test_self_participant_loss_records_actor_and_cause(
+async def test_self_participant_loss_records_actor_and_cause(  # noqa: PLR0913
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
     actor_id: int,
     expected_cause: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     channel_id = 12345
     dialog_id = int(get_peer_id(PeerChannel(channel_id)))
@@ -190,6 +191,9 @@ async def test_self_participant_loss_records_actor_and_cause(
     _insert_dialog(sync_db, dialog_id)
     manager = _make_manager(mock_client, sync_db, shutdown_event)
     manager.set_self_id(42)
+    sync_db.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    sync_db.commit()
+    monkeypatch.setattr("mcp_telegram.event_handlers.delivered_observed_at", lambda: 1788652801)
     update = UpdateChannelParticipant(
         channel_id=channel_id,
         date=datetime(2026, 9, 6, tzinfo=UTC),
@@ -204,12 +208,12 @@ async def test_self_participant_loss_records_actor_and_cause(
 
     assert sync_db.execute(
         "SELECT status,access_lost_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
-    ).fetchone() == ("access_lost", 1788652800)
+    ).fetchone() == ("access_lost", 1788652801)
     assert sync_db.execute(
-        "SELECT reason_code,access_change_cause,actor_id FROM conversation_history_events "
+        "SELECT reason_code,access_change_cause,actor_id,occurred_at,time_basis FROM conversation_history_events "
         "WHERE dialog_id=? AND kind='access_lost'",
         (dialog_id,),
-    ).fetchone() == ("UpdateChannelParticipant", expected_cause, actor_id)
+    ).fetchone() == ("UpdateChannelParticipant", expected_cause, actor_id, 1788652800, "telegram")
     assert dialog_id not in manager._synced_dialog_ids
 
 
@@ -265,6 +269,8 @@ async def test_basic_group_participant_loss_records_actor_and_cause(
     _insert_dialog(sync_db, dialog_id)
     manager = _make_manager(mock_client, sync_db, shutdown_event)
     manager.set_self_id(42)
+    sync_db.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    sync_db.commit()
     update = UpdateChatParticipant(
         chat_id=chat_id,
         date=datetime(2026, 9, 6, tzinfo=UTC),
@@ -1649,3 +1655,79 @@ async def test_retained_pin_order_survives_pending_authoritative_snapshot(
     assert sync_db.execute(
         "SELECT dialog_id FROM dialog_directory_pins WHERE generation=1 AND folder_id=0 ORDER BY position"
     ).fetchall() == [(9902,), (9901,), (9903,)]
+
+
+@pytest.mark.asyncio
+async def test_self_participant_loss_queues_only_matching_common_chat_and_offers_after_commit(
+    mock_client: MagicMock, sync_db: _SQLiteConnection, shutdown_event: asyncio.Event
+) -> None:
+    from mcp_telegram.telegram_rpc_consumers import DemandKind
+
+    _enroll_synced(sync_db, -5)
+    _insert_dialog(sync_db, -5)
+    sync_db.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    for peer, key in ((12, "chat:5"), (13, "channel:5")):
+        sync_db.execute("INSERT INTO entities(id,type,updated_at) VALUES (?,'user',1)", (peer,))
+        sync_db.execute("INSERT INTO dialogs(dialog_id,type) VALUES (?,'user')", (peer,))
+        sync_db.execute(
+            "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_owner_account_id) VALUES (?,'{}',1,42)",
+            (peer,),
+        )
+        sync_db.execute(
+            "INSERT INTO entity_detail_sections(entity_id,section,status,payload_json) VALUES (?,'common_chats','fresh',?)",
+            (peer, '{"published":{"owner_account_id":42,"generation":1,"scan":0,"observation_started_at":100}}'),
+        )
+        sync_db.execute(
+            "INSERT INTO entity_profile_collection_facts(owner_account_id,entity_id,section,item_key,fields_json,coverage_json,observation_order,observed_at) VALUES (42,?,'common_chats',?,'{}','{}',1,100)",
+            (peer, key),
+        )
+        sync_db.execute(
+            "INSERT INTO entity_profile_collection_membership(owner_account_id,entity_id,section,generation,scan,item_key,identity_kind,page_key,ordinal,detail_complete) VALUES (42,?,'common_chats',1,0,?,'remote','first',0,1)",
+            (peer, key),
+        )
+    sync_db.commit()
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+    manager.set_self_id(42)
+    sink = MagicMock()
+    manager.bind_demand_sink(sink)
+    manager.bind_access_loss_observer(MagicMock(side_effect=RuntimeError("observer failure")))
+    update = UpdateChatParticipant(
+        chat_id=5,
+        date=datetime(2026, 9, 6, tzinfo=UTC),
+        actor_id=99,
+        user_id=42,
+        qts=1,
+        prev_participant=None,
+        new_participant=None,
+    )
+    await manager.on_raw_participant(update)
+    assert sync_db.execute("SELECT entity_id FROM entity_profile_refresh_state WHERE status='pending'").fetchall() == [
+        (12,)
+    ]
+    assert sync_db.execute("SELECT COUNT(*) FROM entity_profile_collection_membership").fetchone() == (2,)
+    assert any(call.args[0] == DemandKind.ENTITY_PROFILE_REFRESH for call in sink.offer.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_stale_linked_chat_access_loss_does_not_change_dialog(
+    mock_client: MagicMock, sync_db: _SQLiteConnection, shutdown_event: asyncio.Event
+) -> None:
+    from mcp_telegram.linked_chat_fact import linked_chat_fact_owner
+
+    dialog_id = -1_000_000_000_005
+    _enroll_synced(sync_db, dialog_id)
+    _insert_dialog(sync_db, dialog_id)
+    sync_db.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    linked_chat_fact_owner.invalidate_from_update(sync_db, dialog_id, 100)
+    work = linked_chat_fact_owner.pending_work(sync_db)[0]
+    linked_chat_fact_owner.invalidate_from_update(sync_db, dialog_id, 101)
+    sync_db.commit()
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+    manager.set_self_id(42)
+    await manager._mark_linked_chat_access_lost(work, 102, RuntimeError(), 42, 10)
+    assert sync_db.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        "synced",
+    )
+    assert sync_db.execute(
+        "SELECT COUNT(*) FROM dialog_fact_observations WHERE dialog_id=? AND field='access_state'", (dialog_id,)
+    ).fetchone() == (0,)

@@ -26,6 +26,34 @@ from .telegram_rpc_scheduler import (
 
 logger = logging.getLogger(__name__)
 _MILLISECONDS_PER_SECOND = 1_000
+_MEMBERSHIP_COUNTERS = frozenset(
+    {
+        "received",
+        "ignored",
+        "queued",
+        "coalesced",
+        "published",
+        "failed",
+        "ignored_account_mismatch",
+        "ignored_ineligible",
+        "ignored_snapshot_newer",
+        "ignored_already_pending",
+        "ignored_request_rejected",
+    }
+)
+
+
+def _valid_membership_counts(counts: Mapping[str, int], source: str, reason: str) -> bool:
+    return bool(
+        source in {"message_membership", "retained_repair", "common_chats_refresh", "access_loss"}
+        and reason in {"unspecified", "ineligible", "not_visible", "no_owner", "unchanged", "error"}
+        and counts
+        and counts.keys() <= _MEMBERSHIP_COUNTERS
+        and all(type(value) is int and value >= 0 for value in counts.values())
+        and any(counts.values())
+    )
+
+
 _DELTA_GAP_FILL_COUNTERS = (
     "slice_count",
     "completed",
@@ -320,6 +348,7 @@ class RpcAdmissionObservationAggregator:
         self._aggregates: dict[_AdmissionKey, _AdmissionAggregate] = {}
         self._demand_aggregates: dict[_DemandKey, _DemandAggregate] = {}
         self._profile_aggregates: dict[_ProfileKey, _ProfilePairAggregate] = {}
+        self._membership_counts: dict[tuple[str, str], dict[str, int]] = {}
         self._method_aggregates: dict[_MethodKey, _MethodAggregate] = {}
         self._method_overflow: _MethodAggregate | None = None
         self._rpc_samples: dict[str, list[_RpcSample]] = {}
@@ -750,6 +779,19 @@ class RpcAdmissionObservationAggregator:
         except Exception:  # noqa: BLE001 - telemetry cannot affect the sync slice
             return
 
+    def observe_membership(self, counts: Mapping[str, int], *, source: str, reason: str = "unspecified") -> None:
+        """Aggregate finite membership outcomes without storing identities."""
+        try:
+            if not _valid_membership_counts(counts, source, reason):
+                return
+            with self._state_lock:
+                aggregate = self._membership_counts.setdefault((source, reason), {})
+                for key, value in counts.items():
+                    aggregate[key] = min(2147483647, aggregate.get(key, 0) + value)
+            self.flush_if_due()
+        except Exception:  # noqa: BLE001 - observation cannot affect persistence or scheduling.
+            return
+
     def _aggregate_delta_gap_fill(self, values: Mapping[str, int], reason: str) -> None:
         normalized_reason = reason if reason in _DELTA_GAP_FILL_REASONS else "error"
         with self._state_lock:
@@ -790,6 +832,7 @@ class RpcAdmissionObservationAggregator:
         self._flush_demand_aggregates(demand_aggregates)
         with self._state_lock:
             profile_aggregates, self._profile_aggregates = self._profile_aggregates, {}
+            membership_counts, self._membership_counts = self._membership_counts, {}
             delta_gap_fill, self._delta_gap_fill = (
                 self._delta_gap_fill,
                 cast(dict[str, int], dict.fromkeys(_DELTA_GAP_FILL_COUNTERS, 0)),
@@ -798,10 +841,34 @@ class RpcAdmissionObservationAggregator:
             delta_rejected, self._delta_gap_fill_rejected = self._delta_gap_fill_rejected, 0
             delta_window_started_at = self._delta_gap_fill_window_started_at
         self._flush_profile_aggregates(profile_aggregates)
+        self._flush_membership(membership_counts)
         self._flush_rpc_methods(flush_at)
         self._flush_delta_gap_fill(delta_gap_fill, delta_reasons, delta_rejected, delta_window_started_at, flush_at)
         with self._state_lock:
             self._last_flush_at = max(self._last_flush_at, self._clock())
+
+    def _flush_membership(self, groups: dict[tuple[str, str], dict[str, int]]) -> None:
+        for (source, reason), counts in groups.items():
+            if any(counts.values()):
+                self._record_membership_summary(source, reason, counts)
+
+    def _record_membership_summary(self, source: str, reason: str, counts: dict[str, int]) -> None:
+        try:
+            if (
+                self._recorder.record(
+                    kind="entity_profile.membership",
+                    outcome="summary",
+                    payload={**counts, "source": source, "reason": reason},
+                )
+                is not False
+            ):
+                return
+        except Exception:  # noqa: BLE001 - preserve pending summary after recorder failure.
+            pass
+        with self._state_lock:
+            aggregate = self._membership_counts.setdefault((source, reason), {})
+            for key, value in counts.items():
+                aggregate[key] = min(2147483647, aggregate.get(key, 0) + value)
 
     def _record_rpc_row(
         self,

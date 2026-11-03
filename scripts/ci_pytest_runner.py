@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -11,16 +12,12 @@ from pathlib import Path
 from typing import TextIO, cast
 
 _CAPACITY_MARKERS = ("no space left on device", "disk quota exceeded", "errno 28")
-_SQLITE_SHARED_MEMORY_MARKERS = ("sqlite_errorname=sqlite_ioerr_shmmap",)
-_SQLITE_IO_MARKERS = ("sqlite_errorname=SQLITE_IOERR", "sqlite3.operationalerror: disk i/o error")
-_SQLITE_APPLICATION_MARKERS = (
-    "sqlite_error",
-    "sqlite3.",
-    "database is locked",
-    "cannot start a transaction",
-    "cannot commit",
-)
+_PYTEST_TERMINAL = re.compile(r"^(?:FAILED|ERROR)\s+.+?\s+-\s+(.+)$", re.MULTILINE)
+_SQLITE_EXCEPTION = re.compile(r"^(?:E\s+)?sqlite3\.\w*(?:Error|Exception)\s*:", re.IGNORECASE)
+_SQLITE_CODE = re.compile(r"(?:(?<!\w)sqlite_errorname\s*=\s*|^(?:E\s+)?)(SQLITE_[A-Z0-9_]+)\b(?!\s*=)", re.IGNORECASE)
+_EXCEPTION = re.compile(r"^(?:E\s+)?(?:\w+\.)*\w*(?:Error|Exception)\s*:")
 _NATIVE_EXTENSION_LOAD_MARKERS = ("failed to map segment from shared object",)
+_NATIVE_TERMINAL = re.compile(r"^(?:ImportError|OSError):.*failed to map segment from shared object", re.IGNORECASE)
 _MIN_FREE_BYTES = 512 * 1024 * 1024
 _MIN_FREE_INODES = 4_096
 _MAX_ATTEMPTS = 2
@@ -47,6 +44,39 @@ def report_filesystem_state() -> None:
     _run_diagnostic_command(["du", "-sh", str(runner_temp), "/tmp"])
 
 
+def _sqlite_records(log_text: str) -> tuple[list[str], list[str], bool]:
+    records = [line.strip() for line in log_text.splitlines()]
+    exceptions = [line for line in records if _SQLITE_EXCEPTION.match(line)]
+    codes = [match.group(1).upper() for line in records if (match := _SQLITE_CODE.search(line))]
+    other_exception = any(_EXCEPTION.match(line) and not _SQLITE_EXCEPTION.match(line) for line in records)
+    return exceptions, codes, other_exception
+
+
+def _sqlite_outcome(codes: list[str], exceptions: list[str]) -> str:
+    if any(code.startswith("SQLITE_IOERR_SHMMAP") for code in codes):
+        return "sqlite_shared_memory_mapping_failure"
+    if any(code.startswith("SQLITE_IOERR") for code in codes) or any(
+        "disk i/o error" in line.lower() for line in exceptions
+    ):
+        return "runner_filesystem_io_failure"
+    return "sqlite_application_failure"
+
+
+def _sqlite_failure(log_text: str) -> str | None:
+    """Choose SQLite evidence from terminal results or standalone error records."""
+    summaries = cast(list[str], _PYTEST_TERMINAL.findall(log_text))
+    if summaries and not all(_SQLITE_EXCEPTION.match(summary) for summary in summaries):
+        if all(_NATIVE_TERMINAL.match(summary) for summary in summaries):
+            return None
+        return "unknown_failure"
+    exceptions, codes, other_exception = _sqlite_records(log_text)
+    if not summaries and not exceptions and not codes:
+        return None
+    if other_exception:
+        return "unknown_failure"
+    return _sqlite_outcome(codes, [*summaries, *exceptions])
+
+
 def classify_failure(log_text: str, runner_temp: Path) -> str:
     """Classify CI failures using log markers and live filesystem capacity."""
     lowered = log_text.lower()
@@ -58,12 +88,9 @@ def classify_failure(log_text: str, runner_temp: Path) -> str:
         or stat.f_favail < _MIN_FREE_INODES
     ):
         return "runner_capacity_exhausted"
-    if any(marker in lowered for marker in _SQLITE_SHARED_MEMORY_MARKERS):
-        return "sqlite_shared_memory_mapping_failure"
-    if any(marker.lower() in lowered for marker in _SQLITE_IO_MARKERS):
-        return "runner_filesystem_io_failure"
-    if any(marker in lowered for marker in _SQLITE_APPLICATION_MARKERS):
-        return "sqlite_application_failure"
+    sqlite_failure = _sqlite_failure(log_text)
+    if sqlite_failure is not None:
+        return sqlite_failure
     if any(marker in lowered for marker in _NATIVE_EXTENSION_LOAD_MARKERS):
         return "native_extension_load_failure"
     return "unknown_failure"

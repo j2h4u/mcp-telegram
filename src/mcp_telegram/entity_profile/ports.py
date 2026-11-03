@@ -11,7 +11,6 @@ from .contracts import (
     ChannelReference,
     ChatAvatarHistoryObservation,
     ChatAvatarReference,
-    CommonChatsObservation,
     GroupProfileObservation,
     ProfileCollectionPage,
     TargetKind,
@@ -31,12 +30,6 @@ class GroupProfilePort(Protocol):
     """Fetch one normalized legacy group profile observation."""
 
     async def fetch_group_profile(self, group_id: int) -> GroupProfileObservation: ...
-
-
-class CommonChatsPort(Protocol):
-    """Fetch one bounded common-chat page."""
-
-    async def fetch_common_chats(self, reference: UserReference) -> CommonChatsObservation: ...
 
 
 class UserAvatarHistoryPort(Protocol):
@@ -107,7 +100,6 @@ __all__ = [
     "ChannelProfilePort",
     "ChannelReferenceProvider",
     "ChatAvatarHistoryPort",
-    "CommonChatsPort",
     "GroupProfilePort",
     "ProfilePairObservationHook",
     "UserAvatarHistoryPort",

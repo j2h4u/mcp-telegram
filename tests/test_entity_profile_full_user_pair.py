@@ -38,7 +38,6 @@ from tests.demand_adapter_helpers import run_ready_slice
 from tests.helpers import (
     LoudChannelProfilePort,
     LoudChatAvatarHistoryPort,
-    LoudCommonChatsPort,
     LoudGroupProfilePort,
     LoudUserAvatarHistoryPort,
     LoudUserProfilePort,
@@ -209,7 +208,6 @@ def _pair_service(conn: sqlite3.Connection, client: _PairClient, *, enabled: boo
             group_profile_port=LoudGroupProfilePort(),
             channel_profile_port=LoudChannelProfilePort(),
             channel_reference_provider=LoudChannelProfilePort(),
-            common_chats_port=LoudCommonChatsPort(),
             user_avatar_history_port=LoudUserAvatarHistoryPort(),
             chat_avatar_history_port=LoudChatAvatarHistoryPort(),
             user_profile_port=client,
@@ -330,7 +328,6 @@ async def test_protective_disconnect_serves_valid_partial_profile_from_local_cac
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
-        common_chats_port=LoudCommonChatsPort(),
         user_avatar_history_port=LoudUserAvatarHistoryPort(),
         chat_avatar_history_port=LoudChatAvatarHistoryPort(),
         policy=policy,

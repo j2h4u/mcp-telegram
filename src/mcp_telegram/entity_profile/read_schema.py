@@ -91,7 +91,10 @@ _SUMMARY = closed(
         "diagnostics": {"type": "array", "items": {"type": "string"}},
         "count_discrepancy": {"type": "boolean"},
         "identifiable": {"type": "boolean"},
-        "status": {"type": "string"},
+        "status": {
+            "type": "string",
+            "description": "Acquisition outcome; fresh means the recorded acquisition succeeded, not that current Telegram membership was checked.",
+        },
         "observed_at": _TIMESTAMP,
         "reason": _TEXT,
         "retry_at": _TIMESTAMP,
@@ -142,12 +145,28 @@ _PAGE_COMMON = {
     "scan": _NUMBER,
     "value_semantics": {"type": "string"},
     "membership_semantics": {"type": "string"},
-    "coverage": {"enum": ["published_traversal", "partial_scan", "legacy_unknown", "not_observed"]},
+    "coverage": {
+        "enum": [
+            "published_traversal",
+            "retained_partial",
+            "partial_scan",
+            "observation_unknown",
+            "legacy_unknown",
+            "not_observed",
+        ],
+        "description": "Coverage of the recorded traversal; it does not assert current Telegram membership.",
+    },
     "next_cursor": _TEXT,
     "has_more": {"type": "boolean"},
     "returned_count": {"type": "integer"},
     "returned_active_count": {"type": "integer"},
     "available_sources": _SOURCES,
+    "observation_started_at": _TIMESTAMP,
+    "observation_completed_at": _TIMESTAMP,
+    "age_seconds": _NUMBER,
+    "reported_count": _NUMBER,
+    "retained_unique_count": _NUMBER,
+    "coverage_semantics": {"type": "string"},
     "legacy_evidence": _LEGACY_EVIDENCE,
 }
 
@@ -163,9 +182,36 @@ def _collection_page(section: str) -> dict:
             "age_seconds": _NUMBER,
             "field_evidence": {"type": "array", "items": _EVIDENCE},
             "acquisition": closed({"availability": {"const": "unknown"}}),
+            "detail_complete": {"type": "boolean"},
         }
     )
     return closed({**_PAGE_COMMON, "section": {"const": section}, "items": {"type": "array", "items": item}})
+
+
+def common_chat_trace_schema() -> dict:
+    page = _collection_page("common_chats")
+    item = page["properties"]["items"]["items"]["properties"]
+    item["value"] = closed(
+        {
+            "constructor": {"enum": list(COLLECTION_CONSTRUCTORS["common_chats"])},
+            "peer_kind": {"enum": ["chat", "channel"]},
+            "id": {"type": "integer"},
+            "title": {"$ref": "#/$defs/telegram_content"},
+            "username": {"$ref": "#/$defs/telegram_content"},
+            "megagroup": {"type": "boolean"},
+            "broadcast": {"type": "boolean"},
+            "forum": {"type": "boolean"},
+        }
+    )
+    item["value"]["description"] = "Retained peer identity; full details are available in the profile collection."
+    item["dialog_id"] = {"type": ["integer", "null"]}
+    item["local_state"] = {
+        "anyOf": [
+            closed({"dialog_type": {"type": "string"}, "status": {"type": "string"}, "hidden": {"type": "boolean"}}),
+            {"type": "null"},
+        ]
+    }
+    return page
 
 
 def _history_event() -> dict:

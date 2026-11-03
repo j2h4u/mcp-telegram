@@ -10,6 +10,7 @@ from typing import cast
 from ..pagination import ProfileNavigationToken, decode_profile_navigation, encode_profile_navigation
 from .contracts import PROFILE_COLLECTION_SECTIONS, profile_value_paths
 from .output_schema import (
+    common_chat_constructor_family,
     project_collection_item,
     project_history_value,
     project_legacy_collection_item,
@@ -270,10 +271,11 @@ def _summary_metadata(payload: dict[str, object]) -> dict[str, object]:
 def _collection_source(
     conn: sqlite3.Connection, owner: int, entity: int, section: str
 ) -> tuple[dict[str, ProfileNavigationToken], dict[str, object], list[object], dict[str, object]]:
+    detail_column = "NULL" if section == "common_chats" else "d.detail_json"
     row = cast(
         tuple[object, ...] | None,
         conn.execute(
-            "SELECT s.payload_json,d.detail_json,s.observed_at,s.status,s.reason FROM entity_details d "
+            f"SELECT s.payload_json,{detail_column},s.observed_at,s.status,s.reason FROM entity_details d "
             "LEFT JOIN entity_detail_sections s ON s.entity_id=d.entity_id AND s.section=? "
             "WHERE d.entity_id=? AND d.profile_owner_account_id=?",
             (section, entity, owner),
@@ -281,19 +283,35 @@ def _collection_source(
     )
     raw = json.loads(cast(str, row[0])) if row and row[0] else None
     payload = cast(dict[str, object], raw) if isinstance(raw, dict) else {}
-    legacy = _object(row[1]).get(section) if row else None
-    legacy = cast(list[object], legacy if isinstance(legacy, list) else raw if isinstance(raw, list) else [])
-    receipt = _legacy_receipt(owner, section, payload, raw, row)
+    legacy, receipt = _legacy_collection_data(owner, section, payload, raw, row)
     sources = _v2_sources(owner, entity, section, payload)
-    if legacy or isinstance(raw, list):
-        sources["legacy"] = ProfileNavigationToken(
-            owner, entity, section, "legacy", fingerprint=_fingerprint([legacy, receipt])
-        )
-    if not sources:
-        sources["legacy"] = ProfileNavigationToken(
-            owner, entity, section, "legacy", fingerprint=_fingerprint([legacy, receipt])
-        )
+    if section != "common_chats":
+        _add_legacy_collection_source(sources, (owner, entity, section), legacy, receipt, raw)
     return sources, payload, legacy, receipt
+
+
+def _legacy_collection_data(
+    owner: int, section: str, payload: dict[str, object], raw: object, row: tuple[object, ...] | None
+) -> tuple[list[object], dict[str, object]]:
+    if section == "common_chats":
+        return [], {}
+    value = _object(row[1]).get(section) if row else None
+    legacy = cast(list[object], value if isinstance(value, list) else raw if isinstance(raw, list) else [])
+    return legacy, _legacy_receipt(owner, section, payload, raw, row)
+
+
+def _add_legacy_collection_source(
+    sources: dict[str, ProfileNavigationToken],
+    scope: tuple[int, int, str],
+    legacy: list[object],
+    receipt: dict[str, object],
+    raw: object,
+) -> None:
+    if legacy or isinstance(raw, list) or not sources:
+        owner, entity, section = scope
+        sources["legacy"] = ProfileNavigationToken(
+            owner, entity, section, "legacy", fingerprint=_fingerprint([legacy, receipt])
+        )
 
 
 def _v2_sources(owner: int, entity: int, section: str, payload: dict[str, object]) -> dict[str, ProfileNavigationToken]:
@@ -344,9 +362,12 @@ def _legacy_receipt(
 
 def _collection_page(scope: _ReadScope, section: str, cursor: str | None, limit: int) -> dict[str, object]:
     conn, owner, entity, now = scope.conn, scope.owner, scope.entity, scope.now
-    sources, _payload, legacy, receipt = _collection_source(conn, owner, entity, section)
+    sources, payload, legacy, receipt = _collection_source(conn, owner, entity, section)
     source = sources.get("published", sources.get("legacy", sources.get("active")))
-    assert source is not None
+    if source is None:
+        if cursor is not None:
+            raise ValueError("Local profile selection is not observed")
+        return unobserved_common_chats()
     token = _collection_token(cursor, source, sources)
     if token.source_kind == "legacy":
         result = _legacy_page(token, legacy, receipt, limit, now)
@@ -355,7 +376,7 @@ def _collection_page(scope: _ReadScope, section: str, cursor: str | None, limit:
     rows = cast(
         list[tuple[object, ...]],
         conn.execute(
-            "SELECT m.item_key,m.identity_kind,f.fields_json,f.coverage_json,f.provenance_json,f.observed_at "
+            "SELECT m.item_key,m.identity_kind,f.fields_json,f.coverage_json,f.provenance_json,f.observed_at,m.detail_complete "
             "FROM entity_profile_collection_membership m JOIN entity_profile_collection_facts f "
             "USING(owner_account_id,entity_id,section,item_key) WHERE m.owner_account_id=? AND m.entity_id=? "
             "AND m.section=? AND m.generation=? AND m.scan=? AND m.item_key>? ORDER BY m.item_key LIMIT ?",
@@ -373,14 +394,100 @@ def _collection_page(scope: _ReadScope, section: str, cursor: str | None, limit:
         "scan": token.scan,
         "value_semantics": "latest_retained_values",
         "membership_semantics": "fixed_published" if token.source_kind == "published" else "active_scan",
-        "coverage": "published_traversal" if token.source_kind == "published" else "partial_scan",
+        "coverage": _collection_coverage(payload, token),
         "items": items,
         "next_cursor": next_token,
         "has_more": next_token is not None,
         "returned_count": len(items),
         "returned_active_count": sum(item["state"] == "retained" for item in items),
         "available_sources": _source_descriptors(sources),
+        **_collection_observation(payload, token, now),
     }
+
+
+def _collection_receipt(payload: dict[str, object], token: ProfileNavigationToken) -> dict[str, object]:
+    if token.source_kind == "active":
+        return payload
+    for key in ("published", "previous_published"):
+        receipt = _mapping(payload.get(key))
+        if (receipt.get("owner_account_id"), receipt.get("generation"), receipt.get("scan")) == (
+            token.account,
+            token.generation,
+            token.scan,
+        ):
+            if payload.get("complete") is True and (payload.get("generation"), payload.get("scan")) == (
+                token.generation,
+                token.scan,
+            ):
+                return payload
+            return receipt
+    return {}
+
+
+def _collection_coverage(payload: dict[str, object], token: ProfileNavigationToken) -> str:
+    if token.source_kind == "active":
+        return "partial_scan"
+    complete = _collection_receipt(payload, token).get("complete")
+    if complete is True:
+        return "published_traversal"
+    if complete is False:
+        return "retained_partial"
+    return "observation_unknown"
+
+
+def _collection_observation(payload: dict[str, object], token: ProfileNavigationToken, now: int) -> dict[str, object]:
+    evidence = _collection_receipt(payload, token)
+    completed = evidence.get("observation_completed_at")
+    return {
+        "observation_started_at": evidence.get("observation_started_at"),
+        "observation_completed_at": completed,
+        "age_seconds": _age(now, completed),
+        "reported_count": evidence.get("reported_count"),
+        "retained_unique_count": evidence.get("retained_unique_count"),
+        "coverage_semantics": "traversal_at_observation_not_current_membership",
+    }
+
+
+def unobserved_common_chats() -> dict[str, object]:
+    return {
+        "section": "common_chats",
+        "source": "none",
+        "coverage": "not_observed",
+        "items": [],
+        "next_cursor": None,
+        "has_more": False,
+        "returned_count": 0,
+        "returned_active_count": 0,
+        "available_sources": [],
+        "coverage_semantics": "traversal_at_observation_not_current_membership",
+    }
+
+
+def read_common_chats(
+    conn: sqlite3.Connection, owner: int, entity: int, now: int, *, limit: int | None = None
+) -> dict[str, object]:
+    """Read one bounded account-scoped page from the shared collection source."""
+    return _collection_page(
+        _ReadScope(conn, owner, entity, now), "common_chats", None, _request({})[2] if limit is None else limit
+    )
+
+
+def common_chat_dialog_id(item: Mapping[str, object]) -> int | None:
+    value = item.get("value")
+    if not isinstance(value, dict) or type(value.get("id")) is not int:
+        return None
+    identifier = cast(int, value["id"])
+    constructor = value.get("constructor")
+    if value.get("peer_kind") == "chat":
+        return -identifier
+    if value.get("peer_kind") == "channel":
+        return -1_000_000_000_000 - identifier
+    family = common_chat_constructor_family(constructor)
+    if family == "chat":
+        return -identifier
+    if family == "channel":
+        return -1_000_000_000_000 - identifier
+    return None
 
 
 def _collection_token(
@@ -414,6 +521,7 @@ def _collection_item(section: str, row: tuple[object, ...], now: int) -> dict[st
         "age_seconds": _age(now, row[5]),
         "field_evidence": _field_evidence(_object(row[3]), _object(row[4]), now, profile_value_paths({"item": fields})),
         "acquisition": {"availability": "unknown"},
+        "detail_complete": bool(row[6]),
     }
 
 

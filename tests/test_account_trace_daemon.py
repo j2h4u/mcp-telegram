@@ -68,7 +68,6 @@ from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     LoudChannelProfilePort,
     LoudChatAvatarHistoryPort,
-    LoudCommonChatsPort,
     LoudGroupProfilePort,
     LoudUserAvatarHistoryPort,
     LoudUserProfilePort,
@@ -88,7 +87,6 @@ def trace_server(tmp_path: Path) -> Iterator[tuple[DaemonAPIServer, sqlite3.Conn
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
-        common_chats_port=LoudCommonChatsPort(),
         user_avatar_history_port=LoudUserAvatarHistoryPort(),
         chat_avatar_history_port=LoudChatAvatarHistoryPort(),
         policy=make_daemon_api_policy(),
@@ -1391,6 +1389,66 @@ async def test_trace_zero_hit_resolved_account_returns_observed_zero_gap(
     gaps = cast(list[dict[str, object]], data["gaps"])
     assert gaps[0]["kind"] == "observed_zero"
     assert gaps[0]["severity"] == "info"
+
+
+@pytest.mark.asyncio
+async def test_observed_zero_authored_hits_exposes_retained_candidates_without_rpc(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
+    from telethon.tl import types
+
+    from tests.test_profile_read_integration import _publish
+
+    _server, conn, client = trace_server
+    _forbid_trace_acquisition(client)
+    seed_entity(conn, entity_id=42, name="Target")
+    conn.execute(
+        "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_owner_account_id) VALUES(42,?,1,101)",
+        ('{"common_chats":[{"id":-999}]}',),
+    )
+    conn.commit()
+    _publish(
+        conn,
+        "common_chats",
+        [types.ChatEmpty(7), types.ChannelForbidden(7, 1, "Channel"), types.ChatEmpty(8)],
+        owner=101,
+    )
+    conn.execute(
+        "UPDATE entity_profile_collection_facts SET fields_json=json_set(fields_json, '$.username', NULL, '$.title', NULL) WHERE item_key='1'"
+    )
+    conn.execute(
+        "UPDATE entity_profile_collection_facts SET fields_json=? WHERE item_key='2'", ('{"constructor":"Unknown"}',)
+    )
+    conn.commit()
+    before = conn.total_changes
+    result = _dict(await trace_service._trace_account_messages({"exact_account_id": 42, "coverage_goal": "observed"}))
+    coverage = _dict(_dict(result["data"])["coverage"])
+    page = _dict(coverage["known_common_chats"])
+    assert coverage["dialogs_considered"] == 0 and coverage["observed_message_count"] == 0
+    assert [item["dialog_id"] for item in cast(list[dict], page["items"])] == [-7, -1000000000007, None]
+    assert page["returned_count"] == 3 and not page["has_more"]
+    assert all(item["local_state"]["status"] == "not_synced" for item in cast(list[dict], page["items"])[:2])
+    assert cast(list[dict], page["items"])[2]["state"] == "unsupported"
+    assert conn.total_changes == before and client.mock_calls == []
+    schema = TOOL_REGISTRY["trace_account_messages"].output_schema
+    assert schema is not None
+    from jsonschema import Draft202012Validator
+
+    from mcp_telegram import server
+
+    wire = server._project_tool_result(
+        "trace_account_messages",
+        structured_result(_trace_structured_content(_dict(result["data"]), TraceAccountMessages(exact_account_id=42))),
+        server._CallTelemetry(),
+    )
+    Draft202012Validator(schema).validate(cast(object, wire.structured_content))
+    wire_data = _dict(cast(object, wire.structured_content))
+    wire_page = _dict(_dict(wire_data["coverage"])["known_common_chats"])
+    wire_items = cast(list[dict], wire_page["items"])
+    assert "title" not in wire_items[1]["value"] and "username" not in wire_items[1]["value"]
+    assert wire_items[2]["state"] == "unsupported" and "value" not in wire_items[2]
+    assert wire_page["returned_count"] == 3 and wire_page["source"] == page["source"]
 
 
 @pytest.mark.asyncio

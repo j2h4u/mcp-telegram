@@ -35,6 +35,7 @@ from .activity_peer_resolve import resolve_input_peer, resolve_linked_chat_id
 from .activity_substrate import ActivityClient, call_with_timeout
 from .dialog_identity import ensure_dialog_identity_baseline, publish_dialog_identity
 from .dialog_identity_contracts import DialogIdentityObservation
+from .entity_profile.membership import MembershipSignalCounts
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
 from .linked_chat_fact import LinkedChatFact, LinkedChatState
@@ -156,6 +157,9 @@ class PeerSweepRequest:
     writer: SQLiteWriter = field(kw_only=True)
     hydration_priority: HydrationPriority = HydrationPriority.BACKFILL
     accept_page: Callable[[sqlite3.Connection], bool] | None = None
+    profile_owner_account_id: int | None = None
+    membership_observer: Callable[[MembershipSignalCounts], None] | None = None
+    access_loss_observer: Callable[[MembershipSignalCounts], None] | None = None
 
 
 _LEGACY_PEER_SWEEP_POSITIONAL_ARGS = 3
@@ -230,6 +234,7 @@ def _extract_and_persist_sweep_messages(  # noqa: PLR0913, PLR0917 - atomic page
     observation_order: int,
     identity: DialogIdentityObservation | None,
     identity_revision: int,
+    membership_counts: list[MembershipSignalCounts],
 ) -> tuple[list[ExtractedMessage], frozenset[tuple[int, int]]] | SweepResult:
     """Return page rows or an explicit non-completion processing error."""
     try:
@@ -242,11 +247,13 @@ def _extract_and_persist_sweep_messages(  # noqa: PLR0913, PLR0917 - atomic page
                 logger.warning("sweep_peer_once_extraction_error dialog_id=%r", request.dialog_id, exc_info=True)
                 return _access_skip_result(rpc_calls=2, pages_fetched=1)
             if extracted:
-                insert_messages_with_fts(
+                result = insert_messages_with_fts(
                     conn,
                     [replace(row, observation_order=observation_order) for row in extracted],
                     priority=request.hydration_priority,
+                    profile_owner_account_id=request.profile_owner_account_id,
                 )
+                membership_counts.append(result.membership_counts)
             if identity is not None:
                 publish_dialog_identity(conn, request.dialog_id, identity, identity_revision)
     except Exception:
@@ -281,6 +288,11 @@ def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequ
         kwargs.pop("hydration_priority", HydrationPriority.BACKFILL),
     )
     accept_page = cast(Callable[[sqlite3.Connection], bool] | None, kwargs.pop("accept_page", None))
+    profile_owner_account_id = cast(int | None, kwargs.pop("profile_owner_account_id", None))
+    membership_observer = cast(Callable[[MembershipSignalCounts], None] | None, kwargs.pop("membership_observer", None))
+    access_loss_observer = cast(
+        Callable[[MembershipSignalCounts], None] | None, kwargs.pop("access_loss_observer", None)
+    )
     if kwargs:
         raise TypeError(f"sweep_peer_once: unexpected keyword arguments {sorted(kwargs)!r}")
 
@@ -295,6 +307,9 @@ def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequ
         writer=writer,
         hydration_priority=hydration_priority,
         accept_page=accept_page,
+        profile_owner_account_id=profile_owner_account_id,
+        membership_observer=membership_observer,
+        access_loss_observer=access_loss_observer,
     )
 
 
@@ -322,7 +337,9 @@ def _flood_wait_result(seconds: int, *, rpc_calls: int = 0) -> SweepResult:
     )
 
 
-async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, *, rpc_calls: int) -> _SearchOutcome:
+async def _search_self_messages(
+    request: PeerSweepRequest, peer: TypeInputPeer, *, rpc_calls: int, observation_order: int, owner: int | None
+) -> _SearchOutcome:
     from telethon.tl.functions.messages import SearchRequest
     from telethon.tl.types import InputMessagesFilterEmpty, InputPeerSelf
 
@@ -381,8 +398,7 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, 
             early_result=_access_skip_result(rpc_calls=rpc_calls),
         )
     except ACCESS_LOST_ERRORS as exc:
-        reason = type(exc).__name__
-        await request.writer.run(lambda db: _record_access_lost(db, request.dialog_id, reason))
+        await _observe_search_access_loss(request, exc, observation_order, owner)
         return _SearchOutcome(
             result=None,
             rpc_duration_s=_elapsed_s(search_started_at),
@@ -403,6 +419,21 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, 
         )
 
     return _SearchOutcome(result=cast(_SweepResultLike, result), rpc_duration_s=_elapsed_s(search_started_at))
+
+
+async def _observe_search_access_loss(
+    request: PeerSweepRequest, exc: Exception, observation_order: int, owner: int | None
+) -> None:
+    reason = type(exc).__name__
+    observed_at = int(time.time())
+    counts = await request.writer.run(
+        lambda db: _record_access_lost(db, request, reason, observation_order, observed_at, owner)
+    )
+    if counts is not None and request.access_loss_observer is not None:
+        try:
+            request.access_loss_observer(counts)
+        except Exception:  # noqa: BLE001
+            logger.debug("access_loss_observer_failed")
 
 
 # ---------------------------------------------------------------------------
@@ -449,21 +480,42 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
     if observation is None:
         return SweepResult([], 0, None, None, completed=False, accepted=False)
     identity_revision, observation_order = observation
+    owner = request.profile_owner_account_id
     rpc_calls += 1  # SearchRequest is a governed Telegram call attempt.
-    search = await _search_self_messages(request, peer, rpc_calls=rpc_calls)
+    search = await _search_self_messages(
+        request, peer, rpc_calls=rpc_calls, observation_order=observation_order, owner=owner
+    )
     if search.early_result is not None:
         return search.early_result
 
+    return await _persist_searched_page(request, search, observation_order, identity_revision, rpc_calls)
+
+
+async def _persist_searched_page(
+    request: PeerSweepRequest,
+    search: _SearchOutcome,
+    observation_order: int,
+    identity_revision: int,
+    rpc_calls: int,
+) -> SweepResult:
+    """Commit the searched page and report committed membership signals."""
     rpc_duration_s = search.rpc_duration_s
     batch = list(cast(_SweepResultLike, search.result).messages or [])
     identity = observe_response_dialog_identity(
         search.result, request.dialog_id, source="profile", observed_at=int(time.time())
     )
+    membership_counts: list[MembershipSignalCounts] = []
     page_rows = await request.writer.run(
         lambda db: _extract_and_persist_sweep_messages(
-            db, request, batch, observation_order, identity, identity_revision
+            db, request, batch, observation_order, identity, identity_revision, membership_counts
         )
     )
+    if not isinstance(page_rows, SweepResult) and request.membership_observer is not None:
+        for counts in membership_counts:
+            try:
+                request.membership_observer(counts)
+            except Exception:  # noqa: BLE001
+                logger.debug("membership_observer_failed")
     if isinstance(page_rows, SweepResult):
         return page_rows
     extracted, genuinely_new_keys = page_rows
@@ -541,9 +593,27 @@ def _prepare_sweep_observation(conn: sqlite3.Connection, dialog_id: int) -> tupl
         return identity_revision, allocate_observation_order(conn)
 
 
-def _record_access_lost(conn: sqlite3.Connection, dialog_id: int, reason: str) -> None:
+def _record_access_lost(  # noqa: PLR0913, PLR0917
+    conn: sqlite3.Connection,
+    request: PeerSweepRequest,
+    reason: str,
+    observation_order: int,
+    observed_at: int,
+    owner: int | None,
+) -> MembershipSignalCounts | None:
     with write_transaction(conn):
-        set_access_lost(conn, dialog_id, int(time.time()), reason=reason)
+        if request.accept_page is not None and not request.accept_page(conn):
+            return None
+        return set_access_lost(
+            conn,
+            request.dialog_id,
+            observed_at,
+            reason=reason,
+            profile_owner_account_id=owner,
+            observation_order=observation_order,
+            membership_revision_at=observed_at,
+            processing_at=int(time.time()),
+        ).membership_counts
 
 
 def enroll_activity_dialog(

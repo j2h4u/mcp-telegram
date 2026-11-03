@@ -105,7 +105,10 @@ def _assert_registered_null_boundary(name: str, schema: dict[str, object]) -> No
         # below is also checked with the allowance of its actual output caller.
         nullable = nullable or (
             name == "get_entity_info"
-            and (path[:1] == ("$defs",) or path in {("properties", "semantic"), ("properties", "page")})
+            and (
+                path[:1] == ("$defs",)
+                or path in {("properties", "semantic"), ("properties", "page"), ("properties", "common_chats_page")}
+            )
         )
         sync_null = name == "get_sync_status" and path in {
             ("properties", "enrollment_enabled"),
@@ -135,6 +138,7 @@ def _assert_registered_null_boundary(name: str, schema: dict[str, object]) -> No
         ("get_entity_info", {"type": ["object", "null"]}),
         ("get_entity_info", {"properties": {"legacy": {"type": ["string", "null"]}}}),
         ("list_dialogs", {"properties": {"semantic": {"type": ["string", "null"]}}}),
+        ("trace_account_messages", {"properties": {"common_chats_page": {"type": ["string", "null"]}}}),
         ("get_sync_status", {"properties": {"other": {"type": ["string", "null"]}}}),
         ("list_dialogs", {"properties": {"latest_retained_message": {"type": ["object", "null"]}}}),
         (

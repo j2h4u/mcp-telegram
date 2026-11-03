@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import cast
 
+from ..models import DialogType
 from ..structured import TELEGRAM_CONTENT_OUTPUT_SCHEMA, TelegramContentKind, telegram_content
 from .contracts import ProfileFieldClass
 from .field_manifest import PROFILE_FIELD_MANIFEST, ProfileFieldRule
@@ -174,13 +175,38 @@ COLLECTION_CONSTRUCTORS: dict[str, tuple[str, ...]] = {
 }
 
 
+def common_chat_constructor_family(constructor: object) -> str | None:
+    """Classify only supported Telegram chat constructors by peer family."""
+    if not isinstance(constructor, str) or constructor not in COLLECTION_CONSTRUCTORS["common_chats"]:
+        return None
+    kind = DialogType.parse(constructor.removesuffix("Forbidden").removesuffix("Empty"))
+    if kind is DialogType.GROUP:
+        return "chat"
+    if kind is DialogType.CHANNEL:
+        return "channel"
+    return None
+
+
 def collection_item_schema(section: str) -> dict[str, object]:
     canonical = cast(dict[str, object], _field_schema(ProfileFieldRule(COLLECTION_CONSTRUCTORS[section])))
-    legacy = {"avatar_history": _LEGACY_PHOTO_SCHEMA, "common_chats": _LEGACY_CHAT_SCHEMA}.get(section)
+    legacy = {"avatar_history": _LEGACY_PHOTO_SCHEMA}.get(section)
+    if section == "common_chats":
+        return {"anyOf": [canonical, _PARTIAL_CHAT_SCHEMA]}
     return {"anyOf": [canonical, legacy]} if legacy is not None else canonical
 
 
 def project_collection_item(section: str, fields: Mapping[str, object]) -> object:
+    kind = fields.get("peer_kind")
+    if (
+        section == "common_chats"
+        and isinstance(kind, str)
+        and kind in {"chat", "channel"}
+        and "constructor" not in fields
+    ):
+        result = {key: fields[key] for key in ("peer_kind", "id", "megagroup") if key in fields}
+        if isinstance(fields.get("title"), str):
+            result["title"] = telegram_content(cast(str, fields["title"]), "snippet")
+        return result
     return _project_atom(dict(fields), ProfileFieldRule(COLLECTION_CONSTRUCTORS[section]), "snippet")
 
 
@@ -210,15 +236,15 @@ _LEGACY_PHOTO_SCHEMA: dict[str, object] = {
 }
 
 
-_LEGACY_CHAT_SCHEMA: dict[str, object] = {
+_PARTIAL_CHAT_SCHEMA: dict[str, object] = {
     "type": "object",
     "properties": {
+        "peer_kind": {"enum": ["chat", "channel"]},
         "id": {"type": "integer"},
-        "name": {"anyOf": [{"$ref": "#/$defs/telegram_content"}, {"type": "null"}]},
-        "username": {"anyOf": [{"$ref": "#/$defs/telegram_content"}, {"type": "null"}]},
-        "type": {"type": ["string", "null"]},
+        "title": {"$ref": "#/$defs/telegram_content"},
+        "megagroup": {"type": "boolean"},
     },
-    "required": ["id"],
+    "required": ["peer_kind", "id"],
     "additionalProperties": False,
 }
 
@@ -228,18 +254,7 @@ def project_legacy_collection_item(section: str, value: object) -> object:
         raise ValueError("Unsupported legacy collection value")
     if section == "avatar_history" and type(value.get("photo_id")) is int:
         return {key: value[key] for key in ("photo_id", "date") if key in value}
-    if section == "common_chats" and type(value.get("id")) is int:
-        return _project_legacy_chat(value)
     raise ValueError("Unsupported legacy collection value")
-
-
-def _project_legacy_chat(value: dict[str, object]) -> dict[str, object]:
-    result: dict[str, object] = {key: value[key] for key in ("id", "type") if key in value}
-    for key in ("name", "username"):
-        if key in value:
-            text = value[key]
-            result[key] = telegram_content(text, "snippet") if isinstance(text, str) else None
-    return result
 
 
 def project_history_value(change_key: str, value: object) -> object:

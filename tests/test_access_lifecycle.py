@@ -8,6 +8,7 @@ import pytest
 from mcp_telegram.access_lifecycle import (
     AccessLossEvidence,
     complete_access_revalidation,
+    record_access_recovery_observation,
     restore_access_after_revalidation,
     set_access_lost,
     stamp_access_revalidation,
@@ -15,6 +16,69 @@ from mcp_telegram.access_lifecycle import (
 from mcp_telegram.sync_db import _apply_migrations
 from mcp_telegram.sync_transactions import write_transaction
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+
+
+def test_membership_access_fence_rejects_replay_after_restoration() -> None:
+    conn = _db()
+    try:
+        with write_transaction(conn):
+            conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+            conn.execute("INSERT INTO entities(id,type,updated_at) VALUES (12,'user',1)")
+            conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (12,'user'),(-5,'group')")
+            conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (-5,'synced')")
+            conn.execute(
+                "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_owner_account_id) VALUES (12,'{}',1,42)"
+            )
+            conn.execute(
+                "INSERT INTO entity_detail_sections(entity_id,section,status,payload_json) VALUES (12,'common_chats','fresh',?)",
+                ('{"published":{"owner_account_id":42,"generation":1,"scan":0,"observation_started_at":10}}',),
+            )
+            conn.execute(
+                "INSERT INTO entity_profile_collection_facts(owner_account_id,entity_id,section,item_key,fields_json,coverage_json,observation_order,observed_at) VALUES (42,12,'common_chats','chat:5','{}','{}',1,10)"
+            )
+            conn.execute(
+                "INSERT INTO entity_profile_collection_membership(owner_account_id,entity_id,section,generation,scan,item_key,identity_kind,page_key,ordinal,detail_complete) VALUES (42,12,'common_chats',1,0,'chat:5','remote','first',0,1)"
+            )
+        with pytest.raises(RuntimeError, match="rollback"), write_transaction(conn):
+            assert (
+                set_access_lost(
+                    conn, -5, 20, profile_owner_account_id=42, observation_order=10, membership_revision_at=20
+                ).membership_counts.queued
+                == 1
+            )
+            raise RuntimeError("rollback")
+        assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=-5").fetchone() == ("synced",)
+        assert conn.execute("SELECT COUNT(*) FROM entity_profile_refresh_state WHERE entity_id=12").fetchone() == (0,)
+        with write_transaction(conn):
+            assert not set_access_lost(
+                conn, -5, 20, profile_owner_account_id=77, observation_order=9, membership_revision_at=20
+            ).changed
+            loss = set_access_lost(
+                conn, -5, 20, profile_owner_account_id=42, observation_order=10, membership_revision_at=20
+            )
+            assert loss.changed and loss.membership_counts.queued == 1
+            assert not set_access_lost(conn, -5, 21, profile_owner_account_id=42, observation_order=10).changed
+            assert record_access_recovery_observation(conn, -5, 20)
+            conn.execute("UPDATE entity_profile_refresh_state SET status='complete' WHERE entity_id=12")
+            conn.execute(
+                "UPDATE entity_detail_sections SET status='fresh',payload_json=? WHERE entity_id=12 AND section='common_chats'",
+                ('{"published":{"owner_account_id":42,"generation":1,"scan":0,"observation_started_at":25}}',),
+            )
+            later = set_access_lost(
+                conn, -5, 30, profile_owner_account_id=42, observation_order=30, membership_revision_at=30
+            )
+            assert later.changed and later.membership_counts.queued == 1
+            assert not set_access_lost(conn, -5, 31, profile_owner_account_id=42, observation_order=30).changed
+            assert record_access_recovery_observation(conn, -5, 40)
+            assert restore_access_after_revalidation(conn, -5, 40, expected_observation_order=40)
+            assert not set_access_lost(conn, -5, 41, profile_owner_account_id=42, observation_order=35).changed
+        assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=-5").fetchone() != ("access_lost",)
+        assert conn.execute("SELECT generation FROM entity_profile_refresh_state WHERE entity_id=12").fetchone() == (2,)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM entity_profile_collection_membership WHERE entity_id=12"
+        ).fetchone() == (1,)
+    finally:
+        conn.close()
 
 
 def _db() -> sqlite3.Connection:
@@ -181,13 +245,13 @@ def test_lifecycle_history_and_operational_logs_are_ordered_and_deduplicated(
                 1,
                 10,
                 evidence=AccessLossEvidence("UpdateChannelParticipant", "removed_by_admin", 99),
-            )
-            assert not set_access_lost(conn, 1, 11)
+            ).changed
+            assert not set_access_lost(conn, 1, 11).changed
             assert restore_access_after_revalidation(conn, 1, 12)
             assert not restore_access_after_revalidation(conn, 1, 13)
             conn.execute("UPDATE synced_dialogs SET status = 'syncing' WHERE dialog_id = 1")
             conn.commit()
-            assert set_access_lost(conn, 1, 14)
+            assert set_access_lost(conn, 1, 14).changed
         assert conn.execute(
             "SELECT kind, occurred_at, reason_code, previous_status, access_change_cause, actor_id "
             "FROM conversation_history_events ORDER BY seq"

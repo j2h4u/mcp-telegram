@@ -26,7 +26,7 @@ import logging
 import math
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -41,6 +41,7 @@ from .activity_peer_sweep import (
     working_set_enrollment_release_at,
 )
 from .activity_substrate import ActivityClient
+from .entity_profile.membership import MembershipSignalCounts
 from .hydration_queue import HydrationPriority
 from .sqlite_writer import SQLiteWriter
 from .sync_read_model import SyncStatus
@@ -118,6 +119,8 @@ class ColdPeerPageDemandAdapter(DurableDemandAdapter):
     timeout_s: float
     writer: SQLiteWriter = field(kw_only=True)
     account_id: int = field(kw_only=True)
+    membership_observer: Callable[[MembershipSignalCounts], None] | None = field(default=None, kw_only=True)
+    access_loss_observer: Callable[[MembershipSignalCounts], None] | None = field(default=None, kw_only=True)
     demand_kind = DemandKind.COLD_PEER_PAGE
 
     def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
@@ -261,6 +264,9 @@ class ColdPeerPageDemandAdapter(DurableDemandAdapter):
                     writer=self.writer,
                     expected_dialog=dialog_id,
                     expected_offset=int(selected.revision),
+                    profile_owner_account_id=self.account_id,
+                    membership_observer=self.membership_observer,
+                    access_loss_observer=self.access_loss_observer,
                 )
         return self._cold_result(selected, result)
 
@@ -520,6 +526,9 @@ async def run_cold_backfill_pass(  # noqa: PLR0913 - explicit worker dependencie
     writer: SQLiteWriter,
     expected_dialog: int | None = None,
     expected_offset: int | None = None,
+    profile_owner_account_id: int | None = None,
+    membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
+    access_loss_observer: Callable[[MembershipSignalCounts], None] | None = None,
 ) -> ColdPassResult:
     """Run one cold peer-page operation under its precise durable root."""
     with _cold_demand_scope():
@@ -532,6 +541,9 @@ async def run_cold_backfill_pass(  # noqa: PLR0913 - explicit worker dependencie
             writer=writer,
             expected_dialog=expected_dialog,
             expected_offset=expected_offset,
+            profile_owner_account_id=profile_owner_account_id,
+            membership_observer=membership_observer,
+            access_loss_observer=access_loss_observer,
         )
 
 
@@ -545,6 +557,9 @@ async def _run_cold_backfill_pass(  # noqa: PLR0913 - explicit worker dependenci
     writer: SQLiteWriter,
     expected_dialog: int | None = None,
     expected_offset: int | None = None,
+    profile_owner_account_id: int | None = None,
+    membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
+    access_loss_observer: Callable[[MembershipSignalCounts], None] | None = None,
 ) -> ColdPassResult:
     """Run one Tier-B ColdBackfill pass.
 
@@ -605,6 +620,9 @@ async def _run_cold_backfill_pass(  # noqa: PLR0913 - explicit worker dependenci
                 writer=writer,
                 hydration_priority=HydrationPriority.BACKFILL,
                 accept_page=lambda db: _cold_claim_matches(db, dialog_id, offset_id, claim_until),
+                profile_owner_account_id=profile_owner_account_id,
+                membership_observer=membership_observer,
+                access_loss_observer=access_loss_observer,
             )
     except RpcAttemptBudgetExhaustedError:
         # A slice bound is not an access failure. Release the short claim so

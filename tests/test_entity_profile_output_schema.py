@@ -260,3 +260,25 @@ def test_newer_canonical_clear_survives_stale_snapshot_and_validates(
     assert fields["user.phone"] is None
     assert _mapping(coverage["user.phone"])["state"] == "unknown"
     assert _mapping(_mapping(provenance["fields"])["user.phone"])["order"] == 3
+
+
+@pytest.mark.parametrize(
+    ("constructor", "family", "dialog_id"),
+    [
+        ("Chat", "chat", -7),
+        ("ChatEmpty", "chat", -7),
+        ("ChatForbidden", "chat", -7),
+        ("Channel", "channel", -1000000000007),
+        ("ChannelForbidden", "channel", -1000000000007),
+        ("group", None, None),
+        ("User", None, None),
+        (None, None, None),
+    ],
+)
+def test_common_chat_constructor_family_is_finite_and_preserves_peer_identity(
+    constructor: object, family: str | None, dialog_id: int | None
+) -> None:
+    from mcp_telegram.entity_profile.reader import common_chat_dialog_id
+
+    assert output_schema.common_chat_constructor_family(constructor) == family
+    assert common_chat_dialog_id({"value": {"constructor": constructor, "id": 7}}) == dialog_id
