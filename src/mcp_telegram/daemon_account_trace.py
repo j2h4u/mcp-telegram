@@ -995,6 +995,10 @@ def _known_common_chats(conn: sqlite3.Connection, owner: int, target: int, now: 
     page = read_common_chats(conn, owner, target, now)
     for item in cast(list[dict[str, object]], page["items"]):
         dialog_id = common_chat_dialog_id(item)
+        value = item.get("value")
+        if isinstance(value, dict):
+            identity_fields = ("constructor", "peer_kind", "id", "title", "username", "megagroup", "broadcast", "forum")
+            item["value"] = {key: value[key] for key in identity_fields if key in value}
         item["dialog_id"] = dialog_id
         item["local_state"] = dialog_presence_metadata(conn, dialog_id) if dialog_id is not None else None
     return page

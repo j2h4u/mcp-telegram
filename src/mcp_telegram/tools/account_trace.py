@@ -246,7 +246,7 @@ TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA = {
 }
 
 
-TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA["$defs"] = profile_read_schemas()[1]
+TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA["$defs"] = {"telegram_content": profile_read_schemas()[1]["telegram_content"]}
 
 
 class _TraceDialogSelectorKwargs(TypedDict, total=False):

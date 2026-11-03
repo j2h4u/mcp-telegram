@@ -191,6 +191,19 @@ def _collection_page(section: str) -> dict:
 def common_chat_trace_schema() -> dict:
     page = _collection_page("common_chats")
     item = page["properties"]["items"]["items"]["properties"]
+    item["value"] = closed(
+        {
+            "constructor": {"enum": list(COLLECTION_CONSTRUCTORS["common_chats"])},
+            "peer_kind": {"enum": ["chat", "channel"]},
+            "id": {"type": "integer"},
+            "title": {"$ref": "#/$defs/telegram_content"},
+            "username": {"$ref": "#/$defs/telegram_content"},
+            "megagroup": {"type": "boolean"},
+            "broadcast": {"type": "boolean"},
+            "forum": {"type": "boolean"},
+        }
+    )
+    item["value"]["description"] = "Retained peer identity; full details are available in the profile collection."
     item["dialog_id"] = {"type": ["integer", "null"]}
     item["local_state"] = {
         "anyOf": [

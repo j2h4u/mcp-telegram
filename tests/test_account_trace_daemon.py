@@ -1408,15 +1408,28 @@ async def test_observed_zero_authored_hits_exposes_retained_candidates_without_r
         ('{"common_chats":[{"id":-999}]}',),
     )
     conn.commit()
-    _publish(conn, "common_chats", [types.ChatEmpty(7), types.ChannelForbidden(7, 1, "Channel")], owner=101)
+    _publish(
+        conn,
+        "common_chats",
+        [types.ChatEmpty(7), types.ChannelForbidden(7, 1, "Channel"), types.ChatEmpty(8)],
+        owner=101,
+    )
+    conn.execute(
+        "UPDATE entity_profile_collection_facts SET fields_json=json_set(fields_json, '$.username', NULL, '$.title', NULL) WHERE item_key='1'"
+    )
+    conn.execute(
+        "UPDATE entity_profile_collection_facts SET fields_json=? WHERE item_key='2'", ('{"constructor":"Unknown"}',)
+    )
+    conn.commit()
     before = conn.total_changes
     result = _dict(await trace_service._trace_account_messages({"exact_account_id": 42, "coverage_goal": "observed"}))
     coverage = _dict(_dict(result["data"])["coverage"])
     page = _dict(coverage["known_common_chats"])
     assert coverage["dialogs_considered"] == 0 and coverage["observed_message_count"] == 0
-    assert [item["dialog_id"] for item in cast(list[dict], page["items"])] == [-7, -1000000000007]
-    assert page["returned_count"] == 2 and not page["has_more"]
-    assert all(item["local_state"]["status"] == "not_synced" for item in cast(list[dict], page["items"]))
+    assert [item["dialog_id"] for item in cast(list[dict], page["items"])] == [-7, -1000000000007, None]
+    assert page["returned_count"] == 3 and not page["has_more"]
+    assert all(item["local_state"]["status"] == "not_synced" for item in cast(list[dict], page["items"])[:2])
+    assert cast(list[dict], page["items"])[2]["state"] == "unsupported"
     assert conn.total_changes == before and client.mock_calls == []
     schema = TOOL_REGISTRY["trace_account_messages"].output_schema
     assert schema is not None
@@ -1430,6 +1443,12 @@ async def test_observed_zero_authored_hits_exposes_retained_candidates_without_r
         server._CallTelemetry(),
     )
     Draft202012Validator(schema).validate(cast(object, wire.structured_content))
+    wire_data = _dict(wire.structured_content)
+    wire_page = _dict(_dict(wire_data["coverage"])["known_common_chats"])
+    wire_items = cast(list[dict], wire_page["items"])
+    assert "title" not in wire_items[1]["value"] and "username" not in wire_items[1]["value"]
+    assert wire_items[2]["state"] == "unsupported" and "value" not in wire_items[2]
+    assert wire_page["returned_count"] == 3 and wire_page["source"] == page["source"]
 
 
 @pytest.mark.asyncio
