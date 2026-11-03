@@ -1891,6 +1891,8 @@ async def test_list_folders_includes_canonical_directory_coverage(tmp_path: Path
     conn = _register_sqlite_connection(sqlite3.connect(db_path))
     replace_folder_snapshot(conn, [(3, "Work")], [])
     server = make_server(conn)
+    server.self_id = 42
+    await server._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
 
     result = await server._list_folders({})
 

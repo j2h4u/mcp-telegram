@@ -49,6 +49,11 @@ def apply_scheduled_permission(conn: sqlite3.Connection, dialog_id: int, signatu
         "VALUES (?,?,?,'unknown','baseline_unknown',?,?) "
         "ON CONFLICT(dialog_id) DO UPDATE SET permission_signature=excluded.permission_signature, "
         "acquisition_block=excluded.acquisition_block,authorization_pending=1,dirty_generation=dirty_generation+1, "
-        "discovery_due_at=COALESCE(discovery_due_at,excluded.discovery_due_at),updated_at=excluded.updated_at",
+        "repair_due_at=CASE WHEN coverage_reason LIKE 'scheduled_failure:%' AND repair_due_at IS NOT NULL "
+        "THEN excluded.discovery_due_at ELSE repair_due_at END, "
+        "discovery_due_at=CASE WHEN coverage_reason LIKE 'scheduled_failure:%' AND repair_due_at IS NULL "
+        "THEN excluded.discovery_due_at ELSE COALESCE(discovery_due_at,excluded.discovery_due_at) END, "
+        "coverage_reason=CASE WHEN coverage_reason LIKE 'scheduled_failure:%' THEN 'permission_changed' ELSE coverage_reason END, "
+        "updated_at=excluded.updated_at",
         (dialog_id, now, now, signature, "permission_denied" if denied else None),
     )

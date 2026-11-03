@@ -17,6 +17,7 @@ from ._base import (
 )
 from .account_trace import TraceAccountMessages, trace_account_messages
 from .activity import GetMyRecentActivity, get_my_recent_activity
+from .contact_notes import ManageContactNote, manage_contact_note
 from .conversation_changes import ListConversationChanges, list_conversation_changes
 
 # --- Domain modules (import triggers @mcp_tool registration) ---
@@ -24,6 +25,7 @@ from .discovery import ListDialogs, ListTopics, list_dialogs, list_topics
 from .drafts import GetDraft, ManageDraft, get_draft, manage_draft
 from .entity_info import GetEntityInfo, get_entity_info
 from .feedback import SubmitFeedback, submit_feedback
+from .folders import GetFolder, ManageFolder, get_folder, manage_folder
 from .message_images import MessageImage, get_message_image, prepare_message_image
 from .reading import ListMessages, SearchMessages, list_messages, search_messages
 from .scheduled import ManageScheduledMessage, manage_scheduled_message
@@ -42,6 +44,7 @@ __all__ = [
     "GetDialogStats",
     "GetDraft",
     "GetEntityInfo",
+    "GetFolder",
     "GetInbox",
     "GetMyRecentActivity",
     "GetSyncStatus",
@@ -51,7 +54,9 @@ __all__ = [
     "ListDialogs",
     "ListMessages",
     "ListTopics",
+    "ManageContactNote",
     "ManageDraft",
+    "ManageFolder",
     "ManageScheduledMessage",
     "MarkDialogForSync",
     "MessageImage",
@@ -64,6 +69,7 @@ __all__ = [
     "get_dialog_stats",
     "get_draft",
     "get_entity_info",
+    "get_folder",
     "get_inbox",
     "get_message_image",
     "get_my_recent_activity",
@@ -74,7 +80,9 @@ __all__ = [
     "list_dialogs",
     "list_messages",
     "list_topics",
+    "manage_contact_note",
     "manage_draft",
+    "manage_folder",
     "manage_scheduled_message",
     "mark_dialog_for_sync",
     "mcp_tool",

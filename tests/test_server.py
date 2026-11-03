@@ -900,6 +900,9 @@ def test_list_tools_exposes_snake_case_names_titles_and_annotations() -> None:
         "get_my_recent_activity": "Recent Activity",
         "get_inbox": "Inbox",
         "get_entity_info": "Entity Info",
+        "get_folder": "Get Folder",
+        "manage_folder": "Manage Folder",
+        "manage_contact_note": "Manage Contact Note",
         "submit_feedback": "Submit Feedback",
         "trace_account_messages": "Account Trace",
     }

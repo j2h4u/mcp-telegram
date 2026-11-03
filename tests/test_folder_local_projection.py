@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -18,9 +19,13 @@ from mcp_telegram.folders.contracts import (
 )
 from mcp_telegram.folders.membership import evaluate
 from mcp_telegram.folders.read_repository import folder_snapshot
-from mcp_telegram.folders.sqlite_repository import SQLiteFolderSnapshotRepository
-from mcp_telegram.folders.telegram_adapter import TelethonTelegramFolderGateway, _observation_token
-from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.folders.sqlite_repository import SQLiteFolderSnapshotRepository, read_folder_rules
+from mcp_telegram.folders.telegram_adapter import (
+    TelethonTelegramFolderGateway,
+    _observation_token,
+    folder_update_from_native,
+)
+from mcp_telegram.sync_db import _apply_migration_97, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_savepoint
 
 
@@ -36,6 +41,272 @@ def _conn(path: Path) -> sqlite3.Connection:
 
 def _observation(*rules: FolderRule, started_at: int = 100) -> FolderRuleObservation:
     return FolderRuleObservation(tuple(rules), "rule-token", started_at)
+
+
+def test_migration_marks_preexisting_folder_metadata_unknown(tmp_path: Path) -> None:
+    conn = _conn(tmp_path / "sync.db")
+    try:
+        SQLiteFolderSnapshotRepository(conn).project_observation(
+            _observation(FolderRule(4, "Retained")), completed_at=100
+        )
+        conn.execute("DELETE FROM schema_version WHERE version=97")
+        conn.execute("ALTER TABLE telegram_folder_projection_state DROP COLUMN catalog_revision")
+        conn.execute(
+            "CREATE TABLE telegram_folder_pending_observation (singleton INTEGER PRIMARY KEY, token TEXT, started_at INTEGER, rules_json TEXT)"
+        )
+        conn.execute("INSERT INTO telegram_folder_pending_observation VALUES (1,'unbound',2,'{}')")
+        conn.execute("UPDATE telegram_folder_projection_state SET next_retry_at=105,consecutive_failures=2")
+        conn.execute("INSERT INTO update_delivery VALUES (1,1,1,'checkpoint',?)", (b'{"version":1,"tl":"x"}',))
+        conn.execute("INSERT INTO update_delivery_tokens VALUES (0,3,7)")
+        conn.commit()
+        assert _apply_migration_97(conn, 96) == 97
+        assert conn.execute(
+            "SELECT safe_snapshot,json_type(CAST(pending AS TEXT),'$.auth_scope') FROM update_delivery"
+        ).fetchone() == ("checkpoint", "null")
+        assert conn.execute("SELECT * FROM update_delivery_tokens").fetchall() == [(0, 3, 7)]
+        assert (
+            conn.execute("SELECT 1 FROM sqlite_master WHERE name='telegram_folder_pending_observation'").fetchone()
+            is None
+        )
+        (rule,) = read_folder_rules(conn)
+        assert rule.title == "Retained"
+        assert not rule.complete
+        repo = SQLiteFolderSnapshotRepository(conn)
+        assert not repo.rules_are_fresh(now=101)
+        assert repo.read_next_retry_at() == 105 and repo.read_consecutive_failures() == 2
+        assert repo.read_snapshot_revision() == (1, 7, "rule-token", 100)
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE name IN ('folder_command_receipts','contact_note_operation_receipts') ORDER BY name"
+        ).fetchall() == [("contact_note_operation_receipts",), ("folder_command_receipts",)]
+    finally:
+        conn.close()
+
+
+def test_migration_rolls_back_schema_and_retained_data_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mcp_telegram.folders.command_schema as receipts
+
+    conn = _conn(tmp_path / "sync.db")
+    try:
+        SQLiteFolderSnapshotRepository(conn).project_observation(_observation(FolderRule(4, "Kept")), completed_at=100)
+        conn.execute("DELETE FROM schema_version WHERE version=97")
+        conn.execute("ALTER TABLE telegram_folder_projection_state DROP COLUMN catalog_revision")
+        conn.execute(
+            "CREATE TABLE telegram_folder_pending_observation (singleton INTEGER PRIMARY KEY, token TEXT, started_at INTEGER, rules_json TEXT)"
+        )
+        conn.commit()
+        monkeypatch.setattr(receipts, "FOLDER_COMMAND_SCHEMA", "invalid SQL")
+        with pytest.raises(sqlite3.OperationalError):
+            _apply_migration_97(conn, 96)
+        assert conn.execute("SELECT title FROM telegram_folder_rules").fetchone() == ("Kept",)
+        assert conn.execute("SELECT 1 FROM schema_version WHERE version=97").fetchone() is None
+        assert "catalog_revision" not in {
+            row[1]
+            for row in cast(
+                list[tuple[object, ...]], conn.execute("PRAGMA table_info(telegram_folder_projection_state)").fetchall()
+            )
+        }
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='telegram_folder_pending_observation'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+async def test_native_folder_metadata_survives_storage(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from telethon.tl.types import DialogFilter, MessageEntityCustomEmoji, TextWithEntities
+
+    folder = DialogFilter(
+        id=4,
+        title=TextWithEntities("Work", [MessageEntityCustomEmoji(0, 2, 123)]),
+        pinned_peers=[],
+        include_peers=[],
+        exclude_peers=[],
+        contacts=True,
+        title_noanimate=True,
+        emoticon="📁",
+        color=3,
+    )
+
+    class Client:
+        async def __call__(self, request: object) -> object:
+            return SimpleNamespace(filters=[folder])
+
+    observed = await TelethonTelegramFolderGateway(Client()).fetch_rules(started_at=20)
+    conn = _conn(tmp_path / "sync.db")
+    try:
+        SQLiteFolderSnapshotRepository(conn).project_observation(observed, completed_at=21)
+        (stored,) = read_folder_rules(conn)
+        assert stored.title_entities == (
+            {"_": "MessageEntityCustomEmoji", "offset": 0, "length": 2, "document_id": 123},
+        )
+        assert (stored.title_noanimate, stored.emoticon, stored.color, stored.complete) == (True, "📁", 3, True)
+    finally:
+        conn.close()
+
+
+async def test_unknown_folder_preserves_previous_snapshot(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    class Client:
+        async def __call__(self, request: object) -> object:
+            return SimpleNamespace(filters=[SimpleNamespace()])
+
+    conn = _conn(tmp_path / "sync.db")
+    try:
+        repo = SQLiteFolderSnapshotRepository(conn)
+        repo.project_observation(_observation(FolderRule(4, "Retained")), completed_at=100)
+        unknown = await TelethonTelegramFolderGateway(Client()).fetch_rules(started_at=101)
+        assert not unknown.complete
+        assert repo.project_observation(unknown, completed_at=101) is None
+        assert read_folder_rules(conn)[0].title == "Retained"
+        assert folder_snapshot(conn, stale_after_seconds=900, now=101)["complete"] is False
+    finally:
+        conn.close()
+
+
+def test_supplied_folder_update_is_ordered_and_local(tmp_path: Path) -> None:
+    from telethon.tl.types import DialogFilter, TextWithEntities, UpdateDialogFilter, UpdateDialogFilterOrder
+
+    conn = _conn(tmp_path / "sync.db")
+    try:
+        repo = SQLiteFolderSnapshotRepository(conn)
+        repo.project_observation(_observation(FolderRule(4, "Old")), completed_at=100)
+        folder = DialogFilter(4, TextWithEntities("New", []), [], [], [])
+        with write_savepoint(conn):
+            assert repo.apply_supplied_update(
+                folder_update_from_native(UpdateDialogFilter(4, folder)), account_id=1, order=2, now=101
+            )
+            assert not repo.apply_supplied_update(
+                folder_update_from_native(UpdateDialogFilter(4)), account_id=1, order=1, now=102
+            )
+            assert not repo.apply_supplied_update(
+                folder_update_from_native(UpdateDialogFilter(4)), account_id=2, order=3, now=102
+            )
+            assert not repo.apply_supplied_update(
+                folder_update_from_native(UpdateDialogFilterOrder([5])), account_id=1, order=3, now=102
+            )
+            assert repo.apply_supplied_update(
+                folder_update_from_native(UpdateDialogFilterOrder([4])), account_id=1, order=3, now=102
+            )
+            assert not repo.apply_supplied_update(folder_update_from_native(object()), account_id=1, order=4, now=102)
+        assert read_folder_rules(conn)[0].title == "New"
+    finally:
+        conn.close()
+
+
+def test_supplied_delta_refines_only_its_matching_receipt(tmp_path: Path) -> None:
+    from telethon.tl.types import DialogFilter, TextWithEntities, UpdateDialogFilter
+
+    from mcp_telegram.folders.sqlite_repository import encode_folder_definition
+
+    conn = _conn(tmp_path / "sync.db")
+    try:
+        repo = SQLiteFolderSnapshotRepository(conn)
+        repo.project_observation(_observation(FolderRule(4, "Old"), FolderRule(5, "Other")), completed_at=100)
+        with write_savepoint(conn):
+            conn.executemany(
+                "INSERT INTO folder_command_receipts(account_id,operation_key,dc_id,key_id,action,target,semantic_fingerprint,binding_revision,outcome,verification,dispatch_order,intended_definition,created_at,updated_at) VALUES (1,?,2,'3','update',?,'hash',1,'unknown','exhausted',1,?,1,1)",
+                [
+                    ("first", 4, encode_folder_definition(FolderRule(4, "New"))),
+                    ("second", 5, encode_folder_definition(FolderRule(5, "Other"))),
+                ],
+            )
+            native = DialogFilter(4, TextWithEntities("New", []), [], [], [])
+            assert repo.apply_supplied_update(
+                folder_update_from_native(UpdateDialogFilter(4, native)), account_id=1, order=2, now=101
+            )
+        assert conn.execute(
+            "SELECT operation_key,outcome,verification FROM folder_command_receipts ORDER BY operation_key"
+        ).fetchall() == [("first", "unknown", "matched"), ("second", "unknown", "exhausted")]
+    finally:
+        conn.close()
+
+
+def test_invalidated_facts_survive_local_reprojection(tmp_path: Path) -> None:
+    conn = _conn(tmp_path / "sync.db")
+    try:
+        repo = SQLiteFolderSnapshotRepository(conn)
+        repo.project_observation(_observation(FolderRule(4, "Retained")), completed_at=100)
+        with write_savepoint(conn):
+            repo.invalidate()
+        assert not repo.rules_are_fresh(now=101)
+        repo.reproject_current_rules(now=102)
+        assert read_folder_rules(conn)[0].title == "Retained"
+        assert not folder_snapshot(conn, stale_after_seconds=900, now=102)["complete"]
+    finally:
+        conn.close()
+
+
+def test_catalog_version_changes_for_semantic_aba_but_not_reobservation(tmp_path: Path) -> None:
+    conn = _conn(tmp_path / "sync.db")
+    try:
+        repo = SQLiteFolderSnapshotRepository(conn)
+        a = FolderRuleObservation((FolderRule(4, "A"),), "token-a", 100)
+        b = FolderRuleObservation((FolderRule(4, "B"),), "token-b", 101)
+        repo.project_observation(a, completed_at=100)
+        first = repo.read_catalog_version()
+        repo.project_observation(a, completed_at=101)
+        assert repo.read_catalog_version() == first
+        repo.project_observation(b, completed_at=102)
+        repo.project_observation(a, completed_at=103)
+        assert repo.read_catalog_version()[1] == first[1] + 2
+        with write_savepoint(conn):
+            repo.invalidate()
+        invalidated = repo.read_catalog_version()
+        assert not invalidated[3] and invalidated[1] == first[1] + 3
+        repo.reproject_current_rules(now=104)
+        assert repo.read_catalog_version() == invalidated
+    finally:
+        conn.close()
+
+
+def test_native_filter_and_chatlist_definitions_preserve_supported_fields() -> None:
+    from telethon.tl import types
+
+    from mcp_telegram.folders.sqlite_repository import decode_folder_definition, encode_folder_definition
+
+    peers = [types.InputPeerUser(23, 987654), types.InputPeerChannel(12, 876543), types.InputPeerChat(42)]
+    title = types.TextWithEntities("Hi🙂", [types.MessageEntityBold(0, 2), types.MessageEntityCustomEmoji(2, 2, 987)])
+    variants = [
+        types.DialogFilter(
+            4,
+            title,
+            peers[:1],
+            peers[1:],
+            peers[:1],
+            contacts=True,
+            non_contacts=True,
+            groups=True,
+            broadcasts=True,
+            bots=True,
+            exclude_muted=True,
+            exclude_read=True,
+            exclude_archived=True,
+            title_noanimate=True,
+            emoticon="📁",
+            color=4,
+        ),
+        types.DialogFilterChatlist(
+            5, title, peers[:1], peers[1:], has_my_invites=True, title_noanimate=True, emoticon="📁", color=3
+        ),
+    ]
+    for native in variants:
+        rule = folder_update_from_native(types.UpdateDialogFilter(native.id, native)).rule
+        assert rule is not None and rule.complete
+        definition = encode_folder_definition(rule)
+        assert decode_folder_definition(definition) == rule
+        assert "987654" not in definition and "876543" not in definition
+        assert rule.pinned_ids == (23,)
+        assert rule.included_ids == (-1000000000012, -42)
+        assert rule.title_noanimate and len(rule.title_entities) == 2
+    first = folder_update_from_native(types.UpdateDialogFilter(variants[0].id, variants[0])).rule
+    second = folder_update_from_native(types.UpdateDialogFilter(variants[1].id, variants[1])).rule
+    assert first is not None and first.excluded_ids == (23,)
+    assert second is not None and second.has_my_invites
 
 
 def test_three_valued_precedence_and_missing_explicit_peer() -> None:
@@ -72,7 +343,7 @@ def test_projection_retains_unknown_and_custom_pin_order(tmp_path: Path) -> None
         conn.close()
 
 
-def test_pending_rule_observation_is_preserved_without_catalog(tmp_path: Path) -> None:
+def test_unbound_observation_is_not_replayed_into_another_account(tmp_path: Path) -> None:
     conn = _conn(tmp_path / "sync.db")
     try:
         with write_savepoint(conn):
@@ -80,39 +351,14 @@ def test_pending_rule_observation_is_preserved_without_catalog(tmp_path: Path) -
                 "UPDATE dialog_directory_publication SET account_id=NULL,generation=NULL,observation_started_at=NULL WHERE singleton=1"
             )
         repo = SQLiteFolderSnapshotRepository(conn)
-        assert repo.project_observation(_observation(FolderRule(1, "A"), started_at=55), completed_at=56) is None
-        assert conn.execute("SELECT token,started_at FROM telegram_folder_pending_observation").fetchone() == (
-            "rule-token",
-            55,
-        )
-        assert repo.rules_are_fresh(now=954)
-        assert not repo.rules_are_fresh(now=955)
-    finally:
-        conn.close()
-
-
-def test_newer_pending_rule_replaces_older_rule_before_catalog_publication(tmp_path: Path) -> None:
-    conn = _conn(tmp_path / "sync.db")
-    try:
+        assert repo.project_observation(_observation(FolderRule(2, "Unbound")), completed_at=100) is None
         with write_savepoint(conn):
             conn.execute(
-                "UPDATE dialog_directory_publication SET account_id=NULL,generation=NULL,observation_started_at=NULL WHERE singleton=1"
+                "UPDATE dialog_directory_publication SET account_id=2,generation=8,observation_started_at=101 WHERE singleton=1"
             )
-        repo = SQLiteFolderSnapshotRepository(conn)
-        first = FolderRuleObservation((FolderRule(1, "Old"),), "old", 55)
-        second = FolderRuleObservation((FolderRule(2, "New"),), "new", 70)
-        assert repo.project_observation(first, completed_at=56) is None
-        assert repo.project_observation(second, completed_at=71) is None
-        assert conn.execute("SELECT token,started_at FROM telegram_folder_pending_observation").fetchone() == (
-            "new",
-            70,
-        )
-        with write_savepoint(conn):
-            conn.execute(
-                "UPDATE dialog_directory_publication SET account_id=1,generation=8,observation_started_at=80 WHERE singleton=1"
-            )
-        assert repo.reproject_current_rules(now=81) == 8
-        assert conn.execute("SELECT folder_id,title FROM telegram_folder_rules").fetchall() == [(2, "New")]
+        assert repo.reproject_current_rules(now=102) is None
+        assert read_folder_rules(conn) == ()
+        assert repo.read_last_success_at() is None
     finally:
         conn.close()
 

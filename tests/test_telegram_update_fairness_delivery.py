@@ -220,3 +220,34 @@ async def test_continuous_input_allows_claim_and_then_next_persisted_message(del
         assert _safe(delivery.path).pts == 12
     finally:
         await _stop(loop)
+
+
+async def test_native_fences_advance_before_delivery_admission_wait(
+    delivery: _Delivery, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mcp_telegram.contact_notes.intake import is_current, track_contact_note
+    from mcp_telegram.folders.intake import marker
+
+    gate = delivery.wire[0]
+    repository = gate._delivery_repository
+    assert repository is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def block_admission(*_args: object) -> object:
+        entered.set()
+        await release.wait()
+        raise RuntimeError("test admission stopped")
+
+    monkeypatch.setattr(repository, "admit", block_admission)
+    before = marker()
+    with track_contact_note(55) as note_marker:
+        task = asyncio.create_task(
+            gate._preprocess_updates([types.UpdateDialogFilters(), types.UpdateUser(55)], [], [])
+        )
+        await entered.wait()
+        assert marker() > before
+        assert not is_current(55, note_marker)
+        release.set()
+        with pytest.raises(RuntimeError, match="test admission stopped"):
+            await task

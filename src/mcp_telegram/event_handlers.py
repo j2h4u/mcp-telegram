@@ -47,6 +47,9 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     UpdateChat,
     UpdateChatParticipant,
     UpdateDeleteScheduledMessages,
+    UpdateDialogFilter,
+    UpdateDialogFilterOrder,
+    UpdateDialogFilters,
     UpdateDialogPinned,
     UpdateDialogUnreadMark,
     UpdateMessageReactions,
@@ -67,12 +70,14 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .access_lifecycle import AccessLossEvidence, AccessLossResult, set_access_lost, unhide_after_realtime_presence
+from .auth_scope import TelegramAuthScope
 from .channel_full_siblings import (
     ChannelFullSiblingsToken,
     capture_channel_full_siblings_token,
     write_channel_full_siblings,
 )
 from .delivered_update import (
+    DeliveredUpdate,
     current_delivered_update,
     delivered_observed_at,
     fail_delivered_update,
@@ -108,7 +113,9 @@ from .entity_profile.updates import (
 )
 from .entity_store import PartialEntityIdentity, apply_partial_entity_identity
 from .flood import TelegramRpcThrottled
+from .folders.contracts import FolderRuleUpdate
 from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
+from .folders.telegram_adapter import folder_update_from_native
 from .history_enrollment import EnrollmentOutcome, ensure_automatic_dm_enrollment, full_history_enabled
 from .hydration_queue import HydrationPriority
 from .identity_observation import USERNAME_UNOBSERVED, observe_username
@@ -184,6 +191,10 @@ from .topics.sqlite_repository import SQLiteTopicMetadataRepository
 from .unread_state import apply_unread_facts
 
 logger = logging.getLogger(__name__)
+
+
+class _DeliveredAuthorizationChangedError(RuntimeError):
+    """The admitted delivery no longer has its current account authority."""
 
 
 def _rpc_scope[**P, R](
@@ -973,7 +984,7 @@ class EventHandlerManager:
                     observed_at,
                 ),
             )
-            if identity is not None:
+            if identity is not None and self._delivery_auth_available():
                 self._publish_dm_identity(
                     conn,
                     identity,
@@ -1027,6 +1038,8 @@ class EventHandlerManager:
     ) -> None:
         try:
             with write_transaction(conn):
+                if not self._delivery_auth_available():
+                    return
                 retained = current_delivered_update()
                 newer_fields = (
                     frozenset()
@@ -1045,6 +1058,8 @@ class EventHandlerManager:
                         username=identity.username,
                     ),
                 )
+        except _DeliveredAuthorizationChangedError:
+            raise
         except Exception:
             # Entity enrichment is optional after the mandatory dialog snapshot
             # has committed; the next refresh can fill a failed cache write.
@@ -1112,6 +1127,8 @@ class EventHandlerManager:
             return
         try:
             await self._persist_profile_pushes(sender=sender)
+        except _DeliveredAuthorizationChangedError:
+            raise
         except Exception:
             logger.exception("dm_auto_enroll_profile_failed dialog_id=%d", dialog_id)
 
@@ -2523,6 +2540,8 @@ class EventHandlerManager:
         owner = self._self_id
         if owner is None:
             return False, False, False
+        if not self._delivery_auth_available():
+            return self._request_unattributed_profile_refresh(conn, update, users, topic_entities)
         profiles = EntityProfileRepository(conn, section_ttl_seconds=self._profile_detail_ttl_seconds)
         annotations: list[tuple[object, ProfileFieldObservation]] = []
         handled_name = False
@@ -2697,6 +2716,14 @@ class EventHandlerManager:
     async def on_raw_identity_or_notify(self, update: object) -> None:
         """Materialize supplied profile facts and exact notification mute deadlines."""
         try:
+            if (
+                isinstance(update, (UpdateDialogFilter, UpdateDialogFilterOrder, UpdateDialogFilters))
+                and self._self_id is not None
+            ):
+                normalized = folder_update_from_native(update)
+                await self._writer.run(lambda conn: self._write_folder_update(conn, normalized))
+                self._offer(DemandKind.FOLDER_SNAPSHOT)
+                return
             handled_name = await self._persist_profile_pushes(update=update)
             if not isinstance(update, (UpdateUserName, UpdateNotifySettings)) or handled_name:
                 return
@@ -2706,6 +2733,65 @@ class EventHandlerManager:
         except Exception:
             fail_delivered_update()
             logger.exception("event_identity_or_notify_failed update=%r", type(update).__name__)
+
+    def _write_folder_update(self, conn: sqlite3.Connection, update: FolderRuleUpdate) -> None:
+        available = self._delivery_auth_available()
+        with write_transaction(conn):
+            repository = SQLiteFolderSnapshotRepository(conn)
+            if not available or not repository.apply_supplied_update(
+                update,
+                account_id=cast(int, self._self_id),
+                order=delivered_observation_order(conn),
+                now=delivered_observed_at(),
+            ):
+                repository.invalidate()
+
+    def _delivery_auth_available(self) -> bool:
+        delivery = current_delivered_update()
+        if delivery is None:
+            return True
+        scope_reader = getattr(self._client, "retained_auth_scope", None)
+        current = scope_reader() if callable(scope_reader) else None
+        if not isinstance(current, TelegramAuthScope) or current.account_id != self._self_id:
+            raise _DeliveredAuthorizationChangedError("delivered update authorization changed before publication")
+        self._claim_delivery_scope(delivery)
+        if delivery.auth_scope is not None and delivery.auth_scope.account_id != self._self_id:
+            raise _DeliveredAuthorizationChangedError("delivered update account mismatch")
+        return delivery.auth_scope is not None and delivery.auth_scope == current
+
+    def _claim_delivery_scope(self, delivery: DeliveredUpdate) -> None:
+        token_claim = getattr(self._client, "claim_image_scope", None)
+        if not callable(token_claim) or delivery.scope_token is None or not token_claim(delivery.scope_token):
+            raise _DeliveredAuthorizationChangedError("delivered update authorization changed before publication")
+
+    def _request_unattributed_profile_refresh(
+        self, conn: sqlite3.Connection, update: object, users: Sequence[object], topic_entities: Sequence[object]
+    ) -> tuple[bool, bool, bool]:
+        profiles = EntityProfileRepository(conn, section_ttl_seconds=self._profile_detail_ttl_seconds)
+        pushes = [(user, project_user_profile(user)) for user in users]
+        pushes.append((update, project_profile_update(update)))
+        offered = False
+        with write_transaction(conn):
+            for source, push in pushes:
+                if push is not None and self._eligible_profile_push(conn, push):
+                    sections = set(
+                        self._owned_profile_push_sections(
+                            cast(int, self._self_id), push.entity_id, source, frozenset(push.fields)
+                        )
+                    )
+                    sections.update(("full_profile", "personal_channel"))
+                    offered |= profiles.request_section_refresh(
+                        push.entity_id,
+                        tuple(sorted(sections)),
+                        now=delivered_observed_at(),
+                        pair_mode=None,
+                        reason="delivery_authorization_unavailable",
+                    )
+            for entity in topic_entities:
+                TopicCatalogRepository(conn).request(
+                    int(get_peer_id(cast(TypePeer, entity))), "delivery_authorization_unavailable"
+                )
+        return offered, isinstance(update, UpdateUserName), bool(topic_entities)
 
     def _topic_capability_entities(self, update: object, sender: object) -> tuple[object, ...]:
         entities: object = getattr(update, "_entities", None)

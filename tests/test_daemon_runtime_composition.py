@@ -67,6 +67,7 @@ async def test_daemon_runtime_binds_gate_and_verified_account_to_real_local_seed
             topic_refresher=None,
             message_fact_refresh_policy=dependencies.message_fact_refresh_policy,
             folder_projection_worker=dependencies.folder_projection_worker,
+            folder_command_owner=None,
             fact_hydration_worker=MessageFactHydrationWorker(
                 client,
                 dependencies.conn,

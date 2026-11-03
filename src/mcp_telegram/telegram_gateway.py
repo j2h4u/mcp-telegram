@@ -9,12 +9,13 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Protocol, cast
 
-from telethon.errors import ChatAdminRequiredError, RPCError  # type: ignore[import-untyped]
+from telethon.errors import ChatAdminRequiredError, MethodInvalidError, RPCError  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
 from telethon.tl.functions.channels import (  # type: ignore[import-untyped]
     GetFullChannelRequest,
     GetParticipantsRequest,
 )
+from telethon.tl.functions.help import GetAppConfigRequest  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import (
     GetCommonChatsRequest,
     GetFullChatRequest,  # type: ignore[import-untyped]
@@ -381,8 +382,42 @@ class TelethonUserProfileGateway(UserProfilePort):
             return None
         return _user_reference_from_peer(_session_entity(self._client, user_id), user_id, is_self=is_self)
 
+    async def fetch_contact_note_limit(self, config_hash: int = 0) -> tuple[int, int | None]:
+        """Read one native configuration snapshot; None preserves a previous value."""
+        try:
+            result = await self._client(GetAppConfigRequest(hash=config_hash))
+        except MethodInvalidError:
+            return config_hash, None
+        if isinstance(result, types.help.AppConfigNotModified):
+            return config_hash, None
+        if not isinstance(result, types.help.AppConfig):
+            return 0, 128
+        config = result.config
+        if isinstance(config, types.JsonObject):
+            for entry in config.value:
+                if entry.key == "contact_note_length_limit" and isinstance(entry.value, types.JsonNumber):
+                    value = entry.value.value
+                    if value > 0 and value.is_integer():
+                        return result.hash, int(value)
+        return result.hash, 128
+
     async def fetch_user_profile(
         self, user_id: int, target_kind: TargetKind, *, owner_account_id: int | None = None
+    ) -> UserProfileObservation:
+        target = types.InputUserSelf() if owner_account_id is not None and user_id == owner_account_id else user_id
+        return await self._fetch_user_profile(target, user_id, target_kind, owner_account_id)
+
+    async def fetch_command_user_profile(
+        self, reference: UserReference, target_kind: TargetKind, *, owner_account_id: int
+    ) -> UserProfileObservation:
+        _validate_user_reference(reference)
+        if reference.is_self:
+            raise ValueError("contact-note commands cannot target self")
+        target = types.InputUser(reference.user_id, reference.access_hash)
+        return await self._fetch_user_profile(target, reference.user_id, target_kind, owner_account_id)
+
+    async def _fetch_user_profile(
+        self, target: object, user_id: int, target_kind: TargetKind, owner_account_id: int | None
     ) -> UserProfileObservation:
         if not isinstance(user_id, int) or isinstance(user_id, bool) or user_id <= 0:
             raise ValueError("user target id must be a positive integer")
@@ -391,7 +426,6 @@ class TelethonUserProfileGateway(UserProfilePort):
         except (TypeError, ValueError) as exc:
             raise ValueError("user target kind must be 'user' or 'bot'") from exc
         started_at = self._now_provider()
-        target = types.InputUserSelf() if owner_account_id is not None and user_id == owner_account_id else user_id
         result = await self._client(GetFullUserRequest(id=cast(TypeInputUser, target)))
         completed_at = self._now_provider()
         observation = normalize_full_user_response(

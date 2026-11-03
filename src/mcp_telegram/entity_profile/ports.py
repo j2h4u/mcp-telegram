@@ -64,6 +64,14 @@ class UserProfilePort(Protocol):
     ) -> UserProfileObservation: ...
 
 
+class CommandUserProfilePort(UserProfilePort, Protocol):
+    """Acquire a command profile using a retained local user capability."""
+
+    async def fetch_command_user_profile(
+        self, reference: UserReference, target_kind: TargetKind, *, owner_account_id: int
+    ) -> UserProfileObservation: ...
+
+
 class ProfileCollectionPort(Protocol):
     """One classified collection request; the daemon owns continuation."""
 

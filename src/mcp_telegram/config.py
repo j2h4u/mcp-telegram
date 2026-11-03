@@ -170,7 +170,7 @@ class RuntimeObservationConfig:
     queue_capacity: int = 1_024
     writer_startup_wait_seconds: float = 1.0
     shutdown_drain_grace_seconds: float = 2.0
-    row_cap: int = 300_000
+    row_cap: int = 310_000
     rpc_summary_interval_seconds: float = 300.0
 
     def __post_init__(self) -> None:
@@ -393,8 +393,7 @@ class SchedulingConfig:
     read_position_reconciliation_batch_pause_seconds: float = 1.5
     reconciliation_hourly_seconds: float = 3_600.0
     reconnect_catch_up_interval_seconds: float = 5.0
-    access_probe_interval_seconds: float = 86_400.0
-    access_probe_max_dialogs_per_cycle: int = 3
+    access_probe_enabled: bool = True
     access_probe_cooldown_seconds: int = 604_800
     message_fact_refresh_reaction_max_messages_per_cycle: int = 5
     reaction_detail_max_pages_per_cycle: int = 5
@@ -726,12 +725,8 @@ def resolve_scheduling_config(
         reconnect_catch_up_interval_seconds=_env_positive_float(
             env, "RECONNECT_CATCH_UP_INTERVAL_SECONDS", config.reconnect_catch_up_interval_seconds
         ),
-        access_probe_interval_seconds=_env_positive_float(
-            env, "ACCESS_PROBE_INTERVAL_SECONDS", config.access_probe_interval_seconds
-        ),
-        access_probe_max_dialogs_per_cycle=_env_non_negative_int(
-            env, "ACCESS_PROBE_MAX_DIALOGS_PER_CYCLE", config.access_probe_max_dialogs_per_cycle
-        ),
+        access_probe_enabled=env.get("ACCESS_PROBE_ENABLED", str(config.access_probe_enabled)).strip().lower()
+        in {"1", "true", "yes", "on"},
         access_probe_cooldown_seconds=_env_non_negative_int(
             env, "ACCESS_PROBE_COOLDOWN_SECONDS", config.access_probe_cooldown_seconds
         ),
@@ -1530,8 +1525,7 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         "read_position_reconciliation_batch_pause_seconds",
         "reconciliation_hourly_seconds",
         "reconnect_catch_up_interval_seconds",
-        "access_probe_interval_seconds",
-        "access_probe_max_dialogs_per_cycle",
+        "access_probe_enabled",
         "access_probe_cooldown_seconds",
         "message_fact_refresh_reaction_max_messages_per_cycle",
         "reaction_detail_max_pages_per_cycle",
@@ -1613,19 +1607,8 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             path,
             defaults.reconnect_catch_up_interval_seconds,
         ),
-        access_probe_interval_seconds=_positive_float(
-            scheduling_data,
-            "access_probe_interval_seconds",
-            "scheduling",
-            path,
-            defaults.access_probe_interval_seconds,
-        ),
-        access_probe_max_dialogs_per_cycle=_non_negative_int(
-            scheduling_data,
-            "access_probe_max_dialogs_per_cycle",
-            "scheduling",
-            path,
-            defaults.access_probe_max_dialogs_per_cycle,
+        access_probe_enabled=_bool(
+            scheduling_data, "access_probe_enabled", "scheduling", path, defaults.access_probe_enabled
         ),
         access_probe_cooldown_seconds=_non_negative_int(
             scheduling_data,

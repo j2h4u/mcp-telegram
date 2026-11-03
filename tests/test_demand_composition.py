@@ -124,6 +124,15 @@ class _IdleFolderRepository(FolderSnapshotRepository):
     def read_snapshot_revision(self) -> tuple[int | None, int | None, str | None, int | None] | None:
         return None
 
+    def read_catalog_identity(self) -> tuple[int, int, int] | None:
+        return None
+
+    def read_observation_order(self) -> int:
+        return 0
+
+    def refine_receipts(self, observation: FolderRuleObservation, *, account_id: int, order: int) -> None:
+        pass
+
     def rules_are_fresh(self, *, now: int) -> bool:
         del now
         return False

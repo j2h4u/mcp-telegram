@@ -91,6 +91,14 @@ async def test_folder_refresh_and_retry_use_writer(storage: tuple[sqlite3.Connec
     assert repository.read_last_outcome() == "source_unavailable"
     assert repository.read_consecutive_failures() == 1
     gateway.fail = False
+
+    def seed_catalog(conn: sqlite3.Connection) -> None:
+        with write_transaction(conn):
+            conn.execute(
+                "UPDATE dialog_directory_publication SET account_id=1,generation=1,observation_started_at=1 WHERE singleton=1"
+            )
+
+    await writer.run(seed_catalog)
     await refresher.refresh(completed_at=1002)
     await refresher.reproject_current_rules(now=1003)
     assert repository.read_last_success_at() == 1002

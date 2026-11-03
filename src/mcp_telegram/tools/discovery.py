@@ -61,6 +61,8 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
         "view": {"type": "string", "enum": ["dialogs", "folders"]},
+        "account_id": {"type": "integer"},
+        "catalog_version": {"type": ["string", "null"]},
         "dialogs": {
             "type": "array",
             "items": {
@@ -640,7 +642,7 @@ def _strict_list_dialogs_data(
 
 def _strict_folder_summaries(
     response: Mapping[str, object],
-) -> tuple[list[_FolderSummarySurface], _FolderSnapshotSurface, dict[str, object]]:
+) -> tuple[list[_FolderSummarySurface], _FolderSnapshotSurface, dict[str, object], int, str | None]:
     raw_data = response.get("data")
     if not isinstance(raw_data, Mapping):
         raise SyncReadModelContractError("data must be an object")
@@ -677,6 +679,8 @@ def _strict_folder_summaries(
             _required(raw_data, "directory_coverage", context="list_folders"),
             context="directory_coverage",
         ),
+        _strict_int(raw_data, "account_id", context="list_folders"),
+        _strict_optional_string(raw_data, "catalog_version", context="list_folders"),
     )
 
 
@@ -924,7 +928,7 @@ def _directory_navigation_output(surface: _ListDialogsSurface) -> dict[str, obje
 
 def _folder_view_result(args: ListDialogs, response: Mapping[str, object]) -> ToolResult:
     try:
-        folders, snapshot, directory_coverage = _strict_folder_summaries(response)
+        folders, snapshot, directory_coverage, account_id, catalog_version = _strict_folder_summaries(response)
     except SyncReadModelContractError as exc:
         return _list_dialogs_contract_error(str(exc))
     warnings: list[StructuredWarning] = []
@@ -958,6 +962,8 @@ def _folder_view_result(args: ListDialogs, response: Mapping[str, object]) -> To
     return structured_result(
         {
             "view": "folders",
+            "account_id": account_id,
+            "catalog_version": catalog_version,
             "dialogs": [],
             "folders": structured_folders,
             "count": len(structured_folders),

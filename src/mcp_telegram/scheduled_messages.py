@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, cast
 
-from telethon.errors import ChatAdminRequiredError, RPCError  # type: ignore[import-untyped]
+from telethon.errors import ChatAdminRequiredError, RPCError, rpc_errors_dict  # type: ignore[import-untyped]
 from telethon.tl.types import Message as TelegramMessage  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
@@ -43,6 +43,7 @@ from .telegram_demand import (
 from .telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkKey, WorkRevision
 from .telegram_gateway import ScheduledHistoryClient, fetch_scheduled_history_snapshot
 from .telegram_rpc_consumers import DemandKind
+from .telegram_rpc_error import describe_telegram_rpc_error
 from .telegram_rpc_scheduler import (
     TelegramRpcAdmissionDeferred,
     TelegramRpcMethodRecoveryPending,
@@ -63,6 +64,52 @@ _INSERT_SCHEDULED_FTS_SQL = "INSERT INTO scheduled_messages_fts(dialog_id, messa
 class ScheduledReconciliationPolicy:
     activity_rpc_timeout_seconds: float
     max_dialogs_per_slice: int = 8
+
+
+@dataclass(frozen=True, slots=True)
+class _SnapshotAttempt:
+    dialog_id: int
+    generation: int
+    discovery: bool
+    owner: int | None
+    order: int
+    repair_due: int | None
+    discovery_due: int | None
+
+
+def _failure_identity(exc: RPCError) -> tuple[str, str, int | None, str | None, int]:
+    identity = describe_telegram_rpc_error(exc)
+    symbol = identity.symbol if identity.symbol in rpc_errors_dict else None
+    if isinstance(exc, ACCESS_LOST_ERRORS):
+        category = "access_lost"
+    elif isinstance(exc, ChatAdminRequiredError) or symbol == "CHAT_ADMIN_REQUIRED":
+        category = "admin_required"
+    elif symbol == "PEER_ID_INVALID":
+        category = "invalid_target"
+    elif identity.code is not None and identity.code >= 500:  # noqa: PLR2004
+        category = "server_error"
+    else:
+        category = "unknown_rpc"
+    return category, identity.error_type, identity.code, symbol, 30 if category == "server_error" else 86400
+
+
+def _attempt_current(conn: sqlite3.Connection, attempt: _SnapshotAttempt) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM scheduled_reconciliation_state r JOIN scheduled_sync_state s ON s.key='account' "
+            "WHERE r.dialog_id=? AND r.dirty_generation=? AND r.repair_due_at IS ? AND r.discovery_due_at IS ? "
+            "AND COALESCE(r.snapshot_observation_order,0)<? AND s.account_id IS ? AND " + _scheduled_available_sql("r"),
+            (
+                attempt.dialog_id,
+                attempt.generation,
+                attempt.repair_due,
+                attempt.discovery_due,
+                attempt.order,
+                attempt.owner,
+            ),
+        ).fetchone()
+        is not None
+    )
 
 
 def _as_int(value: object) -> int:
@@ -94,11 +141,15 @@ def _mark_scheduled_dialog_dirty(
             dirty_generation, updated_at, coverage_state, coverage_reason
         ) VALUES (?, NULL, ?, ?, 1, ?, 'unknown', 'baseline_unknown')
         ON CONFLICT(dialog_id) DO UPDATE SET
-            discovery_due_at = CASE WHEN coverage_state IN ('unknown','inaccessible','unsupported')
+            repair_due_at = CASE WHEN coverage_reason LIKE 'scheduled_failure:%' AND repair_due_at IS NOT NULL
+                THEN excluded.discovery_due_at ELSE repair_due_at END,
+            discovery_due_at = CASE WHEN coverage_reason LIKE 'scheduled_failure:%' AND repair_due_at IS NULL
+                THEN excluded.discovery_due_at WHEN coverage_state IN ('unknown','inaccessible','unsupported')
                 THEN COALESCE(discovery_due_at, excluded.discovery_due_at) ELSE discovery_due_at END,
             coverage_state = CASE WHEN coverage_state IN ('inaccessible','unsupported')
                 THEN 'unknown' ELSE coverage_state END,
-            coverage_reason = CASE WHEN coverage_state IN ('inaccessible','unsupported')
+            coverage_reason = CASE WHEN coverage_reason LIKE 'scheduled_failure:%'
+                THEN 'scheduled_event_after_failure' WHEN coverage_state IN ('inaccessible','unsupported')
                 THEN 'scheduled_event_after_terminal_coverage' ELSE coverage_reason END,
             dirty_since = COALESCE(dirty_since, excluded.dirty_since),
             dirty_generation = dirty_generation + 1,
@@ -849,106 +900,117 @@ class ScheduledMessageReconciler:
         generation: int,
         observation_order: int | None = None,
         owner: int | None = None,
+        attempt: _SnapshotAttempt | None = None,
     ) -> tuple[list[object] | None, bool, str | None]:
-        del discovery
+        del discovery, now, generation, observation_order, owner
         try:
             return await self._fetch_scheduled_snapshot(dialog_id), False, None
         except TelegramRpcAdmissionDeferred:
             raise
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
+            logger.warning("scheduled_reconcile_flood_wait dialog_id=%d", dialog_id)
+            raise
+        except RPCError as exc:
+            return None, False, await self._handle_rpc_failure(dialog_id, attempt, exc)
+        except ValueError:
             logger.warning(
-                "scheduled_reconcile_flood_wait dialog_id=%d — stopping account pass",
+                "scheduled_reconcile_incomplete_snapshot dialog_id=%d category=incomplete_snapshot error_type=ValueError",
                 dialog_id,
             )
-            raise
-        except ChatAdminRequiredError:
-            blocked = await self._block_admin_required(dialog_id, generation, now)
-            return None, False, f"blocked:{generation + 1}" if blocked else None
-        except RPCError as exc:
-            logger.warning("scheduled_reconcile_rpc_error dialog_id=%d error_type=%s", dialog_id, type(exc).__name__)
-            if isinstance(exc, ACCESS_LOST_ERRORS):
-                await self._mark_inaccessible(
-                    dialog_id,
-                    generation=generation,
-                    now=int(time.time()),
-                    reason=type(exc).__name__,
-                    observation_order=observation_order,
-                    owner=owner,
-                )
-            return None, False, None
-        except ValueError as exc:
-            logger.warning("scheduled_reconcile_incomplete_snapshot dialog_id=%d error=%s", dialog_id, exc)
+            if attempt is not None:
+                await self._record_incomplete_snapshot(attempt, int(time.time()))
             return None, False, None
 
-    async def _block_admin_required(self, dialog_id: int, generation: int, now: int) -> bool:
-        def persist(conn: sqlite3.Connection) -> bool:
-            with write_transaction(conn):
-                cursor = conn.execute(
-                    f"UPDATE scheduled_reconciliation_state SET acquisition_block='admin_required', "
-                    f"dirty_generation=dirty_generation+1,updated_at=? WHERE dialog_id=? AND dirty_generation=? "
-                    f"AND {_scheduled_available_sql('scheduled_reconciliation_state')}",
-                    (now, dialog_id, generation),
-                )
-                if cursor.rowcount:
-                    _invalidate_scheduled_target(self._mutation_fence, self._verified_account_id, dialog_id)
-                return cursor.rowcount > 0
+    async def _handle_rpc_failure(self, dialog_id: int, attempt: _SnapshotAttempt | None, exc: RPCError) -> str | None:
+        category, error_type, code, symbol, delay = _failure_identity(exc)
+        logger.warning(
+            "scheduled_reconcile_rpc_error dialog_id=%d category=%s error_type=%s code=%s symbol=%s",
+            dialog_id,
+            category,
+            error_type,
+            code,
+            symbol,
+        )
+        if attempt is None:
+            return None
+        completed = int(time.time())
+        if isinstance(exc, ACCESS_LOST_ERRORS):
+            accepted = await self._mark_inaccessible(attempt, completed, error_type)
+            return "blocked" if accepted else "stale"
+        reason = f"scheduled_failure:{category}:{error_type}:{code or 0}:{symbol or '-'}"
+        if category == "admin_required":
+            accepted = await self._block_admin_required(attempt, completed, reason)
+            return "blocked" if accepted else "stale"
+        accepted = await self._record_snapshot_failure(attempt, completed, reason, delay)
+        return "retry" if accepted else "stale"
 
-        return await self._writer.run(persist)
-
-    async def _record_snapshot_failure(self, dialog_id: int, generation: int, now: int, reason: str) -> None:
+    async def _record_incomplete_snapshot(self, attempt: _SnapshotAttempt, now: int) -> None:
         def persist(conn: sqlite3.Connection) -> None:
             with write_transaction(conn):
-                conn.execute(
-                    "UPDATE scheduled_reconciliation_state SET coverage_reason=?,updated_at=? "
-                    f"WHERE dialog_id=? AND dirty_generation=? AND {_scheduled_available_sql('scheduled_reconciliation_state')} "
-                    "AND coverage_state NOT IN ('inaccessible','unsupported')",
-                    (reason, now, dialog_id, generation),
-                )
+                if _attempt_current(conn, attempt):
+                    conn.execute(
+                        "UPDATE scheduled_reconciliation_state SET coverage_reason='incomplete_snapshot:ValueError',updated_at=? WHERE dialog_id=?",
+                        (now, attempt.dialog_id),
+                    )
 
         await self._writer.run(persist)
 
-    async def _mark_inaccessible(  # noqa: PLR0913
-        self,
-        dialog_id: int,
-        *,
-        generation: int,
-        now: int,
-        reason: str,
-        observation_order: int | None,
-        owner: int | None,
-    ) -> None:
-        def persist(conn: sqlite3.Connection) -> MembershipSignalCounts | None:
+    async def _block_admin_required(self, attempt: _SnapshotAttempt, now: int, reason: str) -> bool:
+        def persist(conn: sqlite3.Connection) -> bool:
             with write_transaction(conn):
-                current = cast(
-                    tuple[object] | None,
-                    conn.execute(
-                        f"SELECT 1 FROM scheduled_reconciliation_state WHERE dialog_id=? AND dirty_generation=? AND {_scheduled_available_sql('scheduled_reconciliation_state')}",
-                        (dialog_id, generation),
-                    ).fetchone(),
+                if not _attempt_current(conn, attempt):
+                    return False
+                conn.execute(
+                    "UPDATE scheduled_reconciliation_state SET acquisition_block='admin_required', "
+                    "coverage_reason=?,dirty_generation=dirty_generation+1,updated_at=? WHERE dialog_id=?",
+                    (reason, now, attempt.dialog_id),
                 )
-                if current is None:
-                    return None
+                _invalidate_scheduled_target(self._mutation_fence, attempt.owner, attempt.dialog_id)
+                return True
+
+        return await self._writer.run(persist)
+
+    async def _record_snapshot_failure(self, attempt: _SnapshotAttempt, now: int, reason: str, delay: int) -> bool:
+        def persist(conn: sqlite3.Connection) -> bool:
+            with write_transaction(conn):
+                if not _attempt_current(conn, attempt):
+                    return False
+                column = "discovery_due_at" if attempt.discovery else "repair_due_at"
+                conn.execute(
+                    f"UPDATE scheduled_reconciliation_state SET {column}=?,coverage_reason=?,updated_at=? WHERE dialog_id=?",
+                    (now + delay, reason, now, attempt.dialog_id),
+                )
+                return True
+
+        return await self._writer.run(persist)
+
+    async def _mark_inaccessible(self, attempt: _SnapshotAttempt, now: int, reason: str) -> bool:
+        def persist(conn: sqlite3.Connection) -> tuple[bool, MembershipSignalCounts | None]:
+            with write_transaction(conn):
+                if not _attempt_current(conn, attempt):
+                    return False, None
                 result = set_access_lost(
                     conn,
-                    dialog_id,
+                    attempt.dialog_id,
                     now,
                     reason=reason,
-                    profile_owner_account_id=owner,
-                    observation_order=observation_order,
+                    profile_owner_account_id=self._verified_account_id,
+                    observation_order=attempt.order,
                     membership_revision_at=now,
-                    processing_at=int(time.time()),
+                    processing_at=now,
                 )
                 if result.changed:
-                    _invalidate_scheduled_target(self._mutation_fence, owner, dialog_id)
-                return result.membership_counts
+                    _invalidate_scheduled_target(self._mutation_fence, attempt.owner, attempt.dialog_id)
+                return result.changed, result.membership_counts
 
-        counts = await self._writer.run(persist)
+        accepted, counts = await self._writer.run(persist)
         if counts is not None and self._access_loss_observer is not None:
             try:
                 self._access_loss_observer(counts)
             except Exception:  # noqa: BLE001
                 logger.debug("access_loss_observer_failed")
+        return accepted
 
     async def invalidate_continuity(self, dialog_id: int | None, reason: str = "difference_too_long") -> None:
         """Schedule bounded snapshots only after Telegram reports an unrecoverable update gap."""
@@ -991,23 +1053,39 @@ class ScheduledMessageReconciler:
             outcome = await self._prepare_discovery(dialog_id, now)
             if outcome is not None:
                 return outcome[0], outcome[1], None
-        current = cast(
-            tuple[object] | None,
-            self._conn.execute(
-                f"SELECT 1 FROM scheduled_reconciliation_state WHERE dialog_id=? AND dirty_generation=? AND {_scheduled_available_sql('scheduled_reconciliation_state')}",
-                (dialog_id, generation),
-            ).fetchone(),
-        )
-        if current is None:
-            return 0, False, None
-        observation_order = await self._writer.run(allocate_observation_order)
-        owner = self._verified_account_id
+
+        def capture(conn: sqlite3.Connection) -> _SnapshotAttempt | None:
+            with write_transaction(conn):
+                row = cast(
+                    tuple[int | None, int | None, int | None] | None,
+                    conn.execute(
+                        f"SELECT r.repair_due_at,r.discovery_due_at,s.account_id FROM scheduled_reconciliation_state r "
+                        f"JOIN scheduled_sync_state s ON s.key='account' WHERE r.dialog_id=? AND r.dirty_generation=? "
+                        f"AND {_scheduled_available_sql('r')}",
+                        (dialog_id, generation),
+                    ).fetchone(),
+                )
+                if row is None:
+                    return None
+                due = row[1] if discovery and row[0] is None else row[0] if not discovery else None
+                if (
+                    due is None
+                    or due > int(time.time())
+                    or (self._verified_account_id is not None and row[2] != self._verified_account_id)
+                ):
+                    return None
+                return _SnapshotAttempt(
+                    dialog_id, generation, discovery, row[2], allocate_observation_order(conn), row[0], row[1]
+                )
+
+        attempt = await self._writer.run(capture)
+        if attempt is None:
+            return 0, False, "stale"
+        observation_order = attempt.order
         snapshot, stopped, failure_receipt = await self._fetch_snapshot_or_stop(
-            dialog_id, discovery, now, generation, observation_order, owner
+            dialog_id, discovery, now, generation, observation_order, attempt.owner, attempt
         )
         if snapshot is None:
-            if failure_receipt is None:
-                await self._record_snapshot_failure(dialog_id, generation, now, "rpc_error")
             return 0, stopped, failure_receipt
         receipt = await self._apply_snapshot(
             dialog_id, generation, snapshot, discovery=discovery, now=now, observation_order=observation_order
@@ -1314,6 +1392,10 @@ class _ScheduledDemandAdapter(DurableDemandAdapter):
                     raise
                 except RpcAttemptBudgetExhaustedError:
                     return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        if committed_revision == "retry":
+            return SliceOutcome(selected, SliceOutcomeKind.RETRYABLE_FAILURE)
+        if committed_revision == "stale":
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
         if committed_revision is not None:
             return SliceOutcome(selected, SliceOutcomeKind.PROGRESSED, committed_revision)
         return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)

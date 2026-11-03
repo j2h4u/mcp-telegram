@@ -160,6 +160,8 @@ MCP serving code uses daemon APIs and read-only DB access for lightweight querie
 - `_base.py` — `ToolArgs`, `ToolResult`, `@mcp_tool`, `TOOL_REGISTRY`, `daemon_connection`, telemetry
 - `activity.py` — `get_my_recent_activity`
 - `discovery.py` — `list_dialogs`, `list_topics`
+- `folders.py` — `get_folder`, `manage_folder`
+- `contact_notes.py` — `manage_contact_note`
 - `entity_info.py` — `get_entity_info` (universal entity inspector: User/Bot/Channel/Supergroup/LegacyChat)
 - `feedback.py` — `submit_feedback` (write tool — agents report bugs/suggestions)
 - `account_trace.py` — `trace_account_messages` (observable authored-message evidence by account)
@@ -169,7 +171,7 @@ MCP serving code uses daemon APIs and read-only DB access for lightweight querie
 - `unread.py` — `get_inbox`, `get_unread_summary`
 - `conversation_changes.py` — `list_conversation_changes`
 
-Canonical tool registry: `tools/__init__.py`. Total: 20 MCP tools.
+Canonical tool registry: `tools/__init__.py`. Total: 23 MCP tools.
 All registered tools expose `outputSchema`. Successful MCP tool calls put agent-facing data in `structuredContent` and return empty
 `content`, except `get_message_image`, which returns one native JPEG image when available. Text rendering belongs to non-MCP surfaces such as a future CLI.
 Recoverable tool errors still use `isError=true` with concise text and an Action hint.
@@ -181,7 +183,10 @@ creates/updates/clears/restores native Telegram drafts through the sole gateway;
 those remain unsent until manually sent in Telegram. `manage_scheduled_message`
 creates/updates/cancels one native scheduled item through the same gateway, and
 Telegram publishes it automatically at the selected time. It does not send now.
-Both mutation tools require a concrete dialog and version-safe command inputs;
+`manage_folder` changes one native folder, and `manage_contact_note` changes one
+private contact note. Reuse the same operation key when an outcome is unknown;
+Telegram does not provide an atomic compare-and-swap for these writes.
+Draft and scheduled-message mutations require a concrete dialog and version-safe command inputs;
 ordinary draft and scheduled-message reads remain local. Every tool call may
 write local telemetry. Keep `readOnlyHint=false` for tools that intentionally
 mutate explicit local MCP state such as sync enrollment or `feedback.db`.
@@ -260,8 +265,11 @@ work; search related contract fixtures before freezing. Run one full PR CI on
 the integrated candidate rather than a full run or separate PR for each ticket.
 
 Before final CI, freeze the candidate scope and integrate completed handoffs.
-For public tool registry, schema, or content changes, run the existing `tests/test_server.py`
-and `tests/test_strict_tool_arguments.py` contract modules before CI.
+For public tool registry, schema, or content changes, check the full affected contract
+and routing modules before CI: `tests/test_server.py`, `tests/test_strict_tool_arguments.py`,
+`tests/test_none_wire_contract.py`, `tests/test_tool_routing.py`, and
+`tests/test_mcp_test_client.py`. Check whole affected fixture and routing modules,
+not only registry-count cases; reuse passing results when the contract is unchanged.
 Check changed contracts, callers and fixtures, including actual integration paths
 and producer formats at ownership or persistence boundaries. Run affected static,
 type and complexity checks; collect independent findings and fix them together.

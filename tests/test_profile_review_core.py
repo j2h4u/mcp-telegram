@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 from telethon.tl import types  # type: ignore[import-untyped]
 
+from mcp_telegram.auth_scope import TelegramAuthScope
 from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
 from mcp_telegram.entity_profile.collection_repository import store_semantic_snapshot
 from mcp_telegram.entity_profile.contracts import (
@@ -23,6 +24,7 @@ from mcp_telegram.entity_profile.profile_history_store import append_effective_h
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
 from mcp_telegram.entity_profile.semantic_normalization import normalize_semantic_profile
 from mcp_telegram.entity_profile.updates import project_profile_update, project_user_profile
+from mcp_telegram.image_authorization import ScopeCell
 from mcp_telegram.sync_transactions import write_transaction
 from sqlite_writer_helpers import event_manager
 from test_profile_history_integration import db as db
@@ -189,10 +191,16 @@ async def test_known_name_and_alias_empty_forms_do_not_fake_edits_and_preserve_w
     db: sqlite3.Connection,
 ) -> None:
     persist_full(db, full(100), 100)
-    manager = event_manager(MagicMock(), db, asyncio.Event())
+    client = MagicMock()
+    scope = TelegramAuthScope(1, 7, 2, 99)
+    cell = ScopeCell()
+    assert cell.publish(scope)
+    client.retained_auth_scope.return_value = scope  # pyright: ignore[reportAny]
+    client.claim_image_scope.side_effect = cell.claim  # pyright: ignore[reportAny]
+    manager = event_manager(client, db, asyncio.Event())
     manager.set_self_id(7)
     manager.bind_demand_sink(MagicMock())
-    with delivered_update_context(DeliveredUpdate(200, 200.0, 200)):
+    with delivered_update_context(DeliveredUpdate(200, 200.0, 200, auth_scope=scope, scope_token=cell.capture())):
         await manager.on_raw_identity_or_notify(types.UpdateUserName(42, "Before", "", []))
     persist_full(db, full(300), 300)
     selected = {"user.last_name", "user.usernames"}
@@ -202,11 +210,11 @@ async def test_known_name_and_alias_empty_forms_do_not_fake_edits_and_preserve_w
     )
     persist_full(db, full(400, user=user), 400)
     initial = len([row for row in events(db) if row[0] in selected])
-    with delivered_update_context(DeliveredUpdate(500, 500.0, 500)):
+    with delivered_update_context(DeliveredUpdate(500, 500.0, 500, auth_scope=scope, scope_token=cell.capture())):
         await manager.on_raw_identity_or_notify(types.UpdateUserName(42, "Before", "", []))
     persist_full(db, full(600), 600)
     assert len([row for row in events(db) if row[0] in selected]) == initial + 2
-    with delivered_update_context(DeliveredUpdate(700, 700.0, 700)):
+    with delivered_update_context(DeliveredUpdate(700, 700.0, 700, auth_scope=scope, scope_token=cell.capture())):
         await manager.on_raw_identity_or_notify(types.UpdateUserName(42, "Before", " ", []))
     last = [row for row in events(db) if row[0] == "user.last_name"][-1]
     assert json.loads(cast(str, last[2])) == " "

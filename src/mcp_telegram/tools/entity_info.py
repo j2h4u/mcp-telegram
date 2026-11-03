@@ -126,6 +126,15 @@ GET_ENTITY_INFO_OUTPUT_SCHEMA = {
 
 _PROFILE_PROPERTIES, _PROFILE_DEFINITIONS = profile_read_schemas()
 cast(dict[str, object], GET_ENTITY_INFO_OUTPUT_SCHEMA["properties"]).update(_PROFILE_PROPERTIES)
+cast(dict[str, object], GET_ENTITY_INFO_OUTPUT_SCHEMA["properties"])["contact_note"] = {
+    "type": "object",
+    "properties": {
+        "state": {"enum": ["unknown", "absent", "retained"]},
+        "expected_version": {"type": ["string", "null"]},
+    },
+    "required": ["state", "expected_version"],
+    "additionalProperties": False,
+}
 cast(dict[str, object], GET_ENTITY_INFO_OUTPUT_SCHEMA["properties"])["common_chats_page"] = _PROFILE_PROPERTIES["page"]
 GET_ENTITY_INFO_OUTPUT_SCHEMA["$defs"] = _PROFILE_DEFINITIONS
 GET_ENTITY_INFO_OUTPUT_SCHEMA["additionalProperties"] = False
@@ -660,7 +669,7 @@ def _entity_structured_content(
         "dialog_placement": _dialog_placement_structured(data.get("dialog_placement")),
         **{
             key: data[key]
-            for key in ("semantic", "collections", "history_coverage", "page", "common_chats_page")
+            for key in ("semantic", "collections", "history_coverage", "page", "common_chats_page", "contact_note")
             if key in data
         },
     }

@@ -163,6 +163,40 @@ def test_no_daemon_smoke_expects_all_registered_tools_and_output_schemas() -> No
         assert path_map["outputSchema.type"] == "object", tool_name
 
 
+def test_no_daemon_native_management_steps_use_valid_arguments() -> None:
+    from mcp_telegram.tools.contact_notes import ManageContactNote
+    from mcp_telegram.tools.folders import GetFolder, ManageFolder
+
+    script = cast(
+        dict[str, object],
+        json.loads((_repo_root() / "devtools/mcp_client/smoke-no-daemon.json").read_text(encoding="utf-8")),
+    )
+    models = {"get_folder": GetFolder, "manage_folder": ManageFolder, "manage_contact_note": ManageContactNote}
+    steps = cast(list[dict[str, object]], script["steps"])
+    for name, model in models.items():
+        step = next(step for step in steps if step.get("name") == name)
+        model.model_validate(step["arguments"])
+        expect = cast(dict[str, object], step["expect"])
+        assert expect["is_error"] is True
+        assert "not running" in cast(list[str], expect["content_text_contains"])
+
+
+def test_integration_smoke_reads_folder_without_requiring_fresh_catalog() -> None:
+    from mcp_telegram.tools.folders import GetFolder
+
+    script = cast(
+        dict[str, object],
+        json.loads((_repo_root() / "devtools/mcp_client/smoke-integration.json").read_text(encoding="utf-8")),
+    )
+    steps = cast(list[dict[str, object]], script["steps"])
+    step = next(step for step in steps if step.get("name") == "get_folder")
+    GetFolder.model_validate(step["arguments"])
+    expect = cast(dict[str, object], step["expect"])
+    assert expect["is_error"] is False
+    assert {"structuredContent.account_id", "structuredContent.presence"} <= set(cast(list[str], expect["path_exists"]))
+    assert "structuredContent.presence" not in cast(dict[str, object], expect["path_equals"])
+
+
 def _expectation_branches(expect: dict[str, object]) -> list[dict[str, object]]:
     one_of = expect.get("one_of")
     if one_of is None:

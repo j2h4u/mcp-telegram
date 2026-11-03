@@ -31,6 +31,7 @@ from mcp_telegram.tools import (
     TOOL_REGISTRY,
     GetDraft,
     GetEntityInfo,
+    GetFolder,
     GetInbox,
     GetMyRecentActivity,
     GetSyncStatus,
@@ -39,7 +40,9 @@ from mcp_telegram.tools import (
     ListDialogs,
     ListMessages,
     ListTopics,
+    ManageContactNote,
     ManageDraft,
+    ManageFolder,
     ManageScheduledMessage,
     MarkDialogForSync,
     SearchMessages,
@@ -47,6 +50,7 @@ from mcp_telegram.tools import (
     TraceAccountMessages,
     get_draft,
     get_entity_info,
+    get_folder,
     get_inbox,
     get_my_recent_activity,
     get_sync_status,
@@ -55,7 +59,9 @@ from mcp_telegram.tools import (
     list_dialogs,
     list_messages,
     list_topics,
+    manage_contact_note,
     manage_draft,
+    manage_folder,
     manage_scheduled_message,
     mark_dialog_for_sync,
     search_messages,
@@ -391,6 +397,48 @@ from mcp_telegram.tools.message_images import (
 )
 
 STRUCTURED_TOOL_CASES = {
+    "get_folder": (
+        get_folder,
+        GetFolder(folder_id=4),
+        {"ok": True, "account_id": 7, "presence": "absent", "catalog_version": "folder-v1:7:3:abc"},
+    ),
+    "manage_folder": (
+        manage_folder,
+        ManageFolder(
+            action="delete", operation_key="folder-schema-test", folder_id=4, expected_version="folder-v1:7:3:abc"
+        ),
+        {
+            "ok": True,
+            "account_id": 7,
+            "operation_key": "folder-schema-test",
+            "folder_id": 4,
+            "phase": "completed",
+            "outcome": "unknown",
+            "dispatch": "unknown",
+            "acknowledgement": "unknown",
+            "verification": "pending",
+            "next_action": "Inspect the receipt using the same operation key.",
+        },
+    ),
+    "manage_contact_note": (
+        manage_contact_note,
+        ManageContactNote(
+            dialog_id=123,
+            action="update",
+            operation_key="note-schema-test",
+            expected_version="a" * 64,
+            text="Note",
+            drop_formatting=False,
+        ),
+        {
+            "ok": True,
+            "account_id": 7,
+            "operation_key": "note-schema-test",
+            "outcome": "acknowledged",
+            "verification": "verified",
+            "verification_order": 15,
+        },
+    ),
     "get_message_image": (
         get_message_image,
         GetMessageImage(exact_dialog_id=123, message_id=4),
@@ -864,6 +912,10 @@ async def test_registered_tool_outputs_match_their_null_free_schemas(tool_name: 
     with _patch_daemon(conn):
         result = await server.call_tool(tool_name, args.model_dump(mode="json", exclude_none=True))
 
+    if tool_name in {"get_folder", "manage_folder", "manage_contact_note"}:
+        expected = {"method": tool_name, **args.model_dump(exclude_unset=True, exclude={"timezone"})}
+        conn.request.assert_awaited_once_with(expected)
+
     payload = assert_structured_success_payload(result)
     if tool_name == "get_sync_status":
         assert payload["latest_retained_message"] is None
@@ -895,6 +947,8 @@ async def test_list_dialogs_folder_view_returns_structural_summary():
                 ],
                 "directory_coverage": _directory_coverage_payload(),
                 "folder_snapshot": _unavailable_folder_snapshot_payload(),
+                "account_id": 42,
+                "catalog_version": None,
             },
         }
     )
@@ -1023,6 +1077,7 @@ class _patch_daemon:
 
     def __enter__(self):
         targets = [
+            "mcp_telegram.tools._base.daemon_connection",
             "mcp_telegram.tools.message_images.daemon_connection",
             "mcp_telegram.tools.drafts.daemon_connection",
             "mcp_telegram.tools.scheduled.daemon_connection",

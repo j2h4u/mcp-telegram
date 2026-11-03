@@ -26,6 +26,7 @@ from telethon.tl.functions import PingRequest, ReqDHParamsRequest, ReqPqMultiReq
 from telethon.tl.tlobject import TLRequest  # type: ignore[import-untyped]
 from telethon.tl.types import MsgsAck, MsgsStateInfo  # type: ignore[import-untyped]
 
+from .native_write_fence import FolderWriteRejected, NoteWriteRejected
 from .peer_access import PeerAccessRejectedError
 from .scheduled_write_fence import ScheduledWriteRejected
 from .telegram_rpc_scheduler import RpcAdmissionExpiredError, RpcAdmissionSaturatedError, TelegramRpcScope
@@ -640,7 +641,7 @@ class GuardedMTProtoSender(MTProtoSender):
         owned = packet.state
         try:
             claimed = self._authority.claim_write(owned.owner, packet.permit)
-        except (ScheduledWriteRejected, PeerAccessRejectedError) as error:
+        except (ScheduledWriteRejected, FolderWriteRejected, NoteWriteRejected, PeerAccessRejectedError) as error:
             if not owned.state.future.done():
                 owned.state.future.set_exception(error)
             self.defer_packet(packet)

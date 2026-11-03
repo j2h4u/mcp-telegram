@@ -582,7 +582,7 @@ async def test_reconciliation_processes_only_one_bounded_slice(conn: sqlite3.Con
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10, max_dialogs_per_slice=2),
         writer=inline_writer(conn),
     )
-    worker.bind_account_id(999)
+    worker.bind_account_id(42)
 
     conn.commit()
     await _run_all_demand_slices(worker)
@@ -1348,7 +1348,7 @@ async def test_incomplete_scheduled_response_never_advances_authoritative_absenc
     assert conn.execute("SELECT snapshot_observation_order FROM scheduled_reconciliation_state").fetchone() == (None,)
     assert conn.execute(
         "SELECT coverage_state,coverage_reason,repair_due_at,discovery_due_at FROM scheduled_reconciliation_state"
-    ).fetchone() == ("unknown", "rpc_error", 0, 0)
+    ).fetchone() == ("unknown", "incomplete_snapshot:ValueError", 0, 0)
     for adapter_type in (ScheduledRepairDemandAdapter, ScheduledDiscoveryDemandAdapter):
         status = adapter_type(
             ScheduledMessageReconciler(

@@ -8,6 +8,9 @@ from contextvars import Context, ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from .auth_scope import TelegramAuthScope
+from .image_authorization import ScopeToken
+
 
 @dataclass(slots=True)
 class DeliveredUpdate:
@@ -16,6 +19,8 @@ class DeliveredUpdate:
     reaction_sequence: int
     failed: bool = False
     owner_task: object | None = None
+    auth_scope: TelegramAuthScope | None = None
+    scope_token: ScopeToken | None = None
 
 
 _current: ContextVar[DeliveredUpdate | None] = ContextVar("delivered_update", default=None)

@@ -12,6 +12,7 @@ import pytest
 from telethon.tl import functions, types
 
 from mcp_telegram import telegram_rpc
+from mcp_telegram.native_write_fence import FolderWriteRejected, NoteWriteRejected
 from mcp_telegram.scheduled_write_fence import (
     ScheduledMutationCheck,
     ScheduledMutationFence,
@@ -362,3 +363,25 @@ async def test_scheduled_write_rejects_bypass_or_unsafe_create_fields(wire: _Wir
                     return
                 with scheduled_mutation_context(check), pytest.raises((UnclassifiedTelegramRpcError, ValueError)):
                     gate.register_application(request, bytes(request), scope)
+
+
+@pytest.mark.parametrize("rejection", [FolderWriteRejected, NoteWriteRejected])
+async def test_native_preclaim_refusal_is_known_without_protecting_transport(
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch, rejection: type[Exception]
+) -> None:
+    gate, sender, connection, sink = wire
+    schedule_at = int(time.time()) + 300
+    check = _check("create", schedule_at, ScheduledMutationFence())
+    budget = RpcAttemptBudget(1)
+    response, packet, evidence = await _prepare(wire, "create", schedule_at, check, budget)
+
+    def refuse(*_args: object) -> bool:
+        raise rejection("refused before claim")
+
+    monkeypatch.setattr(gate, "claim_write", refuse)
+    assert not sender.write_packet(packet, connection._send)
+    with pytest.raises(rejection):
+        await response
+    assert sink.frames == [] and budget.attempts == 0 and evidence.actual_attempts == 0
+    assert gate.account_safety_status() is None
+    assert gate._transport_state.value == "ready"

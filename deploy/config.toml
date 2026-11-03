@@ -40,7 +40,7 @@ writer_startup_wait_seconds = 1.0
 shutdown_drain_grace_seconds = 2.0
 # Five-minute per-source summaries keep the 30-day window within this cap.
 rpc_summary_interval_seconds = 300
-row_cap = 250000
+row_cap = 310000
 
 [flood_wait]
 # Resume settled protective stops after 1/2/4/8/16/24h, then require manual action.

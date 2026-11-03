@@ -56,7 +56,7 @@ never-collected non-DM profiles remain separate limitations. See
 - Lets agents submit tool feedback into a local operator queue.
 - Does not provide an immediate-send tool. `manage_scheduled_message` can create, edit, or cancel a native scheduled item that Telegram will publish automatically at its scheduled time.
 
-`get_draft` reads locally retained drafts and their recent undo history; `manage_draft` creates, edits, clears and restores native cloud drafts. Drafts remain unsent until you send them manually in Telegram. Current drafts do not expire; undo history retains up to ten previous states for seven days. `manage_scheduled_message` edits or cancels one retained native scheduled item, while Telegram automatically publishes accepted scheduled items at their selected time. Other tools are **Telegram-read-only**. Every tool call may write local telemetry.
+`get_draft` reads locally retained drafts and their recent undo history; `manage_draft` creates, edits, clears and restores native cloud drafts. Drafts remain unsent until you send them manually in Telegram. Current drafts do not expire; undo history retains up to ten previous states for seven days. `manage_scheduled_message` edits or cancels one retained native scheduled item, while Telegram automatically publishes accepted scheduled items at their selected time. `manage_folder` changes a native folder and `manage_contact_note` changes a private contact note. Other tools are **Telegram-read-only**. Every tool call may write local telemetry.
 `readOnlyHint=true` means no explicit domain/local-state mutation beyond that;
 `readOnlyHint=false` marks tools that intentionally write local MCP state such as
 sync scope or `feedback.db`.
@@ -174,7 +174,7 @@ this work themselves: they return the facts already persisted by the daemon.
 
 ## MCP Tools
 
-There are 20 MCP tools. Successful calls are machine-oriented: agents should
+There are 23 MCP tools. Successful calls are machine-oriented: agents should
 read `structuredContent` for IDs, counts, navigation tokens, coverage, warnings,
 and Telegram-originated content. `get_message_image` additionally returns one native JPEG image when available.
 
@@ -182,13 +182,16 @@ and Telegram-originated content. `get_message_image` additionally returns one na
 | --- | --- |
 | `prepare_message_image` | Explicitly queue bounded acquisition of one photo. |
 | `get_message_image` | Read a retained photo locally as a native MCP image. |
-| `list_dialogs` | List dialogs or summarize the custom-folder structure, with unread, activity, sync, draft, and cached metadata. |
+| `list_dialogs` | List dialogs or summarize the custom-folder structure, with unread, activity, sync, draft, and retained metadata. |
+| `get_folder` | Read a retained native folder definition, version, and coverage without contacting Telegram. |
+| `manage_folder` | Create, update or delete one ordinary folder, including explicit membership and exclusion changes. |
 | `list_topics` | List threads for a topic-capable dialog, including forum topics and bot-DM topics. |
 | `list_messages` | Read one dialog in chronological order within each page. By default it combines local sent, scheduled, and draft rows; set `message_state="sent"` for published history only. Supports pagination, topic/sender/unread filters, UTC time bounds, reply refs, reactions, read-state markers, and archive coverage. |
 | `search_messages` | Full-text search across synced dialogs or within one dialog, with optional UTC time bounds; results include anchors for `list_messages`. |
 | `get_inbox` | Fetch unread messages from personal chats and small groups with budgeted per-dialog output. |
 | `get_unread_summary` | Show a compact unread overview from persisted dialog facts, without message bodies. |
 | `get_entity_info` | Inspect a Telegram user, bot, channel, supergroup, or legacy chat. |
+| `manage_contact_note` | Create, update or clear one private contact note using its observed version. |
 | `get_my_recent_activity` | Show messages you sent recently; defaults to group/forum chats and includes dialog kind, reactions, and reply counts. |
 | `trace_account_messages` | Find observable messages authored by one account with explicit coverage and gap reporting. |
 | `mark_dialog_for_sync` | Enable or disable persistent sync for a dialog. |
@@ -200,6 +203,11 @@ and Telegram-originated content. `get_message_image` additionally returns one na
 | `get_usage_stats` | Summarize local MCP tool telemetry for the last 30 days. |
 | `get_dialog_stats` | Show dialog-level reaction, mention, hashtag, and forward statistics. |
 | `submit_feedback` | Write agent feedback into the local operator queue. |
+
+Folder and contact-note writes use an operation key and an observed version.
+After an unknown outcome, inspect the same operation key rather than issuing a
+new write. Telegram does not provide an atomic compare-and-swap against edits
+from another client.
 
 `get_entity_info` projects retained supported User/UserFull nested facts, exact
 notes, metadata and observed profile changes. Its `section`, `cursor` and `limit`

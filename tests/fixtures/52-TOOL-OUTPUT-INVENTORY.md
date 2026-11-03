@@ -9,10 +9,10 @@ uv run python -c "from mcp_telegram import server; print(len(server.tool_by_name
 ```
 
 Historical Phase 52 baseline registry count: 17 tools.
-Current registry count: 20 tools; scheduled-message and image tools were added after this baseline.
+Current registry count: 23 tools; scheduled-message, image, folder, and contact-note tools were added after this baseline.
 
 Current Phase 52 completion status:
-- The historical Phase 52 baseline recorded 17 registered tools declaring `outputSchema` in the live MCP tool descriptors at that time. The current registry has 20 tools, including scheduled-message and image tools added after the baseline.
+- The historical Phase 52 baseline recorded 17 registered tools declaring `outputSchema` in the live MCP tool descriptors at that time. The current registry has 23 tools, including scheduled-message, image, folder, and contact-note tools added after the baseline.
 - Every successful tool path returns `structuredContent`; recoverable error paths may stay text-only.
 - The table below is the Plan 52-01 pre-implementation baseline and lossless migration map. Its
   `Baseline` columns intentionally preserve the state observed before later Phase 52 plans ran.
@@ -40,6 +40,9 @@ Current Phase 52 completion status:
 | `get_draft` | Get Draft | primary | true | true | yes | local current draft and temporary undo history; unknown distinct from absent | `current`, `history[]`, `selected_history`, `next_action` | none |
 | `manage_draft` | Manage Draft | primary | false | false | yes | explicit native draft create/update/clear/restore, verification and uncertain result guidance; never sends | `outcome`, `operation_key`, `mutation_dispatched`, `save_acknowledged`, `backup_history_id`, `current`, `verification`, `next_action` | native cloud draft mutation |
 | `manage_scheduled_message` | Manage Scheduled Message | primary | false | not in baseline | not in baseline | create/update/cancel one native scheduled queue item; receipt lookup guidance; accepted items may publish automatically later | `ok`, `action`, `operation_key`, `account_id`, `dialog_id`, `scheduled_message_id`, `outcome`, `mutation_dispatched`, `acknowledged`, `receipt_persisted`, `current_is_operation_confirmation`, `schedule_at_utc` | scheduled queue mutation; no immediate-send action |
+| `get_folder` | Get Folder | primary | true | not in baseline | not in baseline | locally retained native definition and independent coverage | `account_id`, `presence`, `catalog_version`, `expected_version`, `definition`, `folder_snapshot` | none |
+| `manage_folder` | Manage Folder | primary | false | not in baseline | not in baseline | explicit native folder create/update/delete and membership changes | `operation_key`, `account_id`, `folder_id`, `outcome`, `dispatch`, `acknowledgement`, `verification` | native folder mutation |
+| `manage_contact_note` | Manage Contact Note | primary | false | not in baseline | not in baseline | explicit private contact note create/update/clear | `operation_key`, `account_id`, `outcome`, `verification` | native contact-note mutation |
 
 ## Lossless Signal Checklist
 

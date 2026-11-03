@@ -8,6 +8,8 @@ from pydantic import BaseModel, ConfigDict
 from telethon import types  # type: ignore[import-untyped]
 from telethon.extensions import BinaryReader  # type: ignore[import-untyped]
 
+from .auth_scope import TelegramAuthScope
+
 
 class ProtocolSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -25,15 +27,18 @@ class DeliveryEnvelope(BaseModel):
     captured_at: float
     checkpoint_after: ProtocolSnapshot
     tl: str
+    auth_scope: dict[str, int] | None
 
     @classmethod
-    def capture(
+    def capture(  # noqa: PLR0913 - explicit authenticated delivery envelope
         cls,
         snapshot: ProtocolSnapshot,
         captured_at: float,
         updates: list[object],
         users: list[object],
         chats: list[object],
+        *,
+        auth_scope: TelegramAuthScope | None = None,
     ) -> DeliveryEnvelope:
         raw = bytes(
             types.Updates(
@@ -44,7 +49,15 @@ class DeliveryEnvelope(BaseModel):
                 snapshot.seq,
             )
         )
-        return cls(captured_at=captured_at, checkpoint_after=snapshot, tl=base64.b64encode(raw).decode("ascii"))
+        return cls(
+            captured_at=captured_at,
+            checkpoint_after=snapshot,
+            tl=base64.b64encode(raw).decode("ascii"),
+            auth_scope=None if auth_scope is None else auth_scope.as_private_mapping(),
+        )
+
+    def retained_auth_scope(self) -> TelegramAuthScope | None:
+        return None if self.auth_scope is None else TelegramAuthScope(**self.auth_scope)
 
     def unpack(self) -> tuple[list[object], list[object], list[object]]:
         try:

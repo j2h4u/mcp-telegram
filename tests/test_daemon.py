@@ -771,7 +771,11 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
             self_id=314,
             _policy=SimpleNamespace(full_user_pair_enabled=True, entity_detail_ttl_seconds=300),
             bind_message_image_service=lambda _service: events.append("image:service_bound"),
+            bind_folder_commands=lambda _owner: None,
+            bind_contact_note_commands=lambda _owner: None,
         ),
+        folder_command_owner=object(),
+        note_command_owner=object(),
         image_worker=_ImageWorker(),
         image_sources=_ImageSources(),
         image_sources_bound=False,
@@ -834,6 +838,8 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
     monkeypatch.setattr(daemon, "DeltaSyncWorker", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(daemon, "FullSyncWorker", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(daemon, "_ensure_demand_runtime", lambda *_args: events.append("ensure"))
+    monkeypatch.setattr(daemon, "_compose_native_management", AsyncMock())
+    monkeypatch.setattr(daemon, "_start_note_receipt_recovery", lambda _ctx: None)
     monkeypatch.setattr(daemon, "run_reconnect_catch_up_loop", run_reconnect)
     monkeypatch.setattr(daemon, "_prime_runtime", prime)
     monkeypatch.setattr(daemon, "_bind_draft_commands", bind_draft_commands)
@@ -1835,6 +1841,10 @@ async def test_default_daemon_composes_current_profile_collection_gateway(
             )
             assert isinstance(context.user_profile_port, TelethonUserProfileGateway)
             assert context.api_server._user_profile_port is context.user_profile_port
+            register = cast(MagicMock, client.register_native_write_domain)
+            assert len(register.call_args_list) == 2
+            assert cast(tuple[object, ...], register.call_args_list[0].args)[0] == "folder"
+            assert cast(tuple[object, ...], register.call_args_list[1].args)[0] == "contact_note"
             assert not hasattr(context.api_server, "_common_chats_port")
             assert paths.daemon_socket_path.exists()
     finally:

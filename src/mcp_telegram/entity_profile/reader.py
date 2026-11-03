@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import cast
 
+from ..contact_notes.state import read_note
 from ..pagination import ProfileNavigationToken, decode_profile_navigation, encode_profile_navigation
 from .contracts import PROFILE_COLLECTION_SECTIONS, profile_value_paths
 from .output_schema import (
@@ -190,6 +191,7 @@ def read_profile(
     section, cursor, limit = _request(req)
     result: dict[str, object] = {
         "semantic": semantic_profile(conn, owner, entity, now),
+        "contact_note": read_note(conn, owner, entity),
         "history_coverage": history_coverage(conn, owner, entity),
     }
     summaries = {name: section_summary(conn, owner, entity, name) for name in sorted(PROFILE_COLLECTION_SECTIONS)}

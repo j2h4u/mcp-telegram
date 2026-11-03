@@ -18,11 +18,13 @@ from mcp_telegram.telegram_rpc_consumers import (
     DemandPolicyOwner,
     ExecutionMode,
     FanoutScope,
+    RpcEffect,
     RpcServiceClass,
     TelegramFactDomain,
     TelegramRpcSource,
     demand_contract,
     demand_freshness_seconds,
+    rpc_effect,
     telegram_rpc_consumer,
     validate_demand_contracts,
 )
@@ -116,6 +118,8 @@ def test_demand_registry_has_exact_operation_and_source_coverage() -> None:
         TelegramRpcSource.DRAFT_SNAPSHOT: {DemandKind.DRAFT_SNAPSHOT},
         TelegramRpcSource.DRAFT_MUTATION: {DemandKind.DRAFT_MUTATION},
         TelegramRpcSource.SCHEDULED_MUTATION: {DemandKind.SCHEDULED_MUTATION},
+        TelegramRpcSource.FOLDER_COMMAND: {DemandKind.FOLDER_COMMAND},
+        TelegramRpcSource.NOTE_COMMAND: {DemandKind.NOTE_COMMAND},
         TelegramRpcSource.MAINTENANCE: {DemandKind.SELF_PROFILE_MAINTENANCE},
         TelegramRpcSource.LINKED_CHAT_REFRESH: {DemandKind.LINKED_CHAT_REFRESH},
     }
@@ -198,6 +202,8 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
         DemandKind.OPERATOR_LOGOUT: 1,
         DemandKind.DRAFT_MUTATION: 3,
         DemandKind.SCHEDULED_MUTATION: 1,
+        DemandKind.FOLDER_COMMAND: 3,
+        DemandKind.NOTE_COMMAND: 4,
     }
     for contract in TELEGRAM_DEMAND_CONTRACTS.values():
         consumer = TELEGRAM_RPC_CONSUMERS[contract.source]
@@ -324,3 +330,18 @@ def test_lookup_rejects_non_enum_source() -> None:
 
     with pytest.raises(TypeError, match="kind must be a DemandKind"):
         demand_contract("scheduled_repair")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "telethon.tl.functions.messages.UpdateDialogFilterRequest:1ad4a04a",
+        "telethon.tl.functions.contacts.UpdateContactNoteRequest:139f63fb",
+    ],
+)
+def test_native_management_methods_are_mutations(method: str) -> None:
+    assert rpc_effect(method) is RpcEffect.MUTATION
+
+
+def test_app_config_has_only_read_effect() -> None:
+    assert rpc_effect("telethon.tl.functions.help.GetAppConfigRequest:61e3f854") is RpcEffect.NONMUTATING_READ

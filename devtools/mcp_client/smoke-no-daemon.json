@@ -1,7 +1,7 @@
 {
   "steps": [
     {
-      "_comment": "All 20 tools registered with output schemas",
+      "_comment": "All 23 tools registered with output schemas",
       "action": "list_tools",
       "expect": {
         "tool_names_include": [
@@ -24,11 +24,18 @@
           "trace_account_messages",
           "get_draft",
           "manage_draft",
-          "manage_scheduled_message"
+          "manage_scheduled_message",
+          "get_folder",
+          "manage_folder",
+          "manage_contact_note"
         ],
         "tool_expectations": {
-          "get_message_image": {"outputSchema.type": "object"},
-          "prepare_message_image": {"outputSchema.type": "object"},
+          "get_message_image": {
+            "outputSchema.type": "object"
+          },
+          "prepare_message_image": {
+            "outputSchema.type": "object"
+          },
           "get_dialog_stats": {
             "outputSchema.type": "object"
           },
@@ -92,6 +99,15 @@
             "outputSchema.type": "object"
           },
           "manage_scheduled_message": {
+            "outputSchema.type": "object"
+          },
+          "get_folder": {
+            "outputSchema.type": "object"
+          },
+          "manage_folder": {
+            "outputSchema.type": "object"
+          },
+          "manage_contact_note": {
             "outputSchema.type": "object"
           }
         }
@@ -300,6 +316,60 @@
       "arguments": {
         "account": "12345",
         "limit": 5
+      },
+      "expect": {
+        "is_error": true,
+        "content_text_contains": [
+          "not running",
+          "mcp-telegram sync"
+        ]
+      }
+    },
+    {
+      "_comment": "get_folder \u2014 daemon route",
+      "action": "call_tool",
+      "name": "get_folder",
+      "arguments": {
+        "folder_id": 4
+      },
+      "expect": {
+        "is_error": true,
+        "content_text_contains": [
+          "not running",
+          "mcp-telegram sync"
+        ]
+      }
+    },
+    {
+      "_comment": "manage_folder \u2014 daemon route",
+      "action": "call_tool",
+      "name": "manage_folder",
+      "arguments": {
+        "action": "create",
+        "operation_key": "no-daemon-smoke",
+        "title": "Folder",
+        "dialog_ids": [
+          123
+        ],
+        "expected_catalog_version": "version"
+      },
+      "expect": {
+        "is_error": true,
+        "content_text_contains": [
+          "not running",
+          "mcp-telegram sync"
+        ]
+      }
+    },
+    {
+      "_comment": "manage_contact_note \u2014 daemon route",
+      "action": "call_tool",
+      "name": "manage_contact_note",
+      "arguments": {
+        "dialog_id": 123,
+        "action": "clear",
+        "operation_key": "no-daemon-smoke",
+        "expected_version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       },
       "expect": {
         "is_error": true,

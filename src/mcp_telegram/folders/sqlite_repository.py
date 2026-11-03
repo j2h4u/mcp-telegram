@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterable
+from dataclasses import replace
 from typing import cast
 
 from ..sync_transactions import require_write_transaction, write_savepoint
@@ -16,7 +17,9 @@ from .contracts import (
     FolderRule,
     FolderRuleKind,
     FolderRuleObservation,
+    FolderRuleUpdate,
     MembershipState,
+    folder_observation_token,
 )
 from .membership import evaluate, pin_position
 from .ports import FolderSnapshotRepository
@@ -36,8 +39,16 @@ def replace_folder_snapshot(
         conn.execute("DELETE FROM telegram_folder_local_members")
         conn.execute("DELETE FROM telegram_folder_rules")
         conn.executemany(
-            "INSERT INTO telegram_folder_rules(namespace,folder_id,title,rule_kind,source_position,rule_json) VALUES ('legacy',?,?, 'filter',?, '{}')",
-            [(folder_id, title, position) for position, (folder_id, title) in enumerate(folder_rows)],
+            "INSERT INTO telegram_folder_rules(namespace,folder_id,title,rule_kind,source_position,rule_json) VALUES ('legacy',?,?, 'filter',?, ?)",
+            [
+                (
+                    folder_id,
+                    title,
+                    position,
+                    _encode_rule(FolderRule(folder_id, title, namespace="legacy", source_position=position)),
+                )
+                for position, (folder_id, title) in enumerate(folder_rows)
+            ],
         )
         conn.executemany(
             "INSERT INTO telegram_folder_local_members(namespace,folder_id,dialog_id,state,pin_position) VALUES ('legacy',?,?, 'present',NULL)",
@@ -59,16 +70,7 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
         return self._state("last_outcome")
 
     def read_last_success_at(self) -> int | None:
-        accepted = _int_state(self._state("rule_observation_started_at"))
-        if accepted is not None:
-            return accepted
-        row = cast(
-            tuple[object] | None,
-            self._conn.execute(
-                "SELECT started_at FROM telegram_folder_pending_observation WHERE singleton=1"
-            ).fetchone(),
-        )
-        return None if row is None or row[0] is None else _as_int(row[0])
+        return _int_state(self._state("rule_observation_started_at"))
 
     def read_next_retry_at(self) -> int | None:
         return _int_state(self._state("next_retry_at"))
@@ -90,9 +92,80 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
             None if row[3] is None else _as_int(row[3]),
         )
 
+    def read_catalog_identity(self) -> tuple[int, int, int] | None:
+        return _canonical_receipt(self._conn)
+
+    def read_catalog_version(self) -> tuple[int | None, int, str | None, bool]:
+        row = cast(
+            tuple[object, object, object, object],
+            self._conn.execute(
+                "SELECT account_id,catalog_revision,accepted_rule_token,coverage_status='complete' AND NOT EXISTS "
+                "(SELECT 1 FROM telegram_folder_rules WHERE json_extract(rule_json,'$.complete') IS NOT 1) "
+                "FROM telegram_folder_projection_state WHERE singleton=1"
+            ).fetchone(),
+        )
+        return (
+            None if row[0] is None else _as_int(row[0]),
+            _as_int(row[1]),
+            None if row[2] is None else str(row[2]),
+            bool(row[3]),
+        )
+
+    def read_observation_order(self) -> int:
+        row = cast(
+            tuple[object] | None,
+            self._conn.execute("SELECT value FROM daemon_state WHERE key='folder_observation_order'").fetchone(),
+        )
+        return 0 if row is None else _as_int(row[0])
+
+    def refine_receipts(self, observation: FolderRuleObservation, *, account_id: int, order: int) -> None:
+        from .command_receipts import refine_from_observation
+
+        refine_from_observation(self._conn, account_id, order, folder_definitions(observation.rules), complete=True)
+
+    def apply_supplied_update(self, update: FolderRuleUpdate, *, account_id: int, order: int, now: int) -> bool:
+        """Apply a supplied filter delta only to its coherent retained catalog."""
+        require_write_transaction(self._conn)
+        canonical = self.read_catalog_identity()
+        if canonical is None or canonical[0] != account_id or order <= self.read_observation_order():
+            return False
+        observation = self._accepted_observation()
+        revision = self.read_snapshot_revision()
+        if observation is None or revision is None or revision[0] != account_id:
+            return False
+        rules = _updated_folder_rules(observation.rules, update)
+        if rules is None:
+            return False
+        rules = [replace(rule, source_position=i) for i, rule in enumerate(rules)]
+        new_rules = tuple(rules)
+        invalidated = self._state("coverage_status") == "unavailable"
+        version = self.read_catalog_version()
+        token = folder_observation_token(new_rules)
+        self.project_observation(FolderRuleObservation(new_rules, token, observation.started_at), completed_at=now)
+        if invalidated:
+            self._conn.execute(
+                "UPDATE telegram_folder_projection_state SET coverage_status='unavailable',catalog_revision=? WHERE singleton=1",
+                (version[1] + int(token != version[2]),),
+            )
+        self._conn.execute(
+            "INSERT INTO daemon_state(key,value) VALUES ('folder_observation_order',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(order),),
+        )
+        _refine_supplied_receipt(self._conn, update, account_id, order, new_rules)
+        return True
+
     def rules_are_fresh(self, *, now: int) -> bool:
         started_at = self.read_last_success_at()
-        return started_at is not None and now < started_at + RULE_TTL_SECONDS
+        covered = self._state("coverage_status") == "complete" or self._state("accepted_rule_token") is None
+        return covered and started_at is not None and now < started_at + RULE_TTL_SECONDS
+
+    def invalidate(self) -> None:
+        require_write_transaction(self._conn)
+        self._conn.execute(
+            "UPDATE telegram_folder_projection_state SET catalog_revision=catalog_revision + "
+            "CASE WHEN coverage_status='complete' THEN 1 ELSE 0 END,coverage_status='unavailable' WHERE singleton=1"
+        )
 
     def next_mute_expiry(self) -> int | None:
         return _int_state(self._state("next_mute_expiry"))
@@ -100,9 +173,11 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
     def project_observation(self, observation: FolderRuleObservation, *, completed_at: int) -> int | None:
         """Publish a rule receipt only when a coherent canonical directory exists."""
         with write_savepoint(self._conn):
+            if not observation.complete or not all(rule.complete for rule in observation.rules):
+                self.invalidate()
+                return None
             canonical = _canonical_receipt(self._conn)
             if canonical is None:
-                self._save_pending(observation)
                 return None
             account_id, generation, canonical_observed_at = canonical
             self._replace_projection(
@@ -123,7 +198,14 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
         """Local publication hook for the canonical directory transaction."""
         require_write_transaction(self._conn)
         canonical = _canonical_receipt(self._conn)
-        observation = self._accepted_observation() or self._pending_observation()
+        accepted = self._accepted_observation()
+        revision = self.read_snapshot_revision()
+        if accepted is not None and canonical is not None and revision is not None and revision[0] != canonical[0]:
+            self.invalidate()
+            return None
+        invalidated = accepted is not None and self._state("coverage_status") == "unavailable"
+        previous_version = self.read_catalog_version()
+        observation = accepted
         if canonical is None or observation is None:
             return None
         account_id, generation, canonical_observed_at = canonical
@@ -134,6 +216,11 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
             canonical_observed_at=canonical_observed_at,
             completed_at=now,
         )
+        if invalidated:
+            self._conn.execute(
+                "UPDATE telegram_folder_projection_state SET coverage_status='unavailable',catalog_revision=? WHERE singleton=1",
+                (previous_version[1],),
+            )
         return generation
 
     def ensure_mute_projection(self, *, now: int) -> int | None:
@@ -194,10 +281,14 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
             default=None,
         )
         self._conn.execute(
-            "UPDATE telegram_folder_projection_state SET account_id=?,canonical_generation=?,accepted_rule_token=?,"
+            "UPDATE telegram_folder_projection_state SET catalog_revision=catalog_revision + CASE WHEN "
+            "account_id IS NOT ? OR accepted_rule_token IS NOT ? OR coverage_status != 'complete' THEN 1 ELSE 0 END, "
+            "account_id=?,canonical_generation=?,accepted_rule_token=?,"
             "rule_observation_started_at=?,completed_at=?,canonical_observed_at=?,next_mute_expiry=?,coverage_status='complete',"
             "last_attempt_at=?,last_outcome='success',next_retry_at=NULL,consecutive_failures=0 WHERE singleton=1",
             (
+                account_id,
+                observation.token,
                 account_id,
                 generation,
                 observation.token,
@@ -208,38 +299,12 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
                 completed_at,
             ),
         )
-        self._conn.execute("DELETE FROM telegram_folder_pending_observation")
-
-    def _save_pending(self, observation: FolderRuleObservation) -> None:
-        require_write_transaction(self._conn)
-        row = cast(
-            tuple[object, object] | None,
-            self._conn.execute(
-                "SELECT token,started_at FROM telegram_folder_pending_observation WHERE singleton=1"
-            ).fetchone(),
-        )
-        if row is None:
-            self._conn.execute(
-                "INSERT INTO telegram_folder_pending_observation(singleton,token,started_at,rules_json) VALUES (1,?,?,?)",
-                (observation.token, observation.started_at, _encode_observation(observation)),
-            )
-        elif observation.started_at >= _as_int(row[1]):
-            self._conn.execute(
-                "UPDATE telegram_folder_pending_observation SET token=?,started_at=?,rules_json=? WHERE singleton=1",
-                (observation.token, observation.started_at, _encode_observation(observation)),
-            )
-        self._conn.execute(
-            "UPDATE telegram_folder_projection_state SET last_attempt_at=?,last_outcome='success',next_retry_at=NULL,consecutive_failures=0,coverage_status='unavailable' WHERE singleton=1",
-            (observation.started_at,),
-        )
 
     def _accepted_observation(self) -> FolderRuleObservation | None:
         rows = cast(
             list[tuple[str]],
             self._conn.execute("SELECT rule_json FROM telegram_folder_rules ORDER BY source_position").fetchall(),
         )
-        if not rows:
-            return None
         state = cast(
             tuple[str | None, int | None] | None,
             self._conn.execute(
@@ -250,25 +315,51 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
             return None
         return FolderRuleObservation(tuple(_decode_rule(raw) for (raw,) in rows), str(state[0]), int(state[1]))
 
-    def _pending_observation(self) -> FolderRuleObservation | None:
-        row = cast(
-            tuple[object, object, object] | None,
-            self._conn.execute(
-                "SELECT token,started_at,rules_json FROM telegram_folder_pending_observation WHERE singleton=1"
-            ).fetchone(),
-        )
-        if row is None:
-            return None
-        payload = cast(dict[str, object], json.loads(str(row[2])))
-        rules = tuple(_decode_rule(str(item)) for item in cast(list[object], payload["rules"]))
-        return FolderRuleObservation(rules, str(row[0]), _as_int(row[1]))
-
     def _state(self, column: str) -> str | None:
         row = cast(
             tuple[object] | None,
             self._conn.execute(f"SELECT {column} FROM telegram_folder_projection_state WHERE singleton=1").fetchone(),
         )
         return None if row is None or row[0] is None else str(row[0])
+
+
+def _refine_supplied_receipt(
+    conn: sqlite3.Connection, update: FolderRuleUpdate, account_id: int, order: int, rules: tuple[FolderRule, ...]
+) -> None:
+    from .command_receipts import refine_from_observation
+
+    if update.kind == "filter":
+        refine_from_observation(
+            conn, account_id, order, folder_definitions(rules), complete=False, affected_folder_id=update.folder_id
+        )
+
+
+def _updated_folder_rules(rules: tuple[FolderRule, ...], update: FolderRuleUpdate) -> list[FolderRule] | None:
+    if update.kind == "filter":
+        return _update_one_folder(list(rules), update)
+    if update.kind == "order":
+        by_id = {rule.folder_id: rule for rule in rules if rule.namespace == "filter"}
+        if len(update.order) != len(by_id) or set(update.order) != set(by_id):
+            return None
+        ordered = iter(by_id[folder_id] for folder_id in update.order)
+        return [next(ordered) if rule.namespace == "filter" else rule for rule in rules]
+    return None
+
+
+def _update_one_folder(rules: list[FolderRule], update: FolderRuleUpdate) -> list[FolderRule] | None:
+    folder_id = update.folder_id
+    value = update.rule
+    if folder_id is None:
+        return None
+    index = next(
+        (i for i, rule in enumerate(rules) if rule.namespace == "filter" and rule.folder_id == folder_id), len(rules)
+    )
+    if value is None:
+        return rules[:index] + rules[index + 1 :]
+    rule = value
+    if not rule.complete or rule.folder_id != folder_id:
+        return None
+    return [*rules[:index], rule, *rules[index + 1 :]]
 
 
 def _canonical_receipt(conn: sqlite3.Connection) -> tuple[int, int, int] | None:
@@ -364,10 +455,16 @@ def _encode_rule(rule: FolderRule) -> str:
             "include": rule.included_ids,
             "pins": rule.pinned_ids,
             "exclude": rule.excluded_ids,
-            "categories": [item.value for item in rule.categories],
+            "categories": sorted(item.value for item in rule.categories),
             "exclude_archived": rule.exclude_archived,
             "exclude_read": rule.exclude_read,
             "exclude_muted": rule.exclude_muted,
+            "title_entities": rule.title_entities,
+            "title_noanimate": rule.title_noanimate,
+            "emoticon": rule.emoticon,
+            "color": rule.color,
+            "has_my_invites": rule.has_my_invites,
+            "complete": rule.complete,
         },
         separators=(",", ":"),
         sort_keys=True,
@@ -389,17 +486,33 @@ def _decode_rule(raw: str) -> FolderRule:
         bool(value["exclude_archived"]),
         bool(value["exclude_read"]),
         bool(value["exclude_muted"]),
+        tuple(cast(list[dict[str, object]], value["title_entities"])),
+        bool(value["title_noanimate"]),
+        cast(str | None, value["emoticon"]),
+        cast(int | None, value["color"]),
+        bool(value["has_my_invites"]),
+        bool(value["complete"]),
     )
 
 
-def _encode_observation(observation: FolderRuleObservation) -> str:
-    return json.dumps(
-        {
-            "token": observation.token,
-            "started_at": observation.started_at,
-            "rules": [_encode_rule(rule) for rule in observation.rules],
-        }
+def read_folder_rules(conn: sqlite3.Connection) -> tuple[FolderRule, ...]:
+    rows = cast(
+        list[tuple[str]],
+        conn.execute("SELECT rule_json FROM telegram_folder_rules ORDER BY source_position").fetchall(),
     )
+    return tuple(_decode_rule(raw) for (raw,) in rows)
+
+
+def encode_folder_definition(rule: FolderRule) -> str:
+    return _encode_rule(replace(rule, source_position=0))
+
+
+def folder_definitions(rules: tuple[FolderRule, ...]) -> dict[int, str]:
+    return {rule.folder_id: encode_folder_definition(rule) for rule in rules if rule.namespace == "filter"}
+
+
+def decode_folder_definition(raw: str) -> FolderRule:
+    return _decode_rule(raw)
 
 
 def _int_state(value: str | None) -> int | None:

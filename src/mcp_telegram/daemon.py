@@ -56,6 +56,7 @@ from telethon.tl.functions.messages import GetPeerDialogsRequest  # type: ignore
 from telethon.tl.types import (  # type: ignore[import-untyped]
     InputDialogPeer,
     InputPeerSelf,
+    InputUser,
     TypeInputDialogPeer,
     TypeInputPeer,
     User,
@@ -65,6 +66,8 @@ from . import daemon_shutdown
 from .activity_cold_backfill import ColdBackfillPacing
 from .auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from .config import McpTelegramConfig, SchedulingConfig, load_config, resolve_scheduling_config
+from .contact_notes.commands import ContactNoteCommandOwner
+from .contact_notes.domain import NoteWriteAuthority
 from .daemon_api import DaemonApiPolicy, DaemonAPIServer, DaemonClientLike, DaemonHealthStatus
 from .delta_sync import (
     AccessProbe,
@@ -102,6 +105,7 @@ from .flood import (
     maybe_log_flood_wait_rollup,
     sleep_through_flood,
 )
+from .folders.commands import FolderCommandOwner, FolderReceiptOwner
 from .folders.refresh import FolderRefresher
 from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .folders.telegram_adapter import FolderClient, TelethonTelegramFolderGateway
@@ -123,6 +127,7 @@ from .message_images.service import MessageImageService
 from .message_images.worker import MessageImageWorker
 from .messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
 from .models import DialogType
+from .native_write_fence import NativeWriteDomain, NativeWriteDomainOwner
 from .peer_access import PeerAccess
 from .reactions import ReactionDetailPolicy, ReactionDetailRefresher
 from .reactions.telegram_adapter import TelethonTelegramReactionGateway
@@ -261,6 +266,8 @@ def read_operator_summary_snapshot(
 
 
 class _DaemonClient(Protocol):
+    def register_native_write_domain(self, domain: NativeWriteDomain, owner: NativeWriteDomainOwner) -> None: ...
+
     def bind_peer_access(self, access: PeerAccess) -> None: ...
     def bind_session_lease(self, lease: TelegramSessionLease) -> None: ...
 
@@ -496,6 +503,12 @@ class _SyncMainContext:
     unix_server: asyncio.AbstractServer | None = None
     handler_manager: EventHandlerManager | None = None
     draft_owner: DraftMessageOwner | None = None
+    folder_receipt_owner: FolderReceiptOwner | None = None
+    folder_command_owner: FolderCommandOwner | None = None
+    note_command_owner: ContactNoteCommandOwner | None = None
+    note_write_authority: NoteWriteAuthority | None = None
+    note_recovery_token: ScopeToken | None = None
+    note_recovery_task: asyncio.Task[object] | None = None
     image_worker: MessageImageWorker | None = None
     image_service: MessageImageService | None = None
     image_sources: ActiveSources | None = None
@@ -1178,8 +1191,7 @@ def _message_fact_refresh_policy_from_config(
 
 def _access_probe_policy_from_scheduling(scheduling: SchedulingConfig) -> AccessProbePolicy:
     return AccessProbePolicy(
-        interval_seconds=scheduling.access_probe_interval_seconds,
-        max_dialogs_per_cycle=scheduling.access_probe_max_dialogs_per_cycle,
+        enabled=scheduling.access_probe_enabled,
         cooldown_seconds=scheduling.access_probe_cooldown_seconds,
     )
 
@@ -1322,9 +1334,33 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
         TelethonTelegramFolderGateway(cast(FolderClient, client)),
         folder_repository,
         writer=writer,
+        auth_scope=client.retained_auth_scope,
+        capture_scope=client.capture_image_scope,
+        claim_scope=client.claim_image_scope,
     )
     group_profile_port = TelethonGroupProfileGateway(client)
     user_profile_port = TelethonUserProfileGateway(client)
+    folder_receipts = FolderReceiptOwner(writer, client)
+    client.register_native_write_domain(
+        "folder",
+        NativeWriteDomainOwner(
+            folder_receipts.verify_request,
+            folder_receipts.bind_attempt,
+            folder_receipts.record_wire_outcome,
+            folder_receipts.validate_binding,
+            folder_receipts.recover_binding,
+            folder_receipts.preclaim,
+            folder_receipts.notify_terminal,
+        ),
+    )
+    note_authority = NoteWriteAuthority(
+        writer,
+        client.retained_auth_scope,
+        user_profile_port.get_user_reference,
+        capture_scope=client.capture_image_scope,
+        claim_scope=client.claim_image_scope,
+    )
+    client.register_native_write_domain("contact_note", note_authority.domain)
     channel_profile_port = TelethonChannelProfileGateway(client)
     user_avatar_history_port = TelethonUserAvatarHistoryGateway(client)
     chat_avatar_history_port = TelethonChatAvatarHistoryGateway(client)
@@ -1434,6 +1470,8 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
             config.scheduling.folder_projection,
             writer=writer,
         ),
+        folder_receipt_owner=folder_receipts,
+        note_write_authority=note_authority,
         fact_hydration_worker=MessageFactHydrationWorker(
             client,
             conn,
@@ -1469,6 +1507,7 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
         scheduling=scheduling,
         flood_wait_kill_switch_event=flood_wait_kill_switch_event,
     )
+    folder_receipts.bind_terminal_offer(partial(_offer_folder_verification, ctx))
 
     client.set_rpc_admission_observer(
         partial(
@@ -1764,6 +1803,15 @@ async def _publish_startup_identity(ctx: _SyncMainContext, profile: object, acco
     await _update_self_profile(ctx.api_server, cast(_MeLike, profile))
     if ctx.api_server.self_id != account_id:
         raise RuntimeError("published startup account does not match verified identity")
+    if ctx.coordinator is not None:
+        _start_note_receipt_recovery(ctx)
+
+
+async def _update_verified_self_profile(ctx: _SyncMainContext, profile: object) -> None:
+    await _update_self_profile(ctx.api_server, cast(_MeLike, profile))
+    scope = ctx.client.retained_auth_scope()
+    if scope is not None and ctx.api_server._auth_scope == scope and ctx.coordinator is not None:
+        _start_note_receipt_recovery(ctx)
 
 
 def _build_message_fact_refresh_dependencies(ctx: _SyncMainContext) -> MessageFactRefreshDeps:
@@ -1912,6 +1960,7 @@ def _build_demand_runtime(
             entity_refresh_coordinator=entity_refresh_coordinator,
             fact_hydration_worker=ctx.fact_hydration_worker,
             folder_projection_worker=ctx.folder_projection_worker,
+            folder_verification=ctx.folder_command_owner,
             message_fact_refresh_deps=message_fact_refresh_deps,
             message_fact_refresh_policy=ctx.message_fact_refresh_policy,
             scheduled_reconciler=scheduled_reconciler,
@@ -1921,7 +1970,7 @@ def _build_demand_runtime(
             activity_rpc_timeout_seconds=ctx.scheduling.activity_rpc_timeout_seconds,
             read_receipt_batch=read_receipt_batch,
             self_profile_cadence=ctx.self_profile_cadence,
-            update_self_profile=lambda me: _update_self_profile(ctx.api_server, cast(_MeLike, me)),
+            update_self_profile=lambda me: _update_verified_self_profile(ctx, me),
             startup_identity=startup_identity,
             publish_startup_identity=publish_startup_identity,
             draft_owner=draft_owner,
@@ -2458,9 +2507,148 @@ def _bind_event_observers(ctx: _SyncMainContext) -> None:
         ctx.handler_manager.bind_access_loss_observer(partial(_observe_access_loss, observer))
 
 
+def _recover_native_management_receipts(conn: sqlite3.Connection, scope: TelegramAuthScope) -> None:
+    from .contact_notes.receipts import recover_interrupted_operations as recover_notes
+    from .folders.command_receipts import recover_interrupted_operations as recover_folders
+
+    recover_notes(conn, scope)
+    recover_folders(conn, scope, int(time.time()))
+
+
+def _start_note_receipt_recovery(ctx: _SyncMainContext) -> None:
+    token = ctx.client.capture_image_scope()
+    if token is None or token == ctx.note_recovery_token:
+        return
+    previous = ctx.note_recovery_task
+    if previous is not None and not previous.done():
+        previous.cancel()
+    ctx.note_recovery_token = token
+    ctx.note_recovery_task = _create_tracked_task(
+        ctx, _restart_note_receipt_recovery(ctx, token, previous), name="native_note_receipt_recovery", critical=True
+    )
+
+
+async def _restart_note_receipt_recovery(
+    ctx: _SyncMainContext, token: ScopeToken, previous: asyncio.Task[object] | None
+) -> None:
+    if previous is not None:
+        await asyncio.gather(previous, return_exceptions=True)
+    await _reconcile_note_receipts(ctx, token)
+
+
+async def _reconcile_note_receipts(ctx: _SyncMainContext, token: ScopeToken) -> None:
+    """Offer a finite startup population to the existing bounded profile owner."""
+    account_id = token.scope.account_id
+    upper = await ctx.writer.run(partial(_note_recovery_watermark, account_id=account_id))
+    if upper is None:
+        return
+    after = 0
+    service = ctx.api_server._get_entity_info_service()
+    while ctx.client.claim_image_scope(token) and not ctx.shutdown_event.is_set():
+        rows = await ctx.writer.run(partial(_unresolved_note_batch, account_id=account_id, after=after, upper=upper))
+        if not rows:
+            return
+        for entity_id in rows:
+            if not ctx.client.claim_image_scope(token) or ctx.shutdown_event.is_set():
+                return
+            await service.request_note_reconciliation(entity_id)
+        after = rows[-1]
+
+
+def _note_recovery_watermark(conn: sqlite3.Connection, account_id: int) -> int | None:
+    row = cast(
+        tuple[int | None] | None,
+        conn.execute(
+            "SELECT MAX(entity_id) FROM contact_note_operation_receipts WHERE account_id=? AND "
+            "((outcome='unknown' AND verification!='observed_after_unknown') OR "
+            "(outcome='acknowledged' AND verification IN ('pending','unavailable')))",
+            (account_id,),
+        ).fetchone(),
+    )
+    return None if row is None or row[0] is None else int(row[0])
+
+
+def _unresolved_note_batch(conn: sqlite3.Connection, account_id: int, after: int, upper: int) -> list[int]:
+    rows = cast(
+        list[tuple[int]],
+        conn.execute(
+            "SELECT DISTINCT entity_id FROM contact_note_operation_receipts "
+            "WHERE account_id=? AND entity_id>? AND entity_id<=? AND "
+            "((outcome='unknown' AND verification!='observed_after_unknown') OR "
+            "(outcome='acknowledged' AND verification IN ('pending','unavailable'))) "
+            "ORDER BY entity_id LIMIT 32",
+            (account_id, after, upper),
+        ).fetchall(),
+    )
+    return [int(row[0]) for row in rows]
+
+
+def _compose_note_command_owner(ctx: _SyncMainContext) -> ContactNoteCommandOwner:
+    gateway = cast(TelethonUserProfileGateway, ctx.user_profile_port)
+    if ctx.note_write_authority is None:
+        raise RuntimeError("note write authority unavailable during command composition")
+    entity_service = ctx.api_server._get_entity_info_service()
+
+    async def request_reconciliation(entity_id: int) -> bool:
+        try:
+            return await entity_service.request_note_reconciliation(entity_id)
+        except Exception:
+            ctx.shutdown_request.request("native_reconciliation_failed")
+            raise
+
+    ctx.note_write_authority.bind_reconciliation(request_reconciliation)
+
+    def resolve_user(entity_id: int) -> InputUser | None:
+        reference = gateway.get_user_reference(entity_id)
+        if reference is None or reference.is_self:
+            return None
+        return InputUser(reference.user_id, reference.access_hash)
+
+    return ContactNoteCommandOwner(
+        ctx.client,
+        ctx.conn,
+        writer=ctx.writer,
+        identity=ctx.client.retained_auth_scope,
+        resolve_input_user=resolve_user,
+        acquire_command_profile=entity_service.acquire_command_profile,
+        request_reconciliation=request_reconciliation,
+        acquire_config=gateway.fetch_contact_note_limit,
+        authority=ctx.note_write_authority,
+    )
+
+
+def _offer_folder_verification(ctx: _SyncMainContext) -> None:
+    if ctx.coordinator is not None:
+        try:
+            ctx.coordinator.offer(DemandKind.FOLDER_SNAPSHOT)
+        except Exception:
+            ctx.shutdown_request.request("native_reconciliation_failed")
+            raise
+
+
 def _observe_access_loss(observer: RpcAdmissionObservationAggregator | None, counts: MembershipSignalCounts) -> None:
     if observer is not None:
         observer.observe_membership(counts.as_observation(), source="access_loss")
+
+
+async def _compose_native_management(ctx: _SyncMainContext) -> None:
+    """Recover receipts for the verified account before admitting commands."""
+    assert ctx.api_server.self_id is not None
+    scope = ctx.client.retained_auth_scope()
+    if scope is None or scope.account_id != ctx.api_server.self_id:
+        raise RuntimeError("verified account scope unavailable during receipt recovery")
+    await ctx.writer.run(lambda conn: _recover_native_management_receipts(conn, scope))
+    if ctx.folder_receipt_owner is None:
+        raise RuntimeError("folder receipt owner unavailable during command composition")
+    ctx.folder_command_owner = FolderCommandOwner(
+        ctx.client,
+        ctx.writer,
+        ctx.folder_projection_worker,
+        ctx.conn,
+        ctx.folder_receipt_owner,
+        offer_verification=partial(_offer_folder_verification, ctx),
+    )
+    ctx.note_command_owner = _compose_note_command_owner(ctx)
 
 
 async def sync_main() -> None:  # noqa: PLR0915 - composition root owns startup sequencing
@@ -2518,6 +2706,7 @@ async def sync_main() -> None:  # noqa: PLR0915 - composition root owns startup 
         if startup_identity is None:
             return
         assert ctx.api_server.self_id is not None
+        await _compose_native_management(ctx)
         ctx.handler_manager.set_self_id(ctx.api_server.self_id)
         await _bind_draft_commands(ctx)
         draft_owner = ctx.draft_owner
@@ -2545,6 +2734,10 @@ async def sync_main() -> None:  # noqa: PLR0915 - composition root owns startup 
             dialog_directory,
             startup_identity,
         )
+        _start_note_receipt_recovery(ctx)
+        assert ctx.folder_command_owner is not None and ctx.note_command_owner is not None
+        ctx.api_server.bind_folder_commands(ctx.folder_command_owner)
+        ctx.api_server.bind_contact_note_commands(ctx.note_command_owner)
         await _bind_scheduled_commands(ctx)
         await draft_owner.request_recovery("startup")
         await ctx.writer.run(lambda conn: TopicCatalogRepository(conn).bootstrap())
