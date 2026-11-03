@@ -31,6 +31,7 @@ from mcp_telegram.delta_sync import (
     prepare_dm_deletion_reconciliation,
 )
 from mcp_telegram.dialog_sync import DialogLightReconciliationDemandAdapter, DialogReconciliationWorker
+from mcp_telegram.entity_profile.membership import MembershipSignalCounts
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.message_history.contracts import (
     MessageHistoryAccessLostError,
@@ -1483,7 +1484,7 @@ async def test_access_probe_adapter_persists_probe_to_gap_fill_handoff(conn: sql
         *,
         expected_completion_generation: int | None = None,
         profile_owner_account_id: int | None = None,
-        membership_observer=None,
+        membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
     ) -> int:
         before = current_demand_token()
         result = await original_gap_slice(

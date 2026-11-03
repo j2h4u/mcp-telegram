@@ -1447,7 +1447,9 @@ def test_membership_changes_queue_only_after_snapshot_and_ignore_replays(conn: s
     assert (
         conn.execute("SELECT service_action FROM messages WHERE dialog_id=-5 AND message_id=3").fetchone()[0] == leave
     )
-    generation = conn.execute("SELECT generation FROM entity_profile_refresh_state WHERE entity_id=12").fetchone()[0]
+    generation = cast(
+        tuple[int], conn.execute("SELECT generation FROM entity_profile_refresh_state WHERE entity_id=12").fetchone()
+    )[0]
     with pytest.raises(RuntimeError, match="rollback"), write_transaction(conn):
         assert _repair_retained_memberships(conn, 77, now=400, limit=2)[0] == 2
         raise RuntimeError("rollback")
