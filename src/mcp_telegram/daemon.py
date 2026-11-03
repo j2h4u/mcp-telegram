@@ -129,6 +129,7 @@ from .read_state import apply_read_cursor, apply_reconciled_unread_count
 from .reconnect import run_reconnect_catch_up_loop
 from .rpc_admission_observations import RpcAdmissionObservationAggregator
 from .runtime_observations import (
+    RecoveryObservationAdapter,
     RuntimeObservationSink,
     _prune_runtime_observations_batch,
     record_runtime_observation,
@@ -173,6 +174,7 @@ from .telegram_gateway import (
 from .telegram_image_download import TelegramImageGateway
 from .telegram_read_receipts import TelethonTelegramReadReceiptGateway
 from .telegram_rpc_consumers import DemandKind, demand_contract
+from .telegram_rpc_recovery import RecoveryObservation, RecoveryObservationEvent, RecoveryStage
 from .telegram_rpc_scheduler import (
     AdmissionObserver,
     RpcAdmissionClosedError,
@@ -325,6 +327,12 @@ class _DaemonClient(Protocol):
     def rpc_observation_methods(self) -> frozenset[str]: ...
 
     def set_flood_event_observer(self, observer: Callable[..., None] | None) -> None: ...
+
+    def set_recovery_observer(self, observer: Callable[[RecoveryObservation], None] | None) -> None: ...
+
+    def observe_auto_resume(
+        self, stage: RecoveryStage, event: RecoveryObservationEvent, *, elapsed_ms: float | None = None
+    ) -> None: ...
 
     def set_scheduled_continuity_recovery(
         self, callback: Callable[[int | None, str], Awaitable[None]] | None
@@ -1095,14 +1103,50 @@ async def _monitor_flood_wait_kill_switch(ctx: _SyncMainContext) -> None:
 async def _monitor_auto_resume(ctx: _SyncMainContext) -> None:
     """Request full lifecycle reconstruction only when the central gate permits it."""
     while not ctx.shutdown_event.is_set():
-        restart_due = await ctx.client.maintain_auto_resume()
+        started = time.monotonic()
+        _observe_resume_monitor(ctx, RecoveryObservationEvent.MONITOR_EVALUATE_START)
+        try:
+            restart_due = await ctx.client.maintain_auto_resume()
+        except asyncio.CancelledError:
+            _observe_resume_monitor(ctx, RecoveryObservationEvent.MONITOR_EVALUATE_CANCELLED, started)
+            raise
+        except BaseException:
+            _observe_resume_monitor(ctx, RecoveryObservationEvent.MONITOR_EVALUATE_FAILED, started)
+            raise
+        _observe_resume_monitor(ctx, RecoveryObservationEvent.MONITOR_EVALUATE_RETURN, started)
         if ctx.shutdown_event.is_set():
             return
         if restart_due:
+            _observe_resume_monitor(ctx, RecoveryObservationEvent.MONITOR_RESTART)
             logger.info("automatic_sync_resume_restarting")
             ctx.shutdown_request.request("auto_resume_restart")
             return
-        await sleep_through_flood(ctx.shutdown_event, 60)
+        started = time.monotonic()
+        _observe_resume_monitor(ctx, RecoveryObservationEvent.MONITOR_SLEEP_START)
+        try:
+            await sleep_through_flood(ctx.shutdown_event, 60)
+        except asyncio.CancelledError:
+            _observe_resume_monitor(ctx, RecoveryObservationEvent.MONITOR_SLEEP_CANCELLED, started)
+            raise
+        except BaseException:
+            _observe_resume_monitor(ctx, RecoveryObservationEvent.MONITOR_SLEEP_FAILED, started)
+            raise
+        _observe_resume_monitor(ctx, RecoveryObservationEvent.MONITOR_SLEEP_RETURN, started)
+
+
+def _observe_resume_monitor(
+    ctx: _SyncMainContext, event: RecoveryObservationEvent, started: float | None = None
+) -> None:
+    try:
+        observe = getattr(ctx.client, "observe_auto_resume", None)
+        if observe is not None:
+            observe(
+                RecoveryStage.MONITOR,
+                event,
+                elapsed_ms=(time.monotonic() - started) * 1000 if started is not None else None,
+            )
+    except Exception:  # noqa: BLE001 - telemetry cannot affect the monitor.
+        logger.warning("recovery_monitor_observer_failed")
 
 
 def _install_flood_wait_kill_switch(config: McpTelegramConfig, event: asyncio.Event) -> None:
@@ -1434,6 +1478,11 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
     )
     client.set_rpc_request_observer(rpc_admission_observer.observe_rpc_event)
     client.set_flood_event_observer(rpc_admission_observer.observe_flood_wait)
+    recovery_observer = RecoveryObservationAdapter(
+        rpc_observation_sink,
+        summary_interval_seconds=config.telemetry.runtime_observations.rpc_summary_interval_seconds,
+    )
+    client.set_recovery_observer(recovery_observer.observe)
     return ctx
 
 
@@ -2091,6 +2140,7 @@ async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
         ctx.client.set_rpc_admission_observer(None)
         ctx.client.set_rpc_request_observer(None)
         ctx.client.set_flood_event_observer(None)
+        ctx.client.set_recovery_observer(None)
 
     async def drain_telemetry() -> None:
         if ctx.rpc_admission_observer is not None:

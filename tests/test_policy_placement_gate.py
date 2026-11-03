@@ -50,6 +50,23 @@ def _findings(source: str) -> set[tuple[str, str]]:
 
 
 NON_OPERATOR_POLICY_CASES = (
+    (
+        "src/mcp_telegram/telegram_rpc_recovery.py",
+        'class RecoveryObservationEvent:\n    PENDING_COOLDOWN = "pending_cooldown"\n',
+    ),
+    ("src/mcp_telegram/telegram_rpc_recovery.py", 'class RecoveryAction:\n    FAILURE_SETTLED = "failure_settled"\n'),
+    (
+        "src/mcp_telegram/telegram_transport.py",
+        "class GuardedMTProtoSender:\n    def __init__(self):\n        self._ack_retry_blocked = False\n",
+    ),
+    (
+        "src/mcp_telegram/telegram_transport.py",
+        "class GuardedMTProtoSender:\n    def _send_loop(self):\n        self._ack_retry_blocked = False\n",
+    ),
+    (
+        "src/mcp_telegram/telegram_transport.py",
+        "class GuardedMTProtoSender:\n    def _snapshot_ack(self):\n        limit = (MAXIMUM_SIZE - 12) // 8\n",
+    ),
     ("src/mcp_telegram/daemon_ipc.py", "REQUEST_LIMIT = 2 * 1024 * 1024\n"),
     ("src/mcp_telegram/daemon_ipc.py", "RESPONSE_FRAME_LIMIT = 64 * 1024\n"),
     ("src/mcp_telegram/daemon_ipc.py", "RESPONSE_LIMIT = 64 * 1024 * 1024\n"),

@@ -51,6 +51,7 @@ _PRIVATE_SENDER_SEAMS: dict[Path, frozenset[tuple[str, str, str]]] = {
         {
             ("_OwnedPacker", "__init__", "self._sender"),
             ("_OwnedPacker", "append", "self._sender"),
+            ("_OwnedPacker", "next_state", "self._sender"),
             ("_AuthConnectionProxy", "__init__", "self._sender"),
             ("_AuthConnectionProxy", "send", "self._sender"),
             ("_AuthConnectionProxy", "recv", "self._sender"),

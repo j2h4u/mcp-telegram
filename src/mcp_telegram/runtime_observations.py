@@ -11,13 +11,14 @@ import threading
 import time
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
 from typing import Protocol, cast
 
 from .sqlite_writer import SQLiteWriter
 from .sync_transactions import write_transaction
+from .telegram_rpc_recovery import RecoveryObservation, RecoveryObservationEvent, RecoveryStage
 
 RUNTIME_INSTANCE_ID = uuid.uuid4().hex
 MAX_PAYLOAD_BYTES = 1024
@@ -25,6 +26,7 @@ DEFAULT_ROW_CAP = 100_000
 _PRUNE_BATCH_SIZE = 1_000
 _WRITER_POLL_SECONDS = 0.05
 _FLUSH_BATCH_SIZE = 32
+_UUID_HEX_LENGTH = 32
 ALLOWED_KINDS = frozenset(
     {
         "mcp.call",
@@ -39,6 +41,7 @@ ALLOWED_KINDS = frozenset(
         "runtime.task_failed",
         "telegram.rpc_admission",
         "telegram.rpc_request",
+        "telegram.recovery",
         "telegram.demand",
         "daemon.request_timing",
         "entity_profile.pair",
@@ -581,6 +584,77 @@ class RuntimeObservationSink:
                 )
 
 
+def _recovery_payload(event: RecoveryObservation) -> dict[str, object]:
+    payload: dict[str, object] = {"stage": event.stage.value, "event": event.event.value}
+    for name, value in (
+        ("action", event.action),
+        ("policy_event", event.policy_event),
+        ("phase", event.phase),
+        ("cause", event.cause),
+        ("command", event.command),
+        ("reason", event.reason),
+    ):
+        if value is not None:
+            payload[name] = value.value
+    if event.snapshot is not None:
+        payload["snapshot"] = asdict(event.snapshot)
+    if event.attempts_total is not None:
+        payload["attempts_total"] = event.attempts_total
+    return payload
+
+
+def _recovery_stream(event: RecoveryObservation) -> tuple[object, ...] | None:
+    if event.stage == RecoveryStage.GUARD:
+        return (RecoveryStage.GUARD,)
+    if event.stage == RecoveryStage.DECISION or event.event in {
+        RecoveryObservationEvent.MONITOR_EVALUATE_START,
+        RecoveryObservationEvent.MONITOR_EVALUATE_RETURN,
+        RecoveryObservationEvent.MONITOR_SLEEP_START,
+        RecoveryObservationEvent.MONITOR_SLEEP_RETURN,
+    }:
+        return (event.stage, event.event, event.action, event.policy_event)
+    return None
+
+
+class RecoveryObservationAdapter:
+    """Submit content-free recovery observations through the existing bounded sink."""
+
+    def __init__(self, sink: RuntimeObservationSink, *, summary_interval_seconds: float) -> None:
+        if summary_interval_seconds <= 0:
+            raise ValueError("summary_interval_seconds must be positive")
+        self._sink = sink
+        self._interval = summary_interval_seconds
+        self._last: dict[tuple[object, ...], tuple[str, float]] = {}
+        self._lock = threading.Lock()
+
+    def observe(self, event: RecoveryObservation) -> None:
+        try:
+            payload = _recovery_payload(event)
+            semantic = encode_payload(payload)
+            for name, value in (("episode_id", event.episode_id), ("grant_id", event.grant_id)):
+                if value is not None and len(value) == _UUID_HEX_LENGTH and all(c in "0123456789abcdef" for c in value):
+                    payload[name] = value
+            self._submit(event, payload, semantic)
+        except Exception:  # noqa: BLE001 - telemetry must never affect recovery
+            logger.warning("recovery_observation_failed")
+
+    def _submit(self, event: RecoveryObservation, payload: dict[str, object], semantic: str) -> None:
+        key = _recovery_stream(event)
+        now = time.monotonic()
+        with self._lock:
+            previous = self._last.get(key) if key is not None else None
+            if previous is not None and previous[0] == semantic and now - previous[1] < self._interval:
+                return
+            accepted = self._sink.record(
+                kind="telegram.recovery",
+                observed_at_ms=event.observed_at_ms,
+                duration_ms=event.elapsed_ms,
+                payload=payload,
+            )
+            if key is not None and accepted:
+                self._last[key] = (semantic, now)
+
+
 def _plan_runtime_observations_batch(
     conn: sqlite3.Connection,
     *,
@@ -691,6 +765,7 @@ __all__ = [
     "DEFAULT_ROW_CAP",
     "MAX_PAYLOAD_BYTES",
     "RUNTIME_INSTANCE_ID",
+    "RecoveryObservationAdapter",
     "RuntimeObservationCounters",
     "RuntimeObservationPolicy",
     "RuntimeObservationSink",

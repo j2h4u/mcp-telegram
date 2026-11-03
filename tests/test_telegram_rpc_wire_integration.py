@@ -80,8 +80,10 @@ type _WireHarness = tuple[TelegramRpcGate, GuardedMTProtoSender, GuardedConnecti
 def _enqueue_ack_snapshot(sender: GuardedMTProtoSender, message_ids: list[int]) -> _RequestState:
     token = sender._control_origin.set((asyncio.current_task(), "ack"))
     try:
-        state = cast(_RequestState, RequestState(types.MsgsAck(message_ids)))
-        sender._send_queue.append(state)
+        sender._send_queue.append(cast(_RequestState, RequestState(types.MsgsAck(message_ids))))
+        sender._snapshot_ack()
+        assert sender._fresh_ack is not None
+        state = sender._fresh_ack
     finally:
         sender._control_origin.reset(token)
     return state
@@ -932,38 +934,46 @@ async def test_reconnect_preserves_newer_ping_marker(wire: _WireHarness, monkeyp
     assert sender._ping == 8
 
 
-async def test_unsent_ack_is_not_evicted_by_sent_replay_cache_pressure(wire: _WireHarness) -> None:
-    _gate, sender, connection, sink = wire
-    states: list[_RequestState] = []
+async def test_ack_burst_waits_for_first_receipt_before_successor(
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate, sender, connection, sink = wire
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    observe = gate.observe_result
+
+    async def hold_receipt(owner: object, error: BaseException | None, result: object = None) -> BaseException | None:
+        entered.set()
+        await release.wait()
+        return await observe(owner, error, result)
+
+    monkeypatch.setattr(gate, "observe_result", hold_receipt)
+    first = _enqueue_ack_snapshot(sender, [1])
+    assert await sender._send_queue.next_state() is first
+    await sender._prepare_state(first)
+    frozen = first.data
     token = sender._control_origin.set((asyncio.current_task(), "ack"))
     try:
-        for message_id in range(11):
-            state = cast(_RequestState, RequestState(types.MsgsAck([message_id])))
-            states.append(state)
-            sender._send_queue.append(state)
-            if message_id == 0:
-                first = await sender._send_queue.next_state()
-                await sender._prepare_state(first)
+        for message_id in range(2, 100):
+            sender._send_queue.append(cast(_RequestState, RequestState(types.MsgsAck([message_id]))))
     finally:
         sender._control_origin.reset(token)
-    first = states[0]
-    packet = connection._send_queue.get_nowait()
-    assert sender.require_owned(first).claims == 0
-    assert not sender.require_owned(first).retired and len(sender._last_acks) == 0
-    assert sender.write_packet(packet, connection._send)
-    assert len(sink.frames) == 1 and sender.require_owned(first).claims == 1
-    for expected in states[1:]:
-        state = await sender._send_queue.next_state()
-        assert state is expected
-        await sender._prepare_state(state)
-        assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
-        await asyncio.gather(*sender._observing)
-    assert len(sink.frames) == 11 and len(sender._last_acks) == 10
-    assert set(sender._owned_states) == set(sender._last_acks)
-    assert first not in sender._owned_states
+    assert sender._fresh_ack is first and len(sender._owned_states) == 1
+    assert first.data == frozen and sender._pending_ack == set(range(2, 100))
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    await asyncio.wait_for(entered.wait(), 1)
+    assert sender._fresh_ack is first and len(sender._owned_states) == 1
+    release.set()
+    await asyncio.gather(*sender._observing)
+    second = await asyncio.wait_for(sender._send_queue.next_state(), 1)
+    assert set(cast(types.MsgsAck, second.request).msg_ids) == set(range(2, 100))
+    await sender._prepare_state(second)
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    await asyncio.gather(*sender._observing)
+    assert len(sink.frames) == 2
 
 
-async def test_unsent_terminal_ack_retains_ids_for_next_natural_snapshot(wire: _WireHarness) -> None:
+async def test_unsent_terminal_ack_retains_ids_for_next_natural_snapshot(wire: _WireHarness) -> None:  # noqa: PLR0915
     gate, sender, connection, sink = wire
     state = _enqueue_ack_snapshot(sender, [99, 100])
     assert await sender._send_queue.next_state() is state
@@ -973,6 +983,8 @@ async def test_unsent_terminal_ack_retains_ids_for_next_natural_snapshot(wire: _
     expired_deadline = time.monotonic() - 1
     owner.scope = replace(owner.scope, deadline=expired_deadline)
     sender._pending_ack.update({100, 101})
+    waiting = asyncio.create_task(sender._send_loop())
+    await asyncio.sleep(0)
     with pytest.raises(RpcAdmissionExpiredError):
         await sender._prepare_state(state)
     await asyncio.sleep(0)
@@ -984,6 +996,10 @@ async def test_unsent_terminal_ack_retains_ids_for_next_natural_snapshot(wire: _
     assert owner.scope.attempt_budget is old_budget and old_budget is not None and old_budget.attempts == 0
     assert not sender._preparing and not sender._observing
     assert connection._send_queue.empty()
+    await asyncio.sleep(0)
+    assert sender._fresh_ack is None and sender._pending_ack == {99, 100, 101}
+    waiting.cancel()
+    await asyncio.gather(waiting, return_exceptions=True)
 
     # Only an already-existing natural sender turn may give the retained IDs a
     # fresh bounded snapshot; cleanup above creates no replacement owner/task.
@@ -1010,6 +1026,119 @@ async def test_unsent_terminal_ack_retains_ids_for_next_natural_snapshot(wire: _
         await asyncio.gather(send_loop, return_exceptions=True)
 
 
+async def test_stale_ready_after_ack_rejection_does_not_retry(
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate, sender, _connection, _sink = wire
+    state = _enqueue_ack_snapshot(sender, [99])
+    assert await sender._send_queue.next_state() is state
+    owned = sender.require_owned(state)
+    owner = gate._require_wire_owner(owned.owner)
+    owner.scope = replace(owner.scope, deadline=time.monotonic() - 1)
+    ready = sender._send_queue._ready
+    original_wait = ready.wait
+    awakened = asyncio.Event()
+    release = asyncio.Event()
+
+    async def held_wait() -> bool:
+        result = await original_wait()
+        awakened.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(ready, "wait", held_wait)
+    waiting = asyncio.create_task(sender._send_loop())
+    try:
+        await asyncio.sleep(0)
+        ready.set()
+        await asyncio.wait_for(awakened.wait(), 1)
+        with pytest.raises(RpcAdmissionExpiredError):
+            await sender._prepare_state(state)
+        await asyncio.sleep(0)
+        await asyncio.gather(*sender._observing)
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert sender._fresh_ack is None and sender._pending_ack == {99}
+    finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+
+
+async def test_ack_admission_burst_does_not_block_probe_or_data(  # noqa: PLR0914, PLR0915
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate, sender, connection, sink = wire
+    admitted = asyncio.Event()
+    release = asyncio.Event()
+    prepare = gate.prepare_write
+
+    async def hold_ack(owner: object) -> object:
+        permit = await prepare(owner)
+        if sender._fresh_ack is not None and sender.require_owned(sender._fresh_ack).owner is owner:
+            admitted.set()
+            await release.wait()
+        return permit
+
+    monkeypatch.setattr(gate, "prepare_write", hold_ack)
+    sender._pending_ack.add(1)
+    loop = asyncio.create_task(sender._send_loop())
+    try:
+        await asyncio.wait_for(admitted.wait(), 5)
+        first = sender._fresh_ack
+        assert first is not None
+        first_owner = gate._require_wire_owner(sender.require_owned(first).owner)
+        deadline, budget = first_owner.scope.deadline, first_owner.scope.attempt_budget
+        token = sender._control_origin.set((asyncio.current_task(), "ack"))
+        try:
+            for message_id in range(2, 100):
+                sender._send_queue.append(cast(_RequestState, RequestState(types.MsgsAck([message_id]))))
+        finally:
+            sender._control_origin.reset(token)
+        assert sender._fresh_ack is first and len(sender._preparing) == 1
+        assert first_owner.scope.deadline == deadline and first_owner.scope.attempt_budget is budget
+        assert gate._admission_scheduler._source_outstanding_depth(TelegramRpcSource.TELETHON_RECONNECT_PROBE) <= 1
+        results = []
+        for request, source, service_class in (
+            (
+                functions.users.GetUsersRequest([types.InputUserSelf()]),
+                TelegramRpcSource.TELETHON_RECONNECT_PROBE,
+                RpcServiceClass.LIVE_SYNC,
+            ),
+            (GetStateRequest(), TelegramRpcSource.MCP_INTERACTIVE, RpcServiceClass.INTERACTIVE),
+        ):
+            scope = TelegramRpcScope(
+                source,
+                service_class,
+                time.monotonic() + 20,
+                asyncio.current_task(),
+                attempt_budget=RpcAttemptBudget(2),
+            )
+            results.append(sender.send_owned(request, scope))
+        for result, response in zip(results, ([types.User(id=42)], "ok"), strict=True):
+            packet = await asyncio.wait_for(connection._send_queue.get(), 12)
+            assert sender.write_packet(packet, connection._send)
+            packet.state.state.future.set_result(response)
+            assert await result == response
+        assert len(sink.frames) == 2 and sender._fresh_ack is first
+        release.set()
+        while True:
+            packet = await asyncio.wait_for(connection._send_queue.get(), 12)
+            if sender.write_packet(packet, connection._send):
+                break
+        await asyncio.gather(*sender._observing)
+        packet = await asyncio.wait_for(connection._send_queue.get(), 12)
+        assert sender.write_packet(packet, connection._send)
+        await asyncio.gather(*sender._observing)
+        assert set(cast(types.MsgsAck, first.request).msg_ids) | set(
+            cast(types.MsgsAck, packet.state.state.request).msg_ids
+        ) == set(range(1, 100))
+    finally:
+        release.set()
+        loop.cancel()
+        await asyncio.gather(loop, return_exceptions=True)
+
+
 async def test_unsent_terminal_ack_capacity_rejection_retains_without_new_owner_or_task(
     wire: _WireHarness,
 ) -> None:
@@ -1017,7 +1146,12 @@ async def test_unsent_terminal_ack_capacity_rejection_retains_without_new_owner_
     source_limit = demand_contract(DemandKind.TELETHON_RECONNECT_PROBE).source_outstanding_limit
     states: list[_RequestState] = []
     for message_id in range(source_limit):
-        state = _enqueue_ack_snapshot(sender, [message_id])
+        token = sender._control_origin.set((asyncio.current_task(), "ping"))
+        try:
+            state = cast(_RequestState, RequestState(functions.PingRequest(message_id)))
+            sender._send_queue.append(state)
+        finally:
+            sender._control_origin.reset(token)
         assert await sender._send_queue.next_state() is state
         states.append(state)
         sender._offer_state(state)
@@ -1246,12 +1380,7 @@ async def test_rpc_control_synthetic_success_is_not_a_provider_response(wire: _W
         recorder, method_names=TelegramRpcGate.rpc_observation_methods(), policy=RuntimeObservationConfig()
     )
     gate.set_rpc_request_observer(observer.observe_rpc_event)
-    token = sender._control_origin.set((asyncio.current_task(), "ack"))
-    try:
-        state = cast(_RequestState, RequestState(types.MsgsAck([99])))
-        sender._send_queue.append(state)
-    finally:
-        sender._control_origin.reset(token)
+    state = _enqueue_ack_snapshot(sender, [99])
     assert await sender._send_queue.next_state() is state
     await sender._prepare_state(state)
     assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)

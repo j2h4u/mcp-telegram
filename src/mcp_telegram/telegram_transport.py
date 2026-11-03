@@ -9,6 +9,7 @@ from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
+from itertools import islice
 from typing import Literal, Never, Protocol, cast
 
 from telethon import version  # type: ignore[import-untyped]
@@ -142,7 +143,16 @@ class _OwnedPacker(MessagePacker):
         self._sender = sender
 
     def append(self, state: _RequestState) -> None:
+        if state not in self._sender._owned_states:
+            origin = self._sender._control_origin.get()
+            if origin is not None and origin == (asyncio.current_task(), "ack") and type(state.request) is MsgsAck:
+                self._sender._pending_ack.update(cast(MsgsAck, state.request).msg_ids)
+                if self._sender._fresh_ack is None:
+                    self._sender._ack_retry_blocked = False
+                    self._ready.set()
+                return
         self._sender.require_owned(state)
+        self._sender._ack_retry_blocked = False
         super().append(state)
 
     def extend(self, states: Iterable[_RequestState]) -> None:
@@ -152,6 +162,9 @@ class _OwnedPacker(MessagePacker):
     async def next_state(self) -> _RequestState:
         while not self._deque:
             self._ready.clear()
+            self._sender._snapshot_ack()
+            if self._deque:
+                break
             await self._ready.wait()
         return cast(_RequestState, self._deque.popleft())
 
@@ -254,6 +267,8 @@ class GuardedMTProtoSender(MTProtoSender):
         self._authority = authority
         self._identity_change = identity_change
         self._owned_states: dict[_RequestState, _OwnedState] = {}
+        self._fresh_ack: _RequestState | None = None
+        self._ack_retry_blocked = False
         self._preparing: set[asyncio.Task[None]] = set()
         self._observing: set[asyncio.Task[None]] = set()
         self._settling: asyncio.Task[None] | None = None
@@ -459,12 +474,22 @@ class GuardedMTProtoSender(MTProtoSender):
                 error = rejected
         except Exception as persistence_error:
             self._authority.protect_transport(persistence_error)
-            self._publish_owned_result(owned, future, error if error is not None else persistence_error)
+            error = error if error is not None else persistence_error
+            self._publish_owned_result(owned, future, error)
             raise
         else:
             self._publish_owned_result(owned, future, error)
         finally:
             self._retire_completed_state(owned)
+            self._settle_fresh_ack(owned, error)
+
+    def _settle_fresh_ack(self, owned: _OwnedState, error: BaseException | None) -> None:
+        if self._fresh_ack is not owned.state:
+            return
+        self._fresh_ack = None
+        self._ack_retry_blocked = isinstance(error, (RpcAdmissionExpiredError, RpcAdmissionSaturatedError))
+        if error is None and self._user_connected and not self._reconnecting:
+            self._send_queue._ready.set()
 
     def _retire_completed_state(self, owned: _OwnedState) -> None:
         if self._pending_state.get(owned.state.msg_id) is owned.state:
@@ -669,16 +694,31 @@ class GuardedMTProtoSender(MTProtoSender):
                     self._owned_states.pop(previous.state, None)
         self._last_acks.append(state)
 
+    def _snapshot_ack(self) -> None:
+        if self._ack_retry_blocked:
+            return
+        if (
+            not self._user_connected
+            or not self.physical_connected()
+            or self._reconnecting
+            or self._fresh_ack is not None
+            or not self._pending_ack
+        ):
+            return
+        # MsgsAck has a constructor and vector header before its eight-byte IDs.
+        limit = (MessageContainer.MAXIMUM_SIZE - TLMessage.SIZE_OVERHEAD - 12) // 8
+        ids = list(islice(self._pending_ack, limit))
+        state = cast(_RequestState, VendorRequestState(MsgsAck(ids)))
+        owner = self._authority.register_protocol(state.request, state.data, "ack")
+        self._remember(state, owner, origin="ack")
+        self._fresh_ack = state
+        self._send_queue.append(state)
+        self._pending_ack.difference_update(ids)
+
     async def _send_loop(self) -> None:
+        self._ack_retry_blocked = False
         while self._user_connected and not self._reconnecting:
-            if self._pending_ack:
-                token = self._control_origin.set((asyncio.current_task(), "ack"))
-                try:
-                    ack = cast(_RequestState, VendorRequestState(MsgsAck(list(self._pending_ack))))
-                    self._send_queue.append(ack)
-                    self._pending_ack.clear()
-                finally:
-                    self._control_origin.reset(token)
+            self._snapshot_ack()
             self._offer_state(await self._send_queue.next_state())
 
     def _keepalive_ping(self, rnd_id: int) -> None:
