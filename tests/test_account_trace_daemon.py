@@ -1443,7 +1443,7 @@ async def test_observed_zero_authored_hits_exposes_retained_candidates_without_r
         server._CallTelemetry(),
     )
     Draft202012Validator(schema).validate(cast(object, wire.structured_content))
-    wire_data = _dict(wire.structured_content)
+    wire_data = _dict(cast(object, wire.structured_content))
     wire_page = _dict(_dict(wire_data["coverage"])["known_common_chats"])
     wire_items = cast(list[dict], wire_page["items"])
     assert "title" not in wire_items[1]["value"] and "username" not in wire_items[1]["value"]
