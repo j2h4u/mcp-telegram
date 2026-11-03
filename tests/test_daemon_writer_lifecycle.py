@@ -65,6 +65,10 @@ async def test_shutdown_preserves_finalizer_commit_loss_boundary_and_final_marke
         def set_flood_event_observer(self, _observer: object) -> None:
             pass
 
+        def set_recovery_observer(self, observer: object) -> None:
+            assert observer is None
+            stages.append("recovery_observer_detached")
+
     class Api:
         async def shutdown(self) -> None:
             stages.append("api_stopped")
@@ -101,7 +105,14 @@ async def test_shutdown_preserves_finalizer_commit_loss_boundary_and_final_marke
     try:
         await daemon._shutdown_sync_main_context(ctx)
         assert ctx.shutdown_event.is_set()
-        assert stages == ["api_stopped", "disconnect", "receipts_drained", "observer_detached", "observer_flushed"]
+        assert stages == [
+            "api_stopped",
+            "disconnect",
+            "receipts_drained",
+            "observer_detached",
+            "recovery_observer_detached",
+            "observer_flushed",
+        ]
         with pytest.raises(sqlite3.ProgrammingError, match="closed"):
             reader.execute("SELECT 1")
         with pytest.raises(RuntimeError, match="unavailable"):
