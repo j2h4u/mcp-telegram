@@ -2483,7 +2483,9 @@ class DaemonAPIServer:
         scope = self._auth_scope
         if scope is None or self.self_id != scope.account_id:
             return self._directory_account_unverified("The connected account is not verified.")
-        payload = {key: value for key, value in req.items() if key not in {"method", "request_id", "timezone"}}
+        payload = {
+            key: value for key, value in req.items() if key not in {"method", "request_id", "operation_id", "timezone"}
+        }
         try:
             command = FolderCommandArguments.model_validate(payload, strict=True)
         except ValidationError:
@@ -2506,6 +2508,7 @@ class DaemonAPIServer:
         allowed = {
             "method",
             "request_id",
+            "operation_id",
             "timezone",
             "dialog_id",
             "action",
