@@ -64,8 +64,24 @@ def test_daemon_health_prints_specific_protection_diagnostics(
                 "account_protection": {
                     "status": "active",
                     "reason": "unresolved_outbound_outcome",
-                    "unresolved_request_count": 1,
-                    "unresolved_requests": [{"method": "GetHistoryRequest", "phase": "unknown"}],
+                    "unresolved_request_count": 12,
+                    "blocking_request_count": 1,
+                    "historical_unknown_request_count": 11,
+                    "unresolved_requests": [
+                        {"method": "GetHistoryRequest", "phase": "unknown", "blocks_acquisition": True}
+                    ]
+                    * 8,
+                    "unresolved_requests_truncated": True,
+                    "automatic_resume": {
+                        "state": "waiting",
+                        "phase": "waiting",
+                        "cause": "read_uncertainty",
+                        "block_reason": None,
+                        "attempts_total": 2,
+                        "attempts_by_policy": {"read_uncertainty": 2},
+                        "next_trial_at_utc": 12345.0,
+                        "generation": "private-generation",
+                    },
                     "generation": "private-generation",
                     "key_id": "private-key",
                 }
@@ -77,7 +93,12 @@ def test_daemon_health_prints_specific_protection_diagnostics(
     assert healthcheck_daemon.main() == 1
     diagnostic = capsys.readouterr().err
     assert "unresolved_outbound_outcome" in diagnostic and "GetHistoryRequest" in diagnostic
-    assert '"unresolved_request_count": 1' in diagnostic
+    assert '"unresolved_request_count": 12' in diagnostic
+    assert '"blocking_request_count": 1' in diagnostic
+    assert '"historical_unknown_request_count": 11' in diagnostic
+    assert '"unresolved_requests_truncated": true' in diagnostic
+    assert '"cause": "read_uncertainty"' in diagnostic
+    assert '"next_trial_at_utc": 12345.0' in diagnostic
     assert "private-" not in diagnostic
 
 

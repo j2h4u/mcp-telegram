@@ -326,6 +326,7 @@ class GuardedMTProtoSender(MTProtoSender):
         return await super().connect(connection)
 
     async def _connect(self) -> None:
+        previous_ping = self._ping
         try:
             await super()._connect()
         except ConnectionError as error:
@@ -333,6 +334,17 @@ class GuardedMTProtoSender(MTProtoSender):
             if isinstance(connection, GuardedConnectionTcpFull) and getattr(connection, "_last_connect_failed", False):
                 raise TransportConnectError("Telegram socket retries exhausted") from error
             raise
+        if (
+            previous_ping is not None
+            and self._ping == previous_ping
+            and not any(
+                isinstance(owned.state.request, PingRequest)
+                and owned.state.request.ping_id == self._ping
+                and not owned.state.future.done()
+                for owned in self._owned_states.values()
+            )
+        ):
+            self._ping = None
 
     async def _disconnect(self, error: BaseException | None = None) -> None:
         if self._terminal_teardown is None:

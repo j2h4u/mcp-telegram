@@ -342,6 +342,46 @@ async def test_response_timeout_after_first_claim_does_not_renew_on_replay(wire:
     await asyncio.gather(*sender._observing)
 
 
+@pytest.mark.parametrize("response_received", [False, True])
+async def test_exhausted_replay_preserves_original_outcome(wire: _WireHarness, response_received: bool) -> None:
+    gate, sender, connection, sink = wire
+    budget = RpcAttemptBudget(1)
+    scope = TelegramRpcScope(
+        TelegramRpcSource.MCP_INTERACTIVE,
+        RpcServiceClass.INTERACTIVE,
+        time.monotonic() + 10,
+        asyncio.current_task(),
+        attempt_budget=budget,
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    result = sender.send_owned(GetStateRequest(), scope)
+    state = await sender._send_queue.next_state()
+    await sender._prepare_state(state)
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    if response_received:
+        state.future.set_result("complete")
+    with pytest.raises(RpcAttemptBudgetExhaustedError):
+        await sender._prepare_state(state)
+    if response_received:
+        assert await result == "complete"
+    else:
+        with pytest.raises(RpcAttemptBudgetExhaustedError):
+            await result
+    await asyncio.gather(*sender._observing)
+    assert len(sink.frames) == budget.attempts == 1
+    encoded = gate._safety_store.load_record()
+    assert encoded is not None
+    record = cast(dict[str, object], json.loads(encoded))
+    intents = cast(dict[str, dict[str, object]], record["intents"])
+    if response_received:
+        assert intents == {}
+        assert gate.account_safety_status() is None
+    else:
+        assert [item["phase"] for item in intents.values()] == ["unknown"]
+        status = gate.account_safety_status()
+        assert status is not None and status["reason"] == "unresolved_outbound_outcome"
+
+
 async def test_response_timeout_does_not_run_during_durable_intent_preparation(
     wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -692,6 +732,83 @@ async def test_failed_ping_cleanup_preserves_claimed_or_newer_ping(
     await asyncio.sleep(0)
     await asyncio.gather(*sender._observing)
     assert sender._ping == (8 if newer_marker else 7)
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+async def test_reconnect_retires_only_terminal_claimed_ping(
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch, terminal: bool
+) -> None:
+    from telethon.network.mtprotosender import MTProtoSender
+
+    gate, sender, connection, _sink = wire
+    reconnects: list[Exception | None] = []
+    monkeypatch.setattr(sender, "_start_reconnect", lambda error: reconnects.append(error))
+    sender._keepalive_ping(7)
+    state = await sender._send_queue.next_state()
+    owned = sender.require_owned(state)
+    await sender._prepare_state(state)
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    if terminal:
+        state.future.set_exception(
+            RpcAdmissionExpiredError(gate._require_wire_owner(owned.owner).scope, "terminal ping failure")
+        )
+        await asyncio.sleep(0)
+        await asyncio.gather(*sender._observing)
+    assert sender._ping == 7
+    if terminal:
+        sender._keepalive_ping(8)
+        assert reconnects == [None]
+        reconnects.clear()
+
+    async def connected(_sender: MTProtoSender) -> None:
+        pass
+
+    monkeypatch.setattr(MTProtoSender, "_connect", connected)
+    await sender._connect()
+    sender._keepalive_ping(8)
+    if terminal:
+        fresh = await asyncio.wait_for(sender._send_queue.next_state(), 0.2)
+        assert isinstance(fresh.request, functions.PingRequest) and fresh.request.ping_id == 8
+        assert state.msg_id is not None
+        await sender._handle_pong(SimpleNamespace(obj=types.Pong(msg_id=state.msg_id, ping_id=7)))
+        assert sender._ping == 8 and reconnects == []
+    else:
+        assert sender._ping == 7 and reconnects == [None]
+
+
+async def test_failed_reconnect_keeps_claimed_ping_marker(wire: _WireHarness, monkeypatch: pytest.MonkeyPatch) -> None:
+    from telethon.network.mtprotosender import MTProtoSender
+
+    _gate, sender, connection, _sink = wire
+    sender._keepalive_ping(7)
+    state = await sender._send_queue.next_state()
+    await sender._prepare_state(state)
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    state.future.set_exception(ConnectionError("ping failed"))
+    await asyncio.sleep(0)
+    await asyncio.gather(*sender._observing)
+
+    async def failed(_sender: MTProtoSender) -> None:
+        raise ConnectionError("reconnect failed")
+
+    monkeypatch.setattr(MTProtoSender, "_connect", failed)
+    with pytest.raises(ConnectionError):
+        await sender._connect()
+    assert sender._ping == 7
+
+
+async def test_reconnect_preserves_newer_ping_marker(wire: _WireHarness, monkeypatch: pytest.MonkeyPatch) -> None:
+    from telethon.network.mtprotosender import MTProtoSender
+
+    _gate, sender, _connection, _sink = wire
+    sender._ping = 7
+
+    async def connected(_sender: MTProtoSender) -> None:
+        sender._ping = 8
+
+    monkeypatch.setattr(MTProtoSender, "_connect", connected)
+    await sender._connect()
+    assert sender._ping == 8
 
 
 async def test_unsent_ack_is_not_evicted_by_sent_replay_cache_pressure(wire: _WireHarness) -> None:
