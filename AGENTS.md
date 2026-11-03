@@ -265,8 +265,11 @@ work; search related contract fixtures before freezing. Run one full PR CI on
 the integrated candidate rather than a full run or separate PR for each ticket.
 
 Before final CI, freeze the candidate scope and integrate completed handoffs.
-For public tool registry, schema, or content changes, run the existing `tests/test_server.py`
-and `tests/test_strict_tool_arguments.py` contract modules before CI.
+For public tool registry, schema, or content changes, check the full affected contract
+and routing modules before CI: `tests/test_server.py`, `tests/test_strict_tool_arguments.py`,
+`tests/test_none_wire_contract.py`, `tests/test_tool_routing.py`, and
+`tests/test_mcp_test_client.py`. Check whole affected fixture and routing modules,
+not only registry-count cases; reuse passing results when the contract is unchanged.
 Check changed contracts, callers and fixtures, including actual integration paths
 and producer formats at ownership or persistence boundaries. Run affected static,
 type and complexity checks; collect independent findings and fix them together.
