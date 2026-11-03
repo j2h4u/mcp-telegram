@@ -17,6 +17,7 @@ from .messages.sqlite_hydration import (
 from .messages.sqlite_hydration_jobs import (
     media_fact_hydration_eligible,
 )
+from .peer_access import peer_target
 from .telethon_media import extract_media_fact
 
 _TERMINAL_RPC_SYMBOLS = frozenset(
@@ -49,7 +50,8 @@ class MediaFactHydrationHandler:
 
     async def request(self, client: object, jobs: Sequence[HydrationJob]) -> object:
         telegram = cast(MediaHydrationClient, client)
-        return await telegram.get_messages(entity=jobs[0].dialog_id, ids=[job.message_id for job in jobs])
+        with peer_target(jobs[0].dialog_id):
+            return await telegram.get_messages(entity=jobs[0].dialog_id, ids=[job.message_id for job in jobs])
 
     def apply(  # noqa: PLR0913 - request boundary accompanies the existing fact application contract
         self,

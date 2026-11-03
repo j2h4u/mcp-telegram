@@ -423,6 +423,9 @@ class FullSyncWorker:
                 _set_dm_enrollment_state(conn, "full_sync_total_peer_cursor", str(dialog_id))
 
         await self._writer.run(persist_total_peer_cursor)
+        if not self._expected_total_repair_is_ready(dialog_id):
+            self._last_total_stale = True
+            return True
         total_messages = await self._probe_total_messages_for_repair(dialog_id)
         if total_messages is None:
             return False
@@ -443,8 +446,8 @@ class FullSyncWorker:
                     )
                     if row is not None and row[0] is not None:
                         self._last_total_committed_revision = f"resolved:{int(row[0])}"
-                _set_total_messages_repair_retry(conn, None)
-                conn.execute("UPDATE synced_dialogs SET full_sync_retry_at=NULL WHERE dialog_id=?", (dialog_id,))
+                    _set_total_messages_repair_retry(conn, None)
+                    conn.execute("UPDATE synced_dialogs SET full_sync_retry_at=NULL WHERE dialog_id=?", (dialog_id,))
 
         await self._writer.run(persist_total)
         logger.info("sync_total_repair_complete dialog_id=%d total_messages=%d", dialog_id, total_messages)
@@ -1089,7 +1092,9 @@ class FullSyncDemandAdapter:
         row = cast(
             tuple[int | None, int | None] | None,
             self._worker._conn.execute(
-                "SELECT total_messages,full_sync_retry_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+                "SELECT total_messages,full_sync_retry_at FROM synced_dialogs "
+                "WHERE dialog_id=? AND status NOT IN ('not_synced', 'access_lost')",
+                (dialog_id,),
             ).fetchone(),
         )
         if row is None or row[0] is not None or selected.revision != f"missing:{dialog_id}":

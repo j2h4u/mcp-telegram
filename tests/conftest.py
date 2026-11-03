@@ -14,6 +14,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from tests.peer_access_helpers import close_test_peer_access
+
 
 def _target_address_space_limit(config: pytest.Config, hard_limit: int) -> int:
     """Choose the bounded test-process address-space budget from pytest options."""
@@ -65,6 +67,12 @@ def _mcp_telegram_test_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         f'[state]\ndir = "{state_dir}"\n\n[telegram_rpc]\ntransport_contract_version = 1\n', encoding="utf-8"
     )
     monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+
+
+@pytest.fixture(autouse=True)
+def _close_test_peer_access() -> Iterable[None]:
+    yield
+    close_test_peer_access()
 
 
 class _MockEntityCache:

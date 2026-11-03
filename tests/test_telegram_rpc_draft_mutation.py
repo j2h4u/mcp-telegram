@@ -11,6 +11,7 @@ from telethon.tl import functions, types
 from telethon.tl.tlobject import TLRequest
 
 from mcp_telegram import telegram_rpc
+from mcp_telegram.peer_access import PeerAccessRejectedError
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
     RpcAttemptBudget,
@@ -137,6 +138,24 @@ async def test_unknown_save_outcome_remains_protected_without_retry(wire: _WireH
         assert budget.attempts == 1 and len(sink.frames) == 1
     status = gate.account_safety_status()
     assert status is not None and status["unresolved_request_count"] == 1
+
+
+async def test_access_loss_before_save_claim_is_definite_and_never_replayed(wire: _WireHarness) -> None:
+    gate, sender, connection, sink = wire
+    auth = gate.retained_auth_scope()
+    assert auth is not None
+    access = gate._peer_access
+    assert access is not None
+    with demand_context(DemandKind.DRAFT_MUTATION) as root, rpc_attempt_budget(RpcAttemptBudget(1)) as budget:
+        response, packet = await _prepare(wire, _save(), current_rpc_scope())
+        access.revoke(auth.account_id)
+        assert not sender.write_packet(packet, connection._send)
+        with pytest.raises(PeerAccessRejectedError):
+            await response
+        assert not root.attempt_evidence.draft_mutation_dispatched
+        assert budget.attempts == 0 and sink.frames == []
+        assert gate.account_safety_status() is None
+        assert gate._ensure_safety_ledger()._record["intents"] == {}
 
 
 @pytest.mark.parametrize("fault", ["missing", "two", "selected", "retry", "root", "source", "acquisition"])

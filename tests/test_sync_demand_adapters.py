@@ -1259,6 +1259,29 @@ async def test_delta_gap_adapter_propagates_coordinator_outcomes_without_checkpo
 
 
 @pytest.mark.asyncio
+async def test_selected_total_repair_stops_after_access_loss(conn: sqlite3.Connection) -> None:
+    dialog_id = 204
+    _seed_history_dialog(conn, dialog_id, status="synced")
+    client = _RawHistoryClient(AsyncMock(return_value=MockTotalList([], total=17)))
+    worker = FullSyncWorker(
+        TelethonFullHistoryPageAdapter(client),
+        conn,
+        asyncio.Event(),
+        total_messages_probe=TelethonHistoryAccessProbe(client),
+        writer=inline_writer(conn),
+    )
+    adapter = FullSyncDemandAdapter(worker, account_id=123)
+    budget = _selected_budget(adapter)
+    conn.execute("UPDATE synced_dialogs SET status='access_lost' WHERE dialog_id=?", (dialog_id,))
+    conn.commit()
+    outcome = await adapter.run_slice(budget)
+    assert outcome.kind is SliceOutcomeKind.STALE
+    assert conn.execute("SELECT total_messages FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        None,
+    )
+
+
+@pytest.mark.asyncio
 async def test_full_sync_total_repair_uses_durable_retry_boundary(conn: sqlite3.Connection) -> None:
     dialog_id = 204
     _seed_history_dialog(conn, dialog_id, status="synced")

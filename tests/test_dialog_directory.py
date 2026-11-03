@@ -2554,3 +2554,64 @@ async def test_directory_demand_slice_reports_no_progress_when_owner_is_stopping
         assert client.requests == []
     finally:
         conn.close()
+
+
+def test_scheduled_channel_permissions_distinguish_subscriber_admin_and_min() -> None:
+    from mcp_telegram.dialog_directory import _scheduled_permission_signature
+
+    common = {"id": 90, "title": "feed", "photo": types.ChatPhotoEmpty(), "date": None}
+    subscriber = _scheduled_permission_signature(types.Channel(**common, broadcast=True))
+    creator = _scheduled_permission_signature(types.Channel(**common, broadcast=True, creator=True))
+    group = _scheduled_permission_signature(types.Channel(**common, megagroup=True))
+    assert subscriber is not None and subscriber.startswith("1:0:0:0:")
+    assert creator is not None and creator.startswith("1:1:")
+    assert group is not None and group.startswith("0:0:0:0:")
+    assert _scheduled_permission_signature(types.Channel(**common, broadcast=True, min=True)) is None
+
+
+def test_directory_permissions_do_not_overwrite_denial_after_request_started(tmp_path: Path) -> None:
+    path = tmp_path / "rights-race.db"
+    ensure_sync_schema(path)
+    conn = _open_sync_db(path)
+    directory = CanonicalDialogDirectory(_FakeClient([]), path, asyncio.Event(), writer=_writer(path))
+    try:
+        conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (-1000000000090,'channel')")
+        conn.execute(
+            "INSERT INTO scheduled_reconciliation_state(dialog_id,discovery_due_at,updated_at) VALUES (-1000000000090,1,1)"
+        )
+        conn.commit()
+        directory._bind_account(conn, 99)
+        with write_transaction(conn):
+            directory._start_generation(conn, 1)
+        with write_transaction(conn):
+            conn.execute(
+                "UPDATE scheduled_reconciliation_state SET acquisition_block='admin_required',dirty_generation=dirty_generation+1 "
+                "WHERE dialog_id=-1000000000090"
+            )
+        with write_transaction(conn):
+            directory._stage_facts(
+                conn,
+                1,
+                (
+                    RawDialogFact(
+                        -1000000000090,
+                        types.Channel(
+                            id=90, title="feed", photo=types.ChatPhotoEmpty(), date=None, broadcast=True, creator=True
+                        ),
+                        _dialog(90, 8),
+                        datetime(2026, 1, 1, tzinfo=UTC),
+                    ),
+                ),
+                folder_id=None,
+                account_id=99,
+            )
+            conn.execute(
+                "UPDATE dialog_directory_state SET ordinary_status='complete',pinned_main_status='complete',"
+                "pinned_archive_status='complete' WHERE singleton=1"
+            )
+            assert directory._publish_if_complete(conn, 1, 99)
+        assert conn.execute(
+            "SELECT acquisition_block FROM scheduled_reconciliation_state WHERE dialog_id=-1000000000090"
+        ).fetchone() == ("admin_required",)
+    finally:
+        conn.close()

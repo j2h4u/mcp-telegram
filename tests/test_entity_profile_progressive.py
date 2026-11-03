@@ -131,6 +131,7 @@ class _FloodClient(_UnusedClient):
 
 def _sections_schema(conn: sqlite3.Connection) -> None:
     with write_savepoint(conn):
+        conn.execute("CREATE TABLE IF NOT EXISTS synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL)")
         conn.execute(
             """CREATE TABLE entity_detail_sections (
                 entity_id INTEGER NOT NULL, section TEXT NOT NULL, status TEXT NOT NULL,

@@ -133,6 +133,7 @@ from .messages.telegram_adapter import (
 )
 from .models import DialogType
 from .observation_order import delivered_observation_order
+from .peer_access import peer_target
 from .reactions.contracts import ReactionAggregate, ReactionAggregateSource, ReactionObservationBoundary
 from .reactions.persistence import allocate_observation_boundary, replace_reaction_aggregates
 from .reactions.projection import project_reaction_aggregates, project_reaction_visibility
@@ -3231,10 +3232,11 @@ class EventHandlerManager:
         return marked
 
     async def _scan_dm_gap_message_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
-        results = cast(
-            "Sequence[_MessageLike | None]",
-            await self._client.get_messages(dialog_id, ids=list(message_ids)),
-        )
+        with peer_target(dialog_id):
+            results = cast(
+                "Sequence[_MessageLike | None]",
+                await self._client.get_messages(dialog_id, ids=list(message_ids)),
+            )
         now = int(time.time())
 
         def _persist_event_0(conn: sqlite3.Connection) -> int:

@@ -17,8 +17,9 @@ from .scheduled_receipts_schema import SCHEDULED_OPERATION_RECEIPT_DDL
 from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 
-_CURRENT_SCHEMA_VERSION = 94
+_CURRENT_SCHEMA_VERSION = 95
 _HISTORY_ENROLLMENT_SIMPLIFICATION_MIGRATION = 94
+_SCHEDULED_ACCESS_MIGRATION = 95
 _MESSAGE_IMAGE_MIGRATION = 93
 _SCHEDULED_COMMAND_MIGRATION = 92
 _SCHEDULED_FINITE_COVERAGE_MIGRATION = 91
@@ -5086,7 +5087,26 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     if _CURRENT_SCHEMA_VERSION >= _MESSAGE_IMAGE_MIGRATION:
         current = _apply_migration_93(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _HISTORY_ENROLLMENT_SIMPLIFICATION_MIGRATION:
-        _apply_migration_94(conn, current)
+        current = _apply_migration_94(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _SCHEDULED_ACCESS_MIGRATION:
+        current = _apply_migration(
+            conn,
+            current,
+            _SCHEDULED_ACCESS_MIGRATION,
+            [
+                "ALTER TABLE scheduled_reconciliation_state ADD COLUMN acquisition_block TEXT",
+                "ALTER TABLE scheduled_reconciliation_state ADD COLUMN permission_signature TEXT",
+                "ALTER TABLE scheduled_reconciliation_state ADD COLUMN authorization_pending INTEGER NOT NULL DEFAULT 0",
+                (
+                    "UPDATE scheduled_reconciliation_state SET authorization_pending=1,dirty_generation=dirty_generation+1, "
+                    "discovery_due_at=COALESCE(discovery_due_at,0) WHERE EXISTS "
+                    "(SELECT 1 FROM synced_dialogs d WHERE d.dialog_id=scheduled_reconciliation_state.dialog_id AND d.status='access_lost')"
+                ),
+                "ALTER TABLE dialog_directory_staging ADD COLUMN scheduled_permission_signature TEXT",
+                "ALTER TABLE dialog_directory_staging ADD COLUMN scheduled_permission_generation INTEGER",
+                "CREATE TABLE dialog_directory_scheduled_baseline (generation INTEGER NOT NULL, dialog_id INTEGER NOT NULL, dirty_generation INTEGER NOT NULL, PRIMARY KEY(generation,dialog_id)) WITHOUT ROWID",
+            ],
+        )
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

@@ -41,6 +41,7 @@ from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .models import DialogType
 from .observation_order import allocate_observation_order
 from .read_state import apply_read_cursor
+from .scheduled_state import apply_scheduled_permission
 from .sqlite_writer import SQLiteWriter
 from .sync_db import open_sync_db_reader
 from .sync_transactions import require_write_transaction, write_transaction
@@ -164,6 +165,36 @@ class _StagedDialogProjection:
     snapshot_at: int
     unread: int | None
     mute_until: int | None
+
+
+def _scheduled_permission_signature(entity: object) -> str | None:
+    if not isinstance(entity, types.Channel) or getattr(entity, "min", False):
+        return None
+    rights = getattr(entity, "admin_rights", None)
+    creator = bool(getattr(entity, "creator", False))
+    broadcast = bool(getattr(entity, "broadcast", False))
+    post = bool(getattr(rights, "post_messages", False))
+    # Group role changes may affect scheduled access even when publishing is allowed.
+    restrictions = [getattr(entity, field, None) for field in ("banned_rights", "default_banned_rights")]
+    details = "".join(
+        str(int(bool(getattr(role, field, False))))
+        for role in restrictions
+        for field in ("send_messages", "send_plain", "send_media", "embed_links", "send_polls")
+    )
+    return f"{int(broadcast)}:{int(creator)}:{int(rights is not None)}:{int(post)}:{details}"
+
+
+def _stage_scheduled_permission(conn: sqlite3.Connection, generation: int, dialog_id: int, entity: object) -> None:
+    signature = _scheduled_permission_signature(entity)
+    if signature is None:
+        return
+    conn.execute(
+        "UPDATE dialog_directory_staging SET scheduled_permission_signature=?, "
+        "scheduled_permission_generation=COALESCE(scheduled_permission_generation, "
+        "COALESCE((SELECT dirty_generation FROM dialog_directory_scheduled_baseline WHERE generation=? AND dialog_id=?),-1)) "
+        "WHERE generation=? AND dialog_id=?",
+        (signature, generation, dialog_id, generation, dialog_id),
+    )
 
 
 def _publication_ready(state: _DirectoryState, generation: int, account_id: int) -> bool:
@@ -403,6 +434,12 @@ class CanonicalDialogDirectory:
         started_at = int(time.time())
         conn.execute("DELETE FROM dialog_directory_staging")
         conn.execute("DELETE FROM dialog_directory_baseline")
+        conn.execute("DELETE FROM dialog_directory_scheduled_baseline")
+        conn.execute(
+            "INSERT INTO dialog_directory_scheduled_baseline(generation,dialog_id,dirty_generation) "
+            "SELECT ?,dialog_id,dirty_generation FROM scheduled_reconciliation_state",
+            (generation,),
+        )
         conn.execute("DELETE FROM dialog_directory_pins")
         conn.execute("DELETE FROM dialog_directory_pin_snapshots")
         conn.execute("DELETE FROM daemon_state WHERE key LIKE 'dialog_directory_pin_fence:%'")
@@ -741,8 +778,9 @@ class CanonicalDialogDirectory:
             raise RuntimeError("stale_directory_page")
         source = "ordinary" if folder_id is None else f"pinned:{folder_id}"
         rows = [self._staged_fact(fact, observed_at, folder_id, source) for fact in facts]
-        for row in rows:
+        for fact, row in zip(facts, rows, strict=True):
             self._stage_fact_row(conn, generation, row, observation_order)
+            _stage_scheduled_permission(conn, generation, row.dialog_id, fact.entity)
         return True
 
     def _stage_fact_row(
@@ -879,6 +917,20 @@ class CanonicalDialogDirectory:
         if not _publication_ready(state, generation, account_id):
             return False
         _publish_generation_pin_snapshots(conn, generation)
+        permissions = cast(
+            list[tuple[int, str]],
+            conn.execute(
+                "SELECT staged.dialog_id,staged.scheduled_permission_signature "
+                "FROM dialog_directory_staging staged LEFT JOIN dialogs d ON d.dialog_id=staged.dialog_id "
+                "LEFT JOIN scheduled_reconciliation_state sr ON sr.dialog_id=staged.dialog_id "
+                "WHERE staged.generation=? AND staged.scheduled_permission_signature IS NOT NULL "
+                "AND COALESCE(sr.dirty_generation,-1)=staged.scheduled_permission_generation "
+                "AND ((d.dialog_id IS NULL AND staged.baseline_revision IS NULL) OR d.revision=staged.baseline_revision)",
+                (generation,),
+            ).fetchall(),
+        )
+        for dialog_id, signature in permissions:
+            apply_scheduled_permission(conn, dialog_id, signature, int(time.time()))
         # Eligibility facts must merge before the dialogs UPDATE below. That
         # UPDATE fires the revision trigger, so doing this afterwards would
         # make the pre-acquisition revision fence reject every existing row.
@@ -1037,6 +1089,7 @@ class CanonicalDialogDirectory:
         SQLiteFolderSnapshotRepository(conn).reproject_current_rules_in_transaction(now=completed_at)
         conn.execute("DELETE FROM dialog_directory_staging WHERE generation=?", (generation,))
         conn.execute("DELETE FROM dialog_directory_baseline WHERE generation=?", (generation,))
+        conn.execute("DELETE FROM dialog_directory_scheduled_baseline WHERE generation=?", (generation,))
         conn.execute("DELETE FROM dialog_directory_pins WHERE generation=?", (generation,))
         conn.execute("DELETE FROM dialog_directory_pin_snapshots WHERE generation=?", (generation,))
         request_profile_directory_pass(conn, account_id, generation)

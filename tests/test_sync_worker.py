@@ -1432,13 +1432,15 @@ async def test_access_lost_chat_forbidden(
 
 
 @pytest.mark.asyncio
-async def test_access_lost_user_banned(
+@pytest.mark.parametrize("error_name", ["UserBannedInChannelError", "ChatWriteForbiddenError"])
+async def test_write_ban_does_not_mark_read_access_lost(
     mock_client: _MockClient,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
+    error_name: str,
 ) -> None:
-    """UserBannedInChannelError sets status='access_lost' and access_lost_at != NULL."""
-    from telethon.errors import UserBannedInChannelError  # type: ignore[import-untyped]
+    """A send restriction does not establish loss of read access."""
+    from telethon import errors  # type: ignore[import-untyped]
 
     dialog_id = 6003
     sync_db.execute(
@@ -1448,21 +1450,20 @@ async def test_access_lost_user_banned(
     seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
 
-    err = UserBannedInChannelError(request=None)
+    err = cast(Exception, getattr(errors, error_name)(request=None))
 
     mock_client.get_messages = AsyncMock(side_effect=err)
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     result = await worker.process_one_batch()
 
-    assert result is True
+    assert result is False
     row = sync_db.execute(
         "SELECT status, access_lost_at FROM synced_dialogs WHERE dialog_id=?",
         (dialog_id,),
     ).fetchone()
     assert row is not None
-    assert row[0] == "access_lost"
-    assert row[1] is not None
+    assert row == ("syncing", None)
 
 
 @pytest.mark.asyncio

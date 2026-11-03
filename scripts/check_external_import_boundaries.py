@@ -72,6 +72,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "history_enrollment.py",
             "hydration_queue.py",
             "image_authorization.py",  # Connection-bound active-target revocation registry.
+            "peer_access.py",  # Connection-bound peer access revocation registry.
             "message_images/fence.py",  # Writer-owned account/source preflight and durable allowance.
             "message_images/repository.py",  # Canonical source and image job projection.
             "message_images/service.py",  # Account-fenced local image status and explicit preparation.
@@ -90,6 +91,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "resolver.py",
             "scheduled_commands.py",  # Native scheduled receipt/fact writer through SQLiteWriter and the sole RPC gate.
             "scheduled_messages.py",
+            "scheduled_state.py",  # Transactional scheduled permission and access state.
             "sync_db.py",
             "sync_transactions.py",
             "conversation_changes.py",

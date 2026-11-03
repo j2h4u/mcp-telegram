@@ -7,9 +7,12 @@ import sqlite3
 from dataclasses import dataclass
 from typing import cast
 
+from ..access_predicates import not_access_lost_sql
 from ..history_enrollment import reset_read_position_retry, restore_access_status
 from ..hydration_queue import HydrationPriority, HydrationQueueRepository
 from ..messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
+from ..peer_access import revoke_peer
+from ..scheduled_state import invalidate_scheduled_access_loss
 from ..sync_transactions import write_savepoint
 
 logger = logging.getLogger(__name__)
@@ -55,6 +58,7 @@ def set_access_lost(  # noqa: PLR0913
     changed = False
     reason_code = evidence.reason_code if evidence is not None else reason
     with write_savepoint(conn):
+        revoke_peer(conn, dialog_id)
         row = cast(
             tuple[str | None] | None,
             conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone(),
@@ -70,6 +74,7 @@ def set_access_lost(  # noqa: PLR0913
                 "UPDATE synced_dialogs SET status = 'access_lost', access_lost_at = ?, delta_refresh_requested_at = CASE WHEN ? IS NULL OR delta_refresh_generation=? THEN NULL ELSE delta_refresh_requested_at END WHERE dialog_id = ?",
                 (now, refresh_generation, refresh_generation, dialog_id),
             )
+        invalidate_scheduled_access_loss(conn, dialog_id, now)
         reset_read_position_retry(conn, dialog_id)
         _purge_hydration_jobs(conn, dialog_id)
         conn.execute("UPDATE dialogs SET hidden = 1, snapshot_at = ? WHERE dialog_id = ?", (now, dialog_id))
@@ -105,11 +110,27 @@ def restore_access_after_revalidation(
             conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone(),
         )
         was_access_lost = row is not None and row[0] == "access_lost"
+        if was_access_lost:
+            revoke_peer(conn, dialog_id)
         conn.execute(
             "UPDATE synced_dialogs SET access_lost_at = NULL, access_last_revalidated_at = ?, access_next_revalidate_at = NULL WHERE dialog_id = ?",
             (now, dialog_id),
         )
         restore_access_status(conn, dialog_id)
+        if was_access_lost:
+            conn.execute(
+                "UPDATE draft_projection_runtime SET recovery_due_at=?,recovery_claimed_at=NULL "
+                "WHERE singleton=1 AND EXISTS (SELECT 1 FROM draft_order_uncertainty u "
+                "WHERE u.account_id=draft_projection_runtime.account_id AND u.dialog_id=?)",
+                (now, dialog_id),
+            )
+            conn.execute(
+                "UPDATE draft_sync_state SET status='recovery_needed',coverage_status='unknown',"
+                "reason='scope_order_uncertain' WHERE account_id=(SELECT account_id FROM draft_projection_runtime "
+                "WHERE singleton=1) AND EXISTS (SELECT 1 FROM draft_order_uncertainty u "
+                "WHERE u.account_id=draft_sync_state.account_id AND u.dialog_id=?)",
+                (dialog_id,),
+            )
         _rearm_terminal_reaction_details(conn, dialog_id, now)
         conn.execute(
             """INSERT INTO dialogs (dialog_id, hidden, needs_refresh, snapshot_at, archived, pinned,
@@ -171,15 +192,6 @@ def complete_access_revalidation(conn: sqlite3.Connection, dialog_id: int, check
             "WHERE dialog_id = ? AND status = 'access_lost'",
             (checked_at, dialog_id),
         )
-
-
-def not_access_lost_sql(dialog_id_expression: str) -> str:
-    """Return a correlated SQL predicate excluding peers whose access is suspended."""
-    return (
-        "NOT EXISTS (SELECT 1 FROM synced_dialogs access_state "
-        f"WHERE access_state.dialog_id={dialog_id_expression} "
-        "AND access_state.status='access_lost')"
-    )
 
 
 def unhide_after_realtime_presence(conn: sqlite3.Connection, dialog_id: int) -> bool:

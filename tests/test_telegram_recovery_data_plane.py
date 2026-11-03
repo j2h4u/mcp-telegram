@@ -16,6 +16,7 @@ from mcp_telegram.daemon import _acquire_startup_identity_before_updates
 from mcp_telegram.daemon_api import DaemonAPIServer
 from mcp_telegram.dialog_directory import CanonicalDialogDirectory, CanonicalDialogDirectoryDemandAdapter
 from mcp_telegram.message_history.telegram_adapter import TelethonFullHistoryPageAdapter
+from mcp_telegram.peer_access import PeerAccess
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import _open_sync_db, load_rpc_safety_record
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncWorker
@@ -73,7 +74,7 @@ def _fresh_wire(old: _WireHarness) -> _WireHarness:
     return fresh, sender, connection, sink
 
 
-async def test_recovered_read_owners_publish_new_local_facts(
+async def test_recovered_read_owners_publish_new_local_facts(  # noqa: PLR0915 - end-to-end recovery lifecycle
     trial_wire: tuple[_WireHarness, Clock], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     old, clock = trial_wire
@@ -92,6 +93,12 @@ async def test_recovered_read_owners_publish_new_local_facts(
     await _record_unknown(old)
     db_path = tmp_path / "sync.db"
     conn = _open_sync_db(db_path)
+    writer = await SQLiteWriter.open(db_path)
+    old_scope = old[0].retained_auth_scope()
+    assert old_scope is not None
+    old_access = PeerAccess(old_scope)
+    await writer.run(old_access.bind)
+    old[0].bind_peer_access(old_access)
     _insert_synced_dialog(conn, 1, status="syncing", enrollment_enabled=True)
     _insert_message(conn, 1, 7, text="retained")
     reader = make_server(conn, old[0])
@@ -104,10 +111,11 @@ async def test_recovered_read_owners_publish_new_local_facts(
     offset = clock.monotonic_seconds - real_time()
     assert await old[0].maintain_auto_resume()
     fresh = _fresh_wire(old)
-    writer = await SQLiteWriter.open(db_path)
     directory = CanonicalDialogDirectory(fresh[0], db_path, asyncio.Event(), writer=writer)
+    access: PeerAccess | None = None
     try:
-        await _startup(fresh, conn, directory)
+        await writer.run(old_access.unbind)
+        access = await _startup(fresh, conn, directory, writer)
         await _history(fresh, conn, writer, clock)
         await _directory(fresh, directory, conn, clock)
         await _check_local(reader, old, fresh)
@@ -116,21 +124,37 @@ async def test_recovered_read_owners_publish_new_local_facts(
         await fresh[2].disconnect()
         await old[0]._admission_scheduler.close()
         await old[2].disconnect()
+        if access is not None:
+            await writer.run(access.unbind)
         await writer.aclose()
         conn.close()
 
 
-async def _startup(wire: _WireHarness, conn: sqlite3.Connection, directory: CanonicalDialogDirectory) -> None:
+async def _startup(
+    wire: _WireHarness, conn: sqlite3.Connection, directory: CanonicalDialogDirectory, writer: SQLiteWriter
+) -> PeerAccess:
     gate = wire[0]
     await gate.prepare_startup_safety()
     await gate.verify_startup_account(42)
     api = _ApiStub()
     api._client = gate
-    ctx = _typed_ctx(conn=conn, client=gate, api_server=api, self_profile_cadence=_CadenceStub())
+    ctx = _typed_ctx(conn=conn, client=gate, api_server=api, self_profile_cadence=_CadenceStub(), writer=writer)
     startup = asyncio.create_task(_acquire_startup_identity_before_updates(ctx, directory))
-    await _reply(wire, functions.users.GetUsersRequest, [types.User(id=42, is_self=True)])
-    assert (await asyncio.wait_for(startup, 3)).result().account_id == 42
-    await gate.finish_startup_auto_resume()
+    try:
+        try:
+            await _reply(wire, functions.users.GetUsersRequest, [types.User(id=42, is_self=True)])
+        except TimeoutError:
+            if startup.done():
+                await startup
+            raise
+        assert (await asyncio.wait_for(startup, 3)).result().account_id == 42
+        await gate.finish_startup_auto_resume()
+        assert ctx.peer_access is not None
+        return ctx.peer_access
+    except BaseException:
+        if ctx.peer_access_bound and ctx.peer_access is not None:
+            await writer.run(ctx.peer_access.unbind)
+        raise
 
 
 async def _history(wire: _WireHarness, conn: sqlite3.Connection, writer: SQLiteWriter, clock: Clock) -> None:

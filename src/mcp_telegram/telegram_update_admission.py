@@ -61,6 +61,7 @@ class GateMessageBox(MessageBox):
         self._method_key = method_key
         self._blocked: dict[str, TelegramRpcThrottled | TelegramRpcMethodRecoveryPending] = {}
         self._preserved_ends: set[int | None] = set()
+        self._access_loss_ends: dict[int, Callable[[], bool]] = {}
         self.wakeup = object()
         self.wakeup_queued = False
         self.intake_queue: UpdateIntakeQueue | None = None
@@ -107,6 +108,10 @@ class GateMessageBox(MessageBox):
             return
         super().end_difference()
 
+    def retire_access_lost(self, request: GetChannelDifferenceRequest, confirmed: Callable[[], bool]) -> None:
+        channel_id = cast(types.InputChannel, request.channel).channel_id
+        self._access_loss_ends[channel_id] = confirmed
+
     def end_channel_difference(
         self, request: GetChannelDifferenceRequest, reason: PrematureEndReason, chat_hashes: object
     ) -> None:
@@ -114,6 +119,11 @@ class GateMessageBox(MessageBox):
         if channel_id in self._preserved_ends:
             self._preserved_ends.remove(channel_id)
             return
+        confirmed = self._access_loss_ends.pop(channel_id, None)
+        if confirmed is not None:
+            if not confirmed():
+                return
+            reason = PrematureEndReason.BANNED
         super().end_channel_difference(request, reason, chat_hashes)
 
     def check_deadlines(self) -> float:

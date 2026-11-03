@@ -12,52 +12,14 @@ from mcp_telegram.access_lifecycle import (
     set_access_lost,
     stamp_access_revalidation,
 )
+from mcp_telegram.sync_db import _apply_migrations
 from mcp_telegram.sync_transactions import write_transaction
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
-    conn.executescript(
-        """CREATE TABLE synced_dialogs (
-             dialog_id INTEGER PRIMARY KEY, status TEXT, access_lost_at INTEGER,
-             delta_refresh_requested_at INTEGER, delta_refresh_generation INTEGER NOT NULL DEFAULT 0, access_last_revalidated_at INTEGER,
-             access_next_revalidate_at INTEGER, total_messages INTEGER,
-             read_position_next_attempt_at INTEGER, read_position_attempt_count INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE full_history_enrollment (
-             dialog_id INTEGER PRIMARY KEY,
-             enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
-
-             updated_at INTEGER NOT NULL
-        ) WITHOUT ROWID;
-        CREATE TABLE dialogs (
-             dialog_id INTEGER PRIMARY KEY, hidden INTEGER, needs_refresh INTEGER,
-             snapshot_at INTEGER, archived INTEGER, pinned INTEGER,
-             unread_mentions_count INTEGER, unread_reactions_count INTEGER, name TEXT);
-        CREATE TABLE conversation_history_events (
-             seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, occurred_at INTEGER,
-             time_basis TEXT, dialog_id INTEGER, message_id INTEGER, version INTEGER,
-             reason_code TEXT, previous_status TEXT,
-             source_namespace TEXT, source_event_id INTEGER,
-             access_change_cause TEXT, actor_id INTEGER);
-        CREATE TABLE message_reaction_events (
-             event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-             dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
-             reactor_id INTEGER, emoji TEXT NOT NULL, reacted_at INTEGER,
-             fetched_at INTEGER NOT NULL, detail_generation INTEGER NOT NULL DEFAULT 0,
-             page_ordinal INTEGER NOT NULL DEFAULT 0, display_generation INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE message_reaction_event_status (
-             dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
-             aggregate_generation INTEGER NOT NULL DEFAULT 1,
-             detail_generation INTEGER NOT NULL DEFAULT 0,
-             display_generation INTEGER NOT NULL DEFAULT 0,
-             published_generation INTEGER NOT NULL DEFAULT 0,
-             checked_at INTEGER NOT NULL, status TEXT NOT NULL,
-             returned_count INTEGER NOT NULL DEFAULT 0, staged_count INTEGER NOT NULL DEFAULT 0,
-             next_offset TEXT, next_attempt_at INTEGER, failure_kind TEXT,
-             PRIMARY KEY (dialog_id, message_id)) WITHOUT ROWID;
-        """
-    )
+    _apply_migrations(conn)
     return conn
 
 
@@ -65,7 +27,9 @@ def test_nested_lifecycle_savepoint_preserves_outer_write() -> None:
     conn = _db()
     conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (1, 'synced')")
     seed_full_history_enrollment(conn, 1, enabled=True)
-    conn.execute("INSERT INTO dialogs VALUES (1, 0, 0, 1, 0, 0, 0, 0, 'x')")
+    conn.execute(
+        "INSERT INTO dialogs (dialog_id,hidden,needs_refresh,snapshot_at,archived,pinned,unread_mentions_count,unread_reactions_count,name) VALUES (1, 0, 0, 1, 0, 0, 0, 0, 'x')"
+    )
     conn.execute("CREATE TABLE unrelated (value INTEGER)")
     conn.commit()
     try:
@@ -89,7 +53,9 @@ def test_access_restore_clears_read_position_retry() -> None:
         "VALUES (2, 'access_lost', 999, 3)"
     )
     seed_full_history_enrollment(conn, 2, enabled=True)
-    conn.execute("INSERT INTO dialogs VALUES (2, 1, 0, 1, 0, 0, 0, 0, 'x')")
+    conn.execute(
+        "INSERT INTO dialogs (dialog_id,hidden,needs_refresh,snapshot_at,archived,pinned,unread_mentions_count,unread_reactions_count,name) VALUES (2, 1, 0, 1, 0, 0, 0, 0, 'x')"
+    )
     conn.commit()
     try:
         restore_access_after_revalidation(conn, 2, 10)
@@ -104,7 +70,9 @@ def test_access_restore_rearms_terminal_reaction_details() -> None:
     conn = _db()
     conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (9, 'access_lost')")
     seed_full_history_enrollment(conn, 9, enabled=True)
-    conn.execute("INSERT INTO dialogs VALUES (9, 1, 0, 1, 0, 0, 0, 0, 'x')")
+    conn.execute(
+        "INSERT INTO dialogs (dialog_id,hidden,needs_refresh,snapshot_at,archived,pinned,unread_mentions_count,unread_reactions_count,name) VALUES (9, 1, 0, 1, 0, 0, 0, 0, 'x')"
+    )
     conn.executemany(
         "INSERT INTO message_reaction_event_status "
         "(dialog_id, message_id, status, checked_at, next_offset, next_attempt_at, staged_count, failure_kind, display_generation) "
@@ -160,7 +128,9 @@ def test_access_loss_clears_read_position_retry() -> None:
         "INSERT INTO synced_dialogs (dialog_id, status, read_position_next_attempt_at, read_position_attempt_count) "
         "VALUES (3, 'synced', 999, 3)"
     )
-    conn.execute("INSERT INTO dialogs VALUES (3, 0, 0, 1, 0, 0, 0, 0, 'x')")
+    conn.execute(
+        "INSERT INTO dialogs (dialog_id,hidden,needs_refresh,snapshot_at,archived,pinned,unread_mentions_count,unread_reactions_count,name) VALUES (3, 0, 0, 1, 0, 0, 0, 0, 'x')"
+    )
     conn.commit()
     try:
         set_access_lost(conn, 3, 10)
@@ -176,7 +146,9 @@ def test_durable_event_failure_rolls_back_lifecycle() -> None:
     conn = _db()
     conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (1, 'synced')")
     seed_full_history_enrollment(conn, 1, enabled=True)
-    conn.execute("INSERT INTO dialogs VALUES (1, 0, 0, 1, 0, 0, 0, 0, 'x')")
+    conn.execute(
+        "INSERT INTO dialogs (dialog_id,hidden,needs_refresh,snapshot_at,archived,pinned,unread_mentions_count,unread_reactions_count,name) VALUES (1, 0, 0, 1, 0, 0, 0, 0, 'x')"
+    )
     conn.commit()
     conn.execute(
         "CREATE TRIGGER reject_history BEFORE INSERT ON conversation_history_events "
@@ -198,7 +170,9 @@ def test_lifecycle_history_and_operational_logs_are_ordered_and_deduplicated(
     conn = _db()
     try:
         conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (1, 'synced')")
-        conn.execute("INSERT INTO dialogs VALUES (1, 0, 0, 1, 0, 0, 0, 0, 'x')")
+        conn.execute(
+            "INSERT INTO dialogs (dialog_id,hidden,needs_refresh,snapshot_at,archived,pinned,unread_mentions_count,unread_reactions_count,name) VALUES (1, 0, 0, 1, 0, 0, 0, 0, 'x')"
+        )
         conn.commit()
 
         with caplog.at_level(logging.INFO, logger="mcp_telegram.access_lifecycle"):

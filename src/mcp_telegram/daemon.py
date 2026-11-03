@@ -122,6 +122,7 @@ from .message_images.service import MessageImageService
 from .message_images.worker import MessageImageWorker
 from .messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
 from .models import DialogType
+from .peer_access import PeerAccess
 from .reactions import ReactionDetailPolicy, ReactionDetailRefresher
 from .reactions.telegram_adapter import TelethonTelegramReactionGateway
 from .read_state import apply_read_cursor, apply_reconciled_unread_count
@@ -258,6 +259,7 @@ def read_operator_summary_snapshot(
 
 
 class _DaemonClient(Protocol):
+    def bind_peer_access(self, access: PeerAccess) -> None: ...
     def bind_session_lease(self, lease: TelegramSessionLease) -> None: ...
 
     def capture_image_scope(self) -> ScopeToken | None: ...
@@ -490,6 +492,8 @@ class _SyncMainContext:
     image_service: MessageImageService | None = None
     image_sources: ActiveSources | None = None
     image_sources_bound: bool = False
+    peer_access: PeerAccess | None = None
+    peer_access_bound: bool = False
     scheduled_mutation_fence: ScheduledMutationFence = field(default_factory=ScheduledMutationFence)
     scheduling: SchedulingConfig = field(default_factory=SchedulingConfig)
     background_tasks: set[asyncio.Task[object]] = field(default_factory=set)
@@ -1497,6 +1501,7 @@ async def _acquire_startup_identity_before_updates(
         if type(account_id) is not int or account_id < 1:
             raise RuntimeError("startup Telegram account identity is invalid")
         await ctx.client.verify_startup_account(account_id)
+        await _bind_peer_access(ctx)
         return profile
 
     adapter = SelfProfileMaintenanceDemandAdapter(
@@ -1961,6 +1966,10 @@ async def _stop_image_sources(ctx: _SyncMainContext) -> None:
             assert ctx.image_sources is not None
             await ctx.writer.run(ctx.image_sources.unbind)
             ctx.image_sources_bound = False
+        if getattr(ctx, "peer_access_bound", False):
+            assert ctx.peer_access is not None
+            await ctx.writer.run(ctx.peer_access.unbind)
+            ctx.peer_access_bound = False
 
 
 async def _close_runtime_connections(ctx: _SyncMainContext) -> None:
@@ -2130,6 +2139,21 @@ def _start_runtime_monitors(ctx: _SyncMainContext) -> None:
     _create_tracked_task(ctx, ctx.client.wait_update_delivery_failure(), name="update_delivery", critical=True)
     _create_tracked_task(ctx, _monitor_flood_wait_kill_switch(ctx), name="flood_wait_kill_switch_monitor")
     _create_tracked_task(ctx, _monitor_auto_resume(ctx), name="automatic_sync_resume_monitor", critical=True)
+
+
+async def _bind_peer_access(ctx: _SyncMainContext) -> None:
+    scope = ctx.client.retained_auth_scope()
+    if scope is None:
+        raise RuntimeError("peer access requires a verified account")
+    access = PeerAccess(scope)
+    ctx.peer_access = access
+
+    def bind_peer_access(conn: sqlite3.Connection) -> None:
+        access.bind(conn)
+        ctx.peer_access_bound = True
+
+    await ctx.writer.run(bind_peer_access)
+    ctx.client.bind_peer_access(access)
 
 
 async def _release_updates_after_replay(ctx: _SyncMainContext, barrier: UpdateProcessingBarrier) -> None:

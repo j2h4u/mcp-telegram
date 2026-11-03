@@ -242,6 +242,10 @@ class _AuthScopeUnavailableError(RuntimeError):
     """The live primary session identity cannot authorize a pair receipt."""
 
 
+class _ProfileAccessLostError(RpcAttemptBudgetExhaustedError):
+    """The selected background peer became unavailable before acquisition."""
+
+
 class _EntityInfoClient(Protocol):
     def get_entity(self, entity_id: int) -> Awaitable[object]: ...
 
@@ -736,6 +740,8 @@ class DaemonEntityInfoService:
                 result = DurableRefreshSliceResult(entity_id)
             else:
                 result = await self._run_selected_profile_owner(cursor, now=now)
+        except _ProfileAccessLostError:
+            result = DurableRefreshSliceResult(entity_id)
         except asyncio.CancelledError:
             if receipt.accepted_state is not None and self._refresh is not None:
                 status = receipt.accepted_state[1]
@@ -748,6 +754,8 @@ class DaemonEntityInfoService:
         finally:
             _PROFILE_REFRESH_WRITES.reset(token)
         current_state = self._profiles.refresh_work_state(entity_id, scope.account_id)
+        if not self._profiles.access_available(entity_id) and receipt.accepted_state is None:
+            return dataclass_replace(result, outcome=SliceOutcome(selected, SliceOutcomeKind.STALE))
         return dataclass_replace(
             result,
             retryable_failure=receipt.retryable_failure,
@@ -756,6 +764,8 @@ class DaemonEntityInfoService:
 
     async def _run_selected_profile_owner(self, cursor: EntityRefreshCursor, *, now: int) -> DurableRefreshSliceResult:
         pair_mode = await self._capture_refresh_pair_mode(cursor)
+        if not self._profiles.access_available(cursor.entity_id):
+            return DurableRefreshSliceResult(cursor.entity_id)
         entity_type = self._stored_entity_type(cursor.entity_id, now=now)
         if entity_type is DialogType.UNKNOWN:
             return await self._run_unknown_entity_refresh(cursor, now=now)
@@ -781,6 +791,10 @@ class DaemonEntityInfoService:
         if result.terminal is DurableRefreshTerminal.FAILURE:
             return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
         return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
+
+    def _require_profile_access(self, entity_id: int) -> None:
+        if _PROFILE_REFRESH_WRITES.get() is not None and not self._profiles.access_available(entity_id):
+            raise _ProfileAccessLostError("profile access lost")
 
     def _prepare_refresh_revision(
         self, profiles: EntityProfileRepository, cursor: EntityRefreshCursor, scope: TelegramAuthScope | None
@@ -808,6 +822,18 @@ class DaemonEntityInfoService:
         terminal = await self._acquire_durable_refresh_core(cursor, now=now)
         return DurableRefreshSliceResult(cursor.entity_id, terminal)
 
+    async def _complete_current_profile_section(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
+        stored = self._profiles.read(cursor.entity_id, now=now)
+        scope = self._capture_pair_scope()
+        return bool(
+            stored is not None
+            and scope is not None
+            and stored.profile_owner_account_id == scope.account_id
+            and await self._write_profiles(
+                lambda profiles: profiles.complete_unchanged_section(cursor, now=now), track_rejection=False
+            )
+        )
+
     async def _run_known_entity_refresh(
         self,
         cursor: EntityRefreshCursor,
@@ -816,29 +842,24 @@ class DaemonEntityInfoService:
         pair_mode: str,
         now: int,
     ) -> DurableRefreshSliceResult:
-        stored = self._profiles.read(cursor.entity_id, now=now)
-        scope = self._capture_pair_scope()
-        if (
-            stored is not None
-            and scope is not None
-            and stored.profile_owner_account_id == scope.account_id
-            and await self._write_profiles(
-                lambda profiles: profiles.complete_unchanged_section(cursor, now=now), track_rejection=False
-            )
-        ):
+        if await self._complete_current_profile_section(cursor, now=now):
             return DurableRefreshSliceResult(
                 cursor.entity_id, self._success_if_refresh_finished(cursor, committed=True)
             )
-        if entity_type is DialogType.GROUP and cursor.next_section == "full_profile":
-            return await self._run_group_full_chat_pair(cursor, now=now)
-        if self._pair_enabled(cursor, entity_type, pair_mode=pair_mode):
-            return await self._run_full_user_pair_refresh(cursor, entity_type, now=now)
-        if self._is_paired_personal_channel_cursor(cursor, entity_type=entity_type, pair_mode=pair_mode):
-            return await self._complete_paired_personal_channel(cursor, entity_type, now=now)
-        if not self._section_applies(entity_type, cursor.next_section):
-            return await self._complete_not_applicable_section(cursor, now=now)
-        terminal = await self._acquire_and_commit_profile_section(cursor, entity_type, now=now)
-        return DurableRefreshSliceResult(cursor.entity_id, terminal)
+        if not self._profiles.access_available(cursor.entity_id):
+            result = DurableRefreshSliceResult(cursor.entity_id)
+        elif entity_type is DialogType.GROUP and cursor.next_section == "full_profile":
+            result = await self._run_group_full_chat_pair(cursor, now=now)
+        elif self._pair_enabled(cursor, entity_type, pair_mode=pair_mode):
+            result = await self._run_full_user_pair_refresh(cursor, entity_type, now=now)
+        elif self._is_paired_personal_channel_cursor(cursor, entity_type=entity_type, pair_mode=pair_mode):
+            result = await self._complete_paired_personal_channel(cursor, entity_type, now=now)
+        elif not self._section_applies(entity_type, cursor.next_section):
+            result = await self._complete_not_applicable_section(cursor, now=now)
+        else:
+            terminal = await self._acquire_and_commit_profile_section(cursor, entity_type, now=now)
+            result = DurableRefreshSliceResult(cursor.entity_id, terminal)
+        return result
 
     async def _run_group_full_chat_pair(
         self,
@@ -958,6 +979,8 @@ class DaemonEntityInfoService:
             )
             terminal = self._success_if_refresh_finished(cursor, committed=True)
         else:
+            if not self._profiles.access_available(cursor.entity_id):
+                return DurableRefreshSliceResult(cursor.entity_id)
             reuse_rejection_reason = self._profiles.full_user_pair_reuse_rejection_reason(cursor, identity, now=now)
             terminal = await self._acquire_and_commit_full_user_pair(
                 cursor,
@@ -1073,6 +1096,7 @@ class DaemonEntityInfoService:
                 if entity_type in {DialogType.USER, DialogType.BOT, DialogType.SERVICE}
                 else None
             )
+            self._require_profile_access(cursor.entity_id)
             result = await self._acquire_profile_section(cursor, entity_type, context=context)
         except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending:
             raise
@@ -1419,6 +1443,8 @@ class DaemonEntityInfoService:
         reuse_rejection_reason: str | None,
         error: Exception,
     ) -> DurableRefreshTerminal | None:
+        if isinstance(error, _ProfileAccessLostError):
+            raise error
         if isinstance(error, (TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending)):
             raise error
         if isinstance(error, RpcAttemptBudgetExhaustedError):
@@ -1585,6 +1611,7 @@ class DaemonEntityInfoService:
             else TargetKind.USER
         )
         field_observation = await self._reserve_profile_observation(captured_scope)
+        self._require_profile_access(cursor.entity_id)
         normalized = await _profile_network_read(
             self._deps.user_profile_port.fetch_user_profile(
                 cursor.entity_id, target_kind, owner_account_id=captured_scope.account_id if captured_scope else None
@@ -2300,6 +2327,7 @@ class DaemonEntityInfoService:
             return EntitySectionCommit({}, status="unavailable", reason="channel_reference_unavailable")
         is_broadcast_channel = entity_type is DialogType.CHANNEL
         await self._capture_linked_chat_fact_generation(entity_id, is_broadcast_channel, context)
+        self._require_profile_access(entity_id)
         observation = await _profile_network_read(port.fetch_channel_profile(reference))
         unavailable = _channel_profile_unavailable_commit(reference, observation)
         if unavailable is not None:

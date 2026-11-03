@@ -484,6 +484,32 @@ def _admission_log_level(event: RpcAdmissionEvent) -> int:
     return logging.DEBUG
 
 
+@dataclass(slots=True)
+class _PressureEpisode:
+    started_at: float
+    reported_at: float
+    reason: str
+    count: int = 0
+    expired: int = 0
+    saturated: int = 0
+    max_wait: float = 0.0
+    max_depth: int = 0
+    progressed: bool = False
+
+
+_ROUTINE_PRESSURE = frozenset(
+    {
+        (RpcAdmissionEventKind.EXPIRED, "deadline_elapsed"),
+        (RpcAdmissionEventKind.REJECTED, "source_outstanding_saturated"),
+    }
+)
+_PRESSURE_REPORT_SECONDS = 60.0
+_PRESSURE_MAX_EPISODES = 128
+type _PressureKey = tuple[
+    TelegramRpcSource, RpcServiceClass | None, DemandKind | None, AcquisitionKind | None, str | None
+]
+
+
 @dataclass(frozen=True, slots=True)
 class RpcAdmission:
     """Proof that one scalar RPC attempt crossed the admission arbiter."""
@@ -604,6 +630,7 @@ class TelegramRpcAdmissionScheduler:
         self._release_handle: asyncio.TimerHandle | None = None
         self._observer = observer
         self._clock = clock
+        self._pressure: dict[_PressureKey, _PressureEpisode] = {}
         self._readiness = readiness or RpcTransportReadiness()
         self._queues = {source: deque[_AdmissionTicket]() for source in TelegramRpcSource}
         self._source_cycles = {
@@ -765,6 +792,7 @@ class TelegramRpcAdmissionScheduler:
         if active is None:
             return
         self._release_active_capacity(active)
+        self._finish_pressure_if_drained(active.scope.source)
         if not self._closed and self._has_dispatchable_ticket_locked():
             self._ensure_dispatcher_locked()
 
@@ -795,6 +823,11 @@ class TelegramRpcAdmissionScheduler:
         if active.scope.request_method != admission.request_method:
             return False
         active.dispatch_recorded = True
+        scope = active.scope
+        key = (scope.source, scope.service_class, scope.demand_kind, scope.acquisition_kind, scope.request_method)
+        episode = self._pressure.get(key)
+        if episode is not None:
+            episode.progressed = True
         self._next_write_at = self._clock() + self._minimum_spacing_seconds
         self._schedule_release_locked()
         if active.scope.attempt_evidence is not None:
@@ -886,6 +919,9 @@ class TelegramRpcAdmissionScheduler:
         failed_dispatcher: asyncio.Task[object] | None,
     ) -> None:
         async with self._lock:
+            for key, episode in self._pressure.items():
+                self._log_pressure(key, episode, "shutdown", self._clock())
+            self._pressure.clear()
             self._close_queued_tickets_locked(reason)
             drain_tasks = self._cancel_shutdown_tasks_locked(
                 initiator=initiator,
@@ -1188,15 +1224,88 @@ class TelegramRpcAdmissionScheduler:
                 demand_kind=scope.demand_kind,
                 acquisition_kind=scope.acquisition_kind,
                 observation_scope=scope,
-                observation_method=observation_method,
+                observation_method=observation_method if observation_method is not None else scope.request_method,
             )
         )
 
     def _emit(self, event: RpcAdmissionEvent) -> None:
+        if self._should_log_admission(event):
+            self._log_admission(event)
+        if self._observer is not None:
+            try:
+                self._observer(event)
+            except Exception:
+                logger.exception("telegram_rpc_admission_observer_failed")
+        if event.source is not None:
+            self._finish_pressure_if_drained(event.source)
+
+    def _should_log_admission(self, event: RpcAdmissionEvent) -> bool:
+        if event.source is None or (event.kind, event.reason) not in _ROUTINE_PRESSURE:
+            return True
+        now = self._clock()
+        key = (event.source, event.service_class, event.demand_kind, event.acquisition_kind, event.observation_method)
+        episode = self._pressure.get(key)
+        first = episode is None
+        if episode is None:
+            assert event.reason is not None
+            episode = self._new_pressure_episode(key, event.reason, now)
+        changed = episode.reason != event.reason
+        episode.reason = event.reason or episode.reason
+        episode.count += 1
+        episode.progressed = False
+        episode.expired += int(event.kind is RpcAdmissionEventKind.EXPIRED)
+        episode.saturated = episode.count - episode.expired
+        episode.max_wait = max(episode.max_wait, event.wait_seconds or 0.0)
+        episode.max_depth = max(episode.max_depth, event.total_outstanding)
+        if not first and now - episode.reported_at >= _PRESSURE_REPORT_SECONDS:
+            self._log_pressure(key, episode, "ongoing", now)
+            episode.reported_at = now
+        return first or changed
+
+    def _new_pressure_episode(self, key: _PressureKey, reason: str, now: float) -> _PressureEpisode:
+        if len(self._pressure) >= _PRESSURE_MAX_EPISODES:
+            oldest = next(iter(self._pressure))
+            self._log_pressure(oldest, self._pressure.pop(oldest), "evicted", now)
+        episode = _PressureEpisode(now, now, reason)
+        self._pressure[key] = episode
+        return episode
+
+    def _finish_pressure_if_drained(self, source: TelegramRpcSource) -> None:
+        if self._source_outstanding_depth(source):
+            return
+        for key, episode in list(self._pressure.items()):
+            if key[0] is source and episode.progressed:
+                self._log_pressure(key, episode, "drained_after_dispatch", self._clock())
+                del self._pressure[key]
+
+    @staticmethod
+    def _log_pressure(key: _PressureKey, episode: _PressureEpisode, status: str, now: float) -> None:
+        source, service_class, demand_kind, acquisition_kind, method = key
+        logger.warning(
+            "telegram_rpc_admission_pressure source=%s class=%s kind=%s acquisition=%s method=%s "
+            "status=%s reason=%s count=%d expired=%d saturated=%d duration_seconds=%.3f "
+            "max_wait_seconds=%.3f max_total_outstanding=%d",
+            source.value,
+            service_class.value if service_class is not None else None,
+            demand_kind.value if demand_kind is not None else None,
+            acquisition_kind.value if acquisition_kind is not None else None,
+            method,
+            status,
+            episode.reason,
+            episode.count,
+            episode.expired,
+            episode.saturated,
+            max(0.0, now - episode.started_at),
+            episode.max_wait,
+            episode.max_depth,
+        )
+
+    @staticmethod
+    def _log_admission(event: RpcAdmissionEvent) -> None:
         logger.log(
             _admission_log_level(event),
             "telegram_rpc_admission event=%s kind=%s acquisition=%s source=%s class=%s "
-            "queue_depth=%d total_depth=%d active_depth=%d total_outstanding=%d wait_seconds=%s reason=%s",
+            "queue_depth=%d total_depth=%d active_depth=%d total_outstanding=%d wait_seconds=%s reason=%s method=%s",
             event.kind.value,
             event.demand_kind.value if event.demand_kind is not None else None,
             event.acquisition_kind.value if event.acquisition_kind is not None else None,
@@ -1208,13 +1317,8 @@ class TelegramRpcAdmissionScheduler:
             event.total_outstanding,
             event.wait_seconds,
             event.reason,
+            event.observation_method,
         )
-        if self._observer is None:
-            return
-        try:
-            self._observer(event)
-        except Exception:
-            logger.exception("telegram_rpc_admission_observer_failed")
 
     def _total_depth(self) -> int:
         return sum(len(queue) for queue in self._queues.values())

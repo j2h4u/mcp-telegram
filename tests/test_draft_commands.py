@@ -191,6 +191,28 @@ async def test_create_acknowledges_without_fabricating_observation(harness: _Har
     assert read_current_draft(harness.conn, harness.scope).text == "draft text"
 
 
+async def test_lost_access_rejects_new_command_but_replays_existing_receipt(harness: _Harness) -> None:
+    request = harness.command("create", "accepted", text="draft")
+    original = await harness.owner.execute(request)
+    harness.conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (200,'access_lost')")
+    harness.conn.commit()
+    assert await harness.owner.execute(request) == original
+    rejected = await harness.owner.execute(harness.command("create", "new", text="other"))
+    assert rejected["error"] == "access_lost"
+    assert len(harness.requests) == 1
+
+
+async def test_access_loss_during_preflight_rejects_without_mutation(harness: _Harness) -> None:
+    def lose_access() -> None:
+        harness.conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (200,'access_lost')")
+        harness.conn.commit()
+
+    harness.after_preflight = lose_access
+    result = await harness.owner.execute(harness.command("create", "lost-during-preflight", text="draft"))
+    assert result["error"] == "access_lost"
+    assert harness.requests == []
+
+
 async def test_update_clear_restore_retains_exact_preimages(harness: _Harness) -> None:
     harness.set_remote("old", entities=[types.MessageEntityTextUrl(0, 3, "https://example.invalid/private")])
     harness.publish()

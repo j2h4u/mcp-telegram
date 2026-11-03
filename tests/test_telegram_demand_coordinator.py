@@ -1163,24 +1163,24 @@ async def test_linked_chat_wait_does_not_block_finite_scheduled_discovery(monkey
     adapters[DemandKind.SCHEDULED_DISCOVERY] = discovery
     coordinator = TelegramDemandCoordinator(cast(Mapping[DemandKind, DurableDemandAdapter], adapters), clock=clock)
     try:
-        # One finite seed and the two known peers are independent of linked-chat acquisition.
-        for _ in range(3):
+        # The finite seed and accessible peer progress while the lost peer stays blocked.
+        for _ in range(2):
             coordinator.scan()
             assert coordinator.ready_kinds == (DemandKind.SCHEDULED_DISCOVERY,)
             await coordinator._execute_slice(DemandKind.SCHEDULED_DISCOVERY)
             coordinator._active_kind = None
-        assert len(client.requests) == 2
+        assert len(client.requests) == 1
         assert conn.execute(
-            "SELECT coverage_state,discovery_due_at FROM scheduled_reconciliation_state"
+            "SELECT dialog_id,coverage_state,discovery_due_at FROM scheduled_reconciliation_state ORDER BY dialog_id"
         ).fetchall() == [
-            ("complete", None),
-            ("complete", None),
+            (-1_000_000_000_900, "unknown", now),
+            (42, "complete", None),
         ]
         assert conn.execute("SELECT retry_at FROM linked_chat_fact_state").fetchone() == (now + 86_400,)
         for _ in range(20):
             coordinator.scan()
             assert coordinator.ready_kinds == ()
-        assert len(client.requests) == 2
+        assert len(client.requests) == 1
     finally:
         conn.close()
 
