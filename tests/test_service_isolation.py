@@ -103,7 +103,7 @@ def _exercise_stalled_daemon(
     initial = _mapping(_cli(env, url, "call-tool"))
     initial_data = _mapping(initial["structuredContent"])
     assert initial["isError"] is False
-    assert initial_data["coverage_status"] == "not_synced"
+    assert initial_data["history_sync_state"] == "not_synced"
     daemon.send_signal(signal.SIGSTOP)
     assert _health(url)["ok"] is True
     _assert_tool_available(env, url)
@@ -126,7 +126,7 @@ def _exercise_stalled_daemon(
     daemon.send_signal(signal.SIGCONT)
     recovered = _mapping(_cli(env, url, "call-tool"))
     assert recovered["isError"] is False
-    for field in ("dialog_id", "coverage_status", "account_protection"):
+    for field in ("dialog_id", "history_sync_state", "account_protection"):
         assert _mapping(recovered["structuredContent"]).get(field) == initial_data.get(field)
     assert http.poll() is None
     print("SIGCONT: get_sync_status recovered without HTTP restart")

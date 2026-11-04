@@ -540,8 +540,10 @@ def _list_messages_coverage(data: dict) -> dict[str, object]:
         "sync_coverage_pct": data.get("sync_coverage_pct"),
         "archived_message_count": data.get("archived_message_count"),
         "observation_horizon_at": data.get("observation_horizon_at"),
-        "history_sync_state": data.get("history_sync_state"),
     }
+    history_sync_state = data.get("history_sync_state")
+    if isinstance(history_sync_state, str):
+        coverage["history_sync_state"] = history_sync_state
     selection_state = data.get("selection_state")
     if selection_state in {"present", "known_empty", "unknown"}:
         coverage["selection_state"] = selection_state

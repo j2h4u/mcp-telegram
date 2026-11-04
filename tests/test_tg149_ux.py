@@ -44,6 +44,7 @@ def test_interval_coverage_survives_mcp_projection_with_retained_rows() -> None:
     )
     schema = LIST_MESSAGES_OUTPUT_SCHEMA["properties"]["coverage"]
     validate(coverage, schema)
+    assert "history_sync_state" not in coverage
     assert coverage["selection_state"] == "present"
     assert coverage["interval_coverage"] == "beyond_horizon"
 

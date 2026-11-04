@@ -47,14 +47,12 @@ def _assert_required_null_schema(payload: dict[str, object]) -> None:
     del missing_latest["latest_retained_message"]
     with pytest.raises(ValidationError):
         validate(missing_latest, schema)
-    missing_lag = dict(payload)
-    missing_lag["message_delivery"] = {
-        "state": "unverified",
-        "gap_status": "unknown",
-        "reason": "no_authoritative_delivery_diagnostics",
-    }
+    missing_account = dict(payload)
+    delivery = dict(cast(dict[str, object], payload["message_delivery"]))
+    del delivery["account"]
+    missing_account["message_delivery"] = delivery
     with pytest.raises(ValidationError):
-        validate(missing_lag, schema)
+        validate(missing_account, schema)
 
 
 def test_latest_query_uses_index_on_migrated_database(tmp_path: Path) -> None:
@@ -133,21 +131,21 @@ async def test_registered_sync_status_projects_local_rows_and_unknown_delivery(
     assert result.is_error is False
     payload = cast(dict[str, object], result.structured_content)
     validate(payload, cast(dict[str, object], server.tool_by_name["get_sync_status"].output_schema))
-    assert payload["coverage_status"] == "synced" and payload["realtime_history"] == "full"
+    assert payload["history_sync_state"] == "complete_as_of_last_sync" and payload["realtime_history"] == "full"
     assert payload["message_retention_policy"] == "all_authorized"
     assert payload["history_complete_at"] == "2023-11-14T22:13:20+00:00"
     assert payload["latest_retained_message"] == (
         None if empty else {"message_id": 2, "sent_at": "2023-11-14T22:16:40+00:00"}
     )
-    assert payload["message_delivery"] == {
-        "state": "unverified",
-        "lag_seconds": None,
-        "gap_status": "unknown",
-        "reason": "no_authoritative_delivery_diagnostics",
+    delivery = cast(dict[str, object], payload["message_delivery"])
+    assert isinstance(delivery["observed_at_ms"], int)
+    assert delivery["account"] == {
+        "continuity": "unknown",
+        "catch_up": {"scope": "account", "state": "unknown", "reason": "owner_unavailable"},
     }
     assessment = cast(dict[str, object], payload["assessment"])
     assert assessment["background_acquisition"] == ("unknown" if unavailable else "no_account_hold_observed")
-    assert "retention policy does not assure delivery" in cast(str, assessment["summary"])
+    assert "Account protocol continuity is unknown" in cast(str, assessment["summary"])
     if empty:
         assert "silence alone does not indicate a fault" in cast(str, assessment["summary"])
     _assert_required_null_schema(payload)
@@ -185,6 +183,6 @@ async def test_registered_status_reports_retry_without_acquisition(monkeypatch: 
     group = cast(dict[str, object], payload["automatic_group_sync"])
     assert group["eligibility"] == "blocked" and group["reason"] == "retry_wait"
     assert group["fresh_telegram_total"] == "unknown" and "retry_at" in group
-    assert payload["enrollment_enabled"] is None and payload["coverage_status"] == "own_only"
+    assert payload["enrollment_enabled"] is None and payload["history_sync_state"] == "own_messages_only"
     validate(payload, cast(dict[str, object], server.tool_by_name["get_sync_status"].output_schema))
     assert all(not statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE")) for statement in statements)
