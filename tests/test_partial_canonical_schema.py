@@ -118,3 +118,100 @@ def test_missing_folder_owner_rolls_back_without_reassigning_facts(
             row[1]
             for row in cast(list[tuple[object, ...]], conn.execute("PRAGMA table_info(topic_metadata)").fetchall())
         }
+
+
+def test_image_job_revision_normalization_is_fenced_and_preserves_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "image-jobs.db"
+    with monkeypatch.context() as old:
+        old.setattr(sync_db, "_CURRENT_SCHEMA_VERSION", 98)
+        sync_db.ensure_sync_schema(path)
+    # id, account, state, body generation, source generation, source photo, source eligible,
+    # job generation, job photo, message deleted, observation deleted, tombstone, kind, payload
+    cases = [
+        (1, 42, "queued", 7, None, None, None, 7, None, 0, 0, False, "other", "{}"),
+        (2, 42, "running", 7, 3, None, 1, 7, None, 0, 0, False, "photo", '{"ttl_seconds":0,"live_photo":false}'),
+        (3, 42, "blocked", 7, 3, None, 1, 7, None, 0, 0, False, "photo", '{"ttl_seconds":[],"live_photo":{}}'),
+        (4, 42, "failed", 7, 3, None, 1, 7, None, 0, 0, False, "photo", "{}"),
+        (5, 43, "queued", 7, 3, None, 1, 7, None, 0, 0, False, "photo", "{}"),
+        (6, 42, "queued", 7, 3, None, 1, 6, None, 0, 0, False, "photo", "{}"),
+        (7, 42, "queued", 7, 3, None, 1, 7, None, 1, 0, False, "photo", "{}"),
+        (8, 42, "queued", 7, 3, None, 1, 7, None, 0, 1, False, "photo", "{}"),
+        (9, 42, "queued", 7, 3, None, 1, 7, None, 0, 0, True, "photo", "{}"),
+        (10, 42, "queued", 7, 3, 55, 1, 7, None, 0, 0, False, "photo", "{}"),
+        (11, 42, "queued", 7, 3, None, 0, 7, None, 0, 0, False, "photo", "{}"),
+        (12, 42, "queued", 7, 3, None, 1, 7, 55, 0, 0, False, "photo", "{}"),
+        (13, 42, "complete", 7, 3, None, 1, 7, None, 0, 0, False, "photo", "{}"),
+        (14, 42, "queued", 7, 3, None, 1, 7, None, 0, 0, False, "other", '{"x":1}'),
+        (15, 42, "queued", 7, 3, None, 1, 7, None, 0, 0, False, "photo", '{"ttl_seconds":1}'),
+        (16, 42, "queued", 7, 3, None, 1, 7, None, 0, 0, False, "photo", '{"live_photo":[1]}'),
+        (17, 42, "queued", 7, 3, None, 1, 7, None, 0, 0, False, "photo", '{"ttl_seconds":"not-json"}'),
+    ]
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+        for (
+            mid,
+            account,
+            state,
+            body,
+            source,
+            photo,
+            eligible,
+            generation,
+            job_photo,
+            deleted,
+            observed_deleted,
+            tombstone,
+            kind,
+            payload,
+        ) in cases:
+            conn.execute(
+                "INSERT INTO messages(dialog_id,message_id,sent_at,is_deleted,media_kind,media_payload) VALUES(10,?,1,?,?,?)",
+                (mid, deleted, kind, payload),
+            )
+            conn.execute(
+                "INSERT INTO message_observations(dialog_id,message_id,observation_order,is_deleted) VALUES(10,?,?,?)",
+                (mid, body, observed_deleted),
+            )
+            if source is not None:
+                conn.execute("INSERT INTO message_image_sources VALUES(10,?,?,?,?)", (mid, photo, source, eligible))
+            if tombstone:
+                conn.execute("INSERT INTO nonchannel_message_deletions VALUES(?,1)", (mid,))
+            conn.execute(
+                "INSERT INTO message_image_jobs VALUES(?,10,?,?,9,?,?,3,2,17,1,4,'unsupported_photo')",
+                (account, mid, state, generation, job_photo),
+            )
+        conn.execute("INSERT INTO message_image_artifacts VALUES (42,10,1,55,7,'saved','hash',10,2,3)")
+        before = cast(
+            list[tuple[int, int, int, str, int, int, int | None, int, int, int, int, int | None, str | None]],
+            conn.execute("SELECT * FROM message_image_jobs ORDER BY message_id").fetchall(),
+        )
+    sync_db.ensure_sync_schema(path)
+    sync_db.ensure_sync_schema(path)
+    with closing(sqlite3.connect(path)) as conn:
+        after = cast(
+            list[tuple[int, int, int, str, int, int, int | None, int, int, int, int, int | None, str | None]],
+            conn.execute("SELECT * FROM message_image_jobs ORDER BY message_id").fetchall(),
+        )
+        assert after == [(*row[:5], (0 if row[2] == 1 else 3) if row[2] <= 4 else row[5], *row[6:]) for row in before]
+        assert conn.execute("SELECT * FROM message_image_artifacts").fetchall() == [
+            (42, 10, 1, 55, 7, "saved", "hash", 10, 2, 3)
+        ]
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (99,)
+
+
+def test_image_job_revision_is_unchanged_without_bound_account(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "unbound-image.db"
+    with monkeypatch.context() as old:
+        old.setattr(sync_db, "_CURRENT_SCHEMA_VERSION", 98)
+        sync_db.ensure_sync_schema(path)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute(
+            "INSERT INTO messages(dialog_id,message_id,sent_at,media_kind,media_payload) VALUES(10,1,1,'photo','{}')"
+        )
+        conn.execute("INSERT INTO message_observations(dialog_id,message_id,observation_order) VALUES(10,1,7)")
+        conn.execute("INSERT INTO message_image_jobs VALUES(42,10,1,'queued',9,7,NULL,3,2,17,1,4,NULL)")
+    sync_db.ensure_sync_schema(path)
+    with closing(sqlite3.connect(path)) as conn:
+        assert conn.execute("SELECT source_generation FROM message_image_jobs").fetchone() == (7,)

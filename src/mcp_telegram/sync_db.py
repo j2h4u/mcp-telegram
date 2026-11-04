@@ -5205,6 +5205,33 @@ def _apply_migration_99(conn: sqlite3.Connection, current: int) -> int:
             """UPDATE telegram_folder_projection_state SET rule_enumeration_complete=1
                 WHERE coverage_status='complete' AND accepted_rule_token IS NOT NULL
                 AND rule_observation_started_at IS NOT NULL AND account_id IS NOT NULL""",
+            # Unresolved image jobs used the body revision; rebind only an exact current source.
+            """UPDATE message_image_jobs AS j SET source_generation=COALESCE((
+                SELECT s.observation_order FROM message_image_sources s
+                WHERE s.dialog_id=j.dialog_id AND s.message_id=j.message_id),0)
+                WHERE j.state IN ('queued','running','blocked','failed') AND j.photo_id IS NULL
+                AND j.account_id=(SELECT account_id FROM dialog_directory_state WHERE singleton=1 AND account_id>0)
+                AND EXISTS (
+                    SELECT 1 FROM messages m
+                    LEFT JOIN message_observations o USING(dialog_id,message_id)
+                    LEFT JOIN message_image_sources s USING(dialog_id,message_id)
+                    WHERE m.dialog_id=j.dialog_id AND m.message_id=j.message_id
+                    AND m.is_deleted=0 AND COALESCE(o.is_deleted,0)=0
+                    AND (m.dialog_id < -1000000000000 OR NOT EXISTS (
+                        SELECT 1 FROM nonchannel_message_deletions d WHERE d.message_id=m.message_id))
+                    AND s.photo_id IS NULL AND COALESCE(s.eligible,1)=1
+                    AND j.source_generation=COALESCE(o.observation_order,0)
+                    AND j.source_generation<>COALESCE(s.observation_order,0)
+                    AND ((m.media_kind='other' AND NOT EXISTS (SELECT 1 FROM json_each(m.media_payload)))
+                        OR (m.media_kind='photo' AND NOT EXISTS (
+                            SELECT 1 FROM json_each(m.media_payload) v
+                            WHERE v.key IN ('ttl_seconds','live_photo') AND NOT (
+                                v.type IN ('null','false') OR (v.type IN ('integer','real') AND v.value=0)
+                                OR (v.type='text' AND v.value='')
+                                OR CASE WHEN v.type IN ('array','object') THEN NOT EXISTS (SELECT 1 FROM json_each(v.value)) ELSE 0 END
+                            )
+                        )))
+                )""",
         ],
     )
 

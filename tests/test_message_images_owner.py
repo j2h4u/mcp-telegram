@@ -1,17 +1,22 @@
 """Durable image primitives use canonical account and source fences."""
 
+import asyncio
 import sqlite3
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
+from unittest.mock import MagicMock
 
 import pytest
 from telethon import types
 from telethon.errors import FileReferenceExpiredError
 
+from mcp_telegram import sync_db
 from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
+from mcp_telegram.event_handlers import EventHandlerManager, _EditedMessageEvent, _NewMessageEvent
 from mcp_telegram.image_authorization import ActiveSources, ScopeCell
 from mcp_telegram.message_contracts import ExtractedMessage
 from mcp_telegram.message_images.contracts import ImageScope
@@ -95,7 +100,7 @@ async def _assert_worker_result(
     result = await service.read(7, 8)
     if race == "unsupported":
         await _assert_unsupported_stays_terminal(service, conn)
-    if race in {"none", "reference", "multi", "same_photo", "same_photo_resolve"}:
+    if race in {"none", "reference", "multi", "same_photo", "same_photo_resolve", "upgraded_unknown"}:
         assert result.image_bytes == b"\xff\xd8\xfftest\xff\xd9"
         assert result.status["acquisition"] == {"state": "complete"}
         if race in {"same_photo", "same_photo_resolve"}:
@@ -165,14 +170,11 @@ async def test_local_image_read_and_budget_use_real_writer(tmp_path: Path) -> No
         conn.close()
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "race",
-    ["none", "delete", "replace", "key", "reference", "multi", "unsupported", "same_photo", "same_photo_resolve"],
-)
-async def test_worker_drains_explicit_legacy_photo_to_canonical_local_read(tmp_path: Path, race: str) -> None:  # noqa: PLR0915
-    db_path = tmp_path / "worker.db"
-    ensure_sync_schema(db_path)
+def _worker_database(db_path: Path, race: str, monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
+    with monkeypatch.context() as schema_patch:
+        if race in {"upgraded_unknown", "upgraded_unsupported"}:
+            schema_patch.setattr(sync_db, "_CURRENT_SCHEMA_VERSION", 98)
+        ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
     with write_transaction(conn):
         conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
@@ -183,6 +185,69 @@ async def test_worker_drains_explicit_legacy_photo_to_canonical_local_read(tmp_p
         conn.execute("INSERT INTO daemon_state(key,value) VALUES('canonical_observation_sequence','1')")
         if race == "same_photo_resolve":
             conn.execute("INSERT INTO message_image_sources VALUES(7,8,99,1,1)")
+        if race in {"upgraded_unknown", "upgraded_unsupported"}:
+            conn.execute("UPDATE message_observations SET observation_order=7 WHERE dialog_id=7 AND message_id=8")
+            conn.execute("UPDATE daemon_state SET value='7' WHERE key='canonical_observation_sequence'")
+            conn.execute(
+                "INSERT INTO message_image_jobs(account_id,dialog_id,message_id,state,attempt_generation,"
+                "source_generation,photo_id,remaining,setup_remaining,offset) VALUES(42,7,8,'queued',4,7,NULL,10,5,0)"
+            )
+            if race == "upgraded_unsupported":
+                conn.execute("UPDATE message_image_jobs SET state='failed',reason='unsupported_photo'")
+    if race in {"upgraded_unknown", "upgraded_unsupported"}:
+        conn.close()
+        ensure_sync_schema(db_path)
+        conn = sqlite3.connect(db_path)
+        assert conn.execute(
+            "SELECT state,attempt_generation,source_generation,remaining,setup_remaining FROM message_image_jobs"
+        ).fetchone() == ("failed" if race == "upgraded_unsupported" else "queued", 4, 0, 10, 5)
+    return conn
+
+
+@pytest.mark.asyncio
+async def test_upgraded_unsupported_photo_stays_failed_without_new_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "unsupported.db"
+    conn = _worker_database(db_path, "upgraded_unsupported", monkeypatch)
+    writer = await SQLiteWriter.open(db_path)
+    scope, _cell = await _bind_image_scope(writer, TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 100))
+    offered: list[bool] = []
+    service = MessageImageService(conn, writer, tmp_path / "images", scope, lambda: offered.append(True))
+    try:
+        result = await service.prepare(7, 8)
+        assert result["acquisition"] == {"state": "failed", "reason": "unsupported_photo"}
+        assert conn.execute(
+            "SELECT state,reason,attempt_generation,source_generation,remaining,setup_remaining FROM message_image_jobs"
+        ).fetchone() == ("failed", "unsupported_photo", 4, 0, 10, 5)
+        assert offered == []
+    finally:
+        await writer.run(scope.sources.unbind)
+        await writer.aclose()
+        conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "race",
+    [
+        "none",
+        "delete",
+        "replace",
+        "key",
+        "reference",
+        "multi",
+        "unsupported",
+        "same_photo",
+        "same_photo_resolve",
+        "upgraded_unknown",
+    ],
+)
+async def test_worker_drains_explicit_legacy_photo_to_canonical_local_read(
+    tmp_path: Path, race: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "worker.db"
+    conn = _worker_database(db_path, race, monkeypatch)
     writer = await SQLiteWriter.open(db_path)
     image_scope, cell = await _bind_image_scope(writer, TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 100))
     image = b"\xff\xd8\xfftest\xff\xd9"
@@ -270,6 +335,10 @@ async def test_worker_drains_explicit_legacy_photo_to_canonical_local_read(tmp_p
     )
     try:
         await service.prepare(7, 8)
+        if race == "upgraded_unknown":
+            assert conn.execute(
+                "SELECT attempt_generation,remaining,setup_remaining FROM message_image_jobs"
+            ).fetchone() == (4, 10, 5)
         await run_ready_slice(worker, limit=32, now=100)
         if race == "reference":
             await run_ready_slice(worker, limit=32, now=100)
@@ -285,6 +354,12 @@ async def test_worker_drains_explicit_legacy_photo_to_canonical_local_read(tmp_p
         if race == "none":
             assert len(observed) == 1 and observed[0].received == 0
         await _assert_worker_result(service, conn, tmp_path, race, (opens, slices))
+        if race == "upgraded_unknown":
+            row = cast(
+                tuple[int, int, int] | None,
+                conn.execute("SELECT attempt_generation,remaining,setup_remaining FROM message_image_jobs").fetchone(),
+            )
+            assert row is not None and row[0] == 4 and 0 <= row[1] < 10 and 0 <= row[2] < 5
     finally:
         await worker.close()
         await writer.run(image_scope.sources.unbind)
@@ -315,6 +390,13 @@ def test_normal_message_ingestion_keeps_photo_id_private_and_orders_same_second_
             assert insert_messages_with_fts(conn, [observed(101, 1)]).accepted_count == 0
         source = current_source(conn, 7, 8)
         assert source is not None and (source.photo_id, source.generation) == (photo_id, 3)
+        assert conn.execute(
+            "SELECT o.observation_order,s.observation_order FROM message_observations o "
+            "JOIN message_image_sources s USING(dialog_id,message_id) WHERE o.dialog_id=7 AND o.message_id=8"
+        ).fetchone() == (2, 3)
+        with write_transaction(conn):
+            conn.execute("UPDATE message_observations SET observation_order=4 WHERE dialog_id=7 AND message_id=8")
+        assert current_source(conn, 7, 8) == source
         payload = cast(
             tuple[str] | None,
             conn.execute("SELECT media_payload FROM messages WHERE dialog_id=7 AND message_id=8").fetchone(),
@@ -322,6 +404,60 @@ def test_normal_message_ingestion_keeps_photo_id_private_and_orders_same_second_
         assert payload == ("{}",)
         assert str(photo_id) not in repr(observed(photo_id, 3))
     finally:
+        conn.close()
+
+
+def test_image_source_without_media_observation_has_zero_generation(tmp_path: Path) -> None:
+    db_path = tmp_path / "unobserved.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        with write_transaction(conn):
+            conn.execute(
+                "INSERT INTO messages(dialog_id,message_id,sent_at,media_kind,media_payload) VALUES(7,8,1,'other','{}')"
+            )
+            conn.execute("INSERT INTO message_observations(dialog_id,message_id,observation_order) VALUES(7,8,42)")
+        source = current_source(conn, 7, 8)
+        assert source is not None and source.photo_id is None and source.generation == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_delivered_same_second_photo_edit_uses_media_generation(tmp_path: Path) -> None:
+    db_path = tmp_path / "delivered.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    with write_transaction(conn):
+        conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+        conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(7,'synced')")
+        conn.execute("INSERT INTO full_history_enrollment VALUES(7,1,1)")
+    writer = await SQLiteWriter.open(db_path)
+    now = datetime.now(UTC)
+
+    def message(photo_id: int) -> types.Message:
+        photo = types.Photo(photo_id, 555, b"private", now, [], 2)
+        return types.Message(
+            8, types.PeerUser(7), date=now, message="", edit_date=now, media=types.MessageMediaPhoto(photo=photo)
+        )
+
+    try:
+        manager = EventHandlerManager(MagicMock(), conn, asyncio.Event(), writer=writer, profile_detail_ttl_seconds=300)
+        manager.bind_demand_sink(MagicMock())
+        new = cast(_NewMessageEvent, SimpleNamespace(chat_id=7, message=message(99), is_private=False))
+        edit = cast(_EditedMessageEvent, SimpleNamespace(chat_id=7, message=message(100)))
+        await manager.on_new_message(new)
+        before = current_source(conn, 7, 8)
+        assert before is not None and before.photo_id == 99
+        await manager.on_message_edited(edit)
+        after = current_source(conn, 7, 8)
+        assert after is not None and after.photo_id == 100 and after.generation > before.generation
+        assert conn.execute(
+            "SELECT o.observation_order,s.observation_order FROM message_observations o "
+            "JOIN message_image_sources s USING(dialog_id,message_id) WHERE o.dialog_id=7 AND o.message_id=8"
+        ).fetchone() == (before.generation, after.generation)
+    finally:
+        await writer.aclose()
         conn.close()
 
 

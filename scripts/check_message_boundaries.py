@@ -1416,7 +1416,7 @@ def _authorized_profile_peer_sql(relative: str, snippet: _SqlSnippet) -> bool:
 
 _IMAGE_SOURCE_SQL_SHAPES: Mapping[tuple[str, str], str] = {
     ("message_images/repository.py", "current_source"): (
-        "SELECT s.photo_id,COALESCE(o.observation_order,0),m.media_kind,m.media_payload,s.eligible FROM messages m "
+        "SELECT s.photo_id,COALESCE(s.observation_order,0),m.media_kind,m.media_payload,s.eligible FROM messages m "
         "LEFT JOIN message_observations o USING(dialog_id,message_id) "
         "LEFT JOIN message_image_sources s USING(dialog_id,message_id) "
         "WHERE m.dialog_id=? AND m.message_id=? AND m.is_deleted=0 AND COALESCE(o.is_deleted,0)=0"
