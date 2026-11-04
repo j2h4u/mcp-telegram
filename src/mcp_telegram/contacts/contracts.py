@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 from typing import Literal, TypedDict
 
-
 CONTACT_PAGE_SIZE_LIMIT = 100
 
 
