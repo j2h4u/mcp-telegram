@@ -49,6 +49,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     current_rpc_scope,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.history_scope_helpers import HistoryScope
 from tests.sqlite_writer_helpers import inline_writer
 
 
@@ -58,23 +59,7 @@ def _selected_budget(adapter: FullSyncDemandAdapter) -> RpcAttemptBudget:
     return RpcAttemptBudget(limit=1, selected=status.selected)
 
 
-_scope_cell = ScopeCell()
-assert _scope_cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 123, 2, 99))
-
-
-class _ProbeScope:
-    def capture_scope(self) -> ScopeToken | None:
-        return _scope_cell.capture()
-
-    def claim_scope(self, token: ScopeToken) -> bool:
-        return _scope_cell.claim(token)
-
-    def capture_image_scope(self) -> ScopeToken | None:
-        return _scope_cell.capture()
-
-    def claim_image_scope(self, token: ScopeToken) -> bool:
-        return _scope_cell.claim(token)
-
+class _ProbeScope(HistoryScope):
     async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
         raise AssertionError(f"unexpected probe for {dialog_id}")
 
@@ -110,6 +95,7 @@ async def _empty_async_iter() -> AsyncIterator[object]:
 
 class _MockClient(_ProbeScope):
     def __init__(self) -> None:
+        super().__init__()
         self.add_event_handler = MagicMock()
         self.remove_event_handler = MagicMock()
         self.get_messages: AsyncMock = AsyncMock()
@@ -191,7 +177,7 @@ def make_worker(
 async def test_automatic_group_history_uses_fresh_total_and_persists_decision(
     sync_db: _SQLiteConnection, total: int | None, enabled: int
 ) -> None:
-    class Port:
+    class Port(_ProbeScope):
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
             return FullHistoryPage((), total, None)
 
@@ -218,7 +204,7 @@ async def test_automatic_group_history_uses_fresh_total_and_persists_decision(
 
 @pytest.mark.asyncio
 async def test_automatic_group_first_page_is_saved_once(sync_db: _SQLiteConnection) -> None:
-    class Port:
+    class Port(_ProbeScope):
         calls = 0
 
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
@@ -254,7 +240,7 @@ async def test_full_sync_adapter_commits_exact_selected_nonterminal_dialog(sync_
     sync_db.commit()
     calls: list[int] = []
 
-    class Port:
+    class Port(_ProbeScope):
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
             del before_message_id
             calls.append(dialog_id)
@@ -288,7 +274,7 @@ async def test_full_sync_adapter_commits_exact_selected_nonterminal_dialog(sync_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enabled", [False, True])
 async def test_automatic_group_rechecks_explicit_race(sync_db: _SQLiteConnection, enabled: bool) -> None:
-    class Port:
+    class Port(_ProbeScope):
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
             (enable_history if enabled else disable_history)(sync_db, dialog_id, now=2)
             sync_db.commit()
@@ -399,7 +385,7 @@ async def test_automatic_group_retry_skips_failed_candidate_and_reports_release(
     )
     sync_db.commit()
 
-    class Port:
+    class Port(_ProbeScope):
         calls = 0
 
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
@@ -435,8 +421,9 @@ async def test_automatic_group_ordinary_error_does_not_block_next_candidate(sync
     )
     sync_db.commit()
 
-    class Port:
+    class Port(_ProbeScope):
         def __init__(self) -> None:
+            super().__init__()
             self.attempted: list[int] = []
 
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
@@ -470,12 +457,13 @@ async def test_ready_total_repair_runs_during_automatic_candidate_backoff(sync_d
     sync_db.execute("INSERT INTO daemon_state(key,value) VALUES ('automatic_group_history_retry:512','1060')")
     sync_db.commit()
 
-    class Port:
+    class Port(_ProbeScope):
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
             raise AssertionError("candidate is in backoff")
 
     class Probe(_ProbeScope):
         def __init__(self) -> None:
+            super().__init__()
             self.attempted: list[int] = []
 
         async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
@@ -688,6 +676,7 @@ async def test_full_sync_disable_race_discards_fetched_body_and_checkpoint(tmp_p
     ensure_sync_schema(db_path)
     first = cast(sqlite3.Connection, _open_sync_db(db_path))
     second = cast(sqlite3.Connection, _open_sync_db(db_path))
+    first.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
     first.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (77, 'syncing')")
     first.execute("INSERT INTO full_history_enrollment VALUES (77, 1, 1)")
     first.commit()
@@ -720,6 +709,7 @@ async def test_full_sync_adapter_reports_stale_when_selected_cursor_loses_cas(tm
     ensure_sync_schema(db_path)
     first = cast(sqlite3.Connection, _open_sync_db(db_path))
     second = cast(sqlite3.Connection, _open_sync_db(db_path))
+    first.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
     first.execute("INSERT INTO synced_dialogs(dialog_id, status, sync_progress) VALUES (78, 'syncing', 0)")
     first.execute("INSERT INTO full_history_enrollment VALUES (78, 1, 1)")
     first.commit()
@@ -730,8 +720,14 @@ async def test_full_sync_adapter_reports_stale_when_selected_cursor_loses_cas(tm
         second.commit()
         return FullHistoryPage((extract_message_row(78, build_mock_message(id=4, text="stale")),), 3, 1)
 
+    scope = HistoryScope()
     adapter = FullSyncDemandAdapter(
-        FullSyncWorker(SimpleNamespace(fetch_page=fetch_page), first, asyncio.Event(), writer=inline_writer(first)),
+        FullSyncWorker(
+            SimpleNamespace(fetch_page=fetch_page, capture_scope=scope.capture_scope, claim_scope=scope.claim_scope),
+            first,
+            asyncio.Event(),
+            writer=inline_writer(first),
+        ),
         account_id=123,
     )
     selected = adapter.status(0.0).selected  # type: ignore[union-attr]
@@ -2849,7 +2845,7 @@ async def test_failed_history_peer_does_not_starve_ready_peer(
     sync_db.commit()
     calls = []
 
-    class Port:
+    class Port(_ProbeScope):
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
             calls.append(dialog_id)
             if dialog_id == 1:
@@ -2878,7 +2874,7 @@ async def test_failed_total_repair_peer_does_not_starve_ready_peer(
     sync_db.commit()
     calls: list[int] = []
 
-    class Port:
+    class Port(_ProbeScope):
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
             raise AssertionError("unexpected history")
 
@@ -2911,7 +2907,7 @@ async def test_cancelled_full_page_rotates_peer_and_resumes_checkpoint(sync_db: 
     sync_db.commit()
     calls: list[tuple[int, int]] = []
 
-    class Port:
+    class Port(_ProbeScope):
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
             calls.append((dialog_id, before_message_id))
             if len(calls) == 1:
@@ -2964,7 +2960,17 @@ async def test_full_sync_old_page_cannot_refresh_new_account_profile(sync_db: _S
         ),
     )
 
-    class Port:
+    class Port(_ProbeScope):
+        def __init__(self) -> None:
+            self._scope = ScopeCell()
+            assert self._scope.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 77, 2, 99))
+
+        def capture_scope(self) -> ScopeToken | None:
+            return self._scope.capture()
+
+        def claim_scope(self, token: ScopeToken) -> bool:
+            return self._scope.claim(token)
+
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
             assert dialog_id == -5 and before_message_id == 0
             entered.set()
@@ -2982,13 +2988,12 @@ async def test_full_sync_old_page_cannot_refresh_new_account_profile(sync_db: _S
     release.set()
     await task
 
-    assert conn.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=-5 AND message_id=3").fetchone() == (1,)
+    assert conn.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=-5 AND message_id=3").fetchone() == (0,)
     assert conn.execute(
         "SELECT status,reason FROM entity_detail_sections WHERE entity_id=12 AND section='common_chats'"
     ).fetchone() == ("fresh", None)
     assert conn.execute("SELECT COUNT(*) FROM entity_profile_refresh_state WHERE entity_id=12").fetchone() == (0,)
-    assert len(observations) == 1
-    assert observations[0].ignored_account_mismatch == 1
+    assert observations == []
 
 
 @pytest.mark.asyncio
@@ -2999,7 +3004,7 @@ async def test_full_sync_rollback_does_not_report_membership(sync_db: _SQLiteCon
     seed_full_history_enrollment(conn, 601, enabled=True)
     conn.commit()
 
-    class Port:
+    class Port(_ProbeScope):
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
             return FullHistoryPage((extract_message_row(dialog_id, build_mock_message(id=9, text="one")),), 1, 9)
 

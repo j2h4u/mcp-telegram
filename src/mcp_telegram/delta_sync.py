@@ -30,7 +30,7 @@ from .access_lifecycle import (
     set_access_lost,
     stamp_access_revalidation,
 )
-from .dialog_identity import ensure_dialog_identity_baseline, publish_dialog_identity
+from .dialog_identity import ensure_dialog_identity_baseline
 from .entity_profile.membership import MembershipSignalCounts
 from .entity_profile.repository import bound_profile_account
 from .flood import TelegramRpcThrottled, _raise_if_latched
@@ -44,6 +44,7 @@ from .message_history.contracts import (
     MessageHistoryAccessLostError,
     MessageHistoryUnavailableError,
 )
+from .message_history.identity_intake import publish_page_identities
 from .message_history.ports import ForwardGapPagePort
 from .messages.sqlite_bundle import (
     ReceivedMessageScopeChangedError,
@@ -543,6 +544,22 @@ class DeltaSyncWorker:
         owner: int | None,
         observer: Callable[[MembershipSignalCounts], None] | None,
     ) -> _DeltaFetchOutcome:
+        scope = self._history_port.capture_scope()
+        if scope is None:
+            self._last_delta_slice_stale = True
+            return _DeltaFetchOutcome([], 0)
+
+        return await self._collect_delta_slice_scoped(dialog_id, max_known_id, generation, owner, observer, scope)
+
+    async def _collect_delta_slice_scoped(  # noqa: PLR0911, PLR0913, PLR0917 - distinct RPC outcomes
+        self,
+        dialog_id: int,
+        max_known_id: int,
+        generation: int,
+        owner: int | None,
+        observer: Callable[[MembershipSignalCounts], None] | None,
+        scope: ScopeToken,
+    ) -> _DeltaFetchOutcome:
         def prepare_observation(conn: sqlite3.Connection) -> tuple[int, int, int]:
             with write_transaction(conn):
                 identity_revision = ensure_dialog_identity_baseline(conn, dialog_id)
@@ -573,14 +590,21 @@ class DeltaSyncWorker:
             logger.warning("delta_slice_rpc_error dialog_id=%d error=%s", dialog_id, exc)
             self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
-        if page.identity is not None:
 
-            def persist_identity(conn: sqlite3.Connection) -> None:
-                with write_transaction(conn):
-                    assert page.identity is not None
-                    publish_dialog_identity(conn, dialog_id, page.identity, identity_revision)
-
-            await self._writer.run(persist_identity)
+        accepted = await self._writer.run(
+            lambda conn: publish_page_identities(
+                conn,
+                self._history_port,
+                scope,
+                page,
+                dialog_id=dialog_id,
+                identity_revision=identity_revision,
+                observation_order=observation_order,
+            )
+        )
+        if not accepted:
+            self._last_delta_slice_stale = True
+            return _DeltaFetchOutcome([], 0)
         rows = [replace(row, observation_order=observation_order) for row in page.messages]
         if self._delta_gap_fill_observation_enabled:
             unique_keys = {(row.message.dialog_id, row.message.message_id) for row in rows}

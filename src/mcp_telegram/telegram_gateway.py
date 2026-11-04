@@ -86,7 +86,7 @@ from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_reading import GatewayFailure, GatewayFailureKind
 from .telegram_rpc_error import describe_telegram_rpc_error, is_reaction_detail_terminal_rpc_error
 from .telegram_rpc_scheduler import RpcAdmissionClosedError, RpcAdmissionError, UnclassifiedTelegramRpcError
-from .telethon_dialog import classify_dialog_type, observe_dialog_identity
+from .telethon_dialog import classify_dialog_type, observe_dialog_identity, observe_referenced_dialog_identities
 
 CATCHABLE_GATEWAY_FAILURES = (Exception,)
 
@@ -173,7 +173,7 @@ class TelethonChannelProfileGateway(ChannelProfilePort):
                 result, channel_id, observed_at=int(started_at)
             ),
             chat_entity_fields=_channel_profile_entity_fields(result, channel_id),
-            supplied_dialog_facts=_supplied_dialog_facts(result, full_chat, observed_at=int(started_at)),
+            supplied_dialog_facts=_supplied_dialog_facts(result, full_chat, channel_id, observed_at=int(started_at)),
         )
 
     async def fetch_channel_contact_overlap(self, reference: ChannelReference) -> ChannelContactOverlapObservation:
@@ -270,7 +270,7 @@ class TelethonGroupProfileGateway(GroupProfilePort):
                 result, group_id, raw_group_id, observed_at=started_at
             ),
             chat_entity_fields=_group_profile_entity_fields(result, raw_group_id),
-            supplied_dialog_facts=_supplied_dialog_facts(result, full_chat, observed_at=started_at),
+            supplied_dialog_facts=_supplied_dialog_facts(result, full_chat, group_id, observed_at=started_at),
             participants_count=_group_profile_participants_count(result, raw_group_id),
         )
 
@@ -447,7 +447,8 @@ class TelethonUserProfileGateway(UserProfilePort):
             observation=ObservationBoundary(started_at=started_at, completed_at=completed_at),
         )
         current_photo = _normalize_user_current_photo(result, user_id)
-        return replace(observation, current_photo=current_photo)
+        identities = _full_user_referenced_identities(result, user_id, normalized_kind, observed_at=int(started_at))
+        return replace(observation, current_photo=current_photo, referenced_identities=identities)
 
     async def fetch_profile_collection_page(
         self, reference: UserReference, section: str, cursor: Mapping[str, object]
@@ -681,16 +682,75 @@ def _collection_metadata(section: str, result: object) -> Mapping[str, object]:
     return metadata
 
 
-def _supplied_dialog_facts(result: object, full_chat: object, *, observed_at: int) -> SuppliedDialogFacts:
+def _full_chat_referenced_identities(
+    result: object, full_chat: object, target_id: int, *, observed_at: int
+) -> tuple[DialogIdentityObservation, ...]:
+    referenced: set[int] = set()
+    if isinstance(full_chat, types.ChannelFull):
+        linked = _nonnegative_int(getattr(full_chat, "linked_chat_id", None))
+        if linked:
+            referenced.add(int(get_peer_id(types.PeerChannel(linked))))
+    elif isinstance(full_chat, types.ChatFull):
+        referenced.update(_group_participant_references(full_chat))
+    referenced.discard(target_id)
+    entities = [
+        *cast(Sequence[object], getattr(result, "users", ()) or ()),
+        *cast(Sequence[object], getattr(result, "chats", ()) or ()),
+    ]
+    return observe_referenced_dialog_identities(entities, referenced, source="profile", observed_at=observed_at)
+
+
+def _group_participant_references(full_chat: types.ChatFull) -> set[int]:
+    participants = getattr(full_chat, "participants", None)
+    if not isinstance(participants, (types.ChatParticipants, types.ChatParticipantsForbidden)):
+        return set()
+    raw_values = getattr(participants, "participants", ())
+    values: list[object] = list(raw_values) if isinstance(raw_values, (list, tuple)) else []
+    values.append(getattr(participants, "self_participant", None))
+    referenced: set[int] = set()
+    for participant in values:
+        if isinstance(participant, (types.ChatParticipant, types.ChatParticipantAdmin, types.ChatParticipantCreator)):
+            user_id = _nonnegative_int(getattr(participant, "user_id", None))
+            if user_id:
+                referenced.add(user_id)
+    return referenced
+
+
+def _full_user_referenced_identities(
+    result: object, target_id: int, target_kind: TargetKind, *, observed_at: int
+) -> tuple[DialogIdentityObservation, ...]:
+    full_user = getattr(result, "full_user", None)
+    if not isinstance(full_user, types.UserFull) or full_user.id != target_id:
+        return ()
+    referenced: set[int] = set()
+    channel_id = _nonnegative_int(getattr(full_user, "personal_channel_id", None))
+    if channel_id:
+        referenced.add(int(get_peer_id(types.PeerChannel(channel_id))))
+    manager_id = _nonnegative_int(getattr(full_user, "bot_manager_id", None))
+    if manager_id and target_kind is TargetKind.BOT:
+        referenced.add(manager_id)
+    referenced.discard(target_id)
+    entities = [
+        *cast(Sequence[object], getattr(result, "users", ()) or ()),
+        *cast(Sequence[object], getattr(result, "chats", ()) or ()),
+    ]
+    return observe_referenced_dialog_identities(entities, referenced, source="profile", observed_at=observed_at)
+
+
+def _supplied_dialog_facts(
+    result: object, full_chat: object, target_id: int, *, observed_at: int
+) -> SuppliedDialogFacts:
     """Normalize only supported cursor, notification and user-sidecar facts."""
     settings = getattr(full_chat, "notify_settings", None)
     mute = getattr(settings, "mute_until", None)
     if isinstance(mute, datetime):
         mute = int(mute.timestamp())
     mute_until = _nonnegative_int(mute)
+    referenced = _full_chat_referenced_identities(result, full_chat, target_id, observed_at=observed_at)
+    referenced_ids = {identity.dialog_id for identity in referenced}
     identities: list[DialogIdentityObservation] = []
     for user in cast(Sequence[object], getattr(result, "users", ()) or ()):
-        if not isinstance(user, types.User):
+        if not isinstance(user, types.User) or user.id in referenced_ids:
             continue
         identity = observe_dialog_identity(user, dialog_id=user.id, source="profile", observed_at=observed_at)
         if identity is not None:
@@ -701,6 +761,7 @@ def _supplied_dialog_facts(result: object, full_chat: object, *, observed_at: in
         unread_count=_nonnegative_int(getattr(full_chat, "unread_count", None)),
         mute_until=mute_until,
         sidecar_identities=tuple(identities),
+        referenced_identities=referenced,
     )
 
 

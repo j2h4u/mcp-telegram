@@ -9,6 +9,7 @@ import asyncio
 from collections.abc import Coroutine
 from typing import Protocol
 
+from .image_authorization import ScopeToken
 from .telegram_demand import current_demand_token
 from .telegram_rpc_scheduler import create_detached_rpc_task, current_rpc_scope
 
@@ -19,6 +20,10 @@ class ActivityClient(Protocol):
     def __call__(self, request: object) -> Coroutine[object, object, object]: ...
 
     def get_input_entity(self, dialog_id: int) -> Coroutine[object, object, object]: ...
+
+    def capture_image_scope(self) -> ScopeToken | None: ...
+
+    def claim_image_scope(self, token: ScopeToken) -> bool: ...
 
 
 async def call_with_timeout(client: ActivityClient, request: object, *, timeout_s: float) -> object:

@@ -94,6 +94,7 @@ from mcp_telegram.telegram_rpc_consumers import (
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcScope, current_rpc_scope, rpc_scope
 from mcp_telegram.topics.demand import TopicSnapshotDemandAdapter
 from tests.helpers import build_mock_message
+from tests.history_scope_helpers import HistoryScope
 from tests.sqlite_writer_helpers import inline_writer
 
 
@@ -477,7 +478,10 @@ async def test_invalid_dm_checkpoint_does_not_block_forward_delta_coordinator(
     dependencies.conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (?,1,1)", (dialog_id,))
     dependencies.conn.commit()
 
-    class EmptyForwardPage:
+    dependencies.conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
+    dependencies.conn.commit()
+
+    class EmptyForwardPage(HistoryScope):
         async def fetch_page(
             self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
         ) -> ForwardGapPage:

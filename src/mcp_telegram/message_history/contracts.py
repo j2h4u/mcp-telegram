@@ -52,6 +52,7 @@ class FullHistoryPage:
     total_messages: int | None
     next_before_message_id: int | None
     identity: DialogIdentityObservation | None = None
+    referenced_identities: tuple[DialogIdentityObservation, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_full_history_messages(self.messages)
@@ -89,6 +90,7 @@ class ForwardGapPage:
     messages: tuple[ExtractedMessage, ...]
     complete: bool
     identity: DialogIdentityObservation | None = None
+    referenced_identities: tuple[DialogIdentityObservation, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.messages, tuple):

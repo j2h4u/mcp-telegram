@@ -1,6 +1,6 @@
 """Telethon entity classification adapter."""
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import cast
 
 from telethon.tl.types import (  # type: ignore[import-untyped]
@@ -48,6 +48,23 @@ def observe_response_dialog_identity(
         if get_peer_id(entity) == dialog_id:
             return observe_dialog_identity(entity, dialog_id=dialog_id, source=source, observed_at=observed_at)
     return None
+
+
+def observe_referenced_dialog_identities(
+    entities: Sequence[object], referenced_ids: Collection[int], *, source: str, observed_at: int
+) -> tuple[DialogIdentityObservation, ...]:
+    """Normalize explicitly referenced peers supplied in a response."""
+    selected: dict[int, DialogIdentityObservation] = {}
+    for entity in entities:
+        if not isinstance(entity, (User, Channel, Chat, ChatForbidden, ChannelForbidden)):
+            continue
+        dialog_id = int(get_peer_id(entity))
+        if dialog_id not in referenced_ids or dialog_id in selected:
+            continue
+        identity = observe_dialog_identity(entity, dialog_id=dialog_id, source=source, observed_at=observed_at)
+        if identity is not None:
+            selected[dialog_id] = identity
+    return tuple(selected.values())
 
 
 def observe_dialog_identity(
@@ -207,5 +224,6 @@ __all__ = [
     "is_reserved_replies_username",
     "normalize_telegram_username",
     "observe_dialog_identity",
+    "observe_referenced_dialog_identities",
     "observe_response_dialog_identity",
 ]

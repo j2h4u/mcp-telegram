@@ -29,7 +29,7 @@ from functools import wraps
 from typing import Protocol, cast
 
 from .access_lifecycle import AccessLossResult, set_access_lost
-from .dialog_identity import ensure_dialog_identity_baseline, publish_dialog_identity
+from .dialog_identity import ensure_dialog_identity_baseline
 from .entity_profile.membership import MembershipSignalCounts
 from .entity_profile.repository import bound_profile_account
 from .entity_store import EntitySnapshot, upsert_entity_stub
@@ -51,6 +51,7 @@ from .message_history.contracts import (
     MessageHistoryAccessLostError,
     MessageHistoryUnavailableError,
 )
+from .message_history.identity_intake import publish_page_identities
 from .message_history.ports import FullHistoryPagePort
 from .messages.sqlite_bundle import (
     ReceivedMessageScopeChangedError,
@@ -866,7 +867,16 @@ class FullSyncWorker:
         self, dialog_id: int, sync_progress: int, profile_owner_account_id: int | None = None
     ) -> _FetchedBatchPage:
         self._last_page_error = None
+        scope = self._history_port.capture_scope()
+        if scope is None:
+            self._last_page_stale = True
+            return _FetchedBatchPage(None, (), None, (sync_progress, False))
 
+        return await self._fetch_batch_page_scoped(dialog_id, sync_progress, profile_owner_account_id, scope)
+
+    async def _fetch_batch_page_scoped(
+        self, dialog_id: int, sync_progress: int, profile_owner_account_id: int | None, scope: ScopeToken
+    ) -> _FetchedBatchPage:
         def prepare_observation(conn: sqlite3.Connection) -> tuple[int, int, int]:
             with write_transaction(conn):
                 identity_revision = ensure_dialog_identity_baseline(conn, dialog_id)
@@ -893,14 +903,21 @@ class FullSyncWorker:
             )
             self._last_page_error = exc
             return _FetchedBatchPage(None, (), None, (sync_progress, False))
-        if page.identity is not None:
 
-            def persist_identity(conn: sqlite3.Connection) -> None:
-                with write_transaction(conn):
-                    assert page.identity is not None
-                    publish_dialog_identity(conn, dialog_id, page.identity, identity_revision)
-
-            await self._writer.run(persist_identity)
+        accepted = await self._writer.run(
+            lambda conn: publish_page_identities(
+                conn,
+                self._history_port,
+                scope,
+                page,
+                dialog_id=dialog_id,
+                identity_revision=identity_revision,
+                observation_order=observation_order,
+            )
+        )
+        if not accepted:
+            self._last_page_stale = True
+            return _FetchedBatchPage(None, (), None, (sync_progress, False))
         total_messages = page.total_messages if sync_progress == 0 else None
         if (
             page.next_before_message_id is not None

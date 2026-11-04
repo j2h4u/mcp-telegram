@@ -29,6 +29,7 @@ from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.sync_worker import FullSyncWorker
 from tests.helpers import build_mock_message
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.history_scope_helpers import HistoryScope
 
 _PREPARATION_PATHS = ["full", "delta", "peer", "backfill", "incremental"]
 
@@ -69,14 +70,22 @@ def _operation(
         on_rpc()
         raise _AcquisitionReachedError
 
-    port = SimpleNamespace(fetch_page=AsyncMock(side_effect=rpc))
+    authority = HistoryScope(1)
+    port = SimpleNamespace(
+        fetch_page=AsyncMock(side_effect=rpc), capture_scope=authority.capture_scope, claim_scope=authority.claim_scope
+    )
     if kind == "full":
         full = FullSyncWorker(cast(FullHistoryPagePort, port), reader, asyncio.Event(), writer=writer)
         return lambda: full._fetch_batch_page(1, 0)
     if kind == "delta":
         delta = DeltaSyncWorker(cast(ForwardGapPagePort, port), reader, asyncio.Event(), writer=writer)
         return lambda: delta._collect_delta_slice(1, 0, 0, 1, None)
-    client = cast(ActivityClient, object())
+    client = cast(
+        ActivityClient,
+        SimpleNamespace(
+            capture_image_scope=authority.capture_image_scope, claim_image_scope=authority.claim_image_scope
+        ),
+    )
     scope_cell = ScopeCell()
     assert scope_cell.publish(TelegramAuthScope(1, 1, 1, 1))
     scope = scope_cell.capture()
@@ -369,12 +378,12 @@ async def test_reaction_anchor_is_after_prep_but_before_commit(
     monkeypatch.setattr(sync_worker.time, "time", lambda: clock[0])
     await writer.run(lambda db: db.set_trace_callback(trace))
 
-    class FullPort:
+    class FullPort(HistoryScope):
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
             acquired()
             return FullHistoryPage((), 0, None)
 
-    class DeltaPort:
+    class DeltaPort(HistoryScope):
         async def fetch_page(
             self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
         ) -> ForwardGapPage:
@@ -382,9 +391,9 @@ async def test_reaction_anchor_is_after_prep_but_before_commit(
             return ForwardGapPage((), complete=True)
 
     if kind == "full":
-        result = await FullSyncWorker(FullPort(), reader, asyncio.Event(), writer=writer)._fetch_batch_page(1, 0)
+        result = await FullSyncWorker(FullPort(1), reader, asyncio.Event(), writer=writer)._fetch_batch_page(1, 0)
     else:
-        result = await DeltaSyncWorker(DeltaPort(), reader, asyncio.Event(), writer=writer)._collect_delta_slice(
+        result = await DeltaSyncWorker(DeltaPort(1), reader, asyncio.Event(), writer=writer)._collect_delta_slice(
             1, 0, 0, 1, None
         )
     assert result.reaction_observed_at == 200
@@ -395,19 +404,20 @@ async def test_history_workers_commit_through_owner_with_readonly_readers(tmp_pa
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     with _open_sync_db(path) as setup:
+        setup.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
         setup.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'not_synced')")
         seed_full_history_enrollment(setup, 1, enabled=True)
     setup.close()
     reader = open_sync_db_reader(path)
     writer = await SQLiteWriter.open(path)
 
-    class FullPort:
+    class FullPort(HistoryScope):
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
             if before_message_id == 0:
                 return FullHistoryPage((extract_message_row(dialog_id, build_mock_message(id=2, text="full")),), 1, 2)
             return FullHistoryPage((), 0, None)
 
-    class DeltaPort:
+    class DeltaPort(HistoryScope):
         async def fetch_page(
             self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
         ) -> ForwardGapPage:
@@ -416,11 +426,11 @@ async def test_history_workers_commit_through_owner_with_readonly_readers(tmp_pa
             )
 
     try:
-        full = FullSyncWorker(FullPort(), reader, asyncio.Event(), writer=writer)
+        full = FullSyncWorker(FullPort(1), reader, asyncio.Event(), writer=writer)
         assert not await full.process_one_batch()
         assert await full.process_one_batch()
         assert reader.execute("SELECT status FROM synced_dialogs WHERE dialog_id=1").fetchone() == ("synced",)
-        delta = DeltaSyncWorker(DeltaPort(), reader, asyncio.Event(), writer=writer)
+        delta = DeltaSyncWorker(DeltaPort(1), reader, asyncio.Event(), writer=writer)
         assert await delta.fetch_delta_slice_for_dialog(1) == 1
         assert delta._last_delta_slice_succeeded
         assert reader.execute("SELECT last_delta_checked_at FROM synced_dialogs WHERE dialog_id=1").fetchone()[0]
@@ -439,20 +449,21 @@ async def test_delta_access_loss_is_committed_before_reporting_it(tmp_path: Path
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     with _open_sync_db(path) as setup:
+        setup.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
         setup.execute("INSERT INTO synced_dialogs(dialog_id,status,delta_refresh_requested_at) VALUES (1,'synced',1)")
         seed_full_history_enrollment(setup, 1, enabled=True)
     setup.close()
     reader = open_sync_db_reader(path)
     writer = await SQLiteWriter.open(path)
 
-    class LostAccessPort:
+    class LostAccessPort(HistoryScope):
         async def fetch_page(
             self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
         ) -> ForwardGapPage:
             raise MessageHistoryAccessLostError("private", reason_code="ChannelPrivateError")
 
     try:
-        worker = DeltaSyncWorker(LostAccessPort(), reader, asyncio.Event(), writer=writer)
+        worker = DeltaSyncWorker(LostAccessPort(1), reader, asyncio.Event(), writer=writer)
         assert await worker.fetch_delta_slice_for_dialog(1) == 0
         assert worker._last_delta_slice_access_lost
         assert not worker._last_delta_slice_succeeded

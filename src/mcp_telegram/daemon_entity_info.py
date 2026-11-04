@@ -32,7 +32,7 @@ from .contacts.intake import track_contact
 from .contacts.state import read_contact_command_state
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_directory import apply_realtime_eligibility
-from .dialog_identity import capture_identity_baseline
+from .dialog_identity import capture_identity_baseline, publish_supplied_identities
 from .entity_profile.contracts import (
     CHANNEL_CONTACT_UNSUPPORTED_REASON,
     CHANNEL_CONTACT_UNSUPPORTED_RPC_CODE,
@@ -441,6 +441,9 @@ class _ProfileSectionContext:
     eligible_pair: bool
     received_scope: ScopeToken | None = None
     received_observation: ProfileFieldObservation | None = None
+    received_guard: Callable[[], bool] | None = None
+    requires_received_scope: bool = False
+    actual_attempts: int = 0
     linked_chat_fact_generation: int | None = None
     linked_chat_id: int | None = None
     linked_chat_fact_captured: bool = False
@@ -479,6 +482,7 @@ class _PairFailure:
     reason: str
     retry_at: int
     reuse_rejection_reason: str | None
+    received_context: _ProfileSectionContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -490,6 +494,7 @@ class _PairCommitRequest:
     pair_mode: str
     attempt_start: int
     reuse_rejection_reason: str | None
+    received_context: _ProfileSectionContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -501,6 +506,7 @@ class _PairMeasurement:
     pair_mode: str
     actual_attempts: int
     committed: bool
+    received_context: _ProfileSectionContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -642,9 +648,8 @@ class DaemonEntityInfoService:
         if intake is None:
             return operation()
         dialog_id, commit, context = intake
-        token = context.received_scope
         observation = context.received_observation
-        if token is None or observation is None or not self._claim_received_profile_scope(conn, token):
+        if observation is None or not self._received_profile_current(conn, context):
             return cast(T, False)
         try:
             with write_savepoint(conn):
@@ -655,9 +660,17 @@ class DaemonEntityInfoService:
             result = cast(T, False)
         if commit.supplied_dialog_facts is not None:
             self._publish_received_dialog_facts(conn, profiles, dialog_id, commit.supplied_dialog_facts, observation)
-        if not self._claim_received_profile_scope(conn, token):
+        if not self._received_profile_current(conn, context):
             raise _AuthScopeUnavailableError("authenticated session lease changed during publication")
         return result
+
+    def _received_profile_current(self, conn: sqlite3.Connection, context: _ProfileSectionContext) -> bool:
+        token = context.received_scope
+        return (
+            token is not None
+            and self._claim_received_profile_scope(conn, token)
+            and (context.received_guard is None or context.received_guard())
+        )
 
     def _claim_received_profile_scope(self, conn: sqlite3.Connection, token: ScopeToken) -> bool:
         """Claim the original lease against the currently bound profile account."""
@@ -696,6 +709,7 @@ class DaemonEntityInfoService:
                 SQLiteFolderSnapshotRepository(conn).reproject_current_rules_in_transaction(now=observation.observed_at)
         for identity in facts.sidecar_identities:
             profiles.publish_supplied_identity(identity, observation)
+        publish_supplied_identities(conn, facts.referenced_identities, observation_order=observation.order)
 
     def _write_profile_avatar_intake[T](
         self,
@@ -1413,11 +1427,7 @@ class DaemonEntityInfoService:
         context = self._profile_section_context(cursor, entity_type)
         identity_baseline = capture_identity_baseline(self._deps.conn, cursor.entity_id)
         try:
-            field_observation = (
-                await self._reserve_profile_observation(context.captured_scope)
-                if entity_type in {DialogType.USER, DialogType.BOT, DialogType.SERVICE}
-                else None
-            )
+            field_observation = await self._profile_field_observation(cursor, entity_type, context)
             self._require_profile_access(cursor.entity_id)
             result = await self._acquire_profile_section(cursor, entity_type, context=context)
         except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending:
@@ -1477,6 +1487,16 @@ class DaemonEntityInfoService:
         committed = await self._commit_profile_section_result(cursor, entity_type, result, context, now=now)
         return self._success_if_refresh_finished(cursor, committed=committed)
 
+    async def _profile_field_observation(
+        self, cursor: EntityRefreshCursor, entity_type: DialogType, context: _ProfileSectionContext
+    ) -> ProfileFieldObservation | None:
+        if entity_type not in {DialogType.USER, DialogType.BOT, DialogType.SERVICE}:
+            return None
+        if cursor.next_section == "full_profile":
+            await self._prepare_received_profile_context(context)
+            return context.received_observation
+        return await self._reserve_profile_observation(context.captured_scope)
+
     def _profile_section_context(
         self,
         cursor: EntityRefreshCursor,
@@ -1491,6 +1511,7 @@ class DaemonEntityInfoService:
         )
 
     async def _prepare_received_profile_context(self, context: _ProfileSectionContext) -> None:
+        context.requires_received_scope = True
         capture = getattr(self._deps.client, "capture_image_scope", None)
         claim = getattr(self._deps.client, "claim_image_scope", None)
         token = capture() if callable(capture) else None
@@ -1520,25 +1541,29 @@ class DaemonEntityInfoService:
     async def _handle_profile_section_failure(
         self, failure: _ProfileSectionFailure, *, guard_scope: bool = False
     ) -> DurableRefreshTerminal | None:
-        failed = await self._write_profiles(
-            lambda profiles: self._persist_profile_section_failure(profiles, failure, guard_scope=guard_scope),
-            received_intake=(failure.cursor.entity_id, EntitySectionCommit({}), failure.context)
-            if failure.context.received_scope is not None
-            else None,
-        )
+        def mark(profiles: EntityProfileRepository) -> bool:
+            return self._persist_profile_section_failure(profiles, failure, guard_scope=guard_scope)
+
+        if failure.context.requires_received_scope:
+            failed = await self._write_pair_accounting(failure.cursor, failure.context, mark)
+        else:
+            failed = await self._write_profiles(mark)
         if failed and failure.cursor.next_section == "common_chats":
             self._observe_membership({"failed": 1}, source="common_chats_refresh")
         actual_attempts = self._rpc_attempt_count() - failure.context.attempt_start
         if failure.context.measures_disabled_pair:
-            await self._write_profiles(
-                lambda profiles: profiles.record_pair_attempt(
-                    failure.cursor,
-                    failure.cursor.next_section,
-                    actual_attempts=actual_attempts,
-                )
-            )
+            await self._record_profile_failure_attempt(failure, actual_attempts)
         self._observe_profile_section_failure(failure.cursor, failure.entity_type, actual_attempts=actual_attempts)
         return DurableRefreshTerminal.FAILURE if failed else None
+
+    async def _record_profile_failure_attempt(self, failure: _ProfileSectionFailure, attempts: int) -> None:
+        def record(profiles: EntityProfileRepository) -> object:
+            return profiles.record_pair_attempt(failure.cursor, failure.cursor.next_section, actual_attempts=attempts)
+
+        if failure.context.requires_received_scope:
+            await self._write_pair_accounting(failure.cursor, failure.context, record)
+        else:
+            await self._write_profiles(record)
 
     def _persist_profile_section_failure(
         self, profiles: EntityProfileRepository, failure: _ProfileSectionFailure, *, guard_scope: bool
@@ -1580,20 +1605,35 @@ class DaemonEntityInfoService:
                 lambda profiles: self._commit_unsupported_contact_overlap(profiles, cursor, result, context, now=now)
             )
         if context.measures_disabled_pair:
-            committed, summary = await self._write_profiles(
-                lambda profiles: self._commit_measured_section_in_scope(
-                    profiles,
-                    cursor,
-                    result,
-                    context,
-                    now=now,
-                )
-            )
-            if summary is not None:
-                self._emit_pair_summary(summary)
-            await self._publish_profile_linked_chat_fact(cursor, entity_type, context, committed, now=now)
-            return committed
+            return await self._commit_measured_profile_section(cursor, entity_type, result, context, now=now)
         return await self._commit_unmeasured_profile_section(cursor, entity_type, result, context, now=now)
+
+    async def _commit_measured_profile_section(
+        self,
+        cursor: EntityRefreshCursor,
+        entity_type: DialogType,
+        result: EntitySectionCommit,
+        context: _ProfileSectionContext,
+        *,
+        now: int,
+    ) -> bool:
+        """Commit measured parent progress and independently supplied peer facts."""
+        summaries: list[dict[str, object] | None] = []
+        context.actual_attempts = self._rpc_attempt_count() - context.attempt_start
+
+        def commit(profiles: EntityProfileRepository) -> bool:
+            accepted, summary = self._commit_measured_section_in_scope(profiles, cursor, result, context, now=now)
+            summaries.append(summary)
+            return accepted
+
+        committed = await self._write_profiles(
+            commit,
+            received_intake=(cursor.entity_id, result, context) if context.received_scope is not None else None,
+        )
+        if summaries and summaries[0] is not None:
+            self._emit_pair_summary(summaries[0])
+        await self._publish_profile_linked_chat_fact(cursor, entity_type, context, committed, now=now)
+        return committed
 
     async def _commit_unmeasured_profile_section(
         self,
@@ -1692,7 +1732,7 @@ class DaemonEntityInfoService:
             result,
             now=now,
             outcome=self._section_commit_outcome(cursor.next_section, result),
-            actual_attempts=self._rpc_attempt_count() - context.attempt_start,
+            actual_attempts=context.actual_attempts,
         )
 
     def _commit_unsupported_contact_overlap(
@@ -1763,8 +1803,10 @@ class DaemonEntityInfoService:
         """Acquire and atomically commit both User profile projections."""
         attempt_start = self._rpc_attempt_count()
         pair_mode = cursor.pair_mode or "enabled"
+        context = self._profile_section_context(cursor, DialogType.USER)
         try:
-            full_profile, personal_channel = await self._acquire_full_user_pair(cursor)
+            await self._prepare_received_profile_context(context)
+            full_profile, personal_channel = await self._acquire_full_user_pair(cursor, context=context)
         except (
             TelegramRpcAdmissionDeferred,
             TelegramRpcMethodRecoveryPending,
@@ -1778,9 +1820,7 @@ class DaemonEntityInfoService:
             AttributeError,
             ValueError,
         ) as exc:
-            return await self._handle_full_user_pair_acquisition_failure(
-                cursor, pair_mode, attempt_start, reuse_rejection_reason, exc
-            )
+            return await self._handle_full_user_pair_acquisition_failure(cursor, context, reuse_rejection_reason, exc)
         if self._pair_scope_mismatch(cursor, full_profile, now=now):
             return await self._handle_full_user_pair_failure(
                 _PairFailure(
@@ -1791,6 +1831,7 @@ class DaemonEntityInfoService:
                     reason="auth_scope_changed",
                     retry_at=scope_changed_retry_at(now),
                     reuse_rejection_reason="auth_scope_changed",
+                    received_context=context,
                 )
             )
         committed = await self._commit_full_user_pair_or_raise(
@@ -1802,6 +1843,7 @@ class DaemonEntityInfoService:
                 pair_mode=pair_mode,
                 attempt_start=attempt_start,
                 reuse_rejection_reason=reuse_rejection_reason,
+                received_context=context,
             )
         )
         actual_attempts = self._rpc_attempt_count() - attempt_start
@@ -1814,6 +1856,7 @@ class DaemonEntityInfoService:
                 pair_mode=pair_mode,
                 actual_attempts=actual_attempts,
                 committed=committed,
+                received_context=context,
             )
         )
         if summary is not None:
@@ -1833,17 +1876,18 @@ class DaemonEntityInfoService:
     async def _handle_full_user_pair_acquisition_failure(
         self,
         cursor: EntityRefreshCursor,
-        pair_mode: str,
-        attempt_start: int,
+        context: _ProfileSectionContext,
         reuse_rejection_reason: str | None,
         error: Exception,
     ) -> DurableRefreshTerminal | None:
+        pair_mode = context.pair_mode
+        attempt_start = context.attempt_start
         if isinstance(error, _ProfileAccessLostError):
             raise error
         if isinstance(error, (TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending)):
             raise error
         if isinstance(error, RpcAttemptBudgetExhaustedError):
-            await self._record_full_user_pair_failure(cursor, pair_mode, attempt_start, reuse_rejection_reason)
+            await self._record_full_user_pair_failure(cursor, pair_mode, attempt_start, reuse_rejection_reason, context)
             raise error
         flood_wait = isinstance(error, TelegramRpcThrottled)
         if flood_wait:
@@ -1860,6 +1904,7 @@ class DaemonEntityInfoService:
                 reason="flood_wait" if flood_wait else type(error).__name__.lower(),
                 retry_at=self._existing_refresh_retry_at(cursor, now),
                 reuse_rejection_reason=reuse_rejection_reason,
+                received_context=context,
             )
         )
         if terminal is not None:
@@ -1869,16 +1914,40 @@ class DaemonEntityInfoService:
         self._note_retryable_profile_failure(error, terminal)
         return terminal
 
+    async def _write_pair_accounting[T](
+        self,
+        cursor: EntityRefreshCursor,
+        context: _ProfileSectionContext,
+        operation: Callable[[EntityProfileRepository], T],
+    ) -> T | None:
+        """Fence durable pair markers by the original acquisition lease."""
+        results: list[T] = []
+
+        def record(profiles: EntityProfileRepository) -> bool:
+            results.append(operation(profiles))
+            return True
+
+        try:
+            accepted = await self._write_profiles(
+                record, track_rejection=False, received_intake=(cursor.entity_id, EntitySectionCommit({}), context)
+            )
+        except _AuthScopeUnavailableError:
+            return None
+        return results[0] if accepted and results else None
+
     async def _record_full_user_pair_failure(
         self,
         cursor: EntityRefreshCursor,
         pair_mode: str,
         attempt_start: int,
         reuse_rejection_reason: str | None,
+        context: _ProfileSectionContext,
     ) -> None:
         actual_attempts = self._rpc_attempt_count() - attempt_start
-        await self._write_profiles(
-            lambda profiles: profiles.record_pair_attempt(cursor, "full_profile", actual_attempts=actual_attempts)
+        await self._write_pair_accounting(
+            cursor,
+            context,
+            lambda profiles: profiles.record_pair_attempt(cursor, "full_profile", actual_attempts=actual_attempts),
         )
         self._observe_profile_pair(
             mode=pair_mode,
@@ -1889,19 +1958,22 @@ class DaemonEntityInfoService:
         )
 
     async def _handle_full_user_pair_failure(self, failure: _PairFailure) -> DurableRefreshTerminal | None:
-        failed = await self._write_profiles(
+        failed = await self._write_pair_accounting(
+            failure.cursor,
+            failure.received_context,
             lambda profiles: profiles.mark_section_failure(
                 failure.cursor,
                 now=failure.now,
                 reason=failure.reason,
                 retry_at=failure.retry_at,
-            )
+            ),
         )
         await self._record_full_user_pair_failure(
             failure.cursor,
             failure.pair_mode,
             failure.attempt_start,
             failure.reuse_rejection_reason,
+            failure.received_context,
         )
         return DurableRefreshTerminal.FAILURE if failed else None
 
@@ -1925,13 +1997,17 @@ class DaemonEntityInfoService:
 
     async def _commit_full_user_pair_or_raise(self, request: _PairCommitRequest) -> bool:
         try:
-            return await self._write_profiles(lambda profiles: self._commit_full_user_pair_in_scope(profiles, request))
+            return await self._write_profiles(
+                lambda profiles: self._commit_full_user_pair_in_scope(profiles, request),
+                received_intake=(request.cursor.entity_id, request.full_profile, request.received_context),
+            )
         except Exception:
             await self._record_full_user_pair_failure(
                 request.cursor,
                 request.pair_mode,
                 request.attempt_start,
                 request.reuse_rejection_reason,
+                request.received_context,
             )
             raise
 
@@ -1980,8 +2056,12 @@ class DaemonEntityInfoService:
             )
             return personal_summary or full_summary
 
-        summary = await self._write_profiles(record)
-        if summary is None and not self._profiles._refresh_has("pair_mode"):
+        summary = await self._write_pair_accounting(measurement.cursor, measurement.received_context, record)
+        if (
+            summary is None
+            and not self._profiles._refresh_has("pair_mode")
+            and self._received_profile_current(self._deps.conn, measurement.received_context)
+        ):
             return self._historical_pair_summary(
                 measurement,
                 latency=latency,
@@ -2072,6 +2152,10 @@ class DaemonEntityInfoService:
     ) -> tuple[CommandProfileAcquisition, bool]:
         contact_guard = contact_current
         contact_current = contact_current or (lambda: True)
+
+        def publication_current() -> bool:
+            return self._note_publication_current(guard) and contact_current()
+
         revision = self._profiles._profile_revision(entity_id)
         identity_baseline = capture_identity_baseline(self._deps.conn, entity_id)
         kind = (
@@ -2107,24 +2191,31 @@ class DaemonEntityInfoService:
             dialog_identity_baseline_revision=identity_baseline,
             field_observation=field_observation,
             semantic_snapshot=normalized.semantic_snapshot,
-            contact_refinement_guard=(
-                None if contact_guard is None else lambda: self._note_publication_current(guard) and contact_current()
-            ),
+            supplied_dialog_facts=SuppliedDialogFacts(referenced_identities=normalized.referenced_identities),
+            contact_refinement_guard=(None if contact_guard is None else publication_current),
         )
 
         def publish(profiles: EntityProfileRepository) -> bool:
-            if not self._note_publication_current(guard) or not contact_current():
+            if not publication_current():
                 return False
             return profiles.commit_command_profile(
                 entity_id,
                 commit,
                 expected_revision=revision,
                 now=int(self._deps.now_provider()),
-                publication_guard=lambda: self._note_publication_current(guard) and contact_current(),
+                publication_guard=publication_current,
             )
 
-        accepted = await self._write_profiles(publish, track_rejection=False)
-        if not self._note_publication_current(guard) or not contact_current():
+        context = _ProfileSectionContext(scope, 0, False, "disabled", False)
+        context.received_scope = guard.token
+        context.received_observation = field_observation
+        context.received_guard = publication_current
+        accepted = await self._write_profiles(
+            publish,
+            track_rejection=False,
+            received_intake=(entity_id, commit, context) if normalized.referenced_identities else None,
+        )
+        if not publication_current():
             return CommandProfileAcquisition(False, False), False
         return self._command_profile_result(normalized, accepted, field_observation), accepted
 
@@ -2146,8 +2237,10 @@ class DaemonEntityInfoService:
     async def _acquire_full_user_pair(
         self,
         cursor: EntityRefreshCursor,
+        *,
+        context: _ProfileSectionContext | None = None,
     ) -> tuple[EntitySectionCommit, EntitySectionCommit]:
-        captured_scope = self._capture_pair_scope()
+        captured_scope = context.captured_scope if context is not None else self._capture_pair_scope()
         identity_baseline = capture_identity_baseline(self._deps.conn, cursor.entity_id)
         now = self._deps.now_provider()
         target_kind = (
@@ -2155,7 +2248,11 @@ class DaemonEntityInfoService:
             if self._stored_entity_type(cursor.entity_id, now=int(now)) is DialogType.BOT
             else TargetKind.USER
         )
-        field_observation = await self._reserve_profile_observation(captured_scope)
+        field_observation = (
+            context.received_observation
+            if context is not None
+            else await self._reserve_profile_observation(captured_scope)
+        )
         self._require_profile_access(cursor.entity_id)
         normalized = await _profile_network_read(
             self._deps.user_profile_port.fetch_user_profile(
@@ -2184,6 +2281,7 @@ class DaemonEntityInfoService:
             dialog_identity_baseline_revision=identity_baseline,
             field_observation=field_observation,
             semantic_snapshot=normalized.semantic_snapshot,
+            supplied_dialog_facts=SuppliedDialogFacts(referenced_identities=normalized.referenced_identities),
         )
         personal_channel = self._normalized_personal_channel_commit(
             normalized.personal_channel,
@@ -2860,6 +2958,7 @@ class DaemonEntityInfoService:
             identity_patch=identity_patch,
             dialog_identity_observation=outcome.dialog_identity_observation,
             semantic_snapshot=observation.semantic_snapshot,
+            supplied_dialog_facts=SuppliedDialogFacts(referenced_identities=observation.referenced_identities),
         )
 
     async def _acquire_channel_full_profile(

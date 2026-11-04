@@ -33,6 +33,7 @@ from mcp_telegram.reading import ReadingService
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.sync_worker import FullSyncWorker
 from sqlite_writer_helpers import inline_writer
+from tests.history_scope_helpers import HistoryScope
 
 PEER = -1001234567890
 
@@ -81,6 +82,8 @@ async def test_history_workers_publish_orphan_identity_without_overwriting_refre
     make_synced_db: Callable[[], sqlite3.Connection], forward: bool, concurrent_refresh: bool
 ) -> None:
     conn = make_synced_db()
+    conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
+    conn.commit()
     enable_history(conn, PEER)
     conn.execute("UPDATE synced_dialogs SET status='synced',read_inbox_max_id=0 WHERE dialog_id=?", (PEER,))
     conn.execute(
@@ -101,7 +104,7 @@ async def test_history_workers_publish_orphan_identity_without_overwriting_refre
     assert dialog["name_unavailable_reason"] == "identity_not_observed"
     assert dialog["category"] == "unknown"
 
-    class Port:
+    class Port(HistoryScope):
         async def fetch_page(self, dialog_id: int, **kwargs: object) -> FullHistoryPage | ForwardGapPage:
             assert capture_identity_baseline(conn, dialog_id) == 0
             if concurrent_refresh:

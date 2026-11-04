@@ -33,6 +33,7 @@ from mcp_telegram.entity_profile.full_user_normalization import normalize_full_u
 from mcp_telegram.entity_profile.ports import ProfileCollectionPort
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, RefreshLimits
 from mcp_telegram.flood import FloodWaitKillSwitchStatus
+from mcp_telegram.image_authorization import ScopeCell, ScopeToken
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 from tests.daemon_api_policy import make_daemon_api_policy
@@ -113,6 +114,8 @@ class _PairClient:
         username: str | None = "target",
         min_user: bool = False,
     ) -> None:
+        self.scope_cell = ScopeCell()
+        assert self.scope_cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 99, 2, 99))
         self.channel_id = channel_id
         self.bot = bot
         self.omit_channel_id = omit_channel_id
@@ -120,6 +123,12 @@ class _PairClient:
         self.min_user = min_user
         self.full_user_calls = 0
         self.collection_port: ProfileCollectionPort | None = None
+
+    def capture_image_scope(self) -> ScopeToken | None:
+        return self.scope_cell.capture()
+
+    def claim_image_scope(self, token: ScopeToken) -> bool:
+        return self.scope_cell.claim(token)
 
     async def fetch_profile_collection_page(
         self, reference: UserReference, section: str, cursor: Mapping[str, object]
@@ -190,6 +199,10 @@ class _PairClient:
 
 
 def _pair_service(conn: sqlite3.Connection, client: _PairClient, *, enabled: bool) -> object:
+    token = client.capture_image_scope()
+    assert token is not None
+    scope = token.scope
+
     def peer_id(value: object) -> int:
         raw_id = getattr(value, "id", None)
         if not isinstance(raw_id, int):
@@ -217,7 +230,7 @@ def _pair_service(conn: sqlite3.Connection, client: _PairClient, *, enabled: boo
             user_profile_port=client,
             refresh_limits=RefreshLimits(),
             enable_full_user_pair=enabled,
-            full_user_auth_scope=lambda: TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99),
+            full_user_auth_scope=lambda: scope,
         )
     )
     service.bind_demand_sink(MagicMock())
@@ -245,6 +258,10 @@ def _prepare(
     conn.execute(
         "INSERT INTO entities VALUES (?, 'channel', 'Local Channel', 'local_channel', NULL, 100)", (-1000000000123,)
     )
+    conn.execute("CREATE TABLE IF NOT EXISTS dialog_directory_state(singleton INTEGER PRIMARY KEY, account_id INTEGER)")
+    updated = conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
+    if updated.rowcount == 0:
+        conn.execute("INSERT INTO dialog_directory_state(singleton,account_id) VALUES (1,99)")
     conn.commit()
     service = _pair_service(conn, _PairClient(bot=bot, min_user=min_user), enabled=True)
     service._profiles.save_core({"id": 42, "type": entity_type, "name": "Target"}, now=100)  # type: ignore[attr-defined]
@@ -336,7 +353,7 @@ async def test_protective_disconnect_serves_valid_partial_profile_from_local_cac
         chat_avatar_history_port=LoudChatAvatarHistoryPort(),
         policy=policy,
     )
-    scope = TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99)
+    scope = TelegramAuthScope(AUTH_SCOPE_VERSION, 99, 2, 99)
     api._ready = True
     api.bind_demand_sink(MagicMock(offer=MagicMock(return_value=True)))
     await api._publish_auth_scope(scope)

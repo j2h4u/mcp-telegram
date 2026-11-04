@@ -358,6 +358,7 @@ class UserProfileObservation:
     personal_channel: ProjectionOutcome
     current_photo: ChatCurrentPhoto | None = None
     semantic_snapshot: ProfileSemanticSnapshot | None = None
+    referenced_identities: tuple[DialogIdentityObservation, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_positive_id(self.target_id, field_name="target_id")
@@ -465,6 +466,7 @@ class SuppliedDialogFacts:
     unread_count: int | None = None
     mute_until: int | None = None
     sidecar_identities: tuple[DialogIdentityObservation, ...] = ()
+    referenced_identities: tuple[DialogIdentityObservation, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

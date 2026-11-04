@@ -82,6 +82,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "folders/ports.py",  # Transaction-local projection binding to the shared SQLite owner.
             "folders/read_repository.py",
             "fts.py",
+            "message_history/identity_intake.py",  # Account-fenced history identity transaction owner.
             "history_enrollment.py",
             "hydration_queue.py",
             "image_authorization.py",  # Connection-bound active-target revocation registry.

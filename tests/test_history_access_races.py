@@ -13,25 +13,17 @@ from telethon.tl.types.messages import Messages
 from mcp_telegram.activity_cold_backfill import _cold_claim_matches
 from mcp_telegram.activity_hot_sweep import _begin_hot_window, _hot_state_matches
 from mcp_telegram.activity_peer_sweep import PeerSweepRequest, enroll_activity_dialog, sweep_peer_once
-from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
-from mcp_telegram.image_authorization import ScopeCell, ScopeToken
 from mcp_telegram.message_history.contracts import FullHistoryPage, HistoryAccessProbeResult
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import _apply_migrations
 from mcp_telegram.sync_worker import FullSyncWorker
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.history_scope_helpers import HistoryScope
 from tests.sqlite_writer_helpers import inline_writer
 
-_scope_cell = ScopeCell()
-assert _scope_cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 123, 2, 99))
 
-
-class _ProbeScope:
-    def capture_scope(self) -> ScopeToken | None:
-        return _scope_cell.capture()
-
-    def claim_scope(self, token: ScopeToken) -> bool:
-        return _scope_cell.claim(token)
+class _ProbeScope(HistoryScope):
+    pass
 
 
 @pytest.mark.parametrize("loss_at", ["resolve", "search"])
@@ -55,7 +47,7 @@ async def test_page_rejects_access_loss_during_await(monkeypatch: pytest.MonkeyP
         entered, release = asyncio.Event(), asyncio.Event()
         searches = 0
 
-        class Client:
+        class Client(_ProbeScope):
             async def __call__(self, request: object) -> object:
                 raise AssertionError("Search must use the governed request boundary")
 

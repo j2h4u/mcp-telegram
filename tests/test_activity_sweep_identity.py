@@ -17,9 +17,10 @@ from mcp_telegram.dialog_identity_contracts import DialogIdentityObservation
 from mcp_telegram.sync_db import _apply_migrations
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
 from sqlite_writer_helpers import inline_writer
+from tests.history_scope_helpers import HistoryScope
 
 
-class _Client:
+class _Client(HistoryScope):
     async def get_input_entity(self, dialog_id: int) -> InputPeerUser:
         return InputPeerUser(dialog_id, 1)
 
@@ -28,7 +29,7 @@ class _Client:
 
 
 def _request(conn: sqlite3.Connection, dialog_id: int = 111) -> PeerSweepRequest:
-    return PeerSweepRequest(_Client(), conn, dialog_id, 0, 0, 20, 1, writer=inline_writer(conn))
+    return PeerSweepRequest(_Client(1), conn, dialog_id, 0, 0, 20, 1, writer=inline_writer(conn))
 
 
 @pytest.mark.parametrize("with_message", [False, True])
@@ -52,6 +53,8 @@ async def test_sweep_retains_only_response_target_identity(
     dialog_id = get_peer_id(target)
     with closing(sqlite3.connect(":memory:")) as conn:
         _apply_migrations(conn)
+        conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
+        conn.commit()
         conn.execute("INSERT INTO dialogs(dialog_id,hidden) VALUES(?,1)", (dialog_id,))
         conn.commit()
         enable_runtime_writes(conn)
@@ -94,6 +97,8 @@ async def test_sweep_retains_only_response_target_identity(
 async def test_sweep_stale_response_cannot_overwrite_newer_identity(monkeypatch: pytest.MonkeyPatch) -> None:
     with closing(sqlite3.connect(":memory:")) as conn:
         _apply_migrations(conn)
+        conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
+        conn.commit()
         enable_runtime_writes(conn)
 
         async def search(client: object, request: object, *, timeout_s: float) -> Messages:
@@ -117,6 +122,8 @@ async def test_sweep_stale_response_cannot_overwrite_newer_identity(monkeypatch:
 async def test_sweep_failed_search_leaves_identity_untouched(monkeypatch: pytest.MonkeyPatch, cancel: bool) -> None:
     with closing(sqlite3.connect(":memory:")) as conn:
         _apply_migrations(conn)
+        conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
+        conn.commit()
         with write_transaction(conn):
             conn.execute("INSERT INTO dialogs(dialog_id,name) VALUES(111,'Existing')")
         enable_runtime_writes(conn)
@@ -144,6 +151,8 @@ async def test_sweep_failed_search_leaves_identity_untouched(monkeypatch: pytest
 async def test_sweep_ignores_response_without_target(monkeypatch: pytest.MonkeyPatch) -> None:
     with closing(sqlite3.connect(":memory:")) as conn:
         _apply_migrations(conn)
+        conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
+        conn.commit()
         enable_runtime_writes(conn)
 
         async def search(client: object, request: object, *, timeout_s: float) -> Messages:
@@ -158,6 +167,8 @@ async def test_sweep_ignores_response_without_target(monkeypatch: pytest.MonkeyP
 async def test_sweep_failed_message_write_does_not_publish_identity(monkeypatch: pytest.MonkeyPatch) -> None:
     with closing(sqlite3.connect(":memory:")) as conn:
         _apply_migrations(conn)
+        conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
+        conn.commit()
         enable_runtime_writes(conn)
 
         async def search(client: object, request: object, *, timeout_s: float) -> Messages:

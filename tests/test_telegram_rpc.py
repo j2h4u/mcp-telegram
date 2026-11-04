@@ -3669,6 +3669,9 @@ async def _dispatch_forward_history_sibling(
     """Run one normal durable sibling after the shared cooldown has expired."""
 
     class GateForwardPort:
+        capture_scope = gate.capture_image_scope
+        claim_scope = gate.claim_image_scope
+
         async def fetch_page(
             self,
             dialog_id: int,

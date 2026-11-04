@@ -19,7 +19,6 @@ from telethon.tl.functions.messages import GetHistoryRequest  # type: ignore[imp
 from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
 from helpers import MockTotalList, build_mock_message
-from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.config import SchedulingConfig, resolve_scheduling_config
 from mcp_telegram.daemon import _access_probe_policy_from_scheduling
 from mcp_telegram.delta_sync import (
@@ -36,7 +35,6 @@ from mcp_telegram.delta_sync import (
 from mcp_telegram.dialog_sync import DialogLightReconciliationDemandAdapter, DialogReconciliationWorker
 from mcp_telegram.entity_profile.membership import MembershipSignalCounts
 from mcp_telegram.flood import TelegramRpcThrottled
-from mcp_telegram.image_authorization import ScopeCell, ScopeToken
 from mcp_telegram.message_history.contracts import (
     HistoryAccessProbeResult,
     MessageHistoryAccessLostError,
@@ -71,25 +69,11 @@ from mcp_telegram.telegram_rpc_scheduler import (
     rpc_scope,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.history_scope_helpers import HistoryScope
 from tests.sqlite_writer_helpers import inline_writer
 
-_scope_cell = ScopeCell()
-assert _scope_cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 123, 2, 99))
 
-
-class _ProbeScope:
-    def capture_scope(self) -> ScopeToken | None:
-        return _scope_cell.capture()
-
-    def claim_scope(self, token: ScopeToken) -> bool:
-        return _scope_cell.claim(token)
-
-    def capture_image_scope(self) -> ScopeToken | None:
-        return _scope_cell.capture()
-
-    def claim_image_scope(self, token: ScopeToken) -> bool:
-        return _scope_cell.claim(token)
-
+class _ProbeScope(HistoryScope):
     async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
         raise AssertionError(f"unexpected probe for {dialog_id}")
 
@@ -171,6 +155,7 @@ class _RawHistoryClient(_ProbeScope):
         *,
         get_entity: Callable[[object], Awaitable[object]] | None = None,
     ) -> None:
+        super().__init__()
         self._get_messages = get_messages
         self._get_entity = get_entity
 
@@ -195,6 +180,7 @@ class _RawHistoryClient(_ProbeScope):
 
 class _ForwardHistoryClient(_ProbeScope):
     def __init__(self, respond: Callable[[GetHistoryRequest], Awaitable[object]]) -> None:
+        super().__init__()
         self._respond = respond
         self.requests: list[GetHistoryRequest] = []
 
@@ -213,7 +199,7 @@ async def test_full_sync_adapter_status_is_read_only_and_slice_has_precise_scope
     _seed_history_dialog(conn, dialog_id, status="syncing")
     observed_scopes: list[TelegramRpcScope] = []
 
-    class Client:
+    class Client(_ProbeScope):
         async def get_input_entity(self, peer: object) -> object:
             return peer
 
@@ -1827,7 +1813,7 @@ async def test_access_recovery_retains_local_flood_retry_and_observes_budget_def
     )
     conn.commit()
 
-    class HistoryPort:
+    class HistoryPort(_ProbeScope):
         async def fetch_page(
             self,
             _dialog_id: int,
@@ -2246,7 +2232,7 @@ async def test_delayed_access_loss_persists_rpc_error_time(conn: sqlite3.Connect
             clock = 1001
             raise MessageHistoryAccessLostError("private", reason_code="private")
 
-    class FailingHistory:
+    class FailingHistory(_ProbeScope):
         async def fetch_page(self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]) -> object:
             nonlocal clock
             clock = 1001
