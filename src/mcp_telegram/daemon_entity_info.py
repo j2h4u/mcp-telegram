@@ -1558,7 +1558,8 @@ class DaemonEntityInfoService:
 
     async def _record_profile_failure_attempt(self, failure: _ProfileSectionFailure, attempts: int) -> None:
         def record(profiles: EntityProfileRepository) -> object:
-            return profiles.record_pair_attempt(failure.cursor, failure.cursor.next_section, actual_attempts=attempts)
+            profiles.record_pair_attempt(failure.cursor, failure.cursor.next_section, actual_attempts=attempts)
+            return None
 
         if failure.context.requires_received_scope:
             await self._write_pair_accounting(failure.cursor, failure.context, record)

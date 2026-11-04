@@ -14,10 +14,14 @@ from .telegram_demand import current_demand_token
 from .telegram_rpc_scheduler import create_detached_rpc_task, current_rpc_scope
 
 
-class ActivityClient(Protocol):
-    """Minimal Telegram client surface required by activity use cases."""
+class ActivityRpcClient(Protocol):
+    """Telegram RPC surface used by local activity helpers."""
 
     def __call__(self, request: object) -> Coroutine[object, object, object]: ...
+
+
+class ActivityClient(ActivityRpcClient, Protocol):
+    """Activity sweep client with session authorization."""
 
     def get_input_entity(self, dialog_id: int) -> Coroutine[object, object, object]: ...
 
@@ -26,7 +30,7 @@ class ActivityClient(Protocol):
     def claim_image_scope(self, token: ScopeToken) -> bool: ...
 
 
-async def call_with_timeout(client: ActivityClient, request: object, *, timeout_s: float) -> object:
+async def call_with_timeout(client: ActivityRpcClient, request: object, *, timeout_s: float) -> object:
     """Invoke a Telegram RPC with a hard deadline and abandon on overrun.
 
     ``asyncio.wait_for`` awaits the wrapped task after cancellation.  Activity
@@ -70,4 +74,4 @@ def _consume_cancelled_task(task: asyncio.Task[object]) -> None:
         pass
 
 
-__all__ = ["ActivityClient", "call_with_timeout"]
+__all__ = ["ActivityClient", "ActivityRpcClient", "call_with_timeout"]
