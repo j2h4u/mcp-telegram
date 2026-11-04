@@ -9,10 +9,10 @@ uv run python -c "from mcp_telegram import server; print(len(server.tool_by_name
 ```
 
 Historical Phase 52 baseline registry count: 17 tools.
-Current registry count: 23 tools; scheduled-message, image, folder, and contact-note tools were added after this baseline.
+Current registry count: 25 tools; scheduled-message, image, folder, and contact-note and contact tools were added after this baseline.
 
 Current Phase 52 completion status:
-- The historical Phase 52 baseline recorded 17 registered tools declaring `outputSchema` in the live MCP tool descriptors at that time. The current registry has 23 tools, including scheduled-message, image, folder, and contact-note tools added after the baseline.
+- The historical Phase 52 baseline recorded 17 registered tools declaring `outputSchema` in the live MCP tool descriptors at that time. The current registry has 25 tools, including scheduled-message, image, folder, and contact-note and contact tools added after the baseline.
 - Every successful tool path returns `structuredContent`; recoverable error paths may stay text-only.
 - The table below is the Plan 52-01 pre-implementation baseline and lossless migration map. Its
   `Baseline` columns intentionally preserve the state observed before later Phase 52 plans ran.
@@ -75,3 +75,6 @@ Current Phase 52 completion status:
 - Existing baseline `outputSchema` tools were not accepted as complete; rows above preserve the gaps that later migration plans had to close.
 - Error results may remain text-only per D-05. This inventory is scoped to successful tool calls.
 - Exceptions were `none` in the Phase 52 baseline. The later `get_message_image` tool returns a native JPEG block when available; other successful tools remain structured-only.
+
+| `list_contacts` | List Contacts | primary | true | not in baseline | not in baseline | local contacts including users without dialogs | `account_id`, `items`, `coverage`, `next_after_entity_id` | none |
+| `manage_contact` | Manage Contact | primary | false | not in baseline | not in baseline | explicit contact create/update/delete | `account_id`, `entity_id`, `operation_key`, `outcome`, `verification` | native contact mutation |

@@ -165,13 +165,20 @@ def test_no_daemon_smoke_expects_all_registered_tools_and_output_schemas() -> No
 
 def test_no_daemon_native_management_steps_use_valid_arguments() -> None:
     from mcp_telegram.tools.contact_notes import ManageContactNote
+    from mcp_telegram.tools.contacts import ListContacts, ManageContact
     from mcp_telegram.tools.folders import GetFolder, ManageFolder
 
     script = cast(
         dict[str, object],
         json.loads((_repo_root() / "devtools/mcp_client/smoke-no-daemon.json").read_text(encoding="utf-8")),
     )
-    models = {"get_folder": GetFolder, "manage_folder": ManageFolder, "manage_contact_note": ManageContactNote}
+    models = {
+        "get_folder": GetFolder,
+        "manage_folder": ManageFolder,
+        "manage_contact_note": ManageContactNote,
+        "list_contacts": ListContacts,
+        "manage_contact": ManageContact,
+    }
     steps = cast(list[dict[str, object]], script["steps"])
     for name, model in models.items():
         step = next(step for step in steps if step.get("name") == name)

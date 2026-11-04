@@ -20,12 +20,15 @@ from telethon.network.connection.tcpfull import ConnectionTcpFull  # type: ignor
 from telethon.network.mtprotoplainsender import MTProtoPlainSender  # type: ignore[import-untyped]
 from telethon.network.mtprotosender import MTProtoSender  # type: ignore[import-untyped]
 from telethon.network.requeststate import RequestState as VendorRequestState  # type: ignore[import-untyped]
+from telethon.tl import types  # type: ignore[import-untyped]
 from telethon.tl.core.messagecontainer import MessageContainer  # type: ignore[import-untyped]
 from telethon.tl.core.tlmessage import TLMessage  # type: ignore[import-untyped]
 from telethon.tl.functions import PingRequest, ReqDHParamsRequest, ReqPqMultiRequest, SetClientDHParamsRequest  # type: ignore[import-untyped]
+from telethon.tl.functions.contacts import AddContactRequest, DeleteContactsRequest  # type: ignore[import-untyped]
 from telethon.tl.tlobject import TLRequest  # type: ignore[import-untyped]
 from telethon.tl.types import MsgsAck, MsgsStateInfo  # type: ignore[import-untyped]
 
+from .image_authorization import ScopeToken
 from .native_write_fence import FolderWriteRejected, NoteWriteRejected
 from .peer_access import PeerAccessRejectedError
 from .scheduled_write_fence import ScheduledWriteRejected
@@ -84,6 +87,8 @@ class TransportAuthority(Protocol):
     def observe_error_now(self, owner: object, error: BaseException) -> None: ...
 
     def observe_response_now(self, owner: object) -> None: ...
+
+    def contact_response_scope(self, owner: object, request: object, result: object) -> ScopeToken | None: ...
 
 
 class _OwnedFuture(asyncio.Future[object]):
@@ -268,6 +273,7 @@ class GuardedMTProtoSender(MTProtoSender):
         self._authority = authority
         self._identity_change = identity_change
         self._owned_states: dict[_RequestState, _OwnedState] = {}
+        self._response_owner: ContextVar[_OwnedState | None] = ContextVar("contact_response_owner", default=None)
         self._fresh_ack: _RequestState | None = None
         self._ack_retry_blocked = False
         self._preparing: set[asyncio.Task[None]] = set()
@@ -746,11 +752,48 @@ class GuardedMTProtoSender(MTProtoSender):
             return False
 
     async def _handle_rpc_result(self, message: object) -> None:
+        result = getattr(message, "obj", None)
+        pending = self._pending_state.get(getattr(result, "req_msg_id", None))
+        owned = self._owned_states.get(pending) if pending is not None else None
+        response_token = self._response_owner.set(owned)
         token = self._control_origin.set((asyncio.current_task(), "ack"))
         try:
             await super()._handle_rpc_result(message)
         finally:
             self._control_origin.reset(token)
+            self._response_owner.reset(response_token)
+
+    def _store_own_updates(self, obj: object, *args: object, **kwargs: object) -> None:
+        owned = self._response_owner.get()
+        if owned is None or owned.request_type not in {AddContactRequest, DeleteContactsRequest}:
+            super()._store_own_updates(obj, *args, **kwargs)
+            return
+        self._store_contact_response(owned, obj)
+
+    def _store_contact_response(self, owned: _OwnedState, obj: object) -> None:
+        if owned.claims < 1 or owned.state.data != owned.body or type(owned.state.request) is not owned.request_type:
+            return
+        if type(obj) not in {types.Updates, types.UpdatesCombined, types.UpdateShort, types.UpdatesTooLong}:
+            return
+        scope = self._authority.contact_response_scope(owned.owner, owned.state.request, obj)
+        if scope is None:
+            return
+        self._queue_contact_response(obj, scope)
+
+    def _queue_contact_response(self, obj: object, scope: ScopeToken) -> None:
+        items: list[object] = [obj]
+        for field in ("updates", "users", "chats"):
+            values = cast(object, getattr(obj, field, ()))
+            if isinstance(values, list):
+                items.extend(cast(list[object], values))
+        short = cast(object, getattr(obj, "update", None))
+        if short is not None:
+            items.append(short)
+        for item in items:
+            vars(item)["_mcp_contact_scope_token"] = scope
+        vars(obj)["_self_outgoing"] = False
+        assert self._updates_queue is not None
+        self._updates_queue.put_nowait(obj)
 
     async def _handle_state_forgotten(self, message: object) -> None:
         token = self._control_origin.set((asyncio.current_task(), "state_info"))

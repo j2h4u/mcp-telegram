@@ -20,6 +20,8 @@ from mcp_telegram.activity_cold_backfill import (
 )
 from mcp_telegram.activity_hot_sweep import HotActivityDemandAdapter
 from mcp_telegram.activity_sync import ArchiveBackfillDemandAdapter, ArchiveIncrementalDemandAdapter
+from mcp_telegram.contacts.demand import ContactCatalogueDemandAdapter
+from mcp_telegram.contacts.refresh import ContactCatalogueRefresher
 from mcp_telegram.daemon import SQLiteSelfProfileCadence
 from mcp_telegram.delta_sync import (
     DeltaAccessProbeDemandAdapter,
@@ -212,6 +214,7 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
     )
     objects: dict[str, object] = {
         "client": MagicMock(),
+        "contact_catalogue": MagicMock(spec=ContactCatalogueRefresher),
         "conn": conn,
         "shutdown": asyncio.Event(),
         "full": MagicMock(),
@@ -245,6 +248,7 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
     publish_startup_identity: Callable[[object, int], Awaitable[None]] = AsyncMock()
     dependencies = DemandCompositionDependencies(
         client=cast(DemandCompositionClient, objects["client"]),
+        contact_catalogue_refresher=cast(ContactCatalogueRefresher, objects["contact_catalogue"]),
         conn=cast(sqlite3.Connection, objects["conn"]),
         account_id=1,
         writer=inline_writer(conn),
@@ -325,7 +329,7 @@ def test_access_loss_observer_reaches_each_durable_producer(
     assert observer.sources == ["access_loss"] * len(callbacks)
 
 
-def test_adapter_map_is_exact_against_literal_24_kind_class_map(
+def test_adapter_map_is_exact_against_literal_25_kind_class_map(
     composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
 ) -> None:
     dependencies, objects = composition_dependencies
@@ -349,6 +353,7 @@ def test_adapter_map_is_exact_against_literal_24_kind_class_map(
         DemandKind.COLD_PEER_PAGE: ColdPeerPageDemandAdapter,
         DemandKind.BACKFILL_HYDRATION_BATCH: FactHydrationDemandAdapter,
         DemandKind.FOLDER_SNAPSHOT: FolderProjectionDemandAdapter,
+        DemandKind.CONTACT_CATALOGUE: ContactCatalogueDemandAdapter,
         DemandKind.TOPIC_SNAPSHOT: TopicSnapshotDemandAdapter,
         DemandKind.MESSAGE_FACT_REFRESH: MessageFactRefreshDemandAdapter,
         DemandKind.READ_RECEIPT_BATCH: ReadReceiptDemandAdapter,
@@ -358,7 +363,7 @@ def test_adapter_map_is_exact_against_literal_24_kind_class_map(
         DemandKind.SELF_PROFILE_MAINTENANCE: SelfProfileMaintenanceDemandAdapter,
         DemandKind.LINKED_CHAT_REFRESH: LinkedChatFactDemandAdapter,
     }
-    assert len(expected) == 24
+    assert len(expected) == 25
     assert set(adapters) == set(expected)
     assert {kind: type(adapter) for kind, adapter in adapters.items()} == expected
     assert all(getattr(adapter, "demand_kind", None) is kind for kind, adapter in adapters.items())
@@ -918,3 +923,51 @@ async def test_linked_chat_coordinator_runs_selected_sibling_and_owns_publicatio
         "SELECT generation,pending_generation FROM linked_chat_fact_state WHERE channel_id=?",
         (int(excluded.key.target),),
     ).fetchone() == (0, 0)
+
+
+async def test_contact_catalogue_coordinator_uses_current_revision_and_publishes(
+    composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
+) -> None:
+    from telethon.tl import functions, types
+
+    from mcp_telegram.auth_scope import TelegramAuthScope
+    from mcp_telegram.contacts.repository import read_contacts, request_contact_catalogue
+    from mcp_telegram.image_authorization import ScopeCell
+    from mcp_telegram.sync_transactions import write_transaction
+
+    dependencies, _objects = composition_dependencies
+    conn = dependencies.conn
+    cell = ScopeCell()
+    assert cell.publish(TelegramAuthScope(1, 1, 2, 3))
+    requests: list[object] = []
+
+    class Client:
+        async def __call__(self, request: object) -> object:
+            assert isinstance(request, functions.contacts.GetContactsRequest)
+            requests.append(request)
+            return types.contacts.Contacts([types.Contact(55, False)], 1, [types.User(55, first_name="Saved")])
+
+    refresher = ContactCatalogueRefresher(
+        Client(), conn, inline_writer(conn), capture_scope=cell.capture, claim_scope=cell.claim
+    )
+    dependencies = replace(dependencies, contact_catalogue_refresher=refresher)
+    with write_transaction(conn):
+        request_contact_catalogue(conn, 1)
+    coordinator = build_durable_coordinator(dependencies)
+    adapter = coordinator._adapters[DemandKind.CONTACT_CATALOGUE]
+    status = adapter.status(time.time())
+    assert status is not None and status.selected is not None
+    with write_transaction(conn):
+        request_contact_catalogue(conn, 1)
+    stale = await adapter.run_slice(RpcAttemptBudget(1, selected=status.selected))
+    assert stale.kind is SliceOutcomeKind.STALE and not requests
+    current = adapter.status(time.time())
+    assert current is not None and current.selected is not None
+    deferred = await adapter.run_slice(RpcAttemptBudget(1, attempts=1, selected=current.selected))
+    assert deferred.kind is SliceOutcomeKind.DEFERRED and not requests
+    coordinator.scan()
+    await coordinator._execute_slice(DemandKind.CONTACT_CATALOGUE)
+    assert len(requests) == 1
+    items = cast(list[dict[str, object]], read_contacts(conn, 1, limit=10, after_entity_id=None)["items"])
+    assert items[0]["entity_id"] == 55
+    assert adapter.status(time.time()) is None

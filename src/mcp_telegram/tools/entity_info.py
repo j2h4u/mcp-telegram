@@ -34,6 +34,7 @@ from ._base import (
     safe_error_code,
     structured_result,
 )
+from .contacts import CONTACT_STATE_SCHEMA
 from .structured import (
     TELEGRAM_CONTENT_OUTPUT_SCHEMA,
     StructuredWarning,
@@ -135,6 +136,7 @@ cast(dict[str, object], GET_ENTITY_INFO_OUTPUT_SCHEMA["properties"])["contact_no
     "required": ["state", "expected_version"],
     "additionalProperties": False,
 }
+cast(dict[str, object], GET_ENTITY_INFO_OUTPUT_SCHEMA["properties"])["contact"] = CONTACT_STATE_SCHEMA
 cast(dict[str, object], GET_ENTITY_INFO_OUTPUT_SCHEMA["properties"])["common_chats_page"] = _PROFILE_PROPERTIES["page"]
 GET_ENTITY_INFO_OUTPUT_SCHEMA["$defs"] = _PROFILE_DEFINITIONS
 GET_ENTITY_INFO_OUTPUT_SCHEMA["additionalProperties"] = False
@@ -669,9 +671,17 @@ def _entity_structured_content(
         "dialog_placement": _dialog_placement_structured(data.get("dialog_placement")),
         **{
             key: data[key]
-            for key in ("semantic", "collections", "history_coverage", "page", "common_chats_page", "contact_note")
+            for key in (
+                "semantic",
+                "collections",
+                "history_coverage",
+                "page",
+                "common_chats_page",
+                "contact_note",
+            )
             if key in data
         },
+        **({"contact": data["contact_state"]} if "contact_state" in data else {}),
     }
 
 

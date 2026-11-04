@@ -68,6 +68,13 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "contact_notes/domain.py",  # Writer-only authority for note physical attempts.
             "contact_notes/receipts.py",  # Durable note attempt and verification receipts.
             "contact_notes/state.py",  # Local account-scoped canonical note projection.
+            "contacts/commands.py",  # Account-fenced native contact commands and receipts.
+            "contacts/demand.py",  # Transaction-local contact acquisition state.
+            "contacts/domain.py",  # Writer-only authority for contact attempts.
+            "contacts/receipts.py",  # Durable contact attempt and verification receipts.
+            "contacts/refresh.py",  # Bounded contact catalogue publication.
+            "contacts/repository.py",  # Local account-scoped contact catalogue.
+            "contacts/state.py",  # Canonical contact command-state projection.
             "folders/command_receipts.py",  # Durable folder attempt and verification receipts.
             "folders/commands.py",  # Folder command owner and writer-bound preclaim.
             "folders/sqlite_repository.py",
@@ -145,6 +152,10 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "contact_notes/composition.py",  # Native note intent construction.
             "contact_notes/domain.py",  # Native note request verification.
             "contact_notes/intake.py",  # Native note body and supplied update classification.
+            "contacts/commands.py",  # Native contact commands through the sole gateway.
+            "contacts/composition.py",  # Native contact intent construction.
+            "contacts/domain.py",  # Native contact request verification.
+            "contacts/refresh.py",  # Bounded native contact catalogue acquisition.
             "folders/commands.py",  # Native folder reconstruction through the sole gateway.
             "folders/telegram_adapter.py",
             "entity_profile/updates.py",  # Normalizes supplied Telegram updates; never acquires remotely.

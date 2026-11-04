@@ -19,7 +19,8 @@ from .scheduled_receipts_schema import SCHEDULED_OPERATION_RECEIPT_DDL
 from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 
-_CURRENT_SCHEMA_VERSION = 97
+_CURRENT_SCHEMA_VERSION = 98
+_CONTACT_CATALOGUE_MIGRATION = 98
 _NATIVE_MANAGEMENT_MIGRATION = 97
 _COMMON_CHAT_NORMALIZATION_MIGRATION = 96
 _CHANNEL_ID_MARKER = 1_000_000_000_000
@@ -5131,7 +5132,29 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_96(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _NATIVE_MANAGEMENT_MIGRATION:
         current = _apply_migration_97(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _CONTACT_CATALOGUE_MIGRATION:
+        current = _apply_migration_98(conn, current)
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
+
+
+def _apply_migration_98(conn: sqlite3.Connection, current: int) -> int:
+    from .contacts.schema import CONTACT_RECEIPT_DDL
+
+    return _apply_migration(
+        conn,
+        current,
+        _CONTACT_CATALOGUE_MIGRATION,
+        [
+            CONTACT_RECEIPT_DDL,
+            """UPDATE entity_profile_semantic_snapshots SET
+            fields_json=json_remove(fields_json, '$."user.first_name"', '$."user.last_name"'),
+            coverage_json=json_remove(coverage_json, '$."user.first_name"', '$."user.last_name"'),
+            provenance_json=json_remove(provenance_json, '$.fields."user.first_name"', '$.fields."user.last_name"')
+            WHERE json_type(fields_json, '$."user.contact"')='true'
+            AND json_extract(coverage_json, '$."user.contact".authoritative')=1""",
+            "CREATE TABLE contact_catalogue_state (account_id INTEGER PRIMARY KEY, requested_revision INTEGER NOT NULL DEFAULT 1, accepted_revision INTEGER NOT NULL DEFAULT 0, observed_at INTEGER, observation_order INTEGER)",
+        ],
+    )
 
 
 def _apply_migration_97(conn: sqlite3.Connection, current: int) -> int:

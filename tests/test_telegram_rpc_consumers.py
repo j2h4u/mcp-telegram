@@ -48,6 +48,7 @@ EXPECTED_DURABLE_DEMAND_ORDER = (
     DemandKind.COLD_PEER_PAGE,
     DemandKind.BACKFILL_HYDRATION_BATCH,
     DemandKind.FOLDER_SNAPSHOT,
+    DemandKind.CONTACT_CATALOGUE,
     DemandKind.TOPIC_SNAPSHOT,
     DemandKind.MESSAGE_FACT_REFRESH,
     DemandKind.READ_RECEIPT_BATCH,
@@ -120,6 +121,8 @@ def test_demand_registry_has_exact_operation_and_source_coverage() -> None:
         TelegramRpcSource.SCHEDULED_MUTATION: {DemandKind.SCHEDULED_MUTATION},
         TelegramRpcSource.FOLDER_COMMAND: {DemandKind.FOLDER_COMMAND},
         TelegramRpcSource.NOTE_COMMAND: {DemandKind.NOTE_COMMAND},
+        TelegramRpcSource.CONTACT_CATALOGUE: {DemandKind.CONTACT_CATALOGUE},
+        TelegramRpcSource.CONTACT_COMMAND: {DemandKind.CONTACT_COMMAND},
         TelegramRpcSource.MAINTENANCE: {DemandKind.SELF_PROFILE_MAINTENANCE},
         TelegramRpcSource.LINKED_CHAT_REFRESH: {DemandKind.LINKED_CHAT_REFRESH},
     }
@@ -204,6 +207,7 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
         DemandKind.SCHEDULED_MUTATION: 1,
         DemandKind.FOLDER_COMMAND: 3,
         DemandKind.NOTE_COMMAND: 4,
+        DemandKind.CONTACT_COMMAND: 3,
     }
     for contract in TELEGRAM_DEMAND_CONTRACTS.values():
         consumer = TELEGRAM_RPC_CONSUMERS[contract.source]
@@ -261,7 +265,7 @@ def test_scheduled_mutation_is_explicit_interactive_inline_and_single_send() -> 
 
 def test_durable_demand_order_is_a_literal_complete_contract() -> None:
     assert DURABLE_DEMAND_ORDER == EXPECTED_DURABLE_DEMAND_ORDER
-    assert len(DURABLE_DEMAND_ORDER) == 24
+    assert len(DURABLE_DEMAND_ORDER) == 25
     assert {
         kind for kind, contract in TELEGRAM_DEMAND_CONTRACTS.items() if contract.execution_mode is ExecutionMode.DURABLE
     } == set(EXPECTED_DURABLE_DEMAND_ORDER)

@@ -36,10 +36,12 @@ from mcp_telegram.tools import (
     GetMyRecentActivity,
     GetSyncStatus,
     GetUnreadSummary,
+    ListContacts,
     ListConversationChanges,
     ListDialogs,
     ListMessages,
     ListTopics,
+    ManageContact,
     ManageContactNote,
     ManageDraft,
     ManageFolder,
@@ -55,10 +57,12 @@ from mcp_telegram.tools import (
     get_my_recent_activity,
     get_sync_status,
     get_unread_summary,
+    list_contacts,
     list_conversation_changes,
     list_dialogs,
     list_messages,
     list_topics,
+    manage_contact,
     manage_contact_note,
     manage_draft,
     manage_folder,
@@ -397,6 +401,37 @@ from mcp_telegram.tools.message_images import (
 )
 
 STRUCTURED_TOOL_CASES = {
+    "list_contacts": (
+        list_contacts,
+        ListContacts(limit=50),
+        {
+            "ok": True,
+            "account_id": 7,
+            "items": [
+                {
+                    "entity_id": 123,
+                    "membership": True,
+                    "first_name": "Ada",
+                    "last_name": "",
+                    "expected_version": "a" * 64,
+                }
+            ],
+            "coverage": {"state": "unknown", "observed_at": None},
+            "next_after_entity_id": None,
+        },
+    ),
+    "manage_contact": (
+        manage_contact,
+        ManageContact(entity_id=123, action="delete", expected_version="a" * 64, operation_key="contact-schema"),
+        {
+            "ok": True,
+            "account_id": 7,
+            "entity_id": 123,
+            "operation_key": "contact-schema",
+            "outcome": "unknown",
+            "verification": "pending",
+        },
+    ),
     "get_folder": (
         get_folder,
         GetFolder(folder_id=4),
@@ -912,7 +947,7 @@ async def test_registered_tool_outputs_match_their_null_free_schemas(tool_name: 
     with _patch_daemon(conn):
         result = await server.call_tool(tool_name, args.model_dump(mode="json", exclude_none=True))
 
-    if tool_name in {"get_folder", "manage_folder", "manage_contact_note"}:
+    if tool_name in {"get_folder", "manage_folder", "manage_contact_note", "list_contacts", "manage_contact"}:
         expected = {"method": tool_name, **args.model_dump(exclude_unset=True, exclude={"timezone"})}
         conn.request.assert_awaited_once_with(expected)
 

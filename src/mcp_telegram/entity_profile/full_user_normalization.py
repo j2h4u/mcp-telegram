@@ -15,6 +15,7 @@ from dataclasses import replace
 from datetime import date, datetime
 from typing import TypedDict, cast
 
+from ..contacts.profile import project_contact_profile
 from ..dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
 from ..identity_observation import USERNAME_UNOBSERVED, observe_username
 from ..telethon_dialog import observe_dialog_identity
@@ -607,6 +608,7 @@ def normalize_full_user_response(
     semantic = normalize_semantic_profile(
         user, full_user, target_id=target_id, owner_account_id=owner_account_id, observation=boundary
     )
+    semantic = project_contact_profile(semantic, user)
     _retain_authorized_legacy_fields(profile, user, full_user, semantic)
     complete = complete and semantic.complete
     identity_observation = (

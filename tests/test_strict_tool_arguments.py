@@ -21,6 +21,13 @@ VALID_ARGUMENTS: dict[str, dict[str, object]] = {
     "list_topics": {"dialog": "123"},
     "get_entity_info": {"entity": "123"},
     "get_folder": {"folder_id": 4},
+    "list_contacts": {},
+    "manage_contact": {
+        "entity_id": 123,
+        "action": "delete",
+        "expected_version": "a" * 64,
+        "operation_key": "validation",
+    },
     "manage_folder": {
         "action": "create",
         "operation_key": "validation",

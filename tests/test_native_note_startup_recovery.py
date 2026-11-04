@@ -10,6 +10,7 @@ from typing import cast
 import pytest
 
 from mcp_telegram.auth_scope import TelegramAuthScope
+from mcp_telegram.contacts.guard import ContactPeerGuard
 from mcp_telegram.daemon import (
     _note_recovery_watermark,
     _reconcile_note_receipts,
@@ -238,6 +239,7 @@ async def test_reconciliation_offer_exception_requests_shutdown_but_false_does_n
     shutdown = SimpleNamespace(request=shutdown_request)
     context = SimpleNamespace(
         user_profile_port=gateway,
+        contact_peer_guard=ContactPeerGuard(),
         note_write_authority=authority,
         client=SimpleNamespace(retained_auth_scope=lambda: None),
         conn=object(),

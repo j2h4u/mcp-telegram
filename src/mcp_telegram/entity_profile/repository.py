@@ -21,6 +21,9 @@ from typing import cast
 from ..access_predicates import not_access_lost_sql
 from ..contact_notes.intake import invalidate_contact_note
 from ..contact_notes.receipts import refine_acknowledged_for_observation, refine_unknown_for_observation
+from ..contacts.intake import invalidate_contact
+from ..contacts.receipts import refine_acknowledged_for_observation as refine_acknowledged_contact
+from ..contacts.receipts import refine_unknown_for_observation as refine_unknown_contact
 from ..dialog_fact_observations import claim_dialog_fact
 from ..dialog_identity import capture_identity_baseline, publish_dialog_identity
 from ..dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation, ObservedText
@@ -95,6 +98,13 @@ def _invalidate_note_merge(merged: EffectiveProfileMerge) -> None:
         path == root or path.startswith((root + ".", root + "[")) for path in merged.accepted_paths for root in roots
     ):
         invalidate_contact_note(merged.snapshot.target_id)
+    contact_roots = ("user.contact", "owner.saved_contact_name", "owner.saved_contact_phone_access", "user.phone")
+    if any(
+        path == root or path.startswith((root + ".", root + "["))
+        for path in merged.accepted_paths
+        for root in contact_roots
+    ):
+        invalidate_contact(merged.snapshot.target_id)
 
 
 class _CoreAcquisitionRejectedError(Exception):
@@ -142,6 +152,7 @@ class EntitySectionCommit:
     semantic_snapshot: ProfileSemanticSnapshot | None = None
     collection_page: ProfileCollectionPage | None = None
     note_refinement_guard: Callable[[], bool] | None = None
+    contact_refinement_guard: Callable[[], bool] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2174,6 +2185,14 @@ class EntityProfileRepository:
                     )
                     refine_acknowledged_for_observation(
                         self._conn, observation.owner_account_id, snapshot.target_id, observation.order, guard
+                    )
+                contact_guard = commit.contact_refinement_guard
+                if contact_guard is not None and contact_guard():
+                    refine_unknown_contact(
+                        self._conn, observation.owner_account_id, snapshot.target_id, observation.order, contact_guard
+                    )
+                    refine_acknowledged_contact(
+                        self._conn, observation.owner_account_id, snapshot.target_id, observation.order, contact_guard
                     )
             return merged
         return None

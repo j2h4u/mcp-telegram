@@ -9,7 +9,7 @@ import logging
 import math
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator, Sequence
 from contextlib import AbstractContextManager, asynccontextmanager, contextmanager
 from contextvars import Context, ContextVar
 from dataclasses import asdict, dataclass, field, replace
@@ -62,11 +62,13 @@ from telethon.utils import get_input_channel, get_peer_id, is_list_like  # type:
 
 from .auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from .contact_notes.intake import capture_contact_note_intake, invalidate_contact_note_scope
+from .contacts.intake import capture_contact_intake, invalidate_contact_scope
 from .delivered_update import DeliveredUpdate, delivered_update_context, fail_delivered_update
 from .flood import FloodWaitObservation, TelegramRpcThrottled, flood_seconds
 from .folders.intake import capture_folder_intake, has_folder_updates, invalidate_folder_intake
 from .image_authorization import ScopeCell, ScopeToken
 from .native_write_fence import (
+    ContactWriteRejected,
     FolderWriteRejected,
     NativeWireOutcome,
     NativeWriteCheck,
@@ -241,6 +243,16 @@ TransientRpcErrors = (
     InterdcCallRichErrorError,
     TimedOutError,
 )
+
+
+def _native_rejection(
+    domain: NativeWriteDomain,
+) -> type[FolderWriteRejected] | type[NoteWriteRejected] | type[ContactWriteRejected]:
+    if domain == "folder":
+        return FolderWriteRejected
+    if domain == "contact_note":
+        return NoteWriteRejected
+    return ContactWriteRejected
 
 
 class CircuitStatus(Protocol):
@@ -719,19 +731,37 @@ def _valid_native_receipt_owner(intent: dict[str, object]) -> bool:
     binding = _native_binding(owner["binding"])
     scope = intent["scope"]
     expected = {
-        "folder": functions.messages.UpdateDialogFilterRequest,
-        "contact_note": functions.contacts.UpdateContactNoteRequest,
+        "folder": (functions.messages.UpdateDialogFilterRequest,),
+        "contact_note": (functions.contacts.UpdateContactNoteRequest,),
+        "contact": (functions.contacts.AddContactRequest, functions.contacts.DeleteContactsRequest),
     }
     return (
         binding is not None
         and type(owner["contained"]) is bool
         and isinstance(scope, dict)
-        and intent["method"]
-        == f"{expected[binding.domain].__module__}.{expected[binding.domain].__name__}:"
-        f"{expected[binding.domain].CONSTRUCTOR_ID:08x}"
+        and _native_receipt_method_matches(binding, cast(str, intent["method"]), expected[binding.domain])
         and (binding.dc_id, binding.key_id, binding.account_id)
         == (scope["dc_id"], scope["key_id"], scope["account_id"])
         and (not owner["contained"] or intent["phase"] == "unknown")
+    )
+
+
+def _native_receipt_method_matches(binding: NativeWriteReceiptBinding, method: str, kinds: tuple[type, ...]) -> bool:
+    return method in {
+        f"{kind.__module__}.{kind.__name__}:{cast(int, getattr(kind, 'CONSTRUCTOR_ID')):08x}"  # noqa: B009 - dynamic vendor class
+        for kind in kinds
+    } and _contact_binding_method_matches(binding, method)
+
+
+def _contact_binding_method_matches(binding: NativeWriteReceiptBinding, method: str) -> bool:
+    if binding.domain != "contact":
+        return True
+    kind = (
+        functions.contacts.DeleteContactsRequest if binding.action == "delete" else functions.contacts.AddContactRequest
+    )
+    return (
+        binding.action in {"create", "update", "delete"}
+        and method == f"{kind.__module__}.{kind.__name__}:{kind.CONSTRUCTOR_ID:08x}"
     )
 
 
@@ -3404,6 +3434,10 @@ def _request_peers(request: TLRequest, account_id: int, photo: _PhotoWireCapabil
 
 def _native_request_peer_values(request: TLRequest) -> list[object] | None:
     values: list[object]
+    if type(request) is functions.contacts.AddContactRequest:
+        return [cast(functions.contacts.AddContactRequest, request).id]
+    if type(request) is functions.contacts.DeleteContactsRequest:
+        return list(cast(functions.contacts.DeleteContactsRequest, request).id)
     if type(request) is functions.messages.UpdateDialogFilterRequest:
         folder = cast(functions.messages.UpdateDialogFilterRequest, request).filter
         if folder is None:
@@ -3418,6 +3452,10 @@ def _native_request_peer_values(request: TLRequest) -> list[object] | None:
         entities = note_request.note.entities
     else:
         return None
+    return _native_peers_with_mentions(values, entities)
+
+
+def _native_peers_with_mentions(values: list[object], entities: Sequence[object]) -> list[object]:
     values.extend(entity.user_id for entity in entities if isinstance(entity, types.InputMessageEntityMentionName))
     values.extend(
         types.PeerUser(entity.user_id) for entity in entities if isinstance(entity, types.MessageEntityMentionName)
@@ -3591,6 +3629,9 @@ class _AuxPhotoAuthority:
 
     def observe_response_now(self, owner: object) -> None:
         self._gate.observe_response_now(owner)
+
+    def contact_response_scope(self, owner: object, request: object, result: object) -> None:
+        return None
 
     def protect_transport(self, error: BaseException) -> None:
         self._lease.revoked = True
@@ -3883,7 +3924,9 @@ class TelegramRpcGate(TelegramClient):
         self._rpc_eligibility_observer: Callable[[str | None], None] | None = None
         self._update_loop_owner: asyncio.Task[object] | None = None
         previous = cast(MessageBox, object.__getattribute__(self, "_message_box"))
-        self._message_box = GateMessageBox(previous, self.rpc_eligibility, _canonical_wire_method)
+        self._message_box = GateMessageBox(
+            previous, self.rpc_eligibility, _canonical_wire_method, self._contact_delivery_scope_valid
+        )
         if self._offline_wire_identity()[0] > 0:
             self._ensure_safety_ledger()
         self._cooldown_save_tasks: dict[int, asyncio.Task[None]] = {}
@@ -3891,7 +3934,7 @@ class TelegramRpcGate(TelegramClient):
     def register_native_write_domain(self, domain: NativeWriteDomain, owner: NativeWriteDomainOwner) -> None:
         """Register the authoritative owner before startup admission."""
         if (
-            domain not in {"folder", "contact_note"}
+            domain not in {"folder", "contact_note", "contact"}
             or not isinstance(owner, NativeWriteDomainOwner)
             or not callable(owner.notify_terminal)
         ):
@@ -3997,6 +4040,7 @@ class TelegramRpcGate(TelegramClient):
             raise RuntimeError("retained Telegram update tokens are incomplete")
         capture_folder_intake(updates)
         capture_contact_note_intake(updates)
+        capture_contact_intake(updates)
         self._install_delivery(envelope, updates, tuple(zip(state.orders, state.reaction_sequences, strict=True)))
         await super()._preprocess_updates(updates, users, chats)  # type: ignore[misc]
         if updates:
@@ -4088,6 +4132,7 @@ class TelegramRpcGate(TelegramClient):
         )
         capture_folder_intake(updates)
         capture_contact_note_intake(updates)
+        capture_contact_intake(updates)
         prior = self._active_delivery
         if prior is not None:
             await prior.done.wait()
@@ -4108,16 +4153,57 @@ class TelegramRpcGate(TelegramClient):
     def _check_delivery_scope(
         self, scope: TelegramAuthScope | None, updates: list[object], users: list[object]
     ) -> None:
+        if any(not self._contact_delivery_scope_valid(item) for item in (*updates, *users)):
+            raise RuntimeError("contact response authorization scope changed")
         if (
             scope is not None
             and self._delivery_account_id is not None
             and scope.account_id != self._delivery_account_id
         ):
             raise RuntimeError("update delivery account mismatch")
-        if (
-            has_folder_updates(updates) or users or any(isinstance(u, types.UpdateUser) for u in updates)
-        ) and scope is None:
+        if self._delivery_needs_verified_scope(updates, users) and scope is None:
             raise RuntimeError("profile or folder update requires a verified authorization scope")
+
+    @staticmethod
+    def _delivery_needs_verified_scope(updates: list[object], users: list[object]) -> bool:
+        return bool(has_folder_updates(updates) or users or any(isinstance(u, types.UpdateUser) for u in updates))
+
+    def _contact_delivery_scope_valid(self, item: object) -> bool:
+        token = getattr(item, "_mcp_contact_scope_token", None)
+        return token is None or (
+            isinstance(token, ScopeToken)
+            and self._session_lease is not None
+            and self._session_lease.is_held()
+            and self.claim_image_scope(token)
+            and self.retained_auth_scope() == token.scope
+        )
+
+    def contact_response_scope(self, owner: object, request: object, result: object) -> ScopeToken | None:
+        """Authorize one exact physical contact response under its original scope."""
+        owner = self._require_wire_owner(owner)
+        check = owner.native_check
+        token = owner.native_scope_token
+        if not owner.claimed or check is None or check.binding.domain != "contact" or token is None:
+            return None
+        if not self._matches_contact_response(owner, request, result):
+            return None
+        if (
+            self._session_lease is None
+            or not self._session_lease.is_held()
+            or not self.claim_image_scope(token)
+            or self.retained_auth_scope() != token.scope
+        ):
+            return None
+        return token
+
+    @staticmethod
+    def _matches_contact_response(owner: _WireAttempt, request: object, result: object) -> bool:
+        return (
+            request is owner.native_request
+            and type(request) in {functions.contacts.AddContactRequest, functions.contacts.DeleteContactsRequest}
+            and bytes(cast(TLRequest, request)) == owner.native_body
+            and isinstance(result, (types.Updates, types.UpdatesCombined, types.UpdateShort, types.UpdatesTooLong))
+        )
 
     @staticmethod
     def _authentication_token_updates(updates: list[object]) -> list[object]:
@@ -4565,7 +4651,7 @@ class TelegramRpcGate(TelegramClient):
         owner.native_body = body
         owner.native_scope_token = self.capture_image_scope()
         if owner.native_scope_token is None:
-            error = FolderWriteRejected if native[0].binding.domain == "folder" else NoteWriteRejected
+            error = _native_rejection(native[0].binding.domain)
             raise error("native_auth_scope_unavailable")
 
     def _native_command_phase(self, request: TLRequest, scope: TelegramRpcScope) -> tuple[str | None, int | None]:
@@ -4578,7 +4664,23 @@ class TelegramRpcGate(TelegramClient):
             if evidence is None or scope.source is not TelegramRpcSource.NOTE_COMMAND:
                 raise NoteWriteRejected("note_root_invalid")
             return self._note_command_phase(request, evidence)
+        if scope.demand_kind is DemandKind.CONTACT_COMMAND:
+            if evidence is None or scope.source is not TelegramRpcSource.CONTACT_COMMAND:
+                raise ContactWriteRejected("contact_root_invalid")
+            return self._contact_command_phase(request, evidence)
         return None, None
+
+    def _contact_command_phase(self, request: TLRequest, evidence: RpcAttemptEvidence) -> tuple[str, int | None]:
+        if type(request) in {functions.contacts.AddContactRequest, functions.contacts.DeleteContactsRequest}:
+            return "contact_mutation", None
+        if type(request) is functions.users.GetFullUserRequest:
+            user = cast(functions.users.GetFullUserRequest, request).id
+            auth = self.retained_auth_scope()
+            if auth is None or type(user) is not types.InputUser or user.user_id == auth.account_id:
+                raise ContactWriteRejected("contact_target_invalid")
+            phase = "contact_postflight" if evidence.contact_mutation_dispatched else "contact_preflight"
+            return phase, int(user.user_id)
+        raise ContactWriteRejected("contact_method_invalid")
 
     @staticmethod
     def _folder_command_phase(request: TLRequest, evidence: RpcAttemptEvidence) -> str:
@@ -4608,6 +4710,8 @@ class TelegramRpcGate(TelegramClient):
         domains: dict[type[object], NativeWriteDomain] = {
             functions.messages.UpdateDialogFilterRequest: "folder",
             functions.contacts.UpdateContactNoteRequest: "contact_note",
+            functions.contacts.AddContactRequest: "contact",
+            functions.contacts.DeleteContactsRequest: "contact",
         }
         domain = domains.get(type(request))
         check = current_native_write_check()
@@ -4615,12 +4719,13 @@ class TelegramRpcGate(TelegramClient):
             if check is not None:
                 raise UnclassifiedTelegramRpcError("native write context used for another request")
             return None
-        error = FolderWriteRejected if domain == "folder" else NoteWriteRejected
-        expected_root = (
-            (DemandKind.FOLDER_COMMAND, TelegramRpcSource.FOLDER_COMMAND)
-            if domain == "folder"
-            else (DemandKind.NOTE_COMMAND, TelegramRpcSource.NOTE_COMMAND)
-        )
+        error = _native_rejection(domain)
+        roots = {
+            "folder": (DemandKind.FOLDER_COMMAND, TelegramRpcSource.FOLDER_COMMAND),
+            "contact_note": (DemandKind.NOTE_COMMAND, TelegramRpcSource.NOTE_COMMAND),
+            "contact": (DemandKind.CONTACT_COMMAND, TelegramRpcSource.CONTACT_COMMAND),
+        }
+        expected_root = roots[domain]
         owner = self._native_write_domains.get(domain)
         auth = self.retained_auth_scope()
         if check is None or owner is None or auth is None:
@@ -4672,7 +4777,7 @@ class TelegramRpcGate(TelegramClient):
     async def _verify_native_request(
         self, check: NativeWriteCheck, domain_owner: NativeWriteDomainOwner, request: TLRequest, body: bytes
     ) -> None:
-        error = FolderWriteRejected if check.binding.domain == "folder" else NoteWriteRejected
+        error = _native_rejection(check.binding.domain)
         if bytes(request) != body or not await domain_owner.verify_request(check.binding, request):
             raise error("native_write_request_mismatch")
         auth = self.retained_auth_scope()
@@ -5304,6 +5409,7 @@ class TelegramRpcGate(TelegramClient):
             return
         invalidate_folder_intake()
         invalidate_contact_note_scope()
+        invalidate_contact_scope()
         await ledger.bind_key(dc_id, key_id, auth_only=owner.scope.transport_auth)
 
     def _check_method_eligibility(self, owner: _WireAttempt) -> None:
@@ -5345,7 +5451,10 @@ class TelegramRpcGate(TelegramClient):
         phase = owner.native_phase
         if phase is None:
             return
-        error = FolderWriteRejected if phase.startswith("folder_") else NoteWriteRejected
+        domain: NativeWriteDomain = (
+            "folder" if phase.startswith("folder_") else "contact" if phase.startswith("contact_") else "contact_note"
+        )
+        error = _native_rejection(domain)
         evidence = owner.scope.attempt_evidence
         if (
             evidence is None
@@ -5368,10 +5477,28 @@ class TelegramRpcGate(TelegramClient):
             owner.native_check is None or evidence.note_target != owner.native_check.binding.target
         ):
             raise NoteWriteRejected("note_target_mismatch")
+        TelegramRpcGate._check_contact_phase_target(owner, phase, evidence)
+
+    @staticmethod
+    def _check_contact_phase_target(owner: _WireAttempt, phase: str, evidence: RpcAttemptEvidence) -> None:
+        if phase in {"contact_preflight", "contact_postflight"} and (
+            owner.native_target is None or evidence.contact_target not in {None, owner.native_target}
+        ):
+            raise ContactWriteRejected("contact_target_mismatch")
+        if phase == "contact_mutation" and (
+            owner.native_check is None or evidence.contact_target != owner.native_check.binding.target
+        ):
+            raise ContactWriteRejected("contact_target_mismatch")
 
     @staticmethod
     def _native_phase_allowed(phase: str, evidence: RpcAttemptEvidence) -> bool:
-        allowed = {
+        allowed = TelegramRpcGate._folder_note_phase_permissions(evidence)
+        allowed.update(TelegramRpcGate._contact_phase_permissions(evidence))
+        return allowed.get(phase, False)
+
+    @staticmethod
+    def _folder_note_phase_permissions(evidence: RpcAttemptEvidence) -> dict[str, bool]:
+        return {
             "folder_preflight": not evidence.folder_preflight_dispatched and not evidence.folder_mutation_dispatched,
             "folder_mutation": evidence.folder_preflight_dispatched and not evidence.folder_mutation_dispatched,
             "folder_postflight": evidence.folder_mutation_dispatched and not evidence.folder_postflight_dispatched,
@@ -5380,13 +5507,20 @@ class TelegramRpcGate(TelegramClient):
             "note_mutation": evidence.note_preflight_dispatched and not evidence.note_mutation_dispatched,
             "note_postflight": evidence.note_mutation_dispatched and not evidence.note_postflight_dispatched,
         }
-        return allowed.get(phase, False)
+
+    @staticmethod
+    def _contact_phase_permissions(evidence: RpcAttemptEvidence) -> dict[str, bool]:
+        return {
+            "contact_preflight": not evidence.contact_preflight_dispatched and not evidence.contact_mutation_dispatched,
+            "contact_mutation": evidence.contact_preflight_dispatched and not evidence.contact_mutation_dispatched,
+            "contact_postflight": evidence.contact_mutation_dispatched and not evidence.contact_postflight_dispatched,
+        }
 
     def _check_native_claim(self, owner: _WireAttempt, permit: _WirePermit) -> None:
         check = owner.native_check
         if check is None:
             return
-        error = FolderWriteRejected if check.binding.domain == "folder" else NoteWriteRejected
+        error = _native_rejection(check.binding.domain)
         auth = self.retained_auth_scope()
         evidence = owner.scope.attempt_evidence
         if (
@@ -5403,7 +5537,9 @@ class TelegramRpcGate(TelegramClient):
             raise error("native_write_claim_invalid")
 
     def _check_native_scope(
-        self, owner: _WireAttempt, error: type[FolderWriteRejected] | type[NoteWriteRejected]
+        self,
+        owner: _WireAttempt,
+        error: type[FolderWriteRejected] | type[NoteWriteRejected] | type[ContactWriteRejected],
     ) -> None:
         if (
             owner.native_scope_token is None
@@ -5426,11 +5562,11 @@ class TelegramRpcGate(TelegramClient):
             and permit.native_owner_token is not None
             and owner.native_request is not None
         )
-        dispatched = (
-            evidence.folder_mutation_dispatched
-            if check.binding.domain == "folder"
-            else evidence.note_mutation_dispatched
-        )
+        dispatched = {
+            "folder": evidence.folder_mutation_dispatched,
+            "contact_note": evidence.note_mutation_dispatched,
+            "contact": evidence.contact_mutation_dispatched,
+        }[check.binding.domain]
         return (
             permit.native_token()
             and permit.native_owner_token()
@@ -5510,12 +5646,7 @@ class TelegramRpcGate(TelegramClient):
         owner.admission = permit.admission
         self._record_draft_dispatch(owner)
         self._record_scheduled_dispatch(owner)
-        if owner.native_phase is not None:
-            evidence = owner.scope.attempt_evidence
-            assert evidence is not None
-            setattr(evidence, f"{owner.native_phase}_dispatched", True)
-            if owner.native_phase == "note_preflight":
-                evidence.note_target = owner.native_target
+        self._record_native_dispatch(owner)
         if owner.scope.attempt_budget is not None:
             owner.scope.attempt_budget.last_method = owner.method
             owner.observation_ordinal = owner.scope.attempt_budget.attempts
@@ -5529,6 +5660,18 @@ class TelegramRpcGate(TelegramClient):
             reason="replay" if owner.claimed > 1 else None,
             attempt_ordinal=owner.observation_ordinal,
         )
+
+    @staticmethod
+    def _record_native_dispatch(owner: _WireAttempt) -> None:
+        if owner.native_phase is None:
+            return
+        evidence = owner.scope.attempt_evidence
+        assert evidence is not None
+        setattr(evidence, f"{owner.native_phase}_dispatched", True)
+        if owner.native_phase == "note_preflight":
+            evidence.note_target = owner.native_target
+        if owner.native_phase == "contact_preflight":
+            evidence.contact_target = owner.native_target
 
     @staticmethod
     def _arm_response_timeout(owner: _WireAttempt) -> None:
@@ -5759,6 +5902,7 @@ class TelegramRpcGate(TelegramClient):
                 DemandKind.SCHEDULED_MUTATION,
                 DemandKind.FOLDER_COMMAND,
                 DemandKind.NOTE_COMMAND,
+                DemandKind.CONTACT_COMMAND,
             }
             and not any((scope.transport_bootstrap, scope.transport_auth, scope.transport_control, owner.self_lookup))
             and owner.photo_capability is None
@@ -5977,9 +6121,21 @@ class TelegramRpcGate(TelegramClient):
 
     @staticmethod
     def _native_outcome(owner: _WireAttempt, error: BaseException | None, result: object) -> NativeWireOutcome:
-        if not owner.claimed or isinstance(error, RPCError) or (error is None and result is False):
+        if not owner.claimed or isinstance(error, RPCError):
+            return "rejected"
+        if owner.native_check is not None and owner.native_check.binding.domain == "contact":
+            return TelegramRpcGate._contact_native_outcome(error, result)
+        if error is None and result is False:
             return "rejected"
         if error is None and result is True:
+            return "acknowledged"
+        return "unknown"
+
+    @staticmethod
+    def _contact_native_outcome(error: BaseException | None, result: object) -> NativeWireOutcome:
+        if error is None and isinstance(
+            result, (types.Updates, types.UpdatesCombined, types.UpdateShort, types.UpdatesTooLong)
+        ):
             return "acknowledged"
         return "unknown"
 
@@ -6021,7 +6177,14 @@ class TelegramRpcGate(TelegramClient):
             or isinstance(error, RPCError)
             or (
                 isinstance(
-                    error, (ScheduledWriteRejected, FolderWriteRejected, NoteWriteRejected, PeerAccessRejectedError)
+                    error,
+                    (
+                        ScheduledWriteRejected,
+                        FolderWriteRejected,
+                        NoteWriteRejected,
+                        ContactWriteRejected,
+                        PeerAccessRejectedError,
+                    ),
                 )
                 and owner.claimed == 0
             )
@@ -6410,6 +6573,7 @@ class TelegramRpcGate(TelegramClient):
                 self.session.save()
         invalidate_folder_intake()
         invalidate_contact_note_scope()
+        invalidate_contact_scope()
         self._authentication_token = token
         self._authentication_mode = True
 
@@ -6445,6 +6609,7 @@ class TelegramRpcGate(TelegramClient):
         ledger.require_writable()
         invalidate_folder_intake()
         invalidate_contact_note_scope()
+        invalidate_contact_scope()
         self._logout_mode = True
         self._admission_scheduler.notify_eligibility_changed()
         prepared = False
@@ -6593,6 +6758,7 @@ class TelegramRpcGate(TelegramClient):
     async def verify_startup_account(self, account_id: int) -> None:
         invalidate_folder_intake()
         invalidate_contact_note_scope()
+        invalidate_contact_scope()
         ledger = self._ensure_safety_ledger()
         await ledger.verify_account(account_id)
         snapshot = ledger.recovery_identity()

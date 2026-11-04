@@ -711,3 +711,13 @@ rationale = "Telegram protocol fallback when contact_note_length_limit is missin
 category = "policy_assignments"
 key = "src/mcp_telegram/contact_notes/commands.py:ContactNoteCommandOwner.__init__:self._limit"
 rationale = "Retains the current scope Telegram app-config value for NotModified responses, initialized to the same protocol fallback."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/contacts/contracts.py:<module>:CONTACT_PAGE_SIZE_LIMIT"
+rationale = "Shared upper bound of the public local contact catalogue page, used by input validation and the SQLite reader."
+
+[[entry]]
+category = "policy_call_keywords"
+key = "src/mcp_telegram/contacts/refresh.py:ContactCatalogueRefresher.refresh.publish:section_ttl_seconds"
+rationale = "Existing profile repository adapter argument mirrors its supplied-user write path; this operation does not evaluate profile reuse or schedule acquisition."

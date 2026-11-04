@@ -185,3 +185,6 @@ _return_exported_sender
 
 # Pydantic exposes this version precondition through the public create schema.
 FolderCommandArguments.expected_catalog_version
+
+# Serialized contact command-state field read by mapping keys in state and composition.
+ContactCommandState.phone_state
