@@ -40,7 +40,6 @@ from mcp_telegram.event_handlers import EventHandlerManager, _InboxReadUpdateLik
 from mcp_telegram.feedback_db import SQLiteFeedbackStore
 from mcp_telegram.feedback_service import FeedbackApplicationService
 from mcp_telegram.flood import FloodWaitKillSwitchStatus, TelegramRpcThrottled
-from mcp_telegram.folders.sqlite_repository import replace_folder_snapshot
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 from mcp_telegram.models import DialogType
 from mcp_telegram.reading.sqlite_projection import (
@@ -72,6 +71,7 @@ from mcp_telegram.topics.catalog import TopicCatalogRepository
 from mcp_telegram.topics.contracts import TopicPage
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.dialog_directory_coverage_fixtures import install_dialog_directory_coverage_schema
+from tests.folder_fixtures import seed_folder_snapshot
 from tests.helpers import (
     LoudChannelProfilePort,
     LoudChatAvatarHistoryPort,
@@ -511,18 +511,21 @@ async def test_entity_info_folder_title_uses_current_folder_rules(tmp_path: Path
     try:
         conn.execute("INSERT INTO telegram_folders(folder_id,title) VALUES (2,'Legacy title')")
         conn.execute(
-            "INSERT INTO telegram_folder_rules(namespace,folder_id,title,rule_kind,source_position,rule_json) "
-            "VALUES ('filter',2,'Renamed folder','filter',0,'{}')"
+            "INSERT INTO telegram_folder_rules(account_id,namespace,folder_id,title,rule_kind,source_position,rule_json) "
+            "VALUES (1,'filter',2,'Renamed folder','filter',0,'{}')"
         )
+        conn.execute("UPDATE telegram_folder_projection_state SET account_id=1 WHERE singleton=1")
         service = make_server(conn)._get_entity_info_service()
-        assert await service._resolve_folder_name(2) == "Renamed folder"
+        assert await service._resolve_folder_name(2, account_id=1) == "Renamed folder"
         conn.execute("UPDATE telegram_folder_rules SET title='Newest title' WHERE namespace='filter' AND folder_id=2")
-        assert await service._resolve_folder_name(2) == "Newest title"
+        assert await service._resolve_folder_name(2, account_id=1) == "Newest title"
         conn.execute(
-            "INSERT INTO telegram_folder_rules(namespace,folder_id,title,rule_kind,source_position,rule_json) "
-            "VALUES ('default',0,'All chats','default',0,'{}')"
+            "INSERT INTO telegram_folder_rules(account_id,namespace,folder_id,title,rule_kind,source_position,rule_json) "
+            "VALUES (1,'default',0,'All chats','default',0,'{}')"
         )
-        assert await service._resolve_folder_name(0) == "All chats"
+        assert await service._resolve_folder_name(0, account_id=1) == "All chats"
+        assert await service._resolve_folder_name(2, account_id=2) is None
+        assert await service._resolve_folder_name(2, account_id=None) is None
     finally:
         conn.close()
 
@@ -588,7 +591,7 @@ async def test_entity_info_dispatch_logs_separate_stage_durations(
     monkeypatch.setattr(
         server, "_reproject_due_folder_memberships", AsyncMock(side_effect=AssertionError("profile read wrote folders"))
     )
-    monkeypatch.setattr("mcp_telegram.daemon_api.dialog_placement", lambda _conn, _entity_id: {})
+    monkeypatch.setattr("mcp_telegram.daemon_api.dialog_placement", lambda _conn, _entity_id, *, account_id: {})
     with caplog.at_level("INFO", logger="mcp_telegram.daemon_api"):
         result = await server._get_entity_info({"entity_id": 42})
     assert result["ok"] is True
@@ -1828,11 +1831,13 @@ async def test_list_dialogs_limits_expensive_projection_after_folder_and_name_fi
     conn = _register_sqlite_connection(sqlite3.connect(db_path))
     for dialog_id in range(1, 21):
         _seed_dialog_row(conn, dialog_id, name=f"Example {dialog_id}", type_="User", last_message_at=1000 - dialog_id)
-    replace_folder_snapshot(conn, [(3, "Work")], [(3, 19), (3, 20)])
+    seed_folder_snapshot(conn, [(3, "Work")], [(3, 19), (3, 20)])
     server = make_server(conn)
     queries: list[str] = []
     conn.set_trace_callback(queries.append)
-    result = server._get_reading_service()._list_dialogs_sync(conn, {"folder_id": 3, "filter": "Example", "limit": 1})
+    result = server._get_reading_service()._list_dialogs_sync(
+        conn, {"folder_id": 3, "filter": "Example", "limit": 1, "verified_account_id": 42}
+    )
     conn.set_trace_callback(None)
     dialogs = cast(list[dict[str, object]], _response_data(result)["dialogs"])
     assert [item["id"] for item in dialogs] == [19]
@@ -1848,15 +1853,17 @@ async def test_list_dialogs_keeps_reader_folder_snapshot_after_concurrent_change
     conn = _register_sqlite_connection(sqlite3.connect(db_path))
     _seed_dialog_row(conn, 1, name="First", type_="User", last_message_at=20)
     _seed_dialog_row(conn, 2, name="Second", type_="User", last_message_at=10)
-    replace_folder_snapshot(conn, [(3, "Work")], [(3, 1), (3, 2)])
+    seed_folder_snapshot(conn, [(3, "Work")], [(3, 1), (3, 2)])
     conn.commit()
     server = make_server(conn)
+    server.self_id = 42
+    await server._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
     service = server._get_reading_service()
     original = service.list_dialogs
 
     async def list_then_change(req: dict[str, object]) -> dict:
         result = await original(req)
-        replace_folder_snapshot(conn, [(3, "Work")], [(3, 2)])
+        seed_folder_snapshot(conn, [(3, "Work")], [(3, 2)])
         conn.commit()
         return result
 
@@ -1873,8 +1880,10 @@ async def test_list_dialogs_serves_preserved_folder_snapshot_without_refresh(tmp
     ensure_sync_schema(db_path)
     conn = _register_sqlite_connection(sqlite3.connect(db_path))
     _seed_dialog_row(conn, 123, name="Fixture Person", type_="User")
-    replace_folder_snapshot(conn, [(3, "Old")], [(3, 123)])
+    seed_folder_snapshot(conn, [(3, "Old")], [(3, 123)])
     server = make_server(conn)
+    server.self_id = 42
+    await server._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
     result = await server._list_dialogs({})
 
     assert result["ok"] is True
@@ -1892,7 +1901,7 @@ async def test_list_folders_includes_canonical_directory_coverage(tmp_path: Path
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = _register_sqlite_connection(sqlite3.connect(db_path))
-    replace_folder_snapshot(conn, [(3, "Work")], [])
+    seed_folder_snapshot(conn, [(3, "Work")], [])
     server = make_server(conn)
     server.self_id = 42
     await server._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
@@ -1902,13 +1911,9 @@ async def test_list_folders_includes_canonical_directory_coverage(tmp_path: Path
     assert result["ok"] is True
     data = cast(dict[str, object], _response_data(result))
     assert data["directory_coverage"] == read_dialog_directory_coverage(conn).to_wire()
-    assert data["folder_snapshot"] == {
-        "generation": None,
-        "status": "unavailable",
-        "completed_at": None,
-        "age_seconds": None,
-        "complete": False,
-    }
+    snapshot = cast(dict[str, object], data["folder_snapshot"])
+    assert snapshot["generation"] == 1 and snapshot["completed_at"] == 1
+    assert snapshot["status"] == "unavailable" and snapshot["complete"] is False
     folders = cast(list[dict[str, object]], data["folders"])
     assert folders[0]["unknown_membership_count"] == 0
 
@@ -1919,8 +1924,10 @@ async def test_list_dialogs_with_folder_filter_uses_preserved_snapshot(tmp_path:
     ensure_sync_schema(db_path)
     conn = _register_sqlite_connection(sqlite3.connect(db_path))
     _seed_dialog_row(conn, 123, name="Fixture Person", type_="User")
-    replace_folder_snapshot(conn, [(3, "Old")], [(3, 123)])
+    seed_folder_snapshot(conn, [(3, "Old")], [(3, 123)])
     server = make_server(conn)
+    server.self_id = 42
+    await server._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
     result = await server._list_dialogs({"folder_id": 3})
 
     assert result["ok"] is True
@@ -2413,6 +2420,7 @@ async def test_list_topics_through_daemon() -> None:
         "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at, is_general, is_deleted) "
         "VALUES (123, 1, 'General', 0, 1, 0)"
     )
+    conn.execute("UPDATE topic_metadata SET known_fields=known_fields | 1")
     conn.commit()
 
     client = _TestClient()
@@ -2453,8 +2461,9 @@ async def test_list_topics_missing_icon_never_acquires_or_offers_refresh(protect
     conn = _make_db_with_topics()
     conn.execute(
         "INSERT INTO topic_metadata "
-        "(dialog_id, topic_id, title, icon_emoji_id, icon_emoji, icon_color, updated_at, is_general, is_deleted) "
-        "VALUES (123, 7, 'Cached topic', 42, NULL, 6, 100, 0, 0)"
+        "(dialog_id, topic_id, title, icon_emoji_id, icon_emoji, icon_color, updated_at, is_general, is_deleted, "
+        "pinned, hidden, known_fields) "
+        "VALUES (123, 7, 'Cached topic', 42, NULL, 6, 100, 0, 0, 0, 0, 25)"
     )
     conn.commit()
     client = _TestClient()
@@ -2505,6 +2514,7 @@ async def test_list_topics_old_local_facts_are_not_expired() -> None:
         "(dialog_id, topic_id, title, icon_emoji_id, icon_emoji, updated_at, snapshot_at, is_general, is_deleted) "
         "VALUES (123, 7, 'Retained topic', 42, '🧭', 1, 1, 0, 0)"
     )
+    conn.execute("UPDATE topic_metadata SET known_fields=known_fields | 1")
     conn.commit()
     client = _TestClient()
     client.get_entity = AsyncMock(side_effect=AssertionError("old facts remain readable without Telegram"))
@@ -2706,8 +2716,8 @@ async def test_list_topics_missing_private_bot_catalog_is_not_known_empty() -> N
 
 
 @pytest.mark.asyncio
-async def test_list_topics_hidden_excluded() -> None:
-    """_list_topics excludes rows with hidden=1."""
+async def test_list_topics_hidden_is_locally_visible() -> None:
+    """A retained hidden topic is locally visible with its observed hidden flag."""
     conn = _make_db_with_topics()
     conn.execute(
         "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at, hidden, is_general, is_deleted) "
@@ -2717,6 +2727,7 @@ async def test_list_topics_hidden_excluded() -> None:
         "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at, hidden, is_general, is_deleted) "
         "VALUES (789, 2, 'HiddenTopic', 0, 1, 0, 0)"
     )
+    conn.execute("UPDATE topic_metadata SET known_fields=known_fields | 17")
     conn.commit()
     client = _TestClient()
     server = make_server(conn, client)
@@ -2726,7 +2737,8 @@ async def test_list_topics_hidden_excluded() -> None:
     assert result["ok"] is True
     topic_ids = [t["id"] for t in result["data"]["topics"]]
     assert 1 in topic_ids
-    assert 2 not in topic_ids, "hidden=1 topic must not appear"
+    assert 2 in topic_ids
+    assert result["data"]["topics"][1]["hidden"] is True
 
 
 @pytest.mark.asyncio

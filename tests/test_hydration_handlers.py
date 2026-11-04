@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -11,10 +12,13 @@ from unittest.mock import patch
 import pytest
 from telethon.errors import RPCError
 from telethon.errors.rpcerrorlist import ChatForbiddenError  # type: ignore[import-untyped]
+from telethon.tl import types
 
+from mcp_telegram.auth_scope import TelegramAuthScope
 from mcp_telegram.fact_hydration import (
     HydrationDropObservation,
     HydrationHandler,
+    MediaPublication,
     MessageFactHydrationWorker,
 )
 from mcp_telegram.flood import TelegramRpcThrottled
@@ -24,11 +28,15 @@ from mcp_telegram.hydration_queue import (
     HydrationJob,
     HydrationQueueRepository,
 )
+from mcp_telegram.image_authorization import ScopeCell, ScopeToken
 from mcp_telegram.media_hydration import MediaFactHydrationHandler
-from mcp_telegram.messages.sqlite_bundle import mark_message_deleted
+from mcp_telegram.messages.sqlite_bundle import mark_message_deleted, persist_received_messages
 from mcp_telegram.messages.sqlite_hydration import apply_message_transcription
+from mcp_telegram.messages.telegram_adapter import extract_received_messages
 from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.peer_access import current_peer_target
+from mcp_telegram.reactions.contracts import ReactionAggregateSource
+from mcp_telegram.reactions.persistence import allocate_observation_boundary
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_demand import RpcAttemptBudget
@@ -45,11 +53,48 @@ from mcp_telegram.transcription_hydration import TranscriptionHydrationHandler
 from tests.sqlite_writer_helpers import inline_writer
 
 
+class _ScopeClient:
+    def __init__(self) -> None:
+        self.cell = ScopeCell()
+        assert self.cell.publish(TelegramAuthScope(1, 42, 2, 99))
+
+    def capture_image_scope(self) -> ScopeToken | None:
+        return self.cell.capture()
+
+    def claim_image_scope(self, token: ScopeToken) -> bool:
+        return self.cell.claim(token)
+
+
+def _received_message(message_id: int, *, media: types.MessageMediaUnsupported | None = None) -> types.Message:
+    return types.Message(
+        id=message_id, peer_id=types.PeerUser(1), date=datetime.fromtimestamp(1, UTC), message="", media=media
+    )
+
+
+def _publication(conn: sqlite3.Connection, response: types.Message) -> MediaPublication:
+    client = _ScopeClient()
+    scope = client.capture_image_scope()
+    assert scope is not None
+    order = allocate_observation_order(conn)
+    boundary = allocate_observation_boundary(conn, ReactionAggregateSource.HISTORY)
+    accepted = persist_received_messages(
+        conn,
+        extract_received_messages([response]),
+        scope=scope,
+        claim_scope=client.claim_image_scope,
+        observation_order=order,
+        reaction_boundary=boundary,
+    )
+    return MediaPublication(response, frozenset({response.id}) if accepted else frozenset())
+
+
 @pytest.fixture
 def db(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     conn = _open_sync_db(path)
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.commit()
     try:
         yield conn
     finally:
@@ -131,7 +176,7 @@ async def test_worker_reserves_before_request_and_rejects_late_fact_and_queue_ef
         else MediaFactHydrationHandler(batch_size=1)
     )
     worker = MessageFactHydrationWorker(
-        object(),
+        _ScopeClient(),
         db,
         asyncio.Event(),
         writer=inline_writer(db),
@@ -145,6 +190,7 @@ async def test_worker_reserves_before_request_and_rejects_late_fact_and_queue_ef
         pause_between_requests_seconds=0,
         backfill_debt_limit=1,
         clock=lambda: clock[0],
+        profile_owner_account_id=42,
     )
 
     async def request(*args: object, **kwargs: object) -> object:
@@ -171,7 +217,7 @@ async def test_worker_reserves_before_request_and_rejects_late_fact_and_queue_ef
             return None
         if kind == TRANSCRIPTION_HYDRATION_KIND:
             return SimpleNamespace(text="older transcription", pending=valid_result == "pending", transcription_id=5)
-        return SimpleNamespace(id=1, media=None)
+        return _received_message(1)
 
     with patch.object(worker, "_request_batch", side_effect=request):
         outcome = await worker._process_batch(handler, [job], 20)
@@ -363,7 +409,7 @@ def test_media_apply_maps_single_result_and_persists_empty_and_unknown_facts(
             db,
             HydrationQueueRepository(db),
             [first, second],
-            SimpleNamespace(id=1, media=SimpleNamespace()),
+            _publication(db, _received_message(1, media=types.MessageMediaUnsupported())),
             now=20,
         )
 
@@ -373,7 +419,7 @@ def test_media_apply_maps_single_result_and_persists_empty_and_unknown_facts(
     assert applied.drop_observations[0].reason == "missing_response"
     assert db.execute("SELECT media_kind, media_payload FROM messages WHERE message_id = 1").fetchone() == (
         "other",
-        '{"type":"SimpleNamespace"}',
+        '{"type":"MessageMediaUnsupported"}',
     )
     assert db.execute("SELECT media_kind, media_payload FROM messages WHERE message_id = 2").fetchone() == (
         "other",
@@ -398,12 +444,12 @@ def test_media_apply_marks_missing_and_invalid_results_terminal(db: sqlite3.Conn
             db,
             queue,
             [first],
-            [SimpleNamespace(id=0), SimpleNamespace(id=99)],
+            MediaPublication([_received_message(99)], frozenset()),
             now=20,
         )
     db.commit()
     with write_transaction(db):
-        invalid = handler.apply(db, queue, [second], 123, now=20)
+        invalid = handler.apply(db, queue, [second], MediaPublication(123, frozenset()), now=20)
 
     assert missing.dropped == 1
     assert missing.drop_observations[0].reason == "missing_response"
@@ -431,7 +477,7 @@ def test_media_apply_rejects_non_collection_results(
             db,
             HydrationQueueRepository(db),
             [job],
-            result,
+            MediaPublication(result, frozenset()),
             now=20,
         )
 
@@ -440,26 +486,35 @@ def test_media_apply_rejects_non_collection_results(
     )
 
 
-def test_media_apply_reports_not_applied_when_access_is_lost(db: sqlite3.Connection) -> None:
+@pytest.mark.asyncio
+async def test_media_worker_drops_job_when_access_is_lost(db: sqlite3.Connection) -> None:
     _seed_dialog(db, status="access_lost")
     _seed_message(db, 1)
     job = _enqueue(db, MEDIA_METADATA_KIND, 1)
-    db.commit()
-
-    db.commit()
-    with write_transaction(db):
-        applied = MediaFactHydrationHandler(batch_size=1).apply(
-            db,
-            HydrationQueueRepository(db),
-            [job],
-            SimpleNamespace(id=1, media=None),
-            now=20,
-        )
-
+    handler = MediaFactHydrationHandler(batch_size=1)
+    worker = MessageFactHydrationWorker(
+        _ScopeClient(),
+        db,
+        asyncio.Event(),
+        writer=inline_writer(db),
+        handlers=(handler,),
+        interval_seconds=1,
+        max_requests_per_cycle=1,
+        max_jobs_per_cycle=1,
+        retry_delay_seconds=1,
+        circuit_retry_seconds=1,
+        max_attempts=3,
+        pause_between_requests_seconds=0,
+        backfill_debt_limit=1,
+        profile_owner_account_id=42,
+    )
+    with patch.object(worker, "_request_batch") as request:
+        applied = await worker._process_batch(handler, [job], 20)
     assert applied.completed == 0
     assert applied.dropped == 1
-    assert applied.drop_observations[0].reason == "not_applied"
+    request.assert_not_called()
     assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+    assert db.execute("SELECT media_kind,media_payload FROM messages").fetchone() == ("other", "{}")
 
 
 def test_transcription_apply_persists_final_result(db: sqlite3.Connection) -> None:
@@ -586,6 +641,11 @@ def test_access_loss_marks_dialogs_and_purges_all_active_hydration_jobs(
     second = _enqueue(db, MEDIA_METADATA_KIND, 2, dialog_id=1, attempts=2)
     third = _enqueue(db, TRANSCRIPTION_HYDRATION_KIND, 3, dialog_id=2, attempts=1)
     db.commit()
+    with write_transaction(db):
+        queue = HydrationQueueRepository(db)
+        first_started, second_started = queue.start(first), queue.start(second)
+        assert first_started is not None and second_started is not None
+        first, second = first_started, second_started
     worker = MessageFactHydrationWorker(
         object(),
         db,

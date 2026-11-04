@@ -28,19 +28,23 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Protocol, cast
 
+from telethon.tl import types
 from telethon.tl.types import TypeInputPeer
+from telethon.utils import get_peer_id
 
 from .access_lifecycle import set_access_lost
 from .activity_peer_resolve import resolve_input_peer, resolve_linked_chat_id
 from .activity_substrate import ActivityClient, call_with_timeout
-from .dialog_identity import ensure_dialog_identity_baseline, publish_dialog_identity
+from .dialog_identity import ensure_dialog_identity_baseline, publish_dialog_identity, publish_supplied_identities
 from .dialog_identity_contracts import DialogIdentityObservation
 from .entity_profile.membership import MembershipSignalCounts
+from .entity_profile.repository import bound_profile_account
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
+from .image_authorization import ScopeToken
 from .linked_chat_fact import LinkedChatFact, LinkedChatState
 from .message_contracts import ExtractedMessage
-from .messages.sqlite_bundle import insert_messages_with_fts, message_exists
+from .messages.sqlite_bundle import ReceivedMessageScopeChangedError, insert_messages_with_fts, message_exists
 from .messages.telegram_adapter import extract_dialog_id, extract_message_row
 from .observation_order import allocate_observation_order
 from .own_only import enroll_own_only_sync_dialog
@@ -49,7 +53,7 @@ from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import RpcAttemptBudgetExhaustedError
 from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcMethodRecoveryPending, TelegramRpcSource
-from .telethon_dialog import observe_response_dialog_identity
+from .telethon_dialog import observe_referenced_dialog_identities, observe_response_dialog_identity
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +231,11 @@ def _extract_sweep_messages(
     return extracted, frozenset(genuinely_new_keys)
 
 
+def _require_sweep_scope(conn: sqlite3.Connection, request: PeerSweepRequest, scope: ScopeToken) -> None:
+    if bound_profile_account(conn) != scope.scope.account_id or not request.client.claim_image_scope(scope):
+        raise ReceivedMessageScopeChangedError
+
+
 def _extract_and_persist_sweep_messages(  # noqa: PLR0913, PLR0917 - atomic page and observation context
     conn: sqlite3.Connection,
     request: PeerSweepRequest,
@@ -235,16 +244,22 @@ def _extract_and_persist_sweep_messages(  # noqa: PLR0913, PLR0917 - atomic page
     identity: DialogIdentityObservation | None,
     identity_revision: int,
     membership_counts: list[MembershipSignalCounts],
+    scope: ScopeToken,
+    referenced: tuple[DialogIdentityObservation, ...],
 ) -> tuple[list[ExtractedMessage], frozenset[tuple[int, int]]] | SweepResult:
     """Return page rows or an explicit non-completion processing error."""
     try:
         with write_transaction(conn):
+            _require_sweep_scope(conn, request, scope)
+            publish_supplied_identities(conn, referenced, observation_order=observation_order)
             if request.accept_page is not None and not request.accept_page(conn):
+                _require_sweep_scope(conn, request, scope)
                 return SweepResult([], 0, None, None, completed=False, accepted=False)
             try:
                 extracted, genuinely_new_keys = _extract_sweep_messages(conn, request, batch)
             except Exception:
                 logger.warning("sweep_peer_once_extraction_error dialog_id=%r", request.dialog_id, exc_info=True)
+                _require_sweep_scope(conn, request, scope)
                 return _access_skip_result(rpc_calls=2, pages_fetched=1)
             if extracted:
                 result = insert_messages_with_fts(
@@ -256,6 +271,9 @@ def _extract_and_persist_sweep_messages(  # noqa: PLR0913, PLR0917 - atomic page
                 membership_counts.append(result.membership_counts)
             if identity is not None:
                 publish_dialog_identity(conn, request.dialog_id, identity, identity_revision)
+            _require_sweep_scope(conn, request, scope)
+    except ReceivedMessageScopeChangedError:
+        return SweepResult([], 0, None, None, completed=False, accepted=False)
     except Exception:
         logger.warning("sweep_peer_once_persistence_error dialog_id=%r", request.dialog_id, exc_info=True)
         return _access_skip_result(rpc_calls=2, pages_fetched=1)
@@ -458,6 +476,10 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
     not history-floor completion.
     """
     request = _coerce_peer_sweep_request(*args, **kwargs)
+    scope = request.client.capture_image_scope()
+    if scope is None:
+        return SweepResult([], 0, None, None, completed=False, accepted=False)
+    observed_at = int(time.time())
 
     # Step 1: entity-type-aware peer resolution from session
     rpc_calls = 1  # get_input_entity is a governed Telegram call attempt.
@@ -488,34 +510,62 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
     if search.early_result is not None:
         return search.early_result
 
-    return await _persist_searched_page(request, search, observation_order, identity_revision, rpc_calls)
+    return await _persist_searched_page(
+        request, search, observation_order, identity_revision, rpc_calls, scope, observed_at
+    )
 
 
-async def _persist_searched_page(
+def _referenced_sweep_identities(
+    response: object, batch: Sequence[_SweepMessageLike], dialog_id: int, observed_at: int
+) -> tuple[DialogIdentityObservation, ...]:
+    peers = (getattr(getattr(message, "fwd_from", None), "from_id", None) for message in batch)
+    referenced_ids = {
+        int(get_peer_id(peer))
+        for peer in peers
+        if isinstance(peer, (types.PeerUser, types.PeerChat, types.PeerChannel))
+    }
+    referenced_ids.discard(dialog_id)
+    entities = (
+        *cast(Sequence[object], getattr(response, "users", ()) or ()),
+        *cast(Sequence[object], getattr(response, "chats", ()) or ()),
+    )
+    return observe_referenced_dialog_identities(entities, referenced_ids, source="profile", observed_at=observed_at)
+
+
+def _notify_sweep_membership(request: PeerSweepRequest, counts_list: list[MembershipSignalCounts]) -> None:
+    if request.membership_observer is None:
+        return
+    for counts in counts_list:
+        try:
+            request.membership_observer(counts)
+        except Exception:  # noqa: BLE001
+            logger.debug("membership_observer_failed")
+
+
+async def _persist_searched_page(  # noqa: PLR0913, PLR0917 - page observation context
     request: PeerSweepRequest,
     search: _SearchOutcome,
     observation_order: int,
     identity_revision: int,
     rpc_calls: int,
+    scope: ScopeToken,
+    observed_at: int,
 ) -> SweepResult:
     """Commit the searched page and report committed membership signals."""
     rpc_duration_s = search.rpc_duration_s
     batch = list(cast(_SweepResultLike, search.result).messages or [])
     identity = observe_response_dialog_identity(
-        search.result, request.dialog_id, source="profile", observed_at=int(time.time())
+        search.result, request.dialog_id, source="profile", observed_at=observed_at
     )
+    referenced = _referenced_sweep_identities(search.result, batch, request.dialog_id, observed_at)
     membership_counts: list[MembershipSignalCounts] = []
     page_rows = await request.writer.run(
         lambda db: _extract_and_persist_sweep_messages(
-            db, request, batch, observation_order, identity, identity_revision, membership_counts
+            db, request, batch, observation_order, identity, identity_revision, membership_counts, scope, referenced
         )
     )
-    if not isinstance(page_rows, SweepResult) and request.membership_observer is not None:
-        for counts in membership_counts:
-            try:
-                request.membership_observer(counts)
-            except Exception:  # noqa: BLE001
-                logger.debug("membership_observer_failed")
+    if not isinstance(page_rows, SweepResult):
+        _notify_sweep_membership(request, membership_counts)
     if isinstance(page_rows, SweepResult):
         return page_rows
     extracted, genuinely_new_keys = page_rows

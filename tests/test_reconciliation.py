@@ -23,6 +23,7 @@ from mcp_telegram.topics.refresh import TopicRefresher
 from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from mcp_telegram.topics.telegram_adapter import TelethonTelegramTopicGateway
 from sqlite_writer_helpers import inline_writer
+from tests.topic_test_helpers import seed_topic_account, topic_scope
 
 
 @pytest.fixture
@@ -269,6 +270,8 @@ async def test_refresh_forum_topics_upserts(sync_db: sqlite3.Connection, shutdow
     entity = MagicMock(forum=True)
     topic = SimpleNamespace(id=1, title="General", icon_emoji_id=None, date=None)
     topic_client = AsyncMock(return_value=SimpleNamespace(topics=[topic]))
+    seed_topic_account(sync_db, 999)
+    scope = topic_scope()
     worker = DialogReconciliationWorker(
         topic_client,
         sync_db,
@@ -277,6 +280,8 @@ async def test_refresh_forum_topics_upserts(sync_db: sqlite3.Connection, shutdow
             TelethonTelegramTopicGateway(topic_client),
             SQLiteTopicSnapshotRepository(sync_db),
             writer=inline_writer(sync_db),
+            capture_scope=scope.capture,
+            claim_scope=scope.claim,
         ),
         writer=inline_writer(sync_db),
     )
@@ -298,6 +303,8 @@ async def test_light_pass_refreshes_forum_topics(
     entity.date = None
     mock_client.get_entity.return_value = entity
     topic_client = AsyncMock(return_value=SimpleNamespace(topics=[]))
+    seed_topic_account(sync_db, 777)
+    scope = topic_scope()
     worker = DialogReconciliationWorker(
         mock_client,
         sync_db,
@@ -306,6 +313,8 @@ async def test_light_pass_refreshes_forum_topics(
             TelethonTelegramTopicGateway(topic_client),
             SQLiteTopicSnapshotRepository(sync_db),
             writer=inline_writer(sync_db),
+            capture_scope=scope.capture,
+            claim_scope=scope.claim,
         ),
         writer=inline_writer(sync_db),
     )

@@ -374,7 +374,6 @@ def folder_catalog_owner(conn: sqlite3.Connection) -> int | None:
 
 def read_folder(conn: sqlite3.Connection, account_id: int, folder_id: int) -> dict[str, object]:
     """Read retained folder facts without initiating acquisition."""
-    from ..dialog_directory_coverage import read_dialog_directory_coverage
     from .read_model import folder_snapshot
     from .sqlite_repository import SQLiteFolderSnapshotRepository, read_folder_rules
 
@@ -383,7 +382,7 @@ def read_folder(conn: sqlite3.Connection, account_id: int, folder_id: int) -> di
         return {"account_id": account_id, "presence": "unknown", "catalog_version": None}
     catalog_version = folder_catalog_version(conn, account_id)
     rule = next((item for item in read_folder_rules(conn) if item.folder_id == folder_id), None)
-    snapshot = folder_snapshot(conn, stale_after_seconds=900)
+    snapshot = folder_snapshot(conn, stale_after_seconds=900, account_id=account_id)
     acquisition = _folder_acquisition(conn)
     if rule is None:
         return {
@@ -392,7 +391,7 @@ def read_folder(conn: sqlite3.Connection, account_id: int, folder_id: int) -> di
             "catalog_version": catalog_version,
             "folder_snapshot": snapshot,
             "acquisition": acquisition,
-            "directory_coverage": read_dialog_directory_coverage(conn).to_wire(),
+            "directory_coverage": _folder_directory_coverage(conn, account_id),
         }
     definition = _folder_definition(rule)
     reason = _folder_write_reason(rule)
@@ -414,10 +413,21 @@ def read_folder(conn: sqlite3.Connection, account_id: int, folder_id: int) -> di
         "supported_actions": ["update", "delete"] if reason is None else [],
         "unsupported_reason": reason,
         "membership": {"present": counts.get("present", 0), "unknown": counts.get("unknown", 0)},
-        "directory_coverage": read_dialog_directory_coverage(conn).to_wire(),
+        "directory_coverage": _folder_directory_coverage(conn, account_id),
         "folder_snapshot": snapshot,
         "acquisition": acquisition,
     }
+
+
+def _folder_directory_coverage(conn: sqlite3.Connection, account_id: int) -> dict[str, object]:
+    from ..dialog_directory_coverage import DialogDirectoryCoverage, read_dialog_directory_coverage
+    from .sqlite_repository import SQLiteFolderSnapshotRepository
+
+    canonical = SQLiteFolderSnapshotRepository(conn).read_catalog_identity()
+    if canonical is None or canonical[0] != account_id:
+        reason = "directory_unavailable" if canonical is None else "account_scope_mismatch"
+        return DialogDirectoryCoverage("never", None, None, None, None, False, False, reason).to_wire()
+    return read_dialog_directory_coverage(conn).to_wire()
 
 
 def _folder_definition(rule: FolderRule) -> dict[str, object]:

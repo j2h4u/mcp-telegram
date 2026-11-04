@@ -96,7 +96,7 @@ from .drafts.sqlite_projection import SQLiteDraftProjection
 from .entity_profile.membership import MembershipSignalCounts
 from .entity_profile.ports import UserProfilePort
 from .entity_profile.refresh import RefreshLimits
-from .entity_profile.repository import admit_self_profile
+from .entity_profile.repository import admit_self_profile, bound_profile_account
 from .event_handlers import EventHandlerManager, UpdateProcessingBarrier
 from .fact_hydration import MessageFactHydrationWorker
 from .feedback_db import SQLiteFeedbackStore, ensure_feedback_schema
@@ -117,6 +117,7 @@ from .folders.worker import FolderProjectionWorker
 from .hydration_queue import HydrationPriority
 from .image_authorization import ActiveSources, ScopeToken
 from .media_hydration import MediaFactHydrationHandler
+from .message_contracts import ReceivedMessage
 from .message_delivery_observations import MessageDeliveryObservations
 from .message_fact_refresh import (
     MessageFactRefreshDeps,
@@ -130,11 +131,16 @@ from .message_history.telegram_adapter import (
 from .message_images.contracts import ImageScope
 from .message_images.service import MessageImageService
 from .message_images.worker import MessageImageWorker
+from .messages.sqlite_bundle import persist_received_messages
 from .messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
+from .messages.telegram_adapter import extract_received_messages
 from .models import DialogType
 from .native_write_fence import NativeWriteDomain, NativeWriteDomainOwner
+from .observation_order import allocate_observation_order
 from .peer_access import PeerAccess
 from .reactions import ReactionDetailPolicy, ReactionDetailRefresher
+from .reactions.contracts import ReactionAggregateSource, ReactionObservationBoundary
+from .reactions.persistence import allocate_observation_boundary
 from .reactions.telegram_adapter import TelethonTelegramReactionGateway
 from .read_state import apply_read_cursor, apply_reconciled_unread_count
 from .reconnect import run_reconnect_catch_up_loop
@@ -374,6 +380,15 @@ class _ReadPositionDialogLike(Protocol):
 
 class _ReadPositionsResultLike(Protocol):
     dialogs: Sequence[_ReadPositionDialogLike]
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadPositionMessages:
+    messages: tuple[ReceivedMessage, ...]
+    scope: ScopeToken
+    claim_scope: Callable[[ScopeToken], bool]
+    order: int
+    reaction_boundary: ReactionObservationBoundary
 
 
 @dataclass(frozen=True, slots=True)
@@ -664,8 +679,14 @@ async def _reconcile_read_position_batch(  # noqa: PLR0913
 ) -> SliceOutcome:
     input_peers, _unresolved_ids = await _build_read_position_input_peers(client, batch_ids)
     if input_peers:
+        token = client.capture_image_scope()
+        if token is None:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        order, reaction_boundary = await writer.run(_reserve_read_position_observation)
         request_started_at = int(time.time())
         result = cast(_ReadPositionsResultLike, await client(GetPeerDialogsRequest(peers=input_peers)))
+        messages = extract_received_messages(cast(list[object], getattr(result, "messages", [])))
+        received = _ReadPositionMessages(messages, token, client.claim_image_scope, order, reaction_boundary)
         success_due_at = int(time.time()) + max(1, math.ceil(success_recheck_seconds))
         _, outcome = await writer.run(
             lambda owned: _apply_read_positions_from_dialogs(
@@ -674,11 +695,17 @@ async def _reconcile_read_position_batch(  # noqa: PLR0913
                 request_started_at=request_started_at,
                 success_due_at=success_due_at,
                 selected=selected,
+                received=received,
             )
         )
     else:
         outcome = SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
     return outcome
+
+
+def _reserve_read_position_observation(conn: sqlite3.Connection) -> tuple[int, ReactionObservationBoundary]:
+    with write_transaction(conn):
+        return allocate_observation_order(conn), allocate_observation_boundary(conn, ReactionAggregateSource.HISTORY)
 
 
 def _select_read_position_work_rows(
@@ -734,13 +761,14 @@ async def _build_read_position_input_peers(
     return input_peers, unresolved_ids
 
 
-def _apply_read_positions_from_dialogs(
+def _apply_read_positions_from_dialogs(  # noqa: PLR0913
     conn: sqlite3.Connection,
     result: _ReadPositionsResultLike,
     *,
     request_started_at: int | None = None,
     success_due_at: int | None = None,
     selected: WorkRevision,
+    received: _ReadPositionMessages | None = None,
 ) -> tuple[int, SliceOutcome]:
     """Apply read cursors from a GetPeerDialogsRequest result."""
     filled = 0
@@ -748,6 +776,8 @@ def _apply_read_positions_from_dialogs(
     with write_transaction(conn):
         dialog_id = int(selected.key.target.removeprefix("dialog:"))
         before = _read_position_business_state(conn, dialog_id)
+        if received is not None and not _apply_read_position_messages(conn, dialog_id, received):
+            return 0, outcome
         if before is None or repr(before) != selected.revision:
             return 0, outcome
         for dialog in result.dialogs:
@@ -768,15 +798,31 @@ def _apply_read_positions_from_dialogs(
     return filled, outcome
 
 
+def _apply_read_position_messages(conn: sqlite3.Connection, dialog_id: int, received: _ReadPositionMessages) -> bool:
+    if bound_profile_account(conn) != received.scope.scope.account_id or not received.claim_scope(received.scope):
+        return False
+    persist_received_messages(
+        conn,
+        received.messages,
+        scope=received.scope,
+        claim_scope=received.claim_scope,
+        observation_order=received.order,
+        expected_dialog_id=dialog_id,
+        reaction_boundary=received.reaction_boundary,
+    )
+    return True
+
+
 def _read_position_business_state(conn: sqlite3.Connection, dialog_id: int) -> tuple[object, ...] | None:
-    return cast(
-        tuple[object, ...] | None,
+    row = cast(
+        Sequence[object] | None,
         conn.execute(
             "SELECT sd.read_inbox_max_id, sd.read_outbox_max_id, COALESCE(d.unread_count,0) "
             "FROM synced_dialogs sd LEFT JOIN dialogs d ON d.dialog_id=sd.dialog_id WHERE sd.dialog_id=?",
             (dialog_id,),
         ).fetchone(),
     )
+    return tuple(row) if row is not None else None
 
 
 def _record_read_reconciliation_event(
@@ -1341,6 +1387,8 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
         TelethonTelegramTopicGateway(cast(TopicClient, client)),
         SQLiteTopicSnapshotRepository(conn),
         writer=writer,
+        capture_scope=client.capture_image_scope,
+        claim_scope=client.claim_image_scope,
     )
     folder_repository = SQLiteFolderSnapshotRepository(conn)
     folder_refresher = FolderRefresher(

@@ -99,3 +99,66 @@ async def test_intake_during_real_commit_revokes_result_and_later_delivery_wins(
         release.set()
         reader.close()
         await writer.aclose()
+
+
+async def test_scope_revoked_inside_publication_rolls_back_all_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    with closing(sqlite3.connect(path)) as seed:
+        seed.execute(
+            "UPDATE dialog_directory_publication SET account_id=1,generation=1,observation_started_at=1 WHERE singleton=1"
+        )
+        seed.commit()
+    cell = ScopeCell()
+    scope = TelegramAuthScope(1, 1, 2, 3)
+    cell.publish(scope)
+    original = SQLiteFolderSnapshotRepository.project_observation
+
+    def revoke(  # noqa: PLR0913 - mirrors the repository publication contract
+        repository: SQLiteFolderSnapshotRepository,
+        observation: FolderRuleObservation,
+        *,
+        completed_at: int,
+        observation_order: int = 0,
+        membership_revision: int | None = None,
+        owner_account_id: int | None = None,
+    ) -> int | None:
+        result = original(
+            repository,
+            observation,
+            completed_at=completed_at,
+            observation_order=observation_order,
+            membership_revision=membership_revision,
+            owner_account_id=owner_account_id,
+        )
+        change_id = cell.begin_change()
+        cell.end_change(change_id)
+        cell.publish(TelegramAuthScope(1, 2, 2, 3))
+        cell.publish(scope)
+        return result
+
+    monkeypatch.setattr(SQLiteFolderSnapshotRepository, "project_observation", revoke)
+    writer = await SQLiteWriter.open(path)
+    reader = open_sync_db_reader(path)
+
+    class Gateway:
+        async def fetch_rules(self, *, started_at: int) -> FolderRuleObservation:
+            return FolderRuleObservation((FolderRule(4, "Observed"),), "observation", started_at)
+
+    try:
+        result = await FolderRefresher(
+            Gateway(),
+            SQLiteFolderSnapshotRepository(reader),
+            writer=writer,
+            auth_scope=lambda: scope,
+            capture_scope=cell.capture,
+            claim_scope=cell.claim,
+        ).refresh(completed_at=100)
+        assert not result.accepted
+        assert reader.execute("SELECT COUNT(*) FROM telegram_folder_rules").fetchone()[0] == 0
+        assert reader.execute("SELECT COUNT(*) FROM telegram_folder_local_members").fetchone()[0] == 0
+    finally:
+        reader.close()
+        await writer.aclose()

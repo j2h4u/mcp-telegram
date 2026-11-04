@@ -7,7 +7,7 @@ import pytest
 from telethon.tl.functions.messages import SearchRequest  # type: ignore[import-untyped]
 from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty  # type: ignore[import-untyped]
 
-from mcp_telegram.activity_substrate import ActivityClient, call_with_timeout
+from mcp_telegram.activity_substrate import ActivityRpcClient, call_with_timeout
 from mcp_telegram.config import TelegramRpcSchedulerConfig
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
@@ -52,7 +52,7 @@ async def test_call_with_timeout_cancels_a_wedged_rpc_without_waiting() -> None:
             del dialog_id
             return object()
 
-    client: ActivityClient = HangingClient()
+    client: ActivityRpcClient = HangingClient()
     with pytest.raises(TimeoutError):
         with demand_context(DemandKind.ARCHIVE_INCREMENTAL):
             await call_with_timeout(client, object(), timeout_s=_TEST_TIMEOUT_S)
@@ -193,7 +193,7 @@ async def test_parent_cancel_removes_actual_gate_ticket_before_limiter_release()
     async def parent() -> None:
         with demand_context(DemandKind.ARCHIVE_INCREMENTAL):
             with acquisition_context(AcquisitionKind.MESSAGE_SEARCH_PAGE):
-                await call_with_timeout(cast(ActivityClient, gate), cancelled_request, timeout_s=10)
+                await call_with_timeout(cast(ActivityRpcClient, gate), cancelled_request, timeout_s=10)
 
     async def survivor() -> object:
         with demand_context(DemandKind.FULL_SYNC_PAGE):

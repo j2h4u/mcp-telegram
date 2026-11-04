@@ -48,6 +48,8 @@ async def test_existing_profile_owner_settles_or_acquires_after_terminal(  # noq
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.commit()
     scope = TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99)
     cell = ScopeCell()
     assert cell.publish(scope)
@@ -170,6 +172,8 @@ async def test_unfinished_acquisition_keeps_native_obligation(tmp_path: Path, in
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.commit()
     cell = ScopeCell()
     assert cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
     client = _ScopeClient()
@@ -224,6 +228,8 @@ async def test_insufficient_full_user_finishes_once_then_later_witness_refines(
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.commit()
     cell = ScopeCell()
     assert cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
     client = _ScopeClient()
@@ -296,6 +302,8 @@ async def test_intake_race_retries_only_current_revision(tmp_path: Path, new_rev
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.commit()
     cell = ScopeCell()
     assert cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
     client = _ScopeClient()
@@ -347,6 +355,8 @@ async def test_contact_update_with_authoritative_noncontact_witness_is_mismatch(
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.commit()
     cell = ScopeCell()
     assert cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
     client = _ScopeClient()

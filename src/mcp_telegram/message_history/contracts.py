@@ -6,10 +6,28 @@ from dataclasses import dataclass
 from typing import Final
 
 from ..dialog_identity_contracts import DialogIdentityObservation
-from ..message_contracts import ExtractedMessage
+from ..image_authorization import ScopeToken
+from ..message_contracts import ExtractedMessage, ReceivedMessage
+from ..reactions.contracts import ReactionObservationBoundary
 
 MESSAGE_HISTORY_PAGE_SIZE: Final = 100
 TOPIC_ATTRIBUTION_EXTRACTOR_VERSION: Final = 1
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryAccessProbeResult:
+    """A single access probe's count and independently supplied messages."""
+
+    total_messages: int | None
+    received: tuple[ReceivedMessage, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryAccessObservation:
+    result: HistoryAccessProbeResult
+    scope: ScopeToken
+    order: int
+    reactions: ReactionObservationBoundary
 
 
 class MessageHistoryAccessLostError(RuntimeError):
@@ -34,6 +52,7 @@ class FullHistoryPage:
     total_messages: int | None
     next_before_message_id: int | None
     identity: DialogIdentityObservation | None = None
+    referenced_identities: tuple[DialogIdentityObservation, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_full_history_messages(self.messages)
@@ -71,6 +90,7 @@ class ForwardGapPage:
     messages: tuple[ExtractedMessage, ...]
     complete: bool
     identity: DialogIdentityObservation | None = None
+    referenced_identities: tuple[DialogIdentityObservation, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.messages, tuple):

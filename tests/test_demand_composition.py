@@ -94,6 +94,7 @@ from mcp_telegram.telegram_rpc_consumers import (
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcScope, current_rpc_scope, rpc_scope
 from mcp_telegram.topics.demand import TopicSnapshotDemandAdapter
 from tests.helpers import build_mock_message
+from tests.history_scope_helpers import HistoryScope
 from tests.sqlite_writer_helpers import inline_writer
 
 
@@ -129,8 +130,14 @@ class _IdleFolderRepository(FolderSnapshotRepository):
     def read_catalog_identity(self) -> tuple[int, int, int] | None:
         return None
 
-    def read_observation_order(self) -> int:
+    def read_catalog_version(self) -> tuple[int | None, int, str | None, bool]:
+        return None, 0, None, False
+
+    def read_membership_revision(self) -> int:
         return 0
+
+    def invalidate(self) -> None:
+        pass
 
     def refine_receipts(self, observation: FolderRuleObservation, *, account_id: int, order: int) -> None:
         pass
@@ -139,8 +146,16 @@ class _IdleFolderRepository(FolderSnapshotRepository):
         del now
         return False
 
-    def project_observation(self, observation: FolderRuleObservation, *, completed_at: int) -> int | None:
-        del observation, completed_at
+    def project_observation(
+        self,
+        observation: FolderRuleObservation,
+        *,
+        completed_at: int,
+        observation_order: int = 0,
+        membership_revision: int | None = None,
+        owner_account_id: int | None = None,
+    ) -> int | None:
+        del observation, completed_at, observation_order, membership_revision, owner_account_id
         return None
 
     def reproject_current_rules(self, *, now: int) -> int | None:
@@ -463,7 +478,10 @@ async def test_invalid_dm_checkpoint_does_not_block_forward_delta_coordinator(
     dependencies.conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (?,1,1)", (dialog_id,))
     dependencies.conn.commit()
 
-    class EmptyForwardPage:
+    dependencies.conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
+    dependencies.conn.commit()
+
+    class EmptyForwardPage(HistoryScope):
         async def fetch_page(
             self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
         ) -> ForwardGapPage:

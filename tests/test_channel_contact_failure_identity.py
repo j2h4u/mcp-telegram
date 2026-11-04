@@ -68,6 +68,7 @@ def scenario() -> Iterator[Scenario]:
     gateway = TelethonChannelProfileGateway(client, now_provider=lambda: 100.0)
     service._deps = replace(service._deps, channel_profile_port=gateway, channel_reference_provider=gateway)
     with write_transaction(conn):
+        conn.execute("UPDATE dialog_directory_state SET account_id=7 WHERE singleton=1")
         conn.execute("INSERT INTO entities(id,type,updated_at) VALUES(?,'supergroup',10)", (_PEER,))
         conn.execute(
             "INSERT INTO entity_profile_refresh_state(entity_id,status,updated_at,next_section,generation) "

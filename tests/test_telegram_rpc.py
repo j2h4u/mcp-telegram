@@ -63,8 +63,10 @@ from mcp_telegram.flood import (
     FloodWaitObservation,
     TelegramRpcThrottled,
 )
+from mcp_telegram.image_authorization import ScopeToken
 from mcp_telegram.message_history.contracts import ForwardGapPage
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
+from mcp_telegram.state import telegram_session_lease
 from mcp_telegram.sync_db import (
     _apply_migrations,
     ensure_sync_schema,
@@ -3540,6 +3542,7 @@ async def test_actual_future_flood_is_recorded_when_caller_cancels_after_respons
 def _dm_reconciliation_test_db() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
+    conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
     conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (211, 'synced')")
     seed_full_history_enrollment(conn, 211, enabled=True)
     conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (211, 'user', 1)")
@@ -3581,6 +3584,12 @@ class _DmEventHandlerGateClient:
     def remove_event_handler(self, _callback: object) -> None:
         return
 
+    def capture_image_scope(self) -> ScopeToken | None:
+        return self._gate.capture_image_scope()
+
+    def claim_image_scope(self, token: ScopeToken) -> bool:
+        return self._gate.claim_image_scope(token)
+
     async def get_messages(self, *args: object, **kwargs: object) -> object:
         return await self._gate.get_messages(*args, **kwargs)
 
@@ -3611,13 +3620,25 @@ class _RecordingDmPageScanner:
 
 def _real_dm_page_scanner(gate: TelegramRpcGate, conn: sqlite3.Connection) -> _RecordingDmPageScanner:
     manager = event_manager(_DmEventHandlerGateClient(gate), conn, asyncio.Event())
+    manager.set_self_id(123)
     return _RecordingDmPageScanner(manager)
 
 
-def _real_dm_page_adapter(
+async def _real_dm_page_adapter(
     conn: sqlite3.Connection,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
 ) -> tuple[TelegramRpcGate, _DmPageFutureSender, DmDeletionReconciliationDemandAdapter, _RecordingDmPageScanner]:
-    gate = _gate()
+    safety = _MemorySafetyStore(AuthKey(bytes(range(256))).key_id)
+    stored = json.loads(safety.raw)
+    stored["scope"]["account_id"] = 123
+    safety.raw = json.dumps(stored, separators=(",", ":"))
+    gate = _gate(safety_store=safety.api())
+    gate._test_safety_store = safety
+    lease = telegram_session_lease(tmp_path)
+    gate.bind_session_lease(lease.__enter__())
+    request.addfinalizer(lambda: lease.__exit__(None, None, None))
+    await gate._ensure_safety_ledger().verify_account(123)
     sender = _DmPageFutureSender()
     _set_sender(gate, sender)
     gate.session.process_entities = lambda _result: None
@@ -3648,6 +3669,9 @@ async def _dispatch_forward_history_sibling(
     """Run one normal durable sibling after the shared cooldown has expired."""
 
     class GateForwardPort:
+        capture_scope = gate.capture_image_scope
+        claim_scope = gate.claim_image_scope
+
         async def fetch_page(
             self,
             dialog_id: int,
@@ -3691,18 +3715,20 @@ async def _dispatch_forward_history_sibling(
 
 
 @pytest.mark.asyncio
-async def test_dm_page_success_uses_real_get_messages_and_commits_tombstone_cursor() -> None:
+async def test_dm_page_success_uses_real_get_messages_and_commits_tombstone_cursor(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
     conn = _dm_reconciliation_test_db()
-    gate, sender, adapter, scanner = _real_dm_page_adapter(conn)
+    gate, sender, adapter, scanner = await _real_dm_page_adapter(conn, tmp_path, request)
     try:
         budget = _selected_dm_page_budget(adapter)
         task = asyncio.create_task(adapter.run_slice(budget))
         await _wait_for(lambda: sender.calls == 1)
 
-        request = sender.requests[0]
-        assert isinstance(request, functions.messages.GetMessagesRequest)
-        assert len(request.id) == 1
-        assert request.id[0].id == 1
+        rpc_request = sender.requests[0]
+        assert isinstance(rpc_request, functions.messages.GetMessagesRequest)
+        assert len(rpc_request.id) == 1
+        assert rpc_request.id[0].id == 1
         scope = sender.scopes[0]
         assert scope.demand_kind is DemandKind.DM_DELETION_RECONCILIATION
         assert scope.acquisition_kind is AcquisitionKind.MESSAGE_LOOKUP
@@ -3723,9 +3749,11 @@ async def test_dm_page_success_uses_real_get_messages_and_commits_tombstone_curs
 
 
 @pytest.mark.asyncio
-async def test_dm_page_cursor_commit_failure_preserves_tombstone_and_blocks_reconstruction() -> None:
+async def test_dm_page_cursor_commit_failure_preserves_tombstone_and_blocks_reconstruction(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
     conn = _dm_reconciliation_test_db()
-    gate, sender, adapter, scanner = _real_dm_page_adapter(conn)
+    gate, sender, adapter, scanner = await _real_dm_page_adapter(conn, tmp_path, request)
     try:
         conn.execute(
             """CREATE TRIGGER fail_dm_cursor_commit
@@ -3768,6 +3796,8 @@ async def test_dm_page_cursor_commit_failure_preserves_tombstone_and_blocks_reco
 @pytest.mark.parametrize("delta_cursor", [None, 1])
 async def test_dm_page_flood_crosses_gate_with_durable_demand_and_acquisition(  # noqa: PLR0915
     delta_cursor: int | None,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
 ) -> None:
     accumulator = FloodWaitAccumulator()
     accumulator.configure_kill_switch(
@@ -3776,7 +3806,7 @@ async def test_dm_page_flood_crosses_gate_with_durable_demand_and_acquisition(  
     conn = _dm_reconciliation_test_db()
     conn.execute("UPDATE synced_dialogs SET delta_message_id=? WHERE dialog_id=211", (delta_cursor,))
     conn.commit()
-    gate, sender, adapter, scanner = _real_dm_page_adapter(conn)
+    gate, sender, adapter, scanner = await _real_dm_page_adapter(conn, tmp_path, request)
     try:
         gate._rpc_circuit_status = accumulator.kill_switch_status
         gate._flood_observer = lambda **event: accumulator.observe(**event)
@@ -3832,13 +3862,15 @@ async def test_dm_page_flood_crosses_gate_with_durable_demand_and_acquisition(  
 
 
 @pytest.mark.asyncio
-async def test_cancelled_dm_page_late_gate_flood_stays_claimed_across_restart() -> None:
+async def test_cancelled_dm_page_late_gate_flood_stays_claimed_across_restart(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
     accumulator = FloodWaitAccumulator()
     accumulator.configure_kill_switch(
         FloodWaitKillSwitchPolicy(enabled=True, window_seconds=600, max_events=5, max_wait_seconds=900)
     )
     conn = _dm_reconciliation_test_db()
-    gate, sender, adapter, scanner = _real_dm_page_adapter(conn)
+    gate, sender, adapter, scanner = await _real_dm_page_adapter(conn, tmp_path, request)
     try:
         gate._rpc_circuit_status = accumulator.kill_switch_status
         gate._flood_observer = lambda **event: accumulator.observe(**event)

@@ -14,10 +14,10 @@ from telethon import types
 import tests.test_entity_profile_full_user_pair as pair_fixtures
 from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.daemon import _start_self_profile_after_replay, _SyncMainContext
-from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
+from mcp_telegram.daemon_entity_info import DaemonEntityInfoService, _ProfileSectionContext
 from mcp_telegram.entity_profile.contracts import TargetKind, UserProfileObservation
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
-from mcp_telegram.entity_profile.repository import EntityProfileRepository, admit_self_profile
+from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit, admit_self_profile
 from mcp_telegram.event_handlers import EventHandlerManager
 from mcp_telegram.models import DialogType
 from mcp_telegram.sqlite_writer import SQLiteWriter
@@ -99,7 +99,7 @@ async def test_self_profile_worker_drains_only_owned_pair(tmp_path: Path, enable
         assert admit_self_profile(
             conn, 42, kind=DialogType.USER, now=100, pair_mode="enabled" if enabled else "disabled"
         )
-    client = _PairClient(channel_id=123)
+    client = _PairClient(channel_id=123, account_id=42)
     service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=enabled))
     coordinator = service.refresh_coordinator
     assert coordinator is not None
@@ -156,7 +156,7 @@ async def test_self_worker_rejects_old_scope_result(tmp_path: Path, changed_scop
             current[0] = changed_scope
             return result
 
-    client = ScopeChangingClient()
+    client = ScopeChangingClient(account_id=42)
     service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=True))
     service._deps = replace(service._deps, full_user_auth_scope=lambda: current[0])
     coordinator = service.refresh_coordinator
@@ -188,7 +188,7 @@ async def test_self_worker_keeps_value_on_failure_then_accepts_clear(
         conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
         conn.execute("DELETE FROM entity_profile_refresh_state WHERE entity_id=42")
         assert admit_self_profile(conn, 42, kind=DialogType.USER, now=100, pair_mode="enabled")
-    client = _PairClient(channel_id=123)
+    client = _PairClient(channel_id=123, account_id=42)
     service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=True))
     service._deps = replace(service._deps, now_provider=lambda: clock[0])
     coordinator = service.refresh_coordinator
@@ -245,7 +245,7 @@ async def test_self_update_during_pair_creates_one_followup(tmp_path: Path) -> N
                 await resume.wait()
             return await super().fetch_user_profile(user_id, target_kind, owner_account_id=owner_account_id)  # type: ignore[arg-type]
 
-    client = BlockedClient()
+    client = BlockedClient(account_id=42)
     service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=True))
     coordinator = service.refresh_coordinator
     assert coordinator is not None
@@ -303,18 +303,26 @@ async def test_self_scope_change_while_writer_queued_rejects_result(
         conn.execute("DELETE FROM entity_profile_refresh_state WHERE entity_id=42")
         admit_self_profile(conn, 42, kind=DialogType.USER, now=100, pair_mode="enabled" if enabled else "disabled")
     current = [TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99)]
-    client = _PairClient(channel_id=123)
+    client = _PairClient(channel_id=123, account_id=42)
     service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=enabled))
     service._deps = replace(service._deps, full_user_auth_scope=lambda: current[0])
     original_write = service._write_profiles
     switched = False
 
-    async def queued_write[T](operation: Callable[[EntityProfileRepository], T], *, track_rejection: bool = True) -> T:
+    async def queued_write[T](
+        operation: Callable[[EntityProfileRepository], T],
+        *,
+        track_rejection: bool = True,
+        received_intake: tuple[int, EntitySectionCommit, _ProfileSectionContext] | None = None,
+        marker_scope: _ProfileSectionContext | None = None,
+    ) -> T:
         nonlocal switched
         if client.full_user_calls and not switched:
             switched = True
             current[0] = TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 100)
-        return await original_write(operation, track_rejection=track_rejection)
+        return await original_write(
+            operation, track_rejection=track_rejection, received_intake=received_intake, marker_scope=marker_scope
+        )
 
     monkeypatch.setattr(service, "_write_profiles", queued_write)
     coordinator = service.refresh_coordinator
@@ -325,9 +333,9 @@ async def test_self_scope_change_while_writer_queued_rejects_result(
         assert conn.execute(
             "SELECT COUNT(*) FROM entity_profile_semantic_snapshots WHERE owner_account_id=42 AND entity_id=42"
         ).fetchone() == (0,)
-        assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
-            "failed",
-        )
+        assert conn.execute(
+            "SELECT status,retry_at FROM entity_profile_refresh_state WHERE entity_id=42"
+        ).fetchone() == ("pending", None)
     finally:
         await service.shutdown()
         conn.close()
@@ -341,7 +349,7 @@ async def test_self_followup_changes_coordinator_revision_when_pair_becomes_elig
         conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
         conn.execute("DELETE FROM entity_profile_refresh_state WHERE entity_id=42")
         admit_self_profile(conn, 42, kind=DialogType.USER, now=100, pair_mode="enabled")
-    client = _PairClient(channel_id=123)
+    client = _PairClient(channel_id=123, account_id=42)
     service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=True))
     coordinator = service.refresh_coordinator
     assert coordinator is not None
@@ -382,16 +390,24 @@ async def test_self_pair_commits_on_real_sqlite_writer_thread(
         conn.execute("DELETE FROM entity_profile_refresh_state WHERE entity_id=42")
         admit_self_profile(conn, 42, kind=DialogType.USER, now=100, pair_mode="enabled")
     writer = await SQLiteWriter.open(path)
-    client = _PairClient(channel_id=123)
+    client = _PairClient(channel_id=123, account_id=42)
     service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=True))
     current = [TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99)]
     service._deps = replace(service._deps, writer=writer, full_user_auth_scope=lambda: current[0])
     original_write = service._write_profiles
 
-    async def queued_write[T](operation: Callable[[EntityProfileRepository], T], *, track_rejection: bool = True) -> T:
+    async def queued_write[T](
+        operation: Callable[[EntityProfileRepository], T],
+        *,
+        track_rejection: bool = True,
+        received_intake: tuple[int, EntitySectionCommit, _ProfileSectionContext] | None = None,
+        marker_scope: _ProfileSectionContext | None = None,
+    ) -> T:
         if rotate_key and client.full_user_calls:
             current[0] = TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 100)
-        return await original_write(operation, track_rejection=track_rejection)
+        return await original_write(
+            operation, track_rejection=track_rejection, received_intake=received_intake, marker_scope=marker_scope
+        )
 
     monkeypatch.setattr(service, "_write_profiles", queued_write)
     coordinator = service.refresh_coordinator
@@ -400,7 +416,7 @@ async def test_self_pair_commits_on_real_sqlite_writer_thread(
         await run_ready_slice(EntityProfileDemandAdapter(coordinator), now=100)
         assert client.full_user_calls == 1
         assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
-            "failed" if rotate_key else "complete",
+            "pending" if rotate_key else "complete",
         )
         profile = service._profiles.read(42, now=100)
         assert profile is not None

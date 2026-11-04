@@ -13,6 +13,7 @@ from typing import Protocol, cast
 
 from .access_lifecycle import set_access_lost
 from .entity_profile.membership import MembershipSignalCounts
+from .entity_profile.repository import bound_profile_account
 from .flood import TelegramRpcThrottled
 from .hydration_queue import (
     MEDIA_METADATA_KIND,
@@ -23,13 +24,18 @@ from .hydration_queue import (
     HydrationQueueRepository,
     HydrationQueueSummary,
 )
+from .image_authorization import ScopeToken
+from .messages.sqlite_bundle import ReceivedMessageScopeChangedError, persist_received_messages
 from .messages.sqlite_hydration import hydration_observation_current, hydration_work_revision
 from .messages.sqlite_hydration_jobs import (
     HydrationRepairCursor,
     repair_media_metadata_hydration_jobs,
     repair_transcription_hydration_jobs,
 )
+from .messages.telegram_adapter import extract_received_messages
 from .observation_order import allocate_observation_order
+from .reactions.contracts import ReactionAggregateSource, ReactionObservationBoundary
+from .reactions.persistence import allocate_observation_boundary
 from .sqlite_writer import SQLiteWriter
 from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
@@ -59,6 +65,13 @@ from .telegram_rpc_scheduler import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _ScopeClient(Protocol):
+    def capture_image_scope(self) -> ScopeToken | None: ...
+    def claim_image_scope(self, token: ScopeToken) -> bool: ...
+
+
 _MAX_LOGGED_MESSAGE_IDS = 32
 _DROP_LEVELS = {
     "terminal_rpc": logging.INFO,
@@ -83,6 +96,15 @@ class AppliedFacts:
     dropped: int = 0
     pending: bool = False
     drop_observations: tuple[HydrationDropObservation, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MediaPublication:
+    """Original media response plus messages accepted by the canonical writer."""
+
+    response: object
+    accepted_message_ids: frozenset[int]
+    superseded_message_ids: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -536,12 +558,28 @@ class MessageFactHydrationWorker:
         *,
         attempt_budget: RpcAttemptBudget | None = None,
     ) -> _BatchOutcome:
-        started, preflight_observations, observation_order = await self._writer.run(
-            lambda conn: self._start_batch(conn, handler, batch)
+        try:
+            return await self._process_batch_owned(handler, batch, effective_now, attempt_budget=attempt_budget)
+        except ReceivedMessageScopeChangedError:
+            return _BatchOutcome(stopped=True)
+
+    async def _process_batch_owned(
+        self,
+        handler: HydrationHandler,
+        batch: Sequence[HydrationJob],
+        effective_now: int,
+        *,
+        attempt_budget: RpcAttemptBudget | None = None,
+    ) -> _BatchOutcome:
+        scope = self._capture_media_scope(handler)
+        started, preflight_observations, observation_order, reaction_boundary = await self._writer.run(
+            lambda conn: self._start_batch(conn, handler, batch, scope=scope)
         )
         if not started:
             self._log_drops(batch, preflight_observations)
             return _BatchOutcome(dropped=len(preflight_observations))
+        if scope is not None and not cast(_ScopeClient, self._client).claim_image_scope(scope):
+            raise ReceivedMessageScopeChangedError
         owner = self._profile_owner_account_id
         attempts_before_request = None if attempt_budget is None else attempt_budget.attempts
         assert observation_order is not None
@@ -554,13 +592,12 @@ class MessageFactHydrationWorker:
         finally:
             effective_now = int(self._clock())
 
-        def requeue_stale(conn: sqlite3.Connection) -> None:
-            with write_transaction(conn):
-                for job in started:
-                    if not hydration_observation_current(conn, job.dialog_id, job.message_id, observation_order):
-                        HydrationQueueRepository(conn).requeue_not_applied(job, job.due_at)
+        if scope is not None and not cast(_ScopeClient, self._client).claim_image_scope(scope):
+            raise ReceivedMessageScopeChangedError
 
-        await self._writer.run(requeue_stale)
+        await self._requeue_obsolete_observations(
+            handler, started, observation_order, failed=failure is not None, scope=scope
+        )
         if failure is not None:
             membership_counts: list[MembershipSignalCounts] = []
             outcome = await self._writer.run(
@@ -577,20 +614,64 @@ class MessageFactHydrationWorker:
                     attempts_before_request=attempts_before_request,
                     owner=owner,
                     membership_counts=membership_counts,
+                    scope=scope,
                 )
             )
-            if self._access_loss_observer is not None:
-                for counts in membership_counts:
-                    try:
-                        self._access_loss_observer(counts)
-                    except Exception:  # noqa: BLE001
-                        logger.debug("access_loss_observer_failed")
+            self._report_access_loss(membership_counts)
             return outcome
         return await self._writer.run(
             lambda conn: self._apply_batch_result(
-                conn, handler, batch, started, preflight_observations, result, effective_now, observation_order
+                conn,
+                handler,
+                batch,
+                started,
+                preflight_observations,
+                result,
+                effective_now,
+                observation_order,
+                scope=scope,
+                reaction_boundary=reaction_boundary,
             )
         )
+
+    def _capture_media_scope(self, handler: HydrationHandler) -> ScopeToken | None:
+        if handler.kind != MEDIA_METADATA_KIND:
+            return None
+        scope = cast(_ScopeClient, self._client).capture_image_scope()
+        if scope is None or scope.scope.account_id != self._profile_owner_account_id:
+            raise RuntimeError("media hydration scope unavailable")
+        return scope
+
+    def _report_access_loss(self, observations: Sequence[MembershipSignalCounts]) -> None:
+        if self._access_loss_observer is None:
+            return
+        for counts in observations:
+            try:
+                self._access_loss_observer(counts)
+            except Exception:  # noqa: BLE001 - telemetry cannot change queue ownership
+                logger.debug("access_loss_observer_failed")
+
+    async def _requeue_obsolete_observations(
+        self,
+        handler: HydrationHandler,
+        jobs: Sequence[HydrationJob],
+        order: int,
+        *,
+        failed: bool,
+        scope: ScopeToken | None,
+    ) -> None:
+        if not failed and handler.kind == MEDIA_METADATA_KIND:
+            return
+
+        def requeue(conn: sqlite3.Connection) -> None:
+            with write_transaction(conn):
+                self._require_media_scope(conn, scope)
+                for job in jobs:
+                    if not hydration_observation_current(conn, job.dialog_id, job.message_id, order):
+                        HydrationQueueRepository(conn).requeue_not_applied(job, job.due_at)
+                self._require_media_scope(conn, scope)
+
+        await self._writer.run(requeue)
 
     def _handle_batch_error(  # noqa: PLR0913, PLR0917 - dispatch preserves existing per-error recovery policies
         self,
@@ -607,6 +688,7 @@ class MessageFactHydrationWorker:
         attempts_before_request: int | None,
         owner: int | None,
         membership_counts: list[MembershipSignalCounts],
+        scope: ScopeToken | None,
     ) -> _BatchOutcome:
         if isinstance(
             exc,
@@ -627,6 +709,7 @@ class MessageFactHydrationWorker:
                 exc,
                 effective_now,
                 observation_order=observation_order,
+                scope=scope,
             )
         if isinstance(exc, TelegramRpcThrottled):
             return self._handle_throttle(
@@ -640,15 +723,18 @@ class MessageFactHydrationWorker:
                 attempt_budget=attempt_budget,
                 attempts_before_request=attempts_before_request,
                 observation_order=observation_order,
+                scope=scope,
             )
         if isinstance(exc, RpcAdmissionClosedError):
             with write_transaction(conn):
+                self._require_media_scope(conn, scope)
                 self._release_undispatched(
                     conn,
                     self._current_jobs(conn, started, observation_order),
                     effective_now,
                     error_code=type(exc).__name__,
                 )
+                self._require_media_scope(conn, scope)
             raise exc
         if isinstance(exc, ACCESS_LOST_ERRORS):
             return self._handle_access_lost(
@@ -662,6 +748,7 @@ class MessageFactHydrationWorker:
                 observation_order=observation_order,
                 owner=owner,
                 membership_counts=membership_counts,
+                scope=scope,
             )
         return self._handle_request_error(
             conn,
@@ -672,6 +759,7 @@ class MessageFactHydrationWorker:
             exc,
             effective_now,
             observation_order=observation_order,
+            scope=scope,
         )
 
     def _apply_batch_result(  # noqa: PLR0913, PLR0917 - one transaction gates result and its queue effects
@@ -684,13 +772,32 @@ class MessageFactHydrationWorker:
         result: object,
         effective_now: int,
         observation_order: int,
+        *,
+        scope: ScopeToken | None,
+        reaction_boundary: ReactionObservationBoundary | None,
     ) -> _BatchOutcome:
         with write_transaction(conn):
-            current = self._current_jobs(conn, started, observation_order)
+            if scope is not None and not self._media_scope_current(conn, scope):
+                return _BatchOutcome(stopped=True)
+            current = (
+                self._leased_media_jobs(conn, handler, started)
+                if handler.kind == MEDIA_METADATA_KIND
+                else self._current_jobs(conn, started, observation_order)
+            )
             stale = [job for job in started if job not in current]
             preflight_observations = (*preflight_observations, *self._observations("not_applied", stale))
+            if scope is not None:
+                result = self._publish_media_response(
+                    conn,
+                    started,
+                    result,
+                    scope=scope,
+                    observation_order=observation_order,
+                    reaction_boundary=reaction_boundary,
+                )
             if not current:
                 self._log_drops(batch, preflight_observations)
+                self._require_media_scope(conn, scope)
                 return _BatchOutcome(dropped=len(preflight_observations))
             applied = handler.apply(
                 conn,
@@ -700,9 +807,43 @@ class MessageFactHydrationWorker:
                 now=effective_now,
                 observation_order=observation_order,
             )
-            return self._finish_applied(
+            outcome = self._finish_applied(
                 conn, handler, batch, current, preflight_observations, applied, int(self._clock())
             )
+            self._require_media_scope(conn, scope)
+            return outcome
+
+    def _publish_media_response(  # noqa: PLR0913 - original observation boundaries accompany response
+        self,
+        conn: sqlite3.Connection,
+        jobs: Sequence[HydrationJob],
+        result: object,
+        *,
+        scope: ScopeToken,
+        observation_order: int,
+        reaction_boundary: ReactionObservationBoundary | None,
+    ) -> MediaPublication:
+        values = result if isinstance(result, (list, tuple)) else [result]
+        ids = {job.message_id for job in jobs}
+        received = extract_received_messages([value for value in values if getattr(value, "id", None) in ids])
+        accepted: set[int] = set()
+        for message in received:
+            if persist_received_messages(
+                conn,
+                [message],
+                scope=scope,
+                claim_scope=cast(_ScopeClient, self._client).claim_image_scope,
+                observation_order=observation_order,
+                expected_dialog_id=jobs[0].dialog_id,
+                reaction_boundary=reaction_boundary,
+            ):
+                accepted.add(message.bundle.message.message_id)
+        superseded = frozenset(
+            job.message_id
+            for job in jobs
+            if not hydration_observation_current(conn, job.dialog_id, job.message_id, observation_order)
+        )
+        return MediaPublication(result, frozenset(accepted), superseded)
 
     def _current_jobs(
         self,
@@ -712,8 +853,37 @@ class MessageFactHydrationWorker:
     ) -> list[HydrationJob]:
         require_write_transaction(conn)
         return [
-            job for job in jobs if hydration_observation_current(conn, job.dialog_id, job.message_id, observation_order)
+            job
+            for job in jobs
+            if (job.kind != MEDIA_METADATA_KIND or self._media_job_leased(conn, job))
+            and hydration_observation_current(conn, job.dialog_id, job.message_id, observation_order)
         ]
+
+    @staticmethod
+    def _leased_media_jobs(
+        conn: sqlite3.Connection, handler: HydrationHandler, jobs: Sequence[HydrationJob]
+    ) -> list[HydrationJob]:
+        require_write_transaction(conn)
+        current: list[HydrationJob] = []
+        for job in jobs:
+            if not MessageFactHydrationWorker._media_job_leased(conn, job):
+                continue
+            if handler.eligible(conn, job):
+                current.append(job)
+            else:
+                HydrationQueueRepository(conn).remove(job)
+        return current
+
+    @staticmethod
+    def _media_job_leased(conn: sqlite3.Connection, job: HydrationJob) -> bool:
+        return (
+            conn.execute(
+                "SELECT 1 FROM hydration_jobs WHERE kind=? AND dialog_id=? AND message_id=? "
+                "AND attempts=? AND due_at=? AND terminal=0 AND last_outcome='processing'",
+                (job.kind, job.dialog_id, job.message_id, job.attempts, job.due_at),
+            ).fetchone()
+            is not None
+        )
 
     async def _request_batch(
         self,
@@ -767,14 +937,17 @@ class MessageFactHydrationWorker:
         effective_now: int,
         *,
         observation_order: int | None = None,
+        scope: ScopeToken | None = None,
     ) -> _BatchOutcome:
         with write_transaction(conn):
+            self._require_media_scope(conn, scope)
             retried = self._release_undispatched(
                 conn,
                 self._current_jobs(conn, started, observation_order),
                 None,
                 error_code=type(exc).__name__,
             )
+            self._require_media_scope(conn, scope)
         self._log_drops(batch, preflight_observations)
         logger.warning(
             "message_fact_hydration admission_rejected kind=%s dialog_id=%d jobs=%d error_type=%s",
@@ -847,6 +1020,7 @@ class MessageFactHydrationWorker:
         attempt_budget: RpcAttemptBudget | None,
         attempts_before_request: int | None,
         observation_order: int | None = None,
+        scope: ScopeToken | None = None,
     ) -> _BatchOutcome:
         """Preserve domain state, then select coordinator or standalone recovery."""
         if attempt_budget is not None:
@@ -861,6 +1035,7 @@ class MessageFactHydrationWorker:
                 effective_now,
                 request_dispatched=attempt_budget.attempts > attempts_before_request,
                 observation_order=observation_order,
+                scope=scope,
             )
             raise exc
         if exc.retry_after_seconds is None:
@@ -888,6 +1063,7 @@ class MessageFactHydrationWorker:
         *,
         request_dispatched: bool,
         observation_order: int | None = None,
+        scope: ScopeToken | None = None,
     ) -> None:
         """Restore durable admission state before the coordinator owns throttling."""
         if request_dispatched and exc.retry_after_seconds is not None:
@@ -906,10 +1082,12 @@ class MessageFactHydrationWorker:
         if request_dispatched:
             return
         with write_transaction(conn):
+            self._require_media_scope(conn, scope)
             error_code = type(exc).__name__
             current = self._current_jobs(conn, started, observation_order)
             for job in current:
                 HydrationQueueRepository(conn).requeue_undispatched(job, job.due_at, error_code=error_code)
+            self._require_media_scope(conn, scope)
         self._log_drops(batch, preflight_observations)
         logger.info(
             "message_fact_hydration coordinator_throttled kind=%s dialog_id=%d jobs=%d dispatched=%s latched=%s",
@@ -953,10 +1131,12 @@ class MessageFactHydrationWorker:
         observation_order: int | None = None,
         owner: int | None = None,
         membership_counts: list[MembershipSignalCounts] | None = None,
+        scope: ScopeToken | None = None,
     ) -> _BatchOutcome:
         descriptor = describe_telegram_rpc_error(exc)
         self._log_drops(batch, preflight_observations)
         with write_transaction(conn):
+            self._require_media_scope(conn, scope)
             dialog_ids = tuple(
                 dict.fromkeys(job.dialog_id for job in self._current_jobs(conn, started, observation_order))
             )
@@ -978,6 +1158,7 @@ class MessageFactHydrationWorker:
                 ).membership_counts
                 if membership_counts is not None:
                     membership_counts.append(counts)
+            self._require_media_scope(conn, scope)
         self._log_summaries(summaries, descriptor)
         drop_counts: dict[str, int] = defaultdict(int)
         for summary in summaries:
@@ -1002,11 +1183,13 @@ class MessageFactHydrationWorker:
         effective_now: int,
         *,
         observation_order: int | None = None,
+        scope: ScopeToken | None = None,
     ) -> _BatchOutcome:
         descriptor = describe_telegram_rpc_error(exc)
         if handler.is_terminal_error(exc):
             committed_revision: str | None = None
             with write_transaction(conn):
+                self._require_media_scope(conn, scope)
                 current = self._current_jobs(conn, started, observation_order)
                 for job in current:
                     HydrationQueueRepository(conn).mark_terminal(
@@ -1014,6 +1197,7 @@ class MessageFactHydrationWorker:
                     )
                 if current:
                     committed_revision = self._revision_for_conn(conn, current[0])
+                self._require_media_scope(conn, scope)
             self._log_drops(batch, preflight_observations)
             self._log_drops(current, self._observations("terminal_rpc", current), descriptor=descriptor)
             stale = [job for job in started if job not in current]
@@ -1023,9 +1207,11 @@ class MessageFactHydrationWorker:
                 terminal_revision=committed_revision,
             )
         with write_transaction(conn):
+            self._require_media_scope(conn, scope)
             current = self._current_jobs(conn, started, observation_order)
             for job in current:
                 HydrationQueueRepository(conn).requeue_not_applied(job, job.due_at)
+            self._require_media_scope(conn, scope)
         self._log_drops(batch, preflight_observations)
         self._log_drops(started, self._observations("not_applied", current), descriptor=descriptor)
         logger.warning(
@@ -1085,9 +1271,17 @@ class MessageFactHydrationWorker:
         return hydration_work_revision(conn, job)
 
     def _start_batch(
-        self, conn: sqlite3.Connection, handler: HydrationHandler, jobs: Sequence[HydrationJob]
-    ) -> tuple[list[HydrationJob], tuple[HydrationDropObservation, ...], int | None]:
+        self,
+        conn: sqlite3.Connection,
+        handler: HydrationHandler,
+        jobs: Sequence[HydrationJob],
+        *,
+        scope: ScopeToken | None,
+    ) -> tuple[
+        list[HydrationJob], tuple[HydrationDropObservation, ...], int | None, ReactionObservationBoundary | None
+    ]:
         with write_transaction(conn):
+            self._require_media_scope(conn, scope)
             started: list[HydrationJob] = []
             observations: list[HydrationDropObservation] = []
             for job in jobs:
@@ -1110,7 +1304,22 @@ class MessageFactHydrationWorker:
                     continue
                 started.append(current)
             observation_order = allocate_observation_order(conn) if started else None
-        return started, tuple(observations), observation_order
+            reaction_boundary = (
+                allocate_observation_boundary(conn, ReactionAggregateSource.HISTORY)
+                if started and handler.kind == MEDIA_METADATA_KIND
+                else None
+            )
+            self._require_media_scope(conn, scope)
+        return started, tuple(observations), observation_order, reaction_boundary
+
+    def _media_scope_current(self, conn: sqlite3.Connection, scope: ScopeToken) -> bool:
+        return bound_profile_account(conn) == scope.scope.account_id and cast(
+            _ScopeClient, self._client
+        ).claim_image_scope(scope)
+
+    def _require_media_scope(self, conn: sqlite3.Connection, scope: ScopeToken | None) -> None:
+        if scope is not None and not self._media_scope_current(conn, scope):
+            raise ReceivedMessageScopeChangedError
 
     def _reschedule_or_drop(  # noqa: PLR0913 - explicit writer connection accompanies queue policy
         self,

@@ -34,8 +34,10 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from telethon.errors.rpcerrorlist import RPCError
 
+from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.daemon import _DaemonClient
 from mcp_telegram.daemon import _initialize_read_positions as _initialize_read_positions_owner
+from mcp_telegram.image_authorization import ScopeCell, ScopeToken
 from mcp_telegram.message_fact_refresh import ReadReceiptDemandAdapter
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_transactions import write_transaction
@@ -55,6 +57,8 @@ def _make_conn():
     conn = sqlite3.connect(":memory:")
     try:
         _apply_migrations(conn)
+        conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
+        conn.commit()
         yield conn
     finally:
         conn.close()
@@ -97,10 +101,23 @@ def _patch_get_peer_id(mapping: Iterable[int]):
     return patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=_side_effect)
 
 
-class _FakeClient:
+class _ScopedClient:
+    def __init__(self) -> None:
+        self.scope = ScopeCell()
+        assert self.scope.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 1, 2, 99))
+
+    def capture_image_scope(self) -> ScopeToken | None:
+        return self.scope.capture()
+
+    def claim_image_scope(self, token: ScopeToken) -> bool:
+        return self.scope.claim(token)
+
+
+class _FakeClient(_ScopedClient):
     _call_count: SimpleNamespace
 
     def __init__(self, dialogs_per_call: list[list[SimpleNamespace]]) -> None:
+        super().__init__()
         self._dialogs_per_call = dialogs_per_call
         self._call_count = SimpleNamespace(n=0)
 
@@ -436,7 +453,7 @@ async def test_bootstrap_live_event_race_newer_wins():
                 ]
             )
 
-        class _RaceClient:
+        class _RaceClient(_ScopedClient):
             async def get_input_entity(self, did: int) -> SimpleNamespace:
                 return SimpleNamespace(_did=did)
 
@@ -458,7 +475,7 @@ async def test_bootstrap_live_event_race_newer_wins():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure_cooldown_seconds", [None, 3600])
 async def test_bootstrap_success_skips_empty_retry_transaction(failure_cooldown_seconds: float | None):
-    """A fully returned peer needs only the transaction that applies its cursors."""
+    """A successful peer reserves its observation and applies cursors without a retry write."""
 
     with _make_conn() as conn:
         _seed(conn, [(1001, None, None, "synced")])
@@ -479,7 +496,7 @@ async def test_bootstrap_success_skips_empty_retry_transaction(failure_cooldown_
                 batch_pause_seconds=0.001,
             )
 
-        assert transactions.call_count == 1
+        assert transactions.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -489,12 +506,18 @@ async def test_bootstrap_failure_does_not_claim_business_progress(failure_mode: 
 
     with _make_conn() as conn:
         _seed(conn, [(1001, None, None, "synced")])
-        client = AsyncMock()
+
+        class _FailureClient(_ScopedClient):
+            get_input_entity = AsyncMock()
+
+            async def __call__(self, _req: object) -> SimpleNamespace:
+                raise RPCError(None, "request failed")
+
+        client = _FailureClient()
         if failure_mode == "unresolved":
             client.get_input_entity.return_value = None
         else:
             client.get_input_entity.return_value = SimpleNamespace(_did=1001)
-            client.side_effect = RPCError(None, "request failed")
 
         if failure_mode == "rpc":
             with pytest.raises(RPCError):

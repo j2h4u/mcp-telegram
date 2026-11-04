@@ -532,6 +532,7 @@ def _project_tool_result(name: str, tool_result: object, telemetry: _CallTelemet
     )
     _restore_profile_nulls(name, tool_result, structured_content)
     _restore_sync_status_nulls(name, tool_result, structured_content)
+    _restore_topic_and_folder_nulls(name, tool_result, structured_content)
     content: list[ContentBlock] = []
     if tool_result.is_error:
         structured_content = _canonical_tool_error(tool_result.error_code, tool_result.content, structured_content)
@@ -543,6 +544,36 @@ def _project_tool_result(name: str, tool_result: object, telemetry: _CallTelemet
         structured_content=structured_content,
         is_error=tool_result.is_error,
     )
+
+
+def _restore_topic_and_folder_nulls(
+    name: str, tool_result: tools.ToolResult, structured_content: dict[str, object] | None
+) -> None:
+    """Retain meaningful nullable topic titles and folder source positions."""
+    if structured_content is None or tool_result.is_error or tool_result.structured_content is None:
+        return
+    original = tool_result.structured_content
+    if name == "list_topics":
+        _restore_topic_titles(original, structured_content)
+    if name == "get_folder":
+        _restore_folder_source_position(original, structured_content)
+
+
+def _restore_topic_titles(original: dict[str, object], output: dict[str, object]) -> None:
+    sources = original.get("topics")
+    targets = output.get("topics")
+    if not isinstance(sources, list) or not isinstance(targets, list):
+        return
+    for source, target in zip(sources, targets, strict=True):
+        if isinstance(source, dict) and isinstance(target, dict) and "title" in source:
+            target["title"] = source["title"]
+
+
+def _restore_folder_source_position(original: dict[str, object], output: dict[str, object]) -> None:
+    source = original.get("definition")
+    target = output.get("definition")
+    if isinstance(source, dict) and isinstance(target, dict) and "source_position" in source:
+        target["source_position"] = source["source_position"]
 
 
 def _image_content(tool_result: tools.ToolResult, metadata: dict[str, object] | None) -> list[ContentBlock]:

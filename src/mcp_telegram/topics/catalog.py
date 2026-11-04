@@ -10,11 +10,13 @@ from typing import cast
 
 from ..access_predicates import not_access_lost_sql
 from ..observation_order import allocate_observation_order
+from ..reactions.contracts import ReactionAggregateSource, ReactionObservationBoundary
+from ..reactions.persistence import allocate_observation_boundary
 from ..sync_transactions import write_savepoint
 from .contracts import TopicCursor, TopicPage, TopicSourceUnavailableError
 from .sqlite_repository import SQLiteTopicSnapshotRepository
 
-type _PageState = tuple[int, int, int | None, int | None, str]
+type _PageState = tuple[int, int, int | None, int | None, str, int | None, int, int]
 type _ScanRow = tuple[int | None, int | None, int, int | None, int, int, int]
 type _CoverageRow = tuple[int | None, int, int | None, str | None, int | None]
 _RESTART_SCAN_REASONS = frozenset(
@@ -36,6 +38,7 @@ class TopicScan:
     revision: int
     observation_order: int
     cursor: TopicCursor
+    reaction_boundary: ReactionObservationBoundary
 
 
 class TopicCatalogRepository:
@@ -163,6 +166,10 @@ class TopicCatalogRepository:
             if row is None or not row[6]:
                 return None
             generation, revision = row[0], row[1]
+            if generation is not None and revision != row[2]:
+                self._reset_scan(dialog_id)
+                generation = None
+                row = (None, None, row[2], None, 0, 0, row[6])
             if generation is None:
                 generation = allocate_observation_order(self._conn)
                 revision = row[2]
@@ -177,6 +184,7 @@ class TopicCatalogRepository:
                 revision,
                 allocate_observation_order(self._conn),
                 TopicCursor(row[3], row[4], row[5]),
+                allocate_observation_boundary(self._conn, ReactionAggregateSource.HISTORY),
             )
 
     def apply_page(self, scan: TopicScan, page: TopicPage) -> bool:
@@ -191,12 +199,21 @@ class TopicCatalogRepository:
             state = cast(
                 _PageState | None,
                 self._conn.execute(
-                    "SELECT generation,revision,expected_count,order_by_create_date,cursors "
+                    "SELECT generation,revision,expected_count,order_by_create_date,cursors,offset_date,offset_id,offset_topic "
                     "FROM topic_catalog_state WHERE dialog_id=?",
                     (scan.dialog_id,),
                 ).fetchone(),
             )
-            if state is None or state[0] != scan.generation:
+            if (
+                state is None
+                or state[0] != scan.generation
+                or state[5:] != (scan.cursor.offset_date, scan.cursor.offset_id, scan.cursor.offset_topic)
+            ):
+                return False, False, None
+            if state[1] != scan.revision:
+                SQLiteTopicSnapshotRepository(self._conn).upsert_topics(
+                    scan.dialog_id, page.topics, observation_order=scan.observation_order
+                )
                 return False, False, None
             ids, seen = self._apply_page_topics(scan, page, state)
             complete = len(seen.union(ids)) == page.count
@@ -244,19 +261,33 @@ class TopicCatalogRepository:
         repository = SQLiteTopicSnapshotRepository(self._conn)
         repository.upsert_topics(scan.dialog_id, page.topics, observation_order=scan.observation_order)
         self._conn.executemany(
-            "UPDATE topic_metadata SET seen_generation=?,catalog_present=1 WHERE dialog_id=? AND topic_id=?",
+            "UPDATE topic_metadata SET seen_generation=? WHERE dialog_id=? AND topic_id=?",
             ((scan.generation, scan.dialog_id, topic_id) for topic_id in ids),
         )
-        # Deleted constructors carry no title; preserve any retained descriptive facts.
+        # Enumeration accounting is independent of the current membership fact.
         self._conn.executemany(
-            """INSERT INTO topic_metadata(dialog_id,topic_id,title,is_general,is_deleted,updated_at,observation_order,seen_generation)
-            VALUES (?,?,'',0,1,?,?,?) ON CONFLICT(dialog_id,topic_id) DO UPDATE SET
-            is_deleted=1,observation_order=excluded.observation_order
-            WHERE topic_metadata.observation_order < excluded.observation_order""",
+            """INSERT INTO topic_metadata(dialog_id,topic_id,title,is_general,is_deleted,updated_at,
+                observation_order,seen_generation,membership_order,pinned,hidden,catalog_present)
+            VALUES (?,?,NULL,0,1,?,?,?,?,NULL,NULL,0) ON CONFLICT(dialog_id,topic_id) DO UPDATE SET
+            is_deleted=1,catalog_present=0,membership_order=excluded.membership_order,
+            observation_order=MAX(topic_metadata.observation_order,excluded.observation_order),
+            seen_generation=excluded.seen_generation
+            WHERE topic_metadata.membership_order < excluded.membership_order""",
             (
-                (scan.dialog_id, topic_id, int(time.time()), scan.observation_order, scan.generation)
+                (
+                    scan.dialog_id,
+                    topic_id,
+                    int(time.time()),
+                    scan.observation_order,
+                    scan.generation,
+                    scan.observation_order,
+                )
                 for topic_id in page.deleted_ids
             ),
+        )
+        self._conn.executemany(
+            "UPDATE topic_metadata SET seen_generation=? WHERE dialog_id=? AND topic_id=?",
+            ((scan.generation, scan.dialog_id, topic_id) for topic_id in page.deleted_ids),
         )
         return ids, seen
 
@@ -292,9 +323,9 @@ class TopicCatalogRepository:
     def _complete(self, scan: TopicScan, revision: int) -> bool:
         if revision == scan.revision:
             self._conn.execute(
-                "UPDATE topic_metadata SET catalog_present=0 WHERE dialog_id=? "
-                "AND seen_generation<>? AND observation_order<?",
-                (scan.dialog_id, scan.generation, scan.generation),
+                "UPDATE topic_metadata SET catalog_present=0,membership_order=? WHERE dialog_id=? "
+                "AND seen_generation<>? AND membership_order<?",
+                (scan.observation_order, scan.dialog_id, scan.generation, scan.observation_order),
             )
             self._conn.execute(
                 "UPDATE topic_catalog_state SET completed_at=?,pending=0,reason=NULL,applicable=1, "

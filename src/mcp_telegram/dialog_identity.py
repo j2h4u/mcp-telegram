@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from dataclasses import replace
 from typing import cast
 
+from .dialog_fact_observations import claim_dialog_fact
 from .dialog_identity_contracts import (
     IDENTITY_OMITTED,
     DialogIdentity,
@@ -13,7 +15,9 @@ from .dialog_identity_contracts import (
     ObservedDialogType,
     ObservedText,
 )
+from .entity_store import PartialEntityIdentity, apply_partial_entity_identity
 from .models import DialogType
+from .sync_transactions import require_write_transaction
 
 _SOURCES = frozenset({"directory", "realtime", "profile"})
 type _JoinedIdentityRow = tuple[
@@ -373,3 +377,69 @@ def publish_dialog_identity(
         return False
     sql, values = _publication_values(prior, observation, expected_revision)
     return conn.execute(sql, values).rowcount == 1
+
+
+def publish_supplied_identities(
+    conn: sqlite3.Connection, identities: Sequence[DialogIdentityObservation], *, observation_order: int
+) -> None:
+    """Merge facts in the caller's original-scope guarded transaction."""
+    require_write_transaction(conn)
+    for identity in identities:
+        _publish_supplied_identity(conn, identity, observation_order)
+
+
+def _publish_supplied_identity(
+    conn: sqlite3.Connection, identity: DialogIdentityObservation, observation_order: int
+) -> None:
+    row = cast(
+        tuple[str] | None, conn.execute("SELECT type FROM entities WHERE id=?", (identity.dialog_id,)).fetchone()
+    )
+    observed_type = _effective_observed_type(identity.dialog_type, complete=identity.complete)
+    if row is None and observed_type is IDENTITY_OMITTED:
+        return
+    known_type = DialogType.parse(row[0]) if row is not None else DialogType.UNKNOWN
+    entity_type = known_type if known_type is not DialogType.UNKNOWN else observed_type
+    accepted = _claim_supplied_identity(conn, identity, observation_order)
+    if accepted is None:
+        return
+    if identity.observed_at is None:
+        raise ValueError("supplied identity requires its original observation time")
+    apply_partial_entity_identity(conn, identity.dialog_id, _entity_identity_patch(accepted, entity_type))
+    projected = replace(accepted, dialog_type=entity_type, complete=accepted.complete and entity_type == observed_type)
+    publish_dialog_identity(conn, identity.dialog_id, projected, capture_identity_baseline(conn, identity.dialog_id))
+
+
+def _entity_identity_patch(
+    identity: DialogIdentityObservation, entity_type: ObservedDialogType
+) -> PartialEntityIdentity:
+    if identity.observed_at is None:
+        raise ValueError("supplied identity requires its original observation time")
+    return PartialEntityIdentity(
+        observed_at=identity.observed_at,
+        observed_type=entity_type.value if isinstance(entity_type, DialogType) else None,
+        name_observed=identity.name is not IDENTITY_OMITTED,
+        name=cast(str | None, identity.name) if identity.name is not IDENTITY_OMITTED else None,
+        username_observed=identity.username is not IDENTITY_OMITTED,
+        username=cast(str | None, identity.username) if identity.username is not IDENTITY_OMITTED else None,
+    )
+
+
+def _claim_supplied_identity(
+    conn: sqlite3.Connection, identity: DialogIdentityObservation, observation_order: int
+) -> DialogIdentityObservation | None:
+    name = identity.name
+    username = identity.username
+    if name is not IDENTITY_OMITTED and not claim_dialog_fact(conn, identity.dialog_id, "name", observation_order):
+        name = IDENTITY_OMITTED
+    if username is not IDENTITY_OMITTED and not claim_dialog_fact(
+        conn, identity.dialog_id, "username", observation_order
+    ):
+        username = IDENTITY_OMITTED
+    if name is IDENTITY_OMITTED and username is IDENTITY_OMITTED:
+        return None
+    return replace(
+        identity,
+        name=name,
+        username=username,
+        complete=identity.complete and name is not IDENTITY_OMITTED and username is not IDENTITY_OMITTED,
+    )

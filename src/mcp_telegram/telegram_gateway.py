@@ -62,6 +62,7 @@ from .entity_profile.contracts import (
     ProjectionStatus,
     StoryProfileValidationCategory,
     StoryProfileValidationError,
+    SuppliedDialogFacts,
     SuppliedProfileUser,
     TargetKind,
     UserAvatarHistoryObservation,
@@ -80,11 +81,12 @@ from .entity_profile.semantic_normalization import normalize_collection_item
 from .entity_profile.updates import ProfilePush, project_user_profile
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .identity_observation import USERNAME_UNOBSERVED, observe_username
+from .messages.telegram_adapter import extract_received_messages
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_reading import GatewayFailure, GatewayFailureKind
 from .telegram_rpc_error import describe_telegram_rpc_error, is_reaction_detail_terminal_rpc_error
 from .telegram_rpc_scheduler import RpcAdmissionClosedError, RpcAdmissionError, UnclassifiedTelegramRpcError
-from .telethon_dialog import classify_dialog_type, observe_dialog_identity
+from .telethon_dialog import classify_dialog_type, observe_dialog_identity, observe_referenced_dialog_identities
 
 CATCHABLE_GATEWAY_FAILURES = (Exception,)
 
@@ -171,6 +173,7 @@ class TelethonChannelProfileGateway(ChannelProfilePort):
                 result, channel_id, observed_at=int(started_at)
             ),
             chat_entity_fields=_channel_profile_entity_fields(result, channel_id),
+            supplied_dialog_facts=_supplied_dialog_facts(result, full_chat, channel_id, observed_at=int(started_at)),
         )
 
     async def fetch_channel_contact_overlap(self, reference: ChannelReference) -> ChannelContactOverlapObservation:
@@ -267,6 +270,7 @@ class TelethonGroupProfileGateway(GroupProfilePort):
                 result, group_id, raw_group_id, observed_at=started_at
             ),
             chat_entity_fields=_group_profile_entity_fields(result, raw_group_id),
+            supplied_dialog_facts=_supplied_dialog_facts(result, full_chat, group_id, observed_at=started_at),
             participants_count=_group_profile_participants_count(result, raw_group_id),
         )
 
@@ -349,7 +353,7 @@ class TelethonChatAvatarHistoryGateway(ChatAvatarHistoryPort):
                     from_id=None,
                 )
             )
-            photos, reported_count, status = _normalize_chat_photos(result, reference)
+            photos, reported_count, status, reason = _normalize_chat_photos(result, reference)
             completed_at = self._now_provider()
         except ACCESS_LOST_ERRORS:
             completed_at = self._now_provider()
@@ -366,9 +370,14 @@ class TelethonChatAvatarHistoryGateway(ChatAvatarHistoryPort):
             photos,
             reported_count,
             status,
-            "bounded_page" if status is ProjectionStatus.PARTIAL else None,
+            reason,
             started_at,
             completed_at,
+            extract_received_messages(
+                cast(
+                    types.messages.Messages | types.messages.MessagesSlice | types.messages.ChannelMessages, result
+                ).messages
+            ),
         )
 
 
@@ -438,7 +447,8 @@ class TelethonUserProfileGateway(UserProfilePort):
             observation=ObservationBoundary(started_at=started_at, completed_at=completed_at),
         )
         current_photo = _normalize_user_current_photo(result, user_id)
-        return replace(observation, current_photo=current_photo)
+        identities = _full_user_referenced_identities(result, user_id, normalized_kind, observed_at=int(started_at))
+        return replace(observation, current_photo=current_photo, referenced_identities=identities)
 
     async def fetch_profile_collection_page(
         self, reference: UserReference, section: str, cursor: Mapping[str, object]
@@ -670,6 +680,89 @@ def _collection_metadata(section: str, result: object) -> Mapping[str, object]:
         if value is not None:
             metadata[name] = value
     return metadata
+
+
+def _full_chat_referenced_identities(
+    result: object, full_chat: object, target_id: int, *, observed_at: int
+) -> tuple[DialogIdentityObservation, ...]:
+    referenced: set[int] = set()
+    if isinstance(full_chat, types.ChannelFull):
+        linked = _nonnegative_int(getattr(full_chat, "linked_chat_id", None))
+        if linked:
+            referenced.add(int(get_peer_id(types.PeerChannel(linked))))
+    elif isinstance(full_chat, types.ChatFull):
+        referenced.update(_group_participant_references(full_chat))
+    referenced.discard(target_id)
+    entities = [
+        *cast(Sequence[object], getattr(result, "users", ()) or ()),
+        *cast(Sequence[object], getattr(result, "chats", ()) or ()),
+    ]
+    return observe_referenced_dialog_identities(entities, referenced, source="profile", observed_at=observed_at)
+
+
+def _group_participant_references(full_chat: types.ChatFull) -> set[int]:
+    participants = getattr(full_chat, "participants", None)
+    if not isinstance(participants, (types.ChatParticipants, types.ChatParticipantsForbidden)):
+        return set()
+    raw_values = getattr(participants, "participants", ())
+    values: list[object] = list(raw_values) if isinstance(raw_values, (list, tuple)) else []
+    values.append(getattr(participants, "self_participant", None))
+    referenced: set[int] = set()
+    for participant in values:
+        if isinstance(participant, (types.ChatParticipant, types.ChatParticipantAdmin, types.ChatParticipantCreator)):
+            user_id = _nonnegative_int(getattr(participant, "user_id", None))
+            if user_id:
+                referenced.add(user_id)
+    return referenced
+
+
+def _full_user_referenced_identities(
+    result: object, target_id: int, target_kind: TargetKind, *, observed_at: int
+) -> tuple[DialogIdentityObservation, ...]:
+    full_user = getattr(result, "full_user", None)
+    if not isinstance(full_user, types.UserFull) or full_user.id != target_id:
+        return ()
+    referenced: set[int] = set()
+    channel_id = _nonnegative_int(getattr(full_user, "personal_channel_id", None))
+    if channel_id:
+        referenced.add(int(get_peer_id(types.PeerChannel(channel_id))))
+    manager_id = _nonnegative_int(getattr(full_user, "bot_manager_id", None))
+    if manager_id and target_kind is TargetKind.BOT:
+        referenced.add(manager_id)
+    referenced.discard(target_id)
+    entities = [
+        *cast(Sequence[object], getattr(result, "users", ()) or ()),
+        *cast(Sequence[object], getattr(result, "chats", ()) or ()),
+    ]
+    return observe_referenced_dialog_identities(entities, referenced, source="profile", observed_at=observed_at)
+
+
+def _supplied_dialog_facts(
+    result: object, full_chat: object, target_id: int, *, observed_at: int
+) -> SuppliedDialogFacts:
+    """Normalize only supported cursor, notification and user-sidecar facts."""
+    settings = getattr(full_chat, "notify_settings", None)
+    mute = getattr(settings, "mute_until", None)
+    if isinstance(mute, datetime):
+        mute = int(mute.timestamp())
+    mute_until = _nonnegative_int(mute)
+    referenced = _full_chat_referenced_identities(result, full_chat, target_id, observed_at=observed_at)
+    referenced_ids = {identity.dialog_id for identity in referenced}
+    identities: list[DialogIdentityObservation] = []
+    for user in cast(Sequence[object], getattr(result, "users", ()) or ()):
+        if not isinstance(user, types.User) or user.id in referenced_ids:
+            continue
+        identity = observe_dialog_identity(user, dialog_id=user.id, source="profile", observed_at=observed_at)
+        if identity is not None:
+            identities.append(identity)
+    return SuppliedDialogFacts(
+        read_inbox_max_id=_nonnegative_int(getattr(full_chat, "read_inbox_max_id", None)),
+        read_outbox_max_id=_nonnegative_int(getattr(full_chat, "read_outbox_max_id", None)),
+        unread_count=_nonnegative_int(getattr(full_chat, "unread_count", None)),
+        mute_until=mute_until,
+        sidecar_identities=tuple(identities),
+        referenced_identities=referenced,
+    )
 
 
 def _collection_sidecars(page: ProfileCollectionPage, result: object) -> ProfileCollectionPage:
@@ -1219,35 +1312,49 @@ def _normalize_photo_user_ids(users: Sequence[object]) -> set[int]:
 
 def _normalize_chat_photos(
     result: object, reference: ChatAvatarReference
-) -> tuple[tuple[ChatCurrentPhoto, ...], int, ProjectionStatus]:
+) -> tuple[tuple[ChatCurrentPhoto, ...], int, ProjectionStatus, str | None]:
     accepted = (types.messages.Messages, types.messages.MessagesSlice, types.messages.ChannelMessages)
     if not isinstance(result, accepted):
         raise ValueError("chat photos envelope is invalid")
     raw_messages = getattr(result, "messages", None)
     if not isinstance(raw_messages, Sequence) or isinstance(raw_messages, str | bytes | bytearray):
         raise ValueError("chat photo messages are invalid")
-    photos: list[ChatCurrentPhoto] = []
-    seen: set[int] = set()
-    for message in raw_messages:
-        photo = _normalize_chat_photo(message, reference, seen)
-        if photo is not None:
-            photos.append(photo)
+    photos, inconsistent_peer = _chat_photo_page_values(raw_messages, reference)
     reported = _count_or_length(result, len(photos))
     status = (
         ProjectionStatus.PARTIAL
-        if isinstance(result, (types.messages.MessagesSlice, types.messages.ChannelMessages))
+        if inconsistent_peer or isinstance(result, (types.messages.MessagesSlice, types.messages.ChannelMessages))
         else ProjectionStatus.USABLE
     )
-    return tuple(photos), max(reported, len(photos)), status
+    reason = (
+        "inconsistent_peer" if inconsistent_peer else "bounded_page" if status is ProjectionStatus.PARTIAL else None
+    )
+    return photos, max(reported, len(photos)), status, reason
 
 
-def _normalize_chat_photo(message: object, reference: ChatAvatarReference, seen: set[int]) -> ChatCurrentPhoto | None:
+def _chat_photo_page_values(
+    messages: Sequence[object], reference: ChatAvatarReference
+) -> tuple[tuple[ChatCurrentPhoto, ...], bool]:
+    photos: list[ChatCurrentPhoto] = []
+    seen: set[int] = set()
+    inconsistent_peer = False
+    for message in messages:
+        if isinstance(message, (types.Message, types.MessageService)) and not _chat_message_matches_reference(
+            message, reference
+        ):
+            inconsistent_peer = True
+            continue
+        photo = _normalize_chat_photo(message, seen)
+        if photo is not None:
+            photos.append(photo)
+    return tuple(photos), inconsistent_peer
+
+
+def _normalize_chat_photo(message: object, seen: set[int]) -> ChatCurrentPhoto | None:
     if isinstance(message, types.MessageEmpty):
         return None
     if not isinstance(message, (types.Message, types.MessageService)):
         raise ValueError("chat photo message is invalid")
-    if not _chat_message_matches_reference(message, reference):
-        raise ValueError("chat photo message target does not match")
     action = getattr(message, "action", None)
     if not isinstance(action, types.MessageActionChatEditPhoto):
         return None

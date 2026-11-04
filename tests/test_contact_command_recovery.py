@@ -66,6 +66,7 @@ async def _fixture(path: Path) -> AsyncIterator[_Fixture]:
 
     def seed(conn: sqlite3.Connection) -> None:
         with write_transaction(conn):
+            conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
             conn.execute("INSERT INTO entities(id,type,updated_at) VALUES(2,'user',0)")
             conn.execute(
                 "INSERT INTO entity_profile_semantic_snapshots(owner_account_id,entity_id,normalization_version,fields_json,coverage_json,provenance_json,source) VALUES(1,2,?,?,?,?,?)",
@@ -290,8 +291,14 @@ async def test_startup_unknown_delete_reconciles_with_background_full_user(tmp_p
 
         class ProfileClient(_PairClient):
             calls = 0
-            capture_image_scope: Callable[[], ScopeToken | None]
-            claim_image_scope: Callable[[ScopeToken], bool]
+            capture_scope: Callable[[], ScopeToken | None]
+            claim_scope: Callable[[ScopeToken], bool]
+
+            def capture_image_scope(self) -> ScopeToken | None:
+                return self.capture_scope()
+
+            def claim_image_scope(self, token: ScopeToken) -> bool:
+                return self.claim_scope(token)
 
             async def fetch_user_profile(
                 self, user_id: int, target_kind: TargetKind, *, owner_account_id: int | None = None
@@ -316,8 +323,8 @@ async def test_startup_unknown_delete_reconciles_with_background_full_user(tmp_p
                 )
 
         client = ProfileClient()
-        client.capture_image_scope = f.cell.capture
-        client.claim_image_scope = f.cell.claim
+        client.capture_scope = f.cell.capture
+        client.claim_scope = f.cell.claim
         service = cast(DaemonEntityInfoService, _pair_service(f.reader, client, enabled=True))
         service._deps = replace(
             service._deps,
@@ -461,8 +468,14 @@ async def test_ack_create_background_readback_allows_newly_visible_phone(tmp_pat
         assert result["outcome"] == "acknowledged" and result["verification"] == "unavailable"
 
         class ProfileClient(_PairClient):
-            capture_image_scope: Callable[[], ScopeToken | None]
-            claim_image_scope: Callable[[ScopeToken], bool]
+            capture_scope: Callable[[], ScopeToken | None]
+            claim_scope: Callable[[ScopeToken], bool]
+
+            def capture_image_scope(self) -> ScopeToken | None:
+                return self.capture_scope()
+
+            def claim_image_scope(self, token: ScopeToken) -> bool:
+                return self.claim_scope(token)
 
             async def fetch_user_profile(
                 self, user_id: int, target_kind: TargetKind, *, owner_account_id: int | None = None
@@ -486,7 +499,7 @@ async def test_ack_create_background_readback_allows_newly_visible_phone(tmp_pat
                 )
 
         client = ProfileClient()
-        client.capture_image_scope, client.claim_image_scope = f.cell.capture, f.cell.claim
+        client.capture_image_scope, client.claim_scope = f.cell.capture, f.cell.claim
         service = cast(DaemonEntityInfoService, _pair_service(f.reader, client, enabled=True))
         service._deps = replace(
             service._deps,

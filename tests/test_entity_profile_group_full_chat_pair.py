@@ -13,11 +13,13 @@ from typing import cast
 import pytest
 from telethon.tl import types
 
+from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
 from mcp_telegram.entity_profile.contracts import GroupProfileObservation
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.entity_profile.repository import EntitySectionCommit
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.image_authorization import ScopeCell, ScopeToken
 from mcp_telegram.telegram_demand import RpcAttemptBudgetExhaustedError
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 from mcp_telegram.telethon_dialog import observe_dialog_identity
@@ -53,12 +55,20 @@ def _full_chat(
 
 class _GroupClient:
     def __init__(self, response: object, *, failure: BaseException | None = None) -> None:
+        self.scope_cell = ScopeCell()
+        assert self.scope_cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
         self.response = response
         self.failure = failure
         self.calls: list[str] = []
         self.search_response: object = SimpleNamespace(count=0, messages=[])
         self.after_call: Callable[[], None] | None = None
         self.created: int | None = None
+
+    def capture_image_scope(self) -> ScopeToken | None:
+        return self.scope_cell.capture()
+
+    def claim_image_scope(self, token: ScopeToken) -> bool:
+        return self.scope_cell.claim(token)
 
     async def __call__(self, request: object) -> object:
         scope = current_rpc_scope()
@@ -158,6 +168,9 @@ class _GroupProfilePort:
 def _service() -> tuple[sqlite3.Connection, DaemonEntityInfoService, _GroupClient]:
     conn = sqlite3.connect(":memory:")
     _fenced_schema(conn, semantic=False)
+    conn.executescript(
+        "CREATE TABLE dialog_directory_state(singleton INTEGER PRIMARY KEY, account_id INTEGER); INSERT INTO dialog_directory_state VALUES(1,42); CREATE TABLE dialog_fact_observations(dialog_id INTEGER,field TEXT,observation_order INTEGER,PRIMARY KEY(dialog_id,field));"
+    )
     conn.execute("INSERT INTO entities VALUES (-123, 'group', 'Group', NULL, NULL, 1)")
     conn.commit()
     client = _GroupClient(_full_chat())

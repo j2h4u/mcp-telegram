@@ -287,8 +287,8 @@ async def test_topic_create_inserts_topic_metadata_row(
     assert row is not None
     assert row["title"] == "General"
     assert row["icon_emoji_id"] == 42
-    assert row["pinned"] == 0
-    assert row["hidden"] == 0
+    assert row["pinned"] is None
+    assert row["hidden"] is None
     assert row["snapshot_at"] is not None and row["snapshot_at"] > 0
 
 
@@ -521,12 +521,12 @@ async def test_topic_edit_hidden_sets_hidden_flag(
 
 
 @pytest.mark.asyncio
-async def test_topic_edit_hidden_on_missing_row_is_noop(
+async def test_topic_edit_hidden_on_missing_row_is_retained(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """hidden=True UPDATE on absent row is silent no-op; no INSERT performed."""
+    """A supplied hidden flag creates a partial topic without inventing a title."""
     dialog_id = 12345
     _enroll_synced(sync_db, dialog_id)
     # No seed row
@@ -542,7 +542,9 @@ async def test_topic_edit_hidden_on_missing_row_is_noop(
     )
     await mgr.on_new_message(event)  # must not raise
 
-    assert _topic_count(sync_db) == 0
+    row = _topic_row(sync_db, dialog_id, 100)
+    assert row["hidden"] == 1
+    assert row["title"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -656,12 +658,12 @@ async def test_update_pinned_forum_topic_skips_unenrolled_dialog(
 
 
 @pytest.mark.asyncio
-async def test_update_pinned_forum_topic_unknown_topic_is_noop(
+async def test_update_pinned_forum_topic_unknown_topic_is_retained(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """Enrolled dialog, no seed row → UPDATE matches 0 rows, no exception, no INSERT."""
+    """An enrolled dialog retains a supplied pin even before topic enumeration."""
     channel_id = 12345
     dialog_id = get_peer_id(PeerChannel(channel_id))
     _enroll_synced(sync_db, dialog_id)
@@ -677,7 +679,9 @@ async def test_update_pinned_forum_topic_unknown_topic_is_noop(
     )
     await mgr.on_raw_forum_topic_pinned(cast(_ForumTopicPinnedUpdateLike, update))  # must not raise
 
-    assert _topic_count(sync_db) == 0
+    row = _topic_row(sync_db, dialog_id, 100)
+    assert row["pinned"] == 1
+    assert row["title"] is None
 
 
 @pytest.mark.asyncio

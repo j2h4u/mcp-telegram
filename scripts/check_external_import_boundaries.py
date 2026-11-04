@@ -82,6 +82,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "folders/ports.py",  # Transaction-local projection binding to the shared SQLite owner.
             "folders/read_repository.py",
             "fts.py",
+            "message_history/identity_intake.py",  # Account-fenced history identity transaction owner.
             "history_enrollment.py",
             "hydration_queue.py",
             "image_authorization.py",  # Connection-bound active-target revocation registry.
@@ -119,6 +120,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "telegram.py",  # Stopped-service factory binds the shared SQLite safety store.
             "topics/catalog.py",  # Durable topic catalog receipts and page progress in sync.db.
             "topics/demand.py",  # Read projection bound to the shared writer for topic acquisition.
+            "topics/refresh.py",  # Writer transactions reserve and atomically publish topic/message facts.
             "topics/sqlite_repository.py",
             "topics/ports.py",  # Transaction-local projection binding to the shared SQLite owner.
             "unread_state.py",

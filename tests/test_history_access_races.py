@@ -13,12 +13,17 @@ from telethon.tl.types.messages import Messages
 from mcp_telegram.activity_cold_backfill import _cold_claim_matches
 from mcp_telegram.activity_hot_sweep import _begin_hot_window, _hot_state_matches
 from mcp_telegram.activity_peer_sweep import PeerSweepRequest, enroll_activity_dialog, sweep_peer_once
-from mcp_telegram.message_history.contracts import FullHistoryPage
+from mcp_telegram.message_history.contracts import FullHistoryPage, HistoryAccessProbeResult
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import _apply_migrations
 from mcp_telegram.sync_worker import FullSyncWorker
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.history_scope_helpers import HistoryScope
 from tests.sqlite_writer_helpers import inline_writer
+
+
+class _ProbeScope(HistoryScope):
+    pass
 
 
 @pytest.mark.parametrize("loss_at", ["resolve", "search"])
@@ -26,6 +31,7 @@ from tests.sqlite_writer_helpers import inline_writer
 async def test_page_rejects_access_loss_during_await(monkeypatch: pytest.MonkeyPatch, loss_at: str, tier: str) -> None:
     with closing(sqlite3.connect(":memory:")) as conn:
         _apply_migrations(conn)
+        conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
         conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(1,'synced')")
         conn.commit()
         enroll_activity_dialog(conn, 1, "user", last_activity_at=1)
@@ -41,7 +47,7 @@ async def test_page_rejects_access_loss_during_await(monkeypatch: pytest.MonkeyP
         entered, release = asyncio.Event(), asyncio.Event()
         searches = 0
 
-        class Client:
+        class Client(_ProbeScope):
             async def __call__(self, request: object) -> object:
                 raise AssertionError("Search must use the governed request boundary")
 
@@ -78,6 +84,7 @@ async def test_page_rejects_access_loss_during_await(monkeypatch: pytest.MonkeyP
 async def test_total_repair_rechecks_access_after_cursor_writer() -> None:
     with closing(sqlite3.connect(":memory:")) as conn:
         _apply_migrations(conn)
+        conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
         for dialog_id in (1, 2):
             conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(?,'synced')", (dialog_id,))
             seed_full_history_enrollment(conn, dialog_id, enabled=True)
@@ -93,13 +100,13 @@ async def test_total_repair_rechecks_access_after_cursor_writer() -> None:
                     await release.wait()
                 return result
 
-        class Port:
+        class Port(_ProbeScope):
             async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
                 raise AssertionError("unexpected history")
 
-            async def probe_total_messages(self, dialog_id: int) -> int:
+            async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
                 calls.append(dialog_id)
-                return 17
+                return HistoryAccessProbeResult(17, ())
 
         port = Port()
         worker = FullSyncWorker(
@@ -122,19 +129,20 @@ async def test_total_repair_rechecks_access_after_cursor_writer() -> None:
 async def test_total_repair_discards_result_after_access_loss() -> None:
     with closing(sqlite3.connect(":memory:")) as conn:
         _apply_migrations(conn)
+        conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
         conn.execute("INSERT INTO synced_dialogs(dialog_id,status,full_sync_retry_at) VALUES(1,'synced',1)")
         seed_full_history_enrollment(conn, 1, enabled=True)
         conn.commit()
         entered, release = asyncio.Event(), asyncio.Event()
 
-        class Port:
+        class Port(_ProbeScope):
             async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
                 raise AssertionError("unexpected history")
 
-            async def probe_total_messages(self, dialog_id: int) -> int:
+            async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
                 entered.set()
                 await release.wait()
-                return 17
+                return HistoryAccessProbeResult(17, ())
 
         port = Port()
         worker = FullSyncWorker(port, conn, asyncio.Event(), total_messages_probe=port, writer=inline_writer(conn))

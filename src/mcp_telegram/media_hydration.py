@@ -6,14 +6,9 @@ import sqlite3
 from collections.abc import Sequence
 from typing import Protocol, cast
 
-from .fact_hydration import AppliedFacts, HydrationDropObservation, _has_terminal_rpc_symbol
+from .fact_hydration import AppliedFacts, HydrationDropObservation, MediaPublication, _has_terminal_rpc_symbol
 from .hydration_queue import MEDIA_METADATA_KIND, HydrationJob, HydrationQueueRepository
-from .media_fact import encode_media_payload
-from .messages.sqlite_hydration import (
-    apply_hydrated_media_fact,
-    enqueue_transcription_for_hydrated_media,
-    hydration_observation_current,
-)
+from .messages.sqlite_hydration import enqueue_transcription_for_hydrated_media
 from .messages.sqlite_hydration_jobs import (
     media_fact_hydration_eligible,
 )
@@ -63,43 +58,32 @@ class MediaFactHydrationHandler:
         now: int,
         observation_order: int | None = None,
     ) -> AppliedFacts:
-        jobs, stale_observations = self._current_jobs(conn, queue, jobs, observation_order)
-        by_id, valid_response = _response_map(result)
+        del observation_order
+        if not isinstance(result, MediaPublication):
+            raise TypeError("media hydration requires canonical publication result")
+        by_id, valid_response = _response_map(result.response)
         hydrated = completed = 0
-        dropped = len(stale_observations)
-        drop_observations: list[HydrationDropObservation] = stale_observations
+        dropped = 0
+        drop_observations: list[HydrationDropObservation] = []
         if not valid_response:
-            drop_observations.extend(
-                HydrationDropObservation("invalid_result", job.message_id, job.kind, job.dialog_id, job.attempts)
-                for job in jobs
-            )
-            for job in jobs:
-                queue.mark_terminal(job)
+            drop_observations.extend(_drop_unavailable_media(queue, job, result, "invalid_result") for job in jobs)
             return AppliedFacts(dropped=dropped + len(jobs), drop_observations=tuple(drop_observations))
         for job in jobs:
             message = by_id.get(job.message_id)
             if message is None:
-                queue.mark_terminal(job)
                 dropped += 1
-                drop_observations.append(
-                    HydrationDropObservation("missing_response", job.message_id, job.kind, job.dialog_id, job.attempts)
-                )
+                drop_observations.append(_drop_unavailable_media(queue, job, result, "missing_response"))
                 continue
-            fact = extract_media_fact(getattr(message, "media", None))
-            kind = None if fact is None else fact.kind
-            payload = encode_media_payload(fact)
-            applied = apply_hydrated_media_fact(
-                conn, job.dialog_id, job.message_id, kind, payload, observation_order=observation_order
-            )
-            queue.remove(job)
-            if not applied:
+            if job.message_id not in result.accepted_message_ids:
+                queue.requeue_not_applied(job, job.due_at)
                 dropped += 1
                 drop_observations.append(
                     HydrationDropObservation("not_applied", job.message_id, job.kind, job.dialog_id, job.attempts)
                 )
-            else:
-                completed += 1
-            if fact is not None and applied:
+                continue
+            queue.remove(job)
+            completed += 1
+            if extract_media_fact(getattr(message, "media", None)) is not None:
                 hydrated += 1
                 enqueue_transcription_for_hydrated_media(conn, job.dialog_id, job.message_id, due_at=now)
         return AppliedFacts(
@@ -109,28 +93,19 @@ class MediaFactHydrationHandler:
             drop_observations=tuple(drop_observations),
         )
 
-    def _current_jobs(
-        self,
-        conn: sqlite3.Connection,
-        queue: HydrationQueueRepository,
-        jobs: Sequence[HydrationJob],
-        observation_order: int | None,
-    ) -> tuple[list[HydrationJob], list[HydrationDropObservation]]:
-        current_jobs = []
-        stale_observations = []
-        for job in jobs:
-            if hydration_observation_current(conn, job.dialog_id, job.message_id, observation_order):
-                current_jobs.append(job)
-            else:
-                if not self.eligible(conn, job):
-                    queue.remove(job)
-                stale_observations.append(
-                    HydrationDropObservation("not_applied", job.message_id, job.kind, job.dialog_id, job.attempts)
-                )
-        return current_jobs, stale_observations
-
     def is_terminal_error(self, exc: BaseException) -> bool:
         return _has_terminal_rpc_symbol(exc, _TERMINAL_RPC_SYMBOLS)
+
+
+def _drop_unavailable_media(
+    queue: HydrationQueueRepository, job: HydrationJob, result: MediaPublication, reason: str
+) -> HydrationDropObservation:
+    if job.message_id in result.superseded_message_ids:
+        queue.requeue_not_applied(job, job.due_at)
+        reason = "not_applied"
+    else:
+        queue.mark_terminal(job)
+    return HydrationDropObservation(reason, job.message_id, job.kind, job.dialog_id, job.attempts)
 
 
 def _response_map(result: object) -> tuple[dict[int, object], bool]:

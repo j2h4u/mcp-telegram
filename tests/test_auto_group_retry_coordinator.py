@@ -6,15 +6,25 @@ from unittest.mock import patch
 import pytest
 
 from mcp_telegram.config import AutomaticGroupHistoryConfig
-from mcp_telegram.message_history.contracts import FullHistoryPage, MessageHistoryUnavailableError
+from mcp_telegram.message_history.contracts import (
+    FullHistoryPage,
+    HistoryAccessProbeResult,
+    MessageHistoryUnavailableError,
+)
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncWorker
 from mcp_telegram.telegram_demand import DemandStatus, DurableDemandAdapter, RpcAttemptBudget
 from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator
 from mcp_telegram.telegram_demand_progress import SliceOutcome, WorkRevision
 from mcp_telegram.telegram_rpc_consumers import DURABLE_DEMAND_ORDER, DemandKind
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.history_scope_helpers import HistoryScope
 from tests.sqlite_writer_helpers import inline_writer
 from tests.test_fact_demand_adapters import _hydration_db
+
+
+class _ProbeScope(HistoryScope):
+    def __init__(self) -> None:
+        super().__init__(1)
 
 
 class IdleAdapter:
@@ -25,7 +35,7 @@ class IdleAdapter:
         raise AssertionError("idle adapter was selected")
 
 
-class UnusedPort:
+class UnusedPort(_ProbeScope):
     async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
         raise AssertionError("selection performed a Telegram read")
 
@@ -34,12 +44,13 @@ class UnusedPort:
 @pytest.mark.parametrize("failure", ["missing", "timeout", "unavailable"])
 async def test_automatic_probe_retries_at_durable_floor_without_restart(failure: str) -> None:
     conn = _hydration_db()
+    conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
     conn.execute("INSERT INTO dialogs(dialog_id,type,members,created) VALUES (501,'group',1,1)")
     conn.commit()
     now = [1000.0]
     retried, settled, timer, stop = (asyncio.Event() for _ in range(4))
 
-    class Port:
+    class Port(_ProbeScope):
         calls = 0
 
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
@@ -108,6 +119,7 @@ async def test_automatic_probe_retries_at_durable_floor_without_restart(failure:
 
 def test_future_enrolled_head_does_not_hide_ready_group_or_peer() -> None:
     conn = _hydration_db()
+    conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
     try:
         conn.execute("INSERT INTO dialogs(dialog_id,type,members,created) VALUES (501,'group',1,1)")
         conn.executemany(
@@ -142,12 +154,13 @@ def test_future_enrolled_head_does_not_hide_ready_group_or_peer() -> None:
 @pytest.mark.parametrize(("total", "expected"), [(5000, (1,)), (5001, (0,)), (None, None)])
 async def test_undecided_group_requires_fresh_bounded_probe(total: int | None, expected: tuple[int] | None) -> None:
     conn = _hydration_db()
+    conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
     try:
         conn.execute("INSERT INTO dialogs(dialog_id,type,members,created) VALUES (501,'group',3,1)")
         conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (501,'own_only')")
         conn.commit()
 
-        class Port:
+        class Port(_ProbeScope):
             async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
                 assert (dialog_id, before_message_id) == (501, 0)
                 return FullHistoryPage((), total, None)
@@ -176,6 +189,7 @@ async def test_undecided_group_requires_fresh_bounded_probe(total: int | None, e
 @pytest.mark.asyncio
 async def test_new_automatic_retry_floor_is_rechecked_before_dispatch() -> None:
     conn = _hydration_db()
+    conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
     try:
         conn.execute("INSERT INTO dialogs(dialog_id,type,members,created) VALUES (501,'group',3,1)")
         conn.commit()
@@ -206,6 +220,8 @@ async def test_existing_history_recovers_from_transient_without_new_revision(
     kind: str, error_type: type[Exception]
 ) -> None:
     conn = _hydration_db()
+    conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
+    conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
     conn.execute(
         "INSERT INTO synced_dialogs(dialog_id,status,total_messages) VALUES (501,?,NULL)",
         ("syncing" if kind == "page" else "synced",),
@@ -215,7 +231,7 @@ async def test_existing_history_recovers_from_transient_without_new_revision(
     now = [1000.0]
     retry, complete, timer, stop = (asyncio.Event() for _ in range(4))
 
-    class Port:
+    class Port(_ProbeScope):
         calls = 0
 
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
@@ -224,11 +240,11 @@ async def test_existing_history_recovers_from_transient_without_new_revision(
                 raise error_type("temporary")
             return FullHistoryPage((), 1, None)
 
-        async def probe_total_messages(self, dialog_id: int) -> int:
+        async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
             self.calls += 1
             if self.calls == 1:
                 raise error_type("temporary")
-            return 1
+            return HistoryAccessProbeResult(1, ())
 
     class Observer:
         def observe_demand(self, **event: object) -> None:
@@ -280,12 +296,13 @@ async def test_explicit_decision_wins_during_probe(enabled: bool) -> None:
     from mcp_telegram.history_enrollment import disable_history, enable_history
 
     conn = _hydration_db()
+    conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
     try:
         conn.execute("INSERT INTO dialogs(dialog_id,type,members,created) VALUES (501,'group',3,1)")
         conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (501,'own_only')")
         conn.commit()
 
-        class Port:
+        class Port(_ProbeScope):
             async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
                 if enabled:
                     enable_history(conn, dialog_id, now=1000)
@@ -314,6 +331,7 @@ async def test_explicit_decision_wins_during_probe(enabled: bool) -> None:
 
 def test_ready_automatic_probe_precedes_ready_total_repair() -> None:
     conn = _hydration_db()
+    conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
     try:
         conn.execute("INSERT INTO dialogs(dialog_id,type,members,created) VALUES (501,'group',3,1)")
         conn.execute("INSERT INTO synced_dialogs(dialog_id,status,total_messages) VALUES (502,'synced',NULL)")
@@ -343,6 +361,7 @@ def test_ready_automatic_probe_precedes_ready_total_repair() -> None:
 
 def test_disabled_group_is_not_selected_for_automatic_probe() -> None:
     conn = _hydration_db()
+    conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
     try:
         conn.execute("INSERT INTO dialogs(dialog_id,type,members,created) VALUES (501,'group',3,1)")
         conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (501,'own_only')")

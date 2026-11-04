@@ -13,6 +13,8 @@ from telethon import functions, types
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService, _EntityInfoClient
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.sqlite_writer import SQLiteWriter
+from mcp_telegram.state import telegram_session_lease
+from mcp_telegram.sync_transactions import write_savepoint
 from mcp_telegram.telegram_demand import DemandStatus, DurableDemandAdapter
 from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator
 from mcp_telegram.telegram_demand_progress import SliceOutcomeKind
@@ -33,6 +35,9 @@ async def profile_setup(
     gate = wire[0]
     conn, prior = _prepare(tmp_path / "profile.sqlite", migrated=True)
     await prior.shutdown()  # type: ignore[attr-defined]
+    with write_savepoint(conn):
+        conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.commit()
     _prepare_self(conn)
     writer = await SQLiteWriter.open(tmp_path / "profile.sqlite")
     service = cast(DaemonEntityInfoService, _pair_service(conn, _PairClient(), enabled=True))
@@ -54,12 +59,14 @@ async def profile_setup(
     assert refresh is not None
     refresh._limits = service._deps.refresh_limits
     profile = EntityProfileDemandAdapter(refresh)
-    try:
-        yield conn, service, profile
-    finally:
-        await service.shutdown()
-        await writer.aclose()
-        conn.close()
+    with telegram_session_lease(tmp_path) as lease:
+        gate.bind_session_lease(lease)
+        try:
+            yield conn, service, profile
+        finally:
+            await service.shutdown()
+            await writer.aclose()
+            conn.close()
 
 
 async def test_profile_claim_wait_keeps_ticket_and_allows_sibling(

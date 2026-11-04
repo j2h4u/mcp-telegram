@@ -31,7 +31,7 @@ def current_source(conn: sqlite3.Connection, dialog_id: int, message_id: int) ->
     row = cast(
         tuple[int | None, int, str | None, str | None, int | None] | None,
         conn.execute(
-            "SELECT s.photo_id,COALESCE(o.observation_order,0),m.media_kind,m.media_payload,s.eligible FROM messages m "
+            "SELECT s.photo_id,COALESCE(s.observation_order,0),m.media_kind,m.media_payload,s.eligible FROM messages m "
             "LEFT JOIN message_observations o USING(dialog_id,message_id) "
             "LEFT JOIN message_image_sources s USING(dialog_id,message_id) "
             "WHERE m.dialog_id=? AND m.message_id=? AND m.is_deleted=0 AND COALESCE(o.is_deleted,0)=0",

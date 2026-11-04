@@ -36,8 +36,11 @@ from ..entity_store import (
     ensure_entity_stub,
     upsert_entity_snapshots,
 )
+from ..image_authorization import ScopeToken
+from ..message_contracts import ReceivedMessage
 from ..models import DialogType
 from ..own_only_contracts import CHANNEL_PEER_ID_OFFSET
+from ..reactions.contracts import ReactionObservationBoundary
 from ..reading.sqlite_projection import last_retained_message_key, read_retained_message_action_page
 from ..resolver import latinize
 from ..sync_transactions import read_snapshot, require_write_transaction, write_savepoint
@@ -71,6 +74,7 @@ from .contracts import (
     ProfileCollectionPage,
     ProfileFieldObservation,
     ProfileSemanticSnapshot,
+    SuppliedDialogFacts,
     SuppliedProfileUser,
 )
 from .membership import MembershipChange, MembershipSignalCounts, membership_signal
@@ -150,6 +154,14 @@ class EntityRefreshCursor:
 
 
 @dataclass(frozen=True, slots=True)
+class ChatAvatarMessageIntake:
+    messages: tuple[ReceivedMessage, ...]
+    scope: ScopeToken
+    observation_order: int
+    reaction_boundary: ReactionObservationBoundary
+
+
+@dataclass(frozen=True, slots=True)
 class EntitySectionCommit:
     detail_patch: Mapping[str, object]
     status: str = "fresh"
@@ -166,6 +178,8 @@ class EntitySectionCommit:
     field_observation: ProfileFieldObservation | None = None
     semantic_snapshot: ProfileSemanticSnapshot | None = None
     collection_page: ProfileCollectionPage | None = None
+    chat_avatar_messages: ChatAvatarMessageIntake | None = None
+    supplied_dialog_facts: SuppliedDialogFacts | None = None
     note_refinement_guard: Callable[[], bool] | None = None
     contact_refinement_guard: Callable[[], bool] | None = None
 
@@ -2321,7 +2335,7 @@ class EntityProfileRepository:
             self.apply_supplied_user(page.supplied_user, observation=observation, boundary=page.observation)
         for identity in page.sidecar_identities:
             if identity.dialog_id != page.entity_id:
-                self._publish_supplied_identity(identity, observation)
+                self.publish_supplied_identity(identity, observation)
 
     def _advance_collection(
         self,
@@ -2417,10 +2431,40 @@ class EntityProfileRepository:
         )
         return reconciled
 
-    def _publish_supplied_identity(
+    def fence_received_profile_identity(
+        self, commit: EntitySectionCommit, observation: ProfileFieldObservation
+    ) -> EntitySectionCommit:
+        """Keep only target identity fields that own the original request order."""
+        identity = commit.dialog_identity_observation
+        if identity is None:
+            return commit
+        name = identity.name
+        username = identity.username
+        if name is not IDENTITY_OMITTED and not claim_dialog_fact(
+            self._conn, identity.dialog_id, "name", observation.order
+        ):
+            name = IDENTITY_OMITTED
+        if username is not IDENTITY_OMITTED and not claim_dialog_fact(
+            self._conn, identity.dialog_id, "username", observation.order
+        ):
+            username = IDENTITY_OMITTED
+        identity = replace(
+            identity,
+            name=name,
+            username=username,
+            complete=name is not IDENTITY_OMITTED and username is not IDENTITY_OMITTED,
+        )
+        patch = dict(commit.identity_patch or {})
+        if name is IDENTITY_OMITTED:
+            patch.pop("name", None)
+        if username is IDENTITY_OMITTED:
+            patch.pop("username", None)
+        return replace(commit, identity_patch=patch, dialog_identity_observation=identity)
+
+    def publish_supplied_identity(
         self, identity: DialogIdentityObservation, observation: ProfileFieldObservation
     ) -> None:
-        if not identity.complete or not self._read_entity_stub(identity.dialog_id):
+        if not self._read_entity_stub(identity.dialog_id):
             return
         name = identity.name
         username = identity.username

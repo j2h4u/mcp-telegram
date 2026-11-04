@@ -16,8 +16,9 @@ _LATEST_RETAINED_MESSAGE_SQL = (
 
 # list_topics - read from topic_metadata snapshot.
 _LIST_TOPICS_SQL = (
-    "SELECT topic_id, title, icon_emoji_id, date, icon_emoji, icon_color, pinned, hidden, snapshot_at "
+    "SELECT topic_id, CASE WHEN known_fields & 1 != 0 THEN title END, icon_emoji_id, date, icon_emoji, icon_color, "
+    "CASE WHEN known_fields & 8 != 0 THEN pinned END, CASE WHEN known_fields & 16 != 0 THEN hidden END, snapshot_at "
     "FROM topic_metadata "
-    "WHERE dialog_id = ? AND is_deleted = 0 AND hidden = 0 AND catalog_present = 1 "
+    "WHERE dialog_id = ? AND is_deleted = 0 AND catalog_present = 1 "
     "ORDER BY topic_id ASC"
 )

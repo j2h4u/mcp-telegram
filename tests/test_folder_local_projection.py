@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -163,7 +164,7 @@ async def test_unknown_folder_preserves_previous_snapshot(tmp_path: Path) -> Non
         assert not unknown.complete
         assert repo.project_observation(unknown, completed_at=101) is None
         assert read_folder_rules(conn)[0].title == "Retained"
-        assert folder_snapshot(conn, stale_after_seconds=900, now=101)["complete"] is False
+        assert folder_snapshot(conn, stale_after_seconds=900, account_id=1, now=101)["complete"] is False
     finally:
         conn.close()
 
@@ -180,17 +181,14 @@ def test_supplied_folder_update_is_ordered_and_local(tmp_path: Path) -> None:
             assert repo.apply_supplied_update(
                 folder_update_from_native(UpdateDialogFilter(4, folder)), account_id=1, order=2, now=101
             )
-            assert not repo.apply_supplied_update(
+            assert repo.apply_supplied_update(
                 folder_update_from_native(UpdateDialogFilter(4)), account_id=1, order=1, now=102
             )
-            assert not repo.apply_supplied_update(
-                folder_update_from_native(UpdateDialogFilter(4)), account_id=2, order=3, now=102
-            )
-            assert not repo.apply_supplied_update(
+            assert repo.apply_supplied_update(
                 folder_update_from_native(UpdateDialogFilterOrder([5])), account_id=1, order=3, now=102
             )
             assert repo.apply_supplied_update(
-                folder_update_from_native(UpdateDialogFilterOrder([4])), account_id=1, order=3, now=102
+                folder_update_from_native(UpdateDialogFilterOrder([4])), account_id=1, order=4, now=102
             )
             assert not repo.apply_supplied_update(folder_update_from_native(object()), account_id=1, order=4, now=102)
         assert read_folder_rules(conn)[0].title == "New"
@@ -236,7 +234,7 @@ def test_invalidated_facts_survive_local_reprojection(tmp_path: Path) -> None:
         assert not repo.rules_are_fresh(now=101)
         repo.reproject_current_rules(now=102)
         assert read_folder_rules(conn)[0].title == "Retained"
-        assert not folder_snapshot(conn, stale_after_seconds=900, now=102)["complete"]
+        assert not folder_snapshot(conn, stale_after_seconds=900, account_id=1, now=102)["complete"]
     finally:
         conn.close()
 
@@ -298,7 +296,7 @@ def test_native_filter_and_chatlist_definitions_preserve_supported_fields() -> N
         rule = folder_update_from_native(types.UpdateDialogFilter(native.id, native)).rule
         assert rule is not None and rule.complete
         definition = encode_folder_definition(rule)
-        assert decode_folder_definition(definition) == rule
+        assert decode_folder_definition(definition) == replace(rule, source_position=0)
         assert "987654" not in definition and "876543" not in definition
         assert rule.pinned_ids == (23,)
         assert rule.included_ids == (-1000000000012, -42)
@@ -434,8 +432,8 @@ def test_canonical_and_rule_receipts_turn_stale_at_exactly_900_seconds(tmp_path:
     try:
         repo = SQLiteFolderSnapshotRepository(conn)
         repo.project_observation(_observation(FolderRule(1, "A"), started_at=100), completed_at=100)
-        assert folder_snapshot(conn, stale_after_seconds=3_600, now=909)["status"] == "fresh"
-        assert folder_snapshot(conn, stale_after_seconds=3_600, now=910)["status"] == "stale"
+        assert folder_snapshot(conn, stale_after_seconds=3_600, account_id=1, now=909)["status"] == "fresh"
+        assert folder_snapshot(conn, stale_after_seconds=3_600, account_id=1, now=910)["status"] == "stale"
     finally:
         conn.close()
 

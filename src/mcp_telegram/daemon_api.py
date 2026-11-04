@@ -1862,9 +1862,17 @@ class DaemonAPIServer:
         await self._reproject_due_folder_memberships()
         if self._directory_audit_requested(req):
             return await self._list_dialogs_audit(req)
-        return await self._get_reading_service().list_dialogs(
-            {**req, "folder_snapshot_stale_after_seconds": self._policy.folder_snapshot_stale_after_seconds}
+        scope = self._auth_scope
+        result = await self._get_reading_service().list_dialogs(
+            {
+                **req,
+                "verified_account_id": self._verified_folder_account(),
+                "folder_snapshot_stale_after_seconds": self._policy.folder_snapshot_stale_after_seconds,
+            }
         )
+        if scope != self._auth_scope or (scope is not None and self.self_id != scope.account_id):
+            return self._directory_account_unverified("The verified account changed during the read.")
+        return result
 
     @staticmethod
     def _directory_audit_requested(req: dict[str, object]) -> bool:
@@ -1918,11 +1926,12 @@ class DaemonAPIServer:
             "data": {
                 "account_id": scope.account_id,
                 "catalog_version": folder_catalog_version(self._conn, scope.account_id),
-                "folders": folder_summaries(self._conn),
+                "folders": folder_summaries(self._conn, account_id=scope.account_id),
                 "directory_coverage": read_dialog_directory_coverage(self._conn).to_wire(),
                 "folder_snapshot": folder_snapshot(
                     self._conn,
                     stale_after_seconds=self._policy.folder_snapshot_stale_after_seconds,
+                    account_id=scope.account_id,
                 ),
             },
         }
@@ -1963,8 +1972,8 @@ class DaemonAPIServer:
                 "date": row[3],
                 "icon_emoji": row[4],
                 "icon_color": row[5],
-                "pinned": bool(row[6]),
-                "hidden": bool(row[7]),
+                "pinned": None if row[6] is None else bool(row[6]),
+                "hidden": None if row[7] is None else bool(row[7]),
                 "snapshot_at": row[8],
             }
             for row in rows
@@ -2363,7 +2372,9 @@ class DaemonAPIServer:
                     channel_reference_provider=cast(ChannelReferenceProvider, self._channel_profile_port),
                     user_avatar_history_port=self._user_avatar_history_port,
                     chat_avatar_history_port=self._chat_avatar_history_port,
-                    get_dialog_placement=lambda entity_id: dialog_placement(self._conn, entity_id),
+                    get_dialog_placement=lambda entity_id: dialog_placement(
+                        self._conn, entity_id, account_id=self._verified_folder_account()
+                    ),
                     refresh_limits=self._policy.entity_profile,
                     enable_full_user_pair=self._policy.full_user_pair_enabled,
                     full_user_auth_scope=lambda: self._auth_scope,
@@ -2373,6 +2384,10 @@ class DaemonAPIServer:
             if self._demand_sink is not None:
                 self._entity_info_service.bind_demand_sink(self._demand_sink)
         return self._entity_info_service
+
+    def _verified_folder_account(self) -> int | None:
+        scope = self._auth_scope
+        return scope.account_id if scope is not None and self.self_id == scope.account_id else None
 
     async def _get_entity_info(self, req: dict[str, object]) -> dict:
         """Type-tagged entity inspector covering 5 Telegram entity kinds."""
@@ -2387,7 +2402,9 @@ class DaemonAPIServer:
             data = cast(dict[str, object], result.get("data", {}))
             entity_id = data.get("id")
             if isinstance(entity_id, int):
-                data["dialog_placement"] = dialog_placement(self._conn, entity_id)
+                data["dialog_placement"] = dialog_placement(
+                    self._conn, entity_id, account_id=self._verified_folder_account()
+                )
         logger.info(
             "entity_info_dispatch_timing service_s=%.3f dialog_placement_s=%.3f%s",
             fetched_at - started_at,

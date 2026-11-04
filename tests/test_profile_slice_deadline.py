@@ -78,7 +78,7 @@ async def test_deadline_drains_real_writer_and_fences_result(
     await prior.shutdown()  # type: ignore[attr-defined]
     _prepare_self(conn)
     writer = await SQLiteWriter.open(path)
-    client = _PairClient()
+    client = _PairClient(account_id=42)
     service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=True))
     scope = service._deps.full_user_auth_scope
     assert scope is not None

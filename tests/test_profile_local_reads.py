@@ -298,7 +298,9 @@ async def test_rpc_reserves_order_before_acquisition_and_newer_push_wins(tmp_pat
     path = tmp_path / "ordered-profile.sqlite"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
-    client = DelayedProfile(channel_id=None)
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.commit()
+    client = DelayedProfile(channel_id=None, account_id=42)
     service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=True))
     service._profiles.save_core({"id": 42, "type": "user", "name": "Known"}, now=100)
     service._profiles.mark_pending(42, now=100)
@@ -396,6 +398,8 @@ async def test_durable_user_profile_preserves_dynamic_relationship_and_emoji_fie
     path = tmp_path / "relationship-profile.sqlite"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
+    conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
+    conn.commit()
     service = cast(DaemonEntityInfoService, _pair_service(conn, RelationshipProfile(), enabled=True))
     service._profiles.save_core({"id": 42, "type": "user", "name": "Known"}, now=100)
     service._profiles.mark_pending(42, now=100)
@@ -459,7 +463,9 @@ async def test_durable_chat_profile_preserves_observed_membership_and_type_facts
     path = tmp_path / "chat-facts.sqlite"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
-    service = _test_service(conn, limits=RefreshLimits())
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.commit()
+    service = _test_service(conn, limits=RefreshLimits(), account_id=42)
     profile = ChannelProfileObservation(
         -1_000_000_000_007, "about", 1, None, None, None, {}, None, 100, 100, chat_entity_fields=facts
     )

@@ -117,9 +117,19 @@ def finish_empty_profile_collections(repo: EntityProfileRepository, entity_id: i
 
 def bind_profile_test_account(service: DaemonEntityInfoService) -> None:
     """Bind fixture-owned private facts to a stable fake Telegram account."""
+    from unittest.mock import MagicMock
+
     from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
+    from mcp_telegram.image_authorization import ScopeCell
 
     scope = TelegramAuthScope(AUTH_SCOPE_VERSION, 1, 2, 99)
+    cell = ScopeCell()
+    assert cell.publish(scope)
+    client = cast(MagicMock, service._deps.client)
+    client.capture_image_scope = cell.capture
+    client.claim_image_scope = cell.claim
+    with write_savepoint(service._profiles._conn):
+        service._profiles._conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
     service._deps = replace(
         service._deps,
         self_id=1,

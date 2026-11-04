@@ -102,6 +102,8 @@ def test_entity_snapshot_is_frozen_slots_value() -> None:
         "username",
         "name_normalized",
         "updated_at",
+        "name_observed",
+        "username_observed",
     ]
     assert not hasattr(snapshot, "__dict__")
     with pytest.raises(FrozenInstanceError):

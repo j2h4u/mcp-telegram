@@ -5,18 +5,23 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Protocol
 
+from ..image_authorization import ScopeToken
 from .contracts import ForwardGapPage, FullHistoryPage
 
 
 class FullHistoryPagePort(Protocol):
     """Fetch one backward page older than an exclusive local checkpoint."""
 
+    def capture_scope(self) -> ScopeToken | None: ...
+    def claim_scope(self, token: ScopeToken) -> bool: ...
     async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage: ...
 
 
 class ForwardGapPagePort(Protocol):
     """Fetch one bounded forward page newer than an exclusive local checkpoint."""
 
+    def capture_scope(self) -> ScopeToken | None: ...
+    def claim_scope(self, token: ScopeToken) -> bool: ...
     async def fetch_page(
         self,
         dialog_id: int,

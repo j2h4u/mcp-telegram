@@ -22,9 +22,10 @@ from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty, InputPee
 from .activity_substrate import ActivityClient, call_with_timeout
 from .entity_profile.membership import MembershipSignalCounts
 from .entity_profile.repository import admit_profile_peer, bound_profile_account
-from .entity_store import EntitySnapshot, upsert_entity_snapshots
+from .entity_store import EntitySnapshot, apply_ordered_entity_snapshots
 from .flood import TelegramRpcThrottled
 from .hydration_queue import HydrationPriority
+from .image_authorization import ScopeToken
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_bundle import insert_messages_with_fts
 from .messages.telegram_adapter import extract_dialog_id, extract_message_row
@@ -79,6 +80,16 @@ class ActivitySyncPacing:
 _PACING = ActivitySyncPacing()
 
 
+def _capture_archive_scope(
+    capture: Callable[[], ScopeToken | None], claim: Callable[[ScopeToken], bool], account_id: int
+) -> ScopeToken | None:
+    """Capture the currently authorized archive account before acquisition."""
+    token = capture()
+    if token is None or token.scope.account_id != account_id or not claim(token):
+        return None
+    return token
+
+
 @dataclass(slots=True)
 class ArchiveBackfillDemandAdapter(DurableDemandAdapter):
     """Expose one global archive-backfill page over existing checkpoints."""
@@ -89,6 +100,8 @@ class ArchiveBackfillDemandAdapter(DurableDemandAdapter):
     timeout_s: float
     writer: SQLiteWriter = field(kw_only=True)
     account_id: int = field(kw_only=True)
+    capture_scope: Callable[[], ScopeToken | None] = field(kw_only=True)
+    claim_scope: Callable[[ScopeToken], bool] = field(kw_only=True)
     membership_observer: Callable[[MembershipSignalCounts], None] | None = field(default=None, kw_only=True)
     demand_kind = DemandKind.ARCHIVE_BACKFILL
 
@@ -115,6 +128,9 @@ class ArchiveBackfillDemandAdapter(DurableDemandAdapter):
             raise RuntimeError("archive backfill requires an owner-selected revision")
         if self.status(time.time()) is None or self._selected() != selected:
             return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        token = _capture_archive_scope(self.capture_scope, self.claim_scope, self.account_id)
+        if token is None:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
         with _archive_demand_scope(DemandKind.ARCHIVE_BACKFILL):
             with rpc_attempt_budget(budget):
                 accepted = await _run_backfill_slice(
@@ -125,6 +141,8 @@ class ArchiveBackfillDemandAdapter(DurableDemandAdapter):
                     writer=self.writer,
                     expected_revision=selected.revision,
                     profile_owner_account_id=self.account_id,
+                    scope=token,
+                    claim_scope=self.claim_scope,
                     membership_observer=self.membership_observer,
                 )
         if accepted is None:
@@ -150,6 +168,8 @@ class ArchiveIncrementalDemandAdapter(DurableDemandAdapter):
     timeout_s: float
     writer: SQLiteWriter = field(kw_only=True)
     account_id: int = field(kw_only=True)
+    capture_scope: Callable[[], ScopeToken | None] = field(kw_only=True)
+    claim_scope: Callable[[ScopeToken], bool] = field(kw_only=True)
     membership_observer: Callable[[MembershipSignalCounts], None] | None = field(default=None, kw_only=True)
     demand_kind = DemandKind.ARCHIVE_INCREMENTAL
 
@@ -189,6 +209,9 @@ class ArchiveIncrementalDemandAdapter(DurableDemandAdapter):
             return SliceOutcome(selected, SliceOutcomeKind.STALE)
         if not status.is_ready(time.time()):
             return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        token = _capture_archive_scope(self.capture_scope, self.claim_scope, self.account_id)
+        if token is None:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
         with _archive_demand_scope(DemandKind.ARCHIVE_INCREMENTAL):
             with rpc_attempt_budget(budget):
                 accepted = await _run_incremental_slice(
@@ -199,10 +222,10 @@ class ArchiveIncrementalDemandAdapter(DurableDemandAdapter):
                     writer=self.writer,
                     expected_revision=selected.revision,
                     profile_owner_account_id=self.account_id,
+                    scope=token,
+                    claim_scope=self.claim_scope,
                     membership_observer=self.membership_observer,
                 )
-        if accepted is None:
-            return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
         if not accepted:
             return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
         if accepted == selected.revision:
@@ -378,6 +401,8 @@ def _user_entity_snapshot(user: object, *, updated_at: int) -> EntitySnapshot | 
         username=username,
         name_normalized=_normalize(name),
         updated_at=updated_at,
+        name_observed=name is not None or not bool(getattr(user, "min", False)),
+        username_observed=username is not None or not bool(getattr(user, "min", False)),
     )
 
 
@@ -400,6 +425,8 @@ def _chat_entity_snapshot(chat: object, *, updated_at: int) -> EntitySnapshot | 
         username=username,
         name_normalized=_normalize(name),
         updated_at=updated_at,
+        name_observed=name is not None or not bool(getattr(chat, "min", False)),
+        username_observed=username is not None or not bool(getattr(chat, "min", False)),
     )
 
 
@@ -417,13 +444,15 @@ def _search_entity_snapshots(result: _SearchResultLike, *, updated_at: int) -> l
     return snapshots
 
 
-def _upsert_entities_from_search(conn: sqlite3.Connection, result: _SearchResultLike) -> None:
+def _upsert_entities_from_search(
+    conn: sqlite3.Connection, result: _SearchResultLike, *, observation_order: int, observed_at: int
+) -> None:
     """Upsert complete user/chat identity snapshots from a search response."""
-    snapshots = _search_entity_snapshots(result, updated_at=int(time.time()))
+    snapshots = _search_entity_snapshots(result, updated_at=observed_at)
     if not snapshots:
         return
     require_write_transaction(conn)
-    upsert_entity_snapshots(conn, snapshots)
+    apply_ordered_entity_snapshots(conn, snapshots, observation_order=observation_order)
 
 
 def _fmt_duration(seconds: int) -> str:
@@ -664,6 +693,30 @@ def _prepare_incremental_slice(
         return min_date, offset_id, allocate_observation_order(conn)
 
 
+class _ArchiveScopeChangedError(RuntimeError):
+    """The original request authorization was revoked during publication."""
+
+
+@contextmanager
+def _guard_archive_scope(
+    conn: sqlite3.Connection, scope: ScopeToken, claim_scope: Callable[[ScopeToken], bool]
+) -> Iterator[None]:
+    yield
+    if not claim_scope(scope) or bound_profile_account(conn) != scope.scope.account_id:
+        raise _ArchiveScopeChangedError
+
+
+def _start_incremental_window(conn: sqlite3.Connection, state: dict[str, str | None], min_date: int) -> int:
+    """Start a durable window once, retaining its original restart boundary."""
+    if state.get(_INCREMENTAL_MIN_DATE_KEY) is not None:
+        return min_date
+    min_date = max(0, int(state.get("last_sync_at") or 0) - 60)
+    _set_state(conn, _INCREMENTAL_STARTED_AT_KEY, str(int(time.time())))
+    _set_state(conn, _INCREMENTAL_MIN_DATE_KEY, str(min_date))
+    _set_state(conn, _INCREMENTAL_OFFSET_ID_KEY, "0")
+    return min_date
+
+
 def _commit_incremental_slice_result(  # noqa: PLR0913, PLR0917
     conn: sqlite3.Connection,
     search_result: _SearchResultLike,
@@ -671,20 +724,21 @@ def _commit_incremental_slice_result(  # noqa: PLR0913, PLR0917
     batch_started_at: float,
     observation_order: int,
     expected_revision: str,
+    observed_at: int,
+    scope: ScopeToken,
+    claim_scope: Callable[[ScopeToken], bool],
     profile_owner_account_id: int | None = None,
     membership_counts: list[MembershipSignalCounts] | None = None,
 ) -> str | None:
     """Persist one incremental page and its restart-safe continuation."""
-    with write_transaction(conn):
+    with write_transaction(conn), _guard_archive_scope(conn, scope, claim_scope):
+        if not claim_scope(scope) or bound_profile_account(conn) != scope.scope.account_id:
+            return None
         state = _load_state(conn)
         current = _incremental_revision(state)
         if current != expected_revision:
             return None
-        if state.get(_INCREMENTAL_MIN_DATE_KEY) is None:
-            min_date = max(0, int(state.get("last_sync_at") or 0) - 60)
-            _set_state(conn, _INCREMENTAL_STARTED_AT_KEY, str(int(time.time())))
-            _set_state(conn, _INCREMENTAL_MIN_DATE_KEY, str(min_date))
-            _set_state(conn, _INCREMENTAL_OFFSET_ID_KEY, "0")
+        min_date = _start_incremental_window(conn, state, min_date)
         batch = list(search_result.messages or [])
         if not batch:
             _finish_incremental_slice(conn)
@@ -700,7 +754,7 @@ def _commit_incremental_slice_result(  # noqa: PLR0913, PLR0917
             profile_owner_account_id=profile_owner_account_id,
             membership_counts=membership_counts,
         )
-        _upsert_entities_from_search(conn, search_result)
+        _upsert_entities_from_search(conn, search_result, observation_order=observation_order, observed_at=observed_at)
         next_offset_id = min(message.id for message in batch)
         _log_incremental_batch(
             _IncrementalState(
@@ -751,6 +805,8 @@ async def _run_backfill_slice(  # noqa: PLR0913
     writer: SQLiteWriter,
     expected_revision: str,
     profile_owner_account_id: int | None = None,
+    scope: ScopeToken,
+    claim_scope: Callable[[ScopeToken], bool],
     membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
 ) -> str | None:
     """Fetch one restart-safe archive-backfill page."""
@@ -760,6 +816,7 @@ async def _run_backfill_slice(  # noqa: PLR0913
         return None
     checkpoint, started_at, observation_order = window
     batch_started_at = time.monotonic()
+    observed_at = int(time.time())
     result = await _search_backfill_batch(
         client,
         checkpoint,
@@ -772,18 +829,24 @@ async def _run_backfill_slice(  # noqa: PLR0913
     search_result = cast(_SearchResultLike, result)
     batch = list(search_result.messages or [])
     membership_counts: list[MembershipSignalCounts] = []
-    next_checkpoint = await writer.run(
-        lambda db: _commit_backfill_slice_result(
-            db,
-            search_result,
-            batch,
-            started_at,
-            observation_order,
-            expected_revision,
-            profile_owner_account_id,
-            membership_counts,
+    try:
+        next_checkpoint = await writer.run(
+            lambda db: _commit_backfill_slice_result(
+                db,
+                search_result,
+                batch,
+                started_at,
+                observation_order,
+                expected_revision,
+                observed_at,
+                scope,
+                claim_scope,
+                profile_owner_account_id,
+                membership_counts,
+            )
         )
-    )
+    except _ArchiveScopeChangedError:
+        return None
     _observe_membership(membership_observer, membership_counts)
     if next_checkpoint is None:
         return None
@@ -808,10 +871,15 @@ def _commit_backfill_slice_result(  # noqa: PLR0913, PLR0917
     started_at: str,
     observation_order: int,
     expected_revision: str,
+    observed_at: int,
+    scope: ScopeToken,
+    claim_scope: Callable[[ScopeToken], bool],
     profile_owner_account_id: int | None = None,
     membership_counts: list[MembershipSignalCounts] | None = None,
 ) -> str | None:
-    with write_transaction(conn):
+    with write_transaction(conn), _guard_archive_scope(conn, scope, claim_scope):
+        if not claim_scope(scope) or bound_profile_account(conn) != scope.scope.account_id:
+            return None
         state = _load_state(conn)
         current = _backfill_revision(state)
         if current != expected_revision:
@@ -830,7 +898,7 @@ def _commit_backfill_slice_result(  # noqa: PLR0913, PLR0917
             profile_owner_account_id=profile_owner_account_id,
             membership_counts=membership_counts,
         )
-        _upsert_entities_from_search(conn, search_result)
+        _upsert_entities_from_search(conn, search_result, observation_order=observation_order, observed_at=observed_at)
         checkpoint = min(message.id for message in batch)
         _set_state(conn, "backfill_started_at", started_at)
         _set_state(conn, "backfill_offset_id", str(checkpoint))
@@ -847,6 +915,8 @@ async def _run_incremental_slice(  # noqa: PLR0913
     writer: SQLiteWriter,
     expected_revision: str,
     profile_owner_account_id: int | None = None,
+    scope: ScopeToken,
+    claim_scope: Callable[[ScopeToken], bool],
     membership_observer: Callable[[MembershipSignalCounts], None] | None = None,
 ) -> str | None:
     """Fetch one restart-safe page from the current incremental window."""
@@ -857,6 +927,7 @@ async def _run_incremental_slice(  # noqa: PLR0913
     min_date, offset_id, observation_order = window
 
     batch_started_at = time.monotonic()
+    observed_at = int(time.time())
     result = await _search_incremental_batch(
         client,
         min_date,
@@ -868,18 +939,24 @@ async def _run_incremental_slice(  # noqa: PLR0913
     if result is _SEARCH_BATCH_RETRY or result is _SEARCH_BATCH_STOP:
         return None
     membership_counts: list[MembershipSignalCounts] = []
-    result_revision = await writer.run(
-        lambda db: _commit_incremental_slice_result(
-            db,
-            cast(_SearchResultLike, result),
-            min_date,
-            batch_started_at,
-            observation_order,
-            expected_revision,
-            profile_owner_account_id,
-            membership_counts,
+    try:
+        result_revision = await writer.run(
+            lambda db: _commit_incremental_slice_result(
+                db,
+                cast(_SearchResultLike, result),
+                min_date,
+                batch_started_at,
+                observation_order,
+                expected_revision,
+                observed_at,
+                scope,
+                claim_scope,
+                profile_owner_account_id,
+                membership_counts,
+            )
         )
-    )
+    except _ArchiveScopeChangedError:
+        return None
     _observe_membership(membership_observer, membership_counts)
     return result_revision
 

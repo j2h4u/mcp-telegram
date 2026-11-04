@@ -31,12 +31,15 @@ from telethon.tl.types import (
 
 from mcp_telegram.event_handlers import EventHandlerManager
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.tools.discovery import _structured_topic
 from mcp_telegram.topics.catalog import TopicCatalogRepository
-from mcp_telegram.topics.contracts import TopicFact
+from mcp_telegram.topics.contracts import TopicBatch, TopicFact, TopicPage
 from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from sqlite_writer_helpers import event_manager, inline_writer
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.topic_test_helpers import seed_topic_account, topic_scope
 
 
 @pytest.fixture()
@@ -113,8 +116,8 @@ async def test_raw_service_create_and_edit_use_peer_id_and_prefer_top_target(
     await manager.on_raw_topic_message(UpdateNewChannelMessage(message=edit, pts=2, pts_count=1))
 
     rows = _topic_rows(db, dialog_id)
-    assert rows[10][1:] == ("old", 4, 0, 0)
-    assert 999 not in rows
+    assert rows[10][1:] == ("old", 4, None, None)
+    assert rows[999][1:] == ("new", None, None, None)
 
 
 @pytest.mark.asyncio
@@ -172,7 +175,7 @@ async def test_plural_pin_membership_clear_and_unknown_do_not_create(client: Mag
     assert [rows[id][3] for id in (1, 2, 3)] == [0, 1, 0]
     await manager.on_raw_forum_topic_pinned(UpdatePinnedForumTopics(peer=PeerChannel(123), order=[]))
     assert all(row[3] == 0 for row in _topic_rows(db).values())
-    assert 999 not in _topic_rows(db)
+    assert _topic_rows(db)[999][3] == 0
 
 
 @pytest.mark.asyncio
@@ -226,7 +229,7 @@ async def test_topic_snapshot_captured_before_fetch_cannot_replace_realtime(
     _seed_topics(db, 1)
 
     class Gateway:
-        async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
+        async def fetch_topics(self, entity: object) -> TopicBatch:
             with write_transaction(db):
                 if mutation == "create":
                     repository.apply_topic_create(
@@ -240,17 +243,105 @@ async def test_topic_snapshot_captured_before_fetch_cannot_replace_realtime(
                     repository.apply_topic_pin(-1000000000123, 1, pinned=True, observed_at=100)
                 else:
                     repository.apply_topic_pins(-1000000000123, (1,), observed_at=100)
-            return (TopicFact(topic_id=1, title="stale snapshot", icon_emoji_id=5),)
+            return TopicBatch((TopicFact(topic_id=1, title="stale snapshot", icon_emoji_id=5),), ())
 
-    await TopicRefresher(Gateway(), repository, writer=inline_writer(db)).refresh(
-        -1000000000123, SimpleNamespace(forum=True)
-    )
+    seed_topic_account(db, -1000000000123)
+    scope = topic_scope()
+    await TopicRefresher(
+        Gateway(), repository, writer=inline_writer(db), capture_scope=scope.capture, claim_scope=scope.claim
+    ).refresh(-1000000000123, SimpleNamespace(forum=True))
     row = _topic_rows(db)[1]
-    assert row[1] == ("realtime" if mutation in {"create", "edit", "hide"} else "topic")
+    assert row[1] == ("realtime" if mutation in {"create", "edit", "hide"} else "stale snapshot")
     if mutation in {"pin", "pins"}:
         assert row[3] == 1
     if mutation == "hide":
         assert row[4] == 1
+
+
+@pytest.mark.asyncio
+async def test_full_topic_snapshot_persists_supplied_message_for_local_reads(db: sqlite3.Connection) -> None:
+    from telethon.tl import types
+    from telethon.tl.functions.messages import GetForumTopicsRequest
+
+    from mcp_telegram.sqlite_writer import SQLiteWriter
+    from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
+    from mcp_telegram.topics.refresh import TopicRefresher
+    from mcp_telegram.topics.telegram_adapter import TelethonTelegramTopicGateway
+    from tests.test_daemon_api import _response_messages, make_server
+
+    dialog_id = -1000000000123
+    seed_topic_account(db, dialog_id)
+    db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?,'synced')", (dialog_id,))
+    db.execute("INSERT INTO dialogs(dialog_id,name,type) VALUES (?,'Forum','supergroup')", (dialog_id,))
+    db.commit()
+    date = datetime(2026, 1, 1, tzinfo=UTC)
+    topic = types.ForumTopic(
+        id=7,
+        date=date,
+        peer=types.PeerChannel(123),
+        title="Visible topic",
+        icon_color=6,
+        top_message=10,
+        read_inbox_max_id=0,
+        read_outbox_max_id=0,
+        unread_count=0,
+        unread_mentions_count=0,
+        unread_reactions_count=0,
+        unread_poll_votes_count=0,
+        from_id=types.PeerUser(77),
+        notify_settings=types.PeerNotifySettings(),
+    )
+    message = types.Message(
+        id=10, peer_id=types.PeerChannel(123), date=date, message="snapshot needle", from_id=types.PeerUser(77)
+    )
+    response = types.messages.ForumTopics(1, [topic], [message], [], [types.User(77, first_name="Sender")], 1)
+
+    class Client:
+        calls = 0
+
+        async def get_input_entity(self, _entity: object) -> object:
+            return types.InputPeerChannel(123, 9)
+
+        async def get_entity(self, _entity: object) -> object:
+            raise AssertionError("unexpected entity acquisition")
+
+        async def __call__(self, request: object) -> object:
+            assert isinstance(request, GetForumTopicsRequest)
+            self.calls += 1
+            return response
+
+    client = Client()
+    scope = topic_scope()
+    writer = await SQLiteWriter.open(Path(db.execute("PRAGMA database_list").fetchone()[2]))
+    feedback = sqlite3.connect(":memory:")
+    try:
+        with rpc_scope(TelegramRpcSource.TOPIC_RECONCILIATION):
+            count = await TopicRefresher(
+                TelethonTelegramTopicGateway(client),
+                SQLiteTopicSnapshotRepository(db),
+                writer=writer,
+                capture_scope=scope.capture,
+                claim_scope=scope.claim,
+            ).refresh(dialog_id, SimpleNamespace(forum=True))
+        assert count == 1 and client.calls == 1
+        assert db.execute(
+            "SELECT title FROM topic_metadata WHERE dialog_id=? AND topic_id=7", (dialog_id,)
+        ).fetchone() == ("Visible topic",)
+        assert db.execute("SELECT text FROM messages WHERE dialog_id=? AND message_id=10", (dialog_id,)).fetchone() == (
+            "snapshot needle",
+        )
+        assert db.execute(
+            "SELECT message_id FROM messages_fts WHERE messages_fts MATCH 'needle' AND dialog_id=?", (dialog_id,)
+        ).fetchone() == (10,)
+        daemon = make_server(db, client, feedback_conn=feedback, writer=writer)
+        listed = await daemon._list_messages({"dialog_id": dialog_id, "limit": 10})
+        searched = await daemon._search_messages({"dialog_id": dialog_id, "query": "needle", "limit": 10})
+        assert [item["text"] for item in _response_messages(listed)] == ["snapshot needle"]
+        assert [item["text"] for item in _response_messages(searched)] == ["snapshot needle"]
+        assert client.calls == 1
+    finally:
+        feedback.close()
+        await writer.aclose()
 
 
 def test_reserved_topic_event_order_rejects_older_event(db: sqlite3.Connection) -> None:
@@ -307,3 +398,109 @@ async def test_min_capability_bundle_does_not_turn_unknown_into_not_applicable(d
 
     assert TopicCatalogRepository(db).coverage(42)["coverage"] != "not_applicable"
     client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_delivered_partial_topics_are_retained_and_locally_visible(db, client):
+    dialog = -1000000000123
+    db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?, 'synced')", (dialog,))
+    seed_full_history_enrollment(db, dialog, enabled=True)
+    db.commit()
+    manager = event_manager(client, db, asyncio.Event())
+    manager.register()
+    peer = PeerChannel(123)
+    create = MessageService(
+        id=10, peer_id=peer, date=datetime(2026, 1, 1, tzinfo=UTC), action=MessageActionTopicCreate("topic", 0x6FB9F0)
+    )
+    await manager.on_raw_topic_message(UpdateNewChannelMessage(message=create, pts=1, pts_count=1))
+    edit = MessageService(
+        id=20,
+        peer_id=peer,
+        date=datetime(2026, 1, 1, tzinfo=UTC),
+        action=MessageActionTopicEdit(title="new", hidden=True),
+        reply_to=MessageReplyHeader(reply_to_msg_id=99),
+    )
+    await manager.on_raw_topic_message(UpdateNewChannelMessage(message=edit, pts=2, pts_count=1))
+    await manager.on_raw_forum_topic_pinned(UpdatePinnedForumTopic(peer=peer, topic_id=98, pinned=True))
+    assert db.execute(
+        "SELECT title,icon_color FROM topic_metadata WHERE dialog_id=? AND topic_id=10", (dialog,)
+    ).fetchone() == ("topic", 0x6FB9F0)
+    assert db.execute(
+        "SELECT title,hidden FROM topic_metadata WHERE dialog_id=? AND topic_id=99", (dialog,)
+    ).fetchone() == ("new", 1)
+    assert db.execute(
+        "SELECT title,pinned,hidden FROM topic_metadata WHERE dialog_id=? AND topic_id=98", (dialog,)
+    ).fetchone() == (None, 1, None)
+    assert _structured_topic({"id": 98, "title": None, "pinned": True}) == {
+        "topic_id": 98,
+        "title": None,
+        "pinned": True,
+    }
+    assert TopicCatalogRepository(db).coverage(dialog)["coverage"] == "partial"
+
+
+def test_new_pin_does_not_prevent_old_page_filling_unknown_fields(db):
+    seed_full_history_enrollment(db, 42, enabled=True)
+    db.commit()
+    catalog = TopicCatalogRepository(db)
+    catalog.request(42, "bootstrap")
+    scan = catalog.begin_page(42)
+    assert scan is not None
+    with write_transaction(db):
+        SQLiteTopicSnapshotRepository(db).apply_topic_pin(42, 7, pinned=True, observed_at=100)
+    assert catalog.apply_page(scan, TopicPage((TopicFact(7, "title", icon_emoji_id=5),), 1, False, None))
+    assert db.execute(
+        "SELECT title,icon_emoji_id,pinned,hidden FROM topic_metadata WHERE dialog_id=42 AND topic_id=7"
+    ).fetchone() == ("title", 5, 1, None)
+
+
+@pytest.mark.asyncio
+async def test_partial_pin_reopens_and_reaches_registered_mcp(db, client, monkeypatch):
+    from contextlib import asynccontextmanager
+
+    from mcp_telegram import server
+    from tests.test_daemon_api import make_server
+
+    dialog = -1000000000123
+    manager = _manager(client, db)
+    await manager.on_raw_forum_topic_pinned(UpdatePinnedForumTopic(peer=PeerChannel(123), topic_id=55, pinned=True))
+    hidden = _service(
+        99,
+        PeerChannel(123),
+        MessageActionTopicEdit(title="hidden", hidden=True),
+        MessageReplyHeader(reply_to_msg_id=56),
+    )
+    await manager.on_raw_topic_message(UpdateNewChannelMessage(message=hidden, pts=2, pts_count=1))
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    reopened = sqlite3.connect(path)
+    feedback = sqlite3.connect(":memory:")
+    daemon = make_server(reopened, client, feedback_conn=feedback)
+
+    class LocalConnection:
+        async def list_topics(self, **request):
+            return await daemon._list_topics(request)
+
+    @asynccontextmanager
+    async def connect():
+        yield LocalConnection()
+
+    monkeypatch.setattr("mcp_telegram.tools.discovery.daemon_connection", connect)
+    try:
+        result = await server.call_tool("list_topics", {"exact_dialog_id": dialog})
+        assert result.is_error is False
+        topic = result.structured_content["topics"][0]
+        assert topic["topic_id"] == 55
+        assert topic["title"] is None
+        assert "title_content" not in topic
+        assert topic["pinned"] is True
+        assert "hidden" not in topic
+        hidden_topic = result.structured_content["topics"][1]
+        assert hidden_topic["topic_id"] == 56
+        assert hidden_topic["hidden"] is True
+        assert hidden_topic["title"] == "hidden"
+        assert result.structured_content["catalog"]["coverage"] == "partial"
+        client.get_entity.assert_not_called()
+        client.get_messages.assert_not_called()
+    finally:
+        feedback.close()
+        reopened.close()

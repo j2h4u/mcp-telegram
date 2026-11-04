@@ -26,7 +26,7 @@ from ..flood import TelegramRpcThrottled
 from ..models import FORUM_TOPICS_PAGE_SIZE
 from ..telegram_demand import UnclassifiedTelegramDemandError
 from ..telegram_rpc_scheduler import current_rpc_scope
-from .contracts import TopicCursor, TopicFact, TopicPage, TopicSourceUnavailableError
+from .contracts import TopicBatch, TopicCursor, TopicFact, TopicPage, TopicSourceUnavailableError
 from .ports import TelegramTopicGateway
 
 
@@ -120,21 +120,23 @@ class TelethonTelegramTopicGateway(TelegramTopicGateway):
             bool(getattr(result, "order_by_create_date", False)),
             _page_cursor(result, cursor, count),
             deleted,
+            tuple(result.messages),
         )
 
-    async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
+    async def fetch_topics(self, entity: object) -> TopicBatch:
         try:
             peer = cast(TypeInputPeer, await self._client.get_input_entity(entity))
-            topics = await self._fetch_topic_pages(peer)
+            topics, messages = await self._fetch_topic_pages(peer)
         except TelegramRpcThrottled:
             raise
         except (RPCError, TypeError) as exc:
             raise TopicSourceUnavailableError("Telegram topic source is unavailable") from exc
         emoji_by_id = await self._resolve_icon_emojis(topics)
-        return tuple(_topic_fact(topic, emoji_by_id) for topic in topics)
+        return TopicBatch(tuple(_topic_fact(topic, emoji_by_id) for topic in topics), messages)
 
-    async def _fetch_topic_pages(self, peer: TypeInputPeer) -> tuple[_TopicLike, ...]:
+    async def _fetch_topic_pages(self, peer: TypeInputPeer) -> tuple[tuple[_TopicLike, ...], tuple[object, ...]]:
         topics: dict[int, _TopicLike] = {}
+        messages: list[object] = []
         seen_cursors: set[tuple[int | None, int, int]] = set()
         offset_date = None
         offset_id = offset_topic = 0
@@ -152,8 +154,9 @@ class TelethonTelegramTopicGateway(TelegramTopicGateway):
                 ),
             )
             page = result.topics or []
+            messages.extend(getattr(result, "messages", ()))
             if _merge_topic_page(topics, page, _optional_int(getattr(result, "count", None))):
-                return tuple(topics.values())
+                return tuple(topics.values()), tuple(messages)
             offset_date, offset_id, offset_topic = _topic_cursor(result, page[-1])
             cursor = (_timestamp(offset_date), offset_id, offset_topic)
             if cursor in seen_cursors:
@@ -219,6 +222,7 @@ def _topic_fact(topic: _TopicLike, emoji_by_id: dict[int, str]) -> TopicFact:
         date=_timestamp(topic.date),
         is_general=_is_general(topic),
         hidden=bool(getattr(topic, "hidden", False)),
+        pinned=bool(getattr(topic, "pinned", False)),
     )
 
 

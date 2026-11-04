@@ -98,6 +98,7 @@ async def test_command_observation_keeps_refresh_cursor_and_publishes_note(tmp_p
     from mcp_telegram.image_authorization import ScopeCell
     from mcp_telegram.sqlite_writer import SQLiteWriter
     from mcp_telegram.sync_db import ensure_sync_schema, open_sync_db_reader
+    from mcp_telegram.sync_transactions import write_transaction
     from mcp_telegram.telegram_gateway import TelethonUserProfileGateway
     from tests.test_entity_profile_full_user_pair import _pair_service, _PairClient
     from tests.test_profile_collection_pages import _Client
@@ -128,11 +129,14 @@ async def test_command_observation_keeps_refresh_cursor_and_publishes_note(tmp_p
     service._deps = replace(
         service._deps,
         client=SimpleNamespace(capture_image_scope=cell.capture, claim_image_scope=cell.claim),
+        full_user_auth_scope=lambda: TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99),
         writer=writer,
         user_profile_port=LocalGateway(_Client(response, response), now_provider=lambda: 100),
     )
 
     def prepare(conn: sqlite3.Connection) -> None:
+        with write_transaction(conn):
+            conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
         repo = EntityProfileRepository(conn, section_ttl_seconds=300)
         repo.save_core({"id": 7, "type": "user", "name": "old"}, now=100)
         repo.mark_pending(7, now=100, pair_eligible_override=True)

@@ -104,6 +104,8 @@ async def test_scheduled_flood_uses_actual_failure_clock_and_does_not_repeat(
             raise TelegramRpcThrottled(retry_after_seconds=8)
 
     conn, repo = _repository(tmp_path / "scheduled.sqlite")
+    conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
+    conn.commit()
     request.addfinalizer(conn.close)
     _peer(conn, 42)
     client = FloodClient(channel_id=None)

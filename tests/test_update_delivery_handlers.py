@@ -30,6 +30,7 @@ from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_rpc import TelegramRpcGate, _canonical_wire_method
 from test_update_delivery import DATE, _client, _database, _message, _pending, _saved
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.history_scope_helpers import HistoryScope
 
 
 @dataclass
@@ -207,6 +208,9 @@ async def test_required_canonical_write_failure_replays_tg98_cases_1_to_4(  # no
 ) -> None:
     path = _database(tmp_path)
     _seed(path, -7, hidden=scenario == "hidden_new")
+    with closing(_open_sync_db(path)) as db:
+        db.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
+        db.commit()
     writer = await SQLiteWriter.open(path)
     reader = open_sync_db_reader(path)
     client = _client(tmp_path / "session", writer, channel=False)
@@ -242,8 +246,9 @@ async def test_required_canonical_write_failure_replays_tg98_cases_1_to_4(  # no
         port = None
         if scenario == "visible_new":
 
-            class Port:
+            class Port(HistoryScope):
                 def __init__(self) -> None:
+                    super().__init__(99)
                     self.calls: list[int] = []
 
                 async def fetch_page(

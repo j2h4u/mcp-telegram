@@ -44,6 +44,7 @@ from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 from sqlite_writer_helpers import inline_writer
+from tests.history_scope_helpers import HistoryScope
 
 _TEST_TIMEOUT_S = 120.0
 
@@ -63,6 +64,8 @@ def _make_db() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(":memory:")
     try:
         _apply_migrations(conn)
+        conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
+        conn.commit()
         yield conn
     finally:
         conn.close()
@@ -93,7 +96,7 @@ def _get_state(conn: sqlite3.Connection, dialog_id: int) -> _DialogState:
     return cast(_DialogState, _load_dialog_state(conn, dialog_id))
 
 
-class _FakeClient:
+class _FakeClient(HistoryScope):
     async def __call__(self, request: object) -> object:
         del request
         return object()

@@ -30,7 +30,7 @@ async def test_profile_waits_for_physical_claim_then_commits_self_pair(
     await prior.shutdown()  # type: ignore[attr-defined]
     _prepare_self(conn)
     writer = await SQLiteWriter.open(tmp_path / "profile.sqlite")
-    service = cast(DaemonEntityInfoService, _pair_service(conn, _PairClient(), enabled=True))
+    service = cast(DaemonEntityInfoService, _pair_service(conn, _PairClient(account_id=42), enabled=True))
     service._deps = replace(
         service._deps,
         writer=writer,

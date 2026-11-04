@@ -18,7 +18,9 @@ from telethon.tl.types import PeerUser
 
 from mcp_telegram import activity_sync
 from mcp_telegram.activity_sync import ArchiveBackfillDemandAdapter, ArchiveIncrementalDemandAdapter
+from mcp_telegram.auth_scope import TelegramAuthScope
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.image_authorization import ScopeCell
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import ensure_sync_schema, open_sync_db_reader
 from mcp_telegram.telegram_demand import DemandStatus, DurableDemandAdapter, RpcAttemptBudget
@@ -33,6 +35,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     current_rpc_scope,
 )
 from sqlite_writer_helpers import inline_writer
+from tests.history_scope_helpers import HistoryScope
 
 _TEST_TIMEOUT_S = 0.05
 
@@ -81,8 +84,9 @@ class _MsgKwargs(TypedDict, total=False):
     out: bool
 
 
-class _FakeClient:
-    def __init__(self, batches: list[FakeSearchResult]) -> None:
+class _FakeClient(HistoryScope):
+    def __init__(self, batches: list[FakeSearchResult], *, account_id: int = 123) -> None:
+        super().__init__(account_id)
         self._batches = list(batches)
         self.scopes: list[TelegramRpcScope] = []
 
@@ -115,8 +119,9 @@ class _DemandObserver:
         self.events.append(event)
 
 
-class _ThrottledClient:
+class _ThrottledClient(HistoryScope):
     def __init__(self, error: TelegramRpcThrottled, *, dispatch: bool, on_dispatch: object | None = None) -> None:
+        super().__init__()
         self._error = error
         self._dispatch = dispatch
         self._on_dispatch = on_dispatch
@@ -165,7 +170,10 @@ def _coordinator(  # noqa: PLR0913
 def _make_db(tmp_path: Path) -> sqlite3.Connection:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    return sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
+    conn.commit()
+    return conn
 
 
 def _msg(msg_id: int, user_id: int, ts: int, **kwargs: Unpack[_MsgKwargs]) -> FakeMessage:
@@ -212,6 +220,10 @@ def test_trim_incremental_batch_stops_at_first_message_before_window() -> None:
     assert past_window is True
 
 
+_TEST_SCOPE = ScopeCell()
+assert _TEST_SCOPE.publish(TelegramAuthScope(1, 123, 1, 1))
+
+
 @pytest.fixture
 def conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     connection = _make_db(tmp_path)
@@ -232,6 +244,8 @@ async def test_archive_backfill_adapter_commits_one_page_with_precise_scope(conn
         _TEST_TIMEOUT_S,
         writer=inline_writer(conn),
         account_id=123,
+        capture_scope=_TEST_SCOPE.capture,
+        claim_scope=_TEST_SCOPE.claim,
         membership_observer=lambda counts: observed.append((counts, conn.in_transaction)),
     )
 
@@ -260,7 +274,14 @@ async def test_archive_commits_through_owner_with_readonly_loop_connection(conn:
     try:
         client = _FakeClient([FakeSearchResult(messages=[_msg(100, 42, 1_700_000_100)]), FakeSearchResult(messages=[])])
         adapter = ArchiveBackfillDemandAdapter(
-            client, reader, asyncio.Event(), _TEST_TIMEOUT_S, writer=writer, account_id=123
+            client,
+            reader,
+            asyncio.Event(),
+            _TEST_TIMEOUT_S,
+            writer=writer,
+            account_id=123,
+            capture_scope=_TEST_SCOPE.capture,
+            claim_scope=_TEST_SCOPE.claim,
         )
         await adapter.run_slice(_selected_budget(adapter))
         assert reader.execute("SELECT value FROM activity_sync_state WHERE key='backfill_offset_id'").fetchone() == (
@@ -287,7 +308,15 @@ async def test_archive_incremental_adapter_resumes_from_key_value_state(conn: sq
         )
     client = _FakeClient([FakeSearchResult(messages=[_msg(12, 42, last_sync_at + 30)]), FakeSearchResult(messages=[])])
     adapter = ArchiveIncrementalDemandAdapter(
-        client, conn, asyncio.Event(), 3_600.0, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
+        client,
+        conn,
+        asyncio.Event(),
+        3_600.0,
+        _TEST_TIMEOUT_S,
+        writer=inline_writer(conn),
+        account_id=123,
+        capture_scope=_TEST_SCOPE.capture,
+        claim_scope=_TEST_SCOPE.claim,
     )
 
     initial = adapter.status(float(last_sync_at))
@@ -324,6 +353,8 @@ async def test_archive_backfill_finite_throttle_is_owned_by_coordinator(conn: sq
         _TEST_TIMEOUT_S,
         writer=inline_writer(conn),
         account_id=123,
+        capture_scope=_TEST_SCOPE.capture,
+        claim_scope=_TEST_SCOPE.claim,
     )
     observer = _DemandObserver()
     request_method = _canonical_wire_method(
@@ -391,7 +422,15 @@ async def test_archive_incremental_latched_throttle_stops_coordinator_without_lo
     error = TelegramRpcThrottled(latched=True, detail="test circuit open")
     client = _ThrottledClient(error, dispatch=False)
     adapter = ArchiveIncrementalDemandAdapter(
-        client, conn, asyncio.Event(), 10.0, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
+        client,
+        conn,
+        asyncio.Event(),
+        10.0,
+        _TEST_TIMEOUT_S,
+        writer=inline_writer(conn),
+        account_id=123,
+        capture_scope=_TEST_SCOPE.capture,
+        claim_scope=_TEST_SCOPE.claim,
     )
     observer = _DemandObserver()
     shutdown_event = asyncio.Event()
@@ -423,7 +462,14 @@ async def test_archive_runtime_commits_page_and_leaves_rpc_connection_idle(conn:
     enable_runtime_writes(conn)
     client = IdleClient([FakeSearchResult(messages=[_msg(100, 42, 1_700_000_100)])])
     adapter = ArchiveBackfillDemandAdapter(
-        client, conn, asyncio.Event(), timeout_s=_TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
+        client,
+        conn,
+        asyncio.Event(),
+        timeout_s=_TEST_TIMEOUT_S,
+        writer=inline_writer(conn),
+        account_id=123,
+        capture_scope=_TEST_SCOPE.capture,
+        claim_scope=_TEST_SCOPE.claim,
     )
     await adapter.run_slice(_selected_budget(adapter))
 
@@ -447,6 +493,8 @@ async def test_archive_page_failure_rolls_back_messages_and_checkpoint(conn: sql
         timeout_s=_TEST_TIMEOUT_S,
         writer=inline_writer(conn),
         account_id=123,
+        capture_scope=_TEST_SCOPE.capture,
+        claim_scope=_TEST_SCOPE.claim,
         membership_observer=observed.append,
     )
     with patch.object(activity_sync, "_upsert_entities_from_search", side_effect=RuntimeError("identity write failed")):
@@ -476,7 +524,15 @@ async def test_incremental_timeout_preserves_page_and_anchor(conn: sqlite3.Conne
     before = activity_sync._load_state(conn)
     with patch.object(activity_sync, "call_with_timeout", new=AsyncMock(side_effect=TimeoutError)):
         adapter = ArchiveIncrementalDemandAdapter(
-            _FakeClient([]), conn, asyncio.Event(), 10, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
+            _FakeClient([]),
+            conn,
+            asyncio.Event(),
+            10,
+            _TEST_TIMEOUT_S,
+            writer=inline_writer(conn),
+            account_id=123,
+            capture_scope=_TEST_SCOPE.capture,
+            claim_scope=_TEST_SCOPE.claim,
         )
         await adapter.run_slice(_selected_budget(adapter))
     assert activity_sync._load_state(conn) == before
@@ -489,12 +545,28 @@ async def test_incremental_next_window_starts_before_scan_arrivals(conn: sqlite3
         conn.execute("INSERT OR REPLACE INTO activity_sync_state(key,value) VALUES ('last_sync_at','100')")
     client = _FakeClient([FakeSearchResult(messages=[_msg(12, 42, 190)]), FakeSearchResult(messages=[])])
     adapter = ArchiveIncrementalDemandAdapter(
-        client, conn, asyncio.Event(), 10, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
+        client,
+        conn,
+        asyncio.Event(),
+        10,
+        _TEST_TIMEOUT_S,
+        writer=inline_writer(conn),
+        account_id=123,
+        capture_scope=_TEST_SCOPE.capture,
+        claim_scope=_TEST_SCOPE.claim,
     )
     with patch.object(activity_sync.time, "time", return_value=200):
         await adapter.run_slice(_selected_budget(adapter))
     restarted = ArchiveIncrementalDemandAdapter(
-        client, conn, asyncio.Event(), 10, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
+        client,
+        conn,
+        asyncio.Event(),
+        10,
+        _TEST_TIMEOUT_S,
+        writer=inline_writer(conn),
+        account_id=123,
+        capture_scope=_TEST_SCOPE.capture,
+        claim_scope=_TEST_SCOPE.claim,
     )
     with patch.object(activity_sync.time, "time", return_value=1000):
         await restarted.run_slice(_selected_budget(restarted))
@@ -511,7 +583,15 @@ async def test_empty_incremental_cycles_receive_new_business_revisions(conn: sql
         conn.execute("INSERT OR REPLACE INTO activity_sync_state(key,value) VALUES ('last_sync_at','100')")
     client = _FakeClient([FakeSearchResult(messages=[]), FakeSearchResult(messages=[]), FakeSearchResult(messages=[])])
     adapter = ArchiveIncrementalDemandAdapter(
-        client, conn, asyncio.Event(), 0, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
+        client,
+        conn,
+        asyncio.Event(),
+        0,
+        _TEST_TIMEOUT_S,
+        writer=inline_writer(conn),
+        account_id=123,
+        capture_scope=_TEST_SCOPE.capture,
+        claim_scope=_TEST_SCOPE.claim,
     )
 
     with patch.object(activity_sync.time, "time", return_value=200):
@@ -523,7 +603,15 @@ async def test_empty_incremental_cycles_receive_new_business_revisions(conn: sql
     reopened = sqlite3.connect(path)
     try:
         restarted = ArchiveIncrementalDemandAdapter(
-            client, reopened, asyncio.Event(), 0, _TEST_TIMEOUT_S, writer=inline_writer(reopened), account_id=123
+            client,
+            reopened,
+            asyncio.Event(),
+            0,
+            _TEST_TIMEOUT_S,
+            writer=inline_writer(reopened),
+            account_id=123,
+            capture_scope=_TEST_SCOPE.capture,
+            claim_scope=_TEST_SCOPE.claim,
         )
         with patch.object(activity_sync.time, "time", return_value=200):
             second = restarted.status(200.0, excluded=frozenset({first.selected}))
@@ -558,13 +646,27 @@ async def test_empty_incremental_cycles_receive_new_business_revisions(conn: sql
 async def test_backfill_completion_anchors_original_start(conn: sqlite3.Connection) -> None:
     client = _FakeClient([FakeSearchResult(messages=[_msg(12, 42, 190)]), FakeSearchResult(messages=[])])
     adapter = ArchiveBackfillDemandAdapter(
-        client, conn, asyncio.Event(), _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
+        client,
+        conn,
+        asyncio.Event(),
+        _TEST_TIMEOUT_S,
+        writer=inline_writer(conn),
+        account_id=123,
+        capture_scope=_TEST_SCOPE.capture,
+        claim_scope=_TEST_SCOPE.claim,
     )
     with patch.object(activity_sync.time, "time", return_value=200):
         await adapter.run_slice(_selected_budget(adapter))
     with patch.object(activity_sync.time, "time", return_value=1000):
         restarted = ArchiveBackfillDemandAdapter(
-            client, conn, asyncio.Event(), _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
+            client,
+            conn,
+            asyncio.Event(),
+            _TEST_TIMEOUT_S,
+            writer=inline_writer(conn),
+            account_id=123,
+            capture_scope=_TEST_SCOPE.capture,
+            claim_scope=_TEST_SCOPE.claim,
         )
         await restarted.run_slice(_selected_budget(restarted))
     assert activity_sync._load_state(conn)["last_sync_at"] == "200"
@@ -588,7 +690,15 @@ async def test_incremental_interruption_keeps_window(conn: sqlite3.Connection, e
     with patch.object(activity_sync, "call_with_timeout", new=AsyncMock(side_effect=error)):
         with pytest.raises(type(error)):
             adapter = ArchiveIncrementalDemandAdapter(
-                _FakeClient([]), conn, asyncio.Event(), 10, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
+                _FakeClient([]),
+                conn,
+                asyncio.Event(),
+                10,
+                _TEST_TIMEOUT_S,
+                writer=inline_writer(conn),
+                account_id=123,
+                capture_scope=_TEST_SCOPE.capture,
+                claim_scope=_TEST_SCOPE.claim,
             )
             await adapter.run_slice(_selected_budget(adapter))
     assert activity_sync._load_state(conn) == before
@@ -611,7 +721,15 @@ async def test_incremental_shutdown_keeps_window(conn: sqlite3.Connection) -> No
     shutdown = asyncio.Event()
     shutdown.set()
     adapter = ArchiveIncrementalDemandAdapter(
-        _FakeClient([]), conn, shutdown, 10, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
+        _FakeClient([]),
+        conn,
+        shutdown,
+        10,
+        _TEST_TIMEOUT_S,
+        writer=inline_writer(conn),
+        account_id=123,
+        capture_scope=_TEST_SCOPE.capture,
+        claim_scope=_TEST_SCOPE.claim,
     )
     await adapter.run_slice(_selected_budget(adapter))
     assert activity_sync._load_state(conn) == before
@@ -633,10 +751,12 @@ async def test_archive_membership_observation_follows_committed_service_message(
         _TEST_TIMEOUT_S,
         writer=inline_writer(conn),
         account_id=123,
+        capture_scope=_TEST_SCOPE.capture,
+        claim_scope=_TEST_SCOPE.claim,
         membership_observer=observed.append,
     )
     await adapter.run_slice(_selected_budget(adapter))
     assert conn.execute("SELECT is_service FROM messages WHERE message_id=100").fetchone() == (1,)
     assert len(observed) == 1
     assert observed[0].received == 1
-    assert observed[0].ignored_account_mismatch == 1
+    assert observed[0].ignored_ineligible == 1

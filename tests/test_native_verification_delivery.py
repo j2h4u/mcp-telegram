@@ -33,6 +33,8 @@ async def test_delivered_delete_settles_receipt_without_another_rpc(tmp_path: Pa
     writer = await SQLiteWriter.open(path)
     reader = open_sync_db_reader(path)
     profile_conn = sqlite3.connect(path)
+    profile_conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
+    profile_conn.commit()
     gate = _client(tmp_path / "session", writer, channel=False)
     lease_context = telegram_session_lease(tmp_path)
     gate.bind_session_lease(lease_context.__enter__())

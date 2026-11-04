@@ -46,7 +46,7 @@ def test_capture_scope_requires_positive_account_and_primary_key() -> None:
 async def test_scope_is_private_evidence_and_invalidated_pair_is_reacquired(tmp_path: Path) -> None:
     conn, raw_service = _prepare(tmp_path / "scope.sqlite", migrated=True)
     service = cast(DaemonEntityInfoService, raw_service)
-    scope = _scope()
+    scope = _scope(account_id=99)
     service._deps = replace(service._deps, full_user_auth_scope=lambda: scope)
     coordinator = service.refresh_coordinator
     assert coordinator is not None
@@ -323,7 +323,7 @@ async def test_scope_change_during_rpc_rejects_receipt_and_progress(tmp_path: Pa
 async def test_same_account_scope_rotation_keeps_local_facts_without_mutation(tmp_path: Path) -> None:
     conn, raw_service = _prepare(tmp_path / "scope-generation.sqlite", migrated=True)
     service = cast(DaemonEntityInfoService, raw_service)
-    current_scope = [_scope()]
+    current_scope = [_scope(account_id=99)]
     service._deps = replace(service._deps, full_user_auth_scope=lambda: current_scope[0])
     coordinator = service.refresh_coordinator
     assert coordinator is not None
@@ -332,7 +332,7 @@ async def test_same_account_scope_rotation_keeps_local_facts_without_mutation(tm
         table: conn.execute(f"SELECT * FROM {table} WHERE entity_id=42").fetchall()
         for table in ("entity_details", "entity_detail_sections", "entity_profile_refresh_state")
     }
-    current_scope[0] = _scope(auth_key_id=100)
+    current_scope[0] = _scope(account_id=99, auth_key_id=100)
 
     result = await service.get_entity_info({"entity_id": 42})
 

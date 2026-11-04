@@ -40,6 +40,7 @@ from mcp_telegram.messages.telegram_adapter import extract_message_row
 from mcp_telegram.sync_db import _apply_migrations
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource
 from sqlite_writer_helpers import inline_writer
+from tests.history_scope_helpers import HistoryScope
 
 _TEST_TIMEOUT_S = 120.0
 
@@ -51,10 +52,12 @@ _TEST_TIMEOUT_S = 120.0
 def _make_db() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
+    conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
+    conn.commit()
     return conn
 
 
-class _FakeClient:
+class _FakeClient(HistoryScope):
     """Minimal fake client for sweep_peer_once tests."""
 
     async def get_input_entity(self, dialog_id: int) -> object:
@@ -1163,6 +1166,8 @@ def test_sweep_membership_observation_follows_real_commit(monkeypatch: pytest.Mo
     from telethon.tl.types import MessageActionChatAddUser, MessageService, PeerChat
 
     with closing(_make_db()) as conn:
+        conn.execute("UPDATE dialog_directory_state SET account_id=77 WHERE singleton=1")
+        conn.commit()
         message = MessageService(
             id=8, peer_id=PeerChat(101), date=datetime.now(UTC), action=MessageActionChatAddUser([12])
         )
@@ -1178,7 +1183,7 @@ def test_sweep_membership_observation_follows_real_commit(monkeypatch: pytest.Mo
         observed = []
         result = asyncio.run(
             sweep_peer_once(
-                client=_FakeClient(),
+                client=_FakeClient(77),
                 conn=conn,
                 dialog_id=101,
                 offset_id=0,
@@ -1218,7 +1223,7 @@ async def test_access_loss_uses_account_captured_before_search(monkeypatch: pyte
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", resolve)
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fail_after_account_change)
         await sweep_peer_once(
-            client=_FakeClient(),
+            client=_FakeClient(77),
             conn=conn,
             dialog_id=dialog_id,
             offset_id=0,
@@ -1261,7 +1266,7 @@ async def test_access_loss_rolls_back_before_observer_on_membership_failure(monk
         monkeypatch.setattr("mcp_telegram.access_lifecycle.request_membership_refreshes", fail_membership)
         with pytest.raises(RuntimeError, match="membership failure"):
             await sweep_peer_once(
-                client=_FakeClient(),
+                client=_FakeClient(77),
                 conn=conn,
                 dialog_id=dialog_id,
                 offset_id=0,
@@ -1325,7 +1330,7 @@ async def test_access_loss_preserves_observation_time_when_writer_is_delayed(mon
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fail_search)
         monkeypatch.setattr("mcp_telegram.access_lifecycle.request_membership_refreshes", capture_refresh)
         await sweep_peer_once(
-            client=_FakeClient(),
+            client=_FakeClient(77),
             conn=conn,
             dialog_id=dialog_id,
             offset_id=0,

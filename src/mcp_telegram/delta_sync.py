@@ -30,18 +30,30 @@ from .access_lifecycle import (
     set_access_lost,
     stamp_access_revalidation,
 )
-from .dialog_identity import ensure_dialog_identity_baseline, publish_dialog_identity
+from .dialog_identity import ensure_dialog_identity_baseline
 from .entity_profile.membership import MembershipSignalCounts
 from .entity_profile.repository import bound_profile_account
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .history_enrollment import full_history_enabled, request_delta_refresh
 from .hydration_queue import HydrationPriority
+from .image_authorization import ScopeToken
 from .message_contracts import ExtractedMessage
-from .message_history.contracts import MessageHistoryAccessLostError, MessageHistoryUnavailableError
+from .message_history.contracts import (
+    HistoryAccessObservation,
+    HistoryAccessProbeResult,
+    MessageHistoryAccessLostError,
+    MessageHistoryUnavailableError,
+)
+from .message_history.identity_intake import publish_page_identities
 from .message_history.ports import ForwardGapPagePort
-from .messages.sqlite_bundle import insert_messages_with_fts
+from .messages.sqlite_bundle import (
+    ReceivedMessageScopeChangedError,
+    insert_messages_with_fts,
+    persist_received_messages,
+)
 from .observation_order import allocate_observation_order
-from .reactions.contracts import ReactionAggregateSource
+from .reactions.contracts import ReactionAggregateSource, ReactionObservationBoundary
+from .reactions.persistence import allocate_observation_boundary
 from .sqlite_values import row_first_int
 from .sqlite_writer import SQLiteWriter
 from .sync_read_model import (
@@ -374,7 +386,19 @@ def prepare_dm_deletion_reconciliation(conn: sqlite3.Connection, *, now: int | N
 class AccessProbe(Protocol):
     """Existing narrow access probe kept separate from paged history ports."""
 
-    async def probe_total_messages(self, dialog_id: int) -> int | None: ...
+    def capture_scope(self) -> ScopeToken | None: ...
+
+    def claim_scope(self, token: ScopeToken) -> bool: ...
+
+    async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _ProbeError:
+    observed_at: int
+    order: int
+    error: BaseException
+    scope: ScopeToken
 
 
 @dataclass(frozen=True, slots=True)
@@ -520,6 +544,22 @@ class DeltaSyncWorker:
         owner: int | None,
         observer: Callable[[MembershipSignalCounts], None] | None,
     ) -> _DeltaFetchOutcome:
+        scope = self._history_port.capture_scope()
+        if scope is None:
+            self._last_delta_slice_stale = True
+            return _DeltaFetchOutcome([], 0)
+
+        return await self._collect_delta_slice_scoped(dialog_id, max_known_id, generation, owner, observer, scope)
+
+    async def _collect_delta_slice_scoped(  # noqa: PLR0911, PLR0913, PLR0917 - distinct RPC outcomes
+        self,
+        dialog_id: int,
+        max_known_id: int,
+        generation: int,
+        owner: int | None,
+        observer: Callable[[MembershipSignalCounts], None] | None,
+        scope: ScopeToken,
+    ) -> _DeltaFetchOutcome:
         def prepare_observation(conn: sqlite3.Connection) -> tuple[int, int, int]:
             with write_transaction(conn):
                 identity_revision = ensure_dialog_identity_baseline(conn, dialog_id)
@@ -550,14 +590,21 @@ class DeltaSyncWorker:
             logger.warning("delta_slice_rpc_error dialog_id=%d error=%s", dialog_id, exc)
             self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
-        if page.identity is not None:
 
-            def persist_identity(conn: sqlite3.Connection) -> None:
-                with write_transaction(conn):
-                    assert page.identity is not None
-                    publish_dialog_identity(conn, dialog_id, page.identity, identity_revision)
-
-            await self._writer.run(persist_identity)
+        accepted = await self._writer.run(
+            lambda conn: publish_page_identities(
+                conn,
+                self._history_port,
+                scope,
+                page,
+                dialog_id=dialog_id,
+                identity_revision=identity_revision,
+                observation_order=observation_order,
+            )
+        )
+        if not accepted:
+            self._last_delta_slice_stale = True
+            return _DeltaFetchOutcome([], 0)
         rows = [replace(row, observation_order=observation_order) for row in page.messages]
         if self._delta_gap_fill_observation_enabled:
             unique_keys = {(row.message.dialog_id, row.message.message_id) for row in rows}
@@ -1464,7 +1511,7 @@ class DeltaAccessProbeDemandAdapter:
                 (dialog_id,),
             ).fetchone(),
         )
-        return repr(row)
+        return repr(None if row is None else (int(row[0]), int(row[1])))
 
     async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
         """Commit probe success before a later slice performs gap fill."""
@@ -1592,7 +1639,7 @@ class DeltaAccessProbeDemandAdapter:
                     logger.debug("delta_gap_fill_observation_failed")
         return successor
 
-    async def _request_probe(self, dialog_id: int) -> int | None:
+    async def _request_probe(self, dialog_id: int) -> HistoryAccessProbeResult:
         with acquisition_context(AcquisitionKind.MESSAGE_LOOKUP):
             with rpc_scope(TelegramRpcSource.DELTA_SYNC):
                 return await self._probe.probe_total_messages(dialog_id)
@@ -1600,7 +1647,11 @@ class DeltaAccessProbeDemandAdapter:
     async def _probe_dialog_for_recovery(
         self, dialog_id: int, now: int, selected: WorkRevision
     ) -> str | SliceOutcome | None:
-        def prepare(conn: sqlite3.Connection) -> int | SliceOutcome:
+        scope = self._probe.capture_scope()
+        if scope is None or scope.scope.account_id != self._account_id:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+
+        def prepare(conn: sqlite3.Connection) -> tuple[int, ReactionObservationBoundary] | SliceOutcome:
             with write_transaction(conn):
                 current_time = int(time.time())
                 if bound_profile_account(conn) != self._account_id:
@@ -1610,11 +1661,14 @@ class DeltaAccessProbeDemandAdapter:
                     return SliceOutcome(selected, SliceOutcomeKind.STALE)
                 if persisted[0] > current_time:
                     return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
-                return allocate_observation_order(conn)
+                return allocate_observation_order(conn), allocate_observation_boundary(
+                    conn, ReactionAggregateSource.HISTORY
+                )
 
-        order = await self._worker._writer.run(prepare)
-        if isinstance(order, SliceOutcome):
-            return order
+        prepared = await self._worker._writer.run(prepare)
+        if isinstance(prepared, SliceOutcome):
+            return prepared
+        order, reactions = prepared
         try:
             result = await self._request_probe(dialog_id)
         except (
@@ -1626,68 +1680,97 @@ class DeltaAccessProbeDemandAdapter:
         ) as exc:
             observed_at = int(time.time())
             error = exc
-            await self._worker._writer.run(
-                lambda conn: self._handle_probe_error(conn, dialog_id, observed_at, order, error)
-            )
+            try:
+                await self._worker._writer.run(
+                    lambda conn: self._handle_probe_error(
+                        conn, dialog_id, _ProbeError(observed_at, order, error, scope)
+                    )
+                )
+            except ReceivedMessageScopeChangedError:
+                return SliceOutcome(selected, SliceOutcomeKind.STALE)
             return None
 
-        return await self._worker._writer.run(
-            lambda conn: self._persist_probe_success(conn, dialog_id, now, result, order)
-        )
+        try:
+            return await self._worker._writer.run(
+                lambda conn: self._persist_probe_success(
+                    conn, dialog_id, now, HistoryAccessObservation(result, scope, order, reactions)
+                )
+            )
+        except ReceivedMessageScopeChangedError:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
 
-    def _handle_probe_error(
-        self, conn: sqlite3.Connection, dialog_id: int, now: int, order: int, exc: BaseException
-    ) -> None:
+    def _probe_error_retry(self, dialog_id: int, exc: BaseException) -> int:
         if isinstance(exc, TelegramRpcAdmissionDeferred):
             logger.info(
                 "access_probe admission_deferred dialog_id=%d error_type=%s — preserving revalidation budget",
                 dialog_id,
                 type(exc).__name__,
             )
-            retry = max(1, int(exc.retry_after_seconds or 1))
-        elif isinstance(exc, MessageHistoryAccessLostError):
+            return max(1, int(exc.retry_after_seconds or 1))
+        if isinstance(exc, MessageHistoryAccessLostError):
             logger.debug("access_still_lost dialog_id=%d", dialog_id)
-            retry = self._policy.cooldown_seconds
-        elif isinstance(exc, TelegramRpcThrottled):
+            return self._policy.cooldown_seconds
+        if isinstance(exc, TelegramRpcThrottled):
             _raise_if_latched(exc)
-            retry = max(self._policy.cooldown_seconds, exc.retry_after_seconds or self._policy.cooldown_seconds)
-        else:
-            logger.warning("probe_rpc_error dialog_id=%d error=%s", dialog_id, exc)
-            retry = self._policy.cooldown_seconds
+            return max(self._policy.cooldown_seconds, exc.retry_after_seconds or self._policy.cooldown_seconds)
+        logger.warning("probe_rpc_error dialog_id=%d error=%s", dialog_id, exc)
+        return self._policy.cooldown_seconds
+
+    def _handle_probe_error(self, conn: sqlite3.Connection, dialog_id: int, failure: _ProbeError) -> None:
+        retry = self._probe_error_retry(dialog_id, failure.error)
         with write_transaction(conn):
-            if bound_profile_account(conn) != self._account_id:
-                return
+            if bound_profile_account(conn) != self._account_id or not self._probe.claim_scope(failure.scope):
+                raise ReceivedMessageScopeChangedError
             current = cast(
                 tuple[int] | None,
                 conn.execute(
                     "SELECT 1 FROM synced_dialogs s WHERE s.dialog_id=? AND s.status='access_lost' "
                     "AND NOT EXISTS (SELECT 1 FROM dialog_fact_observations f WHERE f.dialog_id=s.dialog_id "
                     "AND f.field='access_state' AND f.observation_order>=?)",
-                    (dialog_id, order),
+                    (dialog_id, failure.order),
                 ).fetchone(),
             )
             if current is not None:
-                stamp_access_revalidation(conn, dialog_id, now, retry)
+                stamp_access_revalidation(conn, dialog_id, failure.observed_at, retry)
+            if not self._probe.claim_scope(failure.scope) or bound_profile_account(conn) != self._account_id:
+                raise ReceivedMessageScopeChangedError
 
     def _persist_probe_success(
-        self, conn: sqlite3.Connection, dialog_id: int, now: int, total_messages: int | None, order: int
+        self,
+        conn: sqlite3.Connection,
+        dialog_id: int,
+        now: int,
+        observation: HistoryAccessObservation,
     ) -> str | None:
         with write_transaction(conn):
-            if (
-                bound_profile_account(conn) != self._account_id
-                or conn.execute(
+            if bound_profile_account(conn) != self._account_id:
+                return None
+            access_lost = (
+                conn.execute(
                     "SELECT 1 FROM synced_dialogs WHERE dialog_id=? AND status='access_lost'", (dialog_id,)
                 ).fetchone()
-                is None
-                or not record_access_recovery_observation(conn, dialog_id, order)
-            ):
+                is not None
+            )
+            witnessed = access_lost and record_access_recovery_observation(conn, dialog_id, observation.order)
+            persist_received_messages(
+                conn,
+                observation.result.received,
+                scope=observation.scope,
+                claim_scope=self._probe.claim_scope,
+                observation_order=observation.order,
+                expected_dialog_id=dialog_id,
+                reaction_boundary=observation.reactions,
+                revalidated_access=witnessed,
+            )
+            if not witnessed:
                 return None
+            total_messages = observation.result.total_messages
             if not full_history_enabled(conn, dialog_id):
                 _restore_revalidated_access(
                     conn,
                     dialog_id,
                     total_messages=total_messages,
-                    observation_order=order,
+                    observation_order=observation.order,
                 )
                 return None
             conn.execute(

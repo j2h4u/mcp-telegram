@@ -33,6 +33,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     current_rpc_scope,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
+from tests.history_scope_helpers import HistoryScope
 from tests.sqlite_writer_helpers import inline_writer
 
 
@@ -61,6 +62,8 @@ def sync_db(tmp_path: Path) -> Iterator[_SQLiteConnection]:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = cast(_SQLiteConnection, _open_sync_db(db_path))
+    conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
+    conn.commit()
     yield conn
     conn.close()
 
@@ -78,10 +81,11 @@ def _message(dialog_id: int, message_id: int) -> ExtractedMessage:
     return extract_message_row(dialog_id, build_mock_message(id=message_id, text=str(message_id)))
 
 
-class _ForwardPort:
+class _ForwardPort(HistoryScope):
     def __init__(
         self, pages: Sequence[ForwardGapPage | BaseException | str], conn: _SQLiteConnection | None = None
     ) -> None:
+        super().__init__()
         self.pages = list(pages)
         self.calls: list[tuple[int, bool]] = []
         self.dialog_ids: list[int] = []
@@ -571,7 +575,7 @@ async def test_terminal_old_page_preserves_same_second_refresh(sync_db: sqlite3.
     with write_transaction(sync_db):
         request_delta_refresh(sync_db, 501, 100)
 
-    class Port:
+    class Port(HistoryScope):
         async def fetch_page(
             self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
         ) -> ForwardGapPage:
@@ -597,7 +601,7 @@ async def test_failed_peer_does_not_starve_ready_peer_after_adapter_restart(
     _seed_dialog(cast(_SQLiteConnection, sync_db), 2, refresh_requested_at=1)
     calls = []
 
-    class Port:
+    class Port(HistoryScope):
         async def fetch_page(
             self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
         ) -> ForwardGapPage:
@@ -622,7 +626,7 @@ async def test_excluded_delta_peer_selection_executes_its_exact_sibling(sync_db:
     _seed_dialog(cast(_SQLiteConnection, sync_db), -123, refresh_requested_at=1)
     calls: list[int] = []
 
-    class Port:
+    class Port(HistoryScope):
         async def fetch_page(
             self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
         ) -> ForwardGapPage:
@@ -658,7 +662,7 @@ async def test_empty_delta_cycles_receive_new_business_revisions(
     _seed_dialog(cast(_SQLiteConnection, sync_db), 1, refresh_requested_at=1)
     monkeypatch.setattr("mcp_telegram.delta_sync.DELTA_AUTOMATIC_REFRESH_INTERVAL_S", 0)
 
-    class Port:
+    class Port(HistoryScope):
         async def fetch_page(
             self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
         ) -> ForwardGapPage:
@@ -685,7 +689,7 @@ async def test_empty_delta_cycles_receive_new_business_revisions(
 async def test_delta_completion_cas_rejects_a_competing_empty_cycle(sync_db: sqlite3.Connection) -> None:
     _seed_dialog(cast(_SQLiteConnection, sync_db), 1, refresh_requested_at=1)
 
-    class Port:
+    class Port(HistoryScope):
         async def fetch_page(
             self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
         ) -> ForwardGapPage:
@@ -717,7 +721,7 @@ async def test_delta_peer_revision_change_rejects_only_that_selected_slice(sync_
     _seed_dialog(cast(_SQLiteConnection, sync_db), -123, refresh_requested_at=1)
     calls: list[int] = []
 
-    class Port:
+    class Port(HistoryScope):
         async def fetch_page(
             self, dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
         ) -> ForwardGapPage:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import replace
 from datetime import datetime
 from typing import Protocol, TypeVar, cast
 
@@ -18,7 +19,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
     UserDeactivatedError,
     UserPrivacyRestrictedError,
 )
-from telethon.tl.types import TypePeer  # type: ignore[import-untyped]
+from telethon.tl.types import Message, MessageService, TypePeer  # type: ignore[import-untyped]
 
 from .. import message_contracts as _message_contracts
 from ..flood import TelegramRpcThrottled, _raise_if_latched
@@ -640,6 +641,28 @@ def extract_message_row(
         forward=forward,
         reaction_can_see_list=project_reaction_visibility(_attr(msg, "reactions", None)),
     )
+
+
+def extract_received_messages(messages: Sequence[object]) -> tuple[_message_contracts.ReceivedMessage, ...]:
+    """Normalize supplied message bodies without attributing them to a requested peer."""
+    normalized: list[_message_contracts.ReceivedMessage] = []
+    for message in messages:
+        if not isinstance(message, (Message, MessageService)):
+            continue
+        dialog_id = extract_dialog_id(message)
+        if dialog_id is None or message.id <= 0:
+            continue
+        outgoing = getattr(message, "out", None)
+        normalized.append(
+            _message_contracts.ReceivedMessage(
+                replace(
+                    extract_message_row(dialog_id, message),
+                    reactions_observed=getattr(message, "reactions", None) is not None,
+                ),
+                outgoing if isinstance(outgoing, bool) else None,
+            )
+        )
+    return tuple(normalized)
 
 
 async def resolve_forward_entity_name_map(messages: Sequence[object], client: PeerNameClient) -> dict[int, str]:

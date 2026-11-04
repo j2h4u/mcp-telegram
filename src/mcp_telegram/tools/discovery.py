@@ -695,7 +695,7 @@ LIST_TOPICS_OUTPUT_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "topic_id": {"type": "integer"},
-                    "title": {"type": "string"},
+                    "title": {"type": ["string", "null"]},
                     "title_content": TELEGRAM_CONTENT_OUTPUT_SCHEMA,
                     "icon": {
                         "type": "object",
@@ -710,7 +710,7 @@ LIST_TOPICS_OUTPUT_SCHEMA = {
                     "hidden": {"type": ["boolean", "null"]},
                     "snapshot_at": {"type": ["integer", "null"]},
                 },
-                "required": ["topic_id", "title", "title_content"],
+                "required": ["topic_id", "title"],
                 "additionalProperties": False,
             },
         },
@@ -1160,12 +1160,13 @@ def _list_topics_error_result(args: ListTopics, response: dict[str, object]) -> 
 
 
 def _structured_topic(topic: dict[str, object]) -> dict[str, object]:
-    title = topic.get("title") or ""
+    title = topic.get("title")
     structured_topic: dict[str, object] = {
         "topic_id": topic.get("topic_id", topic.get("id")),
         "title": title,
-        "title_content": telegram_content(str(title), "message_text"),
     }
+    if isinstance(title, str):
+        structured_topic["title_content"] = telegram_content(title, "message_text")
     if icon := _structured_topic_icon(topic):
         structured_topic["icon"] = icon
     for field in ("pinned", "hidden", "snapshot_at"):

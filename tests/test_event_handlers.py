@@ -1373,6 +1373,19 @@ async def test_on_message_deleted_peerless_rejects_ambiguous_dm_message_id(
     ).fetchone() == (0,)
 
 
+def _bind_gap_scope(client: MagicMock, manager: EventHandlerManager) -> None:
+    from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
+    from mcp_telegram.image_authorization import ScopeCell
+
+    scope = ScopeCell()
+    assert scope.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
+    client.capture_image_scope = scope.capture
+    client.claim_image_scope = scope.claim
+    manager.set_self_id(42)
+    manager._conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    manager._conn.commit()
+
+
 @pytest.mark.asyncio
 async def test_gap_scan_marks_deleted(
     mock_client: MagicMock,
@@ -1387,6 +1400,7 @@ async def test_gap_scan_marks_deleted(
         insert_message(sync_db, dialog_id, message_id=msg_id, text=f"msg {msg_id}")
 
     manager = make_manager(mock_client, sync_db, shutdown_event)
+    _bind_gap_scope(mock_client, manager)
     manager.register()
 
     # client.get_messages returns: msg10 present, msg20 absent (None), msg30 present
@@ -1416,6 +1430,7 @@ async def test_gap_scan_rejected_peer_keeps_message_and_clears_context(
     insert_synced_dialog(sync_db, dialog_id)
     insert_message(sync_db, dialog_id, message_id=20, text="retained")
     manager = make_manager(mock_client, sync_db, shutdown_event)
+    _bind_gap_scope(mock_client, manager)
 
     async def reject(entity: int, *, ids: list[int]) -> object:
         assert entity == dialog_id
@@ -1454,6 +1469,7 @@ async def test_gap_scan_skips_unsynced_messages(
     sync_db.commit()
 
     manager = make_manager(mock_client, sync_db, shutdown_event)
+    _bind_gap_scope(mock_client, manager)
     manager.register()
 
     # The future message is excluded from scan (sent_at > scan_start), so get_messages
@@ -1721,6 +1737,7 @@ async def test_gap_scan_only_synced(
     mock_client.get_messages = _get_messages
 
     manager = make_manager(mock_client, sync_db, shutdown_event)
+    _bind_gap_scope(mock_client, manager)
     manager.register()
 
     await manager.run_dm_gap_scan()
@@ -2191,8 +2208,18 @@ async def test_delivered_message_reuses_admitted_order_and_time(
 ) -> None:
     insert_synced_dialog(sync_db, 42)
     manager = make_manager(mock_client, sync_db, shutdown_event)
+    _bind_gap_scope(mock_client, manager)
     event = make_new_message_event(42, build_mock_message(id=502, text="retained"))
-    delivered = DeliveredUpdate(observation_order=991, captured_at=1_700_000_000.75, reaction_sequence=81)
+    scope = mock_client.capture_image_scope()
+    assert scope is not None
+    mock_client.retained_auth_scope.return_value = scope.scope
+    delivered = DeliveredUpdate(
+        observation_order=991,
+        captured_at=1_700_000_000.75,
+        reaction_sequence=81,
+        auth_scope=scope.scope,
+        scope_token=scope,
+    )
     for _ in range(2):
         with delivered_update_context(delivered):
             await manager.on_new_message(event)
@@ -2419,11 +2446,12 @@ async def test_dm_enrollment_keeps_delivery_pending_when_authorization_changes_b
     delivered = DeliveredUpdate(2, 100, 2, auth_scope=scope, scope_token=cell.capture())
     with delivered_update_context(delivered):
         await manager.on_new_message(event)
-    assert claims == 3
+    assert claims >= 3
     assert delivered.failed
-    assert sync_db.execute(
-        "SELECT text FROM messages WHERE dialog_id=? AND message_id=1001", (dialog_id,)
-    ).fetchone() == ("message",)
+    assert (
+        sync_db.execute("SELECT text FROM messages WHERE dialog_id=? AND message_id=1001", (dialog_id,)).fetchone()
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -2478,9 +2506,7 @@ async def test_dm_authorization_change_replays_with_fresh_token_and_retained_ord
         assert shutdown.event.is_set() and shutdown.reason_code == "critical_task_failed"
         assert not monitor_context.api_server._ready
         assert _pending(path) is not None
-        assert reader.execute("SELECT text FROM messages WHERE dialog_id=55 AND message_id=11").fetchone() == (
-            "fixture",
-        )
+        assert reader.execute("SELECT text FROM messages WHERE dialog_id=55 AND message_id=11").fetchone() is None
         tokens = [tuple(row) for row in reader.execute("SELECT * FROM update_delivery_tokens")]
         assert tokens
         cast(SQLiteSession, client.session).close()

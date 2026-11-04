@@ -13,7 +13,8 @@ from telethon.sessions import SQLiteSession
 
 from mcp_telegram import daemon
 from mcp_telegram.config import TelegramRpcSchedulerConfig, load_config
-from mcp_telegram.state import telegram_session_lease
+from mcp_telegram.image_authorization import ScopeCell
+from mcp_telegram.state import TelegramSessionLease, telegram_session_lease
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_rpc import (
     TelegramRpcBudget,
@@ -127,6 +128,7 @@ async def test_composition_failure_closes_client_before_releasing_session_lease(
 ) -> None:
     state_dir = load_config().state.dir
     events: list[str] = []
+    scope = ScopeCell()
 
     async def disconnect() -> None:
         with pytest.raises(RuntimeError, match="already owned"), telegram_session_lease(state_dir):
@@ -138,12 +140,18 @@ async def test_composition_failure_closes_client_before_releasing_session_lease(
             pytest.fail("scheduler teardown ran after session lease release")
         events.append("scheduler")
 
-    def bind_lease(proof: object) -> None:
-        assert proof is not None
+    def bind_lease(proof: TelegramSessionLease) -> None:
+        assert proof.is_held()
         if bind_fails:
             raise RuntimeError("synthetic lease binding failure")
 
-    client = SimpleNamespace(disconnect=disconnect, close_rpc_scheduler=close_scheduler, bind_session_lease=bind_lease)
+    client = SimpleNamespace(
+        disconnect=disconnect,
+        close_rpc_scheduler=close_scheduler,
+        bind_session_lease=bind_lease,
+        capture_image_scope=scope.capture,
+        claim_image_scope=scope.claim,
+    )
 
     def bootstrap(path: Path, *_args: object) -> None:
         ensure_sync_schema(path)

@@ -11,7 +11,7 @@ from typing import Protocol, cast
 
 from telethon.tl.types import TypeInputPeer
 
-from .activity_substrate import ActivityClient
+from .activity_substrate import ActivityRpcClient
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .linked_chat_fact import LinkedChatFact, LinkedChatState, linked_chat_fact_owner
 from .sqlite_writer import SQLiteWriter
@@ -44,7 +44,7 @@ async def resolve_input_peer(client: _InputEntityResolverClient, dialog_id: int)
 
 
 async def resolve_linked_chat_id(
-    client: ActivityClient,
+    client: ActivityRpcClient,
     conn: sqlite3.Connection,
     channel_id: int,
     *,

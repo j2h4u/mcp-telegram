@@ -71,6 +71,7 @@ async def recovery(database: Database) -> AsyncIterator[Recovery]:
     service = _test_service(conn, limits=RefreshLimits(), account_id=77)
     service._deps = replace(service._deps, user_profile_port=gateway, now_provider=lambda: clock[0])
     with write_transaction(conn):
+        conn.execute("UPDATE dialog_directory_state SET account_id=77 WHERE singleton=1")
         conn.execute("UPDATE entity_profile_refresh_state SET next_section='full_profile'")
     try:
         await _run(service)

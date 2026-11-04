@@ -175,7 +175,7 @@ def test_post_start_event_survives_snapshot_and_keeps_invalidation_pending(
         scan, TopicPage((TopicFact(7, "Stale snapshot", icon_emoji_id=5),), 1, False, None)
     )
 
-    expected_title = "After event" if mutation in {"create", "edit", "hide"} else "Before event"
+    expected_title = "After event" if mutation in {"create", "edit", "hide"} else "Stale snapshot"
     assert _row(db, "SELECT title FROM topic_metadata WHERE topic_id=7") == (expected_title,)
     if mutation in {"pin", "pins"}:
         assert _row(db, "SELECT pinned FROM topic_metadata WHERE topic_id=7") == (1,)
@@ -338,7 +338,7 @@ def test_explicit_deleted_constructor_retains_existing_title_and_marks_tombstone
     assert repository.apply_page(_begin(repository), TopicPage((), 2, False, None, deleted_ids=(7, 8)))
 
     assert _row(db, "SELECT title,is_deleted FROM topic_metadata WHERE topic_id=7") == ("Deleted topic name", 1)
-    assert _row(db, "SELECT title,is_deleted FROM topic_metadata WHERE topic_id=8") == ("", 1)
+    assert _row(db, "SELECT title,is_deleted FROM topic_metadata WHERE topic_id=8") == (None, 1)
     assert repository.coverage(42)["coverage"] == "complete"
 
 
@@ -615,3 +615,13 @@ def test_delayed_same_capability_cannot_reopen_newer_forbidden_observation(db: s
     assert repository.next_pending() is None
     assert repository.observe_capability(42, True, allocate_observation_order(db))
     assert repository.next_pending() == (42, 0)
+
+
+def test_empty_pin_set_does_not_restore_catalog_membership(db: sqlite3.Connection) -> None:
+    _enroll(db)
+    _seed(db, 7, "Archived topic")
+    db.execute("UPDATE topic_metadata SET catalog_present=0 WHERE dialog_id=42 AND topic_id=7")
+    db.commit()
+    with write_transaction(db):
+        SQLiteTopicMetadataRepository(db).apply_topic_pins(42, (), observed_at=100)
+    assert _row(db, "SELECT catalog_present,pinned FROM topic_metadata WHERE dialog_id=42 AND topic_id=7") == (0, 0)

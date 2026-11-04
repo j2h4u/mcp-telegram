@@ -16,6 +16,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcSource,
 )
 from sqlite_writer_helpers import inline_writer
+from tests.history_scope_helpers import HistoryScope
 
 
 def _closed_error(source: TelegramRpcSource) -> RpcAdmissionClosedError:
@@ -23,8 +24,9 @@ def _closed_error(source: TelegramRpcSource) -> RpcAdmissionClosedError:
     return RpcAdmissionClosedError(scope, "scheduler closed")
 
 
-class _ClosedActivityClient:
+class _ClosedActivityClient(HistoryScope):
     def __init__(self, error: RpcAdmissionClosedError) -> None:
+        super().__init__()
         self.error = error
 
     async def __call__(self, request: object) -> object:

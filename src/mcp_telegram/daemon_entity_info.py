@@ -31,7 +31,8 @@ from .contacts.intake import intake_marker as contact_intake_marker
 from .contacts.intake import track_contact
 from .contacts.state import read_contact_command_state
 from .demand_wiring import DemandOfferSink, offer_durable_demand
-from .dialog_identity import capture_identity_baseline
+from .dialog_directory import apply_realtime_eligibility
+from .dialog_identity import capture_identity_baseline, publish_supplied_identities
 from .entity_profile.contracts import (
     CHANNEL_CONTACT_UNSUPPORTED_REASON,
     CHANNEL_CONTACT_UNSUPPORTED_RPC_CODE,
@@ -47,6 +48,7 @@ from .entity_profile.contracts import (
     ChannelContactOverlapObservation,
     ChannelProfileObservation,
     ChannelReference,
+    ChatAvatarHistoryObservation,
     ChatAvatarReference,
     ChatCurrentPhoto,
     CommandProfileAcquisition,
@@ -59,6 +61,7 @@ from .entity_profile.contracts import (
     ProjectionOutcome,
     ProjectionStatus,
     StoryProfileValidationError,
+    SuppliedDialogFacts,
     TargetKind,
     UserProfileObservation,
     UserReference,
@@ -84,20 +87,27 @@ from .entity_profile.refresh import (
     scope_changed_retry_at,
 )
 from .entity_profile.repository import (
+    ChatAvatarMessageIntake,
     EntityProfileRepository,
     EntityRefreshCursor,
     EntitySectionCommit,
     NativeVerificationGuardChangedError,
+    bound_profile_account,
     pair_readiness_latency_ms,
 )
 from .flood import TelegramRpcThrottled, _raise_if_latched
-from .folders.read_model import dialog_placement
+from .folders.read_model import dialog_placement, folder_summaries
+from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .image_authorization import ScopeToken
 from .linked_chat_fact import linked_chat_fact_owner
+from .messages.sqlite_bundle import persist_received_messages
 from .models import DialogType
 from .observation_order import allocate_observation_order
+from .reactions.contracts import ReactionAggregateSource, ReactionObservationBoundary
+from .reactions.persistence import allocate_observation_boundary
+from .read_state import apply_read_cursor
 from .sqlite_writer import SQLiteWriter
-from .sync_transactions import write_transaction
+from .sync_transactions import write_savepoint, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import (
     DemandStatus,
@@ -111,6 +121,11 @@ from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_error import describe_telegram_rpc_error
 from .telegram_rpc_scheduler import TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending, current_rpc_scope
 from .telethon_dialog import classify_dialog_type, observe_dialog_identity
+from .unread_state import apply_unread_facts
+
+
+class _ReceivedProfileCommitRejectedError(RuntimeError):
+    """Rejecting a profile publication must roll back its claimed fields."""
 
 
 class _LinkedChatFactCaptureUnavailable:
@@ -424,6 +439,11 @@ class _ProfileSectionContext:
     pair_section: bool
     pair_mode: str
     eligible_pair: bool
+    received_scope: ScopeToken | None = None
+    received_observation: ProfileFieldObservation | None = None
+    received_guard: Callable[[], bool] | None = None
+    requires_received_scope: bool = False
+    actual_attempts: int = 0
     linked_chat_fact_generation: int | None = None
     linked_chat_id: int | None = None
     linked_chat_fact_captured: bool = False
@@ -462,6 +482,7 @@ class _PairFailure:
     reason: str
     retry_at: int
     reuse_rejection_reason: str | None
+    received_context: _ProfileSectionContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,6 +494,7 @@ class _PairCommitRequest:
     pair_mode: str
     attempt_start: int
     reuse_rejection_reason: str | None
+    received_context: _ProfileSectionContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,6 +506,7 @@ class _PairMeasurement:
     pair_mode: str
     actual_attempts: int
     committed: bool
+    received_context: _ProfileSectionContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -574,7 +597,13 @@ class DaemonEntityInfoService:
         )
 
     async def _write_profiles[T](
-        self, operation: Callable[[EntityProfileRepository], T], *, track_rejection: bool = True
+        self,
+        operation: Callable[[EntityProfileRepository], T],
+        *,
+        track_rejection: bool = True,
+        avatar_intake: tuple[int, ChatAvatarMessageIntake] | None = None,
+        received_intake: tuple[int, EntitySectionCommit, _ProfileSectionContext] | None = None,
+        marker_scope: _ProfileSectionContext | None = None,
     ) -> T:
         def write(conn: sqlite3.Connection) -> T:
             profiles = EntityProfileRepository(
@@ -589,7 +618,19 @@ class DaemonEntityInfoService:
                 if receipt is not None
                 else None
             )
-            result = operation(profiles)
+            if avatar_intake is not None or received_intake is not None:
+                with write_transaction(conn):
+                    result = self._write_received_profile_facts(
+                        conn,
+                        profiles,
+                        lambda: self._write_profile_avatar_intake(conn, profiles, operation, avatar_intake),
+                        received_intake,
+                    )
+            elif marker_scope is not None:
+                with write_transaction(conn):
+                    result = self._write_scoped_profile_marker(conn, profiles, operation, marker_scope)
+            else:
+                result = operation(profiles)
             if receipt is not None:
                 accepted, rejected = _profile_write_receipt(result)
                 after = profiles.refresh_work_state(int(receipt.selected.key.target), receipt.selected.key.account_id)
@@ -600,6 +641,123 @@ class DaemonEntityInfoService:
             return result
 
         return await self._deps.writer.run(write)
+
+    def _write_scoped_profile_marker[T](
+        self,
+        conn: sqlite3.Connection,
+        profiles: EntityProfileRepository,
+        operation: Callable[[EntityProfileRepository], T],
+        context: _ProfileSectionContext,
+    ) -> T:
+        if not self._received_profile_current(conn, context):
+            raise _AuthScopeUnavailableError("authenticated session lease is unavailable")
+        result = operation(profiles)
+        if not self._received_profile_current(conn, context):
+            raise _AuthScopeUnavailableError("authenticated session lease changed during publication")
+        return result
+
+    def _write_received_profile_facts[T](
+        self,
+        conn: sqlite3.Connection,
+        profiles: EntityProfileRepository,
+        operation: Callable[[], T],
+        intake: tuple[int, EntitySectionCommit, _ProfileSectionContext] | None,
+    ) -> T:
+        if intake is None:
+            return operation()
+        dialog_id, commit, context = intake
+        observation = context.received_observation
+        if observation is None or not self._received_profile_current(conn, context):
+            return cast(T, False)
+        try:
+            with write_savepoint(conn):
+                result = operation()
+                if not result:
+                    raise _ReceivedProfileCommitRejectedError
+        except _ReceivedProfileCommitRejectedError:
+            result = cast(T, False)
+        if commit.supplied_dialog_facts is not None:
+            self._publish_received_dialog_facts(conn, profiles, dialog_id, commit.supplied_dialog_facts, observation)
+        if not self._received_profile_current(conn, context):
+            raise _AuthScopeUnavailableError("authenticated session lease changed during publication")
+        return result
+
+    def _received_profile_current(self, conn: sqlite3.Connection, context: _ProfileSectionContext) -> bool:
+        token = context.received_scope
+        return (
+            token is not None
+            and self._claim_received_profile_scope(conn, token)
+            and (context.received_guard is None or context.received_guard())
+        )
+
+    def _claim_received_profile_scope(self, conn: sqlite3.Connection, token: ScopeToken) -> bool:
+        """Claim the original lease against the currently bound profile account."""
+        claim = getattr(self._deps.client, "claim_image_scope", None)
+        return callable(claim) and bool(claim(token)) and bound_profile_account(conn) == token.scope.account_id
+
+    @staticmethod
+    def _publish_received_dialog_facts(
+        conn: sqlite3.Connection,
+        profiles: EntityProfileRepository,
+        dialog_id: int,
+        facts: SuppliedDialogFacts,
+        observation: ProfileFieldObservation,
+    ) -> None:
+        if facts.read_inbox_max_id is not None:
+            apply_read_cursor(conn, dialog_id, "inbox", facts.read_inbox_max_id)
+        if facts.read_outbox_max_id is not None:
+            apply_read_cursor(conn, dialog_id, "outbox", facts.read_outbox_max_id)
+        if facts.unread_count is not None:
+            apply_unread_facts(
+                conn,
+                dialog_id,
+                observed_at=observation.observed_at,
+                unread_count=facts.unread_count,
+                observation_order=observation.order,
+            )
+        if facts.mute_until is not None:
+            changed = apply_realtime_eligibility(
+                conn,
+                dialog_id,
+                observed_at=observation.observed_at,
+                mute_until=facts.mute_until,
+                observation_order=observation.order,
+            )
+            if changed:
+                SQLiteFolderSnapshotRepository(conn).reproject_current_rules_in_transaction(now=observation.observed_at)
+        for identity in facts.sidecar_identities:
+            profiles.publish_supplied_identity(identity, observation)
+        publish_supplied_identities(conn, facts.referenced_identities, observation_order=observation.order)
+
+    def _write_profile_avatar_intake[T](
+        self,
+        conn: sqlite3.Connection,
+        profiles: EntityProfileRepository,
+        operation: Callable[[EntityProfileRepository], T],
+        avatar_intake: tuple[int, ChatAvatarMessageIntake] | None,
+    ) -> T:
+        if avatar_intake is None:
+            return operation(profiles)
+        dialog_id, intake = avatar_intake
+        claim = getattr(self._deps.client, "claim_image_scope", None)
+        if (
+            not callable(claim)
+            or bound_profile_account(conn) != intake.scope.scope.account_id
+            or not claim(intake.scope)
+        ):
+            return cast(T, False)
+        claim_scope = cast(Callable[[ScopeToken], bool], claim)
+        result = operation(profiles)
+        persist_received_messages(
+            conn,
+            intake.messages,
+            scope=intake.scope,
+            claim_scope=claim_scope,
+            observation_order=intake.observation_order,
+            expected_dialog_id=dialog_id,
+            reaction_boundary=intake.reaction_boundary,
+        )
+        return result
 
     def bind_profile_observer(self, observer: ProfilePairObservationHook) -> None:
         """Attach the best-effort profile telemetry hook after composition."""
@@ -1061,6 +1219,7 @@ class DaemonEntityInfoService:
         """Acquire one legacy group envelope for independent profile projections."""
         context = self._profile_section_context(cursor, DialogType.GROUP)
         try:
+            await self._prepare_received_profile_context(context)
             full_profile, contact_overlap = await self._acquire_group_full_chat_pair(cursor)
         except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending:
             raise
@@ -1116,25 +1275,21 @@ class DaemonEntityInfoService:
             raise
 
         if self._profile_scope_changed_during_acquisition(context.captured_scope):
-            await self._write_profiles(
-                lambda profiles: profiles.mark_section_failure(
-                    cursor,
-                    now=now,
-                    reason="auth_scope_changed",
-                    retry_at=scope_changed_retry_at(now),
-                )
-            )
-            return DurableRefreshSliceResult(cursor.entity_id, DurableRefreshTerminal.FAILURE)
+            terminal = await self._mark_profile_scope_changed(cursor, context, now=now)
+            return DurableRefreshSliceResult(cursor.entity_id, terminal)
 
         full_profile = self._with_observation_metadata(full_profile, context.captured_scope)
         contact_overlap = self._with_observation_metadata(contact_overlap, context.captured_scope)
         committed = await self._write_profiles(
             lambda profiles: profiles.commit_group_full_chat_pair(
                 cursor,
-                full_profile,
+                profiles.fence_received_profile_identity(
+                    full_profile, cast(ProfileFieldObservation, context.received_observation)
+                ),
                 contact_overlap,
                 now=now,
-            )
+            ),
+            received_intake=(cursor.entity_id, full_profile, context),
         )
         self._observe_profile_section_commit(
             cursor,
@@ -1290,11 +1445,7 @@ class DaemonEntityInfoService:
         context = self._profile_section_context(cursor, entity_type)
         identity_baseline = capture_identity_baseline(self._deps.conn, cursor.entity_id)
         try:
-            field_observation = (
-                await self._reserve_profile_observation(context.captured_scope)
-                if entity_type in {DialogType.USER, DialogType.BOT, DialogType.SERVICE}
-                else None
-            )
+            field_observation = await self._profile_field_observation(cursor, entity_type, context)
             self._require_profile_access(cursor.entity_id)
             result = await self._acquire_profile_section(cursor, entity_type, context=context)
         except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending:
@@ -1346,21 +1497,23 @@ class DaemonEntityInfoService:
             self._note_retryable_profile_failure(exc, terminal)
             return terminal
         if self._profile_scope_changed_during_acquisition(context.captured_scope):
-            await self._write_profiles(
-                lambda profiles: profiles.mark_section_failure(
-                    cursor,
-                    now=now,
-                    reason="auth_scope_changed",
-                    retry_at=scope_changed_retry_at(now),
-                )
-            )
-            return DurableRefreshTerminal.FAILURE
+            return await self._mark_profile_scope_changed(cursor, context, now=now)
         if result.dialog_identity_observation is not None:
             result = dataclass_replace(result, dialog_identity_baseline_revision=identity_baseline)
         result = self._with_observation_metadata(result, context.captured_scope)
         result = dataclass_replace(result, field_observation=field_observation)
         committed = await self._commit_profile_section_result(cursor, entity_type, result, context, now=now)
         return self._success_if_refresh_finished(cursor, committed=committed)
+
+    async def _profile_field_observation(
+        self, cursor: EntityRefreshCursor, entity_type: DialogType, context: _ProfileSectionContext
+    ) -> ProfileFieldObservation | None:
+        if entity_type not in {DialogType.USER, DialogType.BOT, DialogType.SERVICE}:
+            return None
+        if cursor.next_section == "full_profile":
+            await self._prepare_received_profile_context(context)
+            return context.received_observation
+        return await self._reserve_profile_observation(context.captured_scope)
 
     def _profile_section_context(
         self,
@@ -1375,25 +1528,61 @@ class DaemonEntityInfoService:
             eligible_pair=cursor.pair_eligible and entity_type in {DialogType.USER, DialogType.BOT},
         )
 
+    async def _prepare_received_profile_context(self, context: _ProfileSectionContext) -> None:
+        context.requires_received_scope = True
+        capture = getattr(self._deps.client, "capture_image_scope", None)
+        claim = getattr(self._deps.client, "claim_image_scope", None)
+        token = capture() if callable(capture) else None
+        if (
+            not isinstance(token, ScopeToken)
+            or token.scope != context.captured_scope
+            or not callable(claim)
+            or not claim(token)
+        ):
+            raise _AuthScopeUnavailableError("authenticated session lease is unavailable")
+        context.received_scope = token
+        context.received_observation = await self._reserve_profile_observation(context.captured_scope)
+
+    async def _mark_profile_scope_changed(
+        self, cursor: EntityRefreshCursor, context: _ProfileSectionContext, *, now: int
+    ) -> DurableRefreshTerminal | None:
+        marked = await self._write_profiles(
+            lambda profiles: profiles.mark_section_failure(
+                cursor, now=now, reason="auth_scope_changed", retry_at=scope_changed_retry_at(now)
+            ),
+            received_intake=(cursor.entity_id, EntitySectionCommit({}), context)
+            if context.received_scope is not None
+            else None,
+        )
+        return DurableRefreshTerminal.FAILURE if marked else None
+
     async def _handle_profile_section_failure(
         self, failure: _ProfileSectionFailure, *, guard_scope: bool = False
     ) -> DurableRefreshTerminal | None:
-        failed = await self._write_profiles(
-            lambda profiles: self._persist_profile_section_failure(profiles, failure, guard_scope=guard_scope)
-        )
+        def mark(profiles: EntityProfileRepository) -> bool:
+            return self._persist_profile_section_failure(profiles, failure, guard_scope=guard_scope)
+
+        if failure.context.requires_received_scope:
+            failed = await self._write_pair_accounting(failure.context, mark)
+        else:
+            failed = await self._write_profiles(mark)
         if failed and failure.cursor.next_section == "common_chats":
             self._observe_membership({"failed": 1}, source="common_chats_refresh")
         actual_attempts = self._rpc_attempt_count() - failure.context.attempt_start
         if failure.context.measures_disabled_pair:
-            await self._write_profiles(
-                lambda profiles: profiles.record_pair_attempt(
-                    failure.cursor,
-                    failure.cursor.next_section,
-                    actual_attempts=actual_attempts,
-                )
-            )
+            await self._record_profile_failure_attempt(failure, actual_attempts)
         self._observe_profile_section_failure(failure.cursor, failure.entity_type, actual_attempts=actual_attempts)
         return DurableRefreshTerminal.FAILURE if failed else None
+
+    async def _record_profile_failure_attempt(self, failure: _ProfileSectionFailure, attempts: int) -> None:
+        def record(profiles: EntityProfileRepository) -> object:
+            profiles.record_pair_attempt(failure.cursor, failure.cursor.next_section, actual_attempts=attempts)
+            return None
+
+        if failure.context.requires_received_scope:
+            await self._write_pair_accounting(failure.context, record)
+        else:
+            await self._write_profiles(record)
 
     def _persist_profile_section_failure(
         self, profiles: EntityProfileRepository, failure: _ProfileSectionFailure, *, guard_scope: bool
@@ -1434,23 +1623,54 @@ class DaemonEntityInfoService:
             return await self._write_profiles(
                 lambda profiles: self._commit_unsupported_contact_overlap(profiles, cursor, result, context, now=now)
             )
-        actual_attempts = self._rpc_attempt_count() - context.attempt_start
         if context.measures_disabled_pair:
-            committed, summary = await self._write_profiles(
-                lambda profiles: self._commit_measured_section_in_scope(
-                    profiles,
-                    cursor,
-                    result,
-                    context,
-                    now=now,
-                )
-            )
-            if summary is not None:
-                self._emit_pair_summary(summary)
-            await self._publish_profile_linked_chat_fact(cursor, entity_type, context, committed, now=now)
-            return committed
+            return await self._commit_measured_profile_section(cursor, entity_type, result, context, now=now)
+        return await self._commit_unmeasured_profile_section(cursor, entity_type, result, context, now=now)
+
+    async def _commit_measured_profile_section(
+        self,
+        cursor: EntityRefreshCursor,
+        entity_type: DialogType,
+        result: EntitySectionCommit,
+        context: _ProfileSectionContext,
+        *,
+        now: int,
+    ) -> bool:
+        """Commit measured parent progress and independently supplied peer facts."""
+        summaries: list[dict[str, object] | None] = []
+        context.actual_attempts = self._rpc_attempt_count() - context.attempt_start
+
+        def commit(profiles: EntityProfileRepository) -> bool:
+            accepted, summary = self._commit_measured_section_in_scope(profiles, cursor, result, context, now=now)
+            summaries.append(summary)
+            return accepted
+
         committed = await self._write_profiles(
-            lambda profiles: self._commit_profile_section_in_scope(profiles, cursor, result, context, now=now)
+            commit,
+            received_intake=(cursor.entity_id, result, context) if context.received_scope is not None else None,
+        )
+        if summaries and summaries[0] is not None:
+            self._emit_pair_summary(summaries[0])
+        await self._publish_profile_linked_chat_fact(cursor, entity_type, context, committed, now=now)
+        return committed
+
+    async def _commit_unmeasured_profile_section(
+        self,
+        cursor: EntityRefreshCursor,
+        entity_type: DialogType,
+        result: EntitySectionCommit,
+        context: _ProfileSectionContext,
+        *,
+        now: int,
+    ) -> bool:
+        """Commit the ordinary section and publish its independent observations."""
+        actual_attempts = self._rpc_attempt_count() - context.attempt_start
+        committed = await self._write_profiles(
+            lambda profiles: self._commit_profile_section_in_scope(profiles, cursor, result, context, now=now),
+            avatar_intake=(cursor.entity_id, result.chat_avatar_messages)
+            if cursor.next_section == "avatar_history" and result.chat_avatar_messages is not None
+            else None,
+            received_intake=(cursor.entity_id, result, context) if context.received_scope is not None else None,
         )
         if committed and cursor.next_section == "common_chats" and result.collection_page is not None:
             self._observe_common_chats_publication(cursor, result)
@@ -1508,6 +1728,8 @@ class DaemonEntityInfoService:
                 cursor, now=now, reason="auth_scope_changed", retry_at=scope_changed_retry_at(now)
             )
             return False
+        if context.received_observation is not None:
+            result = profiles.fence_received_profile_identity(result, context.received_observation)
         return profiles.commit_section(cursor, result, now=now)
 
     def _commit_measured_section_in_scope(
@@ -1529,7 +1751,7 @@ class DaemonEntityInfoService:
             result,
             now=now,
             outcome=self._section_commit_outcome(cursor.next_section, result),
-            actual_attempts=self._rpc_attempt_count() - context.attempt_start,
+            actual_attempts=context.actual_attempts,
         )
 
     def _commit_unsupported_contact_overlap(
@@ -1600,8 +1822,10 @@ class DaemonEntityInfoService:
         """Acquire and atomically commit both User profile projections."""
         attempt_start = self._rpc_attempt_count()
         pair_mode = cursor.pair_mode or "enabled"
+        context = self._profile_section_context(cursor, DialogType.USER)
         try:
-            full_profile, personal_channel = await self._acquire_full_user_pair(cursor)
+            await self._prepare_received_profile_context(context)
+            full_profile, personal_channel = await self._acquire_full_user_pair(cursor, context=context)
         except (
             TelegramRpcAdmissionDeferred,
             TelegramRpcMethodRecoveryPending,
@@ -1615,9 +1839,7 @@ class DaemonEntityInfoService:
             AttributeError,
             ValueError,
         ) as exc:
-            return await self._handle_full_user_pair_acquisition_failure(
-                cursor, pair_mode, attempt_start, reuse_rejection_reason, exc
-            )
+            return await self._handle_full_user_pair_acquisition_failure(cursor, context, reuse_rejection_reason, exc)
         if self._pair_scope_mismatch(cursor, full_profile, now=now):
             return await self._handle_full_user_pair_failure(
                 _PairFailure(
@@ -1628,6 +1850,7 @@ class DaemonEntityInfoService:
                     reason="auth_scope_changed",
                     retry_at=scope_changed_retry_at(now),
                     reuse_rejection_reason="auth_scope_changed",
+                    received_context=context,
                 )
             )
         committed = await self._commit_full_user_pair_or_raise(
@@ -1639,6 +1862,7 @@ class DaemonEntityInfoService:
                 pair_mode=pair_mode,
                 attempt_start=attempt_start,
                 reuse_rejection_reason=reuse_rejection_reason,
+                received_context=context,
             )
         )
         actual_attempts = self._rpc_attempt_count() - attempt_start
@@ -1651,6 +1875,7 @@ class DaemonEntityInfoService:
                 pair_mode=pair_mode,
                 actual_attempts=actual_attempts,
                 committed=committed,
+                received_context=context,
             )
         )
         if summary is not None:
@@ -1670,17 +1895,18 @@ class DaemonEntityInfoService:
     async def _handle_full_user_pair_acquisition_failure(
         self,
         cursor: EntityRefreshCursor,
-        pair_mode: str,
-        attempt_start: int,
+        context: _ProfileSectionContext,
         reuse_rejection_reason: str | None,
         error: Exception,
     ) -> DurableRefreshTerminal | None:
+        pair_mode = context.pair_mode
+        attempt_start = context.attempt_start
         if isinstance(error, _ProfileAccessLostError):
             raise error
         if isinstance(error, (TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending)):
             raise error
         if isinstance(error, RpcAttemptBudgetExhaustedError):
-            await self._record_full_user_pair_failure(cursor, pair_mode, attempt_start, reuse_rejection_reason)
+            await self._record_full_user_pair_failure(cursor, pair_mode, attempt_start, reuse_rejection_reason, context)
             raise error
         flood_wait = isinstance(error, TelegramRpcThrottled)
         if flood_wait:
@@ -1697,6 +1923,7 @@ class DaemonEntityInfoService:
                 reason="flood_wait" if flood_wait else type(error).__name__.lower(),
                 retry_at=self._existing_refresh_retry_at(cursor, now),
                 reuse_rejection_reason=reuse_rejection_reason,
+                received_context=context,
             )
         )
         if terminal is not None:
@@ -1706,16 +1933,29 @@ class DaemonEntityInfoService:
         self._note_retryable_profile_failure(error, terminal)
         return terminal
 
+    async def _write_pair_accounting[T](
+        self,
+        context: _ProfileSectionContext,
+        operation: Callable[[EntityProfileRepository], T],
+    ) -> T | None:
+        """Fence durable pair markers by the original acquisition lease."""
+        try:
+            return await self._write_profiles(operation, marker_scope=context)
+        except _AuthScopeUnavailableError:
+            return None
+
     async def _record_full_user_pair_failure(
         self,
         cursor: EntityRefreshCursor,
         pair_mode: str,
         attempt_start: int,
         reuse_rejection_reason: str | None,
+        context: _ProfileSectionContext,
     ) -> None:
         actual_attempts = self._rpc_attempt_count() - attempt_start
-        await self._write_profiles(
-            lambda profiles: profiles.record_pair_attempt(cursor, "full_profile", actual_attempts=actual_attempts)
+        await self._write_pair_accounting(
+            context,
+            lambda profiles: profiles.record_pair_attempt(cursor, "full_profile", actual_attempts=actual_attempts),
         )
         self._observe_profile_pair(
             mode=pair_mode,
@@ -1726,19 +1966,21 @@ class DaemonEntityInfoService:
         )
 
     async def _handle_full_user_pair_failure(self, failure: _PairFailure) -> DurableRefreshTerminal | None:
-        failed = await self._write_profiles(
+        failed = await self._write_pair_accounting(
+            failure.received_context,
             lambda profiles: profiles.mark_section_failure(
                 failure.cursor,
                 now=failure.now,
                 reason=failure.reason,
                 retry_at=failure.retry_at,
-            )
+            ),
         )
         await self._record_full_user_pair_failure(
             failure.cursor,
             failure.pair_mode,
             failure.attempt_start,
             failure.reuse_rejection_reason,
+            failure.received_context,
         )
         return DurableRefreshTerminal.FAILURE if failed else None
 
@@ -1762,13 +2004,17 @@ class DaemonEntityInfoService:
 
     async def _commit_full_user_pair_or_raise(self, request: _PairCommitRequest) -> bool:
         try:
-            return await self._write_profiles(lambda profiles: self._commit_full_user_pair_in_scope(profiles, request))
+            return await self._write_profiles(
+                lambda profiles: self._commit_full_user_pair_in_scope(profiles, request),
+                received_intake=(request.cursor.entity_id, request.full_profile, request.received_context),
+            )
         except Exception:
             await self._record_full_user_pair_failure(
                 request.cursor,
                 request.pair_mode,
                 request.attempt_start,
                 request.reuse_rejection_reason,
+                request.received_context,
             )
             raise
 
@@ -1817,8 +2063,12 @@ class DaemonEntityInfoService:
             )
             return personal_summary or full_summary
 
-        summary = await self._write_profiles(record)
-        if summary is None and not self._profiles._refresh_has("pair_mode"):
+        summary = await self._write_pair_accounting(measurement.received_context, record)
+        if (
+            summary is None
+            and not self._profiles._refresh_has("pair_mode")
+            and self._received_profile_current(self._deps.conn, measurement.received_context)
+        ):
             return self._historical_pair_summary(
                 measurement,
                 latency=latency,
@@ -1909,6 +2159,10 @@ class DaemonEntityInfoService:
     ) -> tuple[CommandProfileAcquisition, bool]:
         contact_guard = contact_current
         contact_current = contact_current or (lambda: True)
+
+        def publication_current() -> bool:
+            return self._note_publication_current(guard) and contact_current()
+
         revision = self._profiles._profile_revision(entity_id)
         identity_baseline = capture_identity_baseline(self._deps.conn, entity_id)
         kind = (
@@ -1944,24 +2198,31 @@ class DaemonEntityInfoService:
             dialog_identity_baseline_revision=identity_baseline,
             field_observation=field_observation,
             semantic_snapshot=normalized.semantic_snapshot,
-            contact_refinement_guard=(
-                None if contact_guard is None else lambda: self._note_publication_current(guard) and contact_current()
-            ),
+            supplied_dialog_facts=SuppliedDialogFacts(referenced_identities=normalized.referenced_identities),
+            contact_refinement_guard=(None if contact_guard is None else publication_current),
         )
 
         def publish(profiles: EntityProfileRepository) -> bool:
-            if not self._note_publication_current(guard) or not contact_current():
+            if not publication_current():
                 return False
             return profiles.commit_command_profile(
                 entity_id,
                 commit,
                 expected_revision=revision,
                 now=int(self._deps.now_provider()),
-                publication_guard=lambda: self._note_publication_current(guard) and contact_current(),
+                publication_guard=publication_current,
             )
 
-        accepted = await self._write_profiles(publish, track_rejection=False)
-        if not self._note_publication_current(guard) or not contact_current():
+        context = _ProfileSectionContext(scope, 0, False, "disabled", False)
+        context.received_scope = guard.token
+        context.received_observation = field_observation
+        context.received_guard = publication_current
+        accepted = await self._write_profiles(
+            publish,
+            track_rejection=False,
+            received_intake=(entity_id, commit, context) if normalized.referenced_identities else None,
+        )
+        if not publication_current():
             return CommandProfileAcquisition(False, False), False
         return self._command_profile_result(normalized, accepted, field_observation), accepted
 
@@ -1983,8 +2244,10 @@ class DaemonEntityInfoService:
     async def _acquire_full_user_pair(
         self,
         cursor: EntityRefreshCursor,
+        *,
+        context: _ProfileSectionContext | None = None,
     ) -> tuple[EntitySectionCommit, EntitySectionCommit]:
-        captured_scope = self._capture_pair_scope()
+        captured_scope = context.captured_scope if context is not None else self._capture_pair_scope()
         identity_baseline = capture_identity_baseline(self._deps.conn, cursor.entity_id)
         now = self._deps.now_provider()
         target_kind = (
@@ -1992,7 +2255,11 @@ class DaemonEntityInfoService:
             if self._stored_entity_type(cursor.entity_id, now=int(now)) is DialogType.BOT
             else TargetKind.USER
         )
-        field_observation = await self._reserve_profile_observation(captured_scope)
+        field_observation = (
+            context.received_observation
+            if context is not None
+            else await self._reserve_profile_observation(captured_scope)
+        )
         self._require_profile_access(cursor.entity_id)
         normalized = await _profile_network_read(
             self._deps.user_profile_port.fetch_user_profile(
@@ -2009,7 +2276,10 @@ class DaemonEntityInfoService:
             semantic_snapshot=normalized.semantic_snapshot,
         )
         folder_id = full_profile.detail_patch.get("folder_id")
-        folder_name = await self._resolve_folder_name(folder_id if isinstance(folder_id, int) else None)
+        folder_name = await self._resolve_folder_name(
+            folder_id if isinstance(folder_id, int) else None,
+            account_id=captured_scope.account_id if captured_scope else None,
+        )
         identity_observation = normalized.full_profile.dialog_identity_observation
         full_profile = dataclass_replace(
             full_profile,
@@ -2018,6 +2288,7 @@ class DaemonEntityInfoService:
             dialog_identity_baseline_revision=identity_baseline,
             field_observation=field_observation,
             semantic_snapshot=normalized.semantic_snapshot,
+            supplied_dialog_facts=SuppliedDialogFacts(referenced_identities=normalized.referenced_identities),
         )
         personal_channel = self._normalized_personal_channel_commit(
             normalized.personal_channel,
@@ -2680,7 +2951,9 @@ class DaemonEntityInfoService:
             raise ValueError(outcome.reason or "full user payload is unavailable")
         patch = dict(outcome.payload)
         folder_id = patch.get("folder_id")
-        patch["folder_name"] = await self._resolve_folder_name(folder_id if isinstance(folder_id, int) else None)
+        patch["folder_name"] = await self._resolve_folder_name(
+            folder_id if isinstance(folder_id, int) else None, account_id=scope.account_id if scope else None
+        )
         current_photo = observation.current_photo
         private_payload = _profile_photo_patch(current_photo, observation.semantic_snapshot)
         patch.update(private_payload)
@@ -2692,6 +2965,7 @@ class DaemonEntityInfoService:
             identity_patch=identity_patch,
             dialog_identity_observation=outcome.dialog_identity_observation,
             semantic_snapshot=observation.semantic_snapshot,
+            supplied_dialog_facts=SuppliedDialogFacts(referenced_identities=observation.referenced_identities),
         )
 
     async def _acquire_channel_full_profile(
@@ -2705,6 +2979,8 @@ class DaemonEntityInfoService:
         reference = self._deps.channel_reference_provider.get_channel_reference(entity_id)
         if reference is None:
             return EntitySectionCommit({}, status="unavailable", reason="channel_reference_unavailable")
+        if context is not None:
+            await self._prepare_received_profile_context(context)
         is_broadcast_channel = entity_type is DialogType.CHANNEL
         await self._capture_linked_chat_fact_generation(entity_id, is_broadcast_channel, context)
         self._require_profile_access(entity_id)
@@ -2726,6 +3002,7 @@ class DaemonEntityInfoService:
             dialog_created=observation.created,
             identity_patch=observation.identity_patch,
             dialog_identity_observation=observation.dialog_identity_observation,
+            supplied_dialog_facts=observation.supplied_dialog_facts,
         )
 
     async def _capture_linked_chat_fact_generation(
@@ -2844,6 +3121,7 @@ class DaemonEntityInfoService:
                 **(observation.chat_entity_fields or {}),
             },
             dialog_created=observation.created,
+            supplied_dialog_facts=observation.supplied_dialog_facts,
             payload={
                 "current_photo": (
                     {"photo_id": observation.current_photo.photo_id, "date": observation.current_photo.date}
@@ -3038,6 +3316,7 @@ class DaemonEntityInfoService:
         reference = self._chat_avatar_reference(entity_id)
         if reference is None:
             return EntitySectionCommit({}, status="unavailable", reason="chat_reference_unavailable", payload=None)
+        boundary = await self._reserve_chat_avatar_intake()
         observation = await _profile_network_read(
             self._deps.chat_avatar_history_port.fetch_chat_avatar_history(reference)
         )
@@ -3045,9 +3324,50 @@ class DaemonEntityInfoService:
             raise ValueError("chat avatar observation reference does not match")
         if observation.status is ProjectionStatus.UNAVAILABLE:
             return EntitySectionCommit({}, status="unavailable", reason=observation.reason, payload=None)
+        return self._chat_avatar_history_commit(entity_id, observation, boundary)
+
+    async def _reserve_chat_avatar_intake(
+        self,
+    ) -> tuple[ScopeToken, int, ReactionObservationBoundary] | None:
+        capture = getattr(self._deps.client, "capture_image_scope", None)
+        token = capture() if callable(capture) else None
+        if not isinstance(token, ScopeToken) or token.scope.account_id != self._deps.self_id:
+            return None
+
+        def reserve(conn: sqlite3.Connection) -> tuple[int, ReactionObservationBoundary]:
+            with write_transaction(conn):
+                return allocate_observation_order(conn), allocate_observation_boundary(
+                    conn, ReactionAggregateSource.HISTORY
+                )
+
+        order, reactions = await self._deps.writer.run(reserve)
+        return token, order, reactions
+
+    def _chat_avatar_history_commit(
+        self,
+        entity_id: int,
+        observation: ChatAvatarHistoryObservation,
+        boundary: tuple[ScopeToken, int, ReactionObservationBoundary] | None,
+    ) -> EntitySectionCommit:
         current = self._current_profile_photo(entity_id)
-        merged, count = _reconcile_history_payload(observation.photos, current, observation.reported_count)
-        return EntitySectionCommit({"avatar_history": merged, "avatar_count": count}, payload=merged)
+        photos = observation.photos
+        reported_count = observation.reported_count
+        if observation.reason == "inconsistent_peer":
+            stored = self._profiles.read(entity_id, now=int(self._deps.now_provider()))
+            previous = self._profiles.read_section_payload(entity_id, "avatar_history")
+            photos += _avatar_history_values(previous)
+            prior_count = stored.detail.get("avatar_count") if stored is not None else None
+            if isinstance(prior_count, int):
+                reported_count = max(reported_count, prior_count)
+        merged, count = _reconcile_history_payload(photos, current, reported_count)
+        intake = ChatAvatarMessageIntake(observation.messages, *boundary) if boundary is not None else None
+        return EntitySectionCommit(
+            {"avatar_history": merged, "avatar_count": count},
+            status="unavailable" if observation.reason == "inconsistent_peer" else "fresh",
+            reason=observation.reason if observation.reason == "inconsistent_peer" else None,
+            payload=merged,
+            chat_avatar_messages=intake,
+        )
 
     def _current_profile_photo(self, entity_id: int) -> ChatCurrentPhoto | None:
         stored = self._profiles.read(entity_id, now=int(self._deps.now_provider()))
@@ -3170,6 +3490,7 @@ class DaemonEntityInfoService:
         dispatch_kind = classify_dialog_type(entity)
         name = _opt_str_attr(entity, "first_name") or _opt_str_attr(entity, "title")
         last_name = _opt_str_attr(entity, "last_name")
+        scope = self._capture_pair_scope()
         if last_name:
             name = " ".join(part for part in (name, last_name) if part)
         return {
@@ -3180,7 +3501,7 @@ class DaemonEntityInfoService:
             "dialog_placement": (
                 self._deps.get_dialog_placement(entity_id)
                 if self._deps.get_dialog_placement
-                else dialog_placement(self._deps.conn, entity_id)
+                else dialog_placement(self._deps.conn, entity_id, account_id=scope.account_id if scope else None)
             ),
         }
 
@@ -3199,11 +3520,12 @@ class DaemonEntityInfoService:
         _project_current_photo(result, sections, current_photo)
         if result.get("type") == DialogType.CHANNEL.value:
             result["linked_chat_id"] = self._read_canonical_linked_chat_id(entity_id)
+        scope = self._capture_pair_scope()
         result["dialog_placement"] = result.get(
             "dialog_placement",
             self._deps.get_dialog_placement(entity_id)
             if self._deps.get_dialog_placement
-            else dialog_placement(self._deps.conn, entity_id),
+            else dialog_placement(self._deps.conn, entity_id, account_id=scope.account_id if scope else None),
         )
         result["completeness"] = completeness(sections)
         result["sections"] = self._section_summaries(sections)
@@ -3428,22 +3750,12 @@ class DaemonEntityInfoService:
             return None
         return f"https://t.me/{username}"
 
-    async def _resolve_folder_name(self, folder_id: int | None) -> str | None:
+    async def _resolve_folder_name(self, folder_id: int | None, *, account_id: int | None) -> str | None:
         if folder_id is None:
             return None
         try:
-            row = cast(
-                tuple[object, ...] | None,
-                self._deps.conn.execute(
-                    "SELECT title FROM telegram_folder_rules "
-                    "WHERE (namespace='filter' AND folder_id=?) "
-                    "OR (namespace='default' AND ?=0) "
-                    "ORDER BY CASE namespace WHEN 'filter' THEN 0 ELSE 1 END LIMIT 1",
-                    (folder_id, folder_id),
-                ).fetchone(),
-            )
-            if row is not None:
-                return str(row[0])
+            folders = folder_summaries(self._deps.conn, account_id=account_id)
+            return next((str(folder["title"]) for folder in folders if folder["id"] == folder_id), None)
         except (sqlite3.OperationalError, TypeError, ValueError) as exc:
             self._deps.logger.warning(
                 "entity_info user folder_resolve_failed folder_id=%r error=%s%s",
@@ -3451,7 +3763,7 @@ class DaemonEntityInfoService:
                 exc,
                 self._deps.rid(),
             )
-        return None
+            return None
 
     def _read_canonical_linked_chat_id(self, channel_id: int) -> int | None:
         try:

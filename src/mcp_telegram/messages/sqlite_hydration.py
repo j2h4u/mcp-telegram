@@ -6,13 +6,10 @@ import sqlite3
 from typing import cast
 
 from ..hydration_queue import TRANSCRIPTION_HYDRATION_KIND, HydrationJob, HydrationPriority, HydrationQueueRepository
-from ..image_authorization import invalidate_message_source
 from ..media_fact import decode_media_fact, is_transcribable_telegram_media
 from ..observation_order import delivered_observation_order
 from .sqlite_bundle import has_nonchannel_deletion, persist_transcribed_text, read_message_text
 from .sqlite_hydration_jobs import (
-    _FACT_HYDRATION_ELIGIBILITY_SQL,
-    _MEDIA_METADATA_HYDRATION_ELIGIBILITY_SQL,
     _TRANSCRIBABLE_MEDIA_SQL,
     _is_canonical_media_pair,
     _is_transcribable_media_pair,
@@ -197,42 +194,6 @@ def _remove_transcription_hydration_job(conn: sqlite3.Connection, dialog_id: int
             "DELETE FROM hydration_jobs WHERE kind = ? AND dialog_id = ? AND message_id = ?",
             (TRANSCRIPTION_HYDRATION_KIND, dialog_id, message_id),
         )
-
-
-def apply_hydrated_media_fact(  # noqa: PLR0913
-    conn: sqlite3.Connection,
-    dialog_id: int,
-    message_id: int,
-    media_kind: str | None,
-    media_payload: str | None,
-    *,
-    observation_order: int | None = None,
-) -> bool:
-    """Apply one media fact only while full-history access remains current."""
-    if not hydration_observation_current(conn, dialog_id, message_id, observation_order):
-        return False
-    eligibility = (
-        "dialog_id = ? AND message_id = ? AND "
-        + _MEDIA_METADATA_HYDRATION_ELIGIBILITY_SQL.replace("m.", "")
-        + " AND EXISTS ("
-        + _FACT_HYDRATION_ELIGIBILITY_SQL
-        + ")"
-    )
-    parameters = (dialog_id, message_id, dialog_id)
-    changed = cast(
-        tuple[int] | None,
-        conn.execute(
-            "SELECT 1 FROM messages WHERE " + eligibility + " AND (media_kind IS NOT ? OR media_payload IS NOT ?)",
-            (*parameters, media_kind, media_payload),
-        ).fetchone(),
-    )
-    if changed is not None:
-        invalidate_message_source(conn, dialog_id, message_id)
-    cursor = conn.execute(
-        "UPDATE messages SET media_kind = ?, media_payload = ? WHERE " + eligibility,
-        (media_kind, media_payload, *parameters),
-    )
-    return cursor.rowcount > 0
 
 
 def enqueue_transcription_for_hydrated_media(

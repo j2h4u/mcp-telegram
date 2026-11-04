@@ -31,11 +31,12 @@ from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_demand import demand_context
 from mcp_telegram.telegram_rpc_consumers import DemandKind
-from mcp_telegram.topics.contracts import TopicFact
+from mcp_telegram.topics.contracts import TopicBatch, TopicFact
 from mcp_telegram.topics.refresh import TopicRefresher
 from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from tests.demand_adapter_helpers import run_ready_slice
 from tests.test_scheduled_messages import _message, _ScheduledSnapshotClient
+from tests.topic_test_helpers import topic_scope
 
 
 @pytest_asyncio.fixture
@@ -60,11 +61,25 @@ async def test_topic_snapshot_uses_writer(storage: tuple[sqlite3.Connection, SQL
     reader, writer = storage
 
     class Gateway:
-        async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
+        async def fetch_topics(self, entity: object) -> TopicBatch:
             del entity
-            return (TopicFact(topic_id=7, title="Topic"),)
+            return TopicBatch((TopicFact(topic_id=7, title="Topic"),), ())
 
-    refresher = TopicRefresher(Gateway(), SQLiteTopicSnapshotRepository(reader), writer=writer)
+    def seed(conn: sqlite3.Connection) -> None:
+        with write_transaction(conn):
+            conn.execute("INSERT OR IGNORE INTO dialog_directory_state(singleton,account_id) VALUES (1,1)")
+            conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
+            conn.execute("INSERT OR REPLACE INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (42,1,1)")
+
+    await writer.run(seed)
+    scope = topic_scope()
+    refresher = TopicRefresher(
+        Gateway(),
+        SQLiteTopicSnapshotRepository(reader),
+        writer=writer,
+        capture_scope=scope.capture,
+        claim_scope=scope.claim,
+    )
     assert await refresher.refresh(42, SimpleNamespace(forum=True)) == 1
     assert reader.execute("SELECT title FROM topic_metadata WHERE dialog_id=42").fetchone()[0] == "Topic"
 

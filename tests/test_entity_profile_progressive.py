@@ -54,6 +54,7 @@ from mcp_telegram.entity_profile.refresh import (
 )
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.image_authorization import ScopeCell, ScopeToken
 from mcp_telegram.models import DialogType
 from mcp_telegram.sync_db import _CURRENT_SCHEMA_VERSION, _apply_migration_57, _apply_migrations, ensure_sync_schema
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_savepoint
@@ -124,7 +125,22 @@ class _UnusedClient:
         raise AssertionError("client should not be called in this test")
 
 
-class _FloodClient(_UnusedClient):
+class _FencedUnusedClient(_UnusedClient):
+    def __init__(self, account_id: int) -> None:
+        self._scope_cell = ScopeCell()
+        assert self._scope_cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, account_id, 2, 99))
+
+    def capture_image_scope(self) -> ScopeToken | None:
+        return self._scope_cell.capture()
+
+    def claim_image_scope(self, token: ScopeToken) -> bool:
+        return self._scope_cell.claim(token)
+
+
+class _FloodClient(_FencedUnusedClient):
+    def __init__(self) -> None:
+        super().__init__(42)
+
     async def __call__(self, _request: object) -> object:
         raise TelegramRpcThrottled(retry_after_seconds=7)
 
@@ -375,6 +391,8 @@ async def test_flood_wait_refresh_failure_signals_terminal_waiter_and_persists_r
     _sections_schema(conn)
     with write_savepoint(conn):
         conn.execute("INSERT INTO entities VALUES (42, 'user', 'Good', 'good', NULL, 100)")
+        conn.execute("CREATE TABLE dialog_directory_state(singleton INTEGER PRIMARY KEY, account_id INTEGER)")
+        conn.execute("INSERT INTO dialog_directory_state VALUES(1,42)")
     repo = EntityProfileRepository(conn, section_ttl_seconds=300)
     repo.mark_pending(42, now=100)
     service = _test_service(conn, limits=RefreshLimits())
@@ -411,11 +429,12 @@ def _test_service(
 
         enable_profile_page_fixture(conn)
     enable_runtime_writes(conn)
+    client = _FencedUnusedClient(account_id) if account_id is not None else _UnusedClient()
     service = DaemonEntityInfoService(
         EntityInfoDeps(
             writer=inline_writer(conn),
             conn=conn,
-            client=_UnusedClient(),
+            client=client,
             dm_peer_ids=lambda: set(),
             self_id=None,
             self_profile=None,
@@ -582,7 +601,10 @@ def _channel_profile_service(
         observation_completed_at=100,
     )
     port = FakeChannelProfilePort(profile, overlap_observation)
-    service = _test_service(conn, limits=RefreshLimits())
+    with write_savepoint(conn):
+        conn.execute("CREATE TABLE dialog_directory_state(singleton INTEGER PRIMARY KEY, account_id INTEGER)")
+        conn.execute("INSERT INTO dialog_directory_state VALUES (1,42)")
+    service = _test_service(conn, limits=RefreshLimits(), account_id=42)
     service._deps = replace(
         service._deps,
         channel_profile_port=port,
@@ -632,7 +654,7 @@ async def test_channel_profile_commit_publishes_linked_chat_fact_and_overlays_ca
 
         from mcp_telegram.daemon_entity_info import _ProfileSectionContext
 
-        context = _ProfileSectionContext(None, 0, False, "disabled", False)
+        context = _ProfileSectionContext(service._capture_pair_scope(), 0, False, "disabled", False)
         commit = await service._acquire_channel_full_profile(-10042, DialogType.CHANNEL, context=context)
         with write_savepoint(conn):
             conn.execute(
@@ -709,7 +731,7 @@ async def test_channel_profile_fact_publish_is_fenced_by_newer_dialog_revision()
 
         from mcp_telegram.daemon_entity_info import _ProfileSectionContext
 
-        context = _ProfileSectionContext(None, 0, False, "disabled", False)
+        context = _ProfileSectionContext(service._capture_pair_scope(), 0, False, "disabled", False)
         commit = await service._acquire_channel_full_profile(-10047, DialogType.CHANNEL, context=context)
         with write_savepoint(conn):
             linked_chat_fact_owner.invalidate_from_update(conn, -10047, 100)
@@ -809,6 +831,8 @@ async def test_durable_profile_publication_wakes_cold_adapter_for_local_link_enr
         observation_completed_at=100,
     )
     port = FakeChannelProfilePort(profile, overlap)
+    with write_savepoint(conn):
+        conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
     service = _test_service(conn, limits=RefreshLimits(), account_id=123)
     service._deps = replace(
         service._deps,
@@ -828,8 +852,9 @@ async def test_durable_profile_publication_wakes_cold_adapter_for_local_link_enr
 
     service.bind_demand_sink(RecordingSink())
 
-    class NoRpcClient:
+    class NoRpcClient(_FencedUnusedClient):
         def __init__(self) -> None:
+            super().__init__(123)
             self.calls = 0
 
         async def get_input_entity(self, dialog_id: int) -> object:
@@ -1018,7 +1043,9 @@ async def test_durable_channel_reference_miss_commits_unavailable_without_rpc_at
 
 
 @pytest.mark.asyncio
-async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt(request: pytest.FixtureRequest) -> None:
+async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt(  # noqa: PLR0915
+    request: pytest.FixtureRequest,
+) -> None:
     class BudgetedClient:
         def __init__(self) -> None:
             self.calls: list[str] = []
@@ -1068,10 +1095,12 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt(re
     repository.mark_pending(42, now=100)
     client = BudgetedClient()
 
-    service = _test_service(conn, limits=RefreshLimits(), account_id=42)
+    with write_savepoint(conn):
+        conn.execute("CREATE TABLE dialog_directory_state(singleton INTEGER PRIMARY KEY, account_id INTEGER)")
+        conn.execute("INSERT INTO dialog_directory_state VALUES (1,99)")
+    service = _test_service(conn, limits=RefreshLimits(), account_id=99)
     service._deps = replace(
         service._deps,
-        client=cast(object, client),
         get_peer_id=lambda value: int(value.id),
         user_profile_port=_UserProfilePort(client),
     )
@@ -1092,10 +1121,9 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt(re
     ).fetchone() == ("fresh",)
     await service.shutdown()
 
-    restarted = _test_service(conn, limits=RefreshLimits(), account_id=42)
+    restarted = _test_service(conn, limits=RefreshLimits(), account_id=99)
     restarted._deps = replace(
         restarted._deps,
-        client=cast(object, client),
         get_peer_id=lambda value: int(value.id),
         user_profile_port=_UserProfilePort(client),
     )
@@ -1247,10 +1275,11 @@ async def test_entity_profile_adapter_sets_bounded_rpc_scope() -> None:
     _apply_migrations(conn)
     conn.commit()
     with write_savepoint(conn):
+        conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
         conn.execute("INSERT INTO entities VALUES (42, 'user', 'Known', 'known', NULL, 1)")
     EntityProfileRepository(conn, section_ttl_seconds=300).mark_pending(42, now=100)
     limits = RefreshLimits(foreground_resolve_seconds=0.01, per_rpc_seconds=0.02, whole_refresh_seconds=0.05)
-    service = _test_service(conn, limits=limits, account_id=42)
+    service = _test_service(conn, limits=limits, account_id=99)
     observed: list[
         tuple[TelegramRpcSource, float | None, asyncio.Task[object] | None, DemandKind, AcquisitionKind]
     ] = []
@@ -1277,7 +1306,6 @@ async def test_entity_profile_adapter_sets_bounded_rpc_scope() -> None:
 
     service._deps = replace(
         service._deps,
-        client=ScopedClient(),
         user_profile_port=_UserProfilePort(ScopedClient()),
     )
     coordinator = service.refresh_coordinator
@@ -1439,7 +1467,10 @@ async def test_partial_detail_uses_canonical_identity_and_skips_core_resolution(
     cursor = repo.next_due_refresh(now=100)
     assert cursor is not None
     _advance_fixture_cursor(repo, 42, 7, 100)
-    service = _test_service(conn, limits=RefreshLimits(), account_id=42)
+    with write_savepoint(conn):
+        conn.execute("CREATE TABLE dialog_directory_state(singleton INTEGER PRIMARY KEY, account_id INTEGER)")
+        conn.execute("INSERT INTO dialog_directory_state VALUES (1,99)")
+    service = _test_service(conn, limits=RefreshLimits(), account_id=99)
     resolved_calls: list[int] = []
 
     async def resolve_entity(entity_id: int) -> tuple[object | None, dict[str, object] | None]:
@@ -1570,8 +1601,9 @@ async def test_production_schema_core_write_syncs_revision_before_next_section_a
             "INSERT INTO entity_details(entity_id, detail_json, fetched_at) VALUES (42, ?, 90)",
             (json.dumps({"schema": 1, "about": "legacy"}),),
         )
+    conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
     conn.commit()
-    service = _test_service(conn, limits=RefreshLimits(), account_id=42)
+    service = _test_service(conn, limits=RefreshLimits(), account_id=99)
     service._profiles.mark_pending(42, now=100)
     core_calls = 0
 
@@ -1624,7 +1656,7 @@ async def test_production_schema_core_write_syncs_revision_before_next_section_a
         await service.shutdown()
 
     reopened = sqlite3.connect(path)
-    reopened_service = _test_service(reopened, limits=RefreshLimits())
+    reopened_service = _test_service(reopened, limits=RefreshLimits(), account_id=99)
 
     async def forbidden_resolve(_entity_id: int) -> tuple[object, None]:
         raise AssertionError("reopened known entity must not resolve core again")
@@ -2066,16 +2098,19 @@ async def test_entity_acquisition_timeout_persists_retry_and_keeps_cursor(known:
         per_rpc_seconds=0.005,
         whole_refresh_seconds=0.1,
     )
-    service = _test_service(conn, limits=limits)
+    service = _test_service(conn, limits=limits, account_id=99)
 
-    class SlowClient(_UnusedClient):
+    class SlowClient(_FencedUnusedClient):
         async def get_entity(self, entity_id: int) -> object:
             raise TimeoutError("wire response timeout")
 
         async def __call__(self, request: object) -> object:
             raise TimeoutError("wire response timeout")
 
-    service._deps = replace(service._deps, client=SlowClient(), user_profile_port=_UserProfilePort(SlowClient()))
+    slow_client = SlowClient(99)
+    with write_savepoint(conn):
+        conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
+    service._deps = replace(service._deps, client=slow_client, user_profile_port=_UserProfilePort(slow_client))
     if known:
         with write_savepoint(conn):
             conn.execute("INSERT INTO entities(id,type,name,updated_at) VALUES (42,'user','Known',100)")
