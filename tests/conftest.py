@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import resource
 import sqlite3
 import sys
@@ -15,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from tests.peer_access_helpers import close_test_peer_access
+from tests.thread_failure_diagnostics import collect_thread_resources, is_thread_start_failure
 
 
 def _target_address_space_limit(config: pytest.Config, hard_limit: int) -> int:
@@ -38,20 +40,28 @@ def pytest_configure(config: pytest.Config) -> None:
 
 def pytest_exception_interact(node: pytest.Item, call: pytest.CallInfo[object], report: pytest.TestReport) -> None:
     """Expose SQLite extended error identity in CI failure logs."""
-    del node, report
     if call.excinfo is None:
         return
+    try:
+        if is_thread_start_failure(call.excinfo.value):
+            snapshot = collect_thread_resources(node.nodeid, report.when)
+            print("native_resource_diagnostic " + json.dumps(snapshot, ensure_ascii=True), flush=True)
+    except BaseException:  # noqa: BLE001 - diagnostics must not replace the original test failure.
+        pass
     error: BaseException | None = call.excinfo.value
     seen: set[int] = set()
     while error is not None and id(error) not in seen:
         seen.add(id(error))
         if isinstance(error, sqlite3.Error):
-            print(
-                "sqlite_diagnostic "
-                f"sqlite_errorcode={getattr(error, 'sqlite_errorcode', None)} "
-                f"sqlite_errorname={getattr(error, 'sqlite_errorname', None)}",
-                flush=True,
-            )
+            try:
+                print(
+                    "sqlite_diagnostic "
+                    f"sqlite_errorcode={getattr(error, 'sqlite_errorcode', None)} "
+                    f"sqlite_errorname={getattr(error, 'sqlite_errorname', None)}",
+                    flush=True,
+                )
+            except BaseException:  # noqa: BLE001 - diagnostic output must not replace the original failure.
+                pass
             return
         error = error.__cause__ or error.__context__
 

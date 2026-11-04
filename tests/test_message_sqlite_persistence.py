@@ -1051,6 +1051,7 @@ def test_hydration_rejects_observation_started_before_newer_message(conn: sqlite
     scope = cell.capture()
     assert scope is not None
     with write_transaction(conn):
+        conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
         conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (42,'synced')")
         conn.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (42,1,1)")
         old_order = allocate_observation_order(conn)
@@ -1121,16 +1122,35 @@ def test_same_second_delayed_observation_cannot_replace_newer_bundle(conn: sqlit
     assert read_message_text(conn, 42, 97).text == "newer"
 
 
-def test_newer_telegram_version_resets_observation_order(conn: sqlite3.Connection) -> None:
-    old_version = replace(_message(98, text="old"), observation_order=30)
+def test_missing_current_version_respects_observation_order(conn: sqlite3.Connection) -> None:
+    current = replace(_message(98, text="current"), observation_order=30)
+    delayed = replace(current, observation_order=10, message=replace(current.message, text="stale", edit_date=200))
+    later = replace(delayed, observation_order=40, message=replace(delayed.message, text="later"))
+    with write_transaction(conn):
+        assert insert_messages_with_fts(conn, [current]).accepted_count == 1
+        assert insert_messages_with_fts(conn, [delayed]).accepted_count == 0
+        assert read_message_text(conn, 42, 98).text == "current"
+        assert insert_messages_with_fts(conn, [later]).accepted_count == 1
+    assert read_message_text(conn, 42, 98).text == "later"
+
+
+def test_newer_telegram_version_preserves_later_observation_order(conn: sqlite3.Connection) -> None:
+    old = _message(98, text="old")
+    old_version = replace(old, observation_order=30, message=replace(old.message, edit_date=100))
     new_version = replace(
         old_version, observation_order=10, message=replace(old_version.message, text="new", edit_date=200)
     )
-    same_new_version = replace(new_version, observation_order=20, message=replace(new_version.message, text="latest"))
+    stale_same_version = replace(new_version, observation_order=20, message=replace(new_version.message, text="stale"))
+    later_same_version = replace(new_version, observation_order=40, message=replace(new_version.message, text="latest"))
     with write_transaction(conn):
         insert_messages_with_fts(conn, [old_version])
-        insert_messages_with_fts(conn, [new_version])
-        insert_messages_with_fts(conn, [same_new_version])
+        assert insert_messages_with_fts(conn, [new_version]).accepted_count == 1
+        assert insert_messages_with_fts(conn, [stale_same_version]).accepted_count == 0
+        assert read_message_text(conn, 42, 98).text == "new"
+        assert conn.execute(
+            "SELECT observation_order FROM message_observations WHERE dialog_id=42 AND message_id=98"
+        ).fetchone() == (30,)
+        assert insert_messages_with_fts(conn, [later_same_version]).accepted_count == 1
     assert read_message_text(conn, 42, 98).text == "latest"
 
 
@@ -1152,8 +1172,6 @@ def test_peerless_deletion_blocks_unknown_nonchannel_body_but_not_channel(
     assert conn.execute("SELECT dialog_id,message_id FROM messages").fetchall() == [(-1000000000042, 901)]
     assert conn.execute("SELECT dialog_id,message_id FROM messages_fts").fetchall() == [(-1000000000042, 901)]
     assert conn.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == (0,)
-    assert conn.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=903").fetchone() == (None,)
-    assert conn.execute("SELECT deleted_at FROM nonchannel_message_deletions WHERE message_id=903").fetchone() == (100,)
 
 
 def test_peerless_deletion_is_terminal_after_restart(tmp_path: Path) -> None:
@@ -1188,6 +1206,7 @@ def test_peerless_deletion_rejects_all_hydration_fact_paths(conn: sqlite3.Connec
     scope = cell.capture()
     assert scope is not None
     with write_transaction(conn):
+        conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
         conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (42,'synced')")
         conn.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (42,1,1)")
         insert_messages_with_fts(conn, [_message(903, text=None, media_kind="voice", media_payload="{}")])

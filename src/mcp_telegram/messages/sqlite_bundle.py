@@ -293,7 +293,7 @@ def _is_current_observation(
         incoming_version, current_version = message.edit_date or 0, current[0] or 0
         if incoming_version < current_version:
             return False
-        if incoming_version > current_version:
+        if current[0] is not None and incoming_version > current_version:
             return True
     return _follows_stored_observation(state, item.observation_order, ReactionAggregateSource(source).rank)
 
@@ -455,6 +455,7 @@ def insert_messages_with_fts(  # noqa: PLR0913
     accepted = _accepted_message_bundles(conn, extracted, reaction_source)
     if not accepted:
         return MessageWriteResult(0, MembershipSignalCounts())
+    accepted = [_preserve_newer_received_media(conn, item) for item in accepted]
     evidence = _page_facts(conn, accepted)
     for item in accepted:
         if item.invalidate_image_source:
@@ -628,7 +629,7 @@ def _persist_received_message(
         return 0
     if _received_body_superseded(state, item):
         return 0
-    item = _preserve_newer_received_media(conn, item)
+    item = replace(item, invalidate_image_source=False)
     current = read_message_text(conn, message.dialog_id, message.message_id)
     if current.found and current.text != message.text:
         result = persist_edited_message(
@@ -674,24 +675,31 @@ def _preserve_newer_received_media(
         current[2],
         bool(current[3]),
     )
-    item = replace(item, invalidate_image_source=not unchanged)
+    invalidate = _image_source_invalidation_requested(item, unchanged)
     if item.observation_order is None or current[4] <= item.observation_order:
-        return item
+        return replace(item, invalidate_image_source=invalidate)
     if (
         current[4] == current[5]
         and current[6] is not None
         and message.edit_date is not None
         and message.edit_date > current[6]
     ):
-        return replace(item, media_observation_order=current[4])
+        return replace(
+            item,
+            media_observation_order=current[4],
+            invalidate_image_source=invalidate,
+        )
     return replace(
         item,
         message=replace(message, media_kind=current[0], media_payload=current[1]),
         private_photo_id=current[2],
         private_photo_eligible=bool(current[3]),
         media_observation_order=current[4],
-        invalidate_image_source=False,
     )
+
+
+def _image_source_invalidation_requested(item: _message_contracts.ExtractedMessage, unchanged: bool) -> bool:
+    return item.invalidate_image_source or not unchanged
 
 
 def _received_body_unchanged(conn: sqlite3.Connection, item: _message_contracts.ExtractedMessage) -> bool:

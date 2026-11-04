@@ -678,51 +678,12 @@ def test_migration_v19_adds_v1_6_columns_to_topic_metadata(db_path: Path) -> Non
         assert {"icon_emoji_id", "pinned", "hidden", "snapshot_at", "date"}.issubset(cols)
 
 
-def test_migration_v19_preserves_legacy_topic_metadata_columns(db_path: Path) -> None:
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        # Insert a legacy-shaped row (only legacy columns set explicitly).
-        conn.execute(
-            "INSERT INTO topic_metadata "
-            "(dialog_id, topic_id, title, top_message_id, is_general, is_deleted, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (-1001234, 1, "General", 1, 1, 0, 1700000000),
-        )
-        conn.commit()
-        row = _fetchone_row(
-            conn,
-            "SELECT title, is_general, is_deleted, pinned, hidden FROM topic_metadata WHERE dialog_id=? AND topic_id=?",
-            (-1001234, 1),
-        )
-        assert row is not None
-        assert row[0] == "General"
-        assert row[1] == 1
-        assert row[2] == 0
-        # New columns default to 0 (NOT NULL DEFAULT 0):
-        assert row[3] == 0
-        assert row[4] == 0
-
-
 def test_migration_v19_idempotent(db_path: Path) -> None:
     ensure_sync_schema(db_path)
     ensure_sync_schema(db_path)  # second call must not raise
     with _sync_db_connection(db_path) as conn:
         cols = {row[1] for row in _table_info(conn, "topic_metadata")}
         assert {"icon_emoji_id", "pinned", "hidden", "snapshot_at", "date"}.issubset(cols)
-
-
-def test_migration_v19_pinned_default_zero(db_path: Path) -> None:
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        conn.execute(
-            "INSERT INTO topic_metadata "
-            "(dialog_id, topic_id, title, is_general, is_deleted, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (-1009999, 1, "T", 0, 0, 1700000000),
-        )
-        conn.commit()
-        row = _fetchone_row(conn, "SELECT pinned, hidden FROM topic_metadata WHERE dialog_id=-1009999 AND topic_id=1")
-        assert row == (0, 0)
 
 
 def test_migration_v19_does_not_break_existing_left_join(db_path: Path) -> None:

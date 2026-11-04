@@ -10,7 +10,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.entity_profile.repository import EntityProfileRepository
@@ -59,7 +58,6 @@ async def test_service_accepts_same_scope_at_ttl_boundary_without_db_changes(tmp
     service._deps = replace(
         service._deps,
         now_provider=lambda: 400.0,
-        full_user_auth_scope=lambda: TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 100),
     )
 
     try:

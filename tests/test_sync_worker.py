@@ -11,6 +11,7 @@ import asyncio
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Iterator, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,8 +37,10 @@ from mcp_telegram.message_history.contracts import (
     MessageHistoryUnavailableError,
 )
 from mcp_telegram.message_history.telegram_adapter import TelethonFullHistoryPageAdapter, TelethonHistoryAccessProbe
-from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
+from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts, read_message_text
 from mcp_telegram.messages.telegram_adapter import _PeerLike, extract_message_row
+from mcp_telegram.observation_order import allocate_observation_order
+from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncWorker, _FetchedBatchPage
@@ -668,6 +671,82 @@ async def test_hidden_previously_synced_dm_is_neither_reenrolled_nor_scheduled(s
     assert worker.consume_canonical_dm_publication(cast(sqlite3.Connection, sync_db)) == 0
     assert worker._next_pending_dialog() is None
     assert sync_db.execute("SELECT status FROM synced_dialogs WHERE dialog_id=102").fetchone() == ("syncing",)
+
+
+@pytest.mark.asyncio
+async def test_full_sync_delayed_page_preserves_newer_unversioned_event(tmp_path: Path) -> None:
+    db_path = tmp_path / "message-race.db"
+    ensure_sync_schema(db_path)
+    conn = cast(sqlite3.Connection, _open_sync_db(db_path))
+    conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
+    conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (77, 'syncing')")
+    conn.execute("INSERT INTO full_history_enrollment VALUES (77, 1, 1)")
+    conn.commit()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def fetch(**_kwargs: object) -> MockTotalList:
+        entered.set()
+        await release.wait()
+        return MockTotalList(
+            [
+                build_mock_message(id=4, text="stale", edit_date=datetime(2024, 2, 1, tzinfo=UTC)),
+                build_mock_message(id=3, text="other"),
+                build_mock_message(id=5, text="new body", edit_date=datetime.fromtimestamp(200, UTC)),
+            ],
+            total=3,
+        )
+
+    client = _MockClient()
+    client.get_messages.side_effect = fetch
+    writer = await SQLiteWriter.open(db_path)
+    try:
+        worker = FullSyncWorker(TelethonFullHistoryPageAdapter(client), conn, asyncio.Event(), writer=writer)
+        task = asyncio.create_task(worker._fetch_batch(77, 0))
+        await entered.wait()
+
+        def deliver_event(db: sqlite3.Connection) -> int:
+            with write_transaction(db):
+                event = extract_message_row(77, build_mock_message(id=4, text="current"))
+                insert_messages_with_fts(db, [replace(event, observation_order=allocate_observation_order(db))])
+                body = extract_message_row(
+                    77, build_mock_message(id=5, text="old body", edit_date=datetime.fromtimestamp(100, UTC))
+                )
+                body = replace(
+                    body,
+                    message=replace(body.message, media_kind="photo", media_payload='{"id":99}'),
+                    private_photo_id=99,
+                    observation_order=allocate_observation_order(db),
+                )
+                insert_messages_with_fts(db, [body])
+                media_order = allocate_observation_order(db)
+                db.execute(
+                    "UPDATE message_image_sources SET observation_order=? WHERE dialog_id=77 AND message_id=5",
+                    (media_order,),
+                )
+                return media_order
+
+        media_order = await writer.run(deliver_event)
+        release.set()
+        assert await task == (3, False)
+    finally:
+        release.set()
+        await writer.aclose()
+        conn.close()
+
+    reopened = cast(sqlite3.Connection, _open_sync_db(db_path))
+    try:
+        assert read_message_text(reopened, 77, 4).text == "current"
+        assert read_message_text(reopened, 77, 3).text == "other"
+        assert read_message_text(reopened, 77, 5).text == "new body"
+        assert reopened.execute(
+            "SELECT m.media_kind,m.media_payload,s.photo_id,s.observation_order FROM messages m "
+            "JOIN message_image_sources s USING(dialog_id,message_id) WHERE m.dialog_id=77 AND m.message_id=5"
+        ).fetchone() == ("photo", '{"id":99}', 99, media_order)
+        assert reopened.execute(
+            "SELECT message_id, stemmed_text FROM messages_fts WHERE dialog_id=77 ORDER BY message_id"
+        ).fetchall() == [(3, stem_text("other")), (4, stem_text("current")), (5, stem_text("new body"))]
+    finally:
+        reopened.close()
 
 
 @pytest.mark.asyncio

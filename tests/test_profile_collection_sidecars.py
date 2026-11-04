@@ -116,22 +116,25 @@ def test_sidecar_honors_independent_identity_clocks(database: Database, newer_fi
     assert _private_rows(conn) == private
 
 
-def test_incomplete_unknown_and_target_sidecars_do_not_invent_identity(database: Database) -> None:
+def test_partial_known_sidecar_updates_supplied_fields_without_enrolling_unknown_or_target(database: Database) -> None:
     _path, conn, repo = database
     _seed_sidecar(conn)
-    before = (
-        _rows(conn, "SELECT * FROM entities"),
-        _rows(conn, "SELECT * FROM dialogs"),
-        _rows(conn, "SELECT * FROM dialog_fact_observations"),
-    )
+    target_before = _rows(conn, "SELECT * FROM entities WHERE id=42")
     private = _private_rows(conn)
     with write_transaction(conn):
         assert _commit(repo, _page(_identity(complete=False), _identity(peer=999), _identity(peer=42)))
-    assert (
-        _rows(conn, "SELECT * FROM entities"),
-        _rows(conn, "SELECT * FROM dialogs"),
-        _rows(conn, "SELECT * FROM dialog_fact_observations"),
-    ) == before
+    assert _rows(conn, "SELECT name,username FROM entities WHERE id=99") == [("After", "after")]
+    assert _rows(conn, "SELECT name,username FROM dialogs WHERE dialog_id=99") == [("After", "after")]
+    assert _rows(
+        conn, "SELECT field,observation_order FROM dialog_fact_observations WHERE dialog_id=99 ORDER BY field"
+    ) == [
+        ("name", 100),
+        ("username", 100),
+    ]
+    assert _rows(conn, "SELECT * FROM entities WHERE id=42") == target_before
+    assert _rows(conn, "SELECT id FROM entities WHERE id=999") == []
+    assert _rows(conn, "SELECT dialog_id FROM dialogs WHERE dialog_id IN (42,999)") == []
+    assert _rows(conn, "SELECT dialog_id FROM dialog_fact_observations WHERE dialog_id IN (42,999)") == []
     assert _private_rows(conn) == private
 
 
