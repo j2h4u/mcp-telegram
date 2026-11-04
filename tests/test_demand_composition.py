@@ -129,8 +129,14 @@ class _IdleFolderRepository(FolderSnapshotRepository):
     def read_catalog_identity(self) -> tuple[int, int, int] | None:
         return None
 
-    def read_observation_order(self) -> int:
+    def read_catalog_version(self) -> tuple[int | None, int, str | None, bool]:
+        return None, 0, None, False
+
+    def read_membership_revision(self) -> int:
         return 0
+
+    def invalidate(self) -> None:
+        pass
 
     def refine_receipts(self, observation: FolderRuleObservation, *, account_id: int, order: int) -> None:
         pass
@@ -139,8 +145,16 @@ class _IdleFolderRepository(FolderSnapshotRepository):
         del now
         return False
 
-    def project_observation(self, observation: FolderRuleObservation, *, completed_at: int) -> int | None:
-        del observation, completed_at
+    def project_observation(
+        self,
+        observation: FolderRuleObservation,
+        *,
+        completed_at: int,
+        observation_order: int = 0,
+        membership_revision: int | None = None,
+        owner_account_id: int | None = None,
+    ) -> int | None:
+        del observation, completed_at, observation_order, membership_revision, owner_account_id
         return None
 
     def reproject_current_rules(self, *, now: int) -> int | None:

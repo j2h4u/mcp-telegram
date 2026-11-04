@@ -13,7 +13,13 @@ from telethon.tl.functions.messages import GetHistoryRequest  # type: ignore[imp
 from telethon.tl.types import TypeInputPeer  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
-from ..messages.telegram_adapter import PeerNameClient, extract_message_row, resolve_forward_entity_name_map
+from ..image_authorization import ScopeToken
+from ..messages.telegram_adapter import (
+    PeerNameClient,
+    extract_message_row,
+    extract_received_messages,
+    resolve_forward_entity_name_map,
+)
 from ..telegram_access import ACCESS_LOST_ERRORS
 from ..telethon_dialog import observe_response_dialog_identity
 from .contracts import (
@@ -21,6 +27,7 @@ from .contracts import (
     ExtractedMessage,
     ForwardGapPage,
     FullHistoryPage,
+    HistoryAccessProbeResult,
     MessageHistoryAccessLostError,
     MessageHistoryUnavailableError,
 )
@@ -30,6 +37,9 @@ type _ForwardMessagesResponse = types.messages.Messages | types.messages.Message
 
 
 class _TelegramHistoryClient(Protocol):
+    def capture_image_scope(self) -> ScopeToken | None: ...
+
+    def claim_image_scope(self, token: ScopeToken) -> bool: ...
     async def get_messages(self, **kwargs: object) -> object: ...
 
     async def get_input_entity(self, peer: object) -> object: ...
@@ -249,7 +259,13 @@ class TelethonHistoryAccessProbe:
     def __init__(self, client: object) -> None:
         self._client = cast(_TelegramHistoryClient, client)
 
-    async def probe_total_messages(self, dialog_id: int) -> int | None:
+    def capture_scope(self) -> ScopeToken | None:
+        return self._client.capture_image_scope()
+
+    def claim_scope(self, token: ScopeToken) -> bool:
+        return self._client.claim_image_scope(token)
+
+    async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
         try:
             response = await self._client.get_messages(entity=dialog_id, limit=1)
         except ACCESS_LOST_ERRORS as exc:
@@ -258,7 +274,11 @@ class TelethonHistoryAccessProbe:
             ) from exc
         except (RPCError, TimeoutError, OSError) as exc:
             raise MessageHistoryUnavailableError(f"message history unavailable for dialog {dialog_id}") from exc
-        return _optional_nonnegative_int(getattr(response, "total", None))
+        if not isinstance(response, Sequence):
+            raise MessageHistoryUnavailableError("Telegram history probe response is not a sequence")
+        return HistoryAccessProbeResult(
+            _optional_nonnegative_int(getattr(response, "total", None)), extract_received_messages(response)
+        )
 
 
 def _optional_nonnegative_int(value: object) -> int | None:

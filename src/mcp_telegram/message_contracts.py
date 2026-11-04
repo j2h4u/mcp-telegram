@@ -84,10 +84,21 @@ class ExtractedMessage:
     message: StoredMessage
     reply_count: int
     observation_order: int | None = None
+    media_observation_order: int | None = None
+    body_observation_order: int | None = None
     private_photo_id: int | None = field(default=None, repr=False)
     private_photo_eligible: bool = True
+    invalidate_image_source: bool = True
     reactions_observed: bool = True
     reactions: list[ReactionRecord] = field(default_factory=list)
     entities: list[EntityRecord] = field(default_factory=list)
     forward: ForwardRecord | None = None
     reaction_can_see_list: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReceivedMessage:
+    """One response message with its actual peer and original direction evidence."""
+
+    bundle: ExtractedMessage
+    outgoing: bool | None

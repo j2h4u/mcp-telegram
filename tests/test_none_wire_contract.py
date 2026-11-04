@@ -114,7 +114,9 @@ def _assert_registered_null_boundary(name: str, schema: dict[str, object]) -> No
             ("properties", "enrollment_enabled"),
             ("properties", "latest_retained_message"),
         }
-        assert nullable or sync_null or not _schema_has_null(node), (name, path)
+        topic_null = name == "list_topics" and path == ("properties", "topics", "items", "properties", "title")
+        folder_null = name == "get_folder" and path == ("properties", "definition", "properties", "source_position")
+        assert nullable or sync_null or topic_null or folder_null or not _schema_has_null(node), (name, path)
         properties, required = node.get("properties"), node.get("required")
         if isinstance(properties, dict) and isinstance(required, list):
             assert set(required) <= set(properties), (name, path)

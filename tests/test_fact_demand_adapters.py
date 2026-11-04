@@ -12,6 +12,7 @@ from unittest.mock import patch
 import pytest
 
 from mcp_telegram import fact_hydration
+from mcp_telegram.auth_scope import TelegramAuthScope
 from mcp_telegram.entity_profile.refresh import (
     EntityProfileDemandAdapter,
     EntityRefreshCoordinator,
@@ -28,6 +29,7 @@ from mcp_telegram.hydration_queue import (
     HydrationPriority,
     HydrationQueueRepository,
 )
+from mcp_telegram.image_authorization import ScopeCell, ScopeToken
 from mcp_telegram.media_hydration import MediaFactHydrationHandler
 from mcp_telegram.message_fact_refresh import (
     ReadReceiptDemandAdapter,
@@ -56,6 +58,18 @@ from mcp_telegram.telegram_rpc_scheduler import (
 )
 from mcp_telegram.transcription_hydration import TranscriptionHydrationHandler
 from tests.sqlite_writer_helpers import inline_writer
+
+
+class _ScopeClient:
+    def __init__(self) -> None:
+        self.cell = ScopeCell()
+        assert self.cell.publish(TelegramAuthScope(1, 1, 2, 99))
+
+    def capture_image_scope(self) -> ScopeToken | None:
+        return self.cell.capture()
+
+    def claim_image_scope(self, token: ScopeToken) -> bool:
+        return self.cell.claim(token)
 
 
 def _hydration_db() -> sqlite3.Connection:
@@ -636,7 +650,7 @@ def _repair_hydration_worker(
     interval_seconds: float = 60.0,
 ) -> MessageFactHydrationWorker:
     return MessageFactHydrationWorker(
-        object(),
+        _ScopeClient(),
         conn,
         asyncio.Event(),
         writer=inline_writer(conn),
@@ -650,6 +664,7 @@ def _repair_hydration_worker(
         pause_between_requests_seconds=0.01,
         backfill_debt_limit=1,
         clock=clock,
+        profile_owner_account_id=1,
     )
 
 
@@ -747,6 +762,7 @@ async def test_backfill_slice_seeds_and_processes_repair_candidates(tmp_path: Pa
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
+    conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
     conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
     conn.execute("INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (1, 1, 1)")
     conn.execute(
@@ -772,6 +788,7 @@ async def test_backfill_queued_work_runs_during_repair_cooldown(tmp_path: Path) 
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
+    conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
     conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
     conn.execute("INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (1, 1, 1)")
     conn.executemany(
@@ -812,6 +829,7 @@ async def test_backfill_more_repair_candidates_keep_repair_due(tmp_path: Path) -
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
+    conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
     conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
     conn.execute("INSERT INTO full_history_enrollment(dialog_id, enabled, updated_at) VALUES (1, 1, 1)")
     conn.executemany(

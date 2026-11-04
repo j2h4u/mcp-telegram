@@ -322,10 +322,34 @@ def _registered_output_schema(name: str, schema: dict[str, object] | None) -> di
         if "$defs" in temporal:
             normalized["$defs"] = deepcopy(temporal["$defs"])
     _restore_sync_status_schema(name, normalized, temporal)
+    _restore_topic_and_folder_schema(name, normalized, temporal)
     if name in ASSESSMENT_TOOLS and normalized is not None:
         properties = t.cast(dict[str, object], normalized["properties"])
         properties["assessment"] = deepcopy(ASSESSMENT_SCHEMA)
     return _protection_output_schema(normalized)
+
+
+def _restore_topic_and_folder_schema(
+    name: str, normalized: dict[str, object] | None, temporal: dict[str, object] | None
+) -> None:
+    """Preserve semantic null at the exact topic and folder property paths."""
+    if normalized is not None and temporal is not None and name in {"list_topics", "get_folder"}:
+        target = t.cast(dict[str, object], normalized["properties"])
+        original = t.cast(dict[str, object], temporal["properties"])
+        if name == "list_topics":
+            target_node = t.cast(dict[str, object], t.cast(dict[str, object], target["topics"])["items"])
+            original_node = t.cast(dict[str, object], t.cast(dict[str, object], original["topics"])["items"])
+            key = "title"
+        else:
+            target_node = t.cast(dict[str, object], target["definition"])
+            original_node = t.cast(dict[str, object], original["definition"])
+            key = "source_position"
+        t.cast(dict[str, object], target_node["properties"])[key] = deepcopy(
+            t.cast(dict[str, object], original_node["properties"])[key]
+        )
+        required = t.cast(list[str], target_node["required"])
+        if key not in required:
+            required.append(key)
 
 
 def _restore_sync_status_schema(

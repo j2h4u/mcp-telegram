@@ -34,6 +34,7 @@ from mcp_telegram.topics.catalog import TopicCatalogRepository
 from mcp_telegram.topics.demand import TopicSnapshotDemandAdapter
 from mcp_telegram.topics.telegram_adapter import TelethonTelegramTopicGateway
 from tests.sqlite_writer_helpers import inline_writer
+from tests.topic_test_helpers import topic_scope
 
 
 @pytest.fixture
@@ -105,8 +106,14 @@ class _CountingClient:
 
 
 def _adapter(conn: sqlite3.Connection, client: _CountingClient) -> TopicSnapshotDemandAdapter:
+    scope = topic_scope()
     return TopicSnapshotDemandAdapter(
-        TelethonTelegramTopicGateway(client), conn, writer=inline_writer(conn), account_id=1
+        TelethonTelegramTopicGateway(client),
+        conn,
+        writer=inline_writer(conn),
+        account_id=1,
+        capture_scope=scope.capture,
+        claim_scope=scope.claim,
     )
 
 
@@ -447,3 +454,64 @@ async def test_forbidden_access_blocks_without_retry_and_retains_resumable_page(
 
     assert client.page_offsets == [0, 1]
     assert repository.coverage(42)["reason"] != "source_access_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_topic_page_commits_supplied_message_and_fences_scope(db: sqlite3.Connection) -> None:
+    from telethon.tl.types import Message
+
+    from tests.topic_test_helpers import seed_topic_account
+
+    seed_topic_account(db, 42)
+    db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (42,'synced')")
+    db.commit()
+    scope = topic_scope()
+
+    class Client(_CountingClient):
+        async def __call__(self, request: object) -> object:
+            self._attempt("topic_page")
+            return SimpleNamespace(
+                topics=[_topic(1)],
+                count=1,
+                order_by_create_date=True,
+                messages=[
+                    Message(id=10, peer_id=PeerUser(42), date=datetime(2026, 1, 1, tzinfo=UTC), message="received")
+                ],
+            )
+
+    client = Client()
+    adapter = TopicSnapshotDemandAdapter(
+        TelethonTelegramTopicGateway(client),
+        db,
+        writer=inline_writer(db),
+        account_id=1,
+        capture_scope=scope.capture,
+        claim_scope=scope.claim,
+    )
+    assert (await adapter.run_slice(_selected_budget(adapter, 4))).kind is SliceOutcomeKind.PROGRESSED
+    assert db.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=10").fetchone() == ("received",)
+
+    class Retired(Client):
+        async def __call__(self, request: object) -> object:
+            result = await super().__call__(request)
+            scope.begin_change()
+            return result
+
+    TopicCatalogRepository(db).request(42, "recheck")
+    retired = TopicSnapshotDemandAdapter(
+        TelethonTelegramTopicGateway(Retired()),
+        db,
+        writer=inline_writer(db),
+        account_id=1,
+        capture_scope=scope.capture,
+        claim_scope=scope.claim,
+    )
+    before = cast(
+        tuple[int] | None,
+        db.execute("SELECT observation_order FROM topic_metadata WHERE dialog_id=42 AND topic_id=1").fetchone(),
+    )
+    await _run_selected(retired, 4)
+    assert (
+        db.execute("SELECT observation_order FROM topic_metadata WHERE dialog_id=42 AND topic_id=1").fetchone()
+        == before
+    )

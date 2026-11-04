@@ -298,9 +298,10 @@ async def test_forward_gap_keeps_received_rows_when_interrupted() -> None:
 @pytest.mark.asyncio
 async def test_access_probe_is_separate_and_uses_limit_one() -> None:
     client = _Client()
-    total = await TelethonHistoryAccessProbe(client).probe_total_messages(7)
+    result = await TelethonHistoryAccessProbe(client).probe_total_messages(7)
 
-    assert total == 42
+    assert result.total_messages == 42
+    assert result.received == ()
     assert client.get_messages_calls == [{"entity": 7, "limit": 1}]
 
 

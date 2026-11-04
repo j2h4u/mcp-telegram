@@ -40,20 +40,17 @@ def folder_snapshot(
     conn: FolderReadConnection,
     *,
     stale_after_seconds: int,
+    account_id: int | None,
     now: int | None = None,
 ) -> dict[str, object]:
     """Read compact folder projection health metadata without local writes."""
     values = _folder_state_values(conn)
+    if account_id is None or _state_int(values.get("account_id")) != account_id:
+        return _unavailable_snapshot()
     generation = _state_int(values.get("canonical_generation"))
     completed_at = _state_int(values.get("completed_at"))
-    receipts = (_state_int(values.get("rule_observation_started_at")), _state_int(values.get("canonical_observed_at")))
     current = int(time.time() if now is None else now)
-    freshness_receipts = tuple(receipt for receipt in receipts if receipt is not None)
-    age = (
-        None
-        if len(freshness_receipts) != len(receipts)
-        else max(max(0, current - receipt) for receipt in freshness_receipts)
-    )
+    age = _folder_receipt_age(values, current)
     complete = (
         generation is not None
         and completed_at is not None
@@ -69,13 +66,25 @@ def folder_snapshot(
     }
 
 
+def _unavailable_snapshot() -> dict[str, object]:
+    return {"generation": None, "status": "unavailable", "completed_at": None, "age_seconds": None, "complete": False}
+
+
+def _folder_receipt_age(values: dict[str, str | None], now: int) -> int | None:
+    rule_started = _state_int(values.get("rule_observation_started_at"))
+    directory_started = _state_int(values.get("canonical_observed_at"))
+    if rule_started is None or directory_started is None:
+        return None
+    return max(0, now - rule_started, now - directory_started)
+
+
 def _folder_state_values(conn: FolderReadConnection) -> dict[str, str | None]:
     values: dict[str, str | None] = {}
     try:
         rows = cast(
-            list[tuple[object, object, object, object, object]],
+            list[tuple[object, object, object, object, object, object]],
             conn.execute(
-                "SELECT canonical_generation,completed_at,coverage_status,rule_observation_started_at,canonical_observed_at "
+                "SELECT canonical_generation,completed_at,coverage_status,rule_observation_started_at,canonical_observed_at,account_id "
                 "FROM telegram_folder_projection_state WHERE singleton=1"
             ).fetchall(),
         )
@@ -84,10 +93,11 @@ def _folder_state_values(conn: FolderReadConnection) -> dict[str, str | None]:
             raise
         rows = []
     if rows:
-        generation, completed_at, coverage_status, rule_started_at, canonical_observed_at = rows[0]
+        generation, completed_at, coverage_status, rule_started_at, canonical_observed_at, account_id = rows[0]
         values.update(
             {
                 "canonical_generation": None if generation is None else str(generation),
+                "account_id": None if account_id is None else str(account_id),
                 "completed_at": None if completed_at is None else str(completed_at),
                 "coverage_status": None if coverage_status is None else str(coverage_status),
                 "rule_observation_started_at": None if rule_started_at is None else str(rule_started_at),
@@ -105,8 +115,10 @@ def _snapshot_status(complete: bool, age: int | None, stale_after_seconds: int) 
     return "fresh"
 
 
-def folder_summaries(conn: FolderReadConnection) -> list[dict[str, object]]:
+def folder_summaries(conn: FolderReadConnection, *, account_id: int | None) -> list[dict[str, object]]:
     """Return one compact structural summary per Telegram folder."""
+    if account_id is None:
+        return []
     try:
         rows = cast(
             list[tuple[int, str, int, int, int, int | None, int]],
@@ -122,8 +134,14 @@ def folder_summaries(conn: FolderReadConnection) -> list[dict[str, object]]:
                    FROM telegram_folder_rules AS f
                    LEFT JOIN telegram_folder_local_members AS fm ON fm.namespace=f.namespace AND fm.folder_id=f.folder_id AND fm.state='present'
                    LEFT JOIN dialogs AS d ON d.dialog_id = fm.dialog_id AND d.hidden=0
+                   WHERE f.deleted=0 AND f.catalog_member IS NOT 0 AND f.account_id=? AND f.account_id=(
+                       SELECT account_id FROM telegram_folder_projection_state WHERE singleton=1)
                    GROUP BY f.namespace, f.folder_id, f.title, f.source_position
-                   ORDER BY f.source_position"""
+                   ORDER BY f.source_position IS NULL,f.source_position,
+                     COALESCE((SELECT CAST(j.key AS INTEGER) FROM json_each((SELECT filter_order_json FROM
+                       telegram_folder_projection_state WHERE singleton=1)) j WHERE CAST(j.value AS INTEGER)=f.folder_id),2147483647),
+                     f.folder_id""",
+                (account_id,),
             ).fetchall(),
         )
     except sqlite3.OperationalError as exc:
@@ -145,9 +163,11 @@ def folder_summaries(conn: FolderReadConnection) -> list[dict[str, object]]:
 
 
 def folders_by_dialog(
-    conn: FolderReadConnection, dialog_ids: Sequence[int] | None = None
+    conn: FolderReadConnection, dialog_ids: Sequence[int] | None = None, *, account_id: int | None
 ) -> dict[int, list[dict[str, object]]]:
     result: dict[int, list[dict[str, object]]] = {}
+    if account_id is None:
+        return result
     try:
         rows = cast(
             list[tuple[int, str, int]],
@@ -157,9 +177,15 @@ def folders_by_dialog(
                    JOIN telegram_folder_local_members AS m ON m.namespace=f.namespace AND m.folder_id=f.folder_id
                    JOIN dialogs AS d ON d.dialog_id=m.dialog_id AND d.hidden=0
                    WHERE m.state='present'
+                   AND f.deleted=0 AND f.catalog_member IS NOT 0 AND f.account_id=? AND f.account_id=(
+                       SELECT account_id FROM telegram_folder_projection_state WHERE singleton=1)
                    AND (? IS NULL OR m.dialog_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?)))
                    ORDER BY f.source_position, m.pin_position IS NULL, m.pin_position, m.dialog_id""",
-                (json.dumps(dialog_ids) if dialog_ids is not None else None,) * 2,
+                (
+                    account_id,
+                    json.dumps(dialog_ids) if dialog_ids is not None else None,
+                    json.dumps(dialog_ids) if dialog_ids is not None else None,
+                ),
             ).fetchall(),
         )
     except sqlite3.OperationalError as exc:
@@ -171,7 +197,7 @@ def folders_by_dialog(
     return result
 
 
-def dialog_placement(conn: FolderReadConnection, dialog_id: int) -> dict[str, object]:
+def dialog_placement(conn: FolderReadConnection, dialog_id: int, *, account_id: int | None) -> dict[str, object]:
     try:
         archived_row = cast(
             tuple[int] | None, conn.execute("SELECT archived FROM dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone()
@@ -186,8 +212,10 @@ def dialog_placement(conn: FolderReadConnection, dialog_id: int) -> dict[str, ob
             conn.execute(
                 """SELECT f.folder_id, f.title FROM telegram_folder_rules AS f
                JOIN telegram_folder_local_members AS m ON m.namespace=f.namespace AND m.folder_id=f.folder_id
-               WHERE m.dialog_id = ? AND m.state='present' ORDER BY f.source_position""",
-                (dialog_id,),
+               WHERE m.dialog_id = ? AND m.state='present' AND f.deleted=0 AND f.catalog_member IS NOT 0 AND f.account_id=?
+               AND f.account_id=(SELECT account_id FROM telegram_folder_projection_state WHERE singleton=1)
+               ORDER BY f.source_position""",
+                (dialog_id, account_id),
             ).fetchall(),
         )
     except sqlite3.OperationalError as exc:

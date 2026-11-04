@@ -4497,3 +4497,101 @@ async def test_list_messages_missing_local_anchor_exposes_actionable_context_met
     )
     assert "Action:" in _text_content(result)
     assert "fragment_fetch_failed" not in _text_content(result)
+
+
+async def test_list_topics_preserves_unknown_title_at_mcp_boundary() -> None:
+    from jsonschema import validate
+
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "dialog_id": 123,
+                "topics": [{"id": 7, "title": None, "pinned": True}],
+                "catalog": _topic_catalog_fixture(),
+            },
+        }
+    )
+    with _patch_daemon(conn):
+        result = await server.call_tool("list_topics", {"exact_dialog_id": 123})
+    assert result.is_error is False
+    payload = _json_dict(cast(object, result.structured_content))
+    topic = _json_dict(_json_list(payload["topics"])[0])
+    assert topic["title"] is None
+    assert "title_content" not in topic
+    assert topic["pinned"] is True
+    assert "hidden" not in topic
+    schema = TOOL_REGISTRY["list_topics"].output_schema
+    assert schema is not None
+    validate(payload, schema)
+
+
+async def test_list_topics_keeps_hidden_topic_with_known_title_at_mcp_boundary() -> None:
+    from jsonschema import validate
+
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "dialog_id": 123,
+                "topics": [{"id": 7, "title": "Hidden topic", "hidden": True, "pinned": False}],
+                "catalog": _topic_catalog_fixture(),
+            },
+        }
+    )
+    with _patch_daemon(conn):
+        result = await server.call_tool("list_topics", {"exact_dialog_id": 123})
+    assert result.is_error is False
+    payload = _json_dict(cast(object, result.structured_content))
+    topic = _json_dict(_json_list(payload["topics"])[0])
+    assert topic["title"] == "Hidden topic"
+    assert topic["hidden"] is True
+    assert topic["pinned"] is False
+    schema = TOOL_REGISTRY["list_topics"].output_schema
+    assert schema is not None
+    validate(payload, schema)
+
+
+def test_get_folder_schema_requires_nullable_position() -> None:
+    schema = TOOL_REGISTRY["get_folder"].output_schema
+    assert schema is not None
+    properties = cast(dict[str, object], schema["properties"])
+    definition = cast(dict[str, object], properties["definition"])
+    assert "source_position" in cast(list[str], definition["required"])
+    fields = cast(dict[str, object], definition["properties"])
+    position = cast(dict[str, object], fields["source_position"])
+    assert position["type"] == ["integer", "null"]
+
+
+async def test_get_folder_preserves_unknown_position_at_mcp_boundary() -> None:
+    from jsonschema import validate
+
+    definition = {
+        "folder_id": 4,
+        "title": "Work",
+        "namespace": "filter",
+        "kind": "filter",
+        "source_position": None,
+        "included_ids": [],
+        "pinned_ids": [],
+        "excluded_ids": [],
+        "categories": [],
+        "exclude_archived": False,
+        "exclude_read": False,
+        "exclude_muted": False,
+        "title_entities": [],
+        "title_noanimate": False,
+        "emoticon": None,
+        "color": None,
+        "has_my_invites": False,
+        "complete": True,
+    }
+    conn = _make_daemon_conn({"ok": True, "account_id": 7, "presence": "present", "definition": definition})
+    with _patch_daemon(conn):
+        result = await server.call_tool("get_folder", {"folder_id": 4})
+    assert result.is_error is False
+    payload = _json_dict(cast(object, result.structured_content))
+    assert _json_dict(payload["definition"])["source_position"] is None
+    schema = TOOL_REGISTRY["get_folder"].output_schema
+    assert schema is not None
+    validate(payload, schema)

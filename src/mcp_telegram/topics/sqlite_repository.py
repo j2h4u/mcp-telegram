@@ -1,4 +1,4 @@
-"""SQLite adapter for the canonical ``topic_metadata`` snapshot."""
+"""SQLite adapter for canonical topic facts."""
 
 from __future__ import annotations
 
@@ -10,33 +10,6 @@ from ..observation_order import allocate_observation_order
 from ..sync_transactions import require_write_transaction, write_savepoint
 from .contracts import TopicFact
 from .ports import TopicMetadataRepository, TopicSnapshotRepository
-
-_UPSERT_TOPIC_SQL = """
-INSERT INTO topic_metadata
-    (dialog_id, topic_id, title, top_message_id,
-     is_general, is_deleted, updated_at,
-     icon_emoji_id, icon_emoji, icon_color,
-     pinned, hidden, snapshot_at, date, observation_order)
-VALUES
-    (:dialog_id, :topic_id, :title, NULL,
-     :is_general, 0, :updated_at,
-     :icon_emoji_id, :icon_emoji, :icon_color,
-     0, :hidden, :snapshot_at, :date, :observation_order)
-ON CONFLICT(dialog_id, topic_id) DO UPDATE SET
-    title          = COALESCE(excluded.title, topic_metadata.title),
-    icon_emoji_id  = excluded.icon_emoji_id,
-    icon_emoji     = CASE WHEN excluded.icon_emoji_id IS topic_metadata.icon_emoji_id
-                    THEN COALESCE(excluded.icon_emoji, topic_metadata.icon_emoji) ELSE excluded.icon_emoji END,
-    icon_color     = COALESCE(excluded.icon_color, topic_metadata.icon_color),
-    is_general     = excluded.is_general,
-    hidden         = excluded.hidden,
-    is_deleted     = 0,
-    updated_at     = excluded.updated_at,
-    snapshot_at    = excluded.snapshot_at,
-    date           = COALESCE(excluded.date, topic_metadata.date),
-    observation_order = excluded.observation_order
-WHERE topic_metadata.observation_order < excluded.observation_order
-"""
 
 
 class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataRepository):
@@ -50,31 +23,79 @@ class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataReposi
         with write_savepoint(self._conn):
             return allocate_observation_order(self._conn)
 
+    def _apply(self, dialog_id: int, topic_id: int, fields: dict[str, object], now: int, order: int) -> None:
+        require_write_transaction(self._conn)
+        self._conn.execute(
+            "INSERT OR IGNORE INTO topic_metadata(dialog_id,topic_id,title,is_general,is_deleted,updated_at,"
+            "pinned,hidden,snapshot_at,observation_order,catalog_present,membership_order) "
+            "VALUES (?,?,NULL,0,0,?,NULL,NULL,?,?,1,?)",
+            (dialog_id, topic_id, now, now, order, order),
+        )
+        row = cast(
+            tuple[int, int] | None,
+            self._conn.execute(
+                "SELECT is_deleted,membership_order FROM topic_metadata WHERE dialog_id=? AND topic_id=?",
+                (dialog_id, topic_id),
+            ).fetchone(),
+        )
+        if row is None or (row[0] and row[1] >= order):
+            return
+        for name, value in fields.items():
+            order_column = {
+                "title": "title_order",
+                "icon_emoji_id": "icon_order",
+                "icon_color": "color_order",
+                "pinned": "pinned_order",
+                "hidden": "hidden_order",
+                "date": "date_order",
+            }[name]
+            bit = {"title": 1, "icon_emoji_id": 2, "icon_color": 4, "pinned": 8, "hidden": 16, "date": 32}[name]
+            extra = (
+                ",icon_emoji=CASE WHEN icon_emoji_id IS ? THEN icon_emoji ELSE NULL END"
+                if name == "icon_emoji_id"
+                else ""
+            )
+            args = (
+                (value, value, order, dialog_id, topic_id, order)
+                if extra
+                else (value, order, dialog_id, topic_id, order)
+            )
+            self._conn.execute(
+                f"UPDATE topic_metadata SET {name}=?{extra},{order_column}=?,known_fields=known_fields | {bit} "
+                f"WHERE dialog_id=? AND topic_id=? AND {order_column}<?",
+                args,
+            )
+        self._conn.execute(
+            "UPDATE topic_metadata SET is_deleted=0,catalog_present=1,membership_order=?,updated_at=?,snapshot_at=?,"
+            "observation_order=MAX(observation_order,?) WHERE dialog_id=? AND topic_id=? AND membership_order<?",
+            (order, now, now, order, dialog_id, topic_id, order),
+        )
+
     def upsert_topics(
         self, dialog_id: int, topics: tuple[TopicFact, ...], *, observation_order: int | None = None
     ) -> None:
-        if observation_order is None:
-            observation_order = self.begin_snapshot()
+        order = self.begin_snapshot() if observation_order is None else observation_order
         now = int(time.time())
-        rows = (
-            {
-                "dialog_id": dialog_id,
-                "topic_id": topic.topic_id,
-                "title": topic.title,
-                "is_general": int(topic.is_general),
-                "hidden": int(topic.hidden),
-                "icon_emoji_id": topic.icon_emoji_id,
-                "icon_emoji": topic.icon_emoji,
-                "icon_color": topic.icon_color,
-                "updated_at": now,
-                "snapshot_at": now,
-                "date": topic.date,
-                "observation_order": observation_order,
-            }
-            for topic in topics
-        )
         with write_savepoint(self._conn):
-            self._conn.executemany(_UPSERT_TOPIC_SQL, rows)
+            for topic in topics:
+                fields: dict[str, object] = {
+                    "title": topic.title,
+                    "icon_emoji_id": topic.icon_emoji_id,
+                }
+                if topic.hidden is not None:
+                    fields["hidden"] = int(topic.hidden)
+                if topic.icon_color is not None:
+                    fields["icon_color"] = topic.icon_color
+                if topic.date is not None:
+                    fields["date"] = topic.date
+                if topic.pinned is not None:
+                    fields["pinned"] = int(topic.pinned)
+                self._apply(dialog_id, topic.topic_id, fields, now, order)
+                self._conn.execute(
+                    "UPDATE topic_metadata SET icon_emoji=COALESCE(?,icon_emoji),is_general=? "
+                    "WHERE dialog_id=? AND topic_id=? AND icon_order=? AND is_deleted=0",
+                    (topic.icon_emoji, int(topic.is_general), dialog_id, topic.topic_id, order),
+                )
 
     def apply_topic_create(  # noqa: PLR0913
         self,
@@ -83,34 +104,18 @@ class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataReposi
         *,
         title: str,
         icon_emoji_id: int | None,
+        icon_color: int | None = None,
         date: int | None,
         observed_at: int,
         observation_order: int | None = None,
     ) -> None:
-        require_write_transaction(self._conn)
-        if observation_order is None:
-            observation_order = allocate_observation_order(self._conn)
-        self._conn.execute(
-            """
-            INSERT INTO topic_metadata
-                (dialog_id, topic_id, title, top_message_id,
-                 is_general, is_deleted, updated_at,
-                 icon_emoji_id, pinned, hidden, snapshot_at, date, observation_order)
-            VALUES (?, ?, ?, NULL, 0, 0, ?, ?, 0, 0, ?, ?, ?)
-            ON CONFLICT(dialog_id, topic_id) DO UPDATE SET
-                title = COALESCE(excluded.title, topic_metadata.title),
-                icon_emoji = CASE WHEN excluded.icon_emoji_id IS topic_metadata.icon_emoji_id
-                            THEN topic_metadata.icon_emoji ELSE NULL END,
-                icon_emoji_id = COALESCE(excluded.icon_emoji_id, topic_metadata.icon_emoji_id),
-                catalog_present = 1,
-                updated_at = excluded.updated_at,
-                snapshot_at = excluded.snapshot_at,
-                date = COALESCE(excluded.date, topic_metadata.date),
-                observation_order = excluded.observation_order
-            WHERE topic_metadata.observation_order < excluded.observation_order
-            """,
-            (dialog_id, topic_id, title, observed_at, icon_emoji_id, observed_at, date, observation_order),
-        )
+        order = allocate_observation_order(self._conn) if observation_order is None else observation_order
+        fields: dict[str, object] = {"title": title, "icon_color": icon_color}
+        if icon_emoji_id is not None:
+            fields["icon_emoji_id"] = icon_emoji_id or None
+        if date is not None:
+            fields["date"] = date
+        self._apply(dialog_id, topic_id, fields, observed_at, order)
 
     def apply_topic_edit(  # noqa: PLR0913
         self,
@@ -123,81 +128,37 @@ class SQLiteTopicMetadataRepository(TopicSnapshotRepository, TopicMetadataReposi
         observed_at: int,
         observation_order: int | None = None,
     ) -> None:
-        require_write_transaction(self._conn)
-        if observation_order is None:
-            observation_order = allocate_observation_order(self._conn)
-        self._conn.execute(
-            "UPDATE topic_metadata SET title=COALESCE(?, title), "
-            "icon_emoji=CASE WHEN ? IS NULL OR ? IS icon_emoji_id THEN icon_emoji ELSE NULL END, "
-            "icon_emoji_id=COALESCE(?, icon_emoji_id), hidden=COALESCE(?, hidden), "
-            "catalog_present=1, "
-            "updated_at=?, snapshot_at=?, observation_order=? "
-            "WHERE dialog_id=? AND topic_id=? AND observation_order < ?",
-            (
-                title,
-                icon_emoji_id,
-                icon_emoji_id,
-                icon_emoji_id,
-                hidden,
-                observed_at,
-                observed_at,
-                observation_order,
-                dialog_id,
-                topic_id,
-                observation_order,
-            ),
-        )
+        order = allocate_observation_order(self._conn) if observation_order is None else observation_order
+        fields: dict[str, object] = {}
+        if title is not None:
+            fields["title"] = title
+        if icon_emoji_id is not None:
+            fields["icon_emoji_id"] = icon_emoji_id or None
+        if hidden is not None:
+            fields["hidden"] = int(hidden)
+        if fields:
+            self._apply(dialog_id, topic_id, fields, observed_at, order)
 
     def apply_topic_pin(
-        self,
-        dialog_id: int,
-        topic_id: int,
-        *,
-        pinned: bool,
-        observed_at: int,
-        observation_order: int | None = None,
+        self, dialog_id: int, topic_id: int, *, pinned: bool, observed_at: int, observation_order: int | None = None
     ) -> None:
-        require_write_transaction(self._conn)
-        if observation_order is None:
-            observation_order = allocate_observation_order(self._conn)
-        self._conn.execute(
-            "UPDATE topic_metadata SET pinned=?, catalog_present=1, snapshot_at=?, updated_at=?, observation_order=? "
-            "WHERE dialog_id=? AND topic_id=? AND observation_order < ?",
-            (int(pinned), observed_at, observed_at, observation_order, dialog_id, topic_id, observation_order),
-        )
+        order = allocate_observation_order(self._conn) if observation_order is None else observation_order
+        self._apply(dialog_id, topic_id, {"pinned": int(pinned)}, observed_at, order)
 
     def apply_topic_pins(
-        self,
-        dialog_id: int,
-        order: tuple[int, ...],
-        *,
-        observed_at: int,
-        observation_order: int | None = None,
+        self, dialog_id: int, order: tuple[int, ...], *, observed_at: int, observation_order: int | None = None
     ) -> None:
-        """Apply a complete pin membership set without creating unknown topics."""
-        require_write_transaction(self._conn)
-        if observation_order is None:
-            observation_order = allocate_observation_order(self._conn)
-        rows = cast(
-            list[tuple[int]],
-            self._conn.execute("SELECT topic_id FROM topic_metadata WHERE dialog_id=?", (dialog_id,)).fetchall(),
-        )
-        known = {int(topic_id) for (topic_id,) in rows}
-        if not known:
-            return
-        pinned_ids = known.intersection(order)
+        sequence = allocate_observation_order(self._conn) if observation_order is None else observation_order
+        exclude = f" AND topic_id NOT IN ({','.join('?' for _ in order)})" if order else ""
         self._conn.execute(
-            "UPDATE topic_metadata SET pinned=CASE WHEN topic_id IN ({}) THEN 1 ELSE 0 END, "
-            "snapshot_at=?, updated_at=?, observation_order=? WHERE dialog_id=? AND observation_order < ?".format(
-                ",".join("?" for _ in pinned_ids) or "NULL"
-            ),
-            (*sorted(pinned_ids), observed_at, observed_at, observation_order, dialog_id, observation_order),
+            "UPDATE topic_metadata SET pinned=0,pinned_order=?,known_fields=known_fields | 8,"
+            "updated_at=?,snapshot_at=?,observation_order=MAX(observation_order,?) "
+            "WHERE dialog_id=? AND is_deleted=0 AND pinned_order<?" + exclude,
+            (sequence, observed_at, observed_at, sequence, dialog_id, sequence, *order),
         )
-        self._conn.executemany(
-            "UPDATE topic_metadata SET catalog_present=1 WHERE dialog_id=? AND topic_id=? AND observation_order=?",
-            ((dialog_id, topic_id, observation_order) for topic_id in pinned_ids),
-        )
+        for topic_id in order:
+            self._apply(dialog_id, topic_id, {"pinned": 1}, observed_at, sequence)
 
 
 class SQLiteTopicSnapshotRepository(SQLiteTopicMetadataRepository):
-    """Backward-compatible name for the canonical topic repository."""
+    """Canonical topic snapshot repository."""

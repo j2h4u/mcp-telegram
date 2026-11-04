@@ -12,6 +12,7 @@ from telethon.tl import functions, types  # type: ignore[import-untyped]
 
 from helpers import remove_v80_schema_for_historical_fixture
 from mcp_telegram.dialog_directory import CanonicalDialogDirectory
+from mcp_telegram.image_authorization import ScopeToken
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import (
     _CURRENT_SCHEMA_VERSION,
@@ -195,7 +196,18 @@ def test_v77_upgrade_seeds_only_legacy_dialog_facts_and_restarts_incomplete_gene
 
 class _PublicationClient:
     def __init__(self) -> None:
+        from mcp_telegram.auth_scope import TelegramAuthScope
+        from mcp_telegram.image_authorization import ScopeCell
+
         self.requests: list[object] = []
+        self._scope = ScopeCell()
+        assert self._scope.publish(TelegramAuthScope(1, 100, 2, 99))
+
+    def capture_image_scope(self) -> ScopeToken | None:
+        return self._scope.capture()
+
+    def claim_image_scope(self, token: ScopeToken) -> bool:
+        return self._scope.claim(token)
 
     async def __call__(self, request: object) -> object:
         self.requests.append(request)

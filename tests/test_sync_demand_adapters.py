@@ -19,10 +19,10 @@ from telethon.tl.functions.messages import GetHistoryRequest  # type: ignore[imp
 from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
 from helpers import MockTotalList, build_mock_message
+from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.config import SchedulingConfig, resolve_scheduling_config
 from mcp_telegram.daemon import _access_probe_policy_from_scheduling
 from mcp_telegram.delta_sync import (
-    AccessProbe,
     AccessProbePolicy,
     DeltaAccessProbeDemandAdapter,
     DeltaGapFillDemandAdapter,
@@ -36,7 +36,9 @@ from mcp_telegram.delta_sync import (
 from mcp_telegram.dialog_sync import DialogLightReconciliationDemandAdapter, DialogReconciliationWorker
 from mcp_telegram.entity_profile.membership import MembershipSignalCounts
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.image_authorization import ScopeCell, ScopeToken
 from mcp_telegram.message_history.contracts import (
+    HistoryAccessProbeResult,
     MessageHistoryAccessLostError,
 )
 from mcp_telegram.message_history.ports import ForwardGapPagePort, FullHistoryPagePort
@@ -70,6 +72,26 @@ from mcp_telegram.telegram_rpc_scheduler import (
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.sqlite_writer_helpers import inline_writer
+
+_scope_cell = ScopeCell()
+assert _scope_cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 123, 2, 99))
+
+
+class _ProbeScope:
+    def capture_scope(self) -> ScopeToken | None:
+        return _scope_cell.capture()
+
+    def claim_scope(self, token: ScopeToken) -> bool:
+        return _scope_cell.claim(token)
+
+    def capture_image_scope(self) -> ScopeToken | None:
+        return _scope_cell.capture()
+
+    def claim_image_scope(self, token: ScopeToken) -> bool:
+        return _scope_cell.claim(token)
+
+    async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
+        raise AssertionError(f"unexpected probe for {dialog_id}")
 
 
 @pytest.fixture()
@@ -142,7 +164,7 @@ def _selected_budget(adapter: object, limit: int = 1) -> RpcAttemptBudget:
     return RpcAttemptBudget(limit=limit, selected=selected)
 
 
-class _RawHistoryClient:
+class _RawHistoryClient(_ProbeScope):
     def __init__(
         self,
         get_messages: Callable[..., Awaitable[MockTotalList]],
@@ -171,7 +193,7 @@ class _RawHistoryClient:
         return await self._get_entity(peer)
 
 
-class _ForwardHistoryClient:
+class _ForwardHistoryClient(_ProbeScope):
     def __init__(self, respond: Callable[[GetHistoryRequest], Awaitable[object]]) -> None:
         self._respond = respond
         self.requests: list[GetHistoryRequest] = []
@@ -1336,8 +1358,8 @@ async def test_full_sync_total_repair_persists_access_loss_reason(conn: sqlite3.
     dialog_id = 205
     _seed_history_dialog(conn, dialog_id, status="synced")
 
-    class AccessLostProbe:
-        async def probe_total_messages(self, dialog_id: int) -> int | None:
+    class AccessLostProbe(_ProbeScope):
+        async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
             del dialog_id
             raise MessageHistoryAccessLostError("history access lost", reason_code="ChannelPrivateError")
 
@@ -1424,7 +1446,7 @@ def test_access_probe_configuration_controls_adapter_selection(
     scheduling = resolve_scheduling_config(SchedulingConfig(access_probe_enabled=configured), environ)
     worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
     adapter = DeltaAccessProbeDemandAdapter(
-        worker, _access_probe_policy_from_scheduling(scheduling), cast(AccessProbe, object()), account_id=123
+        worker, _access_probe_policy_from_scheduling(scheduling), _ProbeScope(), account_id=123
     )
     assert (adapter.status(0) is not None) is enabled
 
@@ -1444,7 +1466,7 @@ async def test_access_probe_adapter_restores_non_enrolled_peer_with_precise_scop
         observed_scopes.append(current_rpc_scope())
         return MockTotalList([], total=0)
 
-    client = SimpleNamespace(get_messages=get_messages)
+    client = _RawHistoryClient(get_messages)
     worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
     adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), TelethonHistoryAccessProbe(client), account_id=123)
     changes_before = conn.total_changes
@@ -1568,10 +1590,10 @@ async def test_access_probe_runs_exact_excluded_sibling_and_rejects_its_stale_re
     conn.commit()
     calls: list[int] = []
 
-    class Probe:
-        async def probe_total_messages(self, dialog_id: int) -> int | None:
+    class Probe(_ProbeScope):
+        async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
             calls.append(dialog_id)
-            return 10
+            return HistoryAccessProbeResult(10, ())
 
     worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
     adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), Probe(), account_id=123)
@@ -1627,8 +1649,8 @@ async def test_access_recovery_runs_exact_excluded_sibling(conn: sqlite3.Connect
     conn.commit()
     worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
 
-    class Probe:
-        async def probe_total_messages(self, dialog_id: int) -> int | None:
+    class Probe(_ProbeScope):
+        async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
             del dialog_id
             raise AssertionError("recovery slice must not probe")
 
@@ -1746,8 +1768,8 @@ async def test_non_enrolled_recovery_is_observed_as_skipped_not_terminal(conn: s
     )
     conn.commit()
 
-    class Probe:
-        async def probe_total_messages(self, dialog_id: int) -> int | None:
+    class Probe(_ProbeScope):
+        async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
             raise AssertionError(f"unexpected probe for {dialog_id}")
 
     class Observer:
@@ -1818,10 +1840,10 @@ async def test_access_recovery_retains_local_flood_retry_and_observes_budget_def
                 raise TelegramRpcThrottled(retry_after_seconds=600)
             raise RpcAttemptBudgetExhaustedError("budget exhausted")
 
-    class Probe:
-        async def probe_total_messages(self, dialog_id: int) -> int | None:
+    class Probe(_ProbeScope):
+        async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
             del dialog_id
-            return 10
+            return HistoryAccessProbeResult(10, ())
 
     class Observer:
         def __init__(self) -> None:
@@ -1888,7 +1910,7 @@ async def test_access_probe_slice_records_retry_policy_for_probe_outcomes(
         raise RPCError(None, "probe RPC failed")
 
     get_messages.side_effect = fail
-    client = SimpleNamespace(get_messages=get_messages)
+    client = _RawHistoryClient(get_messages)
     worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
     adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), TelethonHistoryAccessProbe(client), account_id=123)
 
@@ -1912,8 +1934,8 @@ async def test_access_probe_propagates_admission_failure_without_retry_boundary(
     dialog_id = 304
     _seed_history_dialog(conn, dialog_id, status="access_lost")
 
-    class AdmissionFailureProbe:
-        async def probe_total_messages(self, dialog_id: int) -> int | None:
+    class AdmissionFailureProbe(_ProbeScope):
+        async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
             del dialog_id
             if error_kind == "saturated":
                 raise RpcAdmissionSaturatedError(current_rpc_scope(), "probe capacity is full")
@@ -1936,8 +1958,8 @@ async def test_access_probe_propagates_exhausted_slice_budget(conn: sqlite3.Conn
     dialog_id = 304
     _seed_history_dialog(conn, dialog_id, status="access_lost")
 
-    class ExhaustedProbe:
-        async def probe_total_messages(self, dialog_id: int) -> int | None:
+    class ExhaustedProbe(_ProbeScope):
+        async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
             del dialog_id
             raise RpcAttemptBudgetExhaustedError("slice attempt budget exhausted")
 
@@ -2015,7 +2037,7 @@ def test_access_probe_scheduler_preserves_both_retry_floors(
     )
     conn.commit()
     worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
-    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), cast(AccessProbe, object()), account_id=123)
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), _ProbeScope(), account_id=123)
     status = adapter.status(0)
     assert status is not None and status.release_at == expected
 
@@ -2030,12 +2052,12 @@ async def test_later_access_loss_fences_pending_probe(conn: sqlite3.Connection) 
     seed_full_history_enrollment(conn, 988, enabled=False)
     conn.commit()
 
-    class Probe:
-        async def probe_total_messages(self, dialog_id: int) -> int | None:
+    class Probe(_ProbeScope):
+        async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
             with write_transaction(conn):
                 order = allocate_observation_order(conn)
                 set_access_lost(conn, dialog_id, 2, profile_owner_account_id=123, observation_order=order)
-            return 10
+            return HistoryAccessProbeResult(10, ())
 
     worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
     adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), Probe(), account_id=123)
@@ -2054,9 +2076,9 @@ async def test_new_loss_invalidates_persisted_recovery(conn: sqlite3.Connection)
     seed_full_history_enrollment(conn, 989, enabled=True)
     conn.commit()
 
-    class Probe:
-        async def probe_total_messages(self, dialog_id: int) -> int | None:
-            return 10
+    class Probe(_ProbeScope):
+        async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
+            return HistoryAccessProbeResult(10, ())
 
     worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event(), writer=inline_writer(conn))
     adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), Probe(), account_id=123)
@@ -2090,8 +2112,8 @@ async def test_delayed_probe_error_respects_new_state_and_retry_floor(
     conn.commit()
     started, release = asyncio.Event(), asyncio.Event()
 
-    class DelayedProbe:
-        async def probe_total_messages(self, dialog_id: int) -> int | None:
+    class DelayedProbe(_ProbeScope):
+        async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
             started.set()
             await release.wait()
             if failure == "deferred":
@@ -2116,9 +2138,9 @@ async def test_delayed_probe_error_respects_new_state_and_retry_floor(
                 conn.execute("UPDATE synced_dialogs SET access_next_revalidate_at=2000 WHERE dialog_id=?", (dialog_id,))
         if crossing == "restored":
 
-            class SuccessfulProbe:
-                async def probe_total_messages(self, dialog_id: int) -> int | None:
-                    return 10
+            class SuccessfulProbe(_ProbeScope):
+                async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
+                    return HistoryAccessProbeResult(10, ())
 
             successful = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), SuccessfulProbe(), account_id=123)
             await successful.run_slice(_selected_budget(successful))
@@ -2170,8 +2192,8 @@ async def test_probe_rechecks_selection_after_writer_queue(conn: sqlite3.Connect
             await release.wait()
             return operation(conn)
 
-    class Probe:
-        async def probe_total_messages(self, dialog_id: int) -> int | None:
+    class Probe(_ProbeScope):
+        async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
             raise AssertionError("stale selection must not call Telegram")
 
     worker = DeltaSyncWorker(
@@ -2218,8 +2240,8 @@ async def test_delayed_access_loss_persists_rpc_error_time(conn: sqlite3.Connect
                 await release.wait()
             return operation(conn)
 
-    class FailingProbe:
-        async def probe_total_messages(self, dialog_id: int) -> int | None:
+    class FailingProbe(_ProbeScope):
+        async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
             nonlocal clock
             clock = 1001
             raise MessageHistoryAccessLostError("private", reason_code="private")
@@ -2232,14 +2254,15 @@ async def test_delayed_access_loss_persists_rpc_error_time(conn: sqlite3.Connect
 
     writer = cast(SQLiteWriter, DelayedWriter())
     if path == "full_total":
+        probe = FailingProbe()
         full = FullSyncWorker(
             cast(FullHistoryPagePort, object()),
             conn,
             asyncio.Event(),
             writer=writer,
-            total_messages_probe=FailingProbe(),
+            total_messages_probe=probe,
         )
-        work = full._probe_total_messages_for_repair(dialog_id, 123)
+        work = full._probe_total_messages_for_repair(dialog_id, 123, probe)
     else:
         delta = DeltaSyncWorker(cast(ForwardGapPagePort, FailingHistory()), conn, asyncio.Event(), writer=writer)
         work = delta.fetch_delta_slice_for_dialog(dialog_id, profile_owner_account_id=123)

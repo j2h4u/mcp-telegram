@@ -31,6 +31,7 @@ from typing import Protocol, cast
 from .access_lifecycle import AccessLossResult, set_access_lost
 from .dialog_identity import ensure_dialog_identity_baseline, publish_dialog_identity
 from .entity_profile.membership import MembershipSignalCounts
+from .entity_profile.repository import bound_profile_account
 from .entity_store import EntitySnapshot, upsert_entity_stub
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .history_enrollment import (
@@ -40,16 +41,25 @@ from .history_enrollment import (
     record_automatic_group_decision,
 )
 from .hydration_queue import HydrationPriority
+from .image_authorization import ScopeToken
 from .message_contracts import ExtractedMessage as _ExtractedMessage
 from .message_history.contracts import (
     MESSAGE_HISTORY_PAGE_SIZE,
     TOPIC_ATTRIBUTION_EXTRACTOR_VERSION,
+    HistoryAccessObservation,
+    HistoryAccessProbeResult,
     MessageHistoryAccessLostError,
     MessageHistoryUnavailableError,
 )
 from .message_history.ports import FullHistoryPagePort
-from .messages.sqlite_bundle import insert_messages_with_fts
+from .messages.sqlite_bundle import (
+    ReceivedMessageScopeChangedError,
+    insert_messages_with_fts,
+    persist_received_messages,
+)
 from .observation_order import allocate_observation_order
+from .reactions.contracts import ReactionAggregateSource, ReactionObservationBoundary
+from .reactions.persistence import allocate_observation_boundary
 from .read_state import apply_read_cursor
 from .resolver import latinize
 from .sqlite_writer import SQLiteWriter
@@ -177,7 +187,11 @@ _UPDATE_PROGRESS_DONE_SQL = (
 class TotalMessagesProbe(Protocol):
     """Single-message access probe used by total repair, outside page ports."""
 
-    async def probe_total_messages(self, dialog_id: int) -> int | None: ...
+    def capture_scope(self) -> ScopeToken | None: ...
+
+    def claim_scope(self, token: ScopeToken) -> bool: ...
+
+    async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -458,12 +472,34 @@ class FullSyncWorker:
         if not self._expected_total_repair_is_ready(dialog_id):
             self._last_total_stale = True
             return True
-        total_messages = await self._probe_total_messages_for_repair(dialog_id, profile_owner_account_id)
-        if total_messages is None:
+        observation = await self._probe_total_messages_for_repair(
+            dialog_id, profile_owner_account_id, self._total_messages_probe
+        )
+        if observation is None:
             return False
+        return await self._publish_total_probe(dialog_id, observation)
+
+    async def _publish_total_probe(self, dialog_id: int, observation: HistoryAccessObservation) -> bool:
+        total_messages = observation.result.total_messages
 
         def persist_total(conn: sqlite3.Connection) -> None:
             with write_transaction(conn):
+                probe = self._total_messages_probe
+                assert probe is not None
+                if bound_profile_account(conn) != observation.scope.scope.account_id:
+                    self._last_total_stale = True
+                    return
+                persist_received_messages(
+                    conn,
+                    observation.result.received,
+                    scope=observation.scope,
+                    claim_scope=probe.claim_scope,
+                    observation_order=observation.order,
+                    expected_dialog_id=dialog_id,
+                    reaction_boundary=observation.reactions,
+                )
+                if total_messages is None:
+                    return
                 cursor = conn.execute(
                     _UPDATE_TOTAL_MESSAGES_SQL,
                     (total_messages, dialog_id, "access_lost", dialog_id),
@@ -481,24 +517,33 @@ class FullSyncWorker:
                     _set_total_messages_repair_retry(conn, None)
                     conn.execute("UPDATE synced_dialogs SET full_sync_retry_at=NULL WHERE dialog_id=?", (dialog_id,))
 
-        await self._writer.run(persist_total)
+        try:
+            await self._writer.run(persist_total)
+        except ReceivedMessageScopeChangedError:
+            self._last_total_stale = True
+            return False
+        if total_messages is None or self._last_total_stale:
+            return False
         logger.info("sync_total_repair_complete dialog_id=%d total_messages=%d", dialog_id, total_messages)
         return self._next_total_messages_repair_dialog() is None
 
     async def _probe_total_messages_for_repair(
-        self, dialog_id: int, profile_owner_account_id: int | None
-    ) -> int | None:
-        probe = self._total_messages_probe
-        if probe is None:
+        self, dialog_id: int, profile_owner_account_id: int | None, probe: TotalMessagesProbe
+    ) -> HistoryAccessObservation | None:
+
+        scope = self._capture_total_probe_scope(probe, profile_owner_account_id)
+        if scope is None:
             return None
 
-        def prepare(conn: sqlite3.Connection) -> int:
+        def prepare(conn: sqlite3.Connection) -> tuple[int, ReactionObservationBoundary]:
             with write_transaction(conn):
-                return allocate_observation_order(conn)
+                return allocate_observation_order(conn), allocate_observation_boundary(
+                    conn, ReactionAggregateSource.HISTORY
+                )
 
-        order = await self._writer.run(prepare)
+        order, reactions = await self._writer.run(prepare)
         try:
-            total_messages = await probe.probe_total_messages(dialog_id)
+            result = await probe.probe_total_messages(dialog_id)
         except RpcAttemptBudgetExhaustedError:
             raise
         except RpcAdmissionClosedError:
@@ -521,28 +566,56 @@ class FullSyncWorker:
             self._last_total_repair_error = exc
             return None
         except MessageHistoryAccessLostError as exc:
-            observed_at = int(time.time())
-            reason = exc.reason_code
-            result = await self._writer.run(
-                lambda conn: self._persist_access_loss(
-                    conn, dialog_id, reason, profile_owner_account_id, order, observed_at
-                )
-            )
-            _report_membership(_FULL_ACCESS_LOSS_OBSERVER.get(), [result.membership_counts])
-            return None
+            return await self._record_total_probe_loss(dialog_id, profile_owner_account_id, order, scope, exc)
         except (MessageHistoryUnavailableError, TimeoutError) as exc:
             logger.warning("sync_total_repair_failed dialog_id=%d error=%s", dialog_id, exc)
             self._last_total_repair_error = exc
             return None
-        if total_messages is None:
+        if result.total_messages is None:
             logger.warning("sync_total_repair_missing_total dialog_id=%d", dialog_id)
-        return total_messages
+        return HistoryAccessObservation(result, scope, order, reactions)
+
+    async def _record_total_probe_loss(
+        self, dialog_id: int, owner: int | None, order: int, scope: ScopeToken, error: MessageHistoryAccessLostError
+    ) -> HistoryAccessObservation | None:
+        observed_at = int(time.time())
+        try:
+            result = await self._writer.run(
+                lambda conn: self._persist_access_loss(
+                    conn, dialog_id, error.reason_code, owner, order, observed_at, scope=scope
+                )
+            )
+        except ReceivedMessageScopeChangedError:
+            self._last_total_stale = True
+            return None
+        _report_membership(_FULL_ACCESS_LOSS_OBSERVER.get(), [result.membership_counts])
+        return None
+
+    def _capture_total_probe_scope(self, probe: TotalMessagesProbe, owner: int | None) -> ScopeToken | None:
+        scope = probe.capture_scope()
+        if scope is None or (owner is not None and scope.scope.account_id != owner):
+            self._last_total_stale = True
+            return None
+        return scope
 
     def _persist_access_loss(  # noqa: PLR0913, PLR0917
-        self, conn: sqlite3.Connection, dialog_id: int, reason: str, owner: int | None, order: int, observed_at: int
+        self,
+        conn: sqlite3.Connection,
+        dialog_id: int,
+        reason: str,
+        owner: int | None,
+        order: int,
+        observed_at: int,
+        *,
+        scope: ScopeToken | None = None,
     ) -> AccessLossResult:
         with write_transaction(conn):
-            return set_access_lost(
+            probe = self._total_messages_probe
+            if scope is not None and (
+                probe is None or not probe.claim_scope(scope) or bound_profile_account(conn) != scope.scope.account_id
+            ):
+                raise ReceivedMessageScopeChangedError
+            result = set_access_lost(
                 conn,
                 dialog_id,
                 observed_at,
@@ -552,6 +625,11 @@ class FullSyncWorker:
                 membership_revision_at=observed_at,
                 processing_at=int(time.time()),
             )
+            if scope is not None and (
+                probe is None or not probe.claim_scope(scope) or bound_profile_account(conn) != scope.scope.account_id
+            ):
+                raise ReceivedMessageScopeChangedError
+            return result
 
     # ------------------------------------------------------------------
     # Internal helpers

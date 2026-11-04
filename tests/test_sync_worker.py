@@ -22,13 +22,19 @@ from telethon.errors import ChannelPrivateError  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import GetHistoryRequest  # type: ignore[import-untyped]
 
 from helpers import MockTotalList, build_mock_message, build_mock_reactions
+from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.config import AutomaticGroupHistoryConfig
 from mcp_telegram.dialog_identity import capture_identity_baseline, publish_dialog_identity
 from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
 from mcp_telegram.fts import stem_text
 from mcp_telegram.history_enrollment import disable_history, enable_history
+from mcp_telegram.image_authorization import ScopeCell, ScopeToken
 from mcp_telegram.message_contracts import StoredMessage
-from mcp_telegram.message_history.contracts import FullHistoryPage, MessageHistoryUnavailableError
+from mcp_telegram.message_history.contracts import (
+    FullHistoryPage,
+    HistoryAccessProbeResult,
+    MessageHistoryUnavailableError,
+)
 from mcp_telegram.message_history.telegram_adapter import TelethonFullHistoryPageAdapter, TelethonHistoryAccessProbe
 from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
 from mcp_telegram.messages.telegram_adapter import _PeerLike, extract_message_row
@@ -50,6 +56,27 @@ def _selected_budget(adapter: FullSyncDemandAdapter) -> RpcAttemptBudget:
     status = adapter.status(time.time())
     assert status is not None and status.selected is not None
     return RpcAttemptBudget(limit=1, selected=status.selected)
+
+
+_scope_cell = ScopeCell()
+assert _scope_cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 123, 2, 99))
+
+
+class _ProbeScope:
+    def capture_scope(self) -> ScopeToken | None:
+        return _scope_cell.capture()
+
+    def claim_scope(self, token: ScopeToken) -> bool:
+        return _scope_cell.claim(token)
+
+    def capture_image_scope(self) -> ScopeToken | None:
+        return _scope_cell.capture()
+
+    def claim_image_scope(self, token: ScopeToken) -> bool:
+        return _scope_cell.claim(token)
+
+    async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
+        raise AssertionError(f"unexpected probe for {dialog_id}")
 
 
 class _SQLiteCursor(Protocol):
@@ -81,7 +108,7 @@ async def _empty_async_iter() -> AsyncIterator[object]:
         yield None
 
 
-class _MockClient:
+class _MockClient(_ProbeScope):
     def __init__(self) -> None:
         self.add_event_handler = MagicMock()
         self.remove_event_handler = MagicMock()
@@ -127,6 +154,8 @@ def sync_db(tmp_path: Path) -> Iterator[_SQLiteConnection]:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = cast(_SQLiteConnection, _open_sync_db(db_path))
+    conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
+    conn.commit()
     yield conn
     conn.close()
 
@@ -445,13 +474,13 @@ async def test_ready_total_repair_runs_during_automatic_candidate_backoff(sync_d
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
             raise AssertionError("candidate is in backoff")
 
-    class Probe:
+    class Probe(_ProbeScope):
         def __init__(self) -> None:
             self.attempted: list[int] = []
 
-        async def probe_total_messages(self, dialog_id: int) -> int:
+        async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
             self.attempted.append(dialog_id)
-            return 42
+            return HistoryAccessProbeResult(42, ())
 
     probe = Probe()
     worker = FullSyncWorker(
@@ -2853,12 +2882,12 @@ async def test_failed_total_repair_peer_does_not_starve_ready_peer(
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
             raise AssertionError("unexpected history")
 
-    class Probe:
-        async def probe_total_messages(self, dialog_id: int) -> int | None:
+    class Probe(_ProbeScope):
+        async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
             calls.append(dialog_id)
             if dialog_id == 1:
                 raise failure("retry")
-            return 10
+            return HistoryAccessProbeResult(10, ())
 
     worker = FullSyncWorker(
         Port(), sync_db, asyncio.Event(), total_messages_probe=Probe(), writer=inline_writer(sync_db)

@@ -145,6 +145,8 @@ def test_activity_search_entity_upsert_skips_unknown_and_bad_peer(
         _upsert_entities_from_search(
             sync_conn,
             cast(_SearchResultLike, _SearchResult(users=[_User(), _Unknown()], chats=[_Chat()])),
+            observation_order=1,
+            observed_at=1,
         )
     assert sync_conn.execute(
         "SELECT id, type, name, username, name_normalized FROM entities ORDER BY id"

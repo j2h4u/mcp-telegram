@@ -15,7 +15,9 @@ import pytest
 
 from mcp_telegram import activity_peer_sweep, activity_sync, delta_sync, sync_worker
 from mcp_telegram.activity_substrate import ActivityClient
+from mcp_telegram.auth_scope import TelegramAuthScope
 from mcp_telegram.delta_sync import DeltaSyncWorker
+from mcp_telegram.image_authorization import ScopeCell
 from mcp_telegram.message_history.contracts import ForwardGapPage, FullHistoryPage, MessageHistoryAccessLostError
 from mcp_telegram.message_history.ports import ForwardGapPagePort, FullHistoryPagePort
 from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
@@ -75,6 +77,10 @@ def _operation(
         delta = DeltaSyncWorker(cast(ForwardGapPagePort, port), reader, asyncio.Event(), writer=writer)
         return lambda: delta._collect_delta_slice(1, 0, 0, 1, None)
     client = cast(ActivityClient, object())
+    scope_cell = ScopeCell()
+    assert scope_cell.publish(TelegramAuthScope(1, 1, 1, 1))
+    scope = scope_cell.capture()
+    assert scope is not None
     if kind == "peer":
         # Peer resolution precedes the preparation being consolidated; data acquisition does not.
         monkeypatch.setattr(activity_peer_sweep, "_resolve_peer_for_sweep", AsyncMock(return_value=object()))
@@ -84,24 +90,53 @@ def _operation(
     if kind == "backfill":
         monkeypatch.setattr(activity_sync, "_search_backfill_batch", rpc)
         adapter = activity_sync.ArchiveBackfillDemandAdapter(
-            client, reader, asyncio.Event(), timeout_s=1, writer=writer, account_id=1
+            client,
+            reader,
+            asyncio.Event(),
+            timeout_s=1,
+            writer=writer,
+            account_id=1,
+            capture_scope=scope_cell.capture,
+            claim_scope=scope_cell.claim,
         )
         status = adapter.status(0.0)
         assert status is not None and status.selected is not None
         expected_revision = status.selected.revision
         return lambda: activity_sync._run_backfill_slice(
-            client, reader, asyncio.Event(), timeout_s=1, writer=writer, expected_revision=expected_revision
+            client,
+            reader,
+            asyncio.Event(),
+            timeout_s=1,
+            writer=writer,
+            expected_revision=expected_revision,
+            scope=scope,
+            claim_scope=scope_cell.claim,
         )
     assert kind == "incremental"
     monkeypatch.setattr(activity_sync, "_search_incremental_batch", rpc)
     adapter = activity_sync.ArchiveIncrementalDemandAdapter(
-        client, reader, asyncio.Event(), interval_s=1, timeout_s=1, writer=writer, account_id=1
+        client,
+        reader,
+        asyncio.Event(),
+        interval_s=1,
+        timeout_s=1,
+        writer=writer,
+        account_id=1,
+        capture_scope=scope_cell.capture,
+        claim_scope=scope_cell.claim,
     )
     status = adapter.status(0.0)
     assert status is not None and status.selected is not None
     expected_revision = status.selected.revision
     return lambda: activity_sync._run_incremental_slice(
-        client, reader, asyncio.Event(), timeout_s=1, writer=writer, expected_revision=expected_revision
+        client,
+        reader,
+        asyncio.Event(),
+        timeout_s=1,
+        writer=writer,
+        expected_revision=expected_revision,
+        scope=scope,
+        claim_scope=scope_cell.claim,
     )
 
 

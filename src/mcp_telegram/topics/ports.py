@@ -5,11 +5,11 @@ from __future__ import annotations
 import sqlite3
 from typing import Protocol
 
-from .contracts import TopicCursor, TopicFact, TopicPage
+from .contracts import TopicBatch, TopicCursor, TopicFact, TopicPage
 
 
 class TelegramTopicGateway(Protocol):
-    async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]: ...
+    async def fetch_topics(self, entity: object) -> TopicBatch: ...
 
 
 class TelegramTopicPageGateway(Protocol):
@@ -38,6 +38,7 @@ class TopicMetadataRepository(Protocol):
         *,
         title: str,
         icon_emoji_id: int | None,
+        icon_color: int | None = None,
         date: int | None,
         observed_at: int,
         observation_order: int | None = None,

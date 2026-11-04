@@ -19,7 +19,8 @@ from .scheduled_receipts_schema import SCHEDULED_OPERATION_RECEIPT_DDL
 from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 
-_CURRENT_SCHEMA_VERSION = 98
+_CURRENT_SCHEMA_VERSION = 99
+_PARTIAL_CANONICAL_INTAKE_MIGRATION = 99
 _CONTACT_CATALOGUE_MIGRATION = 98
 _NATIVE_MANAGEMENT_MIGRATION = 97
 _COMMON_CHAT_NORMALIZATION_MIGRATION = 96
@@ -5134,7 +5135,78 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_97(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _CONTACT_CATALOGUE_MIGRATION:
         current = _apply_migration_98(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _PARTIAL_CANONICAL_INTAKE_MIGRATION:
+        current = _apply_migration_99(conn, current)
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
+
+
+def _apply_migration_99(conn: sqlite3.Connection, current: int) -> int:
+    """Separate partial topic fields and individual folder rules from catalog coverage."""
+    return _apply_migration(
+        conn,
+        current,
+        _PARTIAL_CANONICAL_INTAKE_MIGRATION,
+        [
+            """CREATE TABLE topic_metadata_new (
+                dialog_id INTEGER NOT NULL, topic_id INTEGER NOT NULL, title TEXT,
+                top_message_id INTEGER, is_general INTEGER NOT NULL, is_deleted INTEGER NOT NULL,
+                inaccessible_error TEXT, inaccessible_at INTEGER, updated_at INTEGER NOT NULL,
+                icon_emoji_id INTEGER, icon_emoji TEXT, icon_color INTEGER, pinned INTEGER, hidden INTEGER,
+                snapshot_at INTEGER, date INTEGER, observation_order INTEGER NOT NULL DEFAULT 0,
+                catalog_present INTEGER NOT NULL DEFAULT 1, seen_generation INTEGER NOT NULL DEFAULT 0,
+                title_order INTEGER NOT NULL DEFAULT 0, icon_order INTEGER NOT NULL DEFAULT 0,
+                color_order INTEGER NOT NULL DEFAULT 0, pinned_order INTEGER NOT NULL DEFAULT 0,
+                hidden_order INTEGER NOT NULL DEFAULT 0, date_order INTEGER NOT NULL DEFAULT 0,
+                membership_order INTEGER NOT NULL DEFAULT 0, known_fields INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(dialog_id, topic_id)
+            )""",
+            """INSERT INTO topic_metadata_new (
+                dialog_id,topic_id,title,top_message_id,is_general,is_deleted,inaccessible_error,inaccessible_at,
+                updated_at,icon_emoji_id,icon_emoji,icon_color,pinned,hidden,snapshot_at,date,observation_order,
+                catalog_present,seen_generation,title_order,icon_order,color_order,pinned_order,hidden_order,
+                date_order,membership_order,known_fields
+            ) SELECT dialog_id,topic_id,title,top_message_id,is_general,is_deleted,inaccessible_error,inaccessible_at,
+                updated_at,icon_emoji_id,icon_emoji,icon_color,pinned,hidden,snapshot_at,date,observation_order,
+                catalog_present,seen_generation,0,0,0,0,0,0,0,
+                (CASE WHEN title <> '' AND title <> 'Topic' THEN 1 ELSE 0 END |
+                 CASE WHEN icon_emoji_id IS NOT NULL THEN 2 ELSE 0 END |
+                 CASE WHEN icon_color IS NOT NULL THEN 4 ELSE 0 END |
+                 CASE WHEN pinned = 1 THEN 8 ELSE 0 END |
+                 CASE WHEN hidden = 1 THEN 16 ELSE 0 END |
+                 CASE WHEN date IS NOT NULL THEN 32 ELSE 0 END)
+                FROM topic_metadata""",
+            "DROP TABLE topic_metadata",
+            "ALTER TABLE topic_metadata_new RENAME TO topic_metadata",
+            _TOPIC_INDEX_DDL,
+            """CREATE TABLE telegram_folder_rules_new (
+                namespace TEXT NOT NULL, folder_id INTEGER NOT NULL, title TEXT,
+                rule_kind TEXT CHECK(rule_kind IN ('filter', 'chatlist', 'default')),
+                source_position INTEGER CHECK(source_position >= 0), rule_json TEXT,
+                account_id INTEGER NOT NULL, observation_order INTEGER NOT NULL DEFAULT 0 CHECK(observation_order >= 0),
+                deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0,1)),
+                catalog_member INTEGER CHECK(catalog_member IN (0,1)),
+                membership_order INTEGER NOT NULL DEFAULT 0 CHECK(membership_order >= 0),
+                CHECK(deleted = 1 OR (title IS NOT NULL AND rule_kind IS NOT NULL AND rule_json IS NOT NULL)),
+                UNIQUE(account_id, namespace, folder_id)
+            )""",
+            """INSERT INTO telegram_folder_rules_new(namespace,folder_id,title,rule_kind,source_position,rule_json,
+                account_id,catalog_member) SELECT namespace,folder_id,title,rule_kind,source_position,rule_json,
+                (SELECT account_id FROM telegram_folder_projection_state WHERE singleton=1),
+                (SELECT CASE WHEN coverage_status='complete' AND accepted_rule_token IS NOT NULL
+                    AND rule_observation_started_at IS NOT NULL AND account_id IS NOT NULL THEN 1 ELSE NULL END
+                    FROM telegram_folder_projection_state WHERE singleton=1)
+                FROM telegram_folder_rules""",
+            "DROP TABLE telegram_folder_rules",
+            "ALTER TABLE telegram_folder_rules_new RENAME TO telegram_folder_rules",
+            "ALTER TABLE telegram_folder_projection_state ADD COLUMN membership_revision INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE telegram_folder_projection_state ADD COLUMN filter_order_json TEXT",
+            "ALTER TABLE telegram_folder_projection_state ADD COLUMN filter_order_observation_order INTEGER NOT NULL DEFAULT 0 CHECK(filter_order_observation_order >= 0)",
+            "ALTER TABLE telegram_folder_projection_state ADD COLUMN rule_enumeration_complete INTEGER NOT NULL DEFAULT 0 CHECK(rule_enumeration_complete IN (0,1))",
+            """UPDATE telegram_folder_projection_state SET rule_enumeration_complete=1
+                WHERE coverage_status='complete' AND accepted_rule_token IS NOT NULL
+                AND rule_observation_started_at IS NOT NULL AND account_id IS NOT NULL""",
+        ],
+    )
 
 
 def _apply_migration_98(conn: sqlite3.Connection, current: int) -> int:

@@ -3609,7 +3609,7 @@ class ReadingService:
             else {}
         )
         own = own_only_basis_by_dialog(conn, ids) if request.scope == "own_only" else {}
-        folders = folders_by_dialog(conn, ids) if req.get("folder_id") not in (None, 1) else {}
+        folders = folders_by_dialog(conn, ids, account_id=account) if req.get("folder_id") not in (None, 1) else {}
         archived = self._directory_archived_facts(conn, ids) if req.get("folder_id") == 1 else {}
         selectable = self._select_list_dialog_rows(
             candidates, request, dialog_filter, summaries, own, identities, conn, {}
@@ -3745,7 +3745,7 @@ class ReadingService:
         data: dict,
     ) -> None:
         folder_id = req.get("folder_id")
-        folders = folders_by_dialog(conn, ids) if folder_id != 1 else {}
+        folders = folders_by_dialog(conn, ids, account_id=account) if folder_id != 1 else {}
         for dialog in data["dialogs"]:
             dialog_id = dialog["id"]
             placements = [{"id": 1, "title": "Archived"}] if folder_id == 1 else folders.get(dialog_id, [])
@@ -3753,9 +3753,9 @@ class ReadingService:
                 folder_ids=[item["id"] for item in placements], folders=placements, is_self=dialog_id == account
             )
         data["folder_snapshot"] = folder_snapshot(
-            conn, stale_after_seconds=req.get("folder_snapshot_stale_after_seconds", 900)
+            conn, stale_after_seconds=req.get("folder_snapshot_stale_after_seconds", 900), account_id=account
         )
-        data["folder_membership_unknown_count"] = self._directory_folder_unknown_count(conn, folder_id)
+        data["folder_membership_unknown_count"] = self._directory_folder_unknown_count(conn, folder_id, account)
         data["navigation"] = {
             "has_more": has_more,
             "order": "dialog_id_asc",
@@ -3770,7 +3770,7 @@ class ReadingService:
             data["bootstrap_pending"] = count_dialog_rows(conn) == 0
 
     @staticmethod
-    def _directory_folder_unknown_count(conn: sqlite3.Connection, folder_id: int | None) -> int:
+    def _directory_folder_unknown_count(conn: sqlite3.Connection, folder_id: int | None, account_id: int | None) -> int:
         if folder_id is None:
             return 0
         if folder_id == 1:
@@ -3780,6 +3780,12 @@ class ReadingService:
                     "SELECT COUNT(*) FROM dialogs d LEFT JOIN dialog_directory_facts f USING(dialog_id) WHERE d.hidden=0 AND COALESCE(f.archived,d.archived) IS NULL"
                 ).fetchone(),
             )[0]
+        owner = cast(
+            tuple[int | None] | None,
+            conn.execute("SELECT account_id FROM telegram_folder_projection_state WHERE singleton=1").fetchone(),
+        )
+        if account_id is None or owner is None or owner[0] != account_id:
+            return cast(tuple[int], conn.execute("SELECT COUNT(*) FROM dialogs WHERE hidden=0").fetchone())[0]
         namespace = "default" if folder_id == 0 else "filter"
         return cast(
             tuple[int],
@@ -3940,7 +3946,9 @@ class ReadingService:
         folder = req.get("folder_id")
         folder_id = None if folder is None else int(folder)
         ids = [_object_to_int(row["dialog_id"]) for row, _, _ in selected]
-        folders = folders_by_dialog(conn, ids) if folder_id not in (None, 1) else {}
+        verified = req.get("verified_account_id")
+        account = verified if type(verified) is int and verified > 0 else None
+        folders = folders_by_dialog(conn, ids, account_id=account) if folder_id not in (None, 1) else {}
         archived = self._directory_archived_facts(conn, ids) if folder_id == 1 else {}
         selected = [
             item
@@ -3956,13 +3964,15 @@ class ReadingService:
         folder = req.get("folder_id")
         folder_id = None if folder is None else int(folder)
         ids = [dialog["id"] for dialog in data["dialogs"]]
-        folders = folders_by_dialog(conn, ids) if folder_id != 1 else {}
+        verified = req.get("verified_account_id")
+        account = verified if type(verified) is int and verified > 0 else None
+        folders = folders_by_dialog(conn, ids, account_id=account) if folder_id != 1 else {}
         for dialog in data["dialogs"]:
             placements = [{"id": 1, "title": "Archived"}] if folder_id == 1 else folders.get(dialog["id"], [])
             dialog["folder_ids"] = [item["id"] for item in placements]
             dialog["folders"] = placements
             dialog["is_self"] = dialog["id"] == self._deps.self_id
         data["folder_snapshot"] = folder_snapshot(
-            conn, stale_after_seconds=req.get("folder_snapshot_stale_after_seconds", 900)
+            conn, stale_after_seconds=req.get("folder_snapshot_stale_after_seconds", 900), account_id=account
         )
-        data["folder_membership_unknown_count"] = self._directory_folder_unknown_count(conn, folder_id)
+        data["folder_membership_unknown_count"] = self._directory_folder_unknown_count(conn, folder_id, account)

@@ -10,13 +10,13 @@ from mcp_telegram.config import DraftRecoveryConfig
 from mcp_telegram.drafts.sqlite_projection import SQLiteDraftProjection
 from mcp_telegram.entity_profile.repository import EntityProfileRepository
 from mcp_telegram.entity_store import EntitySnapshot, upsert_entity_snapshots
-from mcp_telegram.folders.sqlite_repository import replace_folder_snapshot
 from mcp_telegram.hydration_queue import HydrationJob, HydrationQueueRepository
 from mcp_telegram.own_only import OwnOnlyBasis, OwnOnlyClassification, enroll_own_only_dialog
 from mcp_telegram.read_state import apply_read_cursor
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
 from mcp_telegram.topics.sqlite_repository import SQLiteTopicMetadataRepository
+from tests.folder_fixtures import seed_folder_snapshot
 
 
 @pytest.fixture
@@ -61,7 +61,7 @@ def test_nested_folder_and_enrollment_writes_rollback_with_outer_owner(guarded_d
     conn = guarded_db
     with pytest.raises(ValueError, match="rollback"):
         with write_transaction(conn):
-            replace_folder_snapshot(conn, [(1, "Folder")], [])
+            seed_folder_snapshot(conn, [(1, "Folder")], [])
             enroll_own_only_dialog(conn, 55, OwnOnlyClassification(True, (OwnOnlyBasis.DIRECT_MESSAGE,)), now=1)
             assert conn.in_transaction
             raise ValueError("rollback")
@@ -128,7 +128,7 @@ def test_native_runtime_ports_commit_one_coherent_domain_unit(guarded_db: sqlite
         assert started is not None
         assert started.attempts == 1
         enroll_own_only_dialog(conn, 1, OwnOnlyClassification(True, (OwnOnlyBasis.DIRECT_MESSAGE,)), now=12)
-        replace_folder_snapshot(conn, [(2, "Folder")], [])
+        seed_folder_snapshot(conn, [(2, "Folder")], [])
     assert conn.execute("SELECT name FROM entities WHERE id=1").fetchone() == ("Alice",)
     assert conn.execute("SELECT read_inbox_max_id,status FROM synced_dialogs WHERE dialog_id=1").fetchone() == (
         42,
@@ -139,6 +139,8 @@ def test_native_runtime_ports_commit_one_coherent_domain_unit(guarded_db: sqlite
         1,
     )
     assert conn.execute("SELECT attempts FROM hydration_jobs WHERE dialog_id=1").fetchone() == (1,)
-    assert conn.execute("SELECT title FROM telegram_folders WHERE folder_id=2").fetchone() == ("Folder",)
+    assert conn.execute("SELECT title FROM telegram_folder_rules WHERE account_id=42 AND folder_id=2").fetchone() == (
+        "Folder",
+    )
     assert conn.execute("PRAGMA query_only").fetchone() == (1,)
     assert not conn.in_transaction

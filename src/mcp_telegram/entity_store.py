@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import cast
 
+from .dialog_fact_observations import claim_dialog_fact
 from .models import DialogType
 from .resolver import latinize
 from .sync_transactions import require_write_transaction
@@ -20,6 +21,8 @@ class EntitySnapshot:
     username: str | None
     name_normalized: str | None
     updated_at: int
+    name_observed: bool = True
+    username_observed: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +78,32 @@ def upsert_entity_snapshots(conn: sqlite3.Connection, snapshots: Sequence[Entity
     if not snapshots:
         return
     conn.executemany(_UPSERT_ENTITY_SQL, (_snapshot_values(snapshot) for snapshot in snapshots))
+
+
+def apply_ordered_entity_snapshots(
+    conn: sqlite3.Connection, snapshots: Sequence[EntitySnapshot], *, observation_order: int
+) -> None:
+    """Merge only supplied identity fields that still own their request boundary."""
+    require_write_transaction(conn)
+    for snapshot in snapshots:
+        name_observed = snapshot.name_observed and claim_dialog_fact(
+            conn, snapshot.entity_id, "name", observation_order
+        )
+        username_observed = snapshot.username_observed and claim_dialog_fact(
+            conn, snapshot.entity_id, "username", observation_order
+        )
+        apply_partial_entity_identity(
+            conn,
+            snapshot.entity_id,
+            PartialEntityIdentity(
+                observed_at=snapshot.updated_at,
+                observed_type=snapshot.entity_type,
+                name_observed=name_observed,
+                name=snapshot.name,
+                username_observed=username_observed,
+                username=snapshot.username,
+            ),
+        )
 
 
 def apply_partial_entity_identity(

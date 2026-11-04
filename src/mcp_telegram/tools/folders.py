@@ -25,7 +25,7 @@ _FOLDER_DEFINITION_PROPERTIES = {
     "title": {"type": "string", "description": "Untrusted Telegram content."},
     "namespace": {"type": "string"},
     "kind": {"enum": ["filter", "chatlist", "default"]},
-    "source_position": {"type": "integer"},
+    "source_position": {"type": ["integer", "null"]},
     **{
         field: {"type": "array", "items": {"type": "integer"}}
         for field in ("included_ids", "pinned_ids", "excluded_ids")

@@ -1373,6 +1373,19 @@ async def test_on_message_deleted_peerless_rejects_ambiguous_dm_message_id(
     ).fetchone() == (0,)
 
 
+def _bind_gap_scope(client: MagicMock, manager: EventHandlerManager) -> None:
+    from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
+    from mcp_telegram.image_authorization import ScopeCell
+
+    scope = ScopeCell()
+    assert scope.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
+    client.capture_image_scope = scope.capture
+    client.claim_image_scope = scope.claim
+    manager.set_self_id(42)
+    manager._conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    manager._conn.commit()
+
+
 @pytest.mark.asyncio
 async def test_gap_scan_marks_deleted(
     mock_client: MagicMock,
@@ -1387,6 +1400,7 @@ async def test_gap_scan_marks_deleted(
         insert_message(sync_db, dialog_id, message_id=msg_id, text=f"msg {msg_id}")
 
     manager = make_manager(mock_client, sync_db, shutdown_event)
+    _bind_gap_scope(mock_client, manager)
     manager.register()
 
     # client.get_messages returns: msg10 present, msg20 absent (None), msg30 present
@@ -1416,6 +1430,7 @@ async def test_gap_scan_rejected_peer_keeps_message_and_clears_context(
     insert_synced_dialog(sync_db, dialog_id)
     insert_message(sync_db, dialog_id, message_id=20, text="retained")
     manager = make_manager(mock_client, sync_db, shutdown_event)
+    _bind_gap_scope(mock_client, manager)
 
     async def reject(entity: int, *, ids: list[int]) -> object:
         assert entity == dialog_id
@@ -1454,6 +1469,7 @@ async def test_gap_scan_skips_unsynced_messages(
     sync_db.commit()
 
     manager = make_manager(mock_client, sync_db, shutdown_event)
+    _bind_gap_scope(mock_client, manager)
     manager.register()
 
     # The future message is excluded from scan (sent_at > scan_start), so get_messages

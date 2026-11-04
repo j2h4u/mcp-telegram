@@ -54,6 +54,7 @@ from mcp_telegram.entity_profile.refresh import (
 )
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.image_authorization import ScopeCell, ScopeToken
 from mcp_telegram.models import DialogType
 from mcp_telegram.sync_db import _CURRENT_SCHEMA_VERSION, _apply_migration_57, _apply_migrations, ensure_sync_schema
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_savepoint
@@ -122,6 +123,18 @@ class _UnusedClient:
 
     def iter_dialogs(self) -> AsyncIterator[object]:
         raise AssertionError("client should not be called in this test")
+
+
+class _FencedUnusedClient(_UnusedClient):
+    def __init__(self, account_id: int) -> None:
+        self._scope_cell = ScopeCell()
+        assert self._scope_cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, account_id, 2, 99))
+
+    def capture_image_scope(self) -> ScopeToken | None:
+        return self._scope_cell.capture()
+
+    def claim_image_scope(self, token: ScopeToken) -> bool:
+        return self._scope_cell.claim(token)
 
 
 class _FloodClient(_UnusedClient):
@@ -411,11 +424,12 @@ def _test_service(
 
         enable_profile_page_fixture(conn)
     enable_runtime_writes(conn)
+    client = _FencedUnusedClient(account_id) if account_id is not None else _UnusedClient()
     service = DaemonEntityInfoService(
         EntityInfoDeps(
             writer=inline_writer(conn),
             conn=conn,
-            client=_UnusedClient(),
+            client=client,
             dm_peer_ids=lambda: set(),
             self_id=None,
             self_profile=None,
@@ -582,7 +596,10 @@ def _channel_profile_service(
         observation_completed_at=100,
     )
     port = FakeChannelProfilePort(profile, overlap_observation)
-    service = _test_service(conn, limits=RefreshLimits())
+    with write_savepoint(conn):
+        conn.execute("CREATE TABLE dialog_directory_state(singleton INTEGER PRIMARY KEY, account_id INTEGER)")
+        conn.execute("INSERT INTO dialog_directory_state VALUES (1,42)")
+    service = _test_service(conn, limits=RefreshLimits(), account_id=42)
     service._deps = replace(
         service._deps,
         channel_profile_port=port,
@@ -632,7 +649,7 @@ async def test_channel_profile_commit_publishes_linked_chat_fact_and_overlays_ca
 
         from mcp_telegram.daemon_entity_info import _ProfileSectionContext
 
-        context = _ProfileSectionContext(None, 0, False, "disabled", False)
+        context = _ProfileSectionContext(service._capture_pair_scope(), 0, False, "disabled", False)
         commit = await service._acquire_channel_full_profile(-10042, DialogType.CHANNEL, context=context)
         with write_savepoint(conn):
             conn.execute(
@@ -709,7 +726,7 @@ async def test_channel_profile_fact_publish_is_fenced_by_newer_dialog_revision()
 
         from mcp_telegram.daemon_entity_info import _ProfileSectionContext
 
-        context = _ProfileSectionContext(None, 0, False, "disabled", False)
+        context = _ProfileSectionContext(service._capture_pair_scope(), 0, False, "disabled", False)
         commit = await service._acquire_channel_full_profile(-10047, DialogType.CHANNEL, context=context)
         with write_savepoint(conn):
             linked_chat_fact_owner.invalidate_from_update(conn, -10047, 100)
@@ -809,6 +826,8 @@ async def test_durable_profile_publication_wakes_cold_adapter_for_local_link_enr
         observation_completed_at=100,
     )
     port = FakeChannelProfilePort(profile, overlap)
+    with write_savepoint(conn):
+        conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
     service = _test_service(conn, limits=RefreshLimits(), account_id=123)
     service._deps = replace(
         service._deps,

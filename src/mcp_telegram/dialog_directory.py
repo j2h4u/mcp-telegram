@@ -7,7 +7,8 @@ import json
 import logging
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -35,11 +36,16 @@ from .dialog_fact_observations import claim_dialog_fact
 from .dialog_identity import capture_identity_baseline, publish_dialog_identity
 from .dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
 from .dialog_pin_observations import claim_pin_snapshot, ordered_pin_overlay
-from .entity_profile.repository import request_profile_directory_pass
+from .entity_profile.repository import bound_profile_account, request_profile_directory_pass
 from .flood import TelegramRpcThrottled
 from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
+from .image_authorization import ScopeToken
+from .messages.sqlite_bundle import ReceivedMessageScopeChangedError, persist_received_messages
+from .messages.telegram_adapter import extract_received_messages
 from .models import DialogType
 from .observation_order import allocate_observation_order
+from .reactions.contracts import ReactionAggregateSource, ReactionObservationBoundary
+from .reactions.persistence import allocate_observation_boundary
 from .read_state import apply_read_cursor
 from .scheduled_state import apply_scheduled_permission
 from .sqlite_writer import SQLiteWriter
@@ -72,6 +78,10 @@ class DialogDirectoryClient(Protocol):
     async def __call__(self, request: object) -> object: ...
 
     async def get_me(self) -> object: ...
+
+    def capture_image_scope(self) -> ScopeToken | None: ...
+
+    def claim_image_scope(self, token: ScopeToken) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -475,21 +485,35 @@ class CanonicalDialogDirectory:
     async def _acquire_pinned(
         self, conn: sqlite3.Connection, state: _DirectoryState, folder_id: int, account_id: int
     ) -> str | None:
-        observation_order = await self._writer.run(allocate_observation_order)
+        scope = self._client.capture_image_scope()
+        if scope is None or scope.scope.account_id != account_id:
+            return None
+        observation_order, reaction_boundary = await self._writer.run(self._reserve_received_order)
         try:
             response = await self._client(get_pinned_dialogs_request(folder_id))
         except Exception as exc:  # noqa: BLE001 - transport classes vary under Telethon
             self._propagate_policy_exception(exc)
             reason = f"pinned_{folder_id}:{type(exc).__name__}"
-            await self._writer.run(
-                lambda db: self._mark_source_incomplete(db, state.generation, reason, account_id, source_column=None)
-            )
+            try:
+                await self._writer.run(
+                    lambda db: self._mark_source_incomplete(
+                        db, state.generation, reason, account_id, scope, source_column=None
+                    )
+                )
+            except ReceivedMessageScopeChangedError:
+                return None
             self._set_detail(f"canonical dialog directory: retry ({reason})")
             return None
         page = normalize_pinned_dialogs_response(response)
-        detail, successor = await self._writer.run(
-            lambda db: self._commit_pinned_response(db, state, folder_id, account_id, page, observation_order)
-        )
+        try:
+            await self._publish_received_response(response, scope, account_id, observation_order, reaction_boundary)
+            detail, successor = await self._writer.run(
+                lambda db: self._commit_pinned_response(
+                    db, state, folder_id, account_id, page, scope, observation_order
+                )
+            )
+        except ReceivedMessageScopeChangedError:
+            return None
         if detail is not None:
             self._set_detail(detail)
         return successor
@@ -501,11 +525,12 @@ class CanonicalDialogDirectory:
         folder_id: int,
         account_id: int,
         page: RawDialogPage,
+        scope: ScopeToken,
         observation_order: int | None = None,
     ) -> tuple[str | None, str | None]:
         if page.kind == "invalid":
             self._latch_semantic_invalid(
-                conn, state.generation, f"pinned_{folder_id}", page.reason or "invalid", account_id
+                conn, state.generation, f"pinned_{folder_id}", page.reason or "invalid", account_id, scope
             )
             return f"canonical dialog directory: invalid pinned_{folder_id} ({page.reason or 'invalid'})", None
         if page.kind == "not_modified":
@@ -514,12 +539,13 @@ class CanonicalDialogDirectory:
                 state.generation,
                 f"pinned_{folder_id}:not_modified_without_cache",
                 account_id,
+                scope,
                 source_column="pinned_main_status" if folder_id == 0 else "pinned_archive_status",
             )
             return f"canonical dialog directory: retry (pinned_{folder_id}:not_modified_without_cache)", None
         if page.kind not in {"terminal", "page"}:
             raise RuntimeError(f"unexpected normalized pinned response: {page.kind}")
-        with write_transaction(conn):
+        with write_transaction(conn), self._source_scope(scope, account_id):
             staged = self._stage_facts(
                 conn,
                 state.generation,
@@ -547,36 +573,93 @@ class CanonicalDialogDirectory:
         return None, successor
 
     async def _acquire_ordinary(self, conn: sqlite3.Connection, state: _DirectoryState, account_id: int) -> str | None:
-        observation_order = await self._writer.run(allocate_observation_order)
+        scope = self._client.capture_image_scope()
+        if scope is None or scope.scope.account_id != account_id:
+            return None
+        observation_order, reaction_boundary = await self._writer.run(self._reserve_received_order)
         try:
             response = await self._client(get_dialogs_request(state.cursor))
         except Exception as exc:  # noqa: BLE001 - transport classes vary under Telethon
             self._propagate_policy_exception(exc)
             reason = f"ordinary:{type(exc).__name__}"
-            await self._writer.run(
-                lambda db: self._mark_source_incomplete(db, state.generation, reason, account_id, source_column=None)
-            )
+            try:
+                await self._writer.run(
+                    lambda db: self._mark_source_incomplete(
+                        db, state.generation, reason, account_id, scope, source_column=None
+                    )
+                )
+            except ReceivedMessageScopeChangedError:
+                return None
             self._set_detail(f"canonical dialog directory: retry ({reason})")
             return None
         page = normalize_dialogs_response(response, state.cursor)
-        detail, successor = await self._writer.run(
-            lambda db: self._commit_ordinary_response(db, state, account_id, page, observation_order)
-        )
+        try:
+            await self._publish_received_response(response, scope, account_id, observation_order, reaction_boundary)
+            detail, successor = await self._writer.run(
+                lambda db: self._commit_ordinary_response(db, state, account_id, page, scope, observation_order)
+            )
+        except ReceivedMessageScopeChangedError:
+            return None
         if detail is not None:
             self._set_detail(detail)
         return successor
 
-    def _commit_ordinary_response(
+    @staticmethod
+    def _reserve_received_order(conn: sqlite3.Connection) -> tuple[int, ReactionObservationBoundary]:
+        with write_transaction(conn):
+            return allocate_observation_order(conn), allocate_observation_boundary(
+                conn, ReactionAggregateSource.HISTORY
+            )
+
+    @contextmanager
+    def _source_scope(self, scope: ScopeToken, account_id: int) -> Iterator[None]:
+        if scope.scope.account_id != account_id or not self._client.claim_image_scope(scope):
+            raise ReceivedMessageScopeChangedError
+        yield
+        if not self._client.claim_image_scope(scope):
+            raise ReceivedMessageScopeChangedError
+
+    async def _publish_received_response(
+        self,
+        response: object,
+        scope: ScopeToken | None,
+        account_id: int,
+        order: int,
+        reaction_boundary: ReactionObservationBoundary,
+    ) -> None:
+        if scope is None or scope.scope.account_id != account_id:
+            return
+        received = extract_received_messages(cast(list[object], getattr(response, "messages", [])))
+        if not received:
+            return
+
+        def publish(conn: sqlite3.Connection) -> None:
+            with write_transaction(conn):
+                if bound_profile_account(conn) != scope.scope.account_id:
+                    return
+                persist_received_messages(
+                    conn,
+                    received,
+                    scope=scope,
+                    claim_scope=self._client.claim_image_scope,
+                    observation_order=order,
+                    reaction_boundary=reaction_boundary,
+                )
+
+        await self._writer.run(publish)
+
+    def _commit_ordinary_response(  # noqa: PLR0913, PLR0917
         self,
         conn: sqlite3.Connection,
         state: _DirectoryState,
         account_id: int,
         page: RawDialogPage,
+        scope: ScopeToken,
         observation_order: int | None = None,
     ) -> tuple[str | None, str | None]:
-        if self._handle_ordinary_non_authoritative(conn, state, account_id, page, observation_order):
+        if self._handle_ordinary_non_authoritative(conn, state, account_id, page, scope, observation_order):
             return self._ordinary_non_authoritative_result(page)
-        return self._commit_ordinary_authoritative(conn, state, account_id, page, observation_order)
+        return self._commit_ordinary_authoritative(conn, state, account_id, page, scope, observation_order)
 
     @staticmethod
     def _ordinary_non_authoritative_result(page: RawDialogPage) -> tuple[str | None, str | None]:
@@ -586,16 +669,17 @@ class CanonicalDialogDirectory:
             return "canonical dialog directory: retry (ordinary:not_modified_without_cache)", None
         return None, None
 
-    def _commit_ordinary_authoritative(
+    def _commit_ordinary_authoritative(  # noqa: PLR0913, PLR0917
         self,
         conn: sqlite3.Connection,
         state: _DirectoryState,
         account_id: int,
         page: RawDialogPage,
+        scope: ScopeToken,
         observation_order: int | None,
     ) -> tuple[str | None, str | None]:
         published = False
-        with write_transaction(conn):
+        with write_transaction(conn), self._source_scope(scope, account_id):
             if _directory_work_revision(self._load_state(conn)) != _directory_work_revision(state):
                 return None, None
             new_ids = self._new_dialog_ids(conn, state.generation, page.facts)
@@ -653,16 +737,19 @@ class CanonicalDialogDirectory:
         )
         return None, _directory_work_revision(self._load_state(conn))
 
-    def _handle_ordinary_non_authoritative(
+    def _handle_ordinary_non_authoritative(  # noqa: PLR0913, PLR0917
         self,
         conn: sqlite3.Connection,
         state: _DirectoryState,
         account_id: int,
         page: RawDialogPage,
+        scope: ScopeToken,
         observation_order: int | None = None,
     ) -> bool:
         if page.kind == "invalid":
-            self._latch_semantic_invalid(conn, state.generation, "ordinary", page.reason or "invalid", account_id)
+            self._latch_semantic_invalid(
+                conn, state.generation, "ordinary", page.reason or "invalid", account_id, scope
+            )
             return True
         if page.kind == "not_modified":
             self._mark_not_modified_without_cache(
@@ -670,13 +757,14 @@ class CanonicalDialogDirectory:
                 state.generation,
                 "ordinary:not_modified_without_cache",
                 account_id,
+                scope,
                 source_column="ordinary_status",
             )
             return True
         if page.kind != "incomplete":
             return False
         reason = page.reason or "incomplete_page"
-        with write_transaction(conn):
+        with write_transaction(conn), self._source_scope(scope, account_id):
             # An incomplete page may still contribute catalog rows.
             # It never advances the committed cursor or publishes.
             staged = self._stage_facts(
@@ -697,41 +785,43 @@ class CanonicalDialogDirectory:
             )
         return True
 
-    def _mark_source_incomplete(
+    def _mark_source_incomplete(  # noqa: PLR0913
         self,
         conn: sqlite3.Connection,
         generation: int,
         reason: str,
         account_id: int,
+        scope: ScopeToken,
         *,
         source_column: str | None,
     ) -> None:
         source_update = "" if source_column is None else f", {source_column}='incomplete'"
-        with write_transaction(conn):
+        with write_transaction(conn), self._source_scope(scope, account_id):
             conn.execute(
                 f"UPDATE dialog_directory_state SET status='incomplete'{source_update}, reason=?, retry_at=? "
                 "WHERE singleton=1 AND account_id=? AND generation=?",
                 (reason, int(time.time()) + 60, account_id, generation),
             )
 
-    def _mark_not_modified_without_cache(
+    def _mark_not_modified_without_cache(  # noqa: PLR0913
         self,
         conn: sqlite3.Connection,
         generation: int,
         reason: str,
         account_id: int,
+        scope: ScopeToken,
         *,
         source_column: str,
     ) -> None:
-        with write_transaction(conn):
+        with write_transaction(conn), self._source_scope(scope, account_id):
             conn.execute(
                 f"UPDATE dialog_directory_state SET status='incomplete', {source_column}='incomplete', reason=?, retry_at=? "
                 "WHERE singleton=1 AND account_id=? AND generation=?",
                 (reason, int(time.time()) + 900, account_id, generation),
             )
 
-    def _latch_semantic_invalid(
-        self, conn: sqlite3.Connection, generation: int, source: str, specific: str, account_id: int
+    def _latch_semantic_invalid(  # noqa: PLR0913, PLR0917
+        self, conn: sqlite3.Connection, generation: int, source: str, specific: str, account_id: int, scope: ScopeToken
     ) -> None:
         """Latch an impossible source outcome without destroying prior work."""
         column = {
@@ -741,7 +831,7 @@ class CanonicalDialogDirectory:
         }.get(source)
         if column is None:
             raise ValueError(f"unknown directory source: {source}")
-        with write_transaction(conn):
+        with write_transaction(conn), self._source_scope(scope, account_id):
             cursor = conn.execute(
                 f"UPDATE dialog_directory_state SET status='invalid', {column}='invalid', reason=?, retry_at=NULL "
                 "WHERE singleton=1 AND account_id=? AND generation=? AND status != 'invalid'",
@@ -1736,12 +1826,13 @@ def apply_realtime_eligibility(  # noqa: PLR0913
     archived: int | None = None,
     unread: int | None = None,
     mute_until: int | None = None,
+    observation_order: int | None = None,
 ) -> int:
     """Merge a partial realtime eligibility observation without renewing retained facts."""
     require_write_transaction(conn)
-    if archived is not None and not claim_dialog_fact(conn, dialog_id, "archived"):
+    if archived is not None and not claim_dialog_fact(conn, dialog_id, "archived", observation_order):
         archived = None
-    if mute_until is not None and not claim_dialog_fact(conn, dialog_id, "mute_until"):
+    if mute_until is not None and not claim_dialog_fact(conn, dialog_id, "mute_until", observation_order):
         mute_until = None
     if archived is not None:
         conn.execute("UPDATE dialogs SET archived=? WHERE dialog_id=? AND archived<>?", (archived, dialog_id, archived))

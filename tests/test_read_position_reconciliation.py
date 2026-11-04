@@ -12,8 +12,10 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from mcp_telegram.auth_scope import TelegramAuthScope
 from mcp_telegram.daemon import _DaemonClient
 from mcp_telegram.daemon import _initialize_read_positions as _initialize_read_positions_owner
+from mcp_telegram.image_authorization import ScopeCell
 from mcp_telegram.message_fact_refresh import ReadReceiptDemandAdapter
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_transactions import write_transaction
@@ -44,6 +46,13 @@ async def _initialize_read_positions(  # noqa: PLR0913 - mirrors the owner bound
     success_recheck_seconds: float | None = None,
 ) -> None:
     """Exercise exact single-dialog owner slices as the coordinator would."""
+    if isinstance(client, AsyncMock):
+        cell = ScopeCell()
+        assert cell.publish(TelegramAuthScope(1, 1, 2, 99))
+        client.capture_image_scope = cell.capture
+        client.claim_image_scope = cell.claim
+        conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
+        conn.commit()
     adapter = ReadReceiptDemandAdapter(conn, lambda _selected: None, account_id=1)  # type: ignore[arg-type]
     limit = (
         int(max_dialogs)

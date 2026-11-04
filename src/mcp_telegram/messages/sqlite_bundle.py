@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, fields, replace
 from typing import cast
 
@@ -13,7 +13,7 @@ from mcp_telegram.delivered_update import current_delivered_update
 from .. import message_contracts as _message_contracts
 from ..alert_policy import incoming_human_dm_sql
 from ..entity_profile.membership import MembershipChange, MembershipFact, MembershipSignalCounts, changed_members
-from ..entity_profile.repository import request_membership_refreshes
+from ..entity_profile.repository import bound_profile_account, request_membership_refreshes
 from ..fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
 from ..hydration_queue import (
     HYDRATION_QUEUE_TABLE,
@@ -22,12 +22,13 @@ from ..hydration_queue import (
     HydrationPriority,
     HydrationQueueRepository,
 )
-from ..image_authorization import invalidate_message_source, invalidate_nonchannel_sources
+from ..image_authorization import ScopeToken, invalidate_message_source, invalidate_nonchannel_sources
 from ..media_fact import decode_media_fact, is_transcribable_telegram_media
 from ..observation_order import allocate_observation_order
 from ..own_only_contracts import CHANNEL_PEER_ID_OFFSET, is_channel_peer_id
-from ..reactions.contracts import ReactionAggregate, ReactionAggregateSource
+from ..reactions.contracts import ReactionAggregate, ReactionAggregateSource, ReactionObservationBoundary
 from ..reactions.persistence import replace_reaction_aggregates
+from ..sync_transactions import require_write_transaction
 from .sqlite_hydration_jobs import (
     _FACT_HYDRATION_EMPTY_KINDS,
     HydrationJobEvidence,
@@ -314,7 +315,7 @@ def persist_edited_message(  # noqa: PLR0913
     extracted: _message_contracts.ExtractedMessage,
     *,
     old_text: str | None,
-    edit_date: int,
+    edit_date: int | None,
     priority: HydrationPriority = HydrationPriority.FOREGROUND,
     reaction_source: ReactionAggregateSource | str = ReactionAggregateSource.MESSAGE_EDIT,
     profile_owner_account_id: int | None = None,
@@ -359,10 +360,11 @@ def persist_edited_message(  # noqa: PLR0913
         reaction_observed_at=edit_date,
         profile_owner_account_id=profile_owner_account_id,
     )
-    conn.execute(
-        _INSERT_HUMAN_DM_EDIT_ALERT_SQL,
-        (edit_date, dialog_id, message_id, next_version, dialog_id, message_id),
-    )
+    if edit_date is not None:
+        conn.execute(
+            _INSERT_HUMAN_DM_EDIT_ALERT_SQL,
+            (edit_date, dialog_id, message_id, next_version, dialog_id, message_id),
+        )
     return EditedMessageWriteResult(next_version, result.membership_counts)
 
 
@@ -455,28 +457,9 @@ def insert_messages_with_fts(  # noqa: PLR0913
         return MessageWriteResult(0, MembershipSignalCounts())
     evidence = _page_facts(conn, accepted)
     for item in accepted:
-        invalidate_message_source(conn, item.message.dialog_id, item.message.message_id)
-    fallback_sequence = (
-        allocate_observation_order(conn) if any(item.observation_order is None for item in accepted) else 0
-    )
-    for item in accepted:
-        sequence = item.observation_order if item.observation_order is not None else fallback_sequence
-        conn.execute(
-            "INSERT INTO message_observations(dialog_id,message_id,observation_order,source_rank) VALUES(?,?,?,?) ON CONFLICT(dialog_id,message_id) DO UPDATE SET observation_order=excluded.observation_order,source_rank=excluded.source_rank",
-            (item.message.dialog_id, item.message.message_id, sequence, ReactionAggregateSource(reaction_source).rank),
-        )
-        conn.execute(
-            "INSERT INTO message_image_sources(dialog_id,message_id,photo_id,observation_order,eligible) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(dialog_id,message_id) DO UPDATE SET photo_id=excluded.photo_id, "
-            "observation_order=excluded.observation_order,eligible=excluded.eligible",
-            (
-                item.message.dialog_id,
-                item.message.message_id,
-                item.private_photo_id,
-                sequence,
-                int(item.private_photo_eligible),
-            ),
-        )
+        if item.invalidate_image_source:
+            invalidate_message_source(conn, item.message.dialog_id, item.message.message_id)
+    _record_message_observations(conn, accepted, reaction_source)
     projected = _overlay_message_transcriptions(
         conn, _preserve_transcribed_texts(accepted, evidence.facts), evidence.facts
     )
@@ -491,6 +474,281 @@ def insert_messages_with_fts(  # noqa: PLR0913
         else MembershipSignalCounts(received=len(changes), ignored=len(changes), ignored_account_mismatch=len(changes))
     )
     return MessageWriteResult(len(projected), counts)
+
+
+def _record_message_observations(
+    conn: sqlite3.Connection,
+    accepted: Sequence[_message_contracts.ExtractedMessage],
+    reaction_source: ReactionAggregateSource | str,
+) -> None:
+    fallback_sequence = (
+        allocate_observation_order(conn) if any(item.observation_order is None for item in accepted) else 0
+    )
+    for item in accepted:
+        sequence = item.observation_order if item.observation_order is not None else fallback_sequence
+        conn.execute(
+            "INSERT INTO message_observations(dialog_id,message_id,observation_order,source_rank) VALUES(?,?,?,?) "
+            "ON CONFLICT(dialog_id,message_id) DO UPDATE SET "
+            "source_rank=CASE WHEN excluded.observation_order>message_observations.observation_order THEN excluded.source_rank "
+            "WHEN excluded.observation_order=message_observations.observation_order THEN MAX(message_observations.source_rank,excluded.source_rank) "
+            "ELSE message_observations.source_rank END, "
+            "observation_order=MAX(message_observations.observation_order,excluded.observation_order)",
+            (
+                item.message.dialog_id,
+                item.message.message_id,
+                sequence if item.body_observation_order is None else item.body_observation_order,
+                ReactionAggregateSource(reaction_source).rank,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO message_image_sources(dialog_id,message_id,photo_id,observation_order,eligible) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(dialog_id,message_id) DO UPDATE SET photo_id=excluded.photo_id, "
+            "observation_order=excluded.observation_order,eligible=excluded.eligible",
+            (
+                item.message.dialog_id,
+                item.message.message_id,
+                item.private_photo_id,
+                sequence if item.media_observation_order is None else item.media_observation_order,
+                int(item.private_photo_eligible),
+            ),
+        )
+
+
+class ReceivedMessageScopeChangedError(RuntimeError):
+    """Abort the owning transaction when the original acquisition scope changes."""
+
+
+def persist_received_messages(  # noqa: PLR0913 - original request fence belongs with the received facts
+    conn: sqlite3.Connection,
+    messages: Sequence[_message_contracts.ReceivedMessage],
+    *,
+    scope: ScopeToken,
+    claim_scope: Callable[[ScopeToken], bool],
+    observation_order: int,
+    expected_dialog_id: int | None = None,
+    reaction_boundary: ReactionObservationBoundary | None = None,
+    revalidated_access: bool = False,
+) -> int:
+    """Publish eligible received message bodies inside the existing writer transaction."""
+    require_write_transaction(conn)
+    if not claim_scope(scope) or bound_profile_account(conn) != scope.scope.account_id:
+        raise ReceivedMessageScopeChangedError
+    accepted = 0
+    for received in messages:
+        if not _received_message_eligible(conn, received, observation_order, expected_dialog_id, revalidated_access):
+            continue
+        item = replace(received.bundle, observation_order=observation_order)
+        written = _persist_received_message(conn, replace(item, reactions_observed=False), scope.scope.account_id)
+        accepted += written
+        if written:
+            _publish_received_reactions(conn, item, reaction_boundary)
+    if not claim_scope(scope) or bound_profile_account(conn) != scope.scope.account_id:
+        raise ReceivedMessageScopeChangedError
+    return accepted
+
+
+def _publish_received_reactions(
+    conn: sqlite3.Connection, item: _message_contracts.ExtractedMessage, boundary: ReactionObservationBoundary | None
+) -> None:
+    if not item.reactions_observed or boundary is None:
+        return
+    replace_reaction_aggregates(
+        conn,
+        item.message.dialog_id,
+        item.message.message_id,
+        tuple(ReactionAggregate(emoji=row.emoji, count=row.count) for row in item.reactions),
+        source=boundary.source,
+        observed_at=boundary.observed_at,
+        observation_sequence=boundary.sequence,
+        can_see_list=item.reaction_can_see_list,
+    )
+
+
+def _received_message_eligible(
+    conn: sqlite3.Connection,
+    received: _message_contracts.ReceivedMessage,
+    order: int,
+    expected_dialog_id: int | None,
+    revalidated_access: bool,
+) -> bool:
+    dialog_id = received.bundle.message.dialog_id
+    if expected_dialog_id is not None and expected_dialog_id != dialog_id:
+        return False
+    row = cast(
+        tuple[str, int | None] | None,
+        conn.execute(
+            "SELECT s.status,e.enabled FROM synced_dialogs s LEFT JOIN full_history_enrollment e USING(dialog_id) "
+            "WHERE s.dialog_id=?",
+            (dialog_id,),
+        ).fetchone(),
+    )
+    if row is None:
+        return False
+    if row[0] == "access_lost":
+        if not revalidated_access or expected_dialog_id != dialog_id or row[1] != 1:
+            return False
+        return _received_recovery_witness(conn, dialog_id, order)
+    if row[1] == 1:
+        return True
+    return row[0] == "own_only" and _received_own_message_eligible(conn, received)
+
+
+def _received_own_message_eligible(conn: sqlite3.Connection, received: _message_contracts.ReceivedMessage) -> bool:
+    if received.outgoing is not True:
+        return False
+    current = read_message_out(conn, received.bundle.message.dialog_id, received.bundle.message.message_id)
+    return not current.found or current.outgoing
+
+
+def _received_recovery_witness(conn: sqlite3.Connection, dialog_id: int, order: int) -> bool:
+    witnesses = cast(
+        list[tuple[str, int]],
+        conn.execute(
+            "SELECT field,observation_order FROM dialog_fact_observations WHERE dialog_id=? "
+            "AND field IN ('access_state','access_recovery_witness')",
+            (dialog_id,),
+        ).fetchall(),
+    )
+    return dict(witnesses) == {"access_state": order, "access_recovery_witness": order}
+
+
+def _persist_received_message(
+    conn: sqlite3.Connection, item: _message_contracts.ExtractedMessage, account_id: int
+) -> int:
+    message = item.message
+    state = cast(
+        tuple[int, int | None] | None,
+        conn.execute(
+            "SELECT o.observation_order,m.edit_date FROM message_observations o "
+            "JOIN messages m USING(dialog_id,message_id) WHERE o.dialog_id=? AND o.message_id=?",
+            (message.dialog_id, message.message_id),
+        ).fetchone(),
+    )
+    if has_nonchannel_deletion(conn, message.dialog_id, message.message_id):
+        return 0
+    if _received_body_superseded(state, item):
+        return 0
+    item = _preserve_newer_received_media(conn, item)
+    current = read_message_text(conn, message.dialog_id, message.message_id)
+    if current.found and current.text != message.text:
+        result = persist_edited_message(
+            conn, item, old_text=current.text, edit_date=message.edit_date, profile_owner_account_id=account_id
+        )
+        return int(
+            result.version is not None
+            or read_message_text(conn, message.dialog_id, message.message_id).text == message.text
+        )
+    return insert_messages_with_fts(conn, [item], profile_owner_account_id=account_id).accepted_count
+
+
+def _received_body_superseded(state: tuple[int, int | None] | None, item: _message_contracts.ExtractedMessage) -> bool:
+    if state is None or item.observation_order is None or state[0] <= item.observation_order:
+        return False
+    version = item.message.edit_date
+    return state[1] is None or version is None or version <= state[1]
+
+
+def _preserve_newer_received_media(
+    conn: sqlite3.Connection, item: _message_contracts.ExtractedMessage
+) -> _message_contracts.ExtractedMessage:
+    message = item.message
+    key = (message.dialog_id, message.message_id)
+    current = cast(
+        tuple[str | None, str | None, int | None, int, int, int | None, int | None] | None,
+        conn.execute(
+            "SELECT m.media_kind,m.media_payload,s.photo_id,s.eligible,s.observation_order,"
+            "o.observation_order,m.edit_date "
+            "FROM messages m JOIN message_image_sources s USING(dialog_id,message_id) "
+            "LEFT JOIN message_observations o USING(dialog_id,message_id) "
+            "WHERE m.dialog_id=? AND m.message_id=?",
+            key,
+        ).fetchone(),
+    )
+    if current is None:
+        return item
+    if current[5] is not None and _received_body_unchanged(conn, item):
+        item = replace(item, body_observation_order=current[5])
+    unchanged = (message.media_kind, message.media_payload, item.private_photo_id, item.private_photo_eligible) == (
+        current[0],
+        current[1],
+        current[2],
+        bool(current[3]),
+    )
+    item = replace(item, invalidate_image_source=not unchanged)
+    if item.observation_order is None or current[4] <= item.observation_order:
+        return item
+    if (
+        current[4] == current[5]
+        and current[6] is not None
+        and message.edit_date is not None
+        and message.edit_date > current[6]
+    ):
+        return replace(item, media_observation_order=current[4])
+    return replace(
+        item,
+        message=replace(message, media_kind=current[0], media_payload=current[1]),
+        private_photo_id=current[2],
+        private_photo_eligible=bool(current[3]),
+        media_observation_order=current[4],
+        invalidate_image_source=False,
+    )
+
+
+def _received_body_unchanged(conn: sqlite3.Connection, item: _message_contracts.ExtractedMessage) -> bool:
+    """Keep body ordering separate when a complete response only changed media."""
+    message = item.message
+    if message.edit_date is None:
+        return False
+    key = (message.dialog_id, message.message_id)
+    row = cast(
+        tuple[object, ...] | sqlite3.Row | None,
+        conn.execute(
+            "SELECT text,edit_date,formatting_entities,service_action,reply_to_msg_id,forum_topic_id,"
+            "grouped_id,reply_to_peer_id,is_service,post_author FROM messages WHERE dialog_id=? AND message_id=?",
+            key,
+        ).fetchone(),
+    )
+    if row is None or tuple(row) != (
+        message.text,
+        message.edit_date,
+        message.formatting_entities,
+        message.service_action,
+        message.reply_to_msg_id,
+        message.forum_topic_id,
+        message.grouped_id,
+        message.reply_to_peer_id,
+        message.is_service,
+        message.post_author,
+    ):
+        return False
+    entities = cast(
+        list[tuple[int, int, str, str | None] | sqlite3.Row],
+        conn.execute(
+            "SELECT offset,length,type,value FROM message_entities WHERE dialog_id=? AND message_id=? ORDER BY offset,length,type,value",
+            key,
+        ).fetchall(),
+    )
+    expected = sorted(
+        ((entity.offset, entity.length, entity.type, entity.value) for entity in item.entities),
+        key=lambda value: (value[0], value[1], value[2], value[3] is not None, value[3] or ""),
+    )
+    if [tuple(entity) for entity in entities] != expected:
+        return False
+    forward = cast(
+        tuple[object, ...] | sqlite3.Row | None,
+        conn.execute(
+            "SELECT fwd_from_peer_id,fwd_from_name,fwd_date,fwd_channel_post FROM message_forwards WHERE dialog_id=? AND message_id=?",
+            key,
+        ).fetchone(),
+    )
+    if item.forward is None:
+        return forward is None
+    return forward is not None and tuple(forward) == (
+        item.forward.fwd_from_peer_id,
+        item.forward.fwd_from_name,
+        item.forward.fwd_date,
+        item.forward.fwd_channel_post,
+    )
 
 
 def _membership_changes(

@@ -39,6 +39,7 @@ from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, Enti
 from mcp_telegram.fact_hydration import FactHydrationDemandAdapter, MessageFactHydrationWorker
 from mcp_telegram.folders.worker import FolderProjectionDemandAdapter, FolderProjectionWorker, FolderVerification
 from mcp_telegram.hydration_queue import HydrationPriority
+from mcp_telegram.image_authorization import ScopeToken
 from mcp_telegram.linked_chat_fact import LinkedChatWork, linked_chat_fact_owner
 from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshDemandAdapter,
@@ -85,6 +86,10 @@ from mcp_telegram.topics.telegram_adapter import TelethonTelegramTopicGateway, T
 
 
 class DemandCompositionClient(ActivityClient, Protocol):
+    def capture_image_scope(self) -> ScopeToken | None: ...
+
+    def claim_image_scope(self, token: ScopeToken) -> bool: ...
+
     async def get_me(self) -> object: ...
 
     def rpc_eligibility(
@@ -222,6 +227,8 @@ def build_durable_adapter_map(
             dependencies.conn,
             writer=dependencies.writer,
             account_id=dependencies.account_id,
+            capture_scope=dependencies.client.capture_image_scope,
+            claim_scope=dependencies.client.claim_image_scope,
         ),
         DemandKind.ENTITY_PROFILE_REFRESH: EntityProfileDemandAdapter(dependencies.entity_refresh_coordinator),
         DemandKind.DELTA_GAP_FILL: DeltaGapFillDemandAdapter(
@@ -285,6 +292,8 @@ def build_durable_adapter_map(
             dependencies.activity_rpc_timeout_seconds,
             account_id=dependencies.account_id,
             writer=dependencies.writer,
+            capture_scope=dependencies.client.capture_image_scope,
+            claim_scope=dependencies.client.claim_image_scope,
             membership_observer=membership_observer,
         ),
         DemandKind.ARCHIVE_INCREMENTAL: ArchiveIncrementalDemandAdapter(
@@ -295,6 +304,8 @@ def build_durable_adapter_map(
             dependencies.activity_rpc_timeout_seconds,
             account_id=dependencies.account_id,
             writer=dependencies.writer,
+            capture_scope=dependencies.client.capture_image_scope,
+            claim_scope=dependencies.client.claim_image_scope,
             membership_observer=membership_observer,
         ),
         DemandKind.COLD_PEER_PAGE: ColdPeerPageDemandAdapter(

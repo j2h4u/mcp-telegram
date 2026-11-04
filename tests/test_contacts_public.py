@@ -146,7 +146,7 @@ async def test_note_contact_required_gives_new_command_guidance() -> None:
     assert "manage_contact" in action and "current note version" in action and "new operation key" in action
 
 
-async def test_list_contacts_reads_canonical_non_dialog_contact_without_rpc(  # noqa: PLR0915 - real producer and IPC
+async def test_list_contacts_reads_canonical_non_dialog_contact_without_rpc(  # noqa: PLR0914, PLR0915 - real producer and IPC
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from telethon.tl import types
@@ -162,8 +162,15 @@ async def test_list_contacts_reads_canonical_non_dialog_contact_without_rpc(  # 
     manager = event_manager(client, db, asyncio.Event())
     manager.set_self_id(42)
     with write_transaction(db):
-        db.execute("INSERT INTO entities(id,type,name,updated_at) VALUES (55,'user','Public',1)")
-    manager._write_profile_pushes(db, object(), [types.User(55, contact=True, first_name="Saved")], [])
+        db.executemany(
+            "INSERT INTO entities(id,type,name,updated_at) VALUES (?,'user',?,1)", [(55, "Public"), (56, "Second")]
+        )
+    manager._write_profile_pushes(
+        db,
+        object(),
+        [types.User(55, contact=True, first_name="Saved"), types.User(56, contact=True, first_name="Next")],
+        [],
+    )
     api = make_server(db, client=client)
     api.self_id = 42
     await api._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
@@ -185,12 +192,24 @@ async def test_list_contacts_reads_canonical_non_dialog_contact_without_rpc(  # 
     monkeypatch.setattr(entity_info, "daemon_connection", connection)
     async with await asyncio.start_unix_server(api.handle_client, path=socket_path):
         result = await mcp_server.call_tool("list_contacts", {"limit": 1})
-        empty = await mcp_server.call_tool("list_contacts", {"limit": 1, "after_entity_id": 55})
+        first_page = cast(dict[str, object], result.structured_content)
+        cursor = first_page["next_after_entity_id"]
+        assert cursor == 55
+        second = await mcp_server.call_tool("list_contacts", {"limit": 1, "after_entity_id": cursor})
+        empty = await mcp_server.call_tool("list_contacts", {"limit": 1, "after_entity_id": 56})
         detail = await mcp_server.call_tool("get_entity_info", {"exact_entity_id": 55})
-    assert result.is_error is not True and empty.is_error is not True
+    assert result.is_error is not True and second.is_error is not True and empty.is_error is not True
     payload = cast(dict[str, object], result.structured_content)
     items = cast(list[dict[str, object]], payload["items"])
     assert items[0]["entity_id"] == 55 and items[0]["first_name"] == "Saved"
+    second_page = cast(dict[str, object], second.structured_content)
+    second_items = cast(list[dict[str, object]], second_page["items"])
+    assert len(items) == len(second_items) == 1
+    assert second_items[0]["entity_id"] == 56 and second_items[0]["first_name"] == "Next"
+    assert "next_after_entity_id" not in second_page
+    contacts_schema = cast(dict[str, object], mcp_server.tool_by_name["list_contacts"].output_schema)
+    validate(payload, contacts_schema)
+    validate(second_page, contacts_schema)
     assert cast(dict[str, object], payload["coverage"])["state"] == "unknown"
     assert cast(dict[str, object], empty.structured_content)["items"] == []
     assert detail.is_error is not True

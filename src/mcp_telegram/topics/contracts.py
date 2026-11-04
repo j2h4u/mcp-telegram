@@ -18,7 +18,8 @@ class TopicFact:
     icon_color: int | None = None
     date: int | None = None
     is_general: bool = False
-    hidden: bool = False
+    hidden: bool | None = None
+    pinned: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +36,13 @@ class TopicPage:
     order_by_create_date: bool
     next_cursor: TopicCursor | None
     deleted_ids: tuple[int, ...] = ()
+    messages: tuple[object, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TopicBatch:
+    topics: tuple[TopicFact, ...]
+    messages: tuple[object, ...]
 
 
 def is_topic_capable(entity: object) -> bool:

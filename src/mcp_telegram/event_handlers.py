@@ -132,6 +132,7 @@ from .folders.telegram_adapter import folder_update_from_native
 from .history_enrollment import EnrollmentOutcome, ensure_automatic_dm_enrollment, full_history_enabled
 from .hydration_queue import HydrationPriority
 from .identity_observation import USERNAME_UNOBSERVED, observe_username
+from .image_authorization import ScopeToken
 from .linked_chat_fact import LinkedChatWork, linked_chat_fact_owner
 from .message_delivery_observations import observe_current
 from .messages.sqlite_bundle import (
@@ -140,6 +141,7 @@ from .messages.sqlite_bundle import (
     list_undeleted_message_ids,
     mark_message_deleted,
     persist_edited_message,
+    persist_received_messages,
     read_message_out,
     read_message_text,
     record_message_deletions,
@@ -152,6 +154,7 @@ from .messages.sqlite_hydration import (
 )
 from .messages.telegram_adapter import (
     extract_message_row,
+    extract_received_messages,
 )
 from .models import DialogType
 from .observation_order import allocate_observation_order, delivered_observation_order
@@ -487,6 +490,17 @@ def _validated_topic_pin_order(value: object) -> tuple[int, ...] | None:
     return tuple(int(topic_id) for topic_id in value)
 
 
+def _has_unknown_topic(conn: sqlite3.Connection, dialog_id: int, topic_ids: tuple[int, ...]) -> bool:
+    return any(
+        conn.execute(
+            "SELECT 1 FROM topic_metadata WHERE dialog_id=? AND topic_id=? AND is_deleted=0 AND catalog_present=1",
+            (dialog_id, topic_id),
+        ).fetchone()
+        is None
+        for topic_id in topic_ids
+    )
+
+
 def _channel_chat_dialog_id(update: _ChannelChatUpdateLike | _ChatUpdateLike) -> int | None:
     if isinstance(update, UpdateChannel):
         return int(get_peer_id(PeerChannel(update.channel_id)))
@@ -568,6 +582,10 @@ class _TranscriptionEvent:
 
 
 class _EventHandlerClient(Protocol):
+    def capture_image_scope(self) -> ScopeToken | None: ...
+
+    def claim_image_scope(self, token: ScopeToken) -> bool: ...
+
     def add_event_handler(self, _callback: object, _event: object) -> None: ...
 
     def remove_event_handler(self, _callback: object) -> None: ...
@@ -1517,9 +1535,10 @@ class EventHandlerManager:
     ) -> None:
         require_write_transaction(conn)
         action = cast(object | None, getattr(msg, "action", None))
-        if isinstance(action, (MessageActionTopicCreate, MessageActionTopicEdit)):
-            TopicCatalogRepository(conn).request(dialog_id, "topic_changed")
+        if not self._delivery_auth_available():
+            return
         if isinstance(action, MessageActionTopicCreate):
+            TopicCatalogRepository(conn).request(dialog_id, "topic_changed")
             self._handle_topic_create_action(conn, dialog_id, msg, now, action, observation_order=observation_order)
             return
         if isinstance(action, MessageActionTopicEdit):
@@ -1539,12 +1558,13 @@ class EventHandlerManager:
         if topic_id <= 0:
             return
         msg_date = msg.date
-        topic_timestamp = int(msg_date.timestamp()) if msg_date is not None else now
+        topic_timestamp = int(msg_date.timestamp()) if msg_date is not None else None
         SQLiteTopicMetadataRepository(conn).apply_topic_create(
             dialog_id,
             topic_id,
-            title=action.title or "Topic",
+            title=action.title,
             icon_emoji_id=action.icon_emoji_id,
+            icon_color=action.icon_color,
             date=topic_timestamp,
             observed_at=now,
             observation_order=observation_order,
@@ -1576,7 +1596,7 @@ class EventHandlerManager:
             return
 
         topic_id_raw = getattr(reply_to, "reply_to_top_id", None)
-        if not _is_valid_nonnegative_int(topic_id_raw, allow_none=True):
+        if not _is_valid_nonnegative_int(topic_id_raw):
             topic_id_raw = getattr(reply_to, "reply_to_msg_id", None)
         if not _is_valid_nonnegative_int(topic_id_raw):
             logger.debug(
@@ -1586,6 +1606,15 @@ class EventHandlerManager:
             return
 
         topic_id = int(cast(int, topic_id_raw))
+        known = cast(
+            tuple[int] | None,
+            conn.execute(
+                "SELECT 1 FROM topic_metadata WHERE dialog_id=? AND topic_id=? AND is_deleted=0 AND catalog_present=1",
+                (dialog_id, topic_id),
+            ).fetchone(),
+        )
+        if known is None:
+            TopicCatalogRepository(conn).request(dialog_id, "topic_changed")
         SQLiteTopicMetadataRepository(conn).apply_topic_edit(
             dialog_id,
             topic_id,
@@ -2825,16 +2854,23 @@ class EventHandlerManager:
             request_contact_catalogue(conn, self._self_id)
 
     def _write_folder_update(self, conn: sqlite3.Connection, update: FolderRuleUpdate) -> None:
-        available = self._delivery_auth_available()
         with write_transaction(conn):
+            if current_delivered_update() is None:
+                return
+            available = self._delivery_auth_available()
             repository = SQLiteFolderSnapshotRepository(conn)
-            if not available or not repository.apply_supplied_update(
+            if not available:
+                return
+            if not repository.apply_supplied_update(
                 update,
                 account_id=cast(int, self._self_id),
                 order=delivered_observation_order(conn),
                 now=delivered_observed_at(),
             ):
-                repository.invalidate()
+                owner = repository.read_catalog_version()[0]
+                canonical = repository.read_catalog_identity()
+                if owner in (None, self._self_id) and (canonical is None or canonical[0] == self._self_id):
+                    repository.invalidate()
 
     def _delivery_auth_available(self) -> bool:
         delivery = current_delivered_update()
@@ -3370,7 +3406,12 @@ class EventHandlerManager:
 
             def _persist_event_0(conn: sqlite3.Connection) -> None:
                 with write_transaction(conn):
+                    if not self._delivery_auth_available() or not self._metadata_realtime_allowed(
+                        realtime_history_coverage(*_SQLiteRealtimeHistoryStatusReader(conn).read_status(dialog_id))
+                    ):
+                        return
                     observation_order = delivered_observation_order(conn)
+                    missing = _has_unknown_topic(conn, dialog_id, (topic_id,))
                     SQLiteTopicMetadataRepository(conn).apply_topic_pin(
                         dialog_id,
                         topic_id,
@@ -3378,7 +3419,8 @@ class EventHandlerManager:
                         observed_at=now,
                         observation_order=observation_order,
                     )
-                    TopicCatalogRepository(conn).request(dialog_id, "topic_pin_changed")
+                    if missing:
+                        TopicCatalogRepository(conn).request(dialog_id, "topic_pin_changed")
 
             await self._writer.run(_persist_event_0)
             logger.info(
@@ -3413,14 +3455,20 @@ class EventHandlerManager:
 
             def _persist_event_0(conn: sqlite3.Connection) -> None:
                 with write_transaction(conn):
+                    if not self._delivery_auth_available() or not self._metadata_realtime_allowed(
+                        realtime_history_coverage(*_SQLiteRealtimeHistoryStatusReader(conn).read_status(dialog_id))
+                    ):
+                        return
                     observation_order = delivered_observation_order(conn)
+                    missing = _has_unknown_topic(conn, dialog_id, order)
                     SQLiteTopicMetadataRepository(conn).apply_topic_pins(
                         dialog_id,
                         order,
                         observed_at=now,
                         observation_order=observation_order,
                     )
-                    TopicCatalogRepository(conn).request(dialog_id, "topic_pins_changed")
+                    if missing:
+                        TopicCatalogRepository(conn).request(dialog_id, "topic_pins_changed")
 
             await self._writer.run(_persist_event_0)
             logger.info(
@@ -3493,19 +3541,65 @@ class EventHandlerManager:
         return marked
 
     async def _scan_dm_gap_message_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        scope = self._client.capture_image_scope()
+        if scope is None or scope.scope.account_id != self._self_id:
+            raise RuntimeError("DM gap scan scope unavailable")
+
+        def reserve(conn: sqlite3.Connection) -> tuple[int, ReactionObservationBoundary]:
+            with write_transaction(conn):
+                if not self._client.claim_image_scope(scope):
+                    raise RuntimeError("DM gap scan scope changed")
+                return allocate_observation_order(conn), allocate_observation_boundary(
+                    conn, ReactionAggregateSource.HISTORY
+                )
+
+        observation_order, reaction_boundary = await self._writer.run(reserve)
         with peer_target(dialog_id):
             results = cast(
                 "Sequence[_MessageLike | None]",
                 await self._client.get_messages(dialog_id, ids=list(message_ids)),
             )
         now = int(time.time())
+        survivors = extract_received_messages(
+            [
+                result
+                for queried_id, result in zip(message_ids, results, strict=False)
+                if result is not None and getattr(result, "id", None) == queried_id
+            ]
+        )
 
         def _persist_event_0(conn: sqlite3.Connection) -> int:
             marked = 0
             with write_transaction(conn):  # atomic per-dialog batch
+                status = cast(
+                    tuple[str] | None,
+                    conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone(),
+                )
+                if not self._client.claim_image_scope(scope):
+                    return 0
+                can_mark_deleted = full_history_enabled(conn, dialog_id) and status == ("synced",)
                 for queried_id, returned_msg in zip(message_ids, results, strict=False):
-                    if returned_msg is None and mark_message_deleted(conn, dialog_id, queried_id, now):
-                        marked += 1
+                    if returned_msg is None and can_mark_deleted:
+                        current = cast(
+                            tuple[int] | None,
+                            conn.execute(
+                                "SELECT observation_order FROM message_observations WHERE dialog_id=? AND message_id=?",
+                                (dialog_id, queried_id),
+                            ).fetchone(),
+                        )
+                        if (current is None or current[0] <= observation_order) and mark_message_deleted(
+                            conn, dialog_id, queried_id, now
+                        ):
+                            marked += 1
+                persist_received_messages(
+                    conn,
+                    survivors,
+                    scope=scope,
+                    claim_scope=self._client.claim_image_scope,
+                    observation_order=observation_order,
+                    expected_dialog_id=dialog_id,
+                    reaction_boundary=reaction_boundary,
+                )
             return marked
 
         return await self._writer.run(_persist_event_0)

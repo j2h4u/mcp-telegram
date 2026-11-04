@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from collections.abc import Callable
 from typing import cast
 
 from ..dialog_identity import read_dialog_identities
 from ..flood import TelegramRpcThrottled
+from ..image_authorization import ScopeToken
+from ..messages.sqlite_bundle import persist_received_messages
+from ..messages.telegram_adapter import extract_received_messages
 from ..models import DialogType
 from ..sqlite_writer import SQLiteWriter
+from ..sync_transactions import write_transaction
 from ..telegram_demand import (
     AcquisitionKind,
     DemandStatus,
@@ -33,8 +38,15 @@ from .ports import TelegramTopicPageGateway
 class TopicSnapshotDemandAdapter:
     demand_kind = DemandKind.TOPIC_SNAPSHOT
 
-    def __init__(
-        self, gateway: TelegramTopicPageGateway, conn: sqlite3.Connection, *, writer: SQLiteWriter, account_id: int
+    def __init__(  # noqa: PLR0913
+        self,
+        gateway: TelegramTopicPageGateway,
+        conn: sqlite3.Connection,
+        *,
+        writer: SQLiteWriter,
+        account_id: int,
+        capture_scope: Callable[[], ScopeToken | None],
+        claim_scope: Callable[[ScopeToken], bool],
     ) -> None:
         self._gateway = gateway
         self._conn = conn
@@ -42,6 +54,8 @@ class TopicSnapshotDemandAdapter:
         if type(account_id) is not int or account_id <= 0:
             raise ValueError("account_id must be a positive integer")
         self._account_id = account_id
+        self._capture_scope = capture_scope
+        self._claim_scope = claim_scope
 
     def _selected(
         self, excluded: frozenset[WorkRevision] = frozenset(), *, target: str | None = None
@@ -107,9 +121,12 @@ class TopicSnapshotDemandAdapter:
         self, selected: WorkRevision, scan: TopicScan, budget: RpcAttemptBudget
     ) -> SliceOutcome:
         accepted, committed_revision = False, None
+        token = self._current_scope()
+        if token is None:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
         try:
             with durable_demand_context(self.demand_kind):
-                accepted, committed_revision = await self._refresh_page(scan, budget)
+                accepted, committed_revision = await self._refresh_page(scan, budget, token)
         except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending:
             raise
         except RpcAttemptBudgetExhaustedError:
@@ -118,15 +135,31 @@ class TopicSnapshotDemandAdapter:
             raise
         except TopicSourceUnavailableError as exc:
             reason = str(exc)
-            await self._writer.run(lambda conn: TopicCatalogRepository(conn).fail(scan, reason, None))
+            await self._writer.run(
+                lambda conn: TopicCatalogRepository(conn).fail(scan, reason, None) if self._claim_scope(token) else None
+            )
         if accepted:
             return SliceOutcome(selected, SliceOutcomeKind.PROGRESSED, committed_revision)
         after = self._selected(target=selected.key.target)
         return SliceOutcome(selected, SliceOutcomeKind.STALE if after != selected else SliceOutcomeKind.NO_PROGRESS)
 
-    async def _refresh_page(self, scan: TopicScan, budget: RpcAttemptBudget) -> tuple[bool, str | None]:
+    def _current_scope(self) -> ScopeToken | None:
+        token = self._capture_scope()
+        if token is None or token.scope.account_id != self._account_id or not self._claim_scope(token):
+            return None
+        return token
+
+    async def _refresh_page(
+        self, scan: TopicScan, budget: RpcAttemptBudget, token: ScopeToken
+    ) -> tuple[bool, str | None]:
         if self._known_non_topic_user(scan.dialog_id):
-            return await self._writer.run(lambda conn: TopicCatalogRepository(conn).mark_not_applicable_outcome(scan))
+            return await self._writer.run(
+                lambda conn: (
+                    TopicCatalogRepository(conn).mark_not_applicable_outcome(scan)
+                    if self._claim_scope(token)
+                    else (False, None)
+                )
+            )
         with (
             rpc_scope(TelegramRpcSource.TOPIC_RECONCILIATION, acquisition_kind=AcquisitionKind.TOPIC_SNAPSHOT),
             rpc_attempt_budget(budget),
@@ -136,12 +169,33 @@ class TopicSnapshotDemandAdapter:
                 return False, None
             if not is_topic_capable(entity):
                 return await self._writer.run(
-                    lambda conn: TopicCatalogRepository(conn).mark_not_applicable_outcome(scan)
+                    lambda conn: (
+                        TopicCatalogRepository(conn).mark_not_applicable_outcome(scan)
+                        if self._claim_scope(token)
+                        else (False, None)
+                    )
                 )
             page = await self._gateway.fetch_page(entity, scan.cursor)
-        accepted, _complete, revision = await self._writer.run(
-            lambda conn: TopicCatalogRepository(conn).apply_page_outcome(scan, page)
-        )
+        received = extract_received_messages(page.messages)
+
+        def publish(conn: sqlite3.Connection) -> tuple[bool, bool, str | None]:
+            with write_transaction(conn):
+                repository = TopicCatalogRepository(conn)
+                if not self._claim_scope(token) or not repository.acquisition_allowed(scan.dialog_id):
+                    return False, False, None
+                accepted, complete, revision = repository.apply_page_outcome(scan, page)
+                persist_received_messages(
+                    conn,
+                    received,
+                    scope=token,
+                    claim_scope=self._claim_scope,
+                    observation_order=scan.observation_order,
+                    expected_dialog_id=scan.dialog_id,
+                    reaction_boundary=scan.reaction_boundary,
+                )
+                return accepted, complete, revision
+
+        accepted, _complete, revision = await self._writer.run(publish)
         return accepted, revision
 
     def _known_non_topic_user(self, dialog_id: int) -> bool:

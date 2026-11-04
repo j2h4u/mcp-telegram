@@ -1,11 +1,13 @@
 """Contact snapshots remain canonical, account scoped, and usable without dialogs."""
 
 import sqlite3
+from collections.abc import Callable
+from contextlib import closing
 from pathlib import Path
 from typing import cast
 
 import pytest
-from telethon.tl import types
+from telethon.tl import functions, types
 
 from mcp_telegram.auth_scope import TelegramAuthScope
 from mcp_telegram.contacts.refresh import ContactCatalogueRefresher
@@ -93,6 +95,70 @@ async def test_partial_snapshot_does_not_remove_retained_contacts(tmp_path: Path
     }
     reader.close()
     await writer.aclose()
+
+
+@pytest.mark.parametrize("failure", ["partial", "not_modified", "storage"])
+async def test_incomplete_or_failed_refresh_retains_saved_baseline(
+    tmp_path: Path, failure: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mcp_telegram.contacts import refresh as contact_refresh
+
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    writer = await SQLiteWriter.open(path)
+    reader = open_sync_db_reader(path)
+    cell = ScopeCell()
+    assert cell.publish(TelegramAuthScope(1, 42, 2, 3))
+    baseline = types.contacts.Contacts(
+        [types.Contact(55, False)], 1, [types.User(55, contact=True, first_name="Saved", phone="123")]
+    )
+    next_response: object = baseline
+
+    class Client:
+        async def __call__(self, request: object) -> object:
+            assert isinstance(request, functions.contacts.GetContactsRequest)
+            assert request.hash == 0
+            return next_response
+
+    def request(conn: sqlite3.Connection) -> int:
+        with write_transaction(conn):
+            return request_contact_catalogue(conn, 42)
+
+    refresher = ContactCatalogueRefresher(Client(), reader, writer, capture_scope=cell.capture, claim_scope=cell.claim)
+    try:
+        assert (await refresher.refresh(expected_revision=await writer.run(request))).accepted
+        before = read_contact_command_state(reader, 42, 55)
+        coverage = read_contacts(reader, 42, limit=10, after_entity_id=None)["coverage"]
+        revision = await writer.run(request)
+        if failure == "partial":
+            next_response = types.contacts.Contacts([types.Contact(99, False)], 1, [])
+        elif failure == "not_modified":
+            next_response = types.contacts.ContactsNotModified()
+        else:
+            next_response = types.contacts.Contacts(
+                [types.Contact(99, False)], 1, [types.User(99, contact=True, first_name="New")]
+            )
+            original = contact_refresh._publish_contact
+
+            def fail_after_write(*args: object, **kwargs: object) -> None:
+                cast(Callable[..., None], original)(*args, **kwargs)
+                raise sqlite3.OperationalError("controlled storage failure")
+
+            monkeypatch.setattr(contact_refresh, "_publish_contact", fail_after_write)
+        if failure == "storage":
+            with pytest.raises(sqlite3.OperationalError, match="controlled storage failure"):
+                await refresher.refresh(expected_revision=revision)
+        else:
+            assert not (await refresher.refresh(expected_revision=revision)).accepted
+        assert read_contact_command_state(reader, 42, 55) == before
+        assert read_contact_command_state(reader, 42, 99)["membership"] is None
+        assert read_contacts(reader, 42, limit=10, after_entity_id=None)["coverage"] == coverage
+    finally:
+        reader.close()
+        await writer.aclose()
+    with closing(sqlite3.connect(path)) as reopened:
+        assert read_contact_command_state(reopened, 42, 55) == before
+        assert read_contact_command_state(reopened, 42, 99)["membership"] is None
 
 
 @pytest.mark.asyncio

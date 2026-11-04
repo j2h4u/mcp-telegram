@@ -5,8 +5,14 @@ from unittest.mock import patch
 
 import pytest
 
+from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.config import AutomaticGroupHistoryConfig
-from mcp_telegram.message_history.contracts import FullHistoryPage, MessageHistoryUnavailableError
+from mcp_telegram.image_authorization import ScopeCell, ScopeToken
+from mcp_telegram.message_history.contracts import (
+    FullHistoryPage,
+    HistoryAccessProbeResult,
+    MessageHistoryUnavailableError,
+)
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncWorker
 from mcp_telegram.telegram_demand import DemandStatus, DurableDemandAdapter, RpcAttemptBudget
 from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator
@@ -15,6 +21,17 @@ from mcp_telegram.telegram_rpc_consumers import DURABLE_DEMAND_ORDER, DemandKind
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.sqlite_writer_helpers import inline_writer
 from tests.test_fact_demand_adapters import _hydration_db
+
+_scope_cell = ScopeCell()
+assert _scope_cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 1, 2, 99))
+
+
+class _ProbeScope:
+    def capture_scope(self) -> ScopeToken | None:
+        return _scope_cell.capture()
+
+    def claim_scope(self, token: ScopeToken) -> bool:
+        return _scope_cell.claim(token)
 
 
 class IdleAdapter:
@@ -206,6 +223,7 @@ async def test_existing_history_recovers_from_transient_without_new_revision(
     kind: str, error_type: type[Exception]
 ) -> None:
     conn = _hydration_db()
+    conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
     conn.execute(
         "INSERT INTO synced_dialogs(dialog_id,status,total_messages) VALUES (501,?,NULL)",
         ("syncing" if kind == "page" else "synced",),
@@ -215,7 +233,7 @@ async def test_existing_history_recovers_from_transient_without_new_revision(
     now = [1000.0]
     retry, complete, timer, stop = (asyncio.Event() for _ in range(4))
 
-    class Port:
+    class Port(_ProbeScope):
         calls = 0
 
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
@@ -224,11 +242,11 @@ async def test_existing_history_recovers_from_transient_without_new_revision(
                 raise error_type("temporary")
             return FullHistoryPage((), 1, None)
 
-        async def probe_total_messages(self, dialog_id: int) -> int:
+        async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
             self.calls += 1
             if self.calls == 1:
                 raise error_type("temporary")
-            return 1
+            return HistoryAccessProbeResult(1, ())
 
     class Observer:
         def observe_demand(self, **event: object) -> None:

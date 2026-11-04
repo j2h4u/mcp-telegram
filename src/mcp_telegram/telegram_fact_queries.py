@@ -333,13 +333,13 @@ def _persist_read_date_result(  # noqa: PLR0913
 
 def _read_date_business_state(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> tuple[object, ...] | None:
     row = cast(
-        tuple[object, ...] | None,
+        Sequence[object] | None,
         conn.execute(
             "SELECT status, read_at, reason FROM message_read_facts WHERE dialog_id=? AND message_id=?",
             (dialog_id, message_id),
         ).fetchone(),
     )
-    return None if row is None else cast(tuple[object, ...], row)
+    return None if row is None else tuple(row)
 
 
 def _has_read_date_fact(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:

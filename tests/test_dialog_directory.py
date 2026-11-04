@@ -13,6 +13,7 @@ from typing import cast
 import pytest
 from telethon.tl import functions, types  # type: ignore[import-untyped]
 
+from mcp_telegram.auth_scope import TelegramAuthScope
 from mcp_telegram.dialog_directory import (
     CanonicalDialogDirectory,
     CanonicalDialogDirectoryDemandAdapter,
@@ -40,6 +41,7 @@ from mcp_telegram.dialog_identity import capture_identity_baseline, publish_dial
 from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
 from mcp_telegram.entity_profile.repository import _read_profile_admission_state
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.image_authorization import ScopeCell, ScopeToken
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
@@ -321,7 +323,9 @@ async def test_imperfect_slice_advances_and_retains_every_identifiable_row(tmp_p
 def test_ordinary_commit_rejects_same_generation_changed_cursor(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    directory = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event(), writer=_writer(db_path))
+    client = _FakeClient([])
+    assert client._scope.publish(TelegramAuthScope(1, 99, 2, 99))
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event(), writer=_writer(db_path))
     conn = _open_sync_db(db_path)
     try:
         directory._bind_account(conn, 99)
@@ -343,7 +347,9 @@ def test_ordinary_commit_rejects_same_generation_changed_cursor(tmp_path: Path) 
         conn.commit()
         page = normalize_dialogs_response(_response([_dialog(777, 7)]), captured.cursor)
 
-        detail, successor = directory._commit_ordinary_response(conn, captured, 99, page)
+        scope = client.capture_image_scope()
+        assert scope is not None
+        detail, successor = directory._commit_ordinary_response(conn, captured, 99, page, scope)
 
         assert detail is None and successor is None
         assert conn.execute("SELECT COUNT(*) FROM dialog_directory_staging").fetchone() == (0,)
@@ -501,10 +507,18 @@ def test_cursor_round_trip_keeps_real_self_and_forbidden_peers() -> None:
 
 
 class _FakeClient:
-    def __init__(self, responses: list[object]) -> None:
+    def __init__(self, responses: list[object], *, account_id: int = 100) -> None:
         self.responses = responses
         self.requests: list[object] = []
         self.get_me_calls = 0
+        self._scope = ScopeCell()
+        assert self._scope.publish(TelegramAuthScope(1, account_id, 2, 99))
+
+    def capture_image_scope(self) -> ScopeToken | None:
+        return self._scope.capture()
+
+    def claim_image_scope(self, token: ScopeToken) -> bool:
+        return self._scope.claim(token)
 
     async def __call__(self, request: object) -> object:
         self.requests.append(request)
@@ -1078,7 +1092,7 @@ async def test_min_user_identity_mask_survives_directory_restart(tmp_path: Path)
     db_path = tmp_path / "sync.db"
     _stage_min_user_directory_generation(db_path)
     resumed = CanonicalDialogDirectory(
-        _FakeClient([types.messages.Dialogs(dialogs=[], messages=[], chats=[], users=[])]),
+        _FakeClient([types.messages.Dialogs(dialogs=[], messages=[], chats=[], users=[])], account_id=99),
         db_path,
         asyncio.Event(),
         writer=_writer(db_path),
@@ -1100,7 +1114,7 @@ async def test_repeated_peer_stage_merges_partial_and_complete_identity_fieldwis
     db_path = tmp_path / "sync.db"
     _stage_repeated_peer_directory_facts(db_path)
     resumed = CanonicalDialogDirectory(
-        _FakeClient([types.messages.Dialogs(dialogs=[], messages=[], chats=[], users=[])]),
+        _FakeClient([types.messages.Dialogs(dialogs=[], messages=[], chats=[], users=[])], account_id=99),
         db_path,
         asyncio.Event(),
         writer=_writer(db_path),
@@ -1429,7 +1443,9 @@ async def test_pinned_semantic_invalid_latches_its_source_and_logs_once(
         await directory.run_slice()
         conn = _open_sync_db(db_path)
         try:
-            directory._latch_semantic_invalid(conn, 1, "pinned_0", "unexpected_pinned_response:Dialogs", 100)
+            scope = directory._client.capture_image_scope()
+            assert scope is not None
+            directory._latch_semantic_invalid(conn, 1, "pinned_0", "unexpected_pinned_response:Dialogs", 100, scope)
         finally:
             conn.close()
     conn = _open_sync_db(db_path)
@@ -2455,7 +2471,7 @@ async def test_directory_demand_slice_publishes_exact_selected_revision_in_its_r
     ensure_sync_schema(db_path)
     monkeypatch.setattr("mcp_telegram.dialog_directory.time.time", lambda: 1_000)
     shutdown = asyncio.Event()
-    client = _FakeClient([_pinned_response()])
+    client = _FakeClient([_pinned_response()], account_id=123)
     directory = CanonicalDialogDirectory(client, db_path, shutdown, writer=_writer(db_path))
     await directory.bind_account_id(123)
     conn = _open_sync_db(db_path)

@@ -6,11 +6,16 @@ from pathlib import Path
 
 from mcp_telegram.auth_scope import TelegramAuthScope
 from mcp_telegram.image_authorization import ActiveSources, ScopeCell
+from mcp_telegram.message_contracts import ReceivedMessage
 from mcp_telegram.messages.sqlite_bundle import (
     insert_messages_with_fts,
+    persist_received_messages,
     record_message_deletions,
     record_nonchannel_deletions,
 )
+from mcp_telegram.observation_order import allocate_observation_order
+from mcp_telegram.reactions.contracts import ReactionAggregateSource
+from mcp_telegram.reactions.persistence import allocate_observation_boundary
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
 from tests.test_message_sqlite_persistence import _message
@@ -145,28 +150,66 @@ def test_rotation_before_queued_claim_rejects_writer() -> None:
 
 
 def test_hydrated_media_revokes_only_accepted_change_before_commit(tmp_path: Path) -> None:
-    from mcp_telegram.messages.sqlite_hydration import apply_hydrated_media_fact
-
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     conn = _open_sync_db(path)
     enable_runtime_writes(conn)
     sources = ActiveSources()
     sources.bind(conn)
+    cell = ScopeCell()
+    assert cell.publish(TelegramAuthScope(1, 42, 2, 99))
+    scope = cell.capture()
+    assert scope is not None
     try:
         with write_transaction(conn):
             conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (42,'synced')")
             conn.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (42,1,1)")
+            old_order = allocate_observation_order(conn)
+            boundary = allocate_observation_boundary(conn, ReactionAggregateSource.HISTORY)
+            new_order = allocate_observation_order(conn)
             insert_messages_with_fts(
-                conn, [replace(_message(8, text=None, media_kind="other", media_payload="{}"), observation_order=20)]
+                conn,
+                [replace(_message(8, text=None, media_kind="other", media_payload="{}"), observation_order=new_order)],
             )
         lease = sources.register(42, 42, 8, 1)
         with write_transaction(conn):
-            assert not apply_hydrated_media_fact(conn, 42, 8, "photo", "{}", observation_order=10)
+            photo = ReceivedMessage(_message(8, text=None, media_kind="photo", media_payload="{}"), False)
+            unchanged = ReceivedMessage(_message(8, text=None, media_kind="other", media_payload="{}"), False)
+            assert (
+                persist_received_messages(
+                    conn,
+                    [photo],
+                    scope=scope,
+                    claim_scope=cell.claim,
+                    observation_order=old_order,
+                    reaction_boundary=boundary,
+                )
+                == 0
+            )
             assert lease.is_current()
-            assert apply_hydrated_media_fact(conn, 42, 8, "other", "{}", observation_order=20)
+            assert (
+                persist_received_messages(
+                    conn,
+                    [unchanged],
+                    scope=scope,
+                    claim_scope=cell.claim,
+                    observation_order=new_order,
+                    reaction_boundary=boundary,
+                )
+                == 1
+            )
             assert lease.is_current()
-            assert apply_hydrated_media_fact(conn, 42, 8, "photo", "{}", observation_order=20)
+            assert (
+                persist_received_messages(
+                    conn,
+                    [photo],
+                    scope=scope,
+                    claim_scope=cell.claim,
+                    observation_order=new_order,
+                    reaction_boundary=boundary,
+                )
+                == 1
+            )
             assert not lease.is_current()
         assert conn.execute("SELECT media_kind FROM messages WHERE dialog_id=42 AND message_id=8").fetchone() == (
             "photo",

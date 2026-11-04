@@ -43,7 +43,7 @@ async def test_native_update_is_persisted_through_delivery(delivery: _Delivery) 
     assert rule.title == "After"
     assert rule.title_entities == ({"_": "MessageEntityBold", "offset": 0, "length": 5},)
     assert rule.color == 4
-    assert folder_snapshot(delivery.reader, stale_after_seconds=900)["complete"]
+    assert folder_snapshot(delivery.reader, stale_after_seconds=900, account_id=42)["complete"]
 
 
 async def test_auth_switch_before_dispatch_keeps_old_facts(
@@ -90,7 +90,7 @@ async def test_unattributed_folder_delivery_requests_refresh_and_completes(
     await repository.admit(envelope.model_dump_json().encode(), 1)
     await gate.start_update_delivery(42)
     assert delivery.reader.execute("SELECT pending FROM update_delivery WHERE singleton=1").fetchone()[0] is None
-    assert not folder_snapshot(delivery.reader, stale_after_seconds=900)["complete"]
+    assert not folder_snapshot(delivery.reader, stale_after_seconds=900, account_id=42)["complete"]
 
 
 async def test_unattributed_profile_delivery_preserves_note_and_requests_refresh(delivery: _Delivery) -> None:

@@ -1519,7 +1519,7 @@ def test_phase_52_agent_metadata_fields_are_in_output_schemas() -> None:
     assert_nested_item_fields(
         list_topics_schema,
         collection_name="topics",
-        required_fields=("title_content",),
+        required_fields=("title",),
         property_fields=("title_content",),
     )
 

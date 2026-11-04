@@ -371,8 +371,15 @@ async def test_folder_refresh_rejects_publication_after_selected_projection_chan
             calls = 0
 
             async def fetch_rules(self, *, started_at: int) -> FolderRuleObservation:
+                from mcp_telegram.observation_order import allocate_observation_order
+
                 self.calls += 1
-                assert repository.project_observation(newer_observation, completed_at=1001) == 1
+                assert (
+                    repository.project_observation(
+                        newer_observation, completed_at=1001, observation_order=allocate_observation_order(conn)
+                    )
+                    == 1
+                )
                 return FolderRuleObservation((FolderRule(2, "Older"),), "older-token", started_at)
 
         gateway = RacingGateway()
@@ -391,8 +398,10 @@ async def test_folder_refresh_rejects_publication_after_selected_projection_chan
 
         assert gateway.calls == 1
         assert outcome.kind is SliceOutcomeKind.STALE
-        assert repository.read_snapshot_revision() == (1, 1, "newer-token", 1001)
-        assert conn.execute("SELECT title FROM telegram_folder_rules").fetchall() == [("Newer",)]
+        assert set(
+            conn.execute("SELECT title FROM telegram_folder_rules WHERE catalog_member=1 AND deleted=0").fetchall()
+        ) == {("Newer",), ("Older",)}
+        assert repository.read_catalog_version()[3] is False
     finally:
         conn.close()
 

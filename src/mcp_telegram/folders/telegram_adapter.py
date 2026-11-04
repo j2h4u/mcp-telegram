@@ -53,7 +53,7 @@ def _categories(folder: object) -> frozenset[DialogCategory]:
     )
 
 
-def _folder_rule(folder: object, position: int) -> FolderRule | None:
+def _folder_rule(folder: object, position: int | None) -> FolderRule | None:
     title_value = getattr(folder, "title", "")
     title = str(getattr(title_value, "text", title_value))
     kind_name = folder.__class__.__name__
@@ -101,7 +101,7 @@ def _folder_rule(folder: object, position: int) -> FolderRule | None:
 
 def folder_update_from_native(update: object) -> FolderRuleUpdate:
     if isinstance(update, tl.UpdateDialogFilter):
-        rule = None if update.filter is None else _folder_rule(update.filter, 0)
+        rule = None if update.filter is None else _folder_rule(update.filter, None)
         if update.filter is not None and (rule is None or not rule.complete or rule.folder_id != update.id):
             return FolderRuleUpdate("invalid")
         return FolderRuleUpdate("filter", folder_id=update.id, rule=rule)

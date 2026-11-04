@@ -57,7 +57,7 @@ class FolderRule:
     title: str
     namespace: str = FILTER_FOLDER_NAMESPACE
     kind: FolderRuleKind = FolderRuleKind.FILTER
-    source_position: int = 0
+    source_position: int | None = None
     included_ids: tuple[int, ...] = ()
     pinned_ids: tuple[int, ...] = ()
     excluded_ids: tuple[int, ...] = ()

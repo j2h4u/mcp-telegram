@@ -9,16 +9,19 @@ from typing import cast
 
 import pytest
 
+from mcp_telegram.auth_scope import TelegramAuthScope
 from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
 from mcp_telegram.fts import stem_text
 from mcp_telegram.hydration_queue import HydrationOutcome, HydrationPriority, HydrationQueueRepository
-from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
+from mcp_telegram.image_authorization import ScopeCell
+from mcp_telegram.message_contracts import ExtractedMessage, ReceivedMessage, StoredMessage
 from mcp_telegram.messages.sqlite_bundle import (
     find_unique_nonchannel_message_dialogs,
     insert_messages_with_fts,
     list_undeleted_message_ids,
     mark_message_deleted,
     persist_edited_message,
+    persist_received_messages,
     persist_transcribed_text,
     read_message_text,
     record_nonchannel_deletions,
@@ -45,6 +48,7 @@ from mcp_telegram.messages.sqlite_hydration_jobs import (
 )
 from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.reactions.contracts import ReactionAggregateSource
+from mcp_telegram.reactions.persistence import allocate_observation_boundary
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import enable_runtime_writes, write_transaction
 from sqlite_writer_helpers import event_manager
@@ -1042,14 +1046,37 @@ def test_fts_repair_handles_missing_keys_masked_by_duplicates_and_deleted(conn: 
 
 
 def test_hydration_rejects_observation_started_before_newer_message(conn: sqlite3.Connection) -> None:
-    from mcp_telegram.messages.sqlite_hydration import apply_hydrated_media_fact, apply_message_transcription_if_absent
-
+    cell = ScopeCell()
+    assert cell.publish(TelegramAuthScope(1, 42, 2, 99))
+    scope = cell.capture()
+    assert scope is not None
     with write_transaction(conn):
-        insert_messages_with_fts(conn, [replace(_message(96, text="newer"), observation_order=20)])
-        assert not apply_hydrated_media_fact(conn, 42, 96, None, None, observation_order=10)
+        conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (42,'synced')")
+        conn.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (42,1,1)")
+        old_order = allocate_observation_order(conn)
+        boundary = allocate_observation_boundary(conn, ReactionAggregateSource.HISTORY)
+        new_order = allocate_observation_order(conn)
+        insert_messages_with_fts(conn, [replace(_message(96, text="newer"), observation_order=new_order)])
+        assert (
+            persist_received_messages(
+                conn,
+                [ReceivedMessage(_message(96, text="old"), False)],
+                scope=scope,
+                claim_scope=cell.claim,
+                observation_order=old_order,
+                reaction_boundary=boundary,
+            )
+            == 0
+        )
         assert (
             apply_message_transcription_if_absent(
-                conn, 42, 96, transcribed_text="oldvoice", transcription_id=1, received_at=1, observation_order=10
+                conn,
+                42,
+                96,
+                transcribed_text="oldvoice",
+                transcription_id=1,
+                received_at=1,
+                observation_order=old_order,
             )
             == "not_applied"
         )
@@ -1125,6 +1152,8 @@ def test_peerless_deletion_blocks_unknown_nonchannel_body_but_not_channel(
     assert conn.execute("SELECT dialog_id,message_id FROM messages").fetchall() == [(-1000000000042, 901)]
     assert conn.execute("SELECT dialog_id,message_id FROM messages_fts").fetchall() == [(-1000000000042, 901)]
     assert conn.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == (0,)
+    assert conn.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=903").fetchone() == (None,)
+    assert conn.execute("SELECT deleted_at FROM nonchannel_message_deletions WHERE message_id=903").fetchone() == (100,)
 
 
 def test_peerless_deletion_is_terminal_after_restart(tmp_path: Path) -> None:
@@ -1150,16 +1179,33 @@ def test_peerless_deletion_is_terminal_after_restart(tmp_path: Path) -> None:
 
 def test_peerless_deletion_rejects_all_hydration_fact_paths(conn: sqlite3.Connection) -> None:
     from mcp_telegram.messages.sqlite_hydration import (
-        apply_hydrated_media_fact,
         apply_message_transcription_if_absent,
         hydration_observation_current,
     )
 
+    cell = ScopeCell()
+    assert cell.publish(TelegramAuthScope(1, 42, 2, 99))
+    scope = cell.capture()
+    assert scope is not None
     with write_transaction(conn):
+        conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (42,'synced')")
+        conn.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (42,1,1)")
         insert_messages_with_fts(conn, [_message(903, text=None, media_kind="voice", media_payload="{}")])
         record_nonchannel_deletions(conn, [903], 100)
+        order = allocate_observation_order(conn)
+        boundary = allocate_observation_boundary(conn, ReactionAggregateSource.HISTORY)
         assert not hydration_observation_current(conn, 42, 903, 1000)
-        assert not apply_hydrated_media_fact(conn, 42, 903, None, None, observation_order=1000)
+        assert (
+            persist_received_messages(
+                conn,
+                [ReceivedMessage(_message(903, text="late"), False)],
+                scope=scope,
+                claim_scope=cell.claim,
+                observation_order=order,
+                reaction_boundary=boundary,
+            )
+            == 0
+        )
         assert not apply_message_transcription(
             conn, 42, 903, transcribed_text="late", transcription_id=1, received_at=200
         )
@@ -1170,6 +1216,8 @@ def test_peerless_deletion_rejects_all_hydration_fact_paths(conn: sqlite3.Connec
             == "not_applied"
         )
     assert conn.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == (0,)
+    assert conn.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=903").fetchone() == (None,)
+    assert conn.execute("SELECT deleted_at FROM nonchannel_message_deletions WHERE message_id=903").fetchone() == (100,)
 
 
 def test_nonchannel_peer_classifier_matches_telethon_namespace() -> None:

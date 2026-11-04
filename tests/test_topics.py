@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import cast
 
 import pytest
 from telethon.tl.functions.messages import GetCustomEmojiDocumentsRequest, GetForumTopicsRequest
@@ -20,10 +20,29 @@ from mcp_telegram.telegram_rpc_scheduler import (
     rpc_attempt_budget,
     rpc_scope,
 )
-from mcp_telegram.topics.contracts import TopicFact, is_topic_capable
+from mcp_telegram.topics.contracts import TopicBatch, TopicFact, is_topic_capable
 from mcp_telegram.topics.refresh import TopicRefresher
 from mcp_telegram.topics.telegram_adapter import TelethonTelegramTopicGateway
 from tests.sqlite_writer_helpers import inline_writer
+from tests.topic_test_helpers import topic_scope
+
+_SCOPE = topic_scope()
+
+
+@pytest.fixture
+def topic_db() -> Iterator[sqlite3.Connection]:
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE dialog_directory_state(singleton INTEGER,account_id INTEGER)")
+    conn.execute("INSERT INTO dialog_directory_state VALUES (1,1)")
+    conn.execute("CREATE TABLE full_history_enrollment(dialog_id INTEGER,enabled INTEGER)")
+    conn.execute("CREATE TABLE synced_dialogs(dialog_id INTEGER,status TEXT)")
+    conn.execute(
+        "CREATE TABLE message_reaction_observation_counter(singleton INTEGER PRIMARY KEY,next_sequence INTEGER)"
+    )
+    conn.executemany("INSERT INTO full_history_enrollment VALUES (?,1)", [(1,), (42,), (8583106747,)])
+    conn.commit()
+    yield conn
+    conn.close()
 
 
 @dataclass
@@ -38,12 +57,12 @@ class _Gateway:
         self.entities: list[object] = []
         self.scopes: list[tuple[TelegramRpcSource, DemandKind, AcquisitionKind | None]] = []
 
-    async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
+    async def fetch_topics(self, entity: object) -> TopicBatch:
         self.entities.append(entity)
         scope = current_rpc_scope()
         assert scope.demand_kind is not None
         self.scopes.append((scope.source, scope.demand_kind, scope.acquisition_kind))
-        return (TopicFact(topic_id=1, title="General", is_general=True),)
+        return TopicBatch((TopicFact(topic_id=1, title="General", is_general=True),), ())
 
 
 class _Repository:
@@ -75,14 +94,14 @@ def test_topic_capability_includes_forum_supergroups_and_private_bot_views() -> 
 
 
 @pytest.mark.asyncio
-async def test_refreshes_private_bot_topics_when_bot_forum_view_is_enabled() -> None:
+async def test_refreshes_private_bot_topics_when_bot_forum_view_is_enabled(topic_db: sqlite3.Connection) -> None:
     gateway = _Gateway()
     repository = _Repository()
     bot = _Entity(bot=True, bot_forum_view=True)
 
-    count = await TopicRefresher(gateway, repository, writer=inline_writer(cast(sqlite3.Connection, None))).refresh(
-        8583106747, bot
-    )
+    count = await TopicRefresher(
+        gateway, repository, writer=inline_writer(topic_db), capture_scope=_SCOPE.capture, claim_scope=_SCOPE.claim
+    ).refresh(8583106747, bot)
 
     assert count == 1
     assert gateway.entities == [bot]
@@ -90,13 +109,13 @@ async def test_refreshes_private_bot_topics_when_bot_forum_view_is_enabled() -> 
 
 
 @pytest.mark.asyncio
-async def test_does_not_fetch_topics_for_ordinary_private_bot() -> None:
+async def test_does_not_fetch_topics_for_ordinary_private_bot(topic_db: sqlite3.Connection) -> None:
     gateway = _Gateway()
     repository = _Repository()
 
-    count = await TopicRefresher(gateway, repository, writer=inline_writer(cast(sqlite3.Connection, None))).refresh(
-        42, _Entity(bot=True)
-    )
+    count = await TopicRefresher(
+        gateway, repository, writer=inline_writer(topic_db), capture_scope=_SCOPE.capture, claim_scope=_SCOPE.claim
+    ).refresh(42, _Entity(bot=True))
 
     assert count == 0
     assert gateway.entities == []
@@ -104,14 +123,18 @@ async def test_does_not_fetch_topics_for_ordinary_private_bot() -> None:
 
 
 @pytest.mark.asyncio
-async def test_topic_refresh_preserves_interactive_resolution_scope() -> None:
+async def test_topic_refresh_preserves_interactive_resolution_scope(topic_db: sqlite3.Connection) -> None:
     gateway = _Gateway()
     repository = _Repository()
 
     with rpc_scope(TelegramRpcSource.TOPIC_RESOLUTION):
-        await TopicRefresher(gateway, repository, writer=inline_writer(cast(sqlite3.Connection, None))).refresh(
-            42, _Entity(forum=True)
-        )
+        await TopicRefresher(
+            gateway,
+            repository,
+            writer=inline_writer(topic_db),
+            capture_scope=_SCOPE.capture,
+            claim_scope=_SCOPE.claim,
+        ).refresh(42, _Entity(forum=True))
 
     assert gateway.scopes == [
         (
@@ -146,7 +169,7 @@ async def test_telethon_gateway_uses_input_peer_before_fetching_topics() -> None
     assert client.input_requests == [entity]
     assert len(client.requests) == 1
     assert isinstance(client.requests[0], GetForumTopicsRequest)
-    assert topics == (TopicFact(topic_id=306001, title="Topic"),)
+    assert topics.topics == (TopicFact(topic_id=306001, title="Topic", hidden=False, pinned=False),)
 
 
 @pytest.mark.asyncio
@@ -180,8 +203,8 @@ async def test_telethon_gateway_resolves_custom_topic_icon_to_unicode_emoji() ->
     second = await gateway.fetch_topics(object())
 
     assert (
-        first
-        == second
+        first.topics
+        == second.topics
         == (
             TopicFact(
                 topic_id=306001,
@@ -189,6 +212,8 @@ async def test_telethon_gateway_resolves_custom_topic_icon_to_unicode_emoji() ->
                 icon_emoji_id=987,
                 icon_emoji="📊",
                 icon_color=0x6FB9F0,
+                hidden=False,
+                pinned=False,
             ),
         )
     )
@@ -259,7 +284,7 @@ async def test_topic_pagination_preserves_demand_and_deduplicates(create_order: 
     with rpc_scope(TelegramRpcSource.TOPIC_RECONCILIATION), rpc_attempt_budget(budget):
         topics = await TelethonTelegramTopicGateway(client).fetch_topics(object())
     assert budget.attempts == 2
-    assert len(topics) == 150
+    assert len(topics.topics) == 150
     assert len(client.requests) == 2
     assert client.scopes == [DemandKind.TOPIC_SNAPSHOT, DemandKind.TOPIC_SNAPSHOT]
     assert client.requests[1].offset_id == 1100
@@ -280,12 +305,12 @@ async def test_topic_short_server_pages_continue_until_count() -> None:
 
     with rpc_scope(TelegramRpcSource.TOPIC_RECONCILIATION):
         topics = await TelethonTelegramTopicGateway(Client()).fetch_topics(object())
-    assert [topic.topic_id for topic in topics] == [1, 2, 3]
+    assert [topic.topic_id for topic in topics.topics] == [1, 2, 3]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["deferred", "budget", "nonprogress", "empty"])
-async def test_partial_topic_pages_never_publish_snapshot(failure: str) -> None:
+async def test_partial_topic_pages_never_publish_snapshot(failure: str, topic_db: sqlite3.Connection) -> None:
     from mcp_telegram.telegram_demand import RpcAttemptBudgetExhaustedError
     from mcp_telegram.topics.contracts import TopicSourceUnavailableError
 
@@ -314,6 +339,10 @@ async def test_partial_topic_pages_never_publish_snapshot(failure: str) -> None:
     )
     with pytest.raises(error):
         await TopicRefresher(
-            TelethonTelegramTopicGateway(Client()), repository, writer=inline_writer(cast(sqlite3.Connection, None))
+            TelethonTelegramTopicGateway(Client()),
+            repository,
+            writer=inline_writer(topic_db),
+            capture_scope=_SCOPE.capture,
+            claim_scope=_SCOPE.claim,
         ).refresh(1, _Entity(forum=True))
     assert repository.writes == []

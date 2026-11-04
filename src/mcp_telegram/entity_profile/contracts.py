@@ -14,6 +14,7 @@ from enum import StrEnum
 from typing import Literal, TypedDict, cast
 
 from ..dialog_identity_contracts import DialogIdentityObservation
+from ..message_contracts import ReceivedMessage
 
 PROFILE_FLOOD_RETRY_BASE_SECONDS = 300
 PROFILE_FLOOD_RETRY_CAP_SECONDS = 3600
@@ -435,13 +436,14 @@ class ChatAvatarHistoryObservation:
     reason: str | None
     observation_started_at: float
     observation_completed_at: float
+    messages: tuple[ReceivedMessage, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.reference, (ChannelReference, GroupReference)):
             raise TypeError("chat avatar reference is invalid")
         _validate_photos(self.photos)
         _validate_count(self.reported_count)
-        _validate_bounded_status(self.status, self.reason)
+        _validate_bounded_status(self.status, self.reason, partial_reasons=("bounded_page", "inconsistent_peer"))
         _validate_observation_boundary(self.observation_started_at, self.observation_completed_at)
 
 
@@ -452,6 +454,17 @@ class ChatEntityProfileFacts(TypedDict, total=False):
     restrictions: list[dict[str, str | None]]
     has_topics: bool
     migrated_to: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class SuppliedDialogFacts:
+    """Supported dialog facts already supplied by a full-chat response."""
+
+    read_inbox_max_id: int | None = None
+    read_outbox_max_id: int | None = None
+    unread_count: int | None = None
+    mute_until: int | None = None
+    sidecar_identities: tuple[DialogIdentityObservation, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -476,6 +489,7 @@ class ChannelProfileObservation:
     identity_patch: Mapping[str, object] | None = None
     dialog_identity_observation: DialogIdentityObservation | None = None
     chat_entity_fields: ChatEntityProfileFacts | None = None
+    supplied_dialog_facts: SuppliedDialogFacts | None = None
 
     def __post_init__(self) -> None:
         _validate_nonzero_id(self.channel_id, field_name="channel_id")
@@ -532,6 +546,7 @@ class GroupProfileObservation:
     identity_patch: Mapping[str, object] | None = None
     dialog_identity_observation: DialogIdentityObservation | None = None
     chat_entity_fields: ChatEntityProfileFacts | None = None
+    supplied_dialog_facts: SuppliedDialogFacts | None = None
     participants_count: int | None = None
 
     def __post_init__(self) -> None:
@@ -566,13 +581,15 @@ def _validate_photos(value: object) -> None:
         raise ValueError("photos must be deduplicated")
 
 
-def _validate_bounded_status(status: object, reason: str | None) -> None:
+def _validate_bounded_status(
+    status: object, reason: str | None, *, partial_reasons: tuple[str, ...] = ("bounded_page",)
+) -> None:
     if status not in {ProjectionStatus.USABLE, ProjectionStatus.PARTIAL, ProjectionStatus.UNAVAILABLE}:
         raise ValueError("bounded observation status is invalid")
     if status is ProjectionStatus.USABLE and reason is not None:
         raise ValueError("usable bounded observation cannot have a reason")
-    if status is ProjectionStatus.PARTIAL and reason != "bounded_page":
-        raise ValueError("partial bounded observation requires bounded_page")
+    if status is ProjectionStatus.PARTIAL and reason not in partial_reasons:
+        raise ValueError("partial bounded observation has an invalid reason")
     if status is ProjectionStatus.UNAVAILABLE and not reason:
         raise ValueError("unavailable bounded observation requires a reason")
 
