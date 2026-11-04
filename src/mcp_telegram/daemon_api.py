@@ -76,7 +76,7 @@ from .dialog_directory_coverage import (
     classify_directory_coverage,
     read_dialog_directory_coverage,
 )
-from .dialog_identity import read_automatic_group_metadata, read_local_dialog_identities
+from .dialog_identity import read_automatic_group_metadata, read_dialog_identities, read_local_dialog_identities
 from .dialog_selector import SELF_DIALOG_ALIASES, DialogSelector, DialogSelectorError, required_dialog_selector
 from .drafts.read_service import read_draft_request
 from .entity_profile.ports import (
@@ -127,6 +127,7 @@ from .sync_read_model import (
     build_sync_read_model,
     decode_dm_deletion_checkpoint,
     dm_deletion_reconciliation_is_blocked,
+    history_sync_state,
 )
 from .sync_transactions import write_transaction
 from .telegram_demand import AcquisitionKind, demand_context
@@ -793,6 +794,33 @@ def _contact_note_error_action(error: object, action: object) -> str:
     return "Read the contact note and check the same operation key."
 
 
+def _project_message_delivery(snapshot: Mapping[str, object]) -> dict[str, object]:
+    result: dict[str, object] = {"observed_at_ms": snapshot["observed_at_ms"]}
+    for scope in ("account", "channel"):
+        if scope not in snapshot:
+            continue
+        stream = snapshot[scope]
+        if not isinstance(stream, Mapping):
+            stream = {}
+        gap_state = stream.get("gap_state")
+        gap = {"observed": "gap_observed", "none_observed": "no_gap_observed"}.get(
+            gap_state if isinstance(gap_state, str) else "unknown", "unknown"
+        )
+        catch_up = {
+            "scope": scope,
+            "state": stream.get("catch_up_state", "unknown"),
+            "reason": stream.get("reason", "owner_unavailable"),
+        }
+        for field in ("overdue_seconds", "eligible_in_seconds"):
+            if field in stream:
+                catch_up[field] = stream[field]
+        result[scope] = {"continuity": gap, "catch_up": catch_up}
+    for field in ("intake_queue_depth", "pending_channels"):
+        if field in snapshot:
+            result[field] = snapshot[field]
+    return result
+
+
 class DaemonAPIServer:
     """Unix socket server that dispatches JSON requests to Telegram/sync.db.
 
@@ -817,6 +845,7 @@ class DaemonAPIServer:
         policy: DaemonApiPolicy,
         health_status: Callable[[], DaemonHealthStatus] = _healthy_daemon_status,
         account_safety_status: Callable[[], dict[str, object] | None] | None = None,
+        message_delivery_snapshot: Callable[[int | None], dict[str, object]] | None = None,
         account_recovery: Callable[[str, bool], Awaitable[None]] | None = None,
         account_logout: Callable[[], Awaitable[None]] | None = None,
         user_avatar_history_port: UserAvatarHistoryPort,
@@ -852,6 +881,7 @@ class DaemonAPIServer:
         self._policy = policy
         self._health_status = health_status
         self._account_safety_status = account_safety_status
+        self._message_delivery_snapshot = message_delivery_snapshot
         self._account_recovery = account_recovery
         self._account_logout = account_logout
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
@@ -2074,7 +2104,7 @@ class DaemonAPIServer:
             "data": {
                 "dialog_id": dialog_id,
                 "enabled": outcome.enabled,
-                "coverage_status": outcome.coverage_status,
+                "history_sync_state": history_sync_state(outcome.coverage_status),
                 "action": outcome.action,
                 "blocked_reason": outcome.blocked_reason,
                 "full_history_will_be_fetched": outcome.full_history_will_be_fetched,
@@ -2213,6 +2243,7 @@ class DaemonAPIServer:
 
         data: dict = {
             "dialog_id": dialog_id,
+            "message_delivery": self._message_delivery_for_dialog(dialog_id, observed_now),
             "latest_retained_message": None if latest is None else {"message_id": latest[0], "sent_at": latest[1]},
             "delta_refresh_requested_at": delta_refresh_requested_at,
             "sync_progress": sync_progress,
@@ -2235,6 +2266,24 @@ class DaemonAPIServer:
         if sync_read_model.sync_status is SyncStatus.ACCESS_LOST and total_messages is None:
             data["archived_message_count"] = message_count
         return {"ok": True, "data": data}
+
+    def _message_delivery_for_dialog(self, dialog_id: int, observed_now: int) -> dict[str, object]:
+        identity = read_dialog_identities(self._conn, (dialog_id,)).get(dialog_id)
+        channel_id = None
+        if identity is not None and identity.dialog_type in {
+            DialogType.CHANNEL,
+            DialogType.SUPERGROUP,
+            DialogType.FORUM,
+        }:
+            raw_id, peer_type = telethon_utils.resolve_id(dialog_id)
+            if peer_type.__name__ == "PeerChannel":
+                channel_id = raw_id
+        snapshot = (
+            self._message_delivery_snapshot(channel_id)
+            if self._message_delivery_snapshot is not None
+            else {"observed_at_ms": observed_now * 1000, "account": {}}
+        )
+        return _project_message_delivery(snapshot)
 
     def _automatic_group_status(
         self, dialog_id: int, enabled: bool | None, coverage: str | None, now: int

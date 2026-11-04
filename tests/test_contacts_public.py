@@ -206,3 +206,61 @@ async def test_list_contacts_reads_canonical_non_dialog_contact_without_rpc(  # 
     assert db.execute("SELECT 1 FROM dialogs WHERE dialog_id=55").fetchone() is None
     client.assert_not_called()
     db.close()
+
+
+@pytest.mark.parametrize("tool", ["manage_contact", "manage_contact_note"])
+@pytest.mark.parametrize("outcome", ["unknown", "acknowledged"])
+async def test_inconclusive_result_gives_outcome_specific_guidance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool: str, outcome: str
+) -> None:
+    api = make_server()
+    api.self_id = 42
+    await api._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
+    owner = MagicMock()
+    owner.execute = AsyncMock(
+        return_value={
+            "ok": True,
+            "account_id": 42,
+            "entity_id": 43,
+            "operation_key": "op",
+            "outcome": outcome,
+            "verification": "inconclusive",
+        }
+        if tool == "manage_contact"
+        else {
+            "ok": True,
+            "account_id": 42,
+            "operation_key": "op",
+            "outcome": outcome,
+            "verification": "inconclusive",
+        }
+    )
+    if tool == "manage_contact":
+        api.bind_contact_commands(cast(DraftCommands, owner))
+        args = {"entity_id": 43, "action": "delete", "expected_version": "a" * 64, "operation_key": "op"}
+    else:
+        api.bind_contact_note_commands(cast(DraftCommands, owner))
+        args = {"dialog_id": 43, "action": "clear", "expected_version": "a" * 64, "operation_key": "op"}
+    socket_path = tmp_path / "inconclusive.sock"
+
+    @asynccontextmanager
+    async def connection() -> AsyncIterator[DaemonConnection]:
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        try:
+            yield DaemonConnection(reader, writer)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    monkeypatch.setattr(_base, "daemon_connection", connection)
+    monkeypatch.setattr(mcp_server, "daemon_connection", connection)
+    async with await asyncio.start_unix_server(api.handle_client, path=socket_path):
+        result = await mcp_server.call_tool(tool, args)
+    assert result.is_error is not True
+    content = cast(dict[str, object], result.structured_content)
+    hint = cast(str, content["required_action"])
+    assert ("operation key and request body" if outcome == "unknown" else "acknowledged") in hint
+    assert ("do not repeat" if outcome == "unknown" else "do not retry") in hint
+    schema = mcp_server.tool_by_name[tool].output_schema
+    assert schema is not None
+    validate(content, schema)

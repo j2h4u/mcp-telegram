@@ -62,20 +62,22 @@ def _patch_daemon(conn: _StatsConn):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("sync_status", "coverage", "horizon"),
+    ("history_sync_state", "coverage", "horizon"),
     [
         ("not_synced", "unknown", None),
-        ("own_only", "partial", None),
-        ("synced", "partial", None),
-        ("synced", "complete_as_of", 1),
-        ("access_lost", "partial", None),
+        ("own_messages_only", "partial", None),
+        ("complete_as_of_last_sync", "partial", None),
+        ("complete_as_of_last_sync", "complete_as_of", 1),
+        ("access_lost_archive", "partial", None),
     ],
 )
-async def test_get_dialog_stats_structures_sections(sync_status: str, coverage: str, horizon: int | None) -> None:
+async def test_get_dialog_stats_structures_sections(
+    history_sync_state: str, coverage: str, horizon: int | None
+) -> None:
     """GetDialogStats with populated data returns four structured sections."""
     data = {
         "dialog_id": 1,
-        "sync_status": sync_status,
+        "history_sync_state": history_sync_state,
         "coverage": coverage,
         "observation_horizon_at": horizon,
         "top_reactions": [
@@ -104,7 +106,7 @@ async def test_get_dialog_stats_structures_sections(sync_status: str, coverage: 
     structured = cast(dict[str, object], content.structured_content)
     assert structured["dialog"] == "Chat Foo"
     assert structured["dialog_id"] == 1
-    assert structured["sync_status"] == sync_status
+    assert structured["history_sync_state"] == history_sync_state
     assert structured["coverage"] == coverage
     assert structured["observation_horizon_at"] == ("1970-01-01T00:00:01+00:00" if horizon is not None else None)
     assert structured["top_n"] == 5
@@ -172,7 +174,7 @@ async def test_get_dialog_stats_empty_sections() -> None:
     assert structured["top_forwards"] == []
     assert structured["count"] == 0
     assert structured["coverage"] == "unknown"
-    assert structured["sync_status"] == "not_synced"
+    assert structured["history_sync_state"] == "not_synced"
     assert structured["observation_horizon_at"] is None
     schema = TOOL_REGISTRY["get_dialog_stats"].output_schema
     assert schema is not None
@@ -188,7 +190,7 @@ async def test_get_dialog_stats_mcp_wire_horizon_and_smoke_fixture(
             "ok": True,
             "data": {
                 "dialog_id": 987654321,
-                "sync_status": "synced" if horizon is not None else "not_synced",
+                "history_sync_state": "complete_as_of_last_sync" if horizon is not None else "not_synced",
                 "coverage": "complete_as_of" if horizon is not None else "unknown",
                 "observation_horizon_at": horizon,
             },

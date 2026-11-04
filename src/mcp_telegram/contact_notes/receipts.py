@@ -264,7 +264,8 @@ def refine_unknown_for_observation(
     if eligible is None or not guard():
         return 0
     return conn.execute(
-        "UPDATE contact_note_operation_receipts SET verification='observed_after_unknown',verification_order=? "
+        "UPDATE contact_note_operation_receipts SET verification='observed_after_unknown',verification_order=?, "
+        "result_json=json_remove(result_json,'$.verification_reason') "
         "WHERE account_id=? AND entity_id=? AND outcome='unknown' AND verification!='observed_after_unknown' "
         "AND terminal_observation_order IS NOT NULL AND terminal_observation_order<? AND EXISTS ("
         "SELECT 1 FROM entity_profile_semantic_snapshots AS profile "
@@ -294,7 +295,7 @@ def refine_acknowledged_for_observation(
     rows = conn.execute(
         "SELECT operation_key,action,semantic_fingerprint FROM contact_note_operation_receipts "
         "WHERE account_id=? AND entity_id=? AND outcome='acknowledged' "
-        "AND verification IN ('pending','unavailable') AND terminal_observation_order<?",
+        "AND verification IN ('pending','unavailable','inconclusive') AND terminal_observation_order<?",
         (account_id, entity_id, observation_order),
     ).fetchall()
     if not rows or not guard():
@@ -325,9 +326,10 @@ def _publish_acknowledged_refinements(  # noqa: PLR0913 - explicit recorded evid
     for key, action, expected in rows:
         matches = fingerprint == expected and ((action == "clear") == (state == "absent"))
         changed += conn.execute(
-            "UPDATE contact_note_operation_receipts SET verification=?,verification_order=? "
+            "UPDATE contact_note_operation_receipts SET verification=?,verification_order=?, "
+            "result_json=json_remove(result_json,'$.verification_reason') "
             "WHERE account_id=? AND operation_key=? AND outcome='acknowledged' "
-            "AND verification IN ('pending','unavailable')",
+            "AND verification IN ('pending','unavailable','inconclusive')",
             ("verified" if matches else "mismatch", order, account_id, key),
         ).rowcount
     return changed

@@ -78,20 +78,17 @@ def _format_archived_warning(data: dict) -> str:
     """Build the ⚠ archived-dialog warning string from a daemon response dict.
 
     Returns an empty string when dialog_access != "archived".
-    Uses last_synced_at (preferred) or last_event_at for the archive date —
-    never access_lost_at, which records when access was lost, not when sync ran.
+    Uses the recorded history boundary rather than an unrelated event time.
     """
     if data.get("dialog_access") != "archived":
         return ""
-    last_synced_at = data.get("last_synced_at")
-    last_event_at = data.get("last_event_at")
-    sync_ts = last_synced_at or last_event_at
+    sync_ts = data.get("observation_horizon_at")
     date_str = datetime.fromtimestamp(sync_ts, tz=UTC).strftime("%Y-%m-%d") if sync_ts else "unknown date"
     warning = f"\u26a0 No current access to this dialog. Messages are from the local archive (last sync: {date_str}).\n"
     sync_coverage_pct = data.get("sync_coverage_pct")
     archived_message_count = data.get("archived_message_count")
     if sync_coverage_pct is not None and sync_coverage_pct < _ARCHIVE_COVERAGE_COMPLETE_PERCENT:
-        warning += f"Archive coverage: {sync_coverage_pct}% of dialog history.\n"
+        warning += f"Approximate local-to-Telegram count: {sync_coverage_pct}%.\n"
     elif sync_coverage_pct is None:
         if archived_message_count is not None:
             warning += f"Archive coverage: unknown ({archived_message_count} messages archived locally).\n"
@@ -241,10 +238,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                     "description": "Sent-history interval coverage as of its observation horizon; independent of page, attribution, drafts and scheduled messages.",
                 },
                 "observation_horizon_at": {"type": ["integer", "null"]},
-                "sync_status": {
-                    "type": ["string", "null"],
-                    "description": "Persisted history sync state, not uninterrupted delivery.",
-                },
+                "history_sync_state": {"type": "string"},
                 "topic_attribution": {
                     "type": "object",
                     "properties": {
@@ -537,7 +531,7 @@ def _list_messages_coverage(data: dict) -> dict[str, object]:
     coverage: dict[str, object] = {
         "kind": "local_history",
         "state": raw_coverage if raw_coverage in {"complete_as_of", "partial", "unknown"} else "unknown",
-        "fragment_coverage": data.get("sync_status") == "fragment",
+        "fragment_coverage": data.get("history_sync_state") == "fragment_only",
         "dialog_access": dialog_access,
         "access_lost_at": data.get("access_lost_at"),
         "last_synced_at": data.get("last_synced_at"),
@@ -546,8 +540,10 @@ def _list_messages_coverage(data: dict) -> dict[str, object]:
         "sync_coverage_pct": data.get("sync_coverage_pct"),
         "archived_message_count": data.get("archived_message_count"),
         "observation_horizon_at": data.get("observation_horizon_at"),
-        "sync_status": data.get("sync_status"),
     }
+    history_sync_state = data.get("history_sync_state")
+    if isinstance(history_sync_state, str):
+        coverage["history_sync_state"] = history_sync_state
     selection_state = data.get("selection_state")
     if selection_state in {"present", "known_empty", "unknown"}:
         coverage["selection_state"] = selection_state

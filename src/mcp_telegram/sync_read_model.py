@@ -463,14 +463,12 @@ class SyncReadModel:
     def to_wire(self) -> dict[str, object]:
         """Serialize the complete canonical daemon-to-delivery contract."""
         return {
-            "sync_status": self.sync_status.value,
             "enrollment_enabled": self.enrollment_enabled,
             "last_synced_at": self.last_synced_at,
             "last_event_at": self.last_event_at,
             "last_delta_checked_at": self.last_delta_checked_at,
             "saved_message_count": self.saved_message_count,
             "total_messages": self.total_messages,
-            "synced": self.synced,
             "is_syncing": self.is_syncing,
             "realtime_history": self.realtime_history.value,
             "history_scope": self.history_scope.value,
@@ -504,6 +502,16 @@ def _status(value: str | None) -> SyncStatus:
         return SyncStatus(value)
     except ValueError as exc:
         raise SyncReadModelContractError(f"unsupported persisted sync status: {value!r}") from exc
+
+
+def history_sync_state(value: str | None) -> str:
+    """Project the persisted history job state into the public history vocabulary."""
+    if value in {"pending", "failed"}:
+        return value
+    try:
+        return _STATUS_PROFILES[_status(value)].history_sync_state.value
+    except SyncReadModelContractError:
+        return "unknown"
 
 
 def _strict_optional_int(name: str, value: object) -> int | None:
@@ -704,20 +712,24 @@ def _validate_decoded(model: SyncReadModel) -> None:
 
 def decode_sync_read_model(data: Mapping[str, object]) -> SyncReadModel:
     """Strictly decode canonical daemon facts without fabricating defaults."""
+    if "sync_status" in data or "synced" in data:
+        raise SyncReadModelContractError("obsolete sync status fields are not supported")
+    history_state = _enum_field(data, "history_sync_state", HistorySyncState)
+    status = next(status for status, profile in _STATUS_PROFILES.items() if profile.history_sync_state is history_state)
     model = SyncReadModel(
-        sync_status=_enum_field(data, "sync_status", SyncStatus),
+        sync_status=status,
         enrollment_enabled=_optional_bool_field(data, "enrollment_enabled"),
         last_synced_at=_optional_int_field(data, "last_synced_at"),
         last_event_at=_optional_int_field(data, "last_event_at"),
         last_delta_checked_at=_optional_int_field(data, "last_delta_checked_at"),
         saved_message_count=_int_field(data, "saved_message_count"),
         total_messages=_optional_int_field(data, "total_messages"),
-        synced=_bool_field(data, "synced"),
+        synced=status is SyncStatus.SYNCED,
         is_syncing=_bool_field(data, "is_syncing"),
         realtime_history=_enum_field(data, "realtime_history", RealtimeHistory),
         history_scope=_enum_field(data, "history_scope", HistoryScope),
         history_depth_state=_enum_field(data, "history_depth_state", HistoryDepthState),
-        history_sync_state=_enum_field(data, "history_sync_state", HistorySyncState),
+        history_sync_state=history_state,
         history_complete_at=_optional_int_field(data, "history_complete_at"),
         sync_coverage_pct=_optional_int_field(data, "sync_coverage_pct"),
         coverage_state=_enum_field(data, "coverage_state", CoverageState),

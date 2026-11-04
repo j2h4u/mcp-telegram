@@ -356,7 +356,8 @@ class ContactCommandOwner:
             await self._client(request)
         receipt = self._receipt(command, scope)
         if receipt is None or receipt["outcome"] != "acknowledged":
-            await self._offer_reconciliation(scope, command.entity)
+            if receipt is None or receipt["verification"] in {"pending", "unavailable"}:
+                await self._offer_reconciliation(scope, command.entity)
             return receipt or {"outcome": "unknown", "verification": "pending", "current_applicability": "unknown"}
         with self._authority.watch(command.entity) as postflight_watch:
             return await self._postflight(scope, command, postflight_watch, request, binding, budget)
@@ -392,8 +393,7 @@ class ContactCommandOwner:
             ValueError,
         ) as error:
             logger.warning("contact_readback_failed error_type=%s", type(error).__name__)
-            await self._offer_reconciliation(scope, command.entity)
-            return {"outcome": "acknowledged", "verification": "unavailable", "current_applicability": "unknown"}
+            return await self._unavailable_readback(scope, command)
         current = read_contact_command_state(self._reader, scope.account_id, command.entity)
         fresh = (
             observed.accepted
@@ -407,8 +407,15 @@ class ContactCommandOwner:
             candidate = "verified" if self._matches_readback(command, request, current) else "mismatch"
             verification = await self._publish_verification(scope, command, watch, binding, order, candidate)
         if verification == "unavailable":
-            await self._offer_reconciliation(scope, command.entity)
+            return await self._unavailable_readback(scope, command)
         return {"outcome": "acknowledged", "verification": verification, "current_applicability": "unknown"}
+
+    async def _unavailable_readback(self, scope: TelegramAuthScope, command: _Command) -> dict[str, object]:
+        prior = self._receipt(command, scope)
+        if prior is not None and prior["verification"] in {"verified", "mismatch", "inconclusive"}:
+            return prior
+        await self._offer_reconciliation(scope, command.entity)
+        return {"outcome": "acknowledged", "verification": "unavailable", "current_applicability": "unknown"}
 
     @staticmethod
     def _matches_readback(command: _Command, request: TLRequest, state: ContactCommandState) -> bool:
@@ -449,6 +456,6 @@ class ContactCommandOwner:
         if published:
             return candidate
         prior = self._receipt(command, scope)
-        if prior is not None and prior["verification"] in {"verified", "mismatch"}:
+        if prior is not None and prior["verification"] in {"verified", "mismatch", "inconclusive"}:
             return cast(str, prior["verification"])
         return "unavailable"

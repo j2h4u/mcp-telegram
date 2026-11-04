@@ -56,6 +56,9 @@ async def test_shutdown_preserves_finalizer_commit_loss_boundary_and_final_marke
         def set_rpc_admission_observer(self, _observer: object) -> None:
             stages.append("observer_detached")
 
+        def set_message_delivery_observer(self, _observer: object) -> None:
+            pass
+
         def set_rpc_request_observer(self, _observer: object) -> None:
             pass
 

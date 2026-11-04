@@ -87,6 +87,7 @@ from .entity_profile.repository import (
     EntityProfileRepository,
     EntityRefreshCursor,
     EntitySectionCommit,
+    NativeVerificationGuardChangedError,
     pair_readiness_latency_ms,
 )
 from .flood import TelegramRpcThrottled, _raise_if_latched
@@ -938,7 +939,10 @@ class DaemonEntityInfoService:
             and scope is not None
             and stored.profile_owner_account_id == scope.account_id
             and await self._write_profiles(
-                lambda profiles: profiles.complete_unchanged_section(cursor, now=now), track_rejection=False
+                lambda profiles: profiles.complete_unchanged_section(
+                    cursor, now=now, verification_owner=scope.account_id
+                ),
+                track_rejection=False,
             )
         )
 
@@ -958,16 +962,27 @@ class DaemonEntityInfoService:
         with track_contact_note(cursor.entity_id), track_contact(cursor.entity_id):
             guard = self._capture_note_publication_guard(cursor.entity_id, scope)
             if guard is None:
-                return DurableRefreshSliceResult(cursor.entity_id)
+                return DurableRefreshSliceResult(cursor.entity_id, retryable_failure=True)
             marker = contact_intake_marker(cursor.entity_id)
             if marker is None:
-                return DurableRefreshSliceResult(cursor.entity_id)
+                return DurableRefreshSliceResult(cursor.entity_id, retryable_failure=True)
             token = _NOTE_REFINEMENT_GUARD.set(guard)
             contact_token = _CONTACT_REFINEMENT_GUARD.set(
                 lambda: self._note_publication_current(guard) and contact_intake_marker(cursor.entity_id) == marker
             )
             try:
-                return await self._run_known_entity_refresh_inner(cursor, entity_type, pair_mode=pair_mode, now=now)
+                contact_guard = _CONTACT_REFINEMENT_GUARD.get()
+                assert scope is not None and contact_guard is not None
+                pending = await self._write_profiles(
+                    lambda profiles: profiles.settle_native_verification(cursor, scope.account_id, contact_guard),
+                    track_rejection=False,
+                )
+                if pending is None:
+                    return DurableRefreshSliceResult(cursor.entity_id, retryable_failure=True)
+                try:
+                    return await self._run_known_entity_refresh_inner(cursor, entity_type, pair_mode=pair_mode, now=now)
+                except NativeVerificationGuardChangedError:
+                    return DurableRefreshSliceResult(cursor.entity_id, retryable_failure=True)
             finally:
                 _CONTACT_REFINEMENT_GUARD.reset(contact_token)
                 _NOTE_REFINEMENT_GUARD.reset(token)
@@ -984,8 +999,8 @@ class DaemonEntityInfoService:
         return (
             self._deps.conn.execute(
                 "SELECT 1 FROM contact_note_operation_receipts WHERE account_id=? AND entity_id=? "
-                "AND ((outcome='unknown' AND verification!='observed_after_unknown') "
-                "OR (outcome='acknowledged' AND verification IN ('pending','unavailable'))) LIMIT 1",
+                "AND outcome IN ('unknown','acknowledged') "
+                "AND verification IN ('pending','unavailable','inconclusive') LIMIT 1",
                 (scope.account_id, cursor.entity_id),
             ).fetchone()
             is not None
@@ -1003,8 +1018,8 @@ class DaemonEntityInfoService:
         return (
             self._deps.conn.execute(
                 "SELECT 1 FROM contact_operation_receipts WHERE account_id=? AND entity_id=? "
-                "AND ((outcome='unknown' AND verification!='observed_after_unknown') "
-                "OR (outcome='acknowledged' AND verification IN ('pending','unavailable'))) LIMIT 1",
+                "AND outcome IN ('unknown','acknowledged') "
+                "AND verification IN ('pending','unavailable','inconclusive') LIMIT 1",
                 (scope.account_id, cursor.entity_id),
             ).fetchone()
             is not None
@@ -1140,9 +1155,17 @@ class DaemonEntityInfoService:
         *,
         now: int,
     ) -> DurableRefreshSliceResult:
-        identity = self._full_user_pair_identity(self._target_kind(entity_type))
-        if identity is not None and await self._write_profiles(
-            lambda profiles: profiles.reuse_full_user_pair(cursor, identity, now=now), track_rejection=False
+        scope = self._capture_pair_scope()
+        identity = self._full_user_pair_identity(self._target_kind(entity_type), scope=scope)
+        if (
+            identity is not None
+            and scope is not None
+            and await self._write_profiles(
+                lambda profiles: profiles.reuse_full_user_pair(
+                    cursor, identity, now=now, verification_owner=scope.account_id
+                ),
+                track_rejection=False,
+            )
         ):
             self._observe_profile_pair(
                 mode="enabled",

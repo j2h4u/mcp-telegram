@@ -14,6 +14,7 @@ from enum import StrEnum
 from typing import Protocol, TypedDict, cast
 
 from .flood import FloodWaitObservation
+from .message_delivery_observations import MessageDeliveryObservations
 from .telegram_demand import AcquisitionKind, DemandObservationHook
 from .telegram_rpc_consumers import DemandKind, telegram_rpc_consumer
 from .telegram_rpc_scheduler import (
@@ -341,6 +342,7 @@ class RpcAdmissionObservationAggregator:
         if summary_interval_seconds <= 0:
             raise ValueError("summary_interval_seconds must be positive")
         self._recorder = recorder
+        self.delivery = MessageDeliveryObservations(recorder, self.flush_if_due)
         self._method_names = method_names
         self._summary_interval_seconds = summary_interval_seconds
         self._clock = clock
@@ -823,6 +825,10 @@ class RpcAdmissionObservationAggregator:
 
     def _flush_locked(self, *, now: float | None) -> None:
         """Persist one snapshot while serialising source/class summaries."""
+        try:
+            self.delivery.flush()
+        except Exception:  # noqa: BLE001 - diagnostics cannot interrupt existing flushes
+            pass
         flush_at = self._clock() if now is None else now
         with self._state_lock:
             aggregates, self._aggregates = self._aggregates, {}

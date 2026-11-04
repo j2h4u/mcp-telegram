@@ -436,7 +436,7 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
                 "source": "sync_db",
                 "next_navigation": "history-token",
                 "coverage": "partial",
-                "sync_status": "fragment",
+                "history_sync_state": "fragment_only",
                 "observation_horizon_at": None,
                 "dialog_access": "archived",
                 "last_synced_at": 1_699_990_000,

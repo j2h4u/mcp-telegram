@@ -201,7 +201,8 @@ def refine_unknown_for_observation(
     if state["observation_order"] != observation_order or not guard():
         return 0
     return conn.execute(
-        "UPDATE contact_operation_receipts SET verification='observed_after_unknown',verification_order=? "
+        "UPDATE contact_operation_receipts SET verification='observed_after_unknown',verification_order=?, "
+        "result_json=json_remove(result_json,'$.verification_reason') "
         "WHERE account_id=? AND entity_id=? AND outcome='unknown' AND verification!='observed_after_unknown' "
         "AND terminal_observation_order IS NOT NULL AND terminal_observation_order<?",
         (observation_order, account_id, entity_id, observation_order),
@@ -219,9 +220,10 @@ def record_verification(
             return False
         return (
             conn.execute(
-                f"UPDATE contact_operation_receipts SET verification=?,verification_order=? WHERE {_WHERE} "
+                f"UPDATE contact_operation_receipts SET verification=?,verification_order=?, "
+                f"result_json=json_remove(result_json,'$.verification_reason') WHERE {_WHERE} "
                 "AND outcome='acknowledged' AND terminal_observation_order IS NOT NULL "
-                "AND terminal_observation_order<? AND verification IN ('pending','unavailable')",
+                "AND terminal_observation_order<? AND verification IN ('pending','unavailable','inconclusive')",
                 (result, order, *_values(binding), order),
             ).rowcount
             == 1
@@ -242,7 +244,7 @@ def refine_acknowledged_for_observation(
     rows = conn.execute(
         "SELECT operation_key,action,result_json FROM contact_operation_receipts "
         "WHERE account_id=? AND entity_id=? AND outcome='acknowledged' "
-        "AND verification IN ('pending','unavailable') AND terminal_observation_order<?",
+        "AND verification IN ('pending','unavailable','inconclusive') AND terminal_observation_order<?",
         (account_id, entity_id, observation_order),
     ).fetchall()
     count = 0
@@ -251,9 +253,10 @@ def refine_acknowledged_for_observation(
         if matches is None:
             continue
         count += conn.execute(
-            "UPDATE contact_operation_receipts SET verification=?,verification_order=? "
+            "UPDATE contact_operation_receipts SET verification=?,verification_order=?, "
+            "result_json=json_remove(result_json,'$.verification_reason') "
             "WHERE account_id=? AND operation_key=? AND outcome='acknowledged' "
-            "AND verification IN ('pending','unavailable')",
+            "AND verification IN ('pending','unavailable','inconclusive')",
             ("verified" if matches else "mismatch", observation_order, account_id, key),
         ).rowcount
     return count
@@ -265,6 +268,8 @@ def _observation_matches(state: object, action: str, entity_id: int, result_json
     state = cast(ContactCommandState, state)
     if action == "delete":
         return state["membership"] is False
+    if state["membership"] is False:
+        return False
     first, last = state["first_name"], state["last_name"]
     if state["membership"] is not True or first is None or last is None:
         return None

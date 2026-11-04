@@ -3089,8 +3089,9 @@ async def test_list_messages_tool_archived_warning_with_coverage(monkeypatch: py
     message = cast(str, warning["message"])
     assert warning["kind"] == "archived_dialog"
     assert "archive" in message.lower()
-    assert "2023-11-14" in message
-    assert "80%" in message
+    assert "unknown date" in message
+    assert "2023-11-14" not in message
+    assert "Approximate local-to-Telegram count: 80%" in message
 
 
 @pytest.mark.asyncio
@@ -3123,10 +3124,10 @@ async def test_list_messages_tool_archived_warning_unknown_coverage(monkeypatch:
 
 
 @pytest.mark.asyncio
-async def test_list_messages_tool_uses_last_synced_at_not_access_lost_at(
+async def test_list_messages_tool_does_not_fabricate_history_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Verify tool uses last_synced_at for the archive date, NOT access_lost_at."""
+    """Neither event nor access loss supplies an absent history boundary."""
     mock_conn = _make_mock_conn(
         {
             "ok": True,
@@ -3147,9 +3148,9 @@ async def test_list_messages_tool_uses_last_synced_at_not_access_lost_at(
     result = _call_tool_result(await server.call_tool("list_messages", {"exact_dialog_id": 123}))
     payload = cast(dict[str, object], result.structured_content)
     warning = cast(dict[str, object], cast(list[object], payload["warnings"])[0])
-    # Must show 2023-11-14 (last_synced_at), NOT 2024-01-01 (access_lost_at)
     message = cast(str, warning["message"])
-    assert "2023-11-14" in message
+    assert "unknown date" in message
+    assert "2023-11-14" not in message
     assert "2024-01-01" not in message
 
 

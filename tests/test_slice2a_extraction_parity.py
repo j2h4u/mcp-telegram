@@ -129,7 +129,7 @@ def test_build_access_metadata_status_without_evidence_does_not_claim_live_or_co
     meta = _build_access_metadata(conn, dialog_id=100, status="synced")
     assert meta == {
         "dialog_access": "unknown",
-        "sync_status": "synced",
+        "history_sync_state": "complete_as_of_last_sync",
         "coverage": "partial",
         "observation_horizon_at": None,
         "last_synced_at": None,
@@ -152,7 +152,7 @@ def test_build_access_metadata_completed_observation_is_as_of_not_live(
 
     assert meta == {
         "dialog_access": "unknown",
-        "sync_status": "synced",
+        "history_sync_state": "complete_as_of_last_sync",
         "coverage": "complete_as_of",
         "observation_horizon_at": 1700000100,
         "last_synced_at": 1700000100,

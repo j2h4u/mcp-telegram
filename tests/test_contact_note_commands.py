@@ -510,6 +510,62 @@ async def test_acknowledged_write_needs_fresh_canonical_readback(  # noqa: PLR09
         ).fetchone(),
     )
     assert row is not None and tuple(row) == ("verified", 777)
+
+    def publish_inconclusive(conn: sqlite3.Connection) -> None:
+        with write_transaction(conn):
+            conn.execute(
+                "UPDATE contact_note_operation_receipts SET verification='inconclusive', "
+                "result_json=json_set(result_json,'$.verification_reason','insufficient_evidence') "
+                "WHERE operation_key='op8' AND verification='pending'"
+            )
+
+    async def race_inconclusive[T](callback: Callable[[sqlite3.Connection], T]) -> T:
+        if callback.__name__ == "update":
+            await original_run(publish_inconclusive)
+        return await original_run(callback)
+
+    fresh_order: list[int] = []
+    reads = 0
+
+    async def acquire_after_terminal(entity: int) -> CommandProfileAcquisition:
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return await acquire(entity)
+
+        def publish(conn: sqlite3.Connection) -> int:
+            from mcp_telegram.observation_order import allocate_observation_order
+
+            with write_transaction(conn):
+                order = allocate_observation_order(conn)
+                provenance = {"fields": {"full_user.note": {"order": order}, "user.contact": {"order": order}}}
+                conn.execute(
+                    "UPDATE entity_profile_semantic_snapshots SET provenance_json=? WHERE owner_account_id=1 AND entity_id=2",
+                    (json.dumps(provenance),),
+                )
+                return order
+
+        order = await original_run(publish)
+        fresh_order.append(order)
+        return CommandProfileAcquisition(True, True, order)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(writer, "run", race_inconclusive)
+        patch.setattr(owner, "_acquire_profile", acquire_after_terminal)
+        result = await owner.execute(
+            {
+                "dialog_id": 2,
+                "action": "update",
+                "expected_version": updated_version,
+                "operation_key": "op8",
+                "text": "changed",
+            }
+        )
+    assert result == {"outcome": "acknowledged", "verification": "mismatch", "verification_order": fresh_order[0]}
+    assert reader.execute(
+        "SELECT verification,json_extract(result_json,'$.verification_reason') "
+        "FROM contact_note_operation_receipts WHERE operation_key='op8'"
+    ).fetchone() == ("mismatch", None)
     reader.close()
     await writer.aclose()
 

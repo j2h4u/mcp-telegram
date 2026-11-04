@@ -65,6 +65,17 @@ def _history_summary(payload: Mapping[str, object]) -> str:
     }.get(state, "History coverage is unknown.")
 
 
+def _delivery_summary(payload: Mapping[str, object]) -> str:
+    delivery = payload.get("message_delivery")
+    account = delivery.get("account") if isinstance(delivery, Mapping) else None
+    continuity = account.get("continuity") if isinstance(account, Mapping) else None
+    continuity_key = continuity if isinstance(continuity, str) else "unknown"
+    return {
+        "gap_observed": "A protocol gap was observed for the account.",
+        "no_gap_observed": "No account protocol gap was observed at the reported instant; this is not a completeness guarantee.",
+    }.get(continuity_key, "Account protocol continuity is unknown.")
+
+
 def _status_summary(payload: Mapping[str, object]) -> list[str]:
     count = payload.get("saved_message_count")
     if isinstance(count, int) and not isinstance(count, bool) and count > 0:
@@ -74,9 +85,7 @@ def _status_summary(payload: Mapping[str, object]) -> list[str]:
     else:
         parts = ["The local status read completed; the retained message count is unknown."]
     parts.append(_history_summary(payload))
-    parts.append(
-        "The message retention policy does not assure delivery; current lag and missing-message continuity are unverified."
-    )
+    parts.append(_delivery_summary(payload))
     if payload.get("last_delta_checked_at") is not None:
         parts.append("A reconciliation was recorded.")
     if payload.get("delta_refresh_requested_at") is not None:

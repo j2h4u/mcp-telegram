@@ -179,6 +179,74 @@ async def test_acknowledged_command_survives_failed_postflight(tmp_path: Path) -
         assert reconciled == [2]
 
 
+async def test_failed_inline_readback_preserves_concurrent_inconclusive(tmp_path: Path) -> None:
+    async with _fixture(tmp_path / "inconclusive.db") as f:
+        acquisitions = 0
+        reconciled: list[int] = []
+
+        async def acquire(_entity: int) -> ContactProfileAcquisition:
+            nonlocal acquisitions
+            acquisitions += 1
+            if acquisitions == 1:
+                return ContactProfileAcquisition(True, 1)
+
+            def finish(conn: sqlite3.Connection) -> None:
+                with write_transaction(conn):
+                    conn.execute(
+                        "UPDATE contact_operation_receipts SET verification='inconclusive' WHERE operation_key='ack'"
+                    )
+
+            await f.writer.run(finish)
+            raise ConnectionError("controlled postflight failure")
+
+        async def reconcile(entity: int) -> bool:
+            reconciled.append(entity)
+            return True
+
+        async def client(_request: object) -> object:
+            check = current_native_write_check()
+            assert check is not None
+            await f.authority.bind_attempt(check.binding, "physical")
+            await f.authority.record_wire_outcome(check.binding, "physical", "acknowledged")
+            return types.UpdatesTooLong()
+
+        result = await _owner(f, client, acquire, reconcile).execute(_request(f.reader, "ack"))
+        assert result["outcome"] == "acknowledged" and result["verification"] == "inconclusive"
+        assert reconciled == []
+
+
+async def test_inconclusive_unknown_does_not_reoffer_reconciliation(tmp_path: Path) -> None:
+    async with _fixture(tmp_path / "unknown-inconclusive.db") as f:
+        reconciled: list[int] = []
+
+        async def acquire(_entity: int) -> ContactProfileAcquisition:
+            return ContactProfileAcquisition(True, 1)
+
+        async def reconcile(entity: int) -> bool:
+            reconciled.append(entity)
+            return True
+
+        async def client(_request: object) -> object:
+            check = current_native_write_check()
+            assert check is not None
+            await f.authority.bind_attempt(check.binding, "physical")
+            await f.authority.record_wire_outcome(check.binding, "physical", "unknown")
+
+            def finish(conn: sqlite3.Connection) -> None:
+                with write_transaction(conn):
+                    conn.execute(
+                        "UPDATE contact_operation_receipts SET verification='inconclusive' WHERE operation_key='op'"
+                    )
+
+            await f.writer.run(finish)
+            return types.UpdatesTooLong()
+
+        result = await _owner(f, client, acquire, reconcile).execute(_request(f.reader, "op"))
+        assert (result["outcome"], result["verification"]) == ("unknown", "inconclusive")
+        assert receipts.peer_quarantined(f.reader, 1, 2)
+        assert reconciled == []
+
+
 async def test_startup_unknown_delete_reconciles_with_background_full_user(tmp_path: Path) -> None:
     from dataclasses import replace
     from unittest.mock import MagicMock

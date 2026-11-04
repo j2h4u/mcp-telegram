@@ -238,6 +238,12 @@ class _ClientStub:
     def set_rpc_admission_observer(self, observer: object | None) -> None:
         self.observer_detached = observer is None
 
+    def set_message_delivery_observer(self, observer: object | None) -> None:
+        pass
+
+    def message_delivery_snapshot(self, channel_id: int | None = None) -> dict[str, object]:
+        return {"observed_at_ms": 0, "account": {}}
+
     def set_rpc_request_observer(self, observer: object | None) -> None:
         self.request_observer_detached = observer is None
 

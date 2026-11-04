@@ -21,9 +21,11 @@ from typing import cast
 from ..access_predicates import not_access_lost_sql
 from ..contact_notes.intake import invalidate_contact_note
 from ..contact_notes.receipts import refine_acknowledged_for_observation, refine_unknown_for_observation
+from ..contact_notes.state import read_note_command_state
 from ..contacts.intake import invalidate_contact
 from ..contacts.receipts import refine_acknowledged_for_observation as refine_acknowledged_contact
 from ..contacts.receipts import refine_unknown_for_observation as refine_unknown_contact
+from ..contacts.state import read_contact_command_state
 from ..dialog_fact_observations import claim_dialog_fact
 from ..dialog_identity import capture_identity_baseline, publish_dialog_identity
 from ..dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation, ObservedText
@@ -105,6 +107,19 @@ def _invalidate_note_merge(merged: EffectiveProfileMerge) -> None:
         for root in contact_roots
     ):
         invalidate_contact(merged.snapshot.target_id)
+
+
+class NativeVerificationGuardChangedError(Exception):
+    """Abort the current transaction if authorization or intake changed."""
+
+
+def _note_refinement_current(commit: EntitySectionCommit) -> bool:
+    guard = commit.note_refinement_guard
+    if guard is None or guard():
+        return True
+    if commit.contact_refinement_guard is not None:
+        raise NativeVerificationGuardChangedError
+    return False
 
 
 class _CoreAcquisitionRejectedError(Exception):
@@ -693,9 +708,74 @@ class EntityProfileRepository:
                 (encode({"legacy_evidence": receipt}), entity_id, section),
             )
 
-    def complete_unchanged_section(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
+    def native_verification_pending(self, account_id: int, entity_id: int) -> bool:
+        """Whether either native owner still needs a post-terminal observation."""
+        return (
+            self._conn.execute(
+                "SELECT 1 FROM (SELECT account_id,entity_id,outcome,verification FROM contact_note_operation_receipts "
+                "UNION ALL SELECT account_id,entity_id,outcome,verification FROM contact_operation_receipts) "
+                "WHERE account_id=? AND entity_id=? AND outcome IN ('unknown','acknowledged') "
+                "AND verification IN ('pending','unavailable') LIMIT 1",
+                (account_id, entity_id),
+            ).fetchone()
+            is not None
+        )
+
+    def settle_native_verification(
+        self, cursor: EntityRefreshCursor, account_id: int, guard: Callable[[], bool]
+    ) -> bool | None:
+        """Refine both domains from current canonical evidence; return remaining obligation."""
+        try:
+            with write_savepoint(self._conn):
+                if not self._cursor_matches(cursor) or not guard():
+                    return None
+                note = read_note_command_state(self._conn, account_id, cursor.entity_id)
+                note_order = note["observation_order"]
+                if type(note_order) is int and note["contact_observation_order"] == note_order:
+                    refine_unknown_for_observation(self._conn, account_id, cursor.entity_id, note_order, guard)
+                    refine_acknowledged_for_observation(self._conn, account_id, cursor.entity_id, note_order, guard)
+                contact_order = read_contact_command_state(self._conn, account_id, cursor.entity_id)[
+                    "observation_order"
+                ]
+                if contact_order is not None:
+                    refine_unknown_contact(self._conn, account_id, cursor.entity_id, contact_order, guard)
+                    refine_acknowledged_contact(self._conn, account_id, cursor.entity_id, contact_order, guard)
+                if not guard():
+                    raise NativeVerificationGuardChangedError
+                return self.native_verification_pending(account_id, cursor.entity_id)
+        except NativeVerificationGuardChangedError:
+            return None
+
+    def _finish_native_verification_attempt(self, entity_id: int, commit: EntitySectionCommit) -> None:
+        """Finish only obligations preceding this fenced, accepted physical observation."""
+        note_guard, contact_guard = commit.note_refinement_guard, commit.contact_refinement_guard
+        observation = commit.field_observation
+        if note_guard is None or contact_guard is None or observation is None:
+            return
+        if not note_guard() or not contact_guard():
+            raise NativeVerificationGuardChangedError
+        for table in ("contact_note_operation_receipts", "contact_operation_receipts"):
+            self._conn.execute(
+                f"UPDATE {table} SET verification='inconclusive', "
+                "result_json=json_set(result_json,'$.verification_reason','insufficient_evidence') "
+                "WHERE account_id=? AND entity_id=? AND outcome IN ('unknown','acknowledged') "
+                "AND verification IN ('pending','unavailable') AND terminal_observation_order<?",
+                (observation.owner_account_id, entity_id, observation.order),
+            )
+        if not note_guard() or not contact_guard():
+            raise NativeVerificationGuardChangedError
+
+    def complete_unchanged_section(
+        self, cursor: EntityRefreshCursor, *, now: int, verification_owner: int | None = None
+    ) -> bool:
         """Advance retained terminal knowledge without rewriting its observation."""
         with write_savepoint(self._conn):
+            if (
+                cursor.next_section == "full_profile"
+                and verification_owner is not None
+                and self.native_verification_pending(verification_owner, cursor.entity_id)
+            ):
+                return False
             row = self._conn.execute(
                 "SELECT status,observed_at,reason,retry_at FROM entity_detail_sections WHERE entity_id=? AND section=?",
                 (cursor.entity_id, cursor.next_section),
@@ -763,12 +843,17 @@ class EntityProfileRepository:
         identity: Mapping[str, object],
         *,
         now: int,
+        verification_owner: int | None = None,
     ) -> bool:
         """Reuse both positive pair receipts without renewing their age."""
         if cursor.next_section != "full_profile":
             return False
         with write_savepoint(self._conn):
             if not self._cursor_matches(cursor):
+                return False
+            if verification_owner is not None and self.native_verification_pending(
+                verification_owner, cursor.entity_id
+            ):
                 return False
             if not all(
                 self._reusable_receipt_is_valid(
@@ -2102,7 +2187,7 @@ class EntityProfileRepository:
         detail, accepted, reset_owner = self._prepare_observed_commit(
             cursor.entity_id, commit.detail_patch, commit.field_observation
         )
-        if commit.note_refinement_guard is not None and not commit.note_refinement_guard():
+        if not _note_refinement_current(commit):
             return False
         if not self._write_detail(
             cursor.entity_id,
@@ -2119,6 +2204,8 @@ class EntityProfileRepository:
             return False
         self._finish_observed_commit(cursor.entity_id, accepted, reset_owner, commit.field_observation)
         self._store_semantic_commit(commit, history_base, history_evidence)
+        if cursor.next_section == "full_profile":
+            self._finish_native_verification_attempt(cursor.entity_id, commit)
         section_payload = _section_payload(detail, cursor.next_section) if commit.payload is None else commit.payload
         self._write_section(
             cursor.entity_id,
@@ -2945,12 +3032,13 @@ class EntityProfileRepository:
         detail, accepted, reset_owner = self._prepare_observed_commit(
             cursor.entity_id, {**full_profile.detail_patch, **personal_channel.detail_patch}, observation
         )
-        if full_profile.note_refinement_guard is not None and not full_profile.note_refinement_guard():
+        if not _note_refinement_current(full_profile):
             return None
         if not self._write_pair_detail(cursor, detail, full_profile, personal_channel, now=now, accepted=accepted):
             return None
         self._finish_observed_commit(cursor.entity_id, accepted, reset_owner, observation)
         self._store_semantic_commit(full_profile, history_base, history_evidence)
+        self._finish_native_verification_attempt(cursor.entity_id, full_profile)
         self._write_pair_section(cursor.entity_id, "full_profile", full_profile, detail, now=now)
         self._write_pair_section(cursor.entity_id, "personal_channel", personal_channel, detail, now=now)
         return detail

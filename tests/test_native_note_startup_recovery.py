@@ -271,3 +271,25 @@ def test_folder_offer_exception_requests_shutdown() -> None:
     with pytest.raises(OSError):
         daemon._offer_folder_verification(cast(_SyncMainContext, context))
     shutdown_request.assert_called_once_with("native_reconciliation_failed")
+
+
+def test_startup_recovery_excludes_inconclusive_but_keeps_other_waits(tmp_path: Path) -> None:
+    path = tmp_path / "recovery.db"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path, isolation_level=None)
+    for table in ("contact_note_operation_receipts", "contact_operation_receipts"):
+        for entity, outcome, verification in (
+            (10, "unknown", "pending"),
+            (11, "unknown", "unavailable"),
+            (12, "unknown", "inconclusive"),
+            (13, "acknowledged", "pending"),
+            (14, "acknowledged", "unavailable"),
+            (15, "acknowledged", "inconclusive"),
+        ):
+            conn.execute(
+                f"INSERT INTO {table}(account_id,dc_id,key_id,operation_key,request_fingerprint,semantic_fingerprint,expected_version,action,entity_id,outcome,verification,created_at,updated_at) VALUES (1,2,'3',?,?,?,?,'update',?,?,?,0,0)",
+                (f"{table}-{entity}", "a" * 64, "b" * 64, "c" * 64, entity, outcome, verification),
+            )
+    assert _note_recovery_watermark(conn, 1) == 14
+    assert _unresolved_note_batch(conn, 1, 0, 20) == [10, 11, 13, 14]
+    conn.close()

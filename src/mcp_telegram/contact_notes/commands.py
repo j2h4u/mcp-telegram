@@ -367,7 +367,9 @@ class ContactNoteCommandOwner:
         )
         if row is None:
             return
-        uncertain = row[0] == "unknown" or (row[0] == "pending" and row[1] is not None)
+        uncertain = (row[0] == "unknown" and row[2] in {"pending", "unavailable"}) or (
+            row[0] == "pending" and row[1] is not None
+        )
         unverified = row[0] == "acknowledged" and row[2] in {"pending", "unavailable"}
         if uncertain or unverified:
             try:
@@ -450,10 +452,19 @@ class ContactNoteCommandOwner:
                     else "unavailable"
                 )
                 changed = conn.execute(
-                    "UPDATE contact_note_operation_receipts SET verification=?,verification_order=? "
+                    "UPDATE contact_note_operation_receipts SET verification=?,verification_order=?, "
+                    "result_json=json_remove(result_json,'$.verification_reason') "
                     "WHERE account_id=? AND operation_key=? AND outcome='acknowledged' "
-                    "AND verification IN ('pending','unavailable')",
-                    (result, order if result != "unavailable" else None, binding.account_id, binding.operation_key),
+                    "AND verification IN ('pending','unavailable','inconclusive') "
+                    "AND (verification!='inconclusive' OR (?!='unavailable' AND terminal_observation_order<?))",
+                    (
+                        result,
+                        order if result != "unavailable" else None,
+                        binding.account_id,
+                        binding.operation_key,
+                        result,
+                        order,
+                    ),
                 )
                 if changed.rowcount == 1:
                     return result, True, order if result != "unavailable" else None
@@ -465,7 +476,7 @@ class ContactNoteCommandOwner:
                         (binding.account_id, binding.operation_key),
                     ).fetchone(),
                 )
-                if row is None or row[0] not in {"verified", "mismatch"}:
+                if row is None or row[0] not in {"verified", "mismatch", "inconclusive"}:
                     raise RuntimeError("note verification receipt changed")
                 return row[0], False, row[1]
 
