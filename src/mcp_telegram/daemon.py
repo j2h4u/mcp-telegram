@@ -645,8 +645,8 @@ async def _initialize_read_positions(  # noqa: PLR0913
 
     now = int(time.time())
     dialog_id = int(selected.key.target.removeprefix("dialog:"))
-    rows = _select_read_position_work_rows(conn, max_dialogs, now=now)
-    if (dialog_id,) not in rows:
+    dialog_ids = _select_read_position_dialog_ids(conn, max_dialogs, now=now)
+    if dialog_id not in dialog_ids:
         logger.debug("initialize_read_positions — no due rows, skipping")
         return SliceOutcome(selected, SliceOutcomeKind.STALE)
 
@@ -708,36 +708,42 @@ def _reserve_read_position_observation(conn: sqlite3.Connection) -> tuple[int, R
         return allocate_observation_order(conn), allocate_observation_boundary(conn, ReactionAggregateSource.HISTORY)
 
 
-def _select_read_position_work_rows(
+def _select_read_position_dialog_ids(
     conn: sqlite3.Connection,
     max_dialogs: int | None,
     *,
     now: int,
-) -> list[tuple[int]]:
+) -> list[int]:
     """Select the durable NULL-cursor queue, optionally bounded for a pass."""
     if max_dialogs is None:
-        return cast(
-            list[tuple[int]],
+        return [
+            int(cast(int, row[0]))
+            for row in cast(
+                list[Sequence[object]],
+                conn.execute(
+                    f"{_SELECT_READ_POSITION_WORK_SQL} "
+                    "AND (sd.read_position_next_attempt_at IS NULL OR sd.read_position_next_attempt_at <= ?) "
+                    "ORDER BY COALESCE(sd.read_position_next_attempt_at, 0), "
+                    "COALESCE(sd.read_position_attempt_count, 0), sd.dialog_id",
+                    (now,),
+                ).fetchall(),
+            )
+        ]
+    if max_dialogs < 0:
+        raise ValueError("max_dialogs must be non-negative")
+    return [
+        int(cast(int, row[0]))
+        for row in cast(
+            list[Sequence[object]],
             conn.execute(
                 f"{_SELECT_READ_POSITION_WORK_SQL} "
                 "AND (sd.read_position_next_attempt_at IS NULL OR sd.read_position_next_attempt_at <= ?) "
                 "ORDER BY COALESCE(sd.read_position_next_attempt_at, 0), "
-                "COALESCE(sd.read_position_attempt_count, 0), sd.dialog_id",
-                (now,),
+                "COALESCE(sd.read_position_attempt_count, 0), sd.dialog_id LIMIT ?",
+                (now, max_dialogs),
             ).fetchall(),
         )
-    if max_dialogs < 0:
-        raise ValueError("max_dialogs must be non-negative")
-    return cast(
-        list[tuple[int]],
-        conn.execute(
-            f"{_SELECT_READ_POSITION_WORK_SQL} "
-            "AND (sd.read_position_next_attempt_at IS NULL OR sd.read_position_next_attempt_at <= ?) "
-            "ORDER BY COALESCE(sd.read_position_next_attempt_at, 0), "
-            "COALESCE(sd.read_position_attempt_count, 0), sd.dialog_id LIMIT ?",
-            (now, max_dialogs),
-        ).fetchall(),
-    )
+    ]
 
 
 async def _build_read_position_input_peers(
