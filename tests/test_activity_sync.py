@@ -35,6 +35,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     current_rpc_scope,
 )
 from sqlite_writer_helpers import inline_writer
+from tests.history_scope_helpers import HistoryScope
 
 _TEST_TIMEOUT_S = 0.05
 
@@ -83,8 +84,9 @@ class _MsgKwargs(TypedDict, total=False):
     out: bool
 
 
-class _FakeClient:
-    def __init__(self, batches: list[FakeSearchResult]) -> None:
+class _FakeClient(HistoryScope):
+    def __init__(self, batches: list[FakeSearchResult], *, account_id: int = 123) -> None:
+        super().__init__(account_id)
         self._batches = list(batches)
         self.scopes: list[TelegramRpcScope] = []
 
@@ -117,8 +119,9 @@ class _DemandObserver:
         self.events.append(event)
 
 
-class _ThrottledClient:
+class _ThrottledClient(HistoryScope):
     def __init__(self, error: TelegramRpcThrottled, *, dispatch: bool, on_dispatch: object | None = None) -> None:
+        super().__init__()
         self._error = error
         self._dispatch = dispatch
         self._on_dispatch = on_dispatch

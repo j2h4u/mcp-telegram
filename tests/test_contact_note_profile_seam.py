@@ -27,8 +27,14 @@ from tests.test_profile_collection_pages import _Client
 
 
 class _ScopedClient(_PairClient):
-    capture_image_scope: Callable[[], ScopeToken | None]
-    claim_image_scope: Callable[[ScopeToken], bool]
+    capture_scope: Callable[[], ScopeToken | None]
+    claim_scope: Callable[[ScopeToken], bool]
+
+    def capture_image_scope(self) -> ScopeToken | None:
+        return self.capture_scope()
+
+    def claim_image_scope(self, token: ScopeToken) -> bool:
+        return self.claim_scope(token)
 
 
 class _CommandClient(_Client):
@@ -74,8 +80,8 @@ async def test_command_observation_rejects_scope_switch_and_preserves_facts(  # 
     cell = ScopeCell()
     assert cell.publish(scope)
     client = _ScopedClient()
-    client.capture_image_scope = cell.capture
-    client.claim_image_scope = cell.claim
+    client.capture_scope = cell.capture
+    client.claim_scope = cell.claim
     service = cast(DaemonEntityInfoService, _pair_service(reader, client, enabled=True))
     service._deps = replace(
         service._deps,
@@ -106,7 +112,7 @@ async def test_command_observation_rejects_scope_switch_and_preserves_facts(  # 
             cell.begin_change()
             return cell.claim(token)
 
-        client.claim_image_scope = revoke_during_claim
+        client.claim_scope = revoke_during_claim
         service._deps = replace(
             service._deps,
             user_profile_port=_CommandGateway(_CommandClient(response), now_provider=lambda: now),
@@ -116,21 +122,21 @@ async def test_command_observation_rejects_scope_switch_and_preserves_facts(  # 
 
         cell = ScopeCell()
         assert cell.publish(scope)
-        client.capture_image_scope = cell.capture
+        client.capture_scope = cell.capture
 
         def deliver_during_claim(token: ScopeToken) -> bool:
             claimed = cell.claim(token)
             capture_contact_note_intake([types.UpdateUser(7)])
             return claimed
 
-        client.claim_image_scope = deliver_during_claim
+        client.claim_scope = deliver_during_claim
         service._deps = replace(
             service._deps,
             user_profile_port=_CommandGateway(_CommandClient(response), now_provider=lambda: now),
         )
         assert not (await service.acquire_command_profile(7)).accepted
         assert read_note(reader, 42, 7) == original
-        client.claim_image_scope = cell.claim
+        client.claim_scope = cell.claim
 
         class SwitchingClient(_CommandClient):
             async def __call__(self, request: object) -> object:

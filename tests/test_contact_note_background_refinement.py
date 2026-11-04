@@ -28,8 +28,14 @@ from tests.test_profile_collection_pages import _Client
 
 
 class _ScopeClient(_PairClient):
-    capture_image_scope: Callable[[], ScopeToken | None]
-    claim_image_scope: Callable[[ScopeToken], bool]
+    capture_scope: Callable[[], ScopeToken | None]
+    claim_scope: Callable[[ScopeToken], bool]
+
+    def capture_image_scope(self) -> ScopeToken | None:
+        return self.capture_scope()
+
+    def claim_image_scope(self, token: ScopeToken) -> bool:
+        return self.claim_scope(token)
 
 
 @pytest.mark.parametrize("enabled", [True, False])
@@ -40,11 +46,13 @@ async def test_background_refresh_refines_unknown_only_when_current(  # noqa: PL
     path = tmp_path / "profile.db"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.commit()
     scope = TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99)
     cell = ScopeCell()
     assert cell.publish(scope)
     client = _ScopeClient()
-    client.capture_image_scope = cell.capture
+    client.capture_scope = cell.capture
 
     race_active = False
 
@@ -56,7 +64,7 @@ async def test_background_refresh_refines_unknown_only_when_current(  # noqa: PL
             capture_contact_note_intake([types.UpdateUser(7)])
         return claimed
 
-    client.claim_image_scope = claim
+    client.claim_scope = claim
     service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=enabled))
     response = SimpleNamespace(
         users=[types.User(id=7, first_name="name", contact=True)],
@@ -130,10 +138,12 @@ async def test_background_refresh_refines_acknowledged_only_with_current_fresh_e
     path = tmp_path / "profile.db"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.commit()
     cell = ScopeCell()
     assert cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
     client = _ScopeClient()
-    client.capture_image_scope = cell.capture
+    client.capture_scope = cell.capture
 
     race_active = False
 
@@ -145,7 +155,7 @@ async def test_background_refresh_refines_acknowledged_only_with_current_fresh_e
             capture_contact_note_intake([types.UpdateUser(7)])
         return result
 
-    client.claim_image_scope = claim
+    client.claim_scope = claim
     service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=True))
     response = SimpleNamespace(
         users=[types.User(id=7, first_name="name", contact=True)],
@@ -200,11 +210,13 @@ async def test_repeated_reconciliation_coalesces_and_eventually_observes_fresh_n
     path = tmp_path / "profile.db"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.commit()
     cell = ScopeCell()
     assert cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
     client = _ScopeClient()
-    client.capture_image_scope = cell.capture
-    client.claim_image_scope = cell.claim
+    client.capture_scope = cell.capture
+    client.claim_scope = cell.claim
     service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=True))
     response = SimpleNamespace(
         users=[types.User(id=7, first_name="name", contact=True)],

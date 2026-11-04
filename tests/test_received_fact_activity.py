@@ -72,7 +72,7 @@ async def test_activity_search_sidecar_updates_entity_snapshot(tmp_path: Path, k
         id=12, peer_id=types.PeerUser(55), date=datetime.fromtimestamp(now - 100, tz=UTC), message="fixture", out=True
     )
     response = types.messages.Messages(messages=[message], topics=[], chats=[], users=[user])
-    client = _FakeClient([cast(FakeSearchResult, response)])
+    client = _FakeClient([cast(FakeSearchResult, response)], account_id=99)
     scope = ScopeCell()
     assert scope.publish(TelegramAuthScope(1, 99, 1, 1))
     adapter = ArchiveIncrementalDemandAdapter(
@@ -139,7 +139,7 @@ async def test_activity_scope_revoked_during_publication_rolls_back(
     response = types.messages.Messages(
         messages=[message], topics=[], chats=[], users=[types.User(55, first_name="After")]
     )
-    client = _FakeClient([cast(FakeSearchResult, response)])
+    client = _FakeClient([cast(FakeSearchResult, response)], account_id=99)
     adapter = ArchiveIncrementalDemandAdapter(
         client,
         reader,

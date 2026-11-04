@@ -23,6 +23,7 @@ from mcp_telegram.config import ActivityHotSweepConfig
 from mcp_telegram.sync_db import _apply_migrations
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 from sqlite_writer_helpers import inline_writer
+from tests.history_scope_helpers import HistoryScope
 
 _TEST_TIMEOUT_S = 120.0
 _POLICY = ActivityHotSweepConfig(jitter_max_seconds=0)
@@ -38,13 +39,15 @@ def _selected_budget(adapter: HotActivityDemandAdapter) -> RpcAttemptBudget:
 def _make_db() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
+    conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
+    conn.commit()
     try:
         yield conn
     finally:
         conn.close()
 
 
-class _FakeClient:
+class _FakeClient(HistoryScope):
     async def __call__(self, request: object) -> object:
         del request
         return object()
