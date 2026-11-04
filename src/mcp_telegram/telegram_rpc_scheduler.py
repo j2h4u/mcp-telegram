@@ -198,12 +198,12 @@ class TelegramRpcAdmissionDeferred(TelegramRpcThrottled):
 class TelegramRpcMethodRecoveryPending(RuntimeError):  # noqa: N818 - scoped admission outcome, not an account latch.
     """Another real request owns this method's current recovery trial."""
 
-    def __init__(self, method_key: str, generation: str) -> None:
+    def __init__(self, method_key: str, generation: str, *, reason: str = "recovery") -> None:
         super().__init__("Telegram method recovery is already owned")
         self.method_key = method_key
         self.generation = generation
         self.eligible_at = None
-        self.reason = "recovery"
+        self.reason = reason
 
 
 def _current_task() -> asyncio.Task[object] | None:

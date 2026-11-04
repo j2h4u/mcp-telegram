@@ -42,7 +42,7 @@ async def test_migration_retains_legacy_authority_and_persists_with_cas(version:
     result = ledger._record
     recovery = cast(dict[str, object], result["recovery"])
     automatic = cast(dict[str, object], recovery["automatic"])
-    assert result["version"] == 3 and result["generation"] == old["generation"]
+    assert result["version"] == 4 and result["generation"] == old["generation"]
     assert recovery["state"] == state
     assert recovery["consumed_run"] == ("old-run" if state == "consumed" else None)
     assert automatic["attempts_total"] == 2
@@ -53,7 +53,7 @@ async def test_migration_retains_legacy_authority_and_persists_with_cas(version:
     assert automatic["quiet_anchor"] is None and automatic["bound_intent_ids"] == []
     assert store.raw == original
     await ledger._commit(lambda _: None)
-    assert store.raw != original and json.loads(cast(str, store.raw))["version"] == 3
+    assert store.raw != original and json.loads(cast(str, store.raw))["version"] == 4
     if state == "consumed":
         assert ledger.protection_reason == "recovery_trial_incomplete"
 

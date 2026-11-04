@@ -300,6 +300,6 @@ async def test_version_one_receipt_migration_preserves_floor_binding_and_unknown
     assert migrated._record["methods"] == {}
     await migrated.record_floor(method_clock.utc + 50_000)
     persisted = safety_record(store)
-    assert persisted.pop("version") == 3 and persisted.pop("methods") == {}
+    assert persisted.pop("version") == 4 and persisted.pop("methods") == {}
     legacy.pop("version")
     assert persisted == legacy

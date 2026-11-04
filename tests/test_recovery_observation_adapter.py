@@ -20,6 +20,8 @@ from mcp_telegram.telegram_rpc_recovery import (
     RecoveryObservationEvent,
     RecoveryStage,
 )
+from tests.test_telegram_rpc_safety import Clock
+from tests.test_telegram_rpc_safety import clock as clock
 
 
 @pytest.mark.asyncio
@@ -141,3 +143,89 @@ def test_interleaved_decisions_and_guard_transitions() -> None:
     sink.accept = True
     adapter.observe(rejected)
     assert len(sink.events) == 6
+
+
+@pytest.mark.asyncio
+async def test_recovery_timing_is_persisted_and_changes_break_deduplication(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    writer = await SQLiteWriter.open(path)
+    sink = RuntimeObservationSink(path, writer=writer, retention_ttl_seconds=3600, policy=RuntimeObservationConfig())
+    adapter = RecoveryObservationAdapter(sink, summary_interval_seconds=60)
+    event = RecoveryObservation(
+        RecoveryStage.DECISION,
+        RecoveryObservationEvent.DECISION,
+        1000,
+        failure_stage=2,
+        scheduled_due_utc=1300.0,
+        restriction_floor_utc=2000.0,
+        effective_eligible_utc=2000.0,
+        eligible_reason="floor",
+    )
+    adapter.observe(event)
+    adapter.observe(event)
+    adapter.observe(replace(event, restriction_floor_utc=2100.0, effective_eligible_utc=2100.0))
+    adapter.observe(replace(event, stage=RecoveryStage.COMMIT, event=RecoveryObservationEvent.WAITING))
+    adapter.observe(
+        replace(
+            event,
+            observed_at_ms=2000,
+            failure_stage=-1,
+            scheduled_due_utc=float("inf"),
+            restriction_floor_utc=float("nan"),
+            effective_eligible_utc=-1,
+            eligible_reason="private content",
+        )
+    )
+    await sink.aclose()
+    await writer.aclose()
+    with closing(sqlite3.connect(path)) as conn:
+        rows = cast(
+            list[tuple[str]], conn.execute("SELECT payload_json FROM runtime_observations ORDER BY id").fetchall()
+        )
+    payloads = [cast(dict[str, object], json.loads(row[0])) for row in rows]
+    assert len(payloads) == 4
+    assert payloads[0] == {
+        "stage": "decision",
+        "event": "decision",
+        "failure_stage": 2,
+        "scheduled_due_utc": 1300.0,
+        "restriction_floor_utc": 2000.0,
+        "effective_eligible_utc": 2000.0,
+        "eligible_reason": "floor",
+    }
+    assert payloads[1]["effective_eligible_utc"] == 2100.0
+    assert payloads[2]["stage"] == "commit" and payloads[2]["event"] == "waiting"
+    assert payloads[3] == {"stage": "decision", "event": "decision"}
+    assert all(len(row[0].encode()) <= 1024 and "private content" not in row[0] for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_overdue_recovery_observations_keep_original_eligibility(tmp_path: Path, clock: Clock) -> None:
+    from tests.test_telegram_auto_resume import _waiting
+    from tests.test_telegram_rpc_safety import Store, recovery
+
+    store = Store()
+    ledger = await _waiting(store, clock)
+    automatic = cast(dict[str, object], recovery(store)["automatic"])
+    due = cast(dict[str, float], automatic["scheduled_due"])["until_utc"]
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    writer = await SQLiteWriter.open(path)
+    sink = RuntimeObservationSink(path, writer=writer, retention_ttl_seconds=3600, policy=RuntimeObservationConfig())
+    adapter = RecoveryObservationAdapter(sink, summary_interval_seconds=60)
+    ledger.set_recovery_observer(adapter.observe)
+    clock.advance(4000)
+    assert not await ledger.consume_auto_resume(lifecycle_available=lambda: False)
+    clock.advance(20)
+    assert not await ledger.consume_auto_resume(lifecycle_available=lambda: False)
+    await sink.aclose()
+    await writer.aclose()
+    with closing(sqlite3.connect(path)) as conn:
+        rows = cast(list[tuple[str]], conn.execute("SELECT payload_json FROM runtime_observations").fetchall())
+    payloads = [cast(dict[str, object], json.loads(row[0])) for row in rows]
+    decisions = [payload for payload in payloads if payload["stage"] == "decision"]
+    assert len(decisions) == 1
+    assert decisions[0]["scheduled_due_utc"] == due
+    assert decisions[0]["effective_eligible_utc"] == due
+    assert clock.time() > due

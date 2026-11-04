@@ -72,7 +72,7 @@ _DRAFT_SOURCE_ORDER_SCHEMA_76 = 76
 
 _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _RPC_SAFETY_RECORD_KEY = "telegram_rpc_safety"
-_RPC_SAFETY_RECORD_VERSION = 3
+_RPC_SAFETY_RECORD_VERSION = 4
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
 _LEGACY_SCHEDULED_QUIET_DISCOVERY_SECONDS = 86_400
 
@@ -1633,41 +1633,55 @@ def _validate_rpc_safety_record(value: str) -> tuple[int | None, float]:
     if (
         not isinstance(record, dict)
         or type(record.get("version")) is not int
-        or record["version"] not in {1, 2, _RPC_SAFETY_RECORD_VERSION}
+        or record["version"] not in {1, 2, 3, _RPC_SAFETY_RECORD_VERSION}
     ):
         raise ValueError("invalid Telegram RPC safety record version")
     account_id, expected_account = _validate_rpc_safety_scope(cast(dict[str, object], record))
     floor_utc = _validate_rpc_safety_floor(record.get("floor"))
     if not record.get("generation") or not isinstance(record.get("generation"), str):
         raise ValueError("invalid Telegram RPC safety record generation")
-    if record["version"] in {2, _RPC_SAFETY_RECORD_VERSION}:
-        _validate_rpc_method_episodes(record.get("methods"))
+    if record["version"] in {2, 3, _RPC_SAFETY_RECORD_VERSION}:
+        _validate_rpc_method_episodes(record.get("methods"), version=cast(int, record["version"]))
     scope = cast(dict[str, object], record.get("scope"))
     return (account_id if scope["stage"] == "verified" else expected_account, floor_utc)
 
 
-def _validate_rpc_method_episodes(value: object) -> None:
+def _validate_rpc_method_episodes(value: object, *, version: int) -> None:
     if not isinstance(value, dict):
         raise ValueError("invalid Telegram RPC method episodes")
     for method, episode in value.items():
         if not isinstance(method, str) or not method or not isinstance(episode, dict):
             raise ValueError("invalid Telegram RPC method episode")
-        _validate_rpc_method_episode(episode)
+        _validate_rpc_method_episode(episode, version=version)
 
 
-def _validate_rpc_method_episode(episode: dict[object, object]) -> None:
+def _validate_rpc_method_episode(episode: dict[object, object], *, version: int) -> None:
     fields = {"generation", "consecutive_actual_floods", "floor", "claim"}
-    if set(episode) not in (fields, fields | {"state"}):
+    if set(episode) not in (
+        fields,
+        fields | {"state"},
+        fields | {"consecutive_read_budget_failures"},
+        fields | {"state", "consecutive_read_budget_failures"},
+    ):
         raise ValueError("invalid Telegram RPC method episode fields")
+    if ("consecutive_read_budget_failures" in episode) != (version >= _RPC_SAFETY_RECORD_VERSION):
+        raise ValueError("invalid Telegram RPC method episode version")
     _validate_rpc_safety_floor(episode.get("floor"))
+    _validate_rpc_method_counters(episode)
+    _validate_rpc_method_claim(episode["claim"])
+
+
+def _validate_rpc_method_counters(episode: dict[object, object]) -> None:
     count = episode.get("consecutive_actual_floods")
+    read_count = episode.get("consecutive_read_budget_failures", 0)
+    if type(count) is not int or type(read_count) is not int or count < 0 or read_count < 0:
+        raise ValueError("invalid Telegram RPC method failure counters")
     state = episode.get("state", "live")
     if state not in {"live", "recovered"}:
         raise ValueError("invalid Telegram RPC method episode state")
-    _validate_rpc_method_identity(episode, count, state)
-    if state == "recovered" and (count != 0 or episode["claim"] is not None):
+    _validate_rpc_method_identity(episode, count + read_count, state)
+    if state == "recovered" and (count != 0 or read_count != 0 or episode["claim"] is not None):
         raise ValueError("invalid recovered Telegram RPC method episode")
-    _validate_rpc_method_claim(episode["claim"])
 
 
 def _validate_rpc_method_identity(episode: dict[object, object], count: object, state: object) -> None:

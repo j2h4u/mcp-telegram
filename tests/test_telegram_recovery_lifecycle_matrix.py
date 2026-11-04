@@ -199,7 +199,7 @@ async def test_imported_stuck_receipt_is_read_only_until_maintenance(clock: Cloc
     ledger.mark_claimed("stuck-read")
     await ledger.complete("stuck-read", known_outcome=False)
     assert recovery(store)["state"] == "succeeded"
-    assert record(store)["version"] == 3
+    assert record(store)["version"] == 4
     imported = store.raw
     restarted = store.ledger()
     restarted.configure_auto_resume(enabled=True)
@@ -367,6 +367,6 @@ async def test_cancelled_settlement_waits_for_owned_commit(clock: Clock) -> None
     assert await ledger.consume_auto_resume()
     reopened = store.ledger()
     reopened.configure_auto_resume(enabled=True)
-    assert json.loads(cast(str, store.raw))["version"] == 3
+    assert json.loads(cast(str, store.raw))["version"] == 4
     assert not await reopened.maintain_auto_resume()
     assert record(store)["recovery"] is not None
