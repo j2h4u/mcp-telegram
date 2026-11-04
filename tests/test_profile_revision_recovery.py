@@ -167,6 +167,11 @@ def test_second_cas_failure_rolls_back_detail_fence(legacy: Legacy) -> None:
 @pytest.mark.asyncio
 async def test_scheduled_owner_repairs_without_rpc_then_refetches_and_progresses(legacy: Legacy) -> None:
     conn, repo, old = legacy
+    conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
+    conn.execute("UPDATE entity_details SET profile_owner_account_id=99 WHERE entity_id=42")
+    conn.execute("UPDATE entity_profile_field_observations SET owner_account_id=99 WHERE entity_id=42")
+    conn.execute("UPDATE entity_profile_semantic_snapshots SET owner_account_id=99 WHERE entity_id=42")
+    conn.commit()
     client = _PairClient(channel_id=None)
     service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=True))
     service._deps = replace(service._deps, now_provider=lambda: 1000.0)

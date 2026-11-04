@@ -264,7 +264,7 @@ async def test_service_full_profile_uses_bot_target_and_keeps_personal_channel_i
 
 @pytest.mark.asyncio
 async def test_service_refresh_keeps_canonical_service_type_when_full_user_uses_bot_target(tmp_path: Path) -> None:
-    conn, service = _prepare(tmp_path / "service-refresh.sqlite", entity_type="service")
+    conn, service = _prepare(tmp_path / "service-refresh.sqlite", entity_type="service", migrated=True)
     client = cast(_PairClient, service._deps.client)  # type: ignore[attr-defined]
     client.bot = True
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]

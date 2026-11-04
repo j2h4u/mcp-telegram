@@ -2098,16 +2098,19 @@ async def test_entity_acquisition_timeout_persists_retry_and_keeps_cursor(known:
         per_rpc_seconds=0.005,
         whole_refresh_seconds=0.1,
     )
-    service = _test_service(conn, limits=limits)
+    service = _test_service(conn, limits=limits, account_id=99)
 
-    class SlowClient(_UnusedClient):
+    class SlowClient(_FencedUnusedClient):
         async def get_entity(self, entity_id: int) -> object:
             raise TimeoutError("wire response timeout")
 
         async def __call__(self, request: object) -> object:
             raise TimeoutError("wire response timeout")
 
-    service._deps = replace(service._deps, client=SlowClient(), user_profile_port=_UserProfilePort(SlowClient()))
+    slow_client = SlowClient(99)
+    with write_savepoint(conn):
+        conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
+    service._deps = replace(service._deps, client=slow_client, user_profile_port=_UserProfilePort(slow_client))
     if known:
         with write_savepoint(conn):
             conn.execute("INSERT INTO entities(id,type,name,updated_at) VALUES (42,'user','Known',100)")

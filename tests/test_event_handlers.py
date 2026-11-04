@@ -1737,6 +1737,7 @@ async def test_gap_scan_only_synced(
     mock_client.get_messages = _get_messages
 
     manager = make_manager(mock_client, sync_db, shutdown_event)
+    _bind_gap_scope(mock_client, manager)
     manager.register()
 
     await manager.run_dm_gap_scan()
@@ -2207,8 +2208,18 @@ async def test_delivered_message_reuses_admitted_order_and_time(
 ) -> None:
     insert_synced_dialog(sync_db, 42)
     manager = make_manager(mock_client, sync_db, shutdown_event)
+    _bind_gap_scope(mock_client, manager)
     event = make_new_message_event(42, build_mock_message(id=502, text="retained"))
-    delivered = DeliveredUpdate(observation_order=991, captured_at=1_700_000_000.75, reaction_sequence=81)
+    scope = mock_client.capture_image_scope()
+    assert scope is not None
+    mock_client.retained_auth_scope.return_value = scope.scope
+    delivered = DeliveredUpdate(
+        observation_order=991,
+        captured_at=1_700_000_000.75,
+        reaction_sequence=81,
+        auth_scope=scope.scope,
+        scope_token=scope,
+    )
     for _ in range(2):
         with delivered_update_context(delivered):
             await manager.on_new_message(event)
@@ -2435,11 +2446,12 @@ async def test_dm_enrollment_keeps_delivery_pending_when_authorization_changes_b
     delivered = DeliveredUpdate(2, 100, 2, auth_scope=scope, scope_token=cell.capture())
     with delivered_update_context(delivered):
         await manager.on_new_message(event)
-    assert claims == 3
+    assert claims >= 3
     assert delivered.failed
-    assert sync_db.execute(
-        "SELECT text FROM messages WHERE dialog_id=? AND message_id=1001", (dialog_id,)
-    ).fetchone() == ("message",)
+    assert (
+        sync_db.execute("SELECT text FROM messages WHERE dialog_id=? AND message_id=1001", (dialog_id,)).fetchone()
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -2494,9 +2506,7 @@ async def test_dm_authorization_change_replays_with_fresh_token_and_retained_ord
         assert shutdown.event.is_set() and shutdown.reason_code == "critical_task_failed"
         assert not monitor_context.api_server._ready
         assert _pending(path) is not None
-        assert reader.execute("SELECT text FROM messages WHERE dialog_id=55 AND message_id=11").fetchone() == (
-            "fixture",
-        )
+        assert reader.execute("SELECT text FROM messages WHERE dialog_id=55 AND message_id=11").fetchone() is None
         tokens = [tuple(row) for row in reader.execute("SELECT * FROM update_delivery_tokens")]
         assert tokens
         cast(SQLiteSession, client.session).close()

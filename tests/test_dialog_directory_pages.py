@@ -142,12 +142,13 @@ async def test_page_composes_folder_own_and_scheduled_filters(make_synced_db: Ca
     conn = make_synced_db()
     conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
     conn.execute("UPDATE scheduled_sync_state SET account_id=42 WHERE key='account'")
+    conn.execute("UPDATE telegram_folder_projection_state SET account_id=42 WHERE singleton=1")
     conn.executemany(
         "INSERT INTO dialogs(dialog_id,name,type,hidden) VALUES(?,?,'user',0)",
         [(10, "not folder"), (20, "selected"), (30, "unknown membership")],
     )
     conn.execute(
-        "INSERT INTO telegram_folder_rules(namespace,folder_id,title,rule_kind,source_position,rule_json) VALUES('filter',2,'Work','filter',0,'{}')"
+        "INSERT INTO telegram_folder_rules(account_id,namespace,folder_id,title,rule_kind,source_position,rule_json,catalog_member) VALUES(42,'filter',2,'Work','filter',0,'{}',1)"
     )
     conn.executemany(
         "INSERT INTO telegram_folder_local_members(namespace,folder_id,dialog_id,state) VALUES('filter',2,?,?)",

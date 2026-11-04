@@ -641,6 +641,11 @@ def test_access_loss_marks_dialogs_and_purges_all_active_hydration_jobs(
     second = _enqueue(db, MEDIA_METADATA_KIND, 2, dialog_id=1, attempts=2)
     third = _enqueue(db, TRANSCRIPTION_HYDRATION_KIND, 3, dialog_id=2, attempts=1)
     db.commit()
+    with write_transaction(db):
+        queue = HydrationQueueRepository(db)
+        first_started, second_started = queue.start(first), queue.start(second)
+        assert first_started is not None and second_started is not None
+        first, second = first_started, second_started
     worker = MessageFactHydrationWorker(
         object(),
         db,

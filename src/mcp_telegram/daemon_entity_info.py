@@ -603,6 +603,7 @@ class DaemonEntityInfoService:
         track_rejection: bool = True,
         avatar_intake: tuple[int, ChatAvatarMessageIntake] | None = None,
         received_intake: tuple[int, EntitySectionCommit, _ProfileSectionContext] | None = None,
+        marker_scope: _ProfileSectionContext | None = None,
     ) -> T:
         def write(conn: sqlite3.Connection) -> T:
             profiles = EntityProfileRepository(
@@ -625,6 +626,9 @@ class DaemonEntityInfoService:
                         lambda: self._write_profile_avatar_intake(conn, profiles, operation, avatar_intake),
                         received_intake,
                     )
+            elif marker_scope is not None:
+                with write_transaction(conn):
+                    result = self._write_scoped_profile_marker(conn, profiles, operation, marker_scope)
             else:
                 result = operation(profiles)
             if receipt is not None:
@@ -637,6 +641,20 @@ class DaemonEntityInfoService:
             return result
 
         return await self._deps.writer.run(write)
+
+    def _write_scoped_profile_marker[T](
+        self,
+        conn: sqlite3.Connection,
+        profiles: EntityProfileRepository,
+        operation: Callable[[EntityProfileRepository], T],
+        context: _ProfileSectionContext,
+    ) -> T:
+        if not self._received_profile_current(conn, context):
+            raise _AuthScopeUnavailableError("authenticated session lease is unavailable")
+        result = operation(profiles)
+        if not self._received_profile_current(conn, context):
+            raise _AuthScopeUnavailableError("authenticated session lease changed during publication")
+        return result
 
     def _write_received_profile_facts[T](
         self,
@@ -1545,7 +1563,7 @@ class DaemonEntityInfoService:
             return self._persist_profile_section_failure(profiles, failure, guard_scope=guard_scope)
 
         if failure.context.requires_received_scope:
-            failed = await self._write_pair_accounting(failure.cursor, failure.context, mark)
+            failed = await self._write_pair_accounting(failure.context, mark)
         else:
             failed = await self._write_profiles(mark)
         if failed and failure.cursor.next_section == "common_chats":
@@ -1562,7 +1580,7 @@ class DaemonEntityInfoService:
             return None
 
         if failure.context.requires_received_scope:
-            await self._write_pair_accounting(failure.cursor, failure.context, record)
+            await self._write_pair_accounting(failure.context, record)
         else:
             await self._write_profiles(record)
 
@@ -1917,24 +1935,14 @@ class DaemonEntityInfoService:
 
     async def _write_pair_accounting[T](
         self,
-        cursor: EntityRefreshCursor,
         context: _ProfileSectionContext,
         operation: Callable[[EntityProfileRepository], T],
     ) -> T | None:
         """Fence durable pair markers by the original acquisition lease."""
-        results: list[T] = []
-
-        def record(profiles: EntityProfileRepository) -> bool:
-            results.append(operation(profiles))
-            return True
-
         try:
-            accepted = await self._write_profiles(
-                record, track_rejection=False, received_intake=(cursor.entity_id, EntitySectionCommit({}), context)
-            )
+            return await self._write_profiles(operation, marker_scope=context)
         except _AuthScopeUnavailableError:
             return None
-        return results[0] if accepted and results else None
 
     async def _record_full_user_pair_failure(
         self,
@@ -1946,7 +1954,6 @@ class DaemonEntityInfoService:
     ) -> None:
         actual_attempts = self._rpc_attempt_count() - attempt_start
         await self._write_pair_accounting(
-            cursor,
             context,
             lambda profiles: profiles.record_pair_attempt(cursor, "full_profile", actual_attempts=actual_attempts),
         )
@@ -1960,7 +1967,6 @@ class DaemonEntityInfoService:
 
     async def _handle_full_user_pair_failure(self, failure: _PairFailure) -> DurableRefreshTerminal | None:
         failed = await self._write_pair_accounting(
-            failure.cursor,
             failure.received_context,
             lambda profiles: profiles.mark_section_failure(
                 failure.cursor,
@@ -2057,7 +2063,7 @@ class DaemonEntityInfoService:
             )
             return personal_summary or full_summary
 
-        summary = await self._write_pair_accounting(measurement.cursor, measurement.received_context, record)
+        summary = await self._write_pair_accounting(measurement.received_context, record)
         if (
             summary is None
             and not self._profiles._refresh_has("pair_mode")

@@ -258,6 +258,92 @@ async def test_topic_snapshot_captured_before_fetch_cannot_replace_realtime(
         assert row[4] == 1
 
 
+@pytest.mark.asyncio
+async def test_full_topic_snapshot_persists_supplied_message_for_local_reads(db: sqlite3.Connection) -> None:
+    from telethon.tl import types
+    from telethon.tl.functions.messages import GetForumTopicsRequest
+
+    from mcp_telegram.sqlite_writer import SQLiteWriter
+    from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
+    from mcp_telegram.topics.refresh import TopicRefresher
+    from mcp_telegram.topics.telegram_adapter import TelethonTelegramTopicGateway
+    from tests.test_daemon_api import _response_messages, make_server
+
+    dialog_id = -1000000000123
+    seed_topic_account(db, dialog_id)
+    db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?,'synced')", (dialog_id,))
+    db.execute("INSERT INTO dialogs(dialog_id,name,type) VALUES (?,'Forum','supergroup')", (dialog_id,))
+    db.commit()
+    date = datetime(2026, 1, 1, tzinfo=UTC)
+    topic = types.ForumTopic(
+        id=7,
+        date=date,
+        peer=types.PeerChannel(123),
+        title="Visible topic",
+        icon_color=6,
+        top_message=10,
+        read_inbox_max_id=0,
+        read_outbox_max_id=0,
+        unread_count=0,
+        unread_mentions_count=0,
+        unread_reactions_count=0,
+        unread_poll_votes_count=0,
+        from_id=types.PeerUser(77),
+        notify_settings=types.PeerNotifySettings(),
+    )
+    message = types.Message(
+        id=10, peer_id=types.PeerChannel(123), date=date, message="snapshot needle", from_id=types.PeerUser(77)
+    )
+    response = types.messages.ForumTopics(1, [topic], [message], [], [types.User(77, first_name="Sender")], 1)
+
+    class Client:
+        calls = 0
+
+        async def get_input_entity(self, _entity: object) -> object:
+            return types.InputPeerChannel(123, 9)
+
+        async def get_entity(self, _entity: object) -> object:
+            raise AssertionError("unexpected entity acquisition")
+
+        async def __call__(self, request: object) -> object:
+            assert isinstance(request, GetForumTopicsRequest)
+            self.calls += 1
+            return response
+
+    client = Client()
+    scope = topic_scope()
+    writer = await SQLiteWriter.open(Path(db.execute("PRAGMA database_list").fetchone()[2]))
+    feedback = sqlite3.connect(":memory:")
+    try:
+        with rpc_scope(TelegramRpcSource.TOPIC_RECONCILIATION):
+            count = await TopicRefresher(
+                TelethonTelegramTopicGateway(client),
+                SQLiteTopicSnapshotRepository(db),
+                writer=writer,
+                capture_scope=scope.capture,
+                claim_scope=scope.claim,
+            ).refresh(dialog_id, SimpleNamespace(forum=True))
+        assert count == 1 and client.calls == 1
+        assert db.execute(
+            "SELECT title FROM topic_metadata WHERE dialog_id=? AND topic_id=7", (dialog_id,)
+        ).fetchone() == ("Visible topic",)
+        assert db.execute("SELECT text FROM messages WHERE dialog_id=? AND message_id=10", (dialog_id,)).fetchone() == (
+            "snapshot needle",
+        )
+        assert db.execute(
+            "SELECT message_id FROM messages_fts WHERE messages_fts MATCH 'needle' AND dialog_id=?", (dialog_id,)
+        ).fetchone() == (10,)
+        daemon = make_server(db, client, feedback_conn=feedback, writer=writer)
+        listed = await daemon._list_messages({"dialog_id": dialog_id, "limit": 10})
+        searched = await daemon._search_messages({"dialog_id": dialog_id, "query": "needle", "limit": 10})
+        assert [item["text"] for item in _response_messages(listed)] == ["snapshot needle"]
+        assert [item["text"] for item in _response_messages(searched)] == ["snapshot needle"]
+        assert client.calls == 1
+    finally:
+        feedback.close()
+        await writer.aclose()
+
+
 def test_reserved_topic_event_order_rejects_older_event(db: sqlite3.Connection) -> None:
     from mcp_telegram.sync_transactions import write_transaction
 

@@ -144,8 +144,8 @@ def _seed_topic_dialog(
     conn.execute("INSERT INTO synced_dialogs (dialog_id,status) VALUES (?, 'synced')", (dialog_id,))
     conn.execute(
         "INSERT INTO topic_metadata "
-        "(dialog_id,topic_id,title,is_general,is_deleted,updated_at,icon_emoji_id,icon_emoji) "
-        "VALUES (?,?,?,0,0,1,42,NULL)",
+        "(dialog_id,topic_id,title,is_general,is_deleted,updated_at,icon_emoji_id,icon_emoji,known_fields,catalog_present) "
+        "VALUES (?,?,?,0,0,1,42,NULL,3,1)",
         (dialog_id, topic_id, "General"),
     )
     if message is not None:
@@ -462,7 +462,7 @@ async def test_registered_entity_info_keeps_owned_partial_cache_success_under_pr
     assert coordinator is not None
     await run_ready_slice(EntityProfileDemandAdapter(coordinator))
     assert seed_conn.execute("SELECT profile_owner_account_id FROM entity_details WHERE entity_id=42").fetchone() == (
-        42,
+        99,
     )
     await seed_service.shutdown()
     seed_conn.close()
@@ -473,7 +473,7 @@ async def test_registered_entity_info_keeps_owned_partial_cache_success_under_pr
         daemon._policy,
         entity_profile=replace(daemon._policy.entity_profile, foreground_refresh_wait_seconds=0.01),
     )
-    await daemon._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
+    await daemon._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 99, 2, 99))
     daemon._health_status = _active_status
     socket_path = tmp_path / "daemon.sock"
     _install_daemon_socket(monkeypatch, socket_path)

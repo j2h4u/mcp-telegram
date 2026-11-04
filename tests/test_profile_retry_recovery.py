@@ -58,7 +58,7 @@ async def test_executor_persists_missing_section_failure_for_central_gate(tmp_pa
     _collected(conn, 42, owner=42)
     with write_savepoint(conn):
         conn.execute("DELETE FROM entity_detail_sections WHERE section=?", (section,))
-    client = _PairClient(channel_id=None)
+    client = _PairClient(channel_id=None, account_id=42)
     service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=True))
     facts = _RetryingFacts()
     client.collection_port = facts
@@ -93,11 +93,13 @@ async def test_executor_persists_missing_section_failure_for_central_gate(tmp_pa
 @pytest.mark.asyncio
 async def test_executor_acquires_only_missing_personal_channel_without_pair_loop(tmp_path: Path) -> None:
     conn, repo = _repository(tmp_path / "personal-executor.sqlite")
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.commit()
     _peer(conn, 42)
     _collected(conn, 42, owner=42)
     with write_savepoint(conn):
         conn.execute("DELETE FROM entity_detail_sections WHERE section='personal_channel'")
-    client = _PairClient(channel_id=None)
+    client = _PairClient(channel_id=None, account_id=42)
     service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=True))
     service._deps = replace(service._deps, now_provider=lambda: 100_000.0)
     coordinator = service.refresh_coordinator

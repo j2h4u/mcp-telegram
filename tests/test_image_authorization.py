@@ -162,6 +162,7 @@ def test_hydrated_media_revokes_only_accepted_change_before_commit(tmp_path: Pat
     assert scope is not None
     try:
         with write_transaction(conn):
+            conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
             conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (42,'synced')")
             conn.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (42,1,1)")
             old_order = allocate_observation_order(conn)

@@ -34,6 +34,8 @@ async def test_profile_pair_commits_and_recovers_with_readonly_loop_connection(t
     service.bind_profile_observer(Observer())
 
     def prepare(conn: sqlite3.Connection) -> None:
+        with write_transaction(conn):
+            conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
         profiles = EntityProfileRepository(conn, section_ttl_seconds=300)
         profiles.save_core({"id": 42, "type": "user", "name": "Target"}, now=100)
         profiles.mark_pending(42, now=100, pair_eligible_override=True)

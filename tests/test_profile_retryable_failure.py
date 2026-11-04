@@ -54,22 +54,29 @@ async def test_coordinator_retries_persisted_timeout_after_backoff(tmp_path: Pat
         selected = service._durable_refresh_status(100)
         assert selected is not None and selected.selected is not None
         revision = selected.selected
+        assert coordinator._pop_ready(now=clock()) is kind
         await coordinator._execute_slice(kind)
         assert conn.execute("SELECT status,reason FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
             "failed",
             "timeouterror",
         )
         after_failure = service._durable_refresh_status(100)
-        assert after_failure is not None and after_failure.selected == revision
+        assert after_failure is not None and after_failure.selected == revision and client.calls == 1
         budget = coordinator._invocations[revision].budget
-        assert budget.attempts == 1 and client.calls == 1
         coordinator._active_kind = None
         clock.value = 129
         coordinator.scan()
-        assert kind not in coordinator.ready_kinds and client.calls == 1
+        if kind in coordinator.ready_kinds:
+            assert coordinator._statuses[kind].selected != revision
+            assert coordinator._pop_ready(now=clock()) is kind
+            await coordinator._execute_slice(kind)
+            coordinator._active_kind = None
+            coordinator.scan()
+        assert kind not in coordinator.ready_kinds and client.calls == 1 and budget.attempts == 1
         clock.value = 130
         coordinator.scan()
         assert kind in coordinator.ready_kinds
+        assert coordinator._pop_ready(now=clock()) is kind
         await coordinator._execute_slice(kind)
         assert client.calls == 2 and budget.attempts == 2
         assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() != (

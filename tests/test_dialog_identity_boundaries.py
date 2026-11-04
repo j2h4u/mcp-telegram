@@ -266,6 +266,9 @@ def test_identity_tach_modules_have_only_downward_dependencies() -> None:
     modules = {module["path"]: module for module in config["modules"]}
     assert modules["mcp_telegram.dialog_identity_contracts"]["depends_on"] == ["mcp_telegram.models"]
     assert modules["mcp_telegram.dialog_identity"]["depends_on"] == [
+        "mcp_telegram.dialog_fact_observations",
+        "mcp_telegram.entity_store",
+        "mcp_telegram.sync_transactions",
         "mcp_telegram.dialog_identity_contracts",
         "mcp_telegram.models",
     ]

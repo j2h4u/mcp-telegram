@@ -721,6 +721,8 @@ async def test_full_user_semantic_fields_use_captured_owner_and_same_commit(tmp_
     )
 
     def prepare(connection: sqlite3.Connection) -> None:
+        with write_transaction(connection):
+            connection.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
         repo = EntityProfileRepository(connection, section_ttl_seconds=300)
         repo.save_core({"id": 7, "type": "user", "name": "old"}, now=100)
         repo.mark_pending(7, now=100, pair_eligible_override=True)
@@ -733,7 +735,7 @@ async def test_full_user_semantic_fields_use_captured_owner_and_same_commit(tmp_
         owner, target, fields = reader.execute(
             "SELECT owner_account_id,entity_id,fields_json FROM entity_profile_semantic_snapshots"
         ).fetchone()
-        assert (owner, target) == (42, 7)
+        assert (owner, target) == (99, 7)
         decoded = json.loads(fields)
         assert decoded["full_user.note"]["text"] == note
         assert decoded["full_user.note"]["entities"][0]["offset"] == 5

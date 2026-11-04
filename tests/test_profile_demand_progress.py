@@ -36,6 +36,8 @@ def _add_pending(conn: sqlite3.Connection, entity_id: int, now: int = 100) -> No
 @pytest.mark.asyncio
 async def test_access_lost_preserves_profile_work_and_rejects_selected_slice(tmp_path: Path) -> None:
     conn, repo = _repository(tmp_path / "access.sqlite")
+    conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
+    conn.commit()
     _peer(conn, 42)
     repo.mark_pending(42, now=100)
     _add_pending(conn, 77, now=101)
@@ -68,6 +70,8 @@ async def test_access_lost_preserves_profile_work_and_rejects_selected_slice(tmp
 @pytest.mark.asyncio
 async def test_access_loss_during_profile_request_keeps_pending_facts(tmp_path: Path) -> None:
     conn, repo = _repository(tmp_path / "inflight.sqlite")
+    conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
+    conn.commit()
     _peer(conn, 42)
     repo.mark_pending(42, now=100)
 
@@ -102,6 +106,8 @@ async def test_access_loss_during_profile_request_keeps_pending_facts(tmp_path: 
 @pytest.mark.asyncio
 async def test_access_loss_during_profile_preparation_stops_rpc(tmp_path: Path) -> None:
     conn, repo = _repository(tmp_path / "preparation.sqlite")
+    conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
+    conn.commit()
     _peer(conn, 42)
     repo.mark_pending(42, now=100)
     client = _PairClient(channel_id=None)
@@ -165,6 +171,8 @@ def test_five_siblings_and_retry_timestamp_do_not_change_work_revision(tmp_path:
 @pytest.mark.asyncio
 async def test_local_admission_deferral_does_not_write_profile_facts_or_retry(tmp_path: Path) -> None:
     conn, repo = _repository(tmp_path / "deferred.sqlite")
+    conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
+    conn.commit()
     _peer(conn, 42)
     repo.mark_pending(42, now=100)
 
@@ -208,6 +216,8 @@ async def test_local_admission_deferral_does_not_write_profile_facts_or_retry(tm
 @pytest.mark.asyncio
 async def test_rejected_preparation_cas_returns_stale_without_rpc(tmp_path: Path) -> None:
     conn, repo = _repository(tmp_path / "stale.sqlite")
+    conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
+    conn.commit()
     _peer(conn, 42)
     repo.mark_pending(42, now=100)
     client = _PairClient(channel_id=None)
@@ -244,6 +254,8 @@ async def test_rejected_preparation_cas_returns_stale_without_rpc(tmp_path: Path
 @pytest.mark.asyncio
 async def test_accepted_page_commit_returns_progress_receipt_from_sql(tmp_path: Path) -> None:
     conn, repo = _repository(tmp_path / "accepted.sqlite")
+    conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
+    conn.commit()
     _peer(conn, 42)
     repo.mark_pending(42, now=100)
     with write_transaction(conn):
@@ -273,6 +285,8 @@ async def test_accepted_page_commit_returns_progress_receipt_from_sql(tmp_path: 
 @pytest.mark.asyncio
 async def test_negative_channel_id_remains_a_valid_selected_target(tmp_path: Path) -> None:
     conn, repo = _repository(tmp_path / "negative-channel.sqlite")
+    conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
+    conn.commit()
     _peer(conn, -42, kind="channel")
     repo.mark_pending(-42, now=100)
     service = cast(DaemonEntityInfoService, _pair_service(conn, _PairClient(channel_id=None), enabled=False))
@@ -301,6 +315,8 @@ async def test_negative_channel_id_remains_a_valid_selected_target(tmp_path: Pat
 @pytest.mark.asyncio
 async def test_failure_metadata_then_other_writer_advance_is_not_progress(tmp_path: Path) -> None:
     conn, repo = _repository(tmp_path / "failure-race.sqlite")
+    conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
+    conn.commit()
     with write_transaction(conn):
         conn.execute(
             "INSERT INTO entity_profile_refresh_state(entity_id,status,updated_at,next_section,generation) "

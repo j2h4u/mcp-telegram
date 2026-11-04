@@ -105,7 +105,7 @@ def _fenced_schema(conn: sqlite3.Connection, *, semantic: bool = True) -> None:
 
 
 class _PairClient:
-    def __init__(
+    def __init__(  # noqa: PLR0913 - explicit independent fixture options
         self,
         *,
         channel_id: int | None = 123,
@@ -113,9 +113,10 @@ class _PairClient:
         omit_channel_id: bool = False,
         username: str | None = "target",
         min_user: bool = False,
+        account_id: int = 99,
     ) -> None:
         self.scope_cell = ScopeCell()
-        assert self.scope_cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 99, 2, 99))
+        assert self.scope_cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, account_id, 2, 99))
         self.channel_id = channel_id
         self.bot = bot
         self.omit_channel_id = omit_channel_id

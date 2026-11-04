@@ -42,6 +42,7 @@ def db(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     path = tmp_path / "topics.sqlite"
     ensure_sync_schema(path)
     with closing(sqlite3.connect(path)) as conn:
+        conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
         conn.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (42,1,100)")
         conn.commit()
         yield conn
@@ -407,7 +408,7 @@ async def test_missing_capability_variants_preserve_observations_and_pending_wor
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("channel", [False, True])
-async def test_forbidden_access_blocks_without_retry_and_retains_resumable_page(
+async def test_forbidden_access_blocks_without_retry_and_restarts_on_new_request(
     db: sqlite3.Connection,
     channel: bool,
 ) -> None:
@@ -452,8 +453,18 @@ async def test_forbidden_access_blocks_without_retry_and_retains_resumable_page(
     db.commit()
     await _run_selected(_adapter(db, client), 4)
 
-    assert client.page_offsets == [0, 1]
+    assert client.page_offsets == [0, 0]
+    resumed = cast(tuple[object, ...], db.execute(position_sql).fetchone())
+    assert resumed[0] != cursor[0]
+    assert db.execute("SELECT topic_id,title FROM topic_metadata").fetchall() == [(1, "Topic 1")]
     assert repository.coverage(42)["reason"] != "source_access_unavailable"
+    await _run_selected(_adapter(db, client), 4)
+    assert client.page_offsets == [0, 0, 1]
+    assert repository.coverage(42)["coverage"] == "complete"
+    assert db.execute("SELECT topic_id,title FROM topic_metadata ORDER BY topic_id").fetchall() == [
+        (1, "Topic 1"),
+        (2, "Topic 2"),
+    ]
 
 
 @pytest.mark.asyncio

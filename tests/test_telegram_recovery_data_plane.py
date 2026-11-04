@@ -2,6 +2,7 @@
 
 import asyncio
 import sqlite3
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -18,6 +19,7 @@ from mcp_telegram.dialog_directory import CanonicalDialogDirectory, CanonicalDia
 from mcp_telegram.message_history.telegram_adapter import TelethonFullHistoryPageAdapter
 from mcp_telegram.peer_access import PeerAccess
 from mcp_telegram.sqlite_writer import SQLiteWriter
+from mcp_telegram.state import TelegramSessionLease, telegram_session_lease
 from mcp_telegram.sync_db import _open_sync_db, load_rpc_safety_record
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncWorker
 from mcp_telegram.telegram_demand import DurableDemandAdapter, RpcAttemptBudget
@@ -45,7 +47,13 @@ async def _reply(wire: _WireHarness, expected: type, reply: object) -> None:
     state.future.set_result(reply)
 
 
-def _fresh_wire(old: _WireHarness) -> _WireHarness:
+@pytest.fixture
+def session_lease(tmp_path: Path) -> Iterator[TelegramSessionLease]:
+    with telegram_session_lease(tmp_path) as lease:
+        yield lease
+
+
+def _fresh_wire(old: _WireHarness, lease: TelegramSessionLease) -> _WireHarness:
     gate = old[0]
     fresh = TelegramRpcGate(
         gate.session,
@@ -60,6 +68,7 @@ def _fresh_wire(old: _WireHarness) -> _WireHarness:
         safety_store=gate._safety_store,
     )
     fresh._admission_scheduler._clock = asyncio.get_running_loop().time
+    fresh.bind_session_lease(lease)
     sender = cast(GuardedMTProtoSender, fresh._main_sender)
     connection = GuardedConnectionTcpFull("127.0.0.1", 443, 2, loggers=fresh._log)
     connection.bind_owner(sender)
@@ -75,7 +84,10 @@ def _fresh_wire(old: _WireHarness) -> _WireHarness:
 
 
 async def test_recovered_read_owners_publish_new_local_facts(  # noqa: PLR0915 - end-to-end recovery lifecycle
-    trial_wire: tuple[_WireHarness, Clock], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    trial_wire: tuple[_WireHarness, Clock],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    session_lease: TelegramSessionLease,
 ) -> None:
     old, clock = trial_wire
     loop = asyncio.get_running_loop()
@@ -87,12 +99,14 @@ async def test_recovered_read_owners_publish_new_local_facts(  # noqa: PLR0915 -
     old[0]._admission_scheduler._clock = loop.time
     await old[0].finish_startup_auto_resume()
     await old[2].disconnect()
-    old = _fresh_wire(old)
+    old = _fresh_wire(old, session_lease)
     await old[0].prepare_startup_safety()
     await old[0].verify_startup_account(42)
     await _record_unknown(old)
     db_path = tmp_path / "sync.db"
     conn = _open_sync_db(db_path)
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.commit()
     writer = await SQLiteWriter.open(db_path)
     old_scope = old[0].retained_auth_scope()
     assert old_scope is not None
@@ -110,7 +124,7 @@ async def test_recovered_read_owners_publish_new_local_facts(  # noqa: PLR0915 -
     clock.advance(1)
     offset = clock.monotonic_seconds - real_time()
     assert await old[0].maintain_auto_resume()
-    fresh = _fresh_wire(old)
+    fresh = _fresh_wire(old, session_lease)
     directory = CanonicalDialogDirectory(fresh[0], db_path, asyncio.Event(), writer=writer)
     access: PeerAccess | None = None
     try:
