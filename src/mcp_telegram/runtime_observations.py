@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import queue
 import sqlite3
 import threading
@@ -601,6 +602,27 @@ def _recovery_payload(event: RecoveryObservation) -> dict[str, object]:
         payload["snapshot"] = asdict(event.snapshot)
     if event.attempts_total is not None:
         payload["attempts_total"] = event.attempts_total
+    payload.update(_recovery_timing_payload(event))
+    return payload
+
+
+def _recovery_timing_payload(event: RecoveryObservation) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    if event.failure_stage is not None and type(event.failure_stage) is int and event.failure_stage >= 0:
+        payload["failure_stage"] = event.failure_stage
+    payload.update(
+        {
+            name: value
+            for name, value in (
+                ("scheduled_due_utc", event.scheduled_due_utc),
+                ("restriction_floor_utc", event.restriction_floor_utc),
+                ("effective_eligible_utc", event.effective_eligible_utc),
+            )
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0 and math.isfinite(value)
+        }
+    )
+    if event.eligible_reason in {"backoff", "prior_due", "floor", "tie"}:
+        payload["eligible_reason"] = event.eligible_reason
     return payload
 
 

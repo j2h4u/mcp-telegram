@@ -18,7 +18,7 @@ from enum import StrEnum
 from functools import wraps
 from itertools import chain
 from pathlib import Path
-from typing import Never, Protocol, cast
+from typing import Never, Protocol, TypedDict, cast
 from weakref import WeakKeyDictionary
 
 from aiolimiter import AsyncLimiter
@@ -183,7 +183,18 @@ _SCHEDULED_MINIMUM_LEAD_SECONDS = 60
 _BACKEND_ERROR_CODE_MIN = 500
 _BACKEND_ERROR_CODE_MAX = 599
 
-_SAFETY_RECEIPT_VERSION = 3
+_SAFETY_RECEIPT_VERSION = 4
+_RECOVERY_RECEIPT_VERSION = 3
+
+
+class _RecoveryObservationTiming(TypedDict, total=False):
+    failure_stage: int
+    scheduled_due_utc: float
+    restriction_floor_utc: float
+    effective_eligible_utc: float
+    eligible_reason: str
+
+
 _CANONICAL_METHOD_MAX_LENGTH = 256
 _TL_CONSTRUCTOR_HEX_WIDTH = 8
 _AUTO_RESUME_DELAYS = (3600, 7200, 14400, 28800, 57600, 86400)
@@ -522,7 +533,7 @@ def _validate_safety_record(value: object) -> bool:
     }
     if not isinstance(value, dict):
         return False
-    if value.get("version") in {2, _SAFETY_RECEIPT_VERSION}:
+    if value.get("version") in {2, 3, _SAFETY_RECEIPT_VERSION}:
         fields.add("methods")
     if set(value) != fields:
         return False
@@ -542,7 +553,7 @@ def _validate_safety_record(value: object) -> bool:
             ),
             _valid_safety_recovery(value["recovery"], version=cast(int, value["version"])),
             _valid_safety_transition(value["transition"]),
-            _valid_method_episodes(value.get("methods", {})),
+            _valid_method_episodes(value.get("methods", {}), version=cast(int, value["version"])),
         )
     )
 
@@ -559,17 +570,20 @@ def _valid_safety_record_identity(value: dict[str, object]) -> bool:
     return all(
         (
             type(value["version"]) is int,
-            value["version"] in {1, 2, _SAFETY_RECEIPT_VERSION},
+            value["version"] in {1, 2, 3, _SAFETY_RECEIPT_VERSION},
             isinstance(value["generation"], str),
             bool(value["generation"]),
         )
     )
 
 
-def _valid_method_episodes(value: object) -> bool:
+def _valid_method_episodes(value: object, *, version: int) -> bool:
     if not isinstance(value, dict) or len(value) > len(tlobjects):
         return False
-    return all(_valid_method_key(method) and _valid_method_episode(episode) for method, episode in value.items())
+    return all(
+        _valid_method_key(method) and _valid_method_episode(episode, version=version)
+        for method, episode in value.items()
+    )
 
 
 def _valid_method_key(method: object) -> bool:
@@ -586,17 +600,33 @@ def _valid_method_key(method: object) -> bool:
     return kind is not None and issubclass(kind, TLRequest) and name == f"{kind.__module__}.{kind.__name__}"
 
 
-def _valid_method_episode(value: object) -> bool:
+def _valid_method_episode(value: object, *, version: int) -> bool:
     fields = {"generation", "consecutive_actual_floods", "floor", "claim"}
-    if not isinstance(value, dict) or set(value) not in (fields, fields | {"state"}):
+    if not isinstance(value, dict) or set(value) not in (
+        fields,
+        fields | {"state"},
+        fields | {"consecutive_read_budget_failures"},
+        fields | {"state", "consecutive_read_budget_failures"},
+    ):
         return False
     count = value["consecutive_actual_floods"]
+    read_count = value.get("consecutive_read_budget_failures", 0)
+    if ("consecutive_read_budget_failures" in value) != (version >= _SAFETY_RECEIPT_VERSION):
+        return False
     state = value.get("state", "live")
-    if not isinstance(value["generation"], str) or not value["generation"] or type(count) is not int:
+    if (
+        not isinstance(value["generation"], str)
+        or not value["generation"]
+        or type(count) is not int
+        or count < 0
+        or type(read_count) is not int
+    ):
+        return False
+    if read_count < 0:
         return False
     return all(
         (
-            _valid_method_state(state, count, value["claim"]),
+            _valid_method_state(state, count + read_count, value["claim"]),
             _valid_safety_floor(value["floor"]),
             _valid_method_claim(value["claim"]),
         )
@@ -628,6 +658,7 @@ def _valid_safety_intent(key: object, value: object, *, version: int = 3) -> boo
             {"method", "run", "phase", "scope", "policy_recovery"},
             {"method", "run", "phase", "scope", "aux_bootstrap"},
             {"method", "run", "phase", "scope", "native_write_receipt_owner"},
+            {"method", "run", "phase", "scope", "read_retry"},
         )
         and _valid_safety_intent_payload(value, version=version)
     )
@@ -639,11 +670,34 @@ def _valid_safety_intent_payload(value: dict[str, object], *, version: int) -> b
         and isinstance(value["run"], str)
         and value["phase"] in {"prepared", "unknown", "acknowledged_unknown"}
         and _valid_intent_scope(value["scope"])
-        and _valid_policy_recovery(value.get("policy_recovery"), value["scope"])
-        and (version == _SAFETY_RECEIPT_VERSION or "policy_recovery" not in value)
+        and _valid_versioned_policy_recovery(value, version)
         and _valid_aux_bootstrap(value, version=version)
         and _valid_native_receipt_owner(value)
         and _valid_intent_disposition(value)
+        and _valid_versioned_read_retry(value, version)
+    )
+
+
+def _valid_versioned_policy_recovery(value: dict[str, object], version: int) -> bool:
+    return _valid_policy_recovery(value.get("policy_recovery"), value["scope"]) and (
+        version >= _RECOVERY_RECEIPT_VERSION or "policy_recovery" not in value
+    )
+
+
+def _valid_versioned_read_retry(value: dict[str, object], version: int) -> bool:
+    return (version >= _SAFETY_RECEIPT_VERSION or "read_retry" not in value) and _valid_read_retry(value)
+
+
+def _valid_read_retry(intent: dict[str, object]) -> bool:
+    retry = intent.get("read_retry")
+    return retry is None or (
+        isinstance(retry, dict)
+        and set(retry) == {"reason", "method_generation"}
+        and retry["reason"] == "attempt_budget_exhausted"
+        and isinstance(retry["method_generation"], str)
+        and bool(retry["method_generation"])
+        and intent["phase"] == "unknown"
+        and rpc_effect(cast(str, intent["method"])) is RpcEffect.NONMUTATING_READ
     )
 
 
@@ -685,7 +739,7 @@ def _valid_aux_bootstrap(intent: dict[str, object], *, version: int) -> bool:
     aux = intent.get("aux_bootstrap")
     if aux is None:
         return "aux_bootstrap" not in intent
-    if version != _SAFETY_RECEIPT_VERSION or not isinstance(aux, dict):
+    if version < _RECOVERY_RECEIPT_VERSION or not isinstance(aux, dict):
         return False
     return _valid_aux_provenance(intent, aux)
 
@@ -806,19 +860,33 @@ def _is_contained_native(item: dict[str, object], scope: dict[str, object]) -> b
 
 
 def _intent_blocks(item: dict[str, object], scope: dict[str, object]) -> bool:
+    if _is_scoped_read_retry(item, scope):
+        return False
     if _is_contained_native(item, scope):
         return False
-    aux = item.get("aux_bootstrap")
-    if (
-        _is_contained_aux(item)
-        and isinstance(aux, dict)
-        and aux["main_scope"] == {key: scope[key] for key in ("dc_id", "key_id", "account_id")}
-    ):
+    if _is_scoped_contained_aux(item, scope):
         return False
     return item["phase"] != "acknowledged_unknown" and not (
         item["phase"] == "unknown"
         and item.get("policy_recovery") is not None
         and item["scope"] == {key: scope[key] for key in ("dc_id", "key_id", "account_id")}
+    )
+
+
+def _is_scoped_read_retry(item: dict[str, object], scope: dict[str, object]) -> bool:
+    return (
+        scope["stage"] == "verified"
+        and item.get("read_retry") is not None
+        and item["scope"] == {key: scope[key] for key in ("dc_id", "key_id", "account_id")}
+    )
+
+
+def _is_scoped_contained_aux(item: dict[str, object], scope: dict[str, object]) -> bool:
+    aux = item.get("aux_bootstrap")
+    return (
+        _is_contained_aux(item)
+        and isinstance(aux, dict)
+        and aux["main_scope"] == {key: scope[key] for key in ("dc_id", "key_id", "account_id")}
     )
 
 
@@ -843,7 +911,7 @@ def _valid_safety_recovery(value: object, *, version: int = 3) -> bool:
     states = {"authorized", "consumed", "succeeded", "failed"}
     if automatic is not None:
         fields.add("automatic")
-        states.update({"waiting", "fencing", "exhausted"} if version == _SAFETY_RECEIPT_VERSION else {"waiting"})
+        states.update({"waiting", "fencing", "exhausted"} if version >= _RECOVERY_RECEIPT_VERSION else {"waiting"})
         if not _valid_automatic_state(automatic, value.get("state"), version):
             return False
     return set(value) == fields and all(
@@ -861,7 +929,7 @@ def _valid_automatic_state(automatic: object, state: object, version: int) -> bo
     if not _valid_automatic_recovery(automatic, version=version):
         return False
     return not (
-        version == _SAFETY_RECEIPT_VERSION
+        version >= _RECOVERY_RECEIPT_VERSION
         and state == "waiting"
         and cast(dict[str, object], automatic)["scheduled_due"] is None
     )
@@ -870,7 +938,7 @@ def _valid_automatic_state(automatic: object, state: object, version: int) -> bo
 def _valid_automatic_recovery(value: object, *, version: int = 3) -> bool:
     if not isinstance(value, dict):
         return False
-    if version < _SAFETY_RECEIPT_VERSION:
+    if version < _RECOVERY_RECEIPT_VERSION:
         return (
             set(value) == {"attempts", "due"}
             and type(value["attempts"]) is int
@@ -1108,9 +1176,11 @@ class TelegramRpcSafetyLedger:
         version = cast(int, self._record["version"])
         if version == 1:
             self._record["methods"] = {}
+        for episode in cast(dict[str, dict[str, object]], self._record["methods"]).values():
+            episode.setdefault("consecutive_read_budget_failures", 0)
         recovery = self._record["recovery"]
         if (
-            version < _SAFETY_RECEIPT_VERSION
+            version < _RECOVERY_RECEIPT_VERSION
             and isinstance(recovery, dict)
             and isinstance(recovery.get("automatic"), dict)
         ):
@@ -1298,8 +1368,11 @@ class TelegramRpcSafetyLedger:
             return None
         generation = cast(str, episode["generation"])
         claim = episode["claim"]
+        reason, detail = self._method_recovery_reason(episode)
         if isinstance(claim, dict) and (claim["attempt_id"] != attempt_id or claim["run"] != self._run):
-            return TelegramRpcMethodRecoveryPending(method, generation)
+            return TelegramRpcMethodRecoveryPending(
+                method, generation, reason=reason if reason != "method" else "recovery"
+            )
         deadline = self._floor_release_at(cast(dict[str, object], episode["floor"]))
         if deadline <= time.monotonic():
             return None
@@ -1308,8 +1381,17 @@ class TelegramRpcSafetyLedger:
             method_key=method,
             generation=generation,
             eligible_at=deadline,
-            reason="method",
+            reason=reason,
+            detail=detail,
         )
+
+    @staticmethod
+    def _method_recovery_reason(episode: dict[str, object]) -> tuple[str, str | None]:
+        if not episode.get("consecutive_read_budget_failures"):
+            return "method", None
+        if episode["consecutive_actual_floods"]:
+            return "method_mixed_retry", "Method recovery includes FloodWait and a local read budget failure"
+        return "read_budget_retry", "Method retry waits after local read attempt budget exhaustion"
 
     @property
     def protection_reason(self) -> str | None:
@@ -1464,17 +1546,40 @@ class TelegramRpcSafetyLedger:
                     policy_event=policy_event,
                     elapsed_ms=elapsed_ms,
                     phase=phase if mode is RecoveryMode.AUTO else None,
-                    cause=getattr(snapshot, "cause", None),
+                    cause=(
+                        getattr(snapshot, "cause", None)
+                        or (RecoveryCause(cast(str, details["cause"])) if details.get("cause") is not None else None)
+                    ),
                     command=getattr(decision, "command", None),
                     reason=getattr(decision, "reason", None),
                     snapshot=snapshot,
                     episode_id=cast(str | None, details.get("episode_id")),
                     grant_id=cast(str | None, trial.get("generation")) if trial and mode is RecoveryMode.AUTO else None,
                     attempts_total=cast(int | None, details.get("attempts_total")),
+                    **self._recovery_observation_timing(current, details, phase),
                 )
             )
         except Exception:  # noqa: BLE001 - telemetry cannot affect safety or settlement.
             logger.warning("recovery_observer_failed")
+
+    def _recovery_observation_timing(
+        self, record: dict[str, object], details: dict[str, object], phase: RecoveryPhase
+    ) -> _RecoveryObservationTiming:
+        if phase is not RecoveryPhase.WAITING or not isinstance(details.get("scheduled_due"), dict):
+            return {}
+        due = float(cast(float, cast(dict[str, object], details["scheduled_due"])["until_utc"]))
+        floor = float(cast(float, cast(dict[str, object], record["floor"])["until_utc"]))
+        cause = cast(str, details["cause"])
+        stages = cast(dict[str, int], details["failure_stages"])
+        result: _RecoveryObservationTiming = {
+            "failure_stage": stages[cause],
+            "scheduled_due_utc": due,
+            "restriction_floor_utc": floor,
+            "effective_eligible_utc": max(due, floor),
+        }
+        if floor > due:
+            result["eligible_reason"] = "floor"
+        return result
 
     @asynccontextmanager
     async def observe_recovery_await(self, action: RecoveryAction) -> AsyncIterator[None]:
@@ -1513,6 +1618,7 @@ class TelegramRpcSafetyLedger:
             event = {
                 RecoveryPhase.CONSUMED: RecoveryObservationEvent.CONSUMED,
                 RecoveryPhase.SUCCEEDED: RecoveryObservationEvent.SUCCEEDED,
+                RecoveryPhase.WAITING: RecoveryObservationEvent.WAITING,
             }.get(new_phase)
             if event is not None:
                 self.observe_recovery(RecoveryStage.COMMIT, event, record=updated)
@@ -1523,7 +1629,14 @@ class TelegramRpcSafetyLedger:
         previous = cast(dict[str, dict[str, object]], self._record["methods"])
         episodes = cast(dict[str, dict[str, object]], updated["methods"])
         for method, payload in episodes.items():
-            receipt = _MethodReceipt(payload)
+            receipt = _MethodReceipt(
+                payload,
+                credit_enabled=(
+                    self._read_scope_valid
+                    and updated["transition"] is None
+                    and cast(int, payload.get("consecutive_read_budget_failures", 0)) > 0
+                ),
+            )
             prior = previous.get(method)
             if isinstance(prior, _MethodReceipt) and prior["generation"] == payload["generation"]:
                 receipt.credit_enabled = prior.credit_enabled
@@ -1843,8 +1956,11 @@ class TelegramRpcSafetyLedger:
         method_generation: str | None = None,
         method_success: bool = False,
         recovery_cause: RecoveryCause | None = None,
+        scoped_read_failure: bool = False,
     ) -> None:
         def settle_recovery(record: dict[str, object]) -> None:
+            if scoped_read_failure:
+                return
             trial = record["recovery"]
             known_flood = known_outcome and floor_until_utc is not None
             if self._ordinary_method_floor_only(trial, known_flood, circuit_open, recovery_cause):
@@ -1858,7 +1974,10 @@ class TelegramRpcSafetyLedger:
 
         def settle(record: dict[str, object]) -> None:
             self._settle_method(record, attempt_id, actual_flood, method_generation, method_success)
-            self._settle_intent(record, attempt_id, known_outcome)
+            if scoped_read_failure:
+                self._settle_read_budget_failure(record, attempt_id)
+            else:
+                self._settle_intent(record, attempt_id, known_outcome)
             if floor_until_utc is not None:
                 self._settle_restriction(record, floor_until_utc)
             current_trial = record["recovery"]
@@ -1867,9 +1986,48 @@ class TelegramRpcSafetyLedger:
                 record["generation"] = uuid.uuid4().hex
             settle_recovery(record)
 
-        if not known_outcome and attempt_id in self._claimed:
+        if not known_outcome and attempt_id in self._claimed and not scoped_read_failure:
             self._startup_hold = "unresolved_outbound_outcome"
         await self._commit(settle, settled_attempt=attempt_id)
+
+    def _settle_read_budget_failure(self, record: dict[str, object], attempt_id: str) -> None:
+        intent = cast(dict[str, dict[str, object]], record["intents"])[attempt_id]
+        if attempt_id not in self._claimed or intent["run"] != self._run:
+            raise ValueError("read failure does not own a claimed attempt")
+        scope = cast(dict[str, object], record["scope"])
+        if (
+            scope["stage"] != "verified"
+            or record["transition"] is not None
+            or intent["scope"] != {key: scope[key] for key in ("dc_id", "key_id", "account_id")}
+        ):
+            raise ValueError("read failure no longer owns the verified account scope")
+        method = cast(str, intent["method"])
+        episodes = cast(dict[str, dict[str, object]], record["methods"])
+        previous = episodes.get(method)
+        count = cast(int, previous.get("consecutive_read_budget_failures", 0)) + 1 if previous else 1
+        delay = float(backoff_seconds(RecoveryCause.READ_UNCERTAINTY, count - 1))
+        if previous is not None:
+            delay = max(delay, self._floor_release_at(cast(dict[str, object], previous["floor"])) - time.monotonic())
+        generation = uuid.uuid4().hex
+        episodes[method] = _MethodReceipt(
+            {
+                "state": "live",
+                "generation": generation,
+                "consecutive_actual_floods": previous.get("consecutive_actual_floods", 0) if previous else 0,
+                "consecutive_read_budget_failures": count,
+                "floor": {
+                    "boot_id": self._boot_id,
+                    "until_monotonic": time.monotonic() + delay,
+                    "until_utc": time.time() + delay,
+                    "remaining_seconds": delay,
+                },
+                "claim": None,
+            },
+            credit_enabled=True,
+        )
+        intent.update(
+            phase="unknown", read_retry={"reason": "attempt_budget_exhausted", "method_generation": generation}
+        )
 
     @staticmethod
     def _ordinary_method_floor_only(
@@ -1904,7 +2062,9 @@ class TelegramRpcSafetyLedger:
             self._record_method_flood(episodes, method, episode)
         elif episode is not None and episode["claim"] == {"attempt_id": attempt_id, "run": self._run}:
             if success and episode["generation"] == generation:
-                episode.update(state="recovered", consecutive_actual_floods=0, claim=None)
+                episode.update(
+                    state="recovered", consecutive_actual_floods=0, consecutive_read_budget_failures=0, claim=None
+                )
             else:
                 episode["claim"] = None
 
@@ -1925,6 +2085,9 @@ class TelegramRpcSafetyLedger:
                 "state": "live",
                 "generation": uuid.uuid4().hex,
                 "consecutive_actual_floods": count,
+                "consecutive_read_budget_failures": previous.get("consecutive_read_budget_failures", 0)
+                if previous
+                else 0,
                 "floor": {
                     "boot_id": self._boot_id,
                     "until_monotonic": time.monotonic() + remaining,
@@ -1953,7 +2116,8 @@ class TelegramRpcSafetyLedger:
     @staticmethod
     def _retains_unknown_intent(prior: object) -> bool:
         return isinstance(prior, dict) and (
-            _is_contained_aux(prior) or (prior["phase"] == "unknown" and "native_write_receipt_owner" in prior)
+            _is_contained_aux(prior)
+            or (prior["phase"] == "unknown" and ("native_write_receipt_owner" in prior or "read_retry" in prior))
         )
 
     @staticmethod
@@ -4189,6 +4353,8 @@ class TelegramRpcGate(TelegramClient):
         ledger = self._ensure_safety_ledger()
         if self.account_safety_status() is not None or self._rpc_circuit_status().open:
             return TelegramRpcThrottled(latched=True, detail="Telegram account acquisition remains protected")
+        if method_key is not None and method_key in self._pending_method_receipts:
+            return TelegramRpcMethodRecoveryPending(method_key, "pending_receipt")
         deadline = max(account_cooldown_deadline(), ledger.floor_deadline)
         if deadline > time.monotonic():
             return TelegramRpcAdmissionDeferred(
@@ -5567,7 +5733,76 @@ class TelegramRpcGate(TelegramClient):
             owner.receipt = receipt
             self._notify_rpc_eligibility_changed()
         elif not isinstance(error, RPCError) and owner.claimed and not owner.scope.transport_control:
+            if self._ordinary_read_budget_failure(owner, error):
+                self._record_read_budget_failure(owner, error)
+                return
             self._observe_unknown_wire_error(owner, error)
+
+    def _ordinary_read_budget_failure(self, owner: _WireAttempt, error: BaseException) -> bool:
+        return bool(
+            isinstance(error, RpcAttemptBudgetExhaustedError)
+            and owner.claimed
+            and rpc_effect(owner.method) is RpcEffect.NONMUTATING_READ
+            and self._ordinary_read_owner(owner)
+            and self._verified_read_budget(owner)
+        )
+
+    @staticmethod
+    def _ordinary_read_owner(owner: _WireAttempt) -> bool:
+        scope = owner.scope
+        return bool(
+            scope.acquisition_kind is not None
+            and scope.demand_kind is not None
+            and scope.demand_kind
+            not in {
+                DemandKind.DRAFT_MUTATION,
+                DemandKind.SCHEDULED_MUTATION,
+                DemandKind.FOLDER_COMMAND,
+                DemandKind.NOTE_COMMAND,
+            }
+            and not any((scope.transport_bootstrap, scope.transport_auth, scope.transport_control, owner.self_lookup))
+            and owner.photo_capability is None
+            and owner.native_check is None
+            and not owner.draft_mutation
+            and not owner.scheduled_mutation
+        )
+
+    def _verified_read_budget(self, owner: _WireAttempt) -> bool:
+        scope = owner.scope
+        ledger = self._ensure_safety_ledger()
+        auth = self.retained_auth_scope()
+        return bool(
+            ledger._read_scope_valid
+            and ledger._record["transition"] is None
+            and auth is not None
+            and ledger.verified_account_id == auth.account_id
+            and cast(dict[str, object], ledger._record["scope"])["key_id"] == auth.auth_key_id
+            and cast(dict[str, object], ledger._record["scope"])["dc_id"] == auth.dc_id
+            and scope.attempt_budget is not None
+            and scope.attempt_budget.selected is not None
+            and scope.attempt_budget.selected.key.account_id == auth.account_id
+        )
+
+    def _record_read_budget_failure(self, owner: _WireAttempt, error: BaseException) -> None:
+        if owner.receipt is not None:
+            return
+        method = owner.method
+        assert owner.scope.attempt_budget is not None
+        owner.scope.attempt_budget._read_budget_failure_method = method
+        self._pending_method_receipts[method] = self._pending_method_receipts.get(method, 0) + 1
+        task = asyncio.create_task(self._settle_read_budget_failure(owner, error))
+        owner.receipt = task
+        task.add_done_callback(lambda _task: self._method_receipt_finished(method), context=Context())
+        self._notify_rpc_eligibility_changed(method)
+
+    async def _settle_read_budget_failure(self, owner: _WireAttempt, error: BaseException) -> None:
+        ledger = self._ensure_safety_ledger()
+        try:
+            await ledger.complete(owner.attempt_id, known_outcome=False, scoped_read_failure=True)
+        except Exception:
+            logger.exception("read_budget_receipt_failed")
+            raise
+        self._observe_unknown_incident(owner, error, ledger)
 
     def _observe_unknown_wire_error(self, owner: _WireAttempt, error: BaseException) -> None:
         prior_fault = self._wire_fault

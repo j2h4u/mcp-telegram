@@ -121,6 +121,10 @@ def _validate_adapter_contract(
         raise RuntimeError(f"durable demand {kind.value} has no positive slice budget")
 
 
+def _method_wait_reason(reason: str | None, default: str) -> str:
+    return reason if reason in {"read_budget_retry", "method_mixed_retry"} else default
+
+
 class TelegramDemandCoordinator:
     """Run one bounded durable slice at a time until shutdown."""
 
@@ -280,6 +284,8 @@ class TelegramDemandCoordinator:
             "admission_saturated",
             "flood_wait",
             "method_recovery_pending",
+            "read_budget_retry",
+            "method_mixed_retry",
         }:
             self._released_gate_waits.add(revision)
         self._eligibility_waits.pop(revision, None)
@@ -440,7 +446,7 @@ class TelegramDemandCoordinator:
             if isinstance(gate, TelegramRpcMethodRecoveryPending):
                 self._revision_methods[selected] = gate.method_key
                 self._excluded.add(selected)
-                self._exclusion_reasons[selected] = "method_recovery_pending"
+                self._exclusion_reasons[selected] = _method_wait_reason(gate.reason, "method_recovery_pending")
                 self._eligibility_waits[selected] = None
             else:
                 self._park_throttle(selected, method, gate)
@@ -471,7 +477,7 @@ class TelegramDemandCoordinator:
         if method is not None:
             self._revision_methods[selected] = method
         self._excluded.add(selected)
-        self._exclusion_reasons[selected] = "admission_deferred"
+        self._exclusion_reasons[selected] = _method_wait_reason(gate.reason, "admission_deferred")
         self._eligibility_waits[selected] = gate.eligible_at
 
     def _gate_release(self, status: DemandStatus, eligible_at: float | None, observed_at: float) -> DemandStatus:
@@ -612,6 +618,8 @@ class TelegramDemandCoordinator:
         authorization = self._prepare_durable_retry(budget, method) if budget.exhausted else None
         if authorization is not None and self._monotonic_clock() < authorization.deadline:
             invocation.deadline = authorization.deadline
+            return
+        if budget._read_budget_failure_method is not None:
             return
         budget._retry_candidate = None
         budget.limit = (
@@ -761,13 +769,13 @@ class TelegramDemandCoordinator:
     def _handle_outcome_deferred(self, kind: DemandKind, status: DemandStatus, budget: RpcAttemptBudget) -> bool:
         method = self._method_for_work(budget.selected, budget, status.request_method)
         eligibility = self._rpc_eligibility(method)
+        if isinstance(eligibility, (TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending)):
+            self._handle_deferred(kind, budget, eligibility)
+            return True
         if isinstance(eligibility, TelegramRpcThrottled):
             self._handle_throttle(kind, budget, eligibility)
             return True
-        if not isinstance(eligibility, (TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending)):
-            return False
-        self._handle_deferred(kind, budget, eligibility)
-        return True
+        return False
 
     def _handle_closed_admission(self, kind: DemandKind, budget: RpcAttemptBudget) -> bool:
         if self._shutdown_event.is_set():
@@ -788,7 +796,7 @@ class TelegramDemandCoordinator:
                 if method is not None:
                     self._revision_methods[budget.selected] = method
                 self._excluded.add(budget.selected)
-                self._exclusion_reasons[budget.selected] = "admission_deferred"
+                self._exclusion_reasons[budget.selected] = _method_wait_reason(exc.reason, "admission_deferred")
                 self._eligibility_waits[budget.selected] = exc.eligible_at
             self._observe("deferred", kind, actual_attempts=budget.attempts, reason="admission_deferred")
             return
@@ -797,7 +805,7 @@ class TelegramDemandCoordinator:
                 self._revision_methods[budget.selected] = exc.method_key
                 self._prepare_durable_retry(budget, exc.method_key)
                 self._excluded.add(budget.selected)
-                self._exclusion_reasons[budget.selected] = "method_recovery_pending"
+                self._exclusion_reasons[budget.selected] = _method_wait_reason(exc.reason, "method_recovery_pending")
                 self._eligibility_waits[budget.selected] = None
             self._observe("deferred", kind, actual_attempts=budget.attempts, reason="method_recovery_pending")
             return
@@ -854,6 +862,9 @@ class TelegramDemandCoordinator:
         if isinstance(exc, RpcAdmissionSaturatedError):
             self._handle_capacity_deferred(kind, budget)
             return
+        if isinstance(exc, RpcAttemptBudgetExhaustedError) and budget._read_budget_failure_method is not None:
+            self._park_read_budget_failure(kind, budget)
+            return
         if isinstance(exc, RpcAttemptBudgetExhaustedError):
             reason = "attempt_budget_exhausted"
         else:
@@ -862,6 +873,23 @@ class TelegramDemandCoordinator:
             self._excluded.add(budget.selected)
             self._exclusion_reasons[budget.selected] = reason
         self._observe("deferred", kind, actual_attempts=budget.attempts, reason=reason)
+
+    def _park_read_budget_failure(self, kind: DemandKind, budget: RpcAttemptBudget) -> None:
+        method = budget._read_budget_failure_method
+        selected = budget.selected
+        if method is None or selected is None:
+            return
+        self._revision_methods[selected] = method
+        hint = self._rpc_eligibility(method)
+        if isinstance(hint, (TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending)):
+            self._handle_deferred(kind, budget, hint)
+        elif isinstance(hint, TelegramRpcThrottled):
+            self._handle_throttle(kind, budget, hint)
+        else:
+            self._excluded.add(selected)
+            self._exclusion_reasons[selected] = "method_recovery_pending"
+            self._eligibility_waits[selected] = None
+            self._release_ready_gate_waits()
 
     def _handle_capacity_deferred(self, kind: DemandKind, budget: RpcAttemptBudget) -> None:
         if budget.selected is not None:

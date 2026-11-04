@@ -164,6 +164,7 @@ class RpcAttemptBudget:
     selected: WorkRevision | None
     last_method: str | None
     _retry_candidate: object | None
+    _read_budget_failure_method: str | None
 
     def __init__(
         self,
@@ -180,6 +181,7 @@ class RpcAttemptBudget:
         self.selected = selected
         self.last_method = last_method
         self._retry_candidate = None
+        self._read_budget_failure_method = None
 
     @property
     def limit(self) -> int:

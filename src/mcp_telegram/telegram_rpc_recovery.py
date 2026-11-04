@@ -169,6 +169,7 @@ class RecoveryObservationEvent(StrEnum):
     AWAIT_FAILED = "await_failed"
     CONSUMED = "consumed"
     SUCCEEDED = "succeeded"
+    WAITING = "waiting"
     RESET = "reset"
 
 
@@ -205,6 +206,11 @@ class RecoveryObservation:
     episode_id: str | None = None
     grant_id: str | None = None
     attempts_total: int | None = None
+    failure_stage: int | None = None
+    scheduled_due_utc: float | None = None
+    restriction_floor_utc: float | None = None
+    effective_eligible_utc: float | None = None
+    eligible_reason: str | None = None
 
 
 class _Rule(StrEnum):
