@@ -192,6 +192,13 @@ def _ensure_available(
     ).fetchone()
     if pending is not None:
         raise ValueError("note_outcome_unresolved")
+    pending_contact = conn.execute(
+        "SELECT 1 FROM contact_operation_receipts WHERE account_id=? AND entity_id=? "
+        "AND (outcome='pending' OR (outcome='unknown' AND verification!='observed_after_unknown')) LIMIT 1",
+        (account_id, target),
+    ).fetchone()
+    if pending_contact is not None:
+        raise ValueError("contact_outcome_unresolved")
     if unchanged and (no_op_check is None or not no_op_check(conn)):
         raise ValueError("note_state_changed")
 

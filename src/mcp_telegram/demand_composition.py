@@ -14,6 +14,8 @@ from mcp_telegram.activity_cold_backfill import ColdBackfillPacing, ColdPeerPage
 from mcp_telegram.activity_hot_sweep import HotActivityDemandAdapter, HotSweepPolicy
 from mcp_telegram.activity_substrate import ActivityClient
 from mcp_telegram.activity_sync import ArchiveBackfillDemandAdapter, ArchiveIncrementalDemandAdapter
+from mcp_telegram.contacts.demand import ContactCatalogueDemandAdapter
+from mcp_telegram.contacts.refresh import ContactCatalogueRefresher
 from mcp_telegram.delta_sync import (
     AccessProbe,
     AccessProbePolicy,
@@ -125,6 +127,7 @@ class DemandCompositionDependencies:
     entity_refresh_coordinator: EntityRefreshCoordinator
     fact_hydration_worker: MessageFactHydrationWorker
     folder_projection_worker: FolderProjectionWorker
+    contact_catalogue_refresher: ContactCatalogueRefresher
     message_fact_refresh_deps: MessageFactRefreshDeps
     message_fact_refresh_policy: MessageFactRefreshPolicy
     scheduled_reconciler: ScheduledMessageReconciler
@@ -314,6 +317,9 @@ def build_durable_adapter_map(
             dependencies.folder_projection_worker,
             account_id=dependencies.account_id,
             verification=dependencies.folder_verification,
+        ),
+        DemandKind.CONTACT_CATALOGUE: ContactCatalogueDemandAdapter(
+            dependencies.conn, dependencies.account_id, dependencies.contact_catalogue_refresher
         ),
         DemandKind.MESSAGE_FACT_REFRESH: MessageFactRefreshDemandAdapter(
             dependencies.message_fact_refresh_deps,

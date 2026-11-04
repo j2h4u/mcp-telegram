@@ -784,6 +784,15 @@ def _image_response(result: ImageReadResult) -> dict[str, object]:
     return response
 
 
+def _contact_note_error_action(error: object, action: object) -> str:
+    if error == "contact_required":
+        if action == "create" or action == "update":
+            return "If you intend to save this person as a contact, create it with manage_contact, then read the current note version and use a new operation key."
+        if action == "clear":
+            return "No note was cleared. Read the current note and contact state before proceeding."
+    return "Read the contact note and check the same operation key."
+
+
 class DaemonAPIServer:
     """Unix socket server that dispatches JSON requests to Telegram/sync.db.
 
@@ -858,6 +867,7 @@ class DaemonAPIServer:
         self._scheduled_commands: DraftCommands | None = None
         self._folder_commands: DraftCommands | None = None
         self._contact_note_commands: DraftCommands | None = None
+        self._contact_commands: DraftCommands | None = None
         self._message_image_service: MessageImageServicePort | None = None
 
     def bind_message_image_service(self, service: MessageImageServicePort) -> None:
@@ -877,6 +887,9 @@ class DaemonAPIServer:
 
     def bind_contact_note_commands(self, commands: DraftCommands) -> None:
         self._contact_note_commands = commands
+
+    def bind_contact_commands(self, commands: DraftCommands) -> None:
+        self._contact_commands = commands
 
     def bind_runtime_observation_sink(self, sink: RuntimeObservationSink) -> None:
         """Attach the bounded asynchronous sink used for daemon timing evidence."""
@@ -1278,6 +1291,7 @@ class DaemonAPIServer:
             "manage_scheduled_message",
             "manage_folder",
             "manage_contact_note",
+            "manage_contact",
         }
         if foreground:
             request_task.cancel()
@@ -1385,6 +1399,8 @@ class DaemonAPIServer:
             "get_folder": self._get_folder,
             "manage_folder": self._manage_folder,
             "manage_contact_note": self._manage_contact_note,
+            "manage_contact": self._manage_contact,
+            "list_contacts": self._list_contacts,
             "search_messages": self._search_messages,
             "trace_account_messages": self._trace_account_messages,
             "list_dialogs": self._list_dialogs,
@@ -1432,7 +1448,13 @@ class DaemonAPIServer:
                 with _preserve_or_rpc_scope(TelegramRpcSource.OPERATOR_LOGOUT):
                     return await self._logout_account(req)
 
-        if method in {"manage_draft", "manage_scheduled_message", "manage_folder", "manage_contact_note"}:
+        if method in {
+            "manage_draft",
+            "manage_scheduled_message",
+            "manage_folder",
+            "manage_contact_note",
+            "manage_contact",
+        }:
             result = handler(req)
             return result if isinstance(result, dict) else cast(dict[str, object], await result)
 
@@ -2526,9 +2548,56 @@ class DaemonAPIServer:
             return {
                 "ok": False,
                 "error": result["error"],
-                "required_action": "Read the contact note and check the same operation key.",
+                "required_action": _contact_note_error_action(result["error"], req.get("action")),
             }
         return {"ok": True, "account_id": scope.account_id, "operation_key": req.get("operation_key"), **result}
+
+    async def _list_contacts(self, req: dict[str, object]) -> dict[str, object]:
+        from pydantic import ValidationError
+
+        from .contacts.arguments import ContactListArguments
+        from .contacts.repository import read_contacts
+
+        scope = self._auth_scope
+        if scope is None or self.self_id != scope.account_id:
+            return self._directory_account_unverified("The connected account is not verified.")
+        payload = {
+            key: value for key, value in req.items() if key not in {"method", "request_id", "operation_id", "timezone"}
+        }
+        try:
+            args = ContactListArguments.model_validate(payload, strict=True)
+        except ValidationError:
+            return {"ok": False, "error": "invalid_arguments", "required_action": "Check limit and after_entity_id."}
+        data = read_contacts(self._conn, scope.account_id, limit=args.limit, after_entity_id=args.after_entity_id)
+        if self._auth_scope != scope or self.self_id != scope.account_id:
+            return self._directory_account_unverified("The connected account changed during the read.")
+        return {"ok": True, **data}
+
+    async def _manage_contact(self, req: dict[str, object]) -> dict[str, object]:
+        from pydantic import ValidationError
+
+        from .contacts.arguments import ContactCommandArguments
+
+        if self._contact_commands is None:
+            return {"ok": False, "error": "daemon_not_ready", "required_action": "Contact commands are not ready."}
+        scope = self._auth_scope
+        if scope is None or self.self_id != scope.account_id:
+            return self._directory_account_unverified("The connected account is not verified.")
+        payload = {
+            key: value for key, value in req.items() if key not in {"method", "request_id", "operation_id", "timezone"}
+        }
+        try:
+            command = ContactCommandArguments.model_validate(payload, strict=True)
+        except ValidationError:
+            return {
+                "ok": False,
+                "error": "invalid_arguments",
+                "required_action": "Check action-specific contact arguments.",
+            }
+        result = await self._contact_commands.execute(command.model_dump(exclude_unset=True, exclude={"timezone"}))
+        if self._auth_scope != scope or self.self_id != scope.account_id:
+            return self._directory_account_unverified("The connected account changed during the command.")
+        return result
 
     async def _manage_draft(self, req: dict[str, object]) -> dict[str, object]:
         resolved = await self._draft_request(req)

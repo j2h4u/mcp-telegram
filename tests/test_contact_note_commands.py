@@ -15,6 +15,7 @@ from mcp_telegram.auth_scope import TelegramAuthScope
 from mcp_telegram.contact_notes.commands import ContactNoteCommandOwner
 from mcp_telegram.contact_notes.domain import NoteWriteAuthority
 from mcp_telegram.contact_notes.state import note_observation_order, read_note
+from mcp_telegram.contacts.guard import ContactPeerGuard
 from mcp_telegram.entity_profile.contracts import CommandProfileAcquisition, UserReference
 from mcp_telegram.image_authorization import ScopeCell
 from mcp_telegram.sqlite_writer import SQLiteWriter
@@ -87,6 +88,7 @@ async def test_stale_contact_note_never_dispatches(tmp_path: Path, monkeypatch: 
     async def client(_request: object) -> object:
         raise AssertionError("stale request dispatched")
 
+    peer_guard = ContactPeerGuard()
     owner = ContactNoteCommandOwner(
         client,
         reader,
@@ -97,14 +99,14 @@ async def test_stale_contact_note_never_dispatches(tmp_path: Path, monkeypatch: 
         acquire_command_profile=acquire,
         acquire_config=config,
         request_reconciliation=request_reconciliation,
+        peer_guard=peer_guard,
     )
     version = read_note(reader, 1, 2)["expected_version"]
     assert version is not None
     from mcp_telegram.contact_notes import commands
 
-    lock = asyncio.Lock()
+    lock = peer_guard.lock(scope.account_id, 2)
     await lock.acquire()
-    owner._locks[2] = lock
     with rpc_scope(TelegramRpcSource.NOTE_COMMAND, timeout_seconds=0.01):
         assert await owner.execute(
             {"dialog_id": 2, "action": "create", "expected_version": version, "operation_key": "queued", "text": "x"}

@@ -12,12 +12,12 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Literal, Protocol, cast
-from weakref import WeakValueDictionary
 
 from telethon.tl import types
 from telethon.tl.functions.contacts import UpdateContactNoteRequest
 
 from ..auth_scope import TelegramAuthScope
+from ..contacts.guard import ContactPeerGuard
 from ..entity_profile.contracts import CommandProfileAcquisition
 from ..native_write_fence import NativeWriteCheck, NativeWriteReceiptBinding, NoteWriteRejected, native_write_context
 from ..sqlite_writer import SQLiteWriter
@@ -94,6 +94,7 @@ class ContactNoteCommandOwner:
         acquire_command_profile: Callable[[int], Awaitable[CommandProfileAcquisition]],
         acquire_config: Callable[[int], Awaitable[tuple[int, int | None]]],
         request_reconciliation: Callable[[int], Awaitable[bool]],
+        peer_guard: ContactPeerGuard | None = None,
     ) -> None:
         self._client = cast(Callable[[object], Awaitable[object]], client)
         self._reader = reader_conn
@@ -107,7 +108,7 @@ class ContactNoteCommandOwner:
         self._config_scope: TelegramAuthScope | None = None
         self._config_hash = 0
         self._limit = _DEFAULT_LIMIT
-        self._locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
+        self._peer_guard = peer_guard or ContactPeerGuard()
 
     async def execute(self, request: Mapping[str, object]) -> dict[str, object]:
         deadline = _command_deadline()
@@ -118,7 +119,7 @@ class ContactNoteCommandOwner:
         try:
             command = _parse(request, scope.account_id)
             async with asyncio.timeout(max(0, deadline - time.monotonic())):
-                async with self._locks.setdefault(command.entity, asyncio.Lock()):
+                async with self._peer_guard.lock(scope.account_id, command.entity):
                     return await self._locked(scope, command, deadline)
         except (ValueError, NoteWriteRejected) as error:
             return {"error": error.code if isinstance(error, NoteWriteRejected) else str(error)}

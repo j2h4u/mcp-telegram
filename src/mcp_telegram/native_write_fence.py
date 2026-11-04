@@ -8,7 +8,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Literal
 
-type NativeWriteDomain = Literal["folder", "contact_note"]
+type NativeWriteDomain = Literal["folder", "contact_note", "contact"]
 type NativeWireOutcome = Literal["acknowledged", "rejected", "unknown"]
 
 
@@ -28,8 +28,17 @@ class NoteWriteRejectedError(RuntimeError):
         super().__init__(code)
 
 
+class ContactWriteRejectedError(RuntimeError):
+    """A contact packet was refused before its physical claim."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
 FolderWriteRejected = FolderWriteRejectedError
 NoteWriteRejected = NoteWriteRejectedError
+ContactWriteRejected = ContactWriteRejectedError
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +54,7 @@ class NativeWriteReceiptBinding:
     binding_revision: int
 
     def __post_init__(self) -> None:
-        if self.domain not in {"folder", "contact_note"}:
+        if self.domain not in {"folder", "contact_note", "contact"}:
             raise ValueError("invalid native write domain")
         self._validate_identity()
         self._validate_fields()

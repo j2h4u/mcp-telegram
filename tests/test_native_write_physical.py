@@ -94,6 +94,16 @@ async def physical_note(tmp_path: Path) -> AsyncIterator[tuple[object, ...]]:  #
         claim_scope=gate.claim_image_scope,
     )
     gate.register_native_write_domain("contact_note", authority.domain)
+    from mcp_telegram.contacts.domain import ContactWriteAuthority
+
+    contact_authority = ContactWriteAuthority(
+        writer,
+        gate.retained_auth_scope,
+        lambda user_id: UserReference(user_id, 55),
+        capture_scope=gate.capture_image_scope,
+        claim_scope=gate.claim_image_scope,
+    )
+    gate.register_native_write_domain("contact", contact_authority.domain)
     await gate.verify_startup_account(42)
     auth = gate.retained_auth_scope()
     assert auth is not None

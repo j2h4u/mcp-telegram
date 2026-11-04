@@ -140,6 +140,9 @@ class _Authority:
     def observe_response_now(self, owner: object) -> None:
         del owner
 
+    def contact_response_scope(self, owner: object, request: object, result: object) -> None:
+        del owner, request, result
+
     def transport_terminated(self, error: BaseException | None) -> None:
         self.terminations.append(error)
         self.generation += 1

@@ -16,7 +16,7 @@ from telethon.tl import types
 
 from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
-from mcp_telegram.entity_profile.contracts import ProfileFieldObservation
+from mcp_telegram.entity_profile.contracts import ObservationBoundary, ProfileFieldObservation
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntityRefreshCursor, EntitySectionCommit
 from mcp_telegram.observation_order import allocate_observation_order
@@ -60,9 +60,12 @@ def legacy(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[Legacy]:
     repo.save_core({"id": 42, "type": "user", "name": "Peer 42"}, now=101)
     with write_transaction(conn):
         order = allocate_observation_order(conn)
+    observation = ProfileFieldObservation(42, order, 102, "update")
+    boundary = ObservationBoundary(observation.observed_at, observation.observed_at)
     repo.apply_supplied_user(
-        _supplied_profile_user(types.User(42, first_name="Peer 42", phone="123")),
-        observation=ProfileFieldObservation(42, order, 102, "update"),
+        _supplied_profile_user(types.User(42, first_name="Peer 42", phone="123"), boundary),
+        observation=observation,
+        boundary=boundary,
     )
     assert conn.execute("SELECT profile_revision FROM entity_details").fetchone() == (1,)
     with write_transaction(conn):

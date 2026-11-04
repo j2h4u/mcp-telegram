@@ -34,6 +34,7 @@ class AcquisitionKind(StrEnum):
     ENTITY_LOOKUP = "entity_lookup"
     FORWARD_NAME_LOOKUP = "forward_name_lookup"
     FOLDER_SNAPSHOT = "folder_snapshot"
+    CONTACT_CATALOGUE = "contact_catalogue"
     MESSAGE_HISTORY_PAGE = "message_history_page"
     PARTICIPANT_LOOKUP = "participant_lookup"
     MESSAGE_LOOKUP = "message_lookup"
@@ -89,6 +90,10 @@ class RpcAttemptEvidence:
     note_preflight_dispatched: bool = False
     note_mutation_dispatched: bool = False
     note_postflight_dispatched: bool = False
+    contact_target: int | None = None
+    contact_preflight_dispatched: bool = False
+    contact_mutation_dispatched: bool = False
+    contact_postflight_dispatched: bool = False
 
     def record_dispatch(self) -> None:
         """Record one sender dispatch without changing transport behavior."""
@@ -289,7 +294,7 @@ def create_demand_token(
         raise TypeError("kind must be a DemandKind")
     contract = demand_contract(kind)
     now = time.monotonic()
-    if kind in {DemandKind.FOLDER_COMMAND, DemandKind.NOTE_COMMAND}:
+    if kind in {DemandKind.FOLDER_COMMAND, DemandKind.NOTE_COMMAND, DemandKind.CONTACT_COMMAND}:
         _validate_timestamp(now, "now")
         if deadline is not None:
             _validate_timestamp(deadline, "caller_deadline")

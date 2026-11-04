@@ -55,6 +55,7 @@ _READ_METHODS = frozenset(
         "telethon.tl.functions.updates.GetDifferenceRequest:19c2f763",
         "telethon.tl.functions.updates.GetChannelDifferenceRequest:03173d78",
         "telethon.tl.functions.contacts.ResolveUsernameRequest:725afbbc",
+        "telethon.tl.functions.contacts.GetContactsRequest:5dd69e12",
         "telethon.tl.functions.photos.GetUserPhotosRequest:91cd32a8",
         "telethon.tl.functions.upload.GetFileRequest:be5335be",
         "telethon.tl.functions.help.GetConfigRequest:c4f9186b",
@@ -70,6 +71,8 @@ _MUTATION_METHODS = frozenset(
         "telethon.tl.functions.messages.SaveDraftRequest:ad0fa15c",
         "telethon.tl.functions.messages.UpdateDialogFilterRequest:1ad4a04a",
         "telethon.tl.functions.contacts.UpdateContactNoteRequest:139f63fb",
+        "telethon.tl.functions.contacts.AddContactRequest:d9ba2e54",
+        "telethon.tl.functions.contacts.DeleteContactsRequest:096a0e00",
         "telethon.tl.functions.messages.SendMessageRequest:fef48f62",
         "telethon.tl.functions.messages.EditMessageRequest:b106e66c",
         "telethon.tl.functions.messages.DeleteScheduledMessagesRequest:59ae2b16",
@@ -139,6 +142,8 @@ class TelegramRpcSource(StrEnum):
     SCHEDULED_MUTATION = "scheduled_mutation"
     FOLDER_COMMAND = "folder_command"
     NOTE_COMMAND = "note_command"
+    CONTACT_COMMAND = "contact_command"
+    CONTACT_CATALOGUE = "contact_catalogue"
     DRAFT_SNAPSHOT = "draft_snapshot"
     DRAFT_MUTATION = "draft_mutation"
     MAINTENANCE = "maintenance"
@@ -185,6 +190,8 @@ class DemandKind(StrEnum):
     SCHEDULED_MUTATION = "scheduled_mutation"
     FOLDER_COMMAND = "folder_command"
     NOTE_COMMAND = "note_command"
+    CONTACT_COMMAND = "contact_command"
+    CONTACT_CATALOGUE = "contact_catalogue"
     DRAFT_SNAPSHOT = "draft_snapshot"
     DRAFT_MUTATION = "draft_mutation"
     SELF_PROFILE_MAINTENANCE = "self_profile_maintenance"
@@ -215,6 +222,7 @@ DURABLE_DEMAND_ORDER: tuple[DemandKind, ...] = (
     DemandKind.COLD_PEER_PAGE,
     DemandKind.BACKFILL_HYDRATION_BATCH,
     DemandKind.FOLDER_SNAPSHOT,
+    DemandKind.CONTACT_CATALOGUE,
     DemandKind.TOPIC_SNAPSHOT,
     DemandKind.MESSAGE_FACT_REFRESH,
     DemandKind.READ_RECEIPT_BATCH,
@@ -224,7 +232,7 @@ DURABLE_DEMAND_ORDER: tuple[DemandKind, ...] = (
     DemandKind.DRAFT_SNAPSHOT,
     DemandKind.LINKED_CHAT_REFRESH,
 )
-_EXPECTED_DURABLE_DEMAND_COUNT = 24
+_EXPECTED_DURABLE_DEMAND_COUNT = 25
 
 
 class ExecutionMode(StrEnum):
@@ -656,6 +664,17 @@ _REGISTRY: dict[TelegramRpcSource, TelegramRpcConsumerSpec] = {
         _PRODUCER,
         demand_bound=DemandBound.PRODUCER_BOUNDED,
     ),
+    TelegramRpcSource.CONTACT_CATALOGUE: _consumer(
+        "Contact catalogue",
+        "Refresh the account contact catalogue",
+        _B,
+        TelegramFactDomain.ENTITIES,
+        _R,
+        _P,
+        FanoutScope.ACCOUNT,
+        _PRODUCER,
+        demand_bound=DemandBound.PRODUCER_BOUNDED,
+    ),
     TelegramRpcSource.TOPIC_RECONCILIATION: _consumer(
         "Topic reconciliation",
         "Refresh topic metadata for a dialog",
@@ -772,6 +791,16 @@ _REGISTRY: dict[TelegramRpcSource, TelegramRpcConsumerSpec] = {
     TelegramRpcSource.NOTE_COMMAND: _consumer(
         "Contact note command",
         "Observe and change one explicitly selected contact note",
+        _I,
+        TelegramFactDomain.ENTITIES,
+        AcquisitionRole.MUTATION,
+        AcquisitionTrigger.REQUEST,
+        FanoutScope.ENTITY,
+        DemandPolicyOwner.CALLER,
+    ),
+    TelegramRpcSource.CONTACT_COMMAND: _consumer(
+        "Contact command",
+        "Change one explicitly selected contact",
         _I,
         TelegramFactDomain.ENTITIES,
         AcquisitionRole.MUTATION,
@@ -970,6 +999,9 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         _DURABLE,
         max_rpc_attempts_per_slice=2,
     ),
+    DemandKind.CONTACT_CATALOGUE: _contract(
+        DemandKind.CONTACT_CATALOGUE, TelegramRpcSource.CONTACT_CATALOGUE, _DURABLE, max_rpc_attempts_per_slice=1
+    ),
     DemandKind.TOPIC_SNAPSHOT: _contract(
         DemandKind.TOPIC_SNAPSHOT,
         TelegramRpcSource.TOPIC_RECONCILIATION,
@@ -1023,6 +1055,9 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
     ),
     DemandKind.NOTE_COMMAND: _contract(
         DemandKind.NOTE_COMMAND, TelegramRpcSource.NOTE_COMMAND, _INLINE, max_rpc_attempts_per_slice=4
+    ),
+    DemandKind.CONTACT_COMMAND: _contract(
+        DemandKind.CONTACT_COMMAND, TelegramRpcSource.CONTACT_COMMAND, _INLINE, max_rpc_attempts_per_slice=3
     ),
     DemandKind.SCHEDULED_MUTATION: _contract(
         DemandKind.SCHEDULED_MUTATION,
@@ -1125,6 +1160,7 @@ def _validate_contract_durable_policy(kind: DemandKind, contract: DemandContract
         DemandKind.SCHEDULED_MUTATION,
         DemandKind.FOLDER_COMMAND,
         DemandKind.NOTE_COMMAND,
+        DemandKind.CONTACT_COMMAND,
     }:
         _validate_attempt_bound(kind, contract)
         if contract.freshness_target is not None:

@@ -53,12 +53,14 @@ class GateMessageBox(MessageBox):
         previous: MessageBox,
         eligibility: Callable[[str | None], Eligibility],
         method_key: Callable[[object], str],
+        contact_scope_valid: Callable[[object], bool] | None = None,
     ) -> None:
         super().__init__(previous._log)
         for name in MessageBox.__slots__:
             setattr(self, name, getattr(previous, name))
         self._eligibility = eligibility
         self._method_key = method_key
+        self._contact_scope_valid = contact_scope_valid
         self._blocked: dict[str, TelegramRpcThrottled | TelegramRpcMethodRecoveryPending] = {}
         self._preserved_ends: set[int | None] = set()
         self._access_loss_ends: dict[int, Callable[[], bool]] = {}
@@ -144,6 +146,8 @@ class GateMessageBox(MessageBox):
     ) -> tuple[list[object], list[object]]:
         if updates is self.wakeup:
             self.wakeup_queued = False
+            raise GapError
+        if self._contact_scope_valid is not None and not self._contact_scope_valid(updates):
             raise GapError
         preserve_account = bool(self.getting_diff_for & {ENTRY_ACCOUNT, ENTRY_SECRET})
         seq, date = self.seq, self.date

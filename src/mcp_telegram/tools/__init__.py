@@ -18,6 +18,7 @@ from ._base import (
 from .account_trace import TraceAccountMessages, trace_account_messages
 from .activity import GetMyRecentActivity, get_my_recent_activity
 from .contact_notes import ManageContactNote, manage_contact_note
+from .contacts import ListContacts, ManageContact, list_contacts, manage_contact
 from .conversation_changes import ListConversationChanges, list_conversation_changes
 
 # --- Domain modules (import triggers @mcp_tool registration) ---
@@ -50,10 +51,12 @@ __all__ = [
     "GetSyncStatus",
     "GetUnreadSummary",
     "GetUsageStats",
+    "ListContacts",
     "ListConversationChanges",
     "ListDialogs",
     "ListMessages",
     "ListTopics",
+    "ManageContact",
     "ManageContactNote",
     "ManageDraft",
     "ManageFolder",
@@ -76,10 +79,12 @@ __all__ = [
     "get_sync_status",
     "get_unread_summary",
     "get_usage_stats",
+    "list_contacts",
     "list_conversation_changes",
     "list_dialogs",
     "list_messages",
     "list_topics",
+    "manage_contact",
     "manage_contact_note",
     "manage_draft",
     "manage_folder",

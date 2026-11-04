@@ -262,6 +262,28 @@
           "structuredContent"
         ]
       }
+    },
+    {
+      "_comment": "list_contacts — read local contact catalogue independently of dialogs",
+      "action": "call_tool",
+      "name": "list_contacts",
+      "arguments": {
+        "limit": 1
+      },
+      "expect": {
+        "is_error": false,
+        "path_equals": {
+          "content": []
+        },
+        "path_exists": [
+          "structuredContent.account_id",
+          "structuredContent.items",
+          "structuredContent.coverage.state"
+        ],
+        "path_nonempty": [
+          "structuredContent"
+        ]
+      }
     }
   ]
 }

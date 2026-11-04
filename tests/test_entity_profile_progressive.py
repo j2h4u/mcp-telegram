@@ -21,6 +21,7 @@ from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.contact_notes.schema import CONTACT_NOTE_RECEIPT_DDL
+from mcp_telegram.contacts.schema import CONTACT_RECEIPT_DDL
 from mcp_telegram.daemon_entity_info import (
     _SQLITE_INT64_MAX,
     _SQLITE_INT64_MIN,
@@ -131,6 +132,7 @@ class _FloodClient(_UnusedClient):
 def _sections_schema(conn: sqlite3.Connection) -> None:
     with write_savepoint(conn):
         conn.execute(CONTACT_NOTE_RECEIPT_DDL)
+        conn.execute(CONTACT_RECEIPT_DDL)
         conn.execute("CREATE TABLE IF NOT EXISTS synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL)")
         conn.execute(
             """CREATE TABLE entity_detail_sections (

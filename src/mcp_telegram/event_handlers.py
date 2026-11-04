@@ -46,6 +46,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     UpdateChannelParticipant,
     UpdateChat,
     UpdateChatParticipant,
+    UpdateContactsReset,
     UpdateDeleteScheduledMessages,
     UpdateDialogFilter,
     UpdateDialogFilterOrder,
@@ -65,6 +66,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     UpdateTranscribedAudio,
     UpdateUser,
     UpdateUserName,
+    UpdateUserPhone,
     User,
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
@@ -76,6 +78,9 @@ from .channel_full_siblings import (
     capture_channel_full_siblings_token,
     write_channel_full_siblings,
 )
+from .contacts.profile import project_contact_profile
+from .contacts.repository import request_contact_catalogue
+from .contacts.state import read_contact_command_state
 from .delivered_update import (
     DeliveredUpdate,
     current_delivered_update,
@@ -94,7 +99,15 @@ from .dialog_fact_observations import claim_dialog_fact
 from .dialog_identity import capture_identity_baseline, publish_dialog_identity
 from .dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation, ObservedText
 from .dialog_pin_observations import claim_pin_delta, claim_pin_snapshot, ordered_pin_overlay
-from .entity_profile.contracts import ProfileFieldObservation, SuppliedProfileUser
+from .entity_profile.contracts import (
+    ObservationBoundary,
+    ProfileFieldClass,
+    ProfileFieldCoverage,
+    ProfileFieldObservation,
+    ProfileFieldState,
+    ProfileSemanticSnapshot,
+    SuppliedProfileUser,
+)
 from .entity_profile.membership import MembershipSignalCounts
 from .entity_profile.repository import (
     EntityProfileRepository,
@@ -692,6 +705,31 @@ def _mask_profile_identity_fields(push: ProfilePush, excluded: set[str]) -> Prof
             for path, value in push.semantic_coverage.items()
             if not _identity_path_excluded(path, semantic_roots)
         },
+    )
+
+
+def _contact_phone_push(push: ProfilePush, source: UpdateUserPhone, coverage: ProfileFieldCoverage) -> ProfilePush:
+    fields = dict(push.fields)
+    semantic = dict(push.semantic_fields)
+    evidence = dict(push.semantic_coverage)
+    if not source.phone:
+        fields.pop("phone", None)
+        semantic.pop("user.phone", None)
+        evidence.pop("user.phone", None)
+    semantic["owner.saved_contact_phone_access"] = bool(source.phone)
+    evidence["owner.saved_contact_phone_access"] = coverage
+    return replace(push, fields=fields, semantic_fields=semantic, semantic_coverage=evidence)
+
+
+def _contact_user_push(push: ProfilePush, source: User, coverage: ProfileFieldCoverage) -> ProfilePush:
+    if source.min:
+        return _mask_profile_identity_fields(push, {"name", "first_name", "last_name"})
+    name = {"first_name": source.first_name or "", "last_name": source.last_name or ""}
+    push = _mask_profile_identity_fields(push, {"name", "first_name", "last_name"})
+    return replace(
+        push,
+        semantic_fields={**push.semantic_fields, "owner.saved_contact_name": name},
+        semantic_coverage={**push.semantic_coverage, "owner.saved_contact_name": coverage},
     )
 
 
@@ -2555,6 +2593,7 @@ class EventHandlerManager:
                 assert push is not None
                 observation = self._profile_push_observation(conn, source, push)
                 self._ensure_supplied_user_type(conn, source, push, observation)
+                push = self._contact_profile_push(conn, source, push, observation)
                 push = self._filter_retained_profile_identity(conn, push, observation)
                 changed = self._apply_profile_push(profiles, push, observation)
                 sections = self._owned_profile_push_sections(owner, push.entity_id, source, changed)
@@ -2651,10 +2690,47 @@ class EventHandlerManager:
             push is not None
             and self._self_id is not None
             and (
-                personal_profile_peer(conn, self._self_id, push.entity_id)
+                (not push.minimal and push.semantic_fields.get("user.contact") is True)
+                or personal_profile_peer(conn, self._self_id, push.entity_id)
+                or read_contact_command_state(conn, self._self_id, push.entity_id)["membership"] is True
                 or (push.entity_id == self._self_id and bound_profile_account(conn) == self._self_id)
             )
         )
+
+    @staticmethod
+    def _contact_profile_push(
+        conn: sqlite3.Connection, source: object, push: ProfilePush, observation: ProfileFieldObservation
+    ) -> ProfilePush:
+        if isinstance(source, User) and not push.minimal:
+            projected = project_contact_profile(
+                ProfileSemanticSnapshot(
+                    push.entity_id,
+                    observation.owner_account_id,
+                    push.semantic_fields,
+                    push.semantic_coverage,
+                    ObservationBoundary(),
+                ),
+                source,
+            )
+            push = replace(push, semantic_fields=projected.fields, semantic_coverage=projected.coverage)
+        member = push.semantic_fields.get("user.contact")
+        if not isinstance(member, bool):
+            member = read_contact_command_state(conn, observation.owner_account_id, push.entity_id)["membership"]
+        if member is not True:
+            return push
+        coverage = ProfileFieldCoverage(ProfileFieldClass.PRIVATE_FACT, ProfileFieldState.PRESENT, True)
+        if isinstance(source, UpdateUserPhone):
+            return _contact_phone_push(push, source, coverage)
+        if isinstance(source, UpdateUserName):
+            return replace(
+                push,
+                fields={
+                    key: value for key, value in push.fields.items() if key not in {"name", "first_name", "last_name"}
+                },
+            )
+        if not isinstance(source, User):
+            return push
+        return _contact_user_push(push, source, coverage)
 
     def _profile_push_observation(
         self, conn: sqlite3.Connection, source: object, push: ProfilePush
@@ -2716,6 +2792,11 @@ class EventHandlerManager:
     async def on_raw_identity_or_notify(self, update: object) -> None:
         """Materialize supplied profile facts and exact notification mute deadlines."""
         try:
+            if isinstance(update, UpdateContactsReset) and self._self_id is not None:
+                if self._delivery_auth_available():
+                    await self._writer.run(self._request_contact_catalogue)
+                    self._offer(DemandKind.CONTACT_CATALOGUE)
+                return
             if (
                 isinstance(update, (UpdateDialogFilter, UpdateDialogFilterOrder, UpdateDialogFilters))
                 and self._self_id is not None
@@ -2733,6 +2814,11 @@ class EventHandlerManager:
         except Exception:
             fail_delivered_update()
             logger.exception("event_identity_or_notify_failed update=%r", type(update).__name__)
+
+    def _request_contact_catalogue(self, conn: sqlite3.Connection) -> None:
+        assert self._self_id is not None
+        with write_transaction(conn):
+            request_contact_catalogue(conn, self._self_id)
 
     def _write_folder_update(self, conn: sqlite3.Connection, update: FolderRuleUpdate) -> None:
         available = self._delivery_auth_available()

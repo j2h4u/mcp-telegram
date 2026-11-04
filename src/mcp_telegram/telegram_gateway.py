@@ -40,6 +40,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
+from .contacts.profile import project_contact_profile
 from .entity_profile.contracts import (
     CHANNEL_CONTACT_UNSUPPORTED_REASON,
     CHANNEL_CONTACT_UNSUPPORTED_RPC_CODE,
@@ -57,6 +58,7 @@ from .entity_profile.contracts import (
     ObservationBoundary,
     ProfileCollectionItem,
     ProfileCollectionPage,
+    ProfileSemanticSnapshot,
     ProjectionStatus,
     StoryProfileValidationCategory,
     StoryProfileValidationError,
@@ -75,7 +77,7 @@ from .entity_profile.ports import (
     UserProfilePort,
 )
 from .entity_profile.semantic_normalization import normalize_collection_item
-from .entity_profile.updates import project_user_profile
+from .entity_profile.updates import ProfilePush, project_user_profile
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .identity_observation import USERNAME_UNOBSERVED, observe_username
 from .telegram_access import ACCESS_LOST_ERRORS
@@ -687,21 +689,55 @@ def _collection_sidecars(page: ProfileCollectionPage, result: object) -> Profile
         if identity is not None:
             identities.append(identity)
         if peer_id == page.entity_id and isinstance(value, (types.User, types.UserEmpty)):
-            target = _supplied_profile_user(value)
+            target = _supplied_profile_user(value, page.observation)
     return replace(page, supplied_user=target, sidecar_identities=tuple(identities))
 
 
-def _supplied_profile_user(value: types.User | types.UserEmpty) -> SuppliedProfileUser:
+def _supplied_profile_user(value: types.User | types.UserEmpty, boundary: ObservationBoundary) -> SuppliedProfileUser:
     fields, coverage, _diagnostics = normalize_collection_item(value)
+    semantic = project_contact_profile(
+        ProfileSemanticSnapshot(
+            value.id,
+            None,
+            {f"user.{key}": item for key, item in fields.items() if key != "constructor"},
+            {"user" + key[len("item") :]: item for key, item in coverage.items()},
+            boundary,
+        ),
+        value,
+    )
+    semantic = _mask_partial_contact_name(value, semantic)
     push = project_user_profile(value)
     return SuppliedProfileUser(
         value.id,
-        {f"user.{key}": item for key, item in fields.items() if key != "constructor"},
-        {"user" + key[len("item") :]: item for key, item in coverage.items()},
-        push.fields if push else {},
+        semantic.fields,
+        semantic.coverage,
+        _sidecar_legacy_fields(value, push),
         push.minimal if push else True,
         push.authoritative_photo if push else False,
     )
+
+
+def _mask_partial_contact_name(
+    value: types.User | types.UserEmpty, semantic: ProfileSemanticSnapshot
+) -> ProfileSemanticSnapshot:
+    if not isinstance(value, types.User) or not value.min:
+        return semantic
+    names = {"user.first_name", "user.last_name"}
+    return replace(
+        semantic,
+        fields={key: item for key, item in semantic.fields.items() if key not in names},
+        coverage={key: item for key, item in semantic.coverage.items() if key not in names},
+    )
+
+
+def _sidecar_legacy_fields(value: types.User | types.UserEmpty, push: ProfilePush | None) -> dict[str, object]:
+    legacy = dict(push.fields) if push else {}
+    if isinstance(value, types.User) and (value.min or value.contact):
+        for name in ("name", "first_name", "last_name"):
+            legacy.pop(name, None)
+        if not value.min and value.contact and not value.phone:
+            legacy.pop("phone", None)
+    return legacy
 
 
 def _story_detail_page(

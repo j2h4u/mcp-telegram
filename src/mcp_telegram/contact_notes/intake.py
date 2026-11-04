@@ -57,9 +57,14 @@ def current_note_marker(entity_id: int) -> tuple[int, int] | None:
 
 
 def capture_contact_note_intake(updates: list[object]) -> None:
+    global _scope_generation
     with _lock:
         for update in updates:
-            if type(update).__name__ != "UpdateUser":
+            kind = type(update).__name__
+            if kind == "UpdateContactsReset":
+                _scope_generation += 1
+                continue
+            if kind not in {"UpdateUser", "UpdateUserName", "UpdateUserPhone"}:
                 continue
             entity_id = getattr(update, "user_id", None)
             if type(entity_id) is int and entity_id in _peers:

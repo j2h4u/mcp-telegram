@@ -1,7 +1,7 @@
 {
   "steps": [
     {
-      "_comment": "All 23 tools registered with output schemas",
+      "_comment": "All 25 tools registered with output schemas",
       "action": "list_tools",
       "expect": {
         "tool_names_include": [
@@ -27,7 +27,9 @@
           "manage_scheduled_message",
           "get_folder",
           "manage_folder",
-          "manage_contact_note"
+          "manage_contact_note",
+          "list_contacts",
+          "manage_contact"
         ],
         "tool_expectations": {
           "get_message_image": {
@@ -108,6 +110,12 @@
             "outputSchema.type": "object"
           },
           "manage_contact_note": {
+            "outputSchema.type": "object"
+          },
+          "list_contacts": {
+            "outputSchema.type": "object"
+          },
+          "manage_contact": {
             "outputSchema.type": "object"
           }
         }
@@ -370,6 +378,37 @@
         "action": "clear",
         "operation_key": "no-daemon-smoke",
         "expected_version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expect": {
+        "is_error": true,
+        "content_text_contains": [
+          "not running",
+          "mcp-telegram sync"
+        ]
+      }
+    },
+    {
+      "_comment": "list_contacts \u2014 daemon route",
+      "action": "call_tool",
+      "name": "list_contacts",
+      "arguments": {},
+      "expect": {
+        "is_error": true,
+        "content_text_contains": [
+          "not running",
+          "mcp-telegram sync"
+        ]
+      }
+    },
+    {
+      "_comment": "manage_contact \u2014 daemon route",
+      "action": "call_tool",
+      "name": "manage_contact",
+      "arguments": {
+        "entity_id": 123,
+        "action": "delete",
+        "expected_version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "operation_key": "no-daemon-contact"
       },
       "expect": {
         "is_error": true,

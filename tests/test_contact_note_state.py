@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 
 from mcp_telegram.contact_notes.state import read_note
+from mcp_telegram.contacts.schema import CONTACT_RECEIPT_DDL
 
 
 def _refine_unknown(conn: sqlite3.Connection, binding: object) -> bool:
@@ -289,6 +290,7 @@ def test_receipt_terminal_binding_is_immutable() -> None:
     conn = sqlite3.connect(":memory:")
     try:
         conn.execute(CONTACT_NOTE_RECEIPT_DDL)
+        conn.execute(CONTACT_RECEIPT_DDL)
         conn.execute("CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT)")
         conn.execute(
             "CREATE TABLE entity_profile_semantic_snapshots (owner_account_id,entity_id,provenance_json,coverage_json)"
@@ -379,6 +381,7 @@ def test_receipt_reservation_blocks_replay_and_unresolved_peer() -> None:
     conn = sqlite3.connect(":memory:")
     try:
         conn.execute(CONTACT_NOTE_RECEIPT_DDL)
+        conn.execute(CONTACT_RECEIPT_DDL)
         conn.execute("CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT)")
         binding = NativeWriteReceiptBinding("contact_note", 42, 2, 2**64 - 1, "key", "update", 7, "b" * 64, 1)
         assert reserve_operation(conn, binding, "a" * 64, 1, expected_version="v" * 64) == (True, "pending")
@@ -431,6 +434,7 @@ def test_restart_unknown_without_attempt_needs_fresh_authoritative_account_evide
     conn = sqlite3.connect(":memory:")
     try:
         conn.execute(CONTACT_NOTE_RECEIPT_DDL)
+        conn.execute(CONTACT_RECEIPT_DDL)
         conn.execute("CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT)")
         conn.execute(
             "CREATE TABLE entity_profile_semantic_snapshots (owner_account_id,entity_id,provenance_json,coverage_json)"
