@@ -159,7 +159,7 @@
         },
         "path_exists": [
           "structuredContent.dialog_id",
-          "structuredContent.coverage_status",
+          "structuredContent.history_sync_state",
           "structuredContent.message_retention_policy",
           "structuredContent.latest_retained_message",
           "structuredContent.message_delivery",
@@ -168,7 +168,7 @@
         ],
         "path_nonempty": [
           "structuredContent",
-          "structuredContent.coverage_status"
+          "structuredContent.history_sync_state"
         ]
       }
     },

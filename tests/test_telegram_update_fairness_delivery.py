@@ -130,6 +130,36 @@ async def test_dm_input_commits_before_unsent_channel_and_local_read_uses_no_rpc
         await _stop(loop)
 
 
+@pytest.mark.parametrize("outgoing", [False, True])
+async def test_full_push_body_reaches_local_read_without_refetch(delivery: _Delivery, outgoing: bool) -> None:
+    gate, _, _, sink = delivery.wire
+    message = _message(11)
+    message.out = outgoing
+    if outgoing:
+        message.from_id = types.PeerUser(42)
+    message.message = "primary push body"
+    gate._updates_queue.put_nowait(types.UpdateShort(types.UpdateNewMessage(message, 11, 1), delivery.now))
+    loop = asyncio.create_task(gate._update_loop())
+    try:
+        await _wait_message(delivery.reader, 55, 11)
+        async with asyncio.timeout(3):
+            while _pending(delivery.path) is not None:
+                await asyncio.sleep(0)
+        assert delivery.reader.execute("SELECT text FROM messages WHERE dialog_id=55 AND message_id=11").fetchone() == (
+            "primary push body",
+        )
+        assert delivery.reader.execute(
+            "SELECT message_id FROM messages_fts WHERE messages_fts MATCH ? AND dialog_id = ?", ("primary", 55)
+        ).fetchone() == (11,)
+        api = make_server(delivery.reader, gate)
+        api.self_id = 42
+        response = await api._list_messages({"dialog_id": 55, "limit": 20, "message_state": "sent"})
+        assert response["ok"] is True and "primary push body" in str(response["data"])
+        assert not sink.frames
+    finally:
+        await _stop(loop)
+
+
 async def test_claimed_channel_response_then_newer_pts_are_serially_persisted(delivery: _Delivery) -> None:
     gate, sender, connection, sink = delivery.wire
     loop = asyncio.create_task(gate._update_loop())

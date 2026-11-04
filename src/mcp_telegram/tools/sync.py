@@ -12,7 +12,6 @@ from ..sync_read_model import (
     RealtimeHistory,
     SyncReadModel,
     SyncReadModelContractError,
-    SyncStatus,
     decode_latest_retained_message,
     decode_sync_read_model,
 )
@@ -37,7 +36,10 @@ MARK_DIALOG_FOR_SYNC_OUTPUT_SCHEMA = {
     "properties": {
         "dialog_id": {"type": "integer"},
         "enabled": {"type": "boolean"},
-        "coverage_status": {"type": ["string", "null"]},
+        "history_sync_state": {
+            "type": "string",
+            "enum": [*(item.value for item in HistorySyncState), "pending", "failed", "unknown"],
+        },
         "action": {"type": "string"},
         "blocked_reason": {"type": ["string", "null"]},
         "full_history_will_be_fetched": {"type": "boolean"},
@@ -45,7 +47,7 @@ MARK_DIALOG_FOR_SYNC_OUTPUT_SCHEMA = {
     "required": [
         "dialog_id",
         "enabled",
-        "coverage_status",
+        "history_sync_state",
         "action",
         "blocked_reason",
         "full_history_will_be_fetched",
@@ -54,15 +56,50 @@ MARK_DIALOG_FOR_SYNC_OUTPUT_SCHEMA = {
 }
 
 
+_DELIVERY_STREAM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "continuity": {
+            "enum": ["unknown", "gap_observed", "no_gap_observed"],
+            "description": "Protocol gap observation at the reported instant; no observed gap is not a completeness guarantee.",
+        },
+        "catch_up": {
+            "type": "object",
+            "properties": {
+                "scope": {"enum": ["account", "channel"]},
+                "state": {
+                    "enum": ["unknown", "not_due", "due", "in_flight", "blocked"],
+                    "description": "Catch-up state for this stream; in_flight requires a physical claim.",
+                },
+                "reason": {
+                    "enum": [
+                        "owner_unavailable",
+                        "not_due",
+                        "deadline",
+                        "possible_gap",
+                        "explicit_gap",
+                        "intake_pending",
+                        "eligibility",
+                        "physical_claim",
+                        "unknown",
+                    ]
+                },
+                "overdue_seconds": {"type": "number"},
+                "eligible_in_seconds": {"type": "number"},
+            },
+            "required": ["scope", "state", "reason"],
+            "additionalProperties": False,
+        },
+    },
+    "required": ["continuity", "catch_up"],
+    "additionalProperties": False,
+}
+
+
 GET_SYNC_STATUS_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
         "dialog_id": {"type": "integer"},
-        "coverage_status": {
-            "type": "string",
-            "enum": [item.value for item in SyncStatus],
-            "description": "Persisted history sync state, not current delivery or uninterrupted coverage.",
-        },
         "enrollment_enabled": {"type": ["boolean", "null"]},
         "automatic_group_sync": {
             "type": "object",
@@ -96,12 +133,13 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
         "message_delivery": {
             "type": "object",
             "properties": {
-                "state": {"const": "unverified"},
-                "lag_seconds": {"type": "null"},
-                "gap_status": {"const": "unknown"},
-                "reason": {"const": "no_authoritative_delivery_diagnostics"},
+                "observed_at_ms": {"type": "integer"},
+                "account": _DELIVERY_STREAM_SCHEMA,
+                "channel": _DELIVERY_STREAM_SCHEMA,
+                "intake_queue_depth": {"type": "integer"},
+                "pending_channels": {"type": "integer"},
             },
-            "required": ["state", "lag_seconds", "gap_status", "reason"],
+            "required": ["observed_at_ms", "account"],
             "additionalProperties": False,
         },
         "is_syncing": {"type": "boolean"},
@@ -148,7 +186,6 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
     },
     "required": [
         "dialog_id",
-        "coverage_status",
         "enrollment_enabled",
         "automatic_group_sync",
         "realtime_history",
@@ -188,6 +225,7 @@ class _GetSyncStatusSurface:
     model: SyncReadModel
     dialog_id: int
     automatic_group_sync: dict[str, object]
+    message_delivery: dict[str, object]
     delta_refresh_requested_at: int | None
     sync_progress: int | None
     sync_progress_message_id: int | None
@@ -240,6 +278,7 @@ def _decode_get_sync_status_surface(
     return _GetSyncStatusSurface(
         model=decode_sync_read_model(data),
         dialog_id=dialog_id,
+        message_delivery=_decode_message_delivery(_surface_required(data, "message_delivery")),
         automatic_group_sync=_decode_automatic_group_status(_surface_required(data, "automatic_group_sync")),
         delta_refresh_requested_at=_surface_optional_int(data, "delta_refresh_requested_at"),
         sync_progress=_surface_optional_int(data, "sync_progress"),
@@ -250,6 +289,58 @@ def _decode_get_sync_status_surface(
         access_next_revalidate_at=_surface_optional_int(data, "access_next_revalidate_at"),
         latest_retained_message=decode_latest_retained_message(_surface_required(data, "latest_retained_message")),
     )
+
+
+def _decode_message_delivery(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or type(value.get("observed_at_ms")) is not int:
+        raise SyncReadModelContractError("invalid message delivery snapshot")
+    if set(value) - {"observed_at_ms", "account", "channel", "intake_queue_depth", "pending_channels"}:
+        raise SyncReadModelContractError("unexpected message delivery field")
+    for count in ("intake_queue_depth", "pending_channels"):
+        if count in value and (type(value[count]) is not int or value[count] < 0):
+            raise SyncReadModelContractError("invalid message delivery count")
+    _validate_delivery_stream(value.get("account"), "account")
+    if "channel" in value:
+        _validate_delivery_stream(value["channel"], "channel")
+    return value
+
+
+def _validate_delivery_stream(stream: object, scope: str) -> None:
+    if not isinstance(stream, dict) or set(stream) != {"continuity", "catch_up"}:
+        raise SyncReadModelContractError("invalid message delivery stream")
+    if not _is_known_value(stream["continuity"], {"unknown", "gap_observed", "no_gap_observed"}):
+        raise SyncReadModelContractError("invalid protocol continuity")
+    catch_up = stream["catch_up"]
+    if not isinstance(catch_up, dict) or catch_up.get("scope") != scope:
+        raise SyncReadModelContractError("invalid catch-up scope")
+    _validate_catch_up(catch_up)
+
+
+def _validate_catch_up(catch_up: dict[str, object]) -> None:
+    if not _is_known_value(catch_up.get("state"), {"unknown", "not_due", "due", "in_flight", "blocked"}):
+        raise SyncReadModelContractError("invalid catch-up state")
+    if not _is_known_value(
+        catch_up.get("reason"),
+        {
+            "owner_unavailable",
+            "not_due",
+            "deadline",
+            "possible_gap",
+            "explicit_gap",
+            "intake_pending",
+            "eligibility",
+            "physical_claim",
+            "unknown",
+        },
+    ):
+        raise SyncReadModelContractError("invalid catch-up reason")
+    if set(catch_up) - {"scope", "state", "reason", "overdue_seconds", "eligible_in_seconds"}:
+        raise SyncReadModelContractError("unexpected catch-up field")
+    for timing in ("overdue_seconds", "eligible_in_seconds"):
+        if timing in catch_up:
+            duration = catch_up[timing]
+            if isinstance(duration, bool) or not isinstance(duration, int | float) or duration < 0:
+                raise SyncReadModelContractError("invalid catch-up timing")
 
 
 def _decode_automatic_group_status(value: object) -> dict[str, object]:
@@ -280,7 +371,7 @@ def _is_known_value(value: object, allowed: set[str]) -> bool:
 class MarkDialogForSync(ToolArgs):
     """Mark or unmark a dialog for persistent sync. When marked, full message history
     will be fetched shortly. Unmarking preserves existing synced history but stops
-    further sync. Use ListDialogs to find dialog IDs and current sync_status."""
+    further sync. Use ListDialogs to find dialog IDs and history state."""
 
     dialog_id: int = Field(description="Numeric dialog ID from ListDialogs")
     enable: bool = Field(default=True, description="True to start syncing, False to stop")
@@ -315,7 +406,7 @@ async def mark_dialog_for_sync(args: MarkDialogForSync) -> ToolResult:
     structured_content = {
         "dialog_id": args.dialog_id,
         "enabled": args.enable,
-        "coverage_status": data["coverage_status"],
+        "history_sync_state": data["history_sync_state"],
         "action": data["action"],
         "blocked_reason": data["blocked_reason"],
         "full_history_will_be_fetched": data["full_history_will_be_fetched"],
@@ -370,7 +461,6 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
     wire = surface.model.to_wire()
     structured_content = {
         "dialog_id": surface.dialog_id,
-        "coverage_status": wire["sync_status"],
         "enrollment_enabled": wire["enrollment_enabled"],
         "automatic_group_sync": surface.automatic_group_sync,
         "realtime_history": wire["realtime_history"],
@@ -380,12 +470,7 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
             RealtimeHistory.NONE: "none",
         }[surface.model.realtime_history],
         "latest_retained_message": surface.latest_retained_message,
-        "message_delivery": {
-            "state": "unverified",
-            "lag_seconds": None,
-            "gap_status": "unknown",
-            "reason": "no_authoritative_delivery_diagnostics",
-        },
+        "message_delivery": surface.message_delivery,
         "is_syncing": wire["is_syncing"],
         "last_synced_at": wire["last_synced_at"],
         "last_event_at": wire["last_event_at"],

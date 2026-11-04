@@ -19,7 +19,7 @@ from .dialog_selector import DialogSelector, DialogSelectorError, required_dialo
 from .message_content import MessageSnapshot, project_message_content
 from .models import DialogType
 from .sync_db import open_sync_db_reader
-from .sync_read_model import local_history_coverage
+from .sync_read_model import history_sync_state, local_history_coverage
 
 
 class _LoggerLike(Protocol):
@@ -563,7 +563,7 @@ def _project_activity_comments(
                 "dialog_type": row[7],
                 "dialog_category": row[10],
                 "reply_count": int(cast(int | str, row[8])),
-                "sync_status": row[9],
+                "history_sync_state": history_sync_state(cast(str | None, row[9])),
                 "reactions": reactions_by_msg.get((dialog_id, message_id), []),
             }
         )
@@ -647,7 +647,7 @@ class DaemonActivityStatsService:
         ]
         data: dict[str, object] = {
             "dialog_id": dialog_id,
-            "sync_status": status or "not_synced",
+            "history_sync_state": history_sync_state(status),
             "coverage": coverage.state,
             "observation_horizon_at": coverage.observation_horizon_at,
             "top_reactions": reactions,

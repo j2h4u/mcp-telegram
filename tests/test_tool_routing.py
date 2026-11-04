@@ -5,7 +5,7 @@ instead of directly connecting to Telegram. These tests verify:
 - Daemon API is called with correct parameters
 - Dialog name passed to daemon when not in entity cache
 - DaemonNotRunningError handled with actionable error text
-- Response formatting (sync_status, message display, etc.)
+- Response formatting (history state, message display, etc.)
 - Zero Telegram imports in tools/ package
 """
 
@@ -373,6 +373,16 @@ def _canonical_list_dialogs_data(dialogs: list[dict[str, object]]) -> dict[str, 
     }
 
 
+def _message_delivery_payload() -> dict[str, object]:
+    return {
+        "observed_at_ms": 1700000000000,
+        "account": {
+            "continuity": "unknown",
+            "catch_up": {"scope": "account", "state": "unknown", "reason": "owner_unavailable"},
+        },
+    }
+
+
 def _canonical_get_sync_status_data() -> dict[str, object]:
     return {
         "dialog_id": 123,
@@ -382,6 +392,7 @@ def _canonical_get_sync_status_data() -> dict[str, object]:
             "fresh_telegram_total": "unknown",
         },
         "latest_retained_message": None,
+        "message_delivery": _message_delivery_payload(),
         "sync_progress": None,
         "sync_progress_message_id": None,
         "delta_refresh_requested_at": None,
@@ -681,6 +692,7 @@ STRUCTURED_TOOL_CASES = {
                     "fresh_telegram_total": "unknown",
                 },
                 "latest_retained_message": None,
+                "message_delivery": _message_delivery_payload(),
                 "delta_refresh_requested_at": None,
                 "sync_progress": None,
                 "sync_progress_message_id": None,
@@ -698,7 +710,7 @@ STRUCTURED_TOOL_CASES = {
         {
             "ok": True,
             "data": {
-                "coverage_status": "not_synced",
+                "history_sync_state": "not_synced",
                 "action": "queue_full_history",
                 "blocked_reason": None,
                 "full_history_will_be_fetched": True,
@@ -785,6 +797,7 @@ STRUCTURED_TOOL_CASES = {
             "ok": True,
             "data": {
                 "dialog_id": 1,
+                "history_sync_state": "complete_as_of_last_sync",
                 "top_reactions": [{"emoji": "👍", "count": 4}],
                 "top_mentions": [{"value": "@alice", "count": 3}],
                 "top_hashtags": [{"value": "#python", "count": 5}],
@@ -853,7 +866,7 @@ STRUCTURED_TOOL_CASES = {
                         "message_id": 100,
                         "sent_at": 1_700_000_000,
                         "text": "first",
-                        "sync_status": "synced",
+                        "history_sync_state": "complete_as_of_last_sync",
                         "reactions": [{"emoji": "🔥", "count": 1}],
                     }
                 ],
@@ -954,11 +967,9 @@ async def test_registered_tool_outputs_match_their_null_free_schemas(tool_name: 
     payload = assert_structured_success_payload(result)
     if tool_name == "get_sync_status":
         assert payload["latest_retained_message"] is None
-        delivery = cast(dict[str, object], payload["message_delivery"])
-        assert delivery["lag_seconds"] is None
+        assert payload["message_delivery"] == _message_delivery_payload()
         remainder = dict(payload)
         remainder.pop("latest_retained_message")
-        remainder["message_delivery"] = {k: v for k, v in delivery.items() if k != "lag_seconds"}
         _assert_null_free(remainder)
     else:
         _assert_null_free(payload)
@@ -1231,12 +1242,13 @@ async def test_list_dialogs_via_daemon():
     assert first_dialog["name"] == "Alice"
     assert first_dialog["type"] == "User"
     assert first_dialog["unread_count"] == 2
-    assert first_dialog["sync_status"] == "synced"
-    assert first_dialog["synced"] is True
+    assert first_dialog["history_sync_state"] == "complete_as_of_last_sync"
+    assert "sync_status" not in first_dialog
+    assert "synced" not in first_dialog
     assert "last_message_at" in first_dialog
     assert "sync_coverage_pct" in first_dialog
     assert "access_lost_at" in first_dialog
-    assert _json_dict(dialogs[1])["synced"] is False
+    assert _json_dict(dialogs[1])["history_sync_state"] == "not_synced"
     conn.list_dialogs.assert_called_once()
 
 
@@ -1333,8 +1345,8 @@ def test_search_message_schema_accepts_topic_and_topic_absence() -> None:
     assert "topic" not in without_topic
 
 
-async def test_list_dialogs_sync_status_in_output():
-    """ListDialogs output includes sync_status field for every dialog."""
+async def test_list_dialogs_history_sync_state_in_output():
+    """ListDialogs output includes explicit history state for every dialog."""
     conn = _make_daemon_conn(
         {
             "ok": True,
@@ -1354,7 +1366,10 @@ async def test_list_dialogs_sync_status_in_output():
 
     assert result.content == ()
     assert result.structured_content is not None
-    assert _json_dict(_json_list(_json_dict(result.structured_content)["dialogs"])[0])["sync_status"] == "synced"
+    assert (
+        _json_dict(_json_list(_json_dict(result.structured_content)["dialogs"])[0])["history_sync_state"]
+        == "complete_as_of_last_sync"
+    )
 
 
 async def test_list_dialogs_empty_via_daemon():
@@ -2542,7 +2557,7 @@ async def test_mark_dialog_for_sync_via_daemon():
         {
             "ok": True,
             "data": {
-                "coverage_status": "not_synced",
+                "history_sync_state": "not_synced",
                 "action": "queue_full_history",
                 "blocked_reason": None,
                 "full_history_will_be_fetched": True,
@@ -2555,7 +2570,7 @@ async def test_mark_dialog_for_sync_via_daemon():
     assert result.structured_content == {
         "dialog_id": 42,
         "enabled": True,
-        "coverage_status": "not_synced",
+        "history_sync_state": "not_synced",
         "action": "queue_full_history",
         "blocked_reason": None,
         "full_history_will_be_fetched": True,
@@ -2570,7 +2585,7 @@ async def test_mark_dialog_for_sync_synced_dialog_reports_delta_refresh():
             "ok": True,
             "data": {
                 "action": "request_delta_refresh",
-                "coverage_status": "synced",
+                "history_sync_state": "complete_as_of_last_sync",
                 "blocked_reason": None,
                 "full_history_will_be_fetched": False,
             },
@@ -2582,7 +2597,7 @@ async def test_mark_dialog_for_sync_synced_dialog_reports_delta_refresh():
     assert result.structured_content == {
         "dialog_id": 42,
         "enabled": True,
-        "coverage_status": "synced",
+        "history_sync_state": "complete_as_of_last_sync",
         "action": "request_delta_refresh",
         "blocked_reason": None,
         "full_history_will_be_fetched": False,
@@ -2596,7 +2611,7 @@ async def test_mark_dialog_for_sync_disable():
         {
             "ok": True,
             "data": {
-                "coverage_status": "synced",
+                "history_sync_state": "complete_as_of_last_sync",
                 "action": "disabled_history",
                 "blocked_reason": None,
                 "full_history_will_be_fetched": False,
@@ -2609,7 +2624,7 @@ async def test_mark_dialog_for_sync_disable():
     assert result.structured_content == {
         "dialog_id": 42,
         "enabled": False,
-        "coverage_status": "synced",
+        "history_sync_state": "complete_as_of_last_sync",
         "action": "disabled_history",
         "blocked_reason": None,
         "full_history_will_be_fetched": False,
@@ -2640,6 +2655,7 @@ async def test_get_sync_status_via_daemon():
             "fresh_telegram_total": "unknown",
         },
         "latest_retained_message": None,
+        "message_delivery": _message_delivery_payload(),
         "sync_progress": 100,
         "sync_progress_message_id": 100,
         "delete_detection": "reliable (channel)",
@@ -2665,17 +2681,11 @@ async def test_get_sync_status_via_daemon():
             "reason": "already_enabled",
             "fresh_telegram_total": "unknown",
         },
-        "coverage_status": "synced",
         "enrollment_enabled": True,
         "realtime_history": "full",
         "message_retention_policy": "all_authorized",
         "latest_retained_message": None,
-        "message_delivery": {
-            "state": "unverified",
-            "lag_seconds": None,
-            "gap_status": "unknown",
-            "reason": "no_authoritative_delivery_diagnostics",
-        },
+        "message_delivery": _message_delivery_payload(),
         "is_syncing": False,
         "last_synced_at": "2023-11-14T22:13:20+00:00",
         "last_event_at": "2023-11-14T22:30:00+00:00",
@@ -2718,6 +2728,35 @@ async def test_get_sync_status_rejects_malformed_required_surface_field() -> Non
     with _patch_daemon(conn):
         result = await get_sync_status(GetSyncStatus(dialog_id=123))
 
+    assert result.is_error is True
+    assert result.structured_content is None
+    assert "daemon_protocol_error" in _result_text(result)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"scope": "channel"},
+        {"state": "fresh"},
+        {"reason": "invented"},
+        {"overdue_seconds": -1},
+        {"eligible_in_seconds": -1},
+        {"unexpected": True},
+        {"intake_queue_depth": -1},
+        {"pending_channels": -1},
+    ],
+)
+async def test_get_sync_status_rejects_malformed_delivery(change: dict[str, object]) -> None:
+    delivery = _message_delivery_payload()
+    account = cast(dict[str, object], delivery["account"])
+    catch_up = cast(dict[str, object], account["catch_up"])
+    target = delivery if set(change) & {"intake_queue_depth", "pending_channels"} else catch_up
+    target.update(change)
+    data = _canonical_get_sync_status_data()
+    data["message_delivery"] = delivery
+    conn = _make_daemon_conn({"ok": True, "data": data})
+    with _patch_daemon(conn):
+        result = await get_sync_status(GetSyncStatus(dialog_id=123))
     assert result.is_error is True
     assert result.structured_content is None
     assert "daemon_protocol_error" in _result_text(result)

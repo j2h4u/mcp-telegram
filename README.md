@@ -348,6 +348,11 @@ mark_dialog_for_sync(dialog_id=<dialog_id>, enable=true)
 get_sync_status(dialog_id=<dialog_id>)
 ```
 
+History acquisition and its recorded boundary are separate from the locally
+observed account and channel delivery state. An unknown delivery state does not
+indicate a fault, and an observation without a gap is not a guarantee that all
+messages have arrived. These reads do not contact Telegram.
+
 MCP clients that support prompts can request `telegram_workflows` for the
 current workflow guide and important interpretation rules.
 

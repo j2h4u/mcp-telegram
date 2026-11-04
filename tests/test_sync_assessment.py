@@ -174,3 +174,17 @@ def test_only_three_supported_tools() -> None:
     assert {"get_sync_status", "list_messages", "search_messages"} == ASSESSMENT_TOOLS
     with pytest.raises(ValueError):
         build_sync_assessment("get_inbox", {}, {})
+
+
+@pytest.mark.parametrize(
+    ("continuity", "phrase"),
+    [
+        ("gap_observed", "A protocol gap was observed"),
+        ("no_gap_observed", "No account protocol gap was observed"),
+        ("unknown", "Account protocol continuity is unknown"),
+    ],
+)
+def test_status_assessment_reports_observed_continuity(continuity: str, phrase: str) -> None:
+    payload = {"message_delivery": {"account": {"continuity": continuity}}}
+    result = build_sync_assessment("get_sync_status", payload, {})
+    assert phrase in cast(str, result["summary"])

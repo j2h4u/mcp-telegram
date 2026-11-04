@@ -8,7 +8,7 @@ from typing import cast
 import pytest
 from telethon import types
 from telethon._updates import GapError, MessageBox, PrematureEndReason, SessionState
-from telethon._updates.messagebox import ENTRY_ACCOUNT
+from telethon._updates.messagebox import ENTRY_ACCOUNT, ENTRY_SECRET, PossibleGap, State
 
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred
 from mcp_telegram.telegram_update_admission import GateMessageBox, UpdateIntakeQueue
@@ -45,6 +45,74 @@ def setup_gap(wire: _WireHarness) -> tuple[GateMessageBox, datetime]:
 
 def envelope(now: datetime) -> object:
     return types.UpdateShort(types.UpdateUserStatus(7, types.UserStatusOffline(now)), now)
+
+
+@pytest.mark.parametrize("entry", [ENTRY_ACCOUNT, ENTRY_SECRET])
+@pytest.mark.parametrize("gap_due", [False, True])
+async def test_due_account_deadline_preempts_busy_channels(wire: _WireHarness, entry: object, gap_due: bool) -> None:
+    gate = wire[0]
+    box = cast(GateMessageBox, gate._message_box)
+    now = asyncio.get_running_loop().time()
+    box.load(SessionState(42, 2, False, 10, 3, int(datetime.now(UTC).timestamp()), 1, None), [])
+    box.map[ENTRY_ACCOUNT].deadline = now + 100
+    box.map[ENTRY_SECRET].deadline = now + 100
+    if gap_due:
+        box.possible_gaps[entry] = PossibleGap(now, [])
+    else:
+        box.map[entry].deadline = now
+    for channel_id in range(100, 220):
+        box.map[channel_id] = State(20, now + 100)
+        box.try_begin_get_diff(channel_id, "busy channel")
+    assert box.get_difference() is not None
+    assert entry in box.getting_diff_for and entry not in box.possible_gaps
+    assert len(box.getting_diff_for) == 121
+
+
+async def test_uninitialized_account_never_selects_secret_difference(wire: _WireHarness) -> None:
+    box = cast(GateMessageBox, wire[0]._message_box)
+    box.map.clear()
+    box.map[ENTRY_SECRET] = State(1, 0)
+    box.getting_diff_for.add(ENTRY_SECRET)
+    assert box.get_difference() is None
+
+
+@pytest.mark.parametrize("final", [False, True])
+async def test_account_deadline_matures_during_channel_responses(wire: _WireHarness, final: bool) -> None:
+    from telethon.tl.functions.updates import GetChannelDifferenceRequest
+
+    gate = wire[0]
+    box = cast(GateMessageBox, gate._message_box)
+    now = asyncio.get_running_loop().time()
+    box.load(SessionState(42, 2, False, 10, 0, int(datetime.now(UTC).timestamp()), 1, None), [])
+    box.map[ENTRY_ACCOUNT].deadline = now + 100
+    for channel_id in range(100, 220):
+        box.map[channel_id] = State(20, now + 100)
+        box.try_begin_get_diff(channel_id, "busy channel")
+    request = GetChannelDifferenceRequest(types.InputChannel(100, 200), types.ChannelMessagesFilterEmpty(), 20, 10)
+    for _ in range(3):
+        assert box.get_difference() is None
+        response = types.updates.ChannelDifference(
+            pts=20, new_messages=[], other_updates=[], chats=[], users=[], final=final
+        )
+        box.apply_channel_difference(request, response, gate._mb_entity_cache)
+        if final:
+            box.try_begin_get_diff(100, "next busy channel")
+    box.map[ENTRY_ACCOUNT].deadline = asyncio.get_running_loop().time()
+    assert box.get_difference() is not None
+    assert ENTRY_ACCOUNT in box.getting_diff_for and len(box.getting_diff_for) == 121
+
+
+async def test_due_deadline_waits_for_queued_input_and_honors_floor(wire: _WireHarness) -> None:
+    gate = wire[0]
+    box, now = setup_gap(wire)
+    box.getting_diff_for.discard(ENTRY_ACCOUNT)
+    box.map[ENTRY_ACCOUNT].deadline = 0
+    queue = cast(UpdateIntakeQueue, gate._updates_queue)
+    queue.put_nowait(envelope(now))
+    assert box.get_difference() is None and ENTRY_ACCOUNT not in box.getting_diff_for
+    queue.get_nowait()
+    box._eligibility = lambda _method: TelegramRpcAdmissionDeferred(60, eligible_at=time.monotonic() + 60)
+    assert box.get_difference() is None and ENTRY_ACCOUNT in box.getting_diff_for
 
 
 def test_only_real_gap_envelope_grants_credit(wire: _WireHarness, monkeypatch: pytest.MonkeyPatch) -> None:

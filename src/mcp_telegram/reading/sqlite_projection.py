@@ -11,7 +11,7 @@ from typing import Literal, Protocol, cast
 
 from ..alert_policy import incoming_human_dm_sql
 from ..models import DialogType, ReadMessage, ReadState
-from ..sync_read_model import compute_sync_coverage, local_history_coverage
+from ..sync_read_model import compute_sync_coverage, history_sync_state, local_history_coverage
 
 _SELECT_SYNC_STATUS_SQL = "SELECT status FROM synced_dialogs WHERE dialog_id = ?"
 _MESSAGE_SENT_AT_SQL = "SELECT sent_at FROM messages WHERE dialog_id = ? AND message_id = ?"
@@ -127,7 +127,7 @@ def _build_access_metadata(
     coverage = local_history_coverage(status, last_synced_at)
     meta: dict = {
         "dialog_access": "archived" if status == "access_lost" else "unknown",
-        "sync_status": status or "not_synced",
+        "history_sync_state": history_sync_state(status),
         "coverage": coverage.state,
         "observation_horizon_at": coverage.observation_horizon_at,
         "last_synced_at": last_synced_at,

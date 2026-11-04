@@ -67,6 +67,7 @@ from .delivered_update import DeliveredUpdate, delivered_update_context, fail_de
 from .flood import FloodWaitObservation, TelegramRpcThrottled, flood_seconds
 from .folders.intake import capture_folder_intake, has_folder_updates, invalidate_folder_intake
 from .image_authorization import ScopeCell, ScopeToken
+from .message_delivery_observations import DeliveryTrace, MessageDeliveryObservations, current_delivery
 from .native_write_fence import (
     ContactWriteRejected,
     FolderWriteRejected,
@@ -3368,6 +3369,7 @@ class _WireAttempt:
     native_scope_token: ScopeToken | None = None
     native_phase: str | None = None
     native_target: int | None = None
+    difference_channel_id: int | None = None
 
 
 def _application_request(request: object) -> TLRequest:
@@ -3868,6 +3870,8 @@ class TelegramRpcGate(TelegramClient):
         self._delivery_safe: ProtocolSnapshot | None = None
         self._delivery_account_id: int | None = None
         self._active_delivery: _ActiveDelivery | None = None
+        self._account_difference_claim: _WireAttempt | None = None
+        self._channel_difference_claim: _WireAttempt | None = None
         self._delivery_callbacks: dict[object, object] = {}
         self._scheduled_continuity_recovery: Callable[[int | None, str], Awaitable[None]] | None = None
 
@@ -3948,6 +3952,50 @@ class TelegramRpcGate(TelegramClient):
         if self._delivery_repository is not None or self.is_connected():
             raise RuntimeError("update delivery must be configured once before connect")
         self._delivery_repository = repository
+
+    def message_delivery_snapshot(self, channel_id: int | None = None) -> dict[str, object]:
+        """Describe only currently observed local update and catch-up state."""
+        observed_at_ms = int(time.time() * 1000)
+        box = cast(GateMessageBox, self._message_box)
+        if not self._delivery_snapshot_ready():
+            unknown = {"gap_state": "unknown", "catch_up_state": "unknown", "reason": "owner_unavailable"}
+            result: dict[str, object] = {"account": unknown, "observed_at_ms": observed_at_ms}
+            if channel_id is not None:
+                result["channel"] = dict(unknown)
+            return result
+        owner = self._account_difference_claim
+        in_flight = self._difference_claim_active(owner)
+        channel_owner = self._channel_difference_claim
+        channel_in_flight = (
+            channel_id is not None
+            and channel_owner is not None
+            and channel_owner.difference_channel_id == channel_id
+            and self._difference_claim_active(channel_owner)
+        )
+        result = box.delivery_snapshot(
+            channel_id, now=time.monotonic(), account_in_flight=in_flight, channel_in_flight=channel_in_flight
+        )
+        result["observed_at_ms"] = observed_at_ms
+        return result
+
+    def _delivery_snapshot_ready(self) -> bool:
+        return (
+            self._transport_state is _TransportBoundaryState.READY
+            and self.retained_auth_scope() is not None
+            and self._session_lease is not None
+            and self._session_lease.is_held()
+            and self._delivery_ready.is_set()
+        )
+
+    @staticmethod
+    def _difference_claim_active(owner: _WireAttempt | None) -> bool:
+        return owner is not None and owner.claimed > 0 and not owner.observed_result and not owner.terminal
+
+    def set_message_delivery_observer(self, observer: MessageDeliveryObservations | None) -> None:
+        box = cast(GateMessageBox, self._message_box)
+        box.observer = observer
+        if box.intake_queue is not None:
+            box.intake_queue.observer = observer
 
     def close_update_delivery(self) -> None:
         """Fence shutdown before callbacks detach; admitted SQLite writes still settle."""
@@ -4038,6 +4086,7 @@ class TelegramRpcGate(TelegramClient):
             raise RuntimeError("retained update account mismatch")
         if len(updates) != len(state.orders) or len(state.orders) != len(state.reaction_sequences):
             raise RuntimeError("retained Telegram update tokens are incomplete")
+        cast(GateMessageBox, self._message_box).observe_replay_updates(updates)
         capture_folder_intake(updates)
         capture_contact_note_intake(updates)
         capture_contact_intake(updates)
@@ -4141,6 +4190,7 @@ class TelegramRpcGate(TelegramClient):
             raise RuntimeError("Telegram update admission is closed")
         try:
             tokens = await repository.admit(envelope.model_dump_json().encode("utf-8"), len(updates))
+            self._observe_delivery_stage(updates, "admitted")
             self._install_delivery(envelope, updates, tokens)
             result = await super()._preprocess_updates(updates, users, chats)  # type: ignore[misc]
             if not updates:
@@ -4149,6 +4199,23 @@ class TelegramRpcGate(TelegramClient):
         except BaseException:
             self._delivery_failure.set()
             raise
+
+    def _observe_delivery_stage(self, updates: list[object], stage: str) -> None:
+        observer = cast(GateMessageBox, self._message_box).observer
+        if observer is None:
+            return
+        try:
+            for update in updates:
+                trace = getattr(update, "_mcp_delivery_trace", None)
+                scope = getattr(update, "_mcp_delivery_scope", "account")
+                observer.stage(
+                    trace if isinstance(trace, DeliveryTrace) else None,
+                    scope=scope,
+                    stage=stage,
+                    observed_at_ms=int(time.time() * 1000),
+                )
+        except Exception:  # noqa: BLE001 - observation is passive
+            pass
 
     def _check_delivery_scope(
         self, scope: TelegramAuthScope | None, updates: list[object], users: list[object]
@@ -4622,6 +4689,7 @@ class TelegramRpcGate(TelegramClient):
             transport_auth=self._authentication_mode or self._logout_mode,
         )
         owner = _WireAttempt(self._wire_issuer, attempt_id, method, bound, timing=current_timing())
+        self._bind_difference_channel(owner, actual)
         owner.native_phase, owner.native_target = self._native_command_phase(actual, bound)
         self._install_native_owner(owner, native, actual, body)
         self._capture_peer_access(owner, actual, capability)
@@ -4636,6 +4704,13 @@ class TelegramRpcGate(TelegramClient):
         if scheduled_check is not None:
             self._require_scheduled_mutation_budget(bound)
         return owner
+
+    @staticmethod
+    def _bind_difference_channel(owner: _WireAttempt, request: TLRequest) -> None:
+        if isinstance(request, functions.updates.GetChannelDifferenceRequest) and isinstance(
+            request.channel, types.InputChannel
+        ):
+            owner.difference_channel_id = request.channel.channel_id
 
     def _install_native_owner(
         self,
@@ -5636,6 +5711,7 @@ class TelegramRpcGate(TelegramClient):
 
     def _record_wire_dispatch(self, owner: _WireAttempt, permit: _WirePermit) -> None:
         owner.claimed += 1
+        self._record_difference_claim(owner)
         owner.dispatch_at = time.monotonic()
         self._arm_response_timeout(owner)
         if owner.claimed == 1 and not owner.scope.transport_control:
@@ -5660,6 +5736,14 @@ class TelegramRpcGate(TelegramClient):
             reason="replay" if owner.claimed > 1 else None,
             attempt_ordinal=owner.observation_ordinal,
         )
+
+    def _record_difference_claim(self, owner: _WireAttempt) -> None:
+        if self._is_update_difference_owner(owner) and ".GetDifferenceRequest:" in owner.method:
+            self._account_difference_claim = owner
+            cast(GateMessageBox, self._message_box).observe_difference_claim(None)
+        elif self._is_update_difference_owner(owner) and owner.difference_channel_id is not None:
+            self._channel_difference_claim = owner
+            cast(GateMessageBox, self._message_box).observe_difference_claim(owner.difference_channel_id)
 
     @staticmethod
     def _record_native_dispatch(owner: _WireAttempt) -> None:
@@ -8173,6 +8257,12 @@ class TelegramRpcGate(TelegramClient):
             self._delivery_failure.set()
             raise RuntimeError("Telegram update has no durable admission")
         context = active.contexts[id(update)]
+        observer = cast(GateMessageBox, self._message_box).observer
+        trace = getattr(update, "_mcp_delivery_trace", None)
+        scope = getattr(update, "_mcp_delivery_scope", "account")
+        diagnostic = current_delivery.set(
+            None if observer is None else (observer, trace if isinstance(trace, DeliveryTrace) else None, scope)
+        )
         try:
             with delivered_update_context(context), demand_context(DemandKind.REALTIME_EVENT_ACQUISITION):
                 await super()._dispatch_update(update)  # type: ignore[misc]
@@ -8181,6 +8271,7 @@ class TelegramRpcGate(TelegramClient):
             self._delivery_failure.set()
             raise
         finally:
+            current_delivery.reset(diagnostic)
             active.remaining.discard(id(update))
             if not active.remaining:
                 await self._complete_update_delivery()

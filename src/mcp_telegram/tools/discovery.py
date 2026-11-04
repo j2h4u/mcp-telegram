@@ -19,7 +19,6 @@ from ..sync_read_model import (
     HistorySyncState,
     SyncReadModel,
     SyncReadModelContractError,
-    SyncStatus,
     decode_sync_read_model,
 )
 from ..temporal import parse_utc_boundary
@@ -79,15 +78,6 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "is_self": {"type": "boolean"},
                     "last_message_at": {"type": ["integer", "string", "null"]},
                     "unread_count": {"type": ["integer", "null"]},
-                    "sync_status": {
-                        "type": "string",
-                        "enum": [item.value for item in SyncStatus],
-                        "description": "Persisted history sync state, not current delivery.",
-                    },
-                    "synced": {
-                        "type": "boolean",
-                        "description": "Persisted history completion status, not uninterrupted delivery.",
-                    },
                     "sync_coverage_pct": {"type": ["integer", "null"]},
                     "saved_message_count": {"type": "integer"},
                     "history_scope": {"type": "string", "enum": [item.value for item in HistoryScope]},
@@ -151,8 +141,6 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "topic_capability",
                     "last_message_at",
                     "unread_count",
-                    "sync_status",
-                    "synced",
                     "sync_coverage_pct",
                     "saved_message_count",
                     "history_scope",
@@ -768,14 +756,7 @@ class ListDialogs(ToolArgs):
     remain: a short or empty page may still have next_navigation. Repeat the same
     selectors when continuing, and start again for a fresh traversal.
 
-    sync_status values:
-      - 'not_synced'  — no bulk fetch attempted
-      - 'syncing'     — bulk fetch in progress
-      - 'synced'      — complete historical coverage as of history_complete_at; this does not prove active realtime
-      - 'own_only'    — only own-message-related history is stored
-      - 'access_lost' — account no longer has access; read-only snapshot
-      - 'fragment'    — partial retained history; anchored reads use local context only
-
+    History state and its completion boundary are reported separately from message delivery.
     Call `get_sync_status` for retention policy, history boundary and separate delivery diagnostics.
     """
 
@@ -1034,8 +1015,6 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 "topic_capability": dialog.topic_capability,
                 "last_message_at": dialog.last_message_at,
                 "unread_count": dialog.unread_count,
-                "sync_status": wire["sync_status"],
-                "synced": wire["synced"],
                 "sync_coverage_pct": wire["sync_coverage_pct"],
                 "saved_message_count": wire["saved_message_count"],
                 "history_scope": wire["history_scope"],

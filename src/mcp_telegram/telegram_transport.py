@@ -751,6 +751,13 @@ class GuardedMTProtoSender(MTProtoSender):
             await asyncio.sleep(self._delay)
             return False
 
+    async def _handle_update(self, message: TLMessage) -> None:
+        try:
+            message.obj._mcp_delivery_source = "push"
+        except TypeError, AttributeError:
+            pass
+        await super()._handle_update(message)
+
     async def _handle_rpc_result(self, message: object) -> None:
         result = getattr(message, "obj", None)
         pending = self._pending_state.get(getattr(result, "req_msg_id", None))
@@ -764,6 +771,10 @@ class GuardedMTProtoSender(MTProtoSender):
             self._response_owner.reset(response_token)
 
     def _store_own_updates(self, obj: object, *args: object, **kwargs: object) -> None:
+        try:
+            vars(obj)["_mcp_delivery_source"] = "rpc_response"
+        except TypeError:
+            pass
         owned = self._response_owner.get()
         if owned is None or owned.request_type not in {AddContactRequest, DeleteContactsRequest}:
             super()._store_own_updates(obj, *args, **kwargs)

@@ -133,6 +133,7 @@ from .history_enrollment import EnrollmentOutcome, ensure_automatic_dm_enrollmen
 from .hydration_queue import HydrationPriority
 from .identity_observation import USERNAME_UNOBSERVED, observe_username
 from .linked_chat_fact import LinkedChatWork, linked_chat_fact_owner
+from .message_delivery_observations import observe_current
 from .messages.sqlite_bundle import (
     find_unique_nonchannel_message_dialogs,
     insert_messages_with_fts,
@@ -1251,6 +1252,7 @@ class EventHandlerManager:
         if dialog_id is None:
             return
         profile_owner_account_id = self._self_id
+        observe_current("handler", int(time.time() * 1000))
         try:
             reaction_observed_at = delivered_observed_at()
             msg = event.message
@@ -1310,6 +1312,8 @@ class EventHandlerManager:
                 return True, needs_scheduled_work, write_result.membership_counts
 
             accepted, needs_scheduled_work, membership_counts = await self._writer.run(_persist_event_0)
+            if accepted:
+                observe_current("committed", int(time.time() * 1000))
             self._finish_new_message(dialog_id, msg, accepted, needs_scheduled_work, membership_counts)
         except RpcAdmissionClosedError:
             raise

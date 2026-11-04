@@ -117,6 +117,7 @@ from .folders.worker import FolderProjectionWorker
 from .hydration_queue import HydrationPriority
 from .image_authorization import ActiveSources, ScopeToken
 from .media_hydration import MediaFactHydrationHandler
+from .message_delivery_observations import MessageDeliveryObservations
 from .message_fact_refresh import (
     MessageFactRefreshDeps,
     MessageFactRefreshPolicy,
@@ -270,6 +271,8 @@ def read_operator_summary_snapshot(
 
 
 class _DaemonClient(Protocol):
+    def message_delivery_snapshot(self, channel_id: int | None = None) -> dict[str, object]: ...
+
     def register_native_write_domain(self, domain: NativeWriteDomain, owner: NativeWriteDomainOwner) -> None: ...
 
     def bind_peer_access(self, access: PeerAccess) -> None: ...
@@ -332,6 +335,8 @@ class _DaemonClient(Protocol):
     async def close_rpc_scheduler(self) -> None: ...
 
     def set_rpc_admission_observer(self, observer: AdmissionObserver | None) -> None: ...
+
+    def set_message_delivery_observer(self, observer: MessageDeliveryObservations | None) -> None: ...
 
     def set_rpc_request_observer(self, observer: Callable[..., None] | None) -> None: ...
 
@@ -1405,6 +1410,7 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
         feedback_service,
         db_path,
         writer=writer,
+        message_delivery_snapshot=client.message_delivery_snapshot,
         hydration_requester=lambda hydration_conn, dialog_id, due_at: reconcile_fact_hydration_jobs_for_dialog(
             hydration_conn,
             dialog_id,
@@ -1542,6 +1548,7 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
         )
     )
     client.set_rpc_request_observer(rpc_admission_observer.observe_rpc_event)
+    client.set_message_delivery_observer(rpc_admission_observer.delivery)
     client.set_flood_event_observer(rpc_admission_observer.observe_flood_wait)
     recovery_observer = RecoveryObservationAdapter(
         rpc_observation_sink,
@@ -2228,6 +2235,7 @@ async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
 
     async def detach_observer() -> None:
         ctx.client.set_rpc_admission_observer(None)
+        ctx.client.set_message_delivery_observer(None)
         ctx.client.set_rpc_request_observer(None)
         ctx.client.set_flood_event_observer(None)
         ctx.client.set_recovery_observer(None)
@@ -2589,8 +2597,7 @@ def _note_recovery_watermark(conn: sqlite3.Connection, account_id: int) -> int |
         conn.execute(
             "SELECT MAX(entity_id) FROM (SELECT account_id,entity_id,outcome,verification FROM contact_note_operation_receipts "
             "UNION ALL SELECT account_id,entity_id,outcome,verification FROM contact_operation_receipts) WHERE account_id=? AND "
-            "((outcome='unknown' AND verification!='observed_after_unknown') OR "
-            "(outcome='acknowledged' AND verification IN ('pending','unavailable')))",
+            "outcome IN ('unknown','acknowledged') AND verification IN ('pending','unavailable')",
             (account_id,),
         ).fetchone(),
     )
@@ -2604,8 +2611,7 @@ def _unresolved_note_batch(conn: sqlite3.Connection, account_id: int, after: int
             "SELECT DISTINCT entity_id FROM (SELECT account_id,entity_id,outcome,verification FROM contact_note_operation_receipts "
             "UNION ALL SELECT account_id,entity_id,outcome,verification FROM contact_operation_receipts) "
             "WHERE account_id=? AND entity_id>? AND entity_id<=? AND "
-            "((outcome='unknown' AND verification!='observed_after_unknown') OR "
-            "(outcome='acknowledged' AND verification IN ('pending','unavailable'))) "
+            "outcome IN ('unknown','acknowledged') AND verification IN ('pending','unavailable') "
             "ORDER BY entity_id LIMIT 32",
             (account_id, after, upper),
         ).fetchall(),

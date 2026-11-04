@@ -74,6 +74,7 @@ MANAGE_CONTACT_NOTE_OUTPUT_SCHEMA = {
             "description": "Historical observation; it does not guarantee the note remains unchanged.",
         },
         "current_applicability": {"enum": ["unknown"]},
+        "required_action": {"type": "string"},
         "verification_order": {
             "type": "integer",
             "description": "Order of the accepted historical observation, when available.",
@@ -117,4 +118,12 @@ async def manage_contact_note(args: ManageContactNote) -> ToolResult:
     if error := _check_daemon_response(response):
         return error
     response.pop("request_id", None)
+    if response.get("verification") == "inconclusive" and response.get("outcome") in {"unknown", "acknowledged"}:
+        response["required_action"] = (
+            "The outcome remains unknown. Inspect the current local note and reuse the exact operation key and request body to inspect it; "
+            "do not repeat the write while the outcome is unresolved."
+            if response.get("outcome") == "unknown"
+            else "The write was acknowledged, but its result could not be verified. Inspect the current local note; "
+            "do not retry the write with the same or a new key."
+        )
     return structured_result(response)

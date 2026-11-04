@@ -57,6 +57,7 @@ from mcp_telegram.sync_db import (
     ensure_sync_schema,
 )
 from mcp_telegram.sync_read_model import compute_sync_coverage as _compute_sync_coverage
+from mcp_telegram.sync_read_model import history_sync_state
 from mcp_telegram.sync_transactions import enable_runtime_writes
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
@@ -80,6 +81,8 @@ from tests.helpers import (
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.sqlite_writer_helpers import inline_writer
+from tests.test_telegram_rpc_wire_integration import _WireHarness
+from tests.test_telegram_update_fairness import wire as wire
 
 # Track sqlite connections created by module helpers and close them after each test.
 _TRACKED_SQLITE_CONN_CLEANUP: Final[list[sqlite3.Connection]] = []
@@ -1794,9 +1797,9 @@ async def test_list_dialogs_sync_status_via_sql() -> None:
     assert len(dialogs) == 2
 
     by_id = {d["id"]: d for d in dialogs}
-    assert by_id[1]["sync_status"] == "synced"
+    assert by_id[1]["history_sync_state"] == "complete_as_of_last_sync"
     assert by_id[1]["archived"] is True
-    assert by_id[2]["sync_status"] == "not_synced"
+    assert by_id[2]["history_sync_state"] == "not_synced"
     assert by_id[2]["archived"] is False
     cast(MagicMock, client.iter_dialogs).assert_not_called()
 
@@ -2225,7 +2228,7 @@ async def test_list_dialogs_includes_hidden_access_lost_archive() -> None:
     assert result["ok"] is True
     by_id = {d["id"]: d for d in result["data"]["dialogs"]}
     assert by_id[42]["name"] == "Lost Group"
-    assert by_id[42]["sync_status"] == "access_lost"
+    assert by_id[42]["history_sync_state"] == "access_lost_archive"
     assert by_id[42]["access_lost_at"] == 1700000100
     cast(MagicMock, client.iter_dialogs).assert_not_called()
 
@@ -2257,7 +2260,7 @@ async def test_list_dialogs_includes_orphan_access_lost_archive() -> None:
     assert dialogs[0]["display_name_source"] == "numeric"
     assert dialogs[0]["type"] == "unknown"
     assert dialogs[0]["last_message_at"] is None
-    assert dialogs[0]["sync_status"] == "access_lost"
+    assert dialogs[0]["history_sync_state"] == "access_lost_archive"
     assert dialogs[0]["access_lost_at"] == 1700000100
     cast(MagicMock, client.iter_dialogs).assert_not_called()
 
@@ -3337,7 +3340,12 @@ async def test_get_sync_status_synced_dialog() -> None:
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": -1001234567890})
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
-    assert data["sync_status"] == "synced"
+    assert data["history_sync_state"] == "complete_as_of_last_sync"
+    delivery = cast(dict[str, object], data["message_delivery"])
+    assert delivery["account"] == {
+        "continuity": "unknown",
+        "catch_up": {"scope": "account", "state": "unknown", "reason": "owner_unavailable"},
+    }
     assert data["saved_message_count"] == 2
     assert data["last_synced_at"] == 1700000000
     assert data["last_event_at"] == 1700001000
@@ -3502,7 +3510,7 @@ async def test_get_sync_status_non_synced() -> None:
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": 99999})
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
-    assert data["sync_status"] == "not_synced"
+    assert data["history_sync_state"] == "not_synced"
     assert data["saved_message_count"] == 0
 
 
@@ -6316,7 +6324,7 @@ async def test_sync_read_model_fields_match_between_sync_status_and_dialog_catal
     sync_data = cast(dict[str, object], sync_response["data"])
     dialogs = cast(list[dict[str, object]], cast(dict[str, object], dialogs_response["data"])["dialogs"])
     dialog_data = next(dialog for dialog in dialogs if dialog["id"] == dialog_id)
-    assert sync_data["sync_status"] == dialog_data["sync_status"]
+    assert sync_data["history_sync_state"] == dialog_data["history_sync_state"]
     shared_fields = {
         "enrollment_enabled",
         "last_synced_at",
@@ -6324,7 +6332,6 @@ async def test_sync_read_model_fields_match_between_sync_status_and_dialog_catal
         "last_delta_checked_at",
         "saved_message_count",
         "total_messages",
-        "synced",
         "is_syncing",
         "realtime_history",
         "history_scope",
@@ -7349,7 +7356,7 @@ async def test_get_dialog_stats_retained_aggregates_ignore_enrollment(
             {"peer_id": 200, "name": "Channel B", "count": 1},
         ][:limit]
     )
-    assert data["sync_status"] == (status or "not_synced")
+    assert data["history_sync_state"] == history_sync_state(status)
     assert data["coverage"] == coverage
     assert data["observation_horizon_at"] == horizon
     cast(AsyncMock, client.get_entity).assert_not_awaited()
@@ -7369,7 +7376,7 @@ async def test_get_dialog_stats_unknown_exact_id_returns_empty_unknown() -> None
         "ok": True,
         "data": {
             "dialog_id": 999,
-            "sync_status": "not_synced",
+            "history_sync_state": "not_synced",
             "coverage": "unknown",
             "observation_horizon_at": None,
             "directory_coverage": read_dialog_directory_coverage(conn).to_wire(),
@@ -9630,3 +9637,62 @@ async def test_directory_audit_fences_scope_change_and_overwrites_private_owner(
     assert seen[0]["verified_account_id"] == 42
     assert result["error"] == "account_unverified"
     assert "data" not in result
+
+
+@pytest.mark.asyncio
+async def test_sync_status_reports_local_account_and_selected_channel_delivery() -> None:
+    conn = _make_db()
+    dialog_id = -1001234567890
+    conn.execute("INSERT INTO dialogs (dialog_id, type) VALUES (?, ?)", (dialog_id, "channel"))
+    server = make_server(conn)
+    calls: list[int | None] = []
+
+    def snapshot(channel_id: int | None) -> dict[str, object]:
+        calls.append(channel_id)
+        return {
+            "observed_at_ms": 123000,
+            "account": {"gap_state": "none_observed", "catch_up_state": "not_due", "reason": "not_due"},
+            "channel": {
+                "gap_state": "observed",
+                "catch_up_state": "blocked",
+                "reason": "eligibility",
+                "eligible_in_seconds": 5.0,
+            },
+            "intake_queue_depth": 2,
+            "pending_channels": 1,
+        }
+
+    server._message_delivery_snapshot = snapshot
+    result = await server._dispatch({"method": "get_sync_status", "dialog_id": dialog_id})
+    assert calls == [1234567890]
+    data = cast(dict[str, object], result["data"])
+    assert data["message_delivery"] == {
+        "observed_at_ms": 123000,
+        "account": {
+            "continuity": "no_gap_observed",
+            "catch_up": {"scope": "account", "state": "not_due", "reason": "not_due"},
+        },
+        "channel": {
+            "continuity": "gap_observed",
+            "catch_up": {"scope": "channel", "state": "blocked", "reason": "eligibility", "eligible_in_seconds": 5.0},
+        },
+        "intake_queue_depth": 2,
+        "pending_channels": 1,
+    }
+    assert "sync_status" not in data
+    assert "synced" not in data
+
+
+@pytest.mark.asyncio
+async def test_sync_status_uses_unverified_real_gate_snapshot(wire: _WireHarness) -> None:
+    server = make_server()
+    server._message_delivery_snapshot = wire[0].message_delivery_snapshot
+    result = await server._dispatch({"method": "get_sync_status", "dialog_id": 12345})
+    data = cast(dict[str, object], result["data"])
+    delivery = cast(dict[str, object], data["message_delivery"])
+    assert delivery["account"] == {
+        "continuity": "unknown",
+        "catch_up": {"scope": "account", "state": "unknown", "reason": "owner_unavailable"},
+    }
+    assert "intake_queue_depth" not in delivery
+    assert "pending_channels" not in delivery

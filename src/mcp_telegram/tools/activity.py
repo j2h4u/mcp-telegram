@@ -46,7 +46,7 @@ GET_MY_RECENT_ACTIVITY_OUTPUT_SCHEMA = {
                     "text": {"type": "string"},
                     "content": {"type": ["object", "null"]},
                     "media": MEDIA_OUTPUT_SCHEMA,
-                    "sync_status": {"type": ["string", "null"]},
+                    "history_sync_state": {"type": "string"},
                     "reply_count": {"type": "integer"},
                     "reactions": {"type": "array", "items": {"type": "object"}},
                     "navigation": {
@@ -78,7 +78,7 @@ GET_MY_RECENT_ACTIVITY_OUTPUT_SCHEMA = {
                     "sent_at",
                     "text",
                     "content",
-                    "sync_status",
+                    "history_sync_state",
                     "reply_count",
                     "reactions",
                     "navigation",
@@ -205,7 +205,7 @@ def _structured_comment(comment: Mapping[str, object]) -> dict[str, object]:
         "sent_at": comment.get("sent_at"),
         "text": text,
         "content": serialized_content,
-        "sync_status": comment.get("sync_status"),
+        "history_sync_state": comment.get("history_sync_state"),
         "reply_count": _comment_int(comment, "reply_count"),
         "reactions": comment.get("reactions") or [],
         "navigation": {

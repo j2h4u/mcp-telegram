@@ -18,6 +18,7 @@ from mcp_telegram.sync_read_model import (
     decode_sync_read_model,
     dm_deletion_reconciliation_is_blocked,
     encode_dm_deletion_checkpoint,
+    history_sync_state,
 )
 
 _HISTORY_BY_STATUS = {
@@ -34,14 +35,12 @@ _REALTIME_WIRE_BY_POLICY_VALUE = {
     "no_realtime_history": "none",
 }
 _WIRE_KEYS = {
-    "sync_status",
     "enrollment_enabled",
     "last_synced_at",
     "last_event_at",
     "last_delta_checked_at",
     "saved_message_count",
     "total_messages",
-    "synced",
     "is_syncing",
     "realtime_history",
     "history_scope",
@@ -55,6 +54,11 @@ _WIRE_KEYS = {
     "observed_at",
     "action",
 }
+
+
+@pytest.mark.parametrize(("stored", "expected"), [("pending", "pending"), ("failed", "failed"), ("other", "unknown")])
+def test_history_state_projection_preserves_unfinished_or_unknown_job(stored: str, expected: str) -> None:
+    assert history_sync_state(stored) == expected
 
 
 def _build(**overrides: object) -> SyncReadModel:
@@ -93,9 +97,9 @@ def test_status_and_enrollment_matrix_matches_realtime_policy(
     ).to_wire()
     effective_status = "not_synced" if persisted_status is None else persisted_status
 
-    assert wire["sync_status"] == effective_status
+    assert "sync_status" not in wire
     assert wire["enrollment_enabled"] is enrollment_enabled
-    assert wire["synced"] is (effective_status == "synced")
+    assert "synced" not in wire
     assert wire["is_syncing"] is (effective_status == "syncing")
     policy_value = realtime_history_coverage(effective_status, bool(enrollment_enabled)).value
     assert wire["realtime_history"] == _REALTIME_WIRE_BY_POLICY_VALUE[policy_value]
