@@ -19,6 +19,7 @@ from mcp_telegram.daemon_api import DraftCommands
 from mcp_telegram.daemon_client import DaemonConnection
 from mcp_telegram.tools import _base
 from mcp_telegram.tools.contacts import ManageContact
+from tests.test_daemon_api import _close_tracked_sqlite_connections as _close_tracked_sqlite_connections
 from tests.test_daemon_api import make_server
 
 
@@ -147,7 +148,7 @@ async def test_note_contact_required_gives_new_command_guidance() -> None:
 
 
 async def test_list_contacts_reads_canonical_non_dialog_contact_without_rpc(  # noqa: PLR0914, PLR0915 - real producer and IPC
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> None:
     from telethon.tl import types
 
@@ -158,6 +159,7 @@ async def test_list_contacts_reads_canonical_non_dialog_contact_without_rpc(  # 
     path = tmp_path / "contacts.db"
     ensure_sync_schema(path)
     db = _open_sync_db(path)
+    request.addfinalizer(db.close)
     client = MagicMock(side_effect=AssertionError("local contact read must not call Telegram"))
     manager = event_manager(client, db, asyncio.Event())
     manager.set_self_id(42)
@@ -168,7 +170,10 @@ async def test_list_contacts_reads_canonical_non_dialog_contact_without_rpc(  # 
     manager._write_profile_pushes(
         db,
         object(),
-        [types.User(55, contact=True, first_name="Saved"), types.User(56, contact=True, first_name="Next")],
+        [
+            types.User(55, contact=True, mutual_contact=True, first_name="Saved"),
+            types.User(56, contact=True, mutual_contact=False, first_name="Next"),
+        ],
         [],
     )
     api = make_server(db, client=client)
@@ -198,18 +203,36 @@ async def test_list_contacts_reads_canonical_non_dialog_contact_without_rpc(  # 
         second = await mcp_server.call_tool("list_contacts", {"limit": 1, "after_entity_id": cursor})
         empty = await mcp_server.call_tool("list_contacts", {"limit": 1, "after_entity_id": 56})
         detail = await mcp_server.call_tool("get_entity_info", {"exact_entity_id": 55})
+        detail_not_mutual = await mcp_server.call_tool("get_entity_info", {"exact_entity_id": 56})
+        db.commit()
+        manager._write_profile_pushes(db, object(), [types.User(55, min=True, first_name="Partial")], [])
+        after_min = await mcp_server.call_tool("list_contacts", {"limit": 1})
+        db.commit()
+        with write_transaction(db):
+            db.execute(
+                "UPDATE entity_profile_semantic_snapshots SET coverage_json=json_remove(coverage_json, '$.\"user.mutual_contact\"') WHERE owner_account_id=42 AND entity_id=55"
+            )
+        unknown = await mcp_server.call_tool("list_contacts", {"limit": 1})
     assert result.is_error is not True and second.is_error is not True and empty.is_error is not True
     payload = cast(dict[str, object], result.structured_content)
     items = cast(list[dict[str, object]], payload["items"])
     assert items[0]["entity_id"] == 55 and items[0]["first_name"] == "Saved"
+    assert items[0]["mutual_contact"] is True
+    retained_items = cast(list[dict[str, object]], cast(dict[str, object], after_min.structured_content)["items"])
+    assert retained_items[0]["mutual_contact"] is True
+    assert retained_items[0]["expected_version"] == items[0]["expected_version"]
     second_page = cast(dict[str, object], second.structured_content)
     second_items = cast(list[dict[str, object]], second_page["items"])
     assert len(items) == len(second_items) == 1
     assert second_items[0]["entity_id"] == 56 and second_items[0]["first_name"] == "Next"
+    assert second_items[0]["mutual_contact"] is False
+    unknown_items = cast(list[dict[str, object]], cast(dict[str, object], unknown.structured_content)["items"])
+    assert "mutual_contact" not in unknown_items[0]
     assert "next_after_entity_id" not in second_page
     contacts_schema = cast(dict[str, object], mcp_server.tool_by_name["list_contacts"].output_schema)
     validate(payload, contacts_schema)
     validate(second_page, contacts_schema)
+    validate(cast(dict[str, object], unknown.structured_content), contacts_schema)
     assert cast(dict[str, object], payload["coverage"])["state"] == "unknown"
     assert cast(dict[str, object], empty.structured_content)["items"] == []
     assert detail.is_error is not True
@@ -220,11 +243,14 @@ async def test_list_contacts_reads_canonical_non_dialog_contact_without_rpc(  # 
     assert cast(dict[str, object], profile["contact"])["membership"] is True
     relationships = cast(dict[str, object], profile["relationships"])
     assert cast(dict[str, object], relationships["contact"])["contact"] is True
+    assert cast(dict[str, object], relationships["contact"])["mutual_contact"] is True
+    nonmutual = cast(dict[str, object], detail_not_mutual.structured_content)
+    nonmutual_relationships = cast(dict[str, object], nonmutual["relationships"])
+    assert cast(dict[str, object], nonmutual_relationships["contact"])["mutual_contact"] is False
     type_specific = cast(dict[str, object], profile["type_specific"])
     assert cast(dict[str, object], type_specific["relationship"])["contact"] is True
     assert db.execute("SELECT 1 FROM dialogs WHERE dialog_id=55").fetchone() is None
     client.assert_not_called()
-    db.close()
 
 
 @pytest.mark.parametrize("tool", ["manage_contact", "manage_contact_note"])

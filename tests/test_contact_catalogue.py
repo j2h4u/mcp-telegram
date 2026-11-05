@@ -1,5 +1,6 @@
 """Contact snapshots remain canonical, account scoped, and usable without dialogs."""
 
+import json
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing
@@ -19,12 +20,65 @@ from mcp_telegram.sync_db import ensure_sync_schema, open_sync_db_reader
 from mcp_telegram.sync_transactions import write_transaction
 
 
+@pytest.mark.parametrize(
+    ("value", "authority", "expected"),
+    [
+        (True, True, True),
+        (False, True, False),
+        (None, True, None),
+        ("true", True, None),
+        (1, True, None),
+        (True, False, None),
+        (True, 1, None),
+        (True, None, None),
+        ("__missing__", True, None),
+    ],
+)
+def test_contact_mutuality_uses_only_authoritative_boolean(
+    tmp_path: Path, value: object, authority: object, expected: bool | None
+) -> None:
+    path = tmp_path / "contacts.db"
+    ensure_sync_schema(path)
+    with closing(sqlite3.connect(path)) as conn:
+        fields = {"user.contact": True, "user.mutual_contact": value}
+        if value == "__missing__":
+            del fields["user.mutual_contact"]
+        coverage = {"user.contact": {"authoritative": True}, "user.mutual_contact": {"authoritative": authority}}
+        conn.execute(
+            "INSERT INTO entity_profile_semantic_snapshots(owner_account_id,entity_id,normalization_version,fields_json,coverage_json,provenance_json,source) VALUES(42,55,'v1',?,?,?,'rpc')",
+            (json.dumps(fields), json.dumps(coverage), "{}"),
+        )
+        conn.execute(
+            "INSERT INTO entity_profile_semantic_snapshots(owner_account_id,entity_id,normalization_version,fields_json,coverage_json,provenance_json,source) VALUES(43,55,'v1',?,?,?,'rpc')",
+            (
+                json.dumps({"user.contact": True, "user.mutual_contact": True}),
+                json.dumps({"user.contact": {"authoritative": True}, "user.mutual_contact": {"authoritative": True}}),
+                "{}",
+            ),
+        )
+        conn.commit()
+        before = read_contact_command_state(conn, 42, 55)["expected_version"]
+    with closing(sqlite3.connect(path)) as conn:
+        page = read_contacts(conn, 42, limit=10, after_entity_id=None)
+        assert cast(list[dict[str, object]], page["items"])[0]["mutual_contact"] is expected
+        other = read_contacts(conn, 43, limit=10, after_entity_id=None)
+        assert cast(list[dict[str, object]], other["items"])[0]["mutual_contact"] is True
+        assert read_contact_command_state(conn, 42, 55)["expected_version"] == before
+        conn.execute(
+            "UPDATE entity_profile_semantic_snapshots SET fields_json=json_set(fields_json, '$.\"user.mutual_contact\"', json('false')) WHERE owner_account_id=42 AND entity_id=55"
+        )
+        assert read_contact_command_state(conn, 42, 55)["expected_version"] == before
+
+
 @pytest.mark.asyncio
-async def test_complete_snapshot_keeps_contact_without_dialog_and_removes_only_membership(tmp_path: Path) -> None:
+async def test_complete_snapshot_keeps_contact_without_dialog_and_removes_only_membership(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     writer = await SQLiteWriter.open(path)
     reader = open_sync_db_reader(path)
+    request.addfinalizer(reader.close)
     cell = ScopeCell()
     cell.publish(TelegramAuthScope(1, 42, 2, 3))
     responses: list[object] = [
@@ -37,12 +91,12 @@ async def test_complete_snapshot_keeps_contact_without_dialog_and_removes_only_m
             del request
             return responses.pop(0)
 
-    def request(conn: sqlite3.Connection) -> int:
+    def request_refresh(conn: sqlite3.Connection) -> int:
         with write_transaction(conn):
             return request_contact_catalogue(conn, 42)
 
     refresher = ContactCatalogueRefresher(Client(), reader, writer, capture_scope=cell.capture, claim_scope=cell.claim)
-    revision = await writer.run(request)
+    revision = await writer.run(request_refresh)
     result = await refresher.refresh(expected_revision=revision)
     assert result.accepted
     assert read_contact_command_state(reader, 42, 55)["observation_order"] == result.observation_order
@@ -51,6 +105,7 @@ async def test_complete_snapshot_keeps_contact_without_dialog_and_removes_only_m
         {
             "entity_id": 55,
             "membership": True,
+            "mutual_contact": None,
             "first_name": "Saved",
             "last_name": "",
             "expected_version": read_contact_command_state(reader, 42, 55)["expected_version"],
@@ -58,7 +113,7 @@ async def test_complete_snapshot_keeps_contact_without_dialog_and_removes_only_m
     ]
     assert reader.execute("SELECT 1 FROM dialogs WHERE dialog_id=55").fetchone() is None
     assert read_contacts(reader, 43, limit=10, after_entity_id=None)["items"] == []
-    revision = await writer.run(request)
+    revision = await writer.run(request_refresh)
     assert (await refresher.refresh(expected_revision=revision)).accepted
     state = read_contact_command_state(reader, 42, 55)
     assert state["membership"] is False and state["expected_version"] is not None

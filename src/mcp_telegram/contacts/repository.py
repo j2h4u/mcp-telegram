@@ -13,9 +13,12 @@ def read_contacts(
 ) -> dict[str, object]:
     _validate_page(limit, after_entity_id)
     rows = cast(
-        list[tuple[int, str, str, str]],
+        list[tuple[int, str, str, str, str | None, str | None]],
         conn.execute(
-            "SELECT entity_id,fields_json,coverage_json,provenance_json FROM entity_profile_semantic_snapshots WHERE owner_account_id=? AND entity_id>? "
+            "SELECT entity_id,fields_json,coverage_json,provenance_json, "
+            "json_type(fields_json, '$.\"user.mutual_contact\"'), "
+            "json_type(coverage_json, '$.\"user.mutual_contact\".authoritative') "
+            "FROM entity_profile_semantic_snapshots WHERE owner_account_id=? AND entity_id>? "
             "AND json_type(fields_json, '$.\"user.contact\"')='true' "
             "AND json_extract(coverage_json, '$.\"user.contact\".authoritative')=1 "
             "ORDER BY entity_id LIMIT ?",
@@ -23,12 +26,13 @@ def read_contacts(
         ).fetchall(),
     )
     items: list[dict[str, object]] = []
-    for entity_id, fields, coverage, provenance in rows[:limit]:
+    for entity_id, fields, coverage, provenance, mutual_type, authority_type in rows[:limit]:
         state = project_contact_state(account_id, entity_id, (fields, coverage, provenance))
         item: dict[str, object] = {
             key: state[key] for key in ("membership", "first_name", "last_name", "expected_version")
         }
         item["entity_id"] = entity_id
+        item["mutual_contact"] = _mutual_contact(mutual_type, authority_type)
         items.append(item)
     metadata = cast(
         tuple[int | None] | None,
@@ -41,6 +45,12 @@ def read_contacts(
         "coverage": {"state": "complete" if observed_at is not None else "unknown", "observed_at": observed_at},
         "next_after_entity_id": rows[limit - 1][0] if len(rows) > limit else None,
     }
+
+
+def _mutual_contact(value_type: str | None, authority_type: str | None) -> bool | None:
+    if authority_type != "true":
+        return None
+    return True if value_type == "true" else False if value_type == "false" else None
 
 
 def _validate_page(limit: int, after_entity_id: int | None) -> None:
