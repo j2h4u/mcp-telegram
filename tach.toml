@@ -532,7 +532,7 @@ depends_on = ["mcp_telegram.telegram_update_ring", "mcp_telegram.message_deliver
 [[modules]]
 path = "mcp_telegram.telegram_update_admission"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.telegram_update_ring", "mcp_telegram.message_delivery_observations", "mcp_telegram.flood", "mcp_telegram.telegram_rpc_scheduler"]
+depends_on = ["mcp_telegram.telegram_update_ring", "mcp_telegram.message_delivery_observations", "mcp_telegram.image_authorization", "mcp_telegram.flood", "mcp_telegram.telegram_rpc_scheduler"]
 [[modules]]
 path = "mcp_telegram.telegram_update_ring"
 layer = "telegram_gateway"

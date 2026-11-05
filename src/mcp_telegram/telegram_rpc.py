@@ -3848,6 +3848,8 @@ class TelegramRpcGate(TelegramClient):
         )
         box = cast(GateMessageBox, self._message_box)
         queue = UpdateIntakeQueue(box.wakeup, self._admission_scheduler.notify_eligibility_changed)
+        queue.capture_scope = self.capture_image_scope
+        queue.on_real_dequeue = box.real_dequeued
         self._update_ring = TelegramUpdateRing()
         queue.update_ring = self._update_ring
         box.intake_queue = queue
@@ -4190,7 +4192,7 @@ class TelegramRpcGate(TelegramClient):
                 envelope.captured_at,
                 sequence,
                 auth_scope=envelope.retained_auth_scope(),
-                scope_token=scope_token,
+                scope_token=getattr(update, "_mcp_receipt_scope_token", scope_token),
             )
             for update, (order, sequence) in zip(updates, tokens, strict=True)
         }
@@ -4222,6 +4224,7 @@ class TelegramRpcGate(TelegramClient):
             raise RuntimeError("Telegram update admission is closed")
         try:
             tokens = await repository.admit(envelope.model_dump_json().encode("utf-8"), len(updates))
+            self._check_delivery_scope(scope, updates, users)
             self._observe_delivery_stage(updates, "admitted")
             self._install_delivery(envelope, updates, tokens)
             result = await super()._preprocess_updates(updates, users, chats)  # type: ignore[misc]
@@ -4252,6 +4255,7 @@ class TelegramRpcGate(TelegramClient):
     def _check_delivery_scope(
         self, scope: TelegramAuthScope | None, updates: list[object], users: list[object]
     ) -> None:
+        self._check_receipt_scopes(updates)
         if any(not self._contact_delivery_scope_valid(item) for item in (*updates, *users)):
             raise RuntimeError("contact response authorization scope changed")
         if (
@@ -4262,6 +4266,13 @@ class TelegramRpcGate(TelegramClient):
             raise RuntimeError("update delivery account mismatch")
         if self._delivery_needs_verified_scope(updates, users) and scope is None:
             raise RuntimeError("profile or folder update requires a verified authorization scope")
+
+    def _check_receipt_scopes(self, updates: list[object]) -> None:
+        for update in updates:
+            if hasattr(update, "_mcp_receipt_scope_token"):
+                token = getattr(update, "_mcp_receipt_scope_token", None)
+                if not isinstance(token, ScopeToken) or not self.claim_image_scope(token):
+                    raise RuntimeError("update receipt authorization scope changed")
 
     @staticmethod
     def _delivery_needs_verified_scope(updates: list[object], users: list[object]) -> bool:

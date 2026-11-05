@@ -115,7 +115,7 @@ async def test_due_deadline_waits_for_queued_input_and_honors_floor(wire: _WireH
     assert box.get_difference() is None and ENTRY_ACCOUNT in box.getting_diff_for
 
 
-def test_only_real_gap_envelope_grants_credit(wire: _WireHarness, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_gap_processing_does_not_grant_credit(wire: _WireHarness, monkeypatch: pytest.MonkeyPatch) -> None:
     gate = wire[0]
     box, now = setup_gap(wire)
     box.wakeup_queued = True
@@ -129,7 +129,65 @@ def test_only_real_gap_envelope_grants_credit(wire: _WireHarness, monkeypatch: p
     monkeypatch.setattr(MessageBox, "process_updates", gap)
     with pytest.raises(GapError):
         box.process_updates(envelope(now), gate._mb_entity_cache, [])
+    assert not box.difference_credit
+
+
+def test_intake_turn_consumes_original_watermark_before_grant(wire: _WireHarness) -> None:
+    gate = wire[0]
+    box, now = setup_gap(wire)
+    queue = cast(UpdateIntakeQueue, gate._updates_queue)
+    for _ in range(3):
+        queue.put_nowait(envelope(now))
+    queue.get_nowait()
+    queue.put_nowait(envelope(now))
+    assert not box.difference_credit
+    queue.get_nowait()
+    assert not box.difference_credit
+    queue.get_nowait()
+    assert box.difference_credit and queue.real_count == 1
+    box.difference_claimed()
+    assert not box.difference_credit
+    queue.get_nowait()
     assert box.difference_credit
+
+
+@pytest.mark.parametrize("seq", [1, 3])
+async def test_rejected_whole_envelope_rescues_only_user_invalidation(wire: _WireHarness, seq: int) -> None:
+    gate = wire[0]
+    box, now = setup_gap(wire)
+    queue = cast(UpdateIntakeQueue, gate._updates_queue)
+    marker = types.UpdateUser(55)
+    other = types.UpdateUserName(55, "Fixture", "", [])
+    packet = types.Updates([marker, other], [types.User(55, first_name="Fixture")], [], now, seq)
+    queue.put_nowait(packet)
+    assert queue.get_nowait() is packet
+    result: list[object] = []
+    users, chats = box.process_updates(packet, gate._mb_entity_cache, result)
+    assert result == [marker] and users == [] and chats == []
+    assert box.seq == 1
+    if seq == 3:
+        assert ENTRY_ACCOUNT in box.getting_diff_for
+
+
+def test_requeued_user_keeps_original_scope_after_aba() -> None:
+    from mcp_telegram.auth_scope import TelegramAuthScope
+    from mcp_telegram.image_authorization import ScopeCell, ScopeToken
+
+    cell = ScopeCell()
+    scope = TelegramAuthScope(1, 42, 2, 3)
+    assert cell.publish(scope)
+    queue = UpdateIntakeQueue(object(), lambda: None)
+    queue.capture_scope = cell.capture
+    marker = types.UpdateUser(55)
+    packet = types.Updates([marker], [], [], datetime.now(UTC), 1)
+    queue.put_nowait(packet)
+    token = cast(ScopeToken, getattr(marker, "_mcp_receipt_scope_token", None))
+    queue.get_nowait()
+    change = cell.begin_change()
+    cell.end_change(change)
+    assert cell.publish(scope)
+    queue.put_nowait(packet)
+    assert getattr(marker, "_mcp_receipt_scope_token", None) is token and not cell.claim(token)
 
 
 async def test_real_input_precedes_ready_difference_and_sentinel_grants_no_credit(

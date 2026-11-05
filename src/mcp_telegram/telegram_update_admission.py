@@ -16,11 +16,19 @@ from telethon.tl import types  # type: ignore[import-untyped]
 from telethon.tl.functions.updates import GetChannelDifferenceRequest, GetDifferenceRequest  # type: ignore[import-untyped]
 
 from .flood import TelegramRpcThrottled
+from .image_authorization import ScopeToken
 from .message_delivery_observations import DeliveryTrace, MessageDeliveryObservations
 from .telegram_rpc_scheduler import TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending
 from .telegram_update_ring import TelegramUpdateRing
 
 type Eligibility = TelegramRpcThrottled | TelegramRpcMethodRecoveryPending | None
+
+
+def _user_invalidations(envelope: object) -> list[types.UpdateUser]:
+    updates = getattr(envelope, "updates", None)
+    if not isinstance(updates, list):
+        updates = [getattr(envelope, "update", envelope)]
+    return [update for update in updates if type(update) is types.UpdateUser]
 
 
 def _synthetic_notification(item: object) -> bool:
@@ -59,9 +67,15 @@ class UpdateIntakeQueue(asyncio.Queue[object]):
         self.real_count = 0
         self.observer: MessageDeliveryObservations | None = None
         self.update_ring: TelegramUpdateRing | None = None
+        self.capture_scope: Callable[[], ScopeToken | None] | None = None
+        self.on_real_dequeue: Callable[[int], None] | None = None
 
     def put_nowait(self, item: object) -> None:
         ring_sequence = self._capture_ring(item)
+        if self.capture_scope is not None:
+            for update in _user_invalidations(item):
+                if not hasattr(update, "_mcp_receipt_scope_token"):
+                    vars(update)["_mcp_receipt_scope_token"] = self.capture_scope()
         super().put_nowait(item)
         if item is not self._wakeup:
             self.real_count += 1
@@ -155,6 +169,8 @@ class UpdateIntakeQueue(asyncio.Queue[object]):
     def get_nowait(self) -> object:
         item = super().get_nowait()
         if item is not self._wakeup:
+            if self.on_real_dequeue is not None:
+                self.on_real_dequeue(self.real_count)
             self.real_count -= 1
         return item
 
@@ -185,6 +201,7 @@ class GateMessageBox(MessageBox):
         self.wakeup_queued = False
         self.intake_queue: UpdateIntakeQueue | None = None
         self.difference_credit = False
+        self._intake_remaining: int | None = None
         self.observed_gaps: set[object] = set()
         self._promoted_gap_expirations: dict[object, float] = {}
         self.observer: MessageDeliveryObservations | None = None
@@ -390,6 +407,16 @@ class GateMessageBox(MessageBox):
 
     def difference_claimed(self) -> None:
         self.difference_credit = False
+        self._intake_remaining = None
+
+    def real_dequeued(self, queued_count: int) -> None:
+        if self.difference_credit:
+            return
+        if self._intake_remaining is None:
+            self._intake_remaining = queued_count
+        self._intake_remaining -= 1
+        if self._intake_remaining == 0:
+            self.difference_credit = True
 
     def get_difference(self) -> GetDifferenceRequest | None:
         if self.intake_due():
@@ -524,6 +551,7 @@ class GateMessageBox(MessageBox):
             raise GapError
         preserve_account = bool(self.getting_diff_for & {ENTRY_ACCOUNT, ENTRY_SECRET})
         seq, date = self.seq, self.date
+        seq_rejection = self._sequence_rejection(updates, seq)
         pts_before = self._pts_invocations
         accepted_before = self._pts_accepted
         try:
@@ -531,14 +559,37 @@ class GateMessageBox(MessageBox):
                 outcome = cast(tuple[list[object], list[object]], super().process_updates(updates, chat_hashes, result))
             except GapError:
                 self._observe_box(updates, result, "gap")
-                self.difference_credit = True
+                if seq_rejection == "gap" and self._rescue_user_invalidations(updates, result):
+                    return [], []
                 raise
             self._observe_processed(updates, result, seq, pts_before, accepted_before)
-            self.difference_credit = True
+            if seq_rejection == "duplicate" and self._rescue_user_invalidations(updates, result):
+                return [], []
             return outcome
         finally:
             if preserve_account:
                 self.seq, self.date = seq, date
+
+    @staticmethod
+    def _sequence_rejection(updates: object, current_seq: int) -> str | None:
+        if not isinstance(updates, (types.Updates, types.UpdatesCombined)) or getattr(updates, "_self_outgoing", False):
+            return None
+        if updates.date is None:
+            return None
+        seq_start = getattr(updates, "seq_start", None)
+        if seq_start is None:
+            seq_start = updates.seq
+        if not seq_start:
+            return None
+        if seq_start <= current_seq:
+            return "duplicate"
+        return "gap" if seq_start > current_seq + 1 else None
+
+    @staticmethod
+    def _rescue_user_invalidations(updates: object, result: list[object]) -> bool:
+        rescued = [item for item in _user_invalidations(updates) if hasattr(item, "_mcp_receipt_scope_token")]
+        result.extend(rescued)
+        return bool(rescued)
 
     def _observe_processed(
         self, updates: object, result: list[object], seq: int, pts_before: int, accepted_before: int
