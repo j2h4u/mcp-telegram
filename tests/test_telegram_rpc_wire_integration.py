@@ -36,7 +36,12 @@ from mcp_telegram.sync_db import (
     open_sync_db_reader,
     save_rpc_safety_record,
 )
-from mcp_telegram.telegram_demand import RpcAttemptBudget, RpcAttemptBudgetExhaustedError, RpcAttemptEvidence
+from mcp_telegram.telegram_demand import (
+    AcquisitionKind,
+    RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
+    RpcAttemptEvidence,
+)
 from mcp_telegram.telegram_demand_progress import WorkKey, WorkRevision
 from mcp_telegram.telegram_rpc import (
     TelegramRpcBudget,
@@ -2251,3 +2256,137 @@ async def test_budget_rejection_at_claim_records_physical_boundary(wire: _WireHa
     assert budget.attempts == 1 and len(sink.frames) == 1
     first.cancel()
     second.cancel()
+
+
+@pytest.mark.parametrize("with_floor", [False, True])
+async def test_clean_shutdown_contains_only_owned_unknown_read(  # noqa: PLR0914 - one real shutdown and reopen
+    image_wire: _WireHarness, with_floor: bool
+) -> None:
+    gate, sender, connection, sink = image_wire
+    selected = WorkRevision(WorkKey(DemandKind.DELTA_GAP_FILL, 42, "dialog:11"), "revision")
+    scope = TelegramRpcScope(
+        TelegramRpcSource.DELTA_SYNC,
+        demand_contract(DemandKind.DELTA_GAP_FILL).service_class,
+        time.monotonic() + 10,
+        asyncio.current_task(),
+        demand_kind=DemandKind.DELTA_GAP_FILL,
+        acquisition_kind=AcquisitionKind.MESSAGE_HISTORY_PAGE,
+        attempt_budget=RpcAttemptBudget(1, selected=selected),
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    request = messages.GetHistoryRequest(types.InputPeerUser(11, 1), 0, None, 0, 1, 0, 0, 0)
+    result = sender.send_owned(request, scope)
+    state = await sender._send_queue.next_state()
+    await sender._prepare_state(state)
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    assert len(sink.frames) == 1
+    if with_floor:
+        await gate._ensure_safety_ledger().record_floor(time.time() + 3600)
+    await gate.close_rpc_scheduler()
+    with pytest.raises(asyncio.CancelledError):
+        await result
+    encoded = gate._safety_store.load_record()
+    assert encoded is not None
+    record = cast(dict[str, object], json.loads(encoded))
+    intents = cast(dict[str, dict[str, object]], record["intents"])
+    assert len(intents) == 1
+    receipt = next(iter(intents.values()))
+    assert receipt["phase"] == "unknown" and receipt["read_retry"] == {"reason": "clean_shutdown"}
+    assert record["protection"] is None and record["recovery"] is None
+    assert record["methods"] == {}
+    if with_floor:
+        retry_until = gate._ensure_safety_ledger().status()["retry_until_utc"]
+        assert isinstance(retry_until, float) and retry_until > time.time() + 3500
+    saved_scope = cast(dict[str, int], record["scope"])
+    restored = telegram_rpc.TelegramRpcSafetyLedger(
+        gate._safety_store, dc_id=saved_scope["dc_id"], key_id=saved_scope["key_id"]
+    )
+    assert restored.protection_reason is None and not restored._unresolved()
+
+
+async def test_reconnect_discards_only_previous_shutdown_candidates(wire: _WireHarness) -> None:
+    gate, _sender, _connection, _sink = wire
+    original = gate._safety_store.load_record()
+    gate._shutdown_read_attempts.add("old-attempt")
+    gate._shutdown_clear_introduced_hold = True
+    gate._transport_state = _TransportBoundaryState.DISCONNECTED
+
+    gate._begin_transport_connect()
+
+    assert not gate._shutdown_read_attempts
+    assert gate._shutdown_clear_introduced_hold is None
+    assert gate._safety_store.load_record() == original
+    gate._finish_transport_connect()
+
+
+async def test_failed_shutdown_keeps_unknown_read_blocking(
+    wire: _WireHarness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mcp_telegram.state import telegram_session_lease
+
+    gate, sender, connection, _sink = wire
+    selected = WorkRevision(WorkKey(DemandKind.DELTA_GAP_FILL, 42, "dialog:11"), "revision")
+    scope = TelegramRpcScope(
+        TelegramRpcSource.DELTA_SYNC,
+        demand_contract(DemandKind.DELTA_GAP_FILL).service_class,
+        time.monotonic() + 10,
+        asyncio.current_task(),
+        demand_kind=DemandKind.DELTA_GAP_FILL,
+        acquisition_kind=AcquisitionKind.MESSAGE_HISTORY_PAGE,
+        attempt_budget=RpcAttemptBudget(1, selected=selected),
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    with telegram_session_lease(tmp_path) as lease:
+        gate.bind_session_lease(lease)
+        request = messages.GetHistoryRequest(types.InputPeerUser(11, 1), 0, None, 0, 1, 0, 0, 0)
+        result = sender.send_owned(request, scope)
+        state = await sender._send_queue.next_state()
+        await sender._prepare_state(state)
+        assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+
+        async def fail_drain() -> None:
+            raise RuntimeError("unconfirmed shutdown")
+
+        monkeypatch.setattr(gate, "_drain_cooldown_saves", fail_drain)
+        with pytest.raises(RuntimeError, match="unconfirmed shutdown"):
+            await gate.close_rpc_scheduler()
+        with pytest.raises(asyncio.CancelledError):
+            await result
+        encoded = gate._safety_store.load_record()
+        assert encoded is not None
+        record = cast(dict[str, object], json.loads(encoded))
+        receipt = next(iter(cast(dict[str, dict[str, object]], record["intents"]).values()))
+        assert receipt["phase"] == "unknown" and "read_retry" not in receipt
+        assert record["protection"] == "unresolved_outbound_outcome"
+        pin = gate._session_pin
+        assert pin is not None
+        pin._release()
+        gate._session_pin = None
+
+
+async def test_shutdown_does_not_contain_unknown_telegram_mutation(image_wire: _WireHarness) -> None:
+    gate, sender, connection, _sink = image_wire
+    selected = WorkRevision(WorkKey(DemandKind.LIVE_HYDRATION_BATCH, 42, "dialog:11"), "revision")
+    scope = TelegramRpcScope(
+        TelegramRpcSource.FACT_HYDRATION_LIVE,
+        demand_contract(DemandKind.LIVE_HYDRATION_BATCH).service_class,
+        time.monotonic() + 10,
+        asyncio.current_task(),
+        demand_kind=DemandKind.LIVE_HYDRATION_BATCH,
+        acquisition_kind=AcquisitionKind.MESSAGE_LOOKUP,
+        attempt_budget=RpcAttemptBudget(1, selected=selected),
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    result = sender.send_owned(messages.TranscribeAudioRequest(types.InputPeerUser(11, 1), 123), scope)
+    state = await sender._send_queue.next_state()
+    await sender._prepare_state(state)
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    await gate.close_rpc_scheduler()
+    with pytest.raises(asyncio.CancelledError):
+        await result
+    encoded = gate._safety_store.load_record()
+    assert encoded is not None
+    record = cast(dict[str, object], json.loads(encoded))
+    receipt = next(iter(cast(dict[str, dict[str, object]], record["intents"]).values()))
+    assert receipt["phase"] == "unknown" and "read_retry" not in receipt
+    assert record["protection"] == "unresolved_outbound_outcome"

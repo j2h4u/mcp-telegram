@@ -111,9 +111,6 @@ class RuntimeObservationPolicy(Protocol):
     @property
     def rpc_summary_interval_seconds(self) -> float: ...
 
-    @property
-    def raw_update_prune_interval_seconds(self) -> float: ...
-
 
 def tool_telemetry_identity(tool_name: str) -> tuple[str, int]:
     """Return the stable product capability and wire-contract generation."""
@@ -282,7 +279,6 @@ class RuntimeObservationSink:
         self._prune_every_writes = policy.prune_every_writes
         self._shutdown_drain_grace_seconds = policy.shutdown_drain_grace_seconds
         self._row_cap = policy.row_cap
-        self._raw_update_prune_interval_seconds = policy.raw_update_prune_interval_seconds
         self._jobs: queue.Queue[_ObservationJob] = queue.Queue(maxsize=policy.queue_capacity)
         self._close_requested = threading.Event()
         self._state_lock = threading.Lock()
@@ -296,7 +292,6 @@ class RuntimeObservationSink:
         self._prune_pending = False
         self._prune_now_ms: int | None = None
         self._update_ring: UpdateRingPort | None = None
-        self._ring_last_flush = 0.0
         self._ring_counters: dict[str, int] = {}
         self._ring_failed = False
         self._flush_task = asyncio.create_task(self._flush_loop(), name="runtime-observation-flush")
@@ -343,12 +338,7 @@ class RuntimeObservationSink:
             return False
         records = ring.peek_batch(max_count=32, max_bytes=4 * 1024 * 1024)
         counters = ring.counters()
-        now = time.monotonic()
-        if (
-            not records
-            and counters == self._ring_counters
-            and now - self._ring_last_flush < self._raw_update_prune_interval_seconds
-        ):
+        if not records and counters == self._ring_counters:
             return False
         try:
             accepted = await self._writer.run(
@@ -376,7 +366,6 @@ class RuntimeObservationSink:
         self._ring_failed = False
         ring.ack_batch(records)
         self._ring_counters = counters
-        self._ring_last_flush = now
         return bool(records)
 
     @staticmethod

@@ -88,6 +88,8 @@ class TransportAuthority(Protocol):
 
     def observe_error_now(self, owner: object, error: BaseException) -> None: ...
 
+    def observe_shutdown_cancel(self, owner: object) -> None: ...
+
     def observe_response_now(self, owner: object) -> None: ...
 
     def contact_response_scope(self, owner: object, request: object, result: object) -> ScopeToken | None: ...
@@ -96,10 +98,11 @@ class TransportAuthority(Protocol):
 class _OwnedFuture(asyncio.Future[object]):
     """Observe terminal errors before scheduled callbacks can allow another write."""
 
-    def __init__(self, authority: TransportAuthority, owner: object) -> None:
+    def __init__(self, authority: TransportAuthority, owner: object, shutdown_owned: Callable[[], bool]) -> None:
         super().__init__()
         self._authority = authority
         self._owner = owner
+        self._shutdown_owned = shutdown_owned
 
     def set_exception(self, exception: BaseException | type[BaseException]) -> None:
         if not self.done():
@@ -115,9 +118,17 @@ class _OwnedFuture(asyncio.Future[object]):
         super().set_result(result)
 
     def cancel(self, msg: object = None) -> bool:
-        if not self.done():
+        if self.done():
+            return super().cancel(msg)
+        cancelled = super().cancel(msg)
+        if cancelled:
+            if self._shutdown_owned():
+                try:
+                    self._authority.observe_shutdown_cancel(self._owner)
+                except Exception:  # noqa: BLE001 - failure retains the ordinary conservative settlement
+                    pass
             self._authority.observe_error_now(self._owner, asyncio.CancelledError())
-        return super().cancel(msg)
+        return cancelled
 
 
 @dataclass(slots=True)
@@ -479,11 +490,19 @@ class GuardedMTProtoSender(MTProtoSender):
         self, state: _RequestState, owner: object, *, application: bool = False, origin: ProtocolOrigin | None = None
     ) -> _OwnedState:
         result = asyncio.get_running_loop().create_future() if application else None
-        state.future = _OwnedFuture(self._authority, owner)
+        state.future = _OwnedFuture(self._authority, owner, self._shutdown_cancel_owned)
         owned = _OwnedState(state, owner, state.data, type(state.request), result, origin=origin)
         self._owned_states[state] = owned
         state.future.add_done_callback(lambda future: self._result_observed(state, future))
         return owned
+
+    def _shutdown_cancel_owned(self) -> bool:
+        task = asyncio.current_task()
+        return (
+            self._terminal_teardown is not None
+            and self._terminal_cause is None
+            and task in {self._terminal_teardown, self._settling}
+        )
 
     def require_owned(self, state: _RequestState) -> _OwnedState:
         owned = self._owned_states.get(state)

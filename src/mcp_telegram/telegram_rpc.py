@@ -711,10 +711,15 @@ def _valid_read_retry(intent: dict[str, object]) -> bool:
     retry = intent.get("read_retry")
     return retry is None or (
         isinstance(retry, dict)
-        and set(retry) == {"reason", "method_generation"}
-        and retry["reason"] == "attempt_budget_exhausted"
-        and isinstance(retry["method_generation"], str)
-        and bool(retry["method_generation"])
+        and (
+            (retry == {"reason": "clean_shutdown"})
+            or (
+                set(retry) == {"reason", "method_generation"}
+                and retry["reason"] == "attempt_budget_exhausted"
+                and isinstance(retry["method_generation"], str)
+                and bool(retry["method_generation"])
+            )
+        )
         and intent["phase"] == "unknown"
         and rpc_effect(cast(str, intent["method"])) is RpcEffect.NONMUTATING_READ
     )
@@ -1994,9 +1999,10 @@ class TelegramRpcSafetyLedger:
         method_success: bool = False,
         recovery_cause: RecoveryCause | None = None,
         scoped_read_failure: bool = False,
+        shutdown_read_candidate: bool = False,
     ) -> None:
         def settle_recovery(record: dict[str, object]) -> None:
-            if scoped_read_failure:
+            if scoped_read_failure or shutdown_read_candidate:
                 return
             trial = record["recovery"]
             known_flood = known_outcome and floor_until_utc is not None
@@ -2023,7 +2029,12 @@ class TelegramRpcSafetyLedger:
                 record["generation"] = uuid.uuid4().hex
             settle_recovery(record)
 
-        if not known_outcome and attempt_id in self._claimed and not scoped_read_failure:
+        if (
+            not known_outcome
+            and attempt_id in self._claimed
+            and not scoped_read_failure
+            and (not shutdown_read_candidate or self._startup_hold is None)
+        ):
             self._startup_hold = "unresolved_outbound_outcome"
         await self._commit(settle, settled_attempt=attempt_id)
 
@@ -2065,6 +2076,51 @@ class TelegramRpcSafetyLedger:
         intent.update(
             phase="unknown", read_retry={"reason": "attempt_budget_exhausted", "method_generation": generation}
         )
+
+    async def contain_shutdown_reads(self, attempts: set[str], *, clear_introduced_hold: bool) -> None:
+        """Contain exact cancelled reads only after the gateway has fully quiesced."""
+
+        def contain(record: dict[str, object]) -> None:
+            scope = cast(dict[str, object], record["scope"])
+            intents = cast(dict[str, dict[str, object]], record["intents"])
+            expected = {key: scope[key] for key in ("dc_id", "key_id", "account_id")}
+            self._require_shutdown_read_scope(record, scope)
+            for attempt_id in attempts:
+                intent = intents.get(attempt_id)
+                if not self._owned_shutdown_read(intent, expected):
+                    raise ValueError("shutdown read intent does not match the owned attempt")
+                assert intent is not None
+                intent["read_retry"] = {"reason": "clean_shutdown"}
+            if clear_introduced_hold:
+                self._clear_shutdown_read_protection(record, scope, intents)
+
+        await self._commit(contain)
+        if clear_introduced_hold and self._startup_hold == "unresolved_outbound_outcome" and not self._unresolved():
+            self._startup_hold = None
+
+    def _owned_shutdown_read(self, intent: dict[str, object] | None, scope: dict[str, object]) -> bool:
+        return (
+            intent is not None
+            and intent["run"] == self._run
+            and intent["phase"] == "unknown"
+            and intent["scope"] == scope
+            and rpc_effect(cast(str, intent["method"])) is RpcEffect.NONMUTATING_READ
+        )
+
+    def _require_shutdown_read_scope(self, record: dict[str, object], scope: dict[str, object]) -> None:
+        if not self._read_scope_valid or scope["stage"] != "verified" or record["transition"] is not None:
+            raise ValueError("shutdown read scope is no longer verified")
+        if self._claimed or any(owner not in {None, scope["account_id"]} for owner in self._store.canonical_owners()):
+            raise ValueError("shutdown read owners are not quiescent")
+
+    @staticmethod
+    def _clear_shutdown_read_protection(
+        record: dict[str, object], scope: dict[str, object], intents: dict[str, dict[str, object]]
+    ) -> None:
+        if record["protection"] == "unresolved_outbound_outcome" and not any(
+            _intent_blocks(intent, scope) for intent in intents.values()
+        ):
+            record["protection"] = None
 
     @staticmethod
     def _ordinary_method_floor_only(
@@ -3358,6 +3414,7 @@ class _WireAttempt:
     method_generation: str | None = None
     observed_write_returns: int = 0
     observed_result: bool = False
+    shutdown_read_candidate: bool = False
     enqueue_trace: list[tuple[ResendCause, int | None]] = field(default_factory=list)
     enqueue_truncated: int = 0
     last_rejection: BudgetRejection | None = None
@@ -3641,6 +3698,9 @@ class _AuxPhotoAuthority:
     def observe_error_now(self, owner: object, error: BaseException) -> None:
         self._gate.observe_error_now(owner, error)
 
+    def observe_shutdown_cancel(self, owner: object) -> None:
+        self._gate.observe_shutdown_cancel(owner)
+
     def observe_response_now(self, owner: object) -> None:
         self._gate.observe_response_now(owner)
 
@@ -3919,6 +3979,8 @@ class TelegramRpcGate(TelegramClient):
         self._dc_transition_target: int | None = None
         self._owned_disconnect: asyncio.Task[None] | None = None
         self._scheduler_shutdown: asyncio.Task[None] | None = None
+        self._shutdown_read_attempts: set[str] = set()
+        self._shutdown_clear_introduced_hold: bool | None = None
         self._main_disconnect: asyncio.Task[object] | None = None
         self._reconnect_probe: asyncio.Task[None] | None = None
         self._reconnect_wire_owner: _WireAttempt | None = None
@@ -4458,7 +4520,16 @@ class TelegramRpcGate(TelegramClient):
             primary = primary or error
         if primary is not None:
             raise primary
+        await self._contain_shutdown_reads()
         self._release_session_pin()
+
+    async def _contain_shutdown_reads(self) -> None:
+        lease = self._session_lease
+        if self._shutdown_read_attempts and lease is not None and lease.is_held():
+            await self._ensure_safety_ledger().contain_shutdown_reads(
+                self._shutdown_read_attempts,
+                clear_introduced_hold=self._shutdown_clear_introduced_hold is True,
+            )
 
     def _release_session_pin(self) -> None:
         if self._photo_aux_lease is not None:
@@ -6006,6 +6077,23 @@ class TelegramRpcGate(TelegramClient):
             permit.released = True
             self._admission_scheduler.complete(permit.admission)
 
+    def observe_shutdown_cancel(self, owner: object) -> None:
+        attempt = self._require_wire_owner(owner)
+        if not (
+            (self._owned_disconnect is not None or self._scheduler_shutdown is not None)
+            and self._transport_state is _TransportBoundaryState.DISCONNECTING
+            and attempt.claimed
+            and rpc_effect(attempt.method) is RpcEffect.NONMUTATING_READ
+            and self._ordinary_read_owner(attempt)
+            and self._verified_read_budget(attempt)
+        ):
+            return
+        ledger = self._ensure_safety_ledger()
+        if self._shutdown_clear_introduced_hold is None:
+            self._shutdown_clear_introduced_hold = ledger._startup_hold is None and ledger._record["protection"] is None
+        attempt.shutdown_read_candidate = True
+        self._shutdown_read_attempts.add(attempt.attempt_id)
+
     def observe_error_now(self, owner: object, error: BaseException) -> None:
         owner = self._require_wire_owner(owner)
         if isinstance(error, (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError)):
@@ -6225,6 +6313,7 @@ class TelegramRpcGate(TelegramClient):
             method_generation=owner.method_generation,
             method_success=error is None and rejected is None,
             recovery_cause=self._wire_recovery_cause(owner, error),
+            shutdown_read_candidate=owner.shutdown_read_candidate and isinstance(error, asyncio.CancelledError),
         )
         if not known:
             self._observe_unknown_incident(owner, error, ledger)
@@ -6598,6 +6687,8 @@ class TelegramRpcGate(TelegramClient):
 
     async def maintain_auto_resume(self) -> bool:
         """Observe local receipts; only the normal next lifecycle may consume a trial."""
+        if self._scheduler_shutdown is not None or self._owned_disconnect is not None:
+            return False
         ledger = self._ensure_safety_ledger()
         if not self._startup_safety_prepared:
             self.observe_auto_resume(RecoveryStage.GUARD, RecoveryObservationEvent.STARTUP_UNPREPARED)
@@ -8432,6 +8523,8 @@ class TelegramRpcGate(TelegramClient):
         self._reconnect_quiescing = False
         self._owned_disconnect = None
         self._main_disconnect = None
+        self._shutdown_read_attempts.clear()
+        self._shutdown_clear_introduced_hold = None
         self._wire_generation += 1
         self._transport_state = _TransportBoundaryState.CONNECTING
         self._admission_scheduler.notify_eligibility_changed()
