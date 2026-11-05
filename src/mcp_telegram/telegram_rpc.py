@@ -176,6 +176,7 @@ from .telegram_transport import (
     TransportWriteError,
 )
 from .telegram_update_admission import GateMessageBox, UpdateIntakeQueue
+from .telegram_update_ring import TelegramUpdateRing
 from .update_delivery import DeliveryState, UpdateDeliveryRepository
 
 logger = logging.getLogger(__name__)
@@ -3836,6 +3837,8 @@ class TelegramRpcGate(TelegramClient):
         )
         box = cast(GateMessageBox, self._message_box)
         queue = UpdateIntakeQueue(box.wakeup, self._admission_scheduler.notify_eligibility_changed)
+        self._update_ring = TelegramUpdateRing()
+        queue.update_ring = self._update_ring
         box.intake_queue = queue
         self._updates_queue = queue
         unused_sender = cast(_MainSender, object.__getattribute__(self, "_sender"))
@@ -4086,7 +4089,10 @@ class TelegramRpcGate(TelegramClient):
             raise RuntimeError("retained update account mismatch")
         if len(updates) != len(state.orders) or len(state.orders) != len(state.reaction_sequences):
             raise RuntimeError("retained Telegram update tokens are incomplete")
-        cast(GateMessageBox, self._message_box).observe_replay_updates(updates)
+        sequence = self._capture_replayed_update(envelope, updates, users, chats)
+        box = cast(GateMessageBox, self._message_box)
+        box.observe_replay_updates(updates)
+        box._associate_update_traces(sequence, updates)
         capture_folder_intake(updates)
         capture_contact_note_intake(updates)
         capture_contact_intake(updates)
@@ -4098,6 +4104,21 @@ class TelegramRpcGate(TelegramClient):
             await self._complete_update_delivery()
         if self._delivery_failure.is_set():
             raise RuntimeError("retained Telegram update replay failed")
+
+    def _capture_replayed_update(
+        self, envelope: DeliveryEnvelope, updates: list[object], users: list[object], chats: list[object]
+    ) -> int | None:
+        try:
+            replay = types.Updates(
+                cast(list[types.TypeUpdate], updates),
+                cast(list[types.TypeUser], users),
+                cast(list[types.TypeChat], chats),
+                envelope.checkpoint_after.date,
+                envelope.checkpoint_after.seq,
+            )
+            return self._update_ring.capture(replay, source="replay")
+        except Exception:  # noqa: BLE001 - diagnostics cannot prevent durable replay
+            return None
 
     @staticmethod
     def _replay_account_matches(
@@ -6390,6 +6411,7 @@ class TelegramRpcGate(TelegramClient):
             if await self._reject_conflicting_identity(expected, user.id):
                 return RuntimeError("DC transition returned a different Telegram account")
             await ledger.verify_account(user.id)
+            self._update_ring.request_verified_account(user.id)
         return None
 
     async def _reject_conflicting_identity(self, expected: object, account_id: int) -> bool:
@@ -6704,6 +6726,7 @@ class TelegramRpcGate(TelegramClient):
             if type(result) is not types.auth.LoggedOut:
                 raise RuntimeError("Telegram logout was not confirmed")
             await ledger.confirm_logout()
+            self._update_ring.request_logout()
             self.close_update_delivery()
             assert self.session is not None
             with self._image_identity_change():
@@ -6727,6 +6750,10 @@ class TelegramRpcGate(TelegramClient):
         if key_id is None:
             return None
         return TelegramAuthScope(AUTH_SCOPE_VERSION, account_id, dc_id, key_id)
+
+    def update_ring(self) -> TelegramUpdateRing:
+        """Return the existing ingress staging owner for daemon composition."""
+        return self._update_ring
 
     def capture_image_scope(self) -> ScopeToken | None:
         """Capture a verified scope generation on the daemon event loop."""
@@ -6845,6 +6872,7 @@ class TelegramRpcGate(TelegramClient):
         invalidate_contact_scope()
         ledger = self._ensure_safety_ledger()
         await ledger.verify_account(account_id)
+        self._update_ring.request_verified_account(account_id)
         snapshot = ledger.recovery_identity()
         if snapshot.mode is RecoveryMode.MANUAL and snapshot.phase is RecoveryPhase.CONSUMED:
             await ledger.finish_recovery(account_id)

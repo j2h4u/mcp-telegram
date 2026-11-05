@@ -66,7 +66,7 @@ def test_partial_canonical_schema_preserves_facts_and_represents_unknowns(
         )
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute("INSERT INTO telegram_folder_rules(namespace,folder_id,deleted) VALUES ('legacy',3,0)")
-        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (99,)
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (100,)
 
 
 def test_partial_schema_failure_rolls_back_both_domains(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -96,7 +96,7 @@ def test_partial_schema_failure_rolls_back_both_domains(tmp_path: Path, monkeypa
         assert "deleted" not in {row[1] for row in folder_columns}
     sync_db.ensure_sync_schema(path)
     with closing(sqlite3.connect(path)) as conn:
-        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (99,)
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (100,)
 
 
 def test_missing_folder_owner_rolls_back_without_reassigning_facts(
@@ -198,7 +198,7 @@ def test_image_job_revision_normalization_is_fenced_and_preserves_attempts(
         assert conn.execute("SELECT * FROM message_image_artifacts").fetchall() == [
             (42, 10, 1, 55, 7, "saved", "hash", 10, 2, 3)
         ]
-        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (99,)
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (100,)
 
 
 def test_image_job_revision_is_unchanged_without_bound_account(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

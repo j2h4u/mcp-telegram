@@ -771,6 +771,9 @@ class GuardedMTProtoSender(MTProtoSender):
             self._response_owner.reset(response_token)
 
     def _store_own_updates(self, obj: object, *args: object, **kwargs: object) -> None:
+        capture = getattr(self._updates_queue, "capture_rpc_notification", None)
+        if callable(capture):
+            capture(obj)
         try:
             vars(obj)["_mcp_delivery_source"] = "rpc_response"
         except TypeError:

@@ -172,6 +172,7 @@ class RuntimeObservationConfig:
     shutdown_drain_grace_seconds: float = 2.0
     row_cap: int = 320_000
     rpc_summary_interval_seconds: float = 300.0
+    raw_update_prune_interval_seconds: float = 60.0
 
     def __post_init__(self) -> None:
         positive_integers = (
@@ -190,6 +191,7 @@ class RuntimeObservationConfig:
             self.writer_startup_wait_seconds,
             self.shutdown_drain_grace_seconds,
             self.rpc_summary_interval_seconds,
+            self.raw_update_prune_interval_seconds,
         )
         if any(not math.isfinite(value) or value <= 0 for value in durations):
             raise ValueError("runtime observation durations must be finite and positive")
@@ -1029,6 +1031,7 @@ def _parse_telemetry(data: dict[str, object], path: Path) -> TelemetryConfig:
         "shutdown_drain_grace_seconds",
         "row_cap",
         "rpc_summary_interval_seconds",
+        "raw_update_prune_interval_seconds",
     }
     _reject_unknown_keys(runtime_data, runtime_keys, "telemetry.runtime_observations", path)
     runtime_defaults = defaults.runtime_observations
@@ -1082,6 +1085,13 @@ def _parse_telemetry(data: dict[str, object], path: Path) -> TelemetryConfig:
                 "telemetry.runtime_observations",
                 path,
                 runtime_defaults.rpc_summary_interval_seconds,
+            ),
+            raw_update_prune_interval_seconds=_positive_float(
+                runtime_data,
+                "raw_update_prune_interval_seconds",
+                "telemetry.runtime_observations",
+                path,
+                runtime_defaults.raw_update_prune_interval_seconds,
             ),
         )
     except ValueError as exc:

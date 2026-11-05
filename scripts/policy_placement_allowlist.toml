@@ -3,6 +3,11 @@
 
 [[entry]]
 category = "policy_assignments"
+key = "src/mcp_telegram/telegram_update_store.py:<module>:RETENTION_SECONDS"
+rationale = "The fixed 15-minute diagnostic retention contract applies to both staging and persisted notifications."
+
+[[entry]]
+category = "policy_assignments"
 key = "src/mcp_telegram/drafts/commands.py:<module>:_OPERATION_KEY_LIMIT"
 rationale = "Native draft command wire-format bound, shared with the MCP input schema; not operator tuning."
 
