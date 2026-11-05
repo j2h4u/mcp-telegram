@@ -661,25 +661,55 @@ class TelegramDemandCoordinator:
         self._set_inline_active(kind, selected, retained=retained)
         self._observe("selected", kind, queue_age_seconds=max(0.0, selected_at - queued_at), status=status)
         assert invocation.deadline is not None
+        receipt_outcome: object = None
+        receipt_status = "failed"
         try:
             outcome = await self._run_scoped_adapter(kind, status, budget, invocation.deadline)
         except asyncio.CancelledError:
+            receipt_status = "cancelled"
             raise
         except RpcAdmissionClosedError:
+            receipt_status = "deferred"
             if self._handle_closed_admission(kind, budget):
                 return
             raise
         except _DEFERRED_ERRORS as exc:
+            receipt_status = "deferred"
             self._handle_deferred(kind, budget, exc)
         except TelegramRpcThrottled as exc:
+            receipt_status = "deferred"
             self._handle_throttle(kind, budget, exc)
         except Exception as exc:  # noqa: BLE001 - adapter failure must not kill sibling demand
             self._handle_slice_failure(kind, budget, exc)
         else:
             self._handle_outcome(kind, status, budget, outcome)
+            receipt_outcome = outcome
+            receipt_status = "outcome"
         finally:
+            self._observe_slice_receipt(selected, budget, receipt_status, receipt_outcome)
             self._clear_inline_active(retained=retained)
             _SLICE_GENERATION.reset(generation_token)
+
+    def _observe_slice_receipt(
+        self, selected: WorkRevision, budget: RpcAttemptBudget, status: str, outcome: object
+    ) -> None:
+        callback = getattr(self._observer, "observe_slice_receipt", None)
+        if not callable(callback) or selected.key.demand_kind not in {
+            DemandKind.DELTA_GAP_FILL,
+            DemandKind.ENTITY_PROFILE_REFRESH,
+        }:
+            return
+        retry_until = self._transient_waits.get(selected, self._eligibility_waits.get(selected))
+        try:
+            callback(
+                selected=selected,
+                status=status,
+                outcome=outcome,
+                actual_attempts=budget.attempts,
+                retry_not_before_monotonic=retry_until,
+            )
+        except Exception:
+            logger.debug("telegram_demand_receipt_failed", exc_info=True)
 
     def _set_inline_active(self, kind: DemandKind, selected: WorkRevision, *, retained: bool) -> None:
         if not retained:

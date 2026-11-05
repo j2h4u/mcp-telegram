@@ -18,8 +18,23 @@ from telethon.tl.functions.updates import GetChannelDifferenceRequest, GetDiffer
 from .flood import TelegramRpcThrottled
 from .message_delivery_observations import DeliveryTrace, MessageDeliveryObservations
 from .telegram_rpc_scheduler import TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending
+from .telegram_update_ring import TelegramUpdateRing
 
 type Eligibility = TelegramRpcThrottled | TelegramRpcMethodRecoveryPending | None
+
+
+def _synthetic_notification(item: object) -> bool:
+    if isinstance(item, types.UpdatesTooLong):
+        return True
+    if not isinstance(item, types.UpdateShort) or not getattr(item, "_self_outgoing", False):
+        return False
+    update = item.update
+    return (
+        isinstance(update, types.UpdateDeleteMessages)
+        and not update.messages
+        and item.date is not None
+        and item.date.timestamp() == 0
+    )
 
 
 def _has_channel_update(envelope: object) -> bool:
@@ -43,8 +58,10 @@ class UpdateIntakeQueue(asyncio.Queue[object]):
         self._notify = notify
         self.real_count = 0
         self.observer: MessageDeliveryObservations | None = None
+        self.update_ring: TelegramUpdateRing | None = None
 
     def put_nowait(self, item: object) -> None:
+        ring_sequence = self._capture_ring(item)
         super().put_nowait(item)
         if item is not self._wakeup:
             self.real_count += 1
@@ -52,8 +69,52 @@ class UpdateIntakeQueue(asyncio.Queue[object]):
             if self.observer is not None:
                 try:
                     self._observe_intake(item)
+                    trace = getattr(item, "_mcp_delivery_trace", None)
+                    if isinstance(trace, DeliveryTrace) and ring_sequence is not None and self.update_ring is not None:
+                        self.update_ring.associate_trace(ring_sequence, trace.trace_id)
                 except Exception:  # noqa: BLE001 - diagnostic failure cannot reject a queued update
                     pass
+
+    def _capture_ring(self, item: object) -> int | None:
+        try:
+            if item is not self._wakeup and self.update_ring is not None:
+                previous = getattr(item, "_mcp_ring_sequence", None)
+                if type(previous) is int:
+                    return previous
+                source = getattr(item, "_mcp_delivery_source", "unknown")
+                if source == "unknown" and _synthetic_notification(item):
+                    source = "library_synthetic"
+                return self.update_ring.capture(
+                    item, source=source if source in {"push", "rpc_response", "library_synthetic"} else "unknown"
+                )
+        except Exception:  # noqa: BLE001 - diagnostic work never blocks intake
+            pass
+        return None
+
+    def capture_rpc_notification(self, item: object) -> None:
+        """Capture a decoded RPC notification before vendor filtering."""
+        if self.update_ring is None:
+            return
+        try:
+            if isinstance(item, (types.messages.InvitedUsers, types.messages.ChatInviteJoinResultOk)):
+                item = item.updates
+            if not isinstance(
+                item,
+                (
+                    types.Updates,
+                    types.UpdatesCombined,
+                    types.UpdateShort,
+                    types.UpdateShortMessage,
+                    types.UpdateShortChatMessage,
+                    types.UpdateShortSentMessage,
+                    types.UpdatesTooLong,
+                ),
+            ):
+                return
+            vars(item)["_mcp_delivery_source"] = "rpc_response"
+            vars(item)["_mcp_ring_sequence"] = self.update_ring.capture(item, source="rpc_response")
+        except Exception:  # noqa: BLE001 - diagnostic work never blocks RPC result delivery
+            pass
 
     def _observe_intake(self, item: object) -> None:
         observer = self.observer
@@ -283,23 +344,46 @@ class GateMessageBox(MessageBox):
     def apply_difference(
         self, diff: object, chat_hashes: object
     ) -> tuple[list[object], list[object], list[object]] | None:
+        sequence = self._capture_difference(diff, "account_difference")
         result = cast(
             tuple[list[object], list[object], list[object]] | None, super().apply_difference(diff, chat_hashes)
         )
         if result is not None:
             self.observe_recovery_updates(result[0], "account", "recovery")
+            self._associate_update_traces(sequence, result[0])
         return result
 
     def apply_channel_difference(
         self, request: object, diff: object, chat_hashes: object
     ) -> tuple[list[object], list[object], list[object]] | None:
+        sequence = self._capture_difference(diff, "channel_difference")
         result = cast(
             tuple[list[object], list[object], list[object]] | None,
             super().apply_channel_difference(request, diff, chat_hashes),
         )
         if result is not None:
             self.observe_recovery_updates(result[0], "channel", "recovery")
+            self._associate_update_traces(sequence, result[0])
         return result
+
+    def _capture_difference(self, diff: object, source: str) -> int | None:
+        try:
+            if self.intake_queue is not None and self.intake_queue.update_ring is not None:
+                return self.intake_queue.update_ring.capture(diff, source=source)
+        except Exception:  # noqa: BLE001 - diagnostic work never blocks recovery
+            pass
+        return None
+
+    def _associate_update_traces(self, sequence: int | None, updates: list[object]) -> None:
+        try:
+            if sequence is None or self.intake_queue is None or self.intake_queue.update_ring is None:
+                return
+            for update in updates:
+                trace = getattr(update, "_mcp_delivery_trace", None)
+                if isinstance(trace, DeliveryTrace):
+                    self.intake_queue.update_ring.associate_trace(sequence, trace.trace_id)
+        except Exception:  # noqa: BLE001 - diagnostic work never blocks recovery
+            pass
 
     def intake_due(self) -> bool:
         return self.intake_queue is not None and self.intake_queue.real_count > 0 and not self.difference_credit

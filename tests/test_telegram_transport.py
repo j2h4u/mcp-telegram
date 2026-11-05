@@ -23,7 +23,7 @@ from telethon.tl.functions.help import GetConfigRequest
 from telethon.tl.types import BadServerSalt, MsgsAck, MsgsStateInfo, MsgsStateReq, ResPQ, RpcError
 
 from mcp_telegram.telegram_demand import RpcAttemptBudget
-from mcp_telegram.telegram_rpc_scheduler import RpcServiceClass, TelegramRpcScope, TelegramRpcSource
+from mcp_telegram.telegram_rpc_scheduler import ResendCause, RpcServiceClass, TelegramRpcScope, TelegramRpcSource
 from mcp_telegram.telegram_transport import (
     GuardedConnectionTcpFull,
     GuardedMTProtoPlainSender,
@@ -56,6 +56,7 @@ class _Authority:
         self.owners: list[_Owner] = []
         self.claims: list[_Owner] = []
         self.write_returns: list[object] = []
+        self.enqueues: list[tuple[object, object, int | None]] = []
         self.released: list[_Permit] = []
         self.prepared: asyncio.Queue[_Permit] = asyncio.Queue()
         self.deferred: asyncio.Queue[_Permit] = asyncio.Queue()
@@ -116,6 +117,9 @@ class _Authority:
 
     def observe_write_return(self, owner: object) -> None:
         self.write_returns.append(owner)
+
+    def observe_enqueue(self, owner: object, cause: object, code: int | None) -> None:
+        self.enqueues.append((owner, cause, code))
 
     async def observe_result(
         self, owner: object, error: BaseException | None, result: object | None = None
@@ -368,6 +372,7 @@ async def test_vendor_bad_salt_replay_reuses_original_owner_future_and_budget(wi
     assert wire.sender.write_packet(packet, wire.connection._send)
     assert state.msg_id is not None
     await wire.sender._handle_bad_server_salt(TLMessage(99, 0, BadServerSalt(state.msg_id, 1, 48, 9)))
+    assert wire.authority.enqueues[-1] == (original_owner, ResendCause.BAD_SERVER_SALT, None)
     assert await wire.sender._send_queue.next_state() is state
     assert wire.sender.require_owned(state).owner is original_owner
     assert state.future is original_future
@@ -1032,3 +1037,48 @@ async def test_internal_receive_loop_terminal_disconnect_does_not_join_itself(wi
 async def test_connection_pause_for_reconnect_is_not_terminal_sender_disconnect(wire: _Harness) -> None:
     await wire.connection.disconnect()
     assert not wire.authority.terminations
+
+
+async def test_local_defer_records_exact_owned_enqueue(wire: _Harness) -> None:
+    state = wire.enqueue()
+    owner = wire.sender.require_owned(state).owner
+    packet = await wire.prepare(state)
+    wire.sender.defer_packet(packet)
+    assert await wire.sender._send_queue.next_state() is state
+    assert wire.authority.enqueues[-1] == (owner, ResendCause.LOCAL_DEFER, None)
+    assert not wire.writer.frames
+
+
+async def test_vendor_reconnect_requeues_existing_owner_with_reason(
+    wire: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = wire.enqueue(budget=2)
+    owner = wire.sender.require_owned(state).owner
+    packet = await wire.prepare(state)
+    assert wire.sender.write_packet(packet, wire.connection._send)
+    assert state.msg_id is not None
+
+    async def no_io() -> None:
+        return None
+
+    monkeypatch.setattr(wire.connection, "disconnect", no_io)
+    monkeypatch.setattr(wire.sender, "_connect", no_io)
+    wire.sender._reconnecting = True
+    await wire.sender._reconnect(None)
+    assert await wire.sender._send_queue.next_state() is state
+    assert wire.authority.enqueues[-1] == (owner, ResendCause.RECONNECT, None)
+    assert len(wire.writer.frames) == 1
+
+
+async def test_inherited_resend_context_does_not_label_an_unrelated_task(wire: _Harness) -> None:
+    token = wire.sender._resend_origin.set((asyncio.current_task(), ResendCause.BAD_SERVER_SALT, None))
+    try:
+
+        async def other_task() -> _RequestState:
+            return wire.enqueue()
+
+        state = await asyncio.create_task(other_task())
+    finally:
+        wire.sender._resend_origin.reset(token)
+    owner = wire.sender.require_owned(state).owner
+    assert wire.authority.enqueues[-1] == (owner, ResendCause.INITIAL, None)

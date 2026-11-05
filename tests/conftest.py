@@ -6,7 +6,8 @@ import sqlite3
 import sys
 
 _UNIT_MAX_AS_BYTES = 512 * 1024 * 1024
-_COVERAGE_MAX_AS_BYTES = 1024 * 1024 * 1024
+# CI observed a 1010 MiB peak; a 16 MiB native stack exceeds the old 1024 MiB cap.
+_COVERAGE_MAX_AS_BYTES = 1280 * 1024 * 1024
 
 from collections.abc import AsyncIterator, Iterable
 from pathlib import Path

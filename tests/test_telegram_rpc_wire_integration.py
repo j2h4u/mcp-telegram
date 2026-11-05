@@ -2143,3 +2143,111 @@ async def test_invalid_account_identity_revokes_image_scope(image_wire: _WireHar
     await gate._ensure_safety_ledger().reject_identity_result(mismatched_account=False)
     assert not gate.claim_image_scope(token)
     assert gate.capture_image_scope() is None
+
+
+@pytest.mark.parametrize("code", [None, 16, 17, 32, 33])
+async def test_vendor_replay_reports_original_owner_budget_rejection(wire: _WireHarness, code: int | None) -> None:
+    from telethon.tl.core.tlmessage import TLMessage
+    from telethon.tl.types import BadMsgNotification, BadServerSalt
+
+    from mcp_telegram.telegram_rpc_scheduler import BudgetRejection, BudgetRejectionBoundary, ResendCause
+
+    gate, sender, connection, sink = wire
+    observations: list[dict[str, object]] = []
+    gate.set_rpc_request_observer(lambda **fields: observations.append(fields))
+    budget = RpcAttemptBudget(1)
+    scope = TelegramRpcScope(
+        TelegramRpcSource.MCP_INTERACTIVE,
+        RpcServiceClass.INTERACTIVE,
+        time.monotonic() + 10,
+        asyncio.current_task(),
+        attempt_budget=budget,
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    result = sender.send_owned(GetStateRequest(), scope)
+    state = await sender._send_queue.next_state()
+    original_future = state.future
+    owner = sender.require_owned(state).owner
+    await sender._prepare_state(state)
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    assert state.msg_id is not None
+    if code is None:
+        await sender._handle_bad_server_salt(TLMessage(99, 0, BadServerSalt(state.msg_id, 1, 48, 9)))
+    else:
+        await sender._handle_bad_notification(TLMessage(99, 0, BadMsgNotification(state.msg_id, 1, code)))
+    assert await sender._send_queue.next_state() is state
+    assert sender.require_owned(state).owner is owner and state.future is original_future
+    with pytest.raises(RpcAttemptBudgetExhaustedError):
+        await sender._prepare_state(state)
+    await asyncio.gather(*sender._observing)
+    with pytest.raises(RpcAttemptBudgetExhaustedError):
+        await result
+    event = next(row for row in observations if row.get("phase") == "budget_rejected")
+    rejection = cast(BudgetRejection, event["rejection"])
+    assert rejection.boundary is BudgetRejectionBoundary.OWNER_PREPARE
+    assert rejection.enqueue_trace[-1] == (
+        ResendCause.BAD_SERVER_SALT if code is None else ResendCause.BAD_MSG_NOTIFICATION,
+        code,
+    )
+    assert rejection.claimed_count == 1 and rejection.write_returned and rejection.attempted_ordinal == 2
+    assert budget.attempts == 1 and len(sink.frames) == 1
+
+
+async def test_preowner_budget_rejection_has_no_invented_owner(wire: _WireHarness) -> None:
+    from mcp_telegram.telegram_rpc_scheduler import BudgetRejection, BudgetRejectionBoundary, ResendCause
+
+    gate, _, _, sink = wire
+    observations: list[dict[str, object]] = []
+    gate.set_rpc_request_observer(lambda **fields: observations.append(fields))
+    budget = RpcAttemptBudget(1, attempts=1)
+    scope = TelegramRpcScope(
+        TelegramRpcSource.MCP_INTERACTIVE,
+        RpcServiceClass.INTERACTIVE,
+        time.monotonic() + 10,
+        asyncio.current_task(),
+        attempt_budget=budget,
+        attempt_evidence=RpcAttemptEvidence(),
+        diagnostic_retry_cause=ResendCause.GATEWAY_TRANSIENT,
+    )
+    with pytest.raises(RpcAttemptBudgetExhaustedError):
+        await _AdmissionAwareSender(gate, scope).send(GetStateRequest())
+    event = next(row for row in observations if row.get("phase") == "budget_rejected")
+    rejection = cast(BudgetRejection, event["rejection"])
+    assert rejection.boundary is BudgetRejectionBoundary.NEW_APPLICATION
+    assert rejection.owner_attempt_id is None and rejection.claimed_count == 0
+    assert rejection.enqueue_trace == ((ResendCause.GATEWAY_TRANSIENT, None),)
+    assert rejection.attempted_ordinal == 2 and sink.frames == []
+
+
+async def test_budget_rejection_at_claim_records_physical_boundary(wire: _WireHarness) -> None:
+    from mcp_telegram.telegram_rpc_scheduler import BudgetRejection, BudgetRejectionBoundary
+
+    gate, sender, connection, sink = wire
+    observations: list[dict[str, object]] = []
+    gate.set_rpc_request_observer(lambda **fields: observations.append(fields))
+    budget = RpcAttemptBudget(1)
+    scope = TelegramRpcScope(
+        TelegramRpcSource.MCP_INTERACTIVE,
+        RpcServiceClass.INTERACTIVE,
+        time.monotonic() + 10,
+        asyncio.current_task(),
+        attempt_budget=budget,
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    first = sender.send_owned(GetStateRequest(), scope)
+    first_state = await sender._send_queue.next_state()
+    await sender._prepare_state(first_state)
+    first_packet = connection._send_queue.get_nowait()
+    second = sender.send_owned(GetStateRequest(), scope)
+    second_state = await sender._send_queue.next_state()
+    await sender._prepare_state(second_state)
+    second_packet = connection._send_queue.get_nowait()
+    assert sender.write_packet(first_packet, connection._send)
+    assert not sender.write_packet(second_packet, connection._send)
+    event = next(row for row in observations if row.get("phase") == "budget_rejected")
+    rejection = cast(BudgetRejection, event["rejection"])
+    assert rejection.boundary is BudgetRejectionBoundary.OWNER_CLAIM
+    assert rejection.claimed_count == 0 and rejection.attempted_ordinal == 2
+    assert budget.attempts == 1 and len(sink.frames) == 1
+    first.cancel()
+    second.cancel()

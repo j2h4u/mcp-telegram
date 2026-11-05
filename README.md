@@ -449,6 +449,27 @@ remind agents to treat Telegram-originated fields as untrusted content.
 
 ## Operator Commands
 
+Recent decoded Telegram updates are retained in `sync.db` for up to 15 minutes and 64 MiB of logical payload. Capture
+uses bounded in-memory staging and the existing background SQLite writer; interrupted staging, size limits and
+serialization failures can leave gaps. The `source` column distinguishes pushed, recovered, replayed and other
+library-generated updates. The records can contain private Telegram data.
+
+To inspect the configured state database without writing to it, substitute its directory for `STATE_DIR`:
+
+```bash
+sqlite3 -readonly "$STATE_DIR/sync.db" <<'SQL'
+  SELECT observed_at_ms, source, constructor, json_extract(payload_json, '$.user_id') AS user_id
+  FROM raw_telegram_updates
+  WHERE observed_at_ms >= CAST(strftime('%s', 'now', '-15 minutes') AS INTEGER) * 1000
+    AND constructor LIKE 'Update%'
+  ORDER BY observed_at_ms, id LIMIT 100;
+SQL
+```
+
+`payload_json` contains the decoded update fields; `trace_ids_json` holds available delivery correlations. These are
+reserialized data, not original network bytes. The example extracts only a top-level user ID; envelopes may contain
+nested updates and users. Inspect payloads only when needed and avoid copying them into logs.
+
 Inspect one current profile refresh job using an exact entity ID from dialog discovery:
 
 ```bash

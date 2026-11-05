@@ -19,7 +19,8 @@ from .scheduled_receipts_schema import SCHEDULED_OPERATION_RECEIPT_DDL
 from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 
-_CURRENT_SCHEMA_VERSION = 99
+_CURRENT_SCHEMA_VERSION = 100
+_RAW_TELEGRAM_UPDATES_MIGRATION = 100
 _PARTIAL_CANONICAL_INTAKE_MIGRATION = 99
 _CONTACT_CATALOGUE_MIGRATION = 98
 _NATIVE_MANAGEMENT_MIGRATION = 97
@@ -5105,6 +5106,12 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     current = _apply_migration_60(conn, current)
     current = _apply_late_migrations(conn, current)
     current = _apply_migrations_85_to_92(conn, current)
+    _apply_migrations_93_to_100(conn, current)
+    logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
+
+
+def _apply_migrations_93_to_100(conn: sqlite3.Connection, current: int) -> int:
+    """Apply the current message, contact and diagnostic schema revisions."""
     if _CURRENT_SCHEMA_VERSION >= _MESSAGE_IMAGE_MIGRATION:
         current = _apply_migration_93(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _HISTORY_ENROLLMENT_SIMPLIFICATION_MIGRATION:
@@ -5137,7 +5144,33 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_98(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _PARTIAL_CANONICAL_INTAKE_MIGRATION:
         current = _apply_migration_99(conn, current)
-    logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
+    if _CURRENT_SCHEMA_VERSION >= _RAW_TELEGRAM_UPDATES_MIGRATION:
+        current = _apply_migration_100(conn, current)
+    return current
+
+
+def _apply_migration_100(conn: sqlite3.Connection, current: int) -> int:
+    """Retain bounded raw Telegram updates in the existing state database."""
+    return _apply_migration(
+        conn,
+        current,
+        _RAW_TELEGRAM_UPDATES_MIGRATION,
+        [
+            """CREATE TABLE raw_telegram_updates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                runtime_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                observed_at_ms INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                constructor TEXT NOT NULL,
+                payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
+                payload_bytes INTEGER NOT NULL CHECK(payload_bytes BETWEEN 0 AND 4194304 AND payload_bytes=length(CAST(payload_json AS BLOB))),
+                trace_ids_json TEXT NOT NULL CHECK(json_valid(trace_ids_json)),
+                UNIQUE(runtime_id, sequence)
+            )""",
+            "CREATE INDEX raw_telegram_updates_time ON raw_telegram_updates(observed_at_ms,id)",
+        ],
+    )
 
 
 def _apply_migration_99(conn: sqlite3.Connection, current: int) -> int:

@@ -148,6 +148,7 @@ from .rpc_admission_observations import RpcAdmissionObservationAggregator
 from .runtime_observations import (
     RecoveryObservationAdapter,
     RuntimeObservationSink,
+    UpdateRingPort,
     _prune_runtime_observations_batch,
     record_runtime_observation,
 )
@@ -277,6 +278,7 @@ def read_operator_summary_snapshot(
 
 
 class _DaemonClient(Protocol):
+    def update_ring(self) -> UpdateRingPort: ...
     def message_delivery_snapshot(self, channel_id: int | None = None) -> dict[str, object]: ...
 
     def register_native_write_domain(self, domain: NativeWriteDomain, owner: NativeWriteDomainOwner) -> None: ...
@@ -1374,8 +1376,17 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
     _install_flood_wait_kill_switch(config, flood_wait_kill_switch_event)
 
     client = _create_telegram_client(config, conn, writer)
+    rpc_observation_sink: RuntimeObservationSink | None = None
+
+    async def close_client_and_observations() -> None:
+        try:
+            await _disconnect_telegram(client)
+        finally:
+            if rpc_observation_sink is not None:
+                await rpc_observation_sink.aclose()
+
     cleanup.push_async_callback(client.close_rpc_scheduler)
-    cleanup.push_async_callback(_disconnect_telegram, client)
+    cleanup.push_async_callback(close_client_and_observations)
     client.bind_session_lease(session_proof)
     rpc_scheduler_failure: dict[str, str | None] = {"detail": None}
 
@@ -1526,7 +1537,7 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
         retention_ttl_seconds=config.telemetry.retention_ttl_seconds,
         policy=config.telemetry.runtime_observations,
     )
-    cleanup.push_async_callback(rpc_observation_sink.aclose)
+    rpc_observation_sink.attach_update_ring(client.update_ring())
     rpc_admission_observer = RpcAdmissionObservationAggregator(
         rpc_observation_sink,
         policy=config.telemetry.runtime_observations,

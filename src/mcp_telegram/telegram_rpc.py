@@ -151,6 +151,9 @@ from .telegram_rpc_recovery import (
 )
 from .telegram_rpc_scheduler import (
     AdmissionObserver,
+    BudgetRejection,
+    BudgetRejectionBoundary,
+    ResendCause,
     RpcAdmission,
     RpcAdmissionError,
     RpcAdmissionExpiredError,
@@ -176,6 +179,7 @@ from .telegram_transport import (
     TransportWriteError,
 )
 from .telegram_update_admission import GateMessageBox, UpdateIntakeQueue
+from .telegram_update_ring import TelegramUpdateRing
 from .update_delivery import DeliveryState, UpdateDeliveryRepository
 
 logger = logging.getLogger(__name__)
@@ -244,6 +248,8 @@ TransientRpcErrors = (
     InterdcCallRichErrorError,
     TimedOutError,
 )
+
+_MAX_ENQUEUE_TRACE = 4
 
 
 def _native_rejection(
@@ -314,7 +320,7 @@ class _AdmissionAwareSender:
     async def _send(self, request: object, *, ordered: bool) -> object:
         del ordered
         self._gate._raise_if_transport_unavailable()
-        self._gate._reject_exhausted_attempt_budget(self._scope)
+        self._gate._reject_exhausted_attempt_budget(self._scope, request=request)
         sender = self._selected_sender()
         raw_future = sender.send_owned(request, self._scope)
         wire_owner = self._gate._require_wire_owner(sender.application_owner(raw_future))
@@ -3352,6 +3358,9 @@ class _WireAttempt:
     method_generation: str | None = None
     observed_write_returns: int = 0
     observed_result: bool = False
+    enqueue_trace: list[tuple[ResendCause, int | None]] = field(default_factory=list)
+    enqueue_truncated: int = 0
+    last_rejection: BudgetRejection | None = None
     response_timer: asyncio.Timeout | None = None
     observation_ordinal: int | None = None
     draft_mutation: bool = False
@@ -3618,6 +3627,9 @@ class _AuxPhotoAuthority:
     def observe_write_return(self, owner: object) -> None:
         self._gate.observe_write_return(owner)
 
+    def observe_enqueue(self, owner: object, cause: ResendCause, code: int | None) -> None:
+        self._gate.observe_enqueue(owner, cause, code)
+
     def defer_write(self, owner: object, permit: object) -> None:
         self._gate.defer_write(owner, permit)
 
@@ -3836,6 +3848,8 @@ class TelegramRpcGate(TelegramClient):
         )
         box = cast(GateMessageBox, self._message_box)
         queue = UpdateIntakeQueue(box.wakeup, self._admission_scheduler.notify_eligibility_changed)
+        self._update_ring = TelegramUpdateRing()
+        queue.update_ring = self._update_ring
         box.intake_queue = queue
         self._updates_queue = queue
         unused_sender = cast(_MainSender, object.__getattribute__(self, "_sender"))
@@ -4086,7 +4100,10 @@ class TelegramRpcGate(TelegramClient):
             raise RuntimeError("retained update account mismatch")
         if len(updates) != len(state.orders) or len(state.orders) != len(state.reaction_sequences):
             raise RuntimeError("retained Telegram update tokens are incomplete")
-        cast(GateMessageBox, self._message_box).observe_replay_updates(updates)
+        sequence = self._capture_replayed_update(envelope, updates, users, chats)
+        box = cast(GateMessageBox, self._message_box)
+        box.observe_replay_updates(updates)
+        box._associate_update_traces(sequence, updates)
         capture_folder_intake(updates)
         capture_contact_note_intake(updates)
         capture_contact_intake(updates)
@@ -4098,6 +4115,21 @@ class TelegramRpcGate(TelegramClient):
             await self._complete_update_delivery()
         if self._delivery_failure.is_set():
             raise RuntimeError("retained Telegram update replay failed")
+
+    def _capture_replayed_update(
+        self, envelope: DeliveryEnvelope, updates: list[object], users: list[object], chats: list[object]
+    ) -> int | None:
+        try:
+            replay = types.Updates(
+                cast(list[types.TypeUpdate], updates),
+                cast(list[types.TypeUser], users),
+                cast(list[types.TypeChat], chats),
+                envelope.checkpoint_after.date,
+                envelope.checkpoint_after.seq,
+            )
+            return self._update_ring.capture(replay, source="replay")
+        except Exception:  # noqa: BLE001 - diagnostics cannot prevent durable replay
+            return None
 
     @staticmethod
     def _replay_account_matches(
@@ -5358,7 +5390,7 @@ class TelegramRpcGate(TelegramClient):
             raise RuntimeError("Telegram application attempt is terminal")
         if scope.owner_task is not None and (scope.owner_task.done() or scope.owner_task.cancelling()):
             raise asyncio.CancelledError
-        self._reject_exhausted_attempt_budget(scope)
+        self._reject_exhausted_attempt_budget(scope, owner=owner)
         self._check_auto_trial_prepare(owner)
         await self._prepare_native_write(owner)
         await self._prepare_application_intent(owner)
@@ -5515,7 +5547,11 @@ class TelegramRpcGate(TelegramClient):
         self._validate_claim_intent(owner, ledger)
         if not self._admission_scheduler.record_dispatch(permit.admission):
             return False
-        self._record_claim_debit(owner, budget, ledger)
+        try:
+            self._record_claim_debit(owner, budget, ledger)
+        except RpcAttemptBudgetExhaustedError:
+            self._observe_budget_rejection(owner.scope, owner, None, boundary=BudgetRejectionBoundary.OWNER_CLAIM)
+            raise
         if not owner.claimed and self._is_update_difference_owner(owner):
             self._message_box.difference_claimed()
         self._record_wire_dispatch(owner, permit)
@@ -5803,6 +5839,15 @@ class TelegramRpcGate(TelegramClient):
         except Exception:  # noqa: BLE001 - observation cannot fail an already completed local write
             logger.debug("telegram_rpc_write_observation_failed")
 
+    def observe_enqueue(self, owner: object, cause: ResendCause, code: int | None) -> None:
+        attempt = self._require_wire_owner(owner)
+        if cause is ResendCause.INITIAL and attempt.scope.diagnostic_retry_cause is not None:
+            cause = attempt.scope.diagnostic_retry_cause
+        if len(attempt.enqueue_trace) >= _MAX_ENQUEUE_TRACE:
+            attempt.enqueue_trace.pop(0)
+            attempt.enqueue_truncated += 1
+        attempt.enqueue_trace.append((cause, code if cause is ResendCause.BAD_MSG_NOTIFICATION else None))
+
     def _permit_still_eligible(self, owner: _WireAttempt, permit: _WirePermit) -> bool:
         if owner.revoked or self._update_intake_blocks_owner(owner):
             return False
@@ -5859,7 +5904,11 @@ class TelegramRpcGate(TelegramClient):
         task = owner.scope.owner_task
         if task is not None and (task.done() or task.cancelling()):
             return False
-        return self._budget_can_claim(owner)
+        allowed = self._budget_can_claim(owner)
+        budget = owner.scope.attempt_budget
+        if not allowed and budget is not None and (budget.exhausted or budget._retry_candidate is not None):
+            self._observe_budget_rejection(owner.scope, owner, None, boundary=BudgetRejectionBoundary.OWNER_CLAIM)
+        return allowed
 
     def _automatic_trial_claim_allowed(self, owner: _WireAttempt) -> bool:
         ledger = self._ensure_safety_ledger()
@@ -6322,6 +6371,8 @@ class TelegramRpcGate(TelegramClient):
                     incident_error_type=self._incident_error_type(error),
                     incident_terminal_reason=self._incident_terminal_reason(error),
                     incident_owner_attempt=owner.attempt_id,
+                    rejection=owner.last_rejection,
+                    owner_summary=self._budget_snapshot(owner.scope, owner, owner.method),
                 )
         except Exception:  # noqa: BLE001 - observations cannot alter settled safety
             logger.debug("telegram_rpc_incident_observation_failed")
@@ -6390,6 +6441,7 @@ class TelegramRpcGate(TelegramClient):
             if await self._reject_conflicting_identity(expected, user.id):
                 return RuntimeError("DC transition returned a different Telegram account")
             await ledger.verify_account(user.id)
+            self._update_ring.request_verified_account(user.id)
         return None
 
     async def _reject_conflicting_identity(self, expected: object, account_id: int) -> bool:
@@ -6704,6 +6756,7 @@ class TelegramRpcGate(TelegramClient):
             if type(result) is not types.auth.LoggedOut:
                 raise RuntimeError("Telegram logout was not confirmed")
             await ledger.confirm_logout()
+            self._update_ring.request_logout()
             self.close_update_delivery()
             assert self.session is not None
             with self._image_identity_change():
@@ -6727,6 +6780,10 @@ class TelegramRpcGate(TelegramClient):
         if key_id is None:
             return None
         return TelegramAuthScope(AUTH_SCOPE_VERSION, account_id, dc_id, key_id)
+
+    def update_ring(self) -> TelegramUpdateRing:
+        """Return the existing ingress staging owner for daemon composition."""
+        return self._update_ring
 
     def capture_image_scope(self) -> ScopeToken | None:
         """Capture a verified scope generation on the daemon event loop."""
@@ -6845,6 +6902,7 @@ class TelegramRpcGate(TelegramClient):
         invalidate_contact_scope()
         ledger = self._ensure_safety_ledger()
         await ledger.verify_account(account_id)
+        self._update_ring.request_verified_account(account_id)
         snapshot = ledger.recovery_identity()
         if snapshot.mode is RecoveryMode.MANUAL and snapshot.phase is RecoveryPhase.CONSUMED:
             await ledger.finish_recovery(account_id)
@@ -7572,7 +7630,9 @@ class TelegramRpcGate(TelegramClient):
         _AdmissionAwareSender._raise_if_cancel_pending()
         self._reject_exhausted_attempt_budget(scope)
 
-    def _reject_exhausted_attempt_budget(self, scope: TelegramRpcScope) -> None:
+    def _reject_exhausted_attempt_budget(
+        self, scope: TelegramRpcScope, *, owner: _WireAttempt | None = None, request: object | None = None
+    ) -> None:
         budget = scope.attempt_budget
         if budget is None:
             return
@@ -7581,7 +7641,65 @@ class TelegramRpcGate(TelegramClient):
             return
         if budget.exhausted or budget._retry_candidate is not None:
             self._admission_scheduler.record_attempt_budget_exhausted(scope)
+            self._observe_budget_rejection(scope, owner, request)
             raise RpcAttemptBudgetExhaustedError("Telegram RPC attempt budget is exhausted")
+
+    def _observe_budget_rejection(
+        self,
+        scope: TelegramRpcScope,
+        owner: _WireAttempt | None,
+        request: object | None,
+        *,
+        boundary: BudgetRejectionBoundary | None = None,
+    ) -> None:
+        observer = self._rpc_request_observer
+        budget = scope.attempt_budget
+        if observer is None or budget is None:
+            return
+        try:
+            method = owner.method if owner is not None else _canonical_wire_method(request)
+            rejection = self._budget_snapshot(scope, owner, method, boundary=boundary)
+            if owner is not None:
+                owner.last_rejection = rejection
+            observer(scope=scope, phase="budget_rejected", rejection=rejection)
+        except Exception:  # noqa: BLE001 - telemetry must not alter admission
+            logger.debug("telegram_rpc_budget_observation_failed")
+
+    @staticmethod
+    def _budget_enqueue_trace(
+        scope: TelegramRpcScope, owner: _WireAttempt | None
+    ) -> tuple[tuple[ResendCause, int | None], ...]:
+        if owner is not None:
+            return tuple(owner.enqueue_trace)
+        return ((scope.diagnostic_retry_cause, None),) if scope.diagnostic_retry_cause else ()
+
+    @staticmethod
+    def _budget_snapshot(
+        scope: TelegramRpcScope,
+        owner: _WireAttempt | None,
+        method: str | None,
+        *,
+        boundary: BudgetRejectionBoundary | None = None,
+    ) -> BudgetRejection:
+        budget = scope.attempt_budget
+        assert budget is not None
+        return BudgetRejection(
+            scope=scope,
+            method=method,
+            boundary=boundary
+            or (BudgetRejectionBoundary.OWNER_PREPARE if owner else BudgetRejectionBoundary.NEW_APPLICATION),
+            enqueue_trace=TelegramRpcGate._budget_enqueue_trace(scope, owner),
+            enqueue_truncated=owner.enqueue_truncated if owner else 0,
+            claimed_count=owner.claimed if owner else 0,
+            first_claimed_at_ms=owner.incident_claimed_at_ms if owner else None,
+            owner_attempt_id=owner.attempt_id if owner else None,
+            attempted_ordinal=budget.attempts + 1,
+            budget_limit=budget.limit,
+            budget_used=budget.attempts,
+            budget_remaining=budget.remaining,
+            write_returned=bool(owner and owner.observed_write_returns),
+            last_method=budget.last_method,
+        )
 
     async def _get_dc(self, dc_id: int, cdn: bool = False) -> object:
         dc = await super()._get_dc(dc_id, cdn=cdn)  # type: ignore[misc]
@@ -7877,6 +7995,7 @@ class TelegramRpcGate(TelegramClient):
         retry_delays = self._retry_delays_for_call(connection_owned)
         migration_dc: int | None = None
         delay = 0.0
+        retry_cause: ResendCause | None = None
         while True:
             try:
                 if migration_dc is not None:
@@ -7887,13 +8006,14 @@ class TelegramRpcGate(TelegramClient):
                 return await self._call_with_source_policy(
                     request,
                     ordered=ordered,
-                    scope=scope,
+                    scope=replace(scope, diagnostic_retry_cause=retry_cause),
                     connection_owned=connection_owned,
                 )
             except _ConnectionDcMigrationRequestedError as exc:
                 if connection_owned:
                     raise
                 migration_dc = exc.dc_id
+                retry_cause = ResendCause.GATEWAY_DC_RETRY
                 delay = self._next_migration_delay(retry_delays)
                 self._record_rpc_retry(scope, request, reason="dc_migration")
             except TransientRpcErrors:
@@ -7901,6 +8021,7 @@ class TelegramRpcGate(TelegramClient):
                 if next_delay is None:
                     raise
                 delay = next_delay
+                retry_cause = ResendCause.GATEWAY_TRANSIENT
                 self._record_rpc_retry(scope, request, reason="server_transient")
                 if delay and migration_dc is None:
                     await asyncio.sleep(delay)

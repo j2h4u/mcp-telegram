@@ -20,6 +20,14 @@ from typing import Protocol, cast
 from .sqlite_writer import SQLiteWriter
 from .sync_transactions import write_transaction
 from .telegram_rpc_recovery import RecoveryObservation, RecoveryObservationEvent, RecoveryStage
+from .telegram_update_store import (
+    UpdateRecord,
+    begin_update_run,
+    bind_verified_account,
+    end_update_run,
+    reset_updates,
+    write_update_batch,
+)
 
 RUNTIME_INSTANCE_ID = uuid.uuid4().hex
 MAX_PAYLOAD_BYTES = 1024
@@ -62,6 +70,23 @@ ALLOWED_KINDS = frozenset(
 logger = logging.getLogger(__name__)
 
 
+class UpdateRingPort(Protocol):
+    runtime_id: str
+    generation: int | None
+    request_revision: int
+    desired_account: int | None
+    logout_serial: int
+    completed_logout_serial: int
+
+    def reset(self, reason: str) -> None: ...
+    def complete_bind(self, account_id: int, revision: int, generation: int) -> None: ...
+    def peek_batch(self, *, max_count: int, max_bytes: int) -> tuple[UpdateRecord, ...]: ...
+    def ack_batch(self, records: tuple[UpdateRecord, ...]) -> None: ...
+    def release_batch(self) -> None: ...
+    def discard_batch(self, records: tuple[UpdateRecord, ...]) -> None: ...
+    def counters(self) -> dict[str, int]: ...
+
+
 class RuntimeObservationPolicy(Protocol):
     """Operator-owned limits required by the asynchronous observation sink."""
 
@@ -85,6 +110,9 @@ class RuntimeObservationPolicy(Protocol):
 
     @property
     def rpc_summary_interval_seconds(self) -> float: ...
+
+    @property
+    def raw_update_prune_interval_seconds(self) -> float: ...
 
 
 def tool_telemetry_identity(tool_name: str) -> tuple[str, int]:
@@ -254,6 +282,7 @@ class RuntimeObservationSink:
         self._prune_every_writes = policy.prune_every_writes
         self._shutdown_drain_grace_seconds = policy.shutdown_drain_grace_seconds
         self._row_cap = policy.row_cap
+        self._raw_update_prune_interval_seconds = policy.raw_update_prune_interval_seconds
         self._jobs: queue.Queue[_ObservationJob] = queue.Queue(maxsize=policy.queue_capacity)
         self._close_requested = threading.Event()
         self._state_lock = threading.Lock()
@@ -266,7 +295,89 @@ class RuntimeObservationSink:
         self._counters = RuntimeObservationCounters()
         self._prune_pending = False
         self._prune_now_ms: int | None = None
+        self._update_ring: UpdateRingPort | None = None
+        self._ring_last_flush = 0.0
+        self._ring_counters: dict[str, int] = {}
+        self._ring_failed = False
         self._flush_task = asyncio.create_task(self._flush_loop(), name="runtime-observation-flush")
+
+    def attach_update_ring(self, ring: UpdateRingPort) -> None:
+        """Share the existing flush owner with bounded notification staging."""
+        self._update_ring = ring
+
+    async def _bind_update_account(self, ring: UpdateRingPort, account_id: int, revision: int) -> None:
+        generation, changed = await self._writer.run(partial(bind_verified_account, account_id=account_id))
+        if changed:
+            ring.reset("account_changed")
+        if revision != ring.request_revision:
+            return
+        started = await self._writer.run(
+            partial(begin_update_run, runtime_id=ring.runtime_id, expected_generation=generation)
+        )
+        if not started:
+            raise RuntimeError("notification retention generation changed during bind")
+        ring.complete_bind(account_id, revision, generation)
+
+    async def _update_ring_lifecycle(self) -> bool:
+        ring = self._update_ring
+        if ring is None:
+            return False
+        try:
+            if ring.completed_logout_serial < ring.logout_serial:
+                serial = ring.logout_serial
+                await self._writer.run(reset_updates)
+                ring.completed_logout_serial = serial
+                return ring.desired_account is not None or ring.completed_logout_serial < ring.logout_serial
+            if ring.generation is None and ring.desired_account is not None:
+                revision = ring.request_revision
+                await self._bind_update_account(ring, ring.desired_account, revision)
+                return revision != ring.request_revision or ring.completed_logout_serial < ring.logout_serial
+        except Exception as exc:  # noqa: BLE001 - diagnostics do not control ingestion
+            self._ring_failed = True
+            logger.warning("telegram_update_lifecycle_failed error_type=%s", type(exc).__name__)
+        return False
+
+    async def _flush_updates(self) -> bool:
+        ring = self._update_ring
+        if ring is None or ring.generation is None:
+            return False
+        records = ring.peek_batch(max_count=32, max_bytes=4 * 1024 * 1024)
+        counters = ring.counters()
+        now = time.monotonic()
+        if (
+            not records
+            and counters == self._ring_counters
+            and now - self._ring_last_flush < self._raw_update_prune_interval_seconds
+        ):
+            return False
+        try:
+            accepted = await self._writer.run(
+                partial(
+                    write_update_batch,
+                    records=records,
+                    now_ms=time.time_ns() // 1_000_000,
+                    counters=counters,
+                    expected_generation=ring.generation,
+                    runtime_id=ring.runtime_id,
+                )
+            )
+        except asyncio.CancelledError:
+            ring.release_batch()
+            raise
+        except Exception as exc:  # noqa: BLE001 - diagnostics must not stop ingestion
+            ring.release_batch()
+            self._ring_failed = True
+            logger.warning("telegram_update_batch_failed error_type=%s", type(exc).__name__)
+            return False
+        if not accepted:
+            ring.discard_batch(records)
+            self._ring_failed = True
+            return False
+        self._ring_failed = False
+        ring.ack_batch(records)
+        self._ring_counters = counters
+        self._ring_last_flush = now
+        return bool(records)
 
     @staticmethod
     def _database_path(database: Path | str | sqlite3.Connection) -> Path:
@@ -348,6 +459,8 @@ class RuntimeObservationSink:
         The grace bounds buffered work, not an operation already accepted by
         the shared owner: SQLite and OS stalls cannot safely be interrupted here.
         """
+        if self._closed:
+            return
         self.close()
         cancellation: asyncio.CancelledError | None = None
         try:
@@ -364,10 +477,21 @@ class RuntimeObservationSink:
                 cancellation = exc
                 self._drop_queued_jobs("shutdown_grace_drops")
         self._flush_task.result()
+        await self._end_update_run()
         self._closed = True
         self._maybe_log_summary()
         if cancellation is not None:
             raise cancellation
+
+    async def _end_update_run(self) -> None:
+        ring = self._update_ring
+        if ring is not None and ring.generation is not None and not self._ring_failed:
+            try:
+                await self._writer.run(
+                    partial(end_update_run, runtime_id=ring.runtime_id, expected_generation=ring.generation)
+                )
+            except Exception as exc:  # noqa: BLE001 - diagnostics do not control shutdown
+                logger.warning("telegram_update_close_failed error_type=%s", type(exc).__name__)
 
     @property
     def stats(self) -> RuntimeObservationCounters:
@@ -498,21 +622,31 @@ class RuntimeObservationSink:
     async def _flush_loop(self) -> None:
         writes_since_prune = 0
         while True:
-            jobs: list[_ObservationJob] = []
-            while len(jobs) < _FLUSH_BATCH_SIZE:
-                try:
-                    jobs.append(self._jobs.get_nowait())
-                except queue.Empty:
-                    break
+            jobs = self._take_flush_batch()
             if jobs:
                 writes_since_prune = await self._flush_batch(jobs, writes_since_prune)
-            if self._close_requested.is_set() and self._jobs.empty():
+            lifecycle_pending = await self._update_ring_lifecycle()
+            ring_written = await self._flush_updates()
+            ring_active = ring_written or lifecycle_pending
+            if self._flush_finished(ring_active):
                 return
             if self._prune_pending and not self._close_requested.is_set():
                 await self._run_prune_batch()
             self._maybe_log_summary()
             # Yield between bounded batches so core submissions reach the owner.
-            await asyncio.sleep(0 if jobs else _WRITER_POLL_SECONDS)
+            await asyncio.sleep(0 if jobs or ring_active else _WRITER_POLL_SECONDS)
+
+    def _flush_finished(self, ring_active: bool) -> bool:
+        return self._close_requested.is_set() and self._jobs.empty() and not ring_active
+
+    def _take_flush_batch(self) -> list[_ObservationJob]:
+        jobs: list[_ObservationJob] = []
+        while len(jobs) < _FLUSH_BATCH_SIZE:
+            try:
+                jobs.append(self._jobs.get_nowait())
+            except queue.Empty:
+                break
+        return jobs
 
     async def _flush_batch(self, jobs: list[_ObservationJob], writes_since_prune: int) -> int:
         try:

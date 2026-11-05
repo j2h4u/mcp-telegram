@@ -16,8 +16,12 @@ from typing import Protocol, TypedDict, cast
 from .flood import FloodWaitObservation
 from .message_delivery_observations import MessageDeliveryObservations
 from .telegram_demand import AcquisitionKind, DemandObservationHook
+from .telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkRevision
 from .telegram_rpc_consumers import DemandKind, telegram_rpc_consumer
 from .telegram_rpc_scheduler import (
+    BudgetRejection,
+    BudgetRejectionBoundary,
+    ResendCause,
     RpcAdmissionEvent,
     RpcAdmissionEventKind,
     RpcServiceClass,
@@ -197,6 +201,33 @@ _OBSERVATION_ID_HEX_LENGTH = 32
 _METHOD_BUCKET_LIMIT = 16
 _SAMPLED_ROOT_LIMIT = 2
 _ROOT_EVENT_LIMIT = 12
+_MAX_EVIDENCE_COUNTER = 2_147_483_647
+_RECEIPT_KINDS = frozenset({DemandKind.DELTA_GAP_FILL, DemandKind.ENTITY_PROFILE_REFRESH})
+
+
+def work_references(selected: WorkRevision) -> tuple[str, str]:
+    """Project stable, domain-separated references without retaining owner identifiers."""
+    key = selected.key
+    identity: list[object] = [key.demand_kind.value, key.account_id, key.target]
+
+    def digest(domain: str, values: list[object]) -> str:
+        data = json.dumps([domain, *values], ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(data).hexdigest()[:32]
+
+    return digest("tg228.work.v1", identity), digest("tg228.revision.v1", [*identity, selected.revision])
+
+
+def _receipt_state(selected: WorkRevision, status: str, outcome: object, payload: dict[str, object]) -> str:
+    if status != "outcome":
+        return status if status in {"deferred", "failed", "cancelled"} else "invalid_slice_outcome"
+    if not isinstance(outcome, SliceOutcome) or outcome.selected != selected:
+        return "invalid_slice_outcome"
+    revision = outcome.committed_revision_for(selected)
+    if outcome.kind in {SliceOutcomeKind.PROGRESSED, SliceOutcomeKind.TERMINAL} and revision is not None:
+        payload["committed_ref"] = work_references(WorkRevision(selected.key, revision))[1]
+    return outcome.kind.value
+
+
 _RPC_PHASES = (
     "write_claim",
     "write_return",
@@ -259,6 +290,21 @@ def _valid_incident_id(value: str | None) -> bool:
 
 def _valid_incident_time(value: int | None) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _valid_rejection(rejection: BudgetRejection) -> bool:
+    values = (
+        rejection.enqueue_truncated,
+        rejection.claimed_count,
+        rejection.attempted_ordinal,
+        rejection.budget_limit,
+        rejection.budget_used,
+        rejection.budget_remaining,
+    )
+    return (
+        all(type(value) is int and 0 <= value <= _MAX_EVIDENCE_COUNTER for value in values)
+        and type(rejection.write_returned) is bool
+    )
 
 
 @dataclass(slots=True)
@@ -412,6 +458,8 @@ class RpcAdmissionObservationAggregator:
         incident_error_type: str | None = None,
         incident_terminal_reason: str | None = None,
         incident_owner_attempt: str | None = None,
+        rejection: BudgetRejection | None = None,
+        owner_summary: BudgetRejection | None = None,
     ) -> None:
         """Bounded method counters and biased root samples; never admit work."""
         try:
@@ -427,7 +475,12 @@ class RpcAdmissionObservationAggregator:
                     incident_error_type,
                     incident_terminal_reason,
                     incident_owner_attempt,
+                    rejection,
+                    owner_summary,
                 )
+                return
+            if phase == "budget_rejected":
+                self._observe_budget_rejection(scope, request_method, rejection)
                 return
             if phase not in _RPC_PHASES or not _valid_rpc_scope(scope):
                 return
@@ -436,14 +489,7 @@ class RpcAdmissionObservationAggregator:
             now, wall_ms = self._clock(), int(time.time() * _MILLISECONDS_PER_SECOND)
             operation_id, target_ref = self._rpc_identity(scope)
             payload = self._rpc_sample_payload(scope, phase, method, target_ref, reason)
-            if phase in {"write_claim", "write_return"}:
-                payload["attempt_ordinal"] = (
-                    attempt_ordinal if attempt_ordinal is not None else payload.get("root_attempts", 0)
-                )
-            if admission_sequence is not None:
-                payload["admission_sequence"] = admission_sequence
-            if replay_ordinal is not None:
-                payload["replay_ordinal"] = replay_ordinal
+            self._add_sample_ordinals(payload, phase, attempt_ordinal, admission_sequence, replay_ordinal)
             with self._state_lock:
                 aggregate = self._method_bucket(key, now, wall_ms)
                 aggregate.counts[phase] += 1
@@ -452,6 +498,17 @@ class RpcAdmissionObservationAggregator:
         except Exception:  # noqa: BLE001 - neither payloads nor observer failures enter the product path
             with self._state_lock:
                 self._rpc_lost_rows += 1
+
+    @staticmethod
+    def _add_sample_ordinals(
+        payload: dict[str, object], phase: str, attempt: int | None, admission: int | None, replay: int | None
+    ) -> None:
+        if phase in {"write_claim", "write_return"}:
+            payload["attempt_ordinal"] = attempt if attempt is not None else payload.get("root_attempts", 0)
+        if admission is not None:
+            payload["admission_sequence"] = admission
+        if replay is not None:
+            payload["replay_ordinal"] = replay
 
     def _observe_unknown_incident(  # noqa: PLR0913, PLR0917 - passive fields from the physical owner
         self,
@@ -465,6 +522,8 @@ class RpcAdmissionObservationAggregator:
         error_type: str | None,
         terminal_reason: str | None,
         owner_attempt: str | None,
+        rejection: BudgetRejection | None,
+        owner_summary: BudgetRejection | None,
     ) -> None:
         attempt = scope.owned_attempt_id
         method = _observation_method(method, self._method_names)
@@ -497,8 +556,85 @@ class RpcAdmissionObservationAggregator:
             payload["demand_kind"] = scope.demand_kind.value
         if scope.acquisition_kind is not None:
             payload["acquisition_kind"] = scope.acquisition_kind.value
-        if not self._record_rpc_row(
+        self._add_work_references(payload, scope)
+        evidence_source = rejection if rejection is not None else owner_summary
+        if evidence_source is not None:
+            evidence = self._rejection_fields(evidence_source)
+            if rejection is None:
+                evidence.pop("boundary", None)
+                evidence.pop("disposition", None)
+            payload.update(evidence)
+        self._fit_anomaly_payload(payload)
+        if not _rpc_payload_fits(payload) or not self._record_rpc_row(
             outcome="incident_unknown", payload=payload, observed_at_ms=cast(int, settled_at_ms), operation_id=attempt
+        ):
+            with self._state_lock:
+                self._rpc_lost_rows += 1
+
+    @staticmethod
+    def _add_work_references(payload: dict[str, object], scope: TelegramRpcScope) -> None:
+        selected = None if scope.attempt_budget is None else scope.attempt_budget.selected
+        if selected is not None and selected.key.demand_kind in _RECEIPT_KINDS:
+            payload["work_ref"], payload["selected_ref"] = work_references(selected)
+
+    def _rejection_fields(self, rejection: BudgetRejection) -> dict[str, object]:
+        if not _valid_rejection(rejection):
+            raise ValueError("invalid rejection evidence")
+        trace = [
+            {
+                "cause": cause.value,
+                **({"code": code} if cause is ResendCause.BAD_MSG_NOTIFICATION and code in {16, 17, 32, 33} else {}),
+            }
+            for cause, code in rejection.enqueue_trace[-4:]
+            if isinstance(cause, ResendCause)
+        ]
+        payload: dict[str, object] = {
+            "boundary": rejection.boundary.value
+            if isinstance(rejection.boundary, BudgetRejectionBoundary)
+            else "unknown",
+            "disposition": "blocked_before_write",
+            "enqueue_trace": trace,
+            "enqueue_truncated": rejection.enqueue_truncated + max(0, len(rejection.enqueue_trace) - 4),
+            "claimed_count": rejection.claimed_count,
+            "attempted_ordinal": rejection.attempted_ordinal,
+            "budget_limit": rejection.budget_limit,
+            "budget_used": rejection.budget_used,
+            "budget_remaining": rejection.budget_remaining,
+            "write_returned": rejection.write_returned,
+        }
+        if _valid_incident_id(rejection.owner_attempt_id):
+            payload["owner_attempt_id"] = rejection.owner_attempt_id
+        if _valid_incident_time(rejection.first_claimed_at_ms):
+            payload["first_claimed_at_ms"] = rejection.first_claimed_at_ms
+        if rejection.last_method is not None:
+            payload["last_method"] = _observation_method(rejection.last_method, self._method_names)
+        return payload
+
+    @staticmethod
+    def _fit_anomaly_payload(payload: dict[str, object]) -> None:
+        for key in ("last_method", "acquisition_kind"):
+            if _rpc_payload_fits(payload):
+                return
+            if key in payload:
+                payload.pop(key)
+                payload["payload_truncated"] = True
+
+    def _observe_budget_rejection(
+        self, scope: TelegramRpcScope, method: str | None, rejection: BudgetRejection | None
+    ) -> None:
+        if rejection is None or not _valid_rpc_scope(scope):
+            return
+        payload: dict[str, object] = {
+            "method": _observation_method(method or rejection.method, self._method_names),
+            "source": scope.source.value,
+            **self._rejection_fields(rejection),
+        }
+        if scope.demand_kind is not None:
+            payload["demand_kind"] = scope.demand_kind.value
+        self._add_work_references(payload, scope)
+        self._fit_anomaly_payload(payload)
+        if not _rpc_payload_fits(payload) or not self._record_rpc_row(
+            outcome="budget_rejected", payload=payload, observed_at_ms=int(time.time() * _MILLISECONDS_PER_SECOND)
         ):
             with self._state_lock:
                 self._rpc_lost_rows += 1
@@ -699,6 +835,37 @@ class RpcAdmissionObservationAggregator:
             self.flush_if_due()
         except Exception:  # noqa: BLE001 - telemetry cannot break demand producers
             return
+
+    def observe_slice_receipt(
+        self,
+        *,
+        selected: WorkRevision,
+        status: str,
+        outcome: object,
+        actual_attempts: int,
+        retry_not_before_monotonic: float | None,
+    ) -> None:
+        """Persist an owner outcome, distinguishing a commit from an RPC response."""
+        if selected.key.demand_kind not in _RECEIPT_KINDS:
+            return
+        payload: dict[str, object] = {"demand_kind": selected.key.demand_kind.value, "actual_attempts": actual_attempts}
+        payload["work_ref"], payload["selected_ref"] = work_references(selected)
+        state = _receipt_state(selected, status, outcome, payload)
+        if retry_not_before_monotonic is not None and _is_finite(retry_not_before_monotonic):
+            payload["retry_not_before_monotonic"] = retry_not_before_monotonic
+        try:
+            if (
+                _rpc_payload_fits(payload)
+                and self._recorder.record(
+                    kind="telegram.demand", outcome="slice_receipt", reason_code=state, payload=payload
+                )
+                is not False
+            ):
+                return
+        except Exception:  # noqa: BLE001 - sink failure is recorded as coverage loss
+            pass
+        with self._state_lock:
+            self._rpc_lost_rows += 1
 
     def observe_profile_pair(  # noqa: PLR0913 - explicit bounded evidence dimensions
         self,
