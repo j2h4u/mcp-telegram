@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -152,6 +153,10 @@ async def test_list_contacts_reads_canonical_non_dialog_contact_without_rpc(  # 
 ) -> None:
     from telethon.tl import types
 
+    from mcp_telegram.contacts.refresh import ContactCatalogueRefresher
+    from mcp_telegram.contacts.repository import request_contact_catalogue
+    from mcp_telegram.image_authorization import ScopeCell
+    from mcp_telegram.sqlite_writer import SQLiteWriter
     from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
     from mcp_telegram.sync_transactions import write_transaction
     from sqlite_writer_helpers import event_manager
@@ -167,15 +172,36 @@ async def test_list_contacts_reads_canonical_non_dialog_contact_without_rpc(  # 
         db.executemany(
             "INSERT INTO entities(id,type,name,updated_at) VALUES (?,'user',?,1)", [(55, "Public"), (56, "Second")]
         )
-    manager._write_profile_pushes(
-        db,
-        object(),
-        [
-            types.User(55, contact=True, mutual_contact=True, first_name="Saved"),
-            types.User(56, contact=True, mutual_contact=False, first_name="Next"),
-        ],
-        [],
-    )
+    writer = await SQLiteWriter.open(path)
+    cell = ScopeCell()
+    cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
+
+    async def catalogue(request: object) -> object:
+        del request
+        return types.contacts.Contacts(
+            [types.Contact(55, True), types.Contact(56, False)],
+            2,
+            [types.User(55, first_name="Saved"), types.User(56, first_name="Next")],
+        )
+
+    def request_refresh(conn: sqlite3.Connection) -> int:
+        with write_transaction(conn):
+            return request_contact_catalogue(conn, 42)
+
+    try:
+        revision = await writer.run(request_refresh)
+        refresher = ContactCatalogueRefresher(catalogue, db, writer, capture_scope=cell.capture, claim_scope=cell.claim)
+        assert (await refresher.refresh(expected_revision=revision)).accepted
+    finally:
+        await writer.aclose()
+    with write_transaction(db):
+        db.executemany(
+            "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_owner_account_id) VALUES(?,?,1,42)",
+            [
+                (55, json.dumps({"type": "user", "contact": False, "mutual_contact": False})),
+                (56, json.dumps({"type": "user", "contact": False, "mutual_contact": True})),
+            ],
+        )
     api = make_server(db, client=client)
     api.self_id = 42
     await api._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
@@ -213,6 +239,10 @@ async def test_list_contacts_reads_canonical_non_dialog_contact_without_rpc(  # 
                 "UPDATE entity_profile_semantic_snapshots SET coverage_json=json_remove(coverage_json, '$.\"user.mutual_contact\"') WHERE owner_account_id=42 AND entity_id=55"
             )
         unknown = await mcp_server.call_tool("list_contacts", {"limit": 1})
+        unknown_detail = await mcp_server.call_tool("get_entity_info", {"exact_entity_id": 55})
+        api.self_id = 43
+        await api._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 43, 2, 99))
+        other_account_detail = await mcp_server.call_tool("get_entity_info", {"exact_entity_id": 55})
     assert result.is_error is not True and second.is_error is not True and empty.is_error is not True
     payload = cast(dict[str, object], result.structured_content)
     items = cast(list[dict[str, object]], payload["items"])
@@ -233,7 +263,7 @@ async def test_list_contacts_reads_canonical_non_dialog_contact_without_rpc(  # 
     validate(payload, contacts_schema)
     validate(second_page, contacts_schema)
     validate(cast(dict[str, object], unknown.structured_content), contacts_schema)
-    assert cast(dict[str, object], payload["coverage"])["state"] == "unknown"
+    assert cast(dict[str, object], payload["coverage"])["state"] == "complete"
     assert cast(dict[str, object], empty.structured_content)["items"] == []
     assert detail.is_error is not True
     profile = cast(dict[str, object], detail.structured_content)
@@ -249,6 +279,21 @@ async def test_list_contacts_reads_canonical_non_dialog_contact_without_rpc(  # 
     assert cast(dict[str, object], nonmutual_relationships["contact"])["mutual_contact"] is False
     type_specific = cast(dict[str, object], profile["type_specific"])
     assert cast(dict[str, object], type_specific["relationship"])["contact"] is True
+    assert cast(dict[str, object], type_specific["relationship"])["mutual_contact"] is True
+    assert (
+        cast(dict[str, object], cast(dict[str, object], nonmutual["type_specific"])["relationship"])["mutual_contact"]
+        is False
+    )
+    unknown_profile = cast(dict[str, object], unknown_detail.structured_content)
+    other_profile = cast(dict[str, object], other_account_detail.structured_content)
+    other_relationship = cast(dict[str, object], cast(dict[str, object], other_profile["relationships"])["contact"])
+    assert "contact" not in other_relationship and "mutual_contact" not in other_relationship
+    assert "mutual_contact" not in cast(
+        dict[str, object], cast(dict[str, object], unknown_profile["relationships"])["contact"]
+    )
+    assert "mutual_contact" not in cast(
+        dict[str, object], cast(dict[str, object], unknown_profile["type_specific"])["relationship"]
+    )
     assert db.execute("SELECT 1 FROM dialogs WHERE dialog_id=55").fetchone() is None
     client.assert_not_called()
 

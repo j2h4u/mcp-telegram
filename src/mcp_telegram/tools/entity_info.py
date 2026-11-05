@@ -253,16 +253,34 @@ def _common_structured(data: dict, *, entity_id: int) -> dict[str, object]:
     }
 
 
+def _authoritative_profile_field(item: object, path: str) -> bool:
+    if not isinstance(item, dict) or item.get("path") != path:
+        return False
+    evidence = item.get("value")
+    return isinstance(evidence, dict) and evidence.get("authoritative") is True
+
+
+def _contact_relationship(data: dict) -> dict[str, object]:
+    semantic = data.get("semantic")
+    semantic = semantic if isinstance(semantic, dict) else {}
+    fields = semantic.get("fields")
+    fields = fields if isinstance(fields, dict) else {}
+    evidence = semantic.get("field_evidence")
+    evidence = evidence if isinstance(evidence, list) else []
+    result: dict[str, object] = {"close_friend": data.get("close_friend"), "blocked": data.get("blocked")}
+    for name in ("contact", "mutual_contact"):
+        path = f"user.{name}"
+        value = fields.get(path)
+        authoritative = any(_authoritative_profile_field(item, path) for item in evidence)
+        result[name] = value if authoritative and isinstance(value, bool) else None
+    return result
+
+
 def _relationships_structured(data: dict) -> dict[str, object]:
     contacts = data.get("contacts_subscribed")
     return {
         "membership": data.get("my_membership") or {},
-        "contact": {
-            "contact": data.get("contact"),
-            "mutual_contact": data.get("mutual_contact"),
-            "close_friend": data.get("close_friend"),
-            "blocked": data.get("blocked"),
-        },
+        "contact": _contact_relationship(data),
         "common_chats": data.get("common_chats") or [],
         "contacts_subscribed": {
             "items": contacts,
@@ -520,12 +538,7 @@ def _user_or_bot_structured(data: dict) -> dict[str, object]:
             "country": _phone_country(phone) if phone else None,
             "visibility": "visible_to_operator" if phone else "absent_or_hidden",
         },
-        "relationship": {
-            "contact": data.get("contact"),
-            "mutual_contact": data.get("mutual_contact"),
-            "close_friend": data.get("close_friend"),
-            "blocked": data.get("blocked"),
-        },
+        "relationship": _contact_relationship(data),
         "bot_info": _bot_info_structured(data.get("bot_info")),
         "business": _business_structured(data),
         "common_chats": data.get("common_chats") or [],
