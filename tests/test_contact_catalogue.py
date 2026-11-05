@@ -71,8 +71,9 @@ def test_contact_mutuality_uses_only_authoritative_boolean(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mutual", [True, False])
 async def test_complete_snapshot_keeps_contact_without_dialog_and_removes_only_membership(
-    tmp_path: Path, request: pytest.FixtureRequest
+    tmp_path: Path, request: pytest.FixtureRequest, mutual: bool
 ) -> None:
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
@@ -82,7 +83,13 @@ async def test_complete_snapshot_keeps_contact_without_dialog_and_removes_only_m
     cell = ScopeCell()
     cell.publish(TelegramAuthScope(1, 42, 2, 3))
     responses: list[object] = [
-        types.contacts.Contacts([types.Contact(55, False)], 1, [types.User(55, contact=True, first_name="Saved")]),
+        types.contacts.Contacts(
+            [types.Contact(55, mutual)],
+            1,
+            [types.User(55, contact=True, mutual_contact=not mutual, first_name="Saved")],
+        ),
+        types.contacts.Contacts([types.Contact(55, not mutual)], 1, [types.User(55, contact=True)]),
+        types.contacts.Contacts([types.Contact(55, cast(bool, 1))], 1, [types.User(55, contact=True)]),
         types.contacts.Contacts([], 0, []),
     ]
 
@@ -105,7 +112,7 @@ async def test_complete_snapshot_keeps_contact_without_dialog_and_removes_only_m
         {
             "entity_id": 55,
             "membership": True,
-            "mutual_contact": None,
+            "mutual_contact": mutual,
             "first_name": "Saved",
             "last_name": "",
             "expected_version": read_contact_command_state(reader, 42, 55)["expected_version"],
@@ -113,6 +120,16 @@ async def test_complete_snapshot_keeps_contact_without_dialog_and_removes_only_m
     ]
     assert reader.execute("SELECT 1 FROM dialogs WHERE dialog_id=55").fetchone() is None
     assert read_contacts(reader, 43, limit=10, after_entity_id=None)["items"] == []
+    revision = await writer.run(request_refresh)
+    assert (await refresher.refresh(expected_revision=revision)).accepted
+    assert cast(list[dict[str, object]], read_contacts(reader, 42, limit=10, after_entity_id=None)["items"])[0][
+        "mutual_contact"
+    ] is (not mutual)
+    revision = await writer.run(request_refresh)
+    assert (await refresher.refresh(expected_revision=revision)).accepted
+    assert cast(list[dict[str, object]], read_contacts(reader, 42, limit=10, after_entity_id=None)["items"])[0][
+        "mutual_contact"
+    ] is (not mutual)
     revision = await writer.run(request_refresh)
     assert (await refresher.refresh(expected_revision=revision)).accepted
     state = read_contact_command_state(reader, 42, 55)
@@ -254,6 +271,59 @@ async def test_stale_or_incomplete_reply_never_publishes(tmp_path: Path, interru
     }
     reader.close()
     await writer.aclose()
+
+
+async def test_newer_mutual_observation_wins_over_inflight_catalogue(tmp_path: Path) -> None:
+    from mcp_telegram.entity_profile.contracts import (
+        ProfileFieldClass,
+        ProfileFieldCoverage,
+        ProfileFieldObservation,
+        ProfileFieldState,
+        SuppliedProfileUser,
+    )
+    from mcp_telegram.entity_profile.repository import EntityProfileRepository
+    from mcp_telegram.observation_order import allocate_observation_order
+
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    writer = await SQLiteWriter.open(path)
+    reader = open_sync_db_reader(path)
+    cell = ScopeCell()
+    cell.publish(TelegramAuthScope(1, 42, 2, 3))
+
+    def request(conn: sqlite3.Connection) -> int:
+        with write_transaction(conn):
+            return request_contact_catalogue(conn, 42)
+
+    def publish_newer(conn: sqlite3.Connection) -> None:
+        with write_transaction(conn):
+            order = allocate_observation_order(conn)
+            conn.execute("INSERT INTO entities(id,type,updated_at) VALUES(55,'user',1)")
+            coverage = ProfileFieldCoverage(ProfileFieldClass.PRIVATE_FACT, ProfileFieldState.PRESENT, True)
+            EntityProfileRepository(conn, section_ttl_seconds=300).apply_supplied_user(
+                SuppliedProfileUser(
+                    55, {"user.mutual_contact": True}, {"user.mutual_contact": coverage}, {}, False, False
+                ),
+                observation=ProfileFieldObservation(42, order, 200, "update"),
+            )
+
+    class Client:
+        async def __call__(self, request: object) -> object:
+            del request
+            await writer.run(publish_newer)
+            return types.contacts.Contacts([types.Contact(55, False)], 1, [types.User(55)])
+
+    try:
+        revision = await writer.run(request)
+        refresher = ContactCatalogueRefresher(
+            Client(), reader, writer, capture_scope=cell.capture, claim_scope=cell.claim
+        )
+        assert (await refresher.refresh(expected_revision=revision)).accepted
+        items = cast(list[dict[str, object]], read_contacts(reader, 42, limit=10, after_entity_id=None)["items"])
+        assert items[0]["mutual_contact"] is True
+    finally:
+        reader.close()
+        await writer.aclose()
 
 
 def test_contact_only_profile_and_rename_preserve_public_identity(tmp_path: Path) -> None:
