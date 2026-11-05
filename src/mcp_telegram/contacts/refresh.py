@@ -64,7 +64,7 @@ class ContactCatalogueRefresher:
         normalized = _complete_contacts(response)
         if normalized is None:
             return ContactCatalogueRefreshResult(False)
-        ids, users = normalized
+        contacts, users = normalized
 
         def publish(conn: sqlite3.Connection) -> ContactCatalogueRefreshResult:
             with write_transaction(conn):
@@ -84,7 +84,7 @@ class ContactCatalogueRefresher:
                 _publish_catalogue(
                     conn,
                     profiles,
-                    ids,
+                    contacts,
                     users,
                     observation,
                     started_at,
@@ -102,20 +102,22 @@ class ContactCatalogueRefresher:
         return result
 
 
-def _complete_contacts(response: object) -> tuple[set[int], dict[int, types.User]] | None:
+def _complete_contacts(response: object) -> tuple[dict[int, object], dict[int, types.User]] | None:
     if not isinstance(response, types.contacts.Contacts):
         return None
     users = {user.id: user for user in response.users if isinstance(user, types.User) and not user.min}
-    ids = {contact.user_id for contact in response.contacts if isinstance(contact, types.Contact)}
-    if len(ids) != len(response.contacts) or not ids <= users.keys() or min(ids, default=1) <= 0:
+    contacts: dict[int, object] = {
+        contact.user_id: contact.mutual for contact in response.contacts if isinstance(contact, types.Contact)
+    }
+    if len(contacts) != len(response.contacts) or not contacts.keys() <= users.keys() or min(contacts, default=1) <= 0:
         return None
-    return ids, users
+    return contacts, users
 
 
 def _publish_catalogue(  # noqa: PLR0913, PLR0917 - one transaction and captured acquisition facts
     conn: sqlite3.Connection,
     profiles: EntityProfileRepository,
-    ids: set[int],
+    contacts: dict[int, object],
     users: dict[int, types.User],
     observation: ProfileFieldObservation,
     started_at: int,
@@ -129,11 +131,11 @@ def _publish_catalogue(  # noqa: PLR0913, PLR0917 - one transaction and captured
             (observation.owner_account_id,),
         ).fetchall(),
     )
-    for entity_id in ids:
-        _publish_contact(profiles, conn, users[entity_id], observation, started_at)
+    for entity_id, mutual in contacts.items():
+        _publish_contact(profiles, conn, (users[entity_id], mutual), observation, started_at)
         refine_unknown_for_observation(conn, observation.owner_account_id, entity_id, observation.order, guard)
     for (entity_id,) in previous:
-        if entity_id not in ids:
+        if entity_id not in contacts:
             _publish_membership(profiles, entity_id, False, observation, started_at)
 
 
@@ -155,10 +157,11 @@ def _publish_membership(
 def _publish_contact(
     profiles: EntityProfileRepository,
     conn: sqlite3.Connection,
-    user: types.User,
+    contact: tuple[types.User, object],
     observation: ProfileFieldObservation,
     started_at: int,
 ) -> None:
+    user, mutual = contact
     apply_partial_entity_identity(
         conn, user.id, PartialEntityIdentity(observed_at=observation.observed_at, observed_type="user")
     )
@@ -167,6 +170,8 @@ def _publish_contact(
         "owner.saved_contact_name": {"first_name": user.first_name or "", "last_name": user.last_name or ""},
         "owner.saved_contact_phone_access": bool(user.phone),
     }
+    if isinstance(mutual, bool):
+        fields["user.mutual_contact"] = mutual
     if user.phone:
         fields["user.phone"] = user.phone
     coverage = {
