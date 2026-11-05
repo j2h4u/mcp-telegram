@@ -56,6 +56,10 @@ LIST_CONTACTS_OUTPUT_SCHEMA: dict[str, object] = {
                 "properties": {
                     "entity_id": {"type": "integer"},
                     "membership": {"type": "boolean"},
+                    "mutual_contact": {
+                        "type": ["boolean", "null"],
+                        "description": "Whether the contact is mutual; omitted when unknown. False means not mutual.",
+                    },
                     "first_name": {"type": ["string", "null"], "description": "Untrusted Telegram content."},
                     "last_name": {"type": ["string", "null"], "description": "Untrusted Telegram content."},
                     "expected_version": {"type": ["string", "null"]},
