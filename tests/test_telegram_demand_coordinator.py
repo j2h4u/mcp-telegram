@@ -1,20 +1,32 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import closing
+from dataclasses import replace
+from pathlib import Path
 from typing import cast
 
 import pytest
 from telethon.tl import types
 
+from mcp_telegram.config import RuntimeObservationConfig
+from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
+from mcp_telegram.delta_sync import DeltaGapFillDemandAdapter, DeltaSyncWorker
+from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.message_history.contracts import ForwardGapPage
+from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator, work_references
+from mcp_telegram.runtime_observations import RuntimeObservationSink
 from mcp_telegram.scheduled_messages import (
     ScheduledDiscoveryDemandAdapter,
     ScheduledMessageReconciler,
     ScheduledReconciliationPolicy,
 )
+from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import _apply_migrations
 from mcp_telegram.telegram_demand import (
     DemandStatus,
@@ -43,6 +55,8 @@ from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcSource,
 )
 from sqlite_writer_helpers import inline_writer
+from tests.test_delta_sync import _ForwardPort, _message
+from tests.test_entity_profile_full_user_pair import _prepare
 
 
 class _Clock:
@@ -500,6 +514,122 @@ class _Adapter:
 def _adapters(statuses: Mapping[DemandKind, DemandStatus] | None = None) -> dict[DemandKind, _Adapter]:
     statuses = statuses or {}
     return {kind: _Adapter(kind, statuses.get(kind)) for kind in DURABLE_DEMAND_ORDER}
+
+
+@pytest.mark.parametrize("kind", [DemandKind.DELTA_GAP_FILL, DemandKind.ENTITY_PROFILE_REFRESH])
+@pytest.mark.parametrize("outcome_kind", list(SliceOutcomeKind))
+async def test_slice_receipt_only_claims_owner_committed_outcome(
+    kind: DemandKind, outcome_kind: SliceOutcomeKind
+) -> None:
+    class Recorder:
+        def __init__(self) -> None:
+            self.rows: list[dict[str, object]] = []
+
+        def record(self, **row: object) -> bool:
+            self.rows.append(row)
+            return True
+
+    recorder = Recorder()
+    observer = RpcAdmissionObservationAggregator(recorder, policy=RuntimeObservationConfig(), method_names=frozenset())
+    adapters = _adapters({kind: DemandStatus(0)})
+    adapter = adapters[kind]
+    adapter.outcome_kind = outcome_kind
+    coordinator = TelegramDemandCoordinator(adapters, clock=_Clock(), monotonic_clock=_Clock(), observer=observer)
+    await coordinator._execute_slice(kind)
+    row = next(row for row in recorder.rows if row.get("outcome") == "slice_receipt")
+    payload = cast(dict[str, object], row["payload"])
+    assert row["reason_code"] == outcome_kind.value
+    assert (payload["work_ref"], payload["selected_ref"]) == work_references(adapter.selected)
+    if outcome_kind in {SliceOutcomeKind.PROGRESSED, SliceOutcomeKind.TERMINAL}:
+        assert payload["committed_ref"] == work_references(WorkRevision(adapter.selected.key, "r1-committed"))[1]
+    else:
+        assert "committed_ref" not in payload
+
+
+async def test_retryable_receipt_joins_later_committed_revision() -> None:
+    class Recorder:
+        def __init__(self) -> None:
+            self.rows: list[dict[str, object]] = []
+
+        def record(self, **row: object) -> bool:
+            self.rows.append(row)
+            return True
+
+    recorder = Recorder()
+    observer = RpcAdmissionObservationAggregator(recorder, policy=RuntimeObservationConfig(), method_names=frozenset())
+    kind = DemandKind.DELTA_GAP_FILL
+    adapters = _adapters({kind: DemandStatus(0)})
+    adapter = adapters[kind]
+    adapter.outcome_kind = SliceOutcomeKind.RETRYABLE_FAILURE
+    clock = _Clock(100)
+    coordinator = TelegramDemandCoordinator(adapters, clock=clock, monotonic_clock=clock, observer=observer)
+    await coordinator._execute_slice(kind)
+    adapter.outcome_kind = SliceOutcomeKind.PROGRESSED
+    clock.value = 130
+    coordinator.scan()
+    await coordinator._execute_slice(kind)
+    rows = [row for row in recorder.rows if row.get("outcome") == "slice_receipt"]
+    assert [row["reason_code"] for row in rows] == ["retryable_failure", "progressed"]
+    first, second = (cast(dict[str, object], row["payload"]) for row in rows)
+    assert first["work_ref"] == second["work_ref"] and first["selected_ref"] == second["selected_ref"]
+    assert first["retry_not_before_monotonic"] == 130
+    assert "committed_ref" not in first and "committed_ref" in second
+
+
+@pytest.mark.parametrize("kind", [DemandKind.DELTA_GAP_FILL, DemandKind.ENTITY_PROFILE_REFRESH])
+async def test_slice_receipt_matches_real_sqlite_owner_commit_after_reopen(tmp_path: Path, kind: DemandKind) -> None:
+    path = tmp_path / "owner.db"
+    conn, raw_service = _prepare(path, migrated=True)
+    service = cast(DaemonEntityInfoService, raw_service)
+    writer = await SQLiteWriter.open(path)
+    sink = RuntimeObservationSink(path, writer=writer, retention_ttl_seconds=3600, policy=RuntimeObservationConfig())
+    observer = RpcAdmissionObservationAggregator(sink, policy=RuntimeObservationConfig(), method_names=frozenset())
+    adapters: dict[DemandKind, DurableDemandAdapter] = dict(_adapters())
+    if kind is DemandKind.DELTA_GAP_FILL:
+        conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
+        conn.commit()
+        conn.execute("INSERT INTO synced_dialogs(dialog_id,status,delta_refresh_requested_at) VALUES(77,'synced',1)")
+        conn.execute("INSERT INTO full_history_enrollment VALUES(77,1,1)")
+        conn.commit()
+        port = _ForwardPort([ForwardGapPage((_message(77, 11),), complete=True)])
+        adapters[kind] = DeltaGapFillDemandAdapter(
+            DeltaSyncWorker(port, conn, asyncio.Event(), writer=writer), account_id=123
+        )
+    else:
+        service._deps = replace(service._deps, writer=writer)
+        refresh = service.refresh_coordinator
+        assert refresh is not None
+        adapters[kind] = EntityProfileDemandAdapter(refresh)
+    coordinator = TelegramDemandCoordinator(adapters, clock=_Clock(1000), observer=observer)
+    selected = adapters[kind].status(1000)
+    assert selected is not None and selected.selected is not None
+    try:
+        await coordinator._execute_slice(kind)
+    finally:
+        await sink.aclose()
+        await service.shutdown()
+        await writer.aclose()
+        conn.close()
+    with closing(sqlite3.connect(path)) as reopened:
+        row = cast(
+            tuple[str, str] | None,
+            reopened.execute(
+                "SELECT reason_code,payload_json FROM runtime_observations WHERE kind='telegram.demand' AND outcome='slice_receipt'"
+            ).fetchone(),
+        )
+        assert row is not None
+        payload = cast(dict[str, object], json.loads(row[1]))
+        assert row[0] in {"progressed", "terminal"}
+        assert (payload["work_ref"], payload["selected_ref"]) == work_references(selected.selected)
+        assert payload["committed_ref"] != payload["selected_ref"]
+        if kind is DemandKind.DELTA_GAP_FILL:
+            assert reopened.execute(
+                "SELECT count(*) FROM messages WHERE dialog_id=77 AND message_id=11"
+            ).fetchone() == (1,)
+        else:
+            assert reopened.execute(
+                "SELECT status FROM entity_detail_sections WHERE entity_id=42 AND section='full_profile'"
+            ).fetchone() == ("fresh",)
 
 
 @pytest.mark.parametrize("outcome_kind", list(SliceOutcomeKind))

@@ -32,7 +32,7 @@ from .image_authorization import ScopeToken
 from .native_write_fence import FolderWriteRejected, NoteWriteRejected
 from .peer_access import PeerAccessRejectedError
 from .scheduled_write_fence import ScheduledWriteRejected
-from .telegram_rpc_scheduler import RpcAdmissionExpiredError, RpcAdmissionSaturatedError, TelegramRpcScope
+from .telegram_rpc_scheduler import ResendCause, RpcAdmissionExpiredError, RpcAdmissionSaturatedError, TelegramRpcScope
 
 type ProtocolOrigin = Literal["ack", "ping", "state_info", "auth"]
 
@@ -73,6 +73,8 @@ class TransportAuthority(Protocol):
     def claim_write(self, owner: object, permit: object) -> bool: ...
 
     def observe_write_return(self, owner: object) -> None: ...
+
+    def observe_enqueue(self, owner: object, cause: ResendCause, code: int | None) -> None: ...
 
     def defer_write(self, owner: object, permit: object) -> None: ...
 
@@ -157,7 +159,8 @@ class _OwnedPacker(MessagePacker):
                     self._sender._ack_retry_blocked = False
                     self._ready.set()
                 return
-        self._sender.require_owned(state)
+        owned = self._sender.require_owned(state)
+        self._sender._observe_enqueue(owned)
         self._sender._ack_retry_blocked = False
         super().append(state)
 
@@ -286,6 +289,44 @@ class GuardedMTProtoSender(MTProtoSender):
         self._control_origin: ContextVar[tuple[asyncio.Task[object] | None, ProtocolOrigin] | None] = ContextVar(
             "telegram_protocol_origin", default=None
         )
+        self._resend_origin: ContextVar[tuple[asyncio.Task[object] | None, ResendCause, int | None] | None] = (
+            ContextVar("telegram_resend_origin", default=None)
+        )
+
+    def _observe_enqueue(self, owned: _OwnedState, cause: ResendCause | None = None) -> None:
+        origin = self._resend_origin.get()
+        if cause is None and origin is not None and origin[0] is asyncio.current_task():
+            cause, code = origin[1], origin[2]
+        else:
+            code = None
+        cause = cause or (ResendCause.UNATTRIBUTED_REPLAY if owned.claims else ResendCause.INITIAL)
+        try:
+            self._authority.observe_enqueue(owned.owner, cause, code)
+        except Exception:  # noqa: BLE001 - observations cannot affect queue ownership
+            pass
+
+    async def _handle_bad_server_salt(self, message: TLMessage) -> None:
+        token = self._resend_origin.set((asyncio.current_task(), ResendCause.BAD_SERVER_SALT, None))
+        try:
+            await super()._handle_bad_server_salt(message)
+        finally:
+            self._resend_origin.reset(token)
+
+    async def _handle_bad_notification(self, message: TLMessage) -> None:
+        raw_code = getattr(message.obj, "error_code", None)
+        code = raw_code if type(raw_code) is int and raw_code in {16, 17, 32, 33} else None
+        token = self._resend_origin.set((asyncio.current_task(), ResendCause.BAD_MSG_NOTIFICATION, code))
+        try:
+            await super()._handle_bad_notification(message)
+        finally:
+            self._resend_origin.reset(token)
+
+    async def _reconnect(self, last_error: BaseException | None) -> None:
+        token = self._resend_origin.set((asyncio.current_task(), ResendCause.RECONNECT, None))
+        try:
+            await super()._reconnect(last_error)
+        finally:
+            self._resend_origin.reset(token)
 
     @property
     def write_generation(self) -> int:
@@ -609,7 +650,11 @@ class GuardedMTProtoSender(MTProtoSender):
             if packet.state.origin == "auth":
                 self._offer_state(packet.state.state)
             else:
-                self._send_queue.append(packet.state.state)
+                token = self._resend_origin.set((asyncio.current_task(), ResendCause.LOCAL_DEFER, None))
+                try:
+                    self._send_queue.append(packet.state.state)
+                finally:
+                    self._resend_origin.reset(token)
 
     def write_packet(self, packet: _OwnedPacket, write: Callable[[bytes], None]) -> bool:
         owned = packet.state

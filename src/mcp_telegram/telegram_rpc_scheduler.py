@@ -157,6 +157,42 @@ class TelegramRpcScope:
     transport_bootstrap: bool = False
     transport_auth: bool = False
     response_timeout_seconds: float | None = None
+    diagnostic_retry_cause: ResendCause | None = None
+
+
+class ResendCause(StrEnum):
+    INITIAL = "initial"
+    BAD_SERVER_SALT = "bad_server_salt"
+    BAD_MSG_NOTIFICATION = "bad_msg_notification"
+    RECONNECT = "reconnect"
+    LOCAL_DEFER = "local_defer"
+    GATEWAY_TRANSIENT = "gateway_transient"
+    GATEWAY_DC_RETRY = "gateway_dc_retry"
+    UNATTRIBUTED_REPLAY = "unattributed_replay"
+
+
+class BudgetRejectionBoundary(StrEnum):
+    NEW_APPLICATION = "new_application_before_owner"
+    OWNER_PREPARE = "existing_owner_prepare"
+    OWNER_CLAIM = "existing_owner_claim"
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetRejection:
+    scope: TelegramRpcScope
+    method: str | None
+    boundary: BudgetRejectionBoundary
+    enqueue_trace: tuple[tuple[ResendCause, int | None], ...]
+    enqueue_truncated: int
+    claimed_count: int
+    first_claimed_at_ms: int | None
+    owner_attempt_id: str | None
+    attempted_ordinal: int
+    budget_limit: int
+    budget_used: int
+    budget_remaining: int
+    write_returned: bool
+    last_method: str | None
 
 
 @dataclass(frozen=True, slots=True)

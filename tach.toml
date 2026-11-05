@@ -313,7 +313,7 @@ depends_on = ["mcp_telegram.image_authorization", "mcp_telegram.telegram_demand"
 [[modules]]
 path = "mcp_telegram.rpc_admission_observations"
 layer = "application"
-depends_on = ["mcp_telegram.message_delivery_observations", "mcp_telegram.flood", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
+depends_on = ["mcp_telegram.message_delivery_observations", "mcp_telegram.flood", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_demand_progress", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
 [[modules]]
 path = "mcp_telegram.activity_contracts"
 layer = "foundation"
