@@ -141,6 +141,9 @@ class _Authority:
             self.floor = True
             self.generation += 1
 
+    def observe_shutdown_cancel(self, owner: object) -> None:
+        del owner
+
     def observe_response_now(self, owner: object) -> None:
         del owner
 

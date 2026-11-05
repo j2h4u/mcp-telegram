@@ -64,6 +64,22 @@ def test_bounded_staging_and_ack(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ring.counters()["serialization_failures"] == 1
 
 
+def test_staged_unacknowledged_entries_do_not_expire_with_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = [1_000_000_000]
+    monkeypatch.setattr(module.time, "time_ns", lambda: clock[0])
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0] / 1_000_000_000)
+    ring = TelegramUpdateRing()
+    ring.capture(_envelope(), source="push")
+    clock[0] += 1_801_000_000_000
+    ring.capture(_envelope(), source="push")
+    first = ring.peek_batch(max_count=1, max_bytes=module.MAX_ENTRY_BYTES)
+    assert [record.sequence for record in first] == [1]
+    clock[0] += 1_801_000_000_000
+    ring.capture(_envelope(), source="push")
+    ring.ack_batch(first)
+    assert [record.sequence for record in _records(ring)] == [2, 3]
+
+
 async def test_sender_captures_push_rpc_and_library_synthetic(wire: object) -> None:
     from tests.test_telegram_rpc_wire_integration import _WireHarness
 
@@ -115,6 +131,43 @@ async def test_existing_observation_owner_flushes_decoded_envelope(tmp_path: Pat
                 "SELECT value FROM daemon_state WHERE key='raw_telegram_updates.run_open'"
             ).fetchone() == ("0",)
     finally:
+        await writer.aclose()
+
+
+async def test_idle_update_staging_does_not_schedule_periodic_sqlite_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mcp_telegram import runtime_observations
+    from mcp_telegram.config import RuntimeObservationConfig
+    from mcp_telegram.runtime_observations import RuntimeObservationSink
+    from mcp_telegram.sqlite_writer import SQLiteWriter
+    from mcp_telegram.sync_db import ensure_sync_schema
+
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    writer = await SQLiteWriter.open(path)
+    sink = RuntimeObservationSink(path, writer=writer, retention_ttl_seconds=3600, policy=RuntimeObservationConfig())
+    ring = TelegramUpdateRing()
+    sink.attach_update_ring(ring)
+    try:
+        ring.request_verified_account(42)
+        await sink._update_ring_lifecycle()
+        await sink._flush_updates()
+
+        calls: list[bool] = []
+
+        async def unexpected_write(*_args: object, **_kwargs: object) -> bool:
+            calls.append(True)
+            return False
+
+        with monkeypatch.context() as patch:
+            monotonic = runtime_observations.time.monotonic
+            patch.setattr(runtime_observations.time, "monotonic", lambda: monotonic() + 120)
+            patch.setattr(writer, "run", unexpected_write)
+            assert not await sink._flush_updates()
+            assert calls == []
+    finally:
+        await sink.aclose()
         await writer.aclose()
 
 

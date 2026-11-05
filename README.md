@@ -449,7 +449,8 @@ remind agents to treat Telegram-originated fields as untrusted content.
 
 ## Operator Commands
 
-Recent decoded Telegram updates are retained in `sync.db` for up to 15 minutes and 64 MiB of logical payload. Capture
+Decoded Telegram updates are retained in `sync.db` until the 64 MiB logical payload or 65,536 row limit is reached;
+the oldest whole records are then evicted. Age alone does not remove records. Capture
 uses bounded in-memory staging and the existing background SQLite writer; interrupted staging, size limits and
 serialization failures can leave gaps. The `source` column distinguishes pushed, recovered, replayed and other
 library-generated updates. The records can contain private Telegram data.
@@ -460,9 +461,8 @@ To inspect the configured state database without writing to it, substitute its d
 sqlite3 -readonly "$STATE_DIR/sync.db" <<'SQL'
   SELECT observed_at_ms, source, constructor, json_extract(payload_json, '$.user_id') AS user_id
   FROM raw_telegram_updates
-  WHERE observed_at_ms >= CAST(strftime('%s', 'now', '-15 minutes') AS INTEGER) * 1000
-    AND constructor LIKE 'Update%'
-  ORDER BY observed_at_ms, id LIMIT 100;
+  WHERE constructor LIKE 'Update%'
+  ORDER BY observed_at_ms DESC, id DESC LIMIT 100;
 SQL
 ```
 

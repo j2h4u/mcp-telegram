@@ -7,7 +7,6 @@ from typing import cast
 
 from .sync_transactions import write_transaction
 
-RETENTION_SECONDS = 900
 MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
 MAX_ROWS = 65_536
 MAX_ENTRY_BYTES = 4 * 1024 * 1024
@@ -106,12 +105,8 @@ def _add_evictions(conn: sqlite3.Connection, name: str, count: int) -> None:
         _set_state(conn, name, int(_state(conn, name) or 0) + count)
 
 
-def _prune(conn: sqlite3.Connection, now_ms: int, *, capacity_changed: bool) -> None:
-    aged = conn.execute(
-        "DELETE FROM raw_telegram_updates WHERE observed_at_ms<=?", (now_ms - RETENTION_SECONDS * 1000,)
-    ).rowcount
-    _add_evictions(conn, "db_evicted_age", aged)
-    if not capacity_changed:
+def _prune_capacity(conn: sqlite3.Connection, inserted_count: int) -> None:
+    if inserted_count <= 0:
         return
     count, size = cast(
         tuple[int, int],
@@ -170,7 +165,7 @@ def write_update_batch(  # noqa: PLR0913 - explicit batch and lifecycle boundari
                 for r in records
             ),
         )
-        _prune(conn, now_ms, capacity_changed=inserted.rowcount > 0)
+        _prune_capacity(conn, inserted.rowcount)
         for key, value in counters.items():
             if key in {"pending_records", "pending_bytes"}:
                 _set_state(conn, key, value)

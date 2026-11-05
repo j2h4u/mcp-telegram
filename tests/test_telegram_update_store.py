@@ -65,7 +65,7 @@ def test_upgrade_and_persistent_json_account_fences(tmp_path: Path, monkeypatch:
         assert store.bind_verified_account(conn, 43) == (3, False)
 
 
-def test_prunes_oldest_whole_rows_by_time_bytes_and_count(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_prunes_oldest_whole_rows_by_bytes_and_count(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "sync.db"
     sync_db.ensure_sync_schema(path)
     monkeypatch.setattr(store, "MAX_ROWS", 2)
@@ -84,11 +84,8 @@ def test_prunes_oldest_whole_rows_by_time_bytes_and_count(tmp_path: Path, monkey
         )
         assert conn.execute("SELECT sequence FROM raw_telegram_updates ORDER BY sequence").fetchall() == [(3,), (4,)]
         assert conn.execute(
-            "SELECT value FROM daemon_state WHERE key='raw_telegram_updates.db_evicted_age'"
-        ).fetchone() == ("1",)
-        assert conn.execute(
             "SELECT value FROM daemon_state WHERE key='raw_telegram_updates.db_evicted_capacity'"
-        ).fetchone() == ("1",)
+        ).fetchone() == ("2",)
         monkeypatch.setattr(store, "MAX_PAYLOAD_BYTES", 5)
         assert store.write_update_batch(
             conn,
@@ -105,8 +102,37 @@ def test_prunes_oldest_whole_rows_by_time_bytes_and_count(tmp_path: Path, monkey
             conn, [], now_ms=1_900_002, counters={}, runtime_id="one", expected_generation=generation
         )
         conn.set_trace_callback(None)
-        assert conn.execute("SELECT count(*) FROM raw_telegram_updates").fetchone() == (0,)
+        assert conn.execute("SELECT sequence FROM raw_telegram_updates").fetchall() == [(5,)]
         assert not any("SELECT count(*),COALESCE(sum(payload_bytes)" in sql for sql in statements)
+
+
+def test_old_rows_survive_idle_flush_new_write_and_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "retained.db"
+    sync_db.ensure_sync_schema(path)
+    with closing(sqlite3.connect(path)) as conn:
+        generation, _ = store.bind_verified_account(conn, 42)
+        assert store.begin_update_run(conn, runtime_id="one", expected_generation=generation)
+        assert store.write_update_batch(
+            conn,
+            [_record(1, 1_000, "old")],
+            now_ms=1_000,
+            counters={},
+            runtime_id="one",
+            expected_generation=generation,
+        )
+        assert store.write_update_batch(
+            conn, [], now_ms=1_801_000, counters={}, runtime_id="one", expected_generation=generation
+        )
+        assert store.write_update_batch(
+            conn,
+            [_record(2, 1_801_000, "new")],
+            now_ms=1_801_000,
+            counters={},
+            runtime_id="one",
+            expected_generation=generation,
+        )
+    with closing(sqlite3.connect(path)) as conn:
+        assert conn.execute("SELECT sequence FROM raw_telegram_updates ORDER BY sequence").fetchall() == [(1,), (2,)]
 
 
 def test_failed_batch_rolls_back_rows_and_metadata_then_retries(tmp_path: Path) -> None:

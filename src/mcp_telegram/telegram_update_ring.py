@@ -12,7 +12,7 @@ from datetime import datetime
 
 from telethon.tl.tlobject import TLObject
 
-from .telegram_update_store import RETENTION_SECONDS, UpdateRecord
+from .telegram_update_store import UpdateRecord
 
 MAX_RETAINED_BYTES = 64 * 1024 * 1024
 MAX_ENTRY_BYTES = 4 * 1024 * 1024
@@ -31,7 +31,6 @@ def _json_value(value: object) -> str:
 @dataclass(slots=True)
 class _Entry:
     sequence: int
-    monotonic_at: float
     observed_at_ms: int
     source: str
     constructor: str
@@ -58,7 +57,6 @@ class TelegramUpdateRing:
         self.logout_serial = 0
         self.completed_logout_serial = 0
         self._counters = {
-            "evicted_age": 0,
             "evicted_capacity": 0,
             "rejected_oversize": 0,
             "serialization_failures": 0,
@@ -101,13 +99,6 @@ class TelegramUpdateRing:
 
     def capture(self, item: object, *, source: str) -> int:
         """Capture a complete TL value; failures are counted and isolated."""
-        now = time.monotonic()
-        while (
-            self._entries
-            and self._entries[0].sequence > self._inflight_through
-            and now - self._entries[0].monotonic_at >= RETENTION_SECONDS
-        ):
-            self._drop_oldest("evicted_age")
         self._sequence += 1
         try:
             if not isinstance(item, TLObject):
@@ -123,7 +114,7 @@ class TelegramUpdateRing:
         if not self._make_room(size):
             return self._sequence
         self._entries.append(
-            _Entry(self._sequence, now, time.time_ns() // 1_000_000, source, type(item).__name__, payload, size)
+            _Entry(self._sequence, time.time_ns() // 1_000_000, source, type(item).__name__, payload, size)
         )
         self._bytes += size
         return self._sequence

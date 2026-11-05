@@ -293,12 +293,6 @@ def test_runtime_observation_config_rejects_blocking_writer_timeout() -> None:
         RuntimeObservationConfig(writer_busy_timeout_ms=51)
 
 
-@pytest.mark.parametrize("value", [0.0, -1.0, float("inf"), float("nan")])
-def test_runtime_observation_config_rejects_invalid_raw_update_prune_interval(value: float) -> None:
-    with pytest.raises(ValueError, match="durations must be finite and positive"):
-        RuntimeObservationConfig(raw_update_prune_interval_seconds=value)
-
-
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
 def test_load_config_rejects_non_finite_positive_float(tmp_path: Path, value: str) -> None:
     path = _write_config(
@@ -359,7 +353,6 @@ writer_startup_wait_seconds = 1.5
 shutdown_drain_grace_seconds = 2.5
 row_cap = 250001
 rpc_summary_interval_seconds = 301
-raw_update_prune_interval_seconds = 61.5
 
 [flood_wait]
 kill_switch_enabled = true
@@ -428,7 +421,6 @@ daemon_api_slow_request_seconds = 2.5
             shutdown_drain_grace_seconds=2.5,
             row_cap=250001,
             rpc_summary_interval_seconds=301.0,
-            raw_update_prune_interval_seconds=61.5,
         ),
     )
     assert config.flood_wait == FloodWaitConfig(
