@@ -12,7 +12,7 @@ from telethon import types
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.sqlite_writer import SQLiteWriter
-from mcp_telegram.telegram_demand import RpcAttemptBudget
+from mcp_telegram.telegram_demand import RpcAttemptBudget, RpcReadTimeoutError
 from mcp_telegram.telegram_gateway import TelethonUserProfileGateway
 from tests.test_entity_profile_full_user_pair import _pair_service, _PairClient, _prepare
 from tests.test_profile_slice_deadline import _prepare_self
@@ -22,7 +22,7 @@ from tests.test_telegram_rpc_wire_integration import wire as wire
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("response", ["success", "timeout"])
-async def test_profile_waits_for_physical_claim_then_commits_self_pair(
+async def test_profile_waits_for_physical_claim_then_commits_self_pair(  # noqa: PLR0914, PLR0915 - one sender lifecycle
     tmp_path: Path, wire: _WireHarness, response: str
 ) -> None:
     gate, sender, connection, sink = wire
@@ -48,8 +48,10 @@ async def test_profile_waits_for_physical_claim_then_commits_self_pair(
     refresh._limits = service._deps.refresh_limits
     status = EntityProfileDemandAdapter(refresh).status(100)
     assert status is not None and status.selected is not None
+    adapter = EntityProfileDemandAdapter(refresh)
+    last_known_profile = service._profiles.read(42, now=100)
     budget = RpcAttemptBudget(limit=1, selected=status.selected)
-    task = asyncio.create_task(EntityProfileDemandAdapter(refresh).run_slice(budget))
+    task = asyncio.create_task(adapter.run_slice(budget))
     try:
         state = await asyncio.wait_for(sender._send_queue.next_state(), 2)
         await asyncio.sleep(0.06)
@@ -57,15 +59,25 @@ async def test_profile_waits_for_physical_claim_then_commits_self_pair(
         assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() != (
             "failed",
         )
+        refresh_before_claim = service._profiles.refresh_state(42, now=100)
         await sender._prepare_state(state)
+        owner = gate._require_wire_owner(sender.require_owned(state).owner)
         assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
         if response == "timeout":
-            result = await asyncio.wait_for(task, 2)
-            assert result.kind.value == "retryable_failure"
+            with pytest.raises(RpcReadTimeoutError):
+                await asyncio.wait_for(task, 2)
             assert budget.attempts == 1
-            assert conn.execute(
-                "SELECT status,reason FROM entity_profile_refresh_state WHERE entity_id=42"
-            ).fetchone() == ("failed", "timeouterror")
+            assert len(sink.frames) == 1
+            assert state not in sender._owned_states and state.msg_id not in sender._pending_state
+            assert state not in sender._send_queue._deque
+            ledger = gate._ensure_safety_ledger()
+            intent = cast(dict[str, dict[str, object]], ledger._record["intents"])[owner.attempt_id]
+            assert cast(dict[str, object], intent["read_retry"])["reason"] == "sender_timeout"
+            assert gate.rpc_eligibility(owner.method) is not None and gate.account_safety_status() is None
+            assert service._profiles.refresh_state(42, now=100) == refresh_before_claim
+            assert service._profiles.read(42, now=100) == last_known_profile
+            retry_status = adapter.status(100)
+            assert retry_status is not None and retry_status.selected == status.selected
             return
         state.future.set_result(
             SimpleNamespace(
