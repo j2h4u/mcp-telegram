@@ -614,7 +614,11 @@ async def test_failed_peer_does_not_starve_ready_peer_after_adapter_restart(
     adapter = DeltaGapFillDemandAdapter(worker, account_id=123)
     first_budget = _selected_budget(adapter)
     assert first_budget.selected is not None
-    await adapter.run_slice(first_budget)
+    if failure is TimeoutError:
+        with pytest.raises(TimeoutError):
+            await adapter.run_slice(first_budget)
+    else:
+        await adapter.run_slice(first_budget)
     await adapter.run_slice(_selected_budget(adapter, excluded=frozenset({first_budget.selected})))
     assert calls == [1, 2]
     assert sync_db.execute("SELECT delta_retry_at FROM synced_dialogs WHERE dialog_id=1").fetchone()[0] is None

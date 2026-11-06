@@ -51,7 +51,7 @@ from .own_only import enroll_own_only_sync_dialog
 from .sqlite_writer import SQLiteWriter
 from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
-from .telegram_demand import RpcAttemptBudgetExhaustedError
+from .telegram_demand import RpcAttemptBudgetExhaustedError, RpcReadTimeoutError
 from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcMethodRecoveryPending, TelegramRpcSource
 from .telethon_dialog import observe_referenced_dialog_identities, observe_response_dialog_identity
 
@@ -189,7 +189,7 @@ async def _resolve_peer_for_sweep(request: PeerSweepRequest) -> TypeInputPeer | 
     """Resolve one peer while preserving the governed-RPC error boundary."""
     try:
         return await resolve_input_peer(request.client, request.dialog_id)
-    except RpcAttemptBudgetExhaustedError:
+    except RpcAttemptBudgetExhaustedError, RpcReadTimeoutError:
         # A slice boundary is a continuation point, not an access failure.
         # Leave the owning tier's cursor/lease untouched so the next slice can
         # retry the same peer with a fresh budget.
@@ -385,7 +385,7 @@ async def _search_self_messages(
         raise
     except TelegramRpcMethodRecoveryPending:
         raise
-    except RpcAttemptBudgetExhaustedError:
+    except RpcAttemptBudgetExhaustedError, RpcReadTimeoutError:
         # Do not turn a local slice bound into ACCESS_SKIP.  The caller owns
         # durable continuation and will retry this page in the next slice.
         raise

@@ -10,7 +10,7 @@ from telethon.tl.functions.messages import GetOutboxReadDateRequest, GetPeerDial
 from telethon.tl.types import TypeInputPeer
 
 from .flood import TelegramRpcThrottled, _raise_if_latched
-from .telegram_demand import AcquisitionKind, RpcAttemptBudgetExhaustedError
+from .telegram_demand import AcquisitionKind, RpcAttemptBudgetExhaustedError, RpcReadTimeoutError
 from .telegram_gateway import CATCHABLE_GATEWAY_FAILURES, translate_gateway_failure
 from .telegram_reading import (
     GatewayFailure,
@@ -151,7 +151,7 @@ class TelethonTelegramReadReceiptGateway:
                     status="complete",
                     reason=ReadDateReason.RESOLVED,
                 )
-            except RpcAdmissionClosedError, RpcAttemptBudgetExhaustedError:
+            except RpcAdmissionClosedError, RpcAttemptBudgetExhaustedError, RpcReadTimeoutError:
                 raise
             except CATCHABLE_GATEWAY_FAILURES as exc:
                 return classify_read_date_exception(exc)

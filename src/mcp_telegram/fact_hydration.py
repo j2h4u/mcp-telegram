@@ -45,6 +45,7 @@ from .telegram_demand import (
     DurableDemandAdapter,
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
+    RpcReadTimeoutError,
     UnclassifiedTelegramDemandError,
     current_demand_token,
     durable_demand_context,
@@ -696,6 +697,7 @@ class MessageFactHydrationWorker:
                 TelegramRpcAdmissionDeferred,
                 TelegramRpcMethodRecoveryPending,
                 RpcAttemptBudgetExhaustedError,
+                RpcReadTimeoutError,
                 RpcAdmissionSaturatedError,
                 RpcAdmissionExpiredError,
             ),
@@ -933,7 +935,8 @@ class MessageFactHydrationWorker:
         | RpcAdmissionExpiredError
         | TelegramRpcAdmissionDeferred
         | TelegramRpcMethodRecoveryPending
-        | RpcAttemptBudgetExhaustedError,
+        | RpcAttemptBudgetExhaustedError
+        | RpcReadTimeoutError,
         effective_now: int,
         *,
         observation_order: int | None = None,
@@ -963,7 +966,12 @@ class MessageFactHydrationWorker:
             deferred_error=exc
             if isinstance(
                 exc,
-                (RpcAdmissionSaturatedError, TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending),
+                (
+                    RpcAdmissionSaturatedError,
+                    TelegramRpcAdmissionDeferred,
+                    TelegramRpcMethodRecoveryPending,
+                    RpcReadTimeoutError,
+                ),
             )
             else None,
         )

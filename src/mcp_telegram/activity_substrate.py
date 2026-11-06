@@ -31,13 +31,7 @@ class ActivityClient(ActivityRpcClient, Protocol):
 
 
 async def call_with_timeout(client: ActivityRpcClient, request: object, *, timeout_s: float) -> object:
-    """Invoke a Telegram RPC with a hard deadline and abandon on overrun.
-
-    ``asyncio.wait_for`` awaits the wrapped task after cancellation.  Activity
-    workers must return promptly when that task wedges, so use ``asyncio.wait``
-    and explicitly cancel the pending task instead.  Completed tasks propagate
-    their original exception through ``task.result()``.
-    """
+    """Pass the finite deadline to the gateway and retain its response drain."""
     # A plain create_task() copies the caller token but leaves the caller as its
     # owner, which the gate correctly rejects. Transfer the complete token so a
     # timed-out activity call keeps its exact root and nested acquisition.
@@ -52,15 +46,11 @@ async def call_with_timeout(client: ActivityRpcClient, request: object, *, timeo
         attempt_budget=attempt_budget,
     )
     try:
-        done, _pending = await asyncio.wait({task}, timeout=timeout_s)
+        await asyncio.wait({task})
     except asyncio.CancelledError:
         task.cancel()
         task.add_done_callback(_consume_cancelled_task)
         raise
-    if not done:
-        task.cancel()
-        task.add_done_callback(_consume_cancelled_task)
-        raise TimeoutError(f"RPC exceeded {timeout_s}s deadline")
     return task.result()
 
 

@@ -30,6 +30,7 @@ from ..telegram_demand import (
     AcquisitionKind,
     MissingTelegramDemandContextError,
     RpcAttemptBudgetExhaustedError,
+    RpcReadTimeoutError,
     acquisition_context,
     current_demand_token,
 )
@@ -426,15 +427,12 @@ async def _resolve_peer_name(client: PeerNameClient, peer: _PeerLike) -> str | N
     try:
         with _forward_name_context():
             entity = await client.get_entity(peer)
-        title = _attr(entity, "title", None)
-        name = title or _attr(entity, "first_name", None) or ""
-        last = _attr(entity, "last_name", None)
-        if last:
-            name = f"{name} {last}".strip()
-        return name or None
+        return _resolved_peer_name(entity)
     except PeerFloodError:
         logger.warning("resolve_peer_name_peer_flood peer_id=%d", log_id)
         return None
+    except RpcReadTimeoutError:
+        raise
     except RpcAttemptBudgetExhaustedError:
         logger.debug("resolve_peer_name_budget_exhausted peer_id=%d", log_id)
         return None
@@ -461,6 +459,15 @@ async def _resolve_peer_name(client: PeerNameClient, peer: _PeerLike) -> str | N
     except Exception:
         logger.warning("resolve_peer_name_unexpected peer_id=%d", log_id, exc_info=True)
         return None
+
+
+def _resolved_peer_name(entity: object) -> str | None:
+    title = _attr(entity, "title", None)
+    name = title or _attr(entity, "first_name", None) or ""
+    last = _attr(entity, "last_name", None)
+    if last:
+        name = f"{name} {last}".strip()
+    return name or None
 
 
 def _extract_sent_at(msg: object) -> int:

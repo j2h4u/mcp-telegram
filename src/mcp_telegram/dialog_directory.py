@@ -56,6 +56,7 @@ from .telegram_demand import (
     DemandStatus,
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
+    RpcReadTimeoutError,
     acquisition_context,
     durable_demand_context,
 )
@@ -412,6 +413,7 @@ class CanonicalDialogDirectory:
                 TelegramRpcThrottled,
                 TelegramRpcAdmissionDeferred,
                 RpcAttemptBudgetExhaustedError,
+                RpcReadTimeoutError,
                 RpcAdmissionClosedError,
                 asyncio.CancelledError,
             ),

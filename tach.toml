@@ -523,7 +523,7 @@ depends_on = ["mcp_telegram.config", "mcp_telegram.telegram", "mcp_telegram.tele
 [[modules]]
 path = "mcp_telegram.telegram_transport"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.image_authorization", "mcp_telegram.native_write_fence", "mcp_telegram.peer_access", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.scheduled_write_fence"]
+depends_on = ["mcp_telegram.telegram_demand", "mcp_telegram.image_authorization", "mcp_telegram.native_write_fence", "mcp_telegram.peer_access", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.scheduled_write_fence"]
 
 [[modules]]
 path = "mcp_telegram.telegram_rpc"
@@ -604,7 +604,7 @@ depends_on = ["mcp_telegram.reactions.contracts"]
 [[modules]]
 path = "mcp_telegram.reactions.telegram_adapter"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.reactions.contracts", "mcp_telegram.reactions.ports", "mcp_telegram.reactions.projection", "mcp_telegram.telegram_gateway", "mcp_telegram.telegram_rpc_error", "mcp_telegram.telegram_rpc_scheduler"]
+depends_on = ["mcp_telegram.telegram_demand", "mcp_telegram.reactions.contracts", "mcp_telegram.reactions.ports", "mcp_telegram.reactions.projection", "mcp_telegram.telegram_gateway", "mcp_telegram.telegram_rpc_error", "mcp_telegram.telegram_rpc_scheduler"]
 
 [[modules]]
 path = "mcp_telegram.topics.telegram_adapter"

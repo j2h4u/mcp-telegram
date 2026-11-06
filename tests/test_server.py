@@ -1287,6 +1287,11 @@ class _FakeTransportSecuritySettings:
         captured["security"] = kwargs
 
 
+class _FakeTransportSecurityMiddleware:
+    def __init__(self, captured: dict[str, object], settings: object) -> None:
+        captured["request_security_settings"] = settings
+
+
 class _FakeSessionManager:
     def __init__(self, captured: dict[str, object], app: object, **kwargs: object) -> None:
         captured["session_manager"] = {"app": app, **kwargs}
@@ -1369,6 +1374,10 @@ async def test_run_mcp_http_server_normalizes_mount_and_builds_transport(
         "mcp.server.transport_security.TransportSecuritySettings", partial(_FakeTransportSecuritySettings, captured)
     )
     monkeypatch.setattr(
+        "mcp.server.transport_security.TransportSecurityMiddleware",
+        partial(_FakeTransportSecurityMiddleware, captured),
+    )
+    monkeypatch.setattr(
         "mcp.server.streamable_http_manager.StreamableHTTPSessionManager", partial(_FakeSessionManager, captured)
     )
     monkeypatch.setattr("starlette.applications.Starlette", partial(_FakeStarlette, captured))
@@ -1406,6 +1415,7 @@ async def test_run_mcp_http_server_normalizes_mount_and_builds_transport(
         "allowed_origins": ["https://example.com"],
     }
     session_manager = cast(dict[str, object], captured["session_manager"])
+    assert captured["request_security_settings"] is session_manager["security_settings"]
     assert session_manager["stateless"] is True
     assert session_manager["json_response"] is True
     assert captured["server"]

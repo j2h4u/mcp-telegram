@@ -39,7 +39,7 @@ from mcp_telegram.reactions.contracts import ReactionAggregateSource
 from mcp_telegram.reactions.persistence import allocate_observation_boundary
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
-from mcp_telegram.telegram_demand import RpcAttemptBudget
+from mcp_telegram.telegram_demand import RpcAttemptBudget, RpcReadTimeoutError
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
     RpcAdmissionExpiredError,
@@ -269,6 +269,7 @@ async def test_worker_reserves_before_request_and_rejects_late_fact_and_queue_ef
         "access_lost",
         "latched",
         "undispatched",
+        "read_timeout",
     ],
 )
 async def test_old_request_error_refunds_original_and_preserves_replacement(  # noqa: PLR0915
@@ -313,6 +314,8 @@ async def test_old_request_error_refunds_original_and_preserves_replacement(  # 
             budget.debit()
         if failure == "terminal":
             raise RPCError(request=None, message="MSG_VOICE_MISSING", code=400)
+        if failure == "read_timeout":
+            raise RpcReadTimeoutError
         if failure == "transient":
             raise TimeoutError
         if failure == "flood":
@@ -337,7 +340,9 @@ async def test_old_request_error_refunds_original_and_preserves_replacement(  # 
             with pytest.raises(expected_error):
                 await worker._process_batch(handler, [job], 20, attempt_budget=budget)
         else:
-            await worker._process_batch(handler, [job], 20, attempt_budget=budget)
+            result = await worker._process_batch(handler, [job], 20, attempt_budget=budget)
+            if failure == "read_timeout":
+                assert result.stopped and isinstance(result.deferred_error, RpcReadTimeoutError)
     if recreate:
         assert cast(tuple[object, ...], db.execute("SELECT * FROM hydration_jobs").fetchone()) == replacement[0]
     else:

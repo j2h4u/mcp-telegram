@@ -141,35 +141,32 @@ async def test_completed_profile_is_not_reported_active_while_sibling_is_busy() 
 
 
 @pytest.mark.parametrize("claimed", [False, True])
-async def test_parent_timeout_uses_current_root_physical_evidence(claimed: bool) -> None:
+async def test_parent_admission_deadline_does_not_cancel_accepted_local_work(claimed: bool) -> None:
     kind = DemandKind.ENTITY_PROFILE_REFRESH
     adapters = _adapters({kind: DemandStatus(0)})
     adapter = adapters[kind]
     selected = adapter.selected
     budget = RpcAttemptBudget(limit=2, attempts=1, selected=selected)
-    called: list[str | None] = []
-
-    def expiry(method: str | None) -> TelegramRpcAdmissionDeferred:
-        called.append(method)
-        return TelegramRpcAdmissionDeferred(1, eligible_at=time.monotonic() + 1, reason="admission_expired")
+    completed = asyncio.Event()
 
     async def wait() -> None:
         if claimed:
             current_demand_token().attempt_evidence.record_dispatch()
             budget.debit()
-        await asyncio.Event().wait()
+        await asyncio.sleep(0.08)
+        completed.set()
 
     adapter.on_run = wait
-    coordinator = TelegramDemandCoordinator(adapters, admission_expired_deferral=expiry)
+    coordinator = TelegramDemandCoordinator(adapters)
     coordinator._invocations[selected] = _Invocation(budget, time.monotonic() + 0.05)
     coordinator._start_retained(kind)
     task = coordinator._retained_task
     assert task is not None
     await task
-    assert called == ([] if claimed else [None])
+    assert completed.is_set()
     assert budget.attempts == (2 if claimed else 1)
     assert budget.limit == 2
-    assert coordinator.inspect_work(selected)["reason"] == ("deadline_exceeded" if claimed else "admission_deferred")
+    assert coordinator.inspect_work(selected)["hold_kind"] == "none"
     coordinator._harvest_retained()
 
 
@@ -177,19 +174,12 @@ async def test_local_timeout_is_not_parent_admission_expiry() -> None:
     kind = DemandKind.ENTITY_PROFILE_REFRESH
     adapters = _adapters({kind: DemandStatus(0)})
     adapters[kind].run_error = TimeoutError()
-    called: list[bool] = []
-
-    def expiry(_: str | None) -> TelegramRpcAdmissionDeferred:
-        called.append(True)
-        return TelegramRpcAdmissionDeferred(1, eligible_at=time.monotonic() + 1)
-
-    coordinator = TelegramDemandCoordinator(adapters, admission_expired_deferral=expiry)
+    coordinator = TelegramDemandCoordinator(adapters)
     coordinator._start_retained(kind)
     task = coordinator._retained_task
     assert task is not None
     await task
-    assert called == []
-    assert coordinator.inspect_work(adapters[kind].selected)["reason"] == "deadline_exceeded"
+    assert coordinator.inspect_work(adapters[kind].selected)["hold_kind"] == "transient_backoff"
     coordinator._harvest_retained()
 
 
@@ -199,19 +189,12 @@ async def test_sender_expiry_wins_without_parent_factory_or_budget_change() -> N
     adapters[kind].run_error = TelegramRpcAdmissionDeferred(
         1, eligible_at=time.monotonic() + 1, reason="admission_expired"
     )
-    called: list[bool] = []
-
-    def expiry(_: str | None) -> TelegramRpcAdmissionDeferred:
-        called.append(True)
-        return TelegramRpcAdmissionDeferred(1, eligible_at=time.monotonic() + 1)
-
-    coordinator = TelegramDemandCoordinator(adapters, admission_expired_deferral=expiry)
+    coordinator = TelegramDemandCoordinator(adapters)
     coordinator._start_retained(kind)
     task = coordinator._retained_task
     assert task is not None
     await task
     budget = adapters[kind].run_calls[0]
-    assert called == []
     assert budget.attempts == 0 and budget.limit == 1
     assert coordinator.inspect_work(adapters[kind].selected)["reason"] == "admission_deferred"
     coordinator._harvest_retained()

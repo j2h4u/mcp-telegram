@@ -36,28 +36,32 @@ _TEST_TIMEOUT_S = 0.01
 
 
 @pytest.mark.asyncio
-async def test_call_with_timeout_cancels_a_wedged_rpc_without_waiting() -> None:
-    cancelled = asyncio.Event()
+async def test_call_with_timeout_retains_gateway_drain_after_admission_deadline() -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+    deadlines: list[float | None] = []
 
-    class HangingClient:
+    class DrainingClient:
         async def __call__(self, request: object) -> object:
-            del request
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                cancelled.set()
-                raise
+            deadlines.append(current_rpc_scope().deadline)
+            entered.set()
+            await release.wait()
+            return request
 
-        async def get_input_entity(self, dialog_id: int) -> object:
-            del dialog_id
-            return object()
+    request = object()
 
-    client: ActivityRpcClient = HangingClient()
-    with pytest.raises(TimeoutError):
+    async def call() -> object:
         with demand_context(DemandKind.ARCHIVE_INCREMENTAL):
-            await call_with_timeout(client, object(), timeout_s=_TEST_TIMEOUT_S)
+            return await call_with_timeout(DrainingClient(), request, timeout_s=_TEST_TIMEOUT_S)
 
-    await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+    task = asyncio.create_task(call())
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.sleep(_TEST_TIMEOUT_S * 2)
+        assert not task.done()
+        assert deadlines[0] is not None and deadlines[0] < asyncio.get_running_loop().time()
+    finally:
+        release.set()
+    assert await task is request
 
 
 @pytest.mark.asyncio

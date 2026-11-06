@@ -18,7 +18,7 @@ from enum import StrEnum
 from functools import wraps
 from itertools import chain
 from pathlib import Path
-from typing import Never, Protocol, TypedDict, cast
+from typing import Literal, Never, Protocol, TypedDict, cast
 from weakref import WeakKeyDictionary
 
 from aiolimiter import AsyncLimiter
@@ -98,6 +98,7 @@ from .telegram_demand import (
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
     RpcAttemptEvidence,
+    RpcReadTimeoutError,
     RpcRetryAuthorization,
     UnclassifiedTelegramDemandError,
     acquisition_context,
@@ -178,7 +179,7 @@ from .telegram_transport import (
     TransportConnectError,
     TransportWriteError,
 )
-from .telegram_update_admission import GateMessageBox, UpdateIntakeQueue
+from .telegram_update_admission import GateMessageBox, TelegramUpdateEligibilityDeferredError, UpdateIntakeQueue
 from .telegram_update_ring import TelegramUpdateRing
 from .update_delivery import DeliveryState, UpdateDeliveryRepository
 
@@ -285,6 +286,8 @@ class _MainSender(Protocol):
 
     def application_owner(self, result: asyncio.Future[object]) -> object: ...
 
+    def retire_read_timeout(self, result: asyncio.Future[object], owner: object) -> None: ...
+
     @property
     def write_generation(self) -> int: ...
 
@@ -333,16 +336,8 @@ class _AdmissionAwareSender:
                 wire_owner.response_timer = timeout
                 await asyncio.wait({raw_future})
             return raw_future.result()
-        except TimeoutError:
-            self._gate._revoke_wire_owner(wire_owner)
-            raw_future.add_done_callback(self._consume_late_result, context=Context())
-            if wire_owner.claimed == 0:
-                raise RpcAdmissionExpiredError(self._scope, "Telegram RPC admission deadline elapsed") from None
-            if self._gate._wire_fault is not None:
-                raise TelegramRpcThrottled(
-                    retry_after_seconds=None, latched=True, detail="Telegram outbound outcome is uncertain"
-                ) from None
-            raise
+        except TimeoutError as error:
+            return await self._settle_timeout(sender, raw_future, wire_owner, error)
         except asyncio.CancelledError:
             self._gate._revoke_wire_owner(wire_owner)
             raw_future.add_done_callback(self._consume_late_result, context=Context())
@@ -359,6 +354,35 @@ class _AdmissionAwareSender:
                 timing.add_phase("rpc_admission", (admission_end - started_at) * 1000)
                 if wire_owner.dispatch_at is not None:
                     timing.add_phase("rpc_execution", (ended_at - wire_owner.dispatch_at) * 1000)
+
+    async def _settle_timeout(
+        self, sender: _MainSender, raw_future: asyncio.Future[object], wire_owner: _WireAttempt, error: TimeoutError
+    ) -> object:
+        if self._gate._durable_read_timeout_owner(wire_owner):
+            sender.retire_read_timeout(raw_future, wire_owner)
+            return await self._drain_timed_read(raw_future)
+        self._gate._revoke_wire_owner(wire_owner)
+        raw_future.add_done_callback(self._consume_late_result, context=Context())
+        if wire_owner.claimed == 0:
+            raise RpcAdmissionExpiredError(self._scope, "Telegram RPC admission deadline elapsed") from None
+        if self._gate._wire_fault is not None:
+            raise TelegramRpcThrottled(
+                retry_after_seconds=None, latched=True, detail="Telegram outbound outcome is uncertain"
+            ) from None
+        raise error
+
+    @staticmethod
+    async def _drain_timed_read(result: asyncio.Future[object]) -> object:
+        cancelled = False
+        while not result.done():
+            try:
+                await asyncio.wait({result})
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled and not result.cancelled():
+            result.exception()
+            raise asyncio.CancelledError
+        return result.result()
 
     def _selected_sender(self) -> _MainSender:
         capability = _PHOTO_CAPABILITY.get()
@@ -715,7 +739,7 @@ def _valid_read_retry(intent: dict[str, object]) -> bool:
             (retry == {"reason": "clean_shutdown"})
             or (
                 set(retry) == {"reason", "method_generation"}
-                and retry["reason"] == "attempt_budget_exhausted"
+                and retry["reason"] in {"attempt_budget_exhausted", "sender_timeout"}
                 and isinstance(retry["method_generation"], str)
                 and bool(retry["method_generation"])
             )
@@ -1095,6 +1119,7 @@ class _MethodRetryCredit:
     allowance: int
     granted: bool = False
     authorization: RpcRetryAuthorization | None = None
+    renew_unused: bool = False
 
     @property
     def limit(self) -> int:
@@ -1111,6 +1136,13 @@ class _MethodRetryCredit:
         return self.attempts < self.limit or not self.granted
 
     def authorize(self) -> RpcRetryAuthorization | None:
+        if (
+            self.renew_unused
+            and not self.granted
+            and self.authorization is not None
+            and time.monotonic() >= self.authorization.deadline
+        ):
+            self.authorization = None
         if not self.available:
             return None
         if self.authorization is None:
@@ -1432,8 +1464,8 @@ class TelegramRpcSafetyLedger:
         if not episode.get("consecutive_read_budget_failures"):
             return "method", None
         if episode["consecutive_actual_floods"]:
-            return "method_mixed_retry", "Method recovery includes FloodWait and a local read budget failure"
-        return "read_budget_retry", "Method retry waits after local read attempt budget exhaustion"
+            return "method_mixed_retry", "Method recovery includes FloodWait and a local read failure"
+        return "read_budget_retry", "Method retry waits after a local read failure"
 
     @property
     def protection_reason(self) -> str | None:
@@ -1701,7 +1733,12 @@ class TelegramRpcSafetyLedger:
             if allowance is None:
                 return None
             credit = _MethodRetryCredit(
-                selected, method, cast(str, episode["generation"]), self._revision_accounting(budget), allowance
+                selected,
+                method,
+                cast(str, episode["generation"]),
+                self._revision_accounting(budget),
+                allowance,
+                renew_unused=bool(episode.get("consecutive_read_budget_failures")),
             )
             episode.credits[selected] = credit
         budget._accounting = credit.accounting
@@ -1999,6 +2036,7 @@ class TelegramRpcSafetyLedger:
         method_success: bool = False,
         recovery_cause: RecoveryCause | None = None,
         scoped_read_failure: bool = False,
+        read_failure_reason: Literal["attempt_budget_exhausted", "sender_timeout"] = "attempt_budget_exhausted",
         shutdown_read_candidate: bool = False,
     ) -> None:
         def settle_recovery(record: dict[str, object]) -> None:
@@ -2018,7 +2056,7 @@ class TelegramRpcSafetyLedger:
         def settle(record: dict[str, object]) -> None:
             self._settle_method(record, attempt_id, actual_flood, method_generation, method_success)
             if scoped_read_failure:
-                self._settle_read_budget_failure(record, attempt_id)
+                self._settle_read_budget_failure(record, attempt_id, reason=read_failure_reason)
             else:
                 self._settle_intent(record, attempt_id, known_outcome)
             if floor_until_utc is not None:
@@ -2038,7 +2076,13 @@ class TelegramRpcSafetyLedger:
             self._startup_hold = "unresolved_outbound_outcome"
         await self._commit(settle, settled_attempt=attempt_id)
 
-    def _settle_read_budget_failure(self, record: dict[str, object], attempt_id: str) -> None:
+    def _settle_read_budget_failure(
+        self,
+        record: dict[str, object],
+        attempt_id: str,
+        *,
+        reason: Literal["attempt_budget_exhausted", "sender_timeout"],
+    ) -> None:
         intent = cast(dict[str, dict[str, object]], record["intents"])[attempt_id]
         if attempt_id not in self._claimed or intent["run"] != self._run:
             raise ValueError("read failure does not own a claimed attempt")
@@ -2073,9 +2117,7 @@ class TelegramRpcSafetyLedger:
             },
             credit_enabled=True,
         )
-        intent.update(
-            phase="unknown", read_retry={"reason": "attempt_budget_exhausted", "method_generation": generation}
-        )
+        intent.update(phase="unknown", read_retry={"reason": reason, "method_generation": generation})
 
     async def contain_shutdown_reads(self, attempts: set[str], *, clear_introduced_hold: bool) -> None:
         """Contain exact cancelled reads only after the gateway has fully quiesced."""
@@ -6115,11 +6157,25 @@ class TelegramRpcGate(TelegramClient):
 
     def _ordinary_read_budget_failure(self, owner: _WireAttempt, error: BaseException) -> bool:
         return bool(
-            isinstance(error, RpcAttemptBudgetExhaustedError)
+            isinstance(error, (RpcAttemptBudgetExhaustedError, RpcReadTimeoutError))
             and owner.claimed
             and rpc_effect(owner.method) is RpcEffect.NONMUTATING_READ
             and self._ordinary_read_owner(owner)
             and self._verified_read_budget(owner)
+        )
+
+    def _durable_read_timeout_owner(self, owner: _WireAttempt) -> bool:
+        kind = owner.scope.demand_kind
+        return bool(
+            owner.claimed
+            and not owner.terminal
+            and not owner.revoked
+            and kind is not None
+            and demand_contract(kind).execution_mode is ExecutionMode.DURABLE
+            and rpc_effect(owner.method) is RpcEffect.NONMUTATING_READ
+            and self._ordinary_read_owner(owner)
+            and self._verified_read_budget(owner)
+            and self._transport_state is _TransportBoundaryState.READY
         )
 
     @staticmethod
@@ -6174,7 +6230,14 @@ class TelegramRpcGate(TelegramClient):
     async def _settle_read_budget_failure(self, owner: _WireAttempt, error: BaseException) -> None:
         ledger = self._ensure_safety_ledger()
         try:
-            await ledger.complete(owner.attempt_id, known_outcome=False, scoped_read_failure=True)
+            await ledger.complete(
+                owner.attempt_id,
+                known_outcome=False,
+                scoped_read_failure=True,
+                read_failure_reason="sender_timeout"
+                if isinstance(error, RpcReadTimeoutError)
+                else "attempt_budget_exhausted",
+            )
         except Exception:
             logger.exception("read_budget_receipt_failed")
             raise
@@ -6230,7 +6293,7 @@ class TelegramRpcGate(TelegramClient):
         owner = self._require_wire_owner(owner)
         timer = owner.response_timer
         if owner.claimed and timer is not None and not timer.expired():
-            timer.reschedule(owner.scope.deadline)
+            timer.reschedule(None if self._durable_read_timeout_owner(owner) else owner.scope.deadline)
 
     def _note_photo_fault_owner(self, owner: _WireAttempt) -> None:
         if self._wire_fault is None and owner.photo_capability is not None and owner.photo_capability.aux_bootstrap:
@@ -6486,6 +6549,7 @@ class TelegramRpcGate(TelegramClient):
             (RpcAdmissionExpiredError, "admission_expired"),
             (RpcAdmissionSaturatedError, "admission_saturated"),
             (RpcAttemptBudgetExhaustedError, "attempt_budget_exhausted"),
+            (RpcReadTimeoutError, "sender_timeout"),
             (TimeoutError, "timeout"),
             (ConnectionError, "connection"),
             (OSError, "os_error"),
@@ -6497,6 +6561,8 @@ class TelegramRpcGate(TelegramClient):
 
     @staticmethod
     def _incident_terminal_reason(error: BaseException | None) -> str | None:
+        if isinstance(error, RpcReadTimeoutError):
+            return "sender_timeout"
         if isinstance(error, RpcAttemptBudgetExhaustedError):
             return "attempt_budget_exhausted"
         if isinstance(error, RpcAdmissionExpiredError):
@@ -7987,7 +8053,7 @@ class TelegramRpcGate(TelegramClient):
                 and isinstance(self._message_box, GateMessageBox)
             ):
                 self._message_box.preserve_deferred(request, exc)
-                raise ValueError("Telegram difference waits for gate eligibility") from exc
+                raise TelegramUpdateEligibilityDeferredError("Telegram difference waits for gate eligibility") from exc
             raise
         except RpcAdmissionExpiredError as exc:
             if not connection_owned and exc.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:

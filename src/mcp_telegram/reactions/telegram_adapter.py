@@ -9,6 +9,7 @@ from typing import Protocol, cast
 from telethon.tl import types
 from telethon.tl.functions.messages import GetMessageReactionsListRequest
 
+from ..telegram_demand import RpcReadTimeoutError
 from ..telegram_gateway import (
     CATCHABLE_GATEWAY_FAILURES,
     translate_reaction_detail_failure,
@@ -63,7 +64,7 @@ class TelethonTelegramReactionGateway(TelegramReactionGateway):
             next_offset = None if next_raw is None else str(next_raw)
             events = tuple(project_reaction_event(item) for item in response.reactions)
             return ReactionDetailFetchResult(page=ReactionDetailPage(events, next_offset))
-        except RpcAdmissionClosedError:
+        except RpcAdmissionClosedError, RpcReadTimeoutError:
             raise
         except CATCHABLE_GATEWAY_FAILURES as exc:
             failure = translate_reaction_detail_failure(exc)

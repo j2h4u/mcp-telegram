@@ -387,7 +387,6 @@ def build_durable_coordinator(
         observer=observer,
         rpc_eligibility=dependencies.client.rpc_eligibility,
         prepare_durable_retry=dependencies.client.prepare_durable_retry,
-        admission_expired_deferral=dependencies.client.admission_expired_deferral,
     )
     dependencies.client.set_rpc_eligibility_observer(coordinator.eligibility_changed)
     return coordinator

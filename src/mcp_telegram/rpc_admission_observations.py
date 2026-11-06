@@ -17,7 +17,7 @@ from .flood import FloodWaitObservation
 from .message_delivery_observations import MessageDeliveryObservations
 from .telegram_demand import AcquisitionKind, DemandObservationHook
 from .telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkRevision
-from .telegram_rpc_consumers import DemandKind, telegram_rpc_consumer
+from .telegram_rpc_consumers import DURABLE_DEMAND_ORDER, DemandKind, telegram_rpc_consumer
 from .telegram_rpc_scheduler import (
     BudgetRejection,
     BudgetRejectionBoundary,
@@ -202,7 +202,7 @@ _METHOD_BUCKET_LIMIT = 16
 _SAMPLED_ROOT_LIMIT = 2
 _ROOT_EVENT_LIMIT = 12
 _MAX_EVIDENCE_COUNTER = 2_147_483_647
-_RECEIPT_KINDS = frozenset({DemandKind.DELTA_GAP_FILL, DemandKind.ENTITY_PROFILE_REFRESH})
+_RECEIPT_KINDS = frozenset(DURABLE_DEMAND_ORDER)
 
 
 def work_references(selected: WorkRevision) -> tuple[str, str]:
@@ -657,6 +657,7 @@ class RpcAdmissionObservationAggregator:
                 "admission_expired",
                 "admission_saturated",
                 "attempt_budget_exhausted",
+                "sender_timeout",
                 "timeout",
                 "connection",
                 "os_error",
@@ -666,7 +667,12 @@ class RpcAdmissionObservationAggregator:
             payload["error_type"] = error_type if error_type in allowed else "other_exception"
         if owner_attempt == attempt:
             payload["owner_attempt_id"] = owner_attempt
-        if terminal_reason in {"admission_expired", "admission_saturated", "attempt_budget_exhausted"}:
+        if terminal_reason in {
+            "admission_expired",
+            "admission_saturated",
+            "attempt_budget_exhausted",
+            "sender_timeout",
+        }:
             payload["terminal_reason"] = terminal_reason
 
     def _rpc_identity(self, scope: TelegramRpcScope) -> tuple[str | None, str | None]:
@@ -836,7 +842,7 @@ class RpcAdmissionObservationAggregator:
         except Exception:  # noqa: BLE001 - telemetry cannot break demand producers
             return
 
-    def observe_slice_receipt(
+    def observe_slice_receipt(  # noqa: PLR0913 - explicit bounded receipt fields
         self,
         *,
         selected: WorkRevision,
@@ -844,6 +850,10 @@ class RpcAdmissionObservationAggregator:
         outcome: object,
         actual_attempts: int,
         retry_not_before_monotonic: float | None,
+        root_attempts: int = 0,
+        duration_seconds: float = 0.0,
+        hold_kind: str = "none",
+        reason: str | None = None,
     ) -> None:
         """Persist an owner outcome, distinguishing a commit from an RPC response."""
         if selected.key.demand_kind not in _RECEIPT_KINDS:
@@ -851,6 +861,11 @@ class RpcAdmissionObservationAggregator:
         payload: dict[str, object] = {"demand_kind": selected.key.demand_kind.value, "actual_attempts": actual_attempts}
         payload["work_ref"], payload["selected_ref"] = work_references(selected)
         state = _receipt_state(selected, status, outcome, payload)
+        payload["root_attempts"] = root_attempts
+        payload["duration_ms"] = duration_seconds * _MILLISECONDS_PER_SECOND
+        payload["hold_kind"] = hold_kind
+        if reason is not None:
+            payload["hold_reason"] = _normalize_reason(reason)
         if retry_not_before_monotonic is not None and _is_finite(retry_not_before_monotonic):
             payload["retry_not_before_monotonic"] = retry_not_before_monotonic
         try:

@@ -613,3 +613,39 @@ async def test_missing_channel_field_is_partial_while_full_profile_is_usable(tmp
     assert channel_evidence is not None and channel_evidence["outcome"] == "partial"
     await service.shutdown()  # type: ignore[attr-defined]
     conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owned_timeout", [False, True])
+async def test_full_user_pair_preserves_owned_timeout_without_publishing_sections(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owned_timeout: bool
+) -> None:
+    from mcp_telegram.telegram_demand import RpcReadTimeoutError
+
+    conn, raw_service = _prepare(tmp_path / "failed-pair.sqlite")
+    service = cast(DaemonEntityInfoService, raw_service)
+    failure = RpcReadTimeoutError("owned read") if owned_timeout else TimeoutError("ordinary transport error")
+
+    async def fail(
+        user_id: int, target_kind: TargetKind, *, owner_account_id: int | None = None
+    ) -> UserProfileObservation:
+        del user_id, target_kind, owner_account_id
+        raise failure
+
+    monkeypatch.setattr(service._deps.user_profile_port, "fetch_user_profile", fail)
+    refresh = service.refresh_coordinator
+    assert refresh is not None
+    try:
+        if owned_timeout:
+            with pytest.raises(RpcReadTimeoutError) as caught:
+                await run_ready_slice(EntityProfileDemandAdapter(refresh))
+            assert caught.value is failure
+        else:
+            await run_ready_slice(EntityProfileDemandAdapter(refresh))
+        assert conn.execute("SELECT COUNT(*) FROM entity_detail_sections WHERE status='fresh'").fetchone() == (0,)
+        assert conn.execute("SELECT next_section FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
+            "full_profile",
+        )
+    finally:
+        await service.shutdown()
+        conn.close()

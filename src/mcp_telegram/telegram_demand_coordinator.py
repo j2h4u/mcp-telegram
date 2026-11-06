@@ -21,6 +21,7 @@ from mcp_telegram.telegram_demand import (
     DurableDemandAdapter,
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
+    RpcReadTimeoutError,
     RpcRetryAuthorization,
     demand_context,
 )
@@ -52,6 +53,7 @@ _DEFERRED_ERRORS = (
     TelegramRpcAdmissionDeferred,
     TelegramRpcMethodRecoveryPending,
     RpcAttemptBudgetExhaustedError,
+    RpcReadTimeoutError,
     RpcAdmissionSaturatedError,
     RpcAdmissionExpiredError,
 )
@@ -141,7 +143,6 @@ class TelegramDemandCoordinator:
         rpc_eligibility: Callable[[str | None], TelegramRpcThrottled | TelegramRpcMethodRecoveryPending | None]
         | None = None,
         prepare_durable_retry: Callable[[RpcAttemptBudget, str | None], RpcRetryAuthorization | None] | None = None,
-        admission_expired_deferral: Callable[[str | None], TelegramRpcAdmissionDeferred] | None = None,
     ) -> None:
         validate_durable_adapters(adapters)
         if not math.isfinite(safety_scan_seconds) or safety_scan_seconds <= 0:
@@ -153,7 +154,6 @@ class TelegramDemandCoordinator:
         self._monotonic_clock = monotonic_clock
         self._rpc_eligibility = rpc_eligibility or (lambda _method: None)
         self._prepare_durable_retry = prepare_durable_retry or (lambda _budget, _method: None)
-        self._admission_expired_deferral = admission_expired_deferral
         self._safety_scan_seconds = float(safety_scan_seconds)
         self._observer = observer
         self._canonical_progress: Callable[[], None] | None = None
@@ -260,11 +260,10 @@ class TelegramDemandCoordinator:
         if method_key is None:
             self._release_ready_gate_waits()
         else:
-            for revision, invocation in tuple(self._invocations.items()):
-                if self._wait_ready(revision) and self._method_for_work(revision, invocation.budget) == method_key:
-                    self._release_gate_wait(revision)
-            for revision, method in tuple(self._revision_methods.items()):
-                if self._wait_ready(revision) and method == method_key:
+            for revision in tuple(self._eligibility_waits):
+                invocation = self._invocations.get(revision)
+                budget = None if invocation is None else invocation.budget
+                if self._wait_ready(revision) and self._method_for_work(revision, budget) == method_key:
                     self._release_gate_wait(revision)
         self._wake.set()
 
@@ -663,43 +662,56 @@ class TelegramDemandCoordinator:
         assert invocation.deadline is not None
         receipt_outcome: object = None
         receipt_status = "failed"
-        try:
-            outcome = await self._run_scoped_adapter(kind, status, budget, invocation.deadline)
-        except asyncio.CancelledError:
-            receipt_status = "cancelled"
-            raise
-        except RpcAdmissionClosedError:
-            receipt_status = "deferred"
-            if self._handle_closed_admission(kind, budget):
-                return
-            raise
-        except _DEFERRED_ERRORS as exc:
-            receipt_status = "deferred"
-            self._handle_deferred(kind, budget, exc)
-        except TelegramRpcThrottled as exc:
-            receipt_status = "deferred"
-            self._handle_throttle(kind, budget, exc)
-        except Exception as exc:  # noqa: BLE001 - adapter failure must not kill sibling demand
-            self._handle_slice_failure(kind, budget, exc)
-        else:
-            self._handle_outcome(kind, status, budget, outcome)
-            receipt_outcome = outcome
-            receipt_status = "outcome"
-        finally:
-            self._observe_slice_receipt(selected, budget, receipt_status, receipt_outcome)
-            self._clear_inline_active(retained=retained)
-            _SLICE_GENERATION.reset(generation_token)
+        started_at = self._monotonic_clock()
+        with demand_context(kind, deadline=invocation.deadline) as token:
+            try:
+                outcome = await self._run_adapter(kind, budget, selected)
+            except asyncio.CancelledError:
+                receipt_status = "cancelled"
+                raise
+            except RpcAdmissionClosedError:
+                receipt_status = "deferred"
+                if self._handle_closed_admission(kind, budget):
+                    return
+                raise
+            except _DEFERRED_ERRORS as exc:
+                receipt_status = "deferred"
+                self._handle_deferred(kind, budget, exc)
+            except TelegramRpcThrottled as exc:
+                receipt_status = "deferred"
+                self._handle_throttle(kind, budget, exc)
+            except Exception as exc:  # noqa: BLE001 - adapter failure must not kill sibling demand
+                self._handle_slice_failure(kind, budget, exc, root_attempts=token.attempt_evidence.actual_attempts)
+            else:
+                self._handle_outcome(kind, status, budget, outcome)
+                receipt_outcome = outcome
+                receipt_status = "outcome"
+            finally:
+                self._observe_slice_receipt(
+                    selected,
+                    budget,
+                    receipt_status,
+                    receipt_outcome,
+                    root_attempts=token.attempt_evidence.actual_attempts,
+                    duration_seconds=max(0.0, self._monotonic_clock() - started_at),
+                )
+                self._clear_inline_active(retained=retained)
+                _SLICE_GENERATION.reset(generation_token)
 
-    def _observe_slice_receipt(
-        self, selected: WorkRevision, budget: RpcAttemptBudget, status: str, outcome: object
+    def _observe_slice_receipt(  # noqa: PLR0913 - explicit bounded receipt fields
+        self,
+        selected: WorkRevision,
+        budget: RpcAttemptBudget,
+        status: str,
+        outcome: object,
+        *,
+        root_attempts: int,
+        duration_seconds: float,
     ) -> None:
         callback = getattr(self._observer, "observe_slice_receipt", None)
-        if not callable(callback) or selected.key.demand_kind not in {
-            DemandKind.DELTA_GAP_FILL,
-            DemandKind.ENTITY_PROFILE_REFRESH,
-        }:
+        if not callable(callback):
             return
-        retry_until = self._transient_waits.get(selected, self._eligibility_waits.get(selected))
+        hold, retry_until = self._inspect_hold(selected, self._monotonic_clock())
         try:
             callback(
                 selected=selected,
@@ -707,6 +719,10 @@ class TelegramDemandCoordinator:
                 outcome=outcome,
                 actual_attempts=budget.attempts,
                 retry_not_before_monotonic=retry_until,
+                root_attempts=root_attempts,
+                duration_seconds=duration_seconds,
+                hold_kind=hold,
+                reason=self._exclusion_reasons.get(selected),
             )
         except Exception:
             logger.debug("telegram_demand_receipt_failed", exc_info=True)
@@ -719,32 +735,6 @@ class TelegramDemandCoordinator:
     def _clear_inline_active(self, *, retained: bool) -> None:
         if not retained:
             self._active_revision = None
-
-    async def _run_scoped_adapter(
-        self, kind: DemandKind, status: DemandStatus, budget: RpcAttemptBudget, deadline: float
-    ) -> SliceOutcome:
-        selected = status.selected
-        assert selected is not None
-        remaining = max(0.0, deadline - self._monotonic_clock())
-        timer = asyncio.timeout(remaining)
-        with demand_context(kind, deadline=deadline) as token:
-            try:
-                async with timer:
-                    return await self._run_adapter(kind, budget, selected)
-            except TimeoutError:
-                if self._is_admission_expiry(timer, token):
-                    assert self._admission_expired_deferral is not None
-                    method = self._method_for_work(selected, budget, status.request_method)
-                    raise self._admission_expired_deferral(method) from None
-                raise
-
-    def _is_admission_expiry(self, timer: asyncio.Timeout, token: DemandToken) -> bool:
-        return (
-            asyncio.current_task() is self._retained_task
-            and timer.expired()
-            and token.attempt_evidence.actual_attempts == 0
-            and self._admission_expired_deferral is not None
-        )
 
     async def _run_adapter(self, kind: DemandKind, budget: RpcAttemptBudget, selected: WorkRevision) -> SliceOutcome:
         attempts_before = budget.attempts
@@ -892,7 +882,10 @@ class TelegramDemandCoordinator:
         if isinstance(exc, RpcAdmissionSaturatedError):
             self._handle_capacity_deferred(kind, budget)
             return
-        if isinstance(exc, RpcAttemptBudgetExhaustedError) and budget._read_budget_failure_method is not None:
+        if (
+            isinstance(exc, (RpcAttemptBudgetExhaustedError, RpcReadTimeoutError))
+            and budget._read_budget_failure_method is not None
+        ):
             self._park_read_budget_failure(kind, budget)
             return
         if isinstance(exc, RpcAttemptBudgetExhaustedError):
@@ -930,8 +923,12 @@ class TelegramDemandCoordinator:
                 self._release_ready_gate_waits()
         self._observe("deferred", kind, actual_attempts=budget.attempts, reason="admission_saturated")
 
-    def _handle_slice_failure(self, kind: DemandKind, budget: RpcAttemptBudget, exc: Exception) -> None:
-        if budget.selected is not None:
+    def _handle_slice_failure(
+        self, kind: DemandKind, budget: RpcAttemptBudget, exc: Exception, *, root_attempts: int
+    ) -> None:
+        if isinstance(exc, TimeoutError) and root_attempts == 0 and budget.selected is not None:
+            self._schedule_transient_retry(kind, budget.selected, budget)
+        elif budget.selected is not None:
             self._excluded.add(budget.selected)
             self._exclusion_reasons[budget.selected] = (
                 "deadline_exceeded" if isinstance(exc, TimeoutError) else "unclassified_failure"
