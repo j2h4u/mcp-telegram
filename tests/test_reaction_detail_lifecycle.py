@@ -1022,3 +1022,18 @@ def test_deleted_reaction_message_is_not_released_or_selected(tmp_path: Path) ->
     assert _reaction_candidates(conn, stale_before_utc=10, limit=10) == []
     assert _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, (0,)) is None
     conn.close()
+
+
+def test_reaction_gateway_preserves_owned_read_timeout() -> None:
+    from mcp_telegram.reactions.telegram_adapter import TelethonTelegramReactionGateway
+    from mcp_telegram.telegram_demand import RpcReadTimeoutError
+
+    failure = RpcReadTimeoutError("owned read")
+
+    class Client:
+        async def get_input_entity(self, _entity: object) -> object:
+            raise failure
+
+    with pytest.raises(RpcReadTimeoutError) as caught:
+        asyncio.run(TelethonTelegramReactionGateway(Client()).fetch_reaction_page(42, 1, offset=None, limit=10))
+    assert caught.value is failure

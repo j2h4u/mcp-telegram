@@ -5,14 +5,17 @@ import logging
 import pytest
 
 from mcp_telegram.runtime_logging import (
+    _TelethonLocalUpdateWaitFilter,
     _TelethonRoutineDifferenceFilter,
     _TelethonStaleSessionFilter,
     install_telethon_log_filter,
 )
 
 
-def _record(*, message: str, level: int = logging.INFO, name: str = "telethon.client.updates") -> logging.LogRecord:
-    return logging.LogRecord(name, level, __file__, 1, message, (), None)
+def _record(
+    *, message: str, level: int = logging.INFO, name: str = "telethon.client.updates", args: tuple[object, ...] = ()
+) -> logging.LogRecord:
+    return logging.LogRecord(name, level, __file__, 1, message, args, None)
 
 
 @pytest.mark.parametrize(
@@ -51,6 +54,7 @@ def test_telethon_log_filter_installation_is_idempotent() -> None:
         install_telethon_log_filter()
         install_telethon_log_filter()
         assert sum(isinstance(filter_, _TelethonRoutineDifferenceFilter) for filter_ in target_logger.filters) == 1
+        assert sum(isinstance(filter_, _TelethonLocalUpdateWaitFilter) for filter_ in target_logger.filters) == 1
     finally:
         target_logger.filters[:] = original_filters
 
@@ -82,3 +86,86 @@ def test_stale_session_is_debug_only_and_other_security_warnings_survive(
         )
     finally:
         sender.filters[:] = original_filters
+
+
+@pytest.mark.parametrize(
+    ("level", "message", "args"),
+    (
+        (
+            logging.INFO,
+            "Cannot get difference since Telegram is having issues: %s",
+            ("TelegramUpdateEligibilityDeferredError",),
+        ),
+        (
+            logging.WARNING,
+            "Getting difference for channel updates %s caused %s; ending getting difference prematurely until server issues are resolved",
+            (123, "TelegramUpdateEligibilityDeferredError"),
+        ),
+    ),
+)
+@pytest.mark.parametrize("debug_enabled", (False, True))
+def test_local_update_wait_vendor_messages_are_debug_only(
+    level: int, message: str, args: tuple[object, ...], debug_enabled: bool
+) -> None:
+    record = logging.LogRecord("telethon.client.updates", level, __file__, 1, message, args, None)
+    logger = logging.getLogger(record.name)
+    original_level = logger.level
+    try:
+        logger.setLevel(logging.DEBUG if debug_enabled else logging.INFO)
+        assert _TelethonLocalUpdateWaitFilter().filter(record) is debug_enabled
+        if debug_enabled:
+            assert (record.levelno, record.levelname, record.getMessage()) == (
+                logging.DEBUG,
+                "DEBUG",
+                "Update recovery waiting for local RPC eligibility: TelegramUpdateEligibilityDeferredError",
+            )
+    finally:
+        logger.setLevel(original_level)
+
+
+@pytest.mark.parametrize(
+    "record",
+    (
+        _record(
+            message="Cannot get difference since Telegram is having issues: %s",
+            level=logging.INFO,
+            args=("ValueError",),
+        ),
+        _record(
+            message="Getting difference for channel updates %s caused %s; ending getting difference prematurely until server issues are resolved",
+            level=logging.WARNING,
+            args=(123, "ServerError"),
+        ),
+        _record(
+            message="Cannot get difference since Telegram is having issues: %s",
+            level=logging.INFO,
+            name="other.logger",
+            args=("TelegramUpdateEligibilityDeferredError",),
+        ),
+        _record(
+            message="Cannot get difference since Telegram is having issues: %s",
+            level=logging.WARNING,
+            args=("TelegramUpdateEligibilityDeferredError",),
+        ),
+        _record(
+            message=(
+                "Getting difference for channel updates %s caused %s;"
+                " ending getting difference prematurely until server issues are resolved"
+            ),
+            level=logging.WARNING,
+            args=(123, "TelegramUpdateEligibilityDeferredError", "extra"),
+        ),
+        _record(
+            message="Cannot get difference since Telegram is having issues: %s",
+            level=logging.INFO,
+            args=("TelegramUpdateEligibilityDeferredError", "extra"),
+        ),
+        _record(
+            message="Cannot get difference since Telegram is having issues: other",
+            level=logging.INFO,
+            args=("TelegramUpdateEligibilityDeferredError",),
+        ),
+    ),
+)
+def test_local_update_wait_filter_preserves_nonmarker_vendor_records(record: logging.LogRecord) -> None:
+    assert _TelethonLocalUpdateWaitFilter().filter(record) is True

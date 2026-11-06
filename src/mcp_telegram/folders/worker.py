@@ -16,6 +16,7 @@ from ..telegram_demand import (
     DurableDemandAdapter,
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
+    RpcReadTimeoutError,
     durable_demand_context,
 )
 from ..telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkKey, WorkRevision
@@ -119,7 +120,12 @@ class FolderProjectionWorker:
                 receipt = await self._refresh_once(now, budget, force=force)
             except asyncio.CancelledError:
                 raise
-            except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending, TelegramRpcThrottled:
+            except (
+                TelegramRpcAdmissionDeferred,
+                TelegramRpcMethodRecoveryPending,
+                TelegramRpcThrottled,
+                RpcReadTimeoutError,
+            ):
                 raise
             except Exception as exc:
                 if await self._handle_refresh_error(exc):

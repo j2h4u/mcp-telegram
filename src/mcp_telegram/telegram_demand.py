@@ -146,6 +146,10 @@ class RpcAttemptBudgetExhaustedError(RuntimeError):
     """Raised before a send that would exceed a durable slice contract."""
 
 
+class RpcReadTimeoutError(RuntimeError):
+    """A verified durable read timed out and its exact wire owner was retired."""
+
+
 @dataclass(slots=True)
 class RpcAttemptAccounting:
     """One cumulative counter shared by all bindings of an exact revision."""

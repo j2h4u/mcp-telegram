@@ -32,6 +32,7 @@ from .image_authorization import ScopeToken
 from .native_write_fence import FolderWriteRejected, NoteWriteRejected
 from .peer_access import PeerAccessRejectedError
 from .scheduled_write_fence import ScheduledWriteRejected
+from .telegram_demand import RpcReadTimeoutError
 from .telegram_rpc_scheduler import ResendCause, RpcAdmissionExpiredError, RpcAdmissionSaturatedError, TelegramRpcScope
 
 type ProtocolOrigin = Literal["ack", "ping", "state_info", "auth"]
@@ -486,6 +487,16 @@ class GuardedMTProtoSender(MTProtoSender):
         assert owned.result is not None
         return owned.result
 
+    def retire_read_timeout(self, result: asyncio.Future[object], owner: object) -> None:
+        """Settle only the exact application state authorized by the gateway."""
+        for owned in self._owned_states.values():
+            if owned.result is result and owned.owner is owner:
+                if not owned.state.future.done():
+                    owned.state.future.set_exception(RpcReadTimeoutError("Telegram durable read response timed out"))
+                return
+        if not result.done():
+            raise RuntimeError("read timeout lacks its exact application owner")
+
     def _remember(
         self, state: _RequestState, owner: object, *, application: bool = False, origin: ProtocolOrigin | None = None
     ) -> _OwnedState:
@@ -559,6 +570,8 @@ class GuardedMTProtoSender(MTProtoSender):
             self._send_queue._ready.set()
 
     def _retire_completed_state(self, owned: _OwnedState) -> None:
+        while owned.state in self._send_queue._deque:
+            self._send_queue._deque.remove(owned.state)
         if self._pending_state.get(owned.state.msg_id) is owned.state:
             self._pending_state.pop(owned.state.msg_id, None)
         if owned.origin != "ack" or owned.retired or owned.state not in self._last_acks:

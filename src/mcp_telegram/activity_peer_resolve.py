@@ -16,7 +16,7 @@ from .flood import TelegramRpcThrottled, _raise_if_latched
 from .linked_chat_fact import LinkedChatFact, LinkedChatState, linked_chat_fact_owner
 from .sqlite_writer import SQLiteWriter
 from .sync_transactions import write_transaction
-from .telegram_demand import RpcAttemptBudgetExhaustedError
+from .telegram_demand import RpcAttemptBudgetExhaustedError, RpcReadTimeoutError
 from .telegram_rpc_scheduler import RpcAdmissionClosedError
 
 logger = logging.getLogger(__name__)
@@ -30,7 +30,7 @@ async def resolve_input_peer(client: _InputEntityResolverClient, dialog_id: int)
     """Resolve a bare dialog ID through Telethon's local session cache."""
     try:
         return cast(TypeInputPeer, await client.get_input_entity(dialog_id))
-    except RpcAttemptBudgetExhaustedError:
+    except RpcAttemptBudgetExhaustedError, RpcReadTimeoutError:
         raise
     except RpcAdmissionClosedError:
         raise

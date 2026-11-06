@@ -20,7 +20,7 @@ from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.entity_profile.repository import EntitySectionCommit
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.image_authorization import ScopeCell, ScopeToken
-from mcp_telegram.telegram_demand import RpcAttemptBudgetExhaustedError
+from mcp_telegram.telegram_demand import RpcAttemptBudgetExhaustedError, RpcReadTimeoutError
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 from mcp_telegram.telethon_dialog import observe_dialog_identity
 from tests.demand_adapter_helpers import run_ready_slice
@@ -526,11 +526,15 @@ async def test_group_pair_rejects_wrong_envelope_and_nested_channel_full(respons
 
 @pytest.mark.asyncio
 async def test_group_pair_budget_and_flood_wait_leave_projections_unwritten() -> None:
-    for failure in (RpcAttemptBudgetExhaustedError("budget"), TelegramRpcThrottled(retry_after_seconds=7)):
+    for failure in (
+        RpcAttemptBudgetExhaustedError("budget"),
+        RpcReadTimeoutError("sender"),
+        TelegramRpcThrottled(retry_after_seconds=7),
+    ):
         conn, service, client = _service()
         client.failure = failure
-        if isinstance(failure, TelegramRpcThrottled):
-            with pytest.raises(TelegramRpcThrottled):
+        if isinstance(failure, (TelegramRpcThrottled, RpcReadTimeoutError)):
+            with pytest.raises(type(failure)):
                 await run_ready_slice(EntityProfileDemandAdapter(service.refresh_coordinator))  # type: ignore[attr-defined]
         else:
             await run_ready_slice(EntityProfileDemandAdapter(service.refresh_coordinator))  # type: ignore[attr-defined]

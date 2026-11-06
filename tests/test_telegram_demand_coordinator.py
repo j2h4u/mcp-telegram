@@ -34,6 +34,7 @@ from mcp_telegram.telegram_demand import (
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
     RpcRetryAuthorization,
+    current_demand_token,
 )
 from mcp_telegram.telegram_demand_coordinator import (
     CoordinatorState,
@@ -266,6 +267,7 @@ async def test_inspect_work_distinguishes_exact_revision_and_deadline_reason() -
     async def fail() -> None:
         assert coordinator.inspect_work(old)["active_revision_matches"] is False
         assert coordinator.inspect_work(unrelated)["active_for_target"] is False
+        current_demand_token().attempt_evidence.record_dispatch()
         raise TimeoutError
 
     adapter.on_run = fail
@@ -379,8 +381,8 @@ async def test_expired_bare_invocation_is_not_revived_by_gate_notifications() ->
     clock.value = 5000
     coordinator.eligibility_changed("users.getFullUser")
     coordinator.scan()
-    await coordinator._execute_slice(kind)
-    assert coordinator.inspect_work(adapter.selected)["reason"] == "retry_not_authorized"
+    assert kind not in coordinator.ready_kinds
+    assert coordinator.inspect_work(adapter.selected)["reason"] == "no_progress"
     for _ in range(3):
         coordinator.eligibility_changed(None)
         coordinator.eligibility_changed("users.getFullUser")
@@ -516,7 +518,7 @@ def _adapters(statuses: Mapping[DemandKind, DemandStatus] | None = None) -> dict
     return {kind: _Adapter(kind, statuses.get(kind)) for kind in DURABLE_DEMAND_ORDER}
 
 
-@pytest.mark.parametrize("kind", [DemandKind.DELTA_GAP_FILL, DemandKind.ENTITY_PROFILE_REFRESH])
+@pytest.mark.parametrize("kind", DURABLE_DEMAND_ORDER)
 @pytest.mark.parametrize("outcome_kind", list(SliceOutcomeKind))
 async def test_slice_receipt_only_claims_owner_committed_outcome(
     kind: DemandKind, outcome_kind: SliceOutcomeKind
@@ -1362,7 +1364,9 @@ def _discovery_with_link_wait(
 
 
 @pytest.mark.asyncio
-async def test_callback_execution_deadline_resumes_sibling_demand(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_admission_deadline_does_not_cancel_local_callback_before_sibling_demand(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from dataclasses import replace
 
     import mcp_telegram.telegram_demand_coordinator as module
@@ -1378,23 +1382,22 @@ async def test_callback_execution_deadline_resumes_sibling_demand(monkeypatch: p
             admission_timeout_seconds=0.005,
         ),
     )
-    cancelled = asyncio.Event()
+    completed = asyncio.Event()
     shutdown = asyncio.Event()
 
     async def slow_slice() -> None:
-        try:
-            await asyncio.sleep(0.05)
-        finally:
-            cancelled.set()
+        await asyncio.sleep(0.05)
+        completed.set()
 
     async def sibling_slice() -> None:
         shutdown.set()
 
     adapters[target].on_run = slow_slice
+    adapters[target].outcome_kind = SliceOutcomeKind.NO_PROGRESS
     adapters[sibling].on_run = sibling_slice
     coordinator = TelegramDemandCoordinator(adapters, shutdown, clock=_Clock())
     await asyncio.wait_for(coordinator.run(), 0.5)
-    assert cancelled.is_set()
+    assert completed.is_set()
     assert len(adapters[target].run_calls) == 1
     assert len(adapters[sibling].run_calls) == 1
     assert coordinator.state is CoordinatorState.STOPPED
@@ -1523,3 +1526,129 @@ async def test_renewed_typed_method_wait_survives_no_send_outcome(throttled: boo
     assert len(adapter.run_calls) == 2
     assert coordinator._revision_methods[adapter.selected] == "blocked.B"
     assert coordinator._eligibility_waits[adapter.selected] == 180
+
+
+async def test_all_durable_failure_retry_receipts_reopen_from_bounded_sink(  # noqa: PLR0915 - stored receipt contract
+    tmp_path: Path,
+) -> None:
+    from mcp_telegram.sync_transactions import write_transaction
+
+    path = tmp_path / "durable-receipts.db"
+    with closing(sqlite3.connect(path)) as schema:
+        _apply_migrations(schema)
+    writer = await SQLiteWriter.open(path)
+    sink = RuntimeObservationSink(path, writer=writer, retention_ttl_seconds=3600, policy=RuntimeObservationConfig())
+    observer = RpcAdmissionObservationAggregator(sink, policy=RuntimeObservationConfig(), method_names=frozenset())
+    clock = _Clock()
+    adapters = _adapters({kind: DemandStatus(0) for kind in DURABLE_DEMAND_ORDER})
+    for kind, adapter in adapters.items():
+        adapter.selected = WorkRevision(WorkKey(kind, 42, "private.peer.123"), "private.revision.456")
+        adapter.selections = [adapter.selected]
+        adapter.run_error = TimeoutError("private failure text")
+    coordinator = TelegramDemandCoordinator(adapters, clock=clock, monotonic_clock=clock, observer=observer)
+    try:
+        for kind in DURABLE_DEMAND_ORDER:
+            await coordinator._execute_slice(kind)
+            coordinator._active_kind = None
+        clock.value += 30
+        coordinator.scan()
+        for kind in DURABLE_DEMAND_ORDER:
+
+            def commit_marker(conn: sqlite3.Connection, selected_kind: DemandKind = kind) -> None:
+                with write_transaction(conn):
+                    conn.execute("INSERT INTO daemon_state(key,value) VALUES(?,?)", (selected_kind.value, "committed"))
+
+            async def accepted(commit: Callable[[sqlite3.Connection], None] = commit_marker) -> None:
+                await writer.run(commit)
+                clock.value += 0.125
+
+            adapters[kind].run_error = None
+            adapters[kind].on_run = accepted
+            await coordinator._execute_slice(kind)
+            coordinator._active_kind = None
+    finally:
+        await sink.aclose()
+        await writer.aclose()
+    with closing(sqlite3.connect(path)) as reopened:
+        rows = cast(
+            list[tuple[str, str]],
+            reopened.execute(
+                "SELECT reason_code,payload_json FROM runtime_observations "
+                "WHERE kind='telegram.demand' AND outcome='slice_receipt' ORDER BY id"
+            ).fetchall(),
+        )
+        assert reopened.execute("SELECT COUNT(*) FROM daemon_state WHERE value='committed'").fetchone() == (
+            len(DURABLE_DEMAND_ORDER),
+        )
+    assert len(rows) == len(DURABLE_DEMAND_ORDER) * 2
+    for index, kind in enumerate(DURABLE_DEMAND_ORDER):
+        failed, committed = rows[index], rows[index + len(DURABLE_DEMAND_ORDER)]
+        first, second = (
+            cast(dict[str, object], json.loads(failed[1])),
+            cast(dict[str, object], json.loads(committed[1])),
+        )
+        assert failed[0] == "failed" and committed[0] == "progressed"
+        assert first["demand_kind"] == second["demand_kind"] == kind.value
+        assert first["work_ref"] == second["work_ref"] and first["selected_ref"] == second["selected_ref"]
+        assert "committed_ref" not in first and second["committed_ref"] != second["selected_ref"]
+        assert first["hold_kind"] == "transient_backoff" and first["retry_not_before_monotonic"] == 130
+        assert second["hold_kind"] == "none" and second["duration_ms"] == 125
+        assert (
+            first["root_attempts"]
+            == second["root_attempts"]
+            == first["actual_attempts"]
+            == second["actual_attempts"]
+            == 0
+        )
+        assert "private.peer" not in failed[1] + committed[1]
+        assert "private.revision" not in failed[1] + committed[1]
+        assert "private failure" not in failed[1] + committed[1]
+
+
+async def test_accepted_sqlite_callback_commits_once_after_admission_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    from mcp_telegram import telegram_demand_coordinator
+    from mcp_telegram.sync_transactions import write_transaction
+
+    path = tmp_path / "accepted-write.db"
+    with closing(sqlite3.connect(path)) as schema:
+        _apply_migrations(schema)
+    writer = await SQLiteWriter.open(path)
+    started, release = threading.Event(), threading.Event()
+    kind = DemandKind.HOT_ACTIVITY_PAGE
+    adapters = _adapters({kind: DemandStatus(0)})
+    original_contract = telegram_demand_coordinator.demand_contract
+    monkeypatch.setattr(
+        telegram_demand_coordinator,
+        "demand_contract",
+        lambda selected_kind: replace(original_contract(selected_kind), admission_timeout_seconds=0.005),
+    )
+    commits: list[bool] = []
+
+    def accepted(conn: sqlite3.Connection) -> None:
+        with write_transaction(conn):
+            conn.execute("INSERT INTO daemon_state(key,value) VALUES('accepted','committed')")
+            started.set()
+            assert release.wait(2)
+        commits.append(True)
+
+    async def persist() -> None:
+        await writer.run(accepted)
+
+    adapters[kind].on_run = persist
+    coordinator = TelegramDemandCoordinator(adapters)
+    task = asyncio.create_task(coordinator._execute_slice(kind))
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        await asyncio.sleep(0.02)
+        assert not task.done() and commits == []
+    finally:
+        release.set()
+        await task
+        await writer.aclose()
+    assert commits == [True]
+    with closing(sqlite3.connect(path)) as reopened:
+        assert reopened.execute("SELECT value FROM daemon_state WHERE key='accepted'").fetchone() == ("committed",)

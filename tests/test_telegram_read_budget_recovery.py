@@ -291,7 +291,7 @@ async def test_method_diagnostics_report_read_and_mixed_causes(clock: Clock, mix
     deferred = ledger.method_deferral(method)
     assert deferred is not None
     assert deferred.reason == ("method_mixed_retry" if mixed else "read_budget_retry")
-    assert "FloodWait" in str(deferred) if mixed else "budget exhaustion" in str(deferred)
+    assert "FloodWait" in str(deferred) if mixed else "local read failure" in str(deferred)
 
 
 @pytest.mark.parametrize("kind", ["draft", "scheduled", "folder", "note", "bootstrap", "authentication", "self_lookup"])

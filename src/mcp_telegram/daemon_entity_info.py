@@ -113,6 +113,7 @@ from .telegram_demand import (
     DemandStatus,
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
+    RpcReadTimeoutError,
     UnclassifiedTelegramDemandError,
 )
 from .telegram_demand_progress import SliceOutcome, SliceOutcomeKind, WorkKey, WorkRevision
@@ -1221,7 +1222,7 @@ class DaemonEntityInfoService:
         try:
             await self._prepare_received_profile_context(context)
             full_profile, contact_overlap = await self._acquire_group_full_chat_pair(cursor)
-        except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending:
+        except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending, RpcReadTimeoutError:
             raise
         except RpcAttemptBudgetExhaustedError:
             self._observe_profile_section_failure(cursor, DialogType.GROUP, actual_attempts=0)
@@ -1448,7 +1449,7 @@ class DaemonEntityInfoService:
             field_observation = await self._profile_field_observation(cursor, entity_type, context)
             self._require_profile_access(cursor.entity_id)
             result = await self._acquire_profile_section(cursor, entity_type, context=context)
-        except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending:
+        except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending, RpcReadTimeoutError:
             raise
         except RpcAttemptBudgetExhaustedError:
             self._observe_profile_section_failure(cursor, entity_type, actual_attempts=0)
@@ -1903,7 +1904,7 @@ class DaemonEntityInfoService:
         attempt_start = context.attempt_start
         if isinstance(error, _ProfileAccessLostError):
             raise error
-        if isinstance(error, (TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending)):
+        if isinstance(error, (TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending, RpcReadTimeoutError)):
             raise error
         if isinstance(error, RpcAttemptBudgetExhaustedError):
             await self._record_full_user_pair_failure(cursor, pair_mode, attempt_start, reuse_rejection_reason, context)
@@ -2758,7 +2759,7 @@ class DaemonEntityInfoService:
         identity_started_at = int(self._deps.now_provider())
         try:
             entity, error = await self._resolve_entity(cursor.entity_id)
-        except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending:
+        except TelegramRpcAdmissionDeferred, TelegramRpcMethodRecoveryPending, RpcReadTimeoutError:
             raise
         except RpcAttemptBudgetExhaustedError:
             raise
@@ -3591,6 +3592,7 @@ class DaemonEntityInfoService:
             TelegramRpcThrottled,
             RpcAttemptBudgetExhaustedError,
             UnclassifiedTelegramDemandError,
+            RpcReadTimeoutError,
         ):
             raise
         except (TimeoutError, OSError, RPCError, RuntimeError, TypeError, AttributeError) as exc:

@@ -24,6 +24,10 @@ from .telegram_update_ring import TelegramUpdateRing
 type Eligibility = TelegramRpcThrottled | TelegramRpcMethodRecoveryPending | None
 
 
+class TelegramUpdateEligibilityDeferredError(ValueError):
+    """A preserved update gap is waiting for local RPC eligibility."""
+
+
 def _user_invalidations(envelope: object) -> list[types.UpdateUser]:
     updates = getattr(envelope, "updates", None)
     if not isinstance(updates, list):

@@ -938,10 +938,10 @@ async def run_mcp_http_server(
 
     import uvicorn
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-    from mcp.server.transport_security import TransportSecuritySettings
+    from mcp.server.transport_security import TransportSecurityMiddleware, TransportSecuritySettings
     from starlette.applications import Starlette
     from starlette.requests import Request
-    from starlette.responses import JSONResponse
+    from starlette.responses import JSONResponse, Response
     from starlette.routing import Mount, Route
 
     log_level = resolve_logging_config().level
@@ -966,18 +966,26 @@ async def run_mcp_http_server(
 
     mcp_server = bootstrap_server()
     mcp_server.instructions = await _build_server_instructions()
+    security_settings = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_http_allowed_hosts(host=host, port=port),
+        allowed_origins=_http_allowed_origins(),
+    )
+    request_security = TransportSecurityMiddleware(security_settings)
     session_manager = StreamableHTTPSessionManager(
         app=mcp_server,
         stateless=True,
         json_response=True,
-        security_settings=TransportSecuritySettings(
-            enable_dns_rebinding_protection=True,
-            allowed_hosts=_http_allowed_hosts(host=host, port=port),
-            allowed_origins=_http_allowed_origins(),
-        ),
+        security_settings=security_settings,
     )
 
     async def handle_mcp(scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["method"] == "GET":
+            response = await request_security.validate_request(Request(scope, receive=receive))
+            if response is None:
+                response = Response(status_code=405, headers={"Allow": "POST"})
+            await response(scope, receive, send)
+            return
         await session_manager.handle_request(scope, receive, send)
 
     async def handle_health(_: Request) -> JSONResponse:

@@ -20,6 +20,7 @@ from .telegram_demand import (
     DurableDemandAdapter,
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
+    RpcReadTimeoutError,
     acquisition_context,
     durable_demand_context,
 )
@@ -185,6 +186,7 @@ class SelfProfileMaintenanceDemandAdapter(DurableDemandAdapter):
             return None
         except (
             RpcAdmissionClosedError,
+            RpcReadTimeoutError,
             TelegramRpcAdmissionDeferred,
             TelegramRpcMethodRecoveryPending,
             TelegramRpcThrottled,

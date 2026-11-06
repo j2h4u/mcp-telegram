@@ -73,6 +73,7 @@ from .telegram_demand import (
     DemandToken,
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
+    RpcReadTimeoutError,
     UnclassifiedTelegramDemandError,
     acquisition_context,
     current_demand_token,
@@ -266,6 +267,7 @@ def _delta_gap_fill_error_result(exc: BaseException) -> tuple[str, str]:
         (RpcAdmissionSaturatedError, ("deferred", "admission_saturated")),
         (RpcAdmissionExpiredError, ("deferred", "admission_expired")),
         (RpcAttemptBudgetExhaustedError, ("deferred", "budget_exhausted")),
+        (RpcReadTimeoutError, ("deferred", "sender_timeout")),
         (TelegramRpcThrottled, ("deferred", "flood_wait")),
         (asyncio.CancelledError, ("failed", "cancelled")),
         (MessageHistoryUnavailableError, ("failed", "history_unavailable")),
@@ -1071,6 +1073,8 @@ class DeltaGapFillDemandAdapter:
             (TelegramRpcThrottled, TelegramRpcAdmissionDeferred, RpcAdmissionSaturatedError, RpcAdmissionExpiredError),
         ):
             return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        if isinstance(error, TimeoutError):
+            raise error
         if error is not None or self._worker._last_delta_slice_access_lost:
             return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
         if self._worker._last_delta_slice_stale:

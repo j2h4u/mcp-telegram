@@ -1,15 +1,17 @@
 """The real vendor loop retains gaps while passive delivered updates continue."""
 
 import asyncio
+import logging
 import time
 from datetime import UTC, datetime
 from typing import cast
 
 import pytest
 from telethon import functions, types
-from telethon._updates import SessionState
+from telethon._updates import ChannelState, SessionState
 from telethon._updates.messagebox import ENTRY_ACCOUNT
 
+from mcp_telegram.runtime_logging import install_telethon_log_filter
 from mcp_telegram.telegram_rpc import _canonical_wire_method
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred
 from mcp_telegram.telegram_update_admission import GateMessageBox
@@ -18,7 +20,7 @@ from tests.test_telegram_rpc_wire_integration import wire as wire
 
 
 async def test_vendor_difference_deferral_keeps_gap_and_passive_delivery_then_resumes(  # noqa: PLR0915 - one vendor lifecycle
-    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     gate = wire[0]
     box = cast(GateMessageBox, gate._message_box)
@@ -33,6 +35,12 @@ async def test_vendor_difference_deferral_keeps_gap_and_passive_delivery_then_re
     received = asyncio.Event()
     recovered = asyncio.Event()
     monkeypatch.setattr(box, "_eligibility", lambda _method: hint)
+    update_logger = logging.getLogger("telethon.client.updates")
+    monkeypatch.setattr(update_logger, "filters", list(update_logger.filters))
+    sender_logger = logging.getLogger("telethon.network.mtprotosender")
+    monkeypatch.setattr(sender_logger, "filters", list(sender_logger.filters))
+    install_telethon_log_filter()
+    caplog.set_level(logging.DEBUG, logger="telethon.client.updates")
 
     async def difference(request: object, *, ordered: bool) -> object:
         nonlocal hint, calls
@@ -51,7 +59,7 @@ async def test_vendor_difference_deferral_keeps_gap_and_passive_delivery_then_re
         dispatched.append(update)
         received.set()
 
-    monkeypatch.setattr(gate, "_call_registered", difference)
+    monkeypatch.setattr(gate, "_call_classified_difference", difference)
     monkeypatch.setattr(gate, "_dispatch_update", dispatch)
     loop = asyncio.create_task(gate._update_loop())
     try:
@@ -61,6 +69,13 @@ async def test_vendor_difference_deferral_keeps_gap_and_passive_delivery_then_re
         gate._updates_queue.put_nowait(types.UpdateShort(update, now))
         await asyncio.wait_for(received.wait(), 2)
         assert calls == 1 and ENTRY_ACCOUNT in box.getting_diff_for
+        assert any(
+            record.levelno == logging.DEBUG
+            and record.getMessage()
+            == "Update recovery waiting for local RPC eligibility: TelegramUpdateEligibilityDeferredError"
+            for record in caplog.records
+        )
+        assert not any("Telegram is having issues" in record.getMessage() for record in caplog.records)
         assert box.map[ENTRY_ACCOUNT].pts == 10 and box.seq == 1
         assert gate._main_sender.physical_connected() and gate._updates_error is None
         hint = None
@@ -102,6 +117,75 @@ async def test_ordinary_vendor_value_error_still_ends_its_gap(
             await asyncio.sleep(0)
         assert ENTRY_ACCOUNT not in box.getting_diff_for
         assert gate._main_sender.physical_connected()
+    finally:
+        loop.cancel()
+        await loop
+
+
+async def test_vendor_channel_difference_deferral_logs_local_wait_and_resumes(  # noqa: PLR0915 - one vendor lifecycle
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    gate = wire[0]
+    box = cast(GateMessageBox, gate._message_box)
+    now = datetime.now(UTC)
+    box.load(SessionState(42, 2, False, 10, 0, int(now.timestamp()), 1, None), [ChannelState(123, 20)])
+    gate._mb_entity_cache.extend(
+        [], [types.Channel(123, "test", types.ChatPhotoEmpty(), now, access_hash=456, megagroup=True)]
+    )
+    box.try_begin_get_diff(123, "test channel gap")
+    gate._authorized = True
+    gate._catch_up = False
+    caplog.set_level(logging.DEBUG, logger="telethon.client.updates")
+    update_logger = logging.getLogger("telethon.client.updates")
+    monkeypatch.setattr(update_logger, "filters", list(update_logger.filters))
+    sender_logger = logging.getLogger("telethon.network.mtprotosender")
+    monkeypatch.setattr(sender_logger, "filters", list(sender_logger.filters))
+    install_telethon_log_filter()
+    hint: TelegramRpcAdmissionDeferred | None = None
+    calls = 0
+    received = asyncio.Event()
+    resumed = asyncio.Event()
+    monkeypatch.setattr(box, "_eligibility", lambda _method: hint)
+
+    async def difference(request: object, *, ordered: bool) -> object:
+        nonlocal calls, hint
+        del ordered
+        assert isinstance(request, functions.updates.GetChannelDifferenceRequest)
+        calls += 1
+        if calls == 1:
+            hint = TelegramRpcAdmissionDeferred(
+                100, method_key=_canonical_wire_method(request), eligible_at=time.monotonic() + 100, reason="server"
+            )
+            raise hint
+        resumed.set()
+        return types.updates.ChannelDifferenceEmpty(pts=21, final=True)
+
+    async def dispatch(_update: object) -> None:
+        received.set()
+
+    monkeypatch.setattr(gate, "_call_classified_difference", difference)
+    monkeypatch.setattr(gate, "_dispatch_update", dispatch)
+    loop = asyncio.create_task(gate._update_loop())
+    try:
+        while calls == 0:
+            await asyncio.sleep(0)
+        gate._updates_queue.put_nowait(types.UpdateShort(types.UpdateUserStatus(7, types.UserStatusOffline(now)), now))
+        await asyncio.wait_for(received.wait(), 2)
+        assert box.map[123].pts == 20 and 123 in box.getting_diff_for
+        assert gate._main_sender.physical_connected() and gate._updates_error is None
+        assert any(
+            record.levelno == logging.DEBUG
+            and record.getMessage()
+            == "Update recovery waiting for local RPC eligibility: TelegramUpdateEligibilityDeferredError"
+            for record in caplog.records
+        )
+        assert not any("server issues are resolved" in record.getMessage() for record in caplog.records)
+        hint = None
+        gate._notify_rpc_eligibility_changed()
+        await asyncio.wait_for(resumed.wait(), 2)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert box.map[123].pts == 21 and 123 not in box.getting_diff_for
     finally:
         loop.cancel()
         await loop

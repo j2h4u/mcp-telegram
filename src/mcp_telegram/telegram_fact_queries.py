@@ -19,7 +19,7 @@ from typing import cast
 from .models import DialogType, ReadMessage, ReadReactionEvent
 from .sqlite_writer import SQLiteWriter
 from .sync_transactions import require_write_transaction, write_transaction
-from .telegram_demand import RpcAttemptBudgetExhaustedError
+from .telegram_demand import RpcAttemptBudgetExhaustedError, RpcReadTimeoutError
 from .telegram_gateway import CATCHABLE_GATEWAY_FAILURES
 from .telegram_read_receipts import classify_read_date_exception
 from .telegram_reading import (
@@ -264,7 +264,7 @@ async def _fetch_read_date_result(
 ) -> ReadDateFetchResult:
     try:
         result = await gateway.fetch_outbox_read_date(dialog_id, message_id)
-    except RpcAdmissionClosedError, RpcAttemptBudgetExhaustedError:
+    except RpcAdmissionClosedError, RpcAttemptBudgetExhaustedError, RpcReadTimeoutError:
         raise
     except CATCHABLE_GATEWAY_FAILURES as exc:
         return classify_read_date_exception(exc)
