@@ -188,6 +188,29 @@ def test_group_only_user_identity_is_not_a_personal_correspondent(
     assert personal_profile_peer(conn, 77, 42)
 
 
+def test_unknown_dialog_type_keeps_personal_evidence_and_exclusions(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
+    conn = make_synced_db()
+    with write_savepoint(conn):
+        conn.executemany("INSERT INTO dialogs(dialog_id,type) VALUES(?,NULL)", [(42,), (43,), (44,), (45,), (46,)])
+        conn.executemany(
+            "INSERT INTO entities(id,type,updated_at) VALUES(?,?,1)", [(42, "user"), (45, "service"), (46, "bot")]
+        )
+        conn.executemany("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES(?,1,1)", [(43,), (45,)])
+        assert admit_profile_peer(conn, 77, 44, now=100)
+        assert admit_profile_peer(conn, 77, 46, now=100)
+    assert conn.execute("SELECT type FROM entities WHERE id=44").fetchone() == ("unknown",)
+    assert conn.execute("SELECT type FROM entities WHERE id=46").fetchone() == ("bot",)
+    assert not personal_profile_peer(conn, 77, 42)
+    assert personal_profile_peer(conn, 77, 43)
+    assert personal_profile_peer(conn, 77, 44)
+    assert not personal_profile_peer(conn, 77, 45)
+    assert not personal_profile_peer(conn, 77, 77)
+    assert not personal_profile_peer(conn, 77, 777000)
+    assert not personal_profile_peer(conn, 78, 44)
+
+
 @pytest.mark.parametrize("existing_owner,requested_owner,preserved", [(7, 7, True), (8, 7, False)])
 def test_pre_details_not_found_keeps_bound_negative_state(
     make_synced_db: Callable[[], sqlite3.Connection], existing_owner: int, requested_owner: int, preserved: bool
