@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 from typing import cast
 
 from .hydration_queue import HydrationQueueRepository
+from .message_contracts import TOPIC_ATTRIBUTION_EXTRACTOR_VERSION
 from .sync_transactions import require_write_transaction, write_savepoint
 
 
@@ -167,6 +168,20 @@ def enable_history(
         _store_intent(conn, dialog_id, True, timestamp)
         reset_read_position_retry(conn, dialog_id)
         decision = _decide_transition(coverage, enabled=True)
+        if coverage == "synced":
+            receipt = cast(
+                tuple[int, str] | None,
+                conn.execute(
+                    "SELECT topic_attribution_version, topic_attribution_state FROM synced_dialogs WHERE dialog_id=?",
+                    (dialog_id,),
+                ).fetchone(),
+            )
+            if receipt is not None and (receipt[0] != TOPIC_ATTRIBUTION_EXTRACTOR_VERSION or receipt[1] != "complete"):
+                conn.execute(
+                    "UPDATE synced_dialogs SET status='syncing', sync_progress=0 WHERE dialog_id=?", (dialog_id,)
+                )
+                coverage = "syncing"
+                decision = _TransitionDecision("queue_full_history", "syncing", None, True)
         if coverage is None:
             conn.execute(
                 "INSERT INTO synced_dialogs(dialog_id, status) VALUES (?, ?)",

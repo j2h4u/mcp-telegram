@@ -290,6 +290,7 @@ def _sync_read_model_payload(
     is_synced = status == "synced"
     return build_sync_read_model(
         persisted_status=status,
+        history_depth_complete=is_synced,
         enrollment_enabled=is_synced,
         last_synced_at=1700000000 if is_synced else None,
         last_event_at=last_event_at,

@@ -501,20 +501,31 @@ def _topic_attribution_receipt(conn: sqlite3.Connection, dialog_id: int) -> dict
     row = _fetchone_row(
         conn.execute(
             "SELECT topic_attribution_version, topic_attribution_state, "
-            "topic_attribution_observed_at, topic_attribution_completed_at, topic_attribution_no_topic_count "
+            "topic_attribution_observed_at, topic_attribution_completed_at, "
+            "(SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND is_deleted = 0 AND forum_topic_id IS NULL) "
             "FROM synced_dialogs WHERE dialog_id = ?",
-            (dialog_id,),
+            (dialog_id, dialog_id),
         )
     )
     if row is None:
-        return {"version": 0, "state": "unknown", "observed_at": None, "completed_at": None, "no_topic_count": 0}
+        count = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND is_deleted = 0 AND forum_topic_id IS NULL",
+            (dialog_id,),
+        ).fetchone()[0]
+        return {
+            "version": 0,
+            "state": "unknown",
+            "observed_at": None,
+            "completed_at": None,
+            "unassigned_message_count": count,
+        }
     values = _row_sequence(row)
     return {
         "version": int(cast(int | str, values[0] or 0)),
         "state": str(values[1] or "unknown"),
         "observed_at": values[2],
         "completed_at": values[3],
-        "no_topic_count": int(cast(int | str, values[4] or 0)),
+        "unassigned_message_count": int(cast(int | str, values[4] or 0)),
     }
 
 
@@ -526,8 +537,8 @@ def _topic_selection_state(
         return None
     if messages:
         return "present"
-    # Topic roots and legal General-topic members can retain NULL attribution
-    # even after a complete current extraction pass. A local empty filter
+    # Legal General-topic members can retain NULL attribution even after a
+    # complete current extraction pass. A local empty filter
     # therefore cannot prove remote topic absence without a separate
     # topic-member receipt, which this release deliberately does not invent.
     del status, receipt
@@ -873,10 +884,10 @@ class ReadingService:
             access_metadata = _build_access_metadata(self._conn, dialog_id, status)
         result["data"].update(access_metadata)
         result["data"]["interval_coverage"] = local_history_coverage(
-            status, access_metadata["last_synced_at"]
+            status, access_metadata["last_synced_at"], access_metadata["history_depth_complete"]
         ).interval_coverage(request.until_utc)
         result["data"]["selection_state"] = local_history_coverage(
-            status, access_metadata["last_synced_at"]
+            status, access_metadata["last_synced_at"], access_metadata["history_depth_complete"]
         ).selection_state(
             present=bool(result["data"]["messages"]),
             attribution_complete=(
@@ -1406,6 +1417,7 @@ class ReadingService:
         local_count = aggregate.local_message_count
         sync_read_model = build_sync_read_model(
             persisted_status=cast(str | None, row["sync_status"]),
+            history_depth_complete=bool(row["history_depth_complete"]),
             enrollment_enabled=enrollment_enabled,
             last_synced_at=_object_to_int_or_none(row["last_synced_at"]),
             last_event_at=_object_to_int_or_none(row["last_event_at"]),
@@ -2450,7 +2462,9 @@ class ReadingService:
             )
             page = combined[: request.limit]
             history_coverage = local_history_coverage(
-                state.request.status, cast(int | None, access_metadata.get("last_synced_at"))
+                state.request.status,
+                cast(int | None, access_metadata.get("last_synced_at")),
+                bool(access_metadata["history_depth_complete"]),
             )
             selection_state = self._all_selection_state(state, page, history_coverage)
             next_nav = self._all_next_navigation(

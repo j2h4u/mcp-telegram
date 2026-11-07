@@ -11,7 +11,6 @@ from ..message_contracts import ExtractedMessage, ReceivedMessage
 from ..reactions.contracts import ReactionObservationBoundary
 
 MESSAGE_HISTORY_PAGE_SIZE: Final = 100
-TOPIC_ATTRIBUTION_EXTRACTOR_VERSION: Final = 1
 
 
 @dataclass(frozen=True, slots=True)

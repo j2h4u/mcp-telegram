@@ -2222,6 +2222,7 @@ class DaemonAPIServer:
             delta_refresh_requested_at = cast(int | None, row[7])
             access_revalidation = (cast(int | None, row[8]), cast(int | None, row[9]))
             enrollment_enabled = bool(row[10]) if row[10] is not None else None
+            history_depth_complete = bool(row[11])
         else:
             persisted_status = None
             last_synced_at = None
@@ -2234,6 +2235,7 @@ class DaemonAPIServer:
             access_revalidation = (None, None)
             intent = read_intent(self._conn, dialog_id)
             enrollment_enabled = intent.enabled
+            history_depth_complete = False
 
         count_row = cast(tuple[object] | None, self._conn.execute(_COUNT_SYNCED_MESSAGES_SQL, (dialog_id,)).fetchone())
         message_count = int(cast(int | str, count_row[0])) if count_row is not None else 0
@@ -2241,6 +2243,7 @@ class DaemonAPIServer:
         observed_now = int(time.time())
         sync_read_model = build_sync_read_model(
             persisted_status=persisted_status,
+            history_depth_complete=history_depth_complete,
             enrollment_enabled=enrollment_enabled,
             last_synced_at=last_synced_at,
             last_event_at=last_event_at,

@@ -64,6 +64,7 @@ def _make_dialog_dict(*, opts: _DialogDictOptions | None = None, **kwargs: objec
         "is_self": opts.is_self,
         **build_sync_read_model(
             persisted_status="synced",
+            history_depth_complete=True,
             enrollment_enabled=True,
             last_synced_at=1700000000,
             last_event_at=None,

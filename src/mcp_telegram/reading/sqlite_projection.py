@@ -117,20 +117,23 @@ def _build_access_metadata(
 ) -> dict:
     """Build consistent access metadata for list_messages and search_messages."""
     row = cast(
-        tuple[int | None, int | None, int | None] | None,
+        tuple[int | None, int | None, int | None, int] | None,
         conn.execute(
-            "SELECT last_synced_at, last_event_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id = ?",
+            "SELECT last_synced_at, last_event_at, last_delta_checked_at, history_depth_complete FROM synced_dialogs WHERE dialog_id = ?",
             (dialog_id,),
         ).fetchone(),
     )
-    last_synced_at, last_event_at, last_delta_checked_at = row if row is not None else (None, None, None)
-    coverage = local_history_coverage(status, last_synced_at)
+    last_synced_at, last_event_at, last_delta_checked_at, depth_complete = (
+        row if row is not None else (None, None, None, 0)
+    )
+    coverage = local_history_coverage(status, last_synced_at, bool(depth_complete))
     meta: dict = {
         "dialog_access": "archived" if status == "access_lost" else "unknown",
         "history_sync_state": history_sync_state(status),
         "coverage": coverage.state,
         "observation_horizon_at": coverage.observation_horizon_at,
         "last_synced_at": last_synced_at,
+        "history_depth_complete": bool(depth_complete),
         "last_event_at": last_event_at,
         "last_delta_checked_at": last_delta_checked_at,
     }
@@ -182,7 +185,7 @@ WITH agent_visible_dialogs AS (
         sd.last_synced_at,
         sd.last_event_at,
         sd.last_delta_checked_at,
-        sd.access_lost_at
+        sd.access_lost_at, sd.history_depth_complete
     FROM dialogs d
     LEFT JOIN synced_dialogs sd USING(dialog_id)
     LEFT JOIN topic_catalog_state tc ON tc.dialog_id = d.dialog_id
@@ -207,7 +210,7 @@ WITH agent_visible_dialogs AS (
         sd.last_synced_at,
         sd.last_event_at,
         sd.last_delta_checked_at,
-        sd.access_lost_at
+        sd.access_lost_at, sd.history_depth_complete
     FROM synced_dialogs sd
     LEFT JOIN dialogs d USING(dialog_id)
     LEFT JOIN topic_catalog_state tc ON tc.dialog_id = sd.dialog_id
@@ -218,7 +221,7 @@ SELECT
     members, created, last_message_at, snapshot_at,
     unread_mentions_count, unread_reactions_count, unread_count,
     CASE topic_applicable WHEN 1 THEN 'supported' WHEN 0 THEN 'unsupported' ELSE 'unknown' END AS topic_capability,
-    sync_status, total_messages, last_synced_at, last_event_at, last_delta_checked_at, access_lost_at
+    sync_status, total_messages, last_synced_at, last_event_at, last_delta_checked_at, access_lost_at, history_depth_complete
 FROM agent_visible_dialogs
 WHERE (:archived_filter IS NULL OR archived = :archived_filter)
 AND (:pinned_filter IS NULL OR pinned = :pinned_filter)
@@ -232,7 +235,7 @@ SELECT d.dialog_id AS dialog_id, d.archived, d.pinned, d.members, d.created, d.l
        d.unread_mentions_count, d.unread_reactions_count, d.unread_count,
        CASE tc.applicable WHEN 1 THEN 'supported' WHEN 0 THEN 'unsupported' ELSE 'unknown' END AS topic_capability,
        sd.status AS sync_status, sd.total_messages, sd.last_synced_at, sd.last_event_at,
-       sd.last_delta_checked_at, sd.access_lost_at
+       sd.last_delta_checked_at, sd.access_lost_at, sd.history_depth_complete
 FROM dialogs d LEFT JOIN synced_dialogs sd USING(dialog_id)
 LEFT JOIN topic_catalog_state tc ON tc.dialog_id=d.dialog_id
 WHERE (d.hidden=0 OR sd.status='access_lost')
@@ -245,7 +248,7 @@ SELECT sd.dialog_id AS dialog_id, 0 AS archived, 0 AS pinned, NULL AS members, N
        0 AS unread_reactions_count, NULL AS unread_count,
        CASE tc.applicable WHEN 1 THEN 'supported' WHEN 0 THEN 'unsupported' ELSE 'unknown' END AS topic_capability,
        sd.status AS sync_status, sd.total_messages, sd.last_synced_at, sd.last_event_at,
-       sd.last_delta_checked_at, sd.access_lost_at
+       sd.last_delta_checked_at, sd.access_lost_at, sd.history_depth_complete
 FROM synced_dialogs sd LEFT JOIN dialogs d USING(dialog_id)
 LEFT JOIN topic_catalog_state tc ON tc.dialog_id=sd.dialog_id
 WHERE sd.status='access_lost' AND d.dialog_id IS NULL

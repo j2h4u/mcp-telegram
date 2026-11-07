@@ -448,7 +448,7 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
                     "state": "unknown",
                     "observed_at": None,
                     "completed_at": None,
-                    "no_topic_count": 0,
+                    "unassigned_message_count": 0,
                 },
                 "dialog_type": "User",
                 "read_state": {
@@ -484,7 +484,7 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
         "state": "unknown",
         "observed_at": None,
         "completed_at": None,
-        "no_topic_count": 0,
+        "unassigned_message_count": 0,
     }
     validate(instance=payload, schema=LIST_MESSAGES_OUTPUT_SCHEMA)
     assert warnings[0]["kind"] == "archived_dialog"
@@ -526,10 +526,10 @@ def test_list_messages_warns_honestly_when_exact_topic_selection_is_unknown() ->
         )
     )
     warnings = cast(list[dict[str, object]], payload["warnings"])
-    assert warnings[0]["kind"] == "topic_selection_unknown"
+    assert warnings[0]["kind"] == "topic_history_unverified"
     assert warnings[0]["severity"] == "warning"
-    assert "action" not in warnings[0]
-    assert "membership remains unknown" in cast(str, warnings[0]["message"])
+    assert "mark_dialog_for_sync" in cast(str, warnings[0]["action"])
+    assert "get_sync_status" in cast(str, warnings[0]["action"])
     assert payload["limits"] == {
         "requested_limit": 10,
         "applied_limit": 10,
@@ -554,7 +554,45 @@ def test_list_messages_preserves_empty_topic_warning_for_explicit_sent_reads() -
         )
     )
 
-    assert cast(list[dict[str, object]], payload["warnings"])[0]["kind"] == "topic_selection_unknown"
+    assert cast(list[dict[str, object]], payload["warnings"])[0]["kind"] == "topic_history_unverified"
+
+
+@pytest.mark.parametrize(
+    ("state", "version", "message_state", "topic_id", "expected"),
+    [
+        ("unknown", 0, "sent", 5, True),
+        ("partial", 2, "all", 5, True),
+        ("complete", 1, "sent", 5, True),
+        ("complete", 2, "sent", 5, False),
+        ("unknown", 0, "sent", None, False),
+        ("unknown", 0, "scheduled", 5, False),
+        ("unknown", 0, "draft", 5, False),
+    ],
+)
+def test_topic_traversal_warning_for_local_pages(
+    state: str, version: int, message_state: str, topic_id: int | None, expected: bool
+) -> None:
+    args = ListMessages(exact_dialog_id=123, message_state=message_state, navigation="next")
+    payload = _list_messages_structured_content(
+        _ListMessagesStructuredContentContext(
+            args=args,
+            data={"topic_attribution": {"version": version, "state": state}},
+            rows=[{"dialog_id": 123, "message_id": 1, "sent_at": 1, "text": "local"}],
+            dialog_id=123,
+            sender_id=None,
+            sender_name=None,
+            topic_id=topic_id,
+            direction="newest",
+            next_navigation=None,
+        )
+    )
+    warnings = cast(list[dict[str, object]], payload["warnings"])
+    assert any(w["kind"] == "topic_history_unverified" for w in warnings) is expected
+    if expected:
+        message = cast(str, warnings[0]["message"])
+        assert (
+            "partial" if state == "partial" else "older extractor" if state == "complete" else "no current traversal"
+        ) in message
 
 
 def test_list_messages_warns_when_default_all_has_no_local_published_history() -> None:
@@ -581,7 +619,7 @@ def test_list_messages_does_not_diagnose_dialog_id_when_another_filter_makes_top
         )
     )
 
-    assert payload["warnings"] == []
+    assert all(w["kind"] != "dialog_identifier_mismatch" for w in payload["warnings"])
 
 
 def test_list_messages_always_presents_selected_page_chronologically_with_reply_refs():

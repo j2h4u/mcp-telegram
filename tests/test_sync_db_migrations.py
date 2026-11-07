@@ -1329,7 +1329,7 @@ def test_migration_v72_keeps_existing_topic_attribution_unknown(tmp_path: Path) 
             Row | None,
             conn.execute(
                 "SELECT topic_attribution_version, topic_attribution_state, "
-                "topic_attribution_observed_at, topic_attribution_completed_at, topic_attribution_no_topic_count "
+                "topic_attribution_observed_at, topic_attribution_completed_at "
                 "FROM synced_dialogs WHERE dialog_id=1"
             ).fetchone(),
         )
@@ -1337,9 +1337,45 @@ def test_migration_v72_keeps_existing_topic_attribution_unknown(tmp_path: Path) 
         conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
         assert conn.execute(
             "SELECT topic_attribution_version, topic_attribution_state, "
-            "topic_attribution_observed_at, topic_attribution_completed_at, topic_attribution_no_topic_count "
+            "topic_attribution_observed_at, topic_attribution_completed_at "
             "FROM synced_dialogs WHERE dialog_id=1"
-        ).fetchone() == (0, "unknown", None, None, 0)
+        ).fetchone() == (0, "unknown", None, None)
+
+
+def test_migration_v101_invalidates_only_old_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import mcp_telegram.sync_db as sync_db_module
+
+    db_path = tmp_path / "old.db"
+    with monkeypatch.context() as old:
+        old.setattr(sync_db_module, "_CURRENT_SCHEMA_VERSION", 100)
+        ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute(
+            "INSERT INTO synced_dialogs(dialog_id,status,sync_progress,delta_message_id,last_synced_at,"
+            "topic_attribution_version,topic_attribution_state,topic_attribution_observed_at,"
+            "topic_attribution_completed_at,topic_attribution_no_topic_count) VALUES (1,'synced',7,9,11,1,'complete',12,13,14)"
+        )
+        conn.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (1,0,15)")
+        conn.execute("INSERT INTO synced_dialogs(dialog_id,status,last_synced_at) VALUES (2,'syncing',99)")
+        conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at,forum_topic_id,is_deleted) VALUES (1,2,3,4,1)")
+        conn.commit()
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        assert conn.execute(
+            "SELECT status,sync_progress,delta_message_id,last_synced_at,topic_attribution_version,topic_attribution_state,topic_attribution_observed_at,topic_attribution_completed_at FROM synced_dialogs WHERE dialog_id=1"
+        ).fetchone() == ("synced", 7, 9, 11, 0, "unknown", None, None)
+        assert conn.execute("SELECT history_depth_complete FROM synced_dialogs WHERE dialog_id=1").fetchone() == (1,)
+        assert conn.execute(
+            "SELECT history_depth_complete,last_synced_at FROM synced_dialogs WHERE dialog_id=2"
+        ).fetchone() == (0, 99)
+        assert conn.execute("SELECT enabled,updated_at FROM full_history_enrollment WHERE dialog_id=1").fetchone() == (
+            0,
+            15,
+        )
+        assert conn.execute("SELECT forum_topic_id,is_deleted FROM messages WHERE dialog_id=1").fetchone() == (4, 1)
+        assert "topic_attribution_no_topic_count" not in {
+            row[1] for row in conn.execute("PRAGMA table_info(synced_dialogs)")
+        }
 
 
 def test_migration_v73_removes_persisted_campaign_state(tmp_path: Path) -> None:

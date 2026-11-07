@@ -23,6 +23,7 @@ from ..formatter import (
     frame_telegram_snippet,
     resolve_sender_label,
 )
+from ..message_contracts import TOPIC_ATTRIBUTION_EXTRACTOR_VERSION
 from ..models import DialogType, ReadMessage
 from ..search_contracts import SEARCHABLE_QUERY_TOKEN_PATTERN
 from ..temporal import parse_utc_boundary
@@ -241,14 +242,19 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                 "history_sync_state": {"type": "string"},
                 "topic_attribution": {
                     "type": "object",
+                    "description": "Receipt for the extraction traversal of the whole dialog, not proof that a selected topic is complete.",
                     "properties": {
                         "version": {"type": "integer"},
                         "state": {"type": "string", "enum": ["unknown", "partial", "complete"]},
                         "observed_at": {"type": ["integer", "null"]},
                         "completed_at": {"type": ["integer", "null"]},
-                        "no_topic_count": {"type": "integer", "minimum": 0},
+                        "unassigned_message_count": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Current non-deleted local messages without a topic id, including General and unclassified messages; this is not a missing-message count.",
+                        },
                     },
-                    "required": ["version", "state", "observed_at", "completed_at", "no_topic_count"],
+                    "required": ["version", "state", "observed_at", "completed_at", "unassigned_message_count"],
                     "additionalProperties": False,
                 },
             },
@@ -343,7 +349,10 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
             "type": "object",
             "properties": {
                 "next_navigation": {"type": ["string", "null"]},
-                "has_more": {"type": "boolean"},
+                "has_more": {
+                    "type": "boolean",
+                    "description": "Whether more matching local rows are available; false does not establish Telegram history completeness.",
+                },
                 "source_cursor": {"type": ["string", "null"]},
                 "direction": {"type": "string"},
                 "anchor_message_id": {"type": ["integer", "null"]},
@@ -603,19 +612,7 @@ def _empty_exact_topic_warning(
             f"No locally attributed messages matched topic {args.exact_topic_id}; topic membership remains unknown.",
             severity="warning",
         )
-    return structured_warning(
-        "dialog_identifier_mismatch",
-        (
-            f"Topic {args.exact_topic_id} has no published messages in this dialog. The supplied dialog id may "
-            "identify a recipient, sender, account, or chat in another API rather than a dialog in mcp-telegram."
-        ),
-        severity="action_required",
-        action=(
-            "Retry with dialog set to the correspondent's name, @username, or Telegram link so mcp-telegram can "
-            "resolve it. If that identity is unknown, call list_dialogs first. Use exact_dialog_id only with an "
-            "id previously returned by mcp-telegram."
-        ),
-    )
+    return None
 
 
 def _navigation_direction_for_structured(direction: str, anchor_message_id: int | None) -> str:
@@ -798,6 +795,33 @@ def _list_messages_directory_coverage(data: dict) -> object:
     )
 
 
+def _list_messages_topic_warning(ctx: _ListMessagesStructuredContentContext) -> StructuredWarning | None:
+    receipt = ctx.data.get("topic_attribution")
+    unverified = (
+        ctx.topic_id is not None
+        and ctx.args.message_state in {"sent", "all"}
+        and (
+            not isinstance(receipt, dict)
+            or receipt.get("version") != TOPIC_ATTRIBUTION_EXTRACTOR_VERSION
+            or receipt.get("state") != "complete"
+        )
+    )
+    if unverified:
+        if not isinstance(receipt, dict) or receipt.get("state") == "unknown":
+            reason = "no current traversal is recorded"
+        elif receipt.get("version") != TOPIC_ATTRIBUTION_EXTRACTOR_VERSION:
+            reason = "the recorded traversal used an older extractor"
+        else:
+            reason = "the current traversal is partial"
+        return structured_warning(
+            "topic_history_unverified",
+            f"The dialog's topic attribution is unverified: {reason}; local topic results may be incomplete.",
+            severity="warning",
+            action="Call mark_dialog_for_sync to request a new traversal, then use get_sync_status to check progress.",
+        )
+    return _empty_exact_topic_warning(ctx.args, ctx.rows, ctx.data.get("selection_state"))
+
+
 def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext) -> dict[str, object]:
     args = ctx.args
     data = ctx.data
@@ -808,7 +832,7 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
     read_state = data.get("read_state")
     ordered_rows = _chronological_message_rows(rows)
     warnings = _list_messages_warnings(data)
-    if topic_warning := _empty_exact_topic_warning(args, rows, data.get("selection_state")):
+    if topic_warning := _list_messages_topic_warning(ctx):
         warnings.append(topic_warning)
     return {
         "dialog_id": resolved_dialog_id,

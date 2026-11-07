@@ -75,6 +75,7 @@ def _build(**overrides: object) -> SyncReadModel:
     facts.update(overrides)
     return build_sync_read_model(
         persisted_status=cast(str | None, facts["persisted_status"]),
+        history_depth_complete=cast(bool, facts.get("history_depth_complete", facts["persisted_status"] == "synced")),
         enrollment_enabled=cast(bool | None, facts["enrollment_enabled"]),
         last_synced_at=cast(int | None, facts["last_synced_at"]),
         last_event_at=cast(int | None, facts["last_event_at"]),
@@ -109,6 +110,26 @@ def test_status_and_enrollment_matrix_matches_realtime_policy(
         wire["history_sync_state"],
     ) == _HISTORY_BY_STATUS[effective_status]
     assert wire["history_complete_at"] == (90 if effective_status == "synced" else None)
+
+
+@pytest.mark.parametrize("status", ["syncing", "not_synced", "access_lost"])
+def test_previous_full_depth_survives_new_job_disable_and_access_loss(status: str) -> None:
+    model = _build(persisted_status=status, history_depth_complete=True)
+    assert model.history_depth_state == "complete"
+    assert model.history_complete_at == 90
+    assert model.history_sync_state != "complete_as_of_last_sync"
+    if status == "not_synced":
+        assert model.history_scope == "full"
+        assert "Previously completed history remains available" in model.action
+        assert "No full-history completion" not in model.action
+    assert decode_sync_read_model(model.to_wire()) == model
+
+
+def test_access_recovery_timestamp_does_not_establish_full_depth() -> None:
+    model = _build(persisted_status="syncing", history_depth_complete=False, last_synced_at=90)
+    assert model.history_depth_state == "partial"
+    assert model.history_complete_at is None
+    assert decode_sync_read_model(model.to_wire()) == model
 
 
 @pytest.mark.parametrize("persisted_status", ["unknown", "SYNCED", "synced "])

@@ -19,7 +19,8 @@ from .scheduled_receipts_schema import SCHEDULED_OPERATION_RECEIPT_DDL
 from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 
-_CURRENT_SCHEMA_VERSION = 100
+_CURRENT_SCHEMA_VERSION = 101
+_TOPIC_ATTRIBUTION_CORRECTION_MIGRATION = 101
 _RAW_TELEGRAM_UPDATES_MIGRATION = 100
 _PARTIAL_CANONICAL_INTAKE_MIGRATION = 99
 _CONTACT_CATALOGUE_MIGRATION = 98
@@ -5146,6 +5147,21 @@ def _apply_migrations_93_to_100(conn: sqlite3.Connection, current: int) -> int:
         current = _apply_migration_99(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _RAW_TELEGRAM_UPDATES_MIGRATION:
         current = _apply_migration_100(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _TOPIC_ATTRIBUTION_CORRECTION_MIGRATION:
+        current = _apply_migration(
+            conn,
+            current,
+            _TOPIC_ATTRIBUTION_CORRECTION_MIGRATION,
+            [
+                "ALTER TABLE synced_dialogs ADD COLUMN history_depth_complete INTEGER NOT NULL DEFAULT 0 CHECK(history_depth_complete IN (0,1))",
+                "UPDATE synced_dialogs SET history_depth_complete=1 WHERE status='synced'",
+                (
+                    "UPDATE synced_dialogs SET topic_attribution_version=0, topic_attribution_state='unknown', "
+                    "topic_attribution_observed_at=NULL, topic_attribution_completed_at=NULL"
+                ),
+                "ALTER TABLE synced_dialogs DROP COLUMN topic_attribution_no_topic_count",
+            ],
+        )
     return current
 
 
