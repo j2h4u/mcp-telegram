@@ -775,8 +775,10 @@ class FullSyncWorker:
         profile_owner_account_id: int | None = None,
         membership_staged: list[MembershipSignalCounts] | None = None,
     ) -> bool:
-        assert self._automatic_group_history is not None
-        with self._authorized_page_transaction(conn, page):
+        policy = self._automatic_group_history
+        assert policy is not None
+
+        def finalize() -> bool:
             intent = read_intent(conn, dialog_id)
             if intent.enabled is not None:
                 conn.execute("DELETE FROM daemon_state WHERE key=?", (f"automatic_group_history_retry:{dialog_id}",))
@@ -790,12 +792,10 @@ class FullSyncWorker:
             if not self._is_eligible_automatic_group(
                 conn,
                 dialog_id,
-                cutoff=int(time.time()) - self._automatic_group_history.recent_days * 86_400,
+                cutoff=int(time.time()) - policy.recent_days * 86_400,
             ):
                 return True
-            accepted = (
-                page.total_messages is not None and page.total_messages <= self._automatic_group_history.max_messages
-            )
+            accepted = page.total_messages is not None and page.total_messages <= policy.max_messages
             intent = record_automatic_group_decision(
                 conn, dialog_id, enabled=accepted, total_messages=page.total_messages
             )
@@ -806,7 +806,9 @@ class FullSyncWorker:
                     (dialog_id,),
                 )
                 self._store_batch_page_locked(conn, dialog_id, 0, page, profile_owner_account_id, membership_staged)
-        return True
+            return True
+
+        return self._authorized_page_transaction(conn, page, finalize)
 
     def _next_total_messages_repair_dialog(self) -> int | None:
         """Return the next enrolled accessible dialog missing its Telegram total."""
@@ -997,10 +999,13 @@ class FullSyncWorker:
         observer = _FULL_MEMBERSHIP_OBSERVER.get()
 
         def persist_page(conn: sqlite3.Connection) -> tuple[int, bool]:
-            with self._authorized_page_transaction(conn, page):
-                return self._store_batch_page_locked(
+            return self._authorized_page_transaction(
+                conn,
+                page,
+                lambda: self._store_batch_page_locked(
                     conn, dialog_id, sync_progress, page, profile_owner_account_id, staged
-                )
+                ),
+            )
 
         try:
             result = await self._writer.run(persist_page)
@@ -1011,12 +1016,14 @@ class FullSyncWorker:
         _report_membership(observer, staged)
         return result
 
-    @contextmanager
-    def _authorized_page_transaction(self, conn: sqlite3.Connection, page: _FetchedBatchPage) -> Iterator[None]:
+    def _authorized_page_transaction[T](
+        self, conn: sqlite3.Connection, page: _FetchedBatchPage, action: Callable[[], T]
+    ) -> T:
         with write_transaction(conn):
             self._require_page_scope(conn, page)
-            yield
+            result = action()
             self._require_page_scope(conn, page)
+            return result
 
     def _require_page_scope(self, conn: sqlite3.Connection, page: _FetchedBatchPage) -> None:
         scope = page.scope

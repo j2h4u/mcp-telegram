@@ -369,9 +369,10 @@ def _is_known_value(value: object, allowed: set[str]) -> bool:
 
 
 class MarkDialogForSync(ToolArgs):
-    """Mark or unmark a dialog for persistent sync. When marked, full message history
-    will be fetched shortly. Unmarking preserves existing synced history but stops
-    further sync. Use ListDialogs to find dialog IDs and history state."""
+    """Enable or disable persistent history sync for a dialog.
+    A synced dialog with a complete current topic attribution pass requests a delta refresh;
+    an incomplete pass can queue a bounded reinspection. An active sync is not rewound.
+    Disabling sync preserves retained facts. Use ListDialogs to find dialog IDs and history state."""
 
     dialog_id: int = Field(description="Numeric dialog ID from ListDialogs")
     enable: bool = Field(default=True, description="True to start syncing, False to stop")
@@ -419,8 +420,9 @@ class GetSyncStatus(ToolArgs):
     and delete detection reliability. delete_detection is 'reliable (channel)' for channels/supergroups
     (real-time MTProto events), 'best-effort weekly (DM)' while periodic DM verification is active,
     or a paused/stale notice when that maintenance has been suspended.
-    sync_progress is the raw message_id offset cursor, not a row count. Works for any dialog —
-    non-synced dialogs return status='not_synced' with zero counts.
+    sync_progress is the raw message_id offset cursor, not a row count.
+    Retained messages, counts and any known history horizon remain available while acquisition
+    is pending or disabled.
     Retention policy says which delivered messages may be saved; it does not verify delivery.
     Automatic group eligibility describes local facts; a fresh Telegram total requires a background probe.
     The latest retained message is ordered by Telegram sent time, not local arrival."""
