@@ -22,7 +22,7 @@ def test_upgrade_and_persistent_json_account_fences(tmp_path: Path, monkeypatch:
         sync_db.ensure_sync_schema(path)
     sync_db.ensure_sync_schema(path)
     with closing(sqlite3.connect(path)) as conn:
-        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (100,)
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (sync_db._CURRENT_SCHEMA_VERSION,)
         generation, changed = store.bind_verified_account(conn, 42)
         assert (generation, changed) == (1, False)
         assert store.begin_update_run(conn, runtime_id="one", expected_generation=generation)
