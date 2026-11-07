@@ -160,6 +160,30 @@ def _seed_topic_dialog(
 
 
 @pytest.mark.asyncio
+async def test_registered_get_sync_status_uses_canonical_forum_kind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mcp_server, "_schedule_telemetry", lambda _event: None)
+    daemon, sync_conn, feedback_conn, _ = _local_daemon(tmp_path, object())
+    _seed_topic_dialog(sync_conn, 8583106747, "Forum", message=None)
+    sync_conn.execute("UPDATE dialogs SET type='forum' WHERE dialog_id=8583106747")
+    sync_conn.execute("INSERT INTO daemon_state(key,value) VALUES ('delta_dm_gap_scan_state','{}')")
+    sync_conn.commit()
+    socket_path = tmp_path / "daemon.sock"
+    _install_daemon_socket(monkeypatch, socket_path)
+    try:
+        async with await asyncio.start_unix_server(daemon.handle_client, path=socket_path):
+            result = await mcp_server.call_tool("get_sync_status", {"dialog_id": 8583106747})
+    finally:
+        sync_conn.close()
+        feedback_conn.close()
+    assert result.is_error is False
+    payload = cast(dict[str, object], result.structured_content)
+    assert payload["delete_detection"] == "reliable (channel)"
+    validate(payload, cast(dict[str, object], mcp_server.tool_by_name["get_sync_status"].output_schema))
+
+
+@pytest.mark.asyncio
 async def test_registered_local_tool_uses_real_ipc_protection_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

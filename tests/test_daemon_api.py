@@ -3354,6 +3354,7 @@ async def test_get_sync_status_synced_dialog() -> None:
         sync_progress=500,
         total_messages=500,
     )
+    conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (?, ?)", (-1001234567890, "channel"))
     _insert_message(conn, -1001234567890, 1, text="msg1")
     _insert_message(conn, -1001234567890, 2, text="msg2")
     server = make_server(conn)
@@ -3399,9 +3400,10 @@ async def test_get_sync_status_overcount_omits_impossible_coverage() -> None:
 
 @pytest.mark.asyncio
 async def test_get_sync_status_dm_delete_detection() -> None:
-    """get_sync_status returns 'best-effort weekly (DM)' delete_detection for positive dialog_id."""
+    """get_sync_status reports best-effort deletion detection for a known DM."""
     conn = _make_db()
     _insert_synced_dialog(conn, 12345, status="synced")
+    conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (?, ?)", (12345, "user"))
     server = make_server(conn)
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": 12345})
     assert result["ok"] is True
@@ -3410,9 +3412,53 @@ async def test_get_sync_status_dm_delete_detection() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dialog_id", "dialog_type", "expected"),
+    [
+        (8583106747, "forum", "reliable (channel)"),
+        (8583106748, "supergroup", "reliable (channel)"),
+        (8583106749, "channel", "reliable (channel)"),
+        (-1001234567890, "channel", "reliable (channel)"),
+        (-123, "user", "paused (DM; older deletions may be stale)"),
+        (124, "bot", "paused (DM; older deletions may be stale)"),
+        (125, "service", "paused (DM; older deletions may be stale)"),
+        (-126, "group", "unknown (deletion detection coverage unavailable)"),
+        (127, "unknown", "unknown (deletion detection coverage unavailable)"),
+    ],
+)
+async def test_get_sync_status_deletion_detection_uses_dialog_kind(
+    dialog_id: int, dialog_type: str, expected: str
+) -> None:
+    conn = _make_db()
+    _insert_synced_dialog(conn, dialog_id, status="synced")
+    conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (?, ?)", (dialog_id, dialog_type))
+    conn.execute("INSERT INTO daemon_state(key,value) VALUES ('delta_dm_gap_scan_state','{}')")
+    conn.commit()
+    result = await make_server(conn)._dispatch({"method": "get_sync_status", "dialog_id": dialog_id})
+    assert result["ok"] is True
+    assert cast(dict[str, object], result["data"])["delete_detection"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dialog_type", ["forum", "group", "unknown"])
+async def test_get_sync_status_non_dm_does_not_read_dm_checkpoint(dialog_type: str) -> None:
+    conn = _make_db()
+    _insert_synced_dialog(conn, 8583106747, status="synced")
+    conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (?, ?)", (8583106747, dialog_type))
+    conn.commit()
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    result = await make_server(conn)._dispatch({"method": "get_sync_status", "dialog_id": 8583106747})
+    assert result["ok"] is True
+    assert "DM" not in cast(str, cast(dict[str, object], result["data"])["delete_detection"])
+    assert all("delta_dm_gap_scan_state" not in statement for statement in statements)
+
+
+@pytest.mark.asyncio
 async def test_get_sync_status_reports_suspended_dm_deletion_verification() -> None:
     conn = _make_db()
     _insert_synced_dialog(conn, 12345, status="synced")
+    conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (?, ?)", (12345, "user"))
     conn.execute(
         "INSERT INTO daemon_state(key, value) VALUES ('delta_dm_gap_scan_state', ?)",
         (
@@ -3470,6 +3516,7 @@ async def test_get_sync_status_reports_claimed_and_legacy_dm_work_as_paused(
 ) -> None:
     conn = _make_db()
     _insert_synced_dialog(conn, 12345, status="synced")
+    conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (?, ?)", (12345, "user"))
     raw = json.dumps(checkpoint)
     conn.execute(
         "INSERT INTO daemon_state(key, value) VALUES ('delta_dm_gap_scan_state', ?)",
@@ -3493,6 +3540,7 @@ async def test_get_sync_status_reports_invalid_dm_checkpoint_as_paused_without_r
 ) -> None:
     conn = _make_db()
     _insert_synced_dialog(conn, 12345, status="synced")
+    conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (?, ?)", (12345, "user"))
     conn.execute(
         "INSERT INTO daemon_state(key, value) VALUES ('delta_dm_gap_scan_state', ?)",
         (payload,),
@@ -3514,6 +3562,7 @@ async def test_get_sync_status_reports_invalid_dm_checkpoint_as_paused_without_r
 async def test_get_sync_status_propagates_dm_checkpoint_sql_failure() -> None:
     conn = _make_db()
     _insert_synced_dialog(conn, 12345, status="synced")
+    conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (?, ?)", (12345, "user"))
     conn.execute("DROP TABLE daemon_state")
     conn.commit()
     server = make_server(conn)

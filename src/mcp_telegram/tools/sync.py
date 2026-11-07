@@ -419,7 +419,8 @@ class GetSyncStatus(ToolArgs):
     """Get sync status for a dialog: message count, sync progress, last sync/event timestamps,
     and delete detection reliability. delete_detection is 'reliable (channel)' for channels/supergroups
     (real-time MTProto events), 'best-effort weekly (DM)' while periodic DM verification is active,
-    or a paused/stale notice when that maintenance has been suspended.
+    a paused/stale notice when that maintenance has been suspended, or unknown when the dialog kind
+    or its deletion coverage is unavailable.
     sync_progress is the raw message_id offset cursor, not a row count.
     Retained messages, counts and any known history horizon remain available while acquisition
     is pending or disabled.

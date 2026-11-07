@@ -160,6 +160,18 @@ def _dm_deletion_reconciliation_is_blocked(conn: sqlite3.Connection) -> bool:
     return dm_deletion_reconciliation_is_blocked(state)
 
 
+def _deletion_detection(conn: sqlite3.Connection, dialog_type: DialogType) -> str:
+    if dialog_type in {DialogType.CHANNEL, DialogType.SUPERGROUP, DialogType.FORUM}:
+        return "reliable (channel)"
+    if dialog_type in {DialogType.USER, DialogType.BOT, DialogType.SERVICE}:
+        return (
+            "paused (DM; older deletions may be stale)"
+            if _dm_deletion_reconciliation_is_blocked(conn)
+            else "best-effort weekly (DM)"
+        )
+    return "unknown (deletion detection coverage unavailable)"
+
+
 # Entity / telemetry SQL
 _ALL_ENTITY_NAMES_SQL = "SELECT id, name FROM entities WHERE name IS NOT NULL"
 _ALL_ENTITY_NAMES_NORMALIZED_SQL = "SELECT id, name_normalized FROM entities WHERE name_normalized IS NOT NULL"
@@ -2252,21 +2264,17 @@ class DaemonAPIServer:
             total_messages=total_messages,
             now=observed_now,
         )
+        identity = read_dialog_identities(self._conn, (dialog_id,)).get(dialog_id)
+        dialog_type = identity.dialog_type if identity is not None else DialogType.UNKNOWN
 
         data: dict = {
             "dialog_id": dialog_id,
-            "message_delivery": self._message_delivery_for_dialog(dialog_id, observed_now),
+            "message_delivery": self._message_delivery_for_dialog(dialog_id, observed_now, dialog_type),
             "latest_retained_message": None if latest is None else {"message_id": latest[0], "sent_at": latest[1]},
             "delta_refresh_requested_at": delta_refresh_requested_at,
             "sync_progress": sync_progress,
             "sync_progress_message_id": sync_progress,
-            "delete_detection": (
-                "reliable (channel)"
-                if dialog_id < 0
-                else "paused (DM; older deletions may be stale)"
-                if _dm_deletion_reconciliation_is_blocked(self._conn)
-                else "best-effort weekly (DM)"
-            ),
+            "delete_detection": _deletion_detection(self._conn, dialog_type),
             "access_lost_at": access_lost_at,
             "access_last_revalidated_at": access_revalidation[0],
             "access_next_revalidate_at": access_revalidation[1],
@@ -2279,10 +2287,11 @@ class DaemonAPIServer:
             data["archived_message_count"] = message_count
         return {"ok": True, "data": data}
 
-    def _message_delivery_for_dialog(self, dialog_id: int, observed_now: int) -> dict[str, object]:
-        identity = read_dialog_identities(self._conn, (dialog_id,)).get(dialog_id)
+    def _message_delivery_for_dialog(
+        self, dialog_id: int, observed_now: int, dialog_type: DialogType
+    ) -> dict[str, object]:
         channel_id = None
-        if identity is not None and identity.dialog_type in {
+        if dialog_type in {
             DialogType.CHANNEL,
             DialogType.SUPERGROUP,
             DialogType.FORUM,
