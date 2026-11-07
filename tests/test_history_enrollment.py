@@ -24,6 +24,8 @@ def conn() -> sqlite3.Connection:
             dialog_id INTEGER PRIMARY KEY,
             status TEXT NOT NULL,
             sync_progress INTEGER,
+            topic_attribution_version INTEGER NOT NULL DEFAULT 2,
+            topic_attribution_state TEXT NOT NULL DEFAULT 'complete',
             delta_refresh_requested_at INTEGER, delta_refresh_generation INTEGER NOT NULL DEFAULT 0,
             read_position_next_attempt_at INTEGER,
             read_position_attempt_count INTEGER NOT NULL DEFAULT 0
@@ -65,6 +67,31 @@ def test_automatic_dm_does_not_resurrect_explicit_disable(conn: sqlite3.Connecti
     outcome = ensure_automatic_dm_enrollment(conn, 1, now=11)
     assert outcome.blocked_reason == "disabled"
     assert read_intent(conn, 1) == read_intent(conn, 1).__class__(1, False)
+
+
+def test_explicit_repair_requeues_once_without_rewinding(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT INTO synced_dialogs(dialog_id,status,sync_progress,topic_attribution_version,topic_attribution_state) VALUES (8,'synced',77,0,'unknown')"
+    )
+    conn.commit()
+    assert enable_history(conn, 8, now=10).action == "queue_full_history"
+    assert conn.execute("SELECT status,sync_progress FROM synced_dialogs WHERE dialog_id=8").fetchone() == (
+        "syncing",
+        0,
+    )
+    conn.execute("UPDATE synced_dialogs SET sync_progress=42 WHERE dialog_id=8")
+    conn.commit()
+    assert enable_history(conn, 8, now=11).action == "already_syncing"
+    assert conn.execute("SELECT sync_progress FROM synced_dialogs WHERE dialog_id=8").fetchone() == (42,)
+
+
+def test_complete_receipt_requests_delta(conn: sqlite3.Connection) -> None:
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (8,'synced',77)")
+    conn.commit()
+    assert enable_history(conn, 8, now=10).action == "request_delta_refresh"
+    assert conn.execute(
+        "SELECT status,sync_progress,delta_refresh_requested_at FROM synced_dialogs WHERE dialog_id=8"
+    ).fetchone() == ("synced", 77, 10)
 
 
 def test_enrollment_transitions_clear_read_position_retry(conn: sqlite3.Connection) -> None:

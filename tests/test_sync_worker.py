@@ -30,7 +30,7 @@ from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED, DialogIdent
 from mcp_telegram.fts import stem_text
 from mcp_telegram.history_enrollment import disable_history, enable_history
 from mcp_telegram.image_authorization import ScopeCell, ScopeToken
-from mcp_telegram.message_contracts import StoredMessage
+from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
 from mcp_telegram.message_history.contracts import (
     FullHistoryPage,
     HistoryAccessProbeResult,
@@ -173,6 +173,14 @@ def make_worker(
         total_messages_probe=TelethonHistoryAccessProbe(mock_client),
         writer=inline_writer(cast(sqlite3.Connection, sync_db)),
     )
+
+
+def _test_page(
+    worker: FullSyncWorker, total: int | None, batch: tuple[ExtractedMessage, ...], cursor: int | None
+) -> _FetchedBatchPage:
+    scope = worker._history_port.capture_scope()
+    assert scope is not None
+    return _FetchedBatchPage(total, batch, cursor, scope=scope)
 
 
 @pytest.mark.asyncio
@@ -373,9 +381,8 @@ async def test_automatic_group_storage_failure_rolls_back_receipt_and_enrollment
     )
     assert sync_db.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=505").fetchone() == (0,)
     assert sync_db.execute(
-        "SELECT topic_attribution_version,topic_attribution_state,topic_attribution_no_topic_count "
-        "FROM synced_dialogs WHERE dialog_id=505"
-    ).fetchone() == (0, "unknown", 0)
+        "SELECT topic_attribution_version,topic_attribution_state FROM synced_dialogs WHERE dialog_id=505"
+    ).fetchone() == (0, "unknown")
 
 
 @pytest.mark.asyncio
@@ -524,10 +531,9 @@ async def test_automatic_group_acceptance_resumes_partial_history_and_counts_top
         "SELECT enabled FROM full_history_enrollment WHERE dialog_id=?", (dialog_id,)
     ).fetchone() == (1,)
     assert sync_db.execute(
-        "SELECT status,total_messages,sync_progress,topic_attribution_state,topic_attribution_no_topic_count "
-        "FROM synced_dialogs WHERE dialog_id=?",
+        "SELECT status,total_messages,sync_progress,topic_attribution_state FROM synced_dialogs WHERE dialog_id=?",
         (dialog_id,),
-    ).fetchone() == ("syncing", 101, 1, "partial", 99)
+    ).fetchone() == ("syncing", 101, 1, "partial")
 
 
 def publish_local_dialogs(
@@ -581,9 +587,9 @@ async def test_new_full_history_terminal_publishes_complete_topic_attribution_re
     )
     seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
-    worker = make_worker(MagicMock(), sync_db, asyncio.Event())
+    worker = make_worker(_MockClient(), sync_db, asyncio.Event())
 
-    await worker._store_batch_page(dialog_id, 0, _FetchedBatchPage(0, (), None))
+    await worker._store_batch_page(dialog_id, 0, _test_page(worker, 0, (), None))
 
     row = sync_db.execute(
         "SELECT status,topic_attribution_version,topic_attribution_state,"
@@ -592,7 +598,96 @@ async def test_new_full_history_terminal_publishes_complete_topic_attribution_re
         (dialog_id,),
     ).fetchone()
     assert row is not None
-    assert row[0:3] == ("synced", 1, "complete")
+    assert row[0:3] == ("synced", 2, "complete")
+    await worker._store_batch_page(dialog_id, 0, _test_page(worker, 0, (), None))
+    assert (
+        sync_db.execute(
+            "SELECT topic_attribution_observed_at,topic_attribution_completed_at FROM synced_dialogs WHERE dialog_id=?",
+            (dialog_id,),
+        ).fetchone()
+        == row[3:5]
+    )
+
+
+@pytest.mark.asyncio
+async def test_orphan_and_stale_terminal_do_not_claim_full_traversal(sync_db: _SQLiteConnection) -> None:
+    from mcp_telegram.message_contracts import ExtractedMessage
+
+    sync_db.execute("INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (406,'syncing',7)")
+    seed_full_history_enrollment(sync_db, 406, enabled=True)
+    sync_db.commit()
+    worker = make_worker(_MockClient(), sync_db, asyncio.Event())
+    await worker._store_batch_page(406, 0, _test_page(worker, None, (), None))
+    assert sync_db.execute(
+        "SELECT topic_attribution_version,topic_attribution_state,delta_message_id FROM synced_dialogs WHERE dialog_id=406"
+    ).fetchone() == (0, "unknown", None)
+    await worker._store_batch_page(
+        406, 0, _test_page(worker, 1, (ExtractedMessage(message=_stored(406, 9), reply_count=0),), 9)
+    )
+    assert sync_db.execute(
+        "SELECT sync_progress,topic_attribution_version,topic_attribution_state,delta_message_id "
+        "FROM synced_dialogs WHERE dialog_id=406"
+    ).fetchone() == (7, 0, "unknown", None)
+    assert sync_db.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=406").fetchone() == (0,)
+    await worker._store_batch_page(406, 7, _test_page(worker, None, (), None))
+    assert sync_db.execute(
+        "SELECT topic_attribution_version,topic_attribution_state FROM synced_dialogs WHERE dialog_id=406"
+    ).fetchone() == (0, "unknown")
+
+
+@pytest.mark.asyncio
+async def test_receipt_resume_preserves_start_time_and_rejected_terminal(sync_db: _SQLiteConnection) -> None:
+    from mcp_telegram.message_contracts import ExtractedMessage
+
+    sync_db.execute("INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (407,'syncing',0)")
+    seed_full_history_enrollment(sync_db, 407, enabled=True)
+    sync_db.commit()
+    worker = make_worker(_MockClient(), sync_db, asyncio.Event())
+    page = _test_page(worker, 1, (ExtractedMessage(message=_stored(407, 9), reply_count=0),), 9)
+    with patch("mcp_telegram.sync_worker.time.time", return_value=100):
+        await worker._store_batch_page(407, 0, page)
+    with patch("mcp_telegram.sync_worker.time.time", return_value=200):
+        await worker._store_batch_page(407, 0, _test_page(worker, None, (), None))
+    assert sync_db.execute(
+        "SELECT topic_attribution_state,topic_attribution_observed_at,topic_attribution_completed_at "
+        "FROM synced_dialogs WHERE dialog_id=407"
+    ).fetchone() == ("partial", 100, None)
+    with patch("mcp_telegram.sync_worker.time.time", return_value=300):
+        await worker._store_batch_page(407, 9, _test_page(worker, None, (), None))
+    assert sync_db.execute(
+        "SELECT topic_attribution_state,topic_attribution_observed_at,topic_attribution_completed_at,history_depth_complete "
+        "FROM synced_dialogs WHERE dialog_id=407"
+    ).fetchone() == ("complete", 100, 300, 1)
+
+
+def test_real_telethon_topic_headers_and_root() -> None:
+    from telethon.tl import types
+
+    from mcp_telegram.messages.telegram_adapter import extract_reply_and_topic
+
+    direct = types.Message(
+        id=201,
+        peer_id=types.PeerChannel(1),
+        date=datetime.now(UTC),
+        message="x",
+        reply_to=types.MessageReplyHeader(reply_to_msg_id=100, forum_topic=True),
+    )
+    nested = types.Message(
+        id=202,
+        peer_id=types.PeerChannel(1),
+        date=datetime.now(UTC),
+        message="x",
+        reply_to=types.MessageReplyHeader(reply_to_msg_id=201, reply_to_top_id=100, forum_topic=True),
+    )
+    root = types.MessageService(
+        id=100,
+        peer_id=types.PeerChannel(1),
+        date=datetime.now(UTC),
+        action=types.MessageActionTopicCreate(title="topic", icon_color=1),
+    )
+    assert extract_reply_and_topic(direct) == (100, 100)
+    assert extract_reply_and_topic(nested) == (201, 100)
+    assert extract_reply_and_topic(root) == (None, 100)
 
 
 @pytest.mark.asyncio
@@ -1287,6 +1382,26 @@ async def test_admission_rejection_defers_without_checkpoint_or_transport_attemp
 
 
 @pytest.mark.asyncio
+async def test_typed_timeout_propagates_to_coordinator_without_losing_cursor(sync_db: _SQLiteConnection) -> None:
+    from mcp_telegram.telegram_demand import RpcReadTimeoutError
+
+    sync_db.execute("INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (60003,'syncing',77)")
+    seed_full_history_enrollment(sync_db, 60003, enabled=True)
+    sync_db.commit()
+
+    class Port(_ProbeScope):
+        async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            raise RpcReadTimeoutError("gateway retired the request")
+
+    worker = FullSyncWorker(Port(), cast(sqlite3.Connection, sync_db), asyncio.Event(), writer=inline_writer(sync_db))
+    with pytest.raises(RpcReadTimeoutError):
+        await worker._fetch_batch(60003, 77)
+    assert sync_db.execute(
+        "SELECT status,sync_progress,topic_attribution_state FROM synced_dialogs WHERE dialog_id=60003"
+    ).fetchone() == ("syncing", 77, "unknown")
+
+
+@pytest.mark.asyncio
 async def test_scheduler_closure_propagates_from_full_sync(
     mock_client: _MockClient,
     sync_db: _SQLiteConnection,
@@ -1752,8 +1867,8 @@ def test_extract_reply_and_topic_forum_with_top_id():
     assert topic_id == 7
 
 
-def test_extract_reply_and_topic_forum_general():
-    """forum_topic=True with no reply_to_top_id → General topic (id=1)."""
+def test_extract_reply_and_topic_direct_forum_post():
+    """A direct topic post replies to the topic root."""
     from mcp_telegram.messages.telegram_adapter import extract_reply_and_topic
 
     reply_to = SimpleNamespace(
@@ -1764,7 +1879,7 @@ def test_extract_reply_and_topic_forum_general():
     msg = SimpleNamespace(reply_to=reply_to)
     reply_id, topic_id = extract_reply_and_topic(msg)
     assert reply_id == 200
-    assert topic_id == 1
+    assert topic_id == 200
 
 
 def test_extract_reply_and_topic_bot_dm_topic_with_top_id_without_forum_flag() -> None:
@@ -1781,8 +1896,7 @@ def test_extract_reply_and_topic_bot_dm_topic_with_top_id_without_forum_flag() -
     assert extract_reply_and_topic(msg) == (300, 306001)
 
 
-def test_extract_reply_and_topic_keeps_legacy_reply_top_id_fallback() -> None:
-    """Legacy test doubles still map top ids while fixtures migrate to Telethon's field."""
+def test_extract_reply_and_topic_ignores_unsupported_top_id_field() -> None:
     from mcp_telegram.messages.telegram_adapter import extract_reply_and_topic
 
     reply_to = SimpleNamespace(
@@ -1792,7 +1906,7 @@ def test_extract_reply_and_topic_keeps_legacy_reply_top_id_fallback() -> None:
     )
     msg = SimpleNamespace(reply_to=reply_to)
 
-    assert extract_reply_and_topic(msg) == (400, 320601)
+    assert extract_reply_and_topic(msg) == (400, 400)
 
 
 def test_extract_reply_and_topic_uses_message_thread_id_when_reply_to_missing() -> None:
@@ -1805,13 +1919,12 @@ def test_extract_reply_and_topic_uses_message_thread_id_when_reply_to_missing() 
     assert topic_id == 7
 
 
-def test_extract_reply_and_topic_uses_general_topic_for_flag_only_message() -> None:
-    """Flag-only Bot API topic metadata resolves to Telegram's General topic."""
+def test_extract_reply_and_topic_leaves_flag_only_message_unknown() -> None:
     from mcp_telegram.messages.telegram_adapter import extract_reply_and_topic
 
     msg = SimpleNamespace(reply_to=None, message_thread_id=None, is_topic_message=True)
 
-    assert extract_reply_and_topic(msg) == (None, 1)
+    assert extract_reply_and_topic(msg) == (None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -2897,20 +3010,19 @@ async def test_full_history_null_topic_completes_current_receipt_with_evaluated_
     )
     seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
-    worker = make_worker(MagicMock(), sync_db, asyncio.Event())
+    worker = make_worker(_MockClient(), sync_db, asyncio.Event())
 
     await worker._store_batch_page(
         dialog_id,
         0,
-        _FetchedBatchPage(1, (ExtractedMessage(message=_stored(dialog_id, 1), reply_count=0),), 1),
+        _test_page(worker, 1, (ExtractedMessage(message=_stored(dialog_id, 1), reply_count=0),), 1),
     )
-    await worker._store_batch_page(dialog_id, 1, _FetchedBatchPage(None, (), None))
+    await worker._store_batch_page(dialog_id, 1, _test_page(worker, None, (), None))
 
     assert sync_db.execute(
-        "SELECT topic_attribution_version,topic_attribution_state,topic_attribution_no_topic_count "
-        "FROM synced_dialogs WHERE dialog_id=?",
+        "SELECT topic_attribution_version,topic_attribution_state FROM synced_dialogs WHERE dialog_id=?",
         (dialog_id,),
-    ).fetchone() == (1, "complete", 1)
+    ).fetchone() == (2, "complete")
 
 
 @pytest.mark.asyncio
@@ -3076,6 +3188,104 @@ async def test_full_sync_old_page_cannot_refresh_new_account_profile(sync_db: _S
 
 
 @pytest.mark.asyncio
+async def test_full_page_does_not_adopt_new_scope_for_old_selected_account(sync_db: _SQLiteConnection) -> None:
+    conn = cast(sqlite3.Connection, sync_db)
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (604,'syncing',0)")
+    seed_full_history_enrollment(conn, 604, enabled=True)
+    conn.commit()
+
+    class Port(_ProbeScope):
+        async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            raise AssertionError("old selected account must not fetch under new scope")
+
+    worker = FullSyncWorker(Port(), conn, asyncio.Event(), writer=inline_writer(conn))
+    assert await worker._fetch_batch(604, 0, profile_owner_account_id=77) == (0, False)
+    assert conn.execute("SELECT sync_progress,delta_message_id FROM synced_dialogs WHERE dialog_id=604").fetchone() == (
+        0,
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_automatic_group_stale_account_does_not_write_retry_or_enrollment(sync_db: _SQLiteConnection) -> None:
+    conn = cast(sqlite3.Connection, sync_db)
+    conn.execute("INSERT INTO dialogs(dialog_id,type,members,created) VALUES (605,'group',1,?)", (int(time.time()),))
+    conn.commit()
+
+    class Port(_ProbeScope):
+        async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            raise AssertionError("old selected account must not fetch under new scope")
+
+    worker = FullSyncWorker(
+        Port(), conn, asyncio.Event(), automatic_group_history=AutomaticGroupHistoryConfig(), writer=inline_writer(conn)
+    )
+    assert not await worker._process_one_automatic_group(605, profile_owner_account_id=77)
+    assert worker._last_page_stale
+    assert conn.execute("SELECT * FROM full_history_enrollment WHERE dialog_id=605").fetchone() is None
+    assert conn.execute("SELECT * FROM synced_dialogs WHERE dialog_id=605").fetchone() is None
+    assert (
+        conn.execute("SELECT value FROM daemon_state WHERE key='automatic_group_history_retry:605'").fetchone() is None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty", [False, True])
+async def test_full_page_scope_revoked_after_identity_publication_cannot_commit(
+    sync_db: _SQLiteConnection, empty: bool
+) -> None:
+    conn = cast(sqlite3.Connection, sync_db)
+    conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (602,'syncing',0)")
+    seed_full_history_enrollment(conn, 602, enabled=True)
+    conn.commit()
+
+    class Port(_ProbeScope):
+        async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            if empty:
+                return FullHistoryPage((), 0, None)
+            return FullHistoryPage((extract_message_row(dialog_id, build_mock_message(id=9)),), 1, 9)
+
+    port = Port()
+    worker = FullSyncWorker(port, conn, asyncio.Event(), writer=inline_writer(conn))
+    page = await worker._fetch_batch_page(602, 0)
+    assert page.retry is None
+    port.cell.begin_change()
+    await worker._store_batch_page(602, 0, page)
+    assert conn.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=602").fetchone() == (0,)
+    assert conn.execute(
+        "SELECT status,sync_progress,delta_message_id,history_depth_complete,topic_attribution_state "
+        "FROM synced_dialogs WHERE dialog_id=602"
+    ).fetchone() == ("syncing", 0, None, 0, "unknown")
+
+
+@pytest.mark.asyncio
+async def test_full_page_scope_revoked_during_write_rolls_back(sync_db: _SQLiteConnection) -> None:
+    from mcp_telegram.sync_worker import _FULL_MEMBERSHIP_OBSERVER
+
+    conn = cast(sqlite3.Connection, sync_db)
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (603,'syncing',0)")
+    seed_full_history_enrollment(conn, 603, enabled=True)
+    conn.commit()
+    client = _MockClient()
+    worker = make_worker(client, sync_db, asyncio.Event())
+    page = _test_page(worker, 1, (extract_message_row(603, build_mock_message(id=9)),), 9)
+    observations = []
+    token = _FULL_MEMBERSHIP_OBSERVER.set(observations.append)
+    try:
+        with patch.object(
+            worker, "_capture_committed_page_revision", side_effect=lambda *_: client.cell.begin_change()
+        ):
+            assert await worker._store_batch_page(603, 0, page) == (0, False)
+    finally:
+        _FULL_MEMBERSHIP_OBSERVER.reset(token)
+    assert observations == []
+    assert conn.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=603").fetchone() == (0,)
+    assert conn.execute(
+        "SELECT sync_progress,delta_message_id,topic_attribution_state FROM synced_dialogs WHERE dialog_id=603"
+    ).fetchone() == (0, None, "unknown")
+
+
+@pytest.mark.asyncio
 async def test_full_sync_rollback_does_not_report_membership(sync_db: _SQLiteConnection) -> None:
     """A message write rolled back after extraction never emits a committed receipt."""
     conn = cast(sqlite3.Connection, sync_db)
@@ -3090,8 +3300,11 @@ async def test_full_sync_rollback_does_not_report_membership(sync_db: _SQLiteCon
     worker = FullSyncWorker(Port(), conn, asyncio.Event(), writer=inline_writer(conn))
     observations = []
     adapter = FullSyncDemandAdapter(worker, account_id=123, membership_observer=observations.append)
-    with patch.object(worker, "_record_no_topic_attribution", side_effect=RuntimeError("abort transaction")):
+    with patch.object(worker, "_capture_committed_page_revision", side_effect=RuntimeError("abort transaction")):
         with pytest.raises(RuntimeError, match="abort transaction"):
             await adapter.run_slice(_selected_budget(adapter))
     assert not observations
     assert conn.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=601").fetchone() == (0,)
+    assert conn.execute(
+        "SELECT sync_progress,topic_attribution_version,topic_attribution_state FROM synced_dialogs WHERE dialog_id=601"
+    ).fetchone() == (0, 0, "unknown")

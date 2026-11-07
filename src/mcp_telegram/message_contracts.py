@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 
 from .media_fact import decode_media_fact, encode_media_payload
 
+TOPIC_ATTRIBUTION_EXTRACTOR_VERSION = 2
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class StoredMessage:

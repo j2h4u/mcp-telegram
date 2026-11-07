@@ -140,9 +140,11 @@ class LocalHistoryCoverage:
         return "unknown"
 
 
-def local_history_coverage(status: str | None, last_synced_at: int | None) -> LocalHistoryCoverage:
+def local_history_coverage(
+    status: str | None, last_synced_at: int | None, history_depth_complete: bool
+) -> LocalHistoryCoverage:
     """Only a completed full-history sync establishes an observation horizon."""
-    if status == "synced" and last_synced_at is not None:
+    if history_depth_complete and last_synced_at is not None:
         return LocalHistoryCoverage("complete_as_of", last_synced_at)
     return LocalHistoryCoverage("unknown" if status in {None, "not_synced"} else "partial", None)
 
@@ -599,6 +601,7 @@ def _validate_freshness_timestamps(
 def build_sync_read_model(  # noqa: PLR0913
     *,
     persisted_status: str | None,
+    history_depth_complete: bool,
     enrollment_enabled: bool | None,
     last_synced_at: int | None,
     last_event_at: int | None,
@@ -625,6 +628,13 @@ def build_sync_read_model(  # noqa: PLR0913
         default=None,
     )
     profile = _STATUS_PROFILES[status]
+    if status is SyncStatus.NOT_SYNCED and history_depth_complete:
+        profile = _StatusProfile(
+            HistoryScope.FULL,
+            HistoryDepthState.COMPLETE,
+            profile.history_sync_state,
+            "Previously completed history remains available as of history_complete_at; acquisition is not active.",
+        )
     coverage_state = _coverage_state(telegram_total, saved_count)
     return SyncReadModel(
         sync_status=status,
@@ -638,9 +648,13 @@ def build_sync_read_model(  # noqa: PLR0913
         is_syncing=status is SyncStatus.SYNCING,
         realtime_history=_realtime_history(status, enrollment),
         history_scope=profile.history_scope,
-        history_depth_state=profile.history_depth_state,
+        history_depth_state=(
+            HistoryDepthState.COMPLETE
+            if history_depth_complete
+            else (HistoryDepthState.PARTIAL if status is SyncStatus.SYNCED else profile.history_depth_state)
+        ),
         history_sync_state=profile.history_sync_state,
-        history_complete_at=last_synced if status is SyncStatus.SYNCED else None,
+        history_complete_at=last_synced if history_depth_complete else None,
         sync_coverage_pct=compute_sync_coverage(telegram_total, saved_count),
         coverage_state=coverage_state,
         local_knowledge_at=local_knowledge_at,
@@ -695,6 +709,7 @@ def _optional_int_field(data: Mapping[str, object], name: str) -> int | None:
 def _validate_decoded(model: SyncReadModel) -> None:
     expected = build_sync_read_model(
         persisted_status=model.sync_status.value,
+        history_depth_complete=model.history_depth_state is HistoryDepthState.COMPLETE,
         enrollment_enabled=model.enrollment_enabled,
         last_synced_at=model.last_synced_at,
         last_event_at=model.last_event_at,

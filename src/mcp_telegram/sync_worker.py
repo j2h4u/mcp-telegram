@@ -21,7 +21,7 @@ import asyncio
 import logging
 import sqlite3
 import time
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -42,10 +42,10 @@ from .history_enrollment import (
 )
 from .hydration_queue import HydrationPriority
 from .image_authorization import ScopeToken
+from .message_contracts import TOPIC_ATTRIBUTION_EXTRACTOR_VERSION
 from .message_contracts import ExtractedMessage as _ExtractedMessage
 from .message_history.contracts import (
     MESSAGE_HISTORY_PAGE_SIZE,
-    TOPIC_ATTRIBUTION_EXTRACTOR_VERSION,
     HistoryAccessObservation,
     HistoryAccessProbeResult,
     MessageHistoryAccessLostError,
@@ -173,13 +173,13 @@ _UPDATE_TOTAL_MESSAGES_SQL = (
 )
 _UPDATE_PROGRESS_SQL = (
     "UPDATE synced_dialogs SET sync_progress = ?, status = ?, "
-    "total_messages = COALESCE(?, total_messages) WHERE dialog_id = ? "
+    "total_messages = COALESCE(?, total_messages) WHERE dialog_id = ? AND status IN ('not_synced','syncing') "
     "AND COALESCE(sync_progress,0)=? "
     "AND EXISTS (SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1)"
 )
 _UPDATE_PROGRESS_DONE_SQL = (
     "UPDATE synced_dialogs SET sync_progress = ?, status = ?, total_messages = COALESCE(?, total_messages), "
-    "last_synced_at = ? WHERE dialog_id = ? "
+    "last_synced_at = ?, history_depth_complete = 1 WHERE dialog_id = ? AND status IN ('not_synced','syncing') "
     "AND EXISTS (SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1) "
     "AND COALESCE(sync_progress,0)=?"
 )
@@ -202,6 +202,7 @@ class _FetchedBatchPage:
     next_before_message_id: int | None
     retry: tuple[int, bool] | None = None
     reaction_observed_at: int | None = None
+    scope: ScopeToken | None = None
 
 
 def _dm_enrollment_state(conn: sqlite3.Connection, key: str) -> str | None:
@@ -741,17 +742,30 @@ class FullSyncWorker:
         except Exception:
             await self._writer.run(persist_probe_retry)
             raise
-        if page.retry is not None or page.total_messages is None:
-            await self._writer.run(persist_probe_retry)
-            self._last_automatic_pending = True
-            return True
+        if page.total_messages is None:
+            return await self._defer_automatic_group_page(persist_probe_retry)
         staged: list[MembershipSignalCounts] = []
         observer = _FULL_MEMBERSHIP_OBSERVER.get()
-        result = await self._writer.run(
-            lambda conn: self._finalize_automatic_group_page(conn, dialog_id, page, profile_owner_account_id, staged)
-        )
-        _report_membership(observer, staged)
+        try:
+            result = await self._writer.run(
+                lambda conn: self._finalize_automatic_group_page(
+                    conn, dialog_id, page, profile_owner_account_id, staged
+                )
+            )
+        except ReceivedMessageScopeChangedError:
+            self._last_page_stale = True
+            self._last_page_accepted = False
+            result = False
+        else:
+            _report_membership(observer, staged)
         return result
+
+    async def _defer_automatic_group_page(self, persist_retry: Callable[[sqlite3.Connection], None]) -> bool:
+        if self._last_page_stale:
+            return False
+        await self._writer.run(persist_retry)
+        self._last_automatic_pending = True
+        return True
 
     def _finalize_automatic_group_page(
         self,
@@ -762,7 +776,7 @@ class FullSyncWorker:
         membership_staged: list[MembershipSignalCounts] | None = None,
     ) -> bool:
         assert self._automatic_group_history is not None
-        with write_transaction(conn):
+        with self._authorized_page_transaction(conn, page):
             intent = read_intent(conn, dialog_id)
             if intent.enabled is not None:
                 conn.execute("DELETE FROM daemon_state WHERE key=?", (f"automatic_group_history_retry:{dialog_id}",))
@@ -868,7 +882,9 @@ class FullSyncWorker:
     ) -> _FetchedBatchPage:
         self._last_page_error = None
         scope = self._history_port.capture_scope()
-        if scope is None:
+        if scope is None or (
+            profile_owner_account_id is not None and scope.scope.account_id != profile_owner_account_id
+        ):
             self._last_page_stale = True
             return _FetchedBatchPage(None, (), None, (sync_progress, False))
 
@@ -931,6 +947,7 @@ class FullSyncWorker:
             tuple(replace(item, observation_order=observation_order) for item in page.messages),
             page.next_before_message_id,
             reaction_observed_at=reaction_observed_at,
+            scope=scope,
         )
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
@@ -980,14 +997,35 @@ class FullSyncWorker:
         observer = _FULL_MEMBERSHIP_OBSERVER.get()
 
         def persist_page(conn: sqlite3.Connection) -> tuple[int, bool]:
-            with write_transaction(conn):
+            with self._authorized_page_transaction(conn, page):
                 return self._store_batch_page_locked(
                     conn, dialog_id, sync_progress, page, profile_owner_account_id, staged
                 )
 
-        result = await self._writer.run(persist_page)
+        try:
+            result = await self._writer.run(persist_page)
+        except ReceivedMessageScopeChangedError:
+            self._last_page_stale = True
+            self._last_page_accepted = False
+            return sync_progress, False
         _report_membership(observer, staged)
         return result
+
+    @contextmanager
+    def _authorized_page_transaction(self, conn: sqlite3.Connection, page: _FetchedBatchPage) -> Iterator[None]:
+        with write_transaction(conn):
+            self._require_page_scope(conn, page)
+            yield
+            self._require_page_scope(conn, page)
+
+    def _require_page_scope(self, conn: sqlite3.Connection, page: _FetchedBatchPage) -> None:
+        scope = page.scope
+        if (
+            scope is None
+            or bound_profile_account(conn) != scope.scope.account_id
+            or not self._history_port.claim_scope(scope)
+        ):
+            raise ReceivedMessageScopeChangedError
 
     def _store_batch_page_locked(  # noqa: PLR0913, PLR0917
         self,
@@ -999,16 +1037,19 @@ class FullSyncWorker:
         membership_staged: list[MembershipSignalCounts] | None = None,
     ) -> tuple[int, bool]:
         require_write_transaction(conn)
-        if sync_progress == 0 and full_history_enabled(conn, dialog_id):
+        self._last_page_accepted = False
+        if page.next_before_message_id is None:
+            result = self._store_terminal_page_locked(conn, dialog_id, sync_progress, page)
+        else:
+            result = self._store_continuation_page_locked(
+                conn, dialog_id, sync_progress, page, profile_owner_account_id, membership_staged
+            )
+        if self._last_page_accepted and sync_progress == 0:
             conn.execute(
                 "UPDATE synced_dialogs SET delta_message_id=? WHERE dialog_id=? AND delta_message_id IS NULL",
                 (max((item.message.message_id for item in page.batch), default=0), dialog_id),
             )
-        if page.next_before_message_id is None:
-            return self._store_terminal_page_locked(conn, dialog_id, sync_progress, page)
-        return self._store_continuation_page_locked(
-            conn, dialog_id, sync_progress, page, profile_owner_account_id, membership_staged
-        )
+        return result
 
     def _store_terminal_page_locked(
         self, conn: sqlite3.Connection, dialog_id: int, sync_progress: int, page: _FetchedBatchPage
@@ -1017,7 +1058,6 @@ class FullSyncWorker:
             logger.info("sync_batch_discarded_disabled dialog_id=%d fetched=0", dialog_id)
             return sync_progress, True
         now = int(time.time())
-        self._begin_topic_attribution_pass(conn, dialog_id, sync_progress, now)
         cursor = conn.execute(
             _UPDATE_PROGRESS_DONE_SQL,
             (sync_progress, "synced", page.total_messages, now, dialog_id, dialog_id, sync_progress),
@@ -1026,6 +1066,7 @@ class FullSyncWorker:
         if not self._last_page_accepted:
             self._last_page_stale = True
             return sync_progress, False
+        self._begin_topic_attribution_pass(conn, dialog_id, sync_progress, now)
         self._complete_topic_attribution_pass(conn, dialog_id, now)
         self._capture_committed_page_revision(conn, dialog_id)
         logger.info("sync_done dialog_id=%d status=synced (empty batch)", dialog_id)
@@ -1066,7 +1107,6 @@ class FullSyncWorker:
         )
         if membership_staged is not None:
             membership_staged.append(result.membership_counts)
-        self._record_no_topic_attribution(conn, dialog_id, rows)
         self._capture_committed_page_revision(conn, dialog_id)
         logger.debug(
             "sync_batch dialog_id=%d fetched=%d progress=%d done=%s",
@@ -1092,27 +1132,13 @@ class FullSyncWorker:
     ) -> None:
         """Start or safely resume a current-extractor full-history receipt."""
         require_write_transaction(conn)
-        del sync_progress
+        if sync_progress != 0:
+            return
         conn.execute(
             "UPDATE synced_dialogs SET topic_attribution_version=?, topic_attribution_state='partial', "
-            "topic_attribution_observed_at=?, topic_attribution_completed_at=NULL, topic_attribution_no_topic_count=0 "
-            "WHERE dialog_id=? AND status IN ('not_synced', 'syncing') "
-            "AND (topic_attribution_version<>? OR topic_attribution_state<>'partial')",
-            (TOPIC_ATTRIBUTION_EXTRACTOR_VERSION, observed_at, dialog_id, TOPIC_ATTRIBUTION_EXTRACTOR_VERSION),
+            "topic_attribution_observed_at=?, topic_attribution_completed_at=NULL WHERE dialog_id=?",
+            (TOPIC_ATTRIBUTION_EXTRACTOR_VERSION, observed_at, dialog_id),
         )
-
-    def _record_no_topic_attribution(
-        self, conn: sqlite3.Connection, dialog_id: int, batch: Sequence[_ExtractedMessage]
-    ) -> None:
-        """Record legal extractor NULL outcomes from one current history page."""
-        require_write_transaction(conn)
-        count = sum(message.message.forum_topic_id is None for message in batch)
-        if count:
-            conn.execute(
-                "UPDATE synced_dialogs SET topic_attribution_no_topic_count=topic_attribution_no_topic_count+? "
-                "WHERE dialog_id=? AND topic_attribution_version=? AND topic_attribution_state='partial'",
-                (count, dialog_id, TOPIC_ATTRIBUTION_EXTRACTOR_VERSION),
-            )
 
     def _complete_topic_attribution_pass(self, conn: sqlite3.Connection, dialog_id: int, completed_at: int) -> None:
         """Publish a full current-extractor traversal, including legal NULL outcomes."""

@@ -727,6 +727,7 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
         CREATE TABLE synced_dialogs (
             dialog_id           INTEGER PRIMARY KEY,
             status              TEXT NOT NULL DEFAULT 'not_synced',
+            history_depth_complete INTEGER NOT NULL DEFAULT 0,
             last_synced_at      INTEGER,
             last_event_at       INTEGER,
             last_delta_checked_at INTEGER,
@@ -744,8 +745,7 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             topic_attribution_version INTEGER NOT NULL DEFAULT 0,
             topic_attribution_state TEXT NOT NULL DEFAULT 'unknown',
             topic_attribution_observed_at INTEGER,
-            topic_attribution_completed_at INTEGER,
-            topic_attribution_no_topic_count INTEGER NOT NULL DEFAULT 0
+            topic_attribution_completed_at INTEGER
         )
         """
     )
@@ -1106,6 +1106,8 @@ def _insert_synced_dialog(
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (dialog_id, status, last_synced_at, last_event_at, sync_progress, total_messages, access_lost_at),
     )
+    if status == "synced":
+        conn.execute("UPDATE synced_dialogs SET history_depth_complete=1 WHERE dialog_id=?", (dialog_id,))
     seed_full_history_enrollment(conn, dialog_id, enabled=enrollment_enabled)
     conn.commit()
 
@@ -1906,11 +1908,13 @@ async def test_list_folders_includes_canonical_directory_coverage(tmp_path: Path
     server.self_id = 42
     await server._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
 
-    result = await server._list_folders({})
+    with patch("mcp_telegram.dialog_directory_coverage.time.time", return_value=1700000000):
+        result = await server._list_folders({})
+        expected = read_dialog_directory_coverage(conn).to_wire()
 
     assert result["ok"] is True
     data = cast(dict[str, object], _response_data(result))
-    assert data["directory_coverage"] == read_dialog_directory_coverage(conn).to_wire()
+    assert data["directory_coverage"] == expected
     snapshot = cast(dict[str, object], data["folder_snapshot"])
     assert snapshot["generation"] == 1 and snapshot["completed_at"] == 1
     assert snapshot["status"] == "unavailable" and snapshot["complete"] is False
@@ -3272,6 +3276,10 @@ async def test_mark_dialog_for_sync_ignores_existing() -> None:
     """mark_dialog_for_sync on already-synced dialog keeps status and requests delta refresh."""
     conn = _make_db()
     _insert_synced_dialog(conn, 42, status="synced")
+    conn.execute(
+        "UPDATE synced_dialogs SET topic_attribution_version=2, topic_attribution_state='complete' WHERE dialog_id=42"
+    )
+    conn.commit()
     hydration_requests: list[tuple[sqlite3.Connection, int, int]] = []
     server = make_server(conn, hydration_requester=lambda *request: hydration_requests.append(request))
     offered: list[DemandKind] = []
@@ -5586,6 +5594,26 @@ async def test_list_messages_topic_filter() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reinspection_preserves_local_history_horizon() -> None:
+    conn = _make_db()
+    _insert_synced_dialog(conn, 9033, status="synced", last_synced_at=1700000000)
+    _insert_message(conn, 9033, 101, text="retained", forum_topic_id=5)
+    server = make_server(conn)
+    sink = MagicMock()
+    sink.offer.return_value = True
+    server.bind_demand_sink(sink)
+    result = await server._dispatch({"method": "mark_dialog_for_sync", "dialog_id": 9033, "enable": True})
+    assert result["data"]["action"] == "queue_full_history"
+    status = await server._get_sync_status({"dialog_id": 9033})
+    assert status["data"]["history_sync_state"] == "syncing"
+    assert status["data"]["history_depth_state"] == "complete"
+    assert status["data"]["history_complete_at"] == 1700000000
+    read = await server._list_messages({"dialog_id": 9033, "message_state": "sent", "topic_id": 5})
+    assert read["data"]["observation_horizon_at"] == 1700000000
+    assert read["data"]["messages"][0]["message_id"] == 101
+
+
+@pytest.mark.asyncio
 async def test_list_messages_known_topic_with_no_local_rows_stays_local_and_unknown() -> None:
     """Topic metadata is not a receipt for old message attribution."""
     dialog_id = 9031
@@ -5608,7 +5636,21 @@ async def test_list_messages_known_topic_with_no_local_rows_stays_local_and_unkn
     assert _response_messages(result) == []
     assert result["data"]["selection_state"] == "unknown"
     assert result["data"]["topic_attribution"]["state"] == "unknown"
-    assert result["data"]["topic_attribution"]["no_topic_count"] == 0
+    assert result["data"]["topic_attribution"]["unassigned_message_count"] == 1
+
+    _insert_message(conn, dialog_id, 101, text="another unassigned", forum_topic_id=None)
+    conn.execute("UPDATE messages SET is_deleted = 1 WHERE dialog_id = ? AND message_id = 100", (dialog_id,))
+    conn.commit()
+    updated = await server._list_messages(
+        {"dialog_id": dialog_id, "limit": 10, "topic_id": topic_id, "message_state": "sent"}
+    )
+    assert updated["data"]["topic_attribution"] == result["data"]["topic_attribution"]
+    conn.execute("UPDATE messages SET is_deleted = 1 WHERE dialog_id = ? AND message_id = 101", (dialog_id,))
+    conn.commit()
+    updated = await server._list_messages(
+        {"dialog_id": dialog_id, "limit": 10, "topic_id": topic_id, "message_state": "sent"}
+    )
+    assert updated["data"]["topic_attribution"]["unassigned_message_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -6197,7 +6239,7 @@ async def test_get_sync_status_includes_coverage():
     """get_sync_status returns sync_coverage_pct and access_lost_at."""
     conn = _make_db()
     conn.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status, total_messages) VALUES (?, 'synced', 1000)",
+        "INSERT INTO synced_dialogs (dialog_id, status, total_messages, history_depth_complete) VALUES (?, 'synced', 1000, 1)",
         (-100001,),
     )
     seed_full_history_enrollment(conn, -100001, enabled=True)
@@ -6224,8 +6266,8 @@ async def test_get_sync_status_keeps_synced_complete_when_total_is_suspect():
     """A bad Telegram total estimate must not make a completed full sync look incomplete."""
     conn = _make_db()
     conn.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status, total_messages, last_synced_at, last_event_at) "
-        "VALUES (?, 'synced', 1, 1700000000, 1700001000)",
+        "INSERT INTO synced_dialogs (dialog_id, status, total_messages, last_synced_at, last_event_at, history_depth_complete) "
+        "VALUES (?, 'synced', 1, 1700000000, 1700001000, 1)",
         (7110815,),
     )
     seed_full_history_enrollment(conn, 7110815, enabled=True)
@@ -6368,7 +6410,7 @@ async def test_list_dialogs_includes_coverage():
     conn = _make_db_with_dialogs()
     _seed_dialog_row(conn, 5001, name="Test Dialog", type_="User")
     conn.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status, total_messages) VALUES (?, 'synced', 100)",
+        "INSERT INTO synced_dialogs (dialog_id, status, total_messages, history_depth_complete) VALUES (?, 'synced', 100, 1)",
         (5001,),
     )
     seed_full_history_enrollment(conn, 5001, enabled=True)
@@ -8894,6 +8936,7 @@ def _make_trace_db() -> sqlite3.Connection:
         CREATE TABLE synced_dialogs (
             dialog_id           INTEGER PRIMARY KEY,
             status              TEXT NOT NULL DEFAULT 'not_synced',
+            history_depth_complete INTEGER NOT NULL DEFAULT 0,
             last_synced_at      INTEGER,
             last_event_at       INTEGER,
             sync_progress       INTEGER DEFAULT 0,

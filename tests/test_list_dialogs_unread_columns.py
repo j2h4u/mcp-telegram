@@ -73,6 +73,7 @@ def _make_db() -> Iterator[sqlite3.Connection]:
             CREATE TABLE synced_dialogs (
                 dialog_id           INTEGER PRIMARY KEY,
                 status              TEXT NOT NULL DEFAULT 'not_synced',
+            history_depth_complete INTEGER NOT NULL DEFAULT 0,
                 last_synced_at      INTEGER,
                 last_event_at       INTEGER,
                 last_delta_checked_at INTEGER,
@@ -726,6 +727,7 @@ async def test_list_dialogs_structured_output_includes_unread_values_and_channel
 
     sync_model = build_sync_read_model(
         persisted_status="synced",
+        history_depth_complete=True,
         enrollment_enabled=True,
         last_synced_at=1700000000,
         last_event_at=None,

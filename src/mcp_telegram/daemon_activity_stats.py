@@ -34,7 +34,9 @@ class _LoggerLike(Protocol):
     def exception(self, msg: str, *_args: object, **_kwargs: object) -> None: ...
 
 
-_SELECT_SYNC_COVERAGE_SQL = "SELECT status, last_synced_at FROM synced_dialogs WHERE dialog_id = ?"
+_SELECT_SYNC_COVERAGE_SQL = (
+    "SELECT status, last_synced_at, history_depth_complete FROM synced_dialogs WHERE dialog_id = ?"
+)
 _GET_DIALOG_TOP_REACTIONS_SQL = (
     "SELECT emoji, SUM(count) AS cnt "
     "FROM message_reactions WHERE dialog_id = ? "
@@ -611,11 +613,11 @@ class DaemonActivityStatsService:
         dialog_id = resolved
         directory_coverage = cast(DialogDirectoryCoverage | None, getattr(resolved, "coverage", None))
         row = cast(
-            tuple[str, int | None] | None,
+            tuple[str, int | None, int] | None,
             self._deps.conn.execute(_SELECT_SYNC_COVERAGE_SQL, (dialog_id,)).fetchone(),
         )
-        status, last_synced_at = row if row is not None else (None, None)
-        coverage = local_history_coverage(status, last_synced_at)
+        status, last_synced_at, depth_complete = row if row is not None else (None, None, 0)
+        coverage = local_history_coverage(status, last_synced_at, bool(depth_complete))
 
         reactions = [
             {"emoji": r[0], "count": int(cast(int | str, r[1]))}

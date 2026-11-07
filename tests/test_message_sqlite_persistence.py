@@ -1134,6 +1134,31 @@ def test_missing_current_version_respects_observation_order(conn: sqlite3.Connec
     assert read_message_text(conn, 42, 98).text == "later"
 
 
+def test_reinspection_corrects_topic_but_respects_newer_edit_and_deletion(conn: sqlite3.Connection) -> None:
+    old = _message(98, text="old")
+    old = replace(old, observation_order=10, message=replace(old.message, forum_topic_id=1, edit_date=100))
+    corrected = replace(old, observation_order=20, message=replace(old.message, forum_topic_id=55))
+    newer = replace(
+        corrected, observation_order=30, message=replace(corrected.message, forum_topic_id=77, edit_date=200)
+    )
+    with write_transaction(conn):
+        insert_messages_with_fts(conn, [old])
+        insert_messages_with_fts(conn, [corrected])
+        assert conn.execute("SELECT forum_topic_id FROM messages WHERE dialog_id=42 AND message_id=98").fetchone() == (
+            55,
+        )
+        insert_messages_with_fts(conn, [newer])
+        insert_messages_with_fts(conn, [replace(corrected, observation_order=40)])
+        assert conn.execute("SELECT forum_topic_id FROM messages WHERE dialog_id=42 AND message_id=98").fetchone() == (
+            77,
+        )
+        conn.execute("UPDATE messages SET is_deleted=1 WHERE dialog_id=42 AND message_id=98")
+        insert_messages_with_fts(conn, [replace(corrected, observation_order=50)])
+        assert conn.execute(
+            "SELECT forum_topic_id,is_deleted FROM messages WHERE dialog_id=42 AND message_id=98"
+        ).fetchone() == (77, 1)
+
+
 def test_newer_telegram_version_preserves_later_observation_order(conn: sqlite3.Connection) -> None:
     old = _message(98, text="old")
     old_version = replace(old, observation_order=30, message=replace(old.message, edit_date=100))

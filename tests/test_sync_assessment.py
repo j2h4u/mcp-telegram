@@ -140,6 +140,7 @@ def test_equal_instants_with_different_offsets_are_not_later() -> None:
 def test_canonical_complete_state_without_timestamp_has_unknown_boundary() -> None:
     model = build_sync_read_model(
         persisted_status="synced",
+        history_depth_complete=True,
         enrollment_enabled=True,
         last_synced_at=None,
         last_event_at=None,

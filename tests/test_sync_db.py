@@ -115,7 +115,7 @@ def test_synced_dialogs_schema(tmp_sync_db_path: Path) -> None:
             "topic_attribution_state",
             "topic_attribution_observed_at",
             "topic_attribution_completed_at",
-            "topic_attribution_no_topic_count",
+            "history_depth_complete",
         }
         assert expected == set(columns.keys()), f"Unexpected columns. Got: {set(columns.keys())}, expected: {expected}"
         # dialog_id is primary key

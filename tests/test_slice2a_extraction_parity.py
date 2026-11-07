@@ -133,6 +133,7 @@ def test_build_access_metadata_status_without_evidence_does_not_claim_live_or_co
         "coverage": "partial",
         "observation_horizon_at": None,
         "last_synced_at": None,
+        "history_depth_complete": False,
         "last_event_at": None,
         "last_delta_checked_at": None,
     }
@@ -143,8 +144,8 @@ def test_build_access_metadata_completed_observation_is_as_of_not_live(
 ) -> None:
     conn = make_synced_db()
     conn.execute(
-        "INSERT INTO synced_dialogs(dialog_id,status,last_synced_at,last_event_at,last_delta_checked_at) "
-        "VALUES (100,'synced',1700000100,1700000200,1700000300)"
+        "INSERT INTO synced_dialogs(dialog_id,status,last_synced_at,last_event_at,last_delta_checked_at,history_depth_complete) "
+        "VALUES (100,'synced',1700000100,1700000200,1700000300,1)"
     )
     conn.commit()
 
@@ -156,6 +157,7 @@ def test_build_access_metadata_completed_observation_is_as_of_not_live(
         "coverage": "complete_as_of",
         "observation_horizon_at": 1700000100,
         "last_synced_at": 1700000100,
+        "history_depth_complete": True,
         "last_event_at": 1700000200,
         "last_delta_checked_at": 1700000300,
     }

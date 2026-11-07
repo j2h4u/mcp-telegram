@@ -78,6 +78,7 @@ def _make_db() -> Iterator[sqlite3.Connection]:
         CREATE TABLE synced_dialogs (
             dialog_id           INTEGER PRIMARY KEY,
             status              TEXT NOT NULL DEFAULT 'not_synced',
+            history_depth_complete INTEGER NOT NULL DEFAULT 0,
             last_synced_at      INTEGER,
             last_event_at       INTEGER,
             sync_progress       INTEGER DEFAULT 0,
@@ -89,8 +90,7 @@ def _make_db() -> Iterator[sqlite3.Connection]:
             topic_attribution_version INTEGER NOT NULL DEFAULT 0,
             topic_attribution_state TEXT NOT NULL DEFAULT 'unknown',
             topic_attribution_observed_at INTEGER,
-            topic_attribution_completed_at INTEGER,
-            topic_attribution_no_topic_count INTEGER NOT NULL DEFAULT 0
+            topic_attribution_completed_at INTEGER
         )
         """
     )

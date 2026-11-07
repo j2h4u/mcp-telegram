@@ -19,7 +19,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
     UserDeactivatedError,
     UserPrivacyRestrictedError,
 )
-from telethon.tl.types import Message, MessageService, TypePeer  # type: ignore[import-untyped]
+from telethon.tl.types import Message, MessageActionTopicCreate, MessageService, TypePeer  # type: ignore[import-untyped]
 
 from .. import message_contracts as _message_contracts
 from ..flood import TelegramRpcThrottled, _raise_if_latched
@@ -70,7 +70,6 @@ class _ReplyToLike(Protocol):
     reply_to_msg_id: int | None
     forum_topic: bool
     reply_to_top_id: int | None
-    reply_to_reply_top_id: int | None
     reply_to_peer_id: _PeerLike | None
 
 
@@ -151,7 +150,10 @@ def extract_reply_and_topic(msg: object) -> tuple[int | None, int | None]:
     Returns (reply_to_msg_id, forum_topic_id).
     """
     reply_to = _attr(msg, "reply_to", None)
-    return _reply_message_id(reply_to), _reply_forum_topic_id(reply_to) or _message_thread_topic_id(msg)
+    topic_id = _reply_forum_topic_id(reply_to) or _message_thread_topic_id(msg)
+    if isinstance(_attr(msg, "action", None), MessageActionTopicCreate):
+        topic_id = _attr(msg, "id", None)
+    return _reply_message_id(reply_to), topic_id
 
 
 def _reply_message_id(reply_to: object | None) -> int | None:
@@ -171,16 +173,13 @@ def _reply_forum_topic_id(reply_to: object | None) -> int | None:
         return reply_top_id
 
     if _attr(reply_to, "forum_topic", False):
-        return 1
+        return _reply_message_id(reply_to)
 
     return None
 
 
 def _reply_top_id(reply_to: object) -> int | None:
     reply_top_id = _attr(reply_to, "reply_to_top_id", None)
-    if reply_top_id is None:
-        # Compatibility with old test doubles and older Telethon-like shims.
-        reply_top_id = _attr(reply_to, "reply_to_reply_top_id", None)
     return int(reply_top_id) if reply_top_id is not None else None
 
 
@@ -188,10 +187,6 @@ def _message_thread_topic_id(msg: object) -> int | None:
     message_thread_id = _attr(msg, "message_thread_id", None)
     if message_thread_id is not None:
         return int(message_thread_id)
-    if _attr(msg, "is_topic_message", False):
-        # Bot API-style topic messages may surface only a topic flag when the
-        # thread id is absent. Telegram uses topic id 1 for the General topic.
-        return 1
     return None
 
 
@@ -200,8 +195,6 @@ def _touch_reply_to_fields(reply_to: _ReplyToLike) -> None:
         _ = reply_to.forum_topic
     if hasattr(reply_to, "reply_to_top_id"):
         _ = reply_to.reply_to_top_id
-    if hasattr(reply_to, "reply_to_reply_top_id"):
-        _ = reply_to.reply_to_reply_top_id
 
 
 def _touch_forward_fields(fwd: _ForwardLike) -> None:
