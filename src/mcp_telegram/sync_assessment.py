@@ -56,6 +56,12 @@ def _history_summary(payload: Mapping[str, object]) -> str:
         if _timestamp(payload.get("history_complete_at")) is None:
             return "Completed history acquisition is recorded; its current boundary is unknown."
         return "Completed history acquisition is recorded through the reported boundary."
+    if payload.get("history_depth_state") == "complete":
+        if state == "syncing":
+            return "Previously completed history remains available; history synchronization is in progress."
+        if state == "not_synced":
+            activity = "disabled" if payload.get("enrollment_enabled") is False else "not currently active"
+            return f"Previously completed history remains available; history synchronization is {activity}."
     return {
         "syncing": "History synchronization is unfinished; complete history is not established.",
         "own_messages_only": "History coverage is limited to own messages.",

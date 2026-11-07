@@ -141,7 +141,10 @@ def _seed_topic_dialog(
         "VALUES (?,?,?,1,0,1,1,'directory')",
         (dialog_id, name, "supergroup"),
     )
-    conn.execute("INSERT INTO synced_dialogs (dialog_id,status) VALUES (?, 'synced')", (dialog_id,))
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id,status,history_depth_complete) VALUES (?, 'synced', 1)",
+        (dialog_id,),
+    )
     conn.execute(
         "INSERT INTO topic_metadata "
         "(dialog_id,topic_id,title,is_general,is_deleted,updated_at,icon_emoji_id,icon_emoji,known_fields,catalog_present) "
@@ -293,6 +296,35 @@ async def test_registered_assessments_follow_local_results_and_protection(  # no
         else:
             assert "interval_coverage" not in coverage
             assert "interval coverage is unknown" in read_summary
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "enabled", "activity"), [("syncing", 1, "in progress"), ("not_synced", 0, "disabled")]
+)
+async def test_registered_status_assessment_preserves_completed_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str, enabled: int, activity: str
+) -> None:
+    monkeypatch.setattr(mcp_server, "_schedule_telemetry", lambda _event: None)
+    daemon, sync_conn, feedback_conn, _ = _local_daemon(tmp_path, object())
+    _seed_topic_dialog(sync_conn, 123, "Project", message="retained")
+    sync_conn.execute("UPDATE synced_dialogs SET status=?, last_synced_at=1700000100 WHERE dialog_id=123", (state,))
+    sync_conn.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (123,?,1)", (enabled,))
+    sync_conn.commit()
+    socket_path = tmp_path / "daemon.sock"
+    _install_daemon_socket(monkeypatch, socket_path)
+    try:
+        async with await asyncio.start_unix_server(daemon.handle_client, path=socket_path):
+            result = await mcp_server.call_tool("get_sync_status", {"dialog_id": 123})
+    finally:
+        sync_conn.close()
+        feedback_conn.close()
+    assert result.is_error is False
+    payload = cast(dict[str, object], result.structured_content)
+    assert payload["history_depth_state"] == "complete"
+    summary = cast(str, cast(dict[str, object], payload["assessment"])["summary"])
+    assert "Previously completed history remains available" in summary
+    assert activity in summary
 
 
 @pytest.mark.asyncio

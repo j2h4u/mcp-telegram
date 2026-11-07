@@ -171,6 +171,43 @@ def test_held_unfinished_history_and_normal_reconciliation_wording() -> None:
     assert "continuous catch-up" not in summary
 
 
+@pytest.mark.parametrize(
+    ("state", "enrolled", "activity"),
+    [("syncing", True, "in progress"), ("not_synced", False, "disabled")],
+)
+def test_assessment_preserves_completed_history_during_reinspection_or_disable(
+    state: str, enrolled: bool, activity: str
+) -> None:
+    model = build_sync_read_model(
+        persisted_status=state,
+        history_depth_complete=True,
+        enrollment_enabled=enrolled,
+        last_synced_at=90,
+        last_event_at=None,
+        last_delta_checked_at=None,
+        saved_message_count=1,
+        total_messages=None,
+        now=100,
+    )
+    summary = cast(str, build_sync_assessment("get_sync_status", model.to_wire(), {})["summary"])
+    assert "Previously completed history remains available" in summary
+    assert activity in summary
+    assert "complete history is not established" not in summary
+    assert "Completed history acquisition is not recorded" not in summary
+
+
+@pytest.mark.parametrize("state", ["syncing", "not_synced"])
+def test_assessment_does_not_infer_completed_history_from_timestamp(state: str) -> None:
+    payload = {
+        "history_sync_state": state,
+        "history_depth_state": "partial",
+        "last_synced_at": "2026-01-01T00:00:00+00:00",
+    }
+    summary = cast(str, build_sync_assessment("get_sync_status", payload, {})["summary"])
+    assert "Previously completed history remains available" not in summary
+    assert ("complete history is not established" if state == "syncing" else "acquisition is not recorded") in summary
+
+
 def test_only_three_supported_tools() -> None:
     assert {"get_sync_status", "list_messages", "search_messages"} == ASSESSMENT_TOOLS
     with pytest.raises(ValueError):
