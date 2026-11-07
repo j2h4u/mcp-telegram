@@ -48,6 +48,7 @@ async def test_retained_status_with_thin_dialog_replays_before_checkpoint(tmp_pa
         await client.start_update_delivery(99)
 
         assert _pending(path) is None
+        assert reader.execute("SELECT COUNT(*) FROM update_delivery_tokens").fetchone() == (0,)
         assert _safe(path).pts == 11
         assert reader.execute(
             "SELECT json_extract(detail_json,'$.status.type') FROM entity_details WHERE entity_id=55"
