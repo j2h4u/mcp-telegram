@@ -4390,13 +4390,15 @@ def _revisions_precede_snapshot(revisions: list[int | None], start: object) -> b
 def personal_profile_peer(conn: sqlite3.Connection, owner: int, peer: int) -> bool:
     if peer <= 0 or peer == owner or peer in _PROFILE_EXCLUDED_PEERS:
         return False
-    dialog = cast(tuple[str] | None, conn.execute("SELECT type FROM dialogs WHERE dialog_id=?", (peer,)).fetchone())
+    dialog = cast(
+        tuple[str | None] | None, conn.execute("SELECT type FROM dialogs WHERE dialog_id=?", (peer,)).fetchone()
+    )
     entity = cast(tuple[str] | None, conn.execute("SELECT type FROM entities WHERE id=?", (peer,)).fetchone())
     kinds = {str(value[0]).lower() for value in (dialog, entity) if value is not None}
     if kinds & {"service", "replies"}:
         return False
     return (
-        (dialog is not None and dialog[0].lower() in {"user", "bot"})
+        (dialog is not None and str(dialog[0]).lower() in {"user", "bot"})
         or profile_peer_managed(conn, owner, peer)
         or conn.execute("SELECT 1 FROM messages WHERE dialog_id=? LIMIT 1", (peer,)).fetchone() is not None
     )
@@ -4477,7 +4479,7 @@ def _ensure_profile_private_identity(conn: sqlite3.Connection, peer: int, now: i
     row = cast(
         tuple[object, ...] | None, conn.execute("SELECT type,name FROM dialogs WHERE dialog_id=?", (peer,)).fetchone()
     )
-    kind, name = (str(row[0]), cast(str | None, row[1])) if row else ("unknown", None)
+    kind, name = (str(row[0] or "unknown"), cast(str | None, row[1])) if row else ("unknown", None)
     existing = cast(tuple[object, ...] | None, conn.execute("SELECT type FROM entities WHERE id=?", (peer,)).fetchone())
     if (existing and str(existing[0]).lower() in {"service", "replies"}) or kind.lower() in {"service", "replies"}:
         return False
