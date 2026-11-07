@@ -93,6 +93,7 @@ from .sqlite_projection import (
     read_daemon_state_int,
     read_daemon_state_value,
     read_states_for_dialogs,
+    read_topic_attribution_receipt,
 )
 
 # These thresholds are part of reading's local fuzzy dialog projection.  They
@@ -496,42 +497,6 @@ def _status_from_row(row: object | None) -> str | None:
     return None if value is None else str(value)
 
 
-def _topic_attribution_receipt(conn: sqlite3.Connection, dialog_id: int) -> dict[str, object]:
-    """Read the local projection receipt without inferring history completeness."""
-    row = _fetchone_row(
-        conn.execute(
-            "SELECT topic_attribution_version, topic_attribution_state, "
-            "topic_attribution_observed_at, topic_attribution_completed_at, "
-            "(SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND is_deleted = 0 AND forum_topic_id IS NULL) "
-            "FROM synced_dialogs WHERE dialog_id = ?",
-            (dialog_id, dialog_id),
-        )
-    )
-    if row is None:
-        count = cast(
-            tuple[int],
-            conn.execute(
-                "SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND is_deleted = 0 AND forum_topic_id IS NULL",
-                (dialog_id,),
-            ).fetchone(),
-        )[0]
-        return {
-            "version": 0,
-            "state": "unknown",
-            "observed_at": None,
-            "completed_at": None,
-            "unassigned_message_count": count,
-        }
-    values = _row_sequence(row)
-    return {
-        "version": int(cast(int | str, values[0] or 0)),
-        "state": str(values[1] or "unknown"),
-        "observed_at": values[2],
-        "completed_at": values[3],
-        "unassigned_message_count": int(cast(int | str, values[4] or 0)),
-    }
-
-
 def _topic_selection_state(
     *, topic_id: object, messages: Sequence[object], status: str | None, receipt: Mapping[str, object]
 ) -> str | None:
@@ -905,7 +870,7 @@ class ReadingService:
         result["data"]["dialog_name_source"] = identity.display_name_source
         result["data"]["read_state"] = read_state
         with timing_phase("local_projection"):
-            receipt = _topic_attribution_receipt(self._conn, dialog_id)
+            receipt = read_topic_attribution_receipt(self._conn, dialog_id)
             result["data"]["topic_attribution"] = receipt
             selection_state = _topic_selection_state(
                 topic_id=request.topic_id,
@@ -2479,7 +2444,7 @@ class ReadingService:
             topic_metadata: dict[str, object] = {}
             if request.topic_id is not None:
                 with timing_phase("local_projection"):
-                    receipt = _topic_attribution_receipt(self._conn, state.request.dialog_id)
+                    receipt = read_topic_attribution_receipt(self._conn, state.request.dialog_id)
                 topic_metadata = {
                     "topic_attribution": receipt,
                     "selection_state": _topic_selection_state(

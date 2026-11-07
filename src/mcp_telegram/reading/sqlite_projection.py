@@ -55,6 +55,43 @@ def count_dialog_rows(conn: sqlite3.Connection) -> int:
     return 0 if row is None or row[0] is None else int(cast(int | str, row[0]))
 
 
+def read_topic_attribution_receipt(conn: sqlite3.Connection, dialog_id: int) -> dict[str, object]:
+    """Read the local projection receipt without inferring history completeness."""
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT topic_attribution_version, topic_attribution_state, "
+            "topic_attribution_observed_at, topic_attribution_completed_at, "
+            "(SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND is_deleted = 0 AND forum_topic_id IS NULL) "
+            "FROM synced_dialogs WHERE dialog_id = ?",
+            (dialog_id, dialog_id),
+        ).fetchone(),
+    )
+    if row is None:
+        count = cast(
+            tuple[int],
+            conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND is_deleted = 0 AND forum_topic_id IS NULL",
+                (dialog_id,),
+            ).fetchone(),
+        )[0]
+        return {
+            "version": 0,
+            "state": "unknown",
+            "observed_at": None,
+            "completed_at": None,
+            "unassigned_message_count": count,
+        }
+    values = row
+    return {
+        "version": int(cast(int | str, values[0] or 0)),
+        "state": str(values[1] or "unknown"),
+        "observed_at": values[2],
+        "completed_at": values[3],
+        "unassigned_message_count": int(cast(int | str, values[4] or 0)),
+    }
+
+
 def read_daemon_state_value(conn: sqlite3.Connection, key: str) -> str | None:
     row = cast(tuple[object] | None, conn.execute("SELECT value FROM daemon_state WHERE key = ?", (key,)).fetchone())
     return None if row is None or row[0] is None else str(row[0])

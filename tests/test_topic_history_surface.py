@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -15,10 +15,25 @@ from telethon.tl import types
 
 from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
 from mcp_telegram.messages.telegram_adapter import extract_message_row
+from mcp_telegram.reading.sqlite_projection import read_topic_attribution_receipt
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.tools.reading import ListMessages, list_messages
 from tests.test_daemon_api import _TestClient, make_server
+
+
+def test_topic_receipt_counts_orphaned_local_messages(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at,is_deleted) VALUES (1,1,1,0), (1,2,2,1)")
+        assert read_topic_attribution_receipt(conn, 1) == {
+            "version": 0,
+            "state": "unknown",
+            "observed_at": None,
+            "completed_at": None,
+            "unassigned_message_count": 1,
+        }
 
 
 async def test_telegram_topic_header_survives_local_storage_and_mcp(
