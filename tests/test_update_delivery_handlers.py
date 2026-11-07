@@ -87,7 +87,7 @@ def _body(mid: int, text: str, *, group: bool = False) -> types.Message:
     return message
 
 
-async def _admit(client: TelegramRpcGate, updates: list[object], *, include_fixture_user: bool = True) -> list[object]:
+async def _admit(client: TelegramRpcGate, updates: list[object], *, include_fixture_user: bool) -> list[object]:
     processed: list[object] = []
     for update in updates:
         client._message_box.process_updates(
@@ -229,7 +229,7 @@ async def test_required_canonical_write_failure_replays_tg98_cases_1_to_4(  # no
     try:
         await client.start_update_delivery(99)
         baseline = _saved(client)
-        updates = await _admit(client, [update])
+        updates = await _admit(client, [update], include_fixture_user=True)
         assert _pending(path) is not None
         # The fault is installed only after raw TL bytes and tokens committed.
         await _write(
@@ -332,6 +332,7 @@ async def test_same_second_concurrent_edit_history_replay_and_legitimate_return_
                 types.UpdateEditMessage(_body(5, "A"), 11, 1),
                 types.UpdateEditMessage(_body(5, "B"), 12, 1),
             ],
+            include_fixture_user=True,
         )
         active = client._active_delivery
         assert active is not None
@@ -362,7 +363,7 @@ async def test_same_second_concurrent_edit_history_replay_and_legitimate_return_
         assert _pending(path) is None
         assert reader.execute("SELECT text FROM messages").fetchone() == ("B",)
         assert [row[0] for row in reader.execute("SELECT old_text FROM message_versions ORDER BY version")] == history
-        later = await _admit(client, [types.UpdateEditMessage(_body(5, "A"), 13, 1)])
+        later = await _admit(client, [types.UpdateEditMessage(_body(5, "A"), 13, 1)], include_fixture_user=True)
         await client._dispatch_update(later[0])
         assert reader.execute("SELECT text FROM messages").fetchone() == ("A",)
         assert [row[0] for row in reader.execute("SELECT old_text FROM message_versions ORDER BY version")] == [
@@ -424,7 +425,9 @@ async def test_closed_handler_barrier_cancellation_retains_raw_update_for_restar
     try:
         await client.start_update_delivery(99)
         baseline = _saved(client)
-        updates = await _admit(client, [types.UpdateNewMessage(_body(11, "new", group=True), 11, 1)])
+        updates = await _admit(
+            client, [types.UpdateNewMessage(_body(11, "new", group=True), 11, 1)], include_fixture_user=True
+        )
         task = asyncio.create_task(client._dispatch_update(updates[0]))
         await asyncio.sleep(0)
         assert not task.done()
