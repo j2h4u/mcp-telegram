@@ -14,10 +14,14 @@ from unittest.mock import MagicMock
 import pytest
 from telethon.tl import types  # type: ignore[import-untyped]
 
+from mcp_telegram.auth_scope import TelegramAuthScope
+from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
+from mcp_telegram.dialog_identity import ensure_dialog_identity_baseline
 from mcp_telegram.entity_profile.contracts import ProfileFieldObservation
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
 from mcp_telegram.entity_profile.updates import project_profile_update, project_user_profile, push_marker
 from mcp_telegram.event_handlers import EventHandlerManager
+from mcp_telegram.image_authorization import ScopeCell
 from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
@@ -56,6 +60,62 @@ def _detail(conn: sqlite3.Connection) -> dict[str, object]:
 
 def _bundle(update: object, user: types.User) -> None:
     cast(types.UpdateUserStatus, update).__dict__["_entities"] = {user.id: user}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["absent", "thin_with_message", "thin_without_relation", "full"])
+async def test_sparse_status_update_across_canonical_dialog_states(
+    tmp_path: Path, state: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "sparse-profile.sqlite"
+    ensure_sync_schema(path)
+    conn = _open_sync_db(path)
+    try:
+        with write_transaction(conn):
+            conn.execute("INSERT INTO entities(id,type,name,updated_at) VALUES (42,'user','Known',1)")
+            conn.execute(
+                "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_owner_account_id) VALUES (42,?,1,7)",
+                (json.dumps({"schema": 1, "id": 42, "type": "user", "name": "Known", "about": "Retained"}),),
+            )
+            if state.startswith("thin"):
+                ensure_dialog_identity_baseline(conn, 42)
+            elif state == "full":
+                conn.execute("INSERT INTO dialogs(dialog_id,type,name) VALUES (42,'user','Known')")
+            if state in {"absent", "thin_with_message"}:
+                conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at,text) VALUES (42,1,1,'retained')")
+        manager, client = _manager(conn)
+        scope = TelegramAuthScope(1, 7, 2, 99)
+        cell = ScopeCell()
+        assert cell.publish(scope)
+        client.retained_auth_scope.return_value = scope
+        client.claim_image_scope.side_effect = cell.claim
+        delivery = DeliveredUpdate(1, 1.0, 1, auth_scope=scope, scope_token=cell.capture())
+        update = types.UpdateUserStatus(42, types.UserStatusRecently())
+        assert not getattr(update, "_entities", None)
+        row = conn.execute("SELECT type FROM dialogs WHERE dialog_id=42").fetchone()
+        if state == "absent":
+            assert row is None
+        elif state.startswith("thin"):
+            assert row is not None and row[0] is None
+        else:
+            assert row is not None and row[0] == "user"
+
+        with delivered_update_context(delivery):
+            await manager.on_raw_identity_or_notify(update)
+
+        assert delivery.failed is False
+        detail = _detail(conn)
+        assert detail["about"] == "Retained"
+        assert detail["name"] == "Known"
+        if state == "thin_without_relation":
+            assert "status" not in detail
+        else:
+            assert detail["status"] == {"type": "recently"}
+        assert conn.execute("SELECT type,name FROM entities WHERE id=42").fetchone() == ("user", "Known")
+        assert not any(record.message.startswith("event_identity_or_notify_failed") for record in caplog.records)
+        assert all(call[0] in {"retained_auth_scope", "claim_image_scope"} for call in client.mock_calls)
+    finally:
+        conn.close()
 
 
 @pytest.mark.parametrize(

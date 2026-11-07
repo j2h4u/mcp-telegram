@@ -81,6 +81,10 @@ paths where they matter; do not test every private helper separately. For
 meaningful changed logic, consider one business-rule change and one stored
 representation change, and review the affected callers and tests. Apply these
 principles incrementally; untouched legacy code needs no unrelated refactor.
+For changes to a producer, stored representation, or consumer, test a minimal
+current valid producer state before enrichment at the actual consumer. Test
+helpers must not fill fields whose absence is under test; see
+[profile update replay](tests/test_profile_update_replay.py).
 
 ## Architecture
 
