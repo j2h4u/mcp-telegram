@@ -5603,7 +5603,7 @@ async def test_reinspection_preserves_local_history_horizon() -> None:
     sink.offer.return_value = True
     server.bind_demand_sink(sink)
     result = await server._dispatch({"method": "mark_dialog_for_sync", "dialog_id": 9033, "enable": True})
-    assert result["data"]["action"] == "queue_full_history"
+    assert cast(dict[str, object], result["data"])["action"] == "queue_full_history"
     status = await server._get_sync_status({"dialog_id": 9033})
     assert status["data"]["history_sync_state"] == "syncing"
     assert status["data"]["history_depth_state"] == "complete"

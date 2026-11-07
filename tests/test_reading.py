@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import cast
+from typing import Literal, cast
 
 import pytest
 from jsonschema import validate
@@ -570,7 +570,11 @@ def test_list_messages_preserves_empty_topic_warning_for_explicit_sent_reads() -
     ],
 )
 def test_topic_traversal_warning_for_local_pages(
-    state: str, version: int, message_state: str, topic_id: int | None, expected: bool
+    state: str,
+    version: int,
+    message_state: Literal["sent", "scheduled", "draft", "all"],
+    topic_id: int | None,
+    expected: bool,
 ) -> None:
     args = ListMessages(exact_dialog_id=123, message_state=message_state, navigation="next")
     payload = _list_messages_structured_content(
@@ -619,7 +623,7 @@ def test_list_messages_does_not_diagnose_dialog_id_when_another_filter_makes_top
         )
     )
 
-    assert all(w["kind"] != "dialog_identifier_mismatch" for w in payload["warnings"])
+    assert all(w["kind"] != "dialog_identifier_mismatch" for w in cast(list[dict[str, object]], payload["warnings"]))
 
 
 def test_list_messages_always_presents_selected_page_chronologically_with_reply_refs():

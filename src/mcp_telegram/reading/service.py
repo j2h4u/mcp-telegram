@@ -508,10 +508,13 @@ def _topic_attribution_receipt(conn: sqlite3.Connection, dialog_id: int) -> dict
         )
     )
     if row is None:
-        count = conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND is_deleted = 0 AND forum_topic_id IS NULL",
-            (dialog_id,),
-        ).fetchone()[0]
+        count = cast(
+            tuple[int],
+            conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND is_deleted = 0 AND forum_topic_id IS NULL",
+                (dialog_id,),
+            ).fetchone(),
+        )[0]
         return {
             "version": 0,
             "state": "unknown",

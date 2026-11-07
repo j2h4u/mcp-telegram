@@ -1373,9 +1373,7 @@ def test_migration_v101_invalidates_only_old_receipt(tmp_path: Path, monkeypatch
             15,
         )
         assert conn.execute("SELECT forum_topic_id,is_deleted FROM messages WHERE dialog_id=1").fetchone() == (4, 1)
-        assert "topic_attribution_no_topic_count" not in {
-            row[1] for row in conn.execute("PRAGMA table_info(synced_dialogs)")
-        }
+        assert "topic_attribution_no_topic_count" not in {row[1] for row in _table_info(conn, "synced_dialogs")}
 
 
 def test_migration_v73_removes_persisted_campaign_state(tmp_path: Path) -> None:

@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -59,9 +60,13 @@ async def test_telegram_topic_header_survives_local_storage_and_mcp(
         result = await list_messages(ListMessages(exact_dialog_id=1, exact_topic_id=100, message_state="sent"))
         assert result.structured_content is not None
         payload = result.structured_content
-        assert payload["messages"][0]["msg_id"] == 201
-        assert payload["coverage"]["topic_attribution"]["unassigned_message_count"] == 0
-        assert [w["kind"] for w in payload["warnings"]] == ["topic_history_unverified"]
+        messages = cast(list[dict[str, object]], payload["messages"])
+        coverage = cast(dict[str, object], payload["coverage"])
+        receipt = cast(dict[str, object], coverage["topic_attribution"])
+        warnings = cast(list[dict[str, object]], payload["warnings"])
+        assert messages[0]["msg_id"] == 201
+        assert receipt["unassigned_message_count"] == 0
+        assert [w["kind"] for w in warnings] == ["topic_history_unverified"]
         client.iter_messages.assert_not_called()
         client.get_entity.assert_not_called()
         offer.assert_not_called()

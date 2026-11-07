@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -43,8 +44,9 @@ class _History(HistoryScope):
 
 
 def _metadata(conn: sqlite3.Connection) -> dict:
-    status = conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=55").fetchone()[0]
-    return _build_access_metadata(conn, 55, status)
+    row = cast(tuple[str] | None, conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=55").fetchone())
+    assert row is not None
+    return _build_access_metadata(conn, 55, row[0])
 
 
 async def _run(adapter: DeltaAccessProbeDemandAdapter, now: int) -> None:
