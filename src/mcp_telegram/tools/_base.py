@@ -147,7 +147,9 @@ def omit_none_mapping_values(value: object) -> object:
     """
     if isinstance(value, Mapping):
         return {
-            key: item if key == "todo" and value.get("type") == "todo" else omit_none_mapping_values(item)
+            key: item
+            if key == "rich_message" or (key == "todo" and value.get("type") == "todo")
+            else omit_none_mapping_values(item)
             for key, item in value.items()
             if item is not None
         }

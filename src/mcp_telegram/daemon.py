@@ -199,6 +199,7 @@ from .telegram_rpc_scheduler import (
     RpcAdmissionEvent,
     RpcAdmissionEventKind,
     TelegramRpcAdmissionDeferred,
+    rpc_attempt_budget,
 )
 from .telethon_dialog import classify_dialog_type
 from .topics.catalog import TopicCatalogRepository
@@ -2545,6 +2546,15 @@ async def _bind_scheduled_commands(ctx: _SyncMainContext) -> None:
         runtime.coordinator.offer(DemandKind.SCHEDULED_DISCOVERY)
         return True
 
+    async def scheduled_postflight(dialog_id: int) -> bool:
+        await runtime.scheduled_reconciler.invalidate_continuity(dialog_id, "scheduled_post_write")
+        with demand_context(DemandKind.SCHEDULED_DISCOVERY):
+            with rpc_attempt_budget(RpcAttemptBudget(1)):
+                _, receipt = await runtime.scheduled_reconciler._run_demand_slice_with_receipt(
+                    DemandKind.SCHEDULED_DISCOVERY, dialog_id
+                )
+        return receipt is not None
+
     def interrupted_targets(conn: sqlite3.Connection) -> tuple[int, ...]:
         rows = cast(
             list[tuple[int]],
@@ -2582,6 +2592,7 @@ async def _bind_scheduled_commands(ctx: _SyncMainContext) -> None:
             account_is_premium=current_premium,
             request_recovery=request_recovery,
             prioritize_baseline=prioritize_baseline,
+            postflight=scheduled_postflight,
         )
     )
 

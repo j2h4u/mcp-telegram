@@ -13,6 +13,7 @@ from ..dialog_selector import (
     required_dialog_selector,
 )
 from ..drafts.contracts import project_draft_result
+from ..rich_authoring import BodyFormat, parse_authored_body
 from ._base import (
     DaemonNotRunningError,
     ToolArgs,
@@ -71,6 +72,7 @@ class ManageDraft(GetDraft):
     action: Literal["create", "update", "clear", "restore"]
     operation_key: str = Field(min_length=1, max_length=128)
     text: str | None = Field(default=None, max_length=65_536)
+    format: BodyFormat = Field(default="plain", description="Plain text or Telegram native rich Markdown/HTML source.")
     expected_version: str | None = Field(default=None, min_length=1, max_length=256)
     drop_formatting: bool = Field(
         default=False,
@@ -89,6 +91,11 @@ class ManageDraft(GetDraft):
 
     @model_validator(mode="after")
     def validate_text(self) -> ManageDraft:
+        body = parse_authored_body(self.model_dump(include={"text", "format"}, exclude_unset=True))
+        if body is not None and body.format != "plain" and self.drop_formatting:
+            raise ValueError("rich format cannot be combined with drop_formatting")
+        if self.action in {"clear", "restore"} and "format" in self.model_fields_set:
+            raise ValueError("clear/restore do not accept format")
         if self.action in {"create", "update"} and (self.text is None or not self.text.strip()):
             raise ValueError("create/update require nonempty text; use clear to remove a draft")
         if self.action in {"clear", "restore"} and self.text is not None:
@@ -164,18 +171,18 @@ MANAGE_DRAFT_OUTPUT_SCHEMA = {
         },
         "current_is_operation_confirmation": {
             "type": "boolean",
-            "description": "Whether current confirms a verified acknowledged or unchanged operation.",
+            "description": "Whether current confirms a verified acknowledged or unchanged operation. False with observed still includes the complete post-write snapshot.",
         },
         "verification": {
             "type": "object",
             "properties": {
-                "status": {"enum": ["verified", "conflict", "unverified"]},
+                "status": {"enum": ["verified", "observed", "conflict", "unverified"]},
                 "basis": {"enum": ["post_write_snapshot", "preflight", "none"]},
                 "reason": {"type": "string", "maxLength": 128},
             },
             "required": ["status", "basis"],
             "additionalProperties": False,
-            "description": "Whether the canonical observation confirms the requested state; unverified current may predate the write.",
+            "description": "Observed reports a complete post-write rich snapshot without asserting equivalence to source; unverified current may predate the write.",
         },
         "save_acknowledged": {"type": "boolean"},
         "backup_history_id": {"type": "integer"},
@@ -224,6 +231,8 @@ def _draft_error_response(response: Mapping[str, object]) -> ToolResult | None:
 def _draft_request(args: GetDraft, method: str) -> dict[str, object]:
     selector = required_dialog_selector(exact_id=args.exact_dialog_id, dialog=args.dialog)
     request = args.model_dump(exclude_none=True, exclude={"dialog", "exact_dialog_id"})
+    if "format" not in args.model_fields_set:
+        request.pop("format", None)
     request["method"] = method
     if selector.exact_id is not None:
         request["dialog_id"] = selector.exact_id

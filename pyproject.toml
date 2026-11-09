@@ -23,6 +23,7 @@ dependencies = [
   "aiolimiter>=1.3.0",
   "ijson>=3.6.0",
   "jsonschema>=4.26.0,<5",
+  "markdown-it-py>=4.2.0,<5",
 ]
 
 [build-system]

@@ -135,6 +135,47 @@ def test_create_is_text_only_scheduled_and_never_clears_draft() -> None:
         )
 
 
+def test_rich_requests_preserve_format_intent_and_omit_legacy_entities() -> None:
+    create = _parse_command(
+        _request("create", text="**hello**", format="rich_markdown", schedule_at_utc="2033-05-18T03:33:20Z"), 100
+    )
+    request = _build_request(create, None, types.InputPeerUser(200, 123), random_id=9001, premium=True)
+    assert isinstance(request, SendMessageRequest)
+    assert request.message == "" and request.entities is None
+    assert isinstance(request.rich_message, types.InputRichMessageMarkdown)
+    assert request.rich_message.markdown == "**hello**"
+    plain = _parse_command(_request("create", text="**hello**", schedule_at_utc="2033-05-18T03:33:20Z"), 100)
+    assert create.fingerprint() != plain.fingerprint()
+    edit = _parse_command(
+        _request("update", scheduled_message_id=55, expected_version="v", text="old caption", format="rich_html"), 100
+    )
+    changed = _build_request(
+        edit,
+        _row(text="old caption", media_kind=None, media_payload=None),
+        types.InputPeerUser(200, 123),
+        random_id=None,
+        premium=True,
+    )
+    assert isinstance(changed, EditMessageRequest)
+    assert changed.message == "" and changed.entities is None
+    assert isinstance(changed.rich_message, types.InputRichMessageHTML)
+    with pytest.raises(ScheduledCommandError):
+        _parse_command(_request("cancel", scheduled_message_id=55, expected_version="v", format="plain"), 100)
+
+    dependent = _row(
+        text="old caption",
+        media_kind=None,
+        media_payload=None,
+        has_rich_message=1,
+        rich_message='{"_":"RichMessage","blocks":[{"_":"PageBlockPhoto","photo_id":7}],"photos":[],"documents":[]}',
+    )
+    with pytest.raises(ScheduledCommandError, match="media dependencies"):
+        _build_request(edit, dependent, types.InputPeerUser(200, 123), random_id=None, premium=True)
+    unknown = _row(text="old caption", media_kind=None, media_payload=None, has_rich_message=None)
+    with pytest.raises(ScheduledCommandError, match="incomplete"):
+        _build_request(edit, unknown, types.InputPeerUser(200, 123), random_id=None, premium=True)
+
+
 def test_update_keeps_media_and_advanced_composition_and_resends_repeat() -> None:
     command = _parse_command(
         _request(
@@ -155,6 +196,7 @@ def test_update_keeps_media_and_advanced_composition_and_resends_repeat() -> Non
     assert isinstance(request, EditMessageRequest)
     assert request.id == 55
     assert request.message is None
+    assert request.entities is None and request.rich_message is None
     assert request.media is None
     assert request.reply_markup is None
     assert request.schedule_repeat_period == 604_800
@@ -567,6 +609,325 @@ async def test_owner_creation_applies_only_correlated_scheduled_evidence_and_rep
         monkeypatch.setattr("mcp_telegram.scheduled_commands.time.time", lambda: harness.schedule_at + 3600)
         assert await harness.owner.execute(request) == first
         assert len(harness.client.requests) == 1 and retry_client.requests == []
+    finally:
+        harness.close()
+
+
+@pytest.mark.asyncio
+async def test_rich_create_returns_observed_canonical_snapshot_and_replays(tmp_path: Path) -> None:
+    harness = _OwnerHarness(tmp_path / "sync.db", schedule_at=int(datetime.now(UTC).timestamp()) + 900)
+
+    class RichClient:
+        async def __call__(self, request: object) -> object:
+            check = current_scheduled_mutation_check()
+            assert check is not None
+            await check.revalidate()
+            budget = current_rpc_scope().attempt_budget
+            assert budget is not None
+            budget.debit()
+            message = types.Message(
+                id=456,
+                peer_id=types.PeerUser(200),
+                date=datetime.fromtimestamp(harness.schedule_at, UTC),
+                message="",
+                from_scheduled=True,
+                rich_message=types.RichMessage(blocks=[], photos=[], documents=[]),
+            )
+            return SimpleNamespace(
+                updates=[
+                    types.UpdateMessageID(id=456, random_id=cast(SendMessageRequest, request).random_id),
+                    types.UpdateNewScheduledMessage(message),
+                ]
+            )
+
+    try:
+        harness.owner = harness.new_owner(RichClient())
+        request = _owner_create_request(harness, "rich-create") | {"format": "rich_markdown", "text": "**hello**"}
+        result = await harness.owner.execute(request)
+        assert result["outcome"] == "acknowledged"
+        assert result["verification"] == {"status": "observed", "basis": "post_write_snapshot"}
+        assert result["current_is_operation_confirmation"] is False
+        assert cast(dict[str, object], result["current"])["rich_message_status"] == "complete"
+        assert await harness.owner.execute(request) == result
+    finally:
+        harness.close()
+
+
+@pytest.mark.asyncio
+async def test_rich_create_with_mapping_uses_postflight_snapshot(tmp_path: Path) -> None:
+    harness = _OwnerHarness(tmp_path / "sync.db", schedule_at=int(datetime.now(UTC).timestamp()) + 900)
+
+    class MappingClient:
+        async def __call__(self, request: object) -> object:
+            check = current_scheduled_mutation_check()
+            assert check is not None
+            await check.revalidate()
+            budget = current_rpc_scope().attempt_budget
+            assert budget is not None
+            budget.debit()
+            return SimpleNamespace(
+                updates=[types.UpdateMessageID(id=456, random_id=cast(SendMessageRequest, request).random_id)]
+            )
+
+    async def postflight(dialog_id: int) -> bool:
+        assert dialog_id == 200
+        message = types.Message(
+            id=456,
+            peer_id=types.PeerUser(200),
+            date=datetime.fromtimestamp(harness.schedule_at, UTC),
+            message="",
+            from_scheduled=True,
+            rich_message=types.RichMessage(blocks=[], photos=[], documents=[]),
+        )
+        with write_transaction(harness.conn):
+            upsert_scheduled_message(harness.conn, dialog_id, message, now=harness.schedule_at)
+        return True
+
+    try:
+        harness.owner = harness.new_owner(MappingClient())
+        harness.owner._postflight = postflight
+        request = _owner_create_request(harness, "mapped-rich") | {"format": "rich_html", "text": "<b>hello</b>"}
+        result = await harness.owner.execute(request)
+        assert result["scheduled_message_id"] == 456
+        assert result["verification"] == {"status": "observed", "basis": "post_write_snapshot"}
+        assert await harness.owner.execute(request) == result
+    finally:
+        harness.close()
+
+
+@pytest.mark.asyncio
+async def test_large_observation_keeps_acknowledgement_and_safe_replay(tmp_path: Path) -> None:
+    harness = _OwnerHarness(tmp_path / "sync.db", schedule_at=int(datetime.now(UTC).timestamp()) + 900)
+
+    class LargeClient:
+        async def __call__(self, request: object) -> object:
+            check = current_scheduled_mutation_check()
+            assert check is not None
+            await check.revalidate()
+            budget = current_rpc_scope().attempt_budget
+            assert budget is not None
+            budget.debit()
+            message = types.Message(
+                id=456,
+                peer_id=types.PeerUser(200),
+                date=datetime.fromtimestamp(harness.schedule_at, UTC),
+                message="",
+                rich_message=types.RichMessage([types.PageBlockParagraph(types.TextPlain("x" * 20000))], [], []),
+            )
+            return SimpleNamespace(
+                updates=[
+                    types.UpdateMessageID(id=456, random_id=cast(SendMessageRequest, request).random_id),
+                    types.UpdateNewScheduledMessage(message),
+                ]
+            )
+
+    try:
+        harness.owner = harness.new_owner(LargeClient())
+        request = _owner_create_request(harness, "large-rich") | {"format": "rich_html", "text": "hello"}
+        result = await harness.owner.execute(request)
+        assert result["acknowledged"] is True and result["receipt_persisted"] is True
+        assert "current" not in result
+        assert isinstance(result["current_version"], str)
+        assert result["verification"] == {"status": "unverified", "basis": "none", "reason": "snapshot_too_large"}
+        assert (
+            len(
+                cast(
+                    str,
+                    harness.conn.execute("SELECT rich_message FROM scheduled_messages WHERE message_id=456").fetchone()[
+                        0
+                    ],
+                )
+            )
+            > 20000
+        )
+        assert await harness.owner.execute(request) == result
+    finally:
+        harness.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial_kind", ["flag", "unsupported_block"])
+async def test_partial_rich_ack_retains_ack_when_postflight_fails(tmp_path: Path, partial_kind: str) -> None:
+    harness = _OwnerHarness(tmp_path / "sync.db", schedule_at=int(datetime.now(UTC).timestamp()) + 900)
+
+    class PartialClient:
+        async def __call__(self, request: object) -> object:
+            check = current_scheduled_mutation_check()
+            assert check is not None
+            await check.revalidate()
+            budget = current_rpc_scope().attempt_budget
+            assert budget is not None
+            budget.debit()
+            rich = (
+                types.RichMessage([], [], [], part=True)
+                if partial_kind == "flag"
+                else types.RichMessage([types.PageBlockUnsupported()], [], [])
+            )
+            message = types.Message(
+                id=456,
+                peer_id=types.PeerUser(200),
+                date=datetime.fromtimestamp(harness.schedule_at, UTC),
+                message="",
+                rich_message=rich,
+            )
+            return SimpleNamespace(
+                updates=[
+                    types.UpdateMessageID(id=456, random_id=cast(SendMessageRequest, request).random_id),
+                    types.UpdateNewScheduledMessage(message),
+                ]
+            )
+
+    async def unavailable(_dialog_id: int) -> bool:
+        raise TimeoutError
+
+    try:
+        harness.owner = harness.new_owner(PartialClient())
+        harness.owner._postflight = unavailable
+        request = _owner_create_request(harness, "partial-rich") | {"format": "rich_markdown", "text": "hello"}
+        result = await harness.owner.execute(request)
+        assert result["acknowledged"] is True and result["receipt_persisted"] is True
+        assert cast(dict[str, object], result["verification"])["status"] == "unverified"
+        assert harness.conn.execute("SELECT 1 FROM scheduled_messages WHERE message_id=456").fetchone() is None
+        assert await harness.owner.execute(request) == result
+    finally:
+        harness.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_postflight_keeps_acknowledged_receipt(tmp_path: Path) -> None:
+    harness = _OwnerHarness(tmp_path / "sync.db", schedule_at=int(datetime.now(UTC).timestamp()) + 900)
+    started = asyncio.Event()
+
+    async def waiting(_dialog_id: int) -> bool:
+        started.set()
+        await asyncio.Event().wait()
+        return False
+
+    try:
+        harness.client.response = SimpleNamespace(updates=[])
+        harness.owner._postflight = waiting
+        # Update has a stable selected ID even when Telegram returns no full update.
+        with write_transaction(harness.conn):
+            message = types.Message(
+                id=55, peer_id=types.PeerUser(200), date=datetime.fromtimestamp(harness.schedule_at, UTC), message="old"
+            )
+            upsert_scheduled_message(harness.conn, 200, message)
+        order = cast(
+            int,
+            harness.conn.execute("SELECT observation_order FROM scheduled_messages WHERE message_id=55").fetchone()[0],
+        )
+        request = _request(
+            "update",
+            operation_key="interrupted-postflight",
+            scheduled_message_id=55,
+            expected_version=scheduled_message_version(100, 200, 55, order),
+            text="new",
+        )
+        task = asyncio.create_task(harness.owner.execute(request))
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        receipt = read_scheduled_operation(harness.conn, 100, "interrupted-postflight")
+        assert receipt is not None and receipt.outcome == "acknowledged"
+        replay = await harness.owner.execute(request)
+        assert (
+            replay["acknowledged"] is True and cast(dict[str, object], replay["verification"])["status"] == "unverified"
+        )
+    finally:
+        harness.close()
+
+
+@pytest.mark.asyncio
+async def test_time_only_update_retains_full_rich_tree_and_media(tmp_path: Path) -> None:
+    harness = _OwnerHarness(tmp_path / "sync.db", schedule_at=int(datetime.now(UTC).timestamp()) + 900)
+    rich = types.RichMessage([types.PageBlockParagraph(types.TextPlain("original body"))], [], [])
+    media = types.MessageMediaPhoto(photo=types.PhotoEmpty(123))
+
+    def message(at: int) -> types.Message:
+        return types.Message(
+            id=55,
+            peer_id=types.PeerUser(200),
+            date=datetime.fromtimestamp(at, UTC),
+            message="",
+            rich_message=rich,
+            media=media,
+        )
+
+    try:
+        with write_transaction(harness.conn):
+            upsert_scheduled_message(harness.conn, 200, message(harness.schedule_at))
+        order = cast(
+            int,
+            harness.conn.execute("SELECT observation_order FROM scheduled_messages WHERE message_id=55").fetchone()[0],
+        )
+        target = harness.schedule_at + 300
+        harness.client.response = SimpleNamespace(updates=[types.UpdateNewScheduledMessage(message(target))])
+        request = _request(
+            "update",
+            operation_key="time-rich",
+            scheduled_message_id=55,
+            expected_version=scheduled_message_version(100, 200, 55, order),
+            schedule_at_utc=datetime.fromtimestamp(target, UTC).isoformat(),
+        )
+        result = await harness.owner.execute(request)
+        dispatched = cast(EditMessageRequest, harness.client.requests[0])
+        assert dispatched.message is None and dispatched.entities is None and dispatched.rich_message is None
+        assert dispatched.media is None
+        assert result["verification"] == {"status": "verified", "basis": "post_write_snapshot"}
+        current = cast(dict[str, object], result["current"])
+        assert current["rich_message_status"] == "complete" and current["media_kind"] == "photo"
+        assert current["scheduled_at"] == target and current["expected_version"] != request["expected_version"]
+        assert await harness.owner.execute(request) == result
+    finally:
+        harness.close()
+
+
+@pytest.mark.asyncio
+async def test_rich_edit_observes_canonical_body_and_checks_schedule(tmp_path: Path) -> None:
+    harness = _OwnerHarness(tmp_path / "sync.db", schedule_at=int(datetime.now(UTC).timestamp()) + 900)
+    try:
+        old = types.Message(
+            id=55, peer_id=types.PeerUser(200), date=datetime.fromtimestamp(harness.schedule_at, UTC), message="hello"
+        )
+        with write_transaction(harness.conn):
+            upsert_scheduled_message(harness.conn, 200, old)
+        order = cast(
+            int,
+            harness.conn.execute("SELECT observation_order FROM scheduled_messages WHERE message_id=55").fetchone()[0],
+        )
+        target = harness.schedule_at + 300
+        canonical = types.Message(
+            id=55,
+            peer_id=types.PeerUser(200),
+            date=datetime.fromtimestamp(target, UTC),
+            message="",
+            rich_message=types.RichMessage([types.PageBlockParagraph(types.TextPlain("hello"))], [], []),
+        )
+        harness.client.response = SimpleNamespace(updates=[types.UpdateNewScheduledMessage(canonical)])
+        request = _request(
+            "update",
+            operation_key="rich-edit",
+            scheduled_message_id=55,
+            expected_version=scheduled_message_version(100, 200, 55, order),
+            text="hello",
+            format="rich_html",
+            schedule_at_utc=datetime.fromtimestamp(target, UTC).isoformat(),
+        )
+        result = await harness.owner.execute(request)
+        assert isinstance(cast(EditMessageRequest, harness.client.requests[0]).rich_message, types.InputRichMessageHTML)
+        assert result["verification"] == {"status": "observed", "basis": "post_write_snapshot"}
+        assert result["current_is_operation_confirmation"] is False
+        assert cast(dict[str, object], result["current"])["scheduled_at"] == target
+        assert await harness.owner.execute(request) == result
+        second = request | {
+            "operation_key": "rich-schedule-conflict",
+            "expected_version": cast(dict[str, object], result["current"])["expected_version"],
+            "schedule_at_utc": datetime.fromtimestamp(target + 300, UTC).isoformat(),
+        }
+        conflict = await harness.owner.execute(second)
+        assert conflict["verification"] == {"status": "conflict", "basis": "post_write_snapshot"}
+        assert conflict["current_is_operation_confirmation"] is False
     finally:
         harness.close()
 
