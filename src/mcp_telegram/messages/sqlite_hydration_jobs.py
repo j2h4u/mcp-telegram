@@ -138,6 +138,17 @@ def media_fact_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, mess
     )
 
 
+def rich_composition_is_unknown(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
+    """Distinguish unknown content from an already observed partial message."""
+    row = cast(
+        tuple[str | None] | None,
+        conn.execute(
+            "SELECT rich_message FROM messages WHERE dialog_id=? AND message_id=?", (dialog_id, message_id)
+        ).fetchone(),
+    )
+    return row is not None and row[0] is None
+
+
 def rich_composition_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
     """Only retained, undeleted unknown compositions in enrolled dialogs need recovery."""
     return (

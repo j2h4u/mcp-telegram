@@ -93,6 +93,40 @@ async def test_rich_recovery_uses_guarded_wire_and_three_attempt_limit(  # noqa:
     assert len(sink.frames) == 3 and budget.attempts == 3
 
 
+async def test_three_unknown_messages_use_one_wire_request(wire: _WireHarness, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, sender, connection, sink = wire
+    clock = _clock(wire, monkeypatch)
+    source = TelegramRpcSource.FACT_HYDRATION_BACKFILL
+    budget = RpcAttemptBudget(3)
+    scope = TelegramRpcScope(
+        source,
+        TELEGRAM_RPC_CONSUMERS[source].admission.service_class,
+        clock.monotonic() + 60,
+        asyncio.current_task(),
+        demand_kind=DemandKind.BACKFILL_HYDRATION_BATCH,
+        attempt_budget=budget,
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+
+    class WireClient:
+        async def get_messages(self, *, entity: int, ids: list[int]) -> object:
+            assert entity == 100 and ids == [7, 8, 9]
+            return await sender.send_owned(
+                functions.messages.GetMessagesRequest([types.InputMessageID(i) for i in ids]), scope
+            )
+
+    handler = RichCompositionHydrationHandler(batch_size=3)
+    jobs = [HydrationJob(handler.kind, 100, i, 0, 0) for i in (7, 8, 9)]
+    task = asyncio.create_task(handler.request(WireClient(), jobs))
+    state = await asyncio.wait_for(sender._send_queue.next_state(), 3)
+    await sender._prepare_state(state)
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    messages = [types.Message(id=i, peer_id=types.PeerUser(100), date=None, message="") for i in (9, 7, 8)]
+    state.future.set_result(messages)
+    assert await asyncio.wait_for(task, 3) == messages
+    assert len(sink.frames) == 1 and budget.attempts == 1
+
+
 def test_embedded_post_author_is_visible_text_without_url() -> None:
     plain = types.TextPlain
     post = types.PageBlockEmbedPost(

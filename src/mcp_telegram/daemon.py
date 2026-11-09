@@ -1578,7 +1578,7 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
             ),
             handlers=(
                 MediaFactHydrationHandler(batch_size=scheduling.fact_hydration.batch_size),
-                RichCompositionHydrationHandler(),
+                RichCompositionHydrationHandler(batch_size=scheduling.fact_hydration.batch_size),
                 TranscriptionHydrationHandler(
                     recheck_delay_seconds=scheduling.fact_hydration.transcription_recheck_delay_seconds,
                 ),

@@ -44,6 +44,7 @@ from mcp_telegram.reactions.persistence import allocate_observation_boundary
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_demand import RpcAttemptBudget, RpcReadTimeoutError
+from mcp_telegram.telegram_demand_progress import SliceOutcomeKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
     RpcAdmissionExpiredError,
@@ -277,6 +278,194 @@ async def test_partial_rich_owner_publishes_full_response_to_canonical_message(d
     assert outcome.completed == 1
     assert db.execute("SELECT text FROM messages WHERE dialog_id=1 AND message_id=7").fetchone() == ("recovered",)
     assert db.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind=?", (RICH_COMPOSITION_KIND,)).fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial", [True, False])
+async def test_batch_keeps_partial_jobs_for_individual_expansion(db: sqlite3.Connection, partial: bool) -> None:
+    _seed_dialog(db)
+    for message_id in (1, 2, 3):
+        _seed_message(db, message_id)
+    db.commit()
+    with write_transaction(db):
+        for message_id in (1, 2, 3):
+            HydrationQueueRepository(db).enqueue(
+                HydrationJob(RICH_COMPOSITION_KIND, 1, message_id, 1, 0, 1, HydrationPriority.BACKFILL)
+            )
+    messages = [_received_message(i) for i in (1, 2, 3)]
+    for message in messages[:2]:
+        message.rich_message = types.RichMessage(blocks=[], photos=[], documents=[], part=partial)
+    calls: list[int] = []
+
+    class Client(_ScopeClient):
+        async def get_messages(self, **_kwargs: object) -> object:
+            calls.append(1)
+            return messages
+
+    client = Client()
+    handler = RichCompositionHydrationHandler(batch_size=3)
+    worker = MessageFactHydrationWorker(
+        client,
+        db,
+        asyncio.Event(),
+        writer=inline_writer(db),
+        handlers=(handler,),
+        interval_seconds=1,
+        max_requests_per_cycle=3,
+        max_jobs_per_cycle=3,
+        retry_delay_seconds=1,
+        circuit_retry_seconds=1,
+        max_attempts=3,
+        pause_between_requests_seconds=0,
+        backfill_debt_limit=1,
+        profile_owner_account_id=42,
+        clock=lambda: 100.0,
+    )
+    adapter = FactHydrationDemandAdapter(worker, HydrationPriority.BACKFILL, account_id=42)
+    status = adapter.status(100)
+    assert status is not None and status.selected is not None
+
+    async def request(_handler: object, jobs: list[HydrationJob], **_kwargs: object) -> object:
+        assert len(jobs) == 3
+        return await handler.request(client, jobs)
+
+    with patch.object(worker, "_request_batch", side_effect=request):
+        await adapter.run_slice(RpcAttemptBudget(limit=3, selected=status.selected))
+    assert len(calls) == 1
+    rows = db.execute(
+        "SELECT message_id FROM hydration_jobs WHERE kind=? ORDER BY message_id", (RICH_COMPOSITION_KIND,)
+    )
+    assert rows.fetchall() == ([(1,), (2,)] if partial else [])
+    if not partial:
+        assert db.execute("SELECT count(*) FROM messages WHERE rich_message IS NOT NULL").fetchone() == (3,)
+        return
+    assert db.execute(
+        "SELECT message_id, json_extract(rich_message, '$.part') FROM messages WHERE message_id IN (1,2) ORDER BY message_id"
+    ).fetchall() == [(1, 1), (2, 1)]
+    assert db.execute(
+        "SELECT message_id, attempts FROM hydration_jobs WHERE kind=? ORDER BY message_id", (RICH_COMPOSITION_KIND,)
+    ).fetchall() == [(1, 0), (2, 0)]
+    selected = adapter.status(100)
+    assert selected is not None and selected.selected is not None
+    job = adapter._selected_job(selected.selected)
+    assert job is not None
+    assert worker._select_batch(HydrationPriority.BACKFILL, RpcAttemptBudget(3), job, 100) == [job]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", [False, True])
+async def test_lost_selected_lease_does_not_inherit_batch_result(db: sqlite3.Connection, terminal: bool) -> None:
+    _seed_dialog(db)
+    for message_id in (1, 2):
+        _seed_message(db, message_id)
+    db.commit()
+    with write_transaction(db):
+        for message_id in (1, 2):
+            HydrationQueueRepository(db).enqueue(
+                HydrationJob(RICH_COMPOSITION_KIND, 1, message_id, 1, 0, 1, HydrationPriority.BACKFILL)
+            )
+    handler = RichCompositionHydrationHandler(batch_size=2)
+    worker = MessageFactHydrationWorker(
+        _ScopeClient(),
+        db,
+        asyncio.Event(),
+        writer=inline_writer(db),
+        handlers=(handler,),
+        interval_seconds=1,
+        max_requests_per_cycle=3,
+        max_jobs_per_cycle=2,
+        retry_delay_seconds=1,
+        circuit_retry_seconds=1,
+        max_attempts=3,
+        pause_between_requests_seconds=0,
+        backfill_debt_limit=1,
+        profile_owner_account_id=42,
+        clock=lambda: 100.0,
+    )
+    adapter = FactHydrationDemandAdapter(worker, HydrationPriority.BACKFILL, account_id=42)
+    status = adapter.status(100)
+    assert status is not None and status.selected is not None
+    selected_id = int(status.selected.key.target.rsplit(":", 1)[1])
+
+    async def request(_handler: object, jobs: list[HydrationJob], **_kwargs: object) -> object:
+        assert len(jobs) == 2
+        with write_transaction(db):
+            db.execute(
+                "UPDATE hydration_jobs SET due_at=99 WHERE kind=? AND message_id=?",
+                (RICH_COMPOSITION_KIND, selected_id),
+            )
+        if terminal:
+            raise RPCError(request=None, message="MESSAGE_ID_INVALID", code=400)
+        return [_received_message(job.message_id) for job in jobs]
+
+    with patch.object(worker, "_request_batch", side_effect=request):
+        outcome = await adapter.run_slice(RpcAttemptBudget(3, selected=status.selected))
+    assert outcome.kind is SliceOutcomeKind.NO_PROGRESS
+    assert db.execute(
+        "SELECT due_at, terminal FROM hydration_jobs WHERE kind=? AND message_id=?",
+        (RICH_COMPOSITION_KIND, selected_id),
+    ).fetchone() == (99, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["transient", "flood", "cancel"])
+async def test_batch_failure_preserves_all_queued_facts(db: sqlite3.Connection, failure: str) -> None:
+    _seed_dialog(db)
+    for message_id in (1, 2):
+        _seed_message(db, message_id)
+    db.commit()
+    with write_transaction(db):
+        for message_id in (1, 2):
+            HydrationQueueRepository(db).enqueue(
+                HydrationJob(RICH_COMPOSITION_KIND, 1, message_id, 1, 0, 1, HydrationPriority.BACKFILL)
+            )
+    handler = RichCompositionHydrationHandler(batch_size=2)
+    worker = MessageFactHydrationWorker(
+        _ScopeClient(),
+        db,
+        asyncio.Event(),
+        writer=inline_writer(db),
+        handlers=(handler,),
+        interval_seconds=1,
+        max_requests_per_cycle=3,
+        max_jobs_per_cycle=2,
+        retry_delay_seconds=1,
+        circuit_retry_seconds=1,
+        max_attempts=3,
+        pause_between_requests_seconds=0,
+        backfill_debt_limit=1,
+        profile_owner_account_id=42,
+        clock=lambda: 100.0,
+    )
+    adapter = FactHydrationDemandAdapter(worker, HydrationPriority.BACKFILL, account_id=42)
+    status = adapter.status(100)
+    assert status is not None and status.selected is not None
+
+    async def request(_handler: object, jobs: list[HydrationJob], **_kwargs: object) -> object:
+        assert len(jobs) == 2
+        if failure == "cancel":
+            raise asyncio.CancelledError
+        if failure == "flood":
+            raise TelegramRpcThrottled(retry_after_seconds=17)
+        raise TimeoutError
+
+    with patch.object(worker, "_request_batch", side_effect=request):
+        if failure == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await adapter.run_slice(RpcAttemptBudget(3, selected=status.selected))
+        elif failure == "flood":
+            with pytest.raises(TelegramRpcThrottled):
+                await adapter.run_slice(RpcAttemptBudget(3, selected=status.selected))
+        else:
+            await adapter.run_slice(RpcAttemptBudget(3, selected=status.selected))
+    assert db.execute("SELECT message_id FROM messages WHERE is_deleted=0 ORDER BY message_id").fetchall() == [
+        (1,),
+        (2,),
+    ]
+    assert db.execute("SELECT message_id FROM hydration_jobs WHERE terminal=0 ORDER BY message_id").fetchall() == [
+        (1,),
+        (2,),
+    ]
 
 
 @pytest.mark.asyncio
