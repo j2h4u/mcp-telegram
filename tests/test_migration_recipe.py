@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -7,6 +8,8 @@ import pytest
 
 @pytest.mark.parametrize("failure", ["none", "build", "backup", "promotion", "up", "identity"])
 def test_migration_recipe_order(tmp_path: Path, failure: str) -> None:
+    just = shutil.which("just")
+    assert just is not None
     bindir = tmp_path / "bin"
     bindir.mkdir()
     trace = tmp_path / "trace"
@@ -48,7 +51,7 @@ echo "backup $*" >> "$TRACE"
     }
     (tmp_path / "base-image").write_text("old-image\n")
     result = subprocess.run(
-        ["/usr/bin/just", "runtime-migrate", "/state", str(tmp_path / "pair"), "102", "release", "config"],
+        [just, "runtime-migrate", "/state", str(tmp_path / "pair"), "102", "release", "config"],
         env=env,
         capture_output=True,
         text=True,
@@ -77,5 +80,5 @@ echo "backup $*" >> "$TRACE"
         assert not any(line.startswith("docker start ") for line in lines)
     if failure == "none":
         assert lines[-2:] == ["just runtime-wait", "just runtime-smoke"]
-        subprocess.run(["/usr/bin/just", "runtime-start"], env=env, capture_output=True, text=True, check=True)
+        subprocess.run([just, "runtime-start"], env=env, capture_output=True, text=True, check=True)
         assert trace.read_text().splitlines()[-1] == "candidate"
