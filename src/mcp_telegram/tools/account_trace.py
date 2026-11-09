@@ -450,7 +450,11 @@ def _attach_trace_content_metadata(data: dict) -> None:
             )
             payload = item.pop("media_payload", None)
             serialized = serialize_message_content(
-                text, media_description, content_kind, item.get("media_kind"), payload if isinstance(payload, dict) else None
+                text,
+                media_description,
+                content_kind,
+                item.get("media_kind"),
+                payload if isinstance(payload, dict) else None,
             )
             # These assignments intentionally overwrite daemon-provided
             # wrappers.  The daemon owns projection; this tool owns only the

@@ -162,7 +162,10 @@ MANAGE_SCHEDULED_MESSAGE_OUTPUT_SCHEMA: dict[str, object] = {
             "description": "False with observed still includes the complete post-write snapshot; it does not assert source equivalence.",
         },
         "current": {"type": "object", "description": "Canonical observed scheduled message, when available."},
-        "current_version": {"type": "string", "description": "Version of an observed item too large to include in this receipt."},
+        "current_version": {
+            "type": "string",
+            "description": "Version of an observed item too large to include in this receipt.",
+        },
         "verification": {
             "type": "object",
             "properties": {
