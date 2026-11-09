@@ -310,7 +310,7 @@ class _DaemonClient(Protocol):
 
     def bind_auto_resume_identity(self) -> None: ...
 
-    def set_auto_resume_stop(self, stopped: Callable[[], bool]) -> None: ...
+    def set_shutdown_requested(self, stopped: Callable[[], bool]) -> None: ...
 
     async def finish_startup_auto_resume(self) -> None: ...
 
@@ -1377,6 +1377,7 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
     _install_flood_wait_kill_switch(config, flood_wait_kill_switch_event)
 
     client = _create_telegram_client(config, conn, writer)
+    client.set_shutdown_requested(shutdown_event.is_set)
     rpc_observation_sink: RuntimeObservationSink | None = None
 
     async def close_client_and_observations() -> None:
@@ -2320,11 +2321,11 @@ async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
         await _close_runtime_connections(ctx)
 
     stages: tuple[tuple[str, Callable[[], Awaitable[object]]], ...] = (
+        ("telegram_disconnect", lambda: _disconnect_telegram(ctx.client)),
+        ("rpc_scheduler", lambda: ctx.client.close_rpc_scheduler()),
         ("daemon_api", lambda: _stop_daemon_api(ctx)),
         ("background_tasks", lambda: _cancel_background_tasks(ctx)),
         ("image_sources", lambda: _stop_image_sources(ctx)),
-        ("telegram_disconnect", lambda: _disconnect_telegram(ctx.client)),
-        ("rpc_scheduler", lambda: ctx.client.close_rpc_scheduler()),
         ("rpc_observer_detach", detach_observer),
         ("telemetry", drain_telemetry),
         ("runtime_connections", close_runtime_connections),
@@ -2349,7 +2350,6 @@ async def _monitor_sqlite_writer(ctx: _SyncMainContext) -> None:
 
 def _start_runtime_monitors(ctx: _SyncMainContext) -> None:
     """Keep local safety monitoring live even while connection startup is held."""
-    ctx.client.set_auto_resume_stop(ctx.shutdown_event.is_set)
     _create_tracked_task(ctx, _monitor_sqlite_writer(ctx), name="sqlite_write_owner", critical=True)
     _create_tracked_task(ctx, ctx.client.wait_update_delivery_failure(), name="update_delivery", critical=True)
     _create_tracked_task(ctx, _monitor_flood_wait_kill_switch(ctx), name="flood_wait_kill_switch_monitor")

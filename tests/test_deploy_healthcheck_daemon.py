@@ -68,9 +68,9 @@ def test_daemon_health_prints_specific_protection_diagnostics(
                     "blocking_request_count": 1,
                     "historical_unknown_request_count": 11,
                     "unresolved_requests": [
-                        {"method": "GetHistoryRequest", "phase": "unknown", "blocks_acquisition": True}
-                    ]
-                    * 8,
+                        {"method": "GetHistoryRequest", "phase": "unknown", "blocks_acquisition": True},
+                        *[{"method": "GetUsersRequest", "phase": "unknown", "blocks_acquisition": False}] * 7,
+                    ],
                     "unresolved_requests_truncated": True,
                     "automatic_resume": {
                         "state": "waiting",

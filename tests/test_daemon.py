@@ -664,7 +664,7 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
         def automatic_trial_active(self) -> bool:
             return False
 
-        def set_auto_resume_stop(self, stopped: Callable[[], bool]) -> None:
+        def set_shutdown_requested(self, stopped: Callable[[], bool]) -> None:
             assert stopped == shutdown_event.is_set
             events.append("stop:bound")
 
@@ -868,7 +868,6 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
     assert self_profile_start.await_count == (1 if failure_stage is None else 0)
     expected = [
         "context",
-        "stop:bound",
         "task:sqlite_write_owner",
         "task:update_delivery",
         "task:flood_wait_kill_switch_monitor",
@@ -1719,7 +1718,7 @@ async def test_shutdown_cancels_disconnects_and_detaches_before_flushing_telemet
 
     await _shutdown_sync_main_context(ctx)
 
-    assert stages.index("task_cancelled") < stages.index("disconnect")
+    assert stages.index("scheduler_close") < stages.index("task_cancelled")
     assert stages.index("disconnect") < stages.index("scheduler_close")
     assert stages.index("scheduler_close") < stages.index("admission_detach")
     assert stages.index("scheduler_close") < stages.index("request_detach")
@@ -1767,6 +1766,26 @@ async def test_shutdown_waits_for_disconnect_before_scheduler_and_connection_clo
         await asyncio.gather(task, return_exceptions=True)
 
 
+async def test_shutdown_continues_after_disconnect_failure() -> None:
+    stages: list[str] = []
+
+    class Client(_ClientStub):
+        async def disconnect(self) -> None:
+            stages.append("disconnect")
+            raise RuntimeError("disconnect failed")
+
+        async def close_rpc_scheduler(self) -> None:
+            stages.append("scheduler")
+
+    class Connection(_ConnectionStub):
+        def close(self) -> None:
+            stages.append("connection")
+
+    with pytest.raises(RuntimeError, match="disconnect failed"):
+        await _shutdown_sync_main_context(_typed_ctx(client=Client(), conn=Connection()))
+    assert stages == ["disconnect", "scheduler", "connection"]
+
+
 async def _append_async(stages: list[str], stage: str) -> None:
     stages.append(stage)
 
@@ -1812,8 +1831,9 @@ async def test_preidentity_startup_retains_one_budget_and_deadline_across_gate_d
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("already_stopped", [False, True])
 async def test_default_daemon_composes_current_profile_collection_gateway(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shared_writer: SQLiteWriter
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shared_writer: SQLiteWriter, already_stopped: bool
 ) -> None:
     from contextlib import AsyncExitStack
 
@@ -1833,6 +1853,19 @@ async def test_default_daemon_composes_current_profile_collection_gateway(
     client.disconnect = AsyncMock()
     client.rpc_observation_methods = MagicMock(return_value=())
     client.account_safety_status = MagicMock(return_value=None)
+    set_shutdown_requested = MagicMock()
+    client.set_shutdown_requested = set_shutdown_requested
+    shutdown_request = daemon.daemon_shutdown.ShutdownRequest()
+    if already_stopped:
+        shutdown_request.event.set()
+
+    def verify_stop_bound(*_args: object) -> None:
+        stopped = cast(Callable[[], bool], set_shutdown_requested.call_args.args[0])
+        assert stopped() is already_stopped
+        shutdown_request.event.set()
+        assert stopped()
+
+    client.bind_session_lease = MagicMock(side_effect=verify_stop_bound)
     monkeypatch.setattr(daemon, "_create_telegram_client", lambda *_args: client)
     monkeypatch.setattr(daemon, "_install_flood_wait_kill_switch", lambda *_args: None)
     try:
@@ -1845,7 +1878,7 @@ async def test_default_daemon_composes_current_profile_collection_gateway(
                 conn,
                 session_proof=cast(TelegramSessionLease, object()),
                 cleanup=cleanup,
-                shutdown_request=daemon.daemon_shutdown.ShutdownRequest(),
+                shutdown_request=shutdown_request,
             )
             assert isinstance(context.user_profile_port, TelethonUserProfileGateway)
             assert context.api_server._user_profile_port is context.user_profile_port

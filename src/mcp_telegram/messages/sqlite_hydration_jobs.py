@@ -238,7 +238,7 @@ def repair_rich_composition_hydration_jobs(conn: sqlite3.Connection, *, due_at: 
         eligibility="m.is_deleted=0 AND m.rich_message IS NULL",
     )
     has_more = len(rows) > max_jobs
-    state = {"cursor": examined[-1] if examined else state["cursor"], "done": not has_more}
+    state = {"cursor": tuple(examined[-1]) if examined else state["cursor"], "done": not has_more}
     conn.execute(
         "INSERT INTO daemon_state(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (key, json.dumps(state)),

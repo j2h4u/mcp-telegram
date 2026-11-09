@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -145,10 +146,14 @@ async def test_composition_failure_closes_client_before_releasing_session_lease(
         if bind_fails:
             raise RuntimeError("synthetic lease binding failure")
 
+    def bind_shutdown(requested: Callable[[], bool]) -> None:
+        assert not requested()
+
     client = SimpleNamespace(
         disconnect=disconnect,
         close_rpc_scheduler=close_scheduler,
         bind_session_lease=bind_lease,
+        set_shutdown_requested=bind_shutdown,
         capture_image_scope=scope.capture,
         claim_image_scope=scope.claim,
     )

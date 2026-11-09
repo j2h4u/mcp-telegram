@@ -7,8 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from mcp_telegram.fact_hydration import MessageFactHydrationWorker
+from mcp_telegram.fact_hydration import FactHydrationDemandAdapter, MessageFactHydrationWorker
 from mcp_telegram.hydration_queue import HydrationPriority
+from mcp_telegram.media_hydration import RichCompositionHydrationHandler
 from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshDeps,
     MessageFactRefreshPolicy,
@@ -27,9 +28,65 @@ from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_demand import RpcAttemptBudget
+from mcp_telegram.telegram_demand_progress import SliceOutcomeKind
 from mcp_telegram.telegram_fact_queries import enrich_read_at
 from mcp_telegram.telegram_reading import ReadDateFetchResult
 from tests.test_fact_demand_adapters import _HydrationHandler
+
+
+@pytest.mark.asyncio
+async def test_rich_repair_persists_cursor_through_real_writer(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    writer = await SQLiteWriter.open(path)
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+    def seed(db: sqlite3.Connection) -> None:
+        with write_transaction(db):
+            db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (1,'synced')")
+            db.execute("INSERT INTO full_history_enrollment VALUES (1,1,1)")
+            db.executemany("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (1,?,1)", [(1,), (2,), (3,)])
+
+    try:
+        await writer.run(seed)
+        worker = MessageFactHydrationWorker(
+            object(),
+            conn,
+            asyncio.Event(),
+            writer=writer,
+            handlers=(RichCompositionHydrationHandler(batch_size=2),),
+            interval_seconds=60,
+            max_requests_per_cycle=3,
+            max_jobs_per_cycle=2,
+            retry_delay_seconds=1,
+            circuit_retry_seconds=1,
+            max_attempts=3,
+            pause_between_requests_seconds=0,
+            backfill_debt_limit=1,
+            clock=lambda: 100.0,
+        )
+        adapter = FactHydrationDemandAdapter(worker, HydrationPriority.BACKFILL, account_id=1)
+        status = adapter.status(100)
+        assert status is not None and status.selected is not None
+        outcome = await adapter.run_slice(RpcAttemptBudget(3, selected=status.selected))
+        assert outcome.kind is SliceOutcomeKind.PROGRESSED
+        assert conn.execute("SELECT message_id FROM hydration_jobs ORDER BY message_id").fetchall() == [(2,), (3,)]
+        assert conn.execute(
+            "SELECT value FROM daemon_state WHERE key='rich_composition_hydration_cursor'"
+        ).fetchone() == ('{"cursor": [1, 1, 2], "done": false}',)
+        jobs = worker._queue.due_jobs(100, 2, kind="rich_composition", priority=HydrationPriority.BACKFILL)
+        status = adapter.status(100, excluded=frozenset(adapter._revision(job) for job in jobs))
+        assert status is not None and status.selected is not None
+        assert status.selected.key.target == "rich-repair"
+        await adapter.run_slice(RpcAttemptBudget(3, selected=status.selected))
+        assert conn.execute("SELECT message_id FROM hydration_jobs ORDER BY message_id").fetchall() == [
+            (1,),
+            (2,),
+            (3,),
+        ]
+    finally:
+        conn.close()
+        await writer.aclose()
 
 
 def _seed(conn: sqlite3.Connection) -> None:

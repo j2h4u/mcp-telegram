@@ -1,6 +1,7 @@
 """Durable outbound intent, account binding, and explicit recovery boundaries."""
 
 import asyncio
+import copy
 import json
 import math
 import sqlite3
@@ -144,6 +145,49 @@ async def test_protection_diagnostics_are_bounded_safe_and_read_only(clock: Cloc
     assert ledger.status()["unresolved_request_count"] == 0
     assert ledger.status()["unresolved_requests"] == []
     assert ledger.status()["unresolved_requests_truncated"] is False
+
+
+@pytest.mark.parametrize("historical,blocking", [(52, 1), (3, 10), (10, 0)])
+async def test_protection_diagnostics_prioritize_blockers_stably(clock: Clock, historical: int, blocking: int) -> None:
+    store = Store()
+    ledger = store.ledger()
+    await ledger.verify_account(42)
+    await ledger.prepare("template", "updates.GetDifferenceRequest")
+    entries = cast(dict[str, dict[str, object]], ledger._record["intents"])
+    template = entries.pop("template")
+    scope = copy.deepcopy(template["scope"])
+    methods = [
+        f"{kind.__module__}.{kind.__name__}:{kind.CONSTRUCTOR_ID:08x}"
+        for kind in telegram_rpc.tlobjects.values()
+        if issubclass(kind, telegram_rpc.TLRequest)
+    ][: historical + blocking]
+    for number in range(historical + blocking):
+        item = copy.deepcopy(template)
+        item["method"] = methods[number]
+        if number < historical:
+            item["phase"] = "unknown"
+            item["policy_recovery"] = {"contained": True}
+        entries[str(number)] = item
+    acknowledged = copy.deepcopy(template)
+    acknowledged["phase"] = "acknowledged_unknown"
+    entries["acknowledged"] = acknowledged
+    # A contained unknown from another account scope still blocks acquisition.
+    if blocking:
+        mismatch = entries[str(historical)]
+        mismatch["phase"] = "unknown"
+        mismatch["policy_recovery"] = {"contained": True}
+        mismatch["scope"] = {**cast(dict[str, object], scope), "account_id": 43}
+    before = copy.deepcopy(entries)
+    status = ledger.status()
+    assert status["unresolved_request_count"] == historical + blocking
+    assert status["blocking_request_count"] == blocking
+    assert status["historical_unknown_request_count"] == historical
+    assert status["unresolved_requests_truncated"] is (historical + blocking > 8)
+    rows = cast(list[dict[str, object]], status["unresolved_requests"])
+    order = list(range(historical, historical + blocking)) + list(range(historical))
+    assert [row["method"] for row in rows] == [methods[n] for n in order[:8]]
+    assert [row["blocks_acquisition"] for row in rows] == [n >= historical for n in order[:8]]
+    assert entries == before
 
 
 async def test_protection_diagnostics_never_disclose_unrecognized_method_values(clock: Clock) -> None:

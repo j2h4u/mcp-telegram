@@ -238,9 +238,7 @@ async def test_diagnostic_counts_include_all_records_beyond_bounded_list(clock: 
     assert status["historical_unknown_request_count"] == 1
     assert status["unresolved_requests_truncated"] is True
     requests = cast(list[dict[str, object]], status["unresolved_requests"])
-    assert len(requests) == 8
-    assert requests[0]["blocks_acquisition"] is False
-    assert all(item["blocks_acquisition"] is True for item in requests[1:])
+    assert requests == [{"method": HISTORY, "phase": "unknown", "blocks_acquisition": True}] * 8
 
 
 async def test_interrupted_consumed_trial_preserves_spent_attempt(clock: Clock) -> None:
