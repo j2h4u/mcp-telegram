@@ -5229,7 +5229,7 @@ def _apply_migration_102(conn: sqlite3.Connection, current: int) -> int:
                 current_rows = cast(
                     list[tuple[int, int, int, int, bytes, str, str | None]],
                     conn.execute(
-                        "SELECT account_id,dialog_id,top_message_id,subdialog_peer_id,restore_payload,semantic_fingerprint,restore_reason FROM draft_current WHERE restore_payload IS NOT NULL AND semantic_fingerprint IS NOT NULL"
+                        "SELECT account_id,dialog_id,top_message_id,subdialog_peer_id,restore_payload,semantic_fingerprint,restore_reason FROM draft_current WHERE state='present' AND restore_payload IS NOT NULL AND semantic_fingerprint IS NOT NULL"
                     ).fetchall(),
                 )
                 for account, dialog, top, peer, payload, fingerprint, reason in current_rows:
@@ -5242,7 +5242,7 @@ def _apply_migration_102(conn: sqlite3.Connection, current: int) -> int:
                 history_rows = cast(
                     list[tuple[int, bytes, str, str | None]],
                     conn.execute(
-                        "SELECT history_id,restore_payload,semantic_fingerprint,restore_reason FROM draft_versions WHERE restore_payload IS NOT NULL AND semantic_fingerprint IS NOT NULL"
+                        "SELECT history_id,restore_payload,semantic_fingerprint,restore_reason FROM draft_versions WHERE state='present' AND restore_payload IS NOT NULL AND semantic_fingerprint IS NOT NULL"
                     ).fetchall(),
                 )
                 for history_id, payload, fingerprint, reason in history_rows:
