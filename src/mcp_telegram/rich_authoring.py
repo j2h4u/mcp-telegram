@@ -1,12 +1,16 @@
 """Text-only native rich-message authoring intent."""
 
+from __future__ import annotations
+
 from collections.abc import Mapping
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from markdown_it import MarkdownIt
-from telethon.tl import types
+
+if TYPE_CHECKING:
+    from telethon.tl import types
 
 BodyFormat = Literal["plain", "rich_markdown", "rich_html"]
 
@@ -74,6 +78,11 @@ def parse_authored_body(request: Mapping[str, object]) -> AuthoredBody | None:
 
 
 def native_rich_input(body: AuthoredBody) -> types.TypeInputRichMessage | None:
+    if body.format == "plain":
+        return None
+    # HTTP validates intent without loading the daemon's Telegram adapter.
+    from telethon.tl import types
+
     if body.format == "rich_markdown":
         return types.InputRichMessageMarkdown(markdown=body.text)
     if body.format == "rich_html":
