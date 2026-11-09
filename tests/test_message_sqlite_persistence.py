@@ -1221,10 +1221,8 @@ def test_peerless_deletion_is_terminal_after_restart(tmp_path: Path) -> None:
 
 
 def test_peerless_deletion_rejects_all_hydration_fact_paths(conn: sqlite3.Connection) -> None:
-    from mcp_telegram.messages.sqlite_hydration import (
-        apply_message_transcription_if_absent,
-        hydration_observation_current,
-    )
+    from mcp_telegram.messages.sqlite_hydration import apply_message_transcription_if_absent
+    from mcp_telegram.observation_order import hydration_observation_current
 
     cell = ScopeCell()
     assert cell.publish(TelegramAuthScope(1, 42, 2, 99))
@@ -1599,3 +1597,120 @@ def test_self_join_refreshes_only_published_matching_dialog_kind(conn: sqlite3.C
     assert conn.execute("SELECT entity_id FROM entity_profile_refresh_state WHERE status='pending'").fetchall() == [
         (12,)
     ]
+
+
+def test_rich_partial_observation_preserves_same_version_and_new_edit_archives(conn: sqlite3.Connection) -> None:
+    before = _message(333, text="semantic rich")
+    before.message = replace(before.message, edit_date=10, formatting_text="native", rich_message='{"blocks":[]}')
+    partial = _message(333, text="native")
+    partial.message = replace(partial.message, edit_date=10, formatting_text="native")
+    changed = _message(333, text="new semantic")
+    changed.message = replace(changed.message, edit_date=20, formatting_text="native", rich_message="null")
+    with write_transaction(conn):
+        _seed_human_dm(conn)
+        insert_messages_with_fts(conn, [before])
+        insert_messages_with_fts(conn, [partial])
+        assert conn.execute("SELECT text,rich_message FROM messages WHERE message_id=333").fetchone() == (
+            "semantic rich",
+            '{"blocks":[]}',
+        )
+        assert persist_edited_message(conn, changed, old_text="semantic rich", edit_date=20).version == 1
+    assert conn.execute(
+        "SELECT old_rich_message,old_formatting_text FROM message_versions WHERE message_id=333"
+    ).fetchone() == ('{"blocks":[]}', "native")
+    assert conn.execute("SELECT text,rich_message FROM messages WHERE message_id=333").fetchone() == (
+        "new semantic",
+        "null",
+    )
+    assert conn.execute("SELECT stemmed_text FROM messages_fts WHERE message_id=333").fetchone() == (
+        stem_text("new semantic"),
+    )
+
+
+def test_same_revision_partial_keeps_full_and_rich_only_edits_are_versioned(conn: sqlite3.Connection) -> None:
+    full = _message(334, text="full text")
+    full.message = replace(
+        full.message, edit_date=10, formatting_text="", rich_message='{"_":"RichMessage","blocks":[]}'
+    )
+    partial = _message(334, text="partial")
+    partial.message = replace(
+        partial.message, edit_date=10, formatting_text="", rich_message='{"_":"RichMessage","part":true,"blocks":[]}'
+    )
+    edited = replace(
+        full, message=replace(full.message, rich_message='{"_":"RichMessage","blocks":[{"_":"PageBlockDivider"}]}')
+    )
+    with write_transaction(conn):
+        _seed_human_dm(conn)
+        insert_messages_with_fts(conn, [full])
+        insert_messages_with_fts(conn, [partial])
+        assert conn.execute("SELECT text,rich_message FROM messages WHERE message_id=334").fetchone() == (
+            "full text",
+            full.message.rich_message,
+        )
+        assert conn.execute("SELECT stemmed_text FROM messages_fts WHERE message_id=334").fetchone() == (
+            stem_text("full text"),
+        )
+        assert persist_edited_message(conn, edited, old_text="full text", edit_date=10).version == 1
+        assert persist_edited_message(conn, edited, old_text="full text", edit_date=10).version is None
+        newer = replace(partial, message=replace(partial.message, edit_date=11))
+        insert_messages_with_fts(conn, [newer])
+        assert conn.execute("SELECT text,rich_message FROM messages WHERE message_id=334").fetchone() == (
+            "partial",
+            partial.message.rich_message,
+        )
+        cleared = replace(full, message=replace(full.message, edit_date=11, rich_message="null", text=""))
+        insert_messages_with_fts(conn, [cleared])
+        assert conn.execute("SELECT rich_message FROM messages WHERE message_id=334").fetchone() == ("null",)
+    assert conn.execute("SELECT old_rich_message FROM message_versions WHERE message_id=334").fetchall() == [
+        (full.message.rich_message,)
+    ]
+
+
+def test_same_revision_rich_enrichment_does_not_create_history(conn: sqlite3.Connection) -> None:
+    before = _message(335, text="")
+    before.message = replace(before.message, edit_date=10, formatting_text="")
+    full = replace(
+        before, message=replace(before.message, text="rich text", rich_message='{"_":"RichMessage","blocks":[]}')
+    )
+    with write_transaction(conn):
+        _seed_human_dm(conn)
+        insert_messages_with_fts(conn, [before])
+        assert (
+            persist_edited_message(
+                conn, full, old_text="", edit_date=10, reaction_source=ReactionAggregateSource.HISTORY
+            ).version
+            is None
+        )
+        assert conn.execute("SELECT text,rich_message FROM messages WHERE message_id=335").fetchone() == (
+            "rich text",
+            full.message.rich_message,
+        )
+        assert conn.execute("SELECT COUNT(*) FROM message_versions WHERE message_id=335").fetchone() == (0,)
+
+
+def test_received_same_second_rich_edit_is_archived(conn: sqlite3.Connection) -> None:
+    cell = ScopeCell()
+    assert cell.publish(TelegramAuthScope(1, 42, 2, 99))
+    scope = cell.capture()
+    assert scope is not None
+    old = _message(336, text="same")
+    old.message = replace(old.message, edit_date=10, formatting_text="", rich_message='{"_":"RichMessage","blocks":[]}')
+    new = replace(
+        old, message=replace(old.message, rich_message='{"_":"RichMessage","blocks":[{"_":"PageBlockDivider"}]}')
+    )
+    with write_transaction(conn):
+        _seed_human_dm(conn)
+        conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+        conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (42,'synced')")
+        conn.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (42,1,1)")
+        insert_messages_with_fts(conn, [old])
+        order = allocate_observation_order(conn)
+        assert (
+            persist_received_messages(
+                conn, [ReceivedMessage(new, False)], scope=scope, claim_scope=cell.claim, observation_order=order
+            )
+            == 1
+        )
+        assert conn.execute("SELECT old_rich_message FROM message_versions WHERE message_id=336").fetchone() == (
+            old.message.rich_message,
+        )

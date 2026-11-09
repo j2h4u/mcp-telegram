@@ -510,6 +510,10 @@ class DaemonConnection:
             }
         )
 
+    async def repair_message(self, *, dialog_id: int, message_id: int) -> dict:
+        """Request bounded rich-composition recovery for one retained message."""
+        return await self.request({"method": "repair_message", "dialog_id": dialog_id, "message_id": message_id})
+
     async def get_sync_status(self, *, dialog_id: int) -> dict:
         """Return sync status and message stats for a dialog."""
         return await self.request({"method": "get_sync_status", "dialog_id": dialog_id})

@@ -33,6 +33,7 @@ from mcp_telegram.drafts.contracts import (
 )
 from mcp_telegram.drafts.ports import DraftSnapshotGateway
 from mcp_telegram.drafts.snapshot import capture_restore_snapshot
+from mcp_telegram.rich_content import capture_rich_message, decode_rich_message
 from mcp_telegram.telegram_demand import AcquisitionKind, acquisition_context
 from mcp_telegram.telegram_rpc_consumers import TelegramRpcSource
 from mcp_telegram.telegram_rpc_scheduler import rpc_scope
@@ -189,7 +190,7 @@ def _composition_references(
     DraftReference | None,
     DraftReference | None,
     DraftReference | None,
-    DraftReference | None,
+    str,
     DraftReference | None,
     bool,
 ]:
@@ -197,7 +198,8 @@ def _composition_references(
 
     reply, story, quote, monoforum, reply_partial = _reply_context(getattr(draft, "reply_to", None))
     media, media_partial = _reference(getattr(draft, "media", None), fallback_kind="media")
-    rich, rich_partial = _reference(getattr(draft, "rich_message", None), fallback_kind="rich")
+    rich = capture_rich_message(getattr(draft, "rich_message", None))
+    _, rich_status, _ = decode_rich_message(rich)
     suggested, suggested_partial = _reference(getattr(draft, "suggested_post", None), fallback_kind="suggested_post")
     return (
         reply,
@@ -207,7 +209,7 @@ def _composition_references(
         media,
         rich,
         suggested,
-        any((reply_partial, media_partial, rich_partial, suggested_partial)),
+        any((reply_partial, media_partial, rich_status == "partial", suggested_partial)),
     )
 
 

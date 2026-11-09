@@ -52,6 +52,11 @@ REQUIRED_POLICY_SINKS = {
 # these keys here makes the detector reject the same spelling everywhere else.
 NON_OPERATOR_POLICY_FINDINGS: frozenset[tuple[str, str]] = frozenset(
     {
+        # GetRichMessageRequest addresses one message, so its owner must take one job per request.
+        (
+            "policy_call_keywords",
+            "src/mcp_telegram/media_hydration.py:RichCompositionHydrationHandler.__init__:batch_size",
+        ),
         # Recovery enum values label observations and transitions, not timing policy.
         ("policy_assignments", "src/mcp_telegram/telegram_rpc_recovery.py:RecoveryObservationEvent:PENDING_COOLDOWN"),
         ("policy_assignments", "src/mcp_telegram/telegram_rpc_recovery.py:RecoveryAction:FAILURE_SETTLED"),

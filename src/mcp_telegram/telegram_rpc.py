@@ -3577,6 +3577,7 @@ def _request_peer_values(request: TLRequest) -> list[object]:
     kind = type(request)
     peer_methods = (
         functions.messages.GetHistoryRequest,
+        functions.messages.GetRichMessageRequest,
         functions.messages.GetScheduledHistoryRequest,
         functions.messages.GetScheduledMessagesRequest,
         functions.messages.GetForumTopicsRequest,

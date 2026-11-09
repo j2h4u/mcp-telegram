@@ -26,6 +26,7 @@ from ..flood import TelegramRpcThrottled, _raise_if_latched
 from ..media_fact import encode_media_payload
 from ..message_composition import extract_message_composition
 from ..reactions.projection import project_reaction_aggregates, project_reaction_visibility
+from ..rich_content import capture_rich_message, decode_rich_message, rich_message_text
 from ..telegram_demand import (
     AcquisitionKind,
     MissingTelegramDemandContextError,
@@ -487,32 +488,21 @@ def _concrete_attr(obj: object, name: str) -> object | None:
     return values.get(name)
 
 
-def _extract_rich_text(value: object) -> str:
-    """Best-effort plain-text extraction from Telegram rich-text objects."""
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return "".join(_extract_rich_text(item) for item in value)
-
-    parts: list[str] = []
-    for attr in ("text", "texts", "blocks", "items"):
-        child = _concrete_attr(value, attr)
-        if child is not None:
-            parts.append(_extract_rich_text(child))
-    return "".join(parts)
-
-
 def extract_message_text(msg: object) -> str | None:
     text = _attr(msg, "message", None)
-    if isinstance(text, str) and text != "":
-        return text
-    rich_message = _concrete_attr(msg, "rich_message")
-    if rich_message is None:
-        return text if isinstance(text, str) else None
-    rich_text = _extract_rich_text(rich_message).strip()
-    return rich_text or (text if isinstance(text, str) else None)
+    native = text if isinstance(text, str) else None
+    rich = _concrete_attr(msg, "rich_message")
+    if rich is None:
+        return native
+    tree, _, _ = decode_rich_message(capture_rich_message(rich))
+    rich_text = rich_message_text(tree).strip() if tree is not None else ""
+    if not native:
+        return rich_text or native
+    if not rich_text:
+        return native
+    if rich_text == native.strip() or rich_text.startswith(native.strip() + "\n"):
+        return rich_text
+    return f"{native}\n{rich_text}"
 
 
 def _extract_media_fact(msg: object) -> tuple[str | None, str | None, int | None]:
@@ -614,6 +604,8 @@ def extract_message_row(
         media_kind=media_kind_value,
         media_payload=media_payload,
         formatting_entities=formatting_entities,
+        formatting_text=_attr(msg, "message", None),
+        rich_message=capture_rich_message(_concrete_attr(msg, "rich_message")),
         service_action=service_action,
         reply_to_msg_id=reply_to_msg_id,
         forum_topic_id=forum_topic_id,

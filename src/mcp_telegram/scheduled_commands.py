@@ -1191,6 +1191,7 @@ class ScheduledCommandOwner:
             command.dialog_id,
             message,
             now=int(time.time()),
+            authoritative_update=True,
             observation_order=observation_order,
             mutation_fence=self._fence,
             account_id=command.account_id,

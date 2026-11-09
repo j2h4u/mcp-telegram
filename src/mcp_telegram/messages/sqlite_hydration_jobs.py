@@ -11,12 +11,14 @@ from typing import NoReturn, cast
 from .. import message_contracts as _message_contracts
 from ..hydration_queue import (
     MEDIA_METADATA_KIND,
+    RICH_COMPOSITION_KIND,
     TRANSCRIPTION_HYDRATION_KIND,
     HydrationJob,
     HydrationPriority,
     HydrationQueueRepository,
 )
 from ..media_fact import MediaFact, decode_media_fact, encode_media_payload, is_transcribable_telegram_media
+from ..observation_order import hydration_observation_current
 
 _EMPTY_MEDIA_PAYLOAD = "{}"
 _FACT_HYDRATION_EMPTY_KINDS = frozenset(("contact", "other"))
@@ -134,6 +136,125 @@ def media_fact_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, mess
         ).fetchone()
         is not None
     )
+
+
+def rich_composition_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
+    """Only retained, undeleted unknown compositions in enrolled dialogs need recovery."""
+    return (
+        conn.execute(
+            "SELECT 1 FROM messages m WHERE m.dialog_id=? AND m.message_id=? "
+            "AND m.is_deleted=0 AND (m.rich_message IS NULL OR json_extract(m.rich_message,'$.part')=1) "
+            "AND EXISTS (" + _FACT_HYDRATION_ELIGIBILITY_SQL + ")",
+            (dialog_id, message_id, dialog_id),
+        ).fetchone()
+        is not None
+    )
+
+
+def request_rich_composition_repair(
+    conn: sqlite3.Connection, dialog_id: int, message_id: int, *, now: int
+) -> dict[str, object]:
+    """Enqueue one retained authorized target without changing retry state."""
+    if not fact_hydration_eligible(conn, dialog_id) or not hydration_observation_current(
+        conn, dialog_id, message_id, None
+    ):
+        return {"status": "ineligible"}
+    row = cast(
+        tuple[int, str | None, int] | None,
+        conn.execute(
+            "SELECT sent_at,rich_message,is_deleted FROM messages WHERE dialog_id=? AND message_id=?",
+            (dialog_id, message_id),
+        ).fetchone(),
+    )
+    if row is None or row[2] or not rich_composition_hydration_eligible(conn, dialog_id, message_id):
+        if row is not None and not row[2] and row[1] is not None:
+            return {"status": "already_known"}
+        return {"status": "ineligible"}
+    HydrationQueueRepository(conn).enqueue(
+        HydrationJob(RICH_COMPOSITION_KIND, dialog_id, message_id, now, 0, row[0], HydrationPriority.BACKFILL)
+    )
+    job = cast(
+        tuple[int, int, int, str | None] | None,
+        conn.execute(
+            "SELECT terminal,attempts,due_at,last_outcome FROM hydration_jobs WHERE kind=? AND dialog_id=? AND message_id=?",
+            (RICH_COMPOSITION_KIND, dialog_id, message_id),
+        ).fetchone(),
+    )
+    assert job is not None
+    return {"status": "queued", "terminal": bool(job[0]), "attempts": job[1], "due_at": job[2], "last_outcome": job[3]}
+
+
+_RICH_CURSOR_SIZE = 3
+
+
+def _rich_repair_cursor(value: object) -> tuple[int, ...]:
+    if value is None:
+        return (9223372036854775807, 9223372036854775807, 9223372036854775807)
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != _RICH_CURSOR_SIZE
+        or not all(type(item) is int for item in value)
+    ):
+        raise ValueError("invalid rich composition repair cursor")
+    return tuple(value)
+
+
+def repair_rich_composition_hydration_jobs(conn: sqlite3.Connection, *, due_at: int, max_jobs: int) -> bool:
+    """Commit a bounded historical scan and its queue entries in the caller's transaction."""
+    if max_jobs <= 0:
+        return False
+    key = "rich_composition_hydration_cursor"
+    stored = cast(tuple[str] | None, conn.execute("SELECT value FROM daemon_state WHERE key=?", (key,)).fetchone())
+    state = {"cursor": None, "done": False} if stored is None else cast(dict[str, object], json.loads(stored[0]))
+    if state["done"]:
+        return False
+    cursor = _rich_repair_cursor(state["cursor"])
+    rows = cast(
+        list[_RepairRow],
+        conn.execute(
+            "SELECT sent_at,dialog_id,message_id FROM messages INDEXED BY idx_messages_rich_unknown "
+            "WHERE rich_message IS NULL AND is_deleted=0 AND (sent_at,dialog_id,message_id) < (?,?,?) "
+            "ORDER BY sent_at DESC,dialog_id DESC,message_id DESC LIMIT ?",
+            (*cursor, max_jobs + 1),
+        ).fetchall(),
+    )
+    examined = rows[:max_jobs]
+    _enqueue_repair_rows(
+        conn,
+        examined,
+        kind=RICH_COMPOSITION_KIND,
+        due_at=due_at,
+        eligibility="m.is_deleted=0 AND m.rich_message IS NULL",
+    )
+    has_more = len(rows) > max_jobs
+    state = {"cursor": examined[-1] if examined else state["cursor"], "done": not has_more}
+    conn.execute(
+        "INSERT INTO daemon_state(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, json.dumps(state)),
+    )
+    return has_more
+
+
+def rich_composition_repair_revision(conn: sqlite3.Connection) -> str | None:
+    """Inspect one indexed candidate without creating work on ordinary reads."""
+    row = cast(
+        tuple[str] | None,
+        conn.execute("SELECT value FROM daemon_state WHERE key='rich_composition_hydration_cursor'").fetchone(),
+    )
+    state = {"cursor": None, "done": False} if row is None else cast(dict[str, object], json.loads(row[0]))
+    if state["done"]:
+        return None
+    cursor = _rich_repair_cursor(state["cursor"])
+    candidate = cast(
+        tuple[int, int, int] | None,
+        conn.execute(
+            "SELECT sent_at,dialog_id,message_id FROM messages INDEXED BY idx_messages_rich_unknown "
+            "WHERE rich_message IS NULL AND is_deleted=0 AND (sent_at,dialog_id,message_id) < (?,?,?) "
+            "ORDER BY sent_at DESC,dialog_id DESC,message_id DESC LIMIT 1",
+            cursor,
+        ).fetchone(),
+    )
+    return None if candidate is None else repr((state["cursor"], tuple(candidate)))
 
 
 def transcription_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
@@ -290,6 +411,9 @@ def reconcile_fact_hydration_job(
             return
         evidence = HydrationJobEvidence(queue)
     _reconcile_media_hydration_job(conn, evidence.queue, message, due_at=due_at, existing_kinds=evidence.existing_kinds)
+    _reconcile_rich_composition_job(
+        conn, evidence.queue, message, due_at=due_at, existing_kinds=evidence.existing_kinds
+    )
     _reconcile_transcription_hydration_job(
         conn,
         message,
@@ -297,6 +421,31 @@ def reconcile_fact_hydration_job(
         priority=priority,
         evidence=evidence,
     )
+
+
+def _reconcile_rich_composition_job(
+    conn: sqlite3.Connection,
+    queue: HydrationQueueRepository,
+    message: _message_contracts.StoredMessage,
+    *,
+    due_at: int,
+    existing_kinds: frozenset[str] | None,
+) -> None:
+    job = HydrationJob(
+        RICH_COMPOSITION_KIND,
+        message.dialog_id,
+        message.message_id,
+        due_at,
+        0,
+        message.sent_at,
+        HydrationPriority.BACKFILL,
+    )
+    if message.rich_message is None:
+        return
+    if rich_composition_hydration_eligible(conn, message.dialog_id, message.message_id):
+        queue.enqueue(job)
+    elif existing_kinds is None or RICH_COMPOSITION_KIND in existing_kinds:
+        queue.remove(job)
 
 
 def _reconcile_media_hydration_job(

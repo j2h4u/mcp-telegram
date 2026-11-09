@@ -72,7 +72,7 @@ def test_search_hit_schema_and_maximal_projector_have_exact_field_parity() -> No
     properties = cast(dict[str, object], SEARCH_HIT_SCHEMA["properties"])
 
     assert set(hit) == set(properties)
-    assert len(properties) == 25
+    assert len(properties) == 27
     assert cast(list[str], SEARCH_HIT_SCHEMA["required"]) == [
         "dialog_id",
         "dialog_name",
@@ -104,7 +104,7 @@ def test_registered_search_hit_schema_keeps_scheduled_metadata_nullable() -> Non
     results = cast(dict[str, object], properties["results"])
     item = cast(dict[str, object], results["items"])
 
-    assert len(cast(dict[str, object], item["properties"])) == 25
+    assert len(cast(dict[str, object], item["properties"])) == 27
     assert cast(list[str], item["required"]) == [
         "dialog_id",
         "dialog_name_source",
@@ -260,6 +260,8 @@ def test_search_hit_has_no_message_view_only_fields() -> None:
         "reaction_events",
         "reaction_events_status",
         "read_at",
+        "rich_message_status",
+        "rich_text_status",
     }
 
     assert not ((message_view_fields - shared_fields) & set(hit))

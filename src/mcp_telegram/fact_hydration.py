@@ -17,6 +17,7 @@ from .entity_profile.repository import bound_profile_account
 from .flood import TelegramRpcThrottled
 from .hydration_queue import (
     MEDIA_METADATA_KIND,
+    RICH_COMPOSITION_KIND,
     TRANSCRIPTION_HYDRATION_KIND,
     HydrationJob,
     HydrationOutcome,
@@ -26,14 +27,16 @@ from .hydration_queue import (
 )
 from .image_authorization import ScopeToken
 from .messages.sqlite_bundle import ReceivedMessageScopeChangedError, persist_received_messages
-from .messages.sqlite_hydration import hydration_observation_current, hydration_work_revision
+from .messages.sqlite_hydration import hydration_work_revision
 from .messages.sqlite_hydration_jobs import (
     HydrationRepairCursor,
     repair_media_metadata_hydration_jobs,
+    repair_rich_composition_hydration_jobs,
     repair_transcription_hydration_jobs,
+    rich_composition_repair_revision,
 )
 from .messages.telegram_adapter import extract_received_messages
-from .observation_order import allocate_observation_order
+from .observation_order import allocate_observation_order, hydration_observation_current
 from .reactions.contracts import ReactionAggregateSource, ReactionObservationBoundary
 from .reactions.persistence import allocate_observation_boundary
 from .sqlite_writer import SQLiteWriter
@@ -289,6 +292,7 @@ class FactHydrationDemandAdapter(DurableDemandAdapter):
         if type(account_id) is not int or account_id <= 0:
             raise ValueError("account_id must be a positive integer")
         self._account_id = account_id
+        self._next_kind = 0
         self.demand_kind = _hydration_demand_kind(priority)
 
     def _revision(self, job: HydrationJob) -> WorkRevision:
@@ -298,18 +302,30 @@ class FactHydrationDemandAdapter(DurableDemandAdapter):
 
     def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
         """Return queued work or the next bounded backfill-repair time."""
-        jobs = [
-            job
-            for kind in self._worker._handlers
+        kinds = list(self._worker._handlers)
+        if self._priority is HydrationPriority.BACKFILL and RICH_COMPOSITION_KIND in kinds:
+            kinds.append("rich-repair")
+        future_repair: DemandStatus | None = None
+        for offset in range(len(kinds)):
+            kind = kinds[(self._next_kind + offset) % len(kinds)]
+            if kind == "rich-repair":
+                revision = rich_composition_repair_revision(self._worker._conn)
+                if revision is None:
+                    continue
+                selected = WorkRevision(WorkKey(self.demand_kind, self._account_id, kind), revision)
+                if selected not in excluded:
+                    status = DemandStatus(release_at=self._worker.next_repair_at, selected=selected)
+                    if status.is_ready(now):
+                        return status
+                    future_repair = status
+                continue
             for job in self._worker._queue.due_jobs(
                 int(now), self._worker._max_jobs_per_cycle, kind=kind, priority=self._priority
-            )
-        ]
-        for job in jobs:
-            selected = self._revision(job)
-            if selected not in excluded:
-                return DemandStatus(release_at=float(job.due_at), selected=selected)
-        return None
+            ):
+                selected = self._revision(job)
+                if selected not in excluded:
+                    return DemandStatus(release_at=float(job.due_at), selected=selected)
+        return future_repair
 
     async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
         """Seed and run one compatible queue batch within the attempt budget."""
@@ -318,6 +334,14 @@ class FactHydrationDemandAdapter(DurableDemandAdapter):
         selected = budget.selected
         if selected is None:
             raise ValueError("hydration demand requires a selected revision")
+        kinds = list(self._worker._handlers)
+        if self._priority is HydrationPriority.BACKFILL and RICH_COMPOSITION_KIND in kinds:
+            kinds.append("rich-repair")
+        kind = selected.key.target.split(":", 1)[0]
+        if kind in kinds:
+            self._next_kind = (kinds.index(kind) + 1) % len(kinds)
+        if selected.key.target == "rich-repair":
+            return await self._run_repair_slice(selected)
         now = self._worker._clock()
         selection = self._prepare_selected_job(selected, budget, now)
         if isinstance(selection, SliceOutcome):
@@ -325,6 +349,16 @@ class FactHydrationDemandAdapter(DurableDemandAdapter):
         with durable_demand_context(self.demand_kind):
             outcome = await self._worker.run_priority_slice(self._priority, budget, selected_job=selection)
         return self._slice_outcome(selected, outcome)
+
+    async def _run_repair_slice(self, selected: WorkRevision) -> SliceOutcome:
+        if rich_composition_repair_revision(self._worker._conn) != selected.revision:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
+        now = self._worker._clock()
+        await self._worker._run_due_repairs(now, int(now))
+        revision = rich_composition_repair_revision(self._worker._conn) or "complete"
+        if revision != selected.revision:
+            return SliceOutcome(selected, SliceOutcomeKind.PROGRESSED, revision)
+        return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
 
     def _prepare_selected_job(
         self, selected: WorkRevision, budget: RpcAttemptBudget, now: float
@@ -416,7 +450,7 @@ class MessageFactHydrationWorker:
         self._max_jobs_per_cycle = max_jobs_per_cycle
         if self._max_jobs_per_cycle < len(self._handlers):
             raise ValueError("fact hydration max_jobs_per_cycle must cover registered handler kinds")
-        request_capacity = sum(handler.request_cost for handler in self._handlers.values())
+        request_capacity = max((handler.request_cost for handler in self._handlers.values()), default=0)
         if max_requests_per_cycle < request_capacity:
             raise ValueError("fact hydration max_requests_per_cycle must cover registered handler costs")
         self._max_attempts = max_attempts
@@ -549,6 +583,11 @@ class MessageFactHydrationWorker:
             has_more = media.has_more or has_more
             contact_other_cursor = media.next_contact_other_cursor
             video_cursor = media.next_video_cursor
+        if RICH_COMPOSITION_KIND in self._handlers:
+            rich_more = repair_rich_composition_hydration_jobs(
+                conn, due_at=effective_now, max_jobs=self._max_jobs_per_cycle
+            )
+            has_more = rich_more or has_more
         return has_more, (transcription_cursor, contact_other_cursor, video_cursor)
 
     async def _process_batch(
@@ -636,7 +675,7 @@ class MessageFactHydrationWorker:
         )
 
     def _capture_media_scope(self, handler: HydrationHandler) -> ScopeToken | None:
-        if handler.kind != MEDIA_METADATA_KIND:
+        if handler.kind not in (MEDIA_METADATA_KIND, RICH_COMPOSITION_KIND):
             return None
         scope = cast(_ScopeClient, self._client).capture_image_scope()
         if scope is None or scope.scope.account_id != self._profile_owner_account_id:
@@ -661,7 +700,7 @@ class MessageFactHydrationWorker:
         failed: bool,
         scope: ScopeToken | None,
     ) -> None:
-        if not failed and handler.kind == MEDIA_METADATA_KIND:
+        if not failed and handler.kind in (MEDIA_METADATA_KIND, RICH_COMPOSITION_KIND):
             return
 
         def requeue(conn: sqlite3.Connection) -> None:
@@ -783,7 +822,7 @@ class MessageFactHydrationWorker:
                 return _BatchOutcome(stopped=True)
             current = (
                 self._leased_media_jobs(conn, handler, started)
-                if handler.kind == MEDIA_METADATA_KIND
+                if handler.kind in (MEDIA_METADATA_KIND, RICH_COMPOSITION_KIND)
                 else self._current_jobs(conn, started, observation_order)
             )
             stale = [job for job in started if job not in current]
@@ -857,7 +896,7 @@ class MessageFactHydrationWorker:
         return [
             job
             for job in jobs
-            if (job.kind != MEDIA_METADATA_KIND or self._media_job_leased(conn, job))
+            if (job.kind not in (MEDIA_METADATA_KIND, RICH_COMPOSITION_KIND) or self._media_job_leased(conn, job))
             and hydration_observation_current(conn, job.dialog_id, job.message_id, observation_order)
         ]
 
@@ -1314,7 +1353,7 @@ class MessageFactHydrationWorker:
             observation_order = allocate_observation_order(conn) if started else None
             reaction_boundary = (
                 allocate_observation_boundary(conn, ReactionAggregateSource.HISTORY)
-                if started and handler.kind == MEDIA_METADATA_KIND
+                if started and handler.kind in (MEDIA_METADATA_KIND, RICH_COMPOSITION_KIND)
                 else None
             )
             self._require_media_scope(conn, scope)

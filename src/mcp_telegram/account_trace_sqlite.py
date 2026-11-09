@@ -160,7 +160,7 @@ def build_evidence_query(request: TraceMessageQueryRequest) -> tuple[str, dict[s
     candidate_queries = _trace_candidate_queries(request, params)
     sql = (
         f"WITH candidate_messages AS ({' UNION '.join(candidate_queries)}) "
-        "SELECT m.dialog_id, m.message_id, m.sent_at, m.text, m.sender_id, "
+        "SELECT m.dialog_id, m.message_id, m.sent_at, m.text, m.sender_id, m.rich_message, m.formatting_text, m.formatting_entities, "
         "m.media_kind, m.media_payload, m.forum_topic_id AS topic_id, "
         "CAST(m.dialog_id AS TEXT) AS dialog_title, 'unknown' AS dialog_type, "
         "COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "

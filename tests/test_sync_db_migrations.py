@@ -2773,3 +2773,82 @@ def test_v81_upgrade_is_idempotent_and_preserves_request_generation(tmp_path: Pa
         "SELECT delta_refresh_requested_at,delta_refresh_generation FROM synced_dialogs WHERE dialog_id=1"
     ).fetchone() == (100, 9)
     conn.close()
+
+
+def test_migration_v102_preserves_draft_and_allows_full_rich_fact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mcp_telegram.sync_db as sync_db_module
+
+    db_path = tmp_path / "v101.db"
+    with monkeypatch.context() as old:
+        old.setattr(sync_db_module, "_CURRENT_SCHEMA_VERSION", 101)
+        ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute(
+            "INSERT INTO draft_current(account_id,dialog_id,state,text,composition_complete,source_kind,source_observed_at,"
+            "observation_started_at,observation_completed_at,projection_revision,normalization_version,restore_payload) "
+            "VALUES(1,2,'present','retained',1,'realtime_present',3,3,3,1,1,?)",
+            (b"original",),
+        )
+        conn.commit()
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        assert conn.execute("SELECT text,restore_payload FROM draft_current").fetchone() == ("retained", b"original")
+        rich = '"' + "x" * 5000 + '"'
+        conn.execute("UPDATE draft_current SET rich_message_json=?", (rich,))
+        assert conn.execute("SELECT rich_message_json FROM draft_current").fetchone() == (rich,)
+        assert {"rich_message", "formatting_text"} <= {row[1] for row in _table_info(conn, "messages")}
+
+
+def test_v102_formatting_source_requires_evidence_and_real_reobservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import UTC, datetime
+
+    from telethon.tl import types
+
+    from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
+    from mcp_telegram.messages.telegram_adapter import extract_message_row
+    from mcp_telegram.sync_transactions import write_transaction
+
+    path = tmp_path / "formatting.db"
+    with monkeypatch.context() as old:
+        old.setattr(sync_db_module, "_CURRENT_SCHEMA_VERSION", 101)
+        ensure_sync_schema(path)
+    with _sync_db_connection(path) as conn:
+        conn.execute(
+            "INSERT INTO messages(dialog_id,message_id,sent_at,text,formatting_entities) VALUES(1,1,10,'native','[{\"type\":\"bold\"}]')"
+        )
+        conn.execute(
+            "INSERT INTO messages(dialog_id,message_id,sent_at,text,formatting_entities) VALUES(1,2,10,'rich fallback','[]')"
+        )
+        conn.execute(
+            "INSERT INTO scheduled_messages(dialog_id,message_id,text,formatting_entities,first_seen_at,updated_at) VALUES(1,1,'native','[{\"type\":\"bold\"}]',1,1)"
+        )
+        conn.execute(
+            "INSERT INTO scheduled_messages(dialog_id,message_id,text,formatting_entities,first_seen_at,updated_at) VALUES(1,2,'rich fallback','[]',1,1)"
+        )
+        conn.commit()
+    ensure_sync_schema(path)
+    with _sync_db_connection(path) as conn:
+        assert conn.execute("SELECT message_id,formatting_text FROM messages ORDER BY message_id").fetchall() == [
+            (1, "native"),
+            (2, None),
+        ]
+        assert conn.execute(
+            "SELECT message_id,formatting_text FROM scheduled_messages ORDER BY message_id"
+        ).fetchall() == [(1, "native"), (2, None)]
+        message = types.Message(
+            id=2,
+            peer_id=types.PeerUser(1),
+            date=datetime.fromtimestamp(10, UTC),
+            message="",
+            rich_message=types.RichMessage([types.PageBlockParagraph(types.TextPlain("rich fallback"))], [], []),
+        )
+        with write_transaction(conn):
+            insert_messages_with_fts(conn, [extract_message_row(1, message)])
+        assert conn.execute("SELECT text,formatting_text FROM messages WHERE message_id=2").fetchone() == (
+            "rich fallback",
+            "",
+        )

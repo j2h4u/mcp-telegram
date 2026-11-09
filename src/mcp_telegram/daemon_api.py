@@ -1312,6 +1312,7 @@ class DaemonAPIServer:
             "recover_account",
             "logout_account",
             "mark_dialog_for_sync",
+            "repair_message",
             "recover_dialog_directory",
             "record_telemetry",
             "upsert_entities",
@@ -1442,6 +1443,7 @@ class DaemonAPIServer:
             "recover_account": self._recover_account,
             "logout_account": self._logout_account,
             "mark_dialog_for_sync": self._mark_dialog_for_sync,
+            "repair_message": self._repair_message,
             "get_sync_status": self._get_sync_status,
             "recover_dialog_directory": self._recover_dialog_directory,
             "list_conversation_changes": self._list_conversation_changes,
@@ -2076,6 +2078,27 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
     # mark_dialog_for_sync
     # ------------------------------------------------------------------
+
+    async def _repair_message(self, req: dict[str, object]) -> dict:
+        from .entity_profile.repository import bound_profile_account
+        from .messages.sqlite_hydration_jobs import request_rich_composition_repair
+
+        dialog_id = _coerce_int(req.get("dialog_id"), 0)
+        message_id = _coerce_int(req.get("message_id"), 0)
+        scope = self._auth_scope
+        if not dialog_id or message_id <= 0 or scope is None or self.self_id != scope.account_id:
+            return {"ok": False, "error": "invalid_or_unverified", "message": "Invalid message or unverified account."}
+
+        def persist(conn: sqlite3.Connection) -> dict[str, object]:
+            with write_transaction(conn):
+                if self._auth_scope != scope or bound_profile_account(conn) != scope.account_id:
+                    return {"status": "account_unverified"}
+                return request_rich_composition_repair(conn, dialog_id, message_id, now=int(time.time()))
+
+        data = await self._writer.run(persist)
+        if data["status"] == "queued":
+            offer_durable_demand(self._require_demand_sink(), DemandKind.BACKFILL_HYDRATION_BATCH)
+        return {"ok": True, "data": data}
 
     async def _mark_dialog_for_sync(self, req: dict[str, object]) -> dict:
         """Persist explicit full-history intent and report factual coverage."""

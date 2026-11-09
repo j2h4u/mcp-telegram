@@ -43,6 +43,8 @@ _SCHEDULED_MESSAGE_COLUMNS_SQL = """
     sm.published_at AS published_at,
     sm.service_action,
     sm.formatting_entities,
+    sm.formatting_text,
+    sm.rich_message,
     sm.schedule_repeat_period,
     sm.observation_order,
     sm.visibility,

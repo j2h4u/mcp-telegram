@@ -6,11 +6,16 @@ import sqlite3
 from collections.abc import Sequence
 from typing import Protocol, cast
 
+from telethon.tl.functions.messages import GetRichMessageRequest  # type: ignore[import-untyped]
+from telethon.tl.types import TypeInputPeer  # type: ignore[import-untyped]
+from telethon.utils import get_peer_id  # type: ignore[import-untyped]
+
 from .fact_hydration import AppliedFacts, HydrationDropObservation, MediaPublication, _has_terminal_rpc_symbol
-from .hydration_queue import MEDIA_METADATA_KIND, HydrationJob, HydrationQueueRepository
+from .hydration_queue import MEDIA_METADATA_KIND, RICH_COMPOSITION_KIND, HydrationJob, HydrationQueueRepository
 from .messages.sqlite_hydration import enqueue_transcription_for_hydrated_media
 from .messages.sqlite_hydration_jobs import (
     media_fact_hydration_eligible,
+    rich_composition_hydration_eligible,
 )
 from .peer_access import peer_target
 from .telethon_media import extract_media_fact
@@ -28,6 +33,10 @@ _TERMINAL_RPC_SYMBOLS = frozenset(
 
 class MediaHydrationClient(Protocol):
     async def get_messages(self, *_args: object, **_kwargs: object) -> object: ...
+
+    async def get_input_entity(self, dialog_id: int) -> TypeInputPeer: ...
+
+    async def __call__(self, request: object, **kwargs: object) -> object: ...
 
 
 class MediaFactHydrationHandler:
@@ -95,6 +104,50 @@ class MediaFactHydrationHandler:
 
     def is_terminal_error(self, exc: BaseException) -> bool:
         return _has_terminal_rpc_symbol(exc, _TERMINAL_RPC_SYMBOLS)
+
+
+class RichCompositionHydrationHandler(MediaFactHydrationHandler):
+    """Recover a retained message and expand a Telegram partial rich message."""
+
+    kind = RICH_COMPOSITION_KIND
+    request_cost = 3
+
+    def __init__(self) -> None:
+        super().__init__(batch_size=1)
+
+    def eligible(self, conn: sqlite3.Connection, job: HydrationJob) -> bool:
+        return rich_composition_hydration_eligible(conn, job.dialog_id, job.message_id)
+
+    async def request(self, client: object, jobs: Sequence[HydrationJob]) -> object:
+        result = await super().request(client, jobs)
+        by_id, valid = _response_map(result)
+        message = by_id.get(jobs[0].message_id) if valid else None
+        if message is not None:
+            _require_rich_peer(message, jobs[0].dialog_id)
+        rich = getattr(message, "rich_message", None)
+        if not getattr(rich, "part", False):
+            return result
+        telegram = cast(MediaHydrationClient, client)
+        with peer_target(jobs[0].dialog_id):
+            peer = await telegram.get_input_entity(jobs[0].dialog_id)
+            full = await telegram(GetRichMessageRequest(peer=peer, id=jobs[0].message_id))
+        messages = getattr(full, "messages", None)
+        by_id, valid = _response_map(messages)
+        expanded = by_id.get(jobs[0].message_id) if valid else None
+        expanded_rich = cast(object, getattr(expanded, "rich_message", None))
+        if expanded_rich is None or getattr(expanded_rich, "part", False):
+            raise ValueError("Telegram returned incomplete rich message")
+        _require_rich_peer(expanded, jobs[0].dialog_id)
+        return [expanded]
+
+
+def _require_rich_peer(message: object, dialog_id: int) -> None:
+    try:
+        peer_id = get_peer_id(getattr(message, "peer_id", None))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError("Telegram returned a message without a valid peer") from exc
+    if peer_id != dialog_id:
+        raise ValueError("Telegram returned a message from a different peer")
 
 
 def _drop_unavailable_media(

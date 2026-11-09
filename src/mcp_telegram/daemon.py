@@ -116,7 +116,7 @@ from .folders.telegram_adapter import FolderClient, TelethonTelegramFolderGatewa
 from .folders.worker import FolderProjectionWorker
 from .hydration_queue import HydrationPriority
 from .image_authorization import ActiveSources, ScopeToken
-from .media_hydration import MediaFactHydrationHandler
+from .media_hydration import MediaFactHydrationHandler, RichCompositionHydrationHandler
 from .message_contracts import ReceivedMessage
 from .message_delivery_observations import MessageDeliveryObservations
 from .message_fact_refresh import (
@@ -1578,6 +1578,7 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
             ),
             handlers=(
                 MediaFactHydrationHandler(batch_size=scheduling.fact_hydration.batch_size),
+                RichCompositionHydrationHandler(),
                 TranscriptionHydrationHandler(
                     recheck_delay_seconds=scheduling.fact_hydration.transcription_recheck_delay_seconds,
                 ),

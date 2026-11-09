@@ -6,7 +6,14 @@ from typing import cast
 
 import pytest
 from jsonschema import validate
-from telethon.tl.types import MessageEntityTextUrl, ReactionCustomEmoji, ReactionEmoji
+from telethon.tl.types import (
+    MessageEntityTextUrl,
+    PageBlockParagraph,
+    ReactionCustomEmoji,
+    ReactionEmoji,
+    RichMessage,
+    TextPlain,
+)
 
 from mcp_telegram.daemon_message import project_cached_message_facts, project_cached_message_facts_by_dialog
 from mcp_telegram.message_content import MessageSnapshot, project_message_content
@@ -336,7 +343,7 @@ def test_uncached_telegram_projection_uses_rich_message_text_fallback() -> None:
         date=None,
         edit_date=None,
         message=None,
-        rich_message=SimpleNamespace(text="rich caption"),
+        rich_message=RichMessage([PageBlockParagraph(TextPlain("rich caption"))], [], []),
         media=None,
         out=False,
         sender_id=10,

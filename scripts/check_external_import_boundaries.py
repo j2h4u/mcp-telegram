@@ -149,6 +149,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "dialog_directory_tl.py",
             "drafts/telethon_adapter.py",
             "drafts/snapshot.py",  # Private native composition codec and request construction.
+            "drafts/snapshot_codec.py",  # Private snapshot format decoding without network access.
             "drafts/commands.py",  # Explicit draft mutation owner, using the sole RPC gate.
             "event_handlers.py",
             "contact_notes/commands.py",  # Native note command through the sole gateway.
@@ -163,6 +164,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "folders/telegram_adapter.py",
             "entity_profile/updates.py",  # Normalizes supplied Telegram updates; never acquires remotely.
             "messages/telegram_adapter.py",
+            "media_hydration.py",  # Bounded rich-message acquisition through the shared RPC gateway.
             "reactions/telegram_adapter.py",
             "scheduled_commands.py",  # Native scheduled receipt/fact writer through SQLiteWriter and the sole RPC gate.
             "scheduled_messages.py",

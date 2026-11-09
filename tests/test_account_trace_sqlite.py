@@ -31,7 +31,8 @@ def _conn() -> sqlite3.Connection:
         CREATE TABLE messages (
             dialog_id INTEGER, message_id INTEGER, sent_at INTEGER, text TEXT,
             sender_id INTEGER, media_kind TEXT, media_payload TEXT, forum_topic_id INTEGER,
-            post_author TEXT, is_deleted INTEGER, is_service INTEGER, out INTEGER
+            post_author TEXT, is_deleted INTEGER, is_service INTEGER, out INTEGER,
+            rich_message TEXT, formatting_text TEXT, formatting_entities TEXT
         );
         CREATE TABLE dialogs (
             dialog_id INTEGER, name TEXT, type TEXT, username TEXT,
@@ -55,7 +56,7 @@ def test_evidence_page_keeps_limit_plus_one_order_and_row_mapping() -> None:
     conn = _conn()
     try:
         conn.executemany(
-            "INSERT INTO messages VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, 0, 0)",
+            "INSERT INTO messages (dialog_id,message_id,sent_at,text,sender_id,media_kind,media_payload,forum_topic_id,post_author,is_deleted,is_service,out) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, 0, 0)",
             [(42, 1, 10, "older", 7), (42, 2, 20, "newer", 7)],
         )
 
@@ -71,7 +72,7 @@ def test_evidence_page_preserves_effective_sender_fallbacks_and_signature_dedupl
     conn = _conn()
     try:
         conn.executemany(
-            "INSERT INTO messages VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, 0, 0, ?)",
+            "INSERT INTO messages (dialog_id,message_id,sent_at,text,sender_id,media_kind,media_payload,forum_topic_id,post_author,is_deleted,is_service,out) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, 0, 0, ?)",
             [
                 (7, 1, 10, "incoming DM", None, None, 0),
                 (7, 2, 20, "outgoing DM", None, None, 1),
@@ -101,7 +102,7 @@ def test_evidence_page_can_exclude_target_direct_chat_without_hiding_other_autho
     conn = _conn()
     try:
         conn.executemany(
-            "INSERT INTO messages VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, 0, 0)",
+            "INSERT INTO messages (dialog_id,message_id,sent_at,text,sender_id,media_kind,media_payload,forum_topic_id,post_author,is_deleted,is_service,out) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, 0, 0)",
             [(7, 1, 20, "direct", 7), (-100, 2, 10, "group", 7)],
         )
 

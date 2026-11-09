@@ -2,6 +2,7 @@
 
 import asyncio
 import dataclasses
+import json
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -36,6 +37,7 @@ from .account_trace_sqlite import (
 )
 from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_peer_sweep import enroll_activity_dialog
+from .budget import MESSAGE_RESPONSE_MAX_BYTES
 from .daemon_message import fetch_text_links
 from .dialog_directory_coverage import DialogDirectoryCoverage, read_dialog_directory_coverage
 from .dialog_identity import read_dialog_identities
@@ -164,6 +166,7 @@ class _TraceAccountQueryResult:
     observed_message_count: int
     authorship_basis_counts: dict[str, int]
     next_navigation: str | None
+    response_truncated: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,6 +402,18 @@ def _trace_gap_evidence(query_result: _TraceAccountQueryResult) -> list[dict[str
     return summaries
 
 
+def _bounded_trace_evidence(evidence: list[dict[str, object]]) -> list[dict[str, object]]:
+    size = 0
+    for index, item in enumerate(evidence):
+        item_size = len(json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode())
+        if isinstance(item.get("text"), str):
+            item_size += len(json.dumps(item["text"], ensure_ascii=False).encode())
+        if index and size + item_size > MESSAGE_RESPONSE_MAX_BYTES:
+            return evidence[:index]
+        size += item_size
+    return evidence
+
+
 class DaemonAccountTraceService:
     """Account Trace orchestration for daemon-side enrichment and evidence extraction."""
 
@@ -492,12 +507,18 @@ class DaemonAccountTraceService:
         selected_rows = list(rows[:limit])
         evidence: list[dict[str, object]] = []
         dialog_summaries: list[dict[str, object]] = []
+        response_truncated = False
         if request.request.view == "dialogs":
             dialog_summaries = [DaemonAccountTraceService._trace_row_to_dialog_summary(row) for row in selected_rows]
         else:
             selected_rows = _project_trace_content_rows(request.conn, selected_rows)
             evidence = [DaemonAccountTraceService._trace_row_to_evidence(row) for row in selected_rows]
-        next_navigation = _trace_next_navigation(request, rows=rows, selected_rows=selected_rows, limit=limit)
+            evidence = _bounded_trace_evidence(evidence)
+            response_truncated = len(evidence) < len(selected_rows)
+            selected_rows = selected_rows[: len(evidence)]
+        next_navigation = _trace_next_navigation(
+            request, rows=rows, selected_rows=selected_rows, limit=len(selected_rows) if response_truncated else limit
+        )
         observed_message_count = (
             sum(_row_int(row, "message_count") for row in selected_rows)
             if request.request.view == "dialogs"
@@ -514,6 +535,7 @@ class DaemonAccountTraceService:
             observed_message_count=observed_message_count,
             authorship_basis_counts=authorship_basis_counts,
             next_navigation=next_navigation,
+            response_truncated=response_truncated,
         )
 
     def _build_trace_account_success_payload(
@@ -540,6 +562,7 @@ class DaemonAccountTraceService:
                 "post_author_aliases_considered": request.post_author_aliases,
                 "local_cache_writes": request.enrichment["messages_persisted"] if request.enrichment else 0,
                 "direct_chat_excluded": request.direct_chat_excluded,
+                "response_budget_truncated": request.query_result.response_truncated,
             },
             "next_navigation": request.query_result.next_navigation,
         }
@@ -553,6 +576,10 @@ class DaemonAccountTraceService:
     @staticmethod
     def _trace_row_to_evidence(row: Mapping[str, object]) -> dict[str, object]:
         """Convert one trace SQL row into a structured evidence item."""
+        from .message_composition import decode_formatting_entities
+        from .rich_content import decode_rich_message, rich_media_reference_gaps
+
+        rich_message, rich_status, rich_text_status = decode_rich_message(cast(str | None, row.get("rich_message")))
         return {
             "source": "sync_db",
             "evidence_kind": "authored_message",
@@ -568,6 +595,16 @@ class DaemonAccountTraceService:
             "authorship_basis": row["authorship_basis"],
             "author_signature": row["author_signature"],
             "text": row["text"],
+            "rich_message": rich_message,
+            **(
+                {"rich_media_reference_gaps": rich_media_reference_gaps(rich_message)}
+                if rich_message is not None
+                else {}
+            ),
+            "rich_message_status": rich_status,
+            "rich_text_status": rich_text_status,
+            "formatting_text": row.get("formatting_text"),
+            "formatting_entities": decode_formatting_entities(cast(str | None, row.get("formatting_entities"))),
             "media_description": row["media_description"],
             "media_kind": row["media_kind"],
         }

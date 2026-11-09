@@ -466,7 +466,7 @@ _SELECT_MESSAGES_SQL = (
     f"{_SENDER_FIRST_NAME_SQL}, "
     f"m.media_kind, m.media_payload, NULL AS content_kind, m.reply_to_msg_id, m.forum_topic_id, "
     f"m.is_deleted, m.deleted_at, "
-    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id, m.service_action, m.formatting_entities "
+    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id, m.service_action, m.formatting_entities, m.formatting_text, m.rich_message "
     f"FROM messages m "
     f"{_SENDER_ENTITY_JOINS_SQL}"
     f"WHERE m.dialog_id = :dialog_id AND m.is_deleted = 0 "
@@ -478,7 +478,7 @@ _FTS_SCOPED_QUERY_BODY_SQL = (
     f"{_SENDER_FIRST_NAME_SQL}, "
     f"m.sent_at, m.media_kind, m.media_payload, NULL AS content_kind, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
     f"COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
-    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id, m.service_action, m.formatting_entities "
+    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id, m.service_action, m.formatting_entities, m.formatting_text, m.rich_message "
     f"FROM messages_fts f "
     f"JOIN messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id "
     f"LEFT JOIN topic_metadata tm "
@@ -496,7 +496,7 @@ _FTS_GLOBAL_QUERY_BODY_SQL = (
     f"m.sent_at, m.media_kind, m.media_payload, NULL AS content_kind, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
     f"COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
     f"f.dialog_id, "
-    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.service_action, m.formatting_entities "
+    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.service_action, m.formatting_entities, m.formatting_text, m.rich_message "
     f"FROM messages_fts f "
     f"JOIN messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id "
     f"LEFT JOIN topic_metadata tm "
@@ -528,7 +528,7 @@ _FETCH_UNREAD_MESSAGES_SQL = (
     f"{_SENDER_FIRST_NAME_SQL}, {_SENDER_USERNAME_SQL}, m.media_kind, m.media_payload, NULL AS content_kind, "
     f"m.reply_to_msg_id, {_EDIT_DATE_SQL}, "
     f"m.forum_topic_id, COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
-    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id, m.is_deleted, m.deleted_at, m.service_action, m.formatting_entities "
+    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id, m.is_deleted, m.deleted_at, m.service_action, m.formatting_entities, m.formatting_text, m.rich_message "
     f"FROM messages m "
     f"LEFT JOIN topic_metadata tm "
     f"  ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
@@ -553,7 +553,7 @@ _LIST_MESSAGES_BASE_SQL = (
     f"{_EDIT_DATE_SQL}, "
     f"COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id, "
-    f"mf.fwd_from_name, m.post_author, m.service_action, m.formatting_entities "
+    f"mf.fwd_from_name, m.post_author, m.service_action, m.formatting_entities, m.formatting_text, m.rich_message "
     f"FROM messages m "
     f"LEFT JOIN topic_metadata tm "
     f"  ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
@@ -583,7 +583,8 @@ def _assert_select_columns_match_read_message() -> None:
             # Username is an inbox-only enrichment; other read surfaces keep
             # their existing SQL contract during this vertical slice.
             "sender_username",
-            "formatting_text",
+            "rich_message_status",
+            "rich_text_status",
         }
     )
     aliases = frozenset(re.findall(r"\bAS\s+(\w+)", _LIST_MESSAGES_BASE_SQL))

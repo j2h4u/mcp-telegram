@@ -5,6 +5,7 @@ from ..message_view import (  # noqa: F401
     DRAFT_MESSAGE_VIEW_SCHEMA,
     MESSAGE_VIEW_SCHEMA,
     READ_MARKER_SCHEMA,
+    RICH_MEDIA_REFERENCE_GAPS_SCHEMA,
     ReadMarker,
     __all__,
     _content_facts,

@@ -752,7 +752,7 @@ def _present_row(
         ),
         "media_json": _json_value(_reference_value(composition.media)),
         "suggested_post_json": _json_value(_reference_value(composition.suggested_post)),
-        "rich_message_json": _json_value(_reference_value(composition.rich)),
+        "rich_message_json": composition.rich,
         "effect_id": composition.effect_id,
         "no_webpage": _nullable_bool(composition.no_webpage),
         "invert_media": _nullable_bool(composition.invert_media),

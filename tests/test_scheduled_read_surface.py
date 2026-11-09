@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Iterator, Mapping
@@ -362,6 +363,8 @@ def _create_scheduled_table(conn: sqlite3.Connection) -> None:
             text TEXT,
             observation_order INTEGER,
             formatting_entities TEXT,
+            formatting_text TEXT,
+            rich_message TEXT,
             service_action TEXT,
             sender_id INTEGER,
             sender_first_name TEXT,
@@ -595,6 +598,58 @@ async def test_scheduled_newest_budget_cursor_keeps_the_traversal_prefix() -> No
 
     assert pages == [[3], [2], [1]]
     assert seen == [3, 2, 1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["sent", "all"])
+async def test_rich_history_budget_resumes_after_each_complete_message(state: str) -> None:
+    server = _make_scheduled_server()
+    conn = server._conn
+    _insert_synced_dialog(conn, 1, status="synced")
+    _create_scheduled_table(conn)
+    rich = {
+        "_": "RichMessage",
+        "blocks": [{"_": "PageBlockParagraph", "text": {"_": "TextPlain", "text": "x" * 140_000}}],
+    }
+    for message_id in range(1, 4):
+        _insert_message(conn, 1, message_id, text="x" * 140_000, sent_at=message_id)
+        conn.execute(
+            "UPDATE messages SET rich_message=? WHERE dialog_id=1 AND message_id=?", (json.dumps(rich), message_id)
+        )
+    request: dict[str, object] = {"dialog_id": 1, "message_state": state, "direction": "oldest", "limit": 3}
+    seen = []
+    for _ in range(3):
+        page = await server._list_messages(request)
+        assert page["ok"] is True
+        rows = page["data"]["messages"]
+        seen.extend(row["message_id"] for row in rows)
+        assert all(row["rich_message"] == rich for row in rows)
+        if not page["data"]["next_navigation"]:
+            break
+        assert page["data"]["truncation"]["reason"] == "response_budget"
+        request["navigation"] = page["data"]["next_navigation"]
+    assert seen == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_rich_context_budget_keeps_anchor_and_reports_omissions() -> None:
+    server = _make_scheduled_server()
+    conn = server._conn
+    _insert_synced_dialog(conn, 1, status="synced")
+    rich = {
+        "_": "RichMessage",
+        "blocks": [{"_": "PageBlockParagraph", "text": {"_": "TextPlain", "text": "x" * 140_000}}],
+    }
+    for message_id in range(1, 4):
+        _insert_message(conn, 1, message_id, text="x" * 140_000, sent_at=message_id)
+        conn.execute(
+            "UPDATE messages SET rich_message=? WHERE dialog_id=1 AND message_id=?", (json.dumps(rich), message_id)
+        )
+    result = await server._list_messages(
+        {"dialog_id": 1, "message_state": "sent", "context_message_id": 2, "context_size": 3}
+    )
+    assert [row["message_id"] for row in result["data"]["messages"]] == [2]
+    assert result["data"]["truncation"]["hidden_count"] == 2
 
 
 @pytest.mark.asyncio

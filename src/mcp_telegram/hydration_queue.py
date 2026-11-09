@@ -19,9 +19,10 @@ from .sync_transactions import require_write_transaction
 # durable database contract, so callers must never create an ad-hoc variant.
 HYDRATION_QUEUE_TABLE = "hydration_jobs"
 MEDIA_METADATA_KIND = "media_metadata"
+RICH_COMPOSITION_KIND = "rich_composition"
 TRANSCRIPTION_HYDRATION_KIND = "transcription"
 DEFAULT_SUMMARY_MESSAGE_IDS = 32
-_REGISTERED_HYDRATION_KINDS = (MEDIA_METADATA_KIND, TRANSCRIPTION_HYDRATION_KIND)
+_REGISTERED_HYDRATION_KINDS = (MEDIA_METADATA_KIND, RICH_COMPOSITION_KIND, TRANSCRIPTION_HYDRATION_KIND)
 
 
 class HydrationOutcome(StrEnum):

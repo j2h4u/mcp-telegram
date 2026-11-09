@@ -2528,3 +2528,111 @@ async def test_dm_authorization_change_replays_with_fresh_token_and_retained_ord
             cast(SQLiteSession, client.session).close()
         reader.close()
         await writer.aclose()
+
+
+@pytest.mark.asyncio
+async def test_same_second_rich_only_edit_versions_once(
+    mock_client: MagicMock, sync_db: _SQLiteConnection, shutdown_event: asyncio.Event
+) -> None:
+    from mcp_telegram.rich_content import capture_rich_message
+
+    dialog_id = 1001
+    insert_synced_dialog(sync_db, dialog_id)
+    insert_message(sync_db, dialog_id, message_id=199, text="same")
+    confirm_human_dm(sync_db, dialog_id, 199)
+    before = types.RichMessage(
+        [types.PageBlockParagraph(types.TextUrl(types.TextPlain("same"), "https://one.test", 0))], [], []
+    )
+    after = types.RichMessage(
+        [types.PageBlockParagraph(types.TextUrl(types.TextPlain("same"), "https://two.test", 0))], [], []
+    )
+    edit_dt = datetime(2024, 1, 1, 13, 0, tzinfo=UTC)
+    sync_db.execute(
+        "UPDATE messages SET text='same',formatting_text='',rich_message=?,edit_date=? WHERE dialog_id=? AND message_id=199",
+        (capture_rich_message(before), int(edit_dt.timestamp()), dialog_id),
+    )
+    sync_db.commit()
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+    msg = build_mock_message(id=199, text="", edit_date=edit_dt)
+    msg.rich_message = after
+    event = make_message_edited_event(chat_id=dialog_id, message=msg)
+    await manager.on_message_edited(event)
+    await manager.on_message_edited(event)
+    assert sync_db.execute(
+        "SELECT old_rich_message FROM message_versions WHERE dialog_id=? AND message_id=199", (dialog_id,)
+    ).fetchall() == [(capture_rich_message(before),)]
+    assert sync_db.execute(
+        "SELECT rich_message FROM messages WHERE dialog_id=? AND message_id=199", (dialog_id,)
+    ).fetchone() == (capture_rich_message(after),)
+
+
+@pytest.mark.asyncio
+async def test_same_second_partial_edit_replaces_full_and_requests_recovery(
+    mock_client: MagicMock, sync_db: _SQLiteConnection, shutdown_event: asyncio.Event
+) -> None:
+    from mcp_telegram.rich_content import capture_rich_message
+
+    dialog_id = 1001
+    insert_synced_dialog(sync_db, dialog_id)
+    insert_message(sync_db, dialog_id, message_id=198, text="old complete")
+    confirm_human_dm(sync_db, dialog_id, 198)
+    before = types.RichMessage([types.PageBlockParagraph(types.TextPlain("old complete"))], [], [])
+    after = types.RichMessage([types.PageBlockParagraph(types.TextPlain("new partial"))], [], [], part=True)
+    edit_dt = datetime(2024, 1, 1, 13, 0, tzinfo=UTC)
+    sync_db.execute(
+        "UPDATE messages SET formatting_text='',rich_message=?,edit_date=? WHERE dialog_id=? AND message_id=198",
+        (capture_rich_message(before), int(edit_dt.timestamp()), dialog_id),
+    )
+    sync_db.commit()
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+    msg = build_mock_message(id=198, text="", edit_date=edit_dt)
+    msg.rich_message = after
+    await manager.on_message_edited(make_message_edited_event(chat_id=dialog_id, message=msg))
+    assert sync_db.execute(
+        "SELECT text,rich_message FROM messages WHERE dialog_id=? AND message_id=198", (dialog_id,)
+    ).fetchone() == ("new partial", capture_rich_message(after))
+    assert sync_db.execute(
+        "SELECT old_rich_message FROM message_versions WHERE dialog_id=? AND message_id=198", (dialog_id,)
+    ).fetchone() == (capture_rich_message(before),)
+    assert sync_db.execute(
+        "SELECT 1 FROM hydration_jobs WHERE kind='rich_composition' AND dialog_id=? AND message_id=198", (dialog_id,)
+    ).fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+async def test_same_second_partial_to_complete_edit_archives_partial_once(
+    mock_client: MagicMock, sync_db: _SQLiteConnection, shutdown_event: asyncio.Event
+) -> None:
+    from mcp_telegram.rich_content import capture_rich_message
+
+    dialog_id = 1001
+    insert_synced_dialog(sync_db, dialog_id)
+    insert_message(sync_db, dialog_id, message_id=197, text="same")
+    confirm_human_dm(sync_db, dialog_id, 197)
+    before = types.RichMessage(
+        [types.PageBlockParagraph(types.TextUrl(types.TextPlain("same"), "https://old.test", 0))], [], [], part=True
+    )
+    after = types.RichMessage(
+        [types.PageBlockParagraph(types.TextUrl(types.TextPlain("same"), "https://new.test", 0))], [], []
+    )
+    edit_dt = datetime(2024, 1, 1, 13, 0, tzinfo=UTC)
+    sync_db.execute(
+        "UPDATE messages SET formatting_text='',rich_message=?,edit_date=? WHERE dialog_id=? AND message_id=197",
+        (capture_rich_message(before), int(edit_dt.timestamp()), dialog_id),
+    )
+    sync_db.commit()
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+    msg = build_mock_message(id=197, text="", edit_date=edit_dt)
+    msg.rich_message = after
+    event = make_message_edited_event(chat_id=dialog_id, message=msg)
+    await manager.on_message_edited(event)
+    await manager.on_message_edited(event)
+    assert sync_db.execute(
+        "SELECT old_rich_message FROM message_versions WHERE dialog_id=? AND message_id=197", (dialog_id,)
+    ).fetchall() == [(capture_rich_message(before),)]
+    assert sync_db.execute(
+        "SELECT rich_message FROM messages WHERE dialog_id=? AND message_id=197", (dialog_id,)
+    ).fetchone() == (capture_rich_message(after),)

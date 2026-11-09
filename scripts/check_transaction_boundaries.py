@@ -72,6 +72,7 @@ _SYNC_DB_BOOTSTRAP_TRANSACTIONS = frozenset(
         "_apply_migration_96",
         # Bootstrap atomically normalizes retained facts and installs native receipts.
         "_apply_migration_97",
+        "_apply_migration_102",
     }
     | TRANSACTION_EXCEPTIONS[Path("sync_db.py")]
 )

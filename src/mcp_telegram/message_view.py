@@ -7,12 +7,14 @@ which messages belong to a result.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from typing import TypedDict, cast
 
 from .entity_identity import ENTITY_IDENTITY_SCHEMA, EntityIdentity, project_entity_identity
 from .formatter import _compute_inline_markers
 from .models import DialogType, ReadMessage, ReadState
+from .rich_content import decode_rich_message, rich_media_reference_gaps, rich_message_text
 from .structured import (
     MEDIA_OUTPUT_SCHEMA,
     TELEGRAM_CONTENT_OUTPUT_SCHEMA,
@@ -50,6 +52,17 @@ READ_MARKER_SCHEMA: dict[str, object] = {
 }
 
 
+RICH_MEDIA_REFERENCE_GAPS_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "description": "IDs referenced by the rich tree but missing from its photo or document metadata. Empty lists do not establish download availability.",
+    "properties": {
+        "missing_photo_ids": {"type": "array", "items": {"type": "integer"}},
+        "missing_document_ids": {"type": "array", "items": {"type": "integer"}},
+    },
+    "required": ["missing_photo_ids", "missing_document_ids"],
+    "additionalProperties": False,
+}
+
 MESSAGE_VIEW_SCHEMA: dict[str, object] = {
     "type": "object",
     "properties": {
@@ -74,6 +87,13 @@ MESSAGE_VIEW_SCHEMA: dict[str, object] = {
             "description": "Untrusted original Telegram text; formatting_entities UTF-16 spans refer to this text, not rendered content.",
         },
         "formatting_entities_status": {"type": "string", "enum": ["captured", "unknown"]},
+        "rich_message": {
+            "type": ["object", "null"],
+            "description": "Untrusted normalized Telegram rich-message facts.",
+        },
+        "rich_message_status": {"type": "string", "enum": ["unknown", "absent", "complete", "partial"]},
+        "rich_media_reference_gaps": RICH_MEDIA_REFERENCE_GAPS_SCHEMA,
+        "rich_text_status": {"type": ["string", "null"], "enum": ["complete", "unsupported", None]},
         "composition_is_telegram_content": {"type": "boolean", "enum": [True]},
         "topic": TOPIC_IDENTITY_SCHEMA,
         "content": TELEGRAM_CONTENT_OUTPUT_SCHEMA,
@@ -154,6 +174,10 @@ DRAFT_MESSAGE_VIEW_SCHEMA: dict[str, object] = {
                 "media": {"type": ["object", "null"]},
                 "suggested_post": {"type": ["object", "null"]},
                 "rich_message": {"type": ["object", "null"]},
+                "rich_media_reference_gaps": RICH_MEDIA_REFERENCE_GAPS_SCHEMA,
+                "rich_message_status": {"type": "string", "enum": ["absent", "complete", "partial"]},
+                "rich_text_status": {"type": ["string", "null"], "enum": ["complete", "unsupported", None]},
+                "formatting_text": {"type": ["string", "null"]},
                 "effect_id": {"type": ["integer", "null"]},
                 "no_webpage": {"type": ["boolean", "null"]},
                 "invert_media": {"type": ["boolean", "null"]},
@@ -166,6 +190,9 @@ DRAFT_MESSAGE_VIEW_SCHEMA: dict[str, object] = {
                 "media",
                 "suggested_post",
                 "rich_message",
+                "rich_message_status",
+                "rich_text_status",
+                "formatting_text",
                 "effect_id",
                 "no_webpage",
                 "invert_media",
@@ -207,19 +234,25 @@ DRAFT_MESSAGE_VIEW_SCHEMA: dict[str, object] = {
 def project_draft_message_view(row: Mapping[str, object]) -> dict[str, object]:
     """Project one local draft row without manufacturing sent-message facts."""
     text = row.get("text")
+    rich, rich_status, rich_text_status = decode_rich_message(json.dumps(row["rich_message"]))
+    semantic_text = rich_message_text(rich) if rich is not None else text
     return {
         "message_state": "draft",
         "message_key": row["message_key"],
         "dialog_id": row["dialog_id"],
         "draft_scope": row["draft_scope"],
         "draft_status": row["draft_status"],
-        "content": telegram_content(text if isinstance(text, str) else "", "message_text"),
+        "content": telegram_content(semantic_text if isinstance(semantic_text, str) else "", "message_text"),
         "composition": {
             "entities": row["entities"],
             "reply_to": row["reply_to"],
             "media": row["media"],
             "suggested_post": row["suggested_post"],
             "rich_message": row["rich_message"],
+            **({"rich_media_reference_gaps": rich_media_reference_gaps(rich)} if rich is not None else {}),
+            "rich_message_status": rich_status,
+            "rich_text_status": rich_text_status,
+            "formatting_text": text,
             "effect_id": row["effect_id"],
             "no_webpage": row["no_webpage"],
             "invert_media": row["invert_media"],
@@ -327,6 +360,11 @@ def _content_facts(message: ReadMessage) -> dict[str, object]:
     )
     facts = {key: value for key, value in projected.items() if value is not None}
     facts["composition_is_telegram_content"] = True
+    facts["rich_message"] = message.rich_message
+    facts["rich_message_status"] = message.rich_message_status
+    facts["rich_text_status"] = message.rich_text_status
+    if message.rich_message is not None:
+        facts["rich_media_reference_gaps"] = rich_media_reference_gaps(message.rich_message)
     facts["formatting_entities_status"] = "unknown" if message.formatting_entities is None else "captured"
     if message.formatting_entities is not None:
         facts["formatting_entities"] = list(message.formatting_entities)

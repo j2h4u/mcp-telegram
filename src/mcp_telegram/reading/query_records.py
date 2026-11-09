@@ -8,6 +8,7 @@ from typing import cast
 from ..media_fact import decode_media_fact, media_description
 from ..message_composition import decode_formatting_entities, decode_service_action
 from ..models import ContentKind, ReadMessage, ReadReactionEvent
+from ..rich_content import decode_rich_message
 
 
 def _row_value(row: object, key: str, default: object | None = None) -> object | None:
@@ -36,6 +37,9 @@ def read_message_from_row(row: Mapping[str, object] | object, *, reactions_displ
     """Decode any reading SELECT row into the one canonical message record."""
     fact = decode_media_fact(_row_value(row, "media_kind"), _row_value(row, "media_payload"))
     entities = decode_formatting_entities(cast(str | None, _row_value(row, "formatting_entities")))
+    rich_message, rich_message_status, rich_text_status = decode_rich_message(
+        cast(str | None, _row_value(row, "rich_message"))
+    )
     return ReadMessage(
         message_id=_coerce_int(_row_value(row, "message_id"), 0),
         sent_at=_coerce_int(_row_value(row, "sent_at"), 0),
@@ -57,7 +61,10 @@ def read_message_from_row(row: Mapping[str, object] | object, *, reactions_displ
         is_service=_coerce_int(_row_value(row, "is_service", 0), 0),
         service_action=decode_service_action(cast(str | None, _row_value(row, "service_action"))),
         formatting_entities=None if entities is None else tuple(entities),
-        formatting_text=cast(str | None, _row_value(row, "text")) if entities is not None else None,
+        formatting_text=cast(str | None, _row_value(row, "formatting_text")),
+        rich_message=rich_message,
+        rich_message_status=rich_message_status,
+        rich_text_status=rich_text_status,
         out=_coerce_int(_row_value(row, "out", 0), 0),
         fwd_from_name=cast(str | None, _row_value(row, "fwd_from_name")),
         post_author=cast(str | None, _row_value(row, "post_author")),

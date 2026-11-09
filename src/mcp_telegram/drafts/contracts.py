@@ -137,7 +137,7 @@ class DraftComposition:
     quote: DraftReference | None = None
     monoforum: DraftReference | None = None
     media: DraftReference | None = None
-    rich: DraftReference | None = None
+    rich: str | None = None
     no_webpage: bool | None = None
     invert_media: bool | None = None
     effect_id: int | None = None

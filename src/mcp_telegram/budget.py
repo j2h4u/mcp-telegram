@@ -1,5 +1,7 @@
 from .models import DialogType
 
+MESSAGE_RESPONSE_MAX_BYTES = 256 * 1024
+
 # Priority tiers for unread chat sorting (lower = higher priority).
 # Gaps between values allow inserting new tiers without renumbering.
 UNREAD_TIER_HUMAN_DM = 10  # 1-on-1 with a real person

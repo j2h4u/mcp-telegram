@@ -149,7 +149,6 @@ from .messages.sqlite_bundle import (
 )
 from .messages.sqlite_hydration import (
     apply_message_transcription,
-    hydration_observation_current,
     stage_message_transcription,
 )
 from .messages.telegram_adapter import (
@@ -157,7 +156,7 @@ from .messages.telegram_adapter import (
     extract_received_messages,
 )
 from .models import DialogType
-from .observation_order import allocate_observation_order, delivered_observation_order
+from .observation_order import allocate_observation_order, delivered_observation_order, hydration_observation_current
 from .peer_access import peer_target
 from .reactions.contracts import ReactionAggregate, ReactionAggregateSource, ReactionObservationBoundary
 from .reactions.persistence import allocate_observation_boundary, replace_reaction_aggregates
@@ -1901,6 +1900,7 @@ class EventHandlerManager:
                         dialog_id,
                         message,
                         now=delivered_observed_at(),
+                        authoritative_update=True,
                         mutation_fence=self._scheduled_mutation_fence,
                         account_id=self._self_id,
                     )

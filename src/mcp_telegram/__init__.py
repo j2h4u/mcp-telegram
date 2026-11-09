@@ -15,6 +15,28 @@ if TYPE_CHECKING:
 app = Typer(no_args_is_help=True)
 
 
+@app.command("repair-message")
+def repair_message(dialog_id: int, message_id: int) -> None:
+    """Queue rich composition recovery for one retained enrolled message."""
+    import json
+    import sys
+
+    from .daemon_client import DaemonNotRunningError, daemon_connection
+
+    async def request() -> dict:
+        async with daemon_connection() as conn:
+            return await conn.repair_message(dialog_id=dialog_id, message_id=message_id)
+
+    try:
+        result = asyncio.run(request())
+    except (ConfigError, DaemonNotRunningError, OSError, TimeoutError) as exc:
+        print(f"Repair unavailable: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    print(json.dumps(result, ensure_ascii=False))
+    if not result.get("ok"):
+        raise SystemExit(1)
+
+
 @app.command("export-chat")
 def export_chat(
     dialog_id: Annotated[str, Argument(help="Public Telegram group URL, @username, or canonical negative group ID.")],

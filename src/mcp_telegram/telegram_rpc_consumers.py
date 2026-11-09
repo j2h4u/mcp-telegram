@@ -32,6 +32,7 @@ _READ_METHODS = frozenset(
         "telethon.tl.functions.messages.GetChatsRequest:49e9528f",
         "telethon.tl.functions.messages.GetHistoryRequest:4423e6c5",
         "telethon.tl.functions.messages.GetMessagesRequest:63c66506",
+        "telethon.tl.functions.messages.GetRichMessageRequest:501569cf",
         "telethon.tl.functions.messages.GetDialogsRequest:a0f4cb4f",
         "telethon.tl.functions.messages.GetPinnedDialogsRequest:d6b94df2",
         "telethon.tl.functions.messages.GetPeerDialogsRequest:e470bcfd",
@@ -991,7 +992,7 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         DemandKind.BACKFILL_HYDRATION_BATCH,
         TelegramRpcSource.FACT_HYDRATION_BACKFILL,
         _DURABLE,
-        max_rpc_attempts_per_slice=2,
+        max_rpc_attempts_per_slice=3,
     ),
     DemandKind.FOLDER_SNAPSHOT: _contract(
         DemandKind.FOLDER_SNAPSHOT,
