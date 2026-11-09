@@ -6077,7 +6077,7 @@ def test_msg_to_dict_edit_date() -> None:
     """_msg_to_dict includes edit_date as unix timestamp from msg.edit_date."""
     from datetime import datetime
 
-    mock_msg = MagicMock()
+    mock_msg = MagicMock(rich_message=None)
     mock_msg.id = 300
     mock_msg.date = SimpleNamespace(timestamp=lambda: 1700000000.0)
     mock_msg.message = "edited message"
@@ -6097,7 +6097,7 @@ def test_msg_to_dict_edit_date() -> None:
 
 def test_msg_to_dict_no_edit_date_is_none() -> None:
     """_msg_to_dict returns edit_date=None when msg.edit_date is None."""
-    mock_msg = MagicMock()
+    mock_msg = MagicMock(rich_message=None)
     mock_msg.id = 301
     mock_msg.date = SimpleNamespace(timestamp=lambda: 1700000000.0)
     mock_msg.message = "unedited"
@@ -6115,7 +6115,7 @@ def test_msg_to_dict_no_edit_date_is_none() -> None:
 
 def test_msg_to_dict_uses_sender_title_when_first_name_missing() -> None:
     """_msg_to_dict prefers first_name, then title, then None for sender name."""
-    mock_msg = MagicMock()
+    mock_msg = MagicMock(rich_message=None)
     mock_msg.id = 302
     mock_msg.date = SimpleNamespace(timestamp=lambda: 1700000000.0)
     mock_msg.message = "channel message"
@@ -6135,7 +6135,7 @@ def test_msg_to_dict_uses_sender_title_when_first_name_missing() -> None:
 
 def test_msg_to_dict_sender_without_name_attrs_returns_none() -> None:
     """_msg_to_dict tolerates sender objects missing first_name/title attributes."""
-    mock_msg = MagicMock()
+    mock_msg = MagicMock(rich_message=None)
     mock_msg.id = 303
     mock_msg.date = SimpleNamespace(timestamp=lambda: 1700000000.0)
     mock_msg.message = "no-name sender"
@@ -6981,7 +6981,7 @@ def test_msg_to_dict_formats_reactions_display() -> None:
     mock_reactions_obj = MagicMock()
     mock_reactions_obj.results = [mock_rc]
 
-    mock_msg = MagicMock()
+    mock_msg = MagicMock(rich_message=None)
     mock_msg.id = 999
     mock_msg.date = SimpleNamespace(timestamp=lambda: 1700000000.0)
     mock_msg.message = "hello"
@@ -7005,7 +7005,7 @@ def test_msg_to_dict_formats_reactions_display() -> None:
 
 def test_msg_to_dict_no_reactions_returns_empty_display() -> None:
     """_msg_to_dict returns reactions_display='' when msg.reactions is None."""
-    mock_msg = MagicMock()
+    mock_msg = MagicMock(rich_message=None)
     mock_msg.id = 1
     mock_msg.date = SimpleNamespace(timestamp=lambda: 1700000000.0)
     mock_msg.message = "no reactions"
@@ -8996,6 +8996,8 @@ def _make_trace_db() -> sqlite3.Connection:
             is_service      INTEGER NOT NULL DEFAULT 0,
             post_author     TEXT,
             formatting_entities TEXT,
+            rich_message TEXT,
+            formatting_text TEXT,
             service_action TEXT,
             PRIMARY KEY (dialog_id, message_id)
         ) WITHOUT ROWID;
