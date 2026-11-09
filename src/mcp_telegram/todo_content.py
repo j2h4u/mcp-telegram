@@ -8,6 +8,31 @@ class TodoContent(NamedTuple):
     status: Literal["captured", "unknown", "unsupported"]
 
 
+def _title_content(title: object) -> TodoContent:
+    if not isinstance(title, dict):
+        return TodoContent("", "unknown")
+    if title.get("_") != "TextWithEntities":
+        return TodoContent("", "unsupported")
+    text = title.get("text")
+    return TodoContent(text, "captured") if isinstance(text, str) else TodoContent("", "unknown")
+
+
+def _item_content(item: object) -> TodoContent:
+    if not isinstance(item, dict):
+        return TodoContent("", "unknown")
+    if item.get("_") != "TodoItem":
+        return TodoContent("", "unsupported")
+    return _title_content(item.get("title"))
+
+
+def _combine_content(parts: list[TodoContent]) -> TodoContent:
+    statuses = {part.status for part in parts}
+    status: Literal["captured", "unknown", "unsupported"] = (
+        "unsupported" if "unsupported" in statuses else "unknown" if "unknown" in statuses else "captured"
+    )
+    return TodoContent("\n".join(part.text for part in parts if part.text), status)
+
+
 def todo_content(payload: object) -> TodoContent:
     if not isinstance(payload, dict) or not payload:
         return TodoContent("", "unknown")
@@ -18,32 +43,10 @@ def todo_content(payload: object) -> TodoContent:
         return TodoContent("", "unknown")
     if todo.get("_") != "TodoList":
         return TodoContent("", "unsupported")
-    parts: list[str] = []
-    status: Literal["captured", "unknown", "unsupported"] = "captured"
-
-    def add_title(title: object) -> None:
-        nonlocal status
-        if not isinstance(title, dict):
-            if status != "unsupported":
-                status = "unknown"
-        elif title.get("_") != "TextWithEntities":
-            status = "unsupported"
-        elif isinstance(title.get("text"), str):
-            parts.append(title["text"])
-        elif status != "unsupported":
-            status = "unknown"
-
-    add_title(todo.get("title"))
+    parts = [_title_content(todo.get("title"))]
     items = todo.get("list")
-    if not isinstance(items, list):
-        if status != "unsupported":
-            status = "unknown"
+    if isinstance(items, list):
+        parts.extend(_item_content(item) for item in items)
     else:
-        for item in items:
-            if isinstance(item, dict) and item.get("_") == "TodoItem":
-                add_title(item.get("title"))
-            elif isinstance(item, dict):
-                status = "unsupported"
-            elif status != "unsupported":
-                status = "unknown"
-    return TodoContent("\n".join(part for part in parts if part), status)
+        parts.append(TodoContent("", "unknown"))
+    return _combine_content(parts)
