@@ -145,7 +145,10 @@ async def _execute(
         assert result["verification"] == {"status": "verified", "basis": "post_write_snapshot"}
         current = cast(dict[str, object], result["current"])
         local = read_draft_request(rig.conn, {"dialog_id": 200}, account_id=42)
-        assert local["current"] == {key: value for key, value in current.items() if value is not None}
+        assert local["current"] == {
+            **{key: value for key, value in current.items() if value is not None},
+            "rich_content_status": "unknown" if after is None else "absent",
+        }
         assert current["expected_version"] == read_current_draft(rig.conn, rig.scope).expected_version
         assert len(rig.wire[3].frames) == start + 3
         assert save.message == ("" if after is None else after.message)

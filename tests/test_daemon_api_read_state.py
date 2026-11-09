@@ -124,6 +124,8 @@ def _make_db() -> Iterator[sqlite3.Connection]:
             is_service          INTEGER NOT NULL DEFAULT 0,
             post_author         TEXT,
             formatting_entities TEXT,
+            formatting_text     TEXT,
+            rich_message        TEXT,
             service_action      TEXT,
             PRIMARY KEY (dialog_id, message_id)
         ) WITHOUT ROWID
